@@ -2,24 +2,22 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ecow::EcoString;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
-use tokio::task::{LocalSet, spawn_local, yield_now};
-use tokio_postgres::{Client, Config, NoTls};
+use tokio::task::{LocalSet, yield_now};
+use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace};
 
 use crate::cache::status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
 };
-use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::metrics::names;
 use crate::pg;
 use crate::query::ast::Deparse;
-use crate::query::resolved::ResolvedSelectNode;
 use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, Settings};
 
@@ -31,43 +29,18 @@ use super::super::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
     },
 };
-use super::population::population_worker;
+use super::cdc::WriterCdc;
+use super::registration::WriterRegistration;
 
-/// Minimum number of persistent population workers.
-const MIN_POPULATE_POOL_SIZE: usize = 2;
-
-/// Minimum number of connections in the cache pool for concurrent CDC updates.
-const MIN_CACHE_POOL_SIZE: usize = 2;
-
-/// Work item for population worker pool.
-pub struct PopulationWork {
-    pub fingerprint: u64,
-    pub generation: u64,
-    pub table_metadata: Vec<TableMetadata>,
-    /// SELECT branches extracted from the query at registration time.
-    /// For simple SELECT queries, this contains one branch.
-    /// For set operations (UNION/INTERSECT/EXCEPT), contains all branches.
-    pub branches: Vec<ResolvedSelectNode>,
-    /// Maximum rows to fetch during population. `None` = fetch all rows.
-    pub max_limit: Option<u64>,
-    /// Stamped at construction; used by the population worker to record
-    /// `pgcache.cache.population.wait_seconds`.
-    pub enqueued_at: Instant,
-}
-
-/// Cache writer that owns the Cache and serializes all mutations.
-/// This ensures no race conditions between query registration and purging.
-pub struct CacheWriter {
+/// Shared writer state for the CDC apply and registration/population paths.
+/// `WriterCdc` and `WriterRegistration` borrow `&mut WriterCore` per command;
+/// the single-owner `writer_run` select loop serializes mutations (no
+/// locking), preserving the no-race-between-registration-and-purging invariant.
+pub struct WriterCore {
     pub(super) cache: Cache,
     pub(super) db_cache: Client,
     pub(super) db_origin: Rc<Client>,
     pub(super) state_view: Arc<CacheStateView>,
-    /// Channels to persistent population workers (round-robin dispatch).
-    pub(super) populate_txs: Vec<UnboundedSender<PopulationWork>>,
-    /// Index for round-robin dispatch to population workers.
-    pub(super) populate_next: usize,
-    /// Pool of cache connections for concurrent CDC update execution.
-    pub(super) cache_pool: Vec<Rc<Client>>,
     /// Shared set of relation OIDs with active cached queries (read by CDC processor).
     active_relations: ActiveRelations,
     /// Per-relation_oid refcount of cached queries that reference each
@@ -75,330 +48,50 @@ pub struct CacheWriter {
     /// updated on 0↔1 transitions instead of rebuilt by walking
     /// `cached_queries` on every register/evict.
     relation_refcounts: std::collections::HashMap<u32, usize>,
-    /// Aggregate function names from pg_proc, used for scalar subquery decorrelation.
-    pub(super) aggregate_functions: HashSet<String>,
     /// Publication name for dynamic table management.
     publication_name: String,
     /// OIDs currently in the publication (mirrors the origin-side state).
     publication_oids: HashSet<u32>,
     /// Set when a removal path changes active relations; drained by command handlers.
     pub(super) relations_dirty: bool,
-    /// Writer's own command channel for sending deferred commands (e.g., pinned readmit from CDC).
+    /// Loopback command channel into the writer select loop. Used by CDC
+    /// invalidation to defer pinned readmits, by MV to schedule builds, and
+    /// cloned to population workers so they can report Ready/Failed.
     pub(super) query_tx: UnboundedSender<QueryCommand>,
     /// Notifications to coordinator for coalescing queue drain.
     pub(super) notify_tx: UnboundedSender<WriterNotify>,
-    /// Highest LSN whose effects (cache mutations and invalidations) have been
-    /// applied by this writer. Advances on `CommitMark` and `KeepAliveMark`,
-    /// guaranteed transaction-aligned by mpsc ordering.
-    last_applied_lsn: u64,
 }
 
-impl CacheWriter {
+impl WriterCore {
     pub async fn new(
         settings: &Settings,
         state_view: Arc<CacheStateView>,
         active_relations: ActiveRelations,
-        query_tx: UnboundedSender<QueryCommand>,
         notify_tx: UnboundedSender<WriterNotify>,
+        query_tx: UnboundedSender<QueryCommand>,
     ) -> CacheResult<Self> {
-        let (cache_client, cache_connection) = Config::new()
-            .host(&settings.cache.host)
-            .port(settings.cache.port)
-            .user(&settings.cache.user)
-            .dbname(&settings.cache.database)
-            .connect(NoTls)
+        let cache_client = pg::connect(&settings.cache, "writer cache")
             .await
             .map_into_report::<CacheError>()?;
-
-        tokio::spawn(async move {
-            if let Err(e) = cache_connection.await {
-                error!("writer cache connection error: {}", error_chain_format(&e));
-            }
-        });
 
         let origin_client = pg::connect(&settings.origin, "writer origin")
             .await
             .map_into_report::<CacheError>()
             .attach_loc("connecting to origin database")?;
 
-        let db_origin = Rc::new(origin_client);
-
-        let aggregate_functions = aggregate_functions_load(&db_origin)
-            .await
-            .map_into_report::<CacheError>()
-            .attach_loc("loading aggregate functions")?;
-
-        // Spawn persistent population workers (each with its own cache connection)
-        let populate_pool_size = settings.num_workers.max(MIN_POPULATE_POOL_SIZE);
-        let mut populate_txs = Vec::with_capacity(populate_pool_size);
-
-        for i in 0..populate_pool_size {
-            let (cache_conn, cache_conn_task) = Config::new()
-                .host(&settings.cache.host)
-                .port(settings.cache.port)
-                .user(&settings.cache.user)
-                .dbname(&settings.cache.database)
-                .connect(NoTls)
-                .await
-                .map_into_report::<CacheError>()?;
-
-            tokio::spawn(async move {
-                if let Err(e) = cache_conn_task.await {
-                    error!(
-                        "population worker {i} connection error: {}",
-                        error_chain_format(&e),
-                    );
-                }
-            });
-
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            populate_txs.push(tx);
-
-            let worker_db_origin = Rc::clone(&db_origin);
-            let worker_query_tx = query_tx.clone();
-
-            spawn_local(async move {
-                population_worker(i, rx, worker_db_origin, cache_conn, worker_query_tx).await;
-            });
-        }
-
-        // Create cache connection pool for concurrent CDC updates
-        let cache_pool_size = (settings.num_workers / 2).max(MIN_CACHE_POOL_SIZE);
-        let mut cache_pool = Vec::with_capacity(cache_pool_size);
-        for i in 0..cache_pool_size {
-            let (pool_conn, pool_conn_task) = Config::new()
-                .host(&settings.cache.host)
-                .port(settings.cache.port)
-                .user(&settings.cache.user)
-                .dbname(&settings.cache.database)
-                .connect(NoTls)
-                .await
-                .map_into_report::<CacheError>()?;
-
-            tokio::spawn(async move {
-                if let Err(e) = pool_conn_task.await {
-                    error!(
-                        "cache pool connection {i} error: {}",
-                        error_chain_format(&e),
-                    );
-                }
-            });
-
-            cache_pool.push(Rc::new(pool_conn));
-        }
-
         Ok(Self {
             cache: Cache::new(settings),
             db_cache: cache_client,
-            db_origin,
+            db_origin: Rc::new(origin_client),
             state_view,
-            populate_txs,
-            populate_next: 0,
-            cache_pool,
             active_relations,
             relation_refcounts: std::collections::HashMap::new(),
-            aggregate_functions,
             publication_name: settings.cdc.publication_name.clone(),
             publication_oids: HashSet::new(),
             relations_dirty: false,
             query_tx,
             notify_tx,
-            last_applied_lsn: 0,
         })
-    }
-
-    /// Handle a query command, dispatching to the appropriate method.
-    pub async fn query_command_handle(&mut self, cmd: QueryCommand) -> CacheResult<()> {
-        let cmd_label = match &cmd {
-            QueryCommand::Register { .. } => "register",
-            QueryCommand::Ready { .. } => "ready",
-            QueryCommand::Failed { .. } => "failed",
-            QueryCommand::LimitBump { .. } => "limit_bump",
-            QueryCommand::Readmit { .. } => "readmit",
-            QueryCommand::MvBuild { .. } => "mv_build",
-        };
-        let handle_start = Instant::now();
-        match cmd {
-            QueryCommand::Register {
-                fingerprint,
-                cacheable_query,
-                search_path,
-                started_at,
-                subsumption_tx,
-                admit_action,
-                pinned,
-            } => {
-                trace!("command query register {fingerprint}");
-                let search_path_refs: Vec<&str> = search_path.iter().map(String::as_str).collect();
-                if let Err(e) = self
-                    .query_register(
-                        fingerprint,
-                        &cacheable_query,
-                        &search_path_refs,
-                        started_at,
-                        subsumption_tx,
-                        admit_action,
-                        pinned,
-                    )
-                    .await
-                {
-                    error!(
-                        "query register failed for {fingerprint}: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                    self.query_failed_cleanup(fingerprint);
-                }
-            }
-            QueryCommand::Ready {
-                fingerprint,
-                cached_bytes,
-                row_count,
-            } => {
-                self.query_ready_mark(fingerprint, cached_bytes, row_count);
-                // Pinned queries bypass the coordinator-driven "first hit triggers
-                // MV build" flow so they stay warm across restarts and readmits.
-                // See mv_pinned_bootstrap.
-                self.mv_pinned_bootstrap(fingerprint);
-                self.cache.current_size = self.cache_size_load().await?;
-                self.eviction_run().await?;
-            }
-            QueryCommand::Failed { fingerprint } => {
-                self.query_failed_cleanup(fingerprint);
-            }
-            QueryCommand::LimitBump {
-                fingerprint,
-                max_limit,
-            } => {
-                trace!("command limit bump {fingerprint} max_limit={max_limit:?}");
-                if let Err(e) = self.limit_bump_handle(fingerprint, max_limit).await {
-                    error!(
-                        "limit bump failed for {fingerprint}: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                    // Forward rollback isn't reliable: by the time
-                    // `populate_work_dispatch` could fail, the writer has already
-                    // bumped generation/max_limit and the cache table rows are
-                    // stamped with the old generation. Tear down so reads aren't
-                    // served against an unpopulated new generation.
-                    self.query_failed_cleanup(fingerprint);
-                }
-            }
-            QueryCommand::Readmit { fingerprint } => {
-                trace!("command readmit {fingerprint}");
-                if let Err(e) = self.query_readmit(fingerprint, Instant::now()).await {
-                    error!(
-                        "pinned readmit failed for {fingerprint}: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                    self.query_failed_cleanup(fingerprint);
-                }
-            }
-            QueryCommand::MvBuild { fingerprint } => {
-                trace!("command mv build {fingerprint}");
-                if let Err(e) = self.mv_build(fingerprint).await {
-                    error!(
-                        "mv build failed for {fingerprint}: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                    // The cache itself is intact and serving Ready; only the MV
-                    // build path failed. Revert to Pending so the next hit retries
-                    // (matches mv_build's own SQL-error fallback at writer/mv.rs).
-                    self.mv_build_failed_reset(fingerprint);
-                }
-            }
-        }
-        // Publication dirty drain runs per-command because it's correctness
-        // work (it surfaces relation changes to the CDC publication). Gauge
-        // emission is on a periodic tick in `writer_run` — iterating the
-        // state_view DashMap per command dominated writer time at scale.
-        self.publication_dirty_drain().await?;
-        metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
-            .record(handle_start.elapsed().as_secs_f64());
-        Ok(())
-    }
-
-    /// Handle a CDC command, dispatching to the appropriate method.
-    pub async fn cdc_command_handle(&mut self, cmd: CdcCommand) -> CacheResult<()> {
-        let cmd_label = match &cmd {
-            CdcCommand::TableRegister(_) => "cdc_table_register",
-            CdcCommand::Insert { .. } => "cdc_insert",
-            CdcCommand::Update { .. } => "cdc_update",
-            CdcCommand::Delete { .. } => "cdc_delete",
-            CdcCommand::Truncate { .. } => "cdc_truncate",
-            CdcCommand::CommitMark { .. } => "cdc_commit_mark",
-            CdcCommand::KeepAliveMark { .. } => "cdc_keepalive_mark",
-        };
-        let handle_start = Instant::now();
-        match cmd {
-            CdcCommand::TableRegister(table_metadata) => {
-                if let Err(e) = self.cache_table_register(table_metadata).await {
-                    error!(
-                        "table register failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
-            }
-            CdcCommand::Insert {
-                relation_oid,
-                row_data,
-            } => {
-                if let Err(e) = self.handle_insert(relation_oid, row_data).await {
-                    error!(
-                        "cdc insert failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
-            }
-            CdcCommand::Update {
-                relation_oid,
-                key_data,
-                row_data,
-            } => {
-                if let Err(e) = self.handle_update(relation_oid, key_data, row_data).await {
-                    error!(
-                        "cdc update failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
-            }
-            CdcCommand::Delete {
-                relation_oid,
-                row_data,
-            } => {
-                if let Err(e) = self.handle_delete(relation_oid, row_data).await {
-                    error!(
-                        "cdc delete failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
-            }
-            CdcCommand::Truncate { relation_oids } => {
-                if let Err(e) = self.handle_truncate(&relation_oids).await {
-                    error!(
-                        "cdc truncate failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
-            }
-            CdcCommand::CommitMark { lsn } | CdcCommand::KeepAliveMark { lsn } => {
-                self.applied_lsn_advance(lsn);
-            }
-        }
-        self.publication_dirty_drain().await?;
-        metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
-            .record(handle_start.elapsed().as_secs_f64());
-        Ok(())
-    }
-
-    /// Advance `last_applied_lsn` forward to `lsn`, updating the Prometheus
-    /// gauge. No-op if `lsn` does not advance the watermark.
-    fn applied_lsn_advance(&mut self, lsn: u64) {
-        if lsn > self.last_applied_lsn {
-            self.last_applied_lsn = lsn;
-            // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
-            #[allow(clippy::cast_precision_loss)]
-            metrics::gauge!(names::CDC_APPLIED_LSN).set(lsn as f64);
-        }
     }
 
     /// Increment refcounts for each relation_oid the new cached_query
@@ -532,7 +225,7 @@ impl CacheWriter {
     /// orphaned cache tables). `active_relations` is kept up to date
     /// incrementally via `active_relations_acquire` / `_release`, so the only
     /// remaining work here is the publication sync itself.
-    async fn publication_dirty_drain(&mut self) -> CacheResult<()> {
+    pub(super) async fn publication_dirty_drain(&mut self) -> CacheResult<()> {
         if !self.relations_dirty {
             return Ok(());
         }
@@ -705,7 +398,7 @@ impl CacheWriter {
 
     /// Run eviction loop. For CLOCK policy, uses second-chance algorithm with reference bit.
     /// For FIFO policy, evicts the oldest-registered query.
-    async fn eviction_run(&mut self) -> CacheResult<()> {
+    pub(super) async fn eviction_run(&mut self) -> CacheResult<()> {
         /// Maximum number of generation bumps (second chances) per eviction round.
         /// Bounds re-stamping work and prevents pathological case where all queries are referenced.
         const MAX_BUMPS: usize = 5;
@@ -860,7 +553,7 @@ impl CacheWriter {
     ///   fingerprint no longer exists in either map.
     ///
     /// Runs on the 1s gauges tick, not per-command — see callsite.
-    fn stale_entries_cleanup(&mut self) {
+    pub(super) fn stale_entries_cleanup(&mut self) {
         let cleanup_threshold = self.cache.generation_purge_threshold();
 
         let hit_delta = self.state_view.hits_since_gc.swap(0, Ordering::Relaxed);
@@ -885,16 +578,16 @@ impl CacheWriter {
             }
         }
 
-        self.state_view.cached_queries.retain(|_fp, entry| {
-            match &mut entry.state {
+        self.state_view
+            .cached_queries
+            .retain(|_fp, entry| match &mut entry.state {
                 CachedQueryState::Pending { credit, .. } => {
                     *credit = credit.saturating_sub(hit_delta);
                     *credit > 0
                 }
                 CachedQueryState::Invalidated => entry.generation >= cleanup_threshold,
                 CachedQueryState::Loading | CachedQueryState::Ready => true,
-            }
-        });
+            });
 
         // Remove metrics for fingerprints no longer in either map
         self.state_view.metrics.retain(|fp, _| {
@@ -927,7 +620,7 @@ impl CacheWriter {
     }
 
     /// Build and send a status response for an admin `/status` request.
-    async fn status_respond(&self, req: StatusRequest) {
+    async fn status_respond(&self, req: StatusRequest, last_applied_lsn: u64) {
         let cache = &self.cache;
 
         let (mut total_hits, mut total_misses) = (0u64, 0u64);
@@ -1061,9 +754,7 @@ impl CacheWriter {
 
         let response = StatusResponse {
             cache: cache_status,
-            cdc: CdcStatusData {
-                last_applied_lsn: self.last_applied_lsn,
-            },
+            cdc: CdcStatusData { last_applied_lsn },
             queries,
         };
 
@@ -1092,7 +783,9 @@ impl CacheWriter {
     }
 }
 
-/// Main writer runtime - processes query and CDC commands with LocalSet for spawned tasks.
+/// Main writer runtime. Owns `WriterCore` plus the two responsibility
+/// managers (`WriterCdc`, `WriterRegistration`) and serializes their access
+/// to the core through one select loop.
 #[allow(clippy::too_many_arguments)]
 pub fn writer_run(
     settings: &Settings,
@@ -1116,10 +809,19 @@ pub fn writer_run(
 
         LocalSet::new()
             .run_until(async move {
-                // Create writer inside LocalSet so spawn_local works for population workers
-                let mut writer =
-                    CacheWriter::new(settings, state_view, active_relations, query_tx, notify_tx)
-                        .await?;
+                // Built inside the LocalSet so WriterRegistration can spawn_local
+                // its population workers.
+                let mut core = WriterCore::new(
+                    settings,
+                    state_view,
+                    active_relations,
+                    notify_tx,
+                    query_tx.clone(),
+                )
+                .await?;
+                let mut registration =
+                    WriterRegistration::new(settings, &core.db_origin, query_tx).await?;
+                let mut writer_cdc = WriterCdc::new(settings).await?;
 
                 // Gauges (queries_loading/pending/invalidated, cache_size_bytes,
                 // generation, tables_tracked, update_queries_total/max) used to
@@ -1137,15 +839,17 @@ pub fn writer_run(
                             break;
                         }
                         _ = gauges_interval.tick() => {
-                            writer.stale_entries_cleanup();
-                            writer.state_gauges_update();
-                            writer.writer_scale_gauges_update();
+                            core.stale_entries_cleanup();
+                            core.state_gauges_update();
+                            core.writer_scale_gauges_update();
                         }
                         // Handle query commands from coordinator
                         msg = query_rx.recv() => {
                             match msg {
                                 Some(cmd) => {
-                                    if let Err(e) = writer.query_command_handle(cmd).await {
+                                    if let Err(e) =
+                                        registration.query_command_handle(&mut core, cmd).await
+                                    {
                                         error!(
                                             "writer query command failed: {}",
                                             error_chain_format(e.current_context()),
@@ -1162,7 +866,9 @@ pub fn writer_run(
                         msg = cdc_rx.recv() => {
                             match msg {
                                 Some(cmd) => {
-                                    if let Err(e) = writer.cdc_command_handle(cmd).await {
+                                    if let Err(e) =
+                                        writer_cdc.cdc_command_handle(&mut core, cmd).await
+                                    {
                                         error!(
                                             "writer cdc command failed: {}",
                                             error_chain_format(e.current_context()),
@@ -1179,7 +885,9 @@ pub fn writer_run(
                         msg = internal_rx.recv() => {
                             match msg {
                                 Some(cmd) => {
-                                    if let Err(e) = writer.query_command_handle(cmd).await {
+                                    if let Err(e) =
+                                        registration.query_command_handle(&mut core, cmd).await
+                                    {
                                         error!(
                                             "writer internal command failed: {}",
                                             error_chain_format(e.current_context()),
@@ -1195,7 +903,7 @@ pub fn writer_run(
                         // Handle status requests from admin HTTP server
                         msg = status_rx.recv() => {
                             if let Some(req) = msg {
-                                writer.status_respond(req).await;
+                                core.status_respond(req, writer_cdc.last_applied_lsn).await;
                             }
                         }
                     }

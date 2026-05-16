@@ -1,13 +1,17 @@
 use std::num::NonZeroU64;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
 use ecow::EcoString;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+use tokio::task::spawn_local;
+use tokio_postgres::Client;
 use tracing::{debug, error, info, instrument, trace};
 
 use crate::cache::query::limit_rows_needed;
-use crate::catalog::TableMetadata;
+use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::metrics::names;
 use crate::query::ast::{Deparse, QueryBody, QueryExpr, TableNode};
 use crate::query::constraints::{analyze_query_constraints, table_constraints_subsumed};
@@ -19,19 +23,41 @@ use crate::query::resolved::{
 use crate::query::transform::predicate_pushdown_apply;
 use crate::query::update::query_table_update_queries;
 use crate::result::error_chain_format;
+use crate::settings::Settings;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::{AdmitAction, SubsumptionResult, WriterNotify},
+    messages::{AdmitAction, QueryCommand, SubsumptionResult, WriterNotify},
     mv::{ShapeGate, shape_classify},
     query::CacheableQuery,
     types::{
-        CachedQuery, QueryMetrics, SharedResolved, UpdateEvalStrategy,
-        UpdateQueries, UpdateQuery, UpdateQuerySource,
+        CachedQuery, QueryMetrics, SharedResolved, UpdateEvalStrategy, UpdateQueries, UpdateQuery,
+        UpdateQuerySource,
     },
 };
-use super::{CacheWriter, PopulationWork};
+use super::core::WriterCore;
+use super::population::population_worker;
+use crate::pg;
+
+/// Minimum number of persistent population workers.
+const MIN_POPULATE_POOL_SIZE: usize = 2;
+
+/// Work item for population worker pool.
+pub struct PopulationWork {
+    pub fingerprint: u64,
+    pub generation: u64,
+    pub table_metadata: Vec<TableMetadata>,
+    /// SELECT branches extracted from the query at registration time.
+    /// For simple SELECT queries, this contains one branch.
+    /// For set operations (UNION/INTERSECT/EXCEPT), contains all branches.
+    pub branches: Vec<ResolvedSelectNode>,
+    /// Maximum rows to fetch during population. `None` = fetch all rows.
+    pub max_limit: Option<u64>,
+    /// Stamped at construction; used by the population worker to record
+    /// `pgcache.cache.population.wait_seconds`.
+    pub enqueued_at: Instant,
+}
 
 /// Decide whether CDC can evaluate this update query's WHERE in Rust.
 ///
@@ -97,7 +123,172 @@ fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
     (base_query, max_limit)
 }
 
-impl CacheWriter {
+/// Owns the query registration / population path: consumes `QueryCommand`s
+/// and drives resolution, subsumption, population dispatch, and lifecycle
+/// transitions against the shared `WriterCore`. Holds the population worker
+/// channels and aggregate-function catalog (used for decorrelation).
+pub(super) struct WriterRegistration {
+    /// Channels to persistent population workers (round-robin dispatch).
+    populate_txs: Vec<UnboundedSender<PopulationWork>>,
+    /// Index for round-robin dispatch to population workers.
+    populate_next: usize,
+    /// Aggregate function names from pg_proc, used for scalar subquery decorrelation.
+    aggregate_functions: std::collections::HashSet<String>,
+}
+
+impl WriterRegistration {
+    pub async fn new(
+        settings: &Settings,
+        db_origin: &Rc<Client>,
+        query_tx: UnboundedSender<QueryCommand>,
+    ) -> CacheResult<Self> {
+        let aggregate_functions = aggregate_functions_load(db_origin)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("loading aggregate functions")?;
+
+        // Spawn persistent population workers (each with its own cache connection)
+        let populate_pool_size = settings.num_workers.max(MIN_POPULATE_POOL_SIZE);
+        let mut populate_txs = Vec::with_capacity(populate_pool_size);
+
+        for i in 0..populate_pool_size {
+            let cache_conn = pg::connect(&settings.cache, &format!("population worker {i}"))
+                .await
+                .map_into_report::<CacheError>()?;
+
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            populate_txs.push(tx);
+
+            let worker_db_origin = Rc::clone(db_origin);
+            let worker_query_tx = query_tx.clone();
+
+            spawn_local(async move {
+                population_worker(i, rx, worker_db_origin, cache_conn, worker_query_tx).await;
+            });
+        }
+
+        Ok(Self {
+            populate_txs,
+            populate_next: 0,
+            aggregate_functions,
+        })
+    }
+
+    /// Handle a query command, dispatching to the appropriate method.
+    pub async fn query_command_handle(
+        &mut self,
+        core: &mut WriterCore,
+        cmd: QueryCommand,
+    ) -> CacheResult<()> {
+        let cmd_label = match &cmd {
+            QueryCommand::Register { .. } => "register",
+            QueryCommand::Ready { .. } => "ready",
+            QueryCommand::Failed { .. } => "failed",
+            QueryCommand::LimitBump { .. } => "limit_bump",
+            QueryCommand::Readmit { .. } => "readmit",
+            QueryCommand::MvBuild { .. } => "mv_build",
+        };
+        let handle_start = Instant::now();
+        match cmd {
+            QueryCommand::Register {
+                fingerprint,
+                cacheable_query,
+                search_path,
+                started_at,
+                subsumption_tx,
+                admit_action,
+                pinned,
+            } => {
+                trace!("command query register {fingerprint}");
+                let search_path_refs: Vec<&str> = search_path.iter().map(String::as_str).collect();
+                if let Err(e) = self
+                    .query_register(
+                        core,
+                        fingerprint,
+                        &cacheable_query,
+                        &search_path_refs,
+                        started_at,
+                        subsumption_tx,
+                        admit_action,
+                        pinned,
+                    )
+                    .await
+                {
+                    error!(
+                        "query register failed for {fingerprint}: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                    self.query_failed_cleanup(core, fingerprint);
+                }
+            }
+            QueryCommand::Ready {
+                fingerprint,
+                cached_bytes,
+                row_count,
+            } => {
+                self.query_ready_mark(core, fingerprint, cached_bytes, row_count);
+                // Pinned queries bypass the coordinator-driven "first hit triggers
+                // MV build" flow so they stay warm across restarts and readmits.
+                // See mv_pinned_bootstrap.
+                core.mv_pinned_bootstrap(fingerprint);
+                core.cache.current_size = core.cache_size_load().await?;
+                core.eviction_run().await?;
+            }
+            QueryCommand::Failed { fingerprint } => {
+                self.query_failed_cleanup(core, fingerprint);
+            }
+            QueryCommand::LimitBump {
+                fingerprint,
+                max_limit,
+            } => {
+                trace!("command limit bump {fingerprint} max_limit={max_limit:?}");
+                if let Err(e) = self.limit_bump_handle(core, fingerprint, max_limit).await {
+                    error!(
+                        "limit bump failed for {fingerprint}: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                    // Forward rollback isn't reliable: by the time
+                    // `populate_work_dispatch` could fail, the writer has already
+                    // bumped generation/max_limit and the cache table rows are
+                    // stamped with the old generation. Tear down so reads aren't
+                    // served against an unpopulated new generation.
+                    self.query_failed_cleanup(core, fingerprint);
+                }
+            }
+            QueryCommand::Readmit { fingerprint } => {
+                trace!("command readmit {fingerprint}");
+                if let Err(e) = self.query_readmit(core, fingerprint, Instant::now()).await {
+                    error!(
+                        "pinned readmit failed for {fingerprint}: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                    self.query_failed_cleanup(core, fingerprint);
+                }
+            }
+            QueryCommand::MvBuild { fingerprint } => {
+                trace!("command mv build {fingerprint}");
+                if let Err(e) = core.mv_build(fingerprint).await {
+                    error!(
+                        "mv build failed for {fingerprint}: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                    // The cache itself is intact and serving Ready; only the MV
+                    // build path failed. Revert to Pending so the next hit retries
+                    // (matches mv_build's own SQL-error fallback at writer/mv.rs).
+                    core.mv_build_failed_reset(fingerprint);
+                }
+            }
+        }
+        // Publication dirty drain runs per-command because it's correctness
+        // work (it surfaces relation changes to the CDC publication). Gauge
+        // emission is on a periodic tick in `writer_run` — iterating the
+        // state_view DashMap per command dominated writer time at scale.
+        core.publication_dirty_drain().await?;
+        metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
+            .record(handle_start.elapsed().as_secs_f64());
+        Ok(())
+    }
+
     /// Classify a resolved query's shape for MV eligibility. Runs decorrelation
     /// first so the classification matches what first-population / rebuild will
     /// actually see (correlated subqueries get rewritten to JOIN + DISTINCT,
@@ -122,6 +313,7 @@ impl CacheWriter {
     /// then extracts SELECT branches, collects table metadata, and builds PopulationWork.
     fn population_work_build(
         &self,
+        core: &WriterCore,
         fingerprint: u64,
         generation: u64,
         resolved: &SharedResolved,
@@ -153,7 +345,7 @@ impl CacheWriter {
 
         let table_metadata: Vec<TableMetadata> = branch_relation_oids
             .iter()
-            .filter_map(|oid| self.cache.tables.get1(oid).cloned())
+            .filter_map(|oid| core.cache.tables.get1(oid).cloned())
             .collect();
 
         PopulationWork {
@@ -169,6 +361,7 @@ impl CacheWriter {
     /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
     async fn table_schema_resolve(
         &self,
+        core: &WriterCore,
         table_name: &str,
         explicit_schema: Option<&str>,
         search_path: &[&str],
@@ -176,7 +369,7 @@ impl CacheWriter {
         if let Some(schema) = explicit_schema {
             Ok(schema.to_owned())
         } else {
-            self.schema_for_table_find(table_name, search_path).await
+            core.schema_for_table_find(table_name, search_path).await
         }
     }
 
@@ -184,7 +377,8 @@ impl CacheWriter {
     /// fingerprint order for CDC iteration and indexes the constraints for
     /// sub-linear subsumption candidate lookup.
     fn update_query_register(
-        &mut self,
+        &self,
+        core: &mut WriterCore,
         relation_oid: u32,
         table_name: &str,
         update_query: UpdateQuery,
@@ -212,7 +406,7 @@ impl CacheWriter {
                 .unwrap_or_default()
         });
 
-        let mut queries = self
+        let mut queries = core
             .cache
             .update_queries
             .entry(relation_oid)
@@ -258,23 +452,24 @@ impl CacheWriter {
     /// Ensure all tables referenced in the query exist in the cache.
     /// Resolves schemas and creates cache tables as needed.
     async fn cache_tables_ensure(
-        &mut self,
+        &self,
+        core: &mut WriterCore,
         base_query: &QueryExpr,
         search_path: &[&str],
     ) -> CacheResult<()> {
         for table_node in base_query.nodes::<TableNode>() {
             let table_name = table_node.name.as_str();
             let schema = self
-                .table_schema_resolve(table_name, table_node.schema.as_deref(), search_path)
+                .table_schema_resolve(core, table_name, table_node.schema.as_deref(), search_path)
                 .await?;
 
-            if !self
+            if !core
                 .cache
                 .tables
                 .contains_key2(&(schema.as_str(), table_name))
             {
-                let table = self.cache_table_create(Some(&schema), table_name).await?;
-                self.cache.tables.insert_overwrite(table);
+                let table = core.cache_table_create(Some(&schema), table_name).await?;
+                core.cache.tables.insert_overwrite(table);
             }
         }
         Ok(())
@@ -283,7 +478,8 @@ impl CacheWriter {
     /// Decorrelate the resolved AST and register update queries for each table.
     /// Returns the relation OIDs that have update queries registered.
     fn update_queries_register(
-        &mut self,
+        &self,
+        core: &mut WriterCore,
         fingerprint: u64,
         resolved: &SharedResolved,
         has_limit: bool,
@@ -316,7 +512,7 @@ impl CacheWriter {
                 eval_strategy,
             };
 
-            self.update_query_register(relation_oid, table_node.name.as_str(), update_query);
+            self.update_query_register(core, relation_oid, table_node.name.as_str(), update_query);
             relation_oids.push(relation_oid);
         }
         Ok(relation_oids)
@@ -326,7 +522,8 @@ impl CacheWriter {
     /// Returns `(generation, relations_changed)`.
     #[allow(clippy::too_many_arguments)]
     fn cached_query_insert(
-        &mut self,
+        &self,
+        core: &mut WriterCore,
         fingerprint: u64,
         relation_oids: Vec<u32>,
         base_query: QueryExpr,
@@ -336,14 +533,14 @@ impl CacheWriter {
         started_at: Instant,
         pinned: bool,
     ) -> (u64, bool) {
-        self.cache.generation_counter += 1;
-        let generation = self.cache.generation_counter;
-        self.cache.generations.insert(generation);
+        core.cache.generation_counter += 1;
+        let generation = core.cache.generation_counter;
+        core.cache.generations.insert(generation);
 
         // Increment per-relation refcounts. `changed` is true if any oid
         // transitioned 0→1 (new active relation) — caller uses this to
         // decide whether the publication needs syncing inline.
-        let changed = self.active_relations_acquire(&relation_oids);
+        let changed = core.active_relations_acquire(&relation_oids);
 
         let cached_query = CachedQuery {
             fingerprint,
@@ -359,24 +556,26 @@ impl CacheWriter {
             pinned,
         };
 
-        self.cache.cached_queries.insert_overwrite(cached_query);
+        core.cache.cached_queries.insert_overwrite(cached_query);
         (generation, changed)
     }
 
     /// Resolve a query's tables and AST, register update queries, and extract constraints.
     /// This is the first phase of registration, before subsumption or population.
     async fn query_resolve(
-        &mut self,
+        &self,
+        core: &mut WriterCore,
         fingerprint: u64,
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
     ) -> CacheResult<QueryResolution> {
         let (base_query, user_max_limit) = base_query_prepare(&cacheable_query.query);
 
-        self.cache_tables_ensure(&base_query, search_path).await?;
+        self.cache_tables_ensure(core, &base_query, search_path)
+            .await?;
 
         let resolved: SharedResolved = Arc::new(
-            query_expr_resolve(&base_query, &self.cache.tables, search_path)
+            query_expr_resolve(&base_query, &core.cache.tables, search_path)
                 .map_err(|e| e.context_transform(CacheError::from))
                 .attach_loc("resolving query expression")
                 .map(predicate_pushdown_apply)?,
@@ -410,7 +609,7 @@ impl CacheWriter {
 
         let uq_start = Instant::now();
         let relation_oids =
-            self.update_queries_register(fingerprint, &resolved, max_limit.is_some())?;
+            self.update_queries_register(core, fingerprint, &resolved, max_limit.is_some())?;
         metrics::histogram!(names::CACHE_WRITER_RESOLVE_UPDATE_QUERIES_REGISTER_SECONDS)
             .record(uq_start.elapsed().as_secs_f64());
 
@@ -427,7 +626,7 @@ impl CacheWriter {
     /// Check whether all tables in the new query are covered by existing cached queries.
     /// Returns true only if every relation_oid has at least one Ready, non-limited
     /// UpdateQuery whose equality constraints are implied by the new query's constraints.
-    fn subsumption_check(&self, resolution: &QueryResolution) -> bool {
+    fn subsumption_check(&self, core: &WriterCore, resolution: &QueryResolution) -> bool {
         if resolution.relation_oids.is_empty() {
             return false;
         }
@@ -441,11 +640,11 @@ impl CacheWriter {
         let new_constraints = analyze_query_constraints(select);
 
         for &oid in &resolution.relation_oids {
-            let Some(update_queries) = self.cache.update_queries.get(&oid) else {
+            let Some(update_queries) = core.cache.update_queries.get(&oid) else {
                 return false;
             };
 
-            let Some(table_meta) = self.cache.tables.get1(&oid) else {
+            let Some(table_meta) = core.cache.tables.get1(&oid) else {
                 return false;
             };
             let table_name = &table_meta.name;
@@ -470,7 +669,7 @@ impl CacheWriter {
                     return false;
                 }
 
-                let parent = self.cache.cached_queries.get1(&uq.fingerprint);
+                let parent = core.cache.cached_queries.get1(&uq.fingerprint);
 
                 let parent_ready =
                     parent.is_some_and(|q| !q.invalidated && q.registration_started_at.is_none());
@@ -500,7 +699,8 @@ impl CacheWriter {
     /// Handle a subsumed query: assign generation, stamp rows in cache DB, mark Ready.
     /// Returns (generation, resolved) on success. Falls back to None if cache DB execution fails.
     async fn query_subsume(
-        &mut self,
+        &self,
+        core: &mut WriterCore,
         fingerprint: u64,
         resolution: QueryResolution,
         started_at: Instant,
@@ -509,6 +709,7 @@ impl CacheWriter {
         let subsume_start = Instant::now();
 
         let (generation, relations_changed) = self.cached_query_insert(
+            core,
             fingerprint,
             resolution.relation_oids,
             resolution.base_query,
@@ -520,12 +721,12 @@ impl CacheWriter {
         );
 
         if relations_changed {
-            self.publication_update().await?;
+            core.publication_update().await?;
         }
 
         // Stamp rows: SET generation, execute query, reset generation
         let set_gen_sql = format!("SET mem.query_generation = {generation}");
-        if let Err(e) = self
+        if let Err(e) = core
             .db_cache
             .batch_execute(&set_gen_sql)
             .await
@@ -538,14 +739,14 @@ impl CacheWriter {
             return Ok(None);
         }
 
-        let cache_exec_result = self
+        let cache_exec_result = core
             .db_cache
             .batch_execute(resolution.deparsed_sql.as_str())
             .await
             .map_into_report::<CacheError>();
 
         // Always reset generation, even on failure
-        let _ = self
+        let _ = core
             .db_cache
             .batch_execute("SET mem.query_generation = 0")
             .await;
@@ -558,7 +759,7 @@ impl CacheWriter {
             return Ok(None);
         }
 
-        self.state_ready_transition(
+        core.state_ready_transition(
             fingerprint,
             generation,
             Arc::clone(&resolution.resolved),
@@ -567,14 +768,14 @@ impl CacheWriter {
         );
 
         // Clear registration_started_at to signal completion
-        if let Some(mut q) = self.cache.cached_queries.get1_mut(&fingerprint) {
+        if let Some(mut q) = core.cache.cached_queries.get1_mut(&fingerprint) {
             q.registration_started_at = None;
         }
 
         // Record per-query metrics for subsumption
-        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+        if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
             m.cached_since_ns =
-                NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
+                NonZeroU64::new(duration_to_ns_u64(core.state_view.started_at.elapsed()));
             m.subsumption_count += 1;
         }
 
@@ -601,6 +802,7 @@ impl CacheWriter {
     #[allow(clippy::too_many_arguments)]
     pub async fn query_register(
         &mut self,
+        core: &mut WriterCore,
         fingerprint: u64,
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
@@ -610,17 +812,17 @@ impl CacheWriter {
         pinned: bool,
     ) -> CacheResult<()> {
         // Fast readmit path for invalidated queries — skip subsumption
-        if let Some(query) = self.cache.cached_queries.get1(&fingerprint)
+        if let Some(query) = core.cache.cached_queries.get1(&fingerprint)
             && query.invalidated
         {
             let _ = subsumption_tx.send(SubsumptionResult::NotSubsumed);
-            return self.query_readmit(fingerprint, started_at).await;
+            return self.query_readmit(core, fingerprint, started_at).await;
         }
 
         // Phase 1: Resolve
         let resolve_start = Instant::now();
         let resolution = self
-            .query_resolve(fingerprint, cacheable_query, search_path)
+            .query_resolve(core, fingerprint, cacheable_query, search_path)
             .await?;
         metrics::histogram!(names::CACHE_WRITER_REGISTER_RESOLVE_SECONDS)
             .record(resolve_start.elapsed().as_secs_f64());
@@ -628,11 +830,11 @@ impl CacheWriter {
         // Classify shape for MV eligibility. Sticky — readmit/limit-bump
         // preserve the result through state_view_write. Classification was
         // done in `query_resolve`; reuse here.
-        self.mv_state_set(fingerprint, resolution.shape_gate);
+        core.mv_state_set(fingerprint, resolution.shape_gate);
 
         // Phase 2: Subsumption check
         let subsumption_start = Instant::now();
-        let subsumed = self.subsumption_check(&resolution);
+        let subsumed = self.subsumption_check(core, &resolution);
         metrics::histogram!(names::CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS)
             .record(subsumption_start.elapsed().as_secs_f64());
 
@@ -643,7 +845,7 @@ impl CacheWriter {
 
             let subsume_start = Instant::now();
             let subsume_result = self
-                .query_subsume(fingerprint, resolution, started_at, pinned)
+                .query_subsume(core, fingerprint, resolution, started_at, pinned)
                 .await?;
             metrics::histogram!(names::CACHE_WRITER_REGISTER_SUBSUME_SECONDS)
                 .record(subsume_start.elapsed().as_secs_f64());
@@ -662,7 +864,7 @@ impl CacheWriter {
                     // to clean it up and re-insert properly, or just populate.
                     // Since cached_query_insert was already called, just dispatch population.
                     let _ = subsumption_tx.send(SubsumptionResult::NotSubsumed);
-                    let generation = self
+                    let generation = core
                         .cache
                         .cached_queries
                         .get1(&fingerprint)
@@ -670,6 +872,7 @@ impl CacheWriter {
                         .unwrap_or(0);
                     if generation > 0 {
                         let work = self.population_work_build(
+                            core,
                             fingerprint,
                             generation,
                             &fallback_resolved,
@@ -689,7 +892,7 @@ impl CacheWriter {
         if admit_action == AdmitAction::CheckOnly {
             // Pending below threshold — don't register, don't populate.
             // Clean up the update_queries we registered in query_resolve.
-            self.cache
+            core.cache
                 .update_queries_remove_fingerprint(fingerprint, &resolution.relation_oids);
             return Ok(());
         }
@@ -697,6 +900,7 @@ impl CacheWriter {
         // Register and populate
         let insert_start = Instant::now();
         let (generation, relations_changed) = self.cached_query_insert(
+            core,
             fingerprint,
             resolution.relation_oids,
             resolution.base_query,
@@ -706,8 +910,8 @@ impl CacheWriter {
             started_at,
             pinned,
         );
-        let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
-        self.state_view
+        let now = NonZeroU64::new(duration_to_ns_u64(core.state_view.started_at.elapsed()));
+        core.state_view
             .metrics
             .entry(fingerprint)
             .or_insert_with(|| QueryMetrics::new(now));
@@ -716,13 +920,14 @@ impl CacheWriter {
 
         if relations_changed {
             let pub_start = Instant::now();
-            self.publication_update().await?;
+            core.publication_update().await?;
             metrics::histogram!(names::CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS)
                 .record(pub_start.elapsed().as_secs_f64());
         }
 
         let dispatch_start = Instant::now();
         let work = self.population_work_build(
+            core,
             fingerprint,
             generation,
             &resolution.resolved,
@@ -740,22 +945,23 @@ impl CacheWriter {
     /// dispatches population work without re-resolving tables.
     pub(super) async fn query_readmit(
         &mut self,
+        core: &mut WriterCore,
         fingerprint: u64,
         started_at: Instant,
     ) -> CacheResult<()> {
         debug!("readmitting query {fingerprint}");
         metrics::counter!(names::CACHE_READMISSIONS).increment(1);
-        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+        if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
             m.readmission_count += 1;
         }
 
         // Assign new generation
-        self.cache.generation_counter += 1;
-        let new_generation = self.cache.generation_counter;
-        self.cache.generations.insert(new_generation);
+        core.cache.generation_counter += 1;
+        let new_generation = core.cache.generation_counter;
+        core.cache.generations.insert(new_generation);
 
         // Extract data before remove/reinsert (generation is key2)
-        let Some(mut cached) = self.cache.cached_queries.remove1(&fingerprint) else {
+        let Some(mut cached) = core.cache.cached_queries.remove1(&fingerprint) else {
             return Ok(());
         };
 
@@ -768,9 +974,9 @@ impl CacheWriter {
         cached.cached_bytes = 0;
         cached.registration_started_at = Some(started_at);
         // Refcount unchanged — readmit reuses the existing relation_oids set.
-        self.cache.cached_queries.insert_overwrite(cached);
+        core.cache.cached_queries.insert_overwrite(cached);
 
-        self.state_loading_transition(
+        core.state_loading_transition(
             fingerprint,
             new_generation,
             &resolved,
@@ -778,7 +984,8 @@ impl CacheWriter {
             max_limit,
         );
 
-        let work = self.population_work_build(fingerprint, new_generation, &resolved, max_limit);
+        let work =
+            self.population_work_build(core, fingerprint, new_generation, &resolved, max_limit);
         self.populate_work_dispatch(work)?;
         trace!("readmission population queued for query {fingerprint}");
         Ok(())
@@ -786,9 +993,15 @@ impl CacheWriter {
 
     /// Mark a query as ready after successful population.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub fn query_ready_mark(&mut self, fingerprint: u64, cached_bytes: usize, row_count: u64) {
+    pub fn query_ready_mark(
+        &self,
+        core: &mut WriterCore,
+        fingerprint: u64,
+        cached_bytes: usize,
+        row_count: u64,
+    ) {
         trace!("query_ready_mark {fingerprint}");
-        let update_info = if let Some(mut query) = self.cache.cached_queries.get1_mut(&fingerprint)
+        let update_info = if let Some(mut query) = core.cache.cached_queries.get1_mut(&fingerprint)
         {
             query.cached_bytes = cached_bytes;
             let started_at = query.registration_started_at.take();
@@ -813,21 +1026,15 @@ impl CacheWriter {
             });
 
             // Record per-query population metrics
-            if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+            if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
                 m.population_count += 1;
                 m.population_row_count = row_count;
                 m.cached_since_ns =
-                    NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
+                    NonZeroU64::new(duration_to_ns_u64(core.state_view.started_at.elapsed()));
                 m.last_population_duration_us = population_duration_us.and_then(NonZeroU64::new);
             }
 
-            self.state_ready_transition(
-                fingerprint,
-                generation,
-                resolved,
-                deparsed_sql,
-                max_limit,
-            );
+            core.state_ready_transition(fingerprint, generation, resolved, deparsed_sql, max_limit);
 
             trace!(
                 "cached query ready, cached_bytes={cached_bytes} rows={row_count} {fingerprint}"
@@ -843,21 +1050,21 @@ impl CacheWriter {
     /// rejected the query). Without this, a failed Register would leave
     /// `state_view` stuck in `Loading` and every subsequent client request for
     /// that fingerprint would coalesce into `waiting` and hang.
-    pub fn query_failed_cleanup(&mut self, fingerprint: u64) {
+    pub fn query_failed_cleanup(&self, core: &mut WriterCore, fingerprint: u64) {
         trace!("query_failed_cleanup {fingerprint}");
 
-        match self.cache.cached_queries.remove1(&fingerprint) {
+        match core.cache.cached_queries.remove1(&fingerprint) {
             Some(query) => {
-                self.cache.generations.remove(&query.generation);
-                self.cache
+                core.cache.generations.remove(&query.generation);
+                core.cache
                     .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);
-                self.active_relations_release(&query.relation_oids);
+                core.active_relations_release(&query.relation_oids);
                 debug!("cleaned up failed query {fingerprint}");
             }
             None => {
                 // No cached_query but `update_queries_register` may have run
                 // before the failure — sweep orphan entries by fingerprint.
-                for mut entry in self.cache.update_queries.iter_mut() {
+                for mut entry in core.cache.update_queries.iter_mut() {
                     entry.queries.remove(&fingerprint);
                     entry.complexity_order.retain(|fp| *fp != fingerprint);
                     entry.subsumption.remove(fingerprint);
@@ -865,8 +1072,8 @@ impl CacheWriter {
             }
         }
 
-        self.state_view.cached_queries.remove(&fingerprint);
-        let _ = self.notify_tx.send(WriterNotify::Failed { fingerprint });
+        core.state_view.cached_queries.remove(&fingerprint);
+        let _ = core.notify_tx.send(WriterNotify::Failed { fingerprint });
     }
 
     /// Handle a limit bump: re-populate with a higher limit.
@@ -876,10 +1083,11 @@ impl CacheWriter {
     #[instrument(skip_all)]
     pub async fn limit_bump_handle(
         &mut self,
+        core: &mut WriterCore,
         fingerprint: u64,
         new_max_limit: Option<u64>,
     ) -> CacheResult<()> {
-        let Some(cached_query) = self.cache.cached_queries.get1(&fingerprint) else {
+        let Some(cached_query) = core.cache.cached_queries.get1(&fingerprint) else {
             trace!("limit bump: query {fingerprint} not found, skipping");
             return Ok(());
         };
@@ -887,7 +1095,7 @@ impl CacheWriter {
         // A larger max_limit means the existing MV (sized for the old max_limit)
         // is short of rows. Flip Fresh → Dirty before any other mutation so
         // coordinators fall through while the new population runs.
-        self.mv_dirty_mark(fingerprint);
+        core.mv_dirty_mark(fingerprint);
 
         // Collect data needed before mutating
         let resolved = Arc::clone(&cached_query.resolved);
@@ -896,17 +1104,17 @@ impl CacheWriter {
         let old_generation = cached_query.generation;
 
         // Bump generation
-        self.cache.generation_counter += 1;
-        let new_generation = self.cache.generation_counter;
-        self.cache.generations.insert(new_generation);
-        self.cache.generations.remove(&old_generation);
+        core.cache.generation_counter += 1;
+        let new_generation = core.cache.generation_counter;
+        core.cache.generations.insert(new_generation);
+        core.cache.generations.remove(&old_generation);
 
         // Update cached query — must remove and reinsert because generation is key2
-        if let Some(mut cached) = self.cache.cached_queries.remove1(&fingerprint) {
+        if let Some(mut cached) = core.cache.cached_queries.remove1(&fingerprint) {
             cached.generation = new_generation;
             cached.max_limit = new_max_limit;
             cached.registration_started_at = Some(Instant::now());
-            self.cache.cached_queries.insert_overwrite(cached);
+            core.cache.cached_queries.insert_overwrite(cached);
         }
 
         // Update has_limit on update queries. Limited queries are ineligible
@@ -914,8 +1122,8 @@ impl CacheWriter {
         // goes false → true and (re-)added when it goes true → false.
         let has_limit = new_max_limit.is_some();
         for oid in &relation_oids {
-            let table_name = self.cache.tables.get1(oid).map(|t| t.name.clone());
-            if let Some(mut queries) = self.cache.update_queries.get_mut(oid) {
+            let table_name = core.cache.tables.get1(oid).map(|t| t.name.clone());
+            if let Some(mut queries) = core.cache.update_queries.get_mut(oid) {
                 if let Some(uq) = queries.queries.get_mut(&fingerprint) {
                     uq.has_limit = has_limit;
                 }
@@ -936,7 +1144,7 @@ impl CacheWriter {
             }
         }
 
-        self.state_loading_transition(
+        core.state_loading_transition(
             fingerprint,
             new_generation,
             &resolved,
@@ -945,15 +1153,17 @@ impl CacheWriter {
         );
 
         let work =
-            self.population_work_build(fingerprint, new_generation, &resolved, new_max_limit);
+            self.population_work_build(core, fingerprint, new_generation, &resolved, new_max_limit);
         self.populate_work_dispatch(work)?;
         trace!("limit bump population queued for query {fingerprint}");
         Ok(())
     }
+}
 
+impl WriterCore {
     /// Register table metadata from CDC processing.
     #[instrument(skip_all)]
-    pub async fn cache_table_register(
+    pub(super) async fn cache_table_register(
         &mut self,
         mut table_metadata: TableMetadata,
     ) -> CacheResult<()> {

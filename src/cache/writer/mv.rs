@@ -28,7 +28,7 @@ use super::super::{
     mv::{MvState, ShapeGate, mv_table_name},
     types::{CachedQueryState, SharedResolved},
 };
-use super::CacheWriter;
+use super::core::WriterCore;
 
 /// Snapshot of the state we need for an MV build, taken atomically up front so
 /// the long-running SQL doesn't hold a DashMap guard across awaits.
@@ -39,7 +39,7 @@ struct MvBuildContext {
     resolved: SharedResolved,
 }
 
-impl CacheWriter {
+impl WriterCore {
     /// Pinned queries bypass the coordinator-driven "first hit triggers MV
     /// build" flow so they stay warm across startup and readmits. Called from
     /// the Ready handler. Performs the same check-and-transition the

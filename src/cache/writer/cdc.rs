@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fmt::Write;
+use std::rc::Rc;
 use std::time::Instant;
 
 use ecow::EcoString;
 use futures_util::stream::FuturesUnordered;
 use postgres_protocol::escape;
-use tokio_postgres::SimpleQueryMessage;
+use tokio_postgres::{Client, SimpleQueryMessage};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, instrument, trace};
 
@@ -17,21 +18,25 @@ use crate::query::constraints::{QueryConstraints, TableConstraint};
 use crate::query::evaluate::where_value_compare_string;
 use crate::query::transform::resolved_select_node_table_replace_with_values;
 
-use crate::settings::CachePolicy;
+use crate::settings::{CachePolicy, Settings};
 
 use crate::query::evaluate::where_expr_evaluate;
 
-use super::super::messages::QueryCommand;
+use super::super::messages::{CdcCommand, QueryCommand};
 use super::super::mv::MvState;
 use super::super::types::{
     CachedQueryState, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
 };
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
-use super::CacheWriter;
+use super::core::WriterCore;
+use crate::pg;
 use crate::result::error_chain_format;
 
 /// Default capacity for dynamically built SQL strings.
 const SQL_BUFFER_CAPACITY: usize = 1024;
+
+/// Minimum number of connections in the cache pool for concurrent CDC updates.
+const MIN_CACHE_POOL_SIZE: usize = 2;
 
 /// Rows-affected count from a single-statement `simple_query` result. Returns
 /// the first `CommandComplete` count; 0 if none is present (e.g. statement
@@ -56,12 +61,133 @@ pub(super) enum CdcOperation {
     Delete,
 }
 
-impl CacheWriter {
+/// Owns the CDC apply path: consumes `CdcCommand`s and applies mutations /
+/// invalidations to the shared `WriterCore`. Holds the connection pool used
+/// for concurrent CDC update execution and the applied-LSN watermark.
+pub(super) struct WriterCdc {
+    /// Pool of cache connections for concurrent CDC update execution.
+    pub(super) cache_pool: Vec<Rc<Client>>,
+    /// Highest LSN whose effects (cache mutations and invalidations) have been
+    /// applied by this writer. Advances on `CommitMark` and `KeepAliveMark`,
+    /// guaranteed transaction-aligned by mpsc ordering.
+    pub(super) last_applied_lsn: u64,
+}
+
+impl WriterCdc {
+    pub async fn new(settings: &Settings) -> CacheResult<Self> {
+        // Create cache connection pool for concurrent CDC updates
+        let cache_pool_size = (settings.num_workers / 2).max(MIN_CACHE_POOL_SIZE);
+        let mut cache_pool = Vec::with_capacity(cache_pool_size);
+        for i in 0..cache_pool_size {
+            let pool_conn = pg::connect(&settings.cache, &format!("cache pool {i}"))
+                .await
+                .map_into_report::<CacheError>()?;
+            cache_pool.push(Rc::new(pool_conn));
+        }
+
+        Ok(Self {
+            cache_pool,
+            last_applied_lsn: 0,
+        })
+    }
+
+    /// Handle a CDC command, dispatching to the appropriate method.
+    pub async fn cdc_command_handle(
+        &mut self,
+        core: &mut WriterCore,
+        cmd: CdcCommand,
+    ) -> CacheResult<()> {
+        let cmd_label = match &cmd {
+            CdcCommand::TableRegister(_) => "cdc_table_register",
+            CdcCommand::Insert { .. } => "cdc_insert",
+            CdcCommand::Update { .. } => "cdc_update",
+            CdcCommand::Delete { .. } => "cdc_delete",
+            CdcCommand::Truncate { .. } => "cdc_truncate",
+            CdcCommand::CommitMark { .. } => "cdc_commit_mark",
+            CdcCommand::KeepAliveMark { .. } => "cdc_keepalive_mark",
+        };
+        let handle_start = Instant::now();
+        match cmd {
+            CdcCommand::TableRegister(table_metadata) => {
+                if let Err(e) = core.cache_table_register(table_metadata).await {
+                    error!(
+                        "table register failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                }
+            }
+            CdcCommand::Insert {
+                relation_oid,
+                row_data,
+            } => {
+                if let Err(e) = self.handle_insert(core, relation_oid, row_data).await {
+                    error!(
+                        "cdc insert failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                }
+            }
+            CdcCommand::Update {
+                relation_oid,
+                key_data,
+                row_data,
+            } => {
+                if let Err(e) = self
+                    .handle_update(core, relation_oid, key_data, row_data)
+                    .await
+                {
+                    error!(
+                        "cdc update failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                }
+            }
+            CdcCommand::Delete {
+                relation_oid,
+                row_data,
+            } => {
+                if let Err(e) = self.handle_delete(core, relation_oid, row_data).await {
+                    error!(
+                        "cdc delete failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                }
+            }
+            CdcCommand::Truncate { relation_oids } => {
+                if let Err(e) = self.handle_truncate(core, &relation_oids).await {
+                    error!(
+                        "cdc truncate failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                }
+            }
+            CdcCommand::CommitMark { lsn } | CdcCommand::KeepAliveMark { lsn } => {
+                self.applied_lsn_advance(lsn);
+            }
+        }
+        core.publication_dirty_drain().await?;
+        metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
+            .record(handle_start.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// Advance `last_applied_lsn` forward to `lsn`, updating the Prometheus
+    /// gauge. No-op if `lsn` does not advance the watermark.
+    fn applied_lsn_advance(&mut self, lsn: u64) {
+        if lsn > self.last_applied_lsn {
+            self.last_applied_lsn = lsn;
+            // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
+            #[allow(clippy::cast_precision_loss)]
+            metrics::gauge!(names::CDC_APPLIED_LSN).set(lsn as f64);
+        }
+    }
+
     /// Handle INSERT operation.
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_insert(
-        &mut self,
+        &self,
+        core: &mut WriterCore,
         relation_oid: u32,
         row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
@@ -70,6 +196,7 @@ impl CacheWriter {
 
         let fp_list = self
             .update_queries_check_invalidate(
+                core,
                 relation_oid,
                 None,
                 &row_data,
@@ -80,21 +207,21 @@ impl CacheWriter {
 
         let invalidation_count = fp_list.len() as u64;
         for fp in fp_list {
-            self.cache_query_cdc_invalidate(fp)
+            self.cache_query_cdc_invalidate(core, fp)
                 .await
                 .attach_loc("cdc invalidating query")?;
         }
         if invalidation_count > 0 {
             metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
-            self.state_gauges_update();
+            core.state_gauges_update();
         }
 
         let matched = self
-            .update_queries_execute_concurrent(relation_oid, &row_data)
+            .update_queries_execute_concurrent(core, relation_oid, &row_data)
             .await?;
 
         if matched {
-            let total = self
+            let total = core
                 .cache
                 .update_queries
                 .get(&relation_oid)
@@ -114,7 +241,8 @@ impl CacheWriter {
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_update(
-        &mut self,
+        &self,
+        core: &mut WriterCore,
         relation_oid: u32,
         key_data: Vec<Option<String>>,
         new_row_data: Vec<Option<String>>,
@@ -122,10 +250,13 @@ impl CacheWriter {
         let start = Instant::now();
         metrics::counter!(names::CACHE_HANDLE_UPDATES).increment(1);
 
-        let row_changes = self.query_row_changes(relation_oid, &new_row_data).await?;
+        let row_changes = self
+            .query_row_changes(core, relation_oid, &new_row_data)
+            .await?;
         trace!("row_changes {:?}", row_changes);
 
         let fp_list = self.update_queries_check_invalidate(
+            core,
             relation_oid,
             row_changes.as_ref(),
             &new_row_data,
@@ -136,19 +267,19 @@ impl CacheWriter {
         trace!("invalidation_count {}", invalidation_count);
 
         for fp in fp_list {
-            self.cache_query_cdc_invalidate(fp).await?;
+            self.cache_query_cdc_invalidate(core, fp).await?;
         }
         if invalidation_count > 0 {
             metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
-            self.state_gauges_update();
+            core.state_gauges_update();
         }
 
         let matched = self
-            .update_queries_execute_concurrent(relation_oid, &new_row_data)
+            .update_queries_execute_concurrent(core, relation_oid, &new_row_data)
             .await?;
 
         if matched {
-            let total = self
+            let total = core
                 .cache
                 .update_queries
                 .get(&relation_oid)
@@ -160,7 +291,7 @@ impl CacheWriter {
         }
 
         if !matched {
-            let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
+            let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
                 error!("No table metadata found for relation_oid: {}", relation_oid);
                 return Err(CacheError::UnknownTable {
                     oid: Some(relation_oid),
@@ -170,14 +301,14 @@ impl CacheWriter {
             };
 
             let delete_sql = self.cache_delete_sql(table_metadata, &new_row_data)?;
-            self.db_cache
+            core.db_cache
                 .batch_execute(delete_sql.as_str())
                 .await
                 .map_into_report::<CacheError>()?;
         }
 
         if !key_data.is_empty() {
-            let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
+            let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
                 error!("No table metadata found for relation_oid: {}", relation_oid);
                 return Err(CacheError::UnknownTable {
                     oid: Some(relation_oid),
@@ -187,7 +318,7 @@ impl CacheWriter {
             };
 
             let delete_sql = self.cache_delete_sql(table_metadata, &key_data)?;
-            self.db_cache
+            core.db_cache
                 .batch_execute(delete_sql.as_str())
                 .await
                 .map_into_report::<CacheError>()?;
@@ -205,14 +336,15 @@ impl CacheWriter {
     /// exclusion set, which grows the outer result set — requiring invalidation.
     #[instrument(skip_all)]
     pub async fn handle_delete(
-        &mut self,
+        &self,
+        core: &mut WriterCore,
         relation_oid: u32,
         row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
         let start = Instant::now();
         metrics::counter!(names::CACHE_HANDLE_DELETES).increment(1);
 
-        let table_metadata = match self.cache.tables.get1(&relation_oid) {
+        let table_metadata = match core.cache.tables.get1(&relation_oid) {
             Some(metadata) => metadata,
             None => {
                 error!("No table metadata found for relation_oid: {}", relation_oid);
@@ -224,7 +356,7 @@ impl CacheWriter {
 
         let delete_sql = self.cache_delete_sql(table_metadata, &row_data)?;
         let rows_deleted = simple_query_rows_affected(
-            &self
+            &core
                 .db_cache
                 .simple_query(delete_sql.as_str())
                 .await
@@ -234,9 +366,10 @@ impl CacheWriter {
         // Check for subquery invalidations — removing a row can expand the
         // final result set for Exclusion/Scalar subquery tables
         let mut invalidation_count = 0u64;
-        if self.cache.update_queries.contains_key(&relation_oid) {
+        if core.cache.update_queries.contains_key(&relation_oid) {
             let fp_list = self
                 .update_queries_check_invalidate(
+                    core,
                     relation_oid,
                     None,
                     &row_data,
@@ -247,18 +380,18 @@ impl CacheWriter {
 
             invalidation_count = fp_list.len() as u64;
             for fp in fp_list {
-                self.cache_query_cdc_invalidate(fp)
+                self.cache_query_cdc_invalidate(core, fp)
                     .await
                     .attach_loc("cdc invalidating query on delete")?;
             }
             if invalidation_count > 0 {
                 metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
-                self.state_gauges_update();
+                core.state_gauges_update();
             }
         }
 
         if rows_deleted > 0 {
-            let total = self
+            let total = core
                 .cache
                 .update_queries
                 .get(&relation_oid)
@@ -276,13 +409,17 @@ impl CacheWriter {
 
     /// Handle TRUNCATE operation.
     #[instrument(skip_all)]
-    pub async fn handle_truncate(&self, relation_oids: &[u32]) -> CacheResult<()> {
+    pub async fn handle_truncate(
+        &self,
+        core: &WriterCore,
+        relation_oids: &[u32],
+    ) -> CacheResult<()> {
         let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
         sql.push_str("TRUNCATE ");
 
         let mut first = true;
         for oid in relation_oids {
-            if let Some(table_metadata) = self.cache.tables.get1(oid) {
+            if let Some(table_metadata) = core.cache.tables.get1(oid) {
                 if !first {
                     sql.push_str(", ");
                 }
@@ -291,94 +428,10 @@ impl CacheWriter {
             }
         }
 
-        self.db_cache
+        core.db_cache
             .batch_execute(sql.as_str())
             .await
             .map_into_report::<CacheError>()?;
-
-        Ok(())
-    }
-
-    /// Invalidate all cached queries that reference a table.
-    pub(super) async fn cache_table_invalidate(&mut self, relation_oid: u32) -> CacheResult<()> {
-        let fingerprints: Vec<u64> = self
-            .cache
-            .cached_queries
-            .iter()
-            .filter(|q| q.relation_oids.contains(&relation_oid))
-            .map(|q| q.fingerprint)
-            .collect();
-
-        for fp in fingerprints {
-            self.cache_query_evict(fp).await?;
-        }
-        Ok(())
-    }
-
-    /// Fully evict a cached query: remove from all data structures and purge rows.
-    /// Used by the eviction loop and schema-change (table) invalidation.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(super) async fn cache_query_evict(&mut self, fingerprint: u64) -> CacheResult<()> {
-        let Some(query) = self.cache.cached_queries.remove1(&fingerprint) else {
-            trace!(fingerprint, "cache_query_evict: not found, skipping");
-            return Ok(());
-        };
-
-        debug!(
-            fingerprint,
-            generation = query.generation,
-            relation_oids = ?query.relation_oids,
-            "cache_query_evict entry"
-        );
-        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
-            m.eviction_count += 1;
-            m.cached_since_ns = None;
-        }
-        // Removal paths defer publication sync to the end-of-command drain
-        // (publication_dirty_drain) — stale subscriptions to the dropped
-        // oid are filtered out by the writer ignoring its CDC events.
-        self.active_relations_release(&query.relation_oids);
-
-        let prev_generation_threshold = self.cache.generation_purge_threshold();
-
-        // Remove generation from tracking
-        self.cache.generations.remove(&query.generation);
-
-        // Drop the MV table (if any) before removing the state_view entry so we
-        // can read the mv_state. Errors are logged but don't abort the eviction.
-        let mv_state = self
-            .state_view
-            .cached_queries
-            .get(&fingerprint)
-            .map(|v| v.mv_state);
-        if let Some(mv_state) = mv_state
-            && let Err(e) = self.mv_drop(fingerprint, mv_state).await
-        {
-            error!(
-                "mv drop on eviction failed for {fingerprint}: {}",
-                error_chain_format(e.current_context()),
-            );
-        }
-
-        // Remove from state view
-        self.state_view.cached_queries.remove(&fingerprint);
-
-        self.cache
-            .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);
-
-        // Purge generations based on new threshold
-        let new_threshold = self.cache.generation_purge_threshold();
-        if new_threshold > prev_generation_threshold {
-            let cache_size = self.cache.dynamic.load().cache_size;
-            let mut current_size = self.cache_size_load().await?;
-
-            if cache_size.is_some_and(|s| current_size > s) {
-                self.generation_purge(new_threshold).await?;
-                current_size = self.cache_size_load().await?;
-            }
-
-            self.cache.current_size = current_size as usize;
-        }
 
         Ok(())
     }
@@ -389,26 +442,30 @@ impl CacheWriter {
     /// Removes from generations BTreeSet and purges stale rows, but preserves
     /// cached_queries entry and update_queries for reuse on readmission.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(super) async fn cache_query_cdc_invalidate(&mut self, fingerprint: u64) -> CacheResult<()> {
+    pub(super) async fn cache_query_cdc_invalidate(
+        &self,
+        core: &mut WriterCore,
+        fingerprint: u64,
+    ) -> CacheResult<()> {
         // Pinned queries: defer readmission to the writer event loop
-        if self
+        if core
             .cache
             .cached_queries
             .get1(&fingerprint)
             .is_some_and(|q| q.pinned)
         {
             debug!("pinned query invalidated, deferring readmit {fingerprint}");
-            let _ = self.query_tx.send(QueryCommand::Readmit { fingerprint });
+            let _ = core.query_tx.send(QueryCommand::Readmit { fingerprint });
             return Ok(());
         }
 
-        let cfg = self.cache.dynamic.load();
+        let cfg = core.cache.dynamic.load();
 
         if cfg.cache_policy == CachePolicy::Fifo {
-            return self.cache_query_evict(fingerprint).await;
+            return core.cache_query_evict(fingerprint).await;
         }
 
-        let Some(query) = self.cache.cached_queries.get1(&fingerprint) else {
+        let Some(query) = core.cache.cached_queries.get1(&fingerprint) else {
             return Ok(());
         };
 
@@ -419,18 +476,18 @@ impl CacheWriter {
 
         let generation = query.generation;
         debug!("cdc invalidating query {fingerprint}");
-        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+        if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
             m.invalidation_count += 1;
             m.cached_since_ns = None;
         }
 
-        let prev_generation_threshold = self.cache.generation_purge_threshold();
+        let prev_generation_threshold = core.cache.generation_purge_threshold();
 
         // Remove from active generations (no longer serving cached results)
-        self.cache.generations.remove(&generation);
+        core.cache.generations.remove(&generation);
 
         // Mark as invalidated (keep entry for metadata reuse on readmission)
-        if let Some(mut query) = self.cache.cached_queries.get1_mut(&fingerprint) {
+        if let Some(mut query) = core.cache.cached_queries.get1_mut(&fingerprint) {
             query.invalidated = true;
         }
 
@@ -438,7 +495,7 @@ impl CacheWriter {
         // the same get_mut block so coordinators observe both transitions
         // atomically — a reader that sees state=Invalidated never sees the MV
         // in a stale-Fresh state.
-        if let Some(mut entry) = self.state_view.cached_queries.get_mut(&fingerprint) {
+        if let Some(mut entry) = core.state_view.cached_queries.get_mut(&fingerprint) {
             entry.state = CachedQueryState::Invalidated;
             entry.referenced = false;
             if entry.mv_state == MvState::Fresh {
@@ -447,16 +504,16 @@ impl CacheWriter {
         }
 
         // Purge stale rows if generation threshold moved
-        let new_threshold = self.cache.generation_purge_threshold();
+        let new_threshold = core.cache.generation_purge_threshold();
         if new_threshold > prev_generation_threshold {
-            let mut current_size = self.cache_size_load().await?;
+            let mut current_size = core.cache_size_load().await?;
 
             if cfg.cache_size.is_some_and(|s| current_size > s) {
-                self.generation_purge(new_threshold).await?;
-                current_size = self.cache_size_load().await?;
+                core.generation_purge(new_threshold).await?;
+                current_size = core.cache_size_load().await?;
             }
 
-            self.cache.current_size = current_size as usize;
+            core.cache.current_size = current_size as usize;
         }
 
         Ok(())
@@ -470,11 +527,12 @@ impl CacheWriter {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn query_row_changes(
         &self,
+        core: &WriterCore,
         relation_oid: u32,
         row_data: &[Option<String>],
     ) -> CacheResult<Option<HashMap<EcoString, bool>>> {
         let table_metadata =
-            self.cache
+            core.cache
                 .tables
                 .get1(&relation_oid)
                 .ok_or(CacheError::UnknownTable {
@@ -533,7 +591,7 @@ impl CacheWriter {
             return Err(CacheError::NoPrimaryKey.into());
         }
 
-        let msgs = self
+        let msgs = core
             .db_cache
             .simple_query(&sql)
             .await
@@ -752,6 +810,7 @@ impl CacheWriter {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn update_queries_check_invalidate(
         &self,
+        core: &WriterCore,
         relation_oid: u32,
         row_changes: Option<&HashMap<EcoString, bool>>,
         row_data: &[Option<String>],
@@ -759,7 +818,7 @@ impl CacheWriter {
         operation: CdcOperation,
     ) -> CacheResult<Vec<u64>> {
         let update_queries =
-            self.cache
+            core.cache
                 .update_queries
                 .get(&relation_oid)
                 .ok_or(CacheError::UnknownTable {
@@ -767,7 +826,7 @@ impl CacheWriter {
                     name: None,
                 })?;
 
-        let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
+        let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
             error!("No table metadata found for relation_oid: {}", relation_oid);
             return Err(CacheError::UnknownTable {
                 oid: Some(relation_oid),
@@ -821,11 +880,12 @@ impl CacheWriter {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn update_queries_execute_concurrent(
         &self,
+        core: &WriterCore,
         relation_oid: u32,
         row_data: &[Option<String>],
     ) -> CacheResult<bool> {
         let update_queries =
-            self.cache
+            core.cache
                 .update_queries
                 .get(&relation_oid)
                 .ok_or(CacheError::UnknownTable {
@@ -833,7 +893,7 @@ impl CacheWriter {
                     name: None,
                 })?;
 
-        let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
+        let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
             error!("No table metadata found for relation_oid: {}", relation_oid);
             return Err(CacheError::UnknownTable {
                 oid: Some(relation_oid),
@@ -868,7 +928,7 @@ impl CacheWriter {
             // Mark the MV dirty BEFORE the source-row mutation commits, so
             // any coordinator observing the updated source row also observes
             // mv_state != Fresh and falls through to source-row eval.
-            self.mv_dirty_mark(update_query.fingerprint);
+            core.mv_dirty_mark(update_query.fingerprint);
 
             let sql = self.cache_upsert_unconditional_sql(table_metadata, row_data);
             let conn = self.cache_pool.first().ok_or(CacheError::Other)?;
@@ -935,7 +995,7 @@ impl CacheWriter {
                         // before commit here. The window between commit and
                         // this flip is microseconds and matches the "reads
                         // that overlap an invalidation" case in the design doc.
-                        self.mv_dirty_mark(fingerprint);
+                        core.mv_dirty_mark(fingerprint);
                         batch_matched = true;
                     }
                     Ok(n) if n > 1 => {
@@ -1130,6 +1190,92 @@ impl CacheWriter {
         }
 
         Ok(sql)
+    }
+}
+
+impl WriterCore {
+    /// Invalidate all cached queries that reference a table.
+    pub(super) async fn cache_table_invalidate(&mut self, relation_oid: u32) -> CacheResult<()> {
+        let fingerprints: Vec<u64> = self
+            .cache
+            .cached_queries
+            .iter()
+            .filter(|q| q.relation_oids.contains(&relation_oid))
+            .map(|q| q.fingerprint)
+            .collect();
+
+        for fp in fingerprints {
+            self.cache_query_evict(fp).await?;
+        }
+        Ok(())
+    }
+
+    /// Fully evict a cached query: remove from all data structures and purge rows.
+    /// Used by the eviction loop and schema-change (table) invalidation.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(super) async fn cache_query_evict(&mut self, fingerprint: u64) -> CacheResult<()> {
+        let Some(query) = self.cache.cached_queries.remove1(&fingerprint) else {
+            trace!(fingerprint, "cache_query_evict: not found, skipping");
+            return Ok(());
+        };
+
+        debug!(
+            fingerprint,
+            generation = query.generation,
+            relation_oids = ?query.relation_oids,
+            "cache_query_evict entry"
+        );
+        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+            m.eviction_count += 1;
+            m.cached_since_ns = None;
+        }
+        // Removal paths defer publication sync to the end-of-command drain
+        // (publication_dirty_drain) — stale subscriptions to the dropped
+        // oid are filtered out by the writer ignoring its CDC events.
+        self.active_relations_release(&query.relation_oids);
+
+        let prev_generation_threshold = self.cache.generation_purge_threshold();
+
+        // Remove generation from tracking
+        self.cache.generations.remove(&query.generation);
+
+        // Drop the MV table (if any) before removing the state_view entry so we
+        // can read the mv_state. Errors are logged but don't abort the eviction.
+        let mv_state = self
+            .state_view
+            .cached_queries
+            .get(&fingerprint)
+            .map(|v| v.mv_state);
+        if let Some(mv_state) = mv_state
+            && let Err(e) = self.mv_drop(fingerprint, mv_state).await
+        {
+            error!(
+                "mv drop on eviction failed for {fingerprint}: {}",
+                error_chain_format(e.current_context()),
+            );
+        }
+
+        // Remove from state view
+        self.state_view.cached_queries.remove(&fingerprint);
+
+        self.cache
+            .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);
+
+        // Purge generations based on new threshold
+        let new_threshold = self.cache.generation_purge_threshold();
+        if new_threshold > prev_generation_threshold {
+            let cache_size = self.cache.dynamic.load().cache_size;
+            let mut current_size = self.cache_size_load().await?;
+
+            if cache_size.is_some_and(|s| current_size > s) {
+                self.generation_purge(new_threshold).await?;
+                current_size = self.cache_size_load().await?;
+            }
+
+            self.cache.current_size = current_size as usize;
+        }
+
+        Ok(())
     }
 }
 

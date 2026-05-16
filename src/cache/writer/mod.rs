@@ -2,8 +2,8 @@ mod cdc;
 mod core;
 mod mv;
 mod population;
-mod query;
+mod registration;
 mod table;
 
-pub(super) use self::core::PopulationWork;
-pub use self::core::{CacheWriter, writer_run};
+pub use self::core::writer_run;
+pub(super) use self::registration::PopulationWork;

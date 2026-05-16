@@ -8,9 +8,9 @@ use crate::catalog::{
 use crate::result::error_chain_format;
 
 use super::super::{CacheError, CacheResult, MapIntoReport};
-use super::CacheWriter;
+use super::core::WriterCore;
 
-impl CacheWriter {
+impl WriterCore {
     #[instrument(skip_all)]
     pub(super) async fn cache_table_create(
         &self,
