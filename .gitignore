@@ -3,3 +3,5 @@
 codescene-cli.log
 profile.json.gz
 config.toml
+# pgcache-conformance JUnit output (--junit)
+/out.xml

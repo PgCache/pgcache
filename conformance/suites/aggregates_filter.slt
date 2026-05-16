@@ -1,0 +1,76 @@
+# Ported from PostgreSQL src/test/regress/sql/aggregates.sql — the
+# FILTER-clause aggregate cases. Adapted to the canonical `onek` table
+# (loaded by the harness before this suite runs).
+#
+# Origin is the oracle: no results are inlined. Each query is executed
+# on origin and pgcache and the result sets are compared, plus the
+# pgcache log is scanned for swallowed errors. This is the suite that
+# regression-tests PGC-102, where `count(*) FILTER (WHERE ...)` produced
+# a silently wrong result while only logging the failure.
+#
+# Routing is asserted `cached` for every query whose caching is
+# confirmed. The two-count query stays `any` and is expected to log a
+# swallowed error until PGC-136 (MV build fails on duplicate derived
+# column names) is fixed; do not alias it to make the suite green.
+
+# PGC-102: the exact failing shape — count(*) with a FILTER predicate.
+# pgcache: cached
+query I
+SELECT count(*) FILTER (WHERE four = 1) FROM onek;
+
+# pgcache: cached
+query I
+SELECT sum(four) FILTER (WHERE ten > 5) FROM onek;
+
+# Two FILTERed aggregates partitioning the table. Expected RED: PGC-136
+# (MV build fails — two columns both derive the name "count"). Result is
+# still correct (source-row fallback); the swallowed-error log scan is
+# what flags it. Tighten to `cached` once PGC-136 lands.
+# pgcache: any
+query II
+SELECT count(*) FILTER (WHERE hundred < 50),
+       count(*) FILTER (WHERE hundred >= 50)
+FROM onek;
+
+# FILTER combined with GROUP BY.
+# pgcache: cached
+query II
+SELECT ten, count(*) FILTER (WHERE odd = 1) AS odd_cnt
+FROM onek
+GROUP BY ten
+ORDER BY ten;
+
+# FILTER on a non-integer aggregate (avg → numeric).
+# pgcache: cached
+query R
+SELECT avg(unique1) FILTER (WHERE unique1 > 500) FROM onek;
+
+# min/max with FILTER.
+# pgcache: cached
+query II
+SELECT max(unique2) FILTER (WHERE two = 0) AS mx,
+       min(unique2) FILTER (WHERE two = 1) AS mn
+FROM onek;
+
+# DISTINCT inside a FILTERed aggregate.
+# pgcache: cached
+query I
+SELECT count(DISTINCT hundred) FILTER (WHERE ten = 0) FROM onek;
+
+# FILTER + GROUP BY with a partial predicate (some groups get 0).
+# pgcache: cached
+query II
+SELECT four, sum(unique1) FILTER (WHERE unique1 < 100) AS s
+FROM onek
+GROUP BY four
+ORDER BY four;
+
+# FILTER predicate over a text (name) column.
+# pgcache: cached
+query I
+SELECT count(*) FILTER (WHERE stringu1 < 'N') FROM onek;
+
+# FILTER referencing a column not in the aggregate argument.
+# pgcache: cached
+query I
+SELECT sum(unique1) FILTER (WHERE odd > even) FROM onek;

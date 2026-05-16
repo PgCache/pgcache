@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 /// Request for current cache status, sent from the admin HTTP handler.
@@ -7,7 +7,7 @@ pub struct StatusRequest {
 }
 
 /// Full status response assembled by the cache writer.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub cache: CacheStatusData,
     pub cdc: CdcStatusData,
@@ -15,7 +15,7 @@ pub struct StatusResponse {
 }
 
 /// Cache subsystem state.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct CacheStatusData {
     pub size_bytes: usize,
     pub size_limit_bytes: Option<usize>,
@@ -34,7 +34,7 @@ pub struct CacheStatusData {
 /// CDC-processor-local LSNs (`received_lsn`, `flushed_lsn`) and lag values
 /// are exposed as Prometheus gauges on `/metrics` instead — that's their
 /// natural home, and avoids cross-thread plumbing for read-only display.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CdcStatusData {
     /// Highest LSN whose effects (cache mutations and invalidations) have
     /// been fully applied by the writer. Advances on transaction commit
@@ -44,7 +44,7 @@ pub struct CdcStatusData {
 }
 
 /// Per-query status for a cached query.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct QueryStatusData {
     pub fingerprint: u64,
     pub sql_preview: String,
@@ -75,7 +75,7 @@ pub struct QueryStatusData {
 }
 
 /// Summary statistics from the cache-hit latency histogram.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LatencyStats {
     pub count: u64,
     pub mean_us: f64,

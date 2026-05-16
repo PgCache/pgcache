@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "conformance"]
+
 [package]
 name = "pgcache"
 version = "0.4.11"
