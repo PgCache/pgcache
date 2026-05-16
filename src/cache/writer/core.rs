@@ -60,6 +60,16 @@ pub struct WriterCore {
     pub(super) query_tx: UnboundedSender<QueryCommand>,
     /// Notifications to coordinator for coalescing queue drain.
     pub(super) notify_tx: UnboundedSender<WriterNotify>,
+    /// True while `WriterCdc` holds an open `BEGIN` on its write connection
+    /// (set/cleared by `WriterCdc::frame_ensure`/`frame_commit` through their
+    /// `&mut WriterCore`). The maintenance paths read it to defer cache-table
+    /// DDL/purges: a `db_cache` DROP/DELETE on a table the open frame wrote
+    /// would block on the frame's row locks, and the frame only commits at the
+    /// later `CommitMark` — a permanent stall.
+    pub(super) frame_open: bool,
+    /// Set when a generation purge was skipped because a frame was open;
+    /// flushed after the frame commits at `CommitMark`.
+    pub(super) purge_pending: bool,
 }
 
 impl WriterCore {
@@ -91,6 +101,8 @@ impl WriterCore {
             relations_dirty: false,
             query_tx,
             notify_tx,
+            frame_open: false,
+            purge_pending: false,
         })
     }
 
@@ -227,6 +239,13 @@ impl WriterCore {
     /// remaining work here is the publication sync itself.
     pub(super) async fn publication_dirty_drain(&mut self) -> CacheResult<()> {
         if !self.relations_dirty {
+            return Ok(());
+        }
+        // Defer while a CDC frame is open: publication_update's
+        // cache_tables_drop (DROP TABLE on db_cache) would block on the
+        // frame's uncommitted cache-table locks. relations_dirty stays set;
+        // the drain re-runs after frame_commit at CommitMark.
+        if self.frame_open {
             return Ok(());
         }
         self.relations_dirty = false;
@@ -383,9 +402,20 @@ impl WriterCore {
             .set(max_per_relation as f64);
     }
 
-    /// Utility function to get the size of the currently cached data
+    /// Utility function to get the size of the currently cached data.
+    ///
+    /// Returns the last known `current_size` *without querying* while a CDC
+    /// frame is open. `pgcache_total_size()` does `pg_total_relation_size`
+    /// (an `ACCESS SHARE` open) over the tracked cache tables; an in-frame
+    /// `TRUNCATE` holds `ACCESS EXCLUSIVE` on one of them, so the query would
+    /// block on the frame until `CommitMark` — a deadlock. The size is an
+    /// explicitly-drifting estimate and self-corrects on the next load once
+    /// the frame has committed.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn cache_size_load(&mut self) -> CacheResult<usize> {
+        if self.frame_open {
+            return Ok(self.cache.current_size);
+        }
         let size: i64 = self
             .db_cache
             .query_one("SELECT pgcache_total_size()", &[])
@@ -399,6 +429,12 @@ impl WriterCore {
     /// Run eviction loop. For CLOCK policy, uses second-chance algorithm with reference bit.
     /// For FIFO policy, evicts the oldest-registered query.
     pub(super) async fn eviction_run(&mut self) -> CacheResult<()> {
+        // Defer while a CDC frame is open: cache_query_evict / generation_purge
+        // would block on the frame's uncommitted cache-table locks. Eviction is
+        // periodic/best-effort — the next Ready after the frame commits runs it.
+        if self.frame_open {
+            return Ok(());
+        }
         /// Maximum number of generation bumps (second chances) per eviction round.
         /// Bounds re-stamping work and prevents pathological case where all queries are referenced.
         const MAX_BUMPS: usize = 5;
@@ -763,7 +799,20 @@ impl WriterCore {
 
     /// Purge rows with generation <= threshold.
     /// First promotes any gen-0 entries so they become purgeable in future cycles.
+    ///
+    /// Returns `Ok(0)` *without purging* while a CDC frame is open (the purge
+    /// is deferred to `CommitMark`). Callers must not treat that `0` as
+    /// "nothing to reclaim" — e.g. a following `cache_size_load` will read a
+    /// pre-purge size. The size estimate is allowed to drift and self-corrects
+    /// once the deferred purge runs.
     pub(super) async fn generation_purge(&mut self, threshold: u64) -> CacheResult<i64> {
+        // Defer while a CDC frame is open: pgcache_purge_rows DELETEs source
+        // cache-table rows on db_cache, which would block on the frame's
+        // uncommitted locks. Record the intent; flushed after frame_commit.
+        if self.frame_open {
+            self.purge_pending = true;
+            return Ok(0);
+        }
         debug!(threshold, "generation_purge entry");
         self.generation_zero_promote().await?;
 
@@ -869,10 +918,14 @@ pub fn writer_run(
                                     if let Err(e) =
                                         writer_cdc.cdc_command_handle(&mut core, cmd).await
                                     {
+                                        // Propagate: tears down the cache
+                                        // subsystem so the supervisor restart
+                                        // rebuilds it from a clean reset.
                                         error!(
-                                            "writer cdc command failed: {}",
+                                            "writer cdc command failed, resetting cache: {}",
                                             error_chain_format(e.current_context()),
                                         );
+                                        return Err(e);
                                     }
                                 }
                                 None => {

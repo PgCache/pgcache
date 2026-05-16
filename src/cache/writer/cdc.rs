@@ -53,6 +53,14 @@ fn simple_query_rows_affected(msgs: &[SimpleQueryMessage]) -> u64 {
         .unwrap_or(0)
 }
 
+/// Boolean from a single-row `SELECT EXISTS (...)` `simple_query` result.
+/// Postgres returns the boolean in text format; any non-`"t"` (including no
+/// row) is treated as false.
+fn simple_query_exists(msgs: &[SimpleQueryMessage]) -> bool {
+    msgs.iter()
+        .any(|m| matches!(m, SimpleQueryMessage::Row(r) if r.get(0) == Some("t")))
+}
+
 /// Distinguishes INSERT from DELETE so that subquery invalidation logic
 /// can flip Inclusion/Exclusion semantics correctly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,8 +73,16 @@ pub(super) enum CdcOperation {
 /// invalidations to the shared `WriterCore`. Holds the connection pool used
 /// for concurrent CDC update execution and the applied-LSN watermark.
 pub(super) struct WriterCdc {
-    /// Pool of cache connections for concurrent CDC update execution.
+    /// Read/eval pool: parallel predicate evaluation only (`SELECT EXISTS`).
+    /// Read-only, autocommit — sees the pre-source-transaction snapshot, never
+    /// the in-flight frame's uncommitted writes.
     pub(super) cache_pool: Vec<Rc<Client>>,
+    /// Single dedicated write connection. All cache mutations for a source
+    /// transaction are applied here inside one `BEGIN…COMMIT` spanning every
+    /// message of that transaction, so cache readers observe the source
+    /// transaction atomically. Distinct from `cache_pool` and from
+    /// `WriterCore.db_cache`.
+    pub(super) cdc_write_conn: Client,
     /// Highest LSN whose effects (cache mutations and invalidations) have been
     /// applied by this writer. Advances on `CommitMark` and `KeepAliveMark`,
     /// guaranteed transaction-aligned by mpsc ordering.
@@ -85,10 +101,44 @@ impl WriterCdc {
             cache_pool.push(Rc::new(pool_conn));
         }
 
+        let cdc_write_conn = pg::connect(&settings.cache, "cdc write")
+            .await
+            .map_into_report::<CacheError>()?;
+
         Ok(Self {
             cache_pool,
+            cdc_write_conn,
             last_applied_lsn: 0,
         })
+    }
+
+    /// Open the source-transaction frame on `cdc_write_conn` if not already
+    /// open. Called before the first write of a source transaction; subsequent
+    /// writes in the same transaction reuse the open frame. `core.frame_open`
+    /// is the shared signal the maintenance paths read to defer cache-table
+    /// DDL/purges while the frame holds locks.
+    async fn frame_ensure(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        if !core.frame_open {
+            self.cdc_write_conn
+                .batch_execute("BEGIN")
+                .await
+                .map_into_report::<CacheError>()?;
+            core.frame_open = true;
+        }
+        Ok(())
+    }
+
+    /// Commit the open source-transaction frame, if any. A source transaction
+    /// that produced no cache writes leaves no frame open and commits nothing.
+    async fn frame_commit(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        if core.frame_open {
+            self.cdc_write_conn
+                .batch_execute("COMMIT")
+                .await
+                .map_into_report::<CacheError>()?;
+            core.frame_open = false;
+        }
+        Ok(())
     }
 
     /// Handle a CDC command, dispatching to the appropriate method.
@@ -107,64 +157,75 @@ impl WriterCdc {
             CdcCommand::KeepAliveMark { .. } => "cdc_keepalive_mark",
         };
         let handle_start = Instant::now();
+        // Errors propagate (not swallowed): a failed mutation must abort the
+        // whole frame. Dropping `cdc_write_conn` on teardown rolls back the
+        // open transaction, so no explicit ROLLBACK is needed.
         match cmd {
             CdcCommand::TableRegister(table_metadata) => {
-                if let Err(e) = core.cache_table_register(table_metadata).await {
-                    error!(
-                        "table register failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
+                core.cache_table_register(table_metadata)
+                    .await
+                    .attach_loc("cdc table register")?;
             }
             CdcCommand::Insert {
                 relation_oid,
                 row_data,
             } => {
-                if let Err(e) = self.handle_insert(core, relation_oid, row_data).await {
-                    error!(
-                        "cdc insert failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
+                self.handle_insert(core, relation_oid, row_data)
+                    .await
+                    .attach_loc("cdc insert")?;
             }
             CdcCommand::Update {
                 relation_oid,
                 key_data,
                 row_data,
             } => {
-                if let Err(e) = self
-                    .handle_update(core, relation_oid, key_data, row_data)
+                self.handle_update(core, relation_oid, key_data, row_data)
                     .await
-                {
-                    error!(
-                        "cdc update failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
+                    .attach_loc("cdc update")?;
             }
             CdcCommand::Delete {
                 relation_oid,
                 row_data,
             } => {
-                if let Err(e) = self.handle_delete(core, relation_oid, row_data).await {
-                    error!(
-                        "cdc delete failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
+                self.handle_delete(core, relation_oid, row_data)
+                    .await
+                    .attach_loc("cdc delete")?;
             }
             CdcCommand::Truncate { relation_oids } => {
-                if let Err(e) = self.handle_truncate(core, &relation_oids).await {
-                    error!(
-                        "cdc truncate failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
+                self.handle_truncate(core, &relation_oids)
+                    .await
+                    .attach_loc("cdc truncate")?;
+            }
+            CdcCommand::CommitMark { lsn } => {
+                self.frame_commit(core)
+                    .await
+                    .attach_loc("cdc commit frame")?;
+                self.applied_lsn_advance(lsn);
+                // Frame is closed; flush maintenance that was deferred while it
+                // was open (it would have deadlocked on the frame's locks).
+                if core.purge_pending {
+                    let threshold = core.cache.generation_purge_threshold();
+                    core.generation_purge(threshold)
+                        .await
+                        .attach_loc("deferred generation purge")?;
+                    core.purge_pending = false;
                 }
             }
-            CdcCommand::CommitMark { lsn } | CdcCommand::KeepAliveMark { lsn } => {
-                self.applied_lsn_advance(lsn);
+            CdcCommand::KeepAliveMark { lsn } => {
+                // Keepalives only arrive between source transactions, so no
+                // frame should be open. The guard keeps the watermark from
+                // advancing past an uncommitted frame if that ever breaks.
+                debug_assert!(
+                    !core.frame_open,
+                    "keepalive received with an open source-transaction frame"
+                );
+                if !core.frame_open {
+                    self.applied_lsn_advance(lsn);
+                }
             }
         }
+        // Self-defers while the frame is open; flushes here at CommitMark
+        // (frame just committed) and KeepAlive (no frame).
         core.publication_dirty_drain().await?;
         metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
             .record(handle_start.elapsed().as_secs_f64());
@@ -186,13 +247,20 @@ impl WriterCdc {
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_insert(
-        &self,
+        &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
         row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
         let start = Instant::now();
         metrics::counter!(names::CACHE_HANDLE_INSERTS).increment(1);
+
+        // CDC event for a relation we don't cache (never cached, or its
+        // queries were evicted) is a benign no-op — not a frame-consistency
+        // failure. Skip without erroring so it doesn't trip the reset path.
+        if !core.cache.tables.contains_key1(&relation_oid) {
+            return Ok(());
+        }
 
         let fp_list = self
             .update_queries_check_invalidate(
@@ -241,7 +309,7 @@ impl WriterCdc {
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_update(
-        &self,
+        &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
         key_data: Vec<Option<String>>,
@@ -249,6 +317,11 @@ impl WriterCdc {
     ) -> CacheResult<()> {
         let start = Instant::now();
         metrics::counter!(names::CACHE_HANDLE_UPDATES).increment(1);
+
+        // See handle_insert: an untracked relation's CDC is a benign skip.
+        if !core.cache.tables.contains_key1(&relation_oid) {
+            return Ok(());
+        }
 
         let row_changes = self
             .query_row_changes(core, relation_oid, &new_row_data)
@@ -301,7 +374,8 @@ impl WriterCdc {
             };
 
             let delete_sql = self.cache_delete_sql(table_metadata, &new_row_data)?;
-            core.db_cache
+            self.frame_ensure(core).await?;
+            self.cdc_write_conn
                 .batch_execute(delete_sql.as_str())
                 .await
                 .map_into_report::<CacheError>()?;
@@ -318,7 +392,8 @@ impl WriterCdc {
             };
 
             let delete_sql = self.cache_delete_sql(table_metadata, &key_data)?;
-            core.db_cache
+            self.frame_ensure(core).await?;
+            self.cdc_write_conn
                 .batch_execute(delete_sql.as_str())
                 .await
                 .map_into_report::<CacheError>()?;
@@ -336,7 +411,7 @@ impl WriterCdc {
     /// exclusion set, which grows the outer result set — requiring invalidation.
     #[instrument(skip_all)]
     pub async fn handle_delete(
-        &self,
+        &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
         row_data: Vec<Option<String>>,
@@ -355,9 +430,10 @@ impl WriterCdc {
         };
 
         let delete_sql = self.cache_delete_sql(table_metadata, &row_data)?;
+        self.frame_ensure(core).await?;
         let rows_deleted = simple_query_rows_affected(
-            &core
-                .db_cache
+            &self
+                .cdc_write_conn
                 .simple_query(delete_sql.as_str())
                 .await
                 .map_into_report::<CacheError>()?,
@@ -408,10 +484,17 @@ impl WriterCdc {
     }
 
     /// Handle TRUNCATE operation.
+    ///
+    /// The physical `TRUNCATE` of the source tables' cache tables runs in-frame
+    /// on `cdc_write_conn` (atomic with the rest of the source transaction).
+    /// Additionally, every cached query referencing a truncated relation is
+    /// invalidated: a table-wide empty can change derived/multi-table results
+    /// in ways the in-place model can't track, so those queries repopulate
+    /// from origin.
     #[instrument(skip_all)]
     pub async fn handle_truncate(
-        &self,
-        core: &WriterCore,
+        &mut self,
+        core: &mut WriterCore,
         relation_oids: &[u32],
     ) -> CacheResult<()> {
         let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
@@ -428,10 +511,19 @@ impl WriterCdc {
             }
         }
 
-        core.db_cache
-            .batch_execute(sql.as_str())
-            .await
-            .map_into_report::<CacheError>()?;
+        if !first {
+            self.frame_ensure(core).await?;
+            self.cdc_write_conn
+                .batch_execute(sql.as_str())
+                .await
+                .map_into_report::<CacheError>()?;
+        }
+
+        for oid in relation_oids {
+            core.cache_table_invalidate(*oid)
+                .await
+                .attach_loc("invalidating queries on truncate")?;
+        }
 
         Ok(())
     }
@@ -817,22 +909,13 @@ impl WriterCdc {
         key_data: Option<&[Option<String>]>,
         operation: CdcOperation,
     ) -> CacheResult<Vec<u64>> {
-        let update_queries =
-            core.cache
-                .update_queries
-                .get(&relation_oid)
-                .ok_or(CacheError::UnknownTable {
-                    oid: Some(relation_oid),
-                    name: None,
-                })?;
-
+        // No cached query references this relation (never registered, or all
+        // its queries were evicted) → nothing to invalidate. Not an error.
+        let Some(update_queries) = core.cache.update_queries.get(&relation_oid) else {
+            return Ok(Vec::new());
+        };
         let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
-            error!("No table metadata found for relation_oid: {}", relation_oid);
-            return Err(CacheError::UnknownTable {
-                oid: Some(relation_oid),
-                name: None,
-            }
-            .into());
+            return Ok(Vec::new());
         };
 
         let mut fp_list = Vec::new();
@@ -868,196 +951,165 @@ impl WriterCdc {
         Ok(fp_list)
     }
 
-    /// Decide whether a CDC row belongs in cache and, if so, upsert it.
+    /// Decide whether a CDC row belongs in cache and, if so, upsert it once.
     ///
-    /// Two-phase dispatch:
-    /// 1. LocalEval queries are evaluated in Rust. First match short-circuits
-    ///    with a single unconditional upsert.
-    /// 2. If no LocalEval query matches, PgEval queries run via the original
-    ///    concurrent `INSERT ... WHERE EXISTS` batch path.
+    /// Phase A (parallel, read-only): determine which cached queries the row
+    /// matches. LocalEval queries are evaluated in Rust; PgEval queries run
+    /// `SELECT EXISTS (<query>)` fanned across `cache_pool` — autocommit, so
+    /// they observe the pre-source-transaction snapshot, never the in-flight
+    /// frame's uncommitted writes.
     ///
-    /// Returns true if any query matched (row upserted).
+    /// Phase B (serialized, in-frame): if any query matched, a single
+    /// unconditional upsert into the source table's cache table on
+    /// `cdc_write_conn`. The shared cache table holds the row iff some cached
+    /// query needs it, so one upsert suffices regardless of how many matched.
+    ///
+    /// Returns true if the row matched any cached query.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn update_queries_execute_concurrent(
-        &self,
-        core: &WriterCore,
+        &mut self,
+        core: &mut WriterCore,
         relation_oid: u32,
         row_data: &[Option<String>],
     ) -> CacheResult<bool> {
-        let update_queries =
-            core.cache
-                .update_queries
-                .get(&relation_oid)
-                .ok_or(CacheError::UnknownTable {
-                    oid: Some(relation_oid),
-                    name: None,
-                })?;
+        // Phase A: membership evaluation. The `core` borrow is confined to
+        // this block so the in-frame write below doesn't hold it.
+        let (matched, upsert_sql) = {
+            // No cached query references this relation → nothing to upsert.
+            // Not an error (the relation simply isn't maintained in place).
+            let Some(update_queries) = core.cache.update_queries.get(&relation_oid) else {
+                return Ok(false);
+            };
+            let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
+                return Ok(false);
+            };
 
-        let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
-            error!("No table metadata found for relation_oid: {}", relation_oid);
-            return Err(CacheError::UnknownTable {
-                oid: Some(relation_oid),
-                name: None,
-            }
-            .into());
-        };
-
-        let total_queries = update_queries.queries.len();
-        trace!("update_queries_execute_concurrent start [{total_queries}]");
-
-        if total_queries == 0 {
-            return Ok(false);
-        }
-
-        // Phase 1: Rust evaluation for LocalEval queries. Complexity-sorted
-        // iteration gives us the same try-simplest-first property.
-        for update_query in update_queries.iter_complexity_ordered() {
-            if update_query.eval_strategy != UpdateEvalStrategy::LocalEval {
-                continue;
-            }
-            if !update_query_matches_locally(update_query, table_metadata, row_data) {
-                continue;
+            let total_queries = update_queries.queries.len();
+            trace!("update_queries_execute_concurrent start [{total_queries}]");
+            if total_queries == 0 {
+                return Ok(false);
             }
 
-            trace!(
-                "update_queries local-eval matched fingerprint {}",
-                update_query.fingerprint
-            );
-            metrics::counter!(names::CACHE_CDC_LOCAL_EVAL_HITS).increment(1);
+            // Every matching cached query's MV must be marked dirty, so all
+            // queries are evaluated — no short-circuit. Stopping at the first
+            // match (or skipping PgEval once a LocalEval matched) left other
+            // matching queries' MVs `Fresh` while their underlying rows
+            // changed, a stale-MV read.
+            let mut matched = false;
 
-            // Mark the MV dirty BEFORE the source-row mutation commits, so
-            // any coordinator observing the updated source row also observes
-            // mv_state != Fresh and falls through to source-row eval.
-            core.mv_dirty_mark(update_query.fingerprint);
-
-            let sql = self.cache_upsert_unconditional_sql(table_metadata, row_data);
-            let conn = self.cache_pool.first().ok_or(CacheError::Other)?;
-            conn.batch_execute(sql.as_str())
-                .await
-                .map_into_report::<CacheError>()?;
-            return Ok(true);
-        }
-
-        // Phase 2: fall back to PG-side WHERE EXISTS for PgEval queries.
-        let pg_eval_queries: Vec<&UpdateQuery> = update_queries
-            .iter_complexity_ordered()
-            .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval)
-            .collect();
-
-        if pg_eval_queries.is_empty() {
-            trace!(
-                "update_queries_execute_concurrent done [{total_queries}] - local-eval no match, no pg queries"
-            );
-            return Ok(false);
-        }
-
-        let pool_size = self.cache_pool.len();
-        let mut query_iter = pg_eval_queries.iter().copied().enumerate();
-        let mut total_executed = 0;
-
-        loop {
-            let mut futures = FuturesUnordered::new();
-            for (idx, update_query) in query_iter.by_ref().take(pool_size) {
-                let fingerprint = update_query.fingerprint;
-                let sql = self.cache_upsert_with_predicate_sql(
-                    &update_query.resolved,
-                    table_metadata,
-                    row_data,
-                )?;
-
-                let conn = self
-                    .cache_pool
-                    .get(idx % pool_size)
-                    .ok_or(CacheError::Other)?;
-
-                futures.push(async move {
-                    let result = conn
-                        .simple_query(sql.as_str())
-                        .await
-                        .map(|msgs| simple_query_rows_affected(&msgs));
-                    (fingerprint, result)
-                });
+            // LocalEval: Rust evaluation, complexity-ordered (simplest first).
+            let mut local_hit = false;
+            for update_query in update_queries.iter_complexity_ordered() {
+                if update_query.eval_strategy != UpdateEvalStrategy::LocalEval {
+                    continue;
+                }
+                if !update_query_matches_locally(update_query, table_metadata, row_data) {
+                    continue;
+                }
+                trace!(
+                    "update_queries local-eval matched fingerprint {}",
+                    update_query.fingerprint
+                );
+                core.mv_dirty_mark(update_query.fingerprint);
+                matched = true;
+                local_hit = true;
+            }
+            if local_hit {
+                metrics::counter!(names::CACHE_CDC_LOCAL_EVAL_HITS).increment(1);
             }
 
-            if futures.is_empty() {
-                break;
-            }
+            // PgEval: parallel `SELECT EXISTS` across the read pool. Evaluated
+            // independently of LocalEval — a row can match both. `simple_query`
+            // (not `query_one`) keeps each eval to one round trip with no
+            // prepared-statement create/close: the row's values are baked into
+            // the SQL as literals, so a prepared statement would never be
+            // reused. SQL is built lazily per batch to bound peak memory to
+            // `pool_size` strings.
+            let pg_eval: Vec<&UpdateQuery> = update_queries
+                .iter_complexity_ordered()
+                .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval)
+                .collect();
 
-            let mut batch_matched = false;
-            let mut batch_error: Option<CacheError> = None;
-
-            while let Some((fingerprint, result)) = futures.next().await {
-                total_executed += 1;
-                match result {
-                    Ok(1) => {
-                        trace!("update_queries pg-eval matched fingerprint {fingerprint}");
-                        // PG-eval commits concurrently — we can't dirty-mark
-                        // before commit here. The window between commit and
-                        // this flip is microseconds and matches the "reads
-                        // that overlap an invalidation" case in the design doc.
-                        core.mv_dirty_mark(fingerprint);
-                        batch_matched = true;
-                    }
-                    Ok(n) if n > 1 => {
-                        batch_error = Some(CacheError::TooManyModifiedRows);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!(
-                            "sql execution error for fingerprint {fingerprint}: {}",
-                            error_chain_format(&e),
+            if !pg_eval.is_empty() {
+                let pool_size = self.cache_pool.len();
+                let mut iter = pg_eval.into_iter();
+                let mut pg_hit = false;
+                loop {
+                    let mut futures = FuturesUnordered::new();
+                    for (idx, uq) in iter.by_ref().take(pool_size).enumerate() {
+                        let fingerprint = uq.fingerprint;
+                        let sql = self.cache_predicate_exists_sql(
+                            &uq.resolved,
+                            table_metadata,
+                            row_data,
+                        )?;
+                        let conn = Rc::clone(
+                            self.cache_pool
+                                .get(idx % pool_size)
+                                .ok_or(CacheError::Other)?,
                         );
-                        batch_error = Some(CacheError::PgError(e));
+                        futures.push(async move {
+                            let r = conn
+                                .simple_query(&sql)
+                                .await
+                                .map(|msgs| simple_query_exists(&msgs));
+                            (fingerprint, r)
+                        });
                     }
+                    if futures.is_empty() {
+                        break;
+                    }
+                    while let Some((fingerprint, r)) = futures.next().await {
+                        match r {
+                            Ok(true) => {
+                                trace!("update_queries pg-eval matched fingerprint {fingerprint}");
+                                core.mv_dirty_mark(fingerprint);
+                                matched = true;
+                                pg_hit = true;
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                error!(
+                                    "predicate eval error for fingerprint {fingerprint}: {}",
+                                    error_chain_format(&e),
+                                );
+                                return Err(CacheError::PgError(e).into());
+                            }
+                        }
+                    }
+                }
+                if pg_hit {
+                    metrics::counter!(names::CACHE_CDC_PG_EVAL_HITS).increment(1);
                 }
             }
 
-            if let Some(err) = batch_error {
-                return Err(err.into());
-            }
+            let upsert_sql =
+                matched.then(|| self.cache_upsert_unconditional_sql(table_metadata, row_data));
+            (matched, upsert_sql)
+        };
 
-            if batch_matched {
-                trace!(
-                    "update_queries_execute_concurrent done [{total_executed}/{}] - pg-eval matched",
-                    pg_eval_queries.len()
-                );
-                metrics::counter!(names::CACHE_CDC_PG_EVAL_HITS).increment(1);
-                return Ok(true);
-            }
+        // Phase B: single in-frame write.
+        if let Some(sql) = upsert_sql {
+            self.frame_ensure(core).await?;
+            self.cdc_write_conn
+                .batch_execute(sql.as_str())
+                .await
+                .map_into_report::<CacheError>()?;
         }
 
-        trace!(
-            "update_queries_execute_concurrent done [{total_executed}/{}] - no match",
-            pg_eval_queries.len()
-        );
-        Ok(false)
+        Ok(matched)
     }
 
-    pub(super) fn cache_upsert_with_predicate_sql(
+    /// Build `SELECT EXISTS (<cached query with the CDC row's values
+    /// substituted>)` — the membership predicate for one cached query,
+    /// evaluated read-only on the pool against the pre-transaction snapshot.
+    pub(super) fn cache_predicate_exists_sql(
         &self,
         resolved: &crate::query::resolved::ResolvedQueryExpr,
         table_metadata: &crate::catalog::TableMetadata,
         row_data: &[Option<String>],
     ) -> CacheResult<String> {
-        // Extract SELECT body - update queries are always SELECT queries
         let resolved_select = resolved.as_select().ok_or(CacheError::InvalidQuery)?;
-
-        // Collect column names and escaped values for SQL building
-        let mut column_names = Vec::with_capacity(table_metadata.columns.len());
-        let mut values = Vec::with_capacity(table_metadata.columns.len());
-
-        for column_meta in &table_metadata.columns {
-            let position = column_meta.index();
-            if let Some(row_value) = row_data.get(position) {
-                let value = row_value
-                    .as_deref()
-                    .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
-
-                column_names.push(column_meta.name.as_str());
-                values.push(value);
-            }
-        }
-
         let value_select = resolved_select_node_table_replace_with_values(
             resolved_select,
             table_metadata,
@@ -1066,37 +1118,7 @@ impl WriterCdc {
         .map_err(|e| e.context_transform(CacheError::from))?;
         let mut select = String::with_capacity(SQL_BUFFER_CAPACITY);
         crate::query::ast::Deparse::deparse(&value_select, &mut select);
-
-        let schema = &table_metadata.schema;
-        let table = &table_metadata.name;
-
-        // Build INSERT ... ON CONFLICT ... DO UPDATE SET ... in a single String
-        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
-        let _ = write!(sql, "INSERT INTO {schema}.{table} (");
-        for (i, col) in column_names.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(col);
-        }
-        sql.push_str(") SELECT ");
-        for (i, val) in values.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(val);
-        }
-        let _ = write!(sql, " WHERE EXISTS ({select}) ON CONFLICT (");
-        for (i, pk) in table_metadata.primary_key_columns.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
-            }
-            sql.push_str(pk);
-        }
-        sql.push(')');
-        cdc_on_conflict_tail_append(&mut sql, &column_names, &table_metadata.primary_key_columns);
-
-        Ok(sql)
+        Ok(format!("SELECT EXISTS ({select})"))
     }
 
     /// Build an unconditional UPSERT for the row — `INSERT ... ON CONFLICT DO UPDATE`
@@ -1241,6 +1263,11 @@ impl WriterCore {
 
         // Drop the MV table (if any) before removing the state_view entry so we
         // can read the mv_state. Errors are logged but don't abort the eviction.
+        // Unlike the other db_cache maintenance, this is NOT frame-deferred:
+        // MV tables (pgcache_mv schema) are never written by the frame, which
+        // only touches source cache tables — so a DROP here can't deadlock on
+        // the frame's locks even when reached in-frame (e.g. via truncate
+        // invalidation).
         let mv_state = self
             .state_view
             .cached_queries
