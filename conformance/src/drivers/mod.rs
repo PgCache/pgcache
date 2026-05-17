@@ -24,8 +24,11 @@ impl SqlDriver {
             .await
             .with_context(|| format!("connecting to {label}"))?;
         tokio::spawn(async move {
+            // Ends with an error at teardown (pgcache killed / temp DBs
+            // dropped) — expected. A real mid-run failure surfaces via the
+            // failing query/ping, so this is debug-only noise otherwise.
             if let Err(e) = connection.await {
-                tracing::error!(label, error = %e, "connection task ended");
+                tracing::debug!(label, error = %e, "connection task ended");
             }
         });
         Ok(Self { client, label })

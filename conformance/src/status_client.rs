@@ -50,16 +50,34 @@ impl StatusClient {
     }
 
     async fn fetch(&self) -> Result<StatusResponse> {
-        self.http
-            .get(&self.status_url)
-            .send()
-            .await
-            .with_context(|| format!("GET {}", self.status_url))?
-            .error_for_status()
-            .context("/status returned a non-success status")?
-            .json()
-            .await
-            .context("decoding /status JSON")
+        // pgcache's single-threaded cache writer serves `/status`; when it's
+        // briefly busy (CDC apply / MV build) it can miss the handler's 2s
+        // budget and return 503. That's transient — retry within a bounded
+        // window before giving up.
+        const RETRY_BUDGET: Duration = Duration::from_secs(5);
+        const RETRY_BACKOFF: Duration = Duration::from_millis(100);
+        let deadline = Instant::now() + RETRY_BUDGET;
+
+        loop {
+            let resp = self
+                .http
+                .get(&self.status_url)
+                .send()
+                .await
+                .with_context(|| format!("GET {}", self.status_url))?;
+
+            if resp.status().is_server_error() && Instant::now() < deadline {
+                sleep(RETRY_BACKOFF).await;
+                continue;
+            }
+
+            return resp
+                .error_for_status()
+                .context("/status returned a non-success status")?
+                .json()
+                .await
+                .context("decoding /status JSON");
+        }
     }
 
     /// Fetch `/status` and reduce it to a [`StatusSnapshot`].
