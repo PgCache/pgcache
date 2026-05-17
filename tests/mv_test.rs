@@ -849,3 +849,66 @@ async fn test_mv_setop_lifecycle() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-136: a query whose output columns derive the same name (two
+/// unaliased `count(*) FILTER (...)`) must still build an MV. The MV's
+/// physical columns are positional; serve aliases them back, so the
+/// client sees two columns both named `count`. Before the fix the
+/// `CREATE TABLE AS` failed (`column "count" specified more than once`),
+/// the MV never built, and the failure was only logged.
+#[tokio::test]
+async fn test_mv_duplicate_derived_column_names() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE pgc136 (id integer primary key, val text)",
+        &[],
+    )
+    .await?;
+    for i in 0..10 {
+        ctx.query("INSERT INTO pgc136 VALUES ($1, 'q')", &[&i])
+            .await?;
+    }
+    for i in 10..13 {
+        ctx.query("INSERT INTO pgc136 VALUES ($1, 'a')", &[&i])
+            .await?;
+    }
+
+    let sql = "SELECT count(*) FILTER (WHERE val = 'q'), \
+               count(*) FILTER (WHERE val = 'a') FROM pgc136";
+
+    // Miss → forward; settle source-row population.
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 10);
+    assert_eq!(row.get::<_, i64>(1), 3);
+    ctx.cache_settle().await?;
+
+    // Hit on MeasurePending → schedules first-pop, falls through.
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 10);
+    ctx.cache_settle().await?;
+
+    // The regression assertion: the MV must have been built despite the
+    // duplicate derived name.
+    assert_eq!(
+        mv_table_count(&ctx.dbs).await?,
+        1,
+        "MV must build despite duplicate derived column names (PGC-136)"
+    );
+
+    // MV fast-path hit: correct values and both columns named `count`.
+    let m1 = ctx.metrics().await?;
+    let row = ctx.query_one(sql, &[]).await?;
+    let m2 = ctx.metrics().await?;
+    assert_eq!(metrics_delta(&m1, &m2).cache_mv_hits, 1, "expected MV hit");
+    assert_eq!(row.get::<_, i64>(0), 10);
+    assert_eq!(row.get::<_, i64>(1), 3);
+    let names: Vec<&str> = row.columns().iter().map(|c| c.name()).collect();
+    assert_eq!(
+        names,
+        ["count", "count"],
+        "duplicate output names preserved"
+    );
+
+    Ok(())
+}

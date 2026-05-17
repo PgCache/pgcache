@@ -8,10 +8,9 @@
 # regression-tests PGC-102, where `count(*) FILTER (WHERE ...)` produced
 # a silently wrong result while only logging the failure.
 #
-# Routing is asserted `cached` for every query whose caching is
-# confirmed. The two-count query stays `any` and is expected to log a
-# swallowed error until PGC-136 (MV build fails on duplicate derived
-# column names) is fixed; do not alias it to make the suite green.
+# Every query is asserted `cached`. The two-count query (duplicate
+# derived column names) caches via positional MV columns aliased back on
+# serve — PGC-136 fixed.
 
 # PGC-102: the exact failing shape — count(*) with a FILTER predicate.
 # pgcache: cached
@@ -22,11 +21,9 @@ SELECT count(*) FILTER (WHERE four = 1) FROM onek;
 query I
 SELECT sum(four) FILTER (WHERE ten > 5) FROM onek;
 
-# Two FILTERed aggregates partitioning the table. Expected RED: PGC-136
-# (MV build fails — two columns both derive the name "count"). Result is
-# still correct (source-row fallback); the swallowed-error log scan is
-# what flags it. Tighten to `cached` once PGC-136 lands.
-# pgcache: any
+# Two FILTERed aggregates partitioning the table — both columns derive
+# the name "count" (PGC-136 regression: must cache, not just forward).
+# pgcache: cached
 query II
 SELECT count(*) FILTER (WHERE hundred < 50),
        count(*) FILTER (WHERE hundred >= 50)

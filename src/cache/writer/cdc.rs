@@ -590,8 +590,8 @@ impl WriterCdc {
         if let Some(mut entry) = core.state_view.cached_queries.get_mut(&fingerprint) {
             entry.state = CachedQueryState::Invalidated;
             entry.referenced = false;
-            if entry.mv_state == MvState::Fresh {
-                entry.mv_state = MvState::Pending { has_table: true };
+            if entry.mv.state == MvState::Fresh {
+                entry.mv.state = MvState::Pending { has_table: true };
             }
         }
 
@@ -1272,7 +1272,7 @@ impl WriterCore {
             .state_view
             .cached_queries
             .get(&fingerprint)
-            .map(|v| v.mv_state);
+            .map(|v| v.mv.state);
         if let Some(mv_state) = mv_state
             && let Err(e) = self.mv_drop(fingerprint, mv_state).await
         {

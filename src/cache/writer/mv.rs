@@ -16,6 +16,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use ecow::EcoString;
+use tokio_postgres::SimpleQueryMessage;
+use tokio_stream::StreamExt;
 use tracing::{debug, error, trace};
 
 use crate::metrics::names;
@@ -56,10 +59,10 @@ impl WriterCore {
         let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) else {
             return;
         };
-        let MvState::Pending { has_table } = view.mv_state else {
+        let MvState::Pending { has_table } = view.mv.state else {
             return;
         };
-        view.mv_state = MvState::Scheduled { has_table };
+        view.mv.state = MvState::Scheduled { has_table };
         drop(view);
         let _ = self.query_tx.send(QueryCommand::MvBuild { fingerprint });
     }
@@ -91,9 +94,28 @@ impl WriterCore {
             return Ok(());
         }
 
+        // Captured once, reused on rebuild. Failure aborts the build so a
+        // Fresh MV always has names.
+        let names = match self.mv_output_columns(fingerprint, &ctx).await {
+            Ok(n) if !n.is_empty() => n,
+            Ok(_) => {
+                error!("mv build failed for {fingerprint}: query describe returned no columns");
+                self.mv_state_transition(fingerprint, MvState::Pending { has_table });
+                return Ok(());
+            }
+            Err(e) => {
+                error!(
+                    "mv build failed for {fingerprint}: output-column describe: {}",
+                    error_chain_format(e.current_context()),
+                );
+                self.mv_state_transition(fingerprint, MvState::Pending { has_table });
+                return Ok(());
+            }
+        };
+
         let start = Instant::now();
         let mv_table = mv_table_name(fingerprint);
-        let batch = mv_build_batch(&mv_table, &ctx, has_table);
+        let batch = mv_build_batch(&mv_table, &ctx, has_table, names.len());
 
         if let Err(e) = self
             .db_cache
@@ -146,9 +168,10 @@ impl WriterCore {
         // Only flip to Fresh if nobody raced us (e.g. CDC invalidation during the
         // build would have moved us to Pending { has_table: true }).
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint)
-            && matches!(view.mv_state, MvState::Scheduled { .. })
+            && matches!(view.mv.state, MvState::Scheduled { .. })
         {
-            view.mv_state = MvState::Fresh;
+            view.mv.output_columns = Some(Arc::clone(&names));
+            view.mv.state = MvState::Fresh;
         }
 
         metrics::counter!(names::CACHE_MV_REBUILDS).increment(1);
@@ -157,6 +180,40 @@ impl WriterCore {
             elapsed
         );
         Ok(())
+    }
+
+    /// PostgreSQL's output column names for the query. Reused from the
+    /// view on rebuild; otherwise captured by describing `<resolved>
+    /// LIMIT 0` against the cache DB (same query as source-row serve).
+    async fn mv_output_columns(
+        &self,
+        fingerprint: u64,
+        ctx: &MvBuildContext,
+    ) -> CacheResult<Arc<[EcoString]>> {
+        if let Some(v) = self.state_view.cached_queries.get(&fingerprint)
+            && let Some(cols) = &v.mv.output_columns
+        {
+            return Ok(Arc::clone(cols));
+        }
+
+        let mut sql = String::with_capacity(256);
+        ctx.resolved.deparse(&mut sql);
+        sql.push_str(" LIMIT 0");
+
+        let stream = self
+            .db_cache
+            .simple_query_raw(&sql)
+            .await
+            .map_into_report::<CacheError>()?;
+        tokio::pin!(stream);
+        match stream.next().await {
+            Some(Ok(SimpleQueryMessage::RowDescription(cols))) => {
+                Ok(cols.iter().map(|c| EcoString::from(c.name())).collect())
+            }
+            Some(Ok(_)) => Err(CacheError::InvalidMessage.into()),
+            Some(Err(e)) => Err(CacheError::from(e).into()),
+            None => Err(CacheError::InvalidMessage.into()),
+        }
     }
 
     /// Run the Measure size gate (no-op for Materialize / Skip defensively).
@@ -213,7 +270,7 @@ impl WriterCore {
     /// state isn't `Ready` (races resolved at the call site).
     fn mv_context_snapshot(&self, fingerprint: u64) -> Option<(MvBuildContext, bool)> {
         let view = self.state_view.cached_queries.get(&fingerprint)?;
-        let MvState::Scheduled { has_table } = view.mv_state else {
+        let MvState::Scheduled { has_table } = view.mv.state else {
             return None;
         };
         if view.state != CachedQueryState::Ready {
@@ -222,7 +279,7 @@ impl WriterCore {
         let resolved = view.resolved.as_ref().map(Arc::clone)?;
         Some((
             MvBuildContext {
-                shape_gate: view.shape_gate,
+                shape_gate: view.mv.shape_gate,
                 max_limit: view.max_limit,
                 generation: view.generation,
                 resolved,
@@ -246,9 +303,9 @@ impl WriterCore {
     /// holding `&self` in CDC paths don't need to become `&mut self`.
     pub(super) fn mv_dirty_mark(&self, fingerprint: u64) {
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint)
-            && view.mv_state == MvState::Fresh
+            && view.mv.state == MvState::Fresh
         {
-            view.mv_state = MvState::Pending { has_table: true };
+            view.mv.state = MvState::Pending { has_table: true };
         }
     }
 
@@ -272,7 +329,7 @@ impl WriterCore {
             .state_view
             .cached_queries
             .iter()
-            .filter(|entry| entry.mv_state == MvState::Pending { has_table: true })
+            .filter(|entry| entry.mv.state == MvState::Pending { has_table: true })
             .map(|entry| *entry.key())
             .collect();
 
@@ -322,7 +379,7 @@ impl WriterCore {
     /// (evicted during the build).
     fn mv_state_transition(&self, fingerprint: u64, new_state: MvState) {
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
-            view.mv_state = new_state;
+            view.mv.state = new_state;
         }
     }
 
@@ -333,8 +390,8 @@ impl WriterCore {
         let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) else {
             return;
         };
-        if let MvState::Scheduled { has_table } = view.mv_state {
-            view.mv_state = MvState::Pending { has_table };
+        if let MvState::Scheduled { has_table } = view.mv.state {
+            view.mv.state = MvState::Pending { has_table };
         }
     }
 
@@ -393,27 +450,45 @@ fn mv_body_append(buf: &mut String, ctx: &MvBuildContext) {
 /// TABLE AS <body>` with SET/RESET of the query generation. Rebuild uses a
 /// `BEGIN; TRUNCATE; INSERT; COMMIT;` transaction so concurrent reads are never
 /// exposed to an empty intermediate state.
-fn mv_build_batch(mv_table: &str, ctx: &MvBuildContext, has_table: bool) -> String {
+fn mv_build_batch(mv_table: &str, ctx: &MvBuildContext, has_table: bool, arity: usize) -> String {
     use std::fmt::Write;
     let mut sql = String::with_capacity(512);
     let generation = ctx.generation;
+    let cols = mv_columns_list(arity);
     if has_table {
         let _ = write!(
             &mut sql,
             "BEGIN; SET mem.query_generation = {generation}; \
-             TRUNCATE {mv_table}; INSERT INTO {mv_table} "
+             TRUNCATE {mv_table}; INSERT INTO {mv_table} {cols} "
         );
         mv_body_append(&mut sql, ctx);
         sql.push_str("; COMMIT; SET mem.query_generation = 0;");
     } else {
         let _ = write!(
             &mut sql,
-            "SET mem.query_generation = {generation}; CREATE UNLOGGED TABLE {mv_table} AS "
+            "SET mem.query_generation = {generation}; \
+             CREATE UNLOGGED TABLE {mv_table} {cols} AS "
         );
         mv_body_append(&mut sql, ctx);
         sql.push_str("; SET mem.query_generation = 0;");
     }
     sql
+}
+
+/// Positional MV column list `(c0, c1, …, c{n-1})` — lets the table hold
+/// otherwise-colliding output names; `mv_serve_sql` aliases them back.
+fn mv_columns_list(arity: usize) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(arity * 5 + 2);
+    s.push('(');
+    for i in 0..arity {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        let _ = write!(s, "c{i}");
+    }
+    s.push(')');
+    s
 }
 
 /// `SELECT count(*) FROM (<deparsed resolved> LIMIT max_limit) _mv_gate_src`.

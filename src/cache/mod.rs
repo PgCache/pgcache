@@ -33,7 +33,10 @@ mod writer;
 pub use messages::{
     CacheMessage, CacheReply, DataStreamState, ProxyMessage, QueryParameter, QueryParameters,
 };
-pub use mv::{MvState, ShapeGate, mv_serve_sql, mv_state_initial, mv_table_name, shape_classify};
+pub use mv::{
+    MvMeta, MvServe, MvState, ShapeGate, mv_serve_sql, mv_state_initial, mv_table_name,
+    shape_classify,
+};
 pub use runtime::cache_run;
 pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,

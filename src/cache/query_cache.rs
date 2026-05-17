@@ -23,7 +23,7 @@ use super::{
     messages::{
         AdmitAction, CacheReply, PipelineContext, PipelineDescribe, QueryCommand, SubsumptionResult,
     },
-    mv::{MvState, ShapeGate},
+    mv::{MvMeta, MvServe, MvState, ShapeGate},
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
     types::{CacheStateView, CachedQueryState, CachedQueryView, QueryMetrics, SharedResolved},
 };
@@ -91,10 +91,9 @@ pub struct WorkerRequest {
     pub deparsed_sql: EcoString,
     /// Generation number for row tracking in pgcache_pgrx extension
     pub generation: u64,
-    /// When true, read from `pgcache_mv.q_<fingerprint>` (MV fast path).
-    /// When false, deparse the resolved query against source-row cache tables.
-    /// Decided by the coordinator at dispatch time based on `mv_state == Fresh`.
-    pub mv_source: bool,
+    /// Serve from the MV (carrying its aliased output column names) or
+    /// from source rows. Decided by the coordinator at dispatch time.
+    pub mv: MvServe,
     pub result_formats: Vec<i16>,
     pub client_socket: ClientSocket,
     pub reply_tx: oneshot::Sender<CacheReply>,
@@ -223,14 +222,14 @@ impl QueryCache {
                 // Decide MV fast path vs fallthrough based on current mv_state.
                 // Side effect: on Dirty, transitions to RebuildScheduled and sends
                 // QueryCommand::MvRebuild to the writer.
-                let mv_source = self.mv_dispatch_decide(fingerprint);
+                let mv = self.mv_dispatch_decide(fingerprint);
                 self.worker_request_send(
                     fingerprint,
                     msg,
                     Arc::clone(resolved),
                     deparsed_sql.clone(),
                     *generation,
-                    mv_source,
+                    mv,
                 )
             }
 
@@ -375,7 +374,7 @@ impl QueryCache {
         resolved: SharedResolved,
         deparsed_sql: EcoString,
         generation: u64,
-        mv_source: bool,
+        mv: MvServe,
     ) -> CacheResult<()> {
         self.worker_request_send_with(
             fingerprint,
@@ -383,7 +382,7 @@ impl QueryCache {
             resolved,
             deparsed_sql,
             generation,
-            mv_source,
+            mv,
             vec![],
         )
     }
@@ -398,28 +397,37 @@ impl QueryCache {
     /// Fast path (Fresh / terminal / already-scheduled states) takes only a
     /// shared DashMap guard; the write guard is acquired only for the
     /// `Pending → Scheduled` flip.
-    fn mv_dispatch_decide(&self, fingerprint: u64) -> bool {
+    fn mv_dispatch_decide(&self, fingerprint: u64) -> MvServe {
+        // One observation yields both the state and the names, so a
+        // `Fresh` decision can't be separated from its columns.
         let observed = self
             .state_view
             .cached_queries
             .get(&fingerprint)
-            .map(|e| e.mv_state);
-        let (mv_source, dispatch) = match observed {
-            Some(MvState::Fresh) => (true, None),
-            Some(MvState::Pending { has_table }) => {
-                (false, self.mv_schedule(fingerprint, has_table))
+            .map(|e| (e.mv.state, e.mv.output_columns.clone()));
+        let serve = match observed {
+            Some((MvState::Fresh, Some(cols))) => MvServe::Mv(cols),
+            Some((MvState::Fresh, None)) => {
+                error!(
+                    fingerprint,
+                    "MV is Fresh but output columns were never captured; \
+                     serving from source rows"
+                );
+                MvServe::SourceRow
             }
-            _ => (false, None),
+            Some((MvState::Pending { has_table }, _)) => {
+                if let Some(cmd) = self.mv_schedule(fingerprint, has_table) {
+                    let _ = self.query_tx.send(cmd);
+                }
+                MvServe::SourceRow
+            }
+            _ => MvServe::SourceRow,
         };
-        if mv_source {
-            metrics::counter!(names::CACHE_MV_HITS).increment(1);
-        } else {
-            metrics::counter!(names::CACHE_MV_FALLTHROUGH).increment(1);
+        match serve {
+            MvServe::Mv(_) => metrics::counter!(names::CACHE_MV_HITS).increment(1),
+            MvServe::SourceRow => metrics::counter!(names::CACHE_MV_FALLTHROUGH).increment(1),
         }
-        if let Some(cmd) = dispatch {
-            let _ = self.query_tx.send(cmd);
-        }
-        mv_source
+        serve
     }
 
     /// Check-and-transition under write guard: `Pending { has_table } →
@@ -428,10 +436,10 @@ impl QueryCache {
     /// entry moved elsewhere.
     fn mv_schedule(&self, fingerprint: u64, has_table: bool) -> Option<QueryCommand> {
         let mut entry = self.state_view.cached_queries.get_mut(&fingerprint)?;
-        if entry.mv_state != (MvState::Pending { has_table }) {
+        if entry.mv.state != (MvState::Pending { has_table }) {
             return None;
         }
-        entry.mv_state = MvState::Scheduled { has_table };
+        entry.mv.state = MvState::Scheduled { has_table };
         Some(QueryCommand::MvBuild { fingerprint })
     }
 
@@ -444,7 +452,7 @@ impl QueryCache {
         resolved: SharedResolved,
         deparsed_sql: EcoString,
         generation: u64,
-        mv_source: bool,
+        mv: MvServe,
         coalesced: Vec<CoalescedClient>,
     ) -> CacheResult<()> {
         // `lookup_complete_at` is stamped earlier in `query_dispatch` (and
@@ -479,7 +487,7 @@ impl QueryCache {
                 resolved,
                 deparsed_sql,
                 generation,
-                mv_source,
+                mv,
                 result_formats: msg.result_formats,
                 client_socket: msg.client_socket,
                 reply_tx: msg.reply_tx,
@@ -587,14 +595,14 @@ impl QueryCache {
 
             // Coalesced dispatch: MV decision is made once for the whole group
             // (all waiters share the same fingerprint and dispatch moment).
-            let mv_source = self.mv_dispatch_decide(fingerprint);
+            let mv = self.mv_dispatch_decide(fingerprint);
             if let Err(e) = self.worker_request_send_with(
                 fingerprint,
                 primary,
                 Arc::clone(&resolved),
                 deparsed_sql.clone(),
                 generation,
-                mv_source,
+                mv,
                 coalesced,
             ) {
                 error!(
@@ -643,10 +651,8 @@ impl QueryCache {
                     deparsed_sql: None,
                     max_limit: None,
                     referenced: false,
-                    // shape_gate is filled in by the writer after resolution; default
-                    // Skip until classification runs. mv_state follows.
-                    shape_gate: ShapeGate::Skip,
-                    mv_state: MvState::Skipped,
+                    // Writer fills this in after resolution/classification.
+                    mv: MvMeta::new(ShapeGate::Skip),
                 },
             );
             let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
@@ -722,15 +728,8 @@ impl QueryCache {
                 // Subsumed queries have mv_state = MeasurePending (see Future Work:
                 // "MV first-pop for subsumed queries"); mv_dispatch_decide returns
                 // false and the serve goes through the fallthrough path.
-                let mv_source = self.mv_dispatch_decide(fingerprint);
-                self.worker_request_send(
-                    fingerprint,
-                    msg,
-                    resolved,
-                    deparsed_sql,
-                    generation,
-                    mv_source,
-                )
+                let mv = self.mv_dispatch_decide(fingerprint);
+                self.worker_request_send(fingerprint, msg, resolved, deparsed_sql, generation, mv)
             }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
                 self.metrics_miss_record(fingerprint);
@@ -767,10 +766,8 @@ impl QueryCache {
                 deparsed_sql: None,
                 max_limit: None,
                 referenced: false,
-                // shape_gate is filled in by the writer after resolution; default
-                // Skip until classification runs. mv_state follows.
-                shape_gate: ShapeGate::Skip,
-                mv_state: MvState::Skipped,
+                // Writer fills this in after resolution/classification.
+                mv: MvMeta::new(ShapeGate::Skip),
             },
         );
         let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));

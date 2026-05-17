@@ -24,7 +24,7 @@ use crate::settings::{CachePolicy, Settings};
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{CdcCommand, QueryCommand, WriterNotify},
-    mv::{MvState, ShapeGate, mv_state_initial},
+    mv::{MvMeta, ShapeGate},
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
     },
@@ -262,8 +262,7 @@ impl WriterCore {
     /// `QueryCommand::Register`.
     pub(super) fn mv_state_set(&self, fingerprint: u64, shape_gate: ShapeGate) {
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
-            view.shape_gate = shape_gate;
-            view.mv_state = mv_state_initial(shape_gate);
+            view.mv = MvMeta::new(shape_gate);
         }
     }
 
@@ -297,8 +296,7 @@ impl WriterCore {
                 deparsed_sql: Some(deparsed_sql.clone()),
                 max_limit,
                 referenced: false,
-                shape_gate: ShapeGate::Skip,
-                mv_state: MvState::Skipped,
+                mv: MvMeta::new(ShapeGate::Skip),
             });
     }
 

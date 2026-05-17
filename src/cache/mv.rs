@@ -9,6 +9,10 @@
 
 use std::collections::HashSet;
 use std::fmt::Write;
+use std::sync::Arc;
+
+use ecow::EcoString;
+use postgres_protocol::escape::escape_identifier;
 
 use crate::query::ast::{Deparse, LimitClause, OrderDirection, SetOpType};
 use crate::query::resolved::{
@@ -96,6 +100,37 @@ pub fn mv_state_initial(gate: ShapeGate) -> MvState {
     }
 }
 
+/// All MV state for one cached query. Lives on `CachedQueryView`,
+/// written by the writer: registration sets `shape_gate`/`state`; MV
+/// build captures `output_columns` and flips `state` to `Fresh`.
+#[derive(Debug, Clone)]
+pub struct MvMeta {
+    pub shape_gate: ShapeGate,
+    pub state: MvState,
+    /// PostgreSQL's output column names, captured at first build and
+    /// reused across rebuilds. `None` until the MV has ever been built.
+    pub output_columns: Option<Arc<[EcoString]>>,
+}
+
+impl MvMeta {
+    /// Registration-time state for `shape_gate` — no table, no names yet.
+    pub fn new(shape_gate: ShapeGate) -> Self {
+        Self {
+            shape_gate,
+            state: mv_state_initial(shape_gate),
+            output_columns: None,
+        }
+    }
+}
+
+/// Serve-dispatch outcome. The `Mv` variant carries the column names
+/// pulled from the *same* locked view observation that saw `Fresh`, so
+/// "serve from MV without names" is unrepresentable past this point.
+pub enum MvServe {
+    Mv(Arc<[EcoString]>),
+    SourceRow,
+}
+
 /// Format the cache-DB table name for an MV keyed by fingerprint.
 /// Convention: `pgcache_mv.q_<fingerprint>`. The `q_` prefix keeps the
 /// identifier unquoted-safe (PostgreSQL requires a letter/underscore first).
@@ -133,10 +168,27 @@ pub fn mv_serve_sql(
     fingerprint: u64,
     resolved: &ResolvedQueryExpr,
     limit: Option<&LimitClause>,
+    output_columns: &[EcoString],
 ) -> String {
-    let mut sql = String::with_capacity(128);
-    sql.push_str("SELECT * FROM ");
-    sql.push_str(&mv_table_name(fingerprint));
+    let table = mv_table_name(fingerprint);
+    let mut sql = String::with_capacity(16 + table.len() + output_columns.len() * 24);
+    // MV physical columns are positional (`c0..`) so duplicate output
+    // names (e.g. two `count`) are storable; alias them back here. Empty
+    // `output_columns` is a defensive fallback — a `Fresh` MV always has
+    // captured names (the worker logs this case).
+    sql.push_str("SELECT ");
+    if output_columns.is_empty() {
+        sql.push('*');
+    } else {
+        for (i, name) in output_columns.iter().enumerate() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            let _ = write!(sql, "c{i} AS {}", escape_identifier(name.as_str()));
+        }
+    }
+    sql.push_str(" FROM ");
+    sql.push_str(&table);
 
     if !resolved.order_by.is_empty() {
         match &resolved.body {
@@ -676,18 +728,64 @@ mod tests {
 
     // ==================== mv_serve_sql positional ORDER BY ====================
 
-    fn build_serve_sql(sql: &str) -> String {
+    fn resolve_for_serve(sql: &str) -> ResolvedQueryExpr {
         let parsed = pg_query::parse(sql).expect("parse SQL");
         let ast = query_expr_convert(&parsed).expect("convert to AST");
-        let resolved =
-            query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve query");
-        mv_serve_sql(42, &resolved, None)
+        query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve query")
+    }
+
+    /// Empty `output_columns` exercises the positional `SELECT *` fallback,
+    /// which keeps the ORDER BY / LIMIT assertions below orthogonal to the
+    /// aliased-projection tests.
+    fn build_serve_sql(sql: &str) -> String {
+        mv_serve_sql(42, &resolve_for_serve(sql), None, &[])
+    }
+
+    fn build_serve_sql_named(sql: &str, names: &[&str]) -> String {
+        let names: Vec<EcoString> = names.iter().map(|n| EcoString::from(*n)).collect();
+        mv_serve_sql(42, &resolve_for_serve(sql), None, &names)
     }
 
     #[test]
     fn mv_serve_sql_no_order_by() {
         let out = build_serve_sql("SELECT status, count(*) FROM orders GROUP BY status");
         assert_eq!(out, "SELECT * FROM pgcache_mv.q_42");
+    }
+
+    #[test]
+    fn mv_serve_sql_aliases_positional_columns_back() {
+        let out = build_serve_sql_named(
+            "SELECT status, count(*) FROM orders GROUP BY status",
+            &["status", "count"],
+        );
+        assert_eq!(
+            out,
+            r#"SELECT c0 AS "status", c1 AS "count" FROM pgcache_mv.q_42"#
+        );
+    }
+
+    #[test]
+    fn mv_serve_sql_allows_duplicate_output_names() {
+        // PGC-136: two unaliased count(*) — illegal as table columns,
+        // legal as a result set via positional storage + aliased serve.
+        let out =
+            build_serve_sql_named("SELECT count(*), count(*) FROM orders", &["count", "count"]);
+        assert_eq!(
+            out,
+            r#"SELECT c0 AS "count", c1 AS "count" FROM pgcache_mv.q_42"#
+        );
+    }
+
+    #[test]
+    fn mv_serve_sql_aliased_with_positional_order_by() {
+        let out = build_serve_sql_named(
+            "SELECT status, count(*) FROM orders GROUP BY status ORDER BY count(*) DESC",
+            &["status", "count"],
+        );
+        assert_eq!(
+            out,
+            r#"SELECT c0 AS "status", c1 AS "count" FROM pgcache_mv.q_42 ORDER BY 2 DESC"#
+        );
     }
 
     #[test]

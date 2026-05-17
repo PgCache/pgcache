@@ -12,11 +12,7 @@ use hdrhistogram::Histogram;
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 
 use crate::{
-    cache::{
-        mv::{MvState, ShapeGate},
-        query::CacheableQuery,
-        subsumption_index::SubsumptionIndex,
-    },
+    cache::{mv::MvMeta, query::CacheableQuery, subsumption_index::SubsumptionIndex},
     catalog::TableMetadata,
     query::{ast::QueryExpr, constraints::QueryConstraints, resolved::ResolvedQueryExpr},
     settings::{DynamicConfigHandle, Settings},
@@ -382,12 +378,9 @@ pub struct CachedQueryView {
     pub max_limit: Option<u64>,
     /// CLOCK reference bit — set by coordinator on cache hit, read/cleared by writer during eviction
     pub referenced: bool,
-    /// Shape classification set at registration from the decorrelated resolved form.
-    /// Never changes for the life of the cache entry.
-    pub shape_gate: ShapeGate,
-    /// Runtime state of the materialized result. `Fresh` is the only state
-    /// that produces a fast-path dispatch.
-    pub mv_state: MvState,
+    /// MV shape classification, runtime state, and captured output column
+    /// names — all written by the writer (registration / MV build).
+    pub mv: MvMeta,
 }
 
 /// A pre-validated pinned query, ready for registration.

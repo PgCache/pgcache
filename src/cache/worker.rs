@@ -20,7 +20,7 @@ use crate::query::ast::Deparse;
 
 use super::{
     CacheError, CacheResult,
-    mv::mv_serve_sql,
+    mv::{MvServe, mv_serve_sql},
     query_cache::{CoalescedClient, QueryType, WorkerRequest},
     write_queue::WriteQueue,
 };
@@ -278,13 +278,15 @@ async fn handle_cached_query_text(
     // Assemble the wire SQL into the connection's recycled buffer to avoid
     // per-request allocations. Format differs between MV and source-row paths.
     conn.sql_buf.clear();
-    if msg.mv_source {
-        // MV fast path: SELECT * FROM pgcache_mv.q_<fp> [ORDER BY] [LIMIT].
-        // No generation SET — MV tables are not pgcache_pgrx-tracked.
+    if let MvServe::Mv(cols) = &msg.mv {
+        // MV fast path: SELECT <aliased cols> FROM pgcache_mv.q_<fp>
+        // [ORDER BY] [LIMIT]. No generation SET — MV tables are not
+        // pgcache_pgrx-tracked.
         conn.sql_buf.push_str(&mv_serve_sql(
             msg.fingerprint,
             &msg.resolved,
             msg.limit.as_ref(),
+            cols,
         ));
         conn.sql_buf.push(';');
     } else {
@@ -359,7 +361,7 @@ async fn handle_cached_query_text(
 
     // MV path: no SET statement was sent, so skip the SetComplete waiting state
     // and start directly at RowDescription.
-    let mut state = if msg.mv_source {
+    let mut state = if matches!(msg.mv, MvServe::Mv(_)) {
         TextResponseState::RowDescription
     } else {
         TextResponseState::SetComplete
@@ -542,9 +544,9 @@ async fn handle_cached_query_binary(
 
     let include_describe = msg.pipeline_describe != PipelineDescribe::None;
 
-    if msg.mv_source {
+    if let MvServe::Mv(cols) = &msg.mv {
         // MV fast path: extended query only, no SET prefix.
-        let sql = mv_serve_sql(msg.fingerprint, &msg.resolved, msg.limit.as_ref());
+        let sql = mv_serve_sql(msg.fingerprint, &msg.resolved, msg.limit.as_ref(), cols);
         conn.extended_binary_query_send(&sql, include_describe)
             .await
             .inspect_err(|_| {
@@ -603,7 +605,7 @@ async fn handle_cached_query_binary(
 
     // MV path: no SET statement was sent, so skip SetComplete/SetReady and
     // start directly at ParseComplete (first message from the extended query).
-    let mut state = if msg.mv_source {
+    let mut state = if matches!(msg.mv, MvServe::Mv(_)) {
         BinaryResponseState::ParseComplete
     } else {
         BinaryResponseState::SetComplete
