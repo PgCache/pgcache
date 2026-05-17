@@ -541,7 +541,7 @@ impl WriterCore {
         // 3. Re-execute query against cache DB (discard results).
         //    The CustomScan tracker side-effect updates dshash from old_gen to new_gen.
         let mut sql = String::with_capacity(512);
-        crate::query::ast::Deparse::deparse(&*resolved, &mut sql);
+        Deparse::deparse(&*resolved, &mut sql);
         self.db_cache
             .batch_execute(&sql)
             .await

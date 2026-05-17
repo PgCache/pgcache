@@ -16,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 use crate::cache::StatusRequest;
 use crate::proxy::{SharedProxyStatus, StatusSender};
 use crate::settings::{
-    DynamicConfigHandle, config_file_dynamic_extract, config_file_dynamic_update,
+    DynamicConfig, DynamicConfigHandle, DynamicConfigPatch, config_file_dynamic_extract,
+    config_file_dynamic_update,
 };
 
 /// Metrics subsystem errors.
@@ -408,7 +409,7 @@ fn json_error(status: u16, message: &str) -> Result<Response<Full<Bytes>>, http:
 
 #[derive(Serialize)]
 struct ConfigGetResponse<'a> {
-    dynamic: &'a crate::settings::DynamicConfig,
+    dynamic: &'a DynamicConfig,
     restart_required: bool,
     effective_log_level: Option<String>,
 }
@@ -445,7 +446,7 @@ async fn config_put_handle(
         Err(e) => return json_error(400, &format!("failed to read body: {e}")),
     };
 
-    let patch: crate::settings::DynamicConfigPatch = match serde_json::from_slice(&body) {
+    let patch: DynamicConfigPatch = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => return json_error(400, &format!("invalid JSON: {e}")),
     };

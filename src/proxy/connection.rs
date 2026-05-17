@@ -49,8 +49,9 @@ use crate::{
             simple_query_message_build, startup_message_parameter,
         },
     },
-    query::ast::query_expr_fingerprint,
+    query::ast::{query_expr_convert, query_expr_fingerprint},
     settings::{Settings, SslMode},
+    telemetry::pg_version_set,
     timing::{QueryId, QueryTiming, timing_record},
     tls::{self},
 };
@@ -793,7 +794,7 @@ impl ConnectionState {
                             self.search_path_auto_reported = true;
                         }
                         "server_version" => {
-                            crate::telemetry::pg_version_set(value.to_owned());
+                            pg_version_set(value.to_owned());
                         }
                         _ => {}
                     }
@@ -1069,7 +1070,7 @@ impl ConnectionState {
             }
 
             let sql_type = match ast_result {
-                Ok(ast) => match crate::query::ast::query_expr_convert(&ast) {
+                Ok(ast) => match query_expr_convert(&ast) {
                     Ok(query) => match CacheableQuery::try_new(&query, &self.func_volatility) {
                         Ok(cacheable_query) => StatementType::Cacheable(Arc::new(cacheable_query)),
                         Err(_) => StatementType::UncacheableSelect,

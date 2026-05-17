@@ -17,7 +17,7 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{
     cache::{
-        CacheError, CacheResult, MapIntoReport, ReportExt, StatusRequest,
+        CacheError, CacheResult, MapIntoReport, PinnedQuery, ReportExt, StatusRequest,
         cdc::CdcProcessor,
         messages::{CacheReply, CdcCommand, CdcSignal, ProxyMessage, WriterNotify},
         query_cache::{QueryCache, QueryRequest, WorkerRequest, reply_forward},
@@ -277,7 +277,7 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
 pub fn cache_run(
     settings: &Settings,
     cache_rx: Receiver<ProxyMessage>,
-    pinned: &[crate::cache::PinnedQuery],
+    pinned: &[PinnedQuery],
     cancel: CancellationToken,
     status_rx: Receiver<StatusRequest>,
 ) -> CacheResult<()> {

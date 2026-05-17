@@ -14,7 +14,9 @@ use crate::cache::query::limit_rows_needed;
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::metrics::names;
 use crate::query::ast::{Deparse, QueryBody, QueryExpr, TableNode};
-use crate::query::constraints::{analyze_query_constraints, table_constraints_subsumed};
+use crate::query::constraints::{
+    TableConstraint, analyze_query_constraints, table_constraints_subsumed,
+};
 use crate::query::decorrelate::query_expr_decorrelate;
 use crate::query::evaluate::resolved_where_expr_supported;
 use crate::query::resolved::{
@@ -654,7 +656,7 @@ impl WriterRegistration {
             // we still need to apply parent_ready / single-table / fine-grained
             // constraint checks per candidate, but the candidate set is
             // typically far smaller than `queries.len()`.
-            let empty: Vec<crate::query::constraints::TableConstraint> = Vec::new();
+            let empty: Vec<TableConstraint> = Vec::new();
             let new_table_constraints = new_constraints
                 .table_constraints
                 .get(table_name.as_str())

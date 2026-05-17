@@ -25,7 +25,10 @@ use super::{
     },
     mv::{MvMeta, MvServe, MvState, ShapeGate},
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
-    types::{CacheStateView, CachedQueryState, CachedQueryView, QueryMetrics, SharedResolved},
+    types::{
+        CacheStateView, CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics,
+        SharedResolved,
+    },
 };
 
 /// Minimum credit stamped on a Pending entry. Provides a survival floor during
@@ -639,7 +642,7 @@ impl QueryCache {
     }
 
     /// Register pinned queries at startup by sending Register commands with `pinned: true`.
-    pub fn pinned_queries_register(&self, pinned: &[crate::cache::PinnedQuery]) -> CacheResult<()> {
+    pub fn pinned_queries_register(&self, pinned: &[PinnedQuery]) -> CacheResult<()> {
         for pq in pinned {
             // Set Loading state in CacheStateView
             self.state_view.cached_queries.insert(

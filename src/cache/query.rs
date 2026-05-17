@@ -5,7 +5,7 @@ use crate::{
     query::{
         ast::{
             BinaryOp, CteRefNode, JoinNode, JoinType, LimitClause, LiteralValue, MultiOp,
-            QueryBody, QueryExpr, SelectNode, SetOpNode, SubLinkType, TableSource,
+            QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode, SubLinkType, TableSource,
             TableSubqueryNode, WhereExpr,
         },
         resolved::{
@@ -366,7 +366,7 @@ fn is_cacheable_select_list(
 
 /// Check if a column expression is cacheable.
 fn is_cacheable_scalar_expr(
-    expr: &crate::query::ast::ScalarExpr,
+    expr: &ScalarExpr,
     ctx: ExprContext,
     fv: &FunctionVolatilityMap,
 ) -> Result<(), CacheabilityError> {
