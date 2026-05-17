@@ -309,6 +309,16 @@ impl WriterCore {
         }
     }
 
+    /// Whether this query currently has a `Fresh` MV. Only `Fresh` queries
+    /// need full CDC evaluation (so `mv_dirty_mark` can fire on a match);
+    /// non-`Fresh` queries are short-circuitable in the membership check.
+    pub(super) fn mv_is_fresh(&self, fingerprint: u64) -> bool {
+        self.state_view
+            .cached_queries
+            .get(&fingerprint)
+            .is_some_and(|v| v.mv.state == MvState::Fresh)
+    }
+
     /// Eviction pre-sweep: truncate every MV in `Pending { has_table: true }`
     /// so the bytes are reclaimed before we start evicting live cache entries.
     ///

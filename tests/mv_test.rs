@@ -912,3 +912,81 @@ async fn test_mv_duplicate_derived_column_names() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-138: a relation carrying a Fresh-MV query *and* a separate
+/// non-MV cached query. The CDC short-circuit must still (a) dirty-mark
+/// the Fresh MV when a row matches it and (b) upsert the shared cache
+/// table for the non-MV query — skipping neither.
+#[tokio::test]
+async fn test_cdc_short_circuit_preserves_fresh_and_upsert() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE pgc138 (id integer primary key, grp integer not null)",
+        &[],
+    )
+    .await?;
+    // >=10 grp=1 rows so the count(*) MV passes the size gate.
+    for id in 1..=12 {
+        ctx.query("INSERT INTO pgc138 VALUES ($1, 1)", &[&id])
+            .await?;
+    }
+    for id in 13..=15 {
+        ctx.query("INSERT INTO pgc138 VALUES ($1, 2)", &[&id])
+            .await?;
+    }
+
+    let agg = "SELECT count(*) FROM pgc138 WHERE grp = 1";
+    let rows = "SELECT id FROM pgc138 WHERE grp = 1 ORDER BY id";
+
+    async fn rows_count(ctx: &mut TestContext, sql: &str) -> Result<usize, Error> {
+        let r = ctx.simple_query(sql).await?;
+        Ok(r.iter()
+            .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+            .count())
+    }
+
+    // Prime both queries; materialize the aggregate MV.
+    assert_eq!(ctx.query_one(agg, &[]).await?.get::<_, i64>(0), 12);
+    ctx.simple_query(rows).await?;
+    ctx.cache_settle().await?;
+    ctx.query_one(agg, &[]).await?; // first-pop trigger
+    ctx.cache_settle().await?;
+    assert!(
+        mv_table_count(&ctx.dbs).await? >= 1,
+        "aggregate MV should be built"
+    );
+
+    // CDC INSERT a grp=1 row — matches the Fresh agg AND the rows query.
+    ctx.origin_query("INSERT INTO pgc138 VALUES (16, 1)", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    ctx.cache_settle().await?;
+    assert_eq!(
+        ctx.query_one(agg, &[]).await?.get::<_, i64>(0),
+        13,
+        "Fresh MV must reflect the CDC row (was dirty-marked)"
+    );
+    assert_eq!(
+        rows_count(&mut ctx, rows).await?,
+        13,
+        "non-MV query must reflect the CDC row (shared table upserted)"
+    );
+
+    // CDC INSERT a grp=2 row — matches neither WHERE grp=1 query.
+    ctx.origin_query("INSERT INTO pgc138 VALUES (17, 2)", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    ctx.cache_settle().await?;
+    assert_eq!(
+        ctx.query_one(agg, &[]).await?.get::<_, i64>(0),
+        13,
+        "grp=2 row must not affect the grp=1 aggregate"
+    );
+    assert_eq!(
+        rows_count(&mut ctx, rows).await?,
+        13,
+        "grp=2 row must not affect the grp=1 rows query"
+    );
+
+    Ok(())
+}

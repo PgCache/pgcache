@@ -13,9 +13,10 @@ use tracing::{debug, error, instrument, trace};
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
 
-use crate::query::ast::BinaryOp;
+use crate::query::ast::{BinaryOp, Deparse};
 use crate::query::constraints::{QueryConstraints, TableConstraint};
 use crate::query::evaluate::where_value_compare_string;
+use crate::query::resolved::ResolvedQueryExpr;
 use crate::query::transform::resolved_select_node_table_replace_with_values;
 
 use crate::settings::{CachePolicy, Settings};
@@ -87,6 +88,14 @@ pub(super) struct WriterCdc {
     /// applied by this writer. Advances on `CommitMark` and `KeepAliveMark`,
     /// guaranteed transaction-aligned by mpsc ordering.
     pub(super) last_applied_lsn: u64,
+}
+
+/// Whether `pg_eval_matches` evaluates every query or stops at the first
+/// match (membership-only / non-`Fresh` set).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PgEvalMode {
+    All,
+    FirstMatch,
 }
 
 impl WriterCdc {
@@ -990,14 +999,16 @@ impl WriterCdc {
                 return Ok(false);
             }
 
-            // Every matching cached query's MV must be marked dirty, so all
-            // queries are evaluated — no short-circuit. Stopping at the first
-            // match (or skipping PgEval once a LocalEval matched) left other
-            // matching queries' MVs `Fresh` while their underlying rows
-            // changed, a stale-MV read.
+            // Fresh-MV queries must be fully evaluated so every match is
+            // dirty-marked (else a Fresh MV silently goes stale). Non-Fresh
+            // queries only decide whether the row belongs in the shared
+            // cache table — one match triggers the single upsert, so they
+            // short-circuit, exactly as before MV existed.
             let mut matched = false;
 
-            // LocalEval: Rust evaluation, complexity-ordered (simplest first).
+            // LocalEval: Rust evaluation, complexity-ordered (simplest
+            // first). Cheap, so always evaluated in full; `mv_dirty_mark`
+            // self-gates on `Fresh`.
             let mut local_hit = false;
             for update_query in update_queries.iter_complexity_ordered() {
                 if update_query.eval_strategy != UpdateEvalStrategy::LocalEval {
@@ -1018,66 +1029,39 @@ impl WriterCdc {
                 metrics::counter!(names::CACHE_CDC_LOCAL_EVAL_HITS).increment(1);
             }
 
-            // PgEval: parallel `SELECT EXISTS` across the read pool. Evaluated
-            // independently of LocalEval — a row can match both. `simple_query`
-            // (not `query_one`) keeps each eval to one round trip with no
-            // prepared-statement create/close: the row's values are baked into
-            // the SQL as literals, so a prepared statement would never be
-            // reused. SQL is built lazily per batch to bound peak memory to
-            // `pool_size` strings.
+            // PgEval (the expensive set): only Fresh-MV queries need full
+            // evaluation (to dirty-mark matches); the rest short-circuit.
             let pg_eval: Vec<&UpdateQuery> = update_queries
                 .iter_complexity_ordered()
                 .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval)
                 .collect();
 
             if !pg_eval.is_empty() {
-                let pool_size = self.cache_pool.len();
-                let mut iter = pg_eval.into_iter();
-                let mut pg_hit = false;
-                loop {
-                    let mut futures = FuturesUnordered::new();
-                    for (idx, uq) in iter.by_ref().take(pool_size).enumerate() {
-                        let fingerprint = uq.fingerprint;
-                        let sql = self.cache_predicate_exists_sql(
-                            &uq.resolved,
-                            table_metadata,
-                            row_data,
-                        )?;
-                        let conn = Rc::clone(
-                            self.cache_pool
-                                .get(idx % pool_size)
-                                .ok_or(CacheError::Other)?,
-                        );
-                        futures.push(async move {
-                            let r = conn
-                                .simple_query(&sql)
-                                .await
-                                .map(|msgs| simple_query_exists(&msgs));
-                            (fingerprint, r)
-                        });
-                    }
-                    if futures.is_empty() {
-                        break;
-                    }
-                    while let Some((fingerprint, r)) = futures.next().await {
-                        match r {
-                            Ok(true) => {
-                                trace!("update_queries pg-eval matched fingerprint {fingerprint}");
-                                core.mv_dirty_mark(fingerprint);
-                                matched = true;
-                                pg_hit = true;
-                            }
-                            Ok(false) => {}
-                            Err(e) => {
-                                error!(
-                                    "predicate eval error for fingerprint {fingerprint}: {}",
-                                    error_chain_format(&e),
-                                );
-                                return Err(CacheError::PgError(e).into());
-                            }
-                        }
+                let (fresh_pg, rest_pg): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) = pg_eval
+                    .into_iter()
+                    .partition(|q| core.mv_is_fresh(q.fingerprint));
+
+                let fresh_hits = self
+                    .pg_eval_matches(&fresh_pg, table_metadata, row_data, PgEvalMode::All)
+                    .await?;
+                for &fingerprint in &fresh_hits {
+                    core.mv_dirty_mark(fingerprint);
+                }
+                let mut pg_hit = !fresh_hits.is_empty();
+                matched |= pg_hit;
+
+                // Non-Fresh queries only decide the upsert: skip the whole
+                // set once anything matched, else stop at the first match.
+                if !matched {
+                    let rest_hits = self
+                        .pg_eval_matches(&rest_pg, table_metadata, row_data, PgEvalMode::FirstMatch)
+                        .await?;
+                    if !rest_hits.is_empty() {
+                        matched = true;
+                        pg_hit = true;
                     }
                 }
+
                 if pg_hit {
                     metrics::counter!(names::CACHE_CDC_PG_EVAL_HITS).increment(1);
                 }
@@ -1100,13 +1084,76 @@ impl WriterCdc {
         Ok(matched)
     }
 
+    /// Run `SELECT EXISTS (<predicate>)` for each query in parallel across
+    /// the read pool (pool-sized batches) and return the fingerprints that
+    /// matched. `FirstMatch` stops launching further batches once any match
+    /// is seen — for the membership-only (non-`Fresh`) set where one match
+    /// is enough to trigger the shared-table upsert.
+    async fn pg_eval_matches(
+        &self,
+        queries: &[&UpdateQuery],
+        table_metadata: &TableMetadata,
+        row_data: &[Option<String>],
+        mode: PgEvalMode,
+    ) -> CacheResult<Vec<u64>> {
+        let mut hits = Vec::new();
+        if queries.is_empty() {
+            return Ok(hits);
+        }
+        let pool_size = self.cache_pool.len();
+        let mut iter = queries.iter();
+        loop {
+            let mut futures = FuturesUnordered::new();
+            for (idx, uq) in iter.by_ref().take(pool_size).enumerate() {
+                let fingerprint = uq.fingerprint;
+                let sql =
+                    self.cache_predicate_exists_sql(&uq.resolved, table_metadata, row_data)?;
+                let conn = Rc::clone(
+                    self.cache_pool
+                        .get(idx % pool_size)
+                        .ok_or(CacheError::Other)?,
+                );
+                futures.push(async move {
+                    let r = conn
+                        .simple_query(&sql)
+                        .await
+                        .map(|msgs| simple_query_exists(&msgs));
+                    (fingerprint, r)
+                });
+            }
+            if futures.is_empty() {
+                break;
+            }
+            while let Some((fingerprint, r)) = futures.next().await {
+                match r {
+                    Ok(true) => {
+                        trace!("update_queries pg-eval matched fingerprint {fingerprint}");
+                        hits.push(fingerprint);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        error!(
+                            "predicate eval error for fingerprint {fingerprint}: {}",
+                            error_chain_format(&e),
+                        );
+                        return Err(CacheError::PgError(e).into());
+                    }
+                }
+            }
+            if mode == PgEvalMode::FirstMatch && !hits.is_empty() {
+                break;
+            }
+        }
+        Ok(hits)
+    }
+
     /// Build `SELECT EXISTS (<cached query with the CDC row's values
     /// substituted>)` — the membership predicate for one cached query,
     /// evaluated read-only on the pool against the pre-transaction snapshot.
     pub(super) fn cache_predicate_exists_sql(
         &self,
-        resolved: &crate::query::resolved::ResolvedQueryExpr,
-        table_metadata: &crate::catalog::TableMetadata,
+        resolved: &ResolvedQueryExpr,
+        table_metadata: &TableMetadata,
         row_data: &[Option<String>],
     ) -> CacheResult<String> {
         let resolved_select = resolved.as_select().ok_or(CacheError::InvalidQuery)?;
@@ -1117,7 +1164,7 @@ impl WriterCdc {
         )
         .map_err(|e| e.context_transform(CacheError::from))?;
         let mut select = String::with_capacity(SQL_BUFFER_CAPACITY);
-        crate::query::ast::Deparse::deparse(&value_select, &mut select);
+        Deparse::deparse(&value_select, &mut select);
         Ok(format!("SELECT EXISTS ({select})"))
     }
 
@@ -1127,7 +1174,7 @@ impl WriterCdc {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn cache_upsert_unconditional_sql(
         &self,
-        table_metadata: &crate::catalog::TableMetadata,
+        table_metadata: &TableMetadata,
         row_data: &[Option<String>],
     ) -> String {
         let mut column_names = Vec::with_capacity(table_metadata.columns.len());
@@ -1179,7 +1226,7 @@ impl WriterCdc {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn cache_delete_sql(
         &self,
-        table_metadata: &crate::catalog::TableMetadata,
+        table_metadata: &TableMetadata,
         row_data: &[Option<String>],
     ) -> CacheResult<String> {
         let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
