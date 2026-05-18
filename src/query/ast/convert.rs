@@ -483,17 +483,32 @@ fn join_expr_convert(join_expr: &JoinExpr, ctx: &ParseContext) -> Result<TableSo
         });
     };
 
-    let clause = if let Some(clause) = &join_expr.quals {
-        Some(node_convert_to_expr(clause)?)
+    // `ON` / `USING` / `NATURAL` / cross are mutually exclusive in the
+    // grammar, so pg_query sets at most one of quals / using_clause /
+    // is_natural; everything else is a (cross) cartesian join.
+    let qual = if let Some(clause) = &join_expr.quals {
+        JoinQual::On(node_convert_to_expr(clause)?)
+    } else if !join_expr.using_clause.is_empty() {
+        let cols = join_expr
+            .using_clause
+            .iter()
+            .filter_map(|n| match &n.node {
+                Some(NodeEnum::String(s)) => Some(EcoString::from(s.sval.as_str())),
+                _ => None,
+            })
+            .collect();
+        JoinQual::Using(cols)
+    } else if join_expr.is_natural {
+        JoinQual::Natural
     } else {
-        None
+        JoinQual::Cross
     };
 
     Ok(TableSource::Join(JoinNode {
         join_type: JoinType::try_from(join_expr.jointype())?,
         left: Box::new(left_table),
         right: Box::new(right_table),
-        condition: clause,
+        qual,
     }))
 }
 
@@ -1355,7 +1370,7 @@ mod tests {
         // columns from nested joins (since joins can be nested in the AST)
         let mut col_count = 0;
         for join in &joins {
-            if let Some(condition) = &join.condition {
+            if let JoinQual::On(condition) = &join.qual {
                 col_count += condition.nodes::<ColumnNode>().count();
             }
         }
@@ -2127,7 +2142,7 @@ mod tests {
         assert_eq!(join_nodes.len(), 1);
 
         assert_eq!(join_nodes[0].join_type, JoinType::Inner);
-        assert!(join_nodes[0].condition.is_some());
+        assert!(matches!(join_nodes[0].qual, JoinQual::On(_)));
     }
 
     #[test]

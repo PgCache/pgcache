@@ -151,7 +151,7 @@ fn resolved_table_source_alias_update(
         ResolvedTableSource::Join(join) => {
             resolved_table_source_alias_update(&mut join.left, schema, table, alias);
             resolved_table_source_alias_update(&mut join.right, schema, table, alias);
-            if let Some(condition) = &mut join.condition {
+            if let Some(condition) = join.predicate_mut() {
                 resolved_where_expr_alias_update(condition, schema, table, alias);
             }
         }
@@ -311,8 +311,8 @@ mod tests {
     };
     use crate::query::resolve::select_node_resolve;
     use crate::query::resolved::{
-        ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectColumn,
-        ResolvedTableNode, ResolvedTableSource, ResolvedWhereExpr,
+        ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedJoinQual,
+        ResolvedSelectColumn, ResolvedTableNode, ResolvedTableSource, ResolvedWhereExpr,
     };
     use crate::query::transform::AstTransformError;
 
@@ -428,6 +428,77 @@ mod tests {
         assert!(
             !sql.contains("public.j1_tbl"),
             "no dangling schema-qualified ref to the replaced table; got: {sql}"
+        );
+    }
+
+    /// USING/NATURAL deparse **verbatim** (so Postgres performs the
+    /// column merge — matching origin's `SELECT *` width / unqualified
+    /// refs), while carrying a synthesized equi-`predicate` for
+    /// freshness analysis. CROSS deparses `CROSS JOIN` with no
+    /// predicate. (PGC-142)
+    #[test]
+    fn test_join_qual_using_natural_preserved_with_predicate() {
+        let cols1 = &[("i", "int4"), ("j", "int4"), ("t", "text"), ("j1_pk", "int4")];
+        let cols2 = &[("i", "int4"), ("k", "int4"), ("j2_pk", "int4")];
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(table_metadata("j1_tbl", 5001, cols1));
+        tables.insert_overwrite(table_metadata("j2_tbl", 5002, cols2));
+
+        let resolve = |sql: &str| {
+            let ast = pg_query::parse(sql).expect("parse");
+            let qe = query_expr_convert(&ast).expect("convert");
+            let QueryBody::Select(node) = qe.body else {
+                panic!("expected SELECT");
+            };
+            select_node_resolve(&node, &tables, &["public"]).expect("resolve")
+        };
+        let deparsed = |n: &ResolvedSelectNode| {
+            let mut s = String::new();
+            Deparse::deparse(n, &mut s);
+            s
+        };
+        let join_qual = |n: &ResolvedSelectNode| match n.from.first() {
+            Some(ResolvedTableSource::Join(j)) => j.clone(),
+            _ => panic!("expected a join in FROM"),
+        };
+
+        // CROSS → `CROSS JOIN`, no predicate.
+        let cross = resolve("SELECT * FROM j1_tbl CROSS JOIN j2_tbl");
+        let cross_sql = deparsed(&cross);
+        assert!(
+            cross_sql.contains(" CROSS JOIN public.j2_tbl") && !cross_sql.contains(" ON "),
+            "CROSS must deparse as CROSS JOIN with no ON; got: {cross_sql}"
+        );
+        assert!(
+            join_qual(&cross).predicate().is_none(),
+            "CROSS has no analysis predicate"
+        );
+
+        // USING (i) → emitted verbatim (NOT rewritten to ON), with a
+        // synthesized equi-predicate for analysis.
+        let using = resolve("SELECT * FROM j1_tbl JOIN j2_tbl USING (i)");
+        let using_sql = deparsed(&using);
+        assert!(
+            using_sql.contains(" JOIN public.j2_tbl USING (i)") && !using_sql.contains(" ON "),
+            "USING must deparse verbatim, not as ON; got: {using_sql}"
+        );
+        assert!(
+            join_qual(&using).predicate().is_some(),
+            "USING must carry an equi-predicate for analysis"
+        );
+
+        // NATURAL (common column: i) → resolved to `USING (i)`.
+        let natural = deparsed(&resolve("SELECT * FROM j1_tbl NATURAL JOIN j2_tbl"));
+        assert!(
+            natural.contains(" JOIN public.j2_tbl USING (i)") && !natural.contains(" ON "),
+            "NATURAL must resolve to USING over common columns; got: {natural}"
+        );
+
+        // Outer + USING keeps the outer keyword and the USING clause.
+        let left = deparsed(&resolve("SELECT * FROM j1_tbl LEFT JOIN j2_tbl USING (i)"));
+        assert!(
+            left.contains(" LEFT JOIN public.j2_tbl USING (i)"),
+            "LEFT JOIN USING must deparse verbatim; got: {left}"
         );
     }
 
@@ -629,7 +700,7 @@ mod tests {
             join_type: JoinType::Inner,
             left: resolved_table("users", 100, None),
             right: resolved_table("orders", 200, None),
-            condition: None,
+            qual: ResolvedJoinQual::Cross,
         }));
 
         let node = select_node(vec![join], ResolvedSelectColumns::None, None);

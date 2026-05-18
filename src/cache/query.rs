@@ -4,9 +4,9 @@ use crate::{
     catalog::FunctionVolatility,
     query::{
         ast::{
-            BinaryOp, CteRefNode, JoinNode, JoinType, LimitClause, LiteralValue, MultiOp,
-            QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode, SubLinkType, TableSource,
-            TableSubqueryNode, WhereExpr,
+            BinaryOp, CteRefNode, JoinNode, JoinQual, JoinType, LimitClause, LiteralValue,
+            MultiOp, QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode, SubLinkType,
+            TableSource, TableSubqueryNode, WhereExpr,
         },
         resolved::{
             ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectNode, ResolvedTableSource,
@@ -160,10 +160,11 @@ fn is_supported_join(
         return Err(CacheabilityError::UnsupportedFrom);
     }
 
-    // Validate join condition: must be equality, AND of equalities, or absent
-    let condition_valid = match &join.condition {
-        Some(expr) => join_condition_is_valid(expr),
-        None => true,
+    // ON must be equality / AND of equalities. USING/NATURAL resolve to
+    // the same equi-join shape; CROSS (no predicate) is fine.
+    let condition_valid = match &join.qual {
+        JoinQual::On(expr) => join_condition_is_valid(expr),
+        JoinQual::Using(_) | JoinQual::Natural | JoinQual::Cross => true,
     };
 
     if !condition_valid {
@@ -525,7 +526,7 @@ fn resolved_join_terminality_walk(
     // Before recursing, merge this join's condition refs so children see them
     // as "ancestor join conditions"
     let mut child_refs = non_terminal_refs.clone();
-    if let Some(condition) = &join.condition {
+    if let Some(condition) = join.predicate() {
         resolved_column_table_refs_collect(condition, &mut child_refs);
     }
 

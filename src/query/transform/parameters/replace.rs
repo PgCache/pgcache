@@ -5,7 +5,7 @@ use rootcause::Report;
 
 use crate::cache::QueryParameters;
 use crate::query::ast::{
-    LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectNode, TableSource, WhereExpr,
+    JoinQual, LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectNode, TableSource, WhereExpr,
 };
 
 use super::super::{AstTransformError, AstTransformResult};
@@ -98,7 +98,7 @@ fn table_source_parameters_replace(
 ) -> AstTransformResult<()> {
     match table_source {
         TableSource::Join(join) => {
-            if let Some(condition) = &mut join.condition {
+            if let JoinQual::On(condition) = &mut join.qual {
                 where_expr_parameters_replace(condition, parameters)?;
             }
             table_source_parameters_replace(&mut join.left, parameters)?;

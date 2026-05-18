@@ -21,8 +21,8 @@
 use ordered_float::NotNan;
 
 use crate::query::ast::{
-    ArithmeticOp, LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns,
-    SelectNode, TableSource, WhereExpr,
+    ArithmeticOp, JoinQual, LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
+    SelectColumns, SelectNode, TableSource, WhereExpr,
 };
 
 /// Fold pure-literal arithmetic subtrees in `expr` in place.
@@ -73,7 +73,7 @@ fn select_node_fold(node: &mut SelectNode) {
 fn table_source_fold(source: &mut TableSource) {
     match source {
         TableSource::Join(join) => {
-            if let Some(cond) = &mut join.condition {
+            if let JoinQual::On(cond) = &mut join.qual {
                 where_expr_fold(cond);
             }
             table_source_fold(&mut join.left);

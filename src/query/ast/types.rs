@@ -1794,7 +1794,7 @@ impl TableSource {
             TableSource::Join(join) => {
                 join.left.has_subqueries()
                     || join.right.has_subqueries()
-                    || join.condition.as_ref().is_some_and(|c| c.has_subqueries())
+                    || matches!(&join.qual, JoinQual::On(c) if c.has_subqueries())
             }
         }
     }
@@ -1835,7 +1835,7 @@ impl TableSource {
             TableSource::Join(join) => {
                 join.left.subquery_nodes_collect(branches, negated);
                 join.right.subquery_nodes_collect(branches, negated);
-                if let Some(condition) = &join.condition {
+                if let JoinQual::On(condition) = &join.qual {
                     condition.subquery_nodes_collect(branches, negated);
                 }
             }
@@ -2034,20 +2034,41 @@ impl Deparse for CteRefNode {
     }
 }
 
+/// A join's qualifier. `ON` / `USING` / `NATURAL` / cross are mutually
+/// exclusive in SQL, so they are one enum rather than independent
+/// fields that could encode impossible states. The resolver expands
+/// `Using`/`Natural` into an equivalent equi-join condition; `Cross`
+/// (and a no-common-column `Natural`) is a cartesian product.
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub enum JoinQual {
+    /// `JOIN … ON <expr>`
+    On(WhereExpr),
+    /// `JOIN … USING (c, …)`
+    Using(Vec<EcoString>),
+    /// `NATURAL JOIN …`
+    Natural,
+    /// `CROSS JOIN …` / unqualified inner join — cartesian product.
+    Cross,
+}
+
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct JoinNode {
     pub join_type: JoinType,
     pub left: Box<TableSource>,
     pub right: Box<TableSource>,
-    pub condition: Option<WhereExpr>,
+    pub qual: JoinQual,
 }
 
 impl JoinNode {
     pub fn nodes<N: Any>(&self) -> JoinNodeIter<'_, N> {
+        let condition_iter = match &self.qual {
+            JoinQual::On(c) => Some(c.nodes()),
+            JoinQual::Using(_) | JoinQual::Natural | JoinQual::Cross => None,
+        };
         JoinNodeIter {
             left_iter: self.left.nodes(),
             right_iter: self.right.nodes(),
-            condition_iter: self.condition.as_ref().map(|c| c.nodes()),
+            condition_iter,
             _phantom: PhantomData,
         }
     }
@@ -2056,16 +2077,34 @@ impl JoinNode {
 impl Deparse for JoinNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         self.left.deparse(buf);
-        match self.join_type {
-            JoinType::Inner => buf.push_str(" JOIN"),
-            JoinType::Left => buf.push_str(" LEFT JOIN"),
-            JoinType::Right => buf.push_str(" RIGHT JOIN"),
-            JoinType::Full => buf.push_str(" FULL JOIN"),
+        match &self.qual {
+            // CROSS JOIN is always inner; the keyword carries the semantics.
+            JoinQual::Cross => buf.push_str(" CROSS JOIN"),
+            JoinQual::Natural => {
+                buf.push_str(" NATURAL");
+                buf.push_str(self.join_type.join_keyword());
+            }
+            JoinQual::On(_) | JoinQual::Using(_) => {
+                buf.push_str(self.join_type.join_keyword());
+            }
         }
         self.right.deparse(buf);
-        if let Some(condition) = &self.condition {
-            buf.push_str(" ON ");
-            condition.deparse(buf);
+        match &self.qual {
+            JoinQual::On(condition) => {
+                buf.push_str(" ON ");
+                condition.deparse(buf);
+            }
+            JoinQual::Using(cols) => {
+                buf.push_str(" USING (");
+                for (i, c) in cols.iter().enumerate() {
+                    if i > 0 {
+                        buf.push_str(", ");
+                    }
+                    buf.push_str(c);
+                }
+                buf.push(')');
+            }
+            JoinQual::Natural | JoinQual::Cross => {}
         }
         buf
     }
@@ -2107,6 +2146,20 @@ pub enum JoinType {
     Left,
     Right,
     Full,
+}
+
+impl JoinType {
+    /// The SQL keyword for this join type, with a leading space, for
+    /// deparse (e.g. `" LEFT JOIN"`). A `NATURAL`/`CROSS` qualifier is
+    /// rendered by the caller around this.
+    pub(crate) fn join_keyword(self) -> &'static str {
+        match self {
+            JoinType::Inner => " JOIN",
+            JoinType::Left => " LEFT JOIN",
+            JoinType::Right => " RIGHT JOIN",
+            JoinType::Full => " FULL JOIN",
+        }
+    }
 }
 
 impl TryFrom<pg_query::protobuf::JoinType> for JoinType {

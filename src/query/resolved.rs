@@ -31,6 +31,9 @@ error_set! {
 
         #[display("Invalid table reference")]
         InvalidTableRef,
+
+        #[display("Unsupported join qualifier (USING/NATURAL not yet cacheable)")]
+        UnsupportedJoinQualifier,
     }
 }
 
@@ -1213,7 +1216,7 @@ impl ResolvedTableSource {
             ResolvedTableSource::Table(_) => 0,
             ResolvedTableSource::Subquery(sub) => 1 + sub.query.subquery_depth(),
             ResolvedTableSource::Join(join) => {
-                let condition_depth = join.condition.as_ref().map_or(0, |c| c.subquery_depth());
+                let condition_depth = join.predicate().map_or(0, |c| c.subquery_depth());
                 join.left
                     .subquery_depth()
                     .max(join.right.subquery_depth())
@@ -1249,7 +1252,7 @@ impl ResolvedTableSource {
                     .subquery_nodes_collect_with_source(branches, negated);
                 join.right
                     .subquery_nodes_collect_with_source(branches, negated);
-                if let Some(condition) = &join.condition {
+                if let Some(condition) = join.predicate() {
                     condition.subquery_nodes_collect_with_source(branches, negated);
                 }
             }
@@ -1266,7 +1269,7 @@ impl ResolvedTableSource {
             ResolvedTableSource::Join(join) => {
                 join.left.subquery_nodes_collect(branches);
                 join.right.subquery_nodes_collect(branches);
-                if let Some(condition) = &join.condition {
+                if let Some(condition) = join.predicate() {
                     condition.subquery_nodes_collect(branches);
                 }
             }
@@ -1313,21 +1316,59 @@ impl Deparse for ResolvedTableSubqueryNode {
     }
 }
 
+/// A resolved join's qualifier — mutually exclusive in SQL, so one
+/// enum rather than fields that could encode impossible states.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedJoinQual {
+    /// `JOIN … ON <expr>`
+    On(ResolvedWhereExpr),
+    /// `JOIN … USING (c, …)` / `NATURAL JOIN` (resolved to its common
+    /// columns). `columns` is emitted verbatim so Postgres performs the
+    /// column merge; `predicate` is the equivalent equi-join, used only
+    /// for freshness/invalidation analysis, never emitted.
+    Using {
+        columns: Vec<EcoString>,
+        predicate: ResolvedWhereExpr,
+    },
+    /// Cartesian product — `CROSS JOIN` (or an inner `NATURAL` with no
+    /// common columns). Any filtering lives in WHERE.
+    Cross,
+}
+
 /// Resolved JOIN node
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedJoinNode {
     pub join_type: JoinType,
     pub left: ResolvedTableSource,
     pub right: ResolvedTableSource,
-    pub condition: Option<ResolvedWhereExpr>,
+    pub qual: ResolvedJoinQual,
 }
 
 impl ResolvedJoinNode {
+    /// The join predicate for freshness/invalidation analysis — the
+    /// `ON` expression, or the synthesized equi-join for `USING`/
+    /// `NATURAL`. `None` for a cartesian (`CROSS`) join.
+    pub fn predicate(&self) -> Option<&ResolvedWhereExpr> {
+        match &self.qual {
+            ResolvedJoinQual::On(e) | ResolvedJoinQual::Using { predicate: e, .. } => Some(e),
+            ResolvedJoinQual::Cross => None,
+        }
+    }
+
+    /// Mutable view of [`Self::predicate`], for in-place rewrites
+    /// (e.g. the CDC VALUES-replacement alias update).
+    pub fn predicate_mut(&mut self) -> Option<&mut ResolvedWhereExpr> {
+        match &mut self.qual {
+            ResolvedJoinQual::On(e) | ResolvedJoinQual::Using { predicate: e, .. } => Some(e),
+            ResolvedJoinQual::Cross => None,
+        }
+    }
+
     pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
         let left_nodes = self.left.nodes();
         let right_nodes = self.right.nodes();
-        let condition_nodes = self.condition.iter().flat_map(|c| c.nodes());
+        let condition_nodes = self.predicate().into_iter().flat_map(|c| c.nodes());
         current
             .chain(left_nodes)
             .chain(right_nodes)
@@ -1339,18 +1380,36 @@ impl Deparse for ResolvedJoinNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         self.left.deparse(buf);
 
-        match self.join_type {
-            JoinType::Inner => buf.push_str(" JOIN"),
-            JoinType::Left => buf.push_str(" LEFT JOIN"),
-            JoinType::Right => buf.push_str(" RIGHT JOIN"),
-            JoinType::Full => buf.push_str(" FULL JOIN"),
+        // A cartesian join is `CROSS JOIN`, never a bare `JOIN` (a
+        // syntax error). `Cross` only ever has an inner join type
+        // (an outer join always carries ON/USING/NATURAL).
+        if matches!(self.qual, ResolvedJoinQual::Cross) {
+            buf.push_str(" CROSS JOIN");
+        } else {
+            buf.push_str(self.join_type.join_keyword());
         }
 
         self.right.deparse(buf);
 
-        if let Some(condition) = &self.condition {
-            buf.push_str(" ON ");
-            condition.deparse(buf);
+        // `USING (c,…)` is emitted verbatim so Postgres merges the join
+        // columns (matching origin's `SELECT *` width / unqualified
+        // refs); the equi-`predicate` is internal-only and not emitted.
+        match &self.qual {
+            ResolvedJoinQual::On(condition) => {
+                buf.push_str(" ON ");
+                condition.deparse(buf);
+            }
+            ResolvedJoinQual::Using { columns, .. } => {
+                buf.push_str(" USING (");
+                for (i, c) in columns.iter().enumerate() {
+                    if i > 0 {
+                        buf.push_str(", ");
+                    }
+                    buf.push_str(c);
+                }
+                buf.push(')');
+            }
+            ResolvedJoinQual::Cross => {}
         }
 
         buf

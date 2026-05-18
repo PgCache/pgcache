@@ -9,8 +9,9 @@ use crate::cache::SubqueryKind;
 use crate::catalog::ColumnMetadata;
 use crate::query::ast::{BinaryOp, JoinType, SubLinkType, TableAlias, UnaryOp};
 use crate::query::resolved::{
-    ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedQueryBody, ResolvedQueryExpr,
-    ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode,
+    ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedJoinQual, ResolvedQueryBody,
+    ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
+    ResolvedSelectNode,
     ResolvedSetOpNode, ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedUnaryExpr,
     ResolvedWhereExpr,
 };
@@ -324,7 +325,7 @@ fn subquery_exists_decorrelate(
         join_type: JoinType::Inner,
         left,
         right,
-        condition: Some(join_condition),
+        qual: ResolvedJoinQual::On(join_condition),
     }));
 
     // Merge residual inner predicates into outer WHERE
@@ -372,7 +373,7 @@ fn subquery_not_exists_decorrelate(
         join_type: JoinType::Left,
         left,
         right,
-        condition: Some(on_condition),
+        qual: ResolvedJoinQual::On(on_condition),
     }));
 
     // Add IS NULL check on the first inner correlation column.
@@ -413,7 +414,7 @@ fn from_sources_to_table_source(sources: &[ResolvedTableSource]) -> Option<Resol
             join_type: JoinType::Inner,
             left: acc,
             right: next,
-            condition: None,
+            qual: ResolvedJoinQual::Cross,
         }))
     })
 }
@@ -609,7 +610,7 @@ fn subquery_in_any_decorrelate(
         join_type: JoinType::Inner,
         left,
         right,
-        condition: Some(join_condition),
+        qual: ResolvedJoinQual::On(join_condition),
     }));
 
     // Merge residual inner predicates into outer WHERE
@@ -674,7 +675,7 @@ fn subquery_not_in_all_decorrelate(
         join_type: JoinType::Left,
         left,
         right,
-        condition: Some(on_condition),
+        qual: ResolvedJoinQual::On(on_condition),
     }));
 
     // IS NULL check on inner output column (anti-join filter)
@@ -929,7 +930,7 @@ fn left_join_derived(
             join_type: JoinType::Left,
             left,
             right: derived_table,
-            condition: Some(join_condition),
+            qual: ResolvedJoinQual::On(join_condition),
         },
     ))])
 }
@@ -1843,7 +1844,7 @@ mod tests {
         assert_eq!(joins[0].join_type, JoinType::Inner);
         assert!(select.distinct);
 
-        let on = deparse_expr(joins[0].condition.as_ref().unwrap());
+        let on = deparse_expr(joins[0].predicate().unwrap());
         assert!(on.contains("o.emp_id = e.id"), "correlation in ON: {on}");
     }
 
@@ -1866,7 +1867,7 @@ mod tests {
         );
         let joins = select_joins(select);
         assert_eq!(joins.len(), 1);
-        let on = deparse_expr(joins[0].condition.as_ref().unwrap());
+        let on = deparse_expr(joins[0].predicate().unwrap());
         assert!(on.contains("o.emp_id = e.id"), "first correlation: {on}");
         assert!(
             on.contains("o.status = e.status"),
@@ -2028,7 +2029,7 @@ mod tests {
         let joins = select_joins(select);
         assert_eq!(joins.len(), 1);
         assert_eq!(joins[0].join_type, JoinType::Left);
-        let on = deparse_expr(joins[0].condition.as_ref().unwrap());
+        let on = deparse_expr(joins[0].predicate().unwrap());
         assert!(on.contains("e.dept_id = d.id"), "correlation in ON: {on}");
         assert!(on.contains("e.status = 'active'"), "residual in ON: {on}");
         assert!(where_has_is_null(&select.where_clause));
@@ -2693,7 +2694,7 @@ mod tests {
         assert_eq!(joins.len(), 1);
         assert_eq!(joins[0].join_type, JoinType::Inner);
         assert!(select.distinct);
-        let on = deparse_expr(joins[0].condition.as_ref().unwrap());
+        let on = deparse_expr(joins[0].predicate().unwrap());
         assert!(on.contains("e.dept_id = d.id"), "IN predicate in ON: {on}");
         assert!(on.contains("d.name = e.name"), "correlation in ON: {on}");
     }
@@ -2895,7 +2896,7 @@ mod tests {
         assert_eq!(joins.len(), 1);
         assert_eq!(joins[0].join_type, JoinType::Left);
         assert!(where_has_is_null(&select.where_clause));
-        let on = deparse_expr(joins[0].condition.as_ref().unwrap());
+        let on = deparse_expr(joins[0].predicate().unwrap());
         assert!(on.contains("e.dept_id = d.id"), "IN predicate in ON: {on}");
         assert!(on.contains("d.name = e.name"), "correlation in ON: {on}");
     }
@@ -2941,7 +2942,7 @@ mod tests {
         assert_eq!(joins.len(), 1);
         assert_eq!(joins[0].join_type, JoinType::Left);
         // Residual should be in ON clause (not outer WHERE) for LEFT JOIN semantics
-        let on = deparse_expr(joins[0].condition.as_ref().unwrap());
+        let on = deparse_expr(joins[0].predicate().unwrap());
         assert!(
             on.contains("d.location = 'NYC'"),
             "residual in ON clause: {on}"

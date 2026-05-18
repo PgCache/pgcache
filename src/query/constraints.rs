@@ -892,8 +892,9 @@ fn collect_from_table_source(
     complete: &mut bool,
 ) {
     if let ResolvedTableSource::Join(join) = source {
-        // Analyze this join's condition
-        if let Some(condition) = &join.condition {
+        // Analyze this join's predicate (the ON expr, or the
+        // synthesized equi-join for USING/NATURAL).
+        if let Some(condition) = join.predicate() {
             analyze_constraint_expr(condition, constraints, equivalences, complete);
         }
 
