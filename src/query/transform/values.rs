@@ -127,6 +127,36 @@ fn resolved_select_node_column_alias_update(
     }
     // Update SELECT columns
     resolved_select_columns_alias_update(&mut resolved.columns, schema, table, alias);
+    // Update JOIN ON conditions: the replaced table becomes an aliased
+    // VALUES subquery, so refs to it in join conditions must use the
+    // alias too — otherwise a schema-qualified `schema.table.col`
+    // survives while the FROM entry is only `alias`, which Postgres
+    // rejects as "invalid reference to FROM-clause entry" (PGC-139).
+    for source in &mut resolved.from {
+        resolved_table_source_alias_update(source, schema, table, alias);
+    }
+}
+
+/// Update column references for `table` to `alias` within a FROM source's
+/// JOIN conditions, recursing through nested joins. Subquery sources are
+/// left alone — a derived table is its own scope and cannot reference the
+/// outer table being replaced.
+fn resolved_table_source_alias_update(
+    source: &mut ResolvedTableSource,
+    schema: &str,
+    table: &str,
+    alias: &str,
+) {
+    match source {
+        ResolvedTableSource::Join(join) => {
+            resolved_table_source_alias_update(&mut join.left, schema, table, alias);
+            resolved_table_source_alias_update(&mut join.right, schema, table, alias);
+            if let Some(condition) = &mut join.condition {
+                resolved_where_expr_alias_update(condition, schema, table, alias);
+            }
+        }
+        ResolvedTableSource::Table(_) | ResolvedTableSource::Subquery(_) => {}
+    }
 }
 
 /// Update column aliases in a ResolvedQueryExpr
@@ -272,10 +302,14 @@ fn resolved_scalar_expr_alias_update(
 
 #[cfg(test)]
 mod tests {
+    use iddqd::BiHashMap;
     use postgres_types::Type;
 
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-    use crate::query::ast::{BinaryOp, Deparse, JoinType, LiteralValue};
+    use crate::query::ast::{
+        BinaryOp, Deparse, JoinType, LiteralValue, QueryBody, query_expr_convert,
+    };
+    use crate::query::resolve::select_node_resolve;
     use crate::query::resolved::{
         ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectColumn,
         ResolvedTableNode, ResolvedTableSource, ResolvedWhereExpr,
@@ -350,6 +384,51 @@ mod tests {
             where_clause,
             ..Default::default()
         }
+    }
+
+    /// PGC-139: when a join's CDC'd table is swapped for a VALUES
+    /// subquery, refs to it in the JOIN ON condition must use the
+    /// subquery alias. A surviving schema-qualified `public.j1_tbl.col`
+    /// dangles against the aliased FROM entry and Postgres rejects it
+    /// with "invalid reference to FROM-clause entry".
+    #[test]
+    fn test_join_on_condition_uses_subquery_alias() {
+        let cols = &[("i", "int4"), ("j", "int4"), ("t", "text"), ("j1_pk", "int4")];
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(table_metadata("j1_tbl", 5001, cols));
+        tables.insert_overwrite(table_metadata(
+            "j2_tbl",
+            5002,
+            &[("i", "int4"), ("k", "int4"), ("j2_pk", "int4")],
+        ));
+        let j1 = table_metadata("j1_tbl", 5001, cols);
+        let row = vec![
+            Some("1".to_owned()),
+            Some("4".to_owned()),
+            Some("one".to_owned()),
+            Some("1".to_owned()),
+        ];
+
+        let ast = pg_query::parse("SELECT * FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i)")
+            .expect("parse");
+        let qe = query_expr_convert(&ast).expect("convert");
+        let QueryBody::Select(node) = qe.body else {
+            panic!("expected SELECT");
+        };
+        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
+        let replaced = resolved_select_node_table_replace_with_values(&resolved, &j1, &row)
+            .expect("replace");
+        let mut sql = String::new();
+        Deparse::deparse(&replaced, &mut sql);
+
+        assert!(
+            sql.contains("ON j1_tbl.i = "),
+            "ON condition must reference the subquery alias; got: {sql}"
+        );
+        assert!(
+            !sql.contains("public.j1_tbl"),
+            "no dangling schema-qualified ref to the replaced table; got: {sql}"
+        );
     }
 
     // ==================== Happy Path Tests ====================

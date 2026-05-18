@@ -467,7 +467,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn breaker_trips_only_after_threshold() {
+    fn test_breaker_trips_only_after_threshold() {
         let mut report = Report::new();
         let mut streak = 0u32;
         for _ in 0..UNHEALTHY_ABORT_THRESHOLD - 1 {
