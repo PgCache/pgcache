@@ -9,6 +9,13 @@
   present upstream) because pgcache only caches tables that have a
   primary key (tracked in PGC-135). The vendored data is unmodified.
 
+The `j1_tbl` / `j2_tbl` fixtures (defined inline in
+`conformance/src/fixtures.rs`, not as a data file) are the `J1_TBL` /
+`J2_TBL` tables and rows from `src/test/regress/sql/join.sql`. The row
+data is unmodified; a surrogate `*_pk` primary-key column is appended
+(same rationale as `onek` above — pgcache only caches tables with a
+primary key, PGC-135 — since these tables have no natural key upstream).
+
 Used unmodified solely as fixture data for the pgcache SQL conformance
 harness. PostgreSQL license notice (from the upstream `COPYRIGHT` file):
 

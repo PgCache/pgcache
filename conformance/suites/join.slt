@@ -1,0 +1,150 @@
+# Curated port of PostgreSQL src/test/regress/sql/join.sql — the
+# join-semantics core (correlation names, CROSS / INNER / USING /
+# NATURAL / non-equi / OUTER joins). Run against the j1_tbl / j2_tbl
+# fixtures (loaded by the harness before this suite; surrogate *_pk
+# columns appended — see conformance/src/fixtures.rs).
+#
+# Origin is the oracle: no results are inlined. Each query runs on
+# origin and pgcache and the result sets are compared, plus the pgcache
+# log is scanned for swallowed errors.
+#
+# Scope deviations from upstream join.sql:
+#   * EXPLAIN / planner-internal sections (self-join removal, placeholder
+#     vars, hash-join multi-key) are omitted — they assert plans, not
+#     result sets, and don't exercise pgcache's cache/invalidate path.
+#   * Positional column-alias-arity curiosities over CROSS JOIN are
+#     omitted: the appended surrogate column shifts ordinal positions,
+#     so those tests would assert alias arithmetic rather than join
+#     correctness. (Both engines stay consistent, but the test loses its
+#     point.)
+#   * tenk1 / int4_tbl / int8_tbl / multiway (t1,t2,t3) / nullability
+#     (x,y) sections are deferred to a follow-up port.
+#
+# Routing is annotated `any` for v1 (correctness-first). The end-to-end
+# run establishes which shapes pgcache actually caches; annotations are
+# then tightened per shape to lock that behavior as the regression
+# baseline.
+
+#
+# CORRELATION NAMES — table/column aliases.
+#
+
+# A comma-join of column-alias-list tables with the join predicate in
+# WHERE — pgcache forwards this shape (not cached).
+# pgcache: passthrough
+query TT
+SELECT t1.a, t2.e
+  FROM j1_tbl t1 (a, b, c), j2_tbl t2 (d, e)
+  WHERE t1.a = t2.d;
+
+#
+# CROSS JOIN — degenerates into an unqualified inner join.
+#
+
+# pgcache: cached
+query TTT
+SELECT t1.i, k, t
+  FROM j1_tbl t1 CROSS JOIN j2_tbl t2;
+
+#
+# INNER JOIN with USING — the joined column appears once.
+#
+
+# pgcache: cached
+query TTTTT
+SELECT *
+  FROM j1_tbl INNER JOIN j2_tbl USING (i);
+
+# Same as above, slightly different syntax.
+# pgcache: cached
+query TTTTT
+SELECT *
+  FROM j1_tbl JOIN j2_tbl USING (i);
+
+#
+# NATURAL JOIN — inner equi-join on all same-named columns. The
+# surrogate PKs are distinctly named (j1_pk / j2_pk), so the only
+# common column is `i`, exactly as upstream.
+#
+
+# pgcache: cached
+query TTTTT
+SELECT *
+  FROM j1_tbl NATURAL JOIN j2_tbl;
+
+# Renamed so the common column is the aliased `a`.
+# pgcache: cached
+query TTTTT
+SELECT *
+  FROM j1_tbl t1 (a, b, c) NATURAL JOIN j2_tbl t2 (a, d);
+
+#
+# INNER JOIN with ON.
+#
+
+# pgcache: cached
+query TTTTTT
+SELECT *
+  FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i);
+
+# pgcache: cached
+query TTTTTT
+SELECT *
+  FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.k);
+
+#
+# Non-equi-join.
+#
+
+# pgcache: passthrough
+query TTTTTT
+SELECT *
+  FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i <= j2_tbl.k);
+
+#
+# OUTER joins (OUTER is a noise word).
+#
+
+# pgcache: cached
+query TTTTT
+SELECT *
+  FROM j1_tbl LEFT OUTER JOIN j2_tbl USING (i)
+  ORDER BY i, k, t;
+
+# pgcache: cached
+query TTTTT
+SELECT *
+  FROM j1_tbl LEFT JOIN j2_tbl USING (i)
+  ORDER BY i, k, t;
+
+# pgcache: cached
+query TTTTT
+SELECT *
+  FROM j1_tbl RIGHT OUTER JOIN j2_tbl USING (i);
+
+# pgcache: cached
+query TTTTT
+SELECT *
+  FROM j1_tbl RIGHT JOIN j2_tbl USING (i);
+
+# pgcache: passthrough
+query TTTTT
+SELECT *
+  FROM j1_tbl FULL OUTER JOIN j2_tbl USING (i)
+  ORDER BY i, k, t;
+
+# pgcache: passthrough
+query TTTTT
+SELECT *
+  FROM j1_tbl FULL JOIN j2_tbl USING (i)
+  ORDER BY i, k, t;
+
+# pgcache: cached
+query TTTTT
+SELECT *
+  FROM j1_tbl LEFT JOIN j2_tbl USING (i) WHERE (k = 1);
+
+# pgcache: cached
+query TTTTT
+SELECT *
+  FROM j1_tbl LEFT JOIN j2_tbl USING (i) WHERE (i = 1);

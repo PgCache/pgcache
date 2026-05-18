@@ -6,6 +6,7 @@
 //! every statement's behavior is defined by origin and pgcache is
 //! required to match it, route as annotated, and log no swallowed error.
 
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -85,6 +86,9 @@ pub async fn run(cli: Cli) -> Result<()> {
     fixtures::onek_load(origin.client(), ep.publication.as_deref())
         .await
         .context("loading onek fixture")?;
+    fixtures::join_tables_load(origin.client(), ep.publication.as_deref())
+        .await
+        .context("loading join fixtures")?;
 
     let status = StatusClient::new(ep.status_url);
     let mut log_tailer = match &ep.logs_file {
@@ -111,9 +115,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 
     let mut report = Report::new();
+    let mut unhealthy_streak = 0u32;
 
     for file in suite_files(&cli.tests)? {
-        run_file(
+        let control = run_file(
             &file,
             &origin,
             &pgcache,
@@ -121,9 +126,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             log_tailer.as_mut(),
             cdc_timeout,
             &mut report,
+            &mut unhealthy_streak,
         )
         .await
         .with_context(|| format!("running suite {}", file.display()))?;
+        if control.is_break() {
+            tracing::error!(
+                "aborting remaining suites: cache subsystem persistently unavailable"
+            );
+            break;
+        }
     }
 
     println!("{}", report.summary());
@@ -160,6 +172,56 @@ fn suite_files(path: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// Consecutive cache-health failures (status unreachable, CDC- or
+/// cache-settle timeout) before the run aborts. A pass or a plain
+/// result/routing diff on a reachable cache resets the streak, so a
+/// failing-but-up cache never trips this.
+const UNHEALTHY_ABORT_THRESHOLD: u32 = 3;
+
+/// Count one more consecutive unhealthy query. Trips the breaker once
+/// the cache has been unavailable for `UNHEALTHY_ABORT_THRESHOLD`
+/// queries in a row: records a single `CacheUnavailable` marker and
+/// signals the run to abort (so it still gets a summary + JUnit + clean
+/// pgcache shutdown, rather than a raw `?` bail or per-query spinning).
+fn breaker_bump(streak: &mut u32, report: &mut Report, suite: &str) -> ControlFlow<()> {
+    *streak += 1;
+    if *streak < UNHEALTHY_ABORT_THRESHOLD {
+        return ControlFlow::Continue(());
+    }
+    report.record(Outcome {
+        suite: suite.to_string(),
+        statement: format!("<circuit breaker after {streak} unhealthy queries>"),
+        bucket: Some(Bucket::CacheUnavailable),
+        detail: "cache subsystem persistently unavailable; run aborted".to_string(),
+    });
+    ControlFlow::Break(())
+}
+
+/// A `/status` snapshot, or — when the cache is unreachable — a recorded
+/// `CacheUnavailable` outcome plus the breaker's verdict (`Break` =
+/// abort the run, `Continue` = skip the rest of this query).
+fn snapshot_checked(
+    snap: Result<crate::status_client::StatusSnapshot>,
+    when: &str,
+    suite: &str,
+    sql: &str,
+    report: &mut Report,
+    streak: &mut u32,
+) -> Result<crate::status_client::StatusSnapshot, ControlFlow<()>> {
+    match snap {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            report.record(Outcome {
+                suite: suite.to_string(),
+                statement: sql.to_string(),
+                bucket: Some(Bucket::CacheUnavailable),
+                detail: format!("status {when}: {e:#}"),
+            });
+            Err(breaker_bump(streak, report, suite))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_file(
     file: &Path,
@@ -169,7 +231,8 @@ async fn run_file(
     mut log_tailer: Option<&mut LogTailer>,
     cdc_timeout: Duration,
     report: &mut Report,
-) -> Result<()> {
+    unhealthy_streak: &mut u32,
+) -> Result<ControlFlow<()>> {
     let suite = file
         .file_name()
         .and_then(|s| s.to_str())
@@ -221,11 +284,36 @@ async fn run_file(
                         detail: e.to_string(),
                     });
                     routing = Routing::Any;
+                    if breaker_bump(unhealthy_streak, report, &suite).is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
                     continue;
                 }
 
                 let oracle = origin.run(&sql).await;
-                let before = status.snapshot().await.context("status before")?;
+
+                // `/status` must be reachable to verify routing and to
+                // gate the cache-hit attempt on population. Persistent
+                // unreachability is the dead / restart-looping-cache
+                // signal the breaker trips on, instead of `?`-bailing
+                // the whole run past the summary and JUnit output.
+                let before = match snapshot_checked(
+                    status.snapshot().await,
+                    "before",
+                    &suite,
+                    &sql,
+                    report,
+                    unhealthy_streak,
+                ) {
+                    Ok(s) => s,
+                    Err(cf) => {
+                        routing = Routing::Any;
+                        if cf.is_break() {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        continue;
+                    }
+                };
                 if let Some(t) = log_tailer.as_deref_mut() {
                     t.mark()?;
                 }
@@ -234,11 +322,28 @@ async fn run_file(
                 // attempt — otherwise a cached query races a cold-start
                 // populate and looks like a routing miss.
                 let _ = pgcache.run(&sql).await;
-                if let Err(e) = status.cache_settle(cdc_timeout).await {
-                    tracing::warn!(error = %e, "cache did not settle before hit attempt");
+                let settle_failed = status.cache_settle(cdc_timeout).await.is_err();
+                if settle_failed {
+                    tracing::warn!("cache did not settle before hit attempt");
                 }
                 let actual = pgcache.run(&sql).await;
-                let after = status.snapshot().await.context("status after")?;
+                let after = match snapshot_checked(
+                    status.snapshot().await,
+                    "after",
+                    &suite,
+                    &sql,
+                    report,
+                    unhealthy_streak,
+                ) {
+                    Ok(s) => s,
+                    Err(cf) => {
+                        routing = Routing::Any;
+                        if cf.is_break() {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        continue;
+                    }
+                };
 
                 let strategy = sort_strategy(&sql, &expected);
                 let offending = match log_tailer.as_deref_mut() {
@@ -255,11 +360,25 @@ async fn run_file(
                     detail,
                 });
                 routing = Routing::Any;
+
+                // A timed-out cache-settle (cache reachable but a query
+                // stuck mid-population, e.g. a restart-looping writer) is
+                // a health signal even if the result happened to match. A
+                // reachable cache that merely produced a wrong/forwarded
+                // result is not — resetting the streak keeps genuine
+                // diffs from masquerading as unavailability.
+                if settle_failed {
+                    if breaker_bump(unhealthy_streak, report, &suite).is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                } else {
+                    *unhealthy_streak = 0;
+                }
             }
             _ => {}
         }
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 /// Compare a non-result statement (DDL/DML) across the two engines.
@@ -340,5 +459,24 @@ fn sort_strategy(sql: &str, expected: &QueryExpect<DefaultColumnType>) -> SortSt
                 SortStrategy::Rows
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn breaker_trips_only_after_threshold() {
+        let mut report = Report::new();
+        let mut streak = 0u32;
+        for _ in 0..UNHEALTHY_ABORT_THRESHOLD - 1 {
+            assert!(breaker_bump(&mut streak, &mut report, "s").is_continue());
+        }
+        assert_eq!(report.total(), 0, "no marker recorded before the threshold");
+
+        assert!(breaker_bump(&mut streak, &mut report, "s").is_break());
+        assert_eq!(streak, UNHEALTHY_ABORT_THRESHOLD);
+        assert_eq!(report.failures(), 1, "one CacheUnavailable marker on trip");
     }
 }

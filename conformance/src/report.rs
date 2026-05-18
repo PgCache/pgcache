@@ -14,6 +14,7 @@ pub enum Bucket {
     RoutingMismatch,
     SwallowedError,
     CdcTimeout,
+    CacheUnavailable,
 }
 
 impl Bucket {
@@ -23,6 +24,7 @@ impl Bucket {
             Bucket::RoutingMismatch => "routing mismatch",
             Bucket::SwallowedError => "swallowed error",
             Bucket::CdcTimeout => "cdc timeout",
+            Bucket::CacheUnavailable => "cache unavailable",
         }
     }
 }
