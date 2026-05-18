@@ -5,15 +5,17 @@ use crate::cache::SubqueryKind;
 use crate::catalog::TableMetadata;
 use crate::query::ast::{LiteralValue, TableAlias, ValuesClause};
 use crate::query::resolved::{
-    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns,
-    ResolvedSelectNode, ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedWhereExpr,
+    ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
+    ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource, ResolvedTableSubqueryNode,
+    ResolvedWhereExpr,
 };
 
 use super::{AstTransformError, AstTransformResult};
 
-/// Replace a table source with a VALUES clause in a ResolvedSelectNode.
-///
-/// Similar to `resolved_table_replace_with_values` but operates on the new ResolvedSelectNode type.
+/// Replace `table_metadata`'s table source with a single-row `VALUES`
+/// (the CDC row), aliased as the table, so the query can be evaluated
+/// as an `EXISTS(...)` membership test for that row. Column references
+/// to the table across every clause are rewritten to the alias.
 pub fn resolved_select_node_table_replace_with_values(
     resolved: &ResolvedSelectNode,
     table_metadata: &TableMetadata,
@@ -127,6 +129,14 @@ fn resolved_select_node_column_alias_update(
     }
     // Update SELECT columns
     resolved_select_columns_alias_update(&mut resolved.columns, schema, table, alias);
+    // GROUP BY / HAVING — same dangling-ref hazard as the JOIN case
+    // below (PGC-145; same omission class as PGC-139).
+    for col in &mut resolved.group_by {
+        resolved_column_node_alias_update(col, schema, table, alias);
+    }
+    if let Some(having) = &mut resolved.having {
+        resolved_where_expr_alias_update(having, schema, table, alias);
+    }
     // Update JOIN ON conditions: the replaced table becomes an aliased
     // VALUES subquery, so refs to it in join conditions must use the
     // alias too — otherwise a schema-qualified `schema.table.col`
@@ -134,6 +144,19 @@ fn resolved_select_node_column_alias_update(
     // rejects as "invalid reference to FROM-clause entry" (PGC-139).
     for source in &mut resolved.from {
         resolved_table_source_alias_update(source, schema, table, alias);
+    }
+}
+
+/// Rewrite a resolved column node referencing `schema.table` to use
+/// `alias` (the VALUES-subquery name), so it deparses as `alias.col`.
+fn resolved_column_node_alias_update(
+    col: &mut ResolvedColumnNode,
+    schema: &str,
+    table: &str,
+    alias: &str,
+) {
+    if col.schema == schema && col.table == table {
+        col.table_alias = Some(EcoString::from(alias));
     }
 }
 
@@ -246,9 +269,7 @@ fn resolved_scalar_expr_alias_update(
 ) {
     match expr {
         ResolvedScalarExpr::Column(col) => {
-            if col.schema == schema && col.table == table {
-                col.table_alias = Some(EcoString::from(alias));
-            }
+            resolved_column_node_alias_update(col, schema, table, alias);
         }
         ResolvedScalarExpr::Function(func) => {
             for arg in &mut func.args {
@@ -427,6 +448,48 @@ mod tests {
         );
         assert!(
             !sql.contains("public.j1_tbl"),
+            "no dangling schema-qualified ref to the replaced table; got: {sql}"
+        );
+    }
+
+    /// PGC-145: GROUP BY / HAVING refs to the CDC'd table must also use
+    /// the VALUES-subquery alias (same omission class as PGC-139). A
+    /// surviving `public.onek.col` in GROUP BY/HAVING dangles against
+    /// the aliased FROM entry → "invalid reference to FROM-clause
+    /// entry" → writer crash on insert.
+    #[test]
+    fn test_group_by_having_uses_subquery_alias() {
+        let cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(table_metadata("onek", 6001, cols));
+        let onek = table_metadata("onek", 6001, cols);
+        let row = vec![
+            Some("1".to_owned()),
+            Some("7".to_owned()),
+            Some("1".to_owned()),
+        ];
+
+        let ast = pg_query::parse(
+            "SELECT ten, count(*) FILTER (WHERE odd = 1) AS c FROM onek \
+             GROUP BY ten HAVING count(*) > 0",
+        )
+        .expect("parse");
+        let qe = query_expr_convert(&ast).expect("convert");
+        let QueryBody::Select(node) = qe.body else {
+            panic!("expected SELECT");
+        };
+        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
+        let replaced = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
+            .expect("replace");
+        let mut sql = String::new();
+        Deparse::deparse(&replaced, &mut sql);
+
+        assert!(
+            sql.contains("GROUP BY onek.ten"),
+            "GROUP BY must reference the subquery alias; got: {sql}"
+        );
+        assert!(
+            !sql.contains("public.onek"),
             "no dangling schema-qualified ref to the replaced table; got: {sql}"
         );
     }
