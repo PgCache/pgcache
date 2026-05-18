@@ -297,6 +297,12 @@ pub fn cache_run(
         let active_relations: ActiveRelations =
             Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
 
+        // PGC-140: a writer exit must cancel cdc/worker too, else `thread::scope`
+        // never unwinds and the supervisor never restarts the cache. Shadow with a
+        // child token (not `cancel` — it's shared across restarts), drop-guarded.
+        let cancel = cancel.child_token();
+        let _cancel_guard = cancel.clone().drop_guard();
+
         // Spawn writer thread (owns Cache, serializes all mutations)
         // Two channels: one for query registration, one for CDC commands
         let (query_tx, query_rx) = unbounded_channel();
