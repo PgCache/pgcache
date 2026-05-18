@@ -120,7 +120,12 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut report = Report::new();
     let mut unhealthy_streak = 0u32;
 
-    for file in suite_files(&cli.tests)? {
+    // No `--tests` → run every bundled suite.
+    let tests_path = cli
+        .tests
+        .clone()
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("suites"));
+    for file in suite_files(&tests_path)? {
         let control = run_file(
             &file,
             &origin,

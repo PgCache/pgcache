@@ -50,9 +50,10 @@ pub struct Cli {
     #[arg(long)]
     pub publication: Option<String>,
 
-    /// A `.slt` file or a directory of `.slt` files to run.
+    /// A `.slt` file or a directory of `.slt` files to run. Defaults to
+    /// the bundled `conformance/suites/` directory (all suites).
     #[arg(long)]
-    pub tests: PathBuf,
+    pub tests: Option<PathBuf>,
 
     /// Budget for CDC settling between DML and the next SELECT.
     #[arg(long, default_value_t = 60)]
