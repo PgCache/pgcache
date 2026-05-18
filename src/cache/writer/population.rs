@@ -81,9 +81,17 @@ pub async fn population_worker(
                 }
             }
             Err(e) => {
+                // Log the bare SQLSTATE, not the error chain: the chain walker
+                // leaks the offending SQL via the PG DETAIL field (PGC-133).
+                let sqlstate = if let CacheError::PgError(pg) = e.current_context() {
+                    pg.code().map(|c| c.code())
+                } else {
+                    None
+                };
                 error!(
-                    "population worker {id}: population failed for query {}: {e}",
-                    work.fingerprint
+                    "population worker {id}: population failed for query {} sqlstate={}: {e}",
+                    work.fingerprint,
+                    sqlstate.unwrap_or("-"),
                 );
                 if query_tx
                     .send(QueryCommand::Failed {
@@ -242,16 +250,16 @@ fn insert_statement_build(
     }
 }
 
-/// Convert a streamed row into a SQL value tuple string.
+/// Convert a streamed row into `(pk_key, tuple_string, row_byte_count)`.
 ///
 /// Returns `None` for phantom rows (NULL primary keys from outer joins).
-/// Returns the tuple string and the number of bytes in the row's values.
+/// `pk_key` is the escaped primary-key values, used to order rows within a batch.
 fn row_to_tuple(
     row: &SimpleQueryRow,
     insert: &InsertStatement,
     values_buf: &mut Vec<String>,
     tuple_buf: &mut String,
-) -> Option<(String, usize)> {
+) -> Option<(Vec<String>, String, usize)> {
     // Skip NULL-padded phantom rows from outer joins
     if insert
         .pkey_positions
@@ -273,12 +281,21 @@ fn row_to_tuple(
         );
     }
 
+    // Escaped PK values in conflict-column order. PK identity is snapshot-stable,
+    // so this key is identical across workers even when non-PK columns drift
+    // between MVCC snapshots; sorting on it (PGC-133) avoids the PK-index deadlock.
+    let pk_key: Vec<String> = insert
+        .pkey_positions
+        .iter()
+        .filter_map(|&pos| values_buf.get(pos).cloned())
+        .collect();
+
     tuple_buf.clear();
     tuple_buf.push('(');
     tuple_buf.push_str(&values_buf.join(","));
     tuple_buf.push(')');
 
-    Some((tuple_buf.clone(), row_bytes))
+    Some((pk_key, tuple_buf.clone(), row_bytes))
 }
 
 /// Fetch data from origin and stream it into the cache database in batches.
@@ -327,19 +344,20 @@ async fn population_stream(
 
     let mut cached_bytes: usize = 0;
     let mut row_count: u64 = 0;
-    let mut value_tuples: Vec<String> = Vec::with_capacity(POPULATION_INSERT_BATCH_SIZE);
+    let mut value_tuples: Vec<(Vec<String>, String)> =
+        Vec::with_capacity(POPULATION_INSERT_BATCH_SIZE);
     let mut values_buf: Vec<String> = Vec::with_capacity(insert.num_columns);
     let mut tuple_buf = String::new();
 
     loop {
         match stream.next().await {
             Some(Ok(SimpleQueryMessage::Row(row))) => {
-                if let Some((tuple, bytes)) =
+                if let Some((pk_key, tuple, bytes)) =
                     row_to_tuple(&row, &insert, &mut values_buf, &mut tuple_buf)
                 {
                     cached_bytes += bytes;
                     row_count += 1;
-                    value_tuples.push(tuple);
+                    value_tuples.push((pk_key, tuple));
 
                     if value_tuples.len() >= POPULATION_INSERT_BATCH_SIZE {
                         population_batch_flush(
@@ -366,21 +384,14 @@ async fn population_stream(
     Ok((cached_bytes, row_count))
 }
 
-/// Flush a batch of value tuples as a single multi-row INSERT statement.
+/// Flush a batch of value tuples as a single multi-row INSERT, then clear it.
 async fn population_batch_flush(
     db_cache: &Client,
     insert_prefix: &str,
     insert_suffix: &str,
-    value_tuples: &mut Vec<String>,
+    value_tuples: &mut Vec<(Vec<String>, String)>,
 ) -> CacheResult<()> {
-    let mut sql = String::with_capacity(
-        insert_prefix.len()
-            + insert_suffix.len()
-            + value_tuples.iter().map(|t| t.len() + 1).sum::<usize>(),
-    );
-    sql.push_str(insert_prefix);
-    sql.push_str(&value_tuples.join(","));
-    sql.push_str(insert_suffix);
+    let sql = batch_sql_build(insert_prefix, insert_suffix, value_tuples);
 
     db_cache
         .batch_execute(&sql)
@@ -389,4 +400,90 @@ async fn population_batch_flush(
 
     value_tuples.clear();
     Ok(())
+}
+
+/// Sort rows by primary key, then assemble the multi-row INSERT statement.
+///
+/// Sorting every batch (including the final partial one) by PK keeps the
+/// PK-index lock acquisition order consistent across concurrent populations,
+/// which is what prevents the deadlock in PGC-133. Each flush autocommits, so
+/// a consistent intra-batch order is sufficient.
+fn batch_sql_build(
+    insert_prefix: &str,
+    insert_suffix: &str,
+    value_tuples: &mut [(Vec<String>, String)],
+) -> String {
+    value_tuples.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+    let mut sql = String::with_capacity(
+        insert_prefix.len()
+            + insert_suffix.len()
+            + value_tuples.iter().map(|(_, t)| t.len() + 1).sum::<usize>(),
+    );
+    sql.push_str(insert_prefix);
+    for (i, (_, tuple)) in value_tuples.iter().enumerate() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str(tuple);
+    }
+    sql.push_str(insert_suffix);
+    sql
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two populations that stream the same rows in different orders must emit
+    /// byte-identical INSERT bodies so PG locks the PK index in the same order.
+    #[test]
+    fn batch_sql_build_orders_by_pk() {
+        let prefix = "INSERT INTO t(a,b) VALUES ";
+        let suffix = " ON CONFLICT (a) DO NOTHING";
+
+        let mut worker_a = vec![
+            (vec!["1".to_owned()], "(1,'x')".to_owned()),
+            (vec!["3".to_owned()], "(3,'y')".to_owned()),
+            (vec!["2".to_owned()], "(2,'z')".to_owned()),
+        ];
+        // Same rows, different stream order, and a non-PK column that drifted
+        // between MVCC snapshots — the PK key must still drive the ordering.
+        let mut worker_b = vec![
+            (vec!["2".to_owned()], "(2,'DRIFTED')".to_owned()),
+            (vec!["1".to_owned()], "(1,'x')".to_owned()),
+            (vec!["3".to_owned()], "(3,'y')".to_owned()),
+        ];
+
+        let sql_a = batch_sql_build(prefix, suffix, &mut worker_a);
+        let sql_b = batch_sql_build(prefix, suffix, &mut worker_b);
+
+        assert_eq!(
+            sql_a,
+            "INSERT INTO t(a,b) VALUES (1,'x'),(2,'z'),(3,'y') ON CONFLICT (a) DO NOTHING"
+        );
+        // PK order is identical across workers; only the drifted non-PK value
+        // differs, never the row sequence.
+        assert_eq!(
+            sql_b,
+            "INSERT INTO t(a,b) VALUES (1,'x'),(2,'DRIFTED'),(3,'y') ON CONFLICT (a) DO NOTHING"
+        );
+    }
+
+    #[test]
+    fn batch_sql_build_composite_pk_no_separator_ambiguity() {
+        // ("a","b") vs ("ab", "") must not collide into the same sort key.
+        let mut rows = vec![
+            (
+                vec!["'ab'".to_owned(), "''".to_owned()],
+                "('ab','')".to_owned(),
+            ),
+            (
+                vec!["'a'".to_owned(), "'b'".to_owned()],
+                "('a','b')".to_owned(),
+            ),
+        ];
+        let sql = batch_sql_build("", "", &mut rows);
+        assert_eq!(sql, "('a','b'),('ab','')");
+    }
 }
