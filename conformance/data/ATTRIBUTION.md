@@ -16,6 +16,11 @@ data is unmodified; a surrogate `*_pk` primary-key column is appended
 (same rationale as `onek` above — pgcache only caches tables with a
 primary key, PGC-135 — since these tables have no natural key upstream).
 
+The `foo` fixture (inline in `conformance/src/fixtures.rs`) is the
+`foo (f1 int)` table and rows from the ORDER BY / NULLS section of
+`src/test/regress/sql/select.sql`. Row data unmodified; a surrogate
+`foo_pk` primary key is appended (same PGC-135 rationale).
+
 Used unmodified solely as fixture data for the pgcache SQL conformance
 harness. PostgreSQL license notice (from the upstream `COPYRIGHT` file):
 

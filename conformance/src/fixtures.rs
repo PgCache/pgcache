@@ -85,6 +85,27 @@ const J2_TBL_DATA: &str = "INSERT INTO j2_tbl (i, k, j2_pk) VALUES
     (NULL, NULL, 8),
     (NULL, 0, 9)";
 
+/// `foo` from `src/test/regress/sql/select.sql` (the ORDER BY / NULLS
+/// section). Upstream `foo (f1 int)` with rows `(42),(3),(10),(7),
+/// (null),(null),(1)`. A surrogate `foo_pk` is appended (pgcache caches
+/// only tables with a PK — PGC-135) so the NULL-ordering queries are
+/// actually served from cache, not just forwarded; suites add it as a
+/// deterministic ORDER BY tiebreaker since the two NULL rows' relative
+/// order is otherwise unspecified.
+const FOO_DDL: &str = "CREATE TABLE foo (
+    f1     integer,
+    foo_pk integer PRIMARY KEY
+)";
+
+const FOO_DATA: &str = "INSERT INTO foo (f1, foo_pk) VALUES
+    (42, 1),
+    (3, 2),
+    (10, 3),
+    (7, 4),
+    (NULL, 5),
+    (NULL, 6),
+    (1, 7)";
+
 /// Quote a PostgreSQL identifier for safe interpolation.
 fn ident_quote(s: &str) -> String {
     format!("\"{}\"", s.replace('"', "\"\""))
@@ -156,6 +177,27 @@ pub async fn join_tables_load(client: &Client, publication: Option<&str>) -> Res
             .with_context(|| format!("loading {table} data"))?;
         tracing::info!(table, "loaded join fixture");
     }
+    Ok(())
+}
+
+/// Create and populate `foo` on origin (idempotent) and add it to
+/// pgcache's publication, so the select suite's NULL-ordering queries
+/// are cached. Mirrors [`join_tables_load`].
+pub async fn select_tables_load(client: &Client, publication: Option<&str>) -> Result<()> {
+    client
+        .batch_execute("DROP TABLE IF EXISTS foo")
+        .await
+        .context("dropping any existing foo")?;
+    client
+        .batch_execute(FOO_DDL)
+        .await
+        .context("creating foo")?;
+    publication_table_ensure(client, publication, "foo").await?;
+    client
+        .batch_execute(FOO_DATA)
+        .await
+        .context("loading foo data")?;
+    tracing::info!(table = "foo", "loaded select fixture");
     Ok(())
 }
 

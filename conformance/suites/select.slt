@@ -1,0 +1,127 @@
+# Curated port of PostgreSQL src/test/regress/sql/select.sql — the
+# result-correctness SELECT core: WHERE filters, ORDER BY (including
+# `USING <op>` and multi-key mixed directions), boolean predicate
+# combinations, row-constructor IN (VALUES ...), and NULLS FIRST/LAST
+# ordering. Run against the `onek` and `foo` fixtures (loaded by the
+# harness before this suite).
+#
+# Origin is the oracle: no results are inlined. Each query runs on
+# origin and pgcache and the result sets are compared, plus the pgcache
+# log is scanned for swallowed errors.
+#
+# Scope deviations from upstream select.sql:
+#   * `onek2` / `SET enable_seqscan|bitmapscan|sort` / EXPLAIN blocks
+#     assert plans, not results — omitted; the few result-bearing
+#     onek2 queries are adapted to `onek`.
+#   * `person*` inheritance, `nocols`/LATERAL, SRFs, partitioned-table
+#     planning — not pgcache-relevant; omitted.
+#   * `FROM onek, (VALUES ...)` comma joins are forwarded (PGC-143) —
+#     omitted here; comma-join routing is covered in join.slt.
+#   * `foo` ORDER BY queries add the surrogate `foo_pk` as a final
+#     tiebreaker so row order is deterministic (the two NULL `f1` rows
+#     are otherwise unordered) while still exercising NULLS FIRST/LAST.
+
+#
+# ORDER BY over a single table — pgcache's core cacheable path.
+#
+
+# pgcache: cached
+query TTTTTTTTTTTTTTTT
+SELECT * FROM onek
+   WHERE onek.unique1 < 10
+   ORDER BY onek.unique1;
+
+# ORDER BY ... USING <op> (operator-driven sort direction).
+# pgcache: passthrough
+query TT
+SELECT onek.unique1, onek.stringu1 FROM onek
+   WHERE onek.unique1 < 20
+   ORDER BY unique1 using >;
+
+# pgcache: passthrough
+query TT
+SELECT onek.unique1, onek.stringu1 FROM onek
+   WHERE onek.unique1 > 980
+   ORDER BY stringu1 using <, unique1;
+
+# Multi-key sort with mixed directions; string4 is low-cardinality so
+# the unique1 tiebreaker makes the order deterministic.
+# pgcache: passthrough
+query TT
+SELECT onek.unique1, onek.string4 FROM onek
+   WHERE onek.unique1 > 980
+   ORDER BY string4 using <, unique1 using >;
+
+# pgcache: passthrough
+query TT
+SELECT onek.unique1, onek.string4 FROM onek
+   WHERE onek.unique1 > 980
+   ORDER BY string4 using >, unique1 using <;
+
+# pgcache: passthrough
+query TT
+SELECT onek.unique1, onek.string4 FROM onek
+   WHERE onek.unique1 < 20
+   ORDER BY unique1 using >, string4 using <;
+
+# pgcache: passthrough
+query TT
+SELECT onek.unique1, onek.string4 FROM onek
+   WHERE onek.unique1 < 20
+   ORDER BY unique1 using <, string4 using >;
+
+#
+# WHERE predicate combinations (adapted from the onek2 partial-index
+# section — the result queries, not the EXPLAIN/index toggling).
+#
+
+# pgcache: cached
+query TTTTTTTTTTTTTTTT
+SELECT * FROM onek WHERE unique2 = 11 AND stringu1 = 'ATAAAA';
+
+# pgcache: cached
+query T
+SELECT unique2 FROM onek
+   WHERE unique2 = 11 AND stringu1 < 'B'
+   ORDER BY unique2;
+
+# OR combined with AND.
+# pgcache: cached
+query TT
+SELECT unique1, unique2 FROM onek
+   WHERE (unique2 = 11 OR unique1 = 0) AND stringu1 < 'B'
+   ORDER BY unique1;
+
+#
+# Row-constructor IN (VALUES ...) over a single table.
+#
+
+# pgcache: passthrough
+query TTTTTTTTTTTTTTTT
+SELECT * FROM onek
+   WHERE (unique1, ten) IN (VALUES (1, 1), (20, 0), (99, 9), (17, 99))
+   ORDER BY unique1;
+
+#
+# NULLS FIRST / LAST ordering (foo has NULL f1 rows).
+#
+
+# pgcache: cached
+query T
+SELECT f1 FROM foo ORDER BY f1, foo_pk;
+
+# pgcache: cached
+query T
+SELECT f1 FROM foo ORDER BY f1 ASC, foo_pk;
+
+# pgcache: cached
+query T
+SELECT f1 FROM foo ORDER BY f1 NULLS FIRST, foo_pk;
+
+# pgcache: cached
+query T
+SELECT f1 FROM foo ORDER BY f1 DESC, foo_pk;
+
+# pgcache: cached
+query T
+SELECT f1 FROM foo ORDER BY f1 DESC NULLS LAST, foo_pk;

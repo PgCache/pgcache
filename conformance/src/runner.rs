@@ -89,6 +89,9 @@ pub async fn run(cli: Cli) -> Result<()> {
     fixtures::join_tables_load(origin.client(), ep.publication.as_deref())
         .await
         .context("loading join fixtures")?;
+    fixtures::select_tables_load(origin.client(), ep.publication.as_deref())
+        .await
+        .context("loading select fixtures")?;
 
     let status = StatusClient::new(ep.status_url);
     let mut log_tailer = match &ep.logs_file {
