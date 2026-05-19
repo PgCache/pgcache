@@ -1,12 +1,13 @@
 use std::fmt::Write;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use postgres_protocol::escape;
 use rootcause::prelude::ResultExt;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::sleep;
 use tokio_postgres::{Client, SimpleColumn, SimpleQueryMessage, SimpleQueryRow};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, trace};
@@ -22,6 +23,28 @@ use super::PopulationWork;
 
 /// Number of rows to batch per INSERT statement sent to the cache database.
 const POPULATION_INSERT_BATCH_SIZE: usize = 200;
+
+/// Postgres `deadlock_detected`.
+const SQLSTATE_DEADLOCK: &str = "40P01";
+
+/// A population deadlock is transient: concurrent workers materializing
+/// *different* subsets of a shared source cache table can cross on the
+/// PK index / ON CONFLICT path (PGC-147 — the PGC-133 byte-identical
+/// invariant only holds for same-row populations, which doesn't apply
+/// here). Postgres aborts one side; re-running the whole task
+/// succeeds. The task is idempotent (ON CONFLICT upsert + generation
+/// re-stamp), so retry it a few times with exponential backoff.
+const POPULATION_DEADLOCK_MAX_RETRIES: u32 = 5;
+const POPULATION_DEADLOCK_BACKOFF_BASE: Duration = Duration::from_millis(20);
+
+/// SQLSTATE of a `CacheError`, if it wraps a Postgres error.
+fn cache_error_sqlstate(e: &CacheError) -> Option<&str> {
+    if let CacheError::PgError(pg) = e {
+        pg.code().map(|c| c.code())
+    } else {
+        None
+    }
+}
 
 /// Persistent population worker that processes work items from a channel.
 /// Each worker owns its own cache database connection.
@@ -52,16 +75,32 @@ pub async fn population_worker(
             .record(work.enqueued_at.elapsed().as_secs_f64());
 
         let task_start = Instant::now();
-        let result = population_task(
-            work.fingerprint,
-            work.generation,
-            &work.branches,
-            &work.table_metadata,
-            work.max_limit,
-            Rc::clone(&db_origin),
-            &db_cache,
-        )
-        .await;
+        let mut attempt: u32 = 0;
+        let result = loop {
+            let r = population_task(
+                work.fingerprint,
+                work.generation,
+                &work.branches,
+                &work.table_metadata,
+                work.max_limit,
+                Rc::clone(&db_origin),
+                &db_cache,
+            )
+            .await;
+            let deadlock = matches!(&r, Err(e)
+                if cache_error_sqlstate(e.current_context()) == Some(SQLSTATE_DEADLOCK));
+            if deadlock && attempt < POPULATION_DEADLOCK_MAX_RETRIES {
+                let backoff = POPULATION_DEADLOCK_BACKOFF_BASE * 2u32.pow(attempt);
+                attempt += 1;
+                trace!(
+                    "population worker {id}: query {} deadlocked, retry {attempt}/{POPULATION_DEADLOCK_MAX_RETRIES} after {backoff:?}",
+                    work.fingerprint,
+                );
+                sleep(backoff).await;
+                continue;
+            }
+            break r;
+        };
         metrics::histogram!(names::CACHE_POPULATION_TASK_SECONDS)
             .record(task_start.elapsed().as_secs_f64());
 
@@ -83,11 +122,7 @@ pub async fn population_worker(
             Err(e) => {
                 // Log the bare SQLSTATE, not the error chain: the chain walker
                 // leaks the offending SQL via the PG DETAIL field (PGC-133).
-                let sqlstate = if let CacheError::PgError(pg) = e.current_context() {
-                    pg.code().map(|c| c.code())
-                } else {
-                    None
-                };
+                let sqlstate = cache_error_sqlstate(e.current_context());
                 error!(
                     "population worker {id}: population failed for query {} sqlstate={}: {e}",
                     work.fingerprint,

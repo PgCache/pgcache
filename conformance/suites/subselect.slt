@@ -77,9 +77,9 @@ query T
 SELECT count(*) FROM onek o
   WHERE o.unique1 NOT IN (SELECT i.unique2 FROM onek i WHERE i.hundred = o.hundred);
 
-# Correlated scalar subquery in the SELECT list (ADR-015) —
-# pgcache forwards this shape.
-# pgcache: passthrough
+# Correlated scalar subquery in the SELECT list → LEFT JOIN +
+# GROUP BY (ADR-015).
+# pgcache: cached
 query TT
 SELECT o.unique1, (SELECT count(*) FROM onek i WHERE i.hundred = o.hundred) AS c
   FROM onek o WHERE o.unique1 < 5 ORDER BY o.unique1;
@@ -101,8 +101,8 @@ SELECT count(*) FROM onek o
 # join fixtures.
 #
 
-# Derived-table FROM — pgcache forwards this shape.
-# pgcache: passthrough
+# Subquery in FROM (derived table).
+# pgcache: cached
 query T
 SELECT count(*)
   FROM (SELECT unique1, ten FROM onek WHERE ten = 0) ss
