@@ -8,7 +8,7 @@ use futures_util::stream::FuturesUnordered;
 use postgres_protocol::escape;
 use tokio_postgres::{Client, SimpleQueryMessage};
 use tokio_stream::StreamExt;
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, info, instrument, trace};
 
 use crate::catalog::TableMetadata;
 use crate::metrics::names;
@@ -29,7 +29,8 @@ use super::super::types::{
     CachedQueryState, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
 };
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
-use super::core::WriterCore;
+use super::core::{FrameState, WriterCore};
+use super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
 use crate::pg;
 use crate::result::error_chain_format;
 
@@ -38,6 +39,43 @@ const SQL_BUFFER_CAPACITY: usize = 1024;
 
 /// Minimum number of connections in the cache pool for concurrent CDC updates.
 const MIN_CACHE_POOL_SIZE: usize = 2;
+
+/// Test-only deterministic fault injection (PGC-147). Compiled out entirely
+/// unless built with `--features fault-injection`; the writer-side CDC `40P01`
+/// is a timing race that cannot be provoked probabilistically, so the recovery
+/// path is exercised by forcing it here.
+#[cfg(feature = "fault-injection")]
+mod fault {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static CDC_DEADLOCK_ONCE: AtomicBool = AtomicBool::new(false);
+
+    /// Arm the one-shot from the environment (read once at writer startup).
+    pub(super) fn init() {
+        if std::env::var_os("PGCACHE_FAULT_CDC_DEADLOCK_ONCE").is_some() {
+            CDC_DEADLOCK_ONCE.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// True exactly once if armed — consumes the one-shot.
+    pub(super) fn cdc_deadlock_take() -> bool {
+        CDC_DEADLOCK_ONCE.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Whether to simulate a CDC-frame `40P01` for the current insert. Always
+/// `false` (and `core` untouched) unless built with `fault-injection`. The
+/// one-shot is consumed only once a query is cached, so fixture-load inserts
+/// (which precede any cached query) don't trip it — the injected deadlock
+/// lands on a frame that actually has a relation to recover.
+#[cfg(feature = "fault-injection")]
+fn fault_cdc_deadlock_should_inject(core: &WriterCore) -> bool {
+    core.cache.cached_queries.iter().next().is_some() && fault::cdc_deadlock_take()
+}
+#[cfg(not(feature = "fault-injection"))]
+fn fault_cdc_deadlock_should_inject(_core: &WriterCore) -> bool {
+    false
+}
 
 /// Rows-affected count from a single-statement `simple_query` result. Returns
 /// the first `CommandComplete` count; 0 if none is present (e.g. statement
@@ -114,6 +152,9 @@ impl WriterCdc {
             .await
             .map_into_report::<CacheError>()?;
 
+        #[cfg(feature = "fault-injection")]
+        fault::init();
+
         Ok(Self {
             cache_pool,
             cdc_write_conn,
@@ -121,33 +162,117 @@ impl WriterCdc {
         })
     }
 
-    /// Open the source-transaction frame on `cdc_write_conn` if not already
-    /// open. Called before the first write of a source transaction; subsequent
-    /// writes in the same transaction reuse the open frame. `core.frame_open`
-    /// is the shared signal the maintenance paths read to defer cache-table
-    /// DDL/purges while the frame holds locks.
+    /// `BEGIN` on the first cache-table write of the frame (`Active →
+    /// TxnOpen`); idempotent for later writes. A write while `Idle` (no
+    /// preceding `Begin`) is a bug.
     async fn frame_ensure(&mut self, core: &mut WriterCore) -> CacheResult<()> {
-        if !core.frame_open {
+        debug_assert!(
+            !matches!(core.frame_state, FrameState::Idle),
+            "cache-table write before Begin (frame not entered)"
+        );
+        if core.frame_state == FrameState::Active {
             self.cdc_write_conn
                 .batch_execute("BEGIN")
                 .await
                 .map_into_report::<CacheError>()?;
-            core.frame_open = true;
+            core.frame_state = FrameState::TxnOpen;
         }
         Ok(())
     }
 
-    /// Commit the open source-transaction frame, if any. A source transaction
-    /// that produced no cache writes leaves no frame open and commits nothing.
+    /// Commit the frame txn. A write-less frame stayed `Active` and commits
+    /// nothing (its invalidations flush separately at `CommitMark`).
     async fn frame_commit(&mut self, core: &mut WriterCore) -> CacheResult<()> {
-        if core.frame_open {
+        if core.frame_state == FrameState::TxnOpen {
             self.cdc_write_conn
                 .batch_execute("COMMIT")
                 .await
                 .map_into_report::<CacheError>()?;
-            core.frame_open = false;
+            core.frame_state = FrameState::Idle;
         }
         Ok(())
+    }
+
+    /// `40P01` aborted the whole frame txn: roll back (if a `BEGIN` was open)
+    /// and enter `Recovering` (recovery happens at `CommitMark`, PGC-147).
+    async fn frame_recover_enter(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        if core.frame_state == FrameState::TxnOpen {
+            self.cdc_write_conn
+                .batch_execute("ROLLBACK")
+                .await
+                .map_into_report::<CacheError>()?;
+        }
+        core.frame_state = FrameState::Recovering;
+        Ok(())
+    }
+
+    /// Apply the frame's deferred invalidations just before `COMMIT` — atomic
+    /// with the maintenance, past the last deadlock-retriable point (a bare
+    /// `COMMIT` under READ COMMITTED can't `40P01`).
+    async fn frame_invalidations_flush(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        if core.frame_invalidations.is_empty() {
+            return Ok(());
+        }
+        // Collected out: `cache_query_cdc_invalidate` needs `&mut core`, so we
+        // can't hold a borrow of `core.frame_invalidations` across the loop.
+        let fps: Vec<u64> = core.frame_invalidations.iter().copied().collect();
+        let count = fps.len() as u64;
+        for fp in fps {
+            self.cache_query_cdc_invalidate(core, fp)
+                .await
+                .attach_loc("flushing deferred invalidation")?;
+        }
+        metrics::counter!(names::CACHE_INVALIDATIONS).increment(count);
+        core.state_gauges_update();
+        Ok(())
+    }
+
+    /// Recover an aborted (`40P01`) frame: evict every query over the affected
+    /// relations, then truncate those cache tables in a dedicated txn — a
+    /// skipped Delete/Truncate may have left rows origin no longer has, and
+    /// the queries repopulate from origin anyway.
+    async fn frame_recover(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        // Collected out: `cache_table_invalidate` needs `&mut core`.
+        let oids: Vec<u32> = core.frame_relation_oids.iter().copied().collect();
+        info!(
+            relations = oids.len(),
+            "cdc frame recovery: invalidating + truncating affected relations"
+        );
+        // Evict first so no query can read a mid-truncate cache table.
+        for oid in &oids {
+            core.cache_table_invalidate(*oid)
+                .await
+                .attach_loc("recover: invalidating affected relation")?;
+        }
+        if let Some(truncate) = Self::truncate_sql_build(core, oids.into_iter()) {
+            self.cdc_write_conn
+                .batch_execute(&format!("BEGIN; {truncate}; COMMIT"))
+                .await
+                .map_into_report::<CacheError>()
+                .attach_loc("recover: truncating affected cache tables")?;
+        }
+        Ok(())
+    }
+
+    /// `40P01` from a DML handler → enter `Recovering` and swallow (PGC-147);
+    /// any other error propagates (cache subsystem reset, as before).
+    async fn frame_dml_result(
+        &mut self,
+        core: &mut WriterCore,
+        r: CacheResult<()>,
+    ) -> CacheResult<()> {
+        let Err(e) = r else { return Ok(()) };
+        if core.frame_state != FrameState::Recovering
+            && cache_error_sqlstate(e.current_context()) == Some(SQLSTATE_DEADLOCK)
+        {
+            info!(
+                relations = core.frame_relation_oids.len(),
+                "cdc frame deadlocked (40P01); recovering affected relations"
+            );
+            self.frame_recover_enter(core).await?;
+            return Ok(());
+        }
+        Err(e)
     }
 
     /// Handle a CDC command, dispatching to the appropriate method.
@@ -157,6 +282,7 @@ impl WriterCdc {
         cmd: CdcCommand,
     ) -> CacheResult<()> {
         let cmd_label = match &cmd {
+            CdcCommand::Begin { .. } => "cdc_begin",
             CdcCommand::TableRegister(_) => "cdc_table_register",
             CdcCommand::Insert { .. } => "cdc_insert",
             CdcCommand::Update { .. } => "cdc_update",
@@ -166,11 +292,20 @@ impl WriterCdc {
             CdcCommand::KeepAliveMark { .. } => "cdc_keepalive_mark",
         };
         let handle_start = Instant::now();
-        // Errors propagate (not swallowed): a failed mutation must abort the
-        // whole frame. Dropping `cdc_write_conn` on teardown rolls back the
-        // open transaction, so no explicit ROLLBACK is needed.
+        // Relation OIDs are recorded from frame start so a mid-frame 40P01 can
+        // recover every relation the frame touched (pre-deadlock writes rolled
+        // back too).
         match cmd {
+            CdcCommand::Begin { xid } => {
+                debug_assert!(
+                    matches!(core.frame_state, FrameState::Idle),
+                    "Begin within an active source-transaction frame"
+                );
+                trace!(xid, "cdc frame begin");
+                core.frame_state = FrameState::Active;
+            }
             CdcCommand::TableRegister(table_metadata) => {
+                core.frame_relation_oids.insert(table_metadata.relation_oid);
                 core.cache_table_register(table_metadata)
                     .await
                     .attach_loc("cdc table register")?;
@@ -179,36 +314,89 @@ impl WriterCdc {
                 relation_oid,
                 row_data,
             } => {
-                self.handle_insert(core, relation_oid, row_data)
-                    .await
-                    .attach_loc("cdc insert")?;
+                core.frame_relation_oids.insert(relation_oid);
+                if core.frame_state != FrameState::Recovering {
+                    if fault_cdc_deadlock_should_inject(core) {
+                        // Behave exactly as a real 40P01 victim (PGC-147).
+                        self.frame_recover_enter(core)
+                            .await
+                            .attach_loc("fault: injected cdc deadlock")?;
+                    } else {
+                        let r = self.handle_insert(core, relation_oid, row_data).await;
+                        self.frame_dml_result(core, r)
+                            .await
+                            .attach_loc("cdc insert")?;
+                    }
+                }
             }
             CdcCommand::Update {
                 relation_oid,
                 key_data,
                 row_data,
             } => {
-                self.handle_update(core, relation_oid, key_data, row_data)
-                    .await
-                    .attach_loc("cdc update")?;
+                core.frame_relation_oids.insert(relation_oid);
+                if core.frame_state != FrameState::Recovering {
+                    let r = self
+                        .handle_update(core, relation_oid, key_data, row_data)
+                        .await;
+                    self.frame_dml_result(core, r)
+                        .await
+                        .attach_loc("cdc update")?;
+                }
             }
             CdcCommand::Delete {
                 relation_oid,
                 row_data,
             } => {
-                self.handle_delete(core, relation_oid, row_data)
-                    .await
-                    .attach_loc("cdc delete")?;
+                core.frame_relation_oids.insert(relation_oid);
+                if core.frame_state != FrameState::Recovering {
+                    let r = self.handle_delete(core, relation_oid, row_data).await;
+                    self.frame_dml_result(core, r)
+                        .await
+                        .attach_loc("cdc delete")?;
+                }
             }
             CdcCommand::Truncate { relation_oids } => {
-                self.handle_truncate(core, &relation_oids)
-                    .await
-                    .attach_loc("cdc truncate")?;
+                core.frame_relation_oids.extend(relation_oids.iter().copied());
+                if core.frame_state != FrameState::Recovering {
+                    let r = self.handle_truncate(core, &relation_oids).await;
+                    self.frame_dml_result(core, r)
+                        .await
+                        .attach_loc("cdc truncate")?;
+                }
             }
             CdcCommand::CommitMark { lsn } => {
-                self.frame_commit(core)
-                    .await
-                    .attach_loc("cdc commit frame")?;
+                match core.frame_state {
+                    FrameState::TxnOpen => {
+                        self.frame_invalidations_flush(core).await?;
+                        self.frame_commit(core)
+                            .await
+                            .attach_loc("cdc commit frame")?;
+                    }
+                    // A frame can flag queries for invalidation without any
+                    // in-place write (e.g. a growing-join insert excluded from
+                    // in-place maintenance) — no `BEGIN` was opened, but the
+                    // flagged queries must still be invalidated here.
+                    FrameState::Active => {
+                        self.frame_invalidations_flush(core).await?;
+                    }
+                    FrameState::Recovering => {
+                        // Relation-level recovery evicts every query over the
+                        // affected relations — a superset of the selectively
+                        // flagged fps, so the fp flush is subsumed.
+                        self.frame_recover(core)
+                            .await
+                            .attach_loc("cdc recover frame")?;
+                    }
+                    // CommitMark without a preceding Begin: pgoutput always
+                    // pairs them for published txns, so this is unreachable.
+                    FrameState::Idle => {
+                        debug_assert!(false, "CommitMark without a preceding Begin");
+                    }
+                }
+                core.frame_state = FrameState::Idle;
+                core.frame_invalidations.clear();
+                core.frame_relation_oids.clear();
                 self.applied_lsn_advance(lsn);
                 // Frame is closed; flush maintenance that was deferred while it
                 // was open (it would have deadlocked on the frame's locks).
@@ -221,14 +409,14 @@ impl WriterCdc {
                 }
             }
             CdcCommand::KeepAliveMark { lsn } => {
-                // Keepalives only arrive between source transactions, so no
-                // frame should be open. The guard keeps the watermark from
-                // advancing past an uncommitted frame if that ever breaks.
+                // Keepalives only arrive between source transactions, so the
+                // frame must be Idle. The guard keeps the watermark from
+                // advancing past an active frame if that ever breaks.
                 debug_assert!(
-                    !core.frame_open,
-                    "keepalive received with an open source-transaction frame"
+                    core.frame_state == FrameState::Idle,
+                    "keepalive received with an active source-transaction frame"
                 );
-                if !core.frame_open {
+                if core.frame_state == FrameState::Idle {
                     self.applied_lsn_advance(lsn);
                 }
             }
@@ -282,16 +470,11 @@ impl WriterCdc {
             )
             .attach_loc("checking for query invalidations")?;
 
+        // Defer the actual invalidation to just before the frame COMMIT
+        // (frame_invalidations_flush) so it is atomic with the maintenance
+        // it accompanies rather than visible mid-frame.
         let invalidation_count = fp_list.len() as u64;
-        for fp in fp_list {
-            self.cache_query_cdc_invalidate(core, fp)
-                .await
-                .attach_loc("cdc invalidating query")?;
-        }
-        if invalidation_count > 0 {
-            metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
-            core.state_gauges_update();
-        }
+        core.frame_invalidations.extend(fp_list);
 
         let matched = self
             .update_queries_execute_concurrent(core, relation_oid, &row_data)
@@ -347,14 +530,8 @@ impl WriterCdc {
         )?;
         let invalidation_count = fp_list.len() as u64;
         trace!("invalidation_count {}", invalidation_count);
-
-        for fp in fp_list {
-            self.cache_query_cdc_invalidate(core, fp).await?;
-        }
-        if invalidation_count > 0 {
-            metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
-            core.state_gauges_update();
-        }
+        // Deferred to frame_invalidations_flush (see handle_insert).
+        core.frame_invalidations.extend(fp_list);
 
         let matched = self
             .update_queries_execute_concurrent(core, relation_oid, &new_row_data)
@@ -464,15 +641,8 @@ impl WriterCdc {
                 .attach_loc("checking delete invalidations")?;
 
             invalidation_count = fp_list.len() as u64;
-            for fp in fp_list {
-                self.cache_query_cdc_invalidate(core, fp)
-                    .await
-                    .attach_loc("cdc invalidating query on delete")?;
-            }
-            if invalidation_count > 0 {
-                metrics::counter!(names::CACHE_INVALIDATIONS).increment(invalidation_count);
-                core.state_gauges_update();
-            }
+            // Deferred to frame_invalidations_flush (see handle_insert).
+            core.frame_invalidations.extend(fp_list);
         }
 
         if rows_deleted > 0 {
@@ -506,21 +676,7 @@ impl WriterCdc {
         core: &mut WriterCore,
         relation_oids: &[u32],
     ) -> CacheResult<()> {
-        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
-        sql.push_str("TRUNCATE ");
-
-        let mut first = true;
-        for oid in relation_oids {
-            if let Some(table_metadata) = core.cache.tables.get1(oid) {
-                if !first {
-                    sql.push_str(", ");
-                }
-                let _ = write!(sql, "{}.{}", table_metadata.schema, table_metadata.name);
-                first = false;
-            }
-        }
-
-        if !first {
+        if let Some(sql) = Self::truncate_sql_build(core, relation_oids.iter().copied()) {
             self.frame_ensure(core).await?;
             self.cdc_write_conn
                 .batch_execute(sql.as_str())
@@ -535,6 +691,28 @@ impl WriterCdc {
         }
 
         Ok(())
+    }
+
+    /// Build `TRUNCATE <cache table>, ...` for the relations' cache tables,
+    /// or `None` if none of the oids map to a known cache table. Shared by
+    /// `handle_truncate` and the `40P01` recovery path.
+    fn truncate_sql_build(
+        core: &WriterCore,
+        oids: impl Iterator<Item = u32>,
+    ) -> Option<String> {
+        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
+        sql.push_str("TRUNCATE ");
+        let mut first = true;
+        for oid in oids {
+            if let Some(table_metadata) = core.cache.tables.get1(&oid) {
+                if !first {
+                    sql.push_str(", ");
+                }
+                let _ = write!(sql, "{}.{}", table_metadata.schema, table_metadata.name);
+                first = false;
+            }
+        }
+        if first { None } else { Some(sql) }
     }
 
     /// CDC-triggered invalidation of a cached query.
@@ -1011,6 +1189,13 @@ impl WriterCdc {
             // self-gates on `Fresh`.
             let mut local_hit = false;
             for update_query in update_queries.iter_complexity_ordered() {
+                // Flagged for invalidation this frame → not maintained in
+                // place (it forwards to origin and repopulates). Matches the
+                // pre-deferral ordering, where the inline invalidate ran
+                // before this executor so such queries were already excluded.
+                if core.frame_invalidations.contains(&update_query.fingerprint) {
+                    continue;
+                }
                 if update_query.eval_strategy != UpdateEvalStrategy::LocalEval {
                     continue;
                 }
@@ -1033,7 +1218,10 @@ impl WriterCdc {
             // evaluation (to dirty-mark matches); the rest short-circuit.
             let pg_eval: Vec<&UpdateQuery> = update_queries
                 .iter_complexity_ordered()
-                .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval)
+                .filter(|q| {
+                    q.eval_strategy == UpdateEvalStrategy::PgEval
+                        && !core.frame_invalidations.contains(&q.fingerprint)
+                })
                 .collect();
 
             if !pg_eval.is_empty() {

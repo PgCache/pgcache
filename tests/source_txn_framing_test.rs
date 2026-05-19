@@ -20,9 +20,24 @@
 
 use std::io::Error;
 
+use tokio_postgres::SimpleQueryMessage;
+
 use crate::util::{TestContext, assert_row_at};
+#[cfg(feature = "fault-injection")]
+use crate::util::{assert_cache_hit, assert_cache_miss};
 
 mod util;
+
+/// First data cell of a single-row `SELECT count(*)` result.
+fn scalar_of(msgs: &[SimpleQueryMessage]) -> Option<String> {
+    msgs.iter().find_map(|m| {
+        if let SimpleQueryMessage::Row(r) = m {
+            Some(r.get(0).unwrap_or_default().to_owned())
+        } else {
+            None
+        }
+    })
+}
 
 /// A multi-statement source transaction (insert + update + delete on a
 /// single-table Direct query) is applied as one correct unit. Single-table
@@ -311,5 +326,178 @@ async fn test_txn_invalidation_under_small_cache_no_deadlock() -> Result<(), Err
     assert_row_at(&res, 1, &[("id", "1"), ("name", "p1b"), ("val", "a")])?;
     assert_row_at(&res, 2, &[("id", "1"), ("name", "p1b"), ("val", "b")])?;
     assert_row_at(&res, 3, &[("id", "1"), ("name", "p1b"), ("val", "e")])?;
+    Ok(())
+}
+
+/// PGC-147: population↔CDC-frame contention over one base table's shared
+/// source cache table must keep the cache consistent and never reset it.
+///
+/// Several *different-subset* decorrelated correlated subqueries each
+/// materialize their subset into dl_t's single shared source cache table
+/// (population worker pool); interleaved CDC source transactions upsert
+/// overlapping rows into the same cache table with no settle between, so
+/// population is in flight while frames apply. This is the structural
+/// scenario behind the PGC-147 `40P01`.
+///
+/// One-directional invariant (red iff the bug regresses, never flaky): the
+/// cache stays consistent with origin and `cdc_settle` always succeeds (a
+/// writer reset surfaces as a `/status` 503 / settle timeout).
+///
+/// NOTE: this guards the contention path and the deferred-invalidation
+/// behaviour, but does *not* deterministically provoke the writer-side
+/// `40P01` itself — that victim case proved unreproducible probabilistically
+/// (see PGC-147; the population-side retry absorbs most `40P01`s as the
+/// population victim). The recovery path proper is covered by the
+/// fault-injection test `test_cdc_frame_deadlock_recovery`.
+#[tokio::test]
+async fn test_cdc_frame_population_contention_consistent() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table dl_t (id integer primary key, k integer, v integer)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into dl_t select g, g % 50, g % 7 from generate_series(1, 800) g",
+        &[],
+    )
+    .await?;
+    ctx.cdc_settle().await?;
+
+    // Equality-correlated subqueries (decorrelatable per ADR-014/016/015):
+    // each materializes a *different* subset of dl_t into dl_t's shared
+    // source cache table, so concurrent populations break PGC-133's
+    // same-row-set serialization and contend on the PK index.
+    let queries = [
+        "SELECT count(*) FROM dl_t o \
+         WHERE EXISTS (SELECT 1 FROM dl_t i WHERE i.k = o.k AND i.v = 0)",
+        "SELECT count(*) FROM dl_t o \
+         WHERE o.id IN (SELECT i.id FROM dl_t i WHERE i.k = o.k AND i.v = 1)",
+        "SELECT count(*) FROM dl_t o \
+         WHERE o.v = (SELECT max(i.v) FROM dl_t i WHERE i.k = o.k)",
+    ];
+
+    for iter in 0..5 {
+        // Trigger/refresh population of every subset, WITHOUT settling — these
+        // run on the worker pool concurrently with the CDC frame below.
+        for q in &queries {
+            ctx.simple_query(q).await?;
+        }
+
+        // Overlapping CDC source transaction on dl_t: new rows + an update
+        // touching ~1/3 of existing rows → the frame upserts rows the
+        // in-flight populations are also writing.
+        let lo = 801 + iter * 400;
+        let hi = lo + 399;
+        ctx.origin
+            .batch_execute(&format!(
+                "BEGIN; \
+                 insert into dl_t select g, g % 50, g % 7 \
+                   from generate_series({lo}, {hi}) g; \
+                 update dl_t set v = (v + 1) % 7 where id % 3 = 0; \
+                 COMMIT;"
+            ))
+            .await
+            .map_err(Error::other)?;
+
+        // Invariant: the frame committed or recovered — never reset.
+        ctx.cdc_settle().await?;
+
+        for q in &queries {
+            let via_cache = ctx.simple_query(q).await?;
+            let via_origin = ctx.origin.simple_query(q).await.map_err(Error::other)?;
+            assert_eq!(
+                scalar_of(&via_cache),
+                scalar_of(&via_origin),
+                "iter {iter}: pgcache disagrees with origin for `{q}`"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// PGC-147 deterministic recovery test (only built with
+/// `--features fault-injection`; run `--test-threads=1`).
+///
+/// The writer-side CDC `40P01`-victim path is a timing race that cannot be
+/// provoked probabilistically (conformance 20+ runs, contention tests: zero),
+/// so it is forced via the env-armed one-shot `PGCACHE_FAULT_CDC_DEADLOCK_ONCE`:
+/// the first CDC insert that occurs while a query is cached enters recovery
+/// instead of applying — exactly as a real `40P01` victim would.
+///
+/// Asserts the full recovery contract: the cache is **not** reset
+/// (`cdc_settle` succeeds — a reset → `/status` 503 → timeout), the dependent
+/// query is invalidated, and it repopulates cleanly from origin (proving the
+/// affected cache table was truncated, not left with stale rows), with results
+/// correct throughout. Pre-fix the writer propagated the `40P01` and reset the
+/// entire cache mid-load.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_cdc_frame_deadlock_recovery() -> Result<(), Error> {
+    // Armed at writer startup (inherited by the spawned pgcache); removed
+    // immediately after so no later spawn sees it. Race-free under
+    // --test-threads=1 (the harness already requires bounded threads).
+    unsafe { std::env::set_var("PGCACHE_FAULT_CDC_DEADLOCK_ONCE", "1") };
+    let mut ctx = TestContext::setup().await?;
+    unsafe { std::env::remove_var("PGCACHE_FAULT_CDC_DEADLOCK_ONCE") };
+
+    ctx.query(
+        "create table rec_t (id integer primary key, k integer)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into rec_t select g, g % 4 from generate_series(1, 40) g",
+        &[],
+    )
+    .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "SELECT count(*) FROM rec_t WHERE k = 0";
+
+    // Cache it: miss → populate, then a confirming hit. cached_queries is now
+    // non-empty, so the next CDC insert trips the injected deadlock.
+    let m = ctx.metrics().await?;
+    let r0 = ctx.simple_query(q).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let r1 = ctx.simple_query(q).await?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+    assert_eq!(scalar_of(&r0), scalar_of(&r1), "cached value pre-insert");
+
+    // First CDC insert with a query cached → injected 40P01 →
+    // frame_recover_enter → Recovering → CommitMark frame_recover: evict
+    // rec_t's queries + truncate its cache table.
+    ctx.origin
+        .batch_execute("insert into rec_t (id, k) values (10001, 0)")
+        .await
+        .map_err(Error::other)?;
+
+    // Primary invariant: recovery did not reset the cache.
+    ctx.cdc_settle().await?;
+
+    // Invalidated by recovery → next request is a miss, forwarded to origin,
+    // returning the correct incremented count.
+    let expected = ctx.origin.simple_query(q).await.map_err(Error::other)?;
+    let after = ctx.simple_query(q).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    assert_eq!(
+        scalar_of(&after),
+        scalar_of(&expected),
+        "recovered query must match origin (includes the new row)"
+    );
+
+    // Repopulates cleanly from the truncated cache table → correct cache hit.
+    ctx.cache_settle().await?;
+    let rehit = ctx.simple_query(q).await?;
+    assert_cache_hit(&mut ctx, m).await?;
+    assert_eq!(
+        scalar_of(&rehit),
+        scalar_of(&expected),
+        "repopulated query stays correct after recovery truncate"
+    );
+
     Ok(())
 }

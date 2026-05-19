@@ -65,6 +65,9 @@ split-debuginfo = "unpacked"
 console = ["dep:console-subscriber"]
 hotpath = ["dep:hotpath", "hotpath/hotpath"]
 hotpath-alloc = ["hotpath/hotpath-alloc"]
+# Test-only deterministic fault injection (e.g. forcing a CDC-frame 40P01 to
+# exercise PGC-147 recovery). Off by default; compiled out of normal builds.
+fault-injection = []
 
 [dependencies]
 arc-swap = "1.8.2"

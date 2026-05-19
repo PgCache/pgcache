@@ -1,5 +1,6 @@
 mod cdc;
 mod core;
+mod deadlock;
 mod mv;
 mod population;
 mod registration;

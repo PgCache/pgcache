@@ -359,9 +359,15 @@ impl CdcProcessor {
     }
 
     /// Processes transaction begin messages.
-    async fn process_begin(&self, _body: &BeginBody) -> Result<(), Error> {
-        // transaction begin and end messages can be ignored since all logical replication
-        // messages are sent after the transaction has been committed
+    ///
+    /// Forwards a `Begin` marker so the writer enters a source-transaction
+    /// frame explicitly. The watermark does not advance here (only at
+    /// `CommitMark`/`KeepAliveMark`); this is purely the frame delimiter.
+    async fn process_begin(&self, body: &BeginBody) -> Result<(), Error> {
+        let xid = body.xid();
+        if let Err(e) = self.cdc_tx.send(CdcCommand::Begin { xid }) {
+            error!("Failed to forward begin (xid {xid}) to writer: {e:?}");
+        }
         Ok(())
     }
 

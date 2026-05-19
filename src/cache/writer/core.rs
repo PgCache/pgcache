@@ -32,6 +32,22 @@ use super::super::{
 use super::cdc::WriterCdc;
 use super::registration::WriterRegistration;
 
+/// CDC source-txn frame state on `WriterCdc`'s write connection (PGC-108).
+/// `Idle →Begin Active →write TxnOpen →Commit Idle`; `* →40P01 Recovering`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FrameState {
+    /// Between source transactions.
+    Idle,
+    /// In a frame, no cache-table write yet — no `BEGIN`/locks, but
+    /// invalidations/oids may be accumulating for the `CommitMark` flush.
+    Active,
+    /// `BEGIN` open, frame holds row locks, `COMMIT` owed (was `frame_open`).
+    TxnOpen,
+    /// Hit `40P01`, rolled back; drains the rest of the txn with no DB apply,
+    /// recovers affected relations at `CommitMark` (PGC-147). Holds no locks.
+    Recovering,
+}
+
 /// Shared writer state for the CDC apply and registration/population paths.
 /// `WriterCdc` and `WriterRegistration` borrow `&mut WriterCore` per command;
 /// the single-owner `writer_run` select loop serializes mutations (no
@@ -60,13 +76,21 @@ pub struct WriterCore {
     pub(super) query_tx: UnboundedSender<QueryCommand>,
     /// Notifications to coordinator for coalescing queue drain.
     pub(super) notify_tx: UnboundedSender<WriterNotify>,
-    /// True while `WriterCdc` holds an open `BEGIN` on its write connection
-    /// (set/cleared by `WriterCdc::frame_ensure`/`frame_commit` through their
-    /// `&mut WriterCore`). The maintenance paths read it to defer cache-table
-    /// DDL/purges: a `db_cache` DROP/DELETE on a table the open frame wrote
-    /// would block on the frame's row locks, and the frame only commits at the
-    /// later `CommitMark` — a permanent stall.
-    pub(super) frame_open: bool,
+    /// CDC source-transaction frame state (driven by
+    /// `WriterCdc::frame_ensure`/`frame_commit`/recovery through their
+    /// `&mut WriterCore`). Maintenance paths gate on `frame_holds_locks()`
+    /// to defer cache-table DDL/purges: a `db_cache` DROP/DELETE on a table
+    /// an `Open` frame wrote would block on its row locks until the later
+    /// `CommitMark` — a permanent stall. `Recovering` holds no locks.
+    pub(super) frame_state: FrameState,
+    /// Fingerprints flagged for invalidation by the in-progress `Open`
+    /// frame's handlers, applied just before `frame_commit` (so invalidation
+    /// is atomic with the maintenance it accompanies, not visible mid-frame).
+    pub(super) frame_invalidations: HashSet<u64>,
+    /// Relation OIDs touched by the in-progress frame, accumulated from frame
+    /// start so a mid-frame `40P01` can invalidate+truncate every affected
+    /// relation (commands applied before the deadlock were rolled back too).
+    pub(super) frame_relation_oids: HashSet<u32>,
     /// Set when a generation purge was skipped because a frame was open;
     /// flushed after the frame commits at `CommitMark`.
     pub(super) purge_pending: bool,
@@ -101,9 +125,17 @@ impl WriterCore {
             relations_dirty: false,
             query_tx,
             notify_tx,
-            frame_open: false,
+            frame_state: FrameState::Idle,
+            frame_invalidations: HashSet::new(),
+            frame_relation_oids: HashSet::new(),
             purge_pending: false,
         })
+    }
+
+    /// Frame holds row locks (a `BEGIN` is open) — maintenance paths defer
+    /// cache-table DDL/purges while true.
+    pub(super) fn frame_holds_locks(&self) -> bool {
+        matches!(self.frame_state, FrameState::TxnOpen)
     }
 
     /// Increment refcounts for each relation_oid the new cached_query
@@ -245,7 +277,7 @@ impl WriterCore {
         // cache_tables_drop (DROP TABLE on db_cache) would block on the
         // frame's uncommitted cache-table locks. relations_dirty stays set;
         // the drain re-runs after frame_commit at CommitMark.
-        if self.frame_open {
+        if self.frame_holds_locks() {
             return Ok(());
         }
         self.relations_dirty = false;
@@ -411,7 +443,7 @@ impl WriterCore {
     /// the frame has committed.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn cache_size_load(&mut self) -> CacheResult<usize> {
-        if self.frame_open {
+        if self.frame_holds_locks() {
             return Ok(self.cache.current_size);
         }
         let size: i64 = self
@@ -430,7 +462,7 @@ impl WriterCore {
         // Defer while a CDC frame is open: cache_query_evict / generation_purge
         // would block on the frame's uncommitted cache-table locks. Eviction is
         // periodic/best-effort — the next Ready after the frame commits runs it.
-        if self.frame_open {
+        if self.frame_holds_locks() {
             return Ok(());
         }
         /// Maximum number of generation bumps (second chances) per eviction round.
@@ -807,7 +839,7 @@ impl WriterCore {
         // Defer while a CDC frame is open: pgcache_purge_rows DELETEs source
         // cache-table rows on db_cache, which would block on the frame's
         // uncommitted locks. Record the intent; flushed after frame_commit.
-        if self.frame_open {
+        if self.frame_holds_locks() {
             self.purge_pending = true;
             return Ok(0);
         }

@@ -20,12 +20,10 @@ use crate::query::transform::resolved_select_node_replace;
 
 use super::super::{CacheError, CacheResult, MapIntoReport, messages::QueryCommand};
 use super::PopulationWork;
+use super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
 
 /// Number of rows to batch per INSERT statement sent to the cache database.
 const POPULATION_INSERT_BATCH_SIZE: usize = 200;
-
-/// Postgres `deadlock_detected`.
-const SQLSTATE_DEADLOCK: &str = "40P01";
 
 /// A population deadlock is transient: concurrent workers materializing
 /// *different* subsets of a shared source cache table can cross on the
@@ -36,15 +34,6 @@ const SQLSTATE_DEADLOCK: &str = "40P01";
 /// re-stamp), so retry it a few times with exponential backoff.
 const POPULATION_DEADLOCK_MAX_RETRIES: u32 = 5;
 const POPULATION_DEADLOCK_BACKOFF_BASE: Duration = Duration::from_millis(20);
-
-/// SQLSTATE of a `CacheError`, if it wraps a Postgres error.
-fn cache_error_sqlstate(e: &CacheError) -> Option<&str> {
-    if let CacheError::PgError(pg) = e {
-        pg.code().map(|c| c.code())
-    } else {
-        None
-    }
-}
 
 /// Persistent population worker that processes work items from a channel.
 /// Each worker owns its own cache database connection.

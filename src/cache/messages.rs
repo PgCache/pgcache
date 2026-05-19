@@ -312,6 +312,13 @@ pub enum QueryCommand {
 /// Commands for CDC mutations and relation tracking, sent to the writer thread
 #[derive(Debug)]
 pub enum CdcCommand {
+    /// Source-transaction begin marker. Emitted by the CDC processor for each
+    /// pgoutput BEGIN, carrying the source transaction's `xid`. The explicit
+    /// delimiter lets the writer enter a frame deterministically (rather than
+    /// inferring it from the first mutation), so `FrameState::Idle` genuinely
+    /// means "between source transactions".
+    Begin { xid: u32 },
+
     /// Register table metadata from CDC
     TableRegister(TableMetadata),
 
