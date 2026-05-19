@@ -4,9 +4,9 @@ use crate::{
     catalog::FunctionVolatility,
     query::{
         ast::{
-            BinaryOp, CteRefNode, JoinNode, JoinQual, JoinType, LimitClause, LiteralValue,
-            MultiOp, QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode, SubLinkType,
-            TableSource, TableSubqueryNode, WhereExpr,
+            BinaryOp, CteRefNode, JoinNode, JoinQual, JoinType, LimitClause, LiteralValue, MultiOp,
+            QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode, SubLinkType, TableSource,
+            TableSubqueryNode, WhereExpr,
         },
         resolved::{
             ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectNode, ResolvedTableSource,

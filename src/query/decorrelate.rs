@@ -11,9 +11,8 @@ use crate::query::ast::{BinaryOp, JoinType, SubLinkType, TableAlias, UnaryOp};
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedJoinQual, ResolvedQueryBody,
     ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
-    ResolvedSelectNode,
-    ResolvedSetOpNode, ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedUnaryExpr,
-    ResolvedWhereExpr,
+    ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableSource, ResolvedTableSubqueryNode,
+    ResolvedUnaryExpr, ResolvedWhereExpr,
 };
 use crate::query::transform::{where_expr_conjuncts_join, where_expr_conjuncts_split};
 

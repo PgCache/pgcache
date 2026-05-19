@@ -208,3 +208,176 @@ async fn test_filter_subquery_cdc_invalidation() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// DELETE-direction counterpart of `test_filter_subquery_cdc_invalidation`
+/// (PGC-107). Builds the MV while `allowed_types` is populated and EXISTS
+/// is true, then DELETEs the inner row. The cached aggregate must drop
+/// 100 → 0; the bug surfaces as the stale value 100.
+///
+/// Root cause: `row_uncached_invalidation_check` (src/cache/writer/cdc.rs)
+/// classifies the FILTER+EXISTS subquery as `SubqueryKind::Inclusion` and
+/// skips invalidation on `CdcOperation::Delete`. Sound for WHERE-clause
+/// EXISTS (extra cached rows re-filter at serve time); unsound for an
+/// EXISTS inside an aggregate FILTER, where the predicate truth value
+/// feeds the aggregate per row.
+#[tokio::test]
+async fn test_filter_subquery_cdc_invalidation_delete() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE posts (id integer primary key, owneruserid integer not null)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE allowed_types (type_id integer primary key)",
+        &[],
+    )
+    .await?;
+
+    for id in 1..=100 {
+        ctx.query("INSERT INTO posts VALUES ($1, 8)", &[&id])
+            .await?;
+    }
+    // allowed_types starts populated; MV is built while EXISTS is true so
+    // the subsequent DELETE must flip the predicate true → false and force
+    // invalidation.
+    ctx.query("INSERT INTO allowed_types VALUES (1)", &[])
+        .await?;
+
+    ctx.cdc_settle().await?;
+
+    let _ = ctx.simple_query("SELECT count(*) FROM posts").await?;
+    let _ = ctx
+        .simple_query("SELECT count(*) FROM allowed_types")
+        .await?;
+    ctx.cache_settle().await?;
+
+    let sql = "SELECT count(*) FILTER (WHERE EXISTS \
+                   (SELECT 1 FROM allowed_types WHERE type_id = 1)) AS visible \
+               FROM posts WHERE owneruserid = 8";
+
+    let row = ctx.origin.query_one(sql, &[]).await.map_err(Error::other)?;
+    assert_eq!(row.get::<_, i64>("visible"), 100);
+
+    // Q1: cache miss → population.
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>("visible"), 100);
+    ctx.cache_settle().await?;
+
+    // Q2: source-row hit; schedules MV first-build.
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>("visible"), 100);
+    ctx.cache_settle().await?;
+
+    // Q3: served from the MV snapshot — assert this so a staleness bug
+    // on the MV path actually surfaces.
+    let m_before_mv = ctx.metrics().await?;
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>("visible"), 100);
+    let m_after_mv = ctx.metrics().await?;
+    let d = metrics_delta(&m_before_mv, &m_after_mv);
+    assert!(
+        d.cache_mv_hits >= 1,
+        "expected MV fast-path hit before the invalidation test (delta {d:?})"
+    );
+
+    // DELETE the only row in allowed_types. Origin's aggregate drops to 0.
+    // pgcache must invalidate the MV; otherwise it serves stale 100.
+    ctx.origin_query("DELETE FROM allowed_types WHERE type_id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    ctx.cache_settle().await?;
+
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(
+        row.get::<_, i64>("visible"),
+        0,
+        "DELETE from allowed_types must invalidate the FILTER+EXISTS query's MV"
+    );
+
+    Ok(())
+}
+
+/// CASE-WHEN counterpart of `test_filter_subquery_cdc_invalidation_delete`
+/// (PGC-107). The fix retags subqueries inside both `agg_filter` and
+/// `Case` WHEN conditions — these hit different walker arms, so assert
+/// the CASE path independently to catch a future walker rewrite that
+/// re-introduces the bug only on the CASE side.
+#[tokio::test]
+async fn test_case_when_subquery_cdc_invalidation_delete() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE posts (id integer primary key, owneruserid integer not null)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE allowed_types (type_id integer primary key)",
+        &[],
+    )
+    .await?;
+
+    for id in 1..=100 {
+        ctx.query("INSERT INTO posts VALUES ($1, 8)", &[&id])
+            .await?;
+    }
+    ctx.query("INSERT INTO allowed_types VALUES (1)", &[])
+        .await?;
+
+    ctx.cdc_settle().await?;
+
+    let _ = ctx.simple_query("SELECT count(*) FROM posts").await?;
+    let _ = ctx
+        .simple_query("SELECT count(*) FROM allowed_types")
+        .await?;
+    ctx.cache_settle().await?;
+
+    // EXISTS lives inside a CASE WHEN condition (Case-arm walker path,
+    // distinct from agg_filter). Truth value flips THEN/ELSE per row, so
+    // DELETE on the inner table must invalidate the cached aggregate.
+    let sql = "SELECT SUM(CASE WHEN EXISTS \
+                   (SELECT 1 FROM allowed_types WHERE type_id = 1) \
+                   THEN 1 ELSE 0 END)::bigint AS visible \
+               FROM posts WHERE owneruserid = 8";
+
+    let row = ctx.origin.query_one(sql, &[]).await.map_err(Error::other)?;
+    assert_eq!(row.get::<_, i64>("visible"), 100);
+
+    // Q1: cache miss → population.
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>("visible"), 100);
+    ctx.cache_settle().await?;
+
+    // Q2: source-row hit; schedules MV first-build.
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>("visible"), 100);
+    ctx.cache_settle().await?;
+
+    // Q3: must be served from the MV — assert this so a staleness bug
+    // on the MV path actually surfaces.
+    let m_before_mv = ctx.metrics().await?;
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(row.get::<_, i64>("visible"), 100);
+    let m_after_mv = ctx.metrics().await?;
+    let d = metrics_delta(&m_before_mv, &m_after_mv);
+    assert!(
+        d.cache_mv_hits >= 1,
+        "expected MV fast-path hit before the invalidation test (delta {d:?})"
+    );
+
+    ctx.origin_query("DELETE FROM allowed_types WHERE type_id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    ctx.cache_settle().await?;
+
+    let row = ctx.query_one(sql, &[]).await?;
+    assert_eq!(
+        row.get::<_, i64>("visible"),
+        0,
+        "DELETE from allowed_types must invalidate the CASE-WHEN+EXISTS query's MV"
+    );
+
+    Ok(())
+}

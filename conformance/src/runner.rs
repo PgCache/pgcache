@@ -140,9 +140,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         .await
         .with_context(|| format!("running suite {}", file.display()))?;
         if control.is_break() {
-            tracing::error!(
-                "aborting remaining suites: cache subsystem persistently unavailable"
-            );
+            tracing::error!("aborting remaining suites: cache subsystem persistently unavailable");
             break;
         }
     }

@@ -357,7 +357,8 @@ impl WriterCdc {
                 }
             }
             CdcCommand::Truncate { relation_oids } => {
-                core.frame_relation_oids.extend(relation_oids.iter().copied());
+                core.frame_relation_oids
+                    .extend(relation_oids.iter().copied());
                 if core.frame_state != FrameState::Recovering {
                     let r = self.handle_truncate(core, &relation_oids).await;
                     self.frame_dml_result(core, r)
@@ -696,10 +697,7 @@ impl WriterCdc {
     /// Build `TRUNCATE <cache table>, ...` for the relations' cache tables,
     /// or `None` if none of the oids map to a known cache table. Shared by
     /// `handle_truncate` and the `40P01` recovery path.
-    fn truncate_sql_build(
-        core: &WriterCore,
-        oids: impl Iterator<Item = u32>,
-    ) -> Option<String> {
+    fn truncate_sql_build(core: &WriterCore, oids: impl Iterator<Item = u32>) -> Option<String> {
         let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
         sql.push_str("TRUNCATE ");
         let mut first = true;

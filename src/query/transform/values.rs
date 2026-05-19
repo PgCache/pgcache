@@ -414,7 +414,12 @@ mod tests {
     /// with "invalid reference to FROM-clause entry".
     #[test]
     fn test_join_on_condition_uses_subquery_alias() {
-        let cols = &[("i", "int4"), ("j", "int4"), ("t", "text"), ("j1_pk", "int4")];
+        let cols = &[
+            ("i", "int4"),
+            ("j", "int4"),
+            ("t", "text"),
+            ("j1_pk", "int4"),
+        ];
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(table_metadata("j1_tbl", 5001, cols));
         tables.insert_overwrite(table_metadata(
@@ -437,8 +442,8 @@ mod tests {
             panic!("expected SELECT");
         };
         let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = resolved_select_node_table_replace_with_values(&resolved, &j1, &row)
-            .expect("replace");
+        let replaced =
+            resolved_select_node_table_replace_with_values(&resolved, &j1, &row).expect("replace");
         let mut sql = String::new();
         Deparse::deparse(&replaced, &mut sql);
 
@@ -501,7 +506,12 @@ mod tests {
     /// predicate. (PGC-142)
     #[test]
     fn test_join_qual_using_natural_preserved_with_predicate() {
-        let cols1 = &[("i", "int4"), ("j", "int4"), ("t", "text"), ("j1_pk", "int4")];
+        let cols1 = &[
+            ("i", "int4"),
+            ("j", "int4"),
+            ("t", "text"),
+            ("j1_pk", "int4"),
+        ];
         let cols2 = &[("i", "int4"), ("k", "int4"), ("j2_pk", "int4")];
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(table_metadata("j1_tbl", 5001, cols1));

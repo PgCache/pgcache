@@ -28,11 +28,7 @@ use tokio::time::{Instant, sleep};
 /// caller-formatted error to fail with if the deadline passes (the caller
 /// owns the full wording, so per-site message contracts are preserved).
 /// `step`'s own `Err` propagates immediately.
-pub async fn poll_until<F, Fut>(
-    timeout: Duration,
-    interval: Duration,
-    mut step: F,
-) -> Result<()>
+pub async fn poll_until<F, Fut>(timeout: Duration, interval: Duration, mut step: F) -> Result<()>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<ControlFlow<(), String>>>,
@@ -85,9 +81,11 @@ mod tests {
 
     #[tokio::test]
     async fn times_out_with_the_callers_message() {
-        let err = poll_until(Duration::from_millis(40), Duration::from_millis(5), || async {
-            Ok(ControlFlow::Continue("custom detail".to_owned()))
-        })
+        let err = poll_until(
+            Duration::from_millis(40),
+            Duration::from_millis(5),
+            || async { Ok(ControlFlow::Continue("custom detail".to_owned())) },
+        )
         .await
         .unwrap_err();
         assert_eq!(err.to_string(), "custom detail");

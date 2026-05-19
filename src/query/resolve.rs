@@ -6,11 +6,10 @@ use tokio_postgres::types::Type;
 use crate::cache::SubqueryKind;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
 use crate::query::ast::{
-    BinaryOp, ColumnNode, JoinQual, JoinType, LimitClause, LiteralValue, OrderByClause,
-    QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns, SelectNode, TableAlias,
-    TableNode, TableSource, WhereExpr, WindowSpec,
+    BinaryOp, ColumnNode, JoinQual, JoinType, LimitClause, LiteralValue, OrderByClause, QueryBody,
+    QueryExpr, ScalarExpr, SelectColumn, SelectColumns, SelectNode, TableAlias, TableNode,
+    TableSource, WhereExpr, WindowSpec,
 };
-use crate::query::transform::where_expr_conjuncts_join;
 use crate::query::resolved::{
     ResolveError, ResolveResult, ResolvedArithmeticExpr, ResolvedBinaryExpr, ResolvedCaseExpr,
     ResolvedCaseWhen, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode, ResolvedJoinQual,
@@ -19,6 +18,7 @@ use crate::query::resolved::{
     ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource,
     ResolvedTableSubqueryNode, ResolvedUnaryExpr, ResolvedWhereExpr, ResolvedWindowSpec,
 };
+use crate::query::transform::where_expr_conjuncts_join;
 
 /// Resolution scope tracking available tables and their aliases
 /// A `USING`/`NATURAL` join's merged output column. Postgres exposes
@@ -748,9 +748,7 @@ fn table_source_resolve<'a>(
             let qual = match &join_node.qual {
                 JoinQual::On(cond) => ResolvedJoinQual::On(where_expr_resolve(cond, scope)?),
                 JoinQual::Cross => ResolvedJoinQual::Cross,
-                JoinQual::Using(cols) => {
-                    join_using_or_cross(scope, ranges, cols.clone(), jt)?
-                }
+                JoinQual::Using(cols) => join_using_or_cross(scope, ranges, cols.clone(), jt)?,
                 JoinQual::Natural => {
                     let cols = join_natural_common_columns(scope, ranges);
                     join_using_or_cross(scope, ranges, cols, jt)?
@@ -824,8 +822,9 @@ fn scalar_expr_resolve(
             // not an ambiguous per-side lookup. Qualified `t.c` still
             // reaches the base table.
             if col.table.is_none()
-                && let Some(expr) =
-                    scope.merged_column_find(col.column.as_str()).map(|m| m.expr.clone())
+                && let Some(expr) = scope
+                    .merged_column_find(col.column.as_str())
+                    .map(|m| m.expr.clone())
             {
                 return Ok(expr);
             }

@@ -380,6 +380,23 @@ impl ResolvedWhereExpr {
             }
         }
     }
+
+    /// Like `subquery_nodes_collect_with_source` but force every collected
+    /// subquery to `SubqueryKind::Scalar` regardless of `SubLinkType`. The
+    /// truth value feeds an enclosing scalar (aggregate FILTER, CASE WHEN
+    /// condition), so shrink-skip rules are unsound (PGC-107).
+    fn subquery_nodes_collect_as_scalar<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a ResolvedSelectNode, UpdateQuerySource)>,
+    ) {
+        let start = branches.len();
+        self.subquery_nodes_collect_with_source(branches, false);
+        for (_, source) in branches.iter_mut().skip(start) {
+            if let UpdateQuerySource::Subquery(kind) = source {
+                *kind = SubqueryKind::Scalar;
+            }
+        }
+    }
 }
 
 impl Deparse for ResolvedWhereExpr {
@@ -834,9 +851,8 @@ impl ResolvedScalarExpr {
                 for clause in &func.agg_order {
                     clause.expr.subquery_nodes_collect_with_source(branches);
                 }
-                // FILTER predicate is Scalar context — negated=false
                 if let Some(filter) = &func.agg_filter {
-                    filter.subquery_nodes_collect_with_source(branches, false);
+                    filter.subquery_nodes_collect_as_scalar(branches);
                 }
                 if let Some(over) = &func.over {
                     for col in &over.partition_by {
@@ -852,9 +868,7 @@ impl ResolvedScalarExpr {
                     arg.subquery_nodes_collect_with_source(branches);
                 }
                 for when in &case.whens {
-                    // condition is WhereExpr — use negated=false (Scalar context)
-                    when.condition
-                        .subquery_nodes_collect_with_source(branches, false);
+                    when.condition.subquery_nodes_collect_as_scalar(branches);
                     when.result.subquery_nodes_collect_with_source(branches);
                 }
                 if let Some(default) = &case.default {
