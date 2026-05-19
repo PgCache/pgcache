@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 use pg_query::ParseResult;
 use pg_query::protobuf::{
     AExpr, AExprKind, CaseExpr as PgCaseExpr, CoalesceExpr, CteMaterialize, FuncCall, JoinExpr,
-    MinMaxExpr, MinMaxOp, RangeSubselect, SortByDir, TypeCast, TypeName,
+    MinMaxExpr, MinMaxOp, RangeSubselect, SortByDir, SortByNulls, TypeCast, TypeName,
 };
 use pg_query::protobuf::{Node, RangeVar, SelectStmt, SetOperation, node::Node as NodeEnum};
 
@@ -812,37 +812,44 @@ fn window_order_by_convert(
     order_clause: &[pg_query::protobuf::Node],
 ) -> Result<Vec<OrderByClause>, AstError> {
     let mut order_by = Vec::with_capacity(order_clause.len());
-
     for sort_node in order_clause {
         if let Some(NodeEnum::SortBy(sort_by)) = &sort_node.node {
-            let expr = sort_by
-                .node
-                .as_ref()
-                .ok_or_else(|| AstError::UnsupportedFeature {
-                    feature: "ORDER BY with no expression".to_owned(),
-                })
-                .and_then(|n| node_convert_to_scalar_expr(n))?;
-
-            let direction = match SortByDir::try_from(sort_by.sortby_dir) {
-                Ok(SortByDir::SortbyAsc) => OrderDirection::Asc,
-                Ok(SortByDir::SortbyDesc) => OrderDirection::Desc,
-                Ok(SortByDir::SortbyDefault) => OrderDirection::Asc, // Default is ASC
-                _ => {
-                    return Err(AstError::UnsupportedFeature {
-                        feature: format!("ORDER BY direction: {}", sort_by.sortby_dir),
-                    });
-                }
-            };
-
-            order_by.push(OrderByClause { expr, direction });
+            order_by.push(sort_by_to_order_clause(sort_by)?);
         } else {
             return Err(AstError::UnsupportedFeature {
                 feature: format!("Window ORDER BY node type: {sort_node:?}"),
             });
         }
     }
-
     Ok(order_by)
+}
+
+/// Convert one pg_query `SortBy` to an `OrderByClause` (expr + direction
+/// + NULLS ordering). Shared between regular and window ORDER BY paths.
+fn sort_by_to_order_clause(
+    sort_by: &pg_query::protobuf::SortBy,
+) -> Result<OrderByClause, AstError> {
+    let expr_node = sort_by.node.as_ref().ok_or(AstError::UnsupportedFeature {
+        feature: "ORDER BY without expression".to_owned(),
+    })?;
+    let expr = node_convert_to_scalar_expr(expr_node)?;
+    let direction =
+        OrderDirection::try_from(SortByDir::try_from(sort_by.sortby_dir).map_err(|_| {
+            AstError::UnsupportedFeature {
+                feature: format!("Invalid SortByDir value: {}", sort_by.sortby_dir),
+            }
+        })?)?;
+    let null_order =
+        NullOrder::try_from(SortByNulls::try_from(sort_by.sortby_nulls).map_err(|_| {
+            AstError::UnsupportedFeature {
+                feature: format!("Invalid SortByNulls value: {}", sort_by.sortby_nulls),
+            }
+        })?)?;
+    Ok(OrderByClause {
+        expr,
+        direction,
+        null_order,
+    })
 }
 
 fn coalesce_expr_convert(coalesce: &CoalesceExpr) -> Result<FunctionCall, AstError> {
@@ -1024,29 +1031,15 @@ fn case_when_convert(node: &Node) -> Result<CaseWhen, AstError> {
 
 fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, AstError> {
     let mut order_by = Vec::with_capacity(sort_clause.len());
-
     for sort_node in sort_clause {
         if let Some(NodeEnum::SortBy(sort_by)) = &sort_node.node {
-            let expr_node = sort_by.node.as_ref().ok_or(AstError::UnsupportedFeature {
-                feature: "ORDER BY without expression".to_owned(),
-            })?;
-
-            let expr = node_convert_to_scalar_expr(expr_node)?;
-            let direction =
-                OrderDirection::try_from(SortByDir::try_from(sort_by.sortby_dir).map_err(
-                    |_| AstError::UnsupportedFeature {
-                        feature: format!("Invalid SortByDir value: {}", sort_by.sortby_dir),
-                    },
-                )?)?;
-
-            order_by.push(OrderByClause { expr, direction });
+            order_by.push(sort_by_to_order_clause(sort_by)?);
         } else {
             return Err(AstError::UnsupportedFeature {
                 feature: format!("ORDER BY node type: {sort_node:?}"),
             });
         }
     }
-
     Ok(order_by)
 }
 
@@ -3183,6 +3176,7 @@ mod tests {
                         column: EcoString::from("date"),
                     }),
                     direction: OrderDirection::Asc,
+                    null_order: NullOrder::Default,
                 }],
             }),
         };
@@ -3364,6 +3358,7 @@ mod tests {
                     column: EcoString::from("name"),
                 }),
                 direction: OrderDirection::Asc,
+                null_order: NullOrder::Default,
             }],
             agg_filter: None,
             over: None,

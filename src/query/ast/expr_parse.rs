@@ -119,11 +119,51 @@ fn sublink_convert(sub_link: &SubLink) -> Result<WhereExpr, WhereParseError> {
     // Convert the SubLink type
     let sublink_type = SubLinkType::try_from(sub_link.sub_link_type())?;
 
+    // Only `<> ALL` (= NOT IN) is anti-join-equivalent; `< ALL`/`> ALL`/etc.
+    // have min/max semantics and were silently mis-decorrelated as anti-join
+    // (PGC-146). Reject so the query is forwarded.
+    if sublink_type == SubLinkType::All {
+        sublink_all_operator_check(&sub_link.oper_name)?;
+    }
+
     Ok(WhereExpr::Subquery {
         query: Box::new(query),
         sublink_type,
         test_expr,
     })
+}
+
+/// Extract the single-string operator name from an `oper_name` list (SubLink
+/// / A_Expr). Any other shape is a structural parse error.
+fn operator_name_string_extract<'a>(
+    oper_name: &'a [pg_query::Node],
+    context: &str,
+) -> Result<&'a str, WhereParseError> {
+    let [name_node] = oper_name else {
+        return Err(WhereParseError::Other {
+            error: format!("{context}: expected single name node"),
+        });
+    };
+    let Some(NodeEnum::String(s)) = &name_node.node else {
+        return Err(WhereParseError::Other {
+            error: format!("{context}: expected string node"),
+        });
+    };
+    Ok(s.sval.as_str())
+}
+
+/// Ensure a SubLink of type `ALL` uses the only operator that is
+/// anti-join-equivalent: `<>` (semantically `NOT IN`). Other operators
+/// produce a parse error and forward the query to origin.
+fn sublink_all_operator_check(oper_name: &[pg_query::Node]) -> Result<(), WhereParseError> {
+    let op = operator_name_string_extract(oper_name, "ALL operator")?;
+    if op == "<>" {
+        Ok(())
+    } else {
+        Err(WhereParseError::UnsupportedOperator {
+            operator: format!("ALL with operator '{op}'"),
+        })
+    }
 }
 
 /// Convert pg_query NullTest to WhereExpr (IS NULL / IS NOT NULL)
@@ -379,19 +419,7 @@ fn a_expr_convert(expr: &AExpr) -> Result<WhereExpr, WhereParseError> {
 
 /// Extract IN/NOT IN operator from name nodes
 fn in_operator_extract(name_nodes: &[pg_query::Node]) -> Result<MultiOp, WhereParseError> {
-    let [name_node] = name_nodes else {
-        return Err(WhereParseError::Other {
-            error: "IN operator: expected single name node".to_owned(),
-        });
-    };
-
-    let Some(NodeEnum::String(name_str)) = &name_node.node else {
-        return Err(WhereParseError::Other {
-            error: "IN operator: expected string node".to_owned(),
-        });
-    };
-
-    match name_str.sval.as_str() {
+    match operator_name_string_extract(name_nodes, "IN operator")? {
         "=" => Ok(MultiOp::In),
         "<>" => Ok(MultiOp::NotIn),
         other => Err(WhereParseError::UnsupportedOperator {

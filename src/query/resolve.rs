@@ -930,6 +930,7 @@ fn window_spec_resolve(
         order_by.push(ResolvedOrderByClause {
             expr: resolved_expr,
             direction: clause.direction.clone(),
+            null_order: clause.null_order,
         });
     }
     Ok(ResolvedWindowSpec {
@@ -1032,6 +1033,7 @@ fn order_by_resolve(
         resolved.push(ResolvedOrderByClause {
             expr: resolved_expr,
             direction: clause.direction.clone(),
+            null_order: clause.null_order,
         });
     }
     Ok(resolved)
@@ -1063,6 +1065,7 @@ fn order_by_as_identifiers(order_by: &[OrderByClause]) -> Vec<ResolvedOrderByCla
             ResolvedOrderByClause {
                 expr,
                 direction: clause.direction.clone(),
+                null_order: clause.null_order,
             }
         })
         .collect()

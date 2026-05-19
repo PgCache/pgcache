@@ -17,7 +17,7 @@ use crate::query::ast::{Deparse, QueryBody, QueryExpr, TableNode};
 use crate::query::constraints::{
     TableConstraint, analyze_query_constraints, table_constraints_subsumed,
 };
-use crate::query::decorrelate::query_expr_decorrelate;
+use crate::query::decorrelate::{DecorrelateError, query_expr_decorrelate};
 use crate::query::evaluate::resolved_where_expr_supported;
 use crate::query::resolved::{
     ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, query_expr_resolve,
@@ -216,10 +216,25 @@ impl WriterRegistration {
                     )
                     .await
                 {
-                    error!(
-                        "query register failed for {fingerprint}: {}",
-                        error_chain_format(e.current_context()),
-                    );
+                    // A non-decorrelatable correlated subquery is a routing
+                    // decision (forward to origin), not a fault — log at debug
+                    // so it doesn't surface as a swallowed error to upstream
+                    // log scrapers (PGC-104 harness, etc.).
+                    let ctx = e.current_context();
+                    if matches!(
+                        ctx,
+                        CacheError::DecorrelateError(DecorrelateError::NonDecorrelatable { .. })
+                    ) {
+                        debug!(
+                            "query {fingerprint} forwarded (not decorrelatable): {}",
+                            error_chain_format(ctx),
+                        );
+                    } else {
+                        error!(
+                            "query register failed for {fingerprint}: {}",
+                            error_chain_format(ctx),
+                        );
+                    }
                     self.query_failed_cleanup(core, fingerprint);
                 }
             }

@@ -44,7 +44,9 @@ SELECT unique1, (SELECT count(*) FROM onek) AS total
 query T
 SELECT count(*) FROM onek WHERE four = ANY (SELECT four FROM onek WHERE ten = 0);
 
-# pgcache: cached
+# Non-equality `<op> ALL` (PGC-146): only `<>` is anti-join-equivalent;
+# `< ALL`/`> ALL`/etc. have min/max semantics — forwarded to origin.
+# pgcache: passthrough
 query T
 SELECT count(*) FROM onek WHERE unique1 < ALL (SELECT unique1 FROM onek WHERE ten = 0);
 

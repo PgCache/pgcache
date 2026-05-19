@@ -8,8 +8,8 @@ use rootcause::Report;
 use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::catalog::ColumnMetadata;
 use crate::query::ast::{
-    ArithmeticOp, BinaryOp, Deparse, JoinType, LiteralValue, MultiOp, OrderDirection, SetOpType,
-    SubLinkType, TableAlias, UnaryOp, ValuesClause,
+    ArithmeticOp, BinaryOp, Deparse, JoinType, LiteralValue, MultiOp, NullOrder, OrderDirection,
+    SetOpType, SubLinkType, TableAlias, UnaryOp, ValuesClause,
 };
 
 error_set! {
@@ -1421,6 +1421,7 @@ impl Deparse for ResolvedJoinNode {
 pub struct ResolvedOrderByClause {
     pub expr: ResolvedScalarExpr,
     pub direction: OrderDirection,
+    pub null_order: NullOrder,
 }
 
 impl ResolvedOrderByClause {
@@ -1438,6 +1439,7 @@ impl Deparse for ResolvedOrderByClause {
             OrderDirection::Asc => buf.push_str(" ASC"),
             OrderDirection::Desc => buf.push_str(" DESC"),
         }
+        self.null_order.deparse(buf);
         buf
     }
 }

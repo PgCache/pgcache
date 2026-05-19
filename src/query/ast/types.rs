@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use ecow::EcoString;
 use ordered_float::NotNan;
-use pg_query::protobuf::SortByDir;
+use pg_query::protobuf::{SortByDir, SortByNulls};
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
@@ -2219,6 +2219,7 @@ impl TryFrom<pg_query::protobuf::SubLinkType> for SubLinkType {
 pub struct OrderByClause {
     pub expr: ScalarExpr,
     pub direction: OrderDirection,
+    pub null_order: NullOrder,
 }
 
 impl OrderByClause {
@@ -2234,7 +2235,49 @@ impl Deparse for OrderByClause {
         self.expr.deparse(buf);
         buf.push(' ');
         self.direction.deparse(buf);
+        self.null_order.deparse(buf);
         buf
+    }
+}
+
+/// Explicit NULLS ordering on an `ORDER BY` item. `Default` emits nothing so
+/// PostgreSQL applies its built-in ASC=last / DESC=first defaults (PGC-144).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NullOrder {
+    Default,
+    NullsFirst,
+    NullsLast,
+}
+
+impl NullOrder {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+        (self as &dyn Any).downcast_ref::<N>().into_iter()
+    }
+}
+
+impl Deparse for NullOrder {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            NullOrder::Default => {}
+            NullOrder::NullsFirst => buf.push_str(" NULLS FIRST"),
+            NullOrder::NullsLast => buf.push_str(" NULLS LAST"),
+        }
+        buf
+    }
+}
+
+impl TryFrom<SortByNulls> for NullOrder {
+    type Error = AstError;
+
+    fn try_from(n: SortByNulls) -> Result<Self, Self::Error> {
+        match n {
+            SortByNulls::SortbyNullsDefault => Ok(NullOrder::Default),
+            SortByNulls::SortbyNullsFirst => Ok(NullOrder::NullsFirst),
+            SortByNulls::SortbyNullsLast => Ok(NullOrder::NullsLast),
+            SortByNulls::Undefined => Err(AstError::UnsupportedFeature {
+                feature: format!("ORDER BY NULLS ordering: {n:?}"),
+            }),
+        }
     }
 }
 
