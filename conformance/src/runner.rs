@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use sqllogictest::{DefaultColumnType, QueryExpect, Record, SortMode, parse_file};
+use tokio::time::{Instant, sleep};
 
 use crate::annotation::{self, Routing};
 use crate::cdc_settling;
@@ -186,6 +187,10 @@ fn suite_files(path: &Path) -> Result<Vec<PathBuf>> {
 /// failing-but-up cache never trips this.
 const UNHEALTHY_ABORT_THRESHOLD: u32 = 3;
 
+/// Backoff between asserted-run retries while waiting for a `cached`
+/// query's deferred registration/population to land (PGC-148).
+const ROUTING_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
 /// Count one more consecutive unhealthy query. Trips the breaker once
 /// the cache has been unavailable for `UNHEALTHY_ABORT_THRESHOLD`
 /// queries in a row: records a single `CacheUnavailable` marker and
@@ -254,7 +259,7 @@ async fn run_file(
     // it before pgcache is queried.
     let mut pending_lsn: Option<u64> = None;
 
-    for record in records {
+    'records: for record in records {
         match record {
             Record::Comment(lines) => {
                 routing = annotation::scan(lines.iter().map(String::as_str))
@@ -334,8 +339,8 @@ async fn run_file(
                 if settle_failed {
                     tracing::warn!("cache did not settle before hit attempt");
                 }
-                let actual = pgcache.run(&sql).await;
-                let after = match snapshot_checked(
+                let mut actual = pgcache.run(&sql).await;
+                let mut after = match snapshot_checked(
                     status.snapshot().await,
                     "after",
                     &suite,
@@ -352,6 +357,43 @@ async fn run_file(
                         continue;
                     }
                 };
+
+                // `cache_settle` only sees registered queries, so a just-seen
+                // `cached` query whose registration hasn't reached the writer
+                // yet looks "settled" and the asserted run races population
+                // (PGC-148). Re-run until the asserted hit lands, bounded by
+                // the timeout; normally the first run already hit so this
+                // never loops.
+                if routing == Routing::Cached {
+                    let deadline = Instant::now() + cdc_timeout;
+                    while crate::routing_check::assert_routing(routing, &before, &after).is_err()
+                        && Instant::now() < deadline
+                    {
+                        sleep(ROUTING_RETRY_BACKOFF).await;
+                        actual = pgcache.run(&sql).await;
+                        // `snapshot_checked`, not a silent break: a cache that
+                        // goes unreachable mid-retry must feed the health
+                        // breaker, not skip it and then hit the streak-reset
+                        // below on a stale `after`.
+                        after = match snapshot_checked(
+                            status.snapshot().await,
+                            "retry",
+                            &suite,
+                            &sql,
+                            report,
+                            unhealthy_streak,
+                        ) {
+                            Ok(s) => s,
+                            Err(cf) => {
+                                routing = Routing::Any;
+                                if cf.is_break() {
+                                    return Ok(ControlFlow::Break(()));
+                                }
+                                continue 'records;
+                            }
+                        };
+                    }
+                }
 
                 let strategy = sort_strategy(&sql, &expected);
                 let offending = match log_tailer.as_deref_mut() {

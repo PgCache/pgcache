@@ -5,9 +5,10 @@
 //! `cdc.last_applied_lsn`, both read from `/status`.
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use pgcache_lib::cache::StatusResponse;
 use tokio::time::{Instant, sleep};
 
@@ -117,8 +118,7 @@ impl StatusClient {
         // don't observe "settled" before the query even enters Loading.
         sleep(Duration::from_millis(20)).await;
 
-        let deadline = Instant::now() + timeout;
-        loop {
+        crate::poll::poll_until(timeout, Duration::from_millis(25), || async move {
             let resp = self.fetch().await?;
             let in_flight: Vec<String> = resp
                 .queries
@@ -127,16 +127,15 @@ impl StatusClient {
                 .map(|q| format!("{}={}", q.fingerprint, q.state))
                 .collect();
             if in_flight.is_empty() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                bail!(
+                Ok(ControlFlow::Break(()))
+            } else {
+                Ok(ControlFlow::Continue(format!(
                     "cache did not settle within {timeout:?}; in-flight: {}",
                     in_flight.join(", ")
-                );
+                )))
             }
-            sleep(Duration::from_millis(25)).await;
-        }
+        })
+        .await
     }
 }
 

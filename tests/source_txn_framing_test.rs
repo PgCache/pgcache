@@ -329,26 +329,13 @@ async fn test_txn_invalidation_under_small_cache_no_deadlock() -> Result<(), Err
     Ok(())
 }
 
-/// PGC-147: population↔CDC-frame contention over one base table's shared
-/// source cache table must keep the cache consistent and never reset it.
-///
-/// Several *different-subset* decorrelated correlated subqueries each
-/// materialize their subset into dl_t's single shared source cache table
-/// (population worker pool); interleaved CDC source transactions upsert
-/// overlapping rows into the same cache table with no settle between, so
-/// population is in flight while frames apply. This is the structural
-/// scenario behind the PGC-147 `40P01`.
-///
-/// One-directional invariant (red iff the bug regresses, never flaky): the
-/// cache stays consistent with origin and `cdc_settle` always succeeds (a
-/// writer reset surfaces as a `/status` 503 / settle timeout).
-///
-/// NOTE: this guards the contention path and the deferred-invalidation
-/// behaviour, but does *not* deterministically provoke the writer-side
-/// `40P01` itself — that victim case proved unreproducible probabilistically
-/// (see PGC-147; the population-side retry absorbs most `40P01`s as the
-/// population victim). The recovery path proper is covered by the
-/// fault-injection test `test_cdc_frame_deadlock_recovery`.
+/// PGC-147: under population↔CDC-frame contention on one table's shared
+/// source cache table, the cache stays consistent with origin and never
+/// resets — `cdc_settle` always succeeds (a writer reset surfaces as 503 /
+/// timeout). One-directional: red iff the bug regresses, never flaky.
+/// Doesn't deterministically provoke the writer `40P01` (unreproducible
+/// probabilistically — see `test_cdc_frame_deadlock_recovery`); guards the
+/// contention + deferred-invalidation path.
 #[tokio::test]
 async fn test_cdc_frame_population_contention_consistent() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
@@ -418,21 +405,13 @@ async fn test_cdc_frame_population_contention_consistent() -> Result<(), Error> 
     Ok(())
 }
 
-/// PGC-147 deterministic recovery test (only built with
-/// `--features fault-injection`; run `--test-threads=1`).
-///
-/// The writer-side CDC `40P01`-victim path is a timing race that cannot be
-/// provoked probabilistically (conformance 20+ runs, contention tests: zero),
-/// so it is forced via the env-armed one-shot `PGCACHE_FAULT_CDC_DEADLOCK_ONCE`:
-/// the first CDC insert that occurs while a query is cached enters recovery
-/// instead of applying — exactly as a real `40P01` victim would.
-///
-/// Asserts the full recovery contract: the cache is **not** reset
-/// (`cdc_settle` succeeds — a reset → `/status` 503 → timeout), the dependent
-/// query is invalidated, and it repopulates cleanly from origin (proving the
-/// affected cache table was truncated, not left with stale rows), with results
-/// correct throughout. Pre-fix the writer propagated the `40P01` and reset the
-/// entire cache mid-load.
+/// PGC-147 deterministic recovery test (`--features fault-injection`,
+/// `--test-threads=1`). The writer `40P01`-victim path is unreproducible
+/// probabilistically, so it's forced via the env one-shot
+/// `PGCACHE_FAULT_CDC_DEADLOCK_ONCE`. Asserts the full recovery contract: no
+/// cache reset (`cdc_settle` succeeds), the dependent query is invalidated
+/// then repopulates cleanly (cache table was truncated, not left stale),
+/// results correct throughout.
 #[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn test_cdc_frame_deadlock_recovery() -> Result<(), Error> {

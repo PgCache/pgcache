@@ -8,10 +8,10 @@
 //! wire-side `received`/`flushed` gauges do not imply effects are
 //! visible in the cache.
 
+use std::ops::ControlFlow;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-use tokio::time::{Instant, sleep};
+use anyhow::{Context, Result, anyhow};
 use tokio_postgres::types::PgLsn;
 
 /// A source of pgcache's current `last_applied_lsn` (the `/status`
@@ -32,24 +32,21 @@ pub fn lsn_parse(s: &str) -> Result<u64> {
 /// Poll `source` until its `last_applied_lsn` reaches `target`, or fail
 /// once `timeout` elapses.
 pub async fn settle(source: &impl LsnSource, target: u64, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    let poll_interval = Duration::from_millis(25);
-    loop {
+    crate::poll::poll_until(timeout, Duration::from_millis(25), || async {
         let applied = source
             .last_applied_lsn()
             .await
             .context("polling /status::cdc.last_applied_lsn")?;
         if applied >= target {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
+            Ok(ControlFlow::Break(()))
+        } else {
+            Ok(ControlFlow::Continue(format!(
                 "CDC settling timed out after {timeout:?}: applied LSN {applied} \
                  has not reached target {target}"
-            );
+            )))
         }
-        sleep(poll_interval).await;
-    }
+    })
+    .await
 }
 
 #[cfg(test)]

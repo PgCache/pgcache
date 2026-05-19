@@ -5,6 +5,7 @@ pub mod compare;
 pub mod drivers;
 pub mod fixtures;
 pub mod log_tail;
+pub mod poll;
 pub mod report;
 pub mod routing_check;
 pub mod runner;
