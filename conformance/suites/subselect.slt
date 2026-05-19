@@ -1,0 +1,114 @@
+# Curated port of PostgreSQL src/test/regress/sql/subselect.sql — the
+# subquery result-correctness matrix that exercises pgcache's
+# decorrelation (ADR-014..017): uncorrelated and correlated EXISTS /
+# NOT EXISTS / IN / NOT IN / ANY / ALL / scalar subqueries, plus a
+# FROM-clause derived table. Run against the `onek` / `j1_tbl` /
+# `j2_tbl` fixtures.
+#
+# Origin is the oracle: no results are inlined. Queries use `count(*)`
+# (single deterministic row) so the assertion is purely whether
+# pgcache's decorrelated result matches origin — independent of row
+# ordering.
+#
+# Scope deviations from upstream subselect.sql: it is largely EXPLAIN
+# / planner-internal (subquery pull-up, materialization) and built on
+# tenk1/int4_tbl/int8_tbl/subselect_tbl/LATERAL — none pgcache-relevant
+# or available as fixtures. The decorrelation-relevant shapes are
+# adapted to the onek/j-table fixtures (onek columns are NOT NULL, so
+# NOT IN has well-defined semantics). Recursive/CTE subqueries are
+# deferred to with.slt.
+
+#
+# Uncorrelated subqueries.
+#
+
+# pgcache: cached
+query T
+SELECT count(*) FROM onek WHERE hundred IN (SELECT hundred FROM onek WHERE ten = 0);
+
+# pgcache: cached
+query T
+SELECT count(*) FROM onek WHERE thousand NOT IN (SELECT thousand FROM onek WHERE ten = 0);
+
+# pgcache: cached
+query T
+SELECT count(*) FROM onek WHERE unique1 < (SELECT max(unique1) FROM onek WHERE ten = 0);
+
+# Scalar subquery in the SELECT list.
+# pgcache: cached
+query TT
+SELECT unique1, (SELECT count(*) FROM onek) AS total
+  FROM onek WHERE unique1 < 5 ORDER BY unique1;
+
+# pgcache: cached
+query T
+SELECT count(*) FROM onek WHERE four = ANY (SELECT four FROM onek WHERE ten = 0);
+
+# pgcache: cached
+query T
+SELECT count(*) FROM onek WHERE unique1 < ALL (SELECT unique1 FROM onek WHERE ten = 0);
+
+#
+# Correlated subqueries — the decorrelation core (ADR-014..017).
+# Only equality correlation predicates are decorrelatable.
+#
+
+# Correlated EXISTS → INNER JOIN + DISTINCT (ADR-014).
+# pgcache: cached
+query T
+SELECT count(*) FROM onek o
+  WHERE EXISTS (SELECT 1 FROM onek i WHERE i.unique2 = o.unique1 AND i.ten = 0);
+
+# Correlated NOT EXISTS → LEFT JOIN + IS NULL (ADR-014).
+# pgcache: cached
+query T
+SELECT count(*) FROM onek o
+  WHERE NOT EXISTS (SELECT 1 FROM onek i WHERE i.unique2 = o.unique1 AND i.ten = 0);
+
+# Correlated IN → semi-join (ADR-016).
+# pgcache: cached
+query T
+SELECT count(*) FROM onek o
+  WHERE o.unique1 IN (SELECT i.unique2 FROM onek i WHERE i.hundred = o.hundred);
+
+# Correlated NOT IN → anti-join (ADR-017).
+# pgcache: cached
+query T
+SELECT count(*) FROM onek o
+  WHERE o.unique1 NOT IN (SELECT i.unique2 FROM onek i WHERE i.hundred = o.hundred);
+
+# Correlated scalar subquery in the SELECT list (ADR-015) —
+# pgcache forwards this shape.
+# pgcache: passthrough
+query TT
+SELECT o.unique1, (SELECT count(*) FROM onek i WHERE i.hundred = o.hundred) AS c
+  FROM onek o WHERE o.unique1 < 5 ORDER BY o.unique1;
+
+# Correlated scalar subquery in WHERE.
+# pgcache: cached
+query T
+SELECT count(*) FROM onek o
+  WHERE o.unique1 = (SELECT max(i.unique1) FROM onek i WHERE i.hundred = o.hundred);
+
+# Non-equality correlation — not decorrelatable; pgcache forwards.
+# pgcache: passthrough
+query T
+SELECT count(*) FROM onek o
+  WHERE EXISTS (SELECT 1 FROM onek i WHERE i.unique2 < o.unique1 AND i.ten = 0);
+
+#
+# Subquery in FROM (derived table), and correlated EXISTS across the
+# join fixtures.
+#
+
+# Derived-table FROM — pgcache forwards this shape.
+# pgcache: passthrough
+query T
+SELECT count(*)
+  FROM (SELECT unique1, ten FROM onek WHERE ten = 0) ss
+  WHERE ss.unique1 < 500;
+
+# pgcache: cached
+query T
+SELECT count(*) FROM j1_tbl
+  WHERE EXISTS (SELECT 1 FROM j2_tbl WHERE j2_tbl.i = j1_tbl.i);
