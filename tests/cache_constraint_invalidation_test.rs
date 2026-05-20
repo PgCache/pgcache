@@ -377,6 +377,10 @@ async fn test_update_where_column_entering_result_set() -> Result<(), Error> {
     )
     .await?;
 
+    // Drain setup INSERT CDC events before priming so they don't race the
+    // query registration that follows.
+    ctx.cdc_settle().await?;
+
     // Prime the cache with join query filtering by users.status = 'active'
     // Should only return orders for user 1 (amounts 100, 200)
     let res = ctx
@@ -400,6 +404,11 @@ async fn test_update_where_column_entering_result_set() -> Result<(), Error> {
         2,
         &[("user_id", "1"), ("amount", "200"), ("status", "active")],
     )?;
+
+    // Wait for the query to be registered + populated before the UPDATE,
+    // otherwise the UPDATE's CDC event can arrive at the writer before the
+    // query exists to invalidate.
+    ctx.cache_settle().await?;
 
     // UPDATE: Change user 2's status from 'inactive' to 'active'
     // This should invalidate the cache because user 2's orders should now appear
