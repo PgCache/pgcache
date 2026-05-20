@@ -88,6 +88,12 @@ pub fn node_convert_to_expr(node: &pg_query::Node) -> Result<WhereExpr, WherePar
             let scalar = node_convert_to_scalar_expr(node)?;
             Ok(WhereExpr::Scalar(scalar))
         }
+        Some(NodeEnum::TypeCast(_)) => {
+            // Route through the scalar converter to reuse the existing
+            // ScalarExpr::TypeCast resolve/Deparse/constraints path.
+            let scalar = node_convert_to_scalar_expr(node)?;
+            Ok(WhereExpr::Scalar(scalar))
+        }
         unsupported => {
             trace!(?unsupported, "unsupported WHERE clause node type");
             Err(WhereParseError::UnsupportedPattern)
@@ -1966,5 +1972,45 @@ mod tests {
         // ArithmeticExpr::deparse parenthesizes each level, so nested
         // `a % 10000 + 1` round-trips as `((a % 10000) + 1)`.
         assert_eq!(buf, "SELECT * FROM t WHERE x = ((a % 10000) + 1)");
+    }
+
+    #[test]
+    fn where_clause_typecast_column() {
+        // PGC-120: column cast on the left of a comparison. Must parse as
+        // WhereExpr::Scalar(ScalarExpr::TypeCast{...}), not UnsupportedPattern.
+        let where_clause = where_clause_parse("SELECT * FROM t WHERE col::text = 'foo'")
+            .unwrap()
+            .unwrap();
+        let WhereExpr::Binary(binary) = &where_clause else {
+            panic!("expected Binary, got {where_clause:?}");
+        };
+        let WhereExpr::Scalar(ScalarExpr::TypeCast { expr, target_type }) = &*binary.lexpr else {
+            panic!("expected Scalar(TypeCast), got {:?}", binary.lexpr);
+        };
+        assert_eq!(target_type.as_str(), "text");
+        assert!(matches!(&**expr, ScalarExpr::Column(c) if c.column == "col"));
+    }
+
+    #[test]
+    fn where_clause_typecast_deparse() {
+        // PGC-120: round-trip a few common cast shapes through Deparse.
+        for sql in [
+            "SELECT * FROM t WHERE col::text = 'foo'",
+            "SELECT * FROM t WHERE created_at::date = '2024-01-01'",
+            "SELECT * FROM t WHERE (a + b)::int > 10",
+        ] {
+            let q = query_expr_convert(&pg_query::parse(sql).unwrap())
+                .unwrap_or_else(|e| panic!("convert failed for {sql}: {e}"));
+            let mut buf = String::new();
+            q.deparse(&mut buf);
+            // Re-parse the deparsed SQL to confirm semantic round-trip.
+            let q2 = query_expr_convert(&pg_query::parse(&buf).unwrap())
+                .unwrap_or_else(|e| panic!("re-convert failed for {buf:?}: {e}"));
+            assert_eq!(
+                query_expr_fingerprint(&q),
+                query_expr_fingerprint(&q2),
+                "fingerprint mismatch after deparse round-trip\n  in:  {sql}\n  out: {buf}",
+            );
+        }
     }
 }
