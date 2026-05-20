@@ -3551,4 +3551,93 @@ mod tests {
             result
         );
     }
+
+    // ---------------------------------------------------------------
+    // PGC-123: HAVING aggregate metadata must survive resolution and
+    // resolved-side deparse.
+    // ---------------------------------------------------------------
+
+    fn resolved_having_lhs_function(node: &ResolvedSelectNode) -> &ResolvedFunctionCall {
+        let having = node.having.as_ref().expect("resolved HAVING present");
+        let ResolvedWhereExpr::Binary(binary) = having else {
+            panic!("expected Binary HAVING, got {having:?}");
+        };
+        let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Function(func)) = binary.lexpr.as_ref()
+        else {
+            panic!("expected Scalar(Function) on LHS, got {:?}", binary.lexpr);
+        };
+        func
+    }
+
+    #[test]
+    fn test_having_filter_resolves() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let resolved = resolve_sql(
+            "SELECT name FROM users GROUP BY name \
+             HAVING COUNT(*) FILTER (WHERE id > 0) > 5",
+            &tables,
+        );
+
+        let func = resolved_having_lhs_function(&resolved);
+        assert_eq!(func.name, "count");
+        assert!(func.agg_star);
+        assert!(
+            func.agg_filter.is_some(),
+            "FILTER (WHERE ...) must survive resolution"
+        );
+    }
+
+    #[test]
+    fn test_having_distinct_resolves() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let resolved = resolve_sql(
+            "SELECT name FROM users GROUP BY name HAVING COUNT(DISTINCT id) > 1",
+            &tables,
+        );
+
+        let func = resolved_having_lhs_function(&resolved);
+        assert!(func.agg_distinct, "DISTINCT must survive resolution");
+    }
+
+    #[test]
+    fn test_having_aggregate_order_by_resolves() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let resolved = resolve_sql(
+            "SELECT id FROM users GROUP BY id \
+             HAVING string_agg(name, ',' ORDER BY name) <> ''",
+            &tables,
+        );
+
+        let func = resolved_having_lhs_function(&resolved);
+        assert_eq!(func.name, "string_agg");
+        assert!(
+            !func.agg_order.is_empty(),
+            "aggregate ORDER BY must survive resolution"
+        );
+    }
+
+    #[test]
+    fn test_having_filter_resolved_deparse_contains_filter() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let resolved = resolve_sql(
+            "SELECT name FROM users GROUP BY name \
+             HAVING COUNT(*) FILTER (WHERE id > 0) > 5",
+            &tables,
+        );
+
+        let mut buf = String::new();
+        resolved.deparse(&mut buf);
+        assert!(
+            buf.contains("FILTER (WHERE "),
+            "resolved deparse must keep FILTER, got: {buf}"
+        );
+    }
 }

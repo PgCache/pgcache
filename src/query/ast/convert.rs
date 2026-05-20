@@ -4738,4 +4738,123 @@ mod tests {
         offset_only.deparse(&mut buf);
         assert_eq!(buf, " OFFSET 5");
     }
+
+    // ---------------------------------------------------------------
+    // PGC-123: HAVING aggregate metadata (DISTINCT / ORDER BY / FILTER)
+    //
+    // Predicates flow through `WhereExpr`, but the function leaf is wrapped in
+    // `WhereExpr::Scalar(ScalarExpr::Function(FunctionCall))` — `FunctionCall`
+    // already carries the aggregate metadata. These tests assert that the
+    // metadata round-trips through parse + deparse for HAVING.
+    // ---------------------------------------------------------------
+
+    /// Walk the LHS of a `f(...) <op> <rhs>` HAVING expression to the
+    /// `FunctionCall` leaf.
+    fn having_lhs_function(select: &SelectNode) -> &FunctionCall {
+        let having = select.having.as_ref().expect("HAVING present");
+        let WhereExpr::Binary(binary) = having else {
+            panic!("expected Binary HAVING, got {having:?}");
+        };
+        let WhereExpr::Scalar(ScalarExpr::Function(func)) = binary.lexpr.as_ref() else {
+            panic!("expected Scalar(Function) on LHS, got {:?}", binary.lexpr);
+        };
+        func
+    }
+
+    fn select_deparse(select: &SelectNode) -> String {
+        let mut buf = String::new();
+        select.deparse(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn test_having_count_distinct_preserved() {
+        let select = parse_select(
+            "SELECT name FROM users GROUP BY name HAVING COUNT(DISTINCT id) > 1",
+        );
+        let func = having_lhs_function(&select);
+        assert_eq!(func.name, "count");
+        assert!(func.agg_distinct, "DISTINCT must survive HAVING conversion");
+
+        let out = select_deparse(&select);
+        assert!(
+            out.contains("COUNT(DISTINCT "),
+            "deparsed HAVING must contain `COUNT(DISTINCT ...)`, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_having_count_filter_preserved() {
+        let select = parse_select(
+            "SELECT name FROM users GROUP BY name \
+             HAVING COUNT(*) FILTER (WHERE id > 0) > 5",
+        );
+        let func = having_lhs_function(&select);
+        assert_eq!(func.name, "count");
+        assert!(func.agg_star, "COUNT(*) star flag must survive");
+        assert!(
+            func.agg_filter.is_some(),
+            "FILTER (WHERE ...) must survive HAVING conversion"
+        );
+
+        let out = select_deparse(&select);
+        assert!(
+            out.contains("FILTER (WHERE "),
+            "deparsed HAVING must contain `FILTER (WHERE ...)`, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_having_aggregate_order_by_preserved() {
+        // `string_agg(name, ',' ORDER BY name)` — ORDER BY *inside* the aggregate.
+        let select = parse_select(
+            "SELECT id FROM users GROUP BY id \
+             HAVING string_agg(name, ',' ORDER BY name) <> ''",
+        );
+        let func = having_lhs_function(&select);
+        assert_eq!(func.name, "string_agg");
+        assert!(
+            !func.agg_order.is_empty(),
+            "aggregate ORDER BY must survive HAVING conversion"
+        );
+
+        let out = select_deparse(&select);
+        assert!(
+            out.contains("ORDER BY"),
+            "deparsed HAVING must keep aggregate ORDER BY, got: {out}"
+        );
+    }
+
+    #[test]
+    fn test_having_combined_filter_distinct_preserved() {
+        // Belt-and-suspenders: DISTINCT and FILTER on the same aggregate.
+        let select = parse_select(
+            "SELECT name FROM users GROUP BY name \
+             HAVING COUNT(DISTINCT id) FILTER (WHERE id > 0) > 1",
+        );
+        let func = having_lhs_function(&select);
+        assert!(func.agg_distinct, "DISTINCT must survive");
+        assert!(func.agg_filter.is_some(), "FILTER must survive");
+
+        let out = select_deparse(&select);
+        assert!(out.contains("COUNT(DISTINCT "), "deparsed: {out}");
+        assert!(out.contains("FILTER (WHERE "), "deparsed: {out}");
+    }
+
+    #[test]
+    fn test_having_aggregate_roundtrip_stable() {
+        // Parse → deparse → parse → deparse must converge (fixed point).
+        let sql = "SELECT name FROM users GROUP BY name \
+                   HAVING COUNT(*) FILTER (WHERE id > 0) > 5";
+        let select1 = parse_select(sql);
+        let deparsed1 = select_deparse(&select1);
+
+        let select2 = parse_select(&deparsed1);
+        let deparsed2 = select_deparse(&select2);
+
+        assert_eq!(
+            deparsed1, deparsed2,
+            "HAVING aggregate-metadata deparse must round-trip stably"
+        );
+    }
 }
