@@ -4,10 +4,9 @@
 use rootcause::Report;
 
 use crate::cache::QueryParameters;
-use crate::query::ast::{
-    JoinQual, LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectNode, TableSource, WhereExpr,
-};
+use crate::query::ast::{LiteralValue, QueryExpr, ScalarExpr, SelectNode};
 
+use super::super::walk::{QueryWalkerMut, query_expr_walk_mut, select_node_walk_mut};
 use super::super::{AstTransformError, AstTransformResult};
 use super::parameter_to_literal;
 
@@ -16,22 +15,8 @@ pub fn query_expr_parameters_replace(
     parameters: &QueryParameters,
 ) -> AstTransformResult<QueryExpr> {
     let mut new_query = query_expr.clone();
-
-    for cte in &mut new_query.ctes {
-        let replaced = query_expr_parameters_replace(&cte.query, parameters)?;
-        cte.query = replaced;
-    }
-
-    query_body_parameters_replace(&mut new_query.body, parameters)?;
-
-    if let Some(limit) = &mut new_query.limit {
-        if let Some(count) = &mut limit.count {
-            literal_value_parameters_replace(count, parameters)?;
-        }
-        if let Some(offset) = &mut limit.offset {
-            literal_value_parameters_replace(offset, parameters)?;
-        }
-    }
+    let mut replacer = ParameterReplacer { parameters };
+    query_expr_walk_mut(&mut new_query, &mut replacer)?;
 
     // Bind-time substitution can newly expose pure-literal arithmetic that the
     // convert-time fold couldn't reach (e.g. `$1 % 10 + 1` once $1 is bound).
@@ -40,168 +25,31 @@ pub fn query_expr_parameters_replace(
     Ok(new_query)
 }
 
-fn query_body_parameters_replace(
-    body: &mut QueryBody,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    match body {
-        QueryBody::Select(select_node) => {
-            select_node_parameters_replace(select_node, parameters)?;
-        }
-        QueryBody::Values(_) => {}
-        QueryBody::SetOp(set_op) => {
-            query_expr_parameters_replace_mut(&mut set_op.left, parameters)?;
-            query_expr_parameters_replace_mut(&mut set_op.right, parameters)?;
-        }
-    }
-    Ok(())
-}
-
-fn query_expr_parameters_replace_mut(
-    query_expr: &mut QueryExpr,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    query_body_parameters_replace(&mut query_expr.body, parameters)?;
-    if let Some(limit) = &mut query_expr.limit {
-        if let Some(count) = &mut limit.count {
-            literal_value_parameters_replace(count, parameters)?;
-        }
-        if let Some(offset) = &mut limit.offset {
-            literal_value_parameters_replace(offset, parameters)?;
-        }
-    }
-    Ok(())
-}
-
 pub fn select_node_parameters_replace(
     select_node: &mut SelectNode,
     parameters: &QueryParameters,
 ) -> AstTransformResult<()> {
-    if let Some(where_clause) = &mut select_node.where_clause {
-        where_expr_parameters_replace(where_clause, parameters)?;
-    }
-
-    if let Some(having) = &mut select_node.having {
-        where_expr_parameters_replace(having, parameters)?;
-    }
-
-    for table_source in &mut select_node.from {
-        table_source_parameters_replace(table_source, parameters)?;
-    }
-
-    Ok(())
+    let mut replacer = ParameterReplacer { parameters };
+    select_node_walk_mut(select_node, &mut replacer)
 }
 
-fn table_source_parameters_replace(
-    table_source: &mut TableSource,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    match table_source {
-        TableSource::Join(join) => {
-            if let JoinQual::On(condition) = &mut join.qual {
-                where_expr_parameters_replace(condition, parameters)?;
-            }
-            table_source_parameters_replace(&mut join.left, parameters)?;
-            table_source_parameters_replace(&mut join.right, parameters)?;
-        }
-        TableSource::Subquery(subquery) => {
-            query_expr_parameters_replace_mut(&mut subquery.query, parameters)?;
-        }
-        TableSource::CteRef(cte_ref) => {
-            query_expr_parameters_replace_mut(&mut cte_ref.query, parameters)?;
-        }
-        TableSource::Table(_) => {}
-    }
-    Ok(())
+struct ParameterReplacer<'a> {
+    parameters: &'a QueryParameters,
 }
 
-fn where_expr_parameters_replace(
-    expr: &mut WhereExpr,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    match expr {
-        WhereExpr::Scalar(scalar) => scalar_expr_parameters_replace(scalar, parameters)?,
-        WhereExpr::Unary(unary) => {
-            where_expr_parameters_replace(&mut unary.expr, parameters)?;
-        }
-        WhereExpr::Binary(binary) => {
-            where_expr_parameters_replace(&mut binary.lexpr, parameters)?;
-            where_expr_parameters_replace(&mut binary.rexpr, parameters)?;
-        }
-        WhereExpr::Multi(multi) => {
-            for expr in &mut multi.exprs {
-                where_expr_parameters_replace(expr, parameters)?;
-            }
-        }
-        WhereExpr::Subquery {
-            query, test_expr, ..
-        } => {
-            query_expr_parameters_replace_mut(query, parameters)?;
-            if let Some(test) = test_expr {
-                scalar_expr_parameters_replace(test, parameters)?;
-            }
-        }
-    }
-    Ok(())
-}
+impl QueryWalkerMut for ParameterReplacer<'_> {
+    type Error = Report<AstTransformError>;
 
-fn scalar_expr_parameters_replace(
-    expr: &mut ScalarExpr,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    match expr {
-        ScalarExpr::Literal(literal) => {
-            literal_value_parameters_replace(literal, parameters)?;
+    fn visit_scalar_post(&mut self, expr: &mut ScalarExpr) -> Result<(), Self::Error> {
+        if let ScalarExpr::Literal(literal) = expr {
+            literal_value_parameters_replace(literal, self.parameters)?;
         }
-        ScalarExpr::Column(_) => {}
-        ScalarExpr::Function(func) => {
-            for arg in &mut func.args {
-                scalar_expr_parameters_replace(arg, parameters)?;
-            }
-            for clause in &mut func.agg_order {
-                scalar_expr_parameters_replace(&mut clause.expr, parameters)?;
-            }
-            if let Some(filter) = &mut func.agg_filter {
-                where_expr_parameters_replace(filter, parameters)?;
-            }
-            if let Some(over) = &mut func.over {
-                for col in &mut over.partition_by {
-                    scalar_expr_parameters_replace(col, parameters)?;
-                }
-                for clause in &mut over.order_by {
-                    scalar_expr_parameters_replace(&mut clause.expr, parameters)?;
-                }
-            }
-        }
-        ScalarExpr::Case(case) => {
-            if let Some(arg) = &mut case.arg {
-                scalar_expr_parameters_replace(arg, parameters)?;
-            }
-            for when in &mut case.whens {
-                where_expr_parameters_replace(&mut when.condition, parameters)?;
-                scalar_expr_parameters_replace(&mut when.result, parameters)?;
-            }
-            if let Some(default) = &mut case.default {
-                scalar_expr_parameters_replace(default, parameters)?;
-            }
-        }
-        ScalarExpr::Arithmetic(arith) => {
-            scalar_expr_parameters_replace(&mut arith.left, parameters)?;
-            scalar_expr_parameters_replace(&mut arith.right, parameters)?;
-        }
-        ScalarExpr::Subquery(query) => {
-            query_expr_parameters_replace_mut(query, parameters)?;
-        }
-        ScalarExpr::Array(elems) => {
-            for elem in elems {
-                scalar_expr_parameters_replace(elem, parameters)?;
-            }
-        }
-        ScalarExpr::TypeCast { expr, .. } => {
-            scalar_expr_parameters_replace(expr, parameters)?;
-        }
+        Ok(())
     }
-    Ok(())
+
+    fn visit_literal(&mut self, literal: &mut LiteralValue) -> Result<(), Self::Error> {
+        literal_value_parameters_replace(literal, self.parameters)
+    }
 }
 
 fn literal_value_parameters_replace(
@@ -445,6 +293,26 @@ mod tests {
         assert_eq!(
             buf,
             "SELECT id FROM users WHERE age > (SELECT AVG(age) FROM users WHERE status = 'active')"
+        );
+    }
+
+    /// `SELECT id FROM … ORDER BY $1` — bind-time parameter substitution must
+    /// reach the top-level ORDER BY clause.
+    #[test]
+    fn test_ast_parameters_replace_in_order_by() {
+        let sql = "SELECT id FROM users ORDER BY $1";
+        let ast = pg_query::parse(sql).expect("parse SQL");
+        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+
+        let params = typed_text_params(vec![(Some(b"1"), PgType::INT4)]);
+        let replaced =
+            query_expr_parameters_replace(&query_expr, &params).expect("parameter replacement");
+
+        let mut buf = String::new();
+        replaced.deparse(&mut buf);
+        assert!(
+            !buf.contains("$1"),
+            "ORDER BY $1 should be bound, got: {buf}"
         );
     }
 

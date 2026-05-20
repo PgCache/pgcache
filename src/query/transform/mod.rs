@@ -3,6 +3,7 @@ mod parameters;
 mod pushdown;
 mod select_node;
 mod values;
+mod walk;
 
 use error_set::error_set;
 use rootcause::Report;

@@ -18,147 +18,37 @@
 //! - Any non-numeric operand (string, bool, null, parameter, array): not
 //!   folded.
 
+use std::convert::Infallible;
+
 use ordered_float::NotNan;
 
-use crate::query::ast::{
-    ArithmeticOp, JoinQual, LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
-    SelectColumns, SelectNode, TableSource, WhereExpr,
-};
+use crate::query::ast::{ArithmeticOp, LiteralValue, QueryExpr, ScalarExpr};
+
+use super::walk::{QueryWalkerMut, query_expr_walk_mut};
 
 /// Fold pure-literal arithmetic subtrees in `expr` in place.
 pub fn query_expr_constant_fold(expr: &mut QueryExpr) {
-    query_expr_fold(expr);
+    let mut folder = ConstantFolder;
+    // ConstantFolder::Error is Infallible, so the walker cannot fail.
+    let Ok(()) = query_expr_walk_mut(expr, &mut folder);
 }
 
-fn query_expr_fold(expr: &mut QueryExpr) {
-    for cte in &mut expr.ctes {
-        query_expr_fold(&mut cte.query);
-    }
-    query_body_fold(&mut expr.body);
-    for ob in &mut expr.order_by {
-        scalar_expr_fold(&mut ob.expr);
-    }
-}
+struct ConstantFolder;
 
-fn query_body_fold(body: &mut QueryBody) {
-    match body {
-        QueryBody::Select(node) => select_node_fold(node),
-        QueryBody::Values(_) => {}
-        QueryBody::SetOp(set_op) => {
-            query_expr_fold(&mut set_op.left);
-            query_expr_fold(&mut set_op.right);
-        }
-    }
-}
+impl QueryWalkerMut for ConstantFolder {
+    type Error = Infallible;
 
-fn select_node_fold(node: &mut SelectNode) {
-    if let SelectColumns::Columns(cols) = &mut node.columns {
-        for col in cols {
-            if let SelectColumn::Expr { expr, .. } = col {
-                scalar_expr_fold(expr);
-            }
+    fn visit_scalar_post(&mut self, expr: &mut ScalarExpr) -> Result<(), Self::Error> {
+        let ScalarExpr::Arithmetic(arith) = expr else {
+            return Ok(());
+        };
+        let (ScalarExpr::Literal(l), ScalarExpr::Literal(r)) = (&*arith.left, &*arith.right) else {
+            return Ok(());
+        };
+        if let Some(folded) = literal_arithmetic_fold(l, arith.op, r) {
+            *expr = ScalarExpr::Literal(folded);
         }
-    }
-    for source in &mut node.from {
-        table_source_fold(source);
-    }
-    if let Some(w) = &mut node.where_clause {
-        where_expr_fold(w);
-    }
-    if let Some(h) = &mut node.having {
-        where_expr_fold(h);
-    }
-}
-
-fn table_source_fold(source: &mut TableSource) {
-    match source {
-        TableSource::Join(join) => {
-            if let JoinQual::On(cond) = &mut join.qual {
-                where_expr_fold(cond);
-            }
-            table_source_fold(&mut join.left);
-            table_source_fold(&mut join.right);
-        }
-        TableSource::Subquery(sub) => query_expr_fold(&mut sub.query),
-        TableSource::CteRef(cte_ref) => query_expr_fold(&mut cte_ref.query),
-        TableSource::Table(_) => {}
-    }
-}
-
-fn where_expr_fold(expr: &mut WhereExpr) {
-    match expr {
-        WhereExpr::Scalar(scalar) => scalar_expr_fold(scalar),
-        WhereExpr::Unary(u) => where_expr_fold(&mut u.expr),
-        WhereExpr::Binary(b) => {
-            where_expr_fold(&mut b.lexpr);
-            where_expr_fold(&mut b.rexpr);
-        }
-        WhereExpr::Multi(m) => {
-            for e in &mut m.exprs {
-                where_expr_fold(e);
-            }
-        }
-        WhereExpr::Subquery {
-            query, test_expr, ..
-        } => {
-            query_expr_fold(query);
-            if let Some(test) = test_expr {
-                scalar_expr_fold(test);
-            }
-        }
-    }
-}
-
-fn scalar_expr_fold(expr: &mut ScalarExpr) {
-    match expr {
-        ScalarExpr::Arithmetic(arith) => {
-            scalar_expr_fold(&mut arith.left);
-            scalar_expr_fold(&mut arith.right);
-            if let (ScalarExpr::Literal(l), ScalarExpr::Literal(r)) = (&*arith.left, &*arith.right)
-                && let Some(folded) = literal_arithmetic_fold(l, arith.op, r)
-            {
-                *expr = ScalarExpr::Literal(folded);
-            }
-        }
-        ScalarExpr::Function(func) => {
-            for arg in &mut func.args {
-                scalar_expr_fold(arg);
-            }
-            for clause in &mut func.agg_order {
-                scalar_expr_fold(&mut clause.expr);
-            }
-            if let Some(filter) = &mut func.agg_filter {
-                where_expr_fold(filter);
-            }
-            if let Some(over) = &mut func.over {
-                for col in &mut over.partition_by {
-                    scalar_expr_fold(col);
-                }
-                for clause in &mut over.order_by {
-                    scalar_expr_fold(&mut clause.expr);
-                }
-            }
-        }
-        ScalarExpr::Case(case) => {
-            if let Some(arg) = &mut case.arg {
-                scalar_expr_fold(arg);
-            }
-            for when in &mut case.whens {
-                where_expr_fold(&mut when.condition);
-                scalar_expr_fold(&mut when.result);
-            }
-            if let Some(default) = &mut case.default {
-                scalar_expr_fold(default);
-            }
-        }
-        ScalarExpr::Subquery(query) => query_expr_fold(query),
-        ScalarExpr::Array(elems) => {
-            for elem in elems {
-                scalar_expr_fold(elem);
-            }
-        }
-        ScalarExpr::TypeCast { expr, .. } => scalar_expr_fold(expr),
-        ScalarExpr::Column(_) | ScalarExpr::Literal(_) => {}
+        Ok(())
     }
 }
 
@@ -221,7 +111,7 @@ fn float_op(a: f64, op: ArithmeticOp, b: f64) -> Option<LiteralValue> {
 mod tests {
     use super::*;
     use crate::cache::messages::QueryParameters;
-    use crate::query::ast::{query_expr_convert, query_expr_fingerprint};
+    use crate::query::ast::{WhereExpr, query_expr_convert, query_expr_fingerprint};
     use crate::query::transform::query_expr_parameters_replace;
     use bytes::Bytes;
     use postgres_types::Type as PgType;
