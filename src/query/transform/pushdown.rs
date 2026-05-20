@@ -61,7 +61,9 @@ fn select_node_pushdown_apply(mut select: ResolvedSelectNode) -> ResolvedSelectN
 
         for conjunct in conjuncts {
             // Check: all column refs target the subquery alias, and no subquery expressions
-            if !predicate_targets_subquery(&conjunct, alias) || predicate_has_subquery(&conjunct) {
+            if !predicate_targets_subquery(&conjunct, alias)
+                || conjunct.nodes::<ResolvedQueryExpr>().next().is_some()
+            {
                 remaining.push(conjunct);
                 continue;
             }
@@ -127,49 +129,6 @@ fn predicate_targets_subquery(expr: &ResolvedWhereExpr, alias: &str) -> bool {
         && columns
             .iter()
             .all(|col| col.schema.is_empty() && col.table == alias)
-}
-
-/// Check whether the predicate contains a Subquery variant anywhere.
-///
-/// We walk manually rather than using `nodes()` because that would traverse
-/// into the subquery's children — we only need to detect the variant's presence.
-fn predicate_has_subquery(expr: &ResolvedWhereExpr) -> bool {
-    match expr {
-        ResolvedWhereExpr::Subquery { .. } => true,
-        ResolvedWhereExpr::Scalar(scalar) => scalar_expr_has_subquery(scalar),
-        ResolvedWhereExpr::Unary(u) => predicate_has_subquery(&u.expr),
-        ResolvedWhereExpr::Binary(b) => {
-            predicate_has_subquery(&b.lexpr) || predicate_has_subquery(&b.rexpr)
-        }
-        ResolvedWhereExpr::Multi(m) => m.exprs.iter().any(predicate_has_subquery),
-    }
-}
-
-fn scalar_expr_has_subquery(expr: &ResolvedScalarExpr) -> bool {
-    match expr {
-        ResolvedScalarExpr::Subquery(_, _) => true,
-        ResolvedScalarExpr::Function(func) => func.args.iter().any(scalar_expr_has_subquery),
-        ResolvedScalarExpr::Arithmetic(arith) => {
-            scalar_expr_has_subquery(&arith.left) || scalar_expr_has_subquery(&arith.right)
-        }
-        ResolvedScalarExpr::Case(case) => {
-            case.arg
-                .as_ref()
-                .is_some_and(|a| scalar_expr_has_subquery(a))
-                || case.whens.iter().any(|w| {
-                    predicate_has_subquery(&w.condition) || scalar_expr_has_subquery(&w.result)
-                })
-                || case
-                    .default
-                    .as_ref()
-                    .is_some_and(|d| scalar_expr_has_subquery(d))
-        }
-        ResolvedScalarExpr::Array(elems) => elems.iter().any(scalar_expr_has_subquery),
-        ResolvedScalarExpr::TypeCast { expr, .. } => scalar_expr_has_subquery(expr),
-        ResolvedScalarExpr::Column(_)
-        | ResolvedScalarExpr::Identifier(_)
-        | ResolvedScalarExpr::Literal(_) => false,
-    }
 }
 
 /// Extract output column names from the leftmost SELECT of a query.

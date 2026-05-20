@@ -560,21 +560,13 @@ pub type WhereExprNodeIter<'a, N> =
 impl WhereExpr {
     /// Get all nodes of the given type within this WhereExpr tree
     pub fn nodes<N: Any>(&self) -> WhereExprNodeIter<'_, N> {
-        let current = ((self as &dyn Any)
-            .downcast_ref::<N>()
-            .or_else(|| match self {
-                WhereExpr::Unary(unary) => (unary as &dyn Any).downcast_ref::<N>(),
-                WhereExpr::Binary(binary) => (binary as &dyn Any).downcast_ref::<N>(),
-                WhereExpr::Multi(multi) => (multi as &dyn Any).downcast_ref::<N>(),
-                WhereExpr::Scalar(_) | WhereExpr::Subquery { .. } => None,
-            }))
-        .into_iter();
+        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
 
         let children: Box<dyn Iterator<Item = &N>> = match self {
             WhereExpr::Scalar(scalar) => Box::new(scalar.nodes()),
-            WhereExpr::Unary(unary) => Box::new(unary.expr.nodes()),
-            WhereExpr::Binary(binary) => Box::new(binary.lexpr.nodes().chain(binary.rexpr.nodes())),
-            WhereExpr::Multi(multi) => Box::new(multi.exprs.iter().flat_map(|expr| expr.nodes())),
+            WhereExpr::Unary(unary) => Box::new(unary.nodes()),
+            WhereExpr::Binary(binary) => Box::new(binary.nodes()),
+            WhereExpr::Multi(multi) => Box::new(multi.nodes()),
             WhereExpr::Subquery {
                 query, test_expr, ..
             } => {
@@ -1284,13 +1276,15 @@ impl SelectColumn {
         }
     }
 
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
+    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
         let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children: Box<dyn Iterator<Item = &'_ N>> = match self {
-            SelectColumn::Expr { expr, .. } => Box::new(expr.nodes()),
-            SelectColumn::Star(_) => Box::new(std::iter::empty()),
-        };
-        Box::new(current.chain(children))
+        let children = match self {
+            SelectColumn::Expr { expr, .. } => Some(expr.nodes()),
+            SelectColumn::Star(_) => None,
+        }
+        .into_iter()
+        .flatten();
+        current.chain(children)
     }
 
     pub fn has_subqueries(&self) -> bool {
