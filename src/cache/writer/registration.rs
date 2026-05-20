@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,7 +21,8 @@ use crate::query::constraints::{
 use crate::query::decorrelate::{DecorrelateError, query_expr_decorrelate};
 use crate::query::evaluate::resolved_where_expr_supported;
 use crate::query::resolved::{
-    ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, query_expr_resolve,
+    ResolvedColumnNode, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns,
+    ResolvedSelectNode, ResolvedTableNode, query_expr_resolve,
 };
 use crate::query::transform::predicate_pushdown_apply;
 use crate::query::update::query_table_update_queries;
@@ -92,6 +94,66 @@ fn update_eval_strategy_classify(
     } else {
         UpdateEvalStrategy::PgEval
     }
+}
+
+/// Collect column names on `table_name` that participate in the parent
+/// query's LIMIT-window definition: top-level ORDER BY, WHERE, and HAVING.
+///
+/// PGC-94: used by row_cached_invalidation_check to decide whether a CDC
+/// UPDATE on a cached row may shift the window such that an untracked
+/// row needs to fill the gap. Returns an empty set when the query has
+/// no window-defining references on this table.
+///
+/// Aliased ORDER BY (`ORDER BY count(*) DESC LIMIT 10`) carries no table
+/// reference and naturally produces no entries here. Those shapes are
+/// Measure queries that already use PgEval/MV invalidation paths.
+fn limit_window_columns_collect(
+    resolved: &ResolvedQueryExpr,
+    table_name: &str,
+) -> HashSet<EcoString> {
+    let mut cols = HashSet::new();
+    let mut push_if_local = |col: &ResolvedColumnNode| {
+        if col.table.as_str() == table_name {
+            cols.insert(col.column.clone());
+        }
+    };
+
+    let select = resolved.as_select();
+
+    for clause in &resolved.order_by {
+        for col in clause.expr.nodes::<ResolvedColumnNode>() {
+            push_if_local(col);
+        }
+        // Aliased `ORDER BY value` resolves to `Identifier`; chase it through
+        // the SELECT-list to recover the underlying base-table column refs.
+        if let ResolvedScalarExpr::Identifier(name) = &clause.expr
+            && let Some(select) = select
+            && let ResolvedSelectColumns::Columns(select_cols) = &select.columns
+        {
+            for select_col in select_cols {
+                if select_col.output_name() == Some(name) {
+                    for col in select_col.expr.nodes::<ResolvedColumnNode>() {
+                        push_if_local(col);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(select) = select {
+        if let Some(where_expr) = &select.where_clause {
+            for col in where_expr.nodes::<ResolvedColumnNode>() {
+                push_if_local(col);
+            }
+        }
+        if let Some(having) = &select.having {
+            for col in having.nodes::<ResolvedColumnNode>() {
+                push_if_local(col);
+            }
+        }
+    }
+
+    cols
 }
 
 /// Intermediate result from resolving a query before subsumption check or population.
@@ -519,6 +581,12 @@ impl WriterRegistration {
                 .unwrap_or_default();
             let complexity = update_resolved.complexity();
             let eval_strategy = update_eval_strategy_classify(&update_resolved, source);
+            // Walk the parent `resolved` — `update_resolved` has ORDER BY stripped.
+            let limit_window_columns = if has_limit {
+                limit_window_columns_collect(resolved, table_node.name.as_str())
+            } else {
+                HashSet::new()
+            };
             let update_query = UpdateQuery {
                 fingerprint,
                 resolved: update_resolved,
@@ -527,6 +595,7 @@ impl WriterRegistration {
                 constraints,
                 has_limit,
                 eval_strategy,
+                limit_window_columns,
             };
 
             self.update_query_register(core, relation_oid, table_node.name.as_str(), update_query);

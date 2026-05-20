@@ -161,6 +161,10 @@ pub struct UpdateQuery {
     pub has_limit: bool,
     /// Eval strategy for this query's WHERE clause during CDC row matching.
     pub eval_strategy: UpdateEvalStrategy,
+    /// Columns from ORDER BY / WHERE / HAVING that define the LIMIT window.
+    /// Populated only when `has_limit`; consumed by row_cached_invalidation_check
+    /// to detect updates that may demote a cached row out of the window (PGC-94).
+    pub limit_window_columns: HashSet<EcoString>,
 }
 
 /// Collection of update queries for a specific relation.

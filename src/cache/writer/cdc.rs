@@ -1057,6 +1057,19 @@ impl WriterCdc {
             return true;
         }
 
+        // LIMIT windowing: an UPDATE that changes a column defining this
+        // query's window boundary (ORDER BY / WHERE / HAVING) may push the
+        // cached row out of the window — and the untracked row that should
+        // take its place is, by definition, not in the cache. Invalidate
+        // to force repopulation. PGC-94.
+        if update_query.has_limit && matches!(update_query.source, UpdateQuerySource::FromClause) {
+            for column in &update_query.limit_window_columns {
+                if *row_changes.get(column.as_str()).unwrap_or(&false) {
+                    return true;
+                }
+            }
+        }
+
         for column in update_query
             .constraints
             .table_join_columns(&table_metadata.name)

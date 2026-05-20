@@ -482,3 +482,194 @@ async fn test_offset_only() -> Result<(), Error> {
 
     Ok(())
 }
+
+// ----- CDC UPDATE on a LIMIT-cached row (PGC-94) -----
+
+/// UPDATE on an untracked row that promotes it into the window. The
+/// LocalEval upsert path adds the row to the per-table cache and
+/// serving's ORDER BY + LIMIT picks the new top-N from the superset.
+#[tokio::test]
+async fn test_limit_cdc_update_promotes_untracked_row_single_table() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE rankings (id INTEGER PRIMARY KEY, value INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO rankings (id, value) VALUES \
+         (1, 50), (2, 40), (3, 30), (4, 20), (5, 10)",
+        &[],
+    )
+    .await?;
+
+    let query = "SELECT id, value FROM rankings ORDER BY value DESC LIMIT 2";
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "50")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("value", "40")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+    ctx.simple_query(query).await?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("UPDATE rankings SET value = 100 WHERE id = 5", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("id", "5"), ("value", "100")])?;
+    assert_row_at(&res, 2, &[("id", "1"), ("value", "50")])?;
+
+    Ok(())
+}
+
+/// Multi-table promotion via JOIN. The new top-ranked post's owner is
+/// not in cache_users, so the join needs fresh data — `row_uncached_invalidation_check`
+/// invalidates via `join_membership_unchanged` (non-PK join column).
+#[tokio::test]
+async fn test_limit_cdc_update_promotes_untracked_row_via_join() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, score INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO users (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'carol')",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO posts (id, user_id, score) VALUES \
+         (1, 1, 50), (2, 1, 40), (3, 2, 30), (4, 2, 20), (5, 3, 10)",
+        &[],
+    )
+    .await?;
+
+    let query = "SELECT p.id, p.score, u.name \
+                 FROM posts p JOIN users u ON u.id = p.user_id \
+                 ORDER BY p.score DESC LIMIT 2";
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("id", "1"), ("score", "50"), ("name", "alice")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("score", "40"), ("name", "alice")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+
+    ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 5", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("id", "5"), ("score", "100"), ("name", "carol")])?;
+    assert_row_at(&res, 2, &[("id", "1"), ("score", "50"), ("name", "alice")])?;
+
+    Ok(())
+}
+
+/// PGC-94 regression. UPDATE on a *cached* row whose new value demotes
+/// it out of the LIMIT window. The row that should take its place is
+/// outside the cache. `row_cached_invalidation_check` invalidates
+/// because the ORDER BY column changed — repopulation pulls in the
+/// correct top-N from origin.
+#[tokio::test]
+async fn test_limit_cdc_update_demotes_cached_row_leaves_gap() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE rankings (id INTEGER PRIMARY KEY, value INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO rankings (id, value) VALUES \
+         (1, 50), (2, 40), (3, 30), (4, 20), (5, 10)",
+        &[],
+    )
+    .await?;
+
+    let query = "SELECT id, value FROM rankings ORDER BY value DESC LIMIT 2";
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "50")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("value", "40")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+    ctx.simple_query(query).await?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("UPDATE rankings SET value = 5 WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("id", "2"), ("value", "40")])?;
+    assert_row_at(&res, 2, &[("id", "3"), ("value", "30")])?;
+
+    Ok(())
+}
+
+/// Positive control: UPDATE on a column that does NOT define the LIMIT
+/// window stays a cache hit. The row is upserted in place with the
+/// new value; no spurious invalidation.
+#[tokio::test]
+async fn test_limit_cdc_update_non_window_column_keeps_cache() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE rankings (id INTEGER PRIMARY KEY, name TEXT, value INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO rankings (id, name, value) VALUES \
+         (1, 'alpha', 50), (2, 'beta', 40), (3, 'gamma', 30)",
+        &[],
+    )
+    .await?;
+
+    let query = "SELECT id, name, value FROM rankings ORDER BY value DESC LIMIT 2";
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("id", "1"), ("name", "alpha"), ("value", "50")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("name", "beta"), ("value", "40")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+    ctx.simple_query(query).await?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("UPDATE rankings SET name = 'AAA' WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 4);
+    assert_row_at(&res, 1, &[("id", "1"), ("name", "AAA"), ("value", "50")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("name", "beta"), ("value", "40")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
