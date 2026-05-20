@@ -1984,10 +1984,10 @@ mod tests {
         let WhereExpr::Binary(binary) = &where_clause else {
             panic!("expected Binary, got {where_clause:?}");
         };
-        let WhereExpr::Scalar(ScalarExpr::TypeCast { expr, target_type }) = &*binary.lexpr else {
+        let WhereExpr::Scalar(ScalarExpr::TypeCast { expr, target }) = &*binary.lexpr else {
             panic!("expected Scalar(TypeCast), got {:?}", binary.lexpr);
         };
-        assert_eq!(target_type.as_str(), "text");
+        assert_eq!(*target, crate::query::cast::CastTarget::Text);
         assert!(matches!(&**expr, ScalarExpr::Column(c) if c.column == "col"));
     }
 

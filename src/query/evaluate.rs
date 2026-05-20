@@ -1,6 +1,10 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
 use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
+use crate::query::cast::{
+    CastTarget, canonicalize_comparison, cast_target_coerce_text,
+    cast_target_is_coercion_supported, is_canonical_date_literal,
+};
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedScalarExpr, ResolvedWhereExpr,
 };
@@ -49,40 +53,120 @@ pub fn where_expr_evaluate(
     }
 }
 
+// `canonicalize_comparison` now lives in `cast.rs` so constraint analysis can
+// share the same column-LHS canonical form (including identity-strip and
+// op_flip semantics).
+
 /// Evaluate a comparison expression (column op value) against row data.
 fn expr_comparison_evaluate(
     binary_expr: &ResolvedBinaryExpr,
     row_data: &[Option<String>],
     table_name: &str,
 ) -> bool {
-    // Extract column and value from the comparison expression
-    let (column_ref, value) = match (binary_expr.lexpr.as_ref(), binary_expr.rexpr.as_ref()) {
-        (
-            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)),
-            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(val)),
-        ) => (col, val),
-        (
-            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(val)),
-            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)),
-        ) => (col, val),
-        _ => return false, // Should not happen if is_cacheable_expr works correctly
+    let Some((column_ref, target, op, value)) = canonicalize_comparison(binary_expr) else {
+        return false;
     };
 
     let row_value = column_row_value_get(column_ref, row_data, table_name);
 
-    match row_value {
-        ColumnRowValue::Present(row_value_str) => {
-            where_value_compare_string(value, row_value_str, binary_expr.op)
+    match (target, row_value) {
+        (None, ColumnRowValue::Present(row_value_str)) => {
+            where_value_compare_string(value, row_value_str, op)
         }
-        ColumnRowValue::Null => {
-            // Row has NULL value - for equality check if filter is also NULL,
-            // for other comparisons NULL always returns false (SQL semantics)
-            matches!(binary_expr.op, BinaryOp::Equal) && matches!(value, LiteralValue::Null)
+        (Some(target), ColumnRowValue::Present(row_value_str)) => {
+            let Some(coerced) = cast_target_coerce_text(target, row_value_str) else {
+                return false;
+            };
+            literal_compare(&coerced, op, value)
         }
-        ColumnRowValue::NotInTable => {
-            // Column references a different table - can't evaluate from this row
-            false
+        (_, ColumnRowValue::Null) => {
+            // For equality check if filter is also NULL; for other
+            // comparisons NULL always returns false (SQL semantics).
+            // A casted NULL is still NULL — `NULL::int = 5` is NULL/false.
+            target.is_none() && matches!(op, BinaryOp::Equal) && matches!(value, LiteralValue::Null)
         }
+        (_, ColumnRowValue::NotInTable) => false,
+    }
+}
+
+/// Compare two typed `LiteralValue`s. Used by the cast-coercion path: the
+/// row's text has been coerced to a typed `LiteralValue` and now needs to be
+/// compared against the literal from the predicate.
+///
+/// Supported pairings: Integer↔Integer, Integer↔string-of-int,
+/// Boolean↔Boolean, Boolean↔string-of-bool (equality only). Other pairings
+/// return false.
+pub fn literal_compare(left: &LiteralValue, op: BinaryOp, right: &LiteralValue) -> bool {
+    // Boolean comparisons: equality only — matches `where_value_compare_string`
+    // semantics and ORM usage of `::bool`.
+    if let Some((a, b)) = literal_pair_as_bool(left, right) {
+        return match op {
+            BinaryOp::Equal => a == b,
+            BinaryOp::NotEqual => a != b,
+            _ => false,
+        };
+    }
+
+    let ordering = match (left, right) {
+        (LiteralValue::Integer(a), LiteralValue::Integer(b)) => a.cmp(b),
+        (LiteralValue::Integer(a), LiteralValue::String(s)) => {
+            let Ok(b) = s.parse::<i64>() else {
+                return false;
+            };
+            a.cmp(&b)
+        }
+        (LiteralValue::String(s), LiteralValue::Integer(b)) => {
+            let Ok(a) = s.parse::<i64>() else {
+                return false;
+            };
+            a.cmp(b)
+        }
+        // String↔String compares lexicographically. ISO 8601 dates
+        // (`YYYY-MM-DD`) sort chronologically by bytes, so this serves the
+        // `::date` coercion path; other String↔String comparisons happen on
+        // the row-text path (`where_value_compare_string`), not here.
+        (LiteralValue::String(a), LiteralValue::String(b)) => a.as_str().cmp(b.as_str()),
+        (LiteralValue::String(a), LiteralValue::StringWithCast(b, _))
+        | (LiteralValue::StringWithCast(a, _), LiteralValue::String(b)) => {
+            a.as_str().cmp(b.as_str())
+        }
+        _ => return false,
+    };
+    ordering_satisfies_op(ordering, op)
+}
+
+/// Extract a `(bool, bool)` pair from two literals when both sides are
+/// bool-resolvable (a raw `Boolean` or a postgres-style bool string).
+fn literal_pair_as_bool(left: &LiteralValue, right: &LiteralValue) -> Option<(bool, bool)> {
+    let lb = literal_as_bool(left)?;
+    let rb = literal_as_bool(right)?;
+    Some((lb, rb))
+}
+
+fn literal_as_bool(v: &LiteralValue) -> Option<bool> {
+    match v {
+        LiteralValue::Boolean(b) => Some(*b),
+        LiteralValue::String(s) => crate::query::cast::parse_pg_bool(s),
+        // Postgres implicitly coerces integer `1`/`0` in comparisons against
+        // bool; anything else is a planner error at origin (so unreachable here).
+        LiteralValue::Integer(1) => Some(true),
+        LiteralValue::Integer(0) => Some(false),
+        _ => None,
+    }
+}
+
+/// Map a three-way `Ordering` into a boolean per the SQL comparison
+/// operator. Non-ordering ops (LIKE, AND, OR, …) return false.
+fn ordering_satisfies_op(ordering: std::cmp::Ordering, op: BinaryOp) -> bool {
+    use std::cmp::Ordering;
+    match op {
+        BinaryOp::Equal => ordering == Ordering::Equal,
+        BinaryOp::NotEqual => ordering != Ordering::Equal,
+        BinaryOp::LessThan => ordering == Ordering::Less,
+        BinaryOp::LessThanOrEqual => ordering != Ordering::Greater,
+        BinaryOp::GreaterThan => ordering == Ordering::Greater,
+        BinaryOp::GreaterThanOrEqual => ordering != Ordering::Less,
+        _ => false,
     }
 }
 
@@ -154,49 +238,16 @@ pub fn where_value_compare_string(
     row_value_str: &str,
     op: BinaryOp,
 ) -> bool {
-    use std::cmp::Ordering;
-
     match filter_value {
         LiteralValue::String(filter_str) => {
-            let cmp = row_value_str.cmp(filter_str);
-            match op {
-                BinaryOp::Equal => cmp == Ordering::Equal,
-                BinaryOp::NotEqual => cmp != Ordering::Equal,
-                BinaryOp::LessThan => cmp == Ordering::Less,
-                BinaryOp::LessThanOrEqual => cmp != Ordering::Greater,
-                BinaryOp::GreaterThan => cmp == Ordering::Greater,
-                BinaryOp::GreaterThanOrEqual => cmp != Ordering::Less,
-                _ => false,
-            }
+            ordering_satisfies_op(row_value_str.cmp(filter_str), op)
         }
         LiteralValue::StringWithCast(filter_str, _cast) => {
-            let cmp = row_value_str.cmp(filter_str);
-            match op {
-                BinaryOp::Equal => cmp == Ordering::Equal,
-                BinaryOp::NotEqual => cmp != Ordering::Equal,
-                BinaryOp::LessThan => cmp == Ordering::Less,
-                BinaryOp::LessThanOrEqual => cmp != Ordering::Greater,
-                BinaryOp::GreaterThan => cmp == Ordering::Greater,
-                BinaryOp::GreaterThanOrEqual => cmp != Ordering::Less,
-                _ => false,
-            }
+            ordering_satisfies_op(row_value_str.cmp(filter_str), op)
         }
-        LiteralValue::Integer(filter_int) => {
-            if let Ok(row_int) = row_value_str.parse::<i64>() {
-                let cmp = row_int.cmp(filter_int);
-                match op {
-                    BinaryOp::Equal => cmp == Ordering::Equal,
-                    BinaryOp::NotEqual => cmp != Ordering::Equal,
-                    BinaryOp::LessThan => cmp == Ordering::Less,
-                    BinaryOp::LessThanOrEqual => cmp != Ordering::Greater,
-                    BinaryOp::GreaterThan => cmp == Ordering::Greater,
-                    BinaryOp::GreaterThanOrEqual => cmp != Ordering::Less,
-                    _ => false,
-                }
-            } else {
-                false // Can't parse as integer
-            }
-        }
+        LiteralValue::Integer(filter_int) => row_value_str
+            .parse::<i64>()
+            .is_ok_and(|row_int| ordering_satisfies_op(row_int.cmp(filter_int), op)),
         LiteralValue::Float(filter_float) => {
             if let Ok(row_float) = row_value_str.parse::<f64>() {
                 let filter_f64 = filter_float.into_inner();
@@ -270,18 +321,41 @@ pub fn resolved_where_expr_supported(expr: &ResolvedWhereExpr) -> bool {
     }
 }
 
-/// Check if a binary expression is a simple comparison (column op value).
+/// Check if a binary expression is a simple comparison the evaluator can
+/// decide locally. Accepted shapes:
+/// 1. `column op literal` (or reversed) — direct compare.
+/// 2. `identity_cast(column) op literal` — identity casts are stripped by
+///    `resolved_where_scalar_leaf` before this check.
+/// 3. `coerceable_cast(column) op literal` — e.g. `text_col::int4 = 5`.
+///    Admitted only when `cast_target_is_coercion_supported` says the
+///    target+base pair has a coercion path.
+///
+/// For `::date` specifically, the literal must also be in canonical
+/// `YYYY-MM-DD` form so lexicographic compare matches calendar order;
+/// other literal spellings (`'2024-1-5'`, etc.) fall through to PgEval.
 pub fn is_simple_comparison(binary_expr: &ResolvedBinaryExpr) -> bool {
-    matches!(
-        (binary_expr.lexpr.as_ref(), binary_expr.rexpr.as_ref()),
-        (
-            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(_)),
-            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(_)),
-        ) | (
-            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(_)),
-            ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(_)),
-        )
-    )
+    let Some((col, target, _, literal)) = canonicalize_comparison(binary_expr) else {
+        return false;
+    };
+    let Some(target) = target else {
+        return true;
+    };
+    if !cast_target_is_coercion_supported(target, &col.column_metadata.data_type) {
+        return false;
+    }
+    if *target == CastTarget::Date {
+        return literal_is_canonical_date(literal);
+    }
+    true
+}
+
+fn literal_is_canonical_date(literal: &LiteralValue) -> bool {
+    let s = match literal {
+        LiteralValue::String(s) => s.as_str(),
+        LiteralValue::StringWithCast(s, _) => s.as_str(),
+        _ => return false,
+    };
+    is_canonical_date_literal(s)
 }
 
 #[cfg(test)]
@@ -337,6 +411,58 @@ mod tests {
             name: "test_table".into(),
             schema: "public".into(),
             relation_oid: 12345,
+            primary_key_columns: vec!["id".to_owned()],
+            columns,
+            indexes: Vec::new(),
+        }
+    }
+
+    /// Sibling fixture with a `created_at TIMESTAMP` column for PGC-180
+    /// date-narrowing tests. Row layout: `[id, name, created_at]`.
+    fn test_table_metadata_with_timestamp() -> TableMetadata {
+        let columns = ColumnStore::new([
+            ColumnMetadata {
+                name: "id".into(),
+                position: 1,
+                type_oid: 23,
+                data_type: Type::INT4,
+                type_name: "integer".into(),
+                cache_type_name: "int4".into(),
+                is_primary_key: true,
+            },
+            ColumnMetadata {
+                name: "name".into(),
+                position: 2,
+                type_oid: 25,
+                data_type: Type::TEXT,
+                type_name: "text".into(),
+                cache_type_name: "text".into(),
+                is_primary_key: false,
+            },
+            ColumnMetadata {
+                name: "created_at".into(),
+                position: 3,
+                type_oid: 1114,
+                data_type: Type::TIMESTAMP,
+                type_name: "timestamp".into(),
+                cache_type_name: "timestamp".into(),
+                is_primary_key: false,
+            },
+            ColumnMetadata {
+                name: "received_at".into(),
+                position: 4,
+                type_oid: 1184,
+                data_type: Type::TIMESTAMPTZ,
+                type_name: "timestamptz".into(),
+                cache_type_name: "timestamptz".into(),
+                is_primary_key: false,
+            },
+        ]);
+
+        TableMetadata {
+            name: "ts_table".into(),
+            schema: "public".into(),
+            relation_oid: 23456,
             primary_key_columns: vec!["id".to_owned()],
             columns,
             indexes: Vec::new(),
@@ -822,6 +948,933 @@ mod tests {
         }));
 
         assert!(!where_expr_evaluate(&expr, &row_data, table.name.as_str()));
+    }
+
+    // ------------------------------------------------------------------
+    // PGC-149: identity TypeCast strip in comparison eval / classifier
+    // ------------------------------------------------------------------
+
+    fn typecast_text(inner: ResolvedScalarExpr) -> ResolvedWhereExpr {
+        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::TypeCast {
+            expr: Box::new(inner),
+            target: crate::query::cast::CastTarget::Text,
+        })
+    }
+
+    #[test]
+    fn where_expr_evaluate_identity_text_cast_matches() {
+        // `name::text = 'john'` on a TEXT column — cast is identity, must match.
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("john".to_owned())),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_identity_text_cast_no_match() {
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("alice".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("john".to_owned())),
+        );
+
+        assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_identity_text_cast_on_int_column_matches() {
+        // PGC-177: ::text on int column is identity — wire-text matches
+        // canonical int→text exactly.
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("42".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "id")));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("42".to_owned())),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_cast_on_bool_column_is_opaque() {
+        // bool wire-text is `t`/`f`; `::text` on bool returns `true`/`false`.
+        // Not identity — evaluator must bail back to opaque (return false).
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("t".to_owned()),
+        ];
+
+        let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(
+            &table, "active",
+        )));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("true".to_owned())),
+        );
+
+        assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_identity_text_cast_rhs_position() {
+        // `'john' = name::text` — cast on RHS, still must match.
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            val_expr(LiteralValue::String("john".to_owned())),
+            cast_col,
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn resolved_where_expr_supported_admits_identity_text_cast() {
+        let table = test_table_metadata();
+        let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("john".to_owned())),
+        );
+
+        assert!(resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn resolved_where_expr_supported_rejects_non_identity_text_cast() {
+        // ::text on a bool column is not identity (wire-text `t`/`f` vs
+        // canonical `true`/`false`) → must remain unsupported so the
+        // classifier routes through PgEval.
+        let table = test_table_metadata();
+        let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(
+            &table, "active",
+        )));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("true".to_owned())),
+        );
+
+        assert!(!resolved_where_expr_supported(&expr));
+    }
+
+    // ------------------------------------------------------------------
+    // PGC-178: ::int4 / ::int8 text-coercion in comparison eval / classifier
+    // ------------------------------------------------------------------
+
+    fn typecast(target: CastTarget, inner: ResolvedScalarExpr) -> ResolvedWhereExpr {
+        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::TypeCast {
+            expr: Box::new(inner),
+            target,
+        })
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_int4_coercion_matches() {
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("42".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Int4,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Integer(42)),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_int4_coercion_no_match() {
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("42".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Int4,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Integer(99)),
+        );
+
+        assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_int4_unparseable_row_excluded() {
+        // `'abc'::int4` raises in postgres; here the row is excluded.
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("abc".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Int4,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Integer(42)),
+        );
+
+        assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_int4_with_string_literal() {
+        // ORM-generated `text_col::int = '42'` — string literal whose
+        // content parses as int. Must coerce both sides to int and compare.
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("42".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Int4,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("42".to_owned())),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_int4_inequality_compares_numerically() {
+        // Numerical compare avoids the lexicographic-string trap:
+        // "100" < "42" by bytes, but 100 > 42 by value.
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("100".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Int4,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::GreaterThan,
+            cast_col,
+            val_expr(LiteralValue::Integer(42)),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_int8_wide_range_matches() {
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("9223372036854775807".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Int8,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Integer(i64::MAX)),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn resolved_where_expr_supported_admits_text_to_int4_coercion() {
+        let table = test_table_metadata();
+        let cast_col = typecast(
+            CastTarget::Int4,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Integer(42)),
+        );
+
+        assert!(resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn resolved_where_expr_supported_rejects_int4_cast_on_unsupported_base() {
+        // ::int4 on a bool column isn't in the coercion whitelist → unsupported.
+        let table = test_table_metadata();
+        let cast_col = typecast(
+            CastTarget::Int4,
+            ResolvedScalarExpr::Column(resolved_column(&table, "active")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Integer(1)),
+        );
+
+        assert!(!resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn literal_compare_integer_against_integer() {
+        assert!(literal_compare(
+            &LiteralValue::Integer(5),
+            BinaryOp::Equal,
+            &LiteralValue::Integer(5),
+        ));
+        assert!(!literal_compare(
+            &LiteralValue::Integer(5),
+            BinaryOp::Equal,
+            &LiteralValue::Integer(6),
+        ));
+        assert!(literal_compare(
+            &LiteralValue::Integer(5),
+            BinaryOp::LessThan,
+            &LiteralValue::Integer(6),
+        ));
+    }
+
+    #[test]
+    fn literal_compare_integer_against_parseable_string() {
+        assert!(literal_compare(
+            &LiteralValue::Integer(42),
+            BinaryOp::Equal,
+            &LiteralValue::String("42".to_owned()),
+        ));
+        // String "0042" parses to 42 — numeric compare, not lexicographic.
+        assert!(literal_compare(
+            &LiteralValue::Integer(42),
+            BinaryOp::Equal,
+            &LiteralValue::String("0042".to_owned()),
+        ));
+    }
+
+    #[test]
+    fn literal_compare_falls_through_on_unparseable_string() {
+        assert!(!literal_compare(
+            &LiteralValue::Integer(42),
+            BinaryOp::Equal,
+            &LiteralValue::String("not-a-number".to_owned()),
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // Literal-LHS op-flip — `WHERE 5 < col` must evaluate the same as
+    // `WHERE col > 5`. Bug pre-dated PGC-149 in `where_value_compare_string`
+    // and was carried into the cast-coercion path; tests lock both.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn where_expr_evaluate_literal_lhs_less_than_column() {
+        // SQL `WHERE 5 < id` with id=10 → true (5 < 10).
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("10".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let expr = binary_expr(
+            BinaryOp::LessThan,
+            val_expr(LiteralValue::Integer(5)),
+            col_expr(&table, "id"),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_literal_lhs_greater_than_column() {
+        // SQL `WHERE 5 > id` with id=10 → false (5 > 10 is false).
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("10".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let expr = binary_expr(
+            BinaryOp::GreaterThan,
+            val_expr(LiteralValue::Integer(5)),
+            col_expr(&table, "id"),
+        );
+
+        assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_literal_lhs_less_than_column_no_match() {
+        // SQL `WHERE 100 < id` with id=10 → false (100 < 10 is false).
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("10".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let expr = binary_expr(
+            BinaryOp::LessThan,
+            val_expr(LiteralValue::Integer(100)),
+            col_expr(&table, "id"),
+        );
+
+        assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_literal_lhs_less_than_cast_column() {
+        // SQL `WHERE 5 < name::int4` with name="10" → true (5 < 10).
+        // Same flip semantics on the cast-coercion path.
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("10".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Int4,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::LessThan,
+            val_expr(LiteralValue::Integer(5)),
+            cast_col,
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_literal_lhs_greater_than_or_equal_column() {
+        // SQL `WHERE 10 >= id` with id=10 → true (10 >= 10).
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("10".to_owned()),
+            Some("john".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let expr = binary_expr(
+            BinaryOp::GreaterThanOrEqual,
+            val_expr(LiteralValue::Integer(10)),
+            col_expr(&table, "id"),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    // ------------------------------------------------------------------
+    // PGC-181: ::bool text-coercion in comparison eval / classifier
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn where_expr_evaluate_text_to_bool_coercion_matches() {
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("true".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Bool,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Boolean(true)),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_bool_coercion_no_match() {
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("false".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Bool,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Boolean(true)),
+        );
+
+        assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_bool_short_forms() {
+        let table = test_table_metadata();
+        for (stored, literal_b, expected) in [
+            ("t", true, true),
+            ("yes", true, true),
+            ("1", true, true),
+            ("on", true, true),
+            ("f", false, true),
+            ("no", false, true),
+            ("0", false, true),
+            ("off", false, true),
+            ("t", false, false),
+            ("garbage", true, false),
+        ] {
+            let row_data = vec![
+                Some("1".to_owned()),
+                Some(stored.to_owned()),
+                Some("true".to_owned()),
+            ];
+            let cast_col = typecast(
+                CastTarget::Bool,
+                ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+            );
+            let expr = binary_expr(
+                BinaryOp::Equal,
+                cast_col,
+                val_expr(LiteralValue::Boolean(literal_b)),
+            );
+            assert_eq!(
+                where_expr_evaluate(&expr, &row_data, TABLE),
+                expected,
+                "stored {stored:?} = literal {literal_b}"
+            );
+        }
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_bool_with_string_literal() {
+        // ORM-generated `text_col::bool = 't'` — string literal that parses as bool.
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("true".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Bool,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("t".to_owned())),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_bool_with_integer_literal() {
+        // Postgres coerces `1` → true / `0` → false in bool comparisons; our
+        // evaluator mirrors that so the CDC fast path doesn't silently drop rows.
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("true".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Bool,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Integer(1)),
+        );
+        assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_bool_inequality_op_rejected() {
+        // `<` on bool isn't supported by the wedge — eval returns false.
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("true".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Bool,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::LessThan,
+            cast_col,
+            val_expr(LiteralValue::Boolean(true)),
+        );
+        assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_text_to_bool_unparseable_row_excluded() {
+        let table = test_table_metadata();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("garbage".to_owned()),
+            Some("true".to_owned()),
+        ];
+
+        let cast_col = typecast(
+            CastTarget::Bool,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Boolean(true)),
+        );
+
+        assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    #[test]
+    fn resolved_where_expr_supported_admits_text_to_bool_coercion() {
+        let table = test_table_metadata();
+        let cast_col = typecast(
+            CastTarget::Bool,
+            ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+        );
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Boolean(true)),
+        );
+
+        assert!(resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn literal_compare_boolean_pairs() {
+        assert!(literal_compare(
+            &LiteralValue::Boolean(true),
+            BinaryOp::Equal,
+            &LiteralValue::Boolean(true),
+        ));
+        assert!(!literal_compare(
+            &LiteralValue::Boolean(true),
+            BinaryOp::Equal,
+            &LiteralValue::Boolean(false),
+        ));
+        assert!(literal_compare(
+            &LiteralValue::Boolean(true),
+            BinaryOp::NotEqual,
+            &LiteralValue::Boolean(false),
+        ));
+    }
+
+    #[test]
+    fn literal_compare_boolean_against_string_and_integer() {
+        // Mixed bool currency: parseable-bool string and integer 0/1.
+        assert!(literal_compare(
+            &LiteralValue::Boolean(true),
+            BinaryOp::Equal,
+            &LiteralValue::String("yes".to_owned()),
+        ));
+        assert!(literal_compare(
+            &LiteralValue::Boolean(false),
+            BinaryOp::Equal,
+            &LiteralValue::Integer(0),
+        ));
+        assert!(!literal_compare(
+            &LiteralValue::Boolean(true),
+            BinaryOp::Equal,
+            &LiteralValue::Integer(0),
+        ));
+    }
+
+    // ------------------------------------------------------------------
+    // PGC-180: ::date narrowing from timestamp in comparison eval/classifier
+    // ------------------------------------------------------------------
+
+    const TS_TABLE: &str = "ts_table";
+
+    fn typecast_date(inner: ResolvedScalarExpr) -> ResolvedWhereExpr {
+        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::TypeCast {
+            expr: Box::new(inner),
+            target: CastTarget::Date,
+        })
+    }
+
+    #[test]
+    fn where_expr_evaluate_timestamp_to_date_coercion_matches() {
+        let table = test_table_metadata_with_timestamp();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("alice".to_owned()),
+            Some("2024-01-15 23:45:00".to_owned()),
+            None,
+        ];
+
+        let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
+            &table,
+            "created_at",
+        )));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("2024-01-15".to_owned())),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TS_TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_timestamp_to_date_coercion_no_match() {
+        let table = test_table_metadata_with_timestamp();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("alice".to_owned()),
+            Some("2024-01-15 23:45:00".to_owned()),
+            None,
+        ];
+
+        let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
+            &table,
+            "created_at",
+        )));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("2024-01-16".to_owned())),
+        );
+
+        assert!(!where_expr_evaluate(&expr, &row_data, TS_TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_timestamp_to_date_inequality_compares_chronologically() {
+        let table = test_table_metadata_with_timestamp();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("alice".to_owned()),
+            Some("2024-03-15 09:00:00".to_owned()),
+            None,
+        ];
+
+        let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
+            &table,
+            "created_at",
+        )));
+        let expr = binary_expr(
+            BinaryOp::GreaterThan,
+            cast_col,
+            val_expr(LiteralValue::String("2024-01-31".to_owned())),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TS_TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_timestamp_to_date_literal_lhs_flips() {
+        // Locks PGC-186 fix for the date path too: `'2024-01-01' < ts::date`.
+        let table = test_table_metadata_with_timestamp();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("alice".to_owned()),
+            Some("2024-03-15 09:00:00".to_owned()),
+            None,
+        ];
+
+        let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
+            &table,
+            "created_at",
+        )));
+        let expr = binary_expr(
+            BinaryOp::LessThan,
+            val_expr(LiteralValue::String("2024-01-01".to_owned())),
+            cast_col,
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TS_TABLE));
+    }
+
+    #[test]
+    fn where_expr_evaluate_timestamp_to_date_with_typed_literal() {
+        // ORM-generated `created_at::date = '2024-01-15'::date` arrives as
+        // `LiteralValue::StringWithCast(...)`. Classifier must accept it and
+        // evaluator must compare it the same as a plain String literal.
+        let table = test_table_metadata_with_timestamp();
+        let row_data = vec![
+            Some("1".to_owned()),
+            Some("alice".to_owned()),
+            Some("2024-01-15 23:45:00".to_owned()),
+            None,
+        ];
+
+        let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
+            &table,
+            "created_at",
+        )));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::StringWithCast(
+                "2024-01-15".to_owned(),
+                "date".into(),
+            )),
+        );
+
+        assert!(where_expr_evaluate(&expr, &row_data, TS_TABLE));
+    }
+
+    #[test]
+    fn resolved_where_expr_supported_admits_timestamp_to_date() {
+        let table = test_table_metadata_with_timestamp();
+        let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
+            &table,
+            "created_at",
+        )));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("2024-01-15".to_owned())),
+        );
+
+        assert!(resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn resolved_where_expr_supported_rejects_timestamptz_to_date() {
+        // Deferred until PGC-187 (session-TZ tracking).
+        let table = test_table_metadata_with_timestamp();
+        let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
+            &table,
+            "received_at",
+        )));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("2024-01-15".to_owned())),
+        );
+
+        assert!(!resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn resolved_where_expr_supported_rejects_non_canonical_date_literal() {
+        // `'2024-1-15'` would compare wrong lexicographically; classifier
+        // must keep it on the PgEval path.
+        let table = test_table_metadata_with_timestamp();
+        let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
+            &table,
+            "created_at",
+        )));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::String("2024-1-15".to_owned())),
+        );
+
+        assert!(!resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn resolved_where_expr_supported_rejects_non_string_date_literal() {
+        let table = test_table_metadata_with_timestamp();
+        let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
+            &table,
+            "created_at",
+        )));
+        let expr = binary_expr(
+            BinaryOp::Equal,
+            cast_col,
+            val_expr(LiteralValue::Integer(20240115)),
+        );
+
+        assert!(!resolved_where_expr_supported(&expr));
+    }
+
+    #[test]
+    fn literal_compare_string_to_string_lex_order() {
+        // ISO 8601 dates compare chronologically by bytes.
+        assert!(literal_compare(
+            &LiteralValue::String("2024-01-15".to_owned()),
+            BinaryOp::Equal,
+            &LiteralValue::String("2024-01-15".to_owned()),
+        ));
+        assert!(literal_compare(
+            &LiteralValue::String("2024-01-15".to_owned()),
+            BinaryOp::LessThan,
+            &LiteralValue::String("2024-02-01".to_owned()),
+        ));
+        assert!(!literal_compare(
+            &LiteralValue::String("2024-03-01".to_owned()),
+            BinaryOp::LessThan,
+            &LiteralValue::String("2024-02-01".to_owned()),
+        ));
     }
 
     // ------------------------------------------------------------------

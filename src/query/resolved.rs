@@ -11,6 +11,7 @@ use crate::query::ast::{
     ArithmeticOp, BinaryOp, Deparse, JoinType, LiteralValue, MultiOp, NullOrder, OrderDirection,
     SetOpType, SubLinkType, TableAlias, UnaryOp, ValuesClause,
 };
+use crate::query::cast::{CastTarget, cast_target_deparse};
 
 error_set! {
     ResolveError := {
@@ -611,10 +612,10 @@ pub enum ResolvedScalarExpr {
     /// inside this subquery; empty for non-correlated subqueries.
     Subquery(Box<ResolvedQueryExpr>, Vec<ResolvedColumnNode>),
     Array(Vec<ResolvedScalarExpr>),
-    /// `target_type` pre-rendered by `query::ast::convert::type_name_render`.
+    /// `target` classified by `query::cast::cast_target_from_canonical`.
     TypeCast {
         expr: Box<ResolvedScalarExpr>,
-        target_type: EcoString,
+        target: CastTarget,
     },
 }
 
@@ -997,11 +998,11 @@ impl Deparse for ResolvedScalarExpr {
                 buf.push(']');
                 buf
             }
-            ResolvedScalarExpr::TypeCast { expr, target_type } => {
+            ResolvedScalarExpr::TypeCast { expr, target } => {
                 buf.push('(');
                 expr.deparse(buf);
                 buf.push_str(")::");
-                buf.push_str(target_type);
+                buf.push_str(cast_target_deparse(target));
                 buf
             }
         }

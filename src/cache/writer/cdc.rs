@@ -14,8 +14,9 @@ use crate::catalog::TableMetadata;
 use crate::metrics::names;
 
 use crate::query::ast::{BinaryOp, Deparse};
+use crate::query::cast::cast_target_coerce_text;
 use crate::query::constraints::{QueryConstraints, TableConstraint};
-use crate::query::evaluate::where_value_compare_string;
+use crate::query::evaluate::{literal_compare, where_value_compare_string};
 use crate::query::resolved::ResolvedQueryExpr;
 use crate::query::transform::resolved_select_node_table_replace_with_values;
 
@@ -134,6 +135,66 @@ pub(super) struct WriterCdc {
 enum PgEvalMode {
     All,
     FirstMatch,
+}
+
+/// Check that every WHERE constraint for `table_metadata` matches `row_data`.
+/// Returns true when there are no constraints for this table (full-scan
+/// cached query), or when every constraint evaluates to true on the row.
+///
+/// CastComparison constraints coerce the row's wire-text via
+/// `cast_target_coerce_text` and compare via `literal_compare`; a coercion
+/// failure is treated as non-match (the row would have errored at origin).
+pub(super) fn row_constraints_match(
+    constraints: &QueryConstraints,
+    table_metadata: &TableMetadata,
+    row_data: &[Option<String>],
+) -> bool {
+    let Some(constraints) = constraints
+        .table_constraints
+        .get(table_metadata.name.as_str())
+    else {
+        return true;
+    };
+
+    for constraint in constraints {
+        let column_name = match constraint {
+            TableConstraint::Comparison(col, ..)
+            | TableConstraint::AnyOf(col, ..)
+            | TableConstraint::CastComparison(col, ..) => col.as_str(),
+        };
+
+        if let Some(column_meta) = table_metadata.columns.get(column_name) {
+            let position = column_meta.index();
+            if let Some(row_value) = row_data.get(position) {
+                let matches = match row_value {
+                    Some(row_str) => match constraint {
+                        TableConstraint::Comparison(_, op, val) => {
+                            where_value_compare_string(val, row_str, *op)
+                        }
+                        TableConstraint::AnyOf(_, values) => values
+                            .iter()
+                            .any(|v| where_value_compare_string(v, row_str, BinaryOp::Equal)),
+                        TableConstraint::CastComparison(_, cast, op, val) => {
+                            match cast_target_coerce_text(cast, row_str) {
+                                Some(coerced) => literal_compare(&coerced, *op, val),
+                                // Coercion failure (e.g. `'abc'::int4`): the
+                                // row would error at origin and never match
+                                // — safe to treat as non-matching here.
+                                None => false,
+                            }
+                        }
+                    },
+                    // NULL never matches comparison operators
+                    None => false,
+                };
+                if !matches {
+                    return false;
+                }
+            }
+        }
+    }
+
+    true
 }
 
 impl WriterCdc {
@@ -898,43 +959,7 @@ impl WriterCdc {
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
     ) -> bool {
-        let Some(constraints) = constraints
-            .table_constraints
-            .get(table_metadata.name.as_str())
-        else {
-            return true;
-        };
-
-        for constraint in constraints {
-            let column_name = match constraint {
-                TableConstraint::Comparison(col, ..) | TableConstraint::AnyOf(col, ..) => {
-                    col.as_str()
-                }
-            };
-
-            if let Some(column_meta) = table_metadata.columns.get(column_name) {
-                let position = column_meta.index();
-                if let Some(row_value) = row_data.get(position) {
-                    let matches = match row_value {
-                        Some(row_str) => match constraint {
-                            TableConstraint::Comparison(_, op, val) => {
-                                where_value_compare_string(val, row_str, *op)
-                            }
-                            TableConstraint::AnyOf(_, values) => values
-                                .iter()
-                                .any(|v| where_value_compare_string(v, row_str, BinaryOp::Equal)),
-                        },
-                        // NULL never matches comparison operators
-                        None => false,
-                    };
-                    if !matches {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        true
+        row_constraints_match(constraints, table_metadata, row_data)
     }
 
     /// Determine if a query should be invalidated when the row is not currently cached.
@@ -1626,4 +1651,221 @@ fn join_membership_unchanged(
                 .iter()
                 .any(|pk| pk == col)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::{ColumnMetadata, ColumnStore};
+    use crate::query::ast::LiteralValue;
+    use crate::query::cast::CastTarget;
+    use tokio_postgres::types::Type;
+
+    // Row layout: [id INT4 (PK), name TEXT, created_at TIMESTAMP].
+    fn fixture_table() -> TableMetadata {
+        let columns = ColumnStore::new([
+            ColumnMetadata {
+                name: "id".into(),
+                position: 1,
+                type_oid: 23,
+                data_type: Type::INT4,
+                type_name: "int4".into(),
+                cache_type_name: "int4".into(),
+                is_primary_key: true,
+            },
+            ColumnMetadata {
+                name: "name".into(),
+                position: 2,
+                type_oid: 25,
+                data_type: Type::TEXT,
+                type_name: "text".into(),
+                cache_type_name: "text".into(),
+                is_primary_key: false,
+            },
+            ColumnMetadata {
+                name: "created_at".into(),
+                position: 3,
+                type_oid: 1114,
+                data_type: Type::TIMESTAMP,
+                type_name: "timestamp".into(),
+                cache_type_name: "timestamp".into(),
+                is_primary_key: false,
+            },
+        ]);
+        TableMetadata {
+            relation_oid: 1001,
+            name: "users".into(),
+            schema: "public".into(),
+            primary_key_columns: vec!["id".to_owned()],
+            columns,
+            indexes: Vec::new(),
+        }
+    }
+
+    fn constraints_for(table: &str, tcs: Vec<TableConstraint>) -> QueryConstraints {
+        let mut q = QueryConstraints::default();
+        q.table_constraints.insert(EcoString::from(table), tcs);
+        q
+    }
+
+    #[test]
+    fn no_constraints_for_table_matches() {
+        let table = fixture_table();
+        let constraints = QueryConstraints::default();
+        let row = vec![Some("1".to_owned()), Some("alice".to_owned()), None];
+        assert!(row_constraints_match(&constraints, &table, &row));
+    }
+
+    #[test]
+    fn bare_comparison_matches_when_value_equal() {
+        let table = fixture_table();
+        let constraints = constraints_for(
+            "users",
+            vec![TableConstraint::Comparison(
+                "id".into(),
+                BinaryOp::Equal,
+                LiteralValue::Integer(1),
+            )],
+        );
+        let row = vec![Some("1".to_owned()), Some("alice".to_owned()), None];
+        assert!(row_constraints_match(&constraints, &table, &row));
+    }
+
+    #[test]
+    fn bare_comparison_misses_when_value_differs() {
+        let table = fixture_table();
+        let constraints = constraints_for(
+            "users",
+            vec![TableConstraint::Comparison(
+                "id".into(),
+                BinaryOp::Equal,
+                LiteralValue::Integer(1),
+            )],
+        );
+        let row = vec![Some("2".to_owned()), Some("alice".to_owned()), None];
+        assert!(!row_constraints_match(&constraints, &table, &row));
+    }
+
+    // PGC-182: CastComparison constraints must coerce the row's wire-text via
+    // the cast target before comparing. These tests exercise the new arm.
+
+    #[test]
+    fn cast_comparison_int4_matches_when_coerced_value_equal() {
+        let table = fixture_table();
+        let constraints = constraints_for(
+            "users",
+            vec![TableConstraint::CastComparison(
+                "name".into(),
+                CastTarget::Int4,
+                BinaryOp::Equal,
+                LiteralValue::Integer(42),
+            )],
+        );
+        // name="42" coerces to Integer(42) → matches literal Integer(42).
+        let row = vec![Some("1".to_owned()), Some("42".to_owned()), None];
+        assert!(row_constraints_match(&constraints, &table, &row));
+    }
+
+    #[test]
+    fn cast_comparison_int4_misses_when_coerced_value_differs() {
+        let table = fixture_table();
+        let constraints = constraints_for(
+            "users",
+            vec![TableConstraint::CastComparison(
+                "name".into(),
+                CastTarget::Int4,
+                BinaryOp::Equal,
+                LiteralValue::Integer(42),
+            )],
+        );
+        let row = vec![Some("1".to_owned()), Some("99".to_owned()), None];
+        assert!(!row_constraints_match(&constraints, &table, &row));
+    }
+
+    #[test]
+    fn cast_comparison_int4_misses_when_row_unparseable() {
+        // `'abc'::int4` raises in postgres; locally we treat it as non-match.
+        let table = fixture_table();
+        let constraints = constraints_for(
+            "users",
+            vec![TableConstraint::CastComparison(
+                "name".into(),
+                CastTarget::Int4,
+                BinaryOp::Equal,
+                LiteralValue::Integer(42),
+            )],
+        );
+        let row = vec![Some("1".to_owned()), Some("abc".to_owned()), None];
+        assert!(!row_constraints_match(&constraints, &table, &row));
+    }
+
+    #[test]
+    fn cast_comparison_bool_matches_via_pg_bool_spelling() {
+        let table = fixture_table();
+        let constraints = constraints_for(
+            "users",
+            vec![TableConstraint::CastComparison(
+                "name".into(),
+                CastTarget::Bool,
+                BinaryOp::Equal,
+                LiteralValue::Boolean(true),
+            )],
+        );
+        let row = vec![Some("1".to_owned()), Some("yes".to_owned()), None];
+        assert!(row_constraints_match(&constraints, &table, &row));
+    }
+
+    #[test]
+    fn cast_comparison_date_matches_via_timestamp_prefix() {
+        let table = fixture_table();
+        let constraints = constraints_for(
+            "users",
+            vec![TableConstraint::CastComparison(
+                "created_at".into(),
+                CastTarget::Date,
+                BinaryOp::Equal,
+                LiteralValue::String("2024-01-15".to_owned()),
+            )],
+        );
+        let row = vec![
+            Some("1".to_owned()),
+            Some("alice".to_owned()),
+            Some("2024-01-15 09:00:00".to_owned()),
+        ];
+        assert!(row_constraints_match(&constraints, &table, &row));
+    }
+
+    #[test]
+    fn cast_comparison_null_row_value_misses() {
+        let table = fixture_table();
+        let constraints = constraints_for(
+            "users",
+            vec![TableConstraint::CastComparison(
+                "name".into(),
+                CastTarget::Int4,
+                BinaryOp::Equal,
+                LiteralValue::Integer(42),
+            )],
+        );
+        let row = vec![Some("1".to_owned()), None, None];
+        assert!(!row_constraints_match(&constraints, &table, &row));
+    }
+
+    #[test]
+    fn cast_comparison_inequality_compares_numerically() {
+        // Locks the PGC-186 op-flip fix on the CDC pre-filter path too:
+        // `name::int4 > 100` matches when name="500".
+        let table = fixture_table();
+        let constraints = constraints_for(
+            "users",
+            vec![TableConstraint::CastComparison(
+                "name".into(),
+                CastTarget::Int4,
+                BinaryOp::GreaterThan,
+                LiteralValue::Integer(100),
+            )],
+        );
+        let row = vec![Some("1".to_owned()), Some("500".to_owned()), None];
+        assert!(row_constraints_match(&constraints, &table, &row));
+    }
 }

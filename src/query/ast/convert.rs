@@ -8,6 +8,7 @@ use pg_query::protobuf::{
 };
 use pg_query::protobuf::{Node, RangeVar, SelectStmt, SetOperation, node::Node as NodeEnum};
 
+use crate::query::cast::cast_target_from_canonical;
 use crate::query::transform::query_expr_constant_fold;
 
 use super::expr_parse::{
@@ -669,9 +670,10 @@ fn type_cast_convert(tc: &TypeCast) -> Result<ScalarExpr, AstError> {
             feature: "TypeCast missing type name".to_owned(),
         })?;
     let target_type = type_name_render(type_name)?;
+    let target = cast_target_from_canonical(&target_type);
     Ok(ScalarExpr::TypeCast {
         expr: Box::new(inner),
-        target_type,
+        target,
     })
 }
 
@@ -3515,10 +3517,13 @@ mod tests {
         expr
     }
 
-    /// Parse `sql` and unwrap the first column as a `(inner, target_type)` cast.
+    /// Parse `sql` and unwrap the first column as a `(inner, canonical_target)` cast.
     fn parse_first_typecast(sql: &str) -> (ScalarExpr, EcoString) {
+        use crate::query::cast::cast_target_deparse;
         match parse_first_column(sql) {
-            ScalarExpr::TypeCast { expr, target_type } => (*expr, target_type),
+            ScalarExpr::TypeCast { expr, target } => {
+                (*expr, EcoString::from(cast_target_deparse(&target)))
+            }
             other => panic!("expected type cast, got {other:?}"),
         }
     }
@@ -4769,9 +4774,8 @@ mod tests {
 
     #[test]
     fn test_having_count_distinct_preserved() {
-        let select = parse_select(
-            "SELECT name FROM users GROUP BY name HAVING COUNT(DISTINCT id) > 1",
-        );
+        let select =
+            parse_select("SELECT name FROM users GROUP BY name HAVING COUNT(DISTINCT id) > 1");
         let func = having_lhs_function(&select);
         assert_eq!(func.name, "count");
         assert!(func.agg_distinct, "DISTINCT must survive HAVING conversion");

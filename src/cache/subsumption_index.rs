@@ -232,6 +232,14 @@ fn classify(constraints: &[TableConstraint]) -> Classification {
                 all_columns.insert(col.clone());
                 complex = true;
             }
+            // Cast constraints sit in a different value domain from bare
+            // comparisons; the equality-pure fast bucket can't index them
+            // by `(column, value)`. Mark as Complex so detailed subsumption
+            // (`table_constraints_subsumed`) handles the cast logic.
+            TableConstraint::CastComparison(col, _, _, _) => {
+                all_columns.insert(col.clone());
+                complex = true;
+            }
         }
     }
 
@@ -293,6 +301,7 @@ fn project_values(
 mod tests {
     use super::*;
     use crate::query::ast::{BinaryOp, LiteralValue};
+    use crate::query::cast::CastTarget;
     use ecow::EcoString;
 
     fn col(s: &str) -> EcoString {
@@ -313,6 +322,10 @@ mod tests {
 
     fn any_of(c: &str, vs: Vec<LiteralValue>) -> TableConstraint {
         TableConstraint::AnyOf(col(c), vs)
+    }
+
+    fn cast_eq(c: &str, cast: CastTarget, v: LiteralValue) -> TableConstraint {
+        TableConstraint::CastComparison(col(c), cast, BinaryOp::Equal, v)
     }
 
     #[test]
@@ -589,5 +602,24 @@ mod tests {
             !candidates.contains(&1),
             "limitation: equality parent in non-empty class not probed when new is Complex"
         );
+    }
+
+    // PGC-182: CastComparison constraints route through Complex classification
+    // so the equality-pure fast-bucket doesn't try to index them by raw value
+    // (their values live in the cast-output domain, not the column domain).
+
+    #[test]
+    fn cast_comparison_classifies_as_complex() {
+        let constraint = cast_eq("name", CastTarget::Int4, int(42));
+        let class = classify(&[constraint]);
+        assert!(matches!(class, Classification::Complex { .. }));
+    }
+
+    #[test]
+    fn cast_comparison_alongside_equality_classifies_as_complex() {
+        // Mixed: a bare equality + a cast comparison. Cast presence forces Complex.
+        let constraints = vec![eq("id", int(1)), cast_eq("name", CastTarget::Int4, int(42))];
+        let class = classify(&constraints);
+        assert!(matches!(class, Classification::Complex { .. }));
     }
 }

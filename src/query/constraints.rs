@@ -4,19 +4,14 @@ use std::collections::{HashMap, HashSet};
 use ecow::EcoString;
 
 use crate::query::ast::{BinaryOp, LiteralValue, MultiOp};
+use crate::query::cast::{
+    CastTarget, canonicalize_comparison, cast_target_is_coercion_supported,
+    resolved_where_scalar_leaf,
+};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedScalarExpr, ResolvedSelectNode, ResolvedTableSource,
     ResolvedWhereExpr,
 };
-
-/// Unwrap a `WhereExpr::Scalar` to its inner `ResolvedScalarExpr` for pattern matching.
-fn binary_scalar_leaf(expr: &ResolvedWhereExpr) -> Option<&ResolvedScalarExpr> {
-    if let ResolvedWhereExpr::Scalar(scalar) = expr {
-        Some(scalar)
-    } else {
-        None
-    }
-}
 
 /// A column constraint extracted from WHERE/JOIN conditions
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -33,13 +28,24 @@ pub enum ColumnConstraint {
         column: ResolvedColumnNode,
         values: Vec<LiteralValue>,
     },
+    /// Comparison through a non-identity cast: `column::cast op value`.
+    /// The value lives in the cast-output domain, so subsumption math
+    /// must bucket these separately from bare `Comparison` constraints
+    /// on the same column.
+    CastComparison {
+        column: ResolvedColumnNode,
+        cast: CastTarget,
+        op: BinaryOp,
+        value: LiteralValue,
+    },
 }
 
 impl ColumnConstraint {
     pub fn column(&self) -> &ResolvedColumnNode {
         match self {
             ColumnConstraint::Comparison { column, .. }
-            | ColumnConstraint::InSet { column, .. } => column,
+            | ColumnConstraint::InSet { column, .. }
+            | ColumnConstraint::CastComparison { column, .. } => column,
         }
     }
 }
@@ -67,6 +73,10 @@ pub enum TableConstraint {
     Comparison(EcoString, BinaryOp, LiteralValue),
     /// At least one must match (IN semantics): column = v1 OR column = v2 OR ...
     AnyOf(EcoString, Vec<LiteralValue>),
+    /// Cast-output comparison: `column::cast op value`. Stored separately so
+    /// subsumption buckets it by `(column, cast)` independently of bare
+    /// `Comparison` constraints on the same column.
+    CastComparison(EcoString, CastTarget, BinaryOp, LiteralValue),
 }
 
 /// Analysis results for a query showing all constant constraints
@@ -233,7 +243,8 @@ fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRange {
 
     for tc in constraints {
         match tc {
-            TableConstraint::Comparison(_, op, value) => {
+            TableConstraint::Comparison(_, op, value)
+            | TableConstraint::CastComparison(_, _, op, value) => {
                 comparisons.push((*op, value));
             }
             TableConstraint::AnyOf(_, values) => {
@@ -589,16 +600,26 @@ fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> bool {
     }
 }
 
-/// Group table constraints by column name for per-column range building.
+/// Bucket key for per-column range building. Bare-column constraints
+/// (`Comparison`, `AnyOf`) and cast-column constraints (`CastComparison`)
+/// live in separate buckets so subsumption compares within a consistent
+/// value domain.
+type ConstraintBucketKey<'a> = (&'a str, Option<&'a CastTarget>);
+
+/// Group table constraints by (column name, optional cast) for per-bucket
+/// range building.
 fn constraints_group_by_column<'a>(
     constraints: &'a [TableConstraint],
-) -> HashMap<&'a str, Vec<&'a TableConstraint>> {
-    let mut grouped: HashMap<&'a str, Vec<&'a TableConstraint>> = HashMap::new();
+) -> HashMap<ConstraintBucketKey<'a>, Vec<&'a TableConstraint>> {
+    let mut grouped: HashMap<ConstraintBucketKey<'a>, Vec<&'a TableConstraint>> = HashMap::new();
     for tc in constraints {
-        let col = match tc {
-            TableConstraint::Comparison(col, _, _) | TableConstraint::AnyOf(col, _) => col.as_str(),
+        let key: ConstraintBucketKey<'a> = match tc {
+            TableConstraint::Comparison(col, _, _) | TableConstraint::AnyOf(col, _) => {
+                (col.as_str(), None)
+            }
+            TableConstraint::CastComparison(col, cast, _, _) => (col.as_str(), Some(cast)),
         };
-        grouped.entry(col).or_default().push(tc);
+        grouped.entry(key).or_default().push(tc);
     }
     grouped
 }
@@ -620,42 +641,48 @@ fn analyze_constraint_expr(
     match expr {
         // Comparison operators: column op value, value op column, column = column
         ResolvedWhereExpr::Binary(binary) if binary.op.is_comparison() => {
-            match (
-                binary_scalar_leaf(&binary.lexpr),
-                binary_scalar_leaf(&binary.rexpr),
-            ) {
-                // column op literal
-                (Some(ResolvedScalarExpr::Column(col)), Some(ResolvedScalarExpr::Literal(val))) => {
-                    constraints.insert(ColumnConstraint::Comparison {
-                        column: col.clone(),
-                        op: binary.op,
-                        value: val.clone(),
-                    });
-                }
-                // literal op column → column op_flip literal
-                (Some(ResolvedScalarExpr::Literal(val)), Some(ResolvedScalarExpr::Column(col))) => {
-                    if let Some(flipped) = binary.op.op_flip() {
+            // canonicalize_comparison handles both `col op lit` and
+            // `lit op col` (with op_flip), plus stripping identity casts
+            // and reporting non-identity cast targets.
+            if let Some((col, target, op, val)) = canonicalize_comparison(binary) {
+                match target {
+                    None => {
                         constraints.insert(ColumnConstraint::Comparison {
                             column: col.clone(),
-                            op: flipped,
+                            op,
                             value: val.clone(),
                         });
-                    } else {
-                        *complete = false;
                     }
+                    Some(cast)
+                        if cast_target_is_coercion_supported(
+                            cast,
+                            &col.column_metadata.data_type,
+                        ) =>
+                    {
+                        constraints.insert(ColumnConstraint::CastComparison {
+                            column: col.clone(),
+                            cast: cast.clone(),
+                            op,
+                            value: val.clone(),
+                        });
+                    }
+                    Some(_) => *complete = false,
                 }
-                // column = column (equivalence) — equality only
-                (
-                    Some(ResolvedScalarExpr::Column(left)),
-                    Some(ResolvedScalarExpr::Column(right)),
-                ) if binary.op == BinaryOp::Equal => {
-                    equivalences.insert(ColumnEquivalence {
-                        left: left.clone(),
-                        right: right.clone(),
-                    });
-                }
-                _ => *complete = false,
+                return;
             }
+            // column = column (equivalence) — equality only
+            if let (Some(ResolvedScalarExpr::Column(left)), Some(ResolvedScalarExpr::Column(right))) = (
+                resolved_where_scalar_leaf(&binary.lexpr),
+                resolved_where_scalar_leaf(&binary.rexpr),
+            ) && binary.op == BinaryOp::Equal
+            {
+                equivalences.insert(ColumnEquivalence {
+                    left: left.clone(),
+                    right: right.clone(),
+                });
+                return;
+            }
+            *complete = false;
         }
 
         // AND: recursively analyze both sides
@@ -971,6 +998,10 @@ fn propagate_constraints(
                         column: other.clone(),
                         values: values.clone(),
                     },
+                    // CastComparison doesn't propagate — `val::int = 5 AND val = other_val`
+                    // does NOT imply `other_val::int = 5` unless we also know
+                    // `other_val` is cast-compatible. Conservative skip.
+                    ColumnConstraint::CastComparison { .. } => continue,
                 };
                 new_constraints.push(propagated);
             }
@@ -1055,6 +1086,17 @@ pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstrai
             ColumnConstraint::InSet { column, values, .. } => {
                 TableConstraint::AnyOf(column.column.clone(), values.clone())
             }
+            ColumnConstraint::CastComparison {
+                column,
+                cast,
+                op,
+                value,
+            } => TableConstraint::CastComparison(
+                column.column.clone(),
+                cast.clone(),
+                *op,
+                value.clone(),
+            ),
         };
         table_constraints
             .entry(constraint.column().table.clone())
@@ -1138,7 +1180,7 @@ mod tests {
         constraints.table_constraints.get(table).is_some_and(|cs| {
             cs.iter().any(|tc| match tc {
                 TableConstraint::Comparison(c, o, v) => c == column && *o == op && *v == value,
-                TableConstraint::AnyOf(..) => false,
+                TableConstraint::AnyOf(..) | TableConstraint::CastComparison(..) => false,
             })
         })
     }
@@ -1154,7 +1196,7 @@ mod tests {
                 TableConstraint::AnyOf(c, vs) => {
                     c == column && values.iter().all(|v| vs.contains(v)) && vs.len() == values.len()
                 }
-                TableConstraint::Comparison(..) => false,
+                TableConstraint::Comparison(..) | TableConstraint::CastComparison(..) => false,
             })
         })
     }
@@ -2826,5 +2868,267 @@ mod tests {
             table_constraints_subsumed(&new, &cached, "users"),
             "true full-scan cached query should still subsume"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // PGC-149: identity TypeCast strip in constraint extraction
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_identity_text_cast_extracts_comparison_constraint() {
+        // `name::text = 'alice'` on a TEXT column must extract the same
+        // ColumnConstraint::Comparison as `name = 'alice'` would.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let constraints = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::text = 'alice'",
+            &tables,
+        ));
+
+        assert!(constraints.where_analysis_complete);
+        assert!(has_constraint(
+            &constraints,
+            "users",
+            "name",
+            BinaryOp::Equal,
+            LiteralValue::String("alice".to_owned()),
+        ));
+    }
+
+    #[test]
+    fn test_identity_text_cast_enables_subsumption() {
+        // Two queries that only differ by a redundant `::text` on a TEXT
+        // column should subsume each other.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name = 'alice'",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::text = 'alice'",
+            &tables,
+        ));
+
+        assert!(cached.where_analysis_complete);
+        assert!(new.where_analysis_complete);
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_identity_text_cast_on_int_column_extracts_constraint() {
+        // PGC-177: int → ::text is identity, so the constraint must be
+        // extracted as `id = 42` for subsumption to work.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let constraints = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE id::text = '42'",
+            &tables,
+        ));
+
+        assert!(constraints.where_analysis_complete);
+        assert!(has_constraint(
+            &constraints,
+            "users",
+            "id",
+            BinaryOp::Equal,
+            LiteralValue::String("42".to_owned()),
+        ));
+    }
+
+    #[test]
+    fn test_non_identity_text_cast_keeps_analysis_incomplete() {
+        // `name::numeric = 42` is a text → numeric coercion, not identity.
+        // Analysis must remain incomplete so subsumption stays conservative.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let constraints = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::numeric = 42",
+            &tables,
+        ));
+
+        assert!(
+            !constraints.where_analysis_complete,
+            "non-identity cast must leave analysis incomplete"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // PGC-182: subsumption for non-identity casts via CastComparison.
+    // ---------------------------------------------------------------
+
+    fn has_cast_constraint(
+        constraints: &QueryConstraints,
+        table: &str,
+        column: &str,
+        cast: &CastTarget,
+        op: BinaryOp,
+        value: &LiteralValue,
+    ) -> bool {
+        constraints.table_constraints.get(table).is_some_and(|cs| {
+            cs.iter().any(|tc| match tc {
+                TableConstraint::CastComparison(c, k, o, v) => {
+                    c == column && k == cast && *o == op && v == value
+                }
+                _ => false,
+            })
+        })
+    }
+
+    #[test]
+    fn test_text_to_int4_extracts_cast_comparison() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let constraints = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::int4 = 42",
+            &tables,
+        ));
+
+        assert!(constraints.where_analysis_complete);
+        assert!(has_cast_constraint(
+            &constraints,
+            "users",
+            "name",
+            &CastTarget::Int4,
+            BinaryOp::Equal,
+            &LiteralValue::Integer(42),
+        ));
+    }
+
+    #[test]
+    fn test_cast_comparison_subsumes_self() {
+        // Identical cast queries: both extract the same CastComparison,
+        // subsumption holds.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::int4 = 42",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::int4 = 42",
+            &tables,
+        ));
+
+        assert!(cached.where_analysis_complete);
+        assert!(new.where_analysis_complete);
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_cast_comparison_range_subsumes_tighter_range() {
+        // `WHERE name::int4 > 100` (cached) subsumes `WHERE name::int4 > 200`
+        // (new) — every row in the new is also in the cached.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::int4 > 100",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::int4 > 200",
+            &tables,
+        ));
+
+        assert!(table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_cast_comparison_range_does_not_subsume_looser_range() {
+        // `WHERE name::int4 > 200` (cached) does NOT subsume
+        // `WHERE name::int4 > 100` (new) — new is broader.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::int4 > 200",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::int4 > 100",
+            &tables,
+        ));
+
+        assert!(!table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_different_casts_do_not_cross_subsume() {
+        // `name::int4 = 42` and `name::int8 = 42` are separate value domains;
+        // neither query subsumes the other even though the value matches.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::int4 = 42",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::int8 = 42",
+            &tables,
+        ));
+
+        assert!(!table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_bare_and_cast_constraints_do_not_cross_subsume() {
+        // `name = '42'` (bare text compare) and `name::int4 = 42` are
+        // different predicates — bare bytes vs int value. Subsumption must
+        // not cross domains.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+
+        let cached = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name = '42'",
+            &tables,
+        ));
+        let new = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users WHERE name::int4 = 42",
+            &tables,
+        ));
+
+        assert!(!table_constraints_subsumed(&new, &cached, "users"));
+    }
+
+    #[test]
+    fn test_cast_comparison_does_not_propagate_through_equivalence() {
+        // `name::int4 = 5 AND name = other_name` must NOT yield
+        // `other_name::int4 = 5` — the cast doesn't follow equivalences
+        // without knowing the other column's storage type is also castable.
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users2", 1002));
+
+        let constraints = analyze_query_constraints(&resolve_sql(
+            "SELECT * FROM users u JOIN users2 u2 ON u.name = u2.name \
+             WHERE u.name::int4 = 5",
+            &tables,
+        ));
+
+        // u.name::int4 = 5 is extracted, but u2.name has no cast constraint.
+        assert!(has_cast_constraint(
+            &constraints,
+            "users",
+            "name",
+            &CastTarget::Int4,
+            BinaryOp::Equal,
+            &LiteralValue::Integer(5),
+        ));
+        assert!(!has_cast_constraint(
+            &constraints,
+            "users2",
+            "name",
+            &CastTarget::Int4,
+            BinaryOp::Equal,
+            &LiteralValue::Integer(5),
+        ));
     }
 }

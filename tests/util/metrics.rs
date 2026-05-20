@@ -29,6 +29,8 @@ pub struct MetricsSnapshot {
     pub cache_mv_rebuilds: u64,
     pub cache_mv_skipped_rebuilds: u64,
     pub cache_mv_dirty_truncates: u64,
+    pub cache_cdc_local_eval_hits: u64,
+    pub cache_cdc_pg_eval_hits: u64,
     pub cache_hit_rate: f64,
     pub cacheability_rate: f64,
 }
@@ -77,6 +79,8 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut cache_mv_rebuilds = 0u64;
     let mut cache_mv_skipped_rebuilds = 0u64;
     let mut cache_mv_dirty_truncates = 0u64;
+    let mut cache_cdc_local_eval_hits = 0u64;
+    let mut cache_cdc_pg_eval_hits = 0u64;
 
     for line in response.lines() {
         // Skip comments and empty lines
@@ -109,6 +113,8 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_cache_mv_rebuilds" => cache_mv_rebuilds = value,
                 "pgcache_cache_mv_skipped_rebuilds" => cache_mv_skipped_rebuilds = value,
                 "pgcache_cache_mv_dirty_truncates" => cache_mv_dirty_truncates = value,
+                "pgcache_cache_cdc_local_eval_hits" => cache_cdc_local_eval_hits = value,
+                "pgcache_cache_cdc_pg_eval_hits" => cache_cdc_pg_eval_hits = value,
                 _ => {}
             }
         }
@@ -151,6 +157,8 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         cache_mv_rebuilds,
         cache_mv_skipped_rebuilds,
         cache_mv_dirty_truncates,
+        cache_cdc_local_eval_hits,
+        cache_cdc_pg_eval_hits,
         cache_hit_rate,
         cacheability_rate,
     })
@@ -180,6 +188,9 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         cache_mv_skipped_rebuilds: after.cache_mv_skipped_rebuilds
             - before.cache_mv_skipped_rebuilds,
         cache_mv_dirty_truncates: after.cache_mv_dirty_truncates - before.cache_mv_dirty_truncates,
+        cache_cdc_local_eval_hits: after.cache_cdc_local_eval_hits
+            - before.cache_cdc_local_eval_hits,
+        cache_cdc_pg_eval_hits: after.cache_cdc_pg_eval_hits - before.cache_cdc_pg_eval_hits,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

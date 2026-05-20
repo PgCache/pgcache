@@ -8,6 +8,7 @@ use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
 use crate::cache::{SubqueryKind, UpdateQuerySource};
+use crate::query::cast::{CastTarget, cast_target_deparse};
 
 use super::{AstError, Deparse};
 
@@ -1379,11 +1380,12 @@ pub enum ScalarExpr {
     Arithmetic(ArithmeticExpr),
     Subquery(Box<QueryExpr>),
     Array(Vec<ScalarExpr>),
-    // target_type pre-rendered at AST-conversion time so deparse stays a
-    // pure tree walk (no TypeName re-traversal per cache hit).
+    // target classified at AST-conversion time so deparse stays a pure tree
+    // walk (no TypeName re-traversal per cache hit) and evaluator/classifier
+    // can match on the enum rather than re-parsing strings.
     TypeCast {
         expr: Box<ScalarExpr>,
-        target_type: EcoString,
+        target: CastTarget,
     },
 }
 
@@ -1499,11 +1501,11 @@ impl Deparse for ScalarExpr {
                 buf.push(']');
                 buf
             }
-            ScalarExpr::TypeCast { expr, target_type } => {
+            ScalarExpr::TypeCast { expr, target } => {
                 buf.push('(');
                 expr.deparse(buf);
                 buf.push_str(")::");
-                buf.push_str(target_type);
+                buf.push_str(cast_target_deparse(target));
                 buf
             }
         }

@@ -904,11 +904,11 @@ fn scalar_expr_resolve(
             }
             Ok(ResolvedScalarExpr::Array(resolved))
         }
-        ScalarExpr::TypeCast { expr, target_type } => {
+        ScalarExpr::TypeCast { expr, target } => {
             let inner = scalar_expr_resolve(expr, scope)?;
             Ok(ResolvedScalarExpr::TypeCast {
                 expr: Box::new(inner),
-                target_type: target_type.clone(),
+                target: target.clone(),
             })
         }
     }
@@ -1099,9 +1099,9 @@ fn scalar_expr_to_identifier(expr: &ScalarExpr) -> ResolvedScalarExpr {
         ScalarExpr::Array(elems) => {
             ResolvedScalarExpr::Array(elems.iter().map(scalar_expr_to_identifier).collect())
         }
-        ScalarExpr::TypeCast { expr, target_type } => ResolvedScalarExpr::TypeCast {
+        ScalarExpr::TypeCast { expr, target } => ResolvedScalarExpr::TypeCast {
             expr: Box::new(scalar_expr_to_identifier(expr)),
-            target_type: target_type.clone(),
+            target: target.clone(),
         },
     }
 }
