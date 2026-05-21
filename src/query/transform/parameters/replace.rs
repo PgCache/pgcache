@@ -296,6 +296,33 @@ mod tests {
         );
     }
 
+    /// `SELECT $1 FROM …` — bind-time parameter substitution must reach the
+    /// SELECT projection, and the bound form should share a fingerprint with
+    /// the inline-literal form so cache reuse is automatic (PGC-183).
+    #[test]
+    fn test_ast_parameters_replace_in_select_columns() {
+        use crate::query::ast::query_expr_fingerprint;
+
+        let ast = pg_query::parse("SELECT $1 FROM users").expect("parse SQL");
+        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        let params = typed_text_params(vec![(Some(b"42"), PgType::INT4)]);
+        let bound =
+            query_expr_parameters_replace(&query_expr, &params).expect("parameter replacement");
+
+        let mut buf = String::new();
+        bound.deparse(&mut buf);
+        assert!(!buf.contains("$1"), "SELECT $1 should be bound, got: {buf}");
+
+        // Fingerprint must match the inline-literal form.
+        let inline_ast = pg_query::parse("SELECT 42 FROM users").expect("parse inline form");
+        let inline = query_expr_convert(&inline_ast).expect("convert inline form");
+        assert_eq!(
+            query_expr_fingerprint(&bound),
+            query_expr_fingerprint(&inline),
+            "bound `SELECT $1` should share a fingerprint with `SELECT 42`",
+        );
+    }
+
     /// `SELECT id FROM … ORDER BY $1` — bind-time parameter substitution must
     /// reach the top-level ORDER BY clause.
     #[test]

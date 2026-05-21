@@ -291,123 +291,39 @@ fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstErro
                 Some(EcoString::from(res_target.name.as_str()))
             };
 
-            match val_node.node.as_ref() {
-                Some(NodeEnum::ColumnRef(col_ref)) => {
-                    let fields = &col_ref.fields;
+            // Bare or qualified star (`SELECT *`, `SELECT t.*`) are
+            // SELECT-list-only shapes; everything else is a scalar
+            // expression and delegates to `node_convert_to_scalar_expr`.
+            if let Some(NodeEnum::ColumnRef(col_ref)) = &val_node.node {
+                let fields = &col_ref.fields;
 
-                    // Bare star: SELECT *
-                    if let [field] = fields.as_slice()
-                        && let Some(NodeEnum::AStar(_)) = &field.node
-                    {
-                        columns.push(SelectColumn::Star(None));
-                        continue;
-                    }
-
-                    // Qualified star: SELECT t1.*
-                    if fields.len() >= 2
-                        && matches!(
-                            fields.last().and_then(|f| f.node.as_ref()),
-                            Some(NodeEnum::AStar(_))
-                        )
-                    {
-                        let qualifier = fields
-                            .get(fields.len() - 2)
-                            .ok_or(AstError::InvalidTableRef)?;
-                        let table = match qualifier.node.as_ref() {
-                            Some(NodeEnum::String(s)) => EcoString::from(s.sval.as_str()),
-                            _ => return Err(AstError::InvalidTableRef),
-                        };
-                        columns.push(SelectColumn::Star(Some(table)));
-                        continue;
-                    }
-
-                    // Regular column reference
-                    let column_ref = column_ref_extract(col_ref)?;
-
-                    columns.push(SelectColumn::Expr {
-                        expr: ScalarExpr::Column(column_ref),
-                        alias,
-                    });
-                }
-                Some(NodeEnum::SubLink(sub_link)) => {
-                    match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
-                        Some(NodeEnum::SelectStmt(select_stmt)) => {
-                            let query = select_stmt_to_query_expr(select_stmt)?;
-                            columns.push(SelectColumn::Expr {
-                                expr: ScalarExpr::Subquery(Box::new(query)),
-                                alias,
-                            });
-                        }
-                        other => {
-                            return Err(AstError::UnsupportedSelectFeature {
-                                feature: format!("Column expression: {other:?}"),
-                            });
-                        }
-                    }
-                }
-                Some(NodeEnum::FuncCall(func_call)) => {
-                    let function = func_call_convert(func_call)?;
-                    columns.push(SelectColumn::Expr {
-                        expr: ScalarExpr::Function(function),
-                        alias,
-                    });
-                }
-                Some(NodeEnum::AConst(const_val)) => {
-                    let value = const_value_extract(const_val)?;
-                    columns.push(SelectColumn::Expr {
-                        expr: ScalarExpr::Literal(value),
-                        alias,
-                    });
-                }
-                Some(NodeEnum::CoalesceExpr(coalesce)) => {
-                    let function = coalesce_expr_convert(coalesce)?;
-                    columns.push(SelectColumn::Expr {
-                        expr: ScalarExpr::Function(function),
-                        alias,
-                    });
-                }
-                Some(NodeEnum::MinMaxExpr(minmax)) => {
-                    let function = minmax_expr_convert(minmax)?;
-                    columns.push(SelectColumn::Expr {
-                        expr: ScalarExpr::Function(function),
-                        alias,
-                    });
-                }
-                Some(NodeEnum::AExpr(aexpr))
-                    if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprNullif) =>
+                if let [field] = fields.as_slice()
+                    && let Some(NodeEnum::AStar(_)) = &field.node
                 {
-                    let function = aexpr_nullif_convert(aexpr)?;
-                    columns.push(SelectColumn::Expr {
-                        expr: ScalarExpr::Function(function),
-                        alias,
-                    });
+                    columns.push(SelectColumn::Star(None));
+                    continue;
                 }
-                Some(NodeEnum::AExpr(aexpr))
-                    if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprOp) =>
+
+                if fields.len() >= 2
+                    && matches!(
+                        fields.last().and_then(|f| f.node.as_ref()),
+                        Some(NodeEnum::AStar(_))
+                    )
                 {
-                    let arith = aexpr_arithmetic_convert(aexpr)?;
-                    columns.push(SelectColumn::Expr {
-                        expr: ScalarExpr::Arithmetic(arith),
-                        alias,
-                    });
-                }
-                Some(NodeEnum::CaseExpr(case_expr)) => {
-                    let case = case_expr_convert(case_expr)?;
-                    columns.push(SelectColumn::Expr {
-                        expr: ScalarExpr::Case(case),
-                        alias,
-                    });
-                }
-                Some(NodeEnum::TypeCast(tc)) => {
-                    let expr = type_cast_convert(tc)?;
-                    columns.push(SelectColumn::Expr { expr, alias });
-                }
-                other => {
-                    return Err(AstError::UnsupportedSelectFeature {
-                        feature: format!("Column expression: {other:?}"),
-                    });
+                    let qualifier = fields
+                        .get(fields.len() - 2)
+                        .ok_or(AstError::InvalidTableRef)?;
+                    let table = match qualifier.node.as_ref() {
+                        Some(NodeEnum::String(s)) => EcoString::from(s.sval.as_str()),
+                        _ => return Err(AstError::InvalidTableRef),
+                    };
+                    columns.push(SelectColumn::Star(Some(table)));
+                    continue;
                 }
             }
+
+            let expr = node_convert_to_scalar_expr(val_node)?;
+            columns.push(SelectColumn::Expr { expr, alias });
         } else {
             return Err(AstError::UnsupportedSelectFeature {
                 feature: format!("Target: {target:?}"),
@@ -1173,6 +1089,25 @@ mod tests {
                 .map(|t| (t.schema.as_deref(), t.name.as_str()))
                 .collect::<HashSet<_>>(),
             HashSet::<(Option<&str>, _)>::from([(None, "users")])
+        );
+    }
+
+    /// PGC-183: `SELECT $1 FROM …` must parse — the SELECT-list converter
+    /// previously rejected ParamRef even though `node_convert_to_scalar_expr`
+    /// already supported it for WHERE-side use.
+    #[test]
+    fn test_query_expr_convert_select_paramref() {
+        let select = parse_select("SELECT $1 FROM users");
+        let SelectColumns::Columns(cols) = &select.columns else {
+            panic!("expected explicit columns");
+        };
+        assert_eq!(cols.len(), 1);
+        let SelectColumn::Expr { expr, .. } = &cols[0] else {
+            panic!("expected scalar column expression");
+        };
+        assert!(
+            matches!(expr, ScalarExpr::Literal(LiteralValue::Parameter(p)) if p == "$1"),
+            "expected ScalarExpr::Literal(Parameter('$1')), got {expr:?}",
         );
     }
 
