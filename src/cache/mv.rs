@@ -17,7 +17,7 @@ use postgres_protocol::escape::escape_identifier;
 use crate::query::ast::{Deparse, LimitClause, OrderDirection, SetOpType};
 use crate::query::resolved::{
     ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
-    ResolvedSelectColumns, ResolvedSelectNode,
+    ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource,
 };
 
 /// Shape classification set at registration from the decorrelated, resolved
@@ -345,10 +345,17 @@ pub fn shape_classify(
             {
                 // Reducing / transforming shape → Measure.
                 ShapeGate::Measure
+            } else if select_has_join(select) {
+                // A join's result — narrowed by its join/where predicates and
+                // any ORDER BY/LIMIT — is generally far smaller than its
+                // inputs, so the materialized result is not a duplicate of the
+                // source-row cache. The size gate decides whether the
+                // reduction is large enough to justify storage.
+                ShapeGate::Measure
             } else {
-                // Plain filter / projection, join without aggregate — source-
-                // row cache already stores the relevant rows; MV would be a
-                // duplicate.
+                // Single-table plain filter / projection — the source-row
+                // cache already stores exactly these rows; an MV would just
+                // duplicate it.
                 return ShapeGate::Skip;
             }
         }
@@ -362,6 +369,17 @@ pub fn shape_classify(
     }
 
     shape
+}
+
+/// True when the SELECT's top-level FROM joins two or more base tables —
+/// either an explicit `JOIN` or a comma-separated list. Subqueries in FROM are
+/// not descended into; classification is top-level only.
+fn select_has_join(select: &ResolvedSelectNode) -> bool {
+    select.from.len() > 1
+        || select
+            .from
+            .iter()
+            .any(|src| matches!(src, ResolvedTableSource::Join(_)))
 }
 
 /// Returns true if any top-level column expression in the SELECT list satisfies

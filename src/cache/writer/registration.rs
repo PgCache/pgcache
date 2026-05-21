@@ -278,10 +278,8 @@ impl WriterRegistration {
                     )
                     .await
                 {
-                    // A non-decorrelatable correlated subquery is a routing
-                    // decision (forward to origin), not a fault — log at debug
-                    // so it doesn't surface as a swallowed error to upstream
-                    // log scrapers (PGC-104 harness, etc.).
+                    // Non-decorrelatable subqueries are a routing decision
+                    // (forward to origin), not a fault — log at debug.
                     let ctx = e.current_context();
                     if matches!(
                         ctx,
@@ -306,9 +304,6 @@ impl WriterRegistration {
                 row_count,
             } => {
                 self.query_ready_mark(core, fingerprint, cached_bytes, row_count);
-                // Pinned queries bypass the coordinator-driven "first hit triggers
-                // MV build" flow so they stay warm across restarts and readmits.
-                // See mv_pinned_bootstrap.
                 core.mv_pinned_bootstrap(fingerprint);
                 core.cache.current_size = core.cache_size_load().await?;
                 core.eviction_run().await?;

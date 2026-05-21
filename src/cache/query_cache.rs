@@ -408,29 +408,38 @@ impl QueryCache {
             .cached_queries
             .get(&fingerprint)
             .map(|e| (e.mv.state, e.mv.output_columns.clone()));
-        let serve = match observed {
-            Some((MvState::Fresh, Some(cols))) => MvServe::Mv(cols),
+        // `mv_fallthrough` counts only queries that have (or are building) an
+        // MV — `Pending`/`Scheduled`, plus the `Fresh`-without-columns error.
+        // `Skipped`/`Ineligible` queries have no MV and never will, so a
+        // source-row serve there is not a fallthrough and is not counted;
+        // `mv_hits / (mv_hits + mv_fallthrough)` is then a true MV serve rate.
+        match observed {
+            Some((MvState::Fresh, Some(cols))) => {
+                metrics::counter!(names::CACHE_MV_HITS).increment(1);
+                MvServe::Mv(cols)
+            }
             Some((MvState::Fresh, None)) => {
                 error!(
                     fingerprint,
                     "MV is Fresh but output columns were never captured; \
                      serving from source rows"
                 );
+                metrics::counter!(names::CACHE_MV_FALLTHROUGH).increment(1);
                 MvServe::SourceRow
             }
             Some((MvState::Pending { has_table }, _)) => {
                 if let Some(cmd) = self.mv_schedule(fingerprint, has_table) {
                     let _ = self.query_tx.send(cmd);
                 }
+                metrics::counter!(names::CACHE_MV_FALLTHROUGH).increment(1);
+                MvServe::SourceRow
+            }
+            Some((MvState::Scheduled { .. }, _)) => {
+                metrics::counter!(names::CACHE_MV_FALLTHROUGH).increment(1);
                 MvServe::SourceRow
             }
             _ => MvServe::SourceRow,
-        };
-        match serve {
-            MvServe::Mv(_) => metrics::counter!(names::CACHE_MV_HITS).increment(1),
-            MvServe::SourceRow => metrics::counter!(names::CACHE_MV_FALLTHROUGH).increment(1),
         }
-        serve
     }
 
     /// Check-and-transition under write guard: `Pending { has_table } →
