@@ -33,7 +33,7 @@ use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{AdmitAction, QueryCommand, SubsumptionResult, WriterNotify},
-    mv::{ShapeGate, shape_classify},
+    mv::{ShapeGate, resolved_has_join, shape_classify},
     query::CacheableQuery,
     types::{
         CachedQuery, QueryMetrics, SharedResolved, UpdateEvalStrategy, UpdateQueries, UpdateQuery,
@@ -165,6 +165,10 @@ struct QueryResolution {
     relation_oids: Vec<u32>,
     base_query: QueryExpr,
     max_limit: Option<u64>,
+    /// MV cap, separate from `max_limit`. Set for join shapes only (the
+    /// MV body applies the user's LIMIT over the source-row cache);
+    /// `None` for other reducers, whose results are already collapsed.
+    mv_limit: Option<u64>,
     /// MV shape gate. Also gates `max_limit`: reducer shapes force
     /// `max_limit = None` so source-row population isn't truncated in a way
     /// that would break re-evaluation (aggregates, GROUP BY, DISTINCT,
@@ -688,6 +692,14 @@ impl WriterRegistration {
             user_max_limit
         };
 
+        // `mv_limit` caps the MV body, independent of the population cap.
+        // Only joins benefit; other reducers already collapse their input.
+        let mv_limit = if matches!(shape_gate, ShapeGate::Measure) && resolved_has_join(&resolved) {
+            user_max_limit
+        } else {
+            None
+        };
+
         let uq_start = Instant::now();
         let relation_oids =
             self.update_queries_register(core, fingerprint, &resolved, max_limit.is_some())?;
@@ -700,6 +712,7 @@ impl WriterRegistration {
             relation_oids,
             base_query,
             max_limit,
+            mv_limit,
             shape_gate,
         })
     }
@@ -911,7 +924,7 @@ impl WriterRegistration {
         // Classify shape for MV eligibility. Sticky — readmit/limit-bump
         // preserve the result through state_view_write. Classification was
         // done in `query_resolve`; reuse here.
-        core.mv_state_set(fingerprint, resolution.shape_gate);
+        core.mv_state_set(fingerprint, resolution.shape_gate, resolution.mv_limit);
 
         // Phase 2: Subsumption check
         let subsumption_start = Instant::now();

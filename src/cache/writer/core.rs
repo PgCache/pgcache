@@ -292,9 +292,14 @@ impl WriterCore {
     /// bump, since classification is sticky). The state_view entry is expected
     /// to exist — it is inserted by the coordinator before dispatching
     /// `QueryCommand::Register`.
-    pub(super) fn mv_state_set(&self, fingerprint: u64, shape_gate: ShapeGate) {
+    pub(super) fn mv_state_set(
+        &self,
+        fingerprint: u64,
+        shape_gate: ShapeGate,
+        mv_limit: Option<u64>,
+    ) {
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
-            view.mv = MvMeta::new(shape_gate);
+            view.mv = MvMeta::new(shape_gate, mv_limit);
         }
     }
 
@@ -328,7 +333,7 @@ impl WriterCore {
                 deparsed_sql: Some(deparsed_sql.clone()),
                 max_limit,
                 referenced: false,
-                mv: MvMeta::new(ShapeGate::Skip),
+                mv: MvMeta::new(ShapeGate::Skip, None),
             });
     }
 

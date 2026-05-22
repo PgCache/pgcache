@@ -913,6 +913,115 @@ async fn test_mv_duplicate_derived_column_names() -> Result<(), Error> {
     Ok(())
 }
 
+/// PGC-188: the demo's tag-page shape — `post_tags ⋈ posts` filtered to one
+/// tag, `ORDER BY score DESC LIMIT N`. With a popular tag, the unlimited join
+/// is large but the MV is LIMIT-capped, so `result_rows × mv_size_ratio (10)
+/// ≤ source_rows` becomes `min(full_count, 10) × 10 ≤ source` → trivially
+/// satisfied for a realistic tag page. Pre-fix the gate counted the full
+/// unlimited join (limit was nulled for all reducer shapes), so the gate
+/// failed and no MV was ever built.
+#[tokio::test]
+async fn test_mv_join_lifecycle() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE posts (id integer primary key, title text not null, score integer not null)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE post_tags (id serial primary key, post_id integer not null, tag text not null)",
+        &[],
+    )
+    .await?;
+
+    // 300 posts; 300 post_tags. 'rust' is the popular tag — 200 posts (ids
+    // 100..299, score = id). With LIMIT 10 the MV stores top-10 rows; the
+    // gate sees min(200, 10) × 10 = 100 ≤ source-row cache (≈400) → passes.
+    // Pre-fix it saw 200 × 10 = 2000 ≤ 400 → failed.
+    for id in 0..300 {
+        ctx.query(
+            "INSERT INTO posts VALUES ($1, $2, $3)",
+            &[&id, &format!("post {id}"), &id],
+        )
+        .await?;
+        let tag = if id >= 100 { "rust" } else { "other" };
+        ctx.query(
+            "INSERT INTO post_tags (post_id, tag) VALUES ($1, $2)",
+            &[&id, &tag],
+        )
+        .await?;
+    }
+
+    let sql = "SELECT p.id, p.title, p.score FROM post_tags pt \
+               JOIN posts p ON pt.post_id = p.id \
+               WHERE pt.tag = 'rust' ORDER BY p.score DESC LIMIT 10";
+
+    let expected_top10: Vec<i32> = (290..300).rev().collect();
+
+    fn ids(res: &[tokio_postgres::SimpleQueryMessage]) -> Vec<i32> {
+        res.iter()
+            .filter_map(|m| match m {
+                tokio_postgres::SimpleQueryMessage::Row(r) => {
+                    Some(r.get(0).unwrap().parse().unwrap())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    // First query — cache miss, forwarded to origin; source-row population runs.
+    let res = ctx.simple_query(sql).await?;
+    assert_eq!(ids(&res), expected_top10, "origin: top-10 by score DESC");
+
+    ctx.cache_settle().await?;
+    assert_eq!(
+        mv_table_count(&ctx.dbs).await?,
+        0,
+        "MV not built until first cache hit triggers MvFirstPop"
+    );
+
+    // Second query — cache hit on Pending → schedules first-pop, falls through.
+    let res = ctx.simple_query(sql).await?;
+    assert_eq!(ids(&res), expected_top10);
+
+    ctx.cache_settle().await?;
+    assert_eq!(
+        mv_table_count(&ctx.dbs).await?,
+        1,
+        "LIMIT-capped join must produce an MV table after MvFirstPop"
+    );
+
+    // Third query — MV fast-path hit.
+    let m1 = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_eq!(
+        ids(&res),
+        expected_top10,
+        "MV fast path must return the same top-10"
+    );
+    let m2 = ctx.metrics().await?;
+    let d = metrics_delta(&m1, &m2);
+    assert_eq!(d.cache_mv_hits, 1, "expected join MV fast-path hit");
+    assert_eq!(d.cache_mv_fallthrough, 0);
+
+    // A smaller user LIMIT (3) over the same MV — top-3 subset, served from MV.
+    let sql_small = "SELECT p.id, p.title, p.score FROM post_tags pt \
+                     JOIN posts p ON pt.post_id = p.id \
+                     WHERE pt.tag = 'rust' ORDER BY p.score DESC LIMIT 3";
+    let m3 = ctx.metrics().await?;
+    let res = ctx.simple_query(sql_small).await?;
+    assert_eq!(ids(&res), vec![299, 298, 297]);
+    let m4 = ctx.metrics().await?;
+    assert_eq!(
+        metrics_delta(&m3, &m4).cache_mv_hits,
+        1,
+        "smaller LIMIT must be served from the same MV"
+    );
+
+    Ok(())
+}
+
 /// PGC-138: a relation carrying a Fresh-MV query *and* a separate
 /// non-MV cached query. The CDC short-circuit must still (a) dirty-mark
 /// the Fresh MV when a row matches it and (b) upsert the shared cache

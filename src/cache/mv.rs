@@ -110,15 +110,20 @@ pub struct MvMeta {
     /// PostgreSQL's output column names, captured at first build and
     /// reused across rebuilds. `None` until the MV has ever been built.
     pub output_columns: Option<Arc<[EcoString]>>,
+    /// LIMIT cap for the MV body — set for join shapes (top-N over the
+    /// join), `None` otherwise. Dispatch falls through when an incoming
+    /// variant needs more rows than the MV holds.
+    pub limit: Option<u64>,
 }
 
 impl MvMeta {
     /// Registration-time state for `shape_gate` — no table, no names yet.
-    pub fn new(shape_gate: ShapeGate) -> Self {
+    pub fn new(shape_gate: ShapeGate, limit: Option<u64>) -> Self {
         Self {
             shape_gate,
             state: mv_state_initial(shape_gate),
             output_columns: None,
+            limit,
         }
     }
 }
@@ -346,16 +351,12 @@ pub fn shape_classify(
                 // Reducing / transforming shape → Measure.
                 ShapeGate::Measure
             } else if select_has_join(select) {
-                // A join's result — narrowed by its join/where predicates and
-                // any ORDER BY/LIMIT — is generally far smaller than its
-                // inputs, so the materialized result is not a duplicate of the
-                // source-row cache. The size gate decides whether the
-                // reduction is large enough to justify storage.
+                // Join result is generally far smaller than its inputs; size
+                // gate decides whether the reduction justifies storage.
                 ShapeGate::Measure
             } else {
-                // Single-table plain filter / projection — the source-row
-                // cache already stores exactly these rows; an MV would just
-                // duplicate it.
+                // Single-table plain filter/projection — source-row cache
+                // already stores exactly these rows; MV would duplicate it.
                 return ShapeGate::Skip;
             }
         }
@@ -371,15 +372,23 @@ pub fn shape_classify(
     shape
 }
 
-/// True when the SELECT's top-level FROM joins two or more base tables —
-/// either an explicit `JOIN` or a comma-separated list. Subqueries in FROM are
-/// not descended into; classification is top-level only.
+/// Top-level FROM joins two or more base tables (explicit JOIN or comma
+/// list). Subqueries in FROM are not descended into.
 fn select_has_join(select: &ResolvedSelectNode) -> bool {
     select.from.len() > 1
         || select
             .from
             .iter()
             .any(|src| matches!(src, ResolvedTableSource::Join(_)))
+}
+
+/// Top-level body is a SELECT with a join. Only joins get an MV LIMIT
+/// cap; other reducers collapse the input regardless.
+pub fn resolved_has_join(resolved: &ResolvedQueryExpr) -> bool {
+    match &resolved.body {
+        ResolvedQueryBody::Select(s) => select_has_join(s),
+        ResolvedQueryBody::SetOp(_) | ResolvedQueryBody::Values(_) => false,
+    }
 }
 
 /// Returns true if any top-level column expression in the SELECT list satisfies
@@ -678,10 +687,13 @@ mod tests {
     }
 
     #[test]
-    fn classify_join_without_aggregate_is_skip() {
+    fn classify_join_without_aggregate_is_measure() {
+        // A join's result is generally far smaller than its joined inputs;
+        // the size gate (with the user's LIMIT folded in via mv_limit at
+        // registration) decides whether it's worth materializing.
         assert_eq!(
             classify("SELECT o.id, u.name FROM orders o JOIN users u ON o.id = u.id"),
-            ShapeGate::Skip
+            ShapeGate::Measure
         );
     }
 

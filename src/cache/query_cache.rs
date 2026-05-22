@@ -225,7 +225,7 @@ impl QueryCache {
                 // Decide MV fast path vs fallthrough based on current mv_state.
                 // Side effect: on Dirty, transitions to RebuildScheduled and sends
                 // QueryCommand::MvRebuild to the writer.
-                let mv = self.mv_dispatch_decide(fingerprint);
+                let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
                 self.worker_request_send(
                     fingerprint,
                     msg,
@@ -400,45 +400,60 @@ impl QueryCache {
     /// Fast path (Fresh / terminal / already-scheduled states) takes only a
     /// shared DashMap guard; the write guard is acquired only for the
     /// `Pending → Scheduled` flip.
-    fn mv_dispatch_decide(&self, fingerprint: u64) -> MvServe {
-        // One observation yields both the state and the names, so a
-        // `Fresh` decision can't be separated from its columns.
+    fn mv_dispatch_decide(&self, fingerprint: u64, rows_needed: Option<u64>) -> MvServe {
+        // Local outcome: `Fallthrough` is counted in `mv_fallthrough`;
+        // `NoMv` is not (Skipped/Ineligible/missing have no MV and never
+        // will). Exhaustive matching below means a future MvState variant
+        // forces a deliberate choice between the two.
+        enum Decision {
+            Hit(Arc<[EcoString]>),
+            Fallthrough,
+            NoMv,
+        }
+
         let observed = self
             .state_view
             .cached_queries
             .get(&fingerprint)
-            .map(|e| (e.mv.state, e.mv.output_columns.clone()));
-        // `mv_fallthrough` counts only queries that have (or are building) an
-        // MV — `Pending`/`Scheduled`, plus the `Fresh`-without-columns error.
-        // `Skipped`/`Ineligible` queries have no MV and never will, so a
-        // source-row serve there is not a fallthrough and is not counted;
-        // `mv_hits / (mv_hits + mv_fallthrough)` is then a true MV serve rate.
-        match observed {
-            Some((MvState::Fresh, Some(cols))) => {
-                metrics::counter!(names::CACHE_MV_HITS).increment(1);
-                MvServe::Mv(cols)
+            .map(|e| (e.mv.state, e.mv.output_columns.clone(), e.mv.limit));
+
+        let decision = match observed {
+            None => Decision::NoMv,
+            Some((MvState::Fresh, Some(cols), mv_limit))
+                if limit_is_sufficient(mv_limit, rows_needed) =>
+            {
+                Decision::Hit(cols)
             }
-            Some((MvState::Fresh, None)) => {
+            // MV built at a smaller LIMIT than this variant needs.
+            Some((MvState::Fresh, Some(_), _)) => Decision::Fallthrough,
+            Some((MvState::Fresh, None, _)) => {
                 error!(
                     fingerprint,
                     "MV is Fresh but output columns were never captured; \
                      serving from source rows"
                 );
-                metrics::counter!(names::CACHE_MV_FALLTHROUGH).increment(1);
-                MvServe::SourceRow
+                Decision::Fallthrough
             }
-            Some((MvState::Pending { has_table }, _)) => {
+            Some((MvState::Pending { has_table }, _, _)) => {
                 if let Some(cmd) = self.mv_schedule(fingerprint, has_table) {
                     let _ = self.query_tx.send(cmd);
                 }
+                Decision::Fallthrough
+            }
+            Some((MvState::Scheduled { .. }, _, _)) => Decision::Fallthrough,
+            Some((MvState::Skipped | MvState::Ineligible, _, _)) => Decision::NoMv,
+        };
+
+        match decision {
+            Decision::Hit(cols) => {
+                metrics::counter!(names::CACHE_MV_HITS).increment(1);
+                MvServe::Mv(cols)
+            }
+            Decision::Fallthrough => {
                 metrics::counter!(names::CACHE_MV_FALLTHROUGH).increment(1);
                 MvServe::SourceRow
             }
-            Some((MvState::Scheduled { .. }, _)) => {
-                metrics::counter!(names::CACHE_MV_FALLTHROUGH).increment(1);
-                MvServe::SourceRow
-            }
-            _ => MvServe::SourceRow,
+            Decision::NoMv => MvServe::SourceRow,
         }
     }
 
@@ -607,7 +622,9 @@ impl QueryCache {
 
             // Coalesced dispatch: MV decision is made once for the whole group
             // (all waiters share the same fingerprint and dispatch moment).
-            let mv = self.mv_dispatch_decide(fingerprint);
+            // The group already passed `limit_is_sufficient(max_limit, primary_needed)`
+            // above; reuse `primary_needed` as the rows-needed witness.
+            let mv = self.mv_dispatch_decide(fingerprint, primary_needed);
             if let Err(e) = self.worker_request_send_with(
                 fingerprint,
                 primary,
@@ -664,7 +681,7 @@ impl QueryCache {
                     max_limit: None,
                     referenced: false,
                     // Writer fills this in after resolution/classification.
-                    mv: MvMeta::new(ShapeGate::Skip),
+                    mv: MvMeta::new(ShapeGate::Skip, None),
                 },
             );
             let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
@@ -740,7 +757,8 @@ impl QueryCache {
                 // Subsumed queries have mv_state = MeasurePending (see Future Work:
                 // "MV first-pop for subsumed queries"); mv_dispatch_decide returns
                 // false and the serve goes through the fallthrough path.
-                let mv = self.mv_dispatch_decide(fingerprint);
+                let rows_needed = limit_rows_needed(&msg.cacheable_query.query.limit);
+                let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
                 self.worker_request_send(fingerprint, msg, resolved, deparsed_sql, generation, mv)
             }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
@@ -779,7 +797,7 @@ impl QueryCache {
                 max_limit: None,
                 referenced: false,
                 // Writer fills this in after resolution/classification.
-                mv: MvMeta::new(ShapeGate::Skip),
+                mv: MvMeta::new(ShapeGate::Skip, None),
             },
         );
         let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));

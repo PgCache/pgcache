@@ -280,7 +280,9 @@ impl WriterCore {
         Some((
             MvBuildContext {
                 shape_gate: view.mv.shape_gate,
-                max_limit: view.max_limit,
+                // MV body uses its own cap (joins only); independent of
+                // the source-row population cap `view.max_limit`.
+                max_limit: view.mv.limit,
                 generation: view.generation,
                 resolved,
             },
