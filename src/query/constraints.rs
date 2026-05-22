@@ -138,15 +138,15 @@ impl QueryConstraints {
 
 /// One end of a column's value range
 #[derive(Debug, Clone)]
-struct RangeBound {
-    value: LiteralValue,
+pub(crate) struct RangeBound {
+    pub(crate) value: LiteralValue,
     inclusive: bool, // true = >= or <=, false = > or <
 }
 
 /// Canonical representation of all constraints on a single column, reduced
 /// from a set of (BinaryOp, LiteralValue) pairs. Used by subsumption checking.
 #[derive(Debug, Clone)]
-enum ColumnRange {
+pub(crate) enum ColumnRange {
     /// Values are incomparable (Parameter, Null, mixed types) — can't reason
     Unknown,
     /// No constraints — any value matches
@@ -232,7 +232,7 @@ fn value_satisfies_upper(value: &LiteralValue, bound: &RangeBound) -> Option<boo
 }
 
 /// Build a ColumnRange from all constraints on a single column.
-fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRange {
+pub(crate) fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRange {
     if constraints.is_empty() {
         return ColumnRange::Unconstrained;
     }

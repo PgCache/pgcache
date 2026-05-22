@@ -23,7 +23,7 @@ pub(crate) mod query;
 mod query_cache;
 mod runtime;
 pub(crate) mod status;
-pub(crate) mod subsumption_index;
+pub mod subsumption_index;
 mod types;
 mod worker;
 mod write_queue;
