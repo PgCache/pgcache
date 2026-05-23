@@ -8,12 +8,11 @@
 //! value tuple. Queries with any non-equality constraint (Range/IN/etc.) go
 //! to a `ComplexIndex`: one `ColumnIndex` per class column, each
 //! partitioning parents by constraint shape (`eq` / `inset` / `range_lower`
-//! / `range_upper` / `opaque` fallback). `candidates` runs a per-column
-//! containment lookup and intersects the results.
+//! / `range_upper` / `range_both` / `opaque` fallback). `candidates` runs a
+//! per-column containment lookup and intersects the results.
 //!
 //! Lookup is **lossy-safe**: missed subsumption opportunities just mean we
-//! populate from origin instead of stamping existing rows. Wrong subsumption
-//! claims would be a correctness bug; we never make those.
+//! populate from origin instead of stamping existing rows.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -174,11 +173,11 @@ impl SubsumptionIndex {
     /// the new query's constraints on this table. The caller runs the
     /// existing detailed `table_constraints_subsumed` check on each.
     ///
-    /// Returns parents whose constraint-column set is a subset of new's, with
-    /// equality-pure parents on a matching value tuple short-circuited via
-    /// hash lookup. Complex-bucket entries are always returned for any
-    /// subset class — fine-grained range/IN/etc. matching happens in the
-    /// caller.
+    /// Returns parents whose constraint-column set is a subset of new's.
+    /// Equality-pure parents on a matching value tuple are short-circuited
+    /// via hash lookup; complex-bucket parents are filtered per-column via
+    /// `ComplexIndex` (PGC-129/189). Lossy-safe: may over-return, never
+    /// under-returns a true subsumer.
     pub fn candidates(&self, new_constraints: &[TableConstraint]) -> HashSet<u64> {
         let mut candidates = HashSet::new();
         let new_class = classify(new_constraints);
@@ -389,13 +388,19 @@ enum Placement<'a> {
     InSet(&'a HashSet<LiteralValue>),
     RangeLower(LitKey),
     RangeUpper(LitKey),
+    /// Two-sided range with orderable bounds (PGC-189).
+    RangeBoth {
+        lower: LitKey,
+        upper: LitKey,
+    },
     Opaque,
 }
 
 /// Classify a `ColumnRange` into its sub-index. Single-sided ranges with an
-/// orderable bound get a structured bucket; everything else — two-sided
-/// ranges, `Unknown`/`Empty`/`Unconstrained`, non-orderable bounds — routes
-/// to the linear `opaque` fallback.
+/// orderable bound get a structured bucket; two-sided ranges with orderable
+/// bounds land in `range_both`; everything else — `Unknown`/`Empty`/
+/// `Unconstrained`, non-orderable bounds — routes to the linear `opaque`
+/// fallback.
 fn placement(range: &ColumnRange) -> Placement<'_> {
     match range {
         ColumnRange::Equal(v) => Placement::Eq(v),
@@ -407,7 +412,13 @@ fn placement(range: &ColumnRange) -> Placement<'_> {
             (None, Some(ub)) => {
                 LitKey::try_new(&ub.value).map_or(Placement::Opaque, Placement::RangeUpper)
             }
-            (Some(_), Some(_)) | (None, None) => Placement::Opaque,
+            (Some(lb), Some(ub)) => {
+                match (LitKey::try_new(&lb.value), LitKey::try_new(&ub.value)) {
+                    (Some(lower), Some(upper)) => Placement::RangeBoth { lower, upper },
+                    _ => Placement::Opaque,
+                }
+            }
+            (None, None) => Placement::Opaque,
         },
         ColumnRange::Unknown | ColumnRange::Unconstrained | ColumnRange::Empty => Placement::Opaque,
     }
@@ -565,6 +576,10 @@ struct ColumnIndex {
     range_lower: BTreeMap<LitKey, Vec<u64>>,
     /// `column < v` / `<= v` parents, keyed by the upper bound.
     range_upper: BTreeMap<LitKey, Vec<u64>>,
+    /// Two-sided range parents `(l, u)` (PGC-189), keyed by the lower bound
+    /// with the upper bound inline so the lookup can filter during the walk
+    /// — no intersection materialization.
+    range_both: BTreeMap<LitKey, Vec<(LitKey, u64)>>,
     /// Linear fallback for shapes the structured buckets can't place.
     opaque: Vec<u64>,
 }
@@ -584,6 +599,12 @@ impl ColumnIndex {
             Placement::RangeUpper(key) => {
                 self.range_upper.entry(key).or_default().push(fingerprint);
             }
+            Placement::RangeBoth { lower, upper } => {
+                self.range_both
+                    .entry(lower)
+                    .or_default()
+                    .push((upper, fingerprint));
+            }
             Placement::Opaque => self.opaque.push(fingerprint),
         }
     }
@@ -601,6 +622,9 @@ impl ColumnIndex {
             }
             Placement::RangeUpper(key) => {
                 btree_vec_remove(&mut self.range_upper, &key, fingerprint);
+            }
+            Placement::RangeBoth { lower, .. } => {
+                btree_pair_remove(&mut self.range_both, &lower, fingerprint);
             }
             Placement::Opaque => self.opaque.retain(|fp| *fp != fingerprint),
         }
@@ -628,6 +652,7 @@ impl ColumnIndex {
                 // Range parents whose interval contains the point `v`.
                 self.extend_lower_covering(v, &mut out);
                 self.extend_upper_covering(v, &mut out);
+                self.extend_two_sided_lit(v, v, &mut out);
             }
             ColumnRange::InSet(set) => self.containing_inset(set, &mut out),
             ColumnRange::Range { lower, upper, .. } => {
@@ -641,9 +666,22 @@ impl ColumnIndex {
                 if let Some(ub) = upper {
                     self.extend_upper_covering(&ub.value, &mut out);
                 }
+                // Two-sided parents only cover a query that is itself bounded
+                // on both sides — a finite-upper parent cannot cover an
+                // unbounded-above query, and symmetric for below.
+                if let (Some(lb), Some(ub)) = (lower, upper) {
+                    self.extend_two_sided_lit(&lb.value, &ub.value, &mut out);
+                }
             }
         }
         out
+    }
+
+    /// All fingerprints stored in `range_both`, across every key.
+    fn range_both_all(&self) -> impl Iterator<Item = u64> + '_ {
+        self.range_both
+            .values()
+            .flat_map(|v| v.iter().map(|(_, fp)| *fp))
     }
 
     /// Every fingerprint on this column, across all sub-indexes.
@@ -652,6 +690,41 @@ impl ColumnIndex {
         out.extend(self.inset.values().flatten());
         out.extend(self.range_lower.values().flatten());
         out.extend(self.range_upper.values().flatten());
+        out.extend(self.range_both_all());
+    }
+
+    /// Two-sided-range parents whose interval covers `[qlo, qhi]`. Walks the
+    /// `l <= qlo` prefix of `range_both`, inline-filtering each entry's
+    /// stored upper bound against `qhi` — single-pass, no intersection
+    /// materialization.
+    ///
+    /// The `range_both.is_empty()` early-out keeps V1 single-sided workloads
+    /// from paying for V2's two-sided sub-index. Load-bearing for the V1
+    /// midpoint bench.
+    fn extend_two_sided(&self, qlo: &LitKey, qhi: &LitKey, out: &mut Vec<u64>) {
+        if self.range_both.is_empty() {
+            return;
+        }
+        for (_, entries) in self.range_both.range(..=qlo.clone()) {
+            for (upper, fp) in entries {
+                if upper >= qhi {
+                    out.push(*fp);
+                }
+            }
+        }
+    }
+
+    /// `LiteralValue` entry point for `extend_two_sided`. Falls back to
+    /// over-returning every two-sided parent if either bound isn't orderable.
+    #[inline]
+    fn extend_two_sided_lit(&self, qlo: &LiteralValue, qhi: &LiteralValue, out: &mut Vec<u64>) {
+        if self.range_both.is_empty() {
+            return;
+        }
+        match (LitKey::try_new(qlo), LitKey::try_new(qhi)) {
+            (Some(qlo_key), Some(qhi_key)) => self.extend_two_sided(&qlo_key, &qhi_key, out),
+            _ => out.extend(self.range_both_all()),
+        }
     }
 
     /// `range_lower` parents `(l, +inf)` with `l <= bound`. A non-orderable
@@ -709,10 +782,12 @@ impl ColumnIndex {
                 let max = keys.iter().max().expect("set is non-empty");
                 out.extend(self.range_lower.range(..=min.clone()).flat_map(|(_, f)| f));
                 out.extend(self.range_upper.range(max.clone()..).flat_map(|(_, f)| f));
+                self.extend_two_sided(min, max, out);
             }
             None => {
                 out.extend(self.range_lower.values().flatten());
                 out.extend(self.range_upper.values().flatten());
+                out.extend(self.range_both_all());
             }
         }
     }
@@ -735,6 +810,17 @@ fn btree_vec_remove(map: &mut BTreeMap<LitKey, Vec<u64>>, key: &LitKey, fp: u64)
     if let Some(fps) = map.get_mut(key) {
         fps.retain(|x| *x != fp);
         if fps.is_empty() {
+            map.remove(key);
+        }
+    }
+}
+
+/// Remove `fp` from a `BTreeMap`-backed `(other_bound, fp)` posting list,
+/// dropping the key when its list empties.
+fn btree_pair_remove(map: &mut BTreeMap<LitKey, Vec<(LitKey, u64)>>, key: &LitKey, fp: u64) {
+    if let Some(entries) = map.get_mut(key) {
+        entries.retain(|(_, x)| *x != fp);
+        if entries.is_empty() {
             map.remove(key);
         }
     }
@@ -1221,15 +1307,14 @@ mod tests {
     }
 
     #[test]
-    fn two_sided_range_lands_in_opaque_fallback() {
+    fn two_sided_range_avoids_opaque_fallback() {
+        // PGC-189: two-sided range parents go into `range_both`, not the
+        // linear fallback. `complex_fallback_total` stays at zero.
         let mut idx = SubsumptionIndex::new();
-        // Two constraints on `id` — the column shape is Opaque, so the
-        // fingerprint sits in the linear fallback for that column.
         idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
 
         assert_eq!(idx.complex_total(), 1);
-        assert_eq!(idx.complex_fallback_total(), 1);
-        // Still findable — the opaque bucket is always returned.
+        assert_eq!(idx.complex_fallback_total(), 0);
         assert!(idx.candidates(&[eq("id", int(50))]).contains(&1));
     }
 
@@ -1267,18 +1352,129 @@ mod tests {
     }
 
     #[test]
-    fn fallback_localized_to_offending_column() {
+    fn two_sided_column_does_not_mask_sibling() {
+        // Parent: two-sided range on `id` (range_both), clean equality on
+        // `region`. Region's precise filter must still apply across columns.
         let mut idx = SubsumptionIndex::new();
-        // Parent: two-sided range on id (Opaque), clean equality on region.
         idx.insert(
             1,
             &[gt("id", int(0)), lt("id", int(100)), eq("region", int(5))],
         );
 
-        // Opaque only on the id column — region still filters precisely.
         let hit = idx.candidates(&[eq("id", int(50)), eq("region", int(5))]);
         assert!(hit.contains(&1));
         let miss = idx.candidates(&[eq("id", int(50)), eq("region", int(9))]);
         assert!(!miss.contains(&1));
+    }
+
+    // PGC-189: two-sided range parents have their own sub-index. Precision
+    // tests for the `range_both` code paths.
+
+    #[test]
+    fn two_sided_parent_subsumes_interior_equality() {
+        let mut idx = SubsumptionIndex::new();
+        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+
+        // Inside the interval — covered.
+        assert!(idx.candidates(&[eq("id", int(50))]).contains(&1));
+    }
+
+    #[test]
+    fn two_sided_parent_excludes_outside_equality() {
+        let mut idx = SubsumptionIndex::new();
+        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+
+        // Outside on either side — not covered.
+        assert!(!idx.candidates(&[eq("id", int(200))]).contains(&1));
+        assert!(!idx.candidates(&[eq("id", int(-10))]).contains(&1));
+    }
+
+    #[test]
+    fn two_sided_parent_subsumes_narrower_two_sided_query() {
+        let mut idx = SubsumptionIndex::new();
+        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+
+        // Narrower interval — covered.
+        let narrower = vec![gt("id", int(10)), lt("id", int(90))];
+        assert!(idx.candidates(&narrower).contains(&1));
+    }
+
+    #[test]
+    fn two_sided_parent_excludes_broader_two_sided_query() {
+        let mut idx = SubsumptionIndex::new();
+        idx.insert(1, &[gt("id", int(10)), lt("id", int(90))]);
+
+        // Broader interval (parent narrower than query) — not covered.
+        let broader = vec![gt("id", int(0)), lt("id", int(100))];
+        assert!(!idx.candidates(&broader).contains(&1));
+    }
+
+    #[test]
+    fn two_sided_parent_excludes_partial_overlap() {
+        let mut idx = SubsumptionIndex::new();
+        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+
+        // Overlaps on the right but extends past the parent — not covered.
+        let shifted_right = vec![gt("id", int(50)), lt("id", int(200))];
+        assert!(!idx.candidates(&shifted_right).contains(&1));
+
+        // Overlaps on the left but extends past the parent — not covered.
+        let shifted_left = vec![gt("id", int(-50)), lt("id", int(50))];
+        assert!(!idx.candidates(&shifted_left).contains(&1));
+    }
+
+    #[test]
+    fn two_sided_parent_does_not_cover_single_sided_query() {
+        // A finite-bound parent cannot cover a half-infinite query interval.
+        let mut idx = SubsumptionIndex::new();
+        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+
+        // Query (50, +inf): parent's upper=100 < +inf — not covered.
+        assert!(!idx.candidates(&[gt("id", int(50))]).contains(&1));
+        // Query (-inf, 50): parent's lower=0 > -inf — not covered.
+        assert!(!idx.candidates(&[lt("id", int(50))]).contains(&1));
+    }
+
+    #[test]
+    fn two_sided_remove_clears_parent() {
+        let mut idx = SubsumptionIndex::new();
+        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+        idx.remove(1);
+
+        assert!(idx.candidates(&[eq("id", int(50))]).is_empty());
+        assert_eq!(idx.complex_total(), 0);
+        assert_eq!(idx.classes_len(), 0);
+    }
+
+    #[test]
+    fn two_sided_remove_one_keeps_sibling() {
+        let mut idx = SubsumptionIndex::new();
+        idx.insert(1, &[gt("id", int(0)), lt("id", int(50))]);
+        idx.insert(2, &[gt("id", int(0)), lt("id", int(100))]);
+        idx.remove(1);
+
+        // Query at id=75 — only parent 2 (which has upper=100) covers it.
+        let candidates = idx.candidates(&[eq("id", int(75))]);
+        assert!(!candidates.contains(&1));
+        assert!(candidates.contains(&2));
+        assert_eq!(idx.complex_total(), 1);
+    }
+
+    #[test]
+    fn two_sided_mixed_with_single_sided_class() {
+        // Two-sided and single-sided parents coexisting on the same column.
+        let mut idx = SubsumptionIndex::new();
+        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]); // (0, 100)
+        idx.insert(2, &[gt("id", int(20))]); // (20, +inf)
+
+        // id=50 covered by both.
+        let mid = idx.candidates(&[eq("id", int(50))]);
+        assert!(mid.contains(&1));
+        assert!(mid.contains(&2));
+
+        // id=200 covered only by the single-sided parent.
+        let high = idx.candidates(&[eq("id", int(200))]);
+        assert!(!high.contains(&1));
+        assert!(high.contains(&2));
     }
 }
