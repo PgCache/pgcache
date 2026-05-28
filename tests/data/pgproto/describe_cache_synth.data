@@ -1,0 +1,13 @@
+# PGC-195: two Parse+Describe+Sync batches for the same SQL on different
+# statement names. The first populates the per-connection Describe cache
+# (forwarded to origin); the second hits the cache and is synthesized
+# locally with no origin round-trip.
+'P'	"s1"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'D'	'S'	"s1"
+'S'
+'Y'
+'P'	"s2"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'D'	'S'	"s2"
+'S'
+'Y'
+'X'

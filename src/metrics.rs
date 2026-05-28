@@ -157,6 +157,18 @@ pub mod names {
     pub const PROTOCOL_EXTENDED_QUERIES: &str = "pgcache.protocol.extended_queries";
     pub const PROTOCOL_PREPARED_STATEMENTS: &str = "pgcache.protocol.prepared_statements";
 
+    // Per-connection describe-response cache, keyed by (sql, parameter_oids).
+    // Hits serve Parse-only batches locally instead of forwarding to origin.
+    pub const PROTOCOL_DESCRIBE_CACHE_HITS: &str = "pgcache.protocol.describe_cache.hits";
+    pub const PROTOCOL_DESCRIBE_CACHE_MISSES: &str = "pgcache.protocol.describe_cache.misses";
+    pub const PROTOCOL_DESCRIBE_CACHE_EVICTIONS: &str =
+        "pgcache.protocol.describe_cache.evictions";
+    pub const PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS: &str =
+        "pgcache.protocol.describe_cache.invalidations";
+    /// Bind+Execute forwards where pgcache prepended a lazy `Parse` because
+    /// origin didn't yet know the statement.
+    pub const PROTOCOL_LAZY_PARSE_FORWARDED: &str = "pgcache.protocol.lazy_parse_forwarded";
+
     // Writer thread instrumentation (PGC-117)
     /// Per-command handler latency. Labeled with `cmd` for each QueryCommand /
     /// CdcCommand variant.

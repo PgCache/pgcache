@@ -2,10 +2,13 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     net::SocketAddr,
+    num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
     time::Instant,
 };
+
+use lru::LruCache;
 
 use ecow::EcoString;
 
@@ -98,6 +101,25 @@ fn origin_stream_from_tls(tls_stream: tokio_rustls::client::TlsStream<TcpStream>
     }
 }
 
+/// A given SQL can have different `ParameterDescription` responses depending
+/// on the OID hints the client supplied in its `Parse` message, so both go
+/// into the key.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+struct DescribeKey {
+    sql: String,
+    parameter_oids: Vec<u32>,
+}
+
+/// `row_description` is `None` when origin returned `NoData`.
+#[derive(Debug, Clone)]
+struct DescribeCacheEntry {
+    parameter_description: BytesMut,
+    row_description: Option<BytesMut>,
+}
+
+/// Bounded per connection so dynamic-SQL workloads can't grow it unbounded.
+const DESCRIBE_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
+
 /// State machine for intercepting origin responses that shouldn't reach the client.
 /// Only one intercept can be active at a time.
 enum OriginIntercept {
@@ -105,10 +127,11 @@ enum OriginIntercept {
     None,
     /// Intercepting SHOW search_path response (pre-PG18 fallback).
     SearchPath,
-    /// Intercepting proactive Parse response for a named statement.
-    ProactiveParse { statement_name: String },
-    /// ParseComplete (or error) handled; consuming final ReadyForQuery.
-    AwaitingReadyForQuery,
+    /// pgcache prepended a `Parse` ahead of the client's `Bind+Execute+Sync`
+    /// because origin didn't know the statement name. Swallow the resulting
+    /// `ParseComplete` (the client didn't ask for it) and let `BindComplete`
+    /// onward flow through unchanged.
+    LazyParseInline { statement_name: String },
     /// Piggyback: the client's Query was rewritten to append `; SHOW search_path`.
     /// Responses for the original statement are forwarded; the SHOW's response
     /// is stripped and parsed into `search_path_state`.
@@ -357,6 +380,21 @@ pub(super) struct ConnectionState {
 
     /// Caching disabled for this connection (e.g., client targets a different database)
     cache_disabled: bool,
+
+    /// Describe-response cache keyed by `(sql, parameter_oids)`; populated on
+    /// each forwarded Parse+Describe, consulted by the Parse-only synthesize
+    /// path so repeat prepares skip the origin round-trip.
+    describe_cache: LruCache<DescribeKey, DescribeCacheEntry>,
+
+    /// Count of forwards whose `ReadyForQuery` hasn't arrived yet. Synthesized
+    /// responses are deferred while non-zero, preserving client-side response
+    /// ordering.
+    origin_inflight_syncs: usize,
+
+    /// Synthesized responses queued behind in-flight origin work. Drained when
+    /// `origin_inflight_syncs` reaches zero on an origin `ReadyForQuery`
+    /// (after pushing that RFQ to the client).
+    pending_synth: VecDeque<BytesMut>,
 }
 
 /// Buffered extended protocol messages, accumulated until Sync/Flush.
@@ -406,6 +444,12 @@ struct ExtendedPending {
     /// Name of statement most recently described (awaiting ParameterDescription)
     pending_describe_statement: Option<String>,
 
+    /// Statement name to lazily Parse on the next origin forward. Set at Sync
+    /// time for Bind-without-Parse batches against statements origin doesn't
+    /// know; consumed by the forward paths in `handle_cache_reply`. Cleared on
+    /// every Sync so stale state from a prior cache hit doesn't leak.
+    pending_lazy_parse: Option<String>,
+
     /// Buffered extended protocol messages accumulated until Sync/Flush.
     /// Decision-making deferred to Sync time.
     buffer: Option<ExtendedBuffer>,
@@ -420,6 +464,7 @@ impl ExtendedPending {
         Self {
             pending_parse_statement: None,
             pending_describe_statement: None,
+            pending_lazy_parse: None,
             buffer: None,
             pipeline_context: None,
         }
@@ -473,15 +518,17 @@ impl ExtendedPending {
         }
     }
 
-    /// Handle ParameterDescription from origin: update pending statement's parameter OIDs.
+    /// Update the pending statement's parameter OIDs. Does not clear
+    /// `pending_describe_statement`; the following `RowDescription` or `NoData`
+    /// consumes it.
     fn parameter_description_received(
         &mut self,
         msg_data: &BytesMut,
         prepared_statements: &mut HashMap<String, PreparedStatement>,
     ) {
-        if let Some(stmt_name) = self.pending_describe_statement.take()
+        if let Some(stmt_name) = self.pending_describe_statement.as_ref()
             && let Ok(parsed) = parse_parameter_description(msg_data)
-            && let Some(stmt) = prepared_statements.get_mut(&stmt_name)
+            && let Some(stmt) = prepared_statements.get_mut(stmt_name)
         {
             debug!(
                 "updated statement '{}' with parameter OIDs {:?}",
@@ -490,6 +537,36 @@ impl ExtendedPending {
             stmt.parameter_oids = parsed.parameter_oids;
             stmt.parameter_description = Some(msg_data.clone());
         }
+    }
+
+    /// Store the raw RowDescription on the pending statement and clear
+    /// `pending_describe_statement`. Returns the statement name so the caller
+    /// can populate the per-connection describe cache.
+    fn row_description_received(
+        &mut self,
+        msg_data: &BytesMut,
+        prepared_statements: &mut HashMap<String, PreparedStatement>,
+    ) -> Option<String> {
+        let stmt_name = self.pending_describe_statement.take()?;
+        let stmt = prepared_statements.get_mut(&stmt_name)?;
+        stmt.row_description = Some(msg_data.clone());
+        stmt.describe_no_data = false;
+        Some(stmt_name)
+    }
+
+    /// Record NoData (statement has no result columns, e.g. INSERT without
+    /// RETURNING) on the pending statement and clear `pending_describe_statement`.
+    /// Returns the statement name so the caller can populate the per-connection
+    /// describe cache.
+    fn no_data_received(
+        &mut self,
+        prepared_statements: &mut HashMap<String, PreparedStatement>,
+    ) -> Option<String> {
+        let stmt_name = self.pending_describe_statement.take()?;
+        let stmt = prepared_statements.get_mut(&stmt_name)?;
+        stmt.row_description = None;
+        stmt.describe_no_data = true;
+        Some(stmt_name)
     }
 
     /// Take pipeline context (for origin fallback or cache dispatch).
@@ -524,11 +601,63 @@ impl ConnectionState {
             extended: ExtendedPending::new(),
             origin_database,
             cache_disabled: false,
+            describe_cache: LruCache::new(DESCRIBE_CACHE_CAPACITY),
+            origin_inflight_syncs: 0,
+            pending_synth: VecDeque::new(),
+        }
+    }
+
+    /// Mark search_path as needing rediscovery and clear the describe-cache:
+    /// RowDescription column type_oids depend on the resolved search_path,
+    /// so cached entries could carry stale column metadata.
+    fn search_path_mark_unknown(&mut self) {
+        self.search_path_state = SearchPathState::Unknown;
+        if !self.describe_cache.is_empty() {
+            let n = self.describe_cache.len();
+            self.describe_cache.clear();
+            metrics::counter!(names::PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS).increment(n as u64);
+        }
+    }
+
+    /// Populate `describe_cache` from a freshly-Described statement. No-op for
+    /// non-cacheable statements and for statements where origin errored before
+    /// returning a parameter description.
+    fn describe_cache_populate(&mut self, stmt_name: &str) {
+        let Some(stmt) = self.prepared_statements.get(stmt_name) else {
+            return;
+        };
+        if !matches!(stmt.sql_type, StatementType::Cacheable(_)) {
+            return;
+        }
+        let Some(parameter_description) = stmt.parameter_description.clone() else {
+            return;
+        };
+        let key = DescribeKey {
+            sql: stmt.sql.clone(),
+            parameter_oids: stmt.client_parameter_oids.clone(),
+        };
+        let entry = DescribeCacheEntry {
+            parameter_description,
+            row_description: stmt.row_description.clone(),
+        };
+        let was_at_capacity = self.describe_cache.len() == DESCRIBE_CACHE_CAPACITY.get();
+        let replaced = self.describe_cache.put(key, entry).is_some();
+        if !replaced && was_at_capacity {
+            metrics::counter!(names::PROTOCOL_DESCRIBE_CACHE_EVICTIONS).increment(1);
         }
     }
 }
 
 impl ConnectionState {
+    /// Push a Sync-terminated batch to origin, recording the forward in
+    /// telemetry and bumping `origin_inflight_syncs` so deferred synthesized
+    /// responses don't jump the queue.
+    fn origin_dispatch(&mut self, bytes: BytesMut, timing: Option<QueryTiming>) {
+        self.telemetry.origin_forward(timing);
+        self.origin_inflight_syncs += 1;
+        self.origin_write_buf.push_back(bytes);
+    }
+
     /// Handle a message from the client (frontend).
     /// Determines whether to forward to origin, check cache, or take other action.
     #[expect(clippy::wildcard_enum_match_arm)]
@@ -562,8 +691,7 @@ impl ConnectionState {
                                     metrics::counter!(names::QUERIES_INVALID).increment(1);
                                 }
                             }
-                            self.telemetry.origin_forward(None);
-                            self.origin_write_buf.push_back(msg.data);
+                            self.origin_dispatch(msg.data, None);
                             ProxyMode::Read
                         }
                         Ok(Action::CacheCheck(ast)) => {
@@ -575,15 +703,13 @@ impl ConnectionState {
                             metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
                             metrics::counter!(names::QUERIES_INVALID).increment(1);
                             error!("handle_query {}", e);
-                            self.telemetry.origin_forward(None);
-                            self.origin_write_buf.push_back(msg.data);
+                            self.origin_dispatch(msg.data, None);
                             ProxyMode::Read
                         }
                     };
                 } else {
                     metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
-                    self.telemetry.origin_forward(None);
-                    self.origin_write_buf.push_back(msg.data);
+                    self.origin_dispatch(msg.data, None);
                 }
             }
             PgFrontendMessageType::Parse => {
@@ -670,30 +796,26 @@ impl ConnectionState {
                 true
             }
 
-            OriginIntercept::ProactiveParse { statement_name } => {
+            OriginIntercept::LazyParseInline { statement_name } => {
                 let stmt_name = statement_name.clone();
                 match msg.message_type {
                     PgBackendMessageType::ParseComplete => {
+                        // Swallow ParseComplete (client didn't ask for it),
+                        // mark origin-prepared, let the rest flow through.
                         if let Some(stmt) = self.prepared_statements.get_mut(&stmt_name) {
                             stmt.origin_prepared = true;
-                            trace!("origin_prepared set for '{}' (proactive)", stmt_name);
+                            trace!("origin_prepared set for '{}' (lazy parse)", stmt_name);
                         }
-                        self.origin_intercept = OriginIntercept::AwaitingReadyForQuery;
+                        self.origin_intercept = OriginIntercept::None;
+                        true
                     }
-                    PgBackendMessageType::ErrorResponse => {
-                        error!("proactive Parse failed on origin");
-                        self.origin_intercept = OriginIntercept::AwaitingReadyForQuery;
+                    _ => {
+                        // Parse failed (or unexpected response): drop the
+                        // intercept and let ErrorResponse + RFQ reach the client.
+                        self.origin_intercept = OriginIntercept::None;
+                        false
                     }
-                    _ => {}
                 }
-                true
-            }
-
-            OriginIntercept::AwaitingReadyForQuery => {
-                if matches!(msg.message_type, PgBackendMessageType::ReadyForQuery) {
-                    self.origin_intercept = OriginIntercept::None;
-                }
-                true
             }
 
             &OriginIntercept::TrailingShowSearchPath(state) => {
@@ -774,7 +896,12 @@ impl ConnectionState {
     fn handle_origin_message(&mut self, mut msg: PgBackendMessage) {
         trace!("net: origin→proxy {:?}", msg.message_type);
 
+        let was_rfq = matches!(msg.message_type, PgBackendMessageType::ReadyForQuery);
+
         if self.origin_intercept_handle(&msg) {
+            if was_rfq {
+                self.origin_rfq_consumed();
+            }
             return;
         }
 
@@ -803,6 +930,22 @@ impl ConnectionState {
             PgBackendMessageType::ParameterDescription => {
                 self.extended
                     .parameter_description_received(&msg.data, &mut self.prepared_statements);
+            }
+            PgBackendMessageType::RowDescription => {
+                if let Some(name) = self
+                    .extended
+                    .row_description_received(&msg.data, &mut self.prepared_statements)
+                {
+                    self.describe_cache_populate(&name);
+                }
+            }
+            PgBackendMessageType::NoData => {
+                if let Some(name) = self
+                    .extended
+                    .no_data_received(&mut self.prepared_statements)
+                {
+                    self.describe_cache_populate(&name);
+                }
             }
             PgBackendMessageType::ParseComplete => {
                 self.extended.parse_complete(&mut self.prepared_statements);
@@ -862,7 +1005,7 @@ impl ConnectionState {
                     && !self.search_path_auto_reported
                 {
                     debug!("txn ended, marking search_path unknown");
-                    self.search_path_state = SearchPathState::Unknown;
+                    self.search_path_mark_unknown();
                 }
                 self.search_path_just_piggyback_resolved = false;
 
@@ -876,6 +1019,7 @@ impl ConnectionState {
                     debug!("search_path unknown, sending SHOW search_path query");
                     self.origin_intercept = OriginIntercept::SearchPath;
                     let query_msg = simple_query_message_build("SHOW search_path;");
+                    self.origin_inflight_syncs += 1;
                     self.origin_write_buf.push_back(query_msg);
                 }
             }
@@ -887,7 +1031,11 @@ impl ConnectionState {
             msg.message_type,
             msg.data.len()
         );
+        let was_rfq = matches!(msg.message_type, PgBackendMessageType::ReadyForQuery);
         self.client_write_buf.push_back(msg.data);
+        if was_rfq {
+            self.origin_rfq_consumed();
+        }
     }
 
     /// Flush any buffered extended protocol messages to origin.
@@ -900,7 +1048,7 @@ impl ConnectionState {
     /// Forward an extended buffer to origin, appending the trailing message bytes (Sync or Flush).
     /// Records metrics for any Execute in the buffer.
     fn extended_buffer_forward_to_origin(&mut self, buffer: ExtendedBuffer, trailing_bytes: &[u8]) {
-        // Record non-cacheable metrics for Execute(s) in the buffer
+        let mut lazy_parse_stmt: Option<String> = None;
         if buffer.execute_portal.is_some() {
             metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
 
@@ -917,12 +1065,24 @@ impl ConnectionState {
                     }
                     StatementType::Cacheable(_) | StatementType::UncacheableSelect => {}
                 }
+                if !buffer.has_parse && !stmt.origin_prepared {
+                    lazy_parse_stmt = Some(portal.statement_name.clone());
+                }
             }
         }
 
+        if let Some(stmt_name) = lazy_parse_stmt {
+            forward_lazy_parse_install(
+                &stmt_name,
+                &self.prepared_statements,
+                &mut self.extended,
+                &mut self.origin_write_buf,
+                &mut self.origin_intercept,
+            );
+        }
+
         let bytes = self.extended.buffer_forward(buffer, trailing_bytes);
-        self.telemetry.origin_forward(None);
-        self.origin_write_buf.push_back(bytes);
+        self.origin_dispatch(bytes, None);
     }
 
     /// Handle a reply from the cache.
@@ -941,69 +1101,41 @@ impl ConnectionState {
                 metrics::counter!(names::QUERIES_CACHE_HIT).increment(1);
                 self.telemetry.cache_complete(timing);
 
-                // Proactively forward Parse to origin for named statements not yet
-                // origin_prepared. On cache hit, origin never sees Parse — but origin
-                // must know about the statement for subsequent Bind-only cycles and
-                // transaction paths.
-                //
-                // Skip unnamed statements: always re-Parsed, can't be reused via
-                // Bind-only across Sync boundaries.
-                // Skip if another intercept is already active to avoid stacking
-                // multiple origin round-trips whose responses would leak to the client.
-                let proactive_parse_bytes = self
-                    .extended
-                    .pending_parse_statement
-                    .as_ref()
-                    .and_then(|stmt_name| {
-                        if stmt_name.is_empty() {
-                            return None;
-                        }
-                        if !matches!(self.origin_intercept, OriginIntercept::None) {
-                            return None;
-                        }
-                        let stmt = self.prepared_statements.get(stmt_name)?;
-                        if stmt.origin_prepared {
-                            return None;
-                        }
-                        stmt.parse_bytes.clone()
-                    });
-
-                if let Some(parse_bytes) = proactive_parse_bytes {
-                    let stmt_name = self
-                        .extended
-                        .pending_parse_statement
-                        .take()
-                        .unwrap_or_default();
-                    trace!(
-                        "proactive Parse sent to origin for statement '{}'",
-                        stmt_name
-                    );
-                    self.origin_write_buf.push_back(parse_bytes);
-                    let mut sync_buf = BytesMut::with_capacity(5);
-                    sync_buf.put_u8(b'S');
-                    sync_buf.put_i32(4);
-                    self.origin_write_buf.push_back(sync_buf);
-                    self.origin_intercept = OriginIntercept::ProactiveParse {
-                        statement_name: stmt_name,
-                    };
-                } else {
-                    self.extended.pending_parse_statement.take();
-                }
+                // Cache hit: origin saw nothing. Lazy-Parse-on-forward will
+                // catch up the next time we actually have to forward.
+                self.extended.pending_parse_statement.take();
+                self.extended.pending_lazy_parse.take();
 
                 self.proxy_mode = ProxyMode::Read;
             }
             CacheReply::Error(buf) => {
                 metrics::counter!(names::QUERIES_CACHE_ERROR).increment(1);
                 debug!("forwarding to origin");
-                self.telemetry.origin_forward(None);
-                self.origin_write_buf.push_back(buf);
+                if let Some(stmt_name) = self.extended.pending_lazy_parse.take() {
+                    forward_lazy_parse_install(
+                        &stmt_name,
+                        &self.prepared_statements,
+                        &mut self.extended,
+                        &mut self.origin_write_buf,
+                        &mut self.origin_intercept,
+                    );
+                }
+                self.origin_dispatch(buf, None);
                 self.proxy_mode = ProxyMode::Read;
             }
             CacheReply::Forward(buf, timing) => {
                 metrics::counter!(names::QUERIES_CACHE_MISS).increment(1);
                 debug!("forwarding to origin");
-                self.telemetry.origin_forward(Some(timing));
-                self.origin_write_buf.push_back(buf);
+                if let Some(stmt_name) = self.extended.pending_lazy_parse.take() {
+                    forward_lazy_parse_install(
+                        &stmt_name,
+                        &self.prepared_statements,
+                        &mut self.extended,
+                        &mut self.origin_write_buf,
+                        &mut self.origin_intercept,
+                    );
+                }
+                self.origin_dispatch(buf, Some(timing));
                 self.proxy_mode = ProxyMode::Read;
             }
         }
@@ -1034,7 +1166,7 @@ impl ConnectionState {
 
         if search_path_mutates_any(&ast) {
             debug!("search_path mutation detected in Query");
-            self.search_path_state = SearchPathState::Unknown;
+            self.search_path_mark_unknown();
         }
 
         // Piggyback only on single-statement, piggyback-safe mutations, and
@@ -1066,7 +1198,7 @@ impl ConnectionState {
                 && search_path_mutates_any(ast)
             {
                 debug!("search_path mutation detected in Parse");
-                self.search_path_state = SearchPathState::Unknown;
+                self.search_path_mark_unknown();
             }
 
             let sql_type = match ast_result {
@@ -1162,10 +1294,8 @@ impl ConnectionState {
             | StatementType::ParseError => return None,
         };
 
-        // Bind-only (no Parse in buffer): require origin_prepared
-        if !buffer.has_parse && !stmt.origin_prepared {
-            return None;
-        }
+        // Bind-without-Parse against an unknown statement is still cacheable:
+        // `forward_lazy_parse_install` prepends the Parse on miss/forward.
 
         // Describe('S') in buffer: require cached parameter_description
         if buffer.describe == PipelineDescribe::Statement && stmt.parameter_description.is_none() {
@@ -1228,8 +1358,9 @@ impl ConnectionState {
     /// Otherwise, forward the whole batch to origin.
     fn handle_sync_message(&mut self, msg: PgFrontendMessage) {
         let Some(mut buffer) = self.extended.buffer_take() else {
-            // No buffer — forward bare Sync to origin
+            // Bare Sync; origin replies with one RFQ.
             trace!("net: proxy→origin Sync (no buffer)");
+            self.origin_inflight_syncs += 1;
             self.origin_write_buf.push_back(msg.data);
             return;
         };
@@ -1264,10 +1395,23 @@ impl ConnectionState {
 
             // Track pending statement names for origin fallback path
             if buffer.has_parse {
-                self.extended.pending_parse_statement = buffer.parse_statement_name;
+                self.extended.pending_parse_statement = buffer.parse_statement_name.clone();
             }
             if buffer.describe_statement_name.is_some() {
                 self.extended.pending_describe_statement = buffer.describe_statement_name;
+            }
+            // Bind-without-Parse against an origin-unknown statement: record
+            // the name so the forward path can lazy-Parse on its way out.
+            // Reset first so stale state from a prior cache hit can't leak.
+            self.extended.pending_lazy_parse = None;
+            if !buffer.has_parse
+                && let Some(portal_name) = &buffer.execute_portal
+                && let Some(portal) = self.portals.get(portal_name)
+                && let Some(stmt) = self.prepared_statements.get(&portal.statement_name)
+                && !stmt.origin_prepared
+                && !portal.statement_name.is_empty()
+            {
+                self.extended.pending_lazy_parse = Some(portal.statement_name.clone());
             }
 
             // Create timing with fingerprint from the cacheable query
@@ -1280,9 +1424,132 @@ impl ConnectionState {
 
             trace!("net: Sync → cache dispatch");
             self.proxy_mode = ProxyMode::CacheWrite(cache_msg);
+        } else if self.try_synthesize_parse_describe_response(&buffer) {
+            trace!("net: Sync → synthesized ParseComplete+Describe response");
         } else {
             self.extended_buffer_forward_to_origin(buffer, &msg.data);
             trace!("net: Sync → origin (forwarded buffer)");
+        }
+    }
+
+    /// Return the named statement targeted by a Parse-only / Parse+Describe('S')
+    /// Sync batch that's eligible for synthesize. `None` if the batch shape,
+    /// statement state, or session state disqualifies it.
+    ///
+    /// In-transaction is excluded because a statement Parsed mid-txn would
+    /// resolve against the txn's snapshot. Portal Describe is excluded
+    /// because no portal exists without a Bind. Unnamed statements are
+    /// excluded because origin's unnamed slot is one-shot per Sync.
+    fn synth_eligible<'a>(&self, buffer: &'a ExtendedBuffer) -> Option<&'a str> {
+        if !buffer.has_parse || buffer.has_bind || buffer.execute_portal.is_some() {
+            return None;
+        }
+        if buffer.describe == PipelineDescribe::Portal {
+            return None;
+        }
+        if self.in_transaction {
+            return None;
+        }
+        let stmt_name = buffer.parse_statement_name.as_deref()?;
+        if stmt_name.is_empty() {
+            return None;
+        }
+        let stmt = self.prepared_statements.get(stmt_name)?;
+        if !matches!(stmt.sql_type, StatementType::Cacheable(_)) {
+            return None;
+        }
+        Some(stmt_name)
+    }
+
+    /// Attempt to serve a `Parse+Describe('S')+Sync` (or `Parse+Sync`) batch
+    /// from the per-connection describe-response cache. Returns `true` on
+    /// hit, in which case the synthesized response was pushed (or deferred)
+    /// and the caller must not forward to origin. Returns `false` on miss
+    /// or ineligible batch — caller falls through to the normal forward.
+    fn try_synthesize_parse_describe_response(&mut self, buffer: &ExtendedBuffer) -> bool {
+        let Some(stmt_name) = self.synth_eligible(buffer) else {
+            return false;
+        };
+        // synth_eligible already verified the statement exists.
+        let Some(stmt) = self.prepared_statements.get(stmt_name) else {
+            return false;
+        };
+        let key = DescribeKey {
+            sql: stmt.sql.clone(),
+            parameter_oids: stmt.client_parameter_oids.clone(),
+        };
+        let Some(entry) = self.describe_cache.get(&key) else {
+            metrics::counter!(names::PROTOCOL_DESCRIBE_CACHE_MISSES).increment(1);
+            return false;
+        };
+        let parameter_description = entry.parameter_description.clone();
+        let row_description = entry.row_description.clone();
+        let stmt_name = stmt_name.to_owned();
+
+        // Populate the freshly-Parsed statement with the cached Describe
+        // metadata so a subsequent Bind+Execute can build a parameterized
+        // cache message without an origin round-trip.
+        let parsed_param_oids = parse_parameter_description(&parameter_description)
+            .ok()
+            .map(|p| p.parameter_oids);
+        if let Some(stmt_mut) = self.prepared_statements.get_mut(&stmt_name) {
+            if let Some(oids) = parsed_param_oids {
+                stmt_mut.parameter_oids = oids;
+            }
+            stmt_mut.parameter_description = Some(parameter_description.clone());
+            stmt_mut.row_description = row_description.clone();
+            stmt_mut.describe_no_data = row_description.is_none();
+        }
+
+        metrics::counter!(names::PROTOCOL_DESCRIBE_CACHE_HITS).increment(1);
+
+        let mut out = BytesMut::with_capacity(
+            5 + parameter_description.len()
+                + row_description.as_ref().map(BytesMut::len).unwrap_or(5)
+                + 6,
+        );
+        // ParseComplete
+        out.put_slice(&[b'1', 0, 0, 0, 4]);
+        if buffer.describe == PipelineDescribe::Statement {
+            out.put_slice(&parameter_description);
+            if let Some(row_desc) = row_description {
+                out.put_slice(&row_desc);
+            } else {
+                // NoData: tag 'n', length 4 (length field only)
+                out.put_slice(&[b'n', 0, 0, 0, 4]);
+            }
+        }
+        // ReadyForQuery 'I' — synth_eligible excluded in_transaction.
+        out.put_slice(&[b'Z', 0, 0, 0, 5, b'I']);
+
+        // Defer behind in-flight origin work so the synth bytes don't jump
+        // ahead of pending origin responses in the client's read stream.
+        if self.origin_inflight_syncs > 0 || !self.pending_synth.is_empty() {
+            self.pending_synth.push_back(out);
+        } else {
+            self.client_write_buf.push_back(out);
+        }
+
+        true
+    }
+
+    /// Drain deferred synth responses into `client_write_buf`. Caller must
+    /// ensure `origin_inflight_syncs == 0` and that the current origin RFQ
+    /// (if any) is already in `client_write_buf`.
+    fn pending_synth_drain(&mut self) {
+        while let Some(buf) = self.pending_synth.pop_front() {
+            self.client_write_buf.push_back(buf);
+        }
+    }
+
+    /// Account for an origin RFQ either passing through to the client or
+    /// being consumed by an intercept. Drains deferred synth bytes once
+    /// origin goes idle; ordering is correct because the just-arrived RFQ
+    /// (if forwarded) was pushed before this call.
+    fn origin_rfq_consumed(&mut self) {
+        self.origin_inflight_syncs = self.origin_inflight_syncs.saturating_sub(1);
+        if self.origin_inflight_syncs == 0 {
+            self.pending_synth_drain();
         }
     }
 
@@ -1309,12 +1576,16 @@ impl ConnectionState {
         sql_type: StatementType,
         parse_bytes: BytesMut,
     ) {
+        let client_parameter_oids = parsed.parameter_oids.clone();
         let stmt = PreparedStatement {
             name: parsed.statement_name.clone(),
             sql: parsed.sql,
             parameter_oids: parsed.parameter_oids,
+            client_parameter_oids,
             sql_type,
             parameter_description: None,
+            row_description: None,
+            describe_no_data: false,
             origin_prepared: false,
             parse_bytes: Some(parse_bytes),
         };
@@ -1541,21 +1812,59 @@ async fn origin_connect(
     Err(ConnectionError::NoConnection.into())
 }
 
-/// Forward a query to origin when cache dispatch isn't possible.
-///
-/// Sends either the buffered pipeline bytes or the raw message data to origin.
-/// Free function (not a method) to allow disjoint field borrows when `proxy_mode`
-/// has been partially moved by pattern matching.
+/// Forward a query to origin when cache dispatch isn't possible. Sends either
+/// the buffered pipeline bytes or the raw message data and bumps the in-flight
+/// Sync counter. Free function (not a method) to allow disjoint field borrows
+/// when `proxy_mode` has been partially moved by pattern matching.
 fn origin_forward(
     extended: &mut ExtendedPending,
     origin_write_buf: &mut VecDeque<BytesMut>,
+    origin_inflight_syncs: &mut usize,
     msg: CacheMessage,
 ) {
-    if let Some(pipeline) = extended.pipeline_take() {
-        origin_write_buf.push_back(pipeline.buffered_bytes);
-    } else {
-        origin_write_buf.push_back(msg.into_data());
+    let bytes = extended
+        .pipeline_take()
+        .map(|p| p.buffered_bytes)
+        .unwrap_or_else(|| msg.into_data());
+    *origin_inflight_syncs += 1;
+    origin_write_buf.push_back(bytes);
+}
+
+/// Prepend a `Parse` to `origin_write_buf` when origin doesn't yet know the
+/// statement. No-op if origin already knows it, if no `parse_bytes` were
+/// captured, if the statement is unnamed (origin's unnamed slot doesn't
+/// persist across Sync), or if another `OriginIntercept` is already active.
+///
+/// Free function (not a method) to allow disjoint field borrows from the
+/// event-loop call sites that work with `state.*` after partial moves.
+fn forward_lazy_parse_install(
+    stmt_name: &str,
+    prepared_statements: &HashMap<String, PreparedStatement>,
+    extended: &mut ExtendedPending,
+    origin_write_buf: &mut VecDeque<BytesMut>,
+    origin_intercept: &mut OriginIntercept,
+) {
+    if stmt_name.is_empty() {
+        return;
     }
+    if !matches!(origin_intercept, OriginIntercept::None) {
+        return;
+    }
+    let Some(stmt) = prepared_statements.get(stmt_name) else {
+        return;
+    };
+    if stmt.origin_prepared {
+        return;
+    }
+    let Some(parse_bytes) = stmt.parse_bytes.clone() else {
+        return;
+    };
+    origin_write_buf.push_back(parse_bytes);
+    *origin_intercept = OriginIntercept::LazyParseInline {
+        statement_name: stmt_name.to_owned(),
+    };
+    extended.pending_parse_statement = Some(stmt_name.to_owned());
+    metrics::counter!(names::PROTOCOL_LAZY_PARSE_FORWARDED).increment(1);
 }
 
 #[instrument(skip_all)]
@@ -1638,7 +1947,21 @@ async fn handle_connection(
                 else {
                     debug!("search_path unknown, forwarding to origin");
                     metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
-                    origin_forward(&mut state.extended, &mut state.origin_write_buf, msg);
+                    if let Some(stmt_name) = state.extended.pending_lazy_parse.take() {
+                        forward_lazy_parse_install(
+                            &stmt_name,
+                            &state.prepared_statements,
+                            &mut state.extended,
+                            &mut state.origin_write_buf,
+                            &mut state.origin_intercept,
+                        );
+                    }
+                    origin_forward(
+                        &mut state.extended,
+                        &mut state.origin_write_buf,
+                        &mut state.origin_inflight_syncs,
+                        msg,
+                    );
                     state.proxy_mode = ProxyMode::Read;
                     continue;
                 };
@@ -1650,7 +1973,21 @@ async fn handle_connection(
                     Ok(s) => s,
                     Err(e) => {
                         error!("Failed to create client socket: {}", e);
-                        origin_forward(&mut state.extended, &mut state.origin_write_buf, msg);
+                        if let Some(stmt_name) = state.extended.pending_lazy_parse.take() {
+                            forward_lazy_parse_install(
+                                &stmt_name,
+                                &state.prepared_statements,
+                                &mut state.extended,
+                                &mut state.origin_write_buf,
+                                &mut state.origin_intercept,
+                            );
+                        }
+                        origin_forward(
+                            &mut state.extended,
+                            &mut state.origin_write_buf,
+                            &mut state.origin_inflight_syncs,
+                            msg,
+                        );
                         state.proxy_mode = ProxyMode::Read;
                         continue;
                     }

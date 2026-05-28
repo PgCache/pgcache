@@ -1,0 +1,27 @@
+# PGC-195: synthesized Parse followed by a Bind+Execute that must forward.
+# Parse+Describe+Sync and Bind+Execute+Sync are sent as separate batches
+# so the Parse-only path is reachable for the synthesize logic.
+#
+# Warmup phase: forwards Parse+Describe to origin (populates Describe
+# cache), then forwards Bind+Execute (populates data cache for id=1).
+'P'	"s_warm"	"SELECT id, name FROM proto_test WHERE id = $1"	0
+'D'	'S'	"s_warm"
+'S'
+'Y'
+'B'	""	"s_warm"	1	0	1	1	"1"	0
+'E'	""	0
+'S'
+'Y'
+# Probe phase: fresh statement name, same SQL → Describe-cache hit →
+# Parse+Describe+Sync is synthesized (origin never sees s_probe). Then
+# Bind+Execute+Sync for id=2 misses the data cache, so pgcache must
+# prepend s_probe's Parse before forwarding — exercising lazy-Parse.
+'P'	"s_probe"	"SELECT id, name FROM proto_test WHERE id = $1"	0
+'D'	'S'	"s_probe"
+'S'
+'Y'
+'B'	""	"s_probe"	1	0	1	1	"2"	0
+'E'	""	0
+'S'
+'Y'
+'X'

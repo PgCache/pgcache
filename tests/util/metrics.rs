@@ -31,6 +31,9 @@ pub struct MetricsSnapshot {
     pub cache_mv_dirty_truncates: u64,
     pub cache_cdc_local_eval_hits: u64,
     pub cache_cdc_pg_eval_hits: u64,
+    pub protocol_describe_cache_hits: u64,
+    pub protocol_describe_cache_misses: u64,
+    pub protocol_lazy_parse_forwarded: u64,
     pub cache_hit_rate: f64,
     pub cacheability_rate: f64,
 }
@@ -81,6 +84,9 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut cache_mv_dirty_truncates = 0u64;
     let mut cache_cdc_local_eval_hits = 0u64;
     let mut cache_cdc_pg_eval_hits = 0u64;
+    let mut protocol_describe_cache_hits = 0u64;
+    let mut protocol_describe_cache_misses = 0u64;
+    let mut protocol_lazy_parse_forwarded = 0u64;
 
     for line in response.lines() {
         // Skip comments and empty lines
@@ -115,6 +121,9 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_cache_mv_dirty_truncates" => cache_mv_dirty_truncates = value,
                 "pgcache_cache_cdc_local_eval_hits" => cache_cdc_local_eval_hits = value,
                 "pgcache_cache_cdc_pg_eval_hits" => cache_cdc_pg_eval_hits = value,
+                "pgcache_protocol_describe_cache_hits" => protocol_describe_cache_hits = value,
+                "pgcache_protocol_describe_cache_misses" => protocol_describe_cache_misses = value,
+                "pgcache_protocol_lazy_parse_forwarded" => protocol_lazy_parse_forwarded = value,
                 _ => {}
             }
         }
@@ -159,6 +168,9 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         cache_mv_dirty_truncates,
         cache_cdc_local_eval_hits,
         cache_cdc_pg_eval_hits,
+        protocol_describe_cache_hits,
+        protocol_describe_cache_misses,
+        protocol_lazy_parse_forwarded,
         cache_hit_rate,
         cacheability_rate,
     })
@@ -191,6 +203,12 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         cache_cdc_local_eval_hits: after.cache_cdc_local_eval_hits
             - before.cache_cdc_local_eval_hits,
         cache_cdc_pg_eval_hits: after.cache_cdc_pg_eval_hits - before.cache_cdc_pg_eval_hits,
+        protocol_describe_cache_hits: after.protocol_describe_cache_hits
+            - before.protocol_describe_cache_hits,
+        protocol_describe_cache_misses: after.protocol_describe_cache_misses
+            - before.protocol_describe_cache_misses,
+        protocol_lazy_parse_forwarded: after.protocol_lazy_parse_forwarded
+            - before.protocol_lazy_parse_forwarded,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

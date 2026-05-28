@@ -39,10 +39,22 @@ pub enum StatementType {
 pub struct PreparedStatement {
     pub name: String,
     pub sql: String,
+    /// Parameter type OIDs as resolved by origin's `ParameterDescription`,
+    /// falling back to the client-supplied OIDs until origin replies. Used
+    /// for query fingerprinting under cacheable execution.
     pub parameter_oids: Vec<u32>,
+    /// Immutable snapshot of the client-supplied OIDs from `Parse`. Used in
+    /// the describe-cache key so populate and lookup hash identically.
+    pub client_parameter_oids: Vec<u32>,
     pub sql_type: StatementType,
     /// Raw ParameterDescription bytes from origin, used for Describe('S') in pipeline.
     pub parameter_description: Option<BytesMut>,
+    /// Raw RowDescription bytes from origin's Describe('S') response. `None`
+    /// when origin returned `NoData`; pair with `describe_no_data` to
+    /// distinguish "not yet captured" from "captured, no result columns".
+    pub row_description: Option<BytesMut>,
+    /// Origin's Describe('S') response was `NoData`. See `row_description`.
+    pub describe_no_data: bool,
     /// True when origin has acknowledged this statement (ParseComplete received).
     /// Gates pipeline activation — the proxy only buffers Parse/Bind/Execute
     /// when origin_prepared is true.

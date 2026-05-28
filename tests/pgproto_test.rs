@@ -150,3 +150,126 @@ async fn test_pgproto_extended_protocol() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-195: a second `Parse + Describe('S') + Sync` for the same SQL on a
+/// fresh statement name must be served from the per-connection Describe
+/// cache without forwarding to origin. The wire response is identical to
+/// origin's first-time reply: `ParseComplete + ParameterDescription +
+/// RowDescription + ReadyForQuery`.
+#[tokio::test]
+async fn test_pgproto_describe_cache_synth() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE proto_test (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO proto_test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    let output = pgproto_run(
+        ctx.cache_port,
+        "tests/data/pgproto/describe_cache_synth.data",
+    );
+
+    // Two Sync responses — first from origin, second synthesized.
+    assert_eq!(
+        output.matches("ParseComplete").count(),
+        2,
+        "expected two ParseComplete:\n{output}"
+    );
+    assert_eq!(
+        output.matches("ParameterDescription").count(),
+        2,
+        "expected two ParameterDescription:\n{output}"
+    );
+    assert_eq!(
+        output.matches("RowDescription").count(),
+        2,
+        "expected two RowDescription:\n{output}"
+    );
+    assert_eq!(
+        output.matches("ReadyForQuery").count(),
+        2,
+        "expected two ReadyForQuery:\n{output}"
+    );
+
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.protocol_describe_cache_misses, 1,
+        "expected 1 describe-cache miss (the first Parse), got {}",
+        delta.protocol_describe_cache_misses
+    );
+    assert_eq!(
+        delta.protocol_describe_cache_hits, 1,
+        "expected 1 describe-cache hit (the second Parse), got {}",
+        delta.protocol_describe_cache_hits
+    );
+
+    Ok(())
+}
+
+/// PGC-195: when a synthesized Parse is followed by a Bind+Execute that
+/// misses the data cache, pgcache must prepend the captured Parse bytes
+/// before forwarding so origin can resolve the Bind. The intercepted
+/// ParseComplete must not leak to the client.
+#[tokio::test]
+async fn test_pgproto_lazy_parse_on_forward() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE proto_test (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO proto_test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    let output = pgproto_run(
+        ctx.cache_port,
+        "tests/data/pgproto/lazy_parse_on_forward.data",
+    );
+
+    // Both rows should come back (one per Sync boundary).
+    assert!(
+        output.contains("ReadyForQuery"),
+        "expected ReadyForQuery:\n{output}"
+    );
+    assert_eq!(
+        output.matches("<= BE DataRow").count(),
+        2,
+        "expected one DataRow per Sync (id=1, id=2):\n{output}"
+    );
+    // ParseComplete count should match the two client Parse messages —
+    // the proxy's lazy Parse intercepts the *extra* ParseComplete that
+    // origin emits in response to the prepended Parse, so the client
+    // only sees the responses it expected.
+    assert_eq!(
+        output.matches("ParseComplete").count(),
+        2,
+        "expected exactly 2 ParseComplete reaching the client:\n{output}"
+    );
+
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert!(
+        delta.protocol_describe_cache_hits >= 1,
+        "expected at least 1 describe-cache hit, got {}",
+        delta.protocol_describe_cache_hits
+    );
+    assert!(
+        delta.protocol_lazy_parse_forwarded >= 1,
+        "expected at least 1 lazy-Parse forward, got {}",
+        delta.protocol_lazy_parse_forwarded
+    );
+
+    Ok(())
+}
