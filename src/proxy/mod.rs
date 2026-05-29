@@ -1,6 +1,7 @@
 mod cache_sender;
 mod client_stream;
 mod connection;
+mod egress;
 mod query;
 pub mod search_path;
 mod server;
@@ -73,9 +74,14 @@ impl From<io::Error> for ConnectionError {
 /// Current proxy operating mode for a connection.
 #[derive(Debug)]
 pub(crate) enum ProxyMode {
+    /// Normal: read client + origin, flush the egress queue.
     Read,
+    /// A cacheable query is queued in the egress queue but not yet at the head.
+    /// Drain origin and flush egress without reading the client (no read-ahead),
+    /// until the cache slot reaches the head and can be dispatched.
+    OriginDrain,
+    /// A cache query is being served by the worker; await its reply.
     CacheRead(oneshot::Receiver<CacheReply>),
-    CacheWrite(CacheMessage),
 }
 
 /// Proxy health status.
@@ -118,4 +124,4 @@ impl SharedProxyStatus {
     }
 }
 
-use crate::cache::{CacheMessage, CacheReply};
+use crate::cache::CacheReply;

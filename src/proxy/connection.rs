@@ -25,7 +25,7 @@ use tokio::{
 };
 use tokio_stream::StreamExt;
 use tokio_util::{
-    bytes::{Buf, BufMut, BytesMut},
+    bytes::{Buf, BufMut, Bytes, BytesMut},
     codec::FramedRead,
 };
 use tracing::{debug, error, instrument, trace, warn};
@@ -38,6 +38,7 @@ use crate::{
     },
     metrics::names,
     pg::protocol::{
+        ProtocolError,
         backend::{
             AUTHENTICATION_SASL, PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType,
             authentication_type, data_row_first_column, parameter_status_parse,
@@ -52,6 +53,7 @@ use crate::{
             simple_query_message_build, startup_message_parameter,
         },
     },
+    proxy::egress::EgressQueue,
     query::ast::{query_expr_convert, query_expr_fingerprint},
     settings::{Settings, SslMode},
     telemetry::pg_version_set,
@@ -313,8 +315,17 @@ pub(super) struct ConnectionState {
     /// data waiting to be written to origin
     origin_write_buf: VecDeque<BytesMut>,
 
-    /// data waiting to be written to client
-    client_write_buf: VecDeque<BytesMut>,
+    /// Ordered queue of pending client-bound responses (origin relay, synth,
+    /// cache). The single source of truth for client response ordering; see
+    /// [`EgressQueue`]. Replaces the former `client_write_buf` + `pending_synth`
+    /// + `origin_inflight_syncs` coordination.
+    egress: EgressQueue<CacheMessage>,
+
+    /// A `Flush` forwarded a Parse/Bind/Describe sub-request to origin (JDBC
+    /// pattern), opening an `Origin` egress slot whose describe response carries
+    /// no `ReadyForQuery` to seal it. The client reads that response before
+    /// sending its next message, so the next client message seals the slot.
+    flush_describe_pending: bool,
 
     /// Cache of query fingerprints to cacheability decisions
     fingerprint_cache: HashMap<u64, Result<Arc<CacheableQuery>, ForwardReason>>,
@@ -385,16 +396,6 @@ pub(super) struct ConnectionState {
     /// each forwarded Parse+Describe, consulted by the Parse-only synthesize
     /// path so repeat prepares skip the origin round-trip.
     describe_cache: LruCache<DescribeKey, DescribeCacheEntry>,
-
-    /// Count of forwards whose `ReadyForQuery` hasn't arrived yet. Synthesized
-    /// responses are deferred while non-zero, preserving client-side response
-    /// ordering.
-    origin_inflight_syncs: usize,
-
-    /// Synthesized responses queued behind in-flight origin work. Drained when
-    /// `origin_inflight_syncs` reaches zero on an origin `ReadyForQuery`
-    /// (after pushing that RFQ to the client).
-    pending_synth: VecDeque<BytesMut>,
 }
 
 /// Buffered extended protocol messages, accumulated until Sync/Flush.
@@ -583,7 +584,8 @@ impl ConnectionState {
     ) -> Self {
         Self {
             origin_write_buf: VecDeque::new(),
-            client_write_buf: VecDeque::new(),
+            egress: EgressQueue::new(),
+            flush_describe_pending: false,
             fingerprint_cache: HashMap::new(),
             in_transaction: false,
             proxy_mode: ProxyMode::Read,
@@ -602,8 +604,6 @@ impl ConnectionState {
             origin_database,
             cache_disabled: false,
             describe_cache: LruCache::new(DESCRIBE_CACHE_CAPACITY),
-            origin_inflight_syncs: 0,
-            pending_synth: VecDeque::new(),
         }
     }
 
@@ -650,11 +650,11 @@ impl ConnectionState {
 
 impl ConnectionState {
     /// Push a Sync-terminated batch to origin, recording the forward in
-    /// telemetry and bumping `origin_inflight_syncs` so deferred synthesized
-    /// responses don't jump the queue.
+    /// telemetry and reserving an ordered client-response slot so locally
+    /// produced responses (synth, cache) can't jump ahead of this one.
     fn origin_dispatch(&mut self, bytes: BytesMut, timing: Option<QueryTiming>) {
         self.telemetry.origin_forward(timing);
-        self.origin_inflight_syncs += 1;
+        self.egress.origin_open();
         self.origin_write_buf.push_back(bytes);
     }
 
@@ -663,6 +663,16 @@ impl ConnectionState {
     #[expect(clippy::wildcard_enum_match_arm)]
     async fn handle_client_message(&mut self, mut msg: PgFrontendMessage) {
         trace!("net: client→proxy {:?}", msg.message_type);
+
+        // A prior Flush forwarded a Describe sub-request whose response carries
+        // no ReadyForQuery. The client only sends this next message after
+        // reading that response, so the describe egress slot is now complete:
+        // seal it so a following cache/forward response stays correctly ordered
+        // behind it instead of being blocked by the unsealed slot.
+        if self.flush_describe_pending {
+            self.flush_describe_pending = false;
+            self.egress.origin_seal();
+        }
         match msg.message_type {
             PgFrontendMessageType::Query => {
                 metrics::counter!(names::QUERIES_TOTAL).increment(1);
@@ -697,7 +707,8 @@ impl ConnectionState {
                         Ok(Action::CacheCheck(ast)) => {
                             let fingerprint = query_expr_fingerprint(&ast.query);
                             self.telemetry.cache_timing_start(fingerprint);
-                            ProxyMode::CacheWrite(CacheMessage::Query(msg.data, ast))
+                            self.egress.cache_push(CacheMessage::Query(msg.data, ast));
+                            ProxyMode::OriginDrain
                         }
                         Err(e) => {
                             metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
@@ -755,7 +766,7 @@ impl ConnectionState {
                 // If we receive it here, something unexpected happened - log a warning.
                 // Respond with 'N' to allow the connection to continue.
                 debug!("unexpected SslRequest after TLS negotiation phase, responding 'N'");
-                self.client_write_buf.push_back(BytesMut::from(&[b'N'][..]));
+                self.egress.synth_push(Bytes::from_static(b"N"));
             }
             PgFrontendMessageType::PasswordMessageFamily => {
                 // Forward password/SASL messages to origin.
@@ -896,12 +907,9 @@ impl ConnectionState {
     fn handle_origin_message(&mut self, mut msg: PgBackendMessage) {
         trace!("net: origin→proxy {:?}", msg.message_type);
 
-        let was_rfq = matches!(msg.message_type, PgBackendMessageType::ReadyForQuery);
-
         if self.origin_intercept_handle(&msg) {
-            if was_rfq {
-                self.origin_rfq_consumed();
-            }
+            // Swallowed by an intercept (injected SHOW, lazy ParseComplete, …):
+            // these have no client egress slot, so an RFQ here seals nothing.
             return;
         }
 
@@ -1019,7 +1027,8 @@ impl ConnectionState {
                     debug!("search_path unknown, sending SHOW search_path query");
                     self.origin_intercept = OriginIntercept::SearchPath;
                     let query_msg = simple_query_message_build("SHOW search_path;");
-                    self.origin_inflight_syncs += 1;
+                    // Injected query: its response is fully swallowed by the
+                    // SearchPath intercept, so it gets no client egress slot.
                     self.origin_write_buf.push_back(query_msg);
                 }
             }
@@ -1032,9 +1041,11 @@ impl ConnectionState {
             msg.data.len()
         );
         let was_rfq = matches!(msg.message_type, PgBackendMessageType::ReadyForQuery);
-        self.client_write_buf.push_back(msg.data);
+        self.egress.origin_append(msg.data.freeze());
         if was_rfq {
-            self.origin_rfq_consumed();
+            // ReadyForQuery ends this request's response: seal its slot so the
+            // next slot (and any locally-produced response behind it) can flush.
+            self.egress.origin_seal();
         }
     }
 
@@ -1101,8 +1112,11 @@ impl ConnectionState {
                 metrics::counter!(names::QUERIES_CACHE_HIT).increment(1);
                 self.telemetry.cache_complete(timing);
 
-                // Cache hit: origin saw nothing. Lazy-Parse-on-forward will
-                // catch up the next time we actually have to forward.
+                // Cache hit: the worker wrote the full response directly to the
+                // client socket. Pop the serving cache slot so the next slot can
+                // flush. Origin saw nothing; lazy-Parse-on-forward catches up the
+                // next time we actually have to forward.
+                self.egress.cache_done();
                 self.extended.pending_parse_statement.take();
                 self.extended.pending_lazy_parse.take();
 
@@ -1120,7 +1134,7 @@ impl ConnectionState {
                         &mut self.origin_intercept,
                     );
                 }
-                self.origin_dispatch(buf, None);
+                self.cache_reply_forward(buf, None);
                 self.proxy_mode = ProxyMode::Read;
             }
             CacheReply::Forward(buf, timing) => {
@@ -1135,10 +1149,39 @@ impl ConnectionState {
                         &mut self.origin_intercept,
                     );
                 }
-                self.origin_dispatch(buf, Some(timing));
+                self.cache_reply_forward(buf, Some(timing));
                 self.proxy_mode = ProxyMode::Read;
             }
         }
+    }
+
+    /// Forward a cache miss/error to origin: replace the serving cache slot with
+    /// an origin slot in place (keeping response order) and queue the bytes. The
+    /// slot already exists, so this does not open a new one.
+    fn cache_reply_forward(&mut self, buf: BytesMut, timing: Option<QueryTiming>) {
+        self.telemetry.origin_forward(timing);
+        self.egress.cache_to_origin();
+        self.origin_write_buf.push_back(buf);
+    }
+
+    /// Fall back to forwarding a cacheable query to origin after it was taken
+    /// from its egress slot (search_path unknown or client-socket creation
+    /// failed): convert the now-serving `Cache` slot back to an `Origin` slot in
+    /// place, install a lazy `Parse` if origin doesn't yet know the statement,
+    /// forward the query bytes, and return to `Read`.
+    fn cache_slot_forward_to_origin(&mut self, msg: CacheMessage) {
+        self.egress.cache_to_origin();
+        if let Some(stmt_name) = self.extended.pending_lazy_parse.take() {
+            forward_lazy_parse_install(
+                &stmt_name,
+                &self.prepared_statements,
+                &mut self.extended,
+                &mut self.origin_write_buf,
+                &mut self.origin_intercept,
+            );
+        }
+        cache_forward_to_origin(&mut self.extended, &mut self.origin_write_buf, msg);
+        self.proxy_mode = ProxyMode::Read;
     }
 
     /// Inspect an outgoing simple-query `Query` message for search_path
@@ -1360,7 +1403,7 @@ impl ConnectionState {
         let Some(mut buffer) = self.extended.buffer_take() else {
             // Bare Sync; origin replies with one RFQ.
             trace!("net: proxy→origin Sync (no buffer)");
-            self.origin_inflight_syncs += 1;
+            self.egress.origin_open();
             self.origin_write_buf.push_back(msg.data);
             return;
         };
@@ -1423,7 +1466,8 @@ impl ConnectionState {
             self.telemetry.cache_timing_start(fingerprint);
 
             trace!("net: Sync → cache dispatch");
-            self.proxy_mode = ProxyMode::CacheWrite(cache_msg);
+            self.egress.cache_push(cache_msg);
+            self.proxy_mode = ProxyMode::OriginDrain;
         } else if self.try_synthesize_parse_describe_response(&buffer) {
             trace!("net: Sync → synthesized ParseComplete+Describe response");
         } else {
@@ -1522,35 +1566,11 @@ impl ConnectionState {
         // ReadyForQuery 'I' — synth_eligible excluded in_transaction.
         out.put_slice(&[b'Z', 0, 0, 0, 5, b'I']);
 
-        // Defer behind in-flight origin work so the synth bytes don't jump
-        // ahead of pending origin responses in the client's read stream.
-        if self.origin_inflight_syncs > 0 || !self.pending_synth.is_empty() {
-            self.pending_synth.push_back(out);
-        } else {
-            self.client_write_buf.push_back(out);
-        }
+        // Enqueue as an ordered slot: the egress queue keeps it behind any
+        // earlier in-flight origin response so the synth bytes can't jump ahead.
+        self.egress.synth_push(out.freeze());
 
         true
-    }
-
-    /// Drain deferred synth responses into `client_write_buf`. Caller must
-    /// ensure `origin_inflight_syncs == 0` and that the current origin RFQ
-    /// (if any) is already in `client_write_buf`.
-    fn pending_synth_drain(&mut self) {
-        while let Some(buf) = self.pending_synth.pop_front() {
-            self.client_write_buf.push_back(buf);
-        }
-    }
-
-    /// Account for an origin RFQ either passing through to the client or
-    /// being consumed by an intercept. Drains deferred synth bytes once
-    /// origin goes idle; ordering is correct because the just-arrived RFQ
-    /// (if forwarded) was pushed before this call.
-    fn origin_rfq_consumed(&mut self) {
-        self.origin_inflight_syncs = self.origin_inflight_syncs.saturating_sub(1);
-        if self.origin_inflight_syncs == 0 {
-            self.pending_synth_drain();
-        }
     }
 
     /// Handle Flush message — forward buffer to origin, no cache attempt.
@@ -1562,6 +1582,10 @@ impl ConnectionState {
         };
 
         self.extended_buffer_forward_to_origin(buffer, &msg.data);
+        // The forwarded batch ends in Flush, not Sync — origin will send the
+        // describe response with no ReadyForQuery. Mark the opened egress slot
+        // so the next client message seals it (see `handle_client_message`).
+        self.flush_describe_pending = true;
         trace!("net: Flush → origin (forwarded buffer)");
     }
 
@@ -1646,10 +1670,66 @@ impl ConnectionState {
         self.portals.clear();
     }
 
+    /// Dispatch the result of an origin-read poll: handle the message, or map a
+    /// decode error / EOF to a connection error. Shared by the select loops.
+    fn origin_read_dispatch(
+        &mut self,
+        res: Option<Result<PgBackendMessage, ProtocolError>>,
+    ) -> ConnectionResult<()> {
+        match res {
+            Some(Ok(msg)) => {
+                self.handle_origin_message(msg);
+                Ok(())
+            }
+            Some(Err(err)) => {
+                debug!("origin read error [{}]", err);
+                Err(ConnectionError::ProtocolError(err).into())
+            }
+            None => {
+                debug!("origin stream closed");
+                Err(ConnectionError::IoError(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "origin disconnected",
+                ))
+                .into())
+            }
+        }
+    }
+
+    /// Write one buffered chunk to origin, popping it once fully drained. Guard
+    /// the call site with `!self.origin_write_buf.is_empty()`.
     #[expect(
         clippy::indexing_slicing,
-        reason = "VecDeque access guarded by !is_empty()"
+        reason = "VecDeque access guarded by !is_empty() at the call site"
     )]
+    async fn origin_write_flush(
+        &mut self,
+        origin_write: &mut Pin<&mut OriginWriteHalf<'_>>,
+    ) -> ConnectionResult<()> {
+        origin_write
+            .write_buf(&mut self.origin_write_buf[0])
+            .await
+            .map_err(ConnectionError::IoError)?;
+        if !self.origin_write_buf[0].has_remaining() {
+            self.origin_write_buf.pop_front();
+        }
+        Ok(())
+    }
+
+    /// Write the next ready egress chunk to the client. Guard the call site with
+    /// `self.egress.has_writable()`.
+    async fn client_egress_flush(
+        &mut self,
+        client_write: &mut Pin<&mut ClientWriteHalf<'_>>,
+    ) -> ConnectionResult<()> {
+        let n = client_write
+            .write(self.egress.write_chunk())
+            .await
+            .map_err(ConnectionError::IoError)?;
+        self.egress.advance(n);
+        Ok(())
+    }
+
     async fn connection_select<'a, 'b>(
         &mut self,
         origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
@@ -1677,46 +1757,19 @@ impl ConnectionState {
                 }
             }
             res = origin_read.next() => {
-                match res {
-                    Some(Ok(msg)) => {
-                        self.handle_origin_message(msg);
-                    }
-                    Some(Err(err)) => {
-                        debug!("origin read error [{}]", err);
-                        return Err(ConnectionError::ProtocolError(err).into());
-                    }
-                    None => {
-                        debug!("origin stream closed");
-                        return Err(ConnectionError::IoError(io::Error::new(
-                            io::ErrorKind::ConnectionReset,
-                            "origin disconnected",
-                        )).into());
-                    }
-                }
+                self.origin_read_dispatch(res)?;
             }
             _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
-                origin_write.write_buf(&mut self.origin_write_buf[0]).await
-                    .map_err(ConnectionError::IoError)?;
-                if !self.origin_write_buf[0].has_remaining() {
-                    self.origin_write_buf.pop_front();
-                }
+                self.origin_write_flush(origin_write).await?;
             }
-            _ = client_write.writable(), if !self.client_write_buf.is_empty() => {
-                client_write.write_buf(&mut self.client_write_buf[0]).await
-                    .map_err(ConnectionError::IoError)?;
-                if !self.client_write_buf[0].has_remaining() {
-                    self.client_write_buf.pop_front();
-                }
+            _ = client_write.writable(), if self.egress.has_writable() => {
+                self.client_egress_flush(client_write).await?;
             }
         };
 
         Ok(())
     }
 
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "VecDeque access guarded by !is_empty()"
-    )]
     async fn connection_select_with_cache<'a, 'b>(
         &mut self,
         origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
@@ -1734,22 +1787,7 @@ impl ConnectionState {
 
         select! {
             res = origin_read.next() => {
-                match res {
-                    Some(Ok(msg)) => {
-                        self.handle_origin_message(msg);
-                    }
-                    Some(Err(err)) => {
-                        debug!("origin read error [{}]", err);
-                        return Err(ConnectionError::ProtocolError(err).into());
-                    }
-                    None => {
-                        debug!("origin stream closed");
-                        return Err(ConnectionError::IoError(io::Error::new(
-                            io::ErrorKind::ConnectionReset,
-                            "origin disconnected",
-                        )).into());
-                    }
-                }
+                self.origin_read_dispatch(res)?;
             }
             reply = &mut *cache_rx => {
                 match reply {
@@ -1763,18 +1801,35 @@ impl ConnectionState {
                 }
             }
             _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
-                origin_write.write_buf(&mut self.origin_write_buf[0]).await
-                    .map_err(ConnectionError::IoError)?;
-                if !self.origin_write_buf[0].has_remaining() {
-                    self.origin_write_buf.pop_front();
-                }
+                self.origin_write_flush(origin_write).await?;
             }
-            _ = client_write.writable(), if !self.client_write_buf.is_empty() => {
-                client_write.write_buf(&mut self.client_write_buf[0]).await
-                    .map_err(ConnectionError::IoError)?;
-                if !self.client_write_buf[0].has_remaining() {
-                    self.client_write_buf.pop_front();
-                }
+            _ = client_write.writable(), if self.egress.has_writable() => {
+                self.client_egress_flush(client_write).await?;
+            }
+        };
+
+        Ok(())
+    }
+
+    /// Select loop for `OriginDrain`: a cacheable query is queued behind earlier
+    /// responses. Drains origin and flushes the egress queue **without reading
+    /// the client**, so no later request is processed before the queued cache
+    /// query — preserving response order until the cache slot reaches the head.
+    async fn connection_select_drain<'a, 'b>(
+        &mut self,
+        origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
+        origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
+        client_write: &mut Pin<&mut ClientWriteHalf<'a>>,
+    ) -> ConnectionResult<()> {
+        select! {
+            res = origin_read.next() => {
+                self.origin_read_dispatch(res)?;
+            }
+            _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
+                self.origin_write_flush(origin_write).await?;
+            }
+            _ = client_write.writable(), if self.egress.has_writable() => {
+                self.client_egress_flush(client_write).await?;
             }
         };
 
@@ -1812,21 +1867,20 @@ async fn origin_connect(
     Err(ConnectionError::NoConnection.into())
 }
 
-/// Forward a query to origin when cache dispatch isn't possible. Sends either
-/// the buffered pipeline bytes or the raw message data and bumps the in-flight
-/// Sync counter. Free function (not a method) to allow disjoint field borrows
-/// when `proxy_mode` has been partially moved by pattern matching.
-fn origin_forward(
+/// Forward a cacheable query's bytes to origin when cache dispatch isn't
+/// possible (search_path unknown, socket creation failure). Sends either the
+/// buffered pipeline bytes or the raw message data. The query's egress slot has
+/// already been converted to an `Origin` slot by `cache_to_origin`, so this does
+/// not open a new one. Free function to allow disjoint field borrows.
+fn cache_forward_to_origin(
     extended: &mut ExtendedPending,
     origin_write_buf: &mut VecDeque<BytesMut>,
-    origin_inflight_syncs: &mut usize,
     msg: CacheMessage,
 ) {
     let bytes = extended
         .pipeline_take()
         .map(|p| p.buffered_bytes)
         .unwrap_or_else(|| msg.into_data());
-    *origin_inflight_syncs += 1;
     origin_write_buf.push_back(bytes);
 }
 
@@ -1938,31 +1992,36 @@ async fn handle_connection(
                     break;
                 }
             }
-            ProxyMode::CacheWrite(msg) => {
-                // Resolve search_path for this connection (expand $user to session_user)
-                // If search_path is unknown, forward to origin instead of caching
+            ProxyMode::OriginDrain => {
+                // The cacheable query is queued in the egress queue. `cache_dispatch`
+                // returns it (and marks its slot serving) only once the slot has
+                // reached the head; until then we drain origin and flush earlier
+                // responses without reading the client (no read-ahead), so the
+                // cache response can't jump ahead of an in-flight origin response.
+                let Some(msg) = state.egress.cache_dispatch() else {
+                    if let Err(err) = state
+                        .connection_select_drain(
+                            &mut origin_framed_read,
+                            &mut origin_write,
+                            &mut client_write,
+                        )
+                        .await
+                    {
+                        debug!("read error [{}]", err);
+                        break;
+                    }
+                    continue;
+                };
+
+                // The cache query is in hand and its slot is serving. Resolve
+                // search_path; if unknown, forward to origin instead of caching.
                 let Some(resolved_search_path) = state
                     .search_path_state
                     .resolve(state.session_user.as_deref())
                 else {
                     debug!("search_path unknown, forwarding to origin");
                     metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
-                    if let Some(stmt_name) = state.extended.pending_lazy_parse.take() {
-                        forward_lazy_parse_install(
-                            &stmt_name,
-                            &state.prepared_statements,
-                            &mut state.extended,
-                            &mut state.origin_write_buf,
-                            &mut state.origin_intercept,
-                        );
-                    }
-                    origin_forward(
-                        &mut state.extended,
-                        &mut state.origin_write_buf,
-                        &mut state.origin_inflight_syncs,
-                        msg,
-                    );
-                    state.proxy_mode = ProxyMode::Read;
+                    state.cache_slot_forward_to_origin(msg);
                     continue;
                 };
 
@@ -1973,22 +2032,7 @@ async fn handle_connection(
                     Ok(s) => s,
                     Err(e) => {
                         error!("Failed to create client socket: {}", e);
-                        if let Some(stmt_name) = state.extended.pending_lazy_parse.take() {
-                            forward_lazy_parse_install(
-                                &stmt_name,
-                                &state.prepared_statements,
-                                &mut state.extended,
-                                &mut state.origin_write_buf,
-                                &mut state.origin_intercept,
-                            );
-                        }
-                        origin_forward(
-                            &mut state.extended,
-                            &mut state.origin_write_buf,
-                            &mut state.origin_inflight_syncs,
-                            msg,
-                        );
-                        state.proxy_mode = ProxyMode::Read;
+                        state.cache_slot_forward_to_origin(msg);
                         continue;
                     }
                 };
@@ -2015,6 +2059,9 @@ async fn handle_connection(
                         debug!("cache unavailable");
                         state.proxy_status = ProxyStatus::Degraded;
                         let proxy_msg = e.into_message();
+                        // The cache slot is now serving (message already taken);
+                        // convert it back to an origin slot in place.
+                        state.egress.cache_to_origin();
                         if let Some(pipeline) = proxy_msg.pipeline {
                             state.origin_write_buf.push_back(pipeline.buffered_bytes);
                         } else {

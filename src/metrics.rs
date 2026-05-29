@@ -161,8 +161,7 @@ pub mod names {
     // Hits serve Parse-only batches locally instead of forwarding to origin.
     pub const PROTOCOL_DESCRIBE_CACHE_HITS: &str = "pgcache.protocol.describe_cache.hits";
     pub const PROTOCOL_DESCRIBE_CACHE_MISSES: &str = "pgcache.protocol.describe_cache.misses";
-    pub const PROTOCOL_DESCRIBE_CACHE_EVICTIONS: &str =
-        "pgcache.protocol.describe_cache.evictions";
+    pub const PROTOCOL_DESCRIBE_CACHE_EVICTIONS: &str = "pgcache.protocol.describe_cache.evictions";
     pub const PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS: &str =
         "pgcache.protocol.describe_cache.invalidations";
     /// Bind+Execute forwards where pgcache prepended a lazy `Parse` because

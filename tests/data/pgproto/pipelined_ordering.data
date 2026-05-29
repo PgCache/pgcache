@@ -1,0 +1,13 @@
+# PGC-213 repro: pipeline a slow, uncacheable statement immediately before a
+# cacheable SELECT that is already a cache hit. Both simple-query messages are
+# sent before any response is read, so pgcache reads the cacheable query while
+# the uncacheable DO is still running on origin.
+#
+# Correct ordering: the DO's response (CommandComplete, no DataRow) must reach
+# the client before the cache hit's DataRow. The bug lets the worker write the
+# cache response directly to the socket ahead of the in-flight origin response.
+'Q'	"DO $$ BEGIN PERFORM pg_sleep(0.3); END $$"
+'Q'	"SELECT id, name FROM proto_pipeline WHERE id = 1"
+'Y'
+'Y'
+'X'

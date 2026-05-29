@@ -16,11 +16,8 @@ const Q3: &str = "SELECT id, val FROM t WHERE id = $1";
 const Q4: &str = "SELECT id FROM t WHERE id < $1 ORDER BY id DESC LIMIT 5";
 
 async fn setup_table(ctx: &mut TestContext) -> Result<(), Error> {
-    ctx.query(
-        "create table t (id integer primary key, val text)",
-        &[],
-    )
-    .await?;
+    ctx.query("create table t (id integer primary key, val text)", &[])
+        .await?;
     ctx.query(
         "insert into t select i, md5(i::text) from generate_series(1, 100) i",
         &[],
@@ -133,6 +130,9 @@ async fn test_cache_hits_seq_single_sql() -> Result<(), Error> {
     let (hits, misses, commits) = measure(&mut ctx, 1, 400, &[Q1]).await?;
     eprintln!("[seq+single] hits={hits} misses={misses} commits={commits}");
     assert_eq!(misses, 0, "expected 0 cache misses");
-    assert!(commits < 50, "origin saw {commits} commits — PGC-195 regression");
+    assert!(
+        commits < 50,
+        "origin saw {commits} commits — PGC-195 regression"
+    );
     Ok(())
 }
