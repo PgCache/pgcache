@@ -1,4 +1,4 @@
-# ADR-026: CDC Local Eval Fast Path
+# ADR-027: CDC Local Eval Fast Path
 
 ## Status
 Accepted
