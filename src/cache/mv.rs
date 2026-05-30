@@ -439,7 +439,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-    use crate::query::ast::query_expr_convert;
+    use crate::query::ast::query_expr_parse;
     use crate::query::resolved::query_expr_resolve;
 
     #[test]
@@ -528,8 +528,7 @@ mod tests {
     }
 
     fn classify(sql: &str) -> ShapeGate {
-        let parsed = pg_query::parse(sql).expect("parse SQL");
-        let ast = query_expr_convert(&parsed).expect("convert to AST");
+        let ast = query_expr_parse(sql).expect("convert to AST");
         let resolved =
             query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve query");
         shape_classify(&resolved, &test_aggregate_functions())
@@ -759,8 +758,7 @@ mod tests {
     // ==================== mv_serve_sql positional ORDER BY ====================
 
     fn resolve_for_serve(sql: &str) -> ResolvedQueryExpr {
-        let parsed = pg_query::parse(sql).expect("parse SQL");
-        let ast = query_expr_convert(&parsed).expect("convert to AST");
+        let ast = query_expr_parse(sql).expect("convert to AST");
         query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve query")
     }
 

@@ -705,7 +705,7 @@ mod tests {
 
     use crate::cache::{QueryParameter, QueryParameters};
     use crate::query::ast::{
-        Deparse, LiteralValue, QueryBody, SelectNode, query_expr_convert, query_expr_fingerprint,
+        Deparse, LiteralValue, QueryBody, SelectNode, query_expr_fingerprint, query_expr_parse,
     };
 
     use super::super::super::AstTransformError;
@@ -717,8 +717,7 @@ mod tests {
     use super::NUMERIC_NAN;
 
     fn parse_select_node(sql: &str) -> SelectNode {
-        let ast = pg_query::parse(sql).expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
         match query_expr.body {
             QueryBody::Select(node) => *node,
             _ => panic!("expected SELECT"),
@@ -2058,9 +2057,8 @@ mod tests {
         // post-substitution fingerprints. Otherwise pgcache would route
         // them to the same cache entry and one query's results would bleed
         // into the other's.
-        let pg_ast =
-            pg_query::parse("SELECT id FROM widgets WHERE id = ANY($1)").expect("parse SQL");
-        let q1 = query_expr_convert(&pg_ast).expect("convert to QueryExpr");
+        let q1 = query_expr_parse("SELECT id FROM widgets WHERE id = ANY($1)")
+            .expect("convert to QueryExpr");
         let q2 = q1.clone();
 
         let arr1 = vec![

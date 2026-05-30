@@ -104,14 +104,13 @@ mod tests {
     use tokio_util::bytes::Bytes;
 
     use crate::cache::QueryParameters;
-    use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_convert};
+    use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_parse};
 
     use super::super::super::AstTransformError;
     use super::{query_expr_parameters_replace, select_node_parameters_replace};
 
     fn parse_select_node(sql: &str) -> SelectNode {
-        let ast = pg_query::parse(sql).expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
         match query_expr.body {
             QueryBody::Select(node) => *node,
             _ => panic!("expected SELECT"),
@@ -303,8 +302,7 @@ mod tests {
     fn test_ast_parameters_replace_in_select_columns() {
         use crate::query::ast::query_expr_fingerprint;
 
-        let ast = pg_query::parse("SELECT $1 FROM users").expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        let query_expr = query_expr_parse("SELECT $1 FROM users").expect("convert to QueryExpr");
         let params = typed_text_params(vec![(Some(b"42"), PgType::INT4)]);
         let bound =
             query_expr_parameters_replace(&query_expr, &params).expect("parameter replacement");
@@ -314,8 +312,7 @@ mod tests {
         assert!(!buf.contains("$1"), "SELECT $1 should be bound, got: {buf}");
 
         // Fingerprint must match the inline-literal form.
-        let inline_ast = pg_query::parse("SELECT 42 FROM users").expect("parse inline form");
-        let inline = query_expr_convert(&inline_ast).expect("convert inline form");
+        let inline = query_expr_parse("SELECT 42 FROM users").expect("convert inline form");
         assert_eq!(
             query_expr_fingerprint(&bound),
             query_expr_fingerprint(&inline),
@@ -328,8 +325,7 @@ mod tests {
     #[test]
     fn test_ast_parameters_replace_in_order_by() {
         let sql = "SELECT id FROM users ORDER BY $1";
-        let ast = pg_query::parse(sql).expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
 
         let params = typed_text_params(vec![(Some(b"1"), PgType::INT4)]);
         let replaced =
@@ -347,8 +343,7 @@ mod tests {
     fn test_cte_parameter_replacement() {
         let sql = "WITH active_users AS (SELECT id, name FROM users WHERE status = $1) \
                    SELECT id FROM active_users WHERE name = $2";
-        let ast = pg_query::parse(sql).expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
 
         let params = typed_text_params(vec![
             (Some(b"active"), PgType::TEXT),

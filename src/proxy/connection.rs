@@ -54,7 +54,7 @@ use crate::{
         },
     },
     proxy::egress::EgressQueue,
-    query::ast::{query_expr_convert, query_expr_fingerprint},
+    query::ast::{AstError, QueryExpr, query_expr_convert_raw, query_expr_fingerprint},
     settings::{Settings, SslMode},
     telemetry::pg_version_set,
     timing::{QueryId, QueryTiming, timing_record},
@@ -63,9 +63,7 @@ use crate::{
 
 use super::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
 use super::query::{Action, ForwardReason, handle_query};
-use super::search_path::{
-    SearchPath, search_path_mutates_any, search_path_mutates_single_piggybackable,
-};
+use super::search_path::{SearchPath, search_path_mutations_raw};
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
 use super::{CacheSender, ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::result::{MapIntoReport, ReportExt};
@@ -551,7 +549,6 @@ impl ExtendedBuffer {
     fn any_has_parse(&self) -> bool {
         self.pending.has_parse || self.entries.iter().any(|e| e.has_parse)
     }
-
 }
 
 /// State for the extended query protocol pipeline.
@@ -673,9 +670,12 @@ impl ExtendedPending {
     /// forward paths). Replaces any prior contents — this forwards a whole
     /// buffer, so the queues describe exactly its responses.
     fn pending_statements_capture(&mut self, buffer: &ExtendedBuffer) {
-        self.pending_parse_statements = buffer.parse_statements_all().map(EcoString::from).collect();
-        self.pending_describe_statements =
-            buffer.describe_statements_all().map(EcoString::from).collect();
+        self.pending_parse_statements =
+            buffer.parse_statements_all().map(EcoString::from).collect();
+        self.pending_describe_statements = buffer
+            .describe_statements_all()
+            .map(EcoString::from)
+            .collect();
     }
 
     /// Flush any buffered extended protocol messages.
@@ -1380,11 +1380,13 @@ impl ConnectionState {
         let Some(sql) = query_message_sql(&msg.data) else {
             return;
         };
-        let Ok(ast) = pg_query::parse(sql) else {
+        let Ok(mutations) =
+            pg_query::parse_raw_scoped(sql, |tree| unsafe { search_path_mutations_raw(tree) })
+        else {
             return;
         };
 
-        if search_path_mutates_any(&ast) {
+        if mutations.any {
             debug!("search_path mutation detected in Query");
             self.search_path_mark_unknown();
         }
@@ -1392,7 +1394,7 @@ impl ConnectionState {
         // Piggyback only on single-statement, piggyback-safe mutations, and
         // only when no other intercept is active (otherwise the inline SHOW
         // response would collide with the existing intercept's state machine).
-        if search_path_mutates_single_piggybackable(&ast).is_some()
+        if mutations.single_piggybackable.is_some()
             && matches!(self.origin_intercept, OriginIntercept::None)
             && let Some(rewritten) = query_message_append_show_search_path(&msg.data)
         {
@@ -1403,32 +1405,46 @@ impl ConnectionState {
         }
     }
 
+    /// Map a parsed-and-converted query to its cacheability classification.
+    fn statement_type_classify(&self, convert: Result<QueryExpr, AstError>) -> StatementType {
+        match convert {
+            Ok(query) => match CacheableQuery::try_new(&query, &self.func_volatility) {
+                Ok(cacheable_query) => StatementType::Cacheable(Arc::new(cacheable_query)),
+                Err(_) => StatementType::UncacheableSelect,
+            },
+            Err(_) => StatementType::NonSelect,
+        }
+    }
+
     /// Handle Parse message — analyze cacheability, store statement, buffer bytes.
     fn handle_parse_message(&mut self, msg: PgFrontendMessage) {
         if let Ok(parsed) = parse_parse_message(&msg.data) {
-            let ast_result = pg_query::parse(&parsed.sql);
+            // Single raw-tree parse (PGC-192): build the QueryExpr and — on
+            // pre-PG18, where search_path isn't auto-reported — detect a
+            // search_path mutation in the same walk. No protobuf round-trip.
+            // (Pessimistic: the client may or may not Execute the statement.
+            // Piggyback isn't attempted for extended protocol; a standalone
+            // SHOW is issued via the lazy path on the next RFQ.)
+            let check_search_path = !self.search_path_auto_reported;
+            let result = pg_query::parse_raw_scoped(&parsed.sql, |tree| unsafe {
+                let convert = query_expr_convert_raw(tree);
+                // search_path mutations are non-SELECT statements that the
+                // converter rejects, so the second walk is only needed when
+                // convert didn't yield a SELECT — the common cacheable-SELECT
+                // case skips it.
+                let mutates =
+                    check_search_path && convert.is_err() && search_path_mutations_raw(tree).any;
+                (convert, mutates)
+            });
 
-            // Detect search_path mutation at Parse time (pessimistic: the
-            // client may Execute the statement or not). Piggyback isn't
-            // attempted for extended protocol — a standalone SHOW will be
-            // issued via the lazy path on the next RFQ once state is Unknown.
-            // Skipped on PG18+ where ParameterStatus keeps us in sync.
-            if !self.search_path_auto_reported
-                && let Ok(ast) = &ast_result
-                && search_path_mutates_any(ast)
-            {
-                debug!("search_path mutation detected in Parse");
-                self.search_path_mark_unknown();
-            }
-
-            let sql_type = match ast_result {
-                Ok(ast) => match query_expr_convert(&ast) {
-                    Ok(query) => match CacheableQuery::try_new(&query, &self.func_volatility) {
-                        Ok(cacheable_query) => StatementType::Cacheable(Arc::new(cacheable_query)),
-                        Err(_) => StatementType::UncacheableSelect,
-                    },
-                    Err(_) => StatementType::NonSelect,
-                },
+            let sql_type = match result {
+                Ok((convert, mutates)) => {
+                    if mutates {
+                        debug!("search_path mutation detected in Parse");
+                        self.search_path_mark_unknown();
+                    }
+                    self.statement_type_classify(convert)
+                }
                 Err(_) => StatementType::ParseError,
             };
 
@@ -1550,9 +1566,7 @@ impl ConnectionState {
 
     /// Whether the connection's global state currently permits cache serving.
     fn cache_globally_enabled(&self) -> bool {
-        !self.in_transaction
-            && !self.cache_disabled
-            && self.proxy_status == ProxyStatus::Normal
+        !self.in_transaction && !self.cache_disabled && self.proxy_status == ProxyStatus::Normal
     }
 
     /// Handle Describe message — buffer bytes and track describe metadata.
@@ -1633,7 +1647,12 @@ impl ConnectionState {
                 .entries
                 .iter()
                 .all(|e| !e.dirty && e.candidate.is_some())
-            && buffer.entries.iter().filter(|e| e.needs_lazy_parse()).count() <= 1
+            && buffer
+                .entries
+                .iter()
+                .filter(|e| e.needs_lazy_parse())
+                .count()
+                <= 1
     }
 
     /// Build a dispatch context per entry, queue them, and begin the first slot.
@@ -1667,7 +1686,9 @@ impl ConnectionState {
         // Reset the awaited-response queues to just this slot's statement(s);
         // on a miss `batch_remaining_forward` appends the rest in order.
         self.extended.pending_parse_statements.clear();
-        self.extended.pending_parse_statements.extend(ctx.parse_statement);
+        self.extended
+            .pending_parse_statements
+            .extend(ctx.parse_statement);
         self.extended.pending_describe_statements.clear();
         self.extended
             .pending_describe_statements
@@ -1709,7 +1730,8 @@ impl ConnectionState {
             self.extended
                 .pending_describe_statements
                 .extend(next.describe_statement);
-            self.origin_write_buf.push_back(next.pipeline.buffered_bytes);
+            self.origin_write_buf
+                .push_back(next.pipeline.buffered_bytes);
         }
         // A simple `Query` is self-terminating (origin emits its own RFQ);
         // only extended-pipeline entries need a synthesized Sync to close the

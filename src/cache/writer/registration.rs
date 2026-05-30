@@ -1304,7 +1304,7 @@ mod classify_tests {
 
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-    use crate::query::ast::query_expr_convert;
+    use crate::query::ast::query_expr_parse;
     use crate::query::resolved::query_expr_resolve;
 
     fn make_table(name: &str, oid: u32, columns: &[&str]) -> TableMetadata {
@@ -1331,8 +1331,7 @@ mod classify_tests {
     }
 
     fn resolve(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedQueryExpr {
-        let ast = pg_query::parse(sql).expect("parse");
-        let query_expr = query_expr_convert(&ast).expect("convert");
+        let query_expr = query_expr_parse(sql).expect("convert");
         let cacheable = CacheableQuery::try_new(&query_expr, &HashMap::new()).expect("cacheable");
         query_expr_resolve(&cacheable.query, tables, &["public"]).expect("resolve")
     }

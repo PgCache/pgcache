@@ -483,7 +483,7 @@ mod tests {
 
     use super::*;
     use crate::cache::query::CacheableQuery;
-    use crate::query::ast::{QueryBody, query_expr_convert};
+    use crate::query::ast::{QueryBody, query_expr_parse};
 
     #[test]
     fn test_parse_parse_message() {
@@ -676,8 +676,7 @@ mod tests {
         assert_eq!(result.parameter_oids, vec![23]);
 
         // Test that this SQL would be cacheable
-        let ast = pg_query::parse(&result.sql).unwrap();
-        let query = query_expr_convert(&ast).unwrap();
+        let query = query_expr_parse(&result.sql).unwrap();
         let cacheable = CacheableQuery::try_new(&query, &HashMap::new());
         assert!(
             cacheable.is_ok(),
@@ -702,8 +701,7 @@ mod tests {
         assert_eq!(result.statement_name, "");
 
         // Test that this SQL parses and IS cacheable (non-correlated subquery)
-        let ast = pg_query::parse(&result.sql).unwrap();
-        let query = query_expr_convert(&ast).expect("subquery should parse to AST");
+        let query = query_expr_parse(&result.sql).expect("subquery should parse to AST");
 
         // Verify has_subqueries() detects the subquery
         let QueryBody::Select(select) = &query.body else {
@@ -737,10 +735,7 @@ mod tests {
         let result = parse_parse_message(&data).unwrap();
 
         // Test that INSERT is not cacheable (not a SELECT)
-        use crate::query::ast::query_expr_convert;
-
-        let ast = pg_query::parse(&result.sql).unwrap();
-        let cacheable_result = query_expr_convert(&ast);
+        let cacheable_result = query_expr_parse(&result.sql);
         assert!(
             cacheable_result.is_err(),
             "INSERT should not convert to cacheable query"

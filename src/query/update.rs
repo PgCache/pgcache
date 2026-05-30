@@ -73,15 +73,14 @@ mod tests {
     use crate::cache::SubqueryKind;
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-    use crate::query::ast::{Deparse, query_expr_convert};
+    use crate::query::ast::{Deparse, query_expr_parse};
     use crate::query::resolved::query_expr_resolve;
 
     use super::*;
 
     /// Helper to parse SQL and return a CacheableQuery
     fn parse_cacheable(sql: &str) -> CacheableQuery {
-        let ast = pg_query::parse(sql).expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
         CacheableQuery::try_new(&query_expr, &HashMap::new()).expect("query to be cacheable")
     }
 

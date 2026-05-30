@@ -1121,15 +1121,14 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-    use crate::query::ast::{QueryBody, query_expr_convert};
+    use crate::query::ast::{QueryBody, query_expr_parse};
     use crate::query::resolved::select_node_resolve;
 
     use super::*;
 
     // Helper function to parse SQL and resolve to ResolvedSelectNode
     fn resolve_sql(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedSelectNode {
-        let ast = pg_query::parse(sql).expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
         let QueryBody::Select(node) = query_expr.body else {
             panic!("expected SELECT");
         };

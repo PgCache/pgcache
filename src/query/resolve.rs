@@ -1345,9 +1345,8 @@ mod tests {
 
     /// Parse SQL and return a SelectNode (for tests using new types)
     fn parse_select_node(sql: &str) -> SelectNode {
-        use crate::query::ast::{QueryBody, query_expr_convert};
-        let ast = pg_query::parse(sql).expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        use crate::query::ast::{QueryBody, query_expr_parse};
+        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
         match query_expr.body {
             QueryBody::Select(node) => *node,
             _ => panic!("expected SELECT"),
@@ -1362,9 +1361,8 @@ mod tests {
 
     /// Parse SQL and resolve to ResolvedQueryExpr (for ORDER BY/LIMIT tests)
     fn resolve_query(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedQueryExpr {
-        use crate::query::ast::query_expr_convert;
-        let ast = pg_query::parse(sql).expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        use crate::query::ast::query_expr_parse;
+        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
         query_expr_resolve(&query_expr, tables, &["public"]).expect("resolve")
     }
 
@@ -2056,14 +2054,13 @@ mod tests {
 
     #[test]
     fn test_order_by_column_not_found() {
-        use crate::query::ast::query_expr_convert;
+        use crate::query::ast::query_expr_parse;
 
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata("users", 1001));
 
         let sql = "SELECT * FROM users ORDER BY nonexistent_column ASC";
-        let ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let result = query_expr_resolve(&query_expr, &tables, &["public"]);
 

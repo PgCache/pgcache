@@ -1,7 +1,8 @@
-use pg_query::ParseResult;
-use pg_query::protobuf::{
-    DiscardMode, TransactionStmtKind, VariableSetKind, node::Node as NodeEnum,
-};
+use std::os::raw::c_void;
+
+use pg_query::pg_nodes as pg;
+
+use crate::query::ast::raw::{NodePtr, cast, cstr, list_nodes, node_tag};
 
 /// Classification of a parsed statement with respect to search_path state.
 ///
@@ -39,56 +40,84 @@ impl MutationKind {
     }
 }
 
-/// Classify a single parsed statement node.
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "NodeEnum has hundreds of variants; listing non-mutating ones is impractical"
-)]
-fn stmt_classify(node: &NodeEnum) -> Option<MutationKind> {
-    match node {
-        NodeEnum::VariableSetStmt(stmt) => match VariableSetKind::try_from(stmt.kind).ok()? {
-            VariableSetKind::VarResetAll => Some(MutationKind::SearchPathSet),
-            _ if stmt.name.eq_ignore_ascii_case("search_path") => Some(MutationKind::SearchPathSet),
+/// Per-query search_path classification computed from a raw parse tree.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SearchPathMutations {
+    /// Some statement in the parse invalidates the cached search_path — mark
+    /// state stale regardless of piggyback eligibility or multi-statement
+    /// structure.
+    pub any: bool,
+    /// The parse is exactly one statement AND it is a mutation that can safely
+    /// ride in PG's implicit multi-statement transaction — gates the piggyback
+    /// rewrite.
+    pub single_piggybackable: Option<MutationKind>,
+}
+
+/// Classify a single raw statement node with respect to search_path state.
+unsafe fn stmt_classify_raw(stmt: NodePtr) -> Option<MutationKind> {
+    unsafe {
+        match node_tag(stmt) {
+            pg::NodeTag_T_VariableSetStmt => {
+                let s = cast::<pg::VariableSetStmt>(stmt);
+                if (*s).kind == pg::VariableSetKind_VAR_RESET_ALL
+                    || cstr((*s).name).eq_ignore_ascii_case("search_path")
+                {
+                    Some(MutationKind::SearchPathSet)
+                } else {
+                    None
+                }
+            }
+            pg::NodeTag_T_DiscardStmt => match (*cast::<pg::DiscardStmt>(stmt)).target {
+                pg::DiscardMode_DISCARD_ALL => Some(MutationKind::DiscardAll),
+                _ => None,
+            },
+            pg::NodeTag_T_TransactionStmt => match (*cast::<pg::TransactionStmt>(stmt)).kind {
+                pg::TransactionStmtKind_TRANS_STMT_COMMIT
+                | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK
+                | pg::TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED
+                | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED => {
+                    Some(MutationKind::TxnEnd)
+                }
+                _ => None,
+            },
             _ => None,
-        },
-        NodeEnum::DiscardStmt(stmt) => match DiscardMode::try_from(stmt.target).ok()? {
-            DiscardMode::DiscardAll => Some(MutationKind::DiscardAll),
-            _ => None,
-        },
-        NodeEnum::TransactionStmt(stmt) => match TransactionStmtKind::try_from(stmt.kind).ok()? {
-            TransactionStmtKind::TransStmtCommit
-            | TransactionStmtKind::TransStmtRollback
-            | TransactionStmtKind::TransStmtCommitPrepared
-            | TransactionStmtKind::TransStmtRollbackPrepared => Some(MutationKind::TxnEnd),
-            _ => None,
-        },
-        _ => None,
+        }
     }
 }
 
-fn stmt_node(raw: &pg_query::protobuf::RawStmt) -> Option<&NodeEnum> {
-    raw.stmt.as_ref()?.node.as_ref()
-}
-
-/// Returns true if any statement in the parse invalidates the cached
-/// search_path — used to mark state stale regardless of piggyback eligibility
-/// or multi-statement structure.
-pub fn search_path_mutates_any(ast: &ParseResult) -> bool {
-    ast.protobuf
-        .stmts
-        .iter()
-        .filter_map(stmt_node)
-        .any(|n| stmt_classify(n).is_some())
-}
-
-/// If the parse contains exactly one statement AND that statement is a
-/// mutation that can safely ride in PG's implicit multi-statement transaction,
-/// returns its kind. Used to gate the piggyback rewrite.
-pub fn search_path_mutates_single_piggybackable(ast: &ParseResult) -> Option<MutationKind> {
-    let [raw] = ast.protobuf.stmts.as_slice() else {
-        return None;
-    };
-    stmt_classify(stmt_node(raw)?).filter(|k| k.piggybackable())
+/// Classify every statement in a raw parse tree (`List *` of `RawStmt`).
+///
+/// # Safety
+/// `tree_root` must be the live tree handed to a `pg_query::parse_raw_scoped`
+/// callback, valid for the duration of this call.
+pub unsafe fn search_path_mutations_raw(tree_root: *const c_void) -> SearchPathMutations {
+    unsafe {
+        // Single pass: track whether any statement mutates, and the kind of the
+        // sole statement (for the piggyback gate, which requires exactly one).
+        let mut any = false;
+        let mut count = 0usize;
+        let mut first = None;
+        for raw in list_nodes(tree_root as *const pg::List) {
+            let stmt = (*cast::<pg::RawStmt>(raw)).stmt as NodePtr;
+            let kind = if stmt.is_null() {
+                None
+            } else {
+                stmt_classify_raw(stmt)
+            };
+            any |= kind.is_some();
+            if count == 0 {
+                first = kind;
+            }
+            count += 1;
+        }
+        SearchPathMutations {
+            any,
+            single_piggybackable: match (count, first) {
+                (1, Some(k)) if k.piggybackable() => Some(k),
+                _ => None,
+            },
+        }
+    }
 }
 
 /// Represents a single entry in the PostgreSQL search_path.
@@ -306,92 +335,78 @@ mod tests {
         assert_eq!(resolved, vec!["$user", "public"]);
     }
 
-    fn parse(sql: &str) -> ParseResult {
-        pg_query::parse(sql).expect("parse SQL")
+    fn mutates_any(sql: &str) -> bool {
+        pg_query::parse_raw_scoped(sql, |tree| unsafe { search_path_mutations_raw(tree) })
+            .expect("parse SQL")
+            .any
+    }
+
+    fn single_piggybackable(sql: &str) -> Option<MutationKind> {
+        pg_query::parse_raw_scoped(sql, |tree| unsafe { search_path_mutations_raw(tree) })
+            .expect("parse SQL")
+            .single_piggybackable
     }
 
     #[test]
     fn test_mutates_any_set_search_path() {
-        assert!(search_path_mutates_any(&parse(
-            "SET search_path = myapp, public"
-        )));
-        assert!(search_path_mutates_any(&parse("SET search_path TO myapp")));
-        assert!(search_path_mutates_any(&parse(
-            "SET LOCAL search_path = myapp"
-        )));
-        assert!(search_path_mutates_any(&parse(
-            "SET SESSION search_path = myapp"
-        )));
-        assert!(search_path_mutates_any(&parse(
-            "SET search_path TO DEFAULT"
-        )));
+        assert!(mutates_any("SET search_path = myapp, public"));
+        assert!(mutates_any("SET search_path TO myapp"));
+        assert!(mutates_any("SET LOCAL search_path = myapp"));
+        assert!(mutates_any("SET SESSION search_path = myapp"));
+        assert!(mutates_any("SET search_path TO DEFAULT"));
         // Name comparison is case-insensitive.
-        assert!(search_path_mutates_any(&parse("SET Search_Path = myapp")));
+        assert!(mutates_any("SET Search_Path = myapp"));
     }
 
     #[test]
     fn test_mutates_any_reset() {
-        assert!(search_path_mutates_any(&parse("RESET search_path")));
-        assert!(search_path_mutates_any(&parse("RESET ALL")));
+        assert!(mutates_any("RESET search_path"));
+        assert!(mutates_any("RESET ALL"));
     }
 
     #[test]
     fn test_mutates_any_discard() {
-        assert!(search_path_mutates_any(&parse("DISCARD ALL")));
-        assert!(!search_path_mutates_any(&parse("DISCARD TEMP")));
-        assert!(!search_path_mutates_any(&parse("DISCARD PLANS")));
+        assert!(mutates_any("DISCARD ALL"));
+        assert!(!mutates_any("DISCARD TEMP"));
+        assert!(!mutates_any("DISCARD PLANS"));
     }
 
     #[test]
     fn test_mutates_any_txn_end() {
-        assert!(search_path_mutates_any(&parse("COMMIT")));
-        assert!(search_path_mutates_any(&parse("ROLLBACK")));
-        assert!(search_path_mutates_any(&parse("END")));
-        assert!(search_path_mutates_any(&parse("ABORT")));
+        assert!(mutates_any("COMMIT"));
+        assert!(mutates_any("ROLLBACK"));
+        assert!(mutates_any("END"));
+        assert!(mutates_any("ABORT"));
     }
 
     #[test]
     fn test_mutates_any_ignored_statements() {
-        assert!(!search_path_mutates_any(&parse("SELECT 1")));
-        assert!(!search_path_mutates_any(&parse("SET work_mem = 1")));
-        assert!(!search_path_mutates_any(&parse("RESET work_mem")));
-        assert!(!search_path_mutates_any(&parse("BEGIN")));
-        assert!(!search_path_mutates_any(&parse("SAVEPOINT sp")));
-        assert!(!search_path_mutates_any(&parse("ROLLBACK TO SAVEPOINT sp")));
+        assert!(!mutates_any("SELECT 1"));
+        assert!(!mutates_any("SET work_mem = 1"));
+        assert!(!mutates_any("RESET work_mem"));
+        assert!(!mutates_any("BEGIN"));
+        assert!(!mutates_any("SAVEPOINT sp"));
+        assert!(!mutates_any("ROLLBACK TO SAVEPOINT sp"));
     }
 
     #[test]
     fn test_mutates_any_multi_statement() {
-        assert!(search_path_mutates_any(&parse("SELECT 1; COMMIT")));
-        assert!(search_path_mutates_any(&parse(
-            "COMMIT; SET search_path = x"
-        )));
+        assert!(mutates_any("SELECT 1; COMMIT"));
+        assert!(mutates_any("COMMIT; SET search_path = x"));
     }
 
     #[test]
     fn test_mutates_single_piggybackable_only_single_statement() {
+        assert_eq!(single_piggybackable("COMMIT"), Some(MutationKind::TxnEnd));
         assert_eq!(
-            search_path_mutates_single_piggybackable(&parse("COMMIT")),
-            Some(MutationKind::TxnEnd)
-        );
-        assert_eq!(
-            search_path_mutates_single_piggybackable(&parse("SET search_path = x")),
+            single_piggybackable("SET search_path = x"),
             Some(MutationKind::SearchPathSet)
         );
         // DISCARD ALL can't run in an implicit multi-statement txn, so it is
         // detected by mutates_any (see test above) but never piggybackable.
-        assert_eq!(
-            search_path_mutates_single_piggybackable(&parse("DISCARD ALL")),
-            None
-        );
+        assert_eq!(single_piggybackable("DISCARD ALL"), None);
         // Multi-statement: ineligible even if it contains a mutation.
-        assert_eq!(
-            search_path_mutates_single_piggybackable(&parse("SELECT 1; COMMIT")),
-            None
-        );
-        assert_eq!(
-            search_path_mutates_single_piggybackable(&parse("COMMIT; SET search_path = x")),
-            None
-        );
+        assert_eq!(single_piggybackable("SELECT 1; COMMIT"), None);
+        assert_eq!(single_piggybackable("COMMIT; SET search_path = x"), None);
     }
 }

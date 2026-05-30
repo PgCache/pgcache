@@ -111,14 +111,13 @@ fn float_op(a: f64, op: ArithmeticOp, b: f64) -> Option<LiteralValue> {
 mod tests {
     use super::*;
     use crate::cache::messages::QueryParameters;
-    use crate::query::ast::{WhereExpr, query_expr_convert, query_expr_fingerprint};
+    use crate::query::ast::{WhereExpr, query_expr_fingerprint, query_expr_parse};
     use crate::query::transform::query_expr_parameters_replace;
     use bytes::Bytes;
     use postgres_types::Type as PgType;
 
     fn parse_and_fold(sql: &str) -> QueryExpr {
-        let ast = pg_query::parse(sql).unwrap();
-        let mut q = query_expr_convert(&ast).unwrap();
+        let mut q = query_expr_parse(sql).unwrap();
         query_expr_constant_fold(&mut q);
         q
     }
@@ -248,8 +247,7 @@ mod tests {
     #[test]
     fn fold_after_parameter_bind() {
         // Post-bind fold: `$1 % 10000 + 1` with $1=12345 folds to 2346.
-        let ast = pg_query::parse("SELECT id FROM t WHERE user_id = $1 % 10000 + 1").unwrap();
-        let parsed = query_expr_convert(&ast).unwrap();
+        let parsed = query_expr_parse("SELECT id FROM t WHERE user_id = $1 % 10000 + 1").unwrap();
         let bound = query_expr_parameters_replace(&parsed, &int8_param(12345)).unwrap();
 
         let select = bound.as_select().expect("select");
@@ -268,8 +266,7 @@ mod tests {
     fn fold_after_parameter_bind_collapses_fingerprints() {
         // Different $1 values that fold to the same user_id share a fingerprint
         // after bind-time fold — the writer-bottleneck fix that PGC-118 targets.
-        let ast = pg_query::parse("SELECT id FROM t WHERE user_id = $1 % 10000 + 1").unwrap();
-        let parsed = query_expr_convert(&ast).unwrap();
+        let parsed = query_expr_parse("SELECT id FROM t WHERE user_id = $1 % 10000 + 1").unwrap();
 
         let bound1 = query_expr_parameters_replace(&parsed, &int8_param(12345)).unwrap();
         let bound2 = query_expr_parameters_replace(&parsed, &int8_param(22345)).unwrap();

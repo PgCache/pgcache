@@ -10,7 +10,7 @@ use tracing::{debug, trace};
 use crate::{
     cache::query::CacheableQuery,
     catalog::FunctionVolatility,
-    query::ast::{AstError, query_expr_convert},
+    query::ast::{AstError, query_expr_convert_raw},
 };
 
 use super::ParseError;
@@ -57,9 +57,12 @@ pub(super) async fn handle_query(
             Ok(Action::Forward(*reason))
         }
         None => {
-            let ast = pg_query::parse(query)?;
+            // Build the QueryExpr straight off the raw parse tree, skipping the
+            // protobuf serialize/decode round-trip (PGC-192).
+            let convert_result =
+                pg_query::parse_raw_scoped(query, |tree| unsafe { query_expr_convert_raw(tree) })?;
 
-            match query_expr_convert(&ast) {
+            match convert_result {
                 Ok(query) => {
                     // Successfully parsed as SELECT
                     match CacheableQuery::try_new(&query, func_volatility) {

@@ -1,13 +1,14 @@
 mod convert;
-pub mod expr_parse;
+mod convert_raw;
+#[cfg(test)]
+mod expr_parse;
+pub(crate) mod raw;
 mod types;
 
 use ecow::EcoString;
 use error_set::error_set;
 
 use crate::pg::identifier_needs_quotes;
-
-use self::expr_parse::WhereParseError;
 
 error_set! {
     AstError := {
@@ -27,6 +28,33 @@ error_set! {
         #[display("Unsupported SubLink type: {sublink_type}")]
         UnsupportedSubLinkType { sublink_type: String },
         WhereParseError(WhereParseError),
+    }
+}
+
+error_set! {
+    WhereParseError := {
+        #[display("Unsupported WHERE clause pattern")]
+        UnsupportedPattern,
+        #[display("Unsupported A expression: {expr}")]
+        UnsupportedAExpr { expr: String },
+        #[display("Unsupported operator: {operator}")]
+        UnsupportedOperator { operator: String },
+        #[display("Invalid column reference")]
+        InvalidColumnRef,
+        #[display("Invalid constant value: {value}")]
+        InvalidConstValue { value: String },
+        #[display("Complex expression not supported: {expr}")]
+        ComplexExpression { expr: String },
+        #[display("Missing expression")]
+        MissingExpression,
+        #[display("{error}")]
+        Other { error: String },
+        /// Wraps a structural AST conversion failure surfaced while parsing
+        /// a WHERE-side scalar (function call, scalar subquery, arithmetic
+        /// operand, etc.). Boxed to keep the enum size bounded — `AstError`
+        /// already contains `WhereParseError(WhereParseError)`.
+        #[display("{0}")]
+        Conversion(Box<AstError>),
     }
 }
 
@@ -72,4 +100,7 @@ impl Deparse for EcoString {
 
 // Re-export everything public from submodules
 pub use convert::*;
+pub use convert_raw::query_expr_convert_raw;
+#[cfg(test)]
+pub(crate) use convert_raw::query_expr_parse;
 pub use types::*;

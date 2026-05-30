@@ -3,14 +3,13 @@ use std::marker::PhantomData;
 
 use ecow::EcoString;
 use ordered_float::NotNan;
-use pg_query::protobuf::{SortByDir, SortByNulls};
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
 use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::query::cast::{CastTarget, cast_target_deparse};
 
-use super::{AstError, Deparse};
+use super::Deparse;
 
 // Core literal value types that can appear in SQL expressions.
 //
@@ -2158,25 +2157,6 @@ impl JoinType {
     }
 }
 
-impl TryFrom<pg_query::protobuf::JoinType> for JoinType {
-    type Error = AstError;
-
-    fn try_from(v: pg_query::protobuf::JoinType) -> Result<Self, Self::Error> {
-        match v {
-            pg_query::protobuf::JoinType::Undefined => Err(AstError::UnsupportedJoinType),
-            pg_query::protobuf::JoinType::JoinInner => Ok(Self::Inner),
-            pg_query::protobuf::JoinType::JoinLeft => Ok(Self::Left),
-            pg_query::protobuf::JoinType::JoinFull => Ok(Self::Full),
-            pg_query::protobuf::JoinType::JoinRight => Ok(Self::Right),
-            pg_query::protobuf::JoinType::JoinSemi => Err(AstError::UnsupportedJoinType),
-            pg_query::protobuf::JoinType::JoinAnti => Err(AstError::UnsupportedJoinType),
-            pg_query::protobuf::JoinType::JoinRightAnti => Err(AstError::UnsupportedJoinType),
-            pg_query::protobuf::JoinType::JoinUniqueOuter => Err(AstError::UnsupportedJoinType),
-            pg_query::protobuf::JoinType::JoinUniqueInner => Err(AstError::UnsupportedJoinType),
-        }
-    }
-}
-
 /// SubLink type for subqueries in WHERE clauses
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SubLinkType {
@@ -2188,27 +2168,6 @@ pub enum SubLinkType {
     All,
     /// Scalar subquery returning single value
     Expr,
-}
-
-impl TryFrom<pg_query::protobuf::SubLinkType> for SubLinkType {
-    type Error = AstError;
-
-    fn try_from(v: pg_query::protobuf::SubLinkType) -> Result<Self, Self::Error> {
-        use pg_query::protobuf::SubLinkType as PgSubLinkType;
-        match v {
-            PgSubLinkType::ExistsSublink => Ok(Self::Exists),
-            PgSubLinkType::AnySublink => Ok(Self::Any),
-            PgSubLinkType::AllSublink => Ok(Self::All),
-            PgSubLinkType::ExprSublink => Ok(Self::Expr),
-            PgSubLinkType::Undefined
-            | PgSubLinkType::RowcompareSublink
-            | PgSubLinkType::MultiexprSublink
-            | PgSubLinkType::ArraySublink
-            | PgSubLinkType::CteSublink => Err(AstError::UnsupportedSubLinkType {
-                sublink_type: format!("{:?}", v),
-            }),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -2262,21 +2221,6 @@ impl Deparse for NullOrder {
     }
 }
 
-impl TryFrom<SortByNulls> for NullOrder {
-    type Error = AstError;
-
-    fn try_from(n: SortByNulls) -> Result<Self, Self::Error> {
-        match n {
-            SortByNulls::SortbyNullsDefault => Ok(NullOrder::Default),
-            SortByNulls::SortbyNullsFirst => Ok(NullOrder::NullsFirst),
-            SortByNulls::SortbyNullsLast => Ok(NullOrder::NullsLast),
-            SortByNulls::Undefined => Err(AstError::UnsupportedFeature {
-                feature: format!("ORDER BY NULLS ordering: {n:?}"),
-            }),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub enum OrderDirection {
     Asc,
@@ -2296,20 +2240,6 @@ impl Deparse for OrderDirection {
             OrderDirection::Desc => buf.push_str("DESC"),
         }
         buf
-    }
-}
-
-impl TryFrom<SortByDir> for OrderDirection {
-    type Error = AstError;
-
-    fn try_from(dir: SortByDir) -> Result<Self, Self::Error> {
-        match dir {
-            SortByDir::SortbyAsc | SortByDir::SortbyDefault => Ok(OrderDirection::Asc),
-            SortByDir::SortbyDesc => Ok(OrderDirection::Desc),
-            SortByDir::Undefined | SortByDir::SortbyUsing => Err(AstError::UnsupportedFeature {
-                feature: format!("ORDER BY direction: {dir:?}"),
-            }),
-        }
     }
 }
 

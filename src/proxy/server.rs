@@ -151,7 +151,7 @@ use crate::{
         cdc::{replication_cleanup, replication_provision},
         connect,
     },
-    query::ast::{query_expr_convert, query_expr_fingerprint},
+    query::ast::{query_expr_convert_raw, query_expr_fingerprint},
     settings::Settings,
     telemetry, tls,
 };
@@ -357,17 +357,16 @@ fn pinned_queries_validate(
     queries
         .iter()
         .filter_map(|sql| {
-            let ast = match pg_query::parse(sql) {
-                Ok(ast) => ast,
-                Err(e) => {
-                    tracing::warn!("pinned query not parseable, skipping: {sql} ({e})");
+            let query_expr = match pg_query::parse_raw_scoped(sql, |tree| unsafe {
+                query_expr_convert_raw(tree)
+            }) {
+                Ok(Ok(q)) => q,
+                Ok(Err(e)) => {
+                    tracing::warn!("pinned query not convertible, skipping: {sql} ({e})");
                     return None;
                 }
-            };
-            let query_expr = match query_expr_convert(&ast) {
-                Ok(q) => q,
                 Err(e) => {
-                    tracing::warn!("pinned query not convertible, skipping: {sql} ({e})");
+                    tracing::warn!("pinned query not parseable, skipping: {sql} ({e})");
                     return None;
                 }
             };

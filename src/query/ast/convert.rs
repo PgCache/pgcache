@@ -1,1030 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use pg_query::ParseResult;
-use pg_query::protobuf::{
-    AExpr, AExprKind, CaseExpr as PgCaseExpr, CoalesceExpr, CteMaterialize, FuncCall, JoinExpr,
-    MinMaxExpr, MinMaxOp, RangeSubselect, SortByDir, SortByNulls, TypeCast, TypeName,
-};
-use pg_query::protobuf::{Node, RangeVar, SelectStmt, SetOperation, node::Node as NodeEnum};
-
-use crate::query::cast::cast_target_from_canonical;
-use crate::query::transform::query_expr_constant_fold;
-
-use super::expr_parse::{
-    column_ref_extract, const_value_extract, node_convert_to_expr, param_ref_extract,
-    select_stmt_parse_where,
-};
-use super::*;
-
-/// Convert a pg_query ParseResult into a QueryExpr
-pub fn query_expr_convert(ast: &ParseResult) -> Result<QueryExpr, AstError> {
-    let [raw_stmt] = ast.protobuf.stmts.as_slice() else {
-        return Err(AstError::MultipleStatements);
-    };
-
-    let stmt_node = raw_stmt.stmt.as_ref().ok_or(AstError::MissingStatement)?;
-
-    let mut query = match stmt_node.node.as_ref() {
-        Some(NodeEnum::SelectStmt(select_stmt)) => select_stmt_to_query_expr(select_stmt),
-        Some(other) => Err(AstError::UnsupportedStatement {
-            statement_type: format!("{other:?}"),
-        }),
-        None => Err(AstError::MissingStatement),
-    }?;
-
-    // Fold pure-literal arithmetic so different inline-literal queries that
-    // reduce to the same value share a fingerprint (PGC-118).
-    query_expr_constant_fold(&mut query);
-
-    Ok(query)
-}
-
-/// Context for CTE-aware parsing. Tracks CTE definitions from an outer
-/// WITH clause so that table references in the body can be recognized as
-/// CTE references instead of catalog tables.
-struct ParseContext {
-    ctes: Vec<CteDefinition>,
-}
-
-impl ParseContext {
-    fn empty() -> Self {
-        Self { ctes: Vec::new() }
-    }
-
-    fn cte_find(&self, name: &str) -> Option<&CteDefinition> {
-        self.ctes.iter().find(|c| c.name == name)
-    }
-}
-
-/// Extract CTE definitions from a WITH clause protobuf.
-fn with_clause_extract(
-    with_clause: &pg_query::protobuf::WithClause,
-) -> Result<Vec<CteDefinition>, AstError> {
-    if with_clause.recursive {
-        return Err(AstError::UnsupportedFeature {
-            feature: "WITH RECURSIVE".to_owned(),
-        });
-    }
-
-    let mut ctes = Vec::new();
-
-    for cte_node in &with_clause.ctes {
-        let Some(NodeEnum::CommonTableExpr(cte)) = &cte_node.node else {
-            return Err(AstError::UnsupportedFeature {
-                feature: format!("WITH clause entry: {cte_node:?}"),
-            });
-        };
-
-        if cte.cterecursive {
-            return Err(AstError::UnsupportedFeature {
-                feature: format!("recursive CTE: {}", cte.ctename),
-            });
-        }
-
-        let materialization = match CteMaterialize::try_from(cte.ctematerialized) {
-            Ok(CteMaterialize::Always) => CteMaterialization::Materialized,
-            Ok(CteMaterialize::Never) => CteMaterialization::NotMaterialized,
-            _ => CteMaterialization::Default,
-        };
-
-        let column_aliases = cte
-            .aliascolnames
-            .iter()
-            .filter_map(|n| {
-                if let Some(NodeEnum::String(s)) = &n.node {
-                    Some(EcoString::from(s.sval.as_str()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Parse inner query with context of previously parsed CTEs
-        // (supports CTE-referencing-CTE)
-        let inner_select = cte
-            .ctequery
-            .as_ref()
-            .and_then(|n| n.node.as_ref())
-            .ok_or_else(|| AstError::UnsupportedFeature {
-                feature: format!("CTE missing query: {}", cte.ctename),
-            })?;
-
-        let NodeEnum::SelectStmt(inner_stmt) = inner_select else {
-            return Err(AstError::UnsupportedFeature {
-                feature: format!("CTE query is not SELECT: {}", cte.ctename),
-            });
-        };
-
-        let ctx = ParseContext { ctes: ctes.clone() };
-        let query = select_stmt_to_query_expr_with_ctx(inner_stmt, &ctx)?;
-
-        ctes.push(CteDefinition {
-            name: EcoString::from(cte.ctename.as_str()),
-            query,
-            column_aliases,
-            materialization,
-        });
-    }
-
-    Ok(ctes)
-}
-
-/// Convert a SelectStmt to a QueryExpr, handling set operations.
-/// Public entry point — creates an empty ParseContext.
-pub fn select_stmt_to_query_expr(select_stmt: &SelectStmt) -> Result<QueryExpr, AstError> {
-    let ctx = ParseContext::empty();
-    select_stmt_to_query_expr_with_ctx(select_stmt, &ctx)
-}
-
-/// Convert a SelectStmt to a QueryExpr with CTE context.
-fn select_stmt_to_query_expr_with_ctx(
-    select_stmt: &SelectStmt,
-    outer_ctx: &ParseContext,
-) -> Result<QueryExpr, AstError> {
-    // Locking clauses (FOR UPDATE, FOR SHARE, etc.) acquire row locks and must
-    // not be cached — reject early before doing any further parsing work.
-    if !select_stmt.locking_clause.is_empty() {
-        return Err(AstError::UnsupportedSelectFeature {
-            feature: "locking clause (FOR UPDATE/FOR SHARE)".to_owned(),
-        });
-    }
-
-    // Parse WITH clause if present, merging with any outer CTE context
-    let ctes = if let Some(with_clause) = &select_stmt.with_clause {
-        with_clause_extract(with_clause)?
-    } else {
-        Vec::new()
-    };
-
-    // Build context: outer CTEs + this level's CTEs
-    let mut all_ctes = outer_ctx.ctes.clone();
-    all_ctes.extend(ctes.clone());
-    let ctx = ParseContext { ctes: all_ctes };
-    let set_op = SetOperation::try_from(select_stmt.op).unwrap_or(SetOperation::Undefined);
-
-    // ORDER BY and LIMIT apply to the whole query expression
-    let order_by = order_by_clause_convert(&select_stmt.sort_clause)?;
-    let limit = limit_clause_convert(
-        select_stmt.limit_count.as_deref(),
-        select_stmt.limit_offset.as_deref(),
-    )?;
-
-    let body = match set_op {
-        SetOperation::SetopNone | SetOperation::Undefined => {
-            // Check if this is a VALUES clause or a SELECT
-            if !select_stmt.values_lists.is_empty() {
-                let rows = value_list_convert(&select_stmt.values_lists)?;
-                QueryBody::Values(ValuesClause { rows })
-            } else {
-                let select_node = select_stmt_to_select_node(select_stmt, &ctx)?;
-                QueryBody::Select(Box::new(select_node))
-            }
-        }
-        SetOperation::SetopUnion | SetOperation::SetopIntersect | SetOperation::SetopExcept => {
-            // Parse left and right arguments
-            let larg = select_stmt
-                .larg
-                .as_ref()
-                .ok_or_else(|| AstError::UnsupportedFeature {
-                    feature: "SET operation without left argument".to_owned(),
-                })?;
-            let rarg = select_stmt
-                .rarg
-                .as_ref()
-                .ok_or_else(|| AstError::UnsupportedFeature {
-                    feature: "SET operation without right argument".to_owned(),
-                })?;
-
-            // Recursively convert left and right with CTE context
-            let left = select_stmt_to_query_expr_with_ctx(larg, &ctx)?;
-            let right = select_stmt_to_query_expr_with_ctx(rarg, &ctx)?;
-
-            let op_type = match set_op {
-                SetOperation::SetopUnion => SetOpType::Union,
-                SetOperation::SetopIntersect => SetOpType::Intersect,
-                SetOperation::SetopExcept => SetOpType::Except,
-                // SetopNone and Undefined are handled in the outer match
-                SetOperation::SetopNone | SetOperation::Undefined => unreachable!(),
-            };
-
-            QueryBody::SetOp(SetOpNode {
-                op: op_type,
-                all: select_stmt.all,
-                left: Box::new(left),
-                right: Box::new(right),
-            })
-        }
-    };
-
-    Ok(QueryExpr {
-        ctes,
-        body,
-        order_by,
-        limit,
-    })
-}
-
-/// Convert a SelectStmt to a SelectNode (without ORDER BY/LIMIT)
-fn select_stmt_to_select_node(
-    select_stmt: &SelectStmt,
-    ctx: &ParseContext,
-) -> Result<SelectNode, AstError> {
-    let columns = select_columns_convert(&select_stmt.target_list)?;
-    let from = from_clause_convert(&select_stmt.from_clause, ctx)?;
-    let where_clause = select_stmt_parse_where(select_stmt)?;
-    let group_by = group_by_clause_convert(&select_stmt.group_clause)?;
-    let having = having_clause_convert(select_stmt.having_clause.as_deref())?;
-
-    Ok(SelectNode {
-        distinct: !select_stmt.distinct_clause.is_empty(),
-        columns,
-        from,
-        where_clause,
-        group_by,
-        having,
-    })
-}
-
-fn value_list_convert(value_list: &[Node]) -> Result<Vec<Vec<LiteralValue>>, AstError> {
-    let mut rv = Vec::with_capacity(value_list.len());
-    for value in value_list {
-        let mut row = Vec::new();
-        if let Some(NodeEnum::List(node_list)) = &value.node {
-            for item in &node_list.items {
-                match &item.node {
-                    Some(NodeEnum::AConst(const_val)) => {
-                        row.push(const_value_extract(const_val)?);
-                    }
-                    other => {
-                        return Err(AstError::UnsupportedFeature {
-                            feature: format!("Value expression: {other:?}"),
-                        });
-                    }
-                }
-            }
-        } else {
-            return Err(AstError::UnsupportedFeature {
-                feature: format!("Values: {value:?}"),
-            });
-        }
-        rv.push(row);
-    }
-
-    Ok(rv)
-}
-
-fn select_columns_convert(target_list: &[Node]) -> Result<SelectColumns, AstError> {
-    if target_list.is_empty() {
-        return Ok(SelectColumns::None);
-    }
-
-    let mut columns = Vec::with_capacity(target_list.len());
-
-    for target in target_list {
-        if let Some(NodeEnum::ResTarget(res_target)) = &target.node
-            && let Some(val_node) = &res_target.val
-        {
-            let alias = if res_target.name.is_empty() {
-                None
-            } else {
-                Some(EcoString::from(res_target.name.as_str()))
-            };
-
-            // Bare or qualified star (`SELECT *`, `SELECT t.*`) are
-            // SELECT-list-only shapes; everything else is a scalar
-            // expression and delegates to `node_convert_to_scalar_expr`.
-            if let Some(NodeEnum::ColumnRef(col_ref)) = &val_node.node {
-                let fields = &col_ref.fields;
-
-                if let [field] = fields.as_slice()
-                    && let Some(NodeEnum::AStar(_)) = &field.node
-                {
-                    columns.push(SelectColumn::Star(None));
-                    continue;
-                }
-
-                if fields.len() >= 2
-                    && matches!(
-                        fields.last().and_then(|f| f.node.as_ref()),
-                        Some(NodeEnum::AStar(_))
-                    )
-                {
-                    let qualifier = fields
-                        .get(fields.len() - 2)
-                        .ok_or(AstError::InvalidTableRef)?;
-                    let table = match qualifier.node.as_ref() {
-                        Some(NodeEnum::String(s)) => EcoString::from(s.sval.as_str()),
-                        _ => return Err(AstError::InvalidTableRef),
-                    };
-                    columns.push(SelectColumn::Star(Some(table)));
-                    continue;
-                }
-            }
-
-            let expr = node_convert_to_scalar_expr(val_node)?;
-            columns.push(SelectColumn::Expr { expr, alias });
-        } else {
-            return Err(AstError::UnsupportedSelectFeature {
-                feature: format!("Target: {target:?}"),
-            });
-        }
-    }
-
-    Ok(SelectColumns::Columns(columns))
-}
-
-fn from_clause_convert(
-    from_clause: &[Node],
-    ctx: &ParseContext,
-) -> Result<Vec<TableSource>, AstError> {
-    let mut tables = Vec::with_capacity(from_clause.len());
-
-    for from_node in from_clause {
-        match &from_node.node {
-            Some(NodeEnum::RangeVar(range_var)) => {
-                let table_node = table_node_convert(range_var, ctx)?;
-                tables.push(table_node);
-            }
-            Some(NodeEnum::RangeSubselect(range_subselect)) => {
-                let table_subquery_node = table_subquery_node_convert(range_subselect, ctx)?;
-                tables.push(table_subquery_node);
-            }
-            Some(NodeEnum::JoinExpr(join_expr)) => {
-                let join_node = join_expr_convert(join_expr, ctx)?;
-                tables.push(join_node);
-            }
-            _ => {
-                return Err(AstError::UnsupportedSelectFeature {
-                    feature: format!("FROM clause type: {from_node:?}"),
-                });
-            }
-        }
-    }
-
-    Ok(tables)
-}
-
-fn join_arg_convert(node: &Node, side: &str, ctx: &ParseContext) -> Result<TableSource, AstError> {
-    match &node.node {
-        Some(NodeEnum::RangeVar(range_var)) => table_node_convert(range_var, ctx),
-        Some(NodeEnum::RangeSubselect(range_subselect)) => {
-            table_subquery_node_convert(range_subselect, ctx)
-        }
-        Some(NodeEnum::JoinExpr(nested_join)) => {
-            // Recursively handle nested joins
-            join_expr_convert(nested_join, ctx)
-        }
-        _ => Err(AstError::UnsupportedSelectFeature {
-            feature: format!("join {side} argument: {node:?}"),
-        }),
-    }
-}
-
-fn join_expr_convert(join_expr: &JoinExpr, ctx: &ParseContext) -> Result<TableSource, AstError> {
-    // Convert left argument - can be a table, subquery, or another join
-    let left_table = if let Some(larg_node) = &join_expr.larg {
-        join_arg_convert(larg_node, "left", ctx)?
-    } else {
-        return Err(AstError::UnsupportedSelectFeature {
-            feature: "join missing left argument".to_owned(),
-        });
-    };
-
-    // Convert right argument - can be a table, subquery, or another join
-    let right_table = if let Some(rarg_node) = &join_expr.rarg {
-        join_arg_convert(rarg_node, "right", ctx)?
-    } else {
-        return Err(AstError::UnsupportedSelectFeature {
-            feature: "join missing right argument".to_owned(),
-        });
-    };
-
-    // `ON` / `USING` / `NATURAL` / cross are mutually exclusive in the
-    // grammar, so pg_query sets at most one of quals / using_clause /
-    // is_natural; everything else is a (cross) cartesian join.
-    let qual = if let Some(clause) = &join_expr.quals {
-        JoinQual::On(node_convert_to_expr(clause)?)
-    } else if !join_expr.using_clause.is_empty() {
-        let cols = join_expr
-            .using_clause
-            .iter()
-            .filter_map(|n| match &n.node {
-                Some(NodeEnum::String(s)) => Some(EcoString::from(s.sval.as_str())),
-                _ => None,
-            })
-            .collect();
-        JoinQual::Using(cols)
-    } else if join_expr.is_natural {
-        JoinQual::Natural
-    } else {
-        JoinQual::Cross
-    };
-
-    Ok(TableSource::Join(JoinNode {
-        join_type: JoinType::try_from(join_expr.jointype())?,
-        left: Box::new(left_table),
-        right: Box::new(right_table),
-        qual,
-    }))
-}
-
-fn table_node_convert(range_var: &RangeVar, ctx: &ParseContext) -> Result<TableSource, AstError> {
-    let schema = if range_var.schemaname.is_empty() {
-        None
-    } else {
-        Some(EcoString::from(range_var.schemaname.as_str()))
-    };
-
-    let name = EcoString::from(range_var.relname.as_str());
-
-    let alias = range_var.alias.as_ref().map(|alias_node| TableAlias {
-        name: EcoString::from(alias_node.aliasname.as_str()),
-        columns: alias_node
-            .colnames
-            .iter()
-            .flat_map(|n| {
-                if let Some(NodeEnum::String(string_node)) = &n.node {
-                    Some(EcoString::from(string_node.sval.as_str()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>(),
-    });
-
-    // Check if this is a CTE reference (unqualified name matching a CTE)
-    if schema.is_none()
-        && let Some(cte_def) = ctx.cte_find(&name)
-    {
-        return Ok(TableSource::CteRef(CteRefNode {
-            cte_name: name,
-            query: Box::new(cte_def.query.clone()),
-            column_aliases: cte_def.column_aliases.clone(),
-            materialization: cte_def.materialization,
-            alias,
-        }));
-    }
-
-    Ok(TableSource::Table(TableNode {
-        schema,
-        name,
-        alias,
-    }))
-}
-
-fn table_subquery_node_convert(
-    range_subselect: &RangeSubselect,
-    ctx: &ParseContext,
-) -> Result<TableSource, AstError> {
-    let Some(NodeEnum::SelectStmt(select_stmt)) = range_subselect
-        .subquery
-        .as_ref()
-        .and_then(|n| n.node.as_ref())
-    else {
-        return Err(AstError::UnsupportedSelectFeature {
-            feature: format!("{:?}", range_subselect.subquery),
-        });
-    };
-
-    let query = select_stmt_to_query_expr_with_ctx(select_stmt, ctx)?;
-
-    let alias = range_subselect.alias.as_ref().map(|alias_node| TableAlias {
-        name: EcoString::from(alias_node.aliasname.as_str()),
-        columns: alias_node
-            .colnames
-            .iter()
-            .flat_map(|n| {
-                if let Some(NodeEnum::String(string_node)) = &n.node {
-                    Some(EcoString::from(string_node.sval.as_str()))
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>(),
-    });
-
-    Ok(TableSource::Subquery(TableSubqueryNode {
-        lateral: range_subselect.lateral,
-        query: Box::new(query),
-        alias,
-    }))
-}
-
-pub(super) fn node_convert_to_scalar_expr(node: &Node) -> Result<ScalarExpr, AstError> {
-    match node.node.as_ref() {
-        Some(NodeEnum::ColumnRef(col_ref)) => {
-            let column = column_ref_extract(col_ref)?;
-            Ok(ScalarExpr::Column(column))
-        }
-        Some(NodeEnum::AConst(const_val)) => {
-            let value = const_value_extract(const_val)?;
-            Ok(ScalarExpr::Literal(value))
-        }
-        Some(NodeEnum::ParamRef(param_ref)) => {
-            let value = param_ref_extract(param_ref);
-            Ok(ScalarExpr::Literal(value))
-        }
-        Some(NodeEnum::SubLink(sub_link)) => {
-            match sub_link.subselect.as_ref().and_then(|n| n.node.as_ref()) {
-                Some(NodeEnum::SelectStmt(select_stmt)) => {
-                    let query = select_stmt_to_query_expr(select_stmt)?;
-                    Ok(ScalarExpr::Subquery(Box::new(query)))
-                }
-                other => Err(AstError::UnsupportedFeature {
-                    feature: format!("Sublink type: {other:?}"),
-                }),
-            }
-        }
-        Some(NodeEnum::FuncCall(func_call)) => {
-            let function = func_call_convert(func_call)?;
-            Ok(ScalarExpr::Function(function))
-        }
-        Some(NodeEnum::CoalesceExpr(coalesce)) => {
-            let function = coalesce_expr_convert(coalesce)?;
-            Ok(ScalarExpr::Function(function))
-        }
-        Some(NodeEnum::MinMaxExpr(minmax)) => {
-            let function = minmax_expr_convert(minmax)?;
-            Ok(ScalarExpr::Function(function))
-        }
-        Some(NodeEnum::AExpr(aexpr))
-            if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprNullif) =>
-        {
-            let function = aexpr_nullif_convert(aexpr)?;
-            Ok(ScalarExpr::Function(function))
-        }
-        Some(NodeEnum::AExpr(aexpr))
-            if AExprKind::try_from(aexpr.kind) == Ok(AExprKind::AexprOp) =>
-        {
-            let arith = aexpr_arithmetic_convert(aexpr)?;
-            Ok(ScalarExpr::Arithmetic(arith))
-        }
-        Some(NodeEnum::CaseExpr(case_expr)) => {
-            let case = case_expr_convert(case_expr)?;
-            Ok(ScalarExpr::Case(case))
-        }
-        Some(NodeEnum::TypeCast(tc)) => type_cast_convert(tc),
-        other => Err(AstError::UnsupportedFeature {
-            feature: format!("Column expression node: {other:?}"),
-        }),
-    }
-}
-
-fn type_cast_convert(tc: &TypeCast) -> Result<ScalarExpr, AstError> {
-    let arg = tc
-        .arg
-        .as_ref()
-        .ok_or_else(|| AstError::UnsupportedFeature {
-            feature: "TypeCast missing argument".to_owned(),
-        })?;
-    let inner = node_convert_to_scalar_expr(arg)?;
-    let type_name = tc
-        .type_name
-        .as_ref()
-        .ok_or_else(|| AstError::UnsupportedFeature {
-            feature: "TypeCast missing type name".to_owned(),
-        })?;
-    let target_type = type_name_render(type_name)?;
-    let target = cast_target_from_canonical(&target_type);
-    Ok(ScalarExpr::TypeCast {
-        expr: Box::new(inner),
-        target,
-    })
-}
-
-/// Render a pg_query `TypeName` to a canonical SQL string (e.g. `int4`,
-/// `numeric(10,2)`, `text`). Strips the implicit `pg_catalog.` qualifier
-/// PostgreSQL adds for built-in types.
-fn type_name_render(tn: &TypeName) -> Result<EcoString, AstError> {
-    let mut parts: Vec<&str> = Vec::with_capacity(tn.names.len());
-    for n in &tn.names {
-        match n.node.as_ref() {
-            Some(NodeEnum::String(s)) => parts.push(s.sval.as_str()),
-            other => {
-                return Err(AstError::UnsupportedFeature {
-                    feature: format!("TypeName component: {other:?}"),
-                });
-            }
-        }
-    }
-    if parts.is_empty() {
-        return Err(AstError::UnsupportedFeature {
-            feature: "TypeName with no components".to_owned(),
-        });
-    }
-    let name_start = if parts.len() > 1 && parts.first() == Some(&"pg_catalog") {
-        1
-    } else {
-        0
-    };
-
-    let mut out = parts.get(name_start..).unwrap_or(&[]).join(".");
-
-    if !tn.typmods.is_empty() {
-        let mut typmod_strs: Vec<String> = Vec::with_capacity(tn.typmods.len());
-        for tm in &tn.typmods {
-            match tm.node.as_ref() {
-                Some(NodeEnum::AConst(c)) => {
-                    let lit = const_value_extract(c).map_err(|_| AstError::UnsupportedFeature {
-                        feature: "TypeName typmod literal".to_owned(),
-                    })?;
-                    let mut buf = String::new();
-                    lit.deparse(&mut buf);
-                    typmod_strs.push(buf);
-                }
-                other => {
-                    return Err(AstError::UnsupportedFeature {
-                        feature: format!("TypeName typmod: {other:?}"),
-                    });
-                }
-            }
-        }
-        out.push('(');
-        out.push_str(&typmod_strs.join(","));
-        out.push(')');
-    }
-
-    for _ in &tn.array_bounds {
-        out.push_str("[]");
-    }
-
-    Ok(EcoString::from(out))
-}
-
-fn func_call_convert(func_call: &FuncCall) -> Result<FunctionCall, AstError> {
-    // Extract function name - last component of qualified name (e.g., "pg_catalog.count" -> "count")
-    let name = func_call
-        .funcname
-        .iter()
-        .filter_map(|n| match &n.node {
-            Some(NodeEnum::String(s)) => Some(EcoString::from(s.sval.as_str())),
-            _ => None,
-        })
-        .next_back()
-        .ok_or_else(|| AstError::UnsupportedSelectFeature {
-            feature: "function with no name".to_owned(),
-        })?;
-
-    // Handle COUNT(*) - agg_star means no explicit args
-    let args = if func_call.agg_star {
-        vec![]
-    } else {
-        func_call
-            .args
-            .iter()
-            .map(node_convert_to_scalar_expr)
-            .collect::<Result<Vec<_>, _>>()?
-    };
-
-    // Parse aggregate ORDER BY (same structure as window ORDER BY)
-    let agg_order = window_order_by_convert(&func_call.agg_order)?;
-
-    // Parse FILTER (WHERE ...) — per-aggregate predicate. Reuses WHERE-clause
-    // parsing since the grammar is identical (a boolean expression).
-    let agg_filter = func_call
-        .agg_filter
-        .as_deref()
-        .map(node_convert_to_expr)
-        .transpose()?
-        .map(Box::new);
-
-    // Parse OVER clause for window functions
-    let over = func_call
-        .over
-        .as_ref()
-        .map(|win_def| window_def_convert(win_def))
-        .transpose()?;
-
-    Ok(FunctionCall {
-        name,
-        args,
-        agg_star: func_call.agg_star,
-        agg_distinct: func_call.agg_distinct,
-        agg_order,
-        agg_filter,
-        over,
-    })
-}
-
-/// Convert a pg_query WindowDef to our WindowSpec
-fn window_def_convert(win_def: &pg_query::protobuf::WindowDef) -> Result<WindowSpec, AstError> {
-    // Convert PARTITION BY columns
-    let partition_by = win_def
-        .partition_clause
-        .iter()
-        .map(node_convert_to_scalar_expr)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Convert ORDER BY clauses
-    let order_by = window_order_by_convert(&win_def.order_clause)?;
-
-    Ok(WindowSpec {
-        partition_by,
-        order_by,
-    })
-}
-
-/// Convert window ORDER BY clause (similar to regular ORDER BY but from window context)
-fn window_order_by_convert(
-    order_clause: &[pg_query::protobuf::Node],
-) -> Result<Vec<OrderByClause>, AstError> {
-    let mut order_by = Vec::with_capacity(order_clause.len());
-    for sort_node in order_clause {
-        if let Some(NodeEnum::SortBy(sort_by)) = &sort_node.node {
-            order_by.push(sort_by_to_order_clause(sort_by)?);
-        } else {
-            return Err(AstError::UnsupportedFeature {
-                feature: format!("Window ORDER BY node type: {sort_node:?}"),
-            });
-        }
-    }
-    Ok(order_by)
-}
-
-/// Convert one pg_query `SortBy` to an `OrderByClause` (expr + direction
-/// + NULLS ordering). Shared between regular and window ORDER BY paths.
-fn sort_by_to_order_clause(
-    sort_by: &pg_query::protobuf::SortBy,
-) -> Result<OrderByClause, AstError> {
-    let expr_node = sort_by.node.as_ref().ok_or(AstError::UnsupportedFeature {
-        feature: "ORDER BY without expression".to_owned(),
-    })?;
-    let expr = node_convert_to_scalar_expr(expr_node)?;
-    let direction =
-        OrderDirection::try_from(SortByDir::try_from(sort_by.sortby_dir).map_err(|_| {
-            AstError::UnsupportedFeature {
-                feature: format!("Invalid SortByDir value: {}", sort_by.sortby_dir),
-            }
-        })?)?;
-    let null_order =
-        NullOrder::try_from(SortByNulls::try_from(sort_by.sortby_nulls).map_err(|_| {
-            AstError::UnsupportedFeature {
-                feature: format!("Invalid SortByNulls value: {}", sort_by.sortby_nulls),
-            }
-        })?)?;
-    Ok(OrderByClause {
-        expr,
-        direction,
-        null_order,
-    })
-}
-
-fn coalesce_expr_convert(coalesce: &CoalesceExpr) -> Result<FunctionCall, AstError> {
-    let args = coalesce
-        .args
-        .iter()
-        .map(node_convert_to_scalar_expr)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(FunctionCall {
-        name: EcoString::from("coalesce"),
-        args,
-        agg_star: false,
-        agg_distinct: false,
-        agg_order: vec![],
-        agg_filter: None,
-        over: None,
-    })
-}
-
-fn minmax_expr_convert(minmax: &MinMaxExpr) -> Result<FunctionCall, AstError> {
-    let name = match MinMaxOp::try_from(minmax.op) {
-        Ok(MinMaxOp::IsGreatest) => "greatest",
-        Ok(MinMaxOp::IsLeast) => "least",
-        _ => {
-            return Err(AstError::UnsupportedFeature {
-                feature: format!("Unknown MinMaxOp: {}", minmax.op),
-            });
-        }
-    };
-
-    let args = minmax
-        .args
-        .iter()
-        .map(node_convert_to_scalar_expr)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(FunctionCall {
-        name: EcoString::from(name),
-        args,
-        agg_star: false,
-        agg_distinct: false,
-        agg_order: vec![],
-        agg_filter: None,
-        over: None,
-    })
-}
-
-fn aexpr_nullif_convert(aexpr: &AExpr) -> Result<FunctionCall, AstError> {
-    let mut args = Vec::with_capacity(2);
-
-    if let Some(lexpr) = &aexpr.lexpr {
-        args.push(node_convert_to_scalar_expr(lexpr)?);
-    }
-    if let Some(rexpr) = &aexpr.rexpr {
-        args.push(node_convert_to_scalar_expr(rexpr)?);
-    }
-
-    Ok(FunctionCall {
-        name: EcoString::from("nullif"),
-        args,
-        agg_star: false,
-        agg_distinct: false,
-        agg_order: vec![],
-        agg_filter: None,
-        over: None,
-    })
-}
-
-pub(super) fn aexpr_arithmetic_convert(aexpr: &AExpr) -> Result<ArithmeticExpr, AstError> {
-    // Extract operator from name field
-    let op = arithmetic_op_extract(&aexpr.name)?;
-
-    let left = aexpr
-        .lexpr
-        .as_ref()
-        .ok_or_else(|| AstError::UnsupportedFeature {
-            feature: "arithmetic expression without left operand".to_owned(),
-        })
-        .and_then(|n| node_convert_to_scalar_expr(n))?;
-
-    let right = aexpr
-        .rexpr
-        .as_ref()
-        .ok_or_else(|| AstError::UnsupportedFeature {
-            feature: "arithmetic expression without right operand".to_owned(),
-        })
-        .and_then(|n| node_convert_to_scalar_expr(n))?;
-
-    Ok(ArithmeticExpr {
-        left: Box::new(left),
-        op,
-        right: Box::new(right),
-    })
-}
-
-pub(super) fn arithmetic_op_extract(
-    name_nodes: &[pg_query::Node],
-) -> Result<ArithmeticOp, AstError> {
-    let [name_node] = name_nodes else {
-        return Err(AstError::UnsupportedFeature {
-            feature: "multi-part operator names in arithmetic".to_owned(),
-        });
-    };
-
-    match name_node.node.as_ref() {
-        Some(NodeEnum::String(s)) => match s.sval.as_str() {
-            "+" => Ok(ArithmeticOp::Add),
-            "-" => Ok(ArithmeticOp::Subtract),
-            "*" => Ok(ArithmeticOp::Multiply),
-            "/" => Ok(ArithmeticOp::Divide),
-            "%" => Ok(ArithmeticOp::Modulo),
-            op => Err(AstError::UnsupportedFeature {
-                feature: format!("arithmetic operator: {op}"),
-            }),
-        },
-        _ => Err(AstError::UnsupportedFeature {
-            feature: "invalid operator name format".to_owned(),
-        }),
-    }
-}
-
-fn case_expr_convert(case_expr: &PgCaseExpr) -> Result<CaseExpr, AstError> {
-    // Convert optional arg (for simple CASE: CASE expr WHEN val...)
-    let arg = case_expr
-        .arg
-        .as_ref()
-        .map(|n| node_convert_to_scalar_expr(n))
-        .transpose()?
-        .map(Box::new);
-
-    // Convert WHEN clauses
-    let whens = case_expr
-        .args
-        .iter()
-        .map(case_when_convert)
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Convert ELSE clause
-    let default = case_expr
-        .defresult
-        .as_ref()
-        .map(|n| node_convert_to_scalar_expr(n))
-        .transpose()?
-        .map(Box::new);
-
-    Ok(CaseExpr {
-        arg,
-        whens,
-        default,
-    })
-}
-
-fn case_when_convert(node: &Node) -> Result<CaseWhen, AstError> {
-    let Some(NodeEnum::CaseWhen(case_when)) = &node.node else {
-        return Err(AstError::UnsupportedFeature {
-            feature: format!("Expected CaseWhen, got: {:?}", node.node),
-        });
-    };
-
-    let condition = case_when
-        .expr
-        .as_ref()
-        .ok_or_else(|| AstError::UnsupportedFeature {
-            feature: "CASE WHEN without condition".to_owned(),
-        })
-        .and_then(|n| node_convert_to_expr(n).map_err(AstError::from))?;
-
-    let result = case_when
-        .result
-        .as_ref()
-        .ok_or_else(|| AstError::UnsupportedFeature {
-            feature: "CASE WHEN without result".to_owned(),
-        })
-        .and_then(|n| node_convert_to_scalar_expr(n))?;
-
-    Ok(CaseWhen { condition, result })
-}
-
-fn order_by_clause_convert(sort_clause: &[Node]) -> Result<Vec<OrderByClause>, AstError> {
-    let mut order_by = Vec::with_capacity(sort_clause.len());
-    for sort_node in sort_clause {
-        if let Some(NodeEnum::SortBy(sort_by)) = &sort_node.node {
-            order_by.push(sort_by_to_order_clause(sort_by)?);
-        } else {
-            return Err(AstError::UnsupportedFeature {
-                feature: format!("ORDER BY node type: {sort_node:?}"),
-            });
-        }
-    }
-    Ok(order_by)
-}
-
-fn group_by_clause_convert(group_clause: &[Node]) -> Result<Vec<ColumnNode>, AstError> {
-    let mut group_by = Vec::with_capacity(group_clause.len());
-    for node in group_clause {
-        if let Some(NodeEnum::ColumnRef(col_ref)) = &node.node {
-            group_by.push(column_ref_extract(col_ref)?);
-        } else {
-            return Err(AstError::UnsupportedFeature {
-                feature: format!("GROUP BY expression: {node:?}"),
-            });
-        }
-    }
-    Ok(group_by)
-}
-
-fn having_clause_convert(having_clause: Option<&Node>) -> Result<Option<WhereExpr>, AstError> {
-    match having_clause {
-        Some(node) => Ok(Some(node_convert_to_expr(node)?)),
-        None => Ok(None),
-    }
-}
-
-fn limit_clause_convert(
-    limit_count: Option<&Node>,
-    limit_offset: Option<&Node>,
-) -> Result<Option<LimitClause>, AstError> {
-    let count = limit_node_extract(limit_count)?;
-    let offset = limit_node_extract(limit_offset)?;
-
-    if count.is_none() && offset.is_none() {
-        return Ok(None);
-    }
-
-    Ok(Some(LimitClause { count, offset }))
-}
-
-fn limit_node_extract(node: Option<&Node>) -> Result<Option<LiteralValue>, AstError> {
-    let Some(node) = node else { return Ok(None) };
-
-    match &node.node {
-        Some(NodeEnum::AConst(const_val)) => {
-            let value = const_value_extract(const_val)?;
-            match value {
-                LiteralValue::Integer(_) => Ok(Some(value)),
-                LiteralValue::String(_)
-                | LiteralValue::StringWithCast(..)
-                | LiteralValue::Float(_)
-                | LiteralValue::Boolean(_)
-                | LiteralValue::Null
-                | LiteralValue::NullWithCast(_)
-                | LiteralValue::Parameter(_)
-                | LiteralValue::Array(_, _) => Err(AstError::UnsupportedFeature {
-                    feature: format!("LIMIT/OFFSET value: {value:?}"),
-                }),
-            }
-        }
-        Some(NodeEnum::ParamRef(param_ref)) => Ok(Some(LiteralValue::Parameter(format!(
-            "${}",
-            param_ref.number
-        )))),
-        other => Err(AstError::UnsupportedFeature {
-            feature: format!("LIMIT/OFFSET expression: {other:?}"),
-        }),
-    }
-}
+use super::{QueryExpr, SelectNode};
 
 /// Generate a fingerprint hash for a SelectNode.
 /// This is used for cache key generation.
@@ -1065,8 +42,7 @@ mod tests {
 
     /// Parse SQL and return a QueryExpr (new type)
     fn parse_query(sql: &str) -> QueryExpr {
-        let pg_ast = pg_query::parse(sql).expect("parse SQL");
-        query_expr_convert(&pg_ast).expect("convert to QueryExpr")
+        query_expr_parse(sql).expect("convert to QueryExpr")
     }
 
     /// Parse SQL and return a SelectNode (for tests that need direct access)
@@ -1905,20 +881,14 @@ mod tests {
     fn test_round_trip() {
         fn round_trip(sql: &str) {
             // Parse original
-            let ast1 = {
-                let pg_ast1 = pg_query::parse(sql).unwrap();
-                query_expr_convert(&pg_ast1).unwrap()
-            };
+            let ast1 = query_expr_parse(sql).unwrap();
 
             // Deparse to string
             let mut deparsed = String::with_capacity(1024);
             ast1.deparse(&mut deparsed);
 
             // Parse deparsed version
-            let ast2 = {
-                let pg_ast2 = pg_query::parse(&deparsed).unwrap();
-                query_expr_convert(&pg_ast2).unwrap()
-            };
+            let ast2 = query_expr_parse(&deparsed).unwrap();
 
             // Should be equivalent
             assert_eq!(ast1, ast2);
@@ -3539,8 +2509,7 @@ mod tests {
     #[test]
     fn test_query_expr_simple_select() {
         let sql = "SELECT id, name FROM users WHERE id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         assert!(query_expr.is_single_table());
         assert!(query_expr.has_where_clause());
@@ -3553,8 +2522,7 @@ mod tests {
     #[test]
     fn test_query_expr_select_star() {
         let sql = "SELECT * FROM products";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         assert!(query_expr.is_single_table());
         assert!(!query_expr.has_where_clause());
@@ -3569,8 +2537,7 @@ mod tests {
     #[test]
     fn test_query_expr_select_star_with_column() {
         let sql = "SELECT *, col FROM test";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let SelectColumns::Columns(cols) = &query_expr.as_select().unwrap().columns else {
             panic!("Expected Columns");
@@ -3585,8 +2552,7 @@ mod tests {
     #[test]
     fn test_query_expr_select_qualified_star() {
         let sql = "SELECT t1.*, t2.col FROM test t1 JOIN test2 t2 ON t2.id = t1.id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let SelectColumns::Columns(cols) = &query_expr.as_select().unwrap().columns else {
             panic!("Expected Columns");
@@ -3602,8 +2568,7 @@ mod tests {
     fn test_query_expr_select_star_deparse() {
         // Bare star
         let sql = "SELECT * FROM products";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
         let mut buf = String::new();
         query_expr.deparse(&mut buf);
         assert!(
@@ -3613,8 +2578,7 @@ mod tests {
 
         // Qualified star with column
         let sql = "SELECT t1.*, t2.name FROM a t1 JOIN b t2 ON t2.id = t1.id";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
         let mut buf = String::new();
         query_expr.deparse(&mut buf);
         assert!(buf.contains("t1.*"), "should deparse qualified star: {buf}");
@@ -3624,8 +2588,7 @@ mod tests {
     #[test]
     fn test_query_expr_values_clause() {
         let sql = "VALUES (1, 'a'), (2, 'b')";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let QueryBody::Values(values) = &query_expr.body else {
             panic!("expected VALUES clause");
@@ -3643,8 +2606,7 @@ mod tests {
     #[test]
     fn test_query_expr_union() {
         let sql = "SELECT a FROM t1 UNION SELECT b FROM t2";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let QueryBody::SetOp(set_op) = &query_expr.body else {
             panic!("expected set operation");
@@ -3662,8 +2624,7 @@ mod tests {
     #[test]
     fn test_query_expr_union_all() {
         let sql = "SELECT a FROM t1 UNION ALL SELECT b FROM t2";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let QueryBody::SetOp(set_op) = &query_expr.body else {
             panic!("expected set operation");
@@ -3676,8 +2637,7 @@ mod tests {
     #[test]
     fn test_query_expr_union_with_order_by() {
         let sql = "SELECT a FROM t1 UNION SELECT b FROM t2 ORDER BY 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         // ORDER BY should be at the top level
         assert_eq!(query_expr.order_by.len(), 1);
@@ -3695,8 +2655,7 @@ mod tests {
     #[test]
     fn test_query_expr_intersect() {
         let sql = "SELECT a FROM t1 INTERSECT SELECT b FROM t2";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let QueryBody::SetOp(set_op) = &query_expr.body else {
             panic!("expected set operation");
@@ -3708,8 +2667,7 @@ mod tests {
     #[test]
     fn test_query_expr_except() {
         let sql = "SELECT a FROM t1 EXCEPT SELECT b FROM t2";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let QueryBody::SetOp(set_op) = &query_expr.body else {
             panic!("expected set operation");
@@ -3721,8 +2679,7 @@ mod tests {
     #[test]
     fn test_query_expr_chained_union() {
         let sql = "SELECT a FROM t1 UNION SELECT b FROM t2 UNION SELECT c FROM t3";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let QueryBody::SetOp(outer_set_op) = &query_expr.body else {
             panic!("expected set operation");
@@ -3742,8 +2699,7 @@ mod tests {
     #[test]
     fn test_query_expr_deparse_simple_select() {
         let sql = "SELECT id FROM users WHERE id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let mut buf = String::new();
         query_expr.deparse(&mut buf);
@@ -3753,8 +2709,7 @@ mod tests {
     #[test]
     fn test_query_expr_deparse_values() {
         let sql = "VALUES (1, 'a')";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let mut buf = String::new();
         query_expr.deparse(&mut buf);
@@ -3764,8 +2719,7 @@ mod tests {
     #[test]
     fn test_query_expr_deparse_union() {
         let sql = "SELECT a FROM t1 UNION SELECT b FROM t2";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let mut buf = String::new();
         query_expr.deparse(&mut buf);
@@ -3775,8 +2729,7 @@ mod tests {
     #[test]
     fn test_query_expr_deparse_union_all() {
         let sql = "SELECT a FROM t1 UNION ALL SELECT b FROM t2";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let mut buf = String::new();
         query_expr.deparse(&mut buf);
@@ -3786,8 +2739,7 @@ mod tests {
     #[test]
     fn test_query_expr_order_by_limit() {
         let sql = "SELECT a FROM t ORDER BY a LIMIT 10";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         assert_eq!(query_expr.order_by.len(), 1);
         assert!(query_expr.limit.is_some());
@@ -3800,8 +2752,7 @@ mod tests {
     #[test]
     fn test_select_nodes_simple_select() {
         let sql = "SELECT id FROM users WHERE id = 1";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let branches = query_expr.select_nodes();
         assert_eq!(branches.len(), 1, "simple SELECT should have one branch");
@@ -3810,8 +2761,7 @@ mod tests {
     #[test]
     fn test_select_nodes_union() {
         let sql = "SELECT id FROM users UNION SELECT id FROM admins";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let branches = query_expr.select_nodes();
         assert_eq!(branches.len(), 2, "UNION should have two branches");
@@ -3836,8 +2786,7 @@ mod tests {
     #[test]
     fn test_select_nodes_nested_union() {
         let sql = "SELECT id FROM a UNION SELECT id FROM b UNION SELECT id FROM c";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let branches = query_expr.select_nodes();
         assert_eq!(branches.len(), 3, "nested UNION should have three branches");
@@ -3847,8 +2796,7 @@ mod tests {
     fn test_select_nodes_from_subquery() {
         // Derived table in FROM clause
         let sql = "SELECT * FROM (SELECT id FROM users) sub";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let branches = query_expr.select_nodes();
         // Outer SELECT + inner SELECT in FROM subquery
@@ -3859,8 +2807,7 @@ mod tests {
     fn test_select_nodes_where_subquery() {
         // IN subquery in WHERE clause
         let sql = "SELECT * FROM users WHERE id IN (SELECT user_id FROM active)";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let branches = query_expr.select_nodes();
         // Outer SELECT + inner SELECT in WHERE subquery
@@ -3871,8 +2818,7 @@ mod tests {
     fn test_select_nodes_exists_subquery() {
         // EXISTS subquery in WHERE clause
         let sql = "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let branches = query_expr.select_nodes();
         // Outer SELECT + inner SELECT in EXISTS subquery
@@ -3887,8 +2833,7 @@ mod tests {
     fn test_select_nodes_scalar_subquery() {
         // Scalar subquery in SELECT list
         let sql = "SELECT id, (SELECT name FROM users WHERE users.id = orders.user_id) FROM orders";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let branches = query_expr.select_nodes();
         // Outer SELECT + inner SELECT in SELECT list subquery
@@ -3904,8 +2849,7 @@ mod tests {
         // Nested subqueries
         let sql =
             "SELECT * FROM (SELECT id FROM users WHERE id IN (SELECT user_id FROM active)) sub";
-        let pg_ast = pg_query::parse(sql).unwrap();
-        let query_expr = query_expr_convert(&pg_ast).unwrap();
+        let query_expr = query_expr_parse(sql).unwrap();
 
         let branches = query_expr.select_nodes();
         // Outer SELECT + FROM subquery + nested IN subquery
@@ -4294,10 +3238,10 @@ mod tests {
 
     #[test]
     fn test_cte_recursive_rejected() {
-        let result =
-            pg_query::parse("WITH RECURSIVE x AS (SELECT 1 UNION ALL SELECT 1) SELECT * FROM x");
-        if let Ok(ast) = result {
-            let result = query_expr_convert(&ast);
+        {
+            let result = query_expr_parse(
+                "WITH RECURSIVE x AS (SELECT 1 UNION ALL SELECT 1) SELECT * FROM x",
+            );
             assert!(result.is_err(), "recursive CTE should be rejected");
             let err = result.unwrap_err();
             assert!(

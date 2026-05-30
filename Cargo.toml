@@ -139,3 +139,6 @@ regex-lite = "0.1.9"
 [[bench]]
 name = "subsumption_index"
 harness = false
+
+[patch.crates-io]
+pg_query = { path = "../pg_query.rs" }

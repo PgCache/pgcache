@@ -328,7 +328,7 @@ mod tests {
 
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::{
-        BinaryOp, Deparse, JoinType, LiteralValue, QueryBody, query_expr_convert,
+        BinaryOp, Deparse, JoinType, LiteralValue, QueryBody, query_expr_parse,
     };
     use crate::query::resolve::select_node_resolve;
     use crate::query::resolved::{
@@ -435,9 +435,8 @@ mod tests {
             Some("1".to_owned()),
         ];
 
-        let ast = pg_query::parse("SELECT * FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i)")
-            .expect("parse");
-        let qe = query_expr_convert(&ast).expect("convert");
+        let qe = query_expr_parse("SELECT * FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i)")
+            .expect("convert");
         let QueryBody::Select(node) = qe.body else {
             panic!("expected SELECT");
         };
@@ -474,12 +473,11 @@ mod tests {
             Some("1".to_owned()),
         ];
 
-        let ast = pg_query::parse(
+        let qe = query_expr_parse(
             "SELECT ten, count(*) FILTER (WHERE odd = 1) AS c FROM onek \
              GROUP BY ten HAVING count(*) > 0",
         )
-        .expect("parse");
-        let qe = query_expr_convert(&ast).expect("convert");
+        .expect("convert");
         let QueryBody::Select(node) = qe.body else {
             panic!("expected SELECT");
         };
@@ -518,8 +516,7 @@ mod tests {
         tables.insert_overwrite(table_metadata("j2_tbl", 5002, cols2));
 
         let resolve = |sql: &str| {
-            let ast = pg_query::parse(sql).expect("parse");
-            let qe = query_expr_convert(&ast).expect("convert");
+            let qe = query_expr_parse(sql).expect("convert");
             let QueryBody::Select(node) = qe.body else {
                 panic!("expected SELECT");
             };

@@ -57,14 +57,13 @@ mod tests {
     use tokio_util::bytes::Bytes;
 
     use crate::cache::{QueryParameter, QueryParameters};
-    use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_convert};
+    use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_parse};
 
     use super::super::super::AstTransformError;
     use super::super::{parameter_to_literal, select_node_parameters_replace};
 
     fn parse_select_node(sql: &str) -> SelectNode {
-        let ast = pg_query::parse(sql).expect("parse SQL");
-        let query_expr = query_expr_convert(&ast).expect("convert to QueryExpr");
+        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
         match query_expr.body {
             QueryBody::Select(node) => *node,
             _ => panic!("expected SELECT"),

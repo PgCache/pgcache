@@ -578,7 +578,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-    use crate::query::ast::{query_expr_convert, query_expr_fingerprint};
+    use crate::query::ast::{query_expr_fingerprint, query_expr_parse};
     use crate::query::resolved::select_node_resolve;
 
     /// Build a test volatility map with common functions.
@@ -610,8 +610,7 @@ mod tests {
     /// Parse SQL and check cacheability using the test volatility map.
     fn check_cacheable(sql: &str) -> Result<CacheableQuery, CacheabilityError> {
         let fv = test_func_volatility();
-        let ast = pg_query::parse(sql).expect("parse");
-        let query_expr = query_expr_convert(&ast).expect("convert");
+        let query_expr = query_expr_parse(sql).expect("convert");
         CacheableQuery::try_new(&query_expr, &fv)
     }
 
@@ -642,8 +641,7 @@ mod tests {
 
     /// Parse SQL and resolve the SELECT node using the given tables.
     fn resolve_select(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedSelectNode {
-        let ast = pg_query::parse(sql).expect("parse");
-        let query_expr = query_expr_convert(&ast).expect("convert");
+        let query_expr = query_expr_parse(sql).expect("convert");
         let select = match query_expr.body {
             QueryBody::Select(s) => s,
             _ => panic!("expected SELECT"),
@@ -1390,22 +1388,10 @@ mod tests {
         let with_offset = "SELECT * FROM orders WHERE tenant_id = 1 OFFSET 5";
         let with_both = "SELECT * FROM orders WHERE tenant_id = 1 LIMIT 10 OFFSET 5";
 
-        let fp_base = {
-            let ast = pg_query::parse(base).unwrap();
-            query_expr_fingerprint(&query_expr_convert(&ast).unwrap())
-        };
-        let fp_limit = {
-            let ast = pg_query::parse(with_limit).unwrap();
-            query_expr_fingerprint(&query_expr_convert(&ast).unwrap())
-        };
-        let fp_offset = {
-            let ast = pg_query::parse(with_offset).unwrap();
-            query_expr_fingerprint(&query_expr_convert(&ast).unwrap())
-        };
-        let fp_both = {
-            let ast = pg_query::parse(with_both).unwrap();
-            query_expr_fingerprint(&query_expr_convert(&ast).unwrap())
-        };
+        let fp_base = { query_expr_fingerprint(&query_expr_parse(base).unwrap()) };
+        let fp_limit = { query_expr_fingerprint(&query_expr_parse(with_limit).unwrap()) };
+        let fp_offset = { query_expr_fingerprint(&query_expr_parse(with_offset).unwrap()) };
+        let fp_both = { query_expr_fingerprint(&query_expr_parse(with_both).unwrap()) };
 
         assert_eq!(fp_base, fp_limit, "LIMIT should not affect fingerprint");
         assert_eq!(fp_base, fp_offset, "OFFSET should not affect fingerprint");
@@ -1448,8 +1434,7 @@ mod tests {
         ];
 
         for sql in cases {
-            let ast = pg_query::parse(sql).unwrap();
-            let result = query_expr_convert(&ast);
+            let result = query_expr_parse(sql);
             assert!(result.is_err(), "should reject locking clause: {sql}");
         }
     }
@@ -1468,8 +1453,7 @@ mod tests {
         ];
 
         for sql in cases {
-            let ast = pg_query::parse(sql).unwrap();
-            let result = query_expr_convert(&ast);
+            let result = query_expr_parse(sql);
             assert!(
                 result.is_err(),
                 "should reject locking clause in subquery: {sql}"
