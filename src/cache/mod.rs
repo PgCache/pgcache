@@ -31,7 +31,8 @@ mod writer;
 
 // Re-export public types
 pub use messages::{
-    CacheMessage, CacheReply, DataStreamState, ProxyMessage, QueryParameter, QueryParameters,
+    CacheMessage, CacheOutcome, CacheReply, DataStreamState, ProxyMessage, QueryParameter,
+    QueryParameters,
 };
 pub use mv::{
     MvMeta, MvServe, MvState, ShapeGate, mv_serve_sql, mv_state_initial, mv_table_name,

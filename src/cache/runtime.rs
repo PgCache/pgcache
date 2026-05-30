@@ -19,7 +19,7 @@ use crate::{
     cache::{
         CacheError, CacheResult, MapIntoReport, PinnedQuery, ReportExt, StatusRequest,
         cdc::CdcProcessor,
-        messages::{CacheReply, CdcCommand, CdcSignal, ProxyMessage, WriterNotify},
+        messages::{CacheOutcome, CacheReply, CdcCommand, CdcSignal, ProxyMessage, WriterNotify},
         query_cache::{QueryCache, QueryRequest, WorkerRequest, reply_forward},
         types::{ActiveRelations, CacheStateView, WorkerMetrics},
         worker::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
@@ -61,6 +61,7 @@ async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) 
             debug!("forwarding to origin due to parameter conversion error: {e}");
             let _ = reply_forward(
                 proxy_msg.reply_tx,
+                proxy_msg.client_socket,
                 proxy_msg.pipeline,
                 data,
                 proxy_msg.timing,
@@ -94,21 +95,28 @@ async fn handle_worker_request(
                 bytes_served: bytes_served as u64,
             });
 
-            // Send replies to coalesced clients
+            // Send replies to coalesced clients, returning each leased socket.
             for outcome in coalesced_outcomes {
                 match outcome {
                     CoalescedOutcome::Complete(client) => {
-                        let _ = client
-                            .reply_tx
-                            .send(CacheReply::Complete(Some(client.timing)));
+                        let _ = client.reply_tx.send(CacheReply {
+                            socket: client.client_socket,
+                            outcome: CacheOutcome::Complete(Some(client.timing)),
+                        });
                     }
                     CoalescedOutcome::Failed(client) => {
-                        let _ = client.reply_tx.send(CacheReply::Error(client.data));
+                        let _ = client.reply_tx.send(CacheReply {
+                            socket: client.client_socket,
+                            outcome: CacheOutcome::Error(client.data),
+                        });
                     }
                 }
             }
 
-            CacheReply::Complete(Some(msg.timing))
+            CacheReply {
+                socket: msg.client_socket,
+                outcome: CacheOutcome::Complete(Some(msg.timing)),
+            }
         }
         Err(e) => {
             // 42P01 is the expected eviction-window race; other SQLSTATEs are bugs.
@@ -128,7 +136,10 @@ async fn handle_worker_request(
                 .forward_bytes
                 .take()
                 .unwrap_or_else(|| msg.data.split_off(0));
-            CacheReply::Error(error_buf)
+            CacheReply {
+                socket: msg.client_socket,
+                outcome: CacheOutcome::Error(error_buf),
+            }
         }
     };
 
@@ -440,6 +451,7 @@ pub fn cache_run(
                                             let data = proxy_msg.message.into_data();
                                             let _ = reply_forward(
                                                 proxy_msg.reply_tx,
+                                                proxy_msg.client_socket,
                                                 proxy_msg.pipeline,
                                                 data,
                                                 proxy_msg.timing,

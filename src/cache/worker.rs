@@ -10,7 +10,7 @@ use tokio_util::bytes::{Buf, Bytes};
 use tokio_util::codec::FramedRead;
 use tracing::{debug, error, instrument, trace};
 
-use crate::cache::messages::{CacheReply, PipelineDescribe};
+use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe};
 use crate::pg::cache_connection::CacheConnection;
 use crate::pg::protocol::backend::PgBackendMessageType;
 use crate::pg::protocol::encode::{
@@ -175,7 +175,10 @@ async fn broadcast_error_reply(bc: BroadcastState) {
             Ok(Ok(c)) | Ok(Err(c)) => c,
             Err(_) => continue,
         };
-        let _ = client.reply_tx.send(CacheReply::Error(client.data));
+        let _ = client.reply_tx.send(CacheReply {
+            socket: client.client_socket,
+            outcome: CacheOutcome::Error(client.data),
+        });
     }
 }
 

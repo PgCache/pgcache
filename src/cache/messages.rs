@@ -181,9 +181,20 @@ pub enum DataStreamState {
     Complete,
 }
 
-/// Reply messages sent from cache back to proxy
+/// Reply sent from cache back to the proxy. Always returns the leased client
+/// write half (`socket`) so the connection can resume; `outcome` carries what
+/// the worker did. The socket return is kept orthogonal to the outcome so no
+/// path can forget it.
 #[derive(Debug)]
-pub enum CacheReply {
+pub struct CacheReply {
+    /// The leased client write half, returned to the connection.
+    pub socket: ClientSocket,
+    pub outcome: CacheOutcome,
+}
+
+/// What the worker did with a dispatched query (see [`CacheReply`]).
+#[derive(Debug)]
+pub enum CacheOutcome {
     /// Query completed successfully. Worker wrote the full response to the client.
     Complete(Option<QueryTiming>),
     /// Query should be forwarded to origin (cache miss or not cacheable).

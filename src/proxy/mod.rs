@@ -11,7 +11,7 @@ pub use cache_sender::{
     CacheSendError, CacheSender, CacheSenderUpdater, StatusSender, StatusSenderUpdater,
 };
 
-pub use client_stream::{ClientSocket, ClientSocketSource};
+pub use client_stream::{ClientSocket, OwnedClientReadHalf};
 
 use std::io;
 use std::sync::Arc;
@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use error_set::error_set;
 use nix::errno::Errno;
 use rootcause::Report;
-use tokio::sync::oneshot;
 
 use crate::pg::cdc::PgCdcError;
 use crate::pg::protocol::ProtocolError;
@@ -72,6 +71,12 @@ impl From<io::Error> for ConnectionError {
 }
 
 /// Current proxy operating mode for a connection.
+///
+/// These are the two serving-phase sub-states (the connection owns the client
+/// write half in both). The "worker is serving" phase is encoded as control
+/// flow in `connection_run` (the write half is lent to the worker and absent),
+/// not as a variant — so "write to the client while it's lent" is
+/// unrepresentable.
 #[derive(Debug)]
 pub(crate) enum ProxyMode {
     /// Normal: read client + origin, flush the egress queue.
@@ -80,8 +85,6 @@ pub(crate) enum ProxyMode {
     /// Drain origin and flush egress without reading the client (no read-ahead),
     /// until the cache slot reaches the head and can be dispatched.
     OriginDrain,
-    /// A cache query is being served by the worker; await its reply.
-    CacheRead(oneshot::Receiver<CacheReply>),
 }
 
 /// Proxy health status.
@@ -123,5 +126,3 @@ impl SharedProxyStatus {
         self.status_get() == ProxyStatus::Normal
     }
 }
-
-use crate::cache::CacheReply;

@@ -32,7 +32,7 @@ use tracing::{debug, error, instrument, trace, warn};
 
 use crate::{
     cache::{
-        CacheMessage, CacheReply, ProxyMessage, QueryParameters,
+        CacheMessage, CacheOutcome, CacheReply, ProxyMessage, QueryParameters,
         messages::{PipelineContext, PipelineDescribe},
         query::CacheableQuery,
     },
@@ -61,7 +61,7 @@ use crate::{
     tls::{self},
 };
 
-use super::client_stream::{ClientReadHalf, ClientSocketSource, ClientStream, ClientWriteHalf};
+use super::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
 use super::query::{Action, ForwardReason, handle_query};
 use super::search_path::{
     SearchPath, search_path_mutates_any, search_path_mutates_single_piggybackable,
@@ -339,11 +339,6 @@ pub(super) struct ConnectionState {
     /// Proxy status (normal or degraded if cache is unavailable)
     proxy_status: ProxyStatus,
 
-    /// Source for creating ClientSocket instances for cache queries.
-    /// The connection handler writes directly to the client stream, but when
-    /// sending queries to the cache, we create a ClientSocket from this source.
-    client_socket_source: ClientSocketSource,
-
     /// Extended protocol: prepared statements by name
     prepared_statements: HashMap<String, PreparedStatement>,
 
@@ -578,7 +573,6 @@ impl ExtendedPending {
 
 impl ConnectionState {
     fn new(
-        client_socket_source: ClientSocketSource,
         func_volatility: Arc<HashMap<String, FunctionVolatility>>,
         origin_database: EcoString,
     ) -> Self {
@@ -590,7 +584,6 @@ impl ConnectionState {
             in_transaction: false,
             proxy_mode: ProxyMode::Read,
             proxy_status: ProxyStatus::Normal,
-            client_socket_source,
             prepared_statements: HashMap::new(),
             portals: HashMap::new(),
             session_user: None,
@@ -1096,19 +1089,20 @@ impl ConnectionState {
         self.origin_dispatch(bytes, None);
     }
 
-    /// Handle a reply from the cache.
-    /// If cache indicates error or needs forwarding, send query to origin instead.
-    fn handle_cache_reply(&mut self, reply: CacheReply) {
+    /// Handle the outcome of a cache reply (the leased socket has already been
+    /// recovered by `cache_serve_wait`). If the cache indicates error or needs
+    /// forwarding, send the query to origin instead.
+    fn handle_cache_outcome(&mut self, outcome: CacheOutcome) {
         trace!(
             "net: cache→proxy reply={}",
-            match &reply {
-                CacheReply::Complete(_) => "Complete",
-                CacheReply::Forward(_, _) => "Forward",
-                CacheReply::Error(_) => "Error",
+            match &outcome {
+                CacheOutcome::Complete(_) => "Complete",
+                CacheOutcome::Forward(_, _) => "Forward",
+                CacheOutcome::Error(_) => "Error",
             }
         );
-        match reply {
-            CacheReply::Complete(timing) => {
+        match outcome {
+            CacheOutcome::Complete(timing) => {
                 metrics::counter!(names::QUERIES_CACHE_HIT).increment(1);
                 self.telemetry.cache_complete(timing);
 
@@ -1122,7 +1116,7 @@ impl ConnectionState {
 
                 self.proxy_mode = ProxyMode::Read;
             }
-            CacheReply::Error(buf) => {
+            CacheOutcome::Error(buf) => {
                 metrics::counter!(names::QUERIES_CACHE_ERROR).increment(1);
                 debug!("forwarding to origin");
                 if let Some(stmt_name) = self.extended.pending_lazy_parse.take() {
@@ -1137,7 +1131,7 @@ impl ConnectionState {
                 self.cache_reply_forward(buf, None);
                 self.proxy_mode = ProxyMode::Read;
             }
-            CacheReply::Forward(buf, timing) => {
+            CacheOutcome::Forward(buf, timing) => {
                 metrics::counter!(names::QUERIES_CACHE_MISS).increment(1);
                 debug!("forwarding to origin");
                 if let Some(stmt_name) = self.extended.pending_lazy_parse.take() {
@@ -1720,7 +1714,7 @@ impl ConnectionState {
     /// `self.egress.has_writable()`.
     async fn client_egress_flush(
         &mut self,
-        client_write: &mut Pin<&mut ClientWriteHalf<'_>>,
+        client_write: &mut ClientSocket,
     ) -> ConnectionResult<()> {
         let n = client_write
             .write(self.egress.write_chunk())
@@ -1730,12 +1724,12 @@ impl ConnectionState {
         Ok(())
     }
 
-    async fn connection_select<'a, 'b>(
+    async fn connection_select<'b>(
         &mut self,
         origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
-        client_read: &mut Pin<&mut FramedRead<ClientReadHalf<'a>, PgFrontendMessageCodec>>,
+        client_read: &mut Pin<&mut FramedRead<OwnedClientReadHalf, PgFrontendMessageCodec>>,
         origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
-        client_write: &mut Pin<&mut ClientWriteHalf<'a>>,
+        client_write: &mut ClientSocket,
     ) -> ConnectionResult<()> {
         select! {
             res = client_read.next() => {
@@ -1770,56 +1764,50 @@ impl ConnectionState {
         Ok(())
     }
 
-    async fn connection_select_with_cache<'a, 'b>(
+    /// Await the cache worker's reply for the in-flight query, returning the
+    /// leased client write half it hands back. The client write half is with the
+    /// worker, so this does **not** write the client — origin messages that
+    /// arrive meanwhile buffer in the egress queue and flush once the socket is
+    /// restored and we are back in `Read`.
+    async fn cache_serve_wait<'b>(
         &mut self,
         origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
         origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
-        client_write: &mut Pin<&mut ClientWriteHalf<'a>>,
-    ) -> ConnectionResult<()> {
-        // Extract cache_rx from self.proxy_mode
-        let ProxyMode::CacheRead(ref mut cache_rx) = self.proxy_mode else {
-            return Err(ConnectionError::IoError(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Expected CacheRead mode",
-            ))
-            .into());
-        };
-
-        select! {
-            res = origin_read.next() => {
-                self.origin_read_dispatch(res)?;
-            }
-            reply = &mut *cache_rx => {
-                match reply {
-                    Ok(reply) => {
-                        self.handle_cache_reply(reply);
-                    }
-                    Err(_) => {
-                        debug!("cache channel closed");
-                        return Err(ConnectionError::CacheDead.into());
+        mut reply_rx: oneshot::Receiver<CacheReply>,
+    ) -> ConnectionResult<ClientSocket> {
+        loop {
+            select! {
+                res = origin_read.next() => {
+                    self.origin_read_dispatch(res)?;
+                }
+                reply = &mut reply_rx => {
+                    match reply {
+                        Ok(reply) => {
+                            self.handle_cache_outcome(reply.outcome);
+                            return Ok(reply.socket);
+                        }
+                        Err(_) => {
+                            debug!("cache channel closed");
+                            return Err(ConnectionError::CacheDead.into());
+                        }
                     }
                 }
+                _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
+                    self.origin_write_flush(origin_write).await?;
+                }
             }
-            _ = origin_write.writable(), if !self.origin_write_buf.is_empty() => {
-                self.origin_write_flush(origin_write).await?;
-            }
-            _ = client_write.writable(), if self.egress.has_writable() => {
-                self.client_egress_flush(client_write).await?;
-            }
-        };
-
-        Ok(())
+        }
     }
 
     /// Select loop for `OriginDrain`: a cacheable query is queued behind earlier
     /// responses. Drains origin and flushes the egress queue **without reading
     /// the client**, so no later request is processed before the queued cache
     /// query — preserving response order until the cache slot reaches the head.
-    async fn connection_select_drain<'a, 'b>(
+    async fn connection_select_drain<'b>(
         &mut self,
         origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
         origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
-        client_write: &mut Pin<&mut ClientWriteHalf<'a>>,
+        client_write: &mut ClientSocket,
     ) -> ConnectionResult<()> {
         select! {
             res = origin_read.next() => {
@@ -1924,7 +1912,7 @@ fn forward_lazy_parse_install(
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn handle_connection(
-    mut client_stream: ClientStream,
+    client_stream: ClientStream,
     addrs: Vec<SocketAddr>,
     ssl_mode: SslMode,
     server_name: &str,
@@ -1936,9 +1924,6 @@ async fn handle_connection(
     metrics::gauge!(names::CONNECTIONS_ACTIVE).increment(1.0);
     let _connection_guard = ActiveConnectionGuard;
 
-    // Create ClientSocketSource BEFORE splitting (captures raw fd and TLS state)
-    let client_socket_source = client_stream.socket_source_create();
-
     // Connect to origin database (with TLS if required)
     let mut origin_stream = origin_connect(&addrs, ssl_mode, server_name)
         .await
@@ -1948,17 +1933,19 @@ async fn handle_connection(
     let (origin_read, origin_write) = origin_stream.split();
     let origin_framed_read = FramedRead::new(origin_read, PgBackendMessageCodec::default());
 
-    // Split client stream in place (borrowed halves with .writable() support)
-    let (client_read, client_write) = client_stream.split();
+    // Split the client stream into OWNED halves with one reactor registration.
+    // The connection keeps the read half (framed) and owns the write half
+    // (`socket`), which it leases to the cache worker per query — no per-query
+    // `dup`. `socket` is a plain owned value; while it is lent to the worker
+    // there is simply no `socket` binding to write through.
+    let (client_read, mut socket) = client_stream.into_split();
     let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
 
-    // Initialize connection state with socket source
-    let mut state = ConnectionState::new(client_socket_source, func_volatility, origin_database);
+    let mut state = ConnectionState::new(func_volatility, origin_database);
 
     tokio::pin!(origin_framed_read);
     tokio::pin!(client_framed_read);
     tokio::pin!(origin_write);
-    tokio::pin!(client_write);
 
     loop {
         match state.proxy_mode {
@@ -1968,27 +1955,11 @@ async fn handle_connection(
                         &mut origin_framed_read,
                         &mut client_framed_read,
                         &mut origin_write,
-                        &mut client_write,
+                        &mut socket,
                     )
                     .await
                 {
                     debug!("read error [{}]", err);
-                    break;
-                }
-            }
-            ProxyMode::CacheRead(_) => {
-                if let Err(err) = state
-                    .connection_select_with_cache(
-                        &mut origin_framed_read,
-                        &mut origin_write,
-                        &mut client_write,
-                    )
-                    .await
-                {
-                    debug!("read error [{}]", err);
-                    // if matches!(err.current_context(), ConnectionError::CacheDead) {
-                    //     state.proxy_status = ProxyStatus::Degraded;
-                    // }
                     break;
                 }
             }
@@ -2003,7 +1974,7 @@ async fn handle_connection(
                         .connection_select_drain(
                             &mut origin_framed_read,
                             &mut origin_write,
-                            &mut client_write,
+                            &mut socket,
                         )
                         .await
                     {
@@ -2027,23 +1998,13 @@ async fn handle_connection(
 
                 metrics::counter!(names::QUERIES_CACHEABLE).increment(1);
 
-                // Create ClientSocket for this query (dupes the fd)
-                let client_socket = match state.client_socket_source.socket_create() {
-                    Ok(s) => s,
-                    Err(e) => {
-                        error!("Failed to create client socket: {}", e);
-                        state.cache_slot_forward_to_origin(msg);
-                        continue;
-                    }
-                };
-
                 let (reply_tx, reply_rx) = oneshot::channel();
-
                 let timing = state.telemetry.cache_timing_dispatch();
 
+                // Lease the owned write half to the worker for this query.
                 let proxy_msg = ProxyMessage {
                     message: msg,
-                    client_socket,
+                    client_socket: socket,
                     reply_tx,
                     search_path: resolved_search_path,
                     timing,
@@ -2052,13 +2013,30 @@ async fn handle_connection(
 
                 match cache_sender.send(proxy_msg).await {
                     Ok(()) => {
-                        state.proxy_mode = ProxyMode::CacheRead(reply_rx);
+                        // The write half is now with the worker. Await the reply,
+                        // which returns it; origin messages buffer in egress
+                        // meanwhile and flush once we are back in `Read`.
+                        match state
+                            .cache_serve_wait(&mut origin_framed_read, &mut origin_write, reply_rx)
+                            .await
+                        {
+                            Ok(returned) => {
+                                socket = returned;
+                                state.proxy_mode = ProxyMode::Read;
+                            }
+                            Err(err) => {
+                                debug!("cache serve error [{}]", err);
+                                break;
+                            }
+                        }
                     }
                     Err(e) => {
-                        // Cache is unavailable, fall back to proxying directly to origin.
+                        // Cache is unavailable: recover the leased write half and
+                        // fall back to proxying directly to origin.
                         debug!("cache unavailable");
                         state.proxy_status = ProxyStatus::Degraded;
                         let proxy_msg = e.into_message();
+                        socket = proxy_msg.client_socket;
                         // The cache slot is now serving (message already taken);
                         // convert it back to an origin slot in place.
                         state.egress.cache_to_origin();

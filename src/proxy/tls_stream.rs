@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::net::tcp::{ReadHalf, WriteHalf};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf};
 
 use tracing::{debug, trace};
 
@@ -159,6 +159,36 @@ impl<T: TlsConnectionOps> TlsStream<T> {
             }
         }
     }
+
+    /// Consume the stream into **owned** read and write halves that share one
+    /// reactor registration. Unlike [`Self::split`], the halves are `'static`
+    /// and `Send`, so the write half can be moved to another task (e.g. leased
+    /// to the cache worker). Both halves share the TLS state.
+    pub fn into_split(self) -> (OwnedTlsReadHalf<T>, OwnedTlsWriteHalf<T>) {
+        match self {
+            TlsStream::Plain(tcp) => {
+                let (read, write) = tcp.into_split();
+                (
+                    OwnedTlsReadHalf::Plain(read),
+                    OwnedTlsWriteHalf::Plain(write),
+                )
+            }
+            TlsStream::Tls { tcp, tls_state } => {
+                let (read, write) = tcp.into_split();
+                (
+                    OwnedTlsReadHalf::Tls {
+                        tcp: read,
+                        tls_state: Arc::clone(&tls_state),
+                    },
+                    OwnedTlsWriteHalf::Tls {
+                        tcp: write,
+                        tls_state,
+                        pending: None,
+                    },
+                )
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -194,12 +224,16 @@ impl<T: TlsConnectionOps> AsyncRead for TlsReadHalf<'_, T> {
 ///    stack-local and would be lost if we returned early
 /// 2. Only after all ciphertext is consumed, check for buffered plaintext
 /// 3. Read more ciphertext from TCP
-fn poll_tls_read<T: TlsConnectionOps>(
-    tcp: &mut ReadHalf<'_>,
+fn poll_tls_read<T, R>(
+    tcp: &mut R,
     tls_state: &SharedTlsState<T>,
     cx: &mut Context<'_>,
     buf: &mut ReadBuf<'_>,
-) -> Poll<io::Result<()>> {
+) -> Poll<io::Result<()>>
+where
+    T: TlsConnectionOps,
+    R: AsyncRead + Unpin,
+{
     let mut tcp_buf = [0u8; 16 * 1024];
     let mut consumed = 0usize;
     let mut filled = 0usize;
@@ -443,4 +477,122 @@ where
     }
 
     tcp.poll_shutdown(cx)
+}
+
+// ============================================================================
+// Owned halves (from `into_split`) — `'static` + `Send`, for leasing
+// ============================================================================
+
+/// Owned read half of a `TlsStream`. Unlike [`TlsReadHalf`] it borrows nothing,
+/// so it can outlive the original stream value and be stored in a `FramedRead`.
+pub enum OwnedTlsReadHalf<T: TlsConnectionOps> {
+    Plain(OwnedReadHalf),
+    Tls {
+        tcp: OwnedReadHalf,
+        tls_state: SharedTlsState<T>,
+    },
+}
+
+impl<T: TlsConnectionOps> AsyncRead for OwnedTlsReadHalf<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match &mut *self {
+            OwnedTlsReadHalf::Plain(tcp) => Pin::new(tcp).poll_read(cx, buf),
+            OwnedTlsReadHalf::Tls { tcp, tls_state } => poll_tls_read(tcp, tls_state, cx, buf),
+        }
+    }
+}
+
+/// Owned write half of a `TlsStream`. Unlike [`TlsWriteHalf`] it borrows
+/// nothing, so it can be moved to another task (leased to the cache worker).
+/// This is the concrete type behind `ClientSocket`.
+pub enum OwnedTlsWriteHalf<T: TlsConnectionOps> {
+    Plain(OwnedWriteHalf),
+    Tls {
+        tcp: OwnedWriteHalf,
+        tls_state: SharedTlsState<T>,
+        pending: Option<PendingWrite>,
+    },
+}
+
+impl<T: TlsConnectionOps> OwnedTlsWriteHalf<T> {
+    /// Wait for the underlying TCP socket to be writable (backpressure gate for
+    /// select loops).
+    pub async fn writable(&self) -> io::Result<()> {
+        match self {
+            OwnedTlsWriteHalf::Plain(tcp) => tcp.writable().await,
+            OwnedTlsWriteHalf::Tls { tcp, .. } => tcp.writable().await,
+        }
+    }
+}
+
+impl<T: TlsConnectionOps> AsyncWrite for OwnedTlsWriteHalf<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match &mut *self {
+            OwnedTlsWriteHalf::Plain(tcp) => Pin::new(tcp).poll_write(cx, buf),
+            OwnedTlsWriteHalf::Tls {
+                tcp,
+                tls_state,
+                pending,
+            } => tls_poll_write(Pin::new(tcp), tls_state, cx, buf, pending),
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut *self {
+            OwnedTlsWriteHalf::Plain(tcp) => Pin::new(tcp).poll_flush(cx),
+            OwnedTlsWriteHalf::Tls { tcp, .. } => Pin::new(tcp).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut *self {
+            OwnedTlsWriteHalf::Plain(tcp) => Pin::new(tcp).poll_shutdown(cx),
+            OwnedTlsWriteHalf::Tls { tcp, tls_state, .. } => {
+                tls_poll_shutdown(Pin::new(tcp), tls_state, cx)
+            }
+        }
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match &mut *self {
+            OwnedTlsWriteHalf::Plain(tcp) => Pin::new(tcp).poll_write_vectored(cx, bufs),
+            OwnedTlsWriteHalf::Tls {
+                tcp,
+                tls_state,
+                pending,
+            } => {
+                // TLS cannot vectored-write; write the first non-empty slice.
+                let buf = bufs.iter().find(|b| !b.is_empty()).map_or(&[][..], |b| b);
+                tls_poll_write(Pin::new(tcp), tls_state, cx, buf, pending)
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match self {
+            OwnedTlsWriteHalf::Plain(tcp) => tcp.is_write_vectored(),
+            OwnedTlsWriteHalf::Tls { .. } => false,
+        }
+    }
+}
+
+impl<T: TlsConnectionOps> std::fmt::Debug for OwnedTlsWriteHalf<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OwnedTlsWriteHalf::Plain(_) => f.write_str("OwnedTlsWriteHalf::Plain"),
+            OwnedTlsWriteHalf::Tls { .. } => f.write_str("OwnedTlsWriteHalf::Tls"),
+        }
+    }
 }

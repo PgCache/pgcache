@@ -21,7 +21,8 @@ use crate::timing::{QueryTiming, duration_to_ns_u64};
 use super::{
     CacheError, CacheResult,
     messages::{
-        AdmitAction, CacheReply, PipelineContext, PipelineDescribe, QueryCommand, SubsumptionResult,
+        AdmitAction, CacheOutcome, CacheReply, PipelineContext, PipelineDescribe, QueryCommand,
+        SubsumptionResult,
     },
     mv::{MvMeta, MvServe, MvState, ShapeGate},
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
@@ -188,7 +189,13 @@ impl QueryCache {
         let cfg = self.dynamic.load();
         if !Self::query_allowlist_check(&cfg.allowed_tables_parsed, &msg.cacheable_query.query) {
             metrics::counter!(names::QUERIES_ALLOWLIST_SKIPPED).increment(1);
-            return reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing);
+            return reply_forward(
+                msg.reply_tx,
+                msg.client_socket,
+                msg.pipeline,
+                msg.data,
+                msg.timing,
+            );
         }
 
         let fingerprint = query_expr_fingerprint(&msg.cacheable_query.query);
@@ -246,7 +253,13 @@ impl QueryCache {
                 self.metrics_miss_record(fingerprint);
                 // Set Loading immediately to prevent duplicate LimitBump commands from racing
                 self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
-                reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing)?;
+                reply_forward(
+                    msg.reply_tx,
+                    msg.client_socket,
+                    msg.pipeline,
+                    msg.data,
+                    msg.timing,
+                )?;
                 self.query_tx
                     .send(QueryCommand::LimitBump {
                         fingerprint,
@@ -592,12 +605,19 @@ impl QueryCache {
             if !limit_is_sufficient(max_limit, primary_needed) {
                 let _ = reply_forward(
                     primary.reply_tx,
+                    primary.client_socket,
                     primary.pipeline,
                     primary.data,
                     primary.timing,
                 );
                 for msg in waiters {
-                    let _ = reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing);
+                    let _ = reply_forward(
+                        msg.reply_tx,
+                        msg.client_socket,
+                        msg.pipeline,
+                        msg.data,
+                        msg.timing,
+                    );
                 }
                 continue;
             }
@@ -659,7 +679,13 @@ impl QueryCache {
             let drain_started = Instant::now();
             for mut msg in waiters {
                 msg.timing.drain_started_at = Some(drain_started);
-                let _ = reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing);
+                let _ = reply_forward(
+                    msg.reply_tx,
+                    msg.client_socket,
+                    msg.pipeline,
+                    msg.data,
+                    msg.timing,
+                );
             }
         }
 
@@ -763,7 +789,13 @@ impl QueryCache {
             }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
                 self.metrics_miss_record(fingerprint);
-                reply_forward(msg.reply_tx, msg.pipeline, msg.data, msg.timing)
+                reply_forward(
+                    msg.reply_tx,
+                    msg.client_socket,
+                    msg.pipeline,
+                    msg.data,
+                    msg.timing,
+                )
             }
         }
     }
@@ -819,8 +851,10 @@ impl QueryCache {
 }
 
 /// Forward a query to origin by sending the reply through the oneshot channel.
+/// Returns the leased client write half to the connection.
 pub(super) fn reply_forward(
     reply_tx: oneshot::Sender<CacheReply>,
+    socket: ClientSocket,
     pipeline: Option<PipelineContext>,
     data: BytesMut,
     timing: QueryTiming,
@@ -830,6 +864,9 @@ pub(super) fn reply_forward(
         None => data,
     };
     reply_tx
-        .send(CacheReply::Forward(buf, timing))
+        .send(CacheReply {
+            socket,
+            outcome: CacheOutcome::Forward(buf, timing),
+        })
         .map_err(|_| CacheError::Reply.into())
 }
