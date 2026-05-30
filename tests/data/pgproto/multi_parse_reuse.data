@@ -1,0 +1,15 @@
+# PGC-218: pipelined prepare of two named statements (forwarded together), then
+# Bind-only reuse of the FIRST. Origin prepares both S1 and S2; the proxy must
+# mark BOTH origin_prepared (one per ParseComplete, in order) — not just the
+# last. Otherwise the later Bind-only reuse of S1 prepends a spurious lazy Parse
+# and origin rejects it with "prepared statement \"S1\" already exists".
+'P'	"S1"	"SELECT id, name FROM proto_test WHERE id = 1"	0
+'P'	"S2"	"SELECT id, name FROM proto_test WHERE id = 2"	0
+'S'
+'Y'
+# Reuse S1 with a fresh Bind (no re-Parse) + Execute.
+'B'	""	"S1"	0	0	0
+'E'	""	0
+'S'
+'Y'
+'X'

@@ -1,0 +1,13 @@
+# Write then read in one Sync-terminated batch: INSERT then SELECT of the
+# inserted row. The whole batch is one implicit transaction, so the SELECT must
+# observe the INSERT. An uncacheable INSERT makes the batch ineligible for
+# caching, so it forwards whole and the SELECT sees the new row.
+'P'	"S1"	"INSERT INTO proto_test VALUES (50, 'fifty')"	0
+'B'	""	"S1"	0	0	0
+'E'	""	0
+'P'	"S2"	"SELECT name FROM proto_test WHERE id = 50"	0
+'B'	""	"S2"	0	0	0
+'E'	""	0
+'S'
+'Y'
+'X'

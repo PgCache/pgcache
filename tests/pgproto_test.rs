@@ -108,18 +108,15 @@ async fn test_pgproto_extended_protocol() -> Result<(), Error> {
         delta.queries_total,
     );
 
-    // --- Scenario 5: Multiple Executes before Sync (must forward) ---
-    // Two Parse/Bind/Execute pairs before a single Sync.
-    // multiple_executes flag forces forward to origin (uncacheable).
-    let m = ctx.metrics().await?;
+    // --- Scenario 5: Multiple Executes before one Sync (PGC-217) ---
+    // Two Parse/Bind/Execute pairs before a single Sync. Both are cacheable
+    // reads; the batch returns all rows and exactly one ReadyForQuery.
     let output = pgproto_run(ctx.cache_port, "tests/data/pgproto/multi_execute.data");
-    assert_pgproto_select(&output, 3); // at least the first SELECT returns 3 rows
-    let after = ctx.metrics().await?;
-    let delta = metrics_delta(&m, &after);
-    assert!(
-        delta.queries_uncacheable >= 1,
-        "expected uncacheable increment for multi-execute, got {}",
-        delta.queries_uncacheable,
+    assert_pgproto_select(&output, 3); // first SELECT returns 3 rows, second 1
+    assert_eq!(
+        output.matches("ReadyForQuery").count(),
+        1,
+        "expected exactly one RFQ for the multi-execute batch:\n{output}"
     );
 
     // --- Scenario 6: Non-cacheable INSERT forwarded at Sync ---
@@ -269,6 +266,155 @@ async fn test_pgproto_lazy_parse_on_forward() -> Result<(), Error> {
         delta.protocol_lazy_parse_forwarded >= 1,
         "expected at least 1 lazy-Parse forward, got {}",
         delta.protocol_lazy_parse_forwarded
+    );
+
+    Ok(())
+}
+
+/// PGC-217: an extended batch that carries more than one statement's worth of
+/// prep around a single Execute must not be served from cache. The cache path
+/// synthesizes exactly one ParseComplete/BindComplete; serving such a batch
+/// from cache would under-respond and desync the connection. Both the
+/// duplicate-prep shape (`P/B/P/B/E`) and the trailing-prep shape (`P/B/E/P/B`)
+/// must forward to origin so the client receives a ParseComplete/BindComplete
+/// for every statement it sent.
+#[tokio::test]
+async fn test_pgproto_multi_prep_forwards() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE proto_test (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO proto_test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')",
+        &[],
+    )
+    .await?;
+
+    // Warm the cache for `SELECT ... ORDER BY id` — the query both batches
+    // Execute. This makes the cache path reachable, so the test exercises the
+    // mis-synthesis-on-hit bug, not just the drop-on-miss regression.
+    pgproto_run(
+        ctx.cache_port,
+        "tests/data/pgproto/parse_bind_execute_sync.data",
+    );
+    ctx.cache_settle().await?;
+
+    for data in [
+        "tests/data/pgproto/multi_prep_single_execute.data",
+        "tests/data/pgproto/trailing_prep_after_execute.data",
+    ] {
+        let output = pgproto_run(ctx.cache_port, data);
+        assert!(
+            output.contains("ReadyForQuery"),
+            "expected ReadyForQuery for {data}:\n{output}"
+        );
+        assert_eq!(
+            output.matches("ParseComplete").count(),
+            2,
+            "expected 2 ParseComplete (one per client Parse) for {data}:\n{output}"
+        );
+        assert_eq!(
+            output.matches("BindComplete").count(),
+            2,
+            "expected 2 BindComplete (one per client Bind) for {data}:\n{output}"
+        );
+        assert!(
+            output.matches("<= BE DataRow").count() >= 1,
+            "expected at least one DataRow for {data}:\n{output}"
+        );
+    }
+
+    Ok(())
+}
+
+/// PGC-217: a batch of independently-cacheable reads before a single Sync is
+/// served from cache (one cache hit per Execute, one trailing ReadyForQuery).
+/// A batch containing a write is forwarded whole so the read observes the write
+/// (the batch is one implicit transaction).
+#[tokio::test]
+async fn test_pgproto_multi_execute() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE proto_test (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO proto_test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')",
+        &[],
+    )
+    .await?;
+
+    // Warm both queries the batch executes so each Execute hits.
+    ctx.query("SELECT id, name FROM proto_test ORDER BY id", &[])
+        .await?;
+    ctx.query("SELECT id, name FROM proto_test WHERE id = 1", &[])
+        .await?;
+    ctx.cache_settle().await?;
+
+    let m = ctx.metrics().await?;
+    let output = pgproto_run(ctx.cache_port, "tests/data/pgproto/multi_execute.data");
+    assert_eq!(
+        output.matches("ReadyForQuery").count(),
+        1,
+        "expected one RFQ for the batch:\n{output}"
+    );
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_cache_hit, 2,
+        "expected both executes served from cache, got {}",
+        delta.queries_cache_hit
+    );
+
+    // A write+read batch forwards whole; the SELECT observes the INSERT.
+    let output = pgproto_run(
+        ctx.cache_port,
+        "tests/data/pgproto/multi_execute_write_read.data",
+    );
+    assert_eq!(
+        output.matches("ReadyForQuery").count(),
+        1,
+        "expected one RFQ for the write+read batch:\n{output}"
+    );
+    assert!(
+        output.contains("fifty"),
+        "expected the SELECT to observe the in-batch INSERT:\n{output}"
+    );
+
+    Ok(())
+}
+
+/// PGC-218: forwarding a batch with two named Parses must mark BOTH statements
+/// `origin_prepared` (one per ParseComplete, in order), not just the last.
+/// Otherwise a later Bind-only reuse of the first statement prepends a spurious
+/// lazy Parse and origin errors with "already exists".
+#[tokio::test]
+async fn test_pgproto_multi_parse_origin_prepared() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE proto_test (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO proto_test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')",
+        &[],
+    )
+    .await?;
+
+    let output = pgproto_run(ctx.cache_port, "tests/data/pgproto/multi_parse_reuse.data");
+    assert!(
+        !output.contains("already exists") && !output.contains("ErrorResponse"),
+        "Bind-only reuse of the first forwarded statement must not error:\n{output}"
+    );
+    assert!(
+        output.matches("<= BE DataRow").count() >= 1,
+        "expected the reused statement to return its row:\n{output}"
     );
 
     Ok(())

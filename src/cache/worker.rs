@@ -337,7 +337,7 @@ async fn handle_cached_query_text(
     *framed.read_buffer_mut() = read_buf;
 
     let query_type = msg.query_type;
-    let has_sync = msg.has_sync;
+    let emit_rfq = msg.emit_rfq;
     let has_parse = msg.has_parse;
     let has_bind = msg.has_bind;
     let pipeline_describe = msg.pipeline_describe;
@@ -477,8 +477,9 @@ async fn handle_cached_query_text(
         return Err(e);
     }
 
-    // Append ReadyForQuery for simple queries (always) and extended queries with Sync
-    if query_type == QueryType::Simple || has_sync {
+    // Append ReadyForQuery for simple queries (always) and extended queries whose
+    // trailing execute carries the Sync RFQ.
+    if query_type == QueryType::Simple || emit_rfq {
         trace!("net: cache→client ReadyForQuery");
         push_and_broadcast(
             &mut write_queue,
@@ -582,7 +583,7 @@ async fn handle_cached_query_binary(
     let mut framed = FramedRead::new(stream, codec);
     *framed.read_buffer_mut() = read_buf;
 
-    let has_sync = msg.has_sync;
+    let emit_rfq = msg.emit_rfq;
     let has_parse = msg.has_parse;
     let has_bind = msg.has_bind;
     let pipeline_describe = msg.pipeline_describe;
@@ -723,7 +724,7 @@ async fn handle_cached_query_binary(
         return Err(e);
     }
 
-    if has_sync {
+    if emit_rfq {
         trace!("net: cache→client ReadyForQuery (binary pipeline)");
         push_and_broadcast(
             &mut write_queue,

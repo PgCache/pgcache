@@ -1,0 +1,12 @@
+# Multiple Parse/Bind before a single Execute: P1/B1/P2/B2/E/Sync.
+# The segment holds two of each prep message (dirty), so even though there is
+# exactly one Execute it must NOT be cached — the worker synthesizes only one
+# ParseComplete/BindComplete. Forwarding to origin yields the full set.
+'P'	"S1"	"SELECT id, name FROM proto_test WHERE id = 2"	0
+'B'	""	"S1"	0	0	0
+'P'	"S2"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'B'	""	"S2"	0	0	0
+'E'	""	0
+'S'
+'Y'
+'X'

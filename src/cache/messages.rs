@@ -41,9 +41,10 @@ pub enum WriterNotify {
 }
 
 /// Whether the pipeline includes a Describe and which type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PipelineDescribe {
     /// No Describe in the pipeline
+    #[default]
     None,
     /// Describe('S') — worker should include ParameterDescription + RowDescription
     Statement,
@@ -68,6 +69,10 @@ pub struct PipelineContext {
     /// Whether Bind was buffered in this pipeline.
     /// False when Bind was flushed separately (e.g., JDBC Parse/Bind/Describe/Flush then Execute/Sync).
     pub has_bind: bool,
+    /// Whether the worker should append ReadyForQuery after this execute's
+    /// response. True for a Sync-terminated dispatch's trailing execute; false
+    /// for non-trailing executes and Flush dispatches (one Sync ⇒ one RFQ).
+    pub emit_rfq: bool,
 }
 
 /// Converted query data ready for processing

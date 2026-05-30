@@ -47,7 +47,7 @@ pub enum QueryType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CoalesceKey {
     query_type: QueryType,
-    has_sync: bool,
+    emit_rfq: bool,
     has_parse: bool,
     has_bind: bool,
     pipeline_describe: PipelineDescribe,
@@ -105,9 +105,9 @@ pub struct WorkerRequest {
     pub timing: QueryTiming,
     /// Incoming query's LIMIT clause, appended to SQL at serve time
     pub limit: Option<LimitClause>,
-    /// Whether a Sync was included in the buffered pipeline.
-    /// When true, the worker appends ReadyForQuery to the response.
-    pub has_sync: bool,
+    /// Whether the worker should append ReadyForQuery after this execute's
+    /// response (the trailing execute of a Sync-terminated dispatch).
+    pub emit_rfq: bool,
     /// Whether Parse was buffered in the pipeline.
     /// False for Bind-only pipelines (named statement re-execution without Parse).
     pub has_parse: bool,
@@ -501,7 +501,7 @@ impl QueryCache {
         let timing = msg.timing;
 
         let (
-            has_sync,
+            emit_rfq,
             has_parse,
             has_bind,
             pipeline_describe,
@@ -509,7 +509,7 @@ impl QueryCache {
             forward_bytes,
         ) = match msg.pipeline {
             Some(pipeline) => (
-                true,
+                pipeline.emit_rfq,
                 pipeline.has_parse,
                 pipeline.has_bind,
                 pipeline.describe,
@@ -533,7 +533,7 @@ impl QueryCache {
                 reply_tx: msg.reply_tx,
                 timing,
                 limit: msg.cacheable_query.query.limit.clone(),
-                has_sync,
+                emit_rfq,
                 has_parse,
                 has_bind,
                 pipeline_describe,
@@ -549,13 +549,13 @@ impl QueryCache {
 
     /// Build a CoalesceKey from a QueryRequest's pipeline context.
     fn coalesce_key_from_request(msg: &QueryRequest) -> CoalesceKey {
-        let (has_sync, has_parse, has_bind, pipeline_describe) = match &msg.pipeline {
-            Some(p) => (true, p.has_parse, p.has_bind, p.describe),
+        let (emit_rfq, has_parse, has_bind, pipeline_describe) = match &msg.pipeline {
+            Some(p) => (p.emit_rfq, p.has_parse, p.has_bind, p.describe),
             None => (false, false, false, PipelineDescribe::None),
         };
         CoalesceKey {
             query_type: msg.query_type,
-            has_sync,
+            emit_rfq,
             has_parse,
             has_bind,
             pipeline_describe,

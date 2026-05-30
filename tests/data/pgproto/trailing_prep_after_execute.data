@@ -1,0 +1,12 @@
+# Trailing prep after the executed query: P1/B1/E1/P2/B2/Sync.
+# The first Execute forms a clean unit, but P2/B2 follow it before Sync. The
+# cache path must not fire (it would drop the trailing P2/B2); forwarding the
+# whole buffer to origin yields ParseComplete/BindComplete for both statements.
+'P'	"S1"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'B'	""	"S1"	0	0	0
+'E'	""	0
+'P'	"S2"	"SELECT id, name FROM proto_test WHERE id = 1"	0
+'B'	""	"S2"	0	0	0
+'S'
+'Y'
+'X'

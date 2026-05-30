@@ -393,58 +393,186 @@ pub(super) struct ConnectionState {
     describe_cache: LruCache<DescribeKey, DescribeCacheEntry>,
 }
 
-/// Buffered extended protocol messages, accumulated until Sync/Flush.
-/// All decision-making (cache vs. forward) is deferred to Sync time.
-struct ExtendedBuffer {
-    /// Concatenated raw bytes of all buffered messages
-    bytes: BytesMut,
-    /// Whether a Parse was buffered
-    has_parse: bool,
-    /// Whether a Bind was buffered
-    has_bind: bool,
-    /// Whether/what Describe was buffered
-    describe: PipelineDescribe,
-    /// Portal name from Execute (None if no Execute yet)
-    execute_portal: Option<String>,
-    /// True if more than one Execute was buffered (forces forward-to-origin)
-    multiple_executes: bool,
-    /// Statement name from Parse (for pending_parse_statement on forward)
-    parse_statement_name: Option<String>,
-    /// Statement name from Describe('S') (for pending_describe_statement on forward)
-    describe_statement_name: Option<String>,
+/// Wire bytes of a bare `Sync` message (`'S'` + length 4). Synthesized to close
+/// origin's implicit transaction when a multi-execute cache batch falls back to
+/// forwarding (the client's own `Sync` isn't replayed per entry).
+const SYNC_MESSAGE: [u8; 5] = [b'S', 0, 0, 0, 4];
+
+/// A cacheable-query snapshot captured at Execute time. Taken eagerly (not at
+/// Sync) because a multi-execute batch typically reuses the unnamed portal /
+/// statement, so `self.portals` / `prepared_statements` reflect only the *last*
+/// Bind/Parse by Sync time. Snapshotting per entry keeps each execute's own
+/// parameters and query.
+struct CacheCandidate {
+    cacheable_query: Arc<CacheableQuery>,
+    parameters: QueryParameters,
+    result_formats: Vec<i16>,
+    /// ParameterDescription bytes, present only for a Describe('S') entry.
+    parameter_description: Option<BytesMut>,
+    /// Target statement name (for the lazy-Parse-on-forward decision).
+    statement_name: EcoString,
+    /// Whether origin already knows the statement (no lazy Parse needed).
+    origin_prepared: bool,
 }
 
-impl Default for ExtendedBuffer {
-    fn default() -> Self {
-        Self {
-            bytes: BytesMut::new(),
-            has_parse: false,
-            has_bind: false,
-            describe: PipelineDescribe::None,
-            execute_portal: None,
-            multiple_executes: false,
-            parse_statement_name: None,
-            describe_statement_name: None,
-        }
+impl CacheCandidate {
+    /// Whether forwarding a Bind-without-Parse execute against this candidate
+    /// requires prepending a lazy Parse (origin doesn't know the named
+    /// statement). Combine with the entry's `has_parse` at the call site.
+    fn lazy_parse_needed(&self) -> bool {
+        !self.origin_prepared && !self.statement_name.is_empty()
     }
+}
+
+/// Parse/Bind/Describe messages accumulated toward the next Execute. Sealed
+/// into an [`ExecuteEntry`] when an Execute arrives.
+#[derive(Default)]
+struct Segment {
+    /// Concatenated raw bytes of the segment's messages.
+    bytes: BytesMut,
+    /// Whether a Parse was buffered in this segment.
+    has_parse: bool,
+    /// Whether a Bind was buffered in this segment.
+    has_bind: bool,
+    /// Whether/what Describe was buffered in this segment.
+    describe: PipelineDescribe,
+    /// Statement name of each Parse in this segment, in order. One per Parse —
+    /// a dirty segment has several. Drives `pending_parse_statements` on forward.
+    parse_statement_names: Vec<EcoString>,
+    /// Statement name of each Describe('S') in this segment, in order.
+    describe_statement_names: Vec<EcoString>,
+    /// True once the segment holds more than one of any Parse/Bind/Describe —
+    /// i.e. more than one executable's worth of prep. Such a segment can't be
+    /// served from cache (the worker synthesizes exactly one ParseComplete /
+    /// BindComplete / Describe response), so it forces the forward path.
+    dirty: bool,
+}
+
+/// One Execute plus the Parse/Bind/Describe messages that preceded it since the
+/// previous Execute (or batch start). Sealed at Execute; carries its own bytes
+/// so it can be dispatched independently (cached) or concatenated for forward.
+struct ExecuteEntry {
+    /// Raw bytes of this execute's Parse/Bind/Describe/Execute run.
+    bytes: BytesMut,
+    /// Portal name from Execute (None if the Execute failed to parse).
+    portal_name: Option<EcoString>,
+    has_parse: bool,
+    has_bind: bool,
+    describe: PipelineDescribe,
+    /// Statement name of each Parse / Describe('S') in this entry, in order.
+    /// A clean (cacheable) entry has at most one of each.
+    parse_statement_names: Vec<EcoString>,
+    describe_statement_names: Vec<EcoString>,
+    /// Carried from the segment: more than one P/B/D, so not cacheable.
+    dirty: bool,
+    /// Cacheable-query snapshot captured at Execute time, if this execute is a
+    /// cacheable SELECT with a resolvable portal. `None` ⇒ not cacheable.
+    candidate: Option<CacheCandidate>,
+}
+
+impl ExecuteEntry {
+    /// Whether forwarding this entry to origin requires prepending a lazy Parse
+    /// (Bind-without-Parse against a named statement origin doesn't yet know).
+    fn needs_lazy_parse(&self) -> bool {
+        !self.has_parse
+            && self
+                .candidate
+                .as_ref()
+                .is_some_and(CacheCandidate::lazy_parse_needed)
+    }
+}
+
+/// Buffered extended protocol messages, accumulated until Sync/Flush.
+/// All decision-making (cache vs. forward) is deferred to Sync/Flush time.
+#[derive(Default)]
+struct ExtendedBuffer {
+    /// Sealed executes, in arrival order. One per Execute message.
+    entries: Vec<ExecuteEntry>,
+    /// Messages accumulated since the last Execute (or batch start).
+    pending: Segment,
+}
+
+impl ExtendedBuffer {
+    /// Seal the pending segment together with this Execute's bytes into an entry.
+    fn pending_seal(
+        &mut self,
+        execute_bytes: &[u8],
+        portal_name: Option<EcoString>,
+        candidate: Option<CacheCandidate>,
+    ) {
+        let mut seg = std::mem::take(&mut self.pending);
+        seg.bytes.extend_from_slice(execute_bytes);
+        self.entries.push(ExecuteEntry {
+            bytes: seg.bytes,
+            portal_name,
+            has_parse: seg.has_parse,
+            has_bind: seg.has_bind,
+            describe: seg.describe,
+            parse_statement_names: seg.parse_statement_names,
+            describe_statement_names: seg.describe_statement_names,
+            dirty: seg.dirty,
+            candidate,
+        });
+    }
+
+    /// Every Parse statement name across the window in wire order (entries then
+    /// the trailing pending segment) — one per Parse. Drives the ordered
+    /// `pending_parse_statements` queue so each origin ParseComplete marks the
+    /// right statement `origin_prepared`.
+    fn parse_statements_all(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .flat_map(|e| e.parse_statement_names.iter())
+            .chain(self.pending.parse_statement_names.iter())
+            .map(EcoString::as_str)
+    }
+
+    /// Every Describe('S') statement name across the window in wire order.
+    fn describe_statements_all(&self) -> impl Iterator<Item = &str> {
+        self.entries
+            .iter()
+            .flat_map(|e| e.describe_statement_names.iter())
+            .chain(self.pending.describe_statement_names.iter())
+            .map(EcoString::as_str)
+    }
+
+    /// Concatenate all buffered bytes (entries in order, then the trailing
+    /// pending segment) into the wire stream as originally received.
+    fn bytes_concat(&self) -> BytesMut {
+        let mut out = BytesMut::new();
+        for entry in &self.entries {
+            out.extend_from_slice(&entry.bytes);
+        }
+        out.extend_from_slice(&self.pending.bytes);
+        out
+    }
+
+    /// Whether any Parse was buffered across the whole window.
+    fn any_has_parse(&self) -> bool {
+        self.pending.has_parse || self.entries.iter().any(|e| e.has_parse)
+    }
+
 }
 
 /// State for the extended query protocol pipeline.
 /// Accumulates messages until Sync/Flush, then tracks pending origin responses
 /// and pipeline context for cache dispatch.
 struct ExtendedPending {
-    /// Statement name whose ParseComplete we're waiting for from origin.
-    /// Set when Parse is buffered in the pipeline; consumed when origin responds.
-    pending_parse_statement: Option<String>,
+    /// Statement names whose ParseCompletes we're awaiting from origin, in wire
+    /// order — one per forwarded Parse. Each origin ParseComplete pops the front
+    /// and marks that statement `origin_prepared`.
+    pending_parse_statements: VecDeque<EcoString>,
 
-    /// Name of statement most recently described (awaiting ParameterDescription)
-    pending_describe_statement: Option<String>,
+    /// Statement names being described, in wire order — one per forwarded
+    /// Describe('S'). ParameterDescription peeks the front; RowDescription/NoData
+    /// pops it.
+    pending_describe_statements: VecDeque<EcoString>,
 
     /// Statement name to lazily Parse on the next origin forward. Set at Sync
     /// time for Bind-without-Parse batches against statements origin doesn't
     /// know; consumed by the forward paths in `handle_cache_reply`. Cleared on
     /// every Sync so stale state from a prior cache hit doesn't leak.
-    pending_lazy_parse: Option<String>,
+    pending_lazy_parse: Option<EcoString>,
 
     /// Buffered extended protocol messages accumulated until Sync/Flush.
     /// Decision-making deferred to Sync time.
@@ -453,16 +581,80 @@ struct ExtendedPending {
     /// Pipeline context ready for cache dispatch.
     /// Built at Sync time from ExtendedBuffer, consumed by ProxyMessage.
     pipeline_context: Option<PipelineContext>,
+
+    /// Remaining cache slots of a multi-execute batch, queued in order. The
+    /// current in-flight slot lives in `pipeline_context` (+ the egress Cache
+    /// slot); each hit advances to the next here. On a miss the remainder is
+    /// forwarded to origin as one run.
+    batch: VecDeque<DispatchContext>,
+
+    /// Whether the in-flight cache dispatch is an extended-protocol pipeline (vs
+    /// a self-terminating simple `Query`). Gates the synthesized trailing `Sync`
+    /// on the forward-fallback path: extended entries carry no `Sync`, a simple
+    /// `Query` already triggers its own `ReadyForQuery`.
+    dispatch_is_extended: bool,
+}
+
+/// Everything needed to dispatch one execute as a cache slot, computed at Sync
+/// from an [`ExecuteEntry`]'s snapshot. Held in `ExtendedPending::batch` until
+/// its turn; on dispatch the pipeline/statement state is applied to the
+/// connection and the message is leased to a worker.
+struct DispatchContext {
+    msg: CacheMessage,
+    pipeline: PipelineContext,
+    fingerprint: u64,
+    lazy_parse: Option<EcoString>,
+    parse_statement: Option<EcoString>,
+    describe_statement: Option<EcoString>,
+}
+
+impl DispatchContext {
+    /// Assemble a dispatch context from an entry and its cache candidate.
+    /// `is_last` carries the single trailing `ReadyForQuery` for the batch.
+    fn build(entry: ExecuteEntry, candidate: CacheCandidate, is_last: bool) -> Self {
+        let fingerprint = query_expr_fingerprint(&candidate.cacheable_query.query);
+        let lazy_parse = (!entry.has_parse && candidate.lazy_parse_needed())
+            .then(|| candidate.statement_name.clone());
+        let pipeline = PipelineContext {
+            buffered_bytes: entry.bytes,
+            describe: entry.describe,
+            parameter_description: candidate.parameter_description,
+            has_parse: entry.has_parse,
+            has_bind: entry.has_bind,
+            emit_rfq: is_last,
+        };
+        let msg = CacheMessage::QueryParameterized(
+            BytesMut::new(),
+            candidate.cacheable_query,
+            candidate.parameters,
+            candidate.result_formats,
+        );
+        Self {
+            msg,
+            pipeline,
+            fingerprint,
+            lazy_parse,
+            // A cacheable (non-dirty) entry has at most one Parse / Describe('S').
+            parse_statement: if entry.has_parse {
+                entry.parse_statement_names.into_iter().next()
+            } else {
+                None
+            },
+            describe_statement: entry.describe_statement_names.into_iter().next(),
+        }
+    }
 }
 
 impl ExtendedPending {
     fn new() -> Self {
         Self {
-            pending_parse_statement: None,
-            pending_describe_statement: None,
+            pending_parse_statements: VecDeque::new(),
+            pending_describe_statements: VecDeque::new(),
             pending_lazy_parse: None,
             buffer: None,
             pipeline_context: None,
+            batch: VecDeque::new(),
+            dispatch_is_extended: false,
         }
     }
 
@@ -476,55 +668,56 @@ impl ExtendedPending {
         self.buffer.take()
     }
 
+    /// Capture every forwarded Parse/Describe('S') statement name, in wire
+    /// order, into the pending origin-response queues (shared by the flush and
+    /// forward paths). Replaces any prior contents — this forwards a whole
+    /// buffer, so the queues describe exactly its responses.
+    fn pending_statements_capture(&mut self, buffer: &ExtendedBuffer) {
+        self.pending_parse_statements = buffer.parse_statements_all().map(EcoString::from).collect();
+        self.pending_describe_statements =
+            buffer.describe_statements_all().map(EcoString::from).collect();
+    }
+
     /// Flush any buffered extended protocol messages.
     /// Extracts pending statement names from buffer metadata.
     /// Returns the buffer's bytes for the caller to push to origin.
     fn buffer_flush(&mut self) -> Option<BytesMut> {
         let buffer = self.buffer.take()?;
-        if buffer.has_parse {
-            self.pending_parse_statement = buffer.parse_statement_name;
-        }
-        if buffer.describe_statement_name.is_some() {
-            self.pending_describe_statement = buffer.describe_statement_name;
-        }
-        Some(buffer.bytes)
+        self.pending_statements_capture(&buffer);
+        Some(buffer.bytes_concat())
     }
 
     /// Forward buffer to origin with trailing bytes (Sync or Flush).
     /// Extracts pending statement names from buffer metadata.
     /// Returns bytes to push to origin.
-    fn buffer_forward(&mut self, mut buffer: ExtendedBuffer, trailing_bytes: &[u8]) -> BytesMut {
-        if buffer.has_parse {
-            self.pending_parse_statement = buffer.parse_statement_name;
-        }
-        if buffer.describe_statement_name.is_some() {
-            self.pending_describe_statement = buffer.describe_statement_name;
-        }
-        buffer.bytes.extend_from_slice(trailing_bytes);
-        buffer.bytes
+    fn buffer_forward(&mut self, buffer: ExtendedBuffer, trailing_bytes: &[u8]) -> BytesMut {
+        self.pending_statements_capture(&buffer);
+        let mut bytes = buffer.bytes_concat();
+        bytes.extend_from_slice(trailing_bytes);
+        bytes
     }
 
-    /// Handle ParseComplete from origin: mark statement as origin_prepared.
+    /// Handle ParseComplete from origin: mark the next awaited statement as
+    /// origin_prepared (one ParseComplete per forwarded Parse, in order).
     fn parse_complete(&mut self, prepared_statements: &mut HashMap<String, PreparedStatement>) {
-        if let Some(stmt_name) = self.pending_parse_statement.take()
-            && let Some(stmt) = prepared_statements.get_mut(&stmt_name)
+        if let Some(stmt_name) = self.pending_parse_statements.pop_front()
+            && let Some(stmt) = prepared_statements.get_mut(stmt_name.as_str())
         {
             stmt.origin_prepared = true;
             trace!("origin_prepared set for statement '{}'", stmt_name);
         }
     }
 
-    /// Update the pending statement's parameter OIDs. Does not clear
-    /// `pending_describe_statement`; the following `RowDescription` or `NoData`
-    /// consumes it.
+    /// Update the front pending statement's parameter OIDs. Peeks (does not pop)
+    /// the queue; the following `RowDescription` or `NoData` pops it.
     fn parameter_description_received(
         &mut self,
         msg_data: &BytesMut,
         prepared_statements: &mut HashMap<String, PreparedStatement>,
     ) {
-        if let Some(stmt_name) = self.pending_describe_statement.as_ref()
+        if let Some(stmt_name) = self.pending_describe_statements.front()
             && let Ok(parsed) = parse_parameter_description(msg_data)
-            && let Some(stmt) = prepared_statements.get_mut(stmt_name)
+            && let Some(stmt) = prepared_statements.get_mut(stmt_name.as_str())
         {
             debug!(
                 "updated statement '{}' with parameter OIDs {:?}",
@@ -535,31 +728,30 @@ impl ExtendedPending {
         }
     }
 
-    /// Store the raw RowDescription on the pending statement and clear
-    /// `pending_describe_statement`. Returns the statement name so the caller
-    /// can populate the per-connection describe cache.
+    /// Store the raw RowDescription on the front pending statement and pop it.
+    /// Returns the statement name so the caller can populate the per-connection
+    /// describe cache.
     fn row_description_received(
         &mut self,
         msg_data: &BytesMut,
         prepared_statements: &mut HashMap<String, PreparedStatement>,
-    ) -> Option<String> {
-        let stmt_name = self.pending_describe_statement.take()?;
-        let stmt = prepared_statements.get_mut(&stmt_name)?;
+    ) -> Option<EcoString> {
+        let stmt_name = self.pending_describe_statements.pop_front()?;
+        let stmt = prepared_statements.get_mut(stmt_name.as_str())?;
         stmt.row_description = Some(msg_data.clone());
         stmt.describe_no_data = false;
         Some(stmt_name)
     }
 
     /// Record NoData (statement has no result columns, e.g. INSERT without
-    /// RETURNING) on the pending statement and clear `pending_describe_statement`.
-    /// Returns the statement name so the caller can populate the per-connection
-    /// describe cache.
+    /// RETURNING) on the front pending statement and pop it. Returns the
+    /// statement name so the caller can populate the per-connection describe cache.
     fn no_data_received(
         &mut self,
         prepared_statements: &mut HashMap<String, PreparedStatement>,
-    ) -> Option<String> {
-        let stmt_name = self.pending_describe_statement.take()?;
-        let stmt = prepared_statements.get_mut(&stmt_name)?;
+    ) -> Option<EcoString> {
+        let stmt_name = self.pending_describe_statements.pop_front()?;
+        let stmt = prepared_statements.get_mut(stmt_name.as_str())?;
         stmt.row_description = None;
         stmt.describe_no_data = true;
         Some(stmt_name)
@@ -700,6 +892,7 @@ impl ConnectionState {
                         Ok(Action::CacheCheck(ast)) => {
                             let fingerprint = query_expr_fingerprint(&ast.query);
                             self.telemetry.cache_timing_start(fingerprint);
+                            self.extended.dispatch_is_extended = false;
                             self.egress.cache_push(CacheMessage::Query(msg.data, ast));
                             ProxyMode::OriginDrain
                         }
@@ -806,7 +999,7 @@ impl ConnectionState {
                     PgBackendMessageType::ParseComplete => {
                         // Swallow ParseComplete (client didn't ask for it),
                         // mark origin-prepared, let the rest flow through.
-                        if let Some(stmt) = self.prepared_statements.get_mut(&stmt_name) {
+                        if let Some(stmt) = self.prepared_statements.get_mut(stmt_name.as_str()) {
                             stmt.origin_prepared = true;
                             trace!("origin_prepared set for '{}' (lazy parse)", stmt_name);
                         }
@@ -1053,11 +1246,11 @@ impl ConnectionState {
     /// Records metrics for any Execute in the buffer.
     fn extended_buffer_forward_to_origin(&mut self, buffer: ExtendedBuffer, trailing_bytes: &[u8]) {
         let mut lazy_parse_stmt: Option<String> = None;
-        if buffer.execute_portal.is_some() {
+        if let Some(first) = buffer.entries.first() {
             metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
 
-            if let Some(portal_name) = &buffer.execute_portal
-                && let Some(portal) = self.portals.get(portal_name)
+            if let Some(portal_name) = &first.portal_name
+                && let Some(portal) = self.portals.get(portal_name.as_str())
                 && let Some(stmt) = self.prepared_statements.get(&portal.statement_name)
             {
                 match &stmt.sql_type {
@@ -1069,7 +1262,7 @@ impl ConnectionState {
                     }
                     StatementType::Cacheable(_) | StatementType::UncacheableSelect => {}
                 }
-                if !buffer.has_parse && !stmt.origin_prepared {
+                if !buffer.any_has_parse() && !stmt.origin_prepared {
                     lazy_parse_stmt = Some(portal.statement_name.clone());
                 }
             }
@@ -1079,7 +1272,6 @@ impl ConnectionState {
             forward_lazy_parse_install(
                 &stmt_name,
                 &self.prepared_statements,
-                &mut self.extended,
                 &mut self.origin_write_buf,
                 &mut self.origin_intercept,
             );
@@ -1111,71 +1303,62 @@ impl ConnectionState {
                 // flush. Origin saw nothing; lazy-Parse-on-forward catches up the
                 // next time we actually have to forward.
                 self.egress.cache_done();
-                self.extended.pending_parse_statement.take();
+                self.extended.pending_parse_statements.clear();
+                self.extended.pending_describe_statements.clear();
                 self.extended.pending_lazy_parse.take();
 
-                self.proxy_mode = ProxyMode::Read;
+                // Advance to the next batched execute, or finish.
+                self.cache_batch_advance();
             }
             CacheOutcome::Error(buf) => {
                 metrics::counter!(names::QUERIES_CACHE_ERROR).increment(1);
                 debug!("forwarding to origin");
-                if let Some(stmt_name) = self.extended.pending_lazy_parse.take() {
-                    forward_lazy_parse_install(
-                        &stmt_name,
-                        &self.prepared_statements,
-                        &mut self.extended,
-                        &mut self.origin_write_buf,
-                        &mut self.origin_intercept,
-                    );
-                }
                 self.cache_reply_forward(buf, None);
-                self.proxy_mode = ProxyMode::Read;
             }
             CacheOutcome::Forward(buf, timing) => {
                 metrics::counter!(names::QUERIES_CACHE_MISS).increment(1);
                 debug!("forwarding to origin");
-                if let Some(stmt_name) = self.extended.pending_lazy_parse.take() {
-                    forward_lazy_parse_install(
-                        &stmt_name,
-                        &self.prepared_statements,
-                        &mut self.extended,
-                        &mut self.origin_write_buf,
-                        &mut self.origin_intercept,
-                    );
-                }
                 self.cache_reply_forward(buf, Some(timing));
-                self.proxy_mode = ProxyMode::Read;
             }
         }
     }
 
-    /// Forward a cache miss/error to origin: replace the serving cache slot with
-    /// an origin slot in place (keeping response order) and queue the bytes. The
-    /// slot already exists, so this does not open a new one.
-    fn cache_reply_forward(&mut self, buf: BytesMut, timing: Option<QueryTiming>) {
-        self.telemetry.origin_forward(timing);
-        self.egress.cache_to_origin();
-        self.origin_write_buf.push_back(buf);
-    }
-
-    /// Fall back to forwarding a cacheable query to origin after it was taken
-    /// from its egress slot (search_path unknown or client-socket creation
-    /// failed): convert the now-serving `Cache` slot back to an `Origin` slot in
-    /// place, install a lazy `Parse` if origin doesn't yet know the statement,
-    /// forward the query bytes, and return to `Read`.
-    fn cache_slot_forward_to_origin(&mut self, msg: CacheMessage) {
+    /// Convert the serving `Cache` slot to an `Origin` slot in place, lazy-Parse
+    /// the current entry if origin doesn't yet know its statement, forward its
+    /// bytes followed by the rest of the batch and a single trailing Sync, and
+    /// return to `Read`. Shared by every cache→origin fallback (miss/error,
+    /// search_path-unknown, cache-unavailable).
+    fn forward_current_and_rest(&mut self, current_bytes: BytesMut) {
         self.egress.cache_to_origin();
         if let Some(stmt_name) = self.extended.pending_lazy_parse.take() {
             forward_lazy_parse_install(
                 &stmt_name,
                 &self.prepared_statements,
-                &mut self.extended,
                 &mut self.origin_write_buf,
                 &mut self.origin_intercept,
             );
         }
-        cache_forward_to_origin(&mut self.extended, &mut self.origin_write_buf, msg);
+        self.origin_write_buf.push_back(current_bytes);
+        self.batch_remaining_forward();
         self.proxy_mode = ProxyMode::Read;
+    }
+
+    /// Forward a cache miss/error to origin: the worker returns the missed
+    /// entry's bytes, which we forward along with the rest of the batch.
+    fn cache_reply_forward(&mut self, buf: BytesMut, timing: Option<QueryTiming>) {
+        self.telemetry.origin_forward(timing);
+        self.forward_current_and_rest(buf);
+    }
+
+    /// Fall back to forwarding a cacheable query to origin after it was taken
+    /// from its egress slot (search_path unknown or client-socket creation
+    /// failed): forward the pipeline/raw bytes plus the rest of the batch.
+    fn cache_slot_forward_to_origin(&mut self, msg: CacheMessage) {
+        let bytes = self
+            .extended
+            .pipeline_take()
+            .map_or_else(|| msg.into_data(), |p| p.buffered_bytes);
+        self.forward_current_and_rest(bytes);
     }
 
     /// Inspect an outgoing simple-query `Query` message for search_path
@@ -1250,13 +1433,16 @@ impl ConnectionState {
             };
 
             let parse_bytes = msg.data.clone();
-            let statement_name = parsed.statement_name.clone();
+            let statement_name = EcoString::from(parsed.statement_name.as_str());
             self.statement_store(parsed, sql_type, parse_bytes);
 
-            let buffer = self.extended.buffer_get_or_create();
-            buffer.has_parse = true;
-            buffer.parse_statement_name = Some(statement_name);
-            buffer.bytes.extend_from_slice(&msg.data);
+            let seg = &mut self.extended.buffer_get_or_create().pending;
+            if seg.has_parse {
+                seg.dirty = true;
+            }
+            seg.has_parse = true;
+            seg.parse_statement_names.push(statement_name);
+            seg.bytes.extend_from_slice(&msg.data);
             trace!("net: Parse buffered");
             return;
         }
@@ -1268,9 +1454,12 @@ impl ConnectionState {
         if let Ok(parsed) = parse_bind_message(&msg.data) {
             self.portal_store(parsed);
 
-            let buffer = self.extended.buffer_get_or_create();
-            buffer.has_bind = true;
-            buffer.bytes.extend_from_slice(&msg.data);
+            let seg = &mut self.extended.buffer_get_or_create().pending;
+            if seg.has_bind {
+                seg.dirty = true;
+            }
+            seg.has_bind = true;
+            seg.bytes.extend_from_slice(&msg.data);
             trace!("net: Bind buffered");
             return;
         }
@@ -1284,32 +1473,37 @@ impl ConnectionState {
         metrics::counter!(names::PROTOCOL_EXTENDED_QUERIES).increment(1);
         self.telemetry.query_receive();
 
-        let portal_name = parse_execute_message(&msg.data).ok().map(|p| p.portal_name);
+        let portal_name = parse_execute_message(&msg.data)
+            .ok()
+            .map(|p| EcoString::from(p.portal_name));
 
-        let buffer = self.extended.buffer_get_or_create();
+        // Snapshot the cache candidate now, while the portal/statement still
+        // reflect this execute's Bind/Parse (a later execute may rebind the
+        // same — usually unnamed — portal). The current segment's Describe
+        // governs the ParameterDescription requirement.
+        let describe = self
+            .extended
+            .buffer
+            .as_ref()
+            .map_or(PipelineDescribe::None, |b| b.pending.describe);
+        let candidate = self.execute_cache_candidate(portal_name.as_deref(), describe);
 
-        if buffer.execute_portal.is_some() {
-            buffer.multiple_executes = true;
-        } else {
-            buffer.execute_portal = portal_name;
-        }
-
-        buffer.bytes.extend_from_slice(&msg.data);
+        self.extended
+            .buffer_get_or_create()
+            .pending_seal(&msg.data, portal_name, candidate);
         trace!("net: Execute buffered");
     }
 
-    /// Attempt to create a cache message from the extended buffer at Sync time.
-    /// Returns None if caching is not possible.
-    fn buffer_try_cache(&self, buffer: &ExtendedBuffer) -> Option<CacheMessage> {
-        if self.in_transaction || self.cache_disabled {
-            return None;
-        }
-        if self.proxy_status != ProxyStatus::Normal {
-            return None;
-        }
-
-        let portal_name = buffer.execute_portal.as_ref()?;
-        let portal = self.portals.get(portal_name)?;
+    /// Snapshot a cacheable-query candidate for the portal an Execute targets.
+    /// Returns None when the portal/statement doesn't resolve to a cacheable
+    /// SELECT with uniform result formats (and, for Describe('S'), a cached
+    /// ParameterDescription). Global cache gating is checked separately at Sync.
+    fn execute_cache_candidate(
+        &self,
+        portal_name: Option<&str>,
+        describe: PipelineDescribe,
+    ) -> Option<CacheCandidate> {
+        let portal = self.portals.get(portal_name?)?;
 
         // Only handle implicit or uniform result formats
         if portal.result_formats.len() > 1
@@ -1331,45 +1525,56 @@ impl ConnectionState {
             | StatementType::ParseError => return None,
         };
 
-        // Bind-without-Parse against an unknown statement is still cacheable:
-        // `forward_lazy_parse_install` prepends the Parse on miss/forward.
-
-        // Describe('S') in buffer: require cached parameter_description
-        if buffer.describe == PipelineDescribe::Statement && stmt.parameter_description.is_none() {
+        // Describe('S'): require a cached parameter_description
+        if describe == PipelineDescribe::Statement && stmt.parameter_description.is_none() {
             return None;
         }
 
-        Some(CacheMessage::QueryParameterized(
-            // Execute bytes are already in buffer.bytes; pass empty data since
-            // the worker uses pipeline context's buffered_bytes for extended queries
-            BytesMut::new(),
+        Some(CacheCandidate {
             cacheable_query,
-            QueryParameters {
+            parameters: QueryParameters {
                 values: portal.parameter_values.clone(),
                 formats: portal.parameter_formats.clone(),
                 oids: stmt.parameter_oids.clone(),
             },
-            portal.result_formats.clone(),
-        ))
+            result_formats: portal.result_formats.clone(),
+            parameter_description: if describe == PipelineDescribe::Statement {
+                stmt.parameter_description.clone()
+            } else {
+                None
+            },
+            statement_name: EcoString::from(portal.statement_name.as_str()),
+            origin_prepared: stmt.origin_prepared,
+        })
+    }
+
+    /// Whether the connection's global state currently permits cache serving.
+    fn cache_globally_enabled(&self) -> bool {
+        !self.in_transaction
+            && !self.cache_disabled
+            && self.proxy_status == ProxyStatus::Normal
     }
 
     /// Handle Describe message — buffer bytes and track describe metadata.
     fn handle_describe_message(&mut self, msg: PgFrontendMessage) {
         if let Ok(parsed) = parse_describe_message(&msg.data) {
-            let buffer = self.extended.buffer_get_or_create();
+            let seg = &mut self.extended.buffer_get_or_create().pending;
+            if seg.describe != PipelineDescribe::None {
+                seg.dirty = true;
+            }
 
             match parsed.describe_type {
                 b'S' => {
-                    buffer.describe = PipelineDescribe::Statement;
-                    buffer.describe_statement_name = Some(parsed.name);
+                    seg.describe = PipelineDescribe::Statement;
+                    seg.describe_statement_names.push(parsed.name.into());
                 }
                 b'P' => {
-                    buffer.describe = PipelineDescribe::Portal;
+                    seg.describe = PipelineDescribe::Portal;
                 }
                 _ => {}
             }
 
-            buffer.bytes.extend_from_slice(&msg.data);
+            seg.bytes.extend_from_slice(&msg.data);
             trace!("net: Describe buffered");
             return;
         }
@@ -1391,10 +1596,11 @@ impl ConnectionState {
 
     /// Handle Sync message — all cache vs. forward decision-making happens here.
     ///
-    /// If the buffer contains exactly one cacheable Execute, dispatch to cache.
-    /// Otherwise, forward the whole batch to origin.
+    /// If every Execute in the batch is an independently cacheable read, each is
+    /// dispatched as its own cache slot (in order). Otherwise the batch is
+    /// synthesized (Parse-only) or forwarded whole to origin.
     fn handle_sync_message(&mut self, msg: PgFrontendMessage) {
-        let Some(mut buffer) = self.extended.buffer_take() else {
+        let Some(buffer) = self.extended.buffer_take() else {
             // Bare Sync; origin replies with one RFQ.
             trace!("net: proxy→origin Sync (no buffer)");
             self.egress.origin_open();
@@ -1402,71 +1608,115 @@ impl ConnectionState {
             return;
         };
 
-        // Try cache path: single Execute that is cacheable
-        if !buffer.multiple_executes
-            && buffer.execute_portal.is_some()
-            && let Some(cache_msg) = self.buffer_try_cache(&buffer)
-        {
-            // Build PipelineContext from buffer for the cache/forward path
-            let parameter_description = if buffer.describe == PipelineDescribe::Statement {
-                buffer
-                    .execute_portal
-                    .as_ref()
-                    .and_then(|p| self.portals.get(p))
-                    .and_then(|portal| self.prepared_statements.get(&portal.statement_name))
-                    .and_then(|stmt| stmt.parameter_description.clone())
-            } else {
-                None
-            };
-
-            // Append Sync bytes to buffer
-            buffer.bytes.extend_from_slice(&msg.data);
-
-            self.extended.pipeline_context = Some(PipelineContext {
-                buffered_bytes: buffer.bytes,
-                describe: buffer.describe,
-                parameter_description,
-                has_parse: buffer.has_parse,
-                has_bind: buffer.has_bind,
-            });
-
-            // Track pending statement names for origin fallback path
-            if buffer.has_parse {
-                self.extended.pending_parse_statement = buffer.parse_statement_name.clone();
-            }
-            if buffer.describe_statement_name.is_some() {
-                self.extended.pending_describe_statement = buffer.describe_statement_name;
-            }
-            // Bind-without-Parse against an origin-unknown statement: record
-            // the name so the forward path can lazy-Parse on its way out.
-            // Reset first so stale state from a prior cache hit can't leak.
-            self.extended.pending_lazy_parse = None;
-            if !buffer.has_parse
-                && let Some(portal_name) = &buffer.execute_portal
-                && let Some(portal) = self.portals.get(portal_name)
-                && let Some(stmt) = self.prepared_statements.get(&portal.statement_name)
-                && !stmt.origin_prepared
-                && !portal.statement_name.is_empty()
-            {
-                self.extended.pending_lazy_parse = Some(portal.statement_name.clone());
-            }
-
-            // Create timing with fingerprint from the cacheable query
-            let fingerprint = match &cache_msg {
-                CacheMessage::Query(_, ast) | CacheMessage::QueryParameterized(_, ast, _, _) => {
-                    query_expr_fingerprint(&ast.query)
-                }
-            };
-            self.telemetry.cache_timing_start(fingerprint);
-
-            trace!("net: Sync → cache dispatch");
-            self.egress.cache_push(cache_msg);
-            self.proxy_mode = ProxyMode::OriginDrain;
+        if self.cache_batch_eligible(&buffer) {
+            let entries = buffer.entries;
+            trace!("net: Sync → cache batch ({} executes)", entries.len());
+            self.cache_batch_dispatch(entries);
         } else if self.try_synthesize_parse_describe_response(&buffer) {
             trace!("net: Sync → synthesized ParseComplete+Describe response");
         } else {
             self.extended_buffer_forward_to_origin(buffer, &msg.data);
             trace!("net: Sync → origin (forwarded buffer)");
+        }
+    }
+
+    /// Whether every Execute in the batch is an independently cacheable read, so
+    /// the whole batch can be served as a sequence of cache slots. Requires a
+    /// clean `[P?][B?][D?] E` shape per entry, no trailing prep, global cache
+    /// gating, and at most one entry needing a lazy Parse on forward (the
+    /// single-intercept forward path can absorb only one).
+    fn cache_batch_eligible(&self, buffer: &ExtendedBuffer) -> bool {
+        !buffer.entries.is_empty()
+            && buffer.pending.bytes.is_empty()
+            && self.cache_globally_enabled()
+            && buffer
+                .entries
+                .iter()
+                .all(|e| !e.dirty && e.candidate.is_some())
+            && buffer.entries.iter().filter(|e| e.needs_lazy_parse()).count() <= 1
+    }
+
+    /// Build a dispatch context per entry, queue them, and begin the first slot.
+    /// Caller guarantees [`Self::cache_batch_eligible`] (every entry has a
+    /// candidate and the list is non-empty).
+    fn cache_batch_dispatch(&mut self, entries: Vec<ExecuteEntry>) {
+        let last = entries.len() - 1;
+        let mut contexts = VecDeque::with_capacity(entries.len());
+        for (i, mut entry) in entries.into_iter().enumerate() {
+            // Eligibility guarantees a candidate; skip defensively rather than
+            // panic if that invariant is ever violated.
+            let Some(candidate) = entry.candidate.take() else {
+                continue;
+            };
+            contexts.push_back(DispatchContext::build(entry, candidate, i == last));
+        }
+        if let Some(first) = contexts.pop_front() {
+            self.extended.batch = contexts;
+            self.cache_slot_begin(first);
+            self.proxy_mode = ProxyMode::OriginDrain;
+        }
+    }
+
+    /// Apply a dispatch context as the current in-flight cache slot: stamp
+    /// timing, install pipeline + forward-fallback state, and push the egress
+    /// Cache slot.
+    fn cache_slot_begin(&mut self, ctx: DispatchContext) {
+        self.telemetry.cache_timing_start(ctx.fingerprint);
+        self.extended.dispatch_is_extended = true;
+        self.extended.pipeline_context = Some(ctx.pipeline);
+        // Reset the awaited-response queues to just this slot's statement(s);
+        // on a miss `batch_remaining_forward` appends the rest in order.
+        self.extended.pending_parse_statements.clear();
+        self.extended.pending_parse_statements.extend(ctx.parse_statement);
+        self.extended.pending_describe_statements.clear();
+        self.extended
+            .pending_describe_statements
+            .extend(ctx.describe_statement);
+        self.extended.pending_lazy_parse = ctx.lazy_parse;
+        self.egress.cache_push(ctx.msg);
+    }
+
+    /// Advance the batch after a cache hit: begin the next queued slot (staying
+    /// in `OriginDrain`) or, when the batch is exhausted, return to `Read`.
+    fn cache_batch_advance(&mut self) {
+        if let Some(next) = self.extended.batch.pop_front() {
+            self.cache_slot_begin(next);
+            self.proxy_mode = ProxyMode::OriginDrain;
+        } else {
+            self.proxy_mode = ProxyMode::Read;
+        }
+    }
+
+    /// Forward the remaining batch entries (each without a Sync) followed by one
+    /// synthesized `Sync`, so origin runs them in a single implicit transaction
+    /// and emits exactly one ReadyForQuery. Installs a lazy Parse for any entry
+    /// that needs one (eligibility bounds this to at most one across the batch).
+    fn batch_remaining_forward(&mut self) {
+        while let Some(next) = self.extended.batch.pop_front() {
+            if let Some(stmt_name) = next.lazy_parse {
+                forward_lazy_parse_install(
+                    &stmt_name,
+                    &self.prepared_statements,
+                    &mut self.origin_write_buf,
+                    &mut self.origin_intercept,
+                );
+            }
+            // Track this entry's awaited ParseComplete / Describe responses so
+            // they mark the right statement origin_prepared, in order.
+            self.extended
+                .pending_parse_statements
+                .extend(next.parse_statement);
+            self.extended
+                .pending_describe_statements
+                .extend(next.describe_statement);
+            self.origin_write_buf.push_back(next.pipeline.buffered_bytes);
+        }
+        // A simple `Query` is self-terminating (origin emits its own RFQ);
+        // only extended-pipeline entries need a synthesized Sync to close the
+        // implicit transaction and produce the single trailing RFQ.
+        if self.extended.dispatch_is_extended {
+            self.origin_write_buf
+                .push_back(BytesMut::from(SYNC_MESSAGE.as_slice()));
         }
     }
 
@@ -1479,16 +1729,24 @@ impl ConnectionState {
     /// because no portal exists without a Bind. Unnamed statements are
     /// excluded because origin's unnamed slot is one-shot per Sync.
     fn synth_eligible<'a>(&self, buffer: &'a ExtendedBuffer) -> Option<&'a str> {
-        if !buffer.has_parse || buffer.has_bind || buffer.execute_portal.is_some() {
+        // Synthesize only applies to a Parse-only batch: no Execute (no entries),
+        // a Parse but no Bind in the pending segment.
+        if !buffer.entries.is_empty() {
             return None;
         }
-        if buffer.describe == PipelineDescribe::Portal {
+        let seg = &buffer.pending;
+        // A dirty segment holds more than one Parse/Describe — synth produces
+        // exactly one response, so it must forward instead.
+        if !seg.has_parse || seg.has_bind || seg.dirty {
+            return None;
+        }
+        if seg.describe == PipelineDescribe::Portal {
             return None;
         }
         if self.in_transaction {
             return None;
         }
-        let stmt_name = buffer.parse_statement_name.as_deref()?;
+        let stmt_name = seg.parse_statement_names.first().map(EcoString::as_str)?;
         if stmt_name.is_empty() {
             return None;
         }
@@ -1530,7 +1788,7 @@ impl ConnectionState {
         let parsed_param_oids = parse_parameter_description(&parameter_description)
             .ok()
             .map(|p| p.parameter_oids);
-        if let Some(stmt_mut) = self.prepared_statements.get_mut(&stmt_name) {
+        if let Some(stmt_mut) = self.prepared_statements.get_mut(stmt_name.as_str()) {
             if let Some(oids) = parsed_param_oids {
                 stmt_mut.parameter_oids = oids;
             }
@@ -1548,7 +1806,7 @@ impl ConnectionState {
         );
         // ParseComplete
         out.put_slice(&[b'1', 0, 0, 0, 4]);
-        if buffer.describe == PipelineDescribe::Statement {
+        if buffer.pending.describe == PipelineDescribe::Statement {
             out.put_slice(&parameter_description);
             if let Some(row_desc) = row_description {
                 out.put_slice(&row_desc);
@@ -1855,23 +2113,6 @@ async fn origin_connect(
     Err(ConnectionError::NoConnection.into())
 }
 
-/// Forward a cacheable query's bytes to origin when cache dispatch isn't
-/// possible (search_path unknown, socket creation failure). Sends either the
-/// buffered pipeline bytes or the raw message data. The query's egress slot has
-/// already been converted to an `Origin` slot by `cache_to_origin`, so this does
-/// not open a new one. Free function to allow disjoint field borrows.
-fn cache_forward_to_origin(
-    extended: &mut ExtendedPending,
-    origin_write_buf: &mut VecDeque<BytesMut>,
-    msg: CacheMessage,
-) {
-    let bytes = extended
-        .pipeline_take()
-        .map(|p| p.buffered_bytes)
-        .unwrap_or_else(|| msg.into_data());
-    origin_write_buf.push_back(bytes);
-}
-
 /// Prepend a `Parse` to `origin_write_buf` when origin doesn't yet know the
 /// statement. No-op if origin already knows it, if no `parse_bytes` were
 /// captured, if the statement is unnamed (origin's unnamed slot doesn't
@@ -1882,7 +2123,6 @@ fn cache_forward_to_origin(
 fn forward_lazy_parse_install(
     stmt_name: &str,
     prepared_statements: &HashMap<String, PreparedStatement>,
-    extended: &mut ExtendedPending,
     origin_write_buf: &mut VecDeque<BytesMut>,
     origin_intercept: &mut OriginIntercept,
 ) {
@@ -1902,10 +2142,12 @@ fn forward_lazy_parse_install(
         return;
     };
     origin_write_buf.push_back(parse_bytes);
+    // The prepended Parse's ParseComplete is swallowed by the LazyParseInline
+    // intercept (which marks origin_prepared) — it is NOT a client-awaited
+    // response, so it must not be queued in pending_parse_statements.
     *origin_intercept = OriginIntercept::LazyParseInline {
         statement_name: stmt_name.to_owned(),
     };
-    extended.pending_parse_statement = Some(stmt_name.to_owned());
     metrics::counter!(names::PROTOCOL_LAZY_PARSE_FORWARDED).increment(1);
 }
 
@@ -2021,8 +2263,10 @@ async fn handle_connection(
                             .await
                         {
                             Ok(returned) => {
+                                // `handle_cache_outcome` set the next mode:
+                                // `OriginDrain` to serve the next batched slot,
+                                // or `Read` when the batch is done / forwarded.
                                 socket = returned;
-                                state.proxy_mode = ProxyMode::Read;
                             }
                             Err(err) => {
                                 debug!("cache serve error [{}]", err);
@@ -2038,16 +2282,12 @@ async fn handle_connection(
                         let proxy_msg = e.into_message();
                         socket = proxy_msg.client_socket;
                         // The cache slot is now serving (message already taken);
-                        // convert it back to an origin slot in place.
-                        state.egress.cache_to_origin();
-                        if let Some(pipeline) = proxy_msg.pipeline {
-                            state.origin_write_buf.push_back(pipeline.buffered_bytes);
-                        } else {
-                            state
-                                .origin_write_buf
-                                .push_back(proxy_msg.message.into_data());
-                        }
-                        state.proxy_mode = ProxyMode::Read;
+                        // forward this entry (lazy-Parsing if origin doesn't know
+                        // its statement) plus the rest of the batch + one Sync.
+                        let bytes = proxy_msg
+                            .pipeline
+                            .map_or_else(|| proxy_msg.message.into_data(), |p| p.buffered_bytes);
+                        state.forward_current_and_rest(bytes);
                     }
                 }
             }
