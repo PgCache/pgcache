@@ -21,7 +21,6 @@ use tokio_postgres::SimpleQueryMessage;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, trace};
 
-use crate::metrics::names;
 use crate::query::ast::Deparse;
 use crate::result::error_chain_format;
 
@@ -84,7 +83,7 @@ impl WriterCore {
     pub(super) async fn mv_build(&mut self, fingerprint: u64) -> CacheResult<()> {
         let Some((ctx, has_table)) = self.mv_context_snapshot(fingerprint) else {
             trace!("mv build: precondition not met for {fingerprint}");
-            metrics::counter!(names::CACHE_MV_SKIPPED_REBUILDS).increment(1);
+            crate::metrics::handles().mv.skipped_rebuilds.increment(1);
             return Ok(());
         };
 
@@ -144,8 +143,13 @@ impl WriterCore {
 
         let elapsed = start.elapsed();
         let kind = if has_table { "rebuild" } else { "first_pop" };
-        metrics::histogram!(names::CACHE_MV_BUILD_DURATION_SECONDS, "kind" => kind)
-            .record(elapsed.as_secs_f64());
+        let mv = &crate::metrics::handles().mv;
+        let build_handle = if has_table {
+            &mv.build_rebuild
+        } else {
+            &mv.build_first_pop
+        };
+        build_handle.record(elapsed.as_secs_f64());
 
         // State re-check only matters for first-pop: CREATE TABLE AS is atomic
         // but not transactional with any follow-up — if source-row state flipped
@@ -174,7 +178,7 @@ impl WriterCore {
             view.mv.state = MvState::Fresh;
         }
 
-        metrics::counter!(names::CACHE_MV_REBUILDS).increment(1);
+        crate::metrics::handles().mv.rebuilds.increment(1);
         trace!(
             "mv build ({kind}): fresh for {fingerprint} in {:?}",
             elapsed
@@ -363,7 +367,7 @@ impl WriterCore {
                     error_chain_format(e.current_context()),
                 );
             } else {
-                metrics::counter!(names::CACHE_MV_DIRTY_TRUNCATES).increment(1);
+                crate::metrics::handles().mv.dirty_truncates.increment(1);
             }
         }
 

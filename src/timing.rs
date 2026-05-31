@@ -8,8 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::metrics::names;
-
 /// Nanoseconds between two instants, saturating at `u64::MAX`.
 ///
 /// `Duration::as_nanos()` returns `u128`; truncating to `u64` covers ~584 years of
@@ -234,48 +232,28 @@ impl QueryTiming {
 #[allow(clippy::cast_precision_loss)]
 pub fn timing_record(timing: &QueryTiming) {
     let durations = timing.durations();
+    let m = crate::metrics::handles();
 
     // Record to Prometheus histograms (converting ns to seconds)
     macro_rules! record_ns {
-        ($field:expr, $name:expr) => {
+        ($field:expr, $handle:expr) => {
             if let Some(ns) = $field {
-                metrics::histogram!($name).record(ns as f64 / 1_000_000_000.0);
+                $handle.record(ns as f64 / 1_000_000_000.0);
             }
         };
     }
-    record_ns!(durations.parse_ns, names::QUERY_STAGE_PARSE_SECONDS);
-    record_ns!(durations.dispatch_ns, names::QUERY_STAGE_DISPATCH_SECONDS);
-    record_ns!(durations.lookup_ns, names::QUERY_STAGE_LOOKUP_SECONDS);
-    record_ns!(
-        durations.queue_wait_ns,
-        names::QUERY_STAGE_QUEUE_WAIT_SECONDS
-    );
-    record_ns!(durations.conn_wait_ns, names::QUERY_STAGE_CONN_WAIT_SECONDS);
-    record_ns!(
-        durations.spawn_wait_ns,
-        names::QUERY_STAGE_SPAWN_WAIT_SECONDS
-    );
-    record_ns!(
-        durations.worker_execution_ns,
-        names::QUERY_STAGE_WORKER_EXEC_SECONDS
-    );
-    record_ns!(
-        durations.response_write_ns,
-        names::QUERY_STAGE_RESPONSE_WRITE_SECONDS
-    );
-    record_ns!(
-        durations.forward_decision_ns,
-        names::QUERY_STAGE_FORWARD_DECISION_SECONDS
-    );
-    record_ns!(
-        durations.coalesce_intake_ns,
-        names::QUERY_STAGE_COALESCE_INTAKE_SECONDS
-    );
-    record_ns!(
-        durations.coalesce_wait_ns,
-        names::QUERY_STAGE_COALESCE_WAIT_SECONDS
-    );
-    record_ns!(durations.total_ns, names::QUERY_STAGE_TOTAL_SECONDS);
+    record_ns!(durations.parse_ns, m.stage.parse);
+    record_ns!(durations.dispatch_ns, m.stage.dispatch);
+    record_ns!(durations.lookup_ns, m.stage.lookup);
+    record_ns!(durations.queue_wait_ns, m.stage.queue_wait);
+    record_ns!(durations.conn_wait_ns, m.stage.conn_wait);
+    record_ns!(durations.spawn_wait_ns, m.stage.spawn_wait);
+    record_ns!(durations.worker_execution_ns, m.stage.worker_exec);
+    record_ns!(durations.response_write_ns, m.stage.response_write);
+    record_ns!(durations.forward_decision_ns, m.stage.forward_decision);
+    record_ns!(durations.coalesce_intake_ns, m.stage.coalesce_intake);
+    record_ns!(durations.coalesce_wait_ns, m.stage.coalesce_wait);
+    record_ns!(durations.total_ns, m.stage.total);
 
     // Trace-level logging for detailed per-query debugging
     if tracing::enabled!(tracing::Level::TRACE) {

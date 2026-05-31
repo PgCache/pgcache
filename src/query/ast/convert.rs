@@ -1304,12 +1304,8 @@ mod tests {
                     table: None,
                     column: EcoString::from("status"),
                 })),
-                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(
-                    "active".into(),
-                ))),
-                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(
-                    "pending".into(),
-                ))),
+                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String("active".into()))),
+                WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String("pending".into()))),
             ],
         };
 

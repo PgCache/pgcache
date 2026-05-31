@@ -11,7 +11,6 @@ use tokio_stream::StreamExt;
 use tracing::{debug, error, info, instrument, trace};
 
 use crate::catalog::TableMetadata;
-use crate::metrics::names;
 
 use crate::query::ast::{BinaryOp, Deparse};
 use crate::query::cast::cast_target_coerce_text;
@@ -283,7 +282,7 @@ impl WriterCdc {
                 .await
                 .attach_loc("flushing deferred invalidation")?;
         }
-        metrics::counter!(names::CACHE_INVALIDATIONS).increment(count);
+        crate::metrics::handles().cdc.invalidations.increment(count);
         core.state_gauges_update();
         Ok(())
     }
@@ -342,15 +341,16 @@ impl WriterCdc {
         core: &mut WriterCore,
         cmd: CdcCommand,
     ) -> CacheResult<()> {
-        let cmd_label = match &cmd {
-            CdcCommand::Begin { .. } => "cdc_begin",
-            CdcCommand::TableRegister(_) => "cdc_table_register",
-            CdcCommand::Insert { .. } => "cdc_insert",
-            CdcCommand::Update { .. } => "cdc_update",
-            CdcCommand::Delete { .. } => "cdc_delete",
-            CdcCommand::Truncate { .. } => "cdc_truncate",
-            CdcCommand::CommitMark { .. } => "cdc_commit_mark",
-            CdcCommand::KeepAliveMark { .. } => "cdc_keepalive_mark",
+        let m = crate::metrics::handles();
+        let cmd_handle = match &cmd {
+            CdcCommand::Begin { .. } => &m.cdc.cmd_begin,
+            CdcCommand::TableRegister(_) => &m.cdc.cmd_table_register,
+            CdcCommand::Insert { .. } => &m.cdc.cmd_insert,
+            CdcCommand::Update { .. } => &m.cdc.cmd_update,
+            CdcCommand::Delete { .. } => &m.cdc.cmd_delete,
+            CdcCommand::Truncate { .. } => &m.cdc.cmd_truncate,
+            CdcCommand::CommitMark { .. } => &m.cdc.cmd_commit_mark,
+            CdcCommand::KeepAliveMark { .. } => &m.cdc.cmd_keepalive_mark,
         };
         let handle_start = Instant::now();
         // Relation OIDs are recorded from frame start so a mid-frame 40P01 can
@@ -486,8 +486,7 @@ impl WriterCdc {
         // Self-defers while the frame is open; flushes here at CommitMark
         // (frame just committed) and KeepAlive (no frame).
         core.publication_dirty_drain().await?;
-        metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
-            .record(handle_start.elapsed().as_secs_f64());
+        cmd_handle.record(handle_start.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -498,7 +497,7 @@ impl WriterCdc {
             self.last_applied_lsn = lsn;
             // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
             #[allow(clippy::cast_precision_loss)]
-            metrics::gauge!(names::CDC_APPLIED_LSN).set(lsn as f64);
+            crate::metrics::handles().cdc.applied_lsn.set(lsn as f64);
         }
     }
 
@@ -512,7 +511,7 @@ impl WriterCdc {
         row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
         let start = Instant::now();
-        metrics::counter!(names::CACHE_HANDLE_INSERTS).increment(1);
+        crate::metrics::handles().cdc.handle_inserts.increment(1);
 
         // CDC event for a relation we don't cache (never cached, or its
         // queries were evicted) is a benign no-op — not a frame-consistency
@@ -550,11 +549,16 @@ impl WriterCdc {
                 .map_or(0, |q| q.queries.len() as u64);
             let freshness_count = total.saturating_sub(invalidation_count);
             if freshness_count > 0 {
-                metrics::counter!(names::CACHE_FRESHNESS_HITS).increment(freshness_count);
+                crate::metrics::handles()
+                    .cdc
+                    .freshness_hits
+                    .increment(freshness_count);
             }
         }
 
-        metrics::histogram!(names::CACHE_HANDLE_INSERT_SECONDS)
+        crate::metrics::handles()
+            .cdc
+            .handle_insert_seconds
             .record(start.elapsed().as_secs_f64());
         Ok(())
     }
@@ -570,7 +574,7 @@ impl WriterCdc {
         new_row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
         let start = Instant::now();
-        metrics::counter!(names::CACHE_HANDLE_UPDATES).increment(1);
+        crate::metrics::handles().cdc.handle_updates.increment(1);
 
         // See handle_insert: an untracked relation's CDC is a benign skip.
         if !core.cache.tables.contains_key1(&relation_oid) {
@@ -607,7 +611,10 @@ impl WriterCdc {
                 .map_or(0, |q| q.queries.len() as u64);
             let freshness_count = total.saturating_sub(invalidation_count);
             if freshness_count > 0 {
-                metrics::counter!(names::CACHE_FRESHNESS_HITS).increment(freshness_count);
+                crate::metrics::handles()
+                    .cdc
+                    .freshness_hits
+                    .increment(freshness_count);
             }
         }
 
@@ -647,7 +654,9 @@ impl WriterCdc {
                 .map_into_report::<CacheError>()?;
         }
 
-        metrics::histogram!(names::CACHE_HANDLE_UPDATE_SECONDS)
+        crate::metrics::handles()
+            .cdc
+            .handle_update_seconds
             .record(start.elapsed().as_secs_f64());
         Ok(())
     }
@@ -665,13 +674,15 @@ impl WriterCdc {
         row_data: Vec<Option<String>>,
     ) -> CacheResult<()> {
         let start = Instant::now();
-        metrics::counter!(names::CACHE_HANDLE_DELETES).increment(1);
+        crate::metrics::handles().cdc.handle_deletes.increment(1);
 
         let table_metadata = match core.cache.tables.get1(&relation_oid) {
             Some(metadata) => metadata,
             None => {
                 error!("No table metadata found for relation_oid: {}", relation_oid);
-                metrics::histogram!(names::CACHE_HANDLE_DELETE_SECONDS)
+                crate::metrics::handles()
+                    .cdc
+                    .handle_delete_seconds
                     .record(start.elapsed().as_secs_f64());
                 return Ok(());
             }
@@ -715,11 +726,16 @@ impl WriterCdc {
                 .map_or(0, |q| q.queries.len() as u64);
             let freshness_count = total.saturating_sub(invalidation_count);
             if freshness_count > 0 {
-                metrics::counter!(names::CACHE_FRESHNESS_HITS).increment(freshness_count);
+                crate::metrics::handles()
+                    .cdc
+                    .freshness_hits
+                    .increment(freshness_count);
             }
         }
 
-        metrics::histogram!(names::CACHE_HANDLE_DELETE_SECONDS)
+        crate::metrics::handles()
+            .cdc
+            .handle_delete_seconds
             .record(start.elapsed().as_secs_f64());
         Ok(())
     }
@@ -1247,7 +1263,7 @@ impl WriterCdc {
                 local_hit = true;
             }
             if local_hit {
-                metrics::counter!(names::CACHE_CDC_LOCAL_EVAL_HITS).increment(1);
+                crate::metrics::handles().cdc.local_eval_hits.increment(1);
             }
 
             // PgEval (the expensive set): only Fresh-MV queries need full
@@ -1287,7 +1303,7 @@ impl WriterCdc {
                 }
 
                 if pg_hit {
-                    metrics::counter!(names::CACHE_CDC_PG_EVAL_HITS).increment(1);
+                    crate::metrics::handles().cdc.pg_eval_hits.increment(1);
                 }
             }
 
@@ -1582,7 +1598,11 @@ impl WriterCore {
 /// with an empty SET list, so PK-only tables must use `DO NOTHING`.
 ///
 /// Assumes the caller has already emitted `INSERT INTO ... ON CONFLICT (<pk>)`.
-fn cdc_on_conflict_tail_append(sql: &mut String, column_names: &[&str], pkey_columns: &[EcoString]) {
+fn cdc_on_conflict_tail_append(
+    sql: &mut String,
+    column_names: &[&str],
+    pkey_columns: &[EcoString],
+) {
     let is_pk = |name: &str| pkey_columns.iter().any(|pk| pk.as_str() == name);
     let has_non_pk = column_names.iter().any(|c| !is_pk(c));
     if !has_non_pk {

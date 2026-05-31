@@ -13,7 +13,6 @@ use tokio_stream::StreamExt;
 use tracing::{debug, error, trace};
 
 use crate::catalog::TableMetadata;
-use crate::metrics::names;
 use crate::query::ast::Deparse;
 use crate::query::resolved::{ResolvedSelectNode, ResolvedTableNode};
 use crate::query::transform::resolved_select_node_replace;
@@ -46,21 +45,22 @@ pub async fn population_worker(
 ) {
     debug!("population worker {id} started");
 
+    let (idle_handle, queue_handle) = crate::metrics::population_worker_handles(id);
     let mut idle_start = Instant::now();
     while let Some(work) = rx.recv().await {
         // Time spent waiting on rx — recorded as a histogram so the `_sum`
         // gives cumulative idle time per worker (utilization signal) and the
         // quantiles surface variance. Pairs with task_seconds and wall clock
         // to compute per-worker utilization.
-        metrics::histogram!(names::CACHE_POPULATION_WORKER_IDLE_SECONDS, "worker" => id.to_string())
-            .record(idle_start.elapsed().as_secs_f64());
+        idle_handle.record(idle_start.elapsed().as_secs_f64());
 
         // Channel depth gauge; queue length never approaches 2^53.
         #[allow(clippy::cast_precision_loss)]
-        metrics::gauge!(names::CACHE_POPULATION_WORKER_QUEUE, "worker" => id.to_string())
-            .set(rx.len() as f64);
+        queue_handle.set(rx.len() as f64);
 
-        metrics::histogram!(names::CACHE_POPULATION_WAIT_SECONDS)
+        crate::metrics::handles()
+            .reg
+            .population_wait
             .record(work.enqueued_at.elapsed().as_secs_f64());
 
         let task_start = Instant::now();
@@ -90,7 +90,9 @@ pub async fn population_worker(
             }
             break r;
         };
-        metrics::histogram!(names::CACHE_POPULATION_TASK_SECONDS)
+        crate::metrics::handles()
+            .reg
+            .population_task
             .record(task_start.elapsed().as_secs_f64());
 
         idle_start = Instant::now();
@@ -182,7 +184,9 @@ async fn population_task(
                 population_stream(&db_origin, db_cache, table, table_node, branch, max_limit)
                     .await?;
             let stream_elapsed = stream_start.elapsed();
-            metrics::histogram!(names::CACHE_POPULATION_STREAM_SECONDS)
+            crate::metrics::handles()
+                .reg
+                .population_stream
                 .record(stream_elapsed.as_secs_f64());
 
             total_bytes += bytes;

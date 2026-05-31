@@ -1,6 +1,9 @@
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::Duration;
+
+use metrics::{Counter, Gauge, Histogram};
 
 use bytes::Bytes;
 use http::{Method, Response};
@@ -233,6 +236,347 @@ pub mod names {
     pub const QUERY_STAGE_TOTAL_SECONDS: &str = "pgcache.query.stage.total_seconds";
 }
 
+/// Cached metric handles, grouped by usage area.
+///
+/// The `metrics::histogram!`/`counter!`/`gauge!` macros re-hash the metric key on
+/// every call to look the handle up in the recorder registry. Profiling under
+/// load showed that key hashing + registration accounted for ~12% of on-CPU time
+/// — `timing_record` alone fires 12 histograms per query. Resolving each handle
+/// once and reusing it skips the per-call SipHash + registry lookup. Handles are
+/// cheap clonable references to the underlying metric, so caching them is sound.
+///
+/// Access via [`handles`]; `names::` constants appear only in the builders below.
+pub struct Handles {
+    /// Connection lifecycle + wire-protocol counters (proxy connection/server).
+    pub conn: ConnHandles,
+    /// Per-query routing outcomes + end-to-end latency (proxy).
+    pub query: QueryHandles,
+    /// Per-stage query timing histograms (timing.rs).
+    pub stage: StageHandles,
+    /// Cache-worker serving: lookup, MV serve, request coalescing.
+    pub cache: CacheHandles,
+    /// CDC ingest + apply: events, row ops, lag, LSN watermarks.
+    pub cdc: CdcHandles,
+    /// Materialized-view rebuild instrumentation (writer).
+    pub mv: MvHandles,
+    /// Query registration + population pipeline (writer).
+    pub reg: RegHandles,
+    /// Cache state, sizing, admission/eviction, and queue-depth gauges.
+    pub state: StateHandles,
+}
+
+pub struct ConnHandles {
+    pub total: Counter,
+    pub active: Gauge,
+    pub errors: Counter,
+    pub simple_queries: Counter,
+    pub extended_queries: Counter,
+    pub prepared_statements: Gauge,
+    pub describe_hits: Counter,
+    pub describe_misses: Counter,
+    pub describe_evictions: Counter,
+    pub describe_invalidations: Counter,
+    pub lazy_parse_forwarded: Counter,
+}
+
+pub struct QueryHandles {
+    pub total: Counter,
+    pub cacheable: Counter,
+    pub uncacheable: Counter,
+    pub unsupported: Counter,
+    pub invalid: Counter,
+    pub cache_hit: Counter,
+    pub cache_miss: Counter,
+    pub cache_error: Counter,
+    pub allowlist_skipped: Counter,
+    pub cache_latency: Histogram,
+    pub origin_latency: Histogram,
+    pub origin_execution: Histogram,
+}
+
+pub struct StageHandles {
+    pub parse: Histogram,
+    pub dispatch: Histogram,
+    pub lookup: Histogram,
+    pub queue_wait: Histogram,
+    pub conn_wait: Histogram,
+    pub spawn_wait: Histogram,
+    pub worker_exec: Histogram,
+    pub response_write: Histogram,
+    pub forward_decision: Histogram,
+    pub coalesce_intake: Histogram,
+    pub coalesce_wait: Histogram,
+    pub total: Histogram,
+}
+
+pub struct CacheHandles {
+    pub lookup_latency: Histogram,
+    pub mv_hits: Counter,
+    pub mv_fallthrough: Counter,
+    pub coalesce_waiting: Gauge,
+    pub coalesce_served: Counter,
+}
+
+pub struct CdcHandles {
+    pub events_processed: Counter,
+    pub inserts: Counter,
+    pub updates: Counter,
+    pub deletes: Counter,
+    pub lag_seconds: Gauge,
+    pub lag_bytes: Gauge,
+    pub flush_staleness: Gauge,
+    pub received_lsn: Gauge,
+    pub flushed_lsn: Gauge,
+    pub applied_lsn: Gauge,
+    pub invalidations: Counter,
+    pub freshness_hits: Counter,
+    pub local_eval_hits: Counter,
+    pub pg_eval_hits: Counter,
+    pub handle_inserts: Counter,
+    pub handle_updates: Counter,
+    pub handle_deletes: Counter,
+    pub handle_insert_seconds: Histogram,
+    pub handle_update_seconds: Histogram,
+    pub handle_delete_seconds: Histogram,
+    // Per-command handle latency, one cached handle per CdcCommand `cmd` label.
+    pub cmd_begin: Histogram,
+    pub cmd_table_register: Histogram,
+    pub cmd_insert: Histogram,
+    pub cmd_update: Histogram,
+    pub cmd_delete: Histogram,
+    pub cmd_truncate: Histogram,
+    pub cmd_commit_mark: Histogram,
+    pub cmd_keepalive_mark: Histogram,
+}
+
+pub struct MvHandles {
+    pub rebuilds: Counter,
+    pub skipped_rebuilds: Counter,
+    pub dirty_truncates: Counter,
+    // Build-duration histogram, one cached handle per `kind` label.
+    pub build_first_pop: Histogram,
+    pub build_rebuild: Histogram,
+}
+
+pub struct RegHandles {
+    // Per-command handle latency, one cached handle per QueryCommand `cmd` label.
+    pub cmd_register: Histogram,
+    pub cmd_ready: Histogram,
+    pub cmd_failed: Histogram,
+    pub cmd_limit_bump: Histogram,
+    pub cmd_readmit: Histogram,
+    pub cmd_mv_build: Histogram,
+    pub register_resolve: Histogram,
+    pub register_subsumption_check: Histogram,
+    pub register_subsume: Histogram,
+    pub register_insert: Histogram,
+    pub register_publication_update: Histogram,
+    pub register_populate_dispatch: Histogram,
+    pub resolve_update_queries_register: Histogram,
+    pub resolve_deparse: Histogram,
+    pub subsumptions: Counter,
+    pub subsumption_latency: Histogram,
+    pub registration_latency: Histogram,
+    pub population_task: Histogram,
+    pub population_stream: Histogram,
+    pub population_wait: Histogram,
+}
+
+pub struct StateHandles {
+    pub queries_registered: Gauge,
+    pub queries_loading: Gauge,
+    pub queries_pending: Gauge,
+    pub queries_invalidated: Gauge,
+    pub size_bytes: Gauge,
+    pub size_limit_bytes: Gauge,
+    pub generation: Gauge,
+    pub tables_tracked: Gauge,
+    pub update_queries_total: Gauge,
+    pub update_queries_max_per_relation: Gauge,
+    pub evictions: Counter,
+    pub evictions_pinned_bump: Counter,
+    pub evictions_bump: Counter,
+    pub readmissions: Counter,
+    pub queue_writer_query: Gauge,
+    pub queue_writer_cdc: Gauge,
+    pub queue_writer_internal: Gauge,
+    pub queue_worker: Gauge,
+    pub queue_proxy_message: Gauge,
+}
+
+impl Handles {
+    fn build() -> Self {
+        use names::*;
+        Self {
+            conn: ConnHandles {
+                total: metrics::counter!(CONNECTIONS_TOTAL),
+                active: metrics::gauge!(CONNECTIONS_ACTIVE),
+                errors: metrics::counter!(CONNECTIONS_ERRORS),
+                simple_queries: metrics::counter!(PROTOCOL_SIMPLE_QUERIES),
+                extended_queries: metrics::counter!(PROTOCOL_EXTENDED_QUERIES),
+                prepared_statements: metrics::gauge!(PROTOCOL_PREPARED_STATEMENTS),
+                describe_hits: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_HITS),
+                describe_misses: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_MISSES),
+                describe_evictions: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_EVICTIONS),
+                describe_invalidations: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS),
+                lazy_parse_forwarded: metrics::counter!(PROTOCOL_LAZY_PARSE_FORWARDED),
+            },
+            query: QueryHandles {
+                total: metrics::counter!(QUERIES_TOTAL),
+                cacheable: metrics::counter!(QUERIES_CACHEABLE),
+                uncacheable: metrics::counter!(QUERIES_UNCACHEABLE),
+                unsupported: metrics::counter!(QUERIES_UNSUPPORTED),
+                invalid: metrics::counter!(QUERIES_INVALID),
+                cache_hit: metrics::counter!(QUERIES_CACHE_HIT),
+                cache_miss: metrics::counter!(QUERIES_CACHE_MISS),
+                cache_error: metrics::counter!(QUERIES_CACHE_ERROR),
+                allowlist_skipped: metrics::counter!(QUERIES_ALLOWLIST_SKIPPED),
+                cache_latency: metrics::histogram!(CACHE_QUERY_LATENCY_SECONDS),
+                origin_latency: metrics::histogram!(ORIGIN_QUERY_LATENCY_SECONDS),
+                origin_execution: metrics::histogram!(ORIGIN_EXECUTION_SECONDS),
+            },
+            stage: StageHandles {
+                parse: metrics::histogram!(QUERY_STAGE_PARSE_SECONDS),
+                dispatch: metrics::histogram!(QUERY_STAGE_DISPATCH_SECONDS),
+                lookup: metrics::histogram!(QUERY_STAGE_LOOKUP_SECONDS),
+                queue_wait: metrics::histogram!(QUERY_STAGE_QUEUE_WAIT_SECONDS),
+                conn_wait: metrics::histogram!(QUERY_STAGE_CONN_WAIT_SECONDS),
+                spawn_wait: metrics::histogram!(QUERY_STAGE_SPAWN_WAIT_SECONDS),
+                worker_exec: metrics::histogram!(QUERY_STAGE_WORKER_EXEC_SECONDS),
+                response_write: metrics::histogram!(QUERY_STAGE_RESPONSE_WRITE_SECONDS),
+                forward_decision: metrics::histogram!(QUERY_STAGE_FORWARD_DECISION_SECONDS),
+                coalesce_intake: metrics::histogram!(QUERY_STAGE_COALESCE_INTAKE_SECONDS),
+                coalesce_wait: metrics::histogram!(QUERY_STAGE_COALESCE_WAIT_SECONDS),
+                total: metrics::histogram!(QUERY_STAGE_TOTAL_SECONDS),
+            },
+            cache: CacheHandles {
+                lookup_latency: metrics::histogram!(CACHE_LOOKUP_LATENCY_SECONDS),
+                mv_hits: metrics::counter!(CACHE_MV_HITS),
+                mv_fallthrough: metrics::counter!(CACHE_MV_FALLTHROUGH),
+                coalesce_waiting: metrics::gauge!(CACHE_COALESCE_WAITING),
+                coalesce_served: metrics::counter!(CACHE_COALESCE_SERVED),
+            },
+            cdc: CdcHandles {
+                events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),
+                inserts: metrics::counter!(CDC_INSERTS),
+                updates: metrics::counter!(CDC_UPDATES),
+                deletes: metrics::counter!(CDC_DELETES),
+                lag_seconds: metrics::gauge!(CDC_LAG_SECONDS),
+                lag_bytes: metrics::gauge!(CDC_LAG_BYTES),
+                flush_staleness: metrics::gauge!(CDC_FLUSH_STALENESS_SECONDS),
+                received_lsn: metrics::gauge!(CDC_RECEIVED_LSN),
+                flushed_lsn: metrics::gauge!(CDC_FLUSHED_LSN),
+                applied_lsn: metrics::gauge!(CDC_APPLIED_LSN),
+                invalidations: metrics::counter!(CACHE_INVALIDATIONS),
+                freshness_hits: metrics::counter!(CACHE_FRESHNESS_HITS),
+                local_eval_hits: metrics::counter!(CACHE_CDC_LOCAL_EVAL_HITS),
+                pg_eval_hits: metrics::counter!(CACHE_CDC_PG_EVAL_HITS),
+                handle_inserts: metrics::counter!(CACHE_HANDLE_INSERTS),
+                handle_updates: metrics::counter!(CACHE_HANDLE_UPDATES),
+                handle_deletes: metrics::counter!(CACHE_HANDLE_DELETES),
+                handle_insert_seconds: metrics::histogram!(CACHE_HANDLE_INSERT_SECONDS),
+                handle_update_seconds: metrics::histogram!(CACHE_HANDLE_UPDATE_SECONDS),
+                handle_delete_seconds: metrics::histogram!(CACHE_HANDLE_DELETE_SECONDS),
+                cmd_begin: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_begin"),
+                cmd_table_register: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_table_register"),
+                cmd_insert: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_insert"),
+                cmd_update: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_update"),
+                cmd_delete: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_delete"),
+                cmd_truncate: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_truncate"),
+                cmd_commit_mark: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_commit_mark"),
+                cmd_keepalive_mark: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_keepalive_mark"),
+            },
+            mv: MvHandles {
+                rebuilds: metrics::counter!(CACHE_MV_REBUILDS),
+                skipped_rebuilds: metrics::counter!(CACHE_MV_SKIPPED_REBUILDS),
+                dirty_truncates: metrics::counter!(CACHE_MV_DIRTY_TRUNCATES),
+                build_first_pop: metrics::histogram!(CACHE_MV_BUILD_DURATION_SECONDS, "kind" => "first_pop"),
+                build_rebuild: metrics::histogram!(CACHE_MV_BUILD_DURATION_SECONDS, "kind" => "rebuild"),
+            },
+            reg: RegHandles {
+                cmd_register: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "register"),
+                cmd_ready: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "ready"),
+                cmd_failed: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "failed"),
+                cmd_limit_bump: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "limit_bump"),
+                cmd_readmit: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "readmit"),
+                cmd_mv_build: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build"),
+                register_resolve: metrics::histogram!(CACHE_WRITER_REGISTER_RESOLVE_SECONDS),
+                register_subsumption_check: metrics::histogram!(
+                    CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS
+                ),
+                register_subsume: metrics::histogram!(CACHE_WRITER_REGISTER_SUBSUME_SECONDS),
+                register_insert: metrics::histogram!(CACHE_WRITER_REGISTER_INSERT_SECONDS),
+                register_publication_update: metrics::histogram!(
+                    CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS
+                ),
+                register_populate_dispatch: metrics::histogram!(
+                    CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS
+                ),
+                resolve_update_queries_register: metrics::histogram!(
+                    CACHE_WRITER_RESOLVE_UPDATE_QUERIES_REGISTER_SECONDS
+                ),
+                resolve_deparse: metrics::histogram!(CACHE_WRITER_RESOLVE_DEPARSE_SECONDS),
+                subsumptions: metrics::counter!(CACHE_SUBSUMPTIONS),
+                subsumption_latency: metrics::histogram!(CACHE_SUBSUMPTION_LATENCY_SECONDS),
+                registration_latency: metrics::histogram!(QUERY_REGISTRATION_LATENCY_SECONDS),
+                population_task: metrics::histogram!(CACHE_POPULATION_TASK_SECONDS),
+                population_stream: metrics::histogram!(CACHE_POPULATION_STREAM_SECONDS),
+                population_wait: metrics::histogram!(CACHE_POPULATION_WAIT_SECONDS),
+            },
+            state: StateHandles {
+                queries_registered: metrics::gauge!(CACHE_QUERIES_REGISTERED),
+                queries_loading: metrics::gauge!(CACHE_QUERIES_LOADING),
+                queries_pending: metrics::gauge!(CACHE_QUERIES_PENDING),
+                queries_invalidated: metrics::gauge!(CACHE_QUERIES_INVALIDATED),
+                size_bytes: metrics::gauge!(CACHE_SIZE_BYTES),
+                size_limit_bytes: metrics::gauge!(CACHE_SIZE_LIMIT_BYTES),
+                generation: metrics::gauge!(CACHE_GENERATION),
+                tables_tracked: metrics::gauge!(CACHE_TABLES_TRACKED),
+                update_queries_total: metrics::gauge!(CACHE_WRITER_UPDATE_QUERIES_TOTAL),
+                update_queries_max_per_relation: metrics::gauge!(
+                    CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION
+                ),
+                evictions: metrics::counter!(CACHE_EVICTIONS),
+                evictions_pinned_bump: metrics::counter!(CACHE_EVICTIONS, "result" => "pinned_bump"),
+                evictions_bump: metrics::counter!(CACHE_EVICTIONS, "result" => "bump"),
+                readmissions: metrics::counter!(CACHE_READMISSIONS),
+                queue_writer_query: metrics::gauge!(CACHE_WRITER_QUERY_QUEUE),
+                queue_writer_cdc: metrics::gauge!(CACHE_WRITER_CDC_QUEUE),
+                queue_writer_internal: metrics::gauge!(CACHE_WRITER_INTERNAL_QUEUE),
+                queue_worker: metrics::gauge!(CACHE_WORKER_QUEUE),
+                queue_proxy_message: metrics::gauge!(CACHE_PROXY_MESSAGE_QUEUE),
+            },
+        }
+    }
+}
+
+static HANDLES: OnceLock<Handles> = OnceLock::new();
+
+/// Cached metric handles grouped by usage area. First call binds handles to the
+/// currently installed recorder; `metrics_recorder_install` primes this after
+/// install so the handles bind to the real Prometheus recorder rather than a
+/// no-op.
+pub fn handles() -> &'static Handles {
+    HANDLES.get_or_init(Handles::build)
+}
+
+/// Per-worker population handles (idle-time histogram, queue-depth gauge),
+/// labeled `worker={id}`. The label value is dynamic, so these can't live in the
+/// global [`Handles`]; resolve once per worker and reuse across the worker loop.
+pub fn population_worker_handles(id: usize) -> (Histogram, Gauge) {
+    let worker = id.to_string();
+    (
+        metrics::histogram!(names::CACHE_POPULATION_WORKER_IDLE_SECONDS, "worker" => worker.clone()),
+        metrics::gauge!(names::CACHE_POPULATION_WORKER_QUEUE, "worker" => worker),
+    )
+}
+
+/// Per-worker proxy queue-depth gauge, labeled `worker={id}`. Dynamic label —
+/// resolve once per proxy worker and reuse across its accept loop.
+pub fn proxy_worker_queue_handle(id: usize) -> Gauge {
+    metrics::gauge!(names::PROXY_WORKER_QUEUE, "worker" => id.to_string())
+}
+
 /// Install the global Prometheus metrics recorder.
 ///
 /// This only builds the recorder and sets it as global. Call `admin_server_spawn`
@@ -247,6 +591,9 @@ pub fn metrics_recorder_install() -> MetricsResult<PrometheusHandle> {
 
     metrics::set_global_recorder(recorder)
         .map_err(|_| Report::new(MetricsError::RecorderInstall))?;
+
+    // Bind the cached handles to the recorder we just installed.
+    let _ = handles();
 
     Ok(handle)
 }

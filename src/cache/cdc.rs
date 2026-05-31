@@ -25,7 +25,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, trace};
 
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata, cache_type_name_resolve};
-use crate::metrics::names;
 use crate::pg::cdc::connect_replication;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
@@ -165,7 +164,7 @@ impl CdcProcessor {
         self.last_received_lsn = lsn;
         // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
         #[allow(clippy::cast_precision_loss)]
-        metrics::gauge!(names::CDC_RECEIVED_LSN).set(lsn as f64);
+        crate::metrics::handles().cdc.received_lsn.set(lsn as f64);
 
         // Calculate time-based lag: difference between server timestamp and our current time
         let server_timestamp = xlog_data.timestamp();
@@ -174,19 +173,25 @@ impl CdcProcessor {
         // Lag values are floats for Prometheus; precision past 2^53 µs (~285 yr) is irrelevant.
         #[allow(clippy::cast_precision_loss)]
         let lag_seconds = lag_micros as f64 / 1_000_000.0;
-        metrics::gauge!(names::CDC_LAG_SECONDS).set(lag_seconds);
+        crate::metrics::handles().cdc.lag_seconds.set(lag_seconds);
 
         // Byte-based lag: difference between WAL end and our last acknowledged position
         let wal_end = xlog_data.wal_end();
         let lag_bytes = wal_end.saturating_sub(self.last_flushed_lsn);
         #[allow(clippy::cast_precision_loss)]
-        metrics::gauge!(names::CDC_LAG_BYTES).set(lag_bytes as f64);
+        crate::metrics::handles()
+            .cdc
+            .lag_bytes
+            .set(lag_bytes as f64);
 
         // How long since we last acknowledged our position to PostgreSQL
         let flush_staleness = self
             .last_flush_sent
             .map_or(0.0, |t| t.elapsed().as_secs_f64());
-        metrics::gauge!(names::CDC_FLUSH_STALENESS_SECONDS).set(flush_staleness);
+        crate::metrics::handles()
+            .cdc
+            .flush_staleness
+            .set(flush_staleness);
     }
 
     /// Marks the current LSN as decoded after successful processing.
@@ -244,7 +249,10 @@ impl CdcProcessor {
                 // Update tracking on successful send
                 self.last_flushed_lsn = decoded_lsn;
                 #[allow(clippy::cast_precision_loss)]
-                metrics::gauge!(names::CDC_FLUSHED_LSN).set(decoded_lsn as f64);
+                crate::metrics::handles()
+                    .cdc
+                    .flushed_lsn
+                    .set(decoded_lsn as f64);
                 self.last_flush_sent = Some(Instant::now());
                 self.keep_alive_sent_count += 1;
                 let count = self.keep_alive_sent_count;
@@ -292,7 +300,10 @@ impl CdcProcessor {
             self.last_received_lsn = wal_end;
             self.last_decoded_lsn = wal_end;
             #[allow(clippy::cast_precision_loss)]
-            metrics::gauge!(names::CDC_RECEIVED_LSN).set(wal_end as f64);
+            crate::metrics::handles()
+                .cdc
+                .received_lsn
+                .set(wal_end as f64);
 
             // Forward a keep-alive mark to the writer so its applied-LSN
             // watermark can advance during idle periods (no published-table
@@ -319,7 +330,7 @@ impl CdcProcessor {
     ) -> Result<(), Error> {
         match msg {
             ReplicationMessage::XLogData(xlog_data) => {
-                metrics::counter!(names::CDC_EVENTS_PROCESSED).increment(1);
+                crate::metrics::handles().cdc.events_processed.increment(1);
                 self.update_lsn(&xlog_data).await;
                 let result = match xlog_data.into_data() {
                     LogicalReplicationMessage::Begin(body) => self.process_begin(&body).await,
@@ -413,7 +424,7 @@ impl CdcProcessor {
 
     /// Processes insert messages with query-aware filtering.
     async fn process_insert(&mut self, body: &InsertBody) -> Result<(), Error> {
-        metrics::counter!(names::CDC_INSERTS).increment(1);
+        crate::metrics::handles().cdc.inserts.increment(1);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
@@ -438,7 +449,7 @@ impl CdcProcessor {
 
     /// Processes update messages with query-aware filtering.
     async fn process_update(&mut self, body: &UpdateBody) -> Result<(), Error> {
-        metrics::counter!(names::CDC_UPDATES).increment(1);
+        crate::metrics::handles().cdc.updates.increment(1);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table
@@ -464,7 +475,7 @@ impl CdcProcessor {
 
     /// Processes delete messages with query-aware filtering.
     async fn process_delete(&mut self, body: &DeleteBody) -> Result<(), Error> {
-        metrics::counter!(names::CDC_DELETES).increment(1);
+        crate::metrics::handles().cdc.deletes.increment(1);
         let relation_oid = body.rel_id();
 
         // Check if there are any cached queries for this table

@@ -13,7 +13,6 @@ use tracing::{debug, error, info, instrument, trace};
 
 use crate::cache::query::limit_rows_needed;
 use crate::catalog::{TableMetadata, aggregate_functions_load};
-use crate::metrics::names;
 use crate::query::ast::{Deparse, QueryBody, QueryExpr, TableNode};
 use crate::query::constraints::{
     TableConstraint, analyze_query_constraints, table_constraints_subsumed,
@@ -248,13 +247,14 @@ impl WriterRegistration {
         core: &mut WriterCore,
         cmd: QueryCommand,
     ) -> CacheResult<()> {
-        let cmd_label = match &cmd {
-            QueryCommand::Register { .. } => "register",
-            QueryCommand::Ready { .. } => "ready",
-            QueryCommand::Failed { .. } => "failed",
-            QueryCommand::LimitBump { .. } => "limit_bump",
-            QueryCommand::Readmit { .. } => "readmit",
-            QueryCommand::MvBuild { .. } => "mv_build",
+        let reg = &crate::metrics::handles().reg;
+        let cmd_handle = match &cmd {
+            QueryCommand::Register { .. } => &reg.cmd_register,
+            QueryCommand::Ready { .. } => &reg.cmd_ready,
+            QueryCommand::Failed { .. } => &reg.cmd_failed,
+            QueryCommand::LimitBump { .. } => &reg.cmd_limit_bump,
+            QueryCommand::Readmit { .. } => &reg.cmd_readmit,
+            QueryCommand::MvBuild { .. } => &reg.cmd_mv_build,
         };
         let handle_start = Instant::now();
         match cmd {
@@ -268,7 +268,8 @@ impl WriterRegistration {
                 pinned,
             } => {
                 trace!("command query register {fingerprint}");
-                let search_path_refs: Vec<&str> = search_path.iter().map(EcoString::as_str).collect();
+                let search_path_refs: Vec<&str> =
+                    search_path.iter().map(EcoString::as_str).collect();
                 if let Err(e) = self
                     .query_register(
                         core,
@@ -362,8 +363,7 @@ impl WriterRegistration {
         // emission is on a periodic tick in `writer_run` — iterating the
         // state_view DashMap per command dominated writer time at scale.
         core.publication_dirty_drain().await?;
-        metrics::histogram!(names::CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => cmd_label)
-            .record(handle_start.elapsed().as_secs_f64());
+        cmd_handle.record(handle_start.elapsed().as_secs_f64());
         Ok(())
     }
 
@@ -673,7 +673,9 @@ impl WriterRegistration {
         let mut buf = String::with_capacity(256);
         resolved.deparse(&mut buf);
         let deparsed_sql: EcoString = buf.into();
-        metrics::histogram!(names::CACHE_WRITER_RESOLVE_DEPARSE_SECONDS)
+        crate::metrics::handles()
+            .reg
+            .resolve_deparse
             .record(deparse_start.elapsed().as_secs_f64());
 
         // Classify the shape once here; `query_register` and MV setup both reuse
@@ -703,7 +705,9 @@ impl WriterRegistration {
         let uq_start = Instant::now();
         let relation_oids =
             self.update_queries_register(core, fingerprint, &resolved, max_limit.is_some())?;
-        metrics::histogram!(names::CACHE_WRITER_RESOLVE_UPDATE_QUERIES_REGISTER_SECONDS)
+        crate::metrics::handles()
+            .reg
+            .resolve_update_queries_register
             .record(uq_start.elapsed().as_secs_f64());
 
         Ok(QueryResolution {
@@ -873,8 +877,10 @@ impl WriterRegistration {
             m.subsumption_count += 1;
         }
 
-        metrics::counter!(names::CACHE_SUBSUMPTIONS).increment(1);
-        metrics::histogram!(names::CACHE_SUBSUMPTION_LATENCY_SECONDS)
+        crate::metrics::handles().reg.subsumptions.increment(1);
+        crate::metrics::handles()
+            .reg
+            .subsumption_latency
             .record(subsume_start.elapsed().as_secs_f64());
 
         debug!("query subsumed {fingerprint}");
@@ -918,7 +924,9 @@ impl WriterRegistration {
         let resolution = self
             .query_resolve(core, fingerprint, cacheable_query, search_path)
             .await?;
-        metrics::histogram!(names::CACHE_WRITER_REGISTER_RESOLVE_SECONDS)
+        crate::metrics::handles()
+            .reg
+            .register_resolve
             .record(resolve_start.elapsed().as_secs_f64());
 
         // Classify shape for MV eligibility. Sticky — readmit/limit-bump
@@ -929,7 +937,9 @@ impl WriterRegistration {
         // Phase 2: Subsumption check
         let subsumption_start = Instant::now();
         let subsumed = self.subsumption_check(core, &resolution);
-        metrics::histogram!(names::CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS)
+        crate::metrics::handles()
+            .reg
+            .register_subsumption_check
             .record(subsumption_start.elapsed().as_secs_f64());
 
         if subsumed {
@@ -941,7 +951,9 @@ impl WriterRegistration {
             let subsume_result = self
                 .query_subsume(core, fingerprint, resolution, started_at, pinned)
                 .await?;
-            metrics::histogram!(names::CACHE_WRITER_REGISTER_SUBSUME_SECONDS)
+            crate::metrics::handles()
+                .reg
+                .register_subsume
                 .record(subsume_start.elapsed().as_secs_f64());
             match subsume_result {
                 Some((generation, resolved, deparsed_sql)) => {
@@ -1009,13 +1021,17 @@ impl WriterRegistration {
             .metrics
             .entry(fingerprint)
             .or_insert_with(|| QueryMetrics::new(now));
-        metrics::histogram!(names::CACHE_WRITER_REGISTER_INSERT_SECONDS)
+        crate::metrics::handles()
+            .reg
+            .register_insert
             .record(insert_start.elapsed().as_secs_f64());
 
         if relations_changed {
             let pub_start = Instant::now();
             core.publication_update().await?;
-            metrics::histogram!(names::CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS)
+            crate::metrics::handles()
+                .reg
+                .register_publication_update
                 .record(pub_start.elapsed().as_secs_f64());
         }
 
@@ -1028,7 +1044,9 @@ impl WriterRegistration {
             resolution.max_limit,
         );
         self.populate_work_dispatch(work)?;
-        metrics::histogram!(names::CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS)
+        crate::metrics::handles()
+            .reg
+            .register_populate_dispatch
             .record(dispatch_start.elapsed().as_secs_f64());
         trace!("population work queued for query {fingerprint}");
         Ok(())
@@ -1044,7 +1062,7 @@ impl WriterRegistration {
         started_at: Instant,
     ) -> CacheResult<()> {
         debug!("readmitting query {fingerprint}");
-        metrics::counter!(names::CACHE_READMISSIONS).increment(1);
+        crate::metrics::handles().state.readmissions.increment(1);
         if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
             m.readmission_count += 1;
         }
@@ -1114,7 +1132,9 @@ impl WriterRegistration {
             // Record registration latency metric
             let population_duration_us = started_at.map(|s| {
                 let latency = s.elapsed();
-                metrics::histogram!(names::QUERY_REGISTRATION_LATENCY_SECONDS)
+                crate::metrics::handles()
+                    .reg
+                    .registration_latency
                     .record(latency.as_secs_f64());
                 duration_to_us_u64(latency)
             });

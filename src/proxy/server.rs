@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace};
 
 use crate::cache::StatusRequest;
-use crate::metrics::{admin_server_spawn, names};
+use crate::metrics::admin_server_spawn;
 
 /// Initial backoff delay for cache restart attempts
 const INITIAL_BACKOFF_MS: u64 = 100;
@@ -493,7 +493,7 @@ pub fn proxy_run(
                             ))))
                         })?;
                         let _ = socket.set_nodelay(true);
-                        metrics::counter!(names::CONNECTIONS_TOTAL).increment(1);
+                        crate::metrics::handles().conn.total.increment(1);
                         debug!("socket accepted");
 
                         if let Some(worker) = workers.get(cur_worker) {

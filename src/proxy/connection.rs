@@ -36,7 +36,6 @@ use crate::{
         messages::{PipelineContext, PipelineDescribe},
         query::CacheableQuery,
     },
-    metrics::names,
     pg::protocol::{
         ProtocolError,
         backend::{
@@ -73,7 +72,7 @@ struct ActiveConnectionGuard;
 
 impl Drop for ActiveConnectionGuard {
     fn drop(&mut self) {
-        metrics::gauge!(names::CONNECTIONS_ACTIVE).decrement(1.0);
+        crate::metrics::handles().conn.active.decrement(1.0);
     }
 }
 
@@ -264,13 +263,14 @@ impl QueryTelemetry {
     /// via `timing_record`.
     fn origin_complete(&mut self) {
         let now = Instant::now();
+        let m = crate::metrics::handles();
         if let Some(start) = self.origin_sent_at.take() {
-            metrics::histogram!(names::ORIGIN_EXECUTION_SECONDS)
+            m.query
+                .origin_execution
                 .record(start.elapsed().as_secs_f64());
         }
         if let Some(start) = self.client_received_at.take() {
-            metrics::histogram!(names::ORIGIN_QUERY_LATENCY_SECONDS)
-                .record(start.elapsed().as_secs_f64());
+            m.query.origin_latency.record(start.elapsed().as_secs_f64());
         }
         if let Some(mut timing) = self.cache_timing.take() {
             // Forward path: `response_written_at` is intentionally left None.
@@ -287,7 +287,9 @@ impl QueryTelemetry {
     /// and per-stage timing breakdown.
     fn cache_complete(&mut self, reply_timing: Option<QueryTiming>) {
         if let Some(start) = self.client_received_at.take() {
-            metrics::histogram!(names::CACHE_QUERY_LATENCY_SECONDS)
+            crate::metrics::handles()
+                .query
+                .cache_latency
                 .record(start.elapsed().as_secs_f64());
         }
         if let Some(timing) = reply_timing {
@@ -800,7 +802,10 @@ impl ConnectionState {
         if !self.describe_cache.is_empty() {
             let n = self.describe_cache.len();
             self.describe_cache.clear();
-            metrics::counter!(names::PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS).increment(n as u64);
+            crate::metrics::handles()
+                .conn
+                .describe_invalidations
+                .increment(n as u64);
         }
     }
 
@@ -828,7 +833,10 @@ impl ConnectionState {
         let was_at_capacity = self.describe_cache.len() == DESCRIBE_CACHE_CAPACITY.get();
         let replaced = self.describe_cache.put(key, entry).is_some();
         if !replaced && was_at_capacity {
-            metrics::counter!(names::PROTOCOL_DESCRIBE_CACHE_EVICTIONS).increment(1);
+            crate::metrics::handles()
+                .conn
+                .describe_evictions
+                .increment(1);
         }
     }
 }
@@ -860,8 +868,9 @@ impl ConnectionState {
         }
         match msg.message_type {
             PgFrontendMessageType::Query => {
-                metrics::counter!(names::QUERIES_TOTAL).increment(1);
-                metrics::counter!(names::PROTOCOL_SIMPLE_QUERIES).increment(1);
+                let m = crate::metrics::handles();
+                m.query.total.increment(1);
+                m.conn.simple_queries.increment(1);
                 self.telemetry.query_receive();
 
                 self.search_path_inspect_query(&mut msg);
@@ -877,13 +886,13 @@ impl ConnectionState {
                         Ok(Action::Forward(reason)) => {
                             match reason {
                                 ForwardReason::UnsupportedStatement => {
-                                    metrics::counter!(names::QUERIES_UNSUPPORTED).increment(1);
+                                    m.query.unsupported.increment(1);
                                 }
                                 ForwardReason::UncacheableSelect => {
-                                    metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
+                                    m.query.uncacheable.increment(1);
                                 }
                                 ForwardReason::Invalid => {
-                                    metrics::counter!(names::QUERIES_INVALID).increment(1);
+                                    m.query.invalid.increment(1);
                                 }
                             }
                             self.origin_dispatch(msg.data, None);
@@ -897,15 +906,15 @@ impl ConnectionState {
                             ProxyMode::OriginDrain
                         }
                         Err(e) => {
-                            metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
-                            metrics::counter!(names::QUERIES_INVALID).increment(1);
+                            m.query.uncacheable.increment(1);
+                            m.query.invalid.increment(1);
                             error!("handle_query {}", e);
                             self.origin_dispatch(msg.data, None);
                             ProxyMode::Read
                         }
                     };
                 } else {
-                    metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
+                    m.query.uncacheable.increment(1);
                     self.origin_dispatch(msg.data, None);
                 }
             }
@@ -1254,7 +1263,7 @@ impl ConnectionState {
     fn extended_buffer_forward_to_origin(&mut self, buffer: ExtendedBuffer, trailing_bytes: &[u8]) {
         let mut lazy_parse_stmt: Option<EcoString> = None;
         if let Some(first) = buffer.entries.first() {
-            metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
+            crate::metrics::handles().query.uncacheable.increment(1);
 
             if let Some(portal_name) = &first.portal_name
                 && let Some(portal) = self.portals.get(portal_name.as_str())
@@ -1262,10 +1271,10 @@ impl ConnectionState {
             {
                 match &stmt.sql_type {
                     StatementType::NonSelect => {
-                        metrics::counter!(names::QUERIES_UNSUPPORTED).increment(1);
+                        crate::metrics::handles().query.unsupported.increment(1);
                     }
                     StatementType::ParseError => {
-                        metrics::counter!(names::QUERIES_INVALID).increment(1);
+                        crate::metrics::handles().query.invalid.increment(1);
                     }
                     StatementType::Cacheable(_) | StatementType::UncacheableSelect => {}
                 }
@@ -1302,7 +1311,7 @@ impl ConnectionState {
         );
         match outcome {
             CacheOutcome::Complete(timing) => {
-                metrics::counter!(names::QUERIES_CACHE_HIT).increment(1);
+                crate::metrics::handles().query.cache_hit.increment(1);
                 self.telemetry.cache_complete(timing);
 
                 // Cache hit: the worker wrote the full response directly to the
@@ -1318,12 +1327,12 @@ impl ConnectionState {
                 self.cache_batch_advance();
             }
             CacheOutcome::Error(buf) => {
-                metrics::counter!(names::QUERIES_CACHE_ERROR).increment(1);
+                crate::metrics::handles().query.cache_error.increment(1);
                 debug!("forwarding to origin");
                 self.cache_reply_forward(buf, None);
             }
             CacheOutcome::Forward(buf, timing) => {
-                metrics::counter!(names::QUERIES_CACHE_MISS).increment(1);
+                crate::metrics::handles().query.cache_miss.increment(1);
                 debug!("forwarding to origin");
                 self.cache_reply_forward(buf, Some(timing));
             }
@@ -1492,8 +1501,9 @@ impl ConnectionState {
     /// Handle Execute message — record metrics, parse portal name, buffer bytes.
     /// Decision-making deferred to Sync.
     fn handle_execute_message(&mut self, msg: PgFrontendMessage) {
-        metrics::counter!(names::QUERIES_TOTAL).increment(1);
-        metrics::counter!(names::PROTOCOL_EXTENDED_QUERIES).increment(1);
+        let m = crate::metrics::handles();
+        m.query.total.increment(1);
+        m.conn.extended_queries.increment(1);
         self.telemetry.query_receive();
 
         let portal_name = parse_execute_message(&msg.data).ok().map(|p| p.portal_name);
@@ -1802,7 +1812,7 @@ impl ConnectionState {
             parameter_oids: stmt.client_parameter_oids.clone(),
         };
         let Some(entry) = self.describe_cache.get(&key) else {
-            metrics::counter!(names::PROTOCOL_DESCRIBE_CACHE_MISSES).increment(1);
+            crate::metrics::handles().conn.describe_misses.increment(1);
             return false;
         };
         let parameter_description = entry.parameter_description.clone();
@@ -1824,7 +1834,7 @@ impl ConnectionState {
             stmt_mut.describe_no_data = row_description.is_none();
         }
 
-        metrics::counter!(names::PROTOCOL_DESCRIBE_CACHE_HITS).increment(1);
+        crate::metrics::handles().conn.describe_hits.increment(1);
 
         let mut out = BytesMut::with_capacity(
             5 + parameter_description.len()
@@ -1903,7 +1913,10 @@ impl ConnectionState {
                 .prepared_statements
                 .contains_key(&parsed.statement_name)
             {
-                metrics::gauge!(names::PROTOCOL_PREPARED_STATEMENTS).increment(1.0);
+                crate::metrics::handles()
+                    .conn
+                    .prepared_statements
+                    .increment(1.0);
             }
             self.prepared_statements
                 .entry(parsed.statement_name)
@@ -1928,7 +1941,10 @@ impl ConnectionState {
     /// Remove a prepared statement from connection state.
     fn statement_close(&mut self, name: &str) {
         if self.prepared_statements.remove(name).is_some() {
-            metrics::gauge!(names::PROTOCOL_PREPARED_STATEMENTS).decrement(1.0);
+            crate::metrics::handles()
+                .conn
+                .prepared_statements
+                .decrement(1.0);
         }
     }
 
@@ -2175,7 +2191,10 @@ fn forward_lazy_parse_install(
     *origin_intercept = OriginIntercept::LazyParseInline {
         statement_name: stmt_name.into(),
     };
-    metrics::counter!(names::PROTOCOL_LAZY_PARSE_FORWARDED).increment(1);
+    crate::metrics::handles()
+        .conn
+        .lazy_parse_forwarded
+        .increment(1);
 }
 
 #[instrument(skip_all)]
@@ -2190,7 +2209,7 @@ async fn handle_connection(
     origin_database: EcoString,
 ) -> ConnectionResult<()> {
     // Track active connections - guard ensures decrement on any exit path
-    metrics::gauge!(names::CONNECTIONS_ACTIVE).increment(1.0);
+    crate::metrics::handles().conn.active.increment(1.0);
     let _connection_guard = ActiveConnectionGuard;
 
     // Connect to origin database (with TLS if required)
@@ -2260,12 +2279,12 @@ async fn handle_connection(
                     .resolve(state.session_user.as_deref())
                 else {
                     debug!("search_path unknown, forwarding to origin");
-                    metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
+                    crate::metrics::handles().query.uncacheable.increment(1);
                     state.cache_slot_forward_to_origin(msg);
                     continue;
                 };
 
-                metrics::counter!(names::QUERIES_CACHEABLE).increment(1);
+                crate::metrics::handles().query.cacheable.increment(1);
 
                 let (reply_tx, reply_rx) = oneshot::channel();
                 let timing = state.telemetry.cache_timing_dispatch();
@@ -2326,7 +2345,10 @@ async fn handle_connection(
     if remaining_stmts > 0 {
         // Gauge value; per-connection prepared statement count never approaches 2^53.
         #[allow(clippy::cast_precision_loss)]
-        metrics::gauge!(names::PROTOCOL_PREPARED_STATEMENTS).decrement(remaining_stmts as f64);
+        crate::metrics::handles()
+            .conn
+            .prepared_statements
+            .decrement(remaining_stmts as f64);
     }
 
     match state.proxy_status {
@@ -2365,13 +2387,13 @@ pub fn connection_run(
                 .attach_loc("resolving origin host")?
                 .collect();
 
+        let queue_handle = crate::metrics::proxy_worker_queue_handle(worker_id);
         LocalSet::new()
             .run_until(async {
                 while let Some(socket) = rx.recv().await {
                     // Channel depth gauge; queue length never approaches 2^53.
                     #[allow(clippy::cast_precision_loss)]
-                    metrics::gauge!(names::PROXY_WORKER_QUEUE, "worker" => worker_id.to_string())
-                        .set(rx.len() as f64);
+                    queue_handle.set(rx.len() as f64);
 
                     let addrs = addrs.clone();
                     let server_name = server_name.clone();
@@ -2395,7 +2417,7 @@ pub fn connection_run(
                             }) => ClientStream::tls(tcp_stream, tls_state),
                             Ok(tls::ClientTlsResult::Plain(stream)) => ClientStream::plain(stream),
                             Err(e) => {
-                                metrics::counter!(names::CONNECTIONS_ERRORS).increment(1);
+                                crate::metrics::handles().conn.errors.increment(1);
                                 error!("TLS negotiation failed: {}", e);
                                 return Ok(());
                             }
@@ -2414,7 +2436,7 @@ pub fn connection_run(
 
                         if let Err(e) = res {
                             error!("{}", e);
-                            metrics::counter!(names::CONNECTIONS_ERRORS).increment(1);
+                            crate::metrics::handles().conn.errors.increment(1);
                             if matches!(e.current_context(), ConnectionError::CacheDead) {
                                 debug!("connection closed in degraded mode");
                                 return Err(io::Error::other("cache dead"));

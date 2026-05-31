@@ -478,7 +478,10 @@ fn resolved_column_table_refs_collect(expr: &ResolvedWhereExpr, tables: &mut Has
 
 /// Collect the real table names from all table nodes in a resolved table source subtree.
 /// Traverses JOINs but not subqueries.
-fn resolved_source_table_names_collect(source: &ResolvedTableSource, names: &mut HashSet<EcoString>) {
+fn resolved_source_table_names_collect(
+    source: &ResolvedTableSource,
+    names: &mut HashSet<EcoString>,
+) {
     match source {
         ResolvedTableSource::Table(table) => {
             names.insert(table.name.clone());

@@ -1318,10 +1318,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary interval");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "0 mons 0 days 00:00:00.000000".into(),
-                "interval".into()
-            )
+            LiteralValue::StringWithCast("0 mons 0 days 00:00:00.000000".into(), "interval".into())
         );
     }
 
@@ -1338,10 +1335,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary interval");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "2 mons 3 days 04:05:06.700000".into(),
-                "interval".into()
-            )
+            LiteralValue::StringWithCast("2 mons 3 days 04:05:06.700000".into(), "interval".into())
         );
     }
 
@@ -1507,10 +1501,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary timestamp");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "2000-01-01 00:00:00.000000".into(),
-                "timestamp".into()
-            )
+            LiteralValue::StringWithCast("2000-01-01 00:00:00.000000".into(), "timestamp".into())
         );
     }
 
@@ -1526,10 +1517,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary timestamp");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "2000-01-02 12:34:56.123456".into(),
-                "timestamp".into()
-            )
+            LiteralValue::StringWithCast("2000-01-02 12:34:56.123456".into(), "timestamp".into())
         );
     }
 
@@ -1546,10 +1534,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary timestamp");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(
-                "1999-12-31 23:59:59.999999".into(),
-                "timestamp".into()
-            )
+            LiteralValue::StringWithCast("1999-12-31 23:59:59.999999".into(), "timestamp".into())
         );
     }
 

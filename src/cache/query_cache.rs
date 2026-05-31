@@ -11,7 +11,6 @@ use tokio::sync::{mpsc::UnboundedSender, oneshot};
 use tokio_util::bytes::BytesMut;
 use tracing::{error, info, instrument, trace};
 
-use crate::metrics::names;
 use crate::proxy::ClientSocket;
 use crate::query::ast::{LimitClause, QueryExpr, TableNode, query_expr_fingerprint};
 use crate::result::error_chain_format;
@@ -188,7 +187,10 @@ impl QueryCache {
     pub async fn query_dispatch(&mut self, mut msg: QueryRequest) -> CacheResult<()> {
         let cfg = self.dynamic.load();
         if !Self::query_allowlist_check(&cfg.allowed_tables_parsed, &msg.cacheable_query.query) {
-            metrics::counter!(names::QUERIES_ALLOWLIST_SKIPPED).increment(1);
+            crate::metrics::handles()
+                .query
+                .allowlist_skipped
+                .increment(1);
             return reply_forward(
                 msg.reply_tx,
                 msg.client_socket,
@@ -209,7 +211,9 @@ impl QueryCache {
             .cached_queries
             .get(&fingerprint)
             .map(|entry| entry.clone());
-        metrics::histogram!(names::CACHE_LOOKUP_LATENCY_SECONDS)
+        crate::metrics::handles()
+            .cache
+            .lookup_latency
             .record(lookup_start.elapsed().as_secs_f64());
         // Stamp lookup_complete uniformly across all paths so `lookup_seconds`
         // means "proxy dispatch → cache state lookup done." Path-specific
@@ -287,7 +291,10 @@ impl QueryCache {
                     .push(msg);
                 #[allow(clippy::cast_precision_loss)]
                 // queue depth, never near 2^53
-                metrics::gauge!(names::CACHE_COALESCE_WAITING).set(self.waiting_count() as f64);
+                crate::metrics::handles()
+                    .cache
+                    .coalesce_waiting
+                    .set(self.waiting_count() as f64);
                 Ok(())
             }
 
@@ -459,11 +466,11 @@ impl QueryCache {
 
         match decision {
             Decision::Hit(cols) => {
-                metrics::counter!(names::CACHE_MV_HITS).increment(1);
+                crate::metrics::handles().cache.mv_hits.increment(1);
                 MvServe::Mv(cols)
             }
             Decision::Fallthrough => {
-                metrics::counter!(names::CACHE_MV_FALLTHROUGH).increment(1);
+                crate::metrics::handles().cache.mv_fallthrough.increment(1);
                 MvServe::SourceRow
             }
             Decision::NoMv => MvServe::SourceRow,
@@ -662,10 +669,16 @@ impl QueryCache {
         }
 
         if served > 0 {
-            metrics::counter!(names::CACHE_COALESCE_SERVED).increment(served);
+            crate::metrics::handles()
+                .cache
+                .coalesce_served
+                .increment(served);
         }
         #[allow(clippy::cast_precision_loss)] // queue depth, never near 2^53
-        metrics::gauge!(names::CACHE_COALESCE_WAITING).set(self.waiting_count() as f64);
+        crate::metrics::handles()
+            .cache
+            .coalesce_waiting
+            .set(self.waiting_count() as f64);
     }
 
     /// Drain all coalesced waiters for a fingerprint that failed.
@@ -690,7 +703,10 @@ impl QueryCache {
         }
 
         #[allow(clippy::cast_precision_loss)] // queue depth, never near 2^53
-        metrics::gauge!(names::CACHE_COALESCE_WAITING).set(self.waiting_count() as f64);
+        crate::metrics::handles()
+            .cache
+            .coalesce_waiting
+            .set(self.waiting_count() as f64);
     }
 
     /// Register pinned queries at startup by sending Register commands with `pinned: true`.

@@ -15,7 +15,6 @@ use tracing::{debug, error, trace};
 use crate::cache::status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
 };
-use crate::metrics::names;
 use crate::pg;
 use crate::query::ast::Deparse;
 use crate::result::error_chain_format;
@@ -391,7 +390,9 @@ impl WriterCore {
     #[allow(clippy::cast_precision_loss)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn state_gauges_update(&self) {
-        metrics::gauge!(names::CACHE_QUERIES_REGISTERED)
+        crate::metrics::handles()
+            .state
+            .queries_registered
             .set(self.cache.cached_queries.len() as f64);
 
         {
@@ -408,17 +409,38 @@ impl WriterCore {
                 }
             }
 
-            metrics::gauge!(names::CACHE_QUERIES_LOADING).set(loading_count as f64);
-            metrics::gauge!(names::CACHE_QUERIES_PENDING).set(pending_count as f64);
-            metrics::gauge!(names::CACHE_QUERIES_INVALIDATED).set(invalidated_count as f64);
+            crate::metrics::handles()
+                .state
+                .queries_loading
+                .set(loading_count as f64);
+            crate::metrics::handles()
+                .state
+                .queries_pending
+                .set(pending_count as f64);
+            crate::metrics::handles()
+                .state
+                .queries_invalidated
+                .set(invalidated_count as f64);
         }
 
-        metrics::gauge!(names::CACHE_SIZE_BYTES).set(self.cache.current_size as f64);
+        crate::metrics::handles()
+            .state
+            .size_bytes
+            .set(self.cache.current_size as f64);
         if let Some(limit) = self.cache.dynamic.load().cache_size {
-            metrics::gauge!(names::CACHE_SIZE_LIMIT_BYTES).set(limit as f64);
+            crate::metrics::handles()
+                .state
+                .size_limit_bytes
+                .set(limit as f64);
         }
-        metrics::gauge!(names::CACHE_GENERATION).set(self.cache.generation_counter as f64);
-        metrics::gauge!(names::CACHE_TABLES_TRACKED).set(self.cache.tables.len() as f64);
+        crate::metrics::handles()
+            .state
+            .generation
+            .set(self.cache.generation_counter as f64);
+        crate::metrics::handles()
+            .state
+            .tables_tracked
+            .set(self.cache.tables.len() as f64);
     }
 
     /// Update gauges that correlate Register cost against state size. Suspected
@@ -432,8 +454,13 @@ impl WriterCore {
             .iter()
             .map(|entry| entry.queries.len())
             .fold((0usize, 0usize), |(sum, max), n| (sum + n, max.max(n)));
-        metrics::gauge!(names::CACHE_WRITER_UPDATE_QUERIES_TOTAL).set(total as f64);
-        metrics::gauge!(names::CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION)
+        crate::metrics::handles()
+            .state
+            .update_queries_total
+            .set(total as f64);
+        crate::metrics::handles()
+            .state
+            .update_queries_max_per_relation
             .set(max_per_relation as f64);
     }
 
@@ -507,7 +534,10 @@ impl WriterCore {
             // Unlike CLOCK bumps, pinned bumps are not bounded by MAX_BUMPS.
             if query_pinned {
                 trace!("pinned bump {fingerprint}");
-                metrics::counter!(names::CACHE_EVICTIONS, "result" => "pinned_bump").increment(1);
+                crate::metrics::handles()
+                    .state
+                    .evictions_pinned_bump
+                    .increment(1);
                 self.cache_query_generation_bump(fingerprint).await?;
                 pinned_skips += 1;
                 if pinned_skips >= self.cache.cached_queries.len() {
@@ -527,7 +557,7 @@ impl WriterCore {
 
                 if referenced {
                     trace!("clock bump {fingerprint}");
-                    metrics::counter!(names::CACHE_EVICTIONS, "result" => "bump").increment(1);
+                    crate::metrics::handles().state.evictions_bump.increment(1);
                     self.cache_query_generation_bump(fingerprint).await?;
                     bumps += 1;
                     continue;
@@ -535,7 +565,7 @@ impl WriterCore {
             }
 
             // Evict (full removal) — cache_query_evict emits its own entry log
-            metrics::counter!(names::CACHE_EVICTIONS).increment(1);
+            crate::metrics::handles().state.evictions.increment(1);
             self.cache_query_evict(fingerprint).await?;
             // publication_dirty_drain drops the orphaned cache tables; the
             // trigger is what pgcache_total_size sums, so the next iteration's
@@ -999,9 +1029,17 @@ pub fn writer_run(
                     // Channel depths are reported as f64 gauges; queue sizes never approach 2^53.
                     #[allow(clippy::cast_precision_loss)]
                     {
-                        metrics::gauge!(names::CACHE_WRITER_QUERY_QUEUE).set(query_rx.len() as f64);
-                        metrics::gauge!(names::CACHE_WRITER_CDC_QUEUE).set(cdc_rx.len() as f64);
-                        metrics::gauge!(names::CACHE_WRITER_INTERNAL_QUEUE)
+                        crate::metrics::handles()
+                            .state
+                            .queue_writer_query
+                            .set(query_rx.len() as f64);
+                        crate::metrics::handles()
+                            .state
+                            .queue_writer_cdc
+                            .set(cdc_rx.len() as f64);
+                        crate::metrics::handles()
+                            .state
+                            .queue_writer_internal
                             .set(internal_rx.len() as f64);
                     }
                 }

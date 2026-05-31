@@ -25,7 +25,6 @@ use crate::{
         worker::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
         writer::writer_run,
     },
-    metrics::names,
     pg::{cache_connection::CacheConnection, cdc::slot_confirmed_lsn},
     result::error_chain_format,
     settings::Settings,
@@ -489,7 +488,7 @@ pub fn cache_run(
 
                         // Channel depth gauge; queue length never approaches 2^53.
                         #[allow(clippy::cast_precision_loss)]
-                        metrics::gauge!(names::CACHE_PROXY_MESSAGE_QUEUE)
+                        crate::metrics::handles().state.queue_proxy_message
                             .set(cache_rx.len() as f64);
                     }
 
@@ -564,7 +563,10 @@ fn worker_run(
 
                     // Channel depth gauge; queue length never approaches 2^53.
                     #[allow(clippy::cast_precision_loss)]
-                    metrics::gauge!(names::CACHE_WORKER_QUEUE).set(worker_rx.len() as f64);
+                    crate::metrics::handles()
+                        .state
+                        .queue_worker
+                        .set(worker_rx.len() as f64);
                 }
 
                 Ok(())
