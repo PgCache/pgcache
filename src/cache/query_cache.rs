@@ -76,7 +76,7 @@ pub struct QueryRequest {
     pub client_socket: ClientSocket,
     pub reply_tx: oneshot::Sender<CacheReply>,
     /// Resolved search_path for schema resolution
-    pub search_path: Vec<String>,
+    pub search_path: Vec<EcoString>,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Pipeline context from the proxy (None for simple queries and cold-path extended)
@@ -721,7 +721,7 @@ impl QueryCache {
                 .send(QueryCommand::Register {
                     fingerprint: pq.fingerprint,
                     cacheable_query: Arc::clone(&pq.cacheable_query),
-                    search_path: vec!["public".to_owned()],
+                    search_path: vec!["public".into()],
                     started_at: Instant::now(),
                     subsumption_tx,
                     admit_action: AdmitAction::Admit,
@@ -737,7 +737,7 @@ impl QueryCache {
         &self,
         fingerprint: u64,
         cacheable_query: Arc<CacheableQuery>,
-        search_path: Vec<String>,
+        search_path: Vec<EcoString>,
         subsumption_tx: oneshot::Sender<SubsumptionResult>,
         admit_action: AdmitAction,
     ) -> CacheResult<()> {

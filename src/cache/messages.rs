@@ -219,7 +219,7 @@ pub struct ProxyMessage {
     pub client_socket: ClientSocket,
     pub reply_tx: oneshot::Sender<CacheReply>,
     /// Resolved search_path for this connection (with $user expanded to session_user)
-    pub search_path: Vec<String>,
+    pub search_path: Vec<EcoString>,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Pipeline context for atomic extended query dispatch.
@@ -284,7 +284,7 @@ pub enum QueryCommand {
     Register {
         fingerprint: u64,
         cacheable_query: Arc<CacheableQuery>,
-        search_path: Vec<String>,
+        search_path: Vec<EcoString>,
         started_at: Instant,
         /// Writer sends subsumption result back so the coordinator can route the held request.
         subsumption_tx: oneshot::Sender<SubsumptionResult>,

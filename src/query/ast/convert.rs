@@ -419,7 +419,7 @@ mod tests {
         let mut buf = String::new();
 
         // String literal
-        LiteralValue::String("hello".to_owned()).deparse(&mut buf);
+        LiteralValue::String("hello".into()).deparse(&mut buf);
         assert_eq!(buf, "'hello'");
         buf.clear();
 
@@ -448,7 +448,7 @@ mod tests {
         buf.clear();
 
         // Parameter
-        LiteralValue::Parameter("$1".to_owned()).deparse(&mut buf);
+        LiteralValue::Parameter("$1".into()).deparse(&mut buf);
         assert_eq!(buf, "$1");
     }
 
@@ -674,7 +674,7 @@ mod tests {
                 column: EcoString::from("name"),
             }))),
             rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::String("john".to_owned()),
+                LiteralValue::String("john".into()),
             ))),
         };
 
@@ -916,7 +916,7 @@ mod tests {
         let where_clause = ast.where_clause().unwrap();
         let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
         assert_eq!(literals.len(), 1);
-        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_owned()));
+        assert_eq!(literals[0], &LiteralValue::Parameter("$1".into()));
 
         // Test deparsing
         let mut deparsed = String::with_capacity(1024);
@@ -933,8 +933,8 @@ mod tests {
         let where_clause = ast.where_clause().unwrap();
         let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
         assert_eq!(literals.len(), 2);
-        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_owned()));
-        assert_eq!(literals[1], &LiteralValue::Parameter("$2".to_owned()));
+        assert_eq!(literals[0], &LiteralValue::Parameter("$1".into()));
+        assert_eq!(literals[1], &LiteralValue::Parameter("$2".into()));
 
         // Test deparsing
         let mut deparsed = String::with_capacity(1024);
@@ -951,7 +951,7 @@ mod tests {
         let where_clause = ast.where_clause().unwrap();
         let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
         assert_eq!(literals.len(), 2);
-        assert_eq!(literals[0], &LiteralValue::Parameter("$1".to_owned()));
+        assert_eq!(literals[0], &LiteralValue::Parameter("$1".into()));
         assert_eq!(literals[1], &LiteralValue::Boolean(true));
 
         // Test deparsing
@@ -963,14 +963,14 @@ mod tests {
     #[test]
     fn test_literal_empty_string() {
         let mut buf = String::new();
-        LiteralValue::String("".to_owned()).deparse(&mut buf);
+        LiteralValue::String("".into()).deparse(&mut buf);
         assert_eq!(buf, "''");
     }
 
     #[test]
     fn test_literal_string_with_quotes() {
         let mut buf = String::new();
-        LiteralValue::String("test'quote".to_owned()).deparse(&mut buf);
+        LiteralValue::String("test'quote".into()).deparse(&mut buf);
         // postgres-protocol should properly escape the quote
         assert_eq!(buf, "'test''quote'");
     }
@@ -978,7 +978,7 @@ mod tests {
     #[test]
     fn test_literal_string_with_backslashes() {
         let mut buf = String::new();
-        LiteralValue::String("test\\path".to_owned()).deparse(&mut buf);
+        LiteralValue::String("test\\path".into()).deparse(&mut buf);
         // postgres-protocol should use E'' syntax for backslashes
         assert_eq!(buf, "E'test\\\\path'");
     }
@@ -1083,7 +1083,7 @@ mod tests {
         let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
 
         assert_eq!(literals.len(), 3);
-        assert_eq!(literals[0], &LiteralValue::String("john".to_owned()));
+        assert_eq!(literals[0], &LiteralValue::String("john".into()));
         assert_eq!(literals[1], &LiteralValue::Integer(25));
         assert_eq!(literals[2], &LiteralValue::Boolean(true));
     }
@@ -1305,10 +1305,10 @@ mod tests {
                     column: EcoString::from("status"),
                 })),
                 WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(
-                    "active".to_owned(),
+                    "active".into(),
                 ))),
                 WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(
-                    "pending".to_owned(),
+                    "pending".into(),
                 ))),
             ],
         };
@@ -1612,7 +1612,7 @@ mod tests {
         let ast = parse_query("SELECT * FROM users LIMIT $1");
 
         let limit = ast.limit.as_ref().unwrap();
-        assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".to_owned())));
+        assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".into())));
         assert_eq!(limit.offset, None);
     }
 
@@ -1621,8 +1621,8 @@ mod tests {
         let ast = parse_query("SELECT * FROM users LIMIT $1 OFFSET $2");
 
         let limit = ast.limit.as_ref().unwrap();
-        assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".to_owned())));
-        assert_eq!(limit.offset, Some(LiteralValue::Parameter("$2".to_owned())));
+        assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".into())));
+        assert_eq!(limit.offset, Some(LiteralValue::Parameter("$2".into())));
     }
 
     #[test]
@@ -2255,7 +2255,7 @@ mod tests {
                     table: None,
                     column: EcoString::from("name"),
                 }),
-                ScalarExpr::Literal(LiteralValue::String(", ".to_owned())),
+                ScalarExpr::Literal(LiteralValue::String(", ".into())),
             ],
             agg_star: false,
             agg_distinct: false,

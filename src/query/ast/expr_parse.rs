@@ -56,7 +56,7 @@ mod tests {
                 column: EcoString::from("str"),
             }))),
             rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::String("hello".to_owned()),
+                LiteralValue::String("hello".into()),
             ))),
         }));
 
@@ -139,7 +139,7 @@ mod tests {
                     column: EcoString::from("str"),
                 }))),
                 rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::String("hello".to_owned()),
+                    LiteralValue::String("hello".into()),
                 ))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
@@ -172,7 +172,7 @@ mod tests {
                     column: EcoString::from("str"),
                 }))),
                 rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::String("hello".to_owned()),
+                    LiteralValue::String("hello".into()),
                 ))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
@@ -182,7 +182,7 @@ mod tests {
                     column: EcoString::from("str"),
                 }))),
                 rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::String("world".to_owned()),
+                    LiteralValue::String("world".into()),
                 ))),
             })),
         }));
@@ -205,7 +205,7 @@ mod tests {
                     column: EcoString::from("str"),
                 }))),
                 rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::String("hello".to_owned()),
+                    LiteralValue::String("hello".into()),
                 ))),
             })),
         }));
@@ -226,7 +226,7 @@ mod tests {
                 column: EcoString::from("str"),
             }))),
             rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::String("hello".to_owned()),
+                LiteralValue::String("hello".into()),
             ))),
         }));
         assert_eq!(where_clause, expected);
@@ -408,7 +408,7 @@ mod tests {
                         column: EcoString::from("name"),
                     }))),
                     rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                        LiteralValue::String("john".to_owned()),
+                        LiteralValue::String("john".into()),
                     ))),
                 })),
                 rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
@@ -458,7 +458,7 @@ mod tests {
                         column: EcoString::from("name"),
                     }))),
                     rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                        LiteralValue::String("john".to_owned()),
+                        LiteralValue::String("john".into()),
                     ))),
                 })),
                 rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
@@ -468,7 +468,7 @@ mod tests {
                         column: EcoString::from("name"),
                     }))),
                     rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                        LiteralValue::String("jane".to_owned()),
+                        LiteralValue::String("jane".into()),
                     ))),
                 })),
             })),
@@ -479,7 +479,7 @@ mod tests {
                     column: EcoString::from("name"),
                 }))),
                 rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::String("bob".to_owned()),
+                    LiteralValue::String("bob".into()),
                 ))),
             })),
         }));
@@ -501,7 +501,7 @@ mod tests {
                 column: EcoString::from("id"),
             }))),
             rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::Parameter("$1".to_owned()),
+                LiteralValue::Parameter("$1".into()),
             ))),
         }));
         assert_eq!(where_clause, expected);
@@ -523,7 +523,7 @@ mod tests {
                     column: EcoString::from("name"),
                 }))),
                 rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::Parameter("$1".to_owned()),
+                    LiteralValue::Parameter("$1".into()),
                 ))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
@@ -533,7 +533,7 @@ mod tests {
                     column: EcoString::from("age"),
                 }))),
                 rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::Parameter("$2".to_owned()),
+                    LiteralValue::Parameter("$2".into()),
                 ))),
             })),
         }));
@@ -556,7 +556,7 @@ mod tests {
                     column: EcoString::from("name"),
                 }))),
                 rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::Parameter("$1".to_owned()),
+                    LiteralValue::Parameter("$1".into()),
                 ))),
             })),
             rexpr: Box::new(WhereExpr::Binary(BinaryExpr {

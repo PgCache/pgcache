@@ -1,5 +1,7 @@
 use std::{collections::HashMap, mem, sync::Arc, thread, time::Duration};
 
+use ecow::EcoString;
+
 use metrics_exporter_prometheus::PrometheusHandle;
 use rootcause::Report;
 
@@ -172,7 +174,7 @@ type Worker<'scope> = (
 struct WorkerResources {
     cache_sender: CacheSender,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
-    func_volatility: Arc<HashMap<String, FunctionVolatility>>,
+    func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
 }
 
 fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
@@ -310,7 +312,7 @@ fn tls_config_load(settings: &Settings) -> ConnectionResult<Option<Arc<tls::TlsA
 /// function volatilities, and returns an immutable shared map.
 async fn function_volatility_load(
     settings: &Settings,
-) -> ConnectionResult<Arc<HashMap<String, FunctionVolatility>>> {
+) -> ConnectionResult<Arc<HashMap<EcoString, FunctionVolatility>>> {
     let client = connect(&settings.origin, "volatility-load")
         .await
         .map_err(|e| {
@@ -348,7 +350,7 @@ async fn function_volatility_load(
 /// Parse and validate pinned queries at startup, returning only those that are cacheable.
 fn pinned_queries_validate(
     settings: &Settings,
-    func_volatility: &HashMap<String, FunctionVolatility>,
+    func_volatility: &HashMap<EcoString, FunctionVolatility>,
 ) -> Vec<PinnedQuery> {
     let Some(queries) = &settings.pinned_queries else {
         return Vec::new();
@@ -635,7 +637,7 @@ mod tests {
     #[test]
     fn pinned_queries_validate_non_cacheable_function_in_where_rejected() {
         let mut fv = HashMap::new();
-        fv.insert("random".to_owned(), FunctionVolatility::Volatile);
+        fv.insert("random".into(), FunctionVolatility::Volatile);
 
         // Volatile function in WHERE clause makes query non-cacheable
         let settings = test_settings(Some(vec![

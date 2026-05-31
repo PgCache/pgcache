@@ -316,7 +316,7 @@ fn resolved_leftmost_select(resolved: &ResolvedQueryExpr) -> Option<&ResolvedSel
 /// `pg_proc` at writer startup (`catalog::aggregate_functions_load`).
 pub fn shape_classify(
     resolved: &ResolvedQueryExpr,
-    aggregate_functions: &HashSet<String>,
+    aggregate_functions: &HashSet<EcoString>,
 ) -> ShapeGate {
     let shape = match &resolved.body {
         // VALUES is already literal — nothing to materialize that we don't
@@ -499,7 +499,7 @@ mod tests {
             relation_oid: oid,
             name: name.into(),
             schema: "public".into(),
-            primary_key_columns: vec![cols[0].to_owned()],
+            primary_key_columns: vec![cols[0].into()],
             columns,
             indexes: Vec::new(),
         }
@@ -512,7 +512,7 @@ mod tests {
         t
     }
 
-    fn test_aggregate_functions() -> HashSet<String> {
+    fn test_aggregate_functions() -> HashSet<EcoString> {
         [
             "count",
             "sum",
@@ -523,7 +523,7 @@ mod tests {
             "string_agg",
         ]
         .into_iter()
-        .map(String::from)
+        .map(EcoString::from)
         .collect()
     }
 

@@ -201,7 +201,7 @@ pub(super) struct WriterRegistration {
     /// Index for round-robin dispatch to population workers.
     populate_next: usize,
     /// Aggregate function names from pg_proc, used for scalar subquery decorrelation.
-    aggregate_functions: std::collections::HashSet<String>,
+    aggregate_functions: std::collections::HashSet<EcoString>,
 }
 
 impl WriterRegistration {
@@ -268,7 +268,7 @@ impl WriterRegistration {
                 pinned,
             } => {
                 trace!("command query register {fingerprint}");
-                let search_path_refs: Vec<&str> = search_path.iter().map(String::as_str).collect();
+                let search_path_refs: Vec<&str> = search_path.iter().map(EcoString::as_str).collect();
                 if let Err(e) = self
                     .query_register(
                         core,
@@ -1324,7 +1324,7 @@ mod classify_tests {
             relation_oid: oid,
             name: name.into(),
             schema: "public".into(),
-            primary_key_columns: vec![columns[0].to_owned()],
+            primary_key_columns: vec![columns[0].into()],
             columns: cols,
             indexes: Vec::new(),
         }

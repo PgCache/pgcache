@@ -19,14 +19,14 @@ use super::Deparse;
 // clone. See PGC-109.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LiteralValue {
-    String(String),
-    StringWithCast(String, EcoString),
+    String(EcoString),
+    StringWithCast(EcoString, EcoString),
     Integer(i64),
     Float(NotNan<f64>),
     Boolean(bool),
     Null,
     NullWithCast(EcoString),
-    Parameter(String), // For $1, $2, etc.
+    Parameter(EcoString), // For $1, $2, etc.
     /// A 1-D array literal: `(elements, cast)`. Produced by binary array
     /// parameter substitution (PGC-103) so the constraint analyzer can
     /// extract `WHERE col = ANY($1)` as an `InSet` constraint and let
@@ -47,9 +47,11 @@ impl LiteralValue {
             (None, LiteralValue::Null) => true,
             (None, LiteralValue::NullWithCast(_)) => true,
             (None, _) => false,
-            (Some(row_str), LiteralValue::String(constraint_str)) => row_str == constraint_str,
+            (Some(row_str), LiteralValue::String(constraint_str)) => {
+                row_str.as_str() == constraint_str.as_str()
+            }
             (Some(row_str), LiteralValue::StringWithCast(constraint_str, _)) => {
-                row_str == constraint_str
+                row_str.as_str() == constraint_str.as_str()
             }
             (Some(row_str), LiteralValue::Integer(constraint_int)) => {
                 row_str.parse::<i64>().ok() == Some(*constraint_int)

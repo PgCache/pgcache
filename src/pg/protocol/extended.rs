@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use ecow::EcoString;
 use tokio_util::bytes::{Buf, Bytes, BytesMut};
 
 use super::{ProtocolError, ProtocolResult};
@@ -37,7 +38,7 @@ pub enum StatementType {
 /// Prepared statement stored in connection state
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
-    pub name: String,
+    pub name: EcoString,
     pub sql: String,
     /// Parameter type OIDs as resolved by origin's `ParameterDescription`,
     /// falling back to the client-supplied OIDs until origin replies. Used
@@ -69,8 +70,8 @@ pub struct PreparedStatement {
 /// Portal (bound prepared statement) stored in connection state
 #[derive(Debug, Clone)]
 pub struct Portal {
-    pub name: String,
-    pub statement_name: String,
+    pub name: EcoString,
+    pub statement_name: EcoString,
     pub parameter_values: Vec<Option<Bytes>>,
     pub parameter_formats: Vec<i16>, // 0=text, 1=binary
     pub result_formats: Vec<i16>,
@@ -87,7 +88,7 @@ impl Portal {
 /// Parsed Parse message data
 #[derive(Debug, Clone)]
 pub struct ParsedParseMessage {
-    pub statement_name: String,
+    pub statement_name: EcoString,
     pub sql: String,
     pub parameter_oids: Vec<u32>,
 }
@@ -95,8 +96,8 @@ pub struct ParsedParseMessage {
 /// Parsed Bind message data
 #[derive(Debug, Clone)]
 pub struct ParsedBindMessage {
-    pub portal_name: String,
-    pub statement_name: String,
+    pub portal_name: EcoString,
+    pub statement_name: EcoString,
     pub parameter_formats: Vec<i16>,
     pub parameter_values: Vec<Option<Bytes>>,
     pub result_formats: Vec<i16>,
@@ -105,7 +106,7 @@ pub struct ParsedBindMessage {
 /// Parsed Execute message data
 #[derive(Debug, Clone)]
 pub struct ParsedExecuteMessage {
-    pub portal_name: String,
+    pub portal_name: EcoString,
     pub max_rows: i32,
 }
 
@@ -113,7 +114,7 @@ pub struct ParsedExecuteMessage {
 #[derive(Debug, Clone)]
 pub struct ParsedDescribeMessage {
     pub describe_type: u8, // b'S' for statement, b'P' for portal
-    pub name: String,
+    pub name: EcoString,
 }
 
 /// Parsed ParameterDescription message data (backend response)
@@ -126,7 +127,7 @@ pub struct ParsedParameterDescription {
 #[derive(Debug, Clone)]
 pub struct ParsedCloseMessage {
     pub close_type: u8, // b'S' for statement, b'P' for portal
-    pub name: String,
+    pub name: EcoString,
 }
 
 /// Read a null-terminated string from the buffer
@@ -172,7 +173,7 @@ pub fn parse_parse_message(data: &BytesMut) -> ProtocolResult<ParsedParseMessage
 
     let mut buf = buf; // Skip message tag (1 byte) and length (4 bytes)
 
-    let statement_name = read_cstring(&mut buf)?.to_owned();
+    let statement_name = read_cstring(&mut buf)?.into();
     let sql = read_cstring(&mut buf)?.to_owned();
 
     if buf.len() < 2 {
@@ -232,8 +233,8 @@ pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> 
 
     let mut buf = buf; // Skip message tag and length
 
-    let portal_name = read_cstring(&mut buf)?.to_owned();
-    let statement_name = read_cstring(&mut buf)?.to_owned();
+    let portal_name = read_cstring(&mut buf)?.into();
+    let statement_name = read_cstring(&mut buf)?.into();
 
     // Read parameter format codes
     if buf.len() < 2 {
@@ -345,7 +346,7 @@ pub fn parse_execute_message(data: &BytesMut) -> ProtocolResult<ParsedExecuteMes
 
     let mut buf = buf; // Skip message tag and length
 
-    let portal_name = read_cstring(&mut buf)?.to_owned();
+    let portal_name = read_cstring(&mut buf)?.into();
 
     if buf.len() < 4 {
         return Err(ProtocolError::IoError(std::io::Error::new(
@@ -390,7 +391,7 @@ pub fn parse_describe_message(data: &BytesMut) -> ProtocolResult<ParsedDescribeM
     let mut buf = buf; // Skip message tag and length
 
     let describe_type = buf.get_u8();
-    let name = read_cstring(&mut buf)?.to_owned();
+    let name = read_cstring(&mut buf)?.into();
 
     Ok(ParsedDescribeMessage {
         describe_type,
@@ -426,7 +427,7 @@ pub fn parse_close_message(data: &BytesMut) -> ProtocolResult<ParsedCloseMessage
     let mut buf = buf; // Skip message tag and length
 
     let close_type = buf.get_u8();
-    let name = read_cstring(&mut buf)?.to_owned();
+    let name = read_cstring(&mut buf)?.into();
 
     Ok(ParsedCloseMessage { close_type, name })
 }
@@ -745,8 +746,8 @@ mod tests {
     #[test]
     fn test_portal_has_binary_parameters_all_text() {
         let portal = Portal {
-            name: "p1".to_owned(),
-            statement_name: "s1".to_owned(),
+            name: "p1".into(),
+            statement_name: "s1".into(),
             parameter_values: vec![Some(Bytes::from_static(b"42"))],
             parameter_formats: vec![0], // text format
             result_formats: vec![0],
@@ -761,8 +762,8 @@ mod tests {
     #[test]
     fn test_portal_has_binary_parameters_with_binary() {
         let portal = Portal {
-            name: "p1".to_owned(),
-            statement_name: "s1".to_owned(),
+            name: "p1".into(),
+            statement_name: "s1".into(),
             parameter_values: vec![Some(Bytes::from_static(&[0, 0, 0, 42]))],
             parameter_formats: vec![1], // binary format
             result_formats: vec![0],
@@ -777,8 +778,8 @@ mod tests {
     #[test]
     fn test_portal_has_binary_parameters_mixed() {
         let portal = Portal {
-            name: "p1".to_owned(),
-            statement_name: "s1".to_owned(),
+            name: "p1".into(),
+            statement_name: "s1".into(),
             parameter_values: vec![
                 Some(Bytes::from_static(b"text")),
                 Some(Bytes::from_static(&[0, 0, 0, 42])),
@@ -796,8 +797,8 @@ mod tests {
     #[test]
     fn test_portal_has_binary_parameters_empty() {
         let portal = Portal {
-            name: "p1".to_owned(),
-            statement_name: "s1".to_owned(),
+            name: "p1".into(),
+            statement_name: "s1".into(),
             parameter_values: vec![],
             parameter_formats: vec![],
             result_formats: vec![],

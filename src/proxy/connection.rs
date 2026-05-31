@@ -131,7 +131,7 @@ enum OriginIntercept {
     /// because origin didn't know the statement name. Swallow the resulting
     /// `ParseComplete` (the client didn't ask for it) and let `BindComplete`
     /// onward flow through unchanged.
-    LazyParseInline { statement_name: String },
+    LazyParseInline { statement_name: EcoString },
     /// Piggyback: the client's Query was rewritten to append `; SHOW search_path`.
     /// Responses for the original statement are forwarded; the SHOW's response
     /// is stripped and parsed into `search_path_state`.
@@ -194,13 +194,13 @@ enum SearchPathState {
 
 impl SearchPathState {
     /// Resolve the search_path if available, expanding $user to session_user.
-    fn resolve(&self, session_user: Option<&str>) -> Option<Vec<String>> {
+    fn resolve(&self, session_user: Option<&str>) -> Option<Vec<EcoString>> {
         match self {
             Self::Unknown => None,
             Self::Resolved(sp) => Some(
                 sp.resolve(session_user)
                     .into_iter()
-                    .map(String::from)
+                    .map(EcoString::from)
                     .collect(),
             ),
         }
@@ -338,10 +338,10 @@ pub(super) struct ConnectionState {
     proxy_status: ProxyStatus,
 
     /// Extended protocol: prepared statements by name
-    prepared_statements: HashMap<String, PreparedStatement>,
+    prepared_statements: HashMap<EcoString, PreparedStatement>,
 
     /// Extended protocol: portals (bound statements) by name
-    portals: HashMap<String, Portal>,
+    portals: HashMap<EcoString, Portal>,
 
     /// PostgreSQL session user from startup message
     /// TODO: Track SET ROLE queries to update effective user for permission checks
@@ -374,7 +374,7 @@ pub(super) struct ConnectionState {
     telemetry: QueryTelemetry,
 
     /// Function volatility map for cacheability checks
-    func_volatility: Arc<HashMap<String, FunctionVolatility>>,
+    func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
 
     /// Extended query protocol pipeline state
     extended: ExtendedPending,
@@ -699,7 +699,7 @@ impl ExtendedPending {
 
     /// Handle ParseComplete from origin: mark the next awaited statement as
     /// origin_prepared (one ParseComplete per forwarded Parse, in order).
-    fn parse_complete(&mut self, prepared_statements: &mut HashMap<String, PreparedStatement>) {
+    fn parse_complete(&mut self, prepared_statements: &mut HashMap<EcoString, PreparedStatement>) {
         if let Some(stmt_name) = self.pending_parse_statements.pop_front()
             && let Some(stmt) = prepared_statements.get_mut(stmt_name.as_str())
         {
@@ -713,7 +713,7 @@ impl ExtendedPending {
     fn parameter_description_received(
         &mut self,
         msg_data: &BytesMut,
-        prepared_statements: &mut HashMap<String, PreparedStatement>,
+        prepared_statements: &mut HashMap<EcoString, PreparedStatement>,
     ) {
         if let Some(stmt_name) = self.pending_describe_statements.front()
             && let Ok(parsed) = parse_parameter_description(msg_data)
@@ -734,7 +734,7 @@ impl ExtendedPending {
     fn row_description_received(
         &mut self,
         msg_data: &BytesMut,
-        prepared_statements: &mut HashMap<String, PreparedStatement>,
+        prepared_statements: &mut HashMap<EcoString, PreparedStatement>,
     ) -> Option<EcoString> {
         let stmt_name = self.pending_describe_statements.pop_front()?;
         let stmt = prepared_statements.get_mut(stmt_name.as_str())?;
@@ -748,7 +748,7 @@ impl ExtendedPending {
     /// statement name so the caller can populate the per-connection describe cache.
     fn no_data_received(
         &mut self,
-        prepared_statements: &mut HashMap<String, PreparedStatement>,
+        prepared_statements: &mut HashMap<EcoString, PreparedStatement>,
     ) -> Option<EcoString> {
         let stmt_name = self.pending_describe_statements.pop_front()?;
         let stmt = prepared_statements.get_mut(stmt_name.as_str())?;
@@ -765,7 +765,7 @@ impl ExtendedPending {
 
 impl ConnectionState {
     fn new(
-        func_volatility: Arc<HashMap<String, FunctionVolatility>>,
+        func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
         origin_database: EcoString,
     ) -> Self {
         Self {
@@ -1245,7 +1245,7 @@ impl ConnectionState {
     /// Forward an extended buffer to origin, appending the trailing message bytes (Sync or Flush).
     /// Records metrics for any Execute in the buffer.
     fn extended_buffer_forward_to_origin(&mut self, buffer: ExtendedBuffer, trailing_bytes: &[u8]) {
-        let mut lazy_parse_stmt: Option<String> = None;
+        let mut lazy_parse_stmt: Option<EcoString> = None;
         if let Some(first) = buffer.entries.first() {
             metrics::counter!(names::QUERIES_UNCACHEABLE).increment(1);
 
@@ -1449,7 +1449,7 @@ impl ConnectionState {
             };
 
             let parse_bytes = msg.data.clone();
-            let statement_name = EcoString::from(parsed.statement_name.as_str());
+            let statement_name = parsed.statement_name.clone();
             self.statement_store(parsed, sql_type, parse_bytes);
 
             let seg = &mut self.extended.buffer_get_or_create().pending;
@@ -1489,9 +1489,7 @@ impl ConnectionState {
         metrics::counter!(names::PROTOCOL_EXTENDED_QUERIES).increment(1);
         self.telemetry.query_receive();
 
-        let portal_name = parse_execute_message(&msg.data)
-            .ok()
-            .map(|p| EcoString::from(p.portal_name));
+        let portal_name = parse_execute_message(&msg.data).ok().map(|p| p.portal_name);
 
         // Snapshot the cache candidate now, while the portal/statement still
         // reflect this execute's Bind/Parse (a later execute may rebind the
@@ -1559,7 +1557,7 @@ impl ConnectionState {
             } else {
                 None
             },
-            statement_name: EcoString::from(portal.statement_name.as_str()),
+            statement_name: portal.statement_name.clone(),
             origin_prepared: stmt.origin_prepared,
         })
     }
@@ -1580,7 +1578,7 @@ impl ConnectionState {
             match parsed.describe_type {
                 b'S' => {
                     seg.describe = PipelineDescribe::Statement;
-                    seg.describe_statement_names.push(parsed.name.into());
+                    seg.describe_statement_names.push(parsed.name);
                 }
                 b'P' => {
                     seg.describe = PipelineDescribe::Portal;
@@ -2144,7 +2142,7 @@ async fn origin_connect(
 /// event-loop call sites that work with `state.*` after partial moves.
 fn forward_lazy_parse_install(
     stmt_name: &str,
-    prepared_statements: &HashMap<String, PreparedStatement>,
+    prepared_statements: &HashMap<EcoString, PreparedStatement>,
     origin_write_buf: &mut VecDeque<BytesMut>,
     origin_intercept: &mut OriginIntercept,
 ) {
@@ -2168,7 +2166,7 @@ fn forward_lazy_parse_install(
     // intercept (which marks origin_prepared) — it is NOT a client-awaited
     // response, so it must not be queued in pending_parse_statements.
     *origin_intercept = OriginIntercept::LazyParseInline {
-        statement_name: stmt_name.to_owned(),
+        statement_name: stmt_name.into(),
     };
     metrics::counter!(names::PROTOCOL_LAZY_PARSE_FORWARDED).increment(1);
 }
@@ -2181,7 +2179,7 @@ async fn handle_connection(
     ssl_mode: SslMode,
     server_name: &str,
     cache_sender: CacheSender,
-    func_volatility: Arc<HashMap<String, FunctionVolatility>>,
+    func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
 ) -> ConnectionResult<()> {
     // Track active connections - guard ensures decrement on any exit path
@@ -2338,7 +2336,7 @@ pub fn connection_run(
     mut rx: UnboundedReceiver<TcpStream>,
     cache_sender: CacheSender,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
-    func_volatility: Arc<HashMap<String, FunctionVolatility>>,
+    func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
 ) -> ConnectionResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()

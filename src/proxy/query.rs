@@ -4,6 +4,7 @@ use std::{
     sync::Arc,
 };
 
+use ecow::EcoString;
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, trace};
 
@@ -31,7 +32,7 @@ pub(super) enum Action {
 pub(super) async fn handle_query(
     data: &BytesMut,
     fp_cache: &mut HashMap<u64, Result<Arc<CacheableQuery>, ForwardReason>>,
-    func_volatility: &HashMap<String, FunctionVolatility>,
+    func_volatility: &HashMap<EcoString, FunctionVolatility>,
 ) -> Result<Action, ParseError> {
     let len_bytes: [u8; 4] = data
         .get(1..5)

@@ -65,7 +65,7 @@ pub struct WriterCore {
     /// `cached_queries` on every register/evict.
     relation_refcounts: std::collections::HashMap<u32, usize>,
     /// Publication name for dynamic table management.
-    publication_name: String,
+    publication_name: EcoString,
     /// OIDs currently in the publication (mirrors the origin-side state).
     publication_oids: HashSet<u32>,
     /// Set when a removal path changes active relations; drained by command handlers.
@@ -120,7 +120,7 @@ impl WriterCore {
             state_view,
             active_relations,
             relation_refcounts: std::collections::HashMap::new(),
-            publication_name: settings.cdc.publication_name.clone(),
+            publication_name: settings.cdc.publication_name.as_str().into(),
             publication_oids: HashSet::new(),
             relations_dirty: false,
             query_tx,

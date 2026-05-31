@@ -1162,7 +1162,7 @@ mod tests {
             relation_oid,
             name: name.into(),
             schema: "public".into(),
-            primary_key_columns: vec!["id".to_owned()],
+            primary_key_columns: vec!["id".into()],
             columns,
             indexes: Vec::new(),
         }
@@ -1270,7 +1270,7 @@ mod tests {
             relation_oid: 1003,
             name: "c".into(),
             schema: "public".into(),
-            primary_key_columns: vec!["id".to_owned()],
+            primary_key_columns: vec!["id".into()],
             columns: ColumnStore::new([ColumnMetadata {
                 name: "id".into(),
                 position: 1,
@@ -1341,7 +1341,7 @@ mod tests {
             "users",
             "name",
             BinaryOp::Equal,
-            LiteralValue::String("john".to_owned()),
+            LiteralValue::String("john".into()),
         ));
     }
 
@@ -1494,7 +1494,7 @@ mod tests {
             "users",
             "name",
             BinaryOp::Equal,
-            LiteralValue::String("alice".to_owned()),
+            LiteralValue::String("alice".into()),
         ));
     }
 
@@ -1584,7 +1584,7 @@ mod tests {
             "users",
             "name",
             BinaryOp::NotEqual,
-            LiteralValue::String("deleted".to_owned()),
+            LiteralValue::String("deleted".into()),
         ));
     }
 
@@ -1611,7 +1611,7 @@ mod tests {
             "users",
             "name",
             BinaryOp::NotEqual,
-            LiteralValue::String("deleted".to_owned()),
+            LiteralValue::String("deleted".into()),
         ));
     }
 
@@ -1702,7 +1702,7 @@ mod tests {
             "users",
             "name",
             BinaryOp::Equal,
-            LiteralValue::String("alice".to_owned()),
+            LiteralValue::String("alice".into()),
         ));
         assert!(has_constraint(
             &constraints,
@@ -2347,7 +2347,7 @@ mod tests {
     #[test]
     fn test_column_range_build_parameter_unknown() {
         let range =
-            range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Parameter("$1".to_owned()))]);
+            range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Parameter("$1".into()))]);
         assert!(matches!(range, ColumnRange::Unknown));
     }
 
@@ -2438,7 +2438,7 @@ mod tests {
             "users",
             "name",
             BinaryOp::Equal,
-            LiteralValue::String("alice".to_owned()),
+            LiteralValue::String("alice".into()),
         ));
     }
 
@@ -2891,7 +2891,7 @@ mod tests {
             "users",
             "name",
             BinaryOp::Equal,
-            LiteralValue::String("alice".to_owned()),
+            LiteralValue::String("alice".into()),
         ));
     }
 
@@ -2934,7 +2934,7 @@ mod tests {
             "users",
             "id",
             BinaryOp::Equal,
-            LiteralValue::String("42".to_owned()),
+            LiteralValue::String("42".into()),
         ));
     }
 

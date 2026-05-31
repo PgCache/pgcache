@@ -45,7 +45,7 @@ pub(super) fn text_parameter_to_literal(
         }
         // String-like and pass-through types (UUID, temporal, numeric)
         // round-trip as the original text.
-        _ => Ok(LiteralValue::String(s.to_owned())),
+        _ => Ok(LiteralValue::String(s.into())),
     }
 }
 

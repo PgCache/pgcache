@@ -411,7 +411,7 @@ mod tests {
             name: "test_table".into(),
             schema: "public".into(),
             relation_oid: 12345,
-            primary_key_columns: vec!["id".to_owned()],
+            primary_key_columns: vec!["id".into()],
             columns,
             indexes: Vec::new(),
         }
@@ -463,7 +463,7 @@ mod tests {
             name: "ts_table".into(),
             schema: "public".into(),
             relation_oid: 23456,
-            primary_key_columns: vec!["id".to_owned()],
+            primary_key_columns: vec!["id".into()],
             columns,
             indexes: Vec::new(),
         }
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn where_value_compare_string_string_match() {
-        let filter_value = LiteralValue::String("hello".to_owned());
+        let filter_value = LiteralValue::String("hello".into());
         assert!(where_value_compare_string(
             &filter_value,
             "hello",
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn where_value_compare_string_parameter_never_matches() {
-        let filter_value = LiteralValue::Parameter("$1".to_owned());
+        let filter_value = LiteralValue::Parameter("$1".into());
         assert!(!where_value_compare_string(
             &filter_value,
             "$1",
@@ -709,7 +709,7 @@ mod tests {
         let expr = binary(
             BinaryOp::Equal,
             col_expr(&table, "name"),
-            val_expr(LiteralValue::String("john".to_owned())),
+            val_expr(LiteralValue::String("john".into())),
         );
 
         assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
@@ -727,7 +727,7 @@ mod tests {
         let expr = binary(
             BinaryOp::Equal,
             col_expr(&table, "name"),
-            val_expr(LiteralValue::String("jane".to_owned())),
+            val_expr(LiteralValue::String("jane".into())),
         );
 
         assert!(!expr_comparison_evaluate(&expr, &row_data, TABLE));
@@ -777,7 +777,7 @@ mod tests {
         // value = column (reverse order)
         let expr = binary(
             BinaryOp::Equal,
-            val_expr(LiteralValue::String("john".to_owned())),
+            val_expr(LiteralValue::String("john".into())),
             col_expr(&table, "name"),
         );
 
@@ -800,7 +800,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             col_expr(&table, "name"),
-            val_expr(LiteralValue::String("john".to_owned())),
+            val_expr(LiteralValue::String("john".into())),
         );
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
@@ -825,7 +825,7 @@ mod tests {
             binary_expr(
                 BinaryOp::Equal,
                 col_expr(&table, "name"),
-                val_expr(LiteralValue::String("john".to_owned())),
+                val_expr(LiteralValue::String("john".into())),
             ),
         );
 
@@ -851,7 +851,7 @@ mod tests {
             binary_expr(
                 BinaryOp::Equal,
                 col_expr(&table, "name"),
-                val_expr(LiteralValue::String("john".to_owned())),
+                val_expr(LiteralValue::String("john".into())),
             ),
         );
 
@@ -877,7 +877,7 @@ mod tests {
             binary_expr(
                 BinaryOp::Equal,
                 col_expr(&table, "name"),
-                val_expr(LiteralValue::String("john".to_owned())),
+                val_expr(LiteralValue::String("john".into())),
             ),
         );
 
@@ -903,7 +903,7 @@ mod tests {
             binary_expr(
                 BinaryOp::Equal,
                 col_expr(&table, "name"),
-                val_expr(LiteralValue::String("jane".to_owned())),
+                val_expr(LiteralValue::String("jane".into())),
             ),
         );
 
@@ -975,7 +975,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("john".to_owned())),
+            val_expr(LiteralValue::String("john".into())),
         );
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
@@ -994,7 +994,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("john".to_owned())),
+            val_expr(LiteralValue::String("john".into())),
         );
 
         assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
@@ -1015,7 +1015,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("42".to_owned())),
+            val_expr(LiteralValue::String("42".into())),
         );
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
@@ -1038,7 +1038,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("true".to_owned())),
+            val_expr(LiteralValue::String("true".into())),
         );
 
         assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
@@ -1057,7 +1057,7 @@ mod tests {
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
         let expr = binary_expr(
             BinaryOp::Equal,
-            val_expr(LiteralValue::String("john".to_owned())),
+            val_expr(LiteralValue::String("john".into())),
             cast_col,
         );
 
@@ -1071,7 +1071,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("john".to_owned())),
+            val_expr(LiteralValue::String("john".into())),
         );
 
         assert!(resolved_where_expr_supported(&expr));
@@ -1089,7 +1089,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("true".to_owned())),
+            val_expr(LiteralValue::String("true".into())),
         );
 
         assert!(!resolved_where_expr_supported(&expr));
@@ -1191,7 +1191,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("42".to_owned())),
+            val_expr(LiteralValue::String("42".into())),
         );
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
@@ -1300,13 +1300,13 @@ mod tests {
         assert!(literal_compare(
             &LiteralValue::Integer(42),
             BinaryOp::Equal,
-            &LiteralValue::String("42".to_owned()),
+            &LiteralValue::String("42".into()),
         ));
         // String "0042" parses to 42 — numeric compare, not lexicographic.
         assert!(literal_compare(
             &LiteralValue::Integer(42),
             BinaryOp::Equal,
-            &LiteralValue::String("0042".to_owned()),
+            &LiteralValue::String("0042".into()),
         ));
     }
 
@@ -1315,7 +1315,7 @@ mod tests {
         assert!(!literal_compare(
             &LiteralValue::Integer(42),
             BinaryOp::Equal,
-            &LiteralValue::String("not-a-number".to_owned()),
+            &LiteralValue::String("not-a-number".into()),
         ));
     }
 
@@ -1527,7 +1527,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("t".to_owned())),
+            val_expr(LiteralValue::String("t".into())),
         );
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
@@ -1641,7 +1641,7 @@ mod tests {
         assert!(literal_compare(
             &LiteralValue::Boolean(true),
             BinaryOp::Equal,
-            &LiteralValue::String("yes".to_owned()),
+            &LiteralValue::String("yes".into()),
         ));
         assert!(literal_compare(
             &LiteralValue::Boolean(false),
@@ -1685,7 +1685,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("2024-01-15".to_owned())),
+            val_expr(LiteralValue::String("2024-01-15".into())),
         );
 
         assert!(where_expr_evaluate(&expr, &row_data, TS_TABLE));
@@ -1708,7 +1708,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("2024-01-16".to_owned())),
+            val_expr(LiteralValue::String("2024-01-16".into())),
         );
 
         assert!(!where_expr_evaluate(&expr, &row_data, TS_TABLE));
@@ -1731,7 +1731,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::GreaterThan,
             cast_col,
-            val_expr(LiteralValue::String("2024-01-31".to_owned())),
+            val_expr(LiteralValue::String("2024-01-31".into())),
         );
 
         assert!(where_expr_evaluate(&expr, &row_data, TS_TABLE));
@@ -1754,7 +1754,7 @@ mod tests {
         )));
         let expr = binary_expr(
             BinaryOp::LessThan,
-            val_expr(LiteralValue::String("2024-01-01".to_owned())),
+            val_expr(LiteralValue::String("2024-01-01".into())),
             cast_col,
         );
 
@@ -1782,7 +1782,7 @@ mod tests {
             BinaryOp::Equal,
             cast_col,
             val_expr(LiteralValue::StringWithCast(
-                "2024-01-15".to_owned(),
+                "2024-01-15".into(),
                 "date".into(),
             )),
         );
@@ -1800,7 +1800,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("2024-01-15".to_owned())),
+            val_expr(LiteralValue::String("2024-01-15".into())),
         );
 
         assert!(resolved_where_expr_supported(&expr));
@@ -1817,7 +1817,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("2024-01-15".to_owned())),
+            val_expr(LiteralValue::String("2024-01-15".into())),
         );
 
         assert!(!resolved_where_expr_supported(&expr));
@@ -1835,7 +1835,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Equal,
             cast_col,
-            val_expr(LiteralValue::String("2024-1-15".to_owned())),
+            val_expr(LiteralValue::String("2024-1-15".into())),
         );
 
         assert!(!resolved_where_expr_supported(&expr));
@@ -1861,19 +1861,19 @@ mod tests {
     fn literal_compare_string_to_string_lex_order() {
         // ISO 8601 dates compare chronologically by bytes.
         assert!(literal_compare(
-            &LiteralValue::String("2024-01-15".to_owned()),
+            &LiteralValue::String("2024-01-15".into()),
             BinaryOp::Equal,
-            &LiteralValue::String("2024-01-15".to_owned()),
+            &LiteralValue::String("2024-01-15".into()),
         ));
         assert!(literal_compare(
-            &LiteralValue::String("2024-01-15".to_owned()),
+            &LiteralValue::String("2024-01-15".into()),
             BinaryOp::LessThan,
-            &LiteralValue::String("2024-02-01".to_owned()),
+            &LiteralValue::String("2024-02-01".into()),
         ));
         assert!(!literal_compare(
-            &LiteralValue::String("2024-03-01".to_owned()),
+            &LiteralValue::String("2024-03-01".into()),
             BinaryOp::LessThan,
-            &LiteralValue::String("2024-02-01".to_owned()),
+            &LiteralValue::String("2024-02-01".into()),
         ));
     }
 
@@ -2039,7 +2039,7 @@ mod tests {
         let expr = binary(
             BinaryOp::NotEqual,
             col_expr(&table, "name"),
-            val_expr(LiteralValue::String("jane".to_owned())),
+            val_expr(LiteralValue::String("jane".into())),
         );
 
         assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
@@ -2057,7 +2057,7 @@ mod tests {
         let expr = binary(
             BinaryOp::NotEqual,
             col_expr(&table, "name"),
-            val_expr(LiteralValue::String("john".to_owned())),
+            val_expr(LiteralValue::String("john".into())),
         );
 
         assert!(!expr_comparison_evaluate(&expr, &row_data, TABLE));
@@ -2297,14 +2297,14 @@ mod tests {
         let expr = binary(
             BinaryOp::LessThan,
             col_expr(&table, "name"),
-            val_expr(LiteralValue::String("zebra".to_owned())),
+            val_expr(LiteralValue::String("zebra".into())),
         );
         assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
 
         let expr = binary(
             BinaryOp::GreaterThan,
             col_expr(&table, "name"),
-            val_expr(LiteralValue::String("alice".to_owned())),
+            val_expr(LiteralValue::String("alice".into())),
         );
         assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
     }
@@ -2318,7 +2318,7 @@ mod tests {
         let expr = binary(
             BinaryOp::GreaterThan,
             col_expr(&table, "name"),
-            val_expr(LiteralValue::String("test".to_owned())),
+            val_expr(LiteralValue::String("test".into())),
         );
         assert!(!expr_comparison_evaluate(&expr, &row_data, TABLE));
 
@@ -2413,7 +2413,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::Like,
             col_expr(&table, "name"),
-            val_expr(LiteralValue::String("j%".to_owned())),
+            val_expr(LiteralValue::String("j%".into())),
         );
         assert!(!resolved_where_expr_supported(&expr));
     }
@@ -2490,7 +2490,7 @@ mod tests {
             binary_expr(
                 BinaryOp::Like,
                 col_expr(&table, "name"),
-                val_expr(LiteralValue::String("j%".to_owned())),
+                val_expr(LiteralValue::String("j%".into())),
             ),
         );
         assert!(!resolved_where_expr_supported(&expr));

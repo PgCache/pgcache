@@ -1446,7 +1446,7 @@ mod tests {
             relation_oid,
             name: name.into(),
             schema: "public".into(),
-            primary_key_columns: vec!["id".to_owned()],
+            primary_key_columns: vec!["id".into()],
             columns,
             indexes: Vec::new(),
         }
@@ -1477,7 +1477,7 @@ mod tests {
             relation_oid,
             name: name.into(),
             schema: "public".into(),
-            primary_key_columns: vec![column_names[0].to_owned()],
+            primary_key_columns: vec![column_names[0].into()],
             columns,
             indexes: Vec::new(),
         }
@@ -2605,8 +2605,8 @@ mod tests {
 
         // Parameterized values are preserved through resolution
         let limit = resolved.limit.unwrap();
-        assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".to_owned())));
-        assert_eq!(limit.offset, Some(LiteralValue::Parameter("$2".to_owned())));
+        assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".into())));
+        assert_eq!(limit.offset, Some(LiteralValue::Parameter("$2".into())));
     }
 
     #[test]

@@ -60,7 +60,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                         message: "binary enum value is not valid UTF-8".to_owned(),
                     })
                 })?;
-                return Ok(LiteralValue::String(s.to_owned()));
+                return Ok(LiteralValue::String(s.into()));
             }
             postgres_types::Kind::Composite(_)
             | postgres_types::Kind::Range(_)
@@ -148,7 +148,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                     message: format!("invalid binary text: {e}"),
                 })
             })?;
-            Ok(LiteralValue::String(value.to_owned()))
+            Ok(LiteralValue::String(value.into()))
         }
         Some(PgType::UUID) => {
             let bytes: &[u8; 16] = bytes.try_into().map_err(|_| {
@@ -178,14 +178,14 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 bytes[14],
                 bytes[15]
             );
-            Ok(LiteralValue::String(uuid_str))
+            Ok(LiteralValue::String(uuid_str.into()))
         }
         Some(PgType::BYTEA) => {
             // The leading `\` in `\x<hex>` forces `escape_literal` into
             // E-string form so the SQL stays well-formed.
             let raw = pg_types::bytea_from_sql(bytes);
             Ok(LiteralValue::StringWithCast(
-                bytea_to_hex_literal(raw),
+                bytea_to_hex_literal(raw).into(),
                 PgType::BYTEA.name().into(),
             ))
         }
@@ -196,7 +196,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 })
             })?;
             Ok(LiteralValue::StringWithCast(
-                time_micros_to_text(micros),
+                time_micros_to_text(micros).into(),
                 PgType::TIME.name().into(),
             ))
         }
@@ -216,7 +216,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 }
             };
             Ok(LiteralValue::StringWithCast(
-                text,
+                text.into(),
                 PgType::DATE.name().into(),
             ))
         }
@@ -232,7 +232,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 _ => timestamp_micros_to_text(micros),
             };
             Ok(LiteralValue::StringWithCast(
-                text,
+                text.into(),
                 PgType::TIMESTAMP.name().into(),
             ))
         }
@@ -250,7 +250,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 _ => format!("{}+00", timestamp_micros_to_text(micros)),
             };
             Ok(LiteralValue::StringWithCast(
-                text,
+                text.into(),
                 PgType::TIMESTAMPTZ.name().into(),
             ))
         }
@@ -261,7 +261,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 })
             })?;
             Ok(LiteralValue::StringWithCast(
-                macaddr_to_text(&octets),
+                macaddr_to_text(&octets).into(),
                 PgType::MACADDR.name().into(),
             ))
         }
@@ -275,7 +275,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 })
             })?;
             Ok(LiteralValue::StringWithCast(
-                macaddr_to_text(octets),
+                macaddr_to_text(octets).into(),
                 PgType::MACADDR8.name().into(),
             ))
         }
@@ -286,7 +286,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 })
             })?;
             Ok(LiteralValue::StringWithCast(
-                inet_to_text(&inet, false),
+                inet_to_text(&inet, false).into(),
                 PgType::INET.name().into(),
             ))
         }
@@ -297,7 +297,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 })
             })?;
             Ok(LiteralValue::StringWithCast(
-                inet_to_text(&inet, true),
+                inet_to_text(&inet, true).into(),
                 PgType::CIDR.name().into(),
             ))
         }
@@ -309,7 +309,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 })
             })?;
             Ok(LiteralValue::StringWithCast(
-                text,
+                text.into(),
                 PgType::NUMERIC.name().into(),
             ))
         }
@@ -326,7 +326,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
             let micros = i64::from_be_bytes(arr[0..8].try_into().expect("8-byte time component"));
             let zone = i32::from_be_bytes(arr[8..12].try_into().expect("4-byte zone component"));
             Ok(LiteralValue::StringWithCast(
-                timetz_to_text(micros, zone),
+                timetz_to_text(micros, zone).into(),
                 PgType::TIMETZ.name().into(),
             ))
         }
@@ -345,7 +345,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
             let months =
                 i32::from_be_bytes(arr[12..16].try_into().expect("4-byte months component"));
             Ok(LiteralValue::StringWithCast(
-                interval_to_text(micros, days, months),
+                interval_to_text(micros, days, months).into(),
                 PgType::INTERVAL.name().into(),
             ))
         }
@@ -360,7 +360,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                 })
             })?;
             Ok(LiteralValue::StringWithCast(
-                value.to_owned(),
+                value.into(),
                 PgType::JSON.name().into(),
             ))
         }
@@ -377,7 +377,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
                         })
                     })?;
                     Ok(LiteralValue::StringWithCast(
-                        value.to_owned(),
+                        value.into(),
                         PgType::JSONB.name().into(),
                     ))
                 }
@@ -798,7 +798,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary numeric");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(expected.to_owned(), "numeric".into()),
+            LiteralValue::StringWithCast(expected.into(), "numeric".into()),
             "wire bytes {bytes:?}"
         );
     }
@@ -926,7 +926,7 @@ mod tests {
             oid: PgType::TEXT.oid(),
         };
         let result = parameter_to_literal(&param).expect("to convert parameter");
-        assert_eq!(result, LiteralValue::String("hello world".to_owned()));
+        assert_eq!(result, LiteralValue::String("hello world".into()));
     }
 
     #[test]
@@ -943,7 +943,7 @@ mod tests {
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(
             result,
-            LiteralValue::String("550e8400-e29b-41d4-a716-446655440000".to_owned())
+            LiteralValue::String("550e8400-e29b-41d4-a716-446655440000".into())
         );
     }
 
@@ -1036,7 +1036,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary json");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(r#"{"a":1,"b":[2,3]}"#.to_owned(), "json".into())
+            LiteralValue::StringWithCast(r#"{"a":1,"b":[2,3]}"#.into(), "json".into())
         );
     }
 
@@ -1054,7 +1054,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary jsonb");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast(r#"{"k":"v"}"#.to_owned(), "jsonb".into())
+            LiteralValue::StringWithCast(r#"{"k":"v"}"#.into(), "jsonb".into())
         );
     }
 
@@ -1084,7 +1084,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary bytea");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("\\xdeadbeef".to_owned(), "bytea".into())
+            LiteralValue::StringWithCast("\\xdeadbeef".into(), "bytea".into())
         );
     }
 
@@ -1098,7 +1098,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode empty bytea");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("\\x".to_owned(), "bytea".into())
+            LiteralValue::StringWithCast("\\x".into(), "bytea".into())
         );
     }
 
@@ -1135,8 +1135,8 @@ mod tests {
             literal,
             LiteralValue::Array(
                 vec![
-                    LiteralValue::StringWithCast("\\x01".to_owned(), "bytea".into()),
-                    LiteralValue::StringWithCast("\\xab".to_owned(), "bytea".into()),
+                    LiteralValue::StringWithCast("\\x01".into(), "bytea".into()),
+                    LiteralValue::StringWithCast("\\xab".into(), "bytea".into()),
                 ],
                 "bytea[]".into()
             )
@@ -1161,7 +1161,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary time");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("12:00:00.000000".to_owned(), "time".into())
+            LiteralValue::StringWithCast("12:00:00.000000".into(), "time".into())
         );
     }
 
@@ -1177,7 +1177,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary time");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("13:45:30.123456".to_owned(), "time".into())
+            LiteralValue::StringWithCast("13:45:30.123456".into(), "time".into())
         );
     }
 
@@ -1218,8 +1218,8 @@ mod tests {
             literal,
             LiteralValue::Array(
                 vec![
-                    LiteralValue::StringWithCast("00:00:00.000000".to_owned(), "time".into()),
-                    LiteralValue::StringWithCast("12:00:00.000000".to_owned(), "time".into()),
+                    LiteralValue::StringWithCast("00:00:00.000000".into(), "time".into()),
+                    LiteralValue::StringWithCast("12:00:00.000000".into(), "time".into()),
                 ],
                 "time[]".into()
             )
@@ -1238,7 +1238,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary timetz");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("12:00:00.000000+00".to_owned(), "timetz".into())
+            LiteralValue::StringWithCast("12:00:00.000000+00".into(), "timetz".into())
         );
     }
 
@@ -1256,7 +1256,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary timetz");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("12:00:00.000000+05".to_owned(), "timetz".into())
+            LiteralValue::StringWithCast("12:00:00.000000+05".into(), "timetz".into())
         );
     }
 
@@ -1272,7 +1272,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary timetz");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("12:00:00.000000-08".to_owned(), "timetz".into())
+            LiteralValue::StringWithCast("12:00:00.000000-08".into(), "timetz".into())
         );
     }
 
@@ -1289,7 +1289,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary timetz");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("09:00:00.000000+05:30".to_owned(), "timetz".into())
+            LiteralValue::StringWithCast("09:00:00.000000+05:30".into(), "timetz".into())
         );
     }
 
@@ -1319,7 +1319,7 @@ mod tests {
         assert_eq!(
             literal,
             LiteralValue::StringWithCast(
-                "0 mons 0 days 00:00:00.000000".to_owned(),
+                "0 mons 0 days 00:00:00.000000".into(),
                 "interval".into()
             )
         );
@@ -1339,7 +1339,7 @@ mod tests {
         assert_eq!(
             literal,
             LiteralValue::StringWithCast(
-                "2 mons 3 days 04:05:06.700000".to_owned(),
+                "2 mons 3 days 04:05:06.700000".into(),
                 "interval".into()
             )
         );
@@ -1359,7 +1359,7 @@ mod tests {
         assert_eq!(
             literal,
             LiteralValue::StringWithCast(
-                "-1 mons -2 days -01:00:00.000000".to_owned(),
+                "-1 mons -2 days -01:00:00.000000".into(),
                 "interval".into()
             )
         );
@@ -1405,7 +1405,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary date");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("2000-01-01".to_owned(), "date".into())
+            LiteralValue::StringWithCast("2000-01-01".into(), "date".into())
         );
     }
 
@@ -1419,7 +1419,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary date");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("2000-01-02".to_owned(), "date".into())
+            LiteralValue::StringWithCast("2000-01-02".into(), "date".into())
         );
     }
 
@@ -1433,7 +1433,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary date");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("1999-12-31".to_owned(), "date".into())
+            LiteralValue::StringWithCast("1999-12-31".into(), "date".into())
         );
     }
 
@@ -1449,7 +1449,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary date");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("0001-01-01".to_owned(), "date".into())
+            LiteralValue::StringWithCast("0001-01-01".into(), "date".into())
         );
     }
 
@@ -1465,7 +1465,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary date");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("0001-01-01 BC".to_owned(), "date".into())
+            LiteralValue::StringWithCast("0001-01-01 BC".into(), "date".into())
         );
     }
 
@@ -1479,7 +1479,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode infinity date");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("infinity".to_owned(), "date".into())
+            LiteralValue::StringWithCast("infinity".into(), "date".into())
         );
     }
 
@@ -1493,7 +1493,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode -infinity date");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("-infinity".to_owned(), "date".into())
+            LiteralValue::StringWithCast("-infinity".into(), "date".into())
         );
     }
 
@@ -1508,7 +1508,7 @@ mod tests {
         assert_eq!(
             literal,
             LiteralValue::StringWithCast(
-                "2000-01-01 00:00:00.000000".to_owned(),
+                "2000-01-01 00:00:00.000000".into(),
                 "timestamp".into()
             )
         );
@@ -1527,7 +1527,7 @@ mod tests {
         assert_eq!(
             literal,
             LiteralValue::StringWithCast(
-                "2000-01-02 12:34:56.123456".to_owned(),
+                "2000-01-02 12:34:56.123456".into(),
                 "timestamp".into()
             )
         );
@@ -1547,7 +1547,7 @@ mod tests {
         assert_eq!(
             literal,
             LiteralValue::StringWithCast(
-                "1999-12-31 23:59:59.999999".to_owned(),
+                "1999-12-31 23:59:59.999999".into(),
                 "timestamp".into()
             )
         );
@@ -1563,7 +1563,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode infinity timestamp");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("infinity".to_owned(), "timestamp".into())
+            LiteralValue::StringWithCast("infinity".into(), "timestamp".into())
         );
     }
 
@@ -1578,7 +1578,7 @@ mod tests {
         assert_eq!(
             literal,
             LiteralValue::StringWithCast(
-                "2000-01-01 00:00:00.000000+00".to_owned(),
+                "2000-01-01 00:00:00.000000+00".into(),
                 "timestamptz".into()
             )
         );
@@ -1594,7 +1594,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode -infinity timestamptz");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("-infinity".to_owned(), "timestamptz".into())
+            LiteralValue::StringWithCast("-infinity".into(), "timestamptz".into())
         );
     }
 
@@ -1628,8 +1628,8 @@ mod tests {
             literal,
             LiteralValue::Array(
                 vec![
-                    LiteralValue::StringWithCast("2000-01-01".to_owned(), "date".into()),
-                    LiteralValue::StringWithCast("2000-01-02".to_owned(), "date".into()),
+                    LiteralValue::StringWithCast("2000-01-01".into(), "date".into()),
+                    LiteralValue::StringWithCast("2000-01-02".into(), "date".into()),
                 ],
                 "date[]".into()
             )
@@ -1646,7 +1646,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary macaddr");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("00:11:22:33:44:55".to_owned(), "macaddr".into())
+            LiteralValue::StringWithCast("00:11:22:33:44:55".into(), "macaddr".into())
         );
     }
 
@@ -1676,7 +1676,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary macaddr8");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("00:11:22:33:44:55:66:77".to_owned(), "macaddr8".into())
+            LiteralValue::StringWithCast("00:11:22:33:44:55:66:77".into(), "macaddr8".into())
         );
     }
 
@@ -1691,7 +1691,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary inet");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("192.168.1.0/24".to_owned(), "inet".into())
+            LiteralValue::StringWithCast("192.168.1.0/24".into(), "inet".into())
         );
     }
 
@@ -1708,7 +1708,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary inet");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("192.168.1.1".to_owned(), "inet".into())
+            LiteralValue::StringWithCast("192.168.1.1".into(), "inet".into())
         );
     }
 
@@ -1729,7 +1729,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary inet v6");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("2001:db8::/64".to_owned(), "inet".into())
+            LiteralValue::StringWithCast("2001:db8::/64".into(), "inet".into())
         );
     }
 
@@ -1744,7 +1744,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary cidr");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("10.0.0.0/8".to_owned(), "cidr".into())
+            LiteralValue::StringWithCast("10.0.0.0/8".into(), "cidr".into())
         );
     }
 
@@ -1761,7 +1761,7 @@ mod tests {
         let literal = parameter_to_literal(&param).expect("decode binary cidr");
         assert_eq!(
             literal,
-            LiteralValue::StringWithCast("192.168.1.1/32".to_owned(), "cidr".into())
+            LiteralValue::StringWithCast("192.168.1.1/32".into(), "cidr".into())
         );
     }
 
@@ -1798,8 +1798,8 @@ mod tests {
             literal,
             LiteralValue::Array(
                 vec![
-                    LiteralValue::StringWithCast("00:11:22:33:44:55".to_owned(), "macaddr".into()),
-                    LiteralValue::StringWithCast("aa:bb:cc:dd:ee:ff".to_owned(), "macaddr".into()),
+                    LiteralValue::StringWithCast("00:11:22:33:44:55".into(), "macaddr".into()),
+                    LiteralValue::StringWithCast("aa:bb:cc:dd:ee:ff".into(), "macaddr".into()),
                 ],
                 "macaddr[]".into()
             )
@@ -1982,8 +1982,8 @@ mod tests {
             literal,
             LiteralValue::Array(
                 vec![
-                    LiteralValue::StringWithCast("42.5".to_owned(), "numeric".into()),
-                    LiteralValue::StringWithCast("-3.14".to_owned(), "numeric".into()),
+                    LiteralValue::StringWithCast("42.5".into(), "numeric".into()),
+                    LiteralValue::StringWithCast("-3.14".into(), "numeric".into()),
                 ],
                 "numeric[]".into()
             )
@@ -2188,11 +2188,11 @@ mod tests {
             literal,
             LiteralValue::Array(
                 vec![
-                    LiteralValue::String("plain".to_owned()),
-                    LiteralValue::String("with,comma".to_owned()),
-                    LiteralValue::String("has\"quote".to_owned()),
-                    LiteralValue::String("back\\slash".to_owned()),
-                    LiteralValue::String(String::new()),
+                    LiteralValue::String("plain".into()),
+                    LiteralValue::String("with,comma".into()),
+                    LiteralValue::String("has\"quote".into()),
+                    LiteralValue::String("back\\slash".into()),
+                    LiteralValue::String("".into()),
                 ],
                 "text[]".into()
             )
@@ -2228,8 +2228,8 @@ mod tests {
             literal,
             LiteralValue::Array(
                 vec![
-                    LiteralValue::String("NULL".to_owned()),
-                    LiteralValue::String("a".to_owned()),
+                    LiteralValue::String("NULL".into()),
+                    LiteralValue::String("a".into()),
                 ],
                 "text[]".into()
             )

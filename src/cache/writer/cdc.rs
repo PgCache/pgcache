@@ -1582,7 +1582,7 @@ impl WriterCore {
 /// with an empty SET list, so PK-only tables must use `DO NOTHING`.
 ///
 /// Assumes the caller has already emitted `INSERT INTO ... ON CONFLICT (<pk>)`.
-fn cdc_on_conflict_tail_append(sql: &mut String, column_names: &[&str], pkey_columns: &[String]) {
+fn cdc_on_conflict_tail_append(sql: &mut String, column_names: &[&str], pkey_columns: &[EcoString]) {
     let is_pk = |name: &str| pkey_columns.iter().any(|pk| pk.as_str() == name);
     let has_non_pk = column_names.iter().any(|c| !is_pk(c));
     if !has_non_pk {
@@ -1696,7 +1696,7 @@ mod tests {
             relation_oid: 1001,
             name: "users".into(),
             schema: "public".into(),
-            primary_key_columns: vec!["id".to_owned()],
+            primary_key_columns: vec!["id".into()],
             columns,
             indexes: Vec::new(),
         }
@@ -1824,7 +1824,7 @@ mod tests {
                 "created_at".into(),
                 CastTarget::Date,
                 BinaryOp::Equal,
-                LiteralValue::String("2024-01-15".to_owned()),
+                LiteralValue::String("2024-01-15".into()),
             )],
         );
         let row = vec![

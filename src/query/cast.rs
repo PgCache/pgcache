@@ -120,7 +120,9 @@ pub fn cast_target_coerce_text(target: &CastTarget, row_text: &str) -> Option<Li
             row_text.parse::<i64>().ok().map(LiteralValue::Integer)
         }
         CastTarget::Bool => parse_pg_bool(row_text).map(LiteralValue::Boolean),
-        CastTarget::Date => timestamp_text_to_date(row_text).map(LiteralValue::String),
+        CastTarget::Date => {
+            timestamp_text_to_date(row_text).map(|s| LiteralValue::String(s.into()))
+        }
         CastTarget::Text | CastTarget::Other(_) => None,
     }
 }
@@ -639,7 +641,7 @@ mod tests {
     fn test_coerce_text_date_from_timestamp_with_space() {
         assert_eq!(
             cast_target_coerce_text(&CastTarget::Date, "2024-01-15 23:45:00"),
-            Some(LiteralValue::String("2024-01-15".to_owned()))
+            Some(LiteralValue::String("2024-01-15".into()))
         );
     }
 
@@ -648,7 +650,7 @@ mod tests {
         // ISO 8601 with `T` separator.
         assert_eq!(
             cast_target_coerce_text(&CastTarget::Date, "2024-01-15T09:00:00"),
-            Some(LiteralValue::String("2024-01-15".to_owned()))
+            Some(LiteralValue::String("2024-01-15".into()))
         );
     }
 
@@ -656,7 +658,7 @@ mod tests {
     fn test_coerce_text_date_from_timestamp_with_fractional_seconds() {
         assert_eq!(
             cast_target_coerce_text(&CastTarget::Date, "2024-01-15 23:45:00.123456"),
-            Some(LiteralValue::String("2024-01-15".to_owned()))
+            Some(LiteralValue::String("2024-01-15".into()))
         );
     }
 
@@ -666,7 +668,7 @@ mod tests {
         // truncation). Accept that too.
         assert_eq!(
             cast_target_coerce_text(&CastTarget::Date, "2024-01-15"),
-            Some(LiteralValue::String("2024-01-15".to_owned()))
+            Some(LiteralValue::String("2024-01-15".into()))
         );
     }
 

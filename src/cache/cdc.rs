@@ -38,8 +38,8 @@ use super::{
 /// Processes replication messages and synchronizes changes with the cache database.
 pub struct CdcProcessor {
     cdc_client: Client,
-    publication_name: String,
-    slot_name: String,
+    publication_name: EcoString,
+    slot_name: EcoString,
 
     cdc_tx: UnboundedSender<CdcCommand>,
     /// Shared set of relation OIDs with active cached queries (maintained by writer).
@@ -75,8 +75,8 @@ impl CdcProcessor {
 
         Ok(Self {
             cdc_client: origin_cdc_client,
-            publication_name: settings.cdc.publication_name.clone(),
-            slot_name: settings.cdc.slot_name.clone(),
+            publication_name: settings.cdc.publication_name.as_str().into(),
+            slot_name: settings.cdc.slot_name.as_str().into(),
             cdc_tx,
             active_relations,
             last_received_lsn: 0,
@@ -539,7 +539,7 @@ impl CdcProcessor {
             };
 
             if is_primary_key {
-                primary_key_columns.push(column.name().unwrap_or("unknown_column").to_owned());
+                primary_key_columns.push(column.name().unwrap_or("unknown_column").into());
             }
 
             columns.push(column_metadata);

@@ -405,7 +405,7 @@ mod tests {
             name: name.into(),
             schema: "public".into(),
             columns,
-            primary_key_columns: vec![column_names[0].to_owned()],
+            primary_key_columns: vec![column_names[0].into()],
             indexes: Vec::new(),
         }
     }

@@ -774,7 +774,7 @@ impl ResolvedScalarExpr {
     /// appears in `agg_fns`. Walks through CASE branches and arithmetic operands,
     /// but does not descend into scalar subqueries (an aggregate nested inside a
     /// subquery doesn't make the outer expression aggregating).
-    pub fn has_aggregate(&self, agg_fns: &HashSet<String>) -> bool {
+    pub fn has_aggregate(&self, agg_fns: &HashSet<EcoString>) -> bool {
         match self {
             ResolvedScalarExpr::Function(func) => {
                 agg_fns.contains(func.name.as_str())

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use ecow::EcoString;
+
 use crate::{
     catalog::FunctionVolatility,
     query::{
@@ -29,7 +31,7 @@ error_set! {
 }
 
 /// Type alias for the function volatility map passed through cacheability checks.
-type FunctionVolatilityMap = HashMap<String, FunctionVolatility>;
+type FunctionVolatilityMap = HashMap<EcoString, FunctionVolatility>;
 
 #[derive(Debug, Clone)]
 pub struct CacheableQuery {
@@ -437,7 +439,7 @@ fn is_cacheable_scalar_expr(
 /// (not aliases), eliminating alias ambiguity.
 pub fn outer_join_optional_tables(
     select: &ResolvedSelectNode,
-) -> (HashSet<String>, HashSet<String>) {
+) -> (HashSet<EcoString>, HashSet<EcoString>) {
     let join = match select.from.as_slice() {
         [ResolvedTableSource::Join(join)] => join,
         _ => return (HashSet::new(), HashSet::new()),
@@ -468,18 +470,18 @@ pub fn outer_join_optional_tables(
 }
 
 /// Collect real table names from all column references in a resolved WHERE expression.
-fn resolved_column_table_refs_collect(expr: &ResolvedWhereExpr, tables: &mut HashSet<String>) {
+fn resolved_column_table_refs_collect(expr: &ResolvedWhereExpr, tables: &mut HashSet<EcoString>) {
     for col in expr.nodes::<ResolvedColumnNode>() {
-        tables.insert(col.table.to_string());
+        tables.insert(col.table.clone());
     }
 }
 
 /// Collect the real table names from all table nodes in a resolved table source subtree.
 /// Traverses JOINs but not subqueries.
-fn resolved_source_table_names_collect(source: &ResolvedTableSource, names: &mut HashSet<String>) {
+fn resolved_source_table_names_collect(source: &ResolvedTableSource, names: &mut HashSet<EcoString>) {
     match source {
         ResolvedTableSource::Table(table) => {
-            names.insert(table.name.to_string());
+            names.insert(table.name.clone());
         }
         ResolvedTableSource::Join(join) => {
             resolved_source_table_names_collect(&join.left, names);
@@ -501,9 +503,9 @@ fn resolved_source_table_names_collect(source: &ResolvedTableSource, names: &mut
 /// excludes a join's own condition from the terminal definition.
 fn resolved_join_terminality_walk(
     join: &ResolvedJoinNode,
-    non_terminal_refs: &HashSet<String>,
-    all_optional: &mut HashSet<String>,
-    non_terminal: &mut HashSet<String>,
+    non_terminal_refs: &HashSet<EcoString>,
+    all_optional: &mut HashSet<EcoString>,
+    non_terminal: &mut HashSet<EcoString>,
 ) {
     // Collect optional-side tables at this level
     if matches!(join.join_type, JoinType::Left | JoinType::Right) {
@@ -598,12 +600,12 @@ mod tests {
             "substring",
             "date_trunc",
         ] {
-            map.insert(name.to_owned(), FunctionVolatility::Immutable);
+            map.insert(name.into(), FunctionVolatility::Immutable);
         }
         for name in ["now", "current_timestamp"] {
-            map.insert(name.to_owned(), FunctionVolatility::Stable);
+            map.insert(name.into(), FunctionVolatility::Stable);
         }
-        map.insert("random".to_owned(), FunctionVolatility::Volatile);
+        map.insert("random".into(), FunctionVolatility::Volatile);
         map
     }
 
@@ -633,7 +635,7 @@ mod tests {
             relation_oid,
             name: name.into(),
             schema: "public".into(),
-            primary_key_columns: vec![column_names[0].to_owned()],
+            primary_key_columns: vec![column_names[0].into()],
             columns,
             indexes: Vec::new(),
         }

@@ -931,10 +931,9 @@ unsafe fn limit_node_extract(node: NodePtr) -> Result<Option<LiteralValue>, AstE
                     }),
                 }
             }
-            pg::NodeTag_T_ParamRef => Ok(Some(LiteralValue::Parameter(format!(
-                "${}",
-                (*cast::<pg::ParamRef>(node)).number
-            )))),
+            pg::NodeTag_T_ParamRef => Ok(Some(LiteralValue::Parameter(
+                format!("${}", (*cast::<pg::ParamRef>(node)).number).into(),
+            ))),
             other => Err(AstError::UnsupportedFeature {
                 feature: format!("LIMIT/OFFSET expression: {other:?}"),
             }),
@@ -1008,8 +1007,8 @@ unsafe fn const_value_extract(c: *const pg::A_Const) -> Result<LiteralValue, Whe
                     })
             }
             pg::NodeTag_T_Boolean => Ok(LiteralValue::Boolean(val.boolval.boolval)),
-            pg::NodeTag_T_String => Ok(LiteralValue::String(cstr(val.sval.sval).to_owned())),
-            pg::NodeTag_T_BitString => Ok(LiteralValue::String(cstr(val.bsval.bsval).to_owned())),
+            pg::NodeTag_T_String => Ok(LiteralValue::String(cstr(val.sval.sval).into())),
+            pg::NodeTag_T_BitString => Ok(LiteralValue::String(cstr(val.bsval.bsval).into())),
             _ => Ok(LiteralValue::Null),
         }
     }
@@ -1044,7 +1043,7 @@ unsafe fn column_ref_extract(col_ref: *const pg::ColumnRef) -> Result<ColumnNode
 }
 
 unsafe fn param_ref_extract(param_ref: *const pg::ParamRef) -> LiteralValue {
-    unsafe { LiteralValue::Parameter(format!("${}", (*param_ref).number)) }
+    unsafe { LiteralValue::Parameter(format!("${}", (*param_ref).number).into()) }
 }
 
 // ---------- WHERE clause ----------

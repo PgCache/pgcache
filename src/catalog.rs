@@ -96,7 +96,7 @@ pub struct TableMetadata {
     /// Schema name (e.g., "public")
     pub schema: EcoString,
     /// Names of columns that form the primary key
-    pub primary_key_columns: Vec<String>,
+    pub primary_key_columns: Vec<EcoString>,
     /// Column metadata sorted by position with name lookups
     pub columns: ColumnStore,
     /// Index metadata for non-primary-key indexes
@@ -247,13 +247,13 @@ impl std::hash::Hash for ColumnMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IndexMetadata {
     /// Index name (for reference/logging, not used in CREATE INDEX)
-    pub name: String,
+    pub name: EcoString,
     /// Whether this is a unique index
     pub is_unique: bool,
     /// Index method (btree, hash, gist, gin, etc.)
-    pub method: String,
+    pub method: EcoString,
     /// Ordered list of column names in the index
-    pub columns: Vec<String>,
+    pub columns: Vec<EcoString>,
 }
 
 /// PostgreSQL function volatility classification.
@@ -278,7 +278,7 @@ pub enum FunctionVolatility {
 /// case-insensitive identifier handling.
 pub async fn function_volatility_map_load(
     client: &Client,
-) -> Result<HashMap<String, FunctionVolatility>, Error> {
+) -> Result<HashMap<EcoString, FunctionVolatility>, Error> {
     let rows = client
         .query(
             "SELECT p.proname,
@@ -304,7 +304,7 @@ pub async fn function_volatility_map_load(
             1 => FunctionVolatility::Stable,
             _ => FunctionVolatility::Volatile,
         };
-        map.insert(name.to_owned(), volatility);
+        map.insert(name.into(), volatility);
     }
 
     Ok(map)
@@ -316,7 +316,7 @@ pub async fn function_volatility_map_load(
 /// of lowercase function names. Used during decorrelation to determine whether
 /// a scalar subquery's output expression contains an aggregate (which controls
 /// whether a GROUP BY is needed in the derived table).
-pub async fn aggregate_functions_load(client: &Client) -> Result<HashSet<String>, Error> {
+pub async fn aggregate_functions_load(client: &Client) -> Result<HashSet<EcoString>, Error> {
     let rows = client
         .query(
             "SELECT DISTINCT lower(p.proname) FROM pg_proc p WHERE p.prokind = 'a'",
@@ -327,7 +327,7 @@ pub async fn aggregate_functions_load(client: &Client) -> Result<HashSet<String>
     let mut set = HashSet::with_capacity(rows.len());
     for row in &rows {
         let name: &str = row.get(0);
-        set.insert(name.to_owned());
+        set.insert(name.into());
     }
 
     Ok(set)

@@ -103,7 +103,7 @@ mod tests {
             relation_oid,
             name: name.into(),
             schema: "public".into(),
-            primary_key_columns: vec![column_names[0].to_owned()],
+            primary_key_columns: vec![column_names[0].into()],
             columns,
             indexes: Vec::new(),
         }

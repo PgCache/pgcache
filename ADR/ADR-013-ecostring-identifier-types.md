@@ -3,6 +3,8 @@
 ## Status
 Accepted
 
+> **Amended by [ADR-032](ADR-032-ecostring-by-default.md).** ADR-032 adopts EcoString-by-default codebase-wide and reverses the "Not converted" decision below for `LiteralValue` string variants and `Parameter` (now converted on consistency grounds). The identifier conversions and the buffer/boundary carve-outs in this ADR still stand.
+
 ## Context
 `ResolvedColumnNode` is the most frequently cloned type in the query resolution path. A 65-column UNION query across 7 tables produces 65+ column nodes, each cloned multiple times through scope building, tree transformations, and the two full-query clones in the transform pass. Every clone allocates heap memory and copies string content for schema, table, column, and type name fields — ~7 strings per column node across `ResolvedColumnNode` and its embedded `ColumnMetadata`.
 

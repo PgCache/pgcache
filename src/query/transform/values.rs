@@ -93,7 +93,7 @@ pub fn resolved_select_node_table_replace_with_values(
         if let Some(row_value) = row_data.get(position) {
             let value = row_value.as_deref().map_or_else(
                 || LiteralValue::NullWithCast(column_meta.type_name.clone()),
-                |v| LiteralValue::StringWithCast(v.to_owned(), column_meta.type_name.clone()),
+                |v| LiteralValue::StringWithCast(v.into(), column_meta.type_name.clone()),
             );
             values.push(value);
             column_names.push(EcoString::from(column_meta.name.as_str()));
@@ -368,7 +368,7 @@ mod tests {
             relation_oid: oid,
             name: name.into(),
             schema: "public".into(),
-            primary_key_columns: vec![cols.first().expect("at least one column").0.to_owned()],
+            primary_key_columns: vec![cols.first().expect("at least one column").0.into()],
             columns,
             indexes: Vec::new(),
         }

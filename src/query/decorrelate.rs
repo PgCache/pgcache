@@ -66,11 +66,11 @@ struct DecorrelateState<'a> {
     /// Counter for scalar column aliases: _ds1, _ds2, ...
     scalar_column_counter: u32,
     /// Aggregate function names from pg_proc (lowercase).
-    aggregate_functions: &'a HashSet<String>,
+    aggregate_functions: &'a HashSet<EcoString>,
 }
 
 impl<'a> DecorrelateState<'a> {
-    fn new(aggregate_functions: &'a HashSet<String>) -> Self {
+    fn new(aggregate_functions: &'a HashSet<EcoString>) -> Self {
         Self {
             derived_table_counter: 0,
             scalar_column_counter: 0,
@@ -715,7 +715,7 @@ fn subquery_not_in_all_decorrelate(
 /// WHERE clause (guaranteed to exist).
 fn scalar_inner_prepare(
     inner_query: &ResolvedQueryExpr,
-    agg_fns: &HashSet<String>,
+    agg_fns: &HashSet<EcoString>,
 ) -> DecorrelateResult<(ResolvedSelectNode, ResolvedWhereExpr)> {
     let inner_select = inner_query_select(inner_query).ok_or_else(|| {
         Report::from(DecorrelateError::NonDecorrelatable {
@@ -1487,7 +1487,7 @@ fn select_node_decorrelate(
 /// used to decide whether derived tables need GROUP BY during scalar decorrelation.
 pub fn query_expr_decorrelate(
     resolved: &ResolvedQueryExpr,
-    aggregate_functions: &HashSet<String>,
+    aggregate_functions: &HashSet<EcoString>,
 ) -> DecorrelateResult<DecorrelateOutcome> {
     let mut state = DecorrelateState::new(aggregate_functions);
     query_expr_decorrelate_inner(resolved, &mut state)
@@ -1567,7 +1567,7 @@ mod tests {
             relation_oid,
             name: name.into(),
             schema: "public".into(),
-            primary_key_columns: vec![column_names[0].to_owned()],
+            primary_key_columns: vec![column_names[0].into()],
             columns,
             indexes: Vec::new(),
         }
@@ -1605,7 +1605,7 @@ mod tests {
         tables
     }
 
-    fn test_aggregate_functions() -> HashSet<String> {
+    fn test_aggregate_functions() -> HashSet<EcoString> {
         [
             "count",
             "sum",
@@ -1618,7 +1618,7 @@ mod tests {
             "bool_or",
         ]
         .into_iter()
-        .map(String::from)
+        .map(EcoString::from)
         .collect()
     }
 

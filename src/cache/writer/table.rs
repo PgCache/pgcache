@@ -1,3 +1,4 @@
+use ecow::EcoString;
 use tokio_postgres::Row;
 use tokio_postgres::types::Type;
 use tracing::{debug, error, instrument};
@@ -30,7 +31,7 @@ impl WriterCore {
     ) -> CacheResult<TableMetadata> {
         let rows = self.query_table_columns_get(schema, table).await?;
 
-        let mut primary_key_columns: Vec<String> = Vec::new();
+        let mut primary_key_columns: Vec<EcoString> = Vec::new();
         let mut columns: Vec<ColumnMetadata> = Vec::with_capacity(rows.len());
         let mut relation_oid: Option<u32> = None;
         let mut schema: Option<&str> = schema;
@@ -71,7 +72,7 @@ impl WriterCore {
             };
 
             if column.is_primary_key {
-                primary_key_columns.push(column.name.to_string());
+                primary_key_columns.push(column.name.clone());
             }
 
             columns.push(column);
@@ -237,11 +238,15 @@ impl WriterCore {
         let indexes = rows
             .iter()
             .map(|row| {
-                let columns: Vec<String> = row.get("columns");
+                let columns: Vec<EcoString> = row
+                    .get::<_, Vec<String>>("columns")
+                    .into_iter()
+                    .map(Into::into)
+                    .collect();
                 IndexMetadata {
-                    name: row.get("index_name"),
+                    name: row.get::<_, String>("index_name").into(),
                     is_unique: row.get("is_unique"),
-                    method: row.get("method"),
+                    method: row.get::<_, String>("method").into(),
                     columns,
                 }
             })
