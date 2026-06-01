@@ -31,13 +31,16 @@ use super::super::{
 use super::cdc::WriterCdc;
 use super::registration::WriterRegistration;
 
-/// CDC source-txn frame state on `WriterCdc`'s write connection (PGC-108).
-/// `Idle →Begin Active →write TxnOpen →Commit Idle`; `* →40P01 Recovering`.
 /// Preallocated capacity for the per-frame SQL write buffer (PGC-228). Fixed up
 /// front so the buffer never reallocates in steady state; also the byte
 /// threshold at which a frame's writes are chunk-flushed to bound memory.
 pub(super) const FRAME_BUF_CAPACITY: usize = 256 * 1024;
 
+/// CDC source-txn frame state on `WriterCdc`'s write connection (PGC-108).
+/// `Idle →Begin Active →write TxnOpen →Commit Idle`; `* →40P01 Recovering`.
+/// Writes are buffered (PGC-228): a `BEGIN` and the cache-table statements
+/// accumulate in `frame_buf` and reach the server only when the buffer is
+/// chunk-flushed mid-frame or flushed as one `BEGIN; …; COMMIT` at `CommitMark`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FrameState {
     /// Between source transactions.
@@ -45,7 +48,10 @@ pub(super) enum FrameState {
     /// In a frame, no cache-table write yet — no `BEGIN`/locks, but
     /// invalidations/oids may be accumulating for the `CommitMark` flush.
     Active,
-    /// `BEGIN` open, frame holds row locks, `COMMIT` owed (was `frame_open`).
+    /// A cache-table write has been buffered: a `BEGIN` is owed and a `COMMIT`
+    /// pending at `CommitMark` (was `frame_open`). Holds no server-side locks
+    /// until the buffer flushes (chunk-flush or `CommitMark`); from the first
+    /// flush on, the open txn holds row locks until `COMMIT`.
     TxnOpen,
     /// Hit `40P01`, rolled back; drains the rest of the txn with no DB apply,
     /// recovers affected relations at `CommitMark` (PGC-147). Holds no locks.
@@ -81,10 +87,11 @@ pub struct WriterCore {
     /// Notifications to coordinator for coalescing queue drain.
     pub(super) notify_tx: UnboundedSender<WriterNotify>,
     /// CDC source-transaction frame state (driven by
-    /// `WriterCdc::frame_ensure`/`frame_commit`/recovery through their
-    /// `&mut WriterCore`). Maintenance paths gate on `frame_holds_locks()`
-    /// to defer cache-table DDL/purges: a `db_cache` DROP/DELETE on a table
-    /// an `Open` frame wrote would block on its row locks until the later
+    /// `WriterCdc::frame_begin_ensure`/`frame_commit`/recovery through their
+    /// `&mut WriterCore`). Maintenance paths gate on `frame_holds_locks()` to
+    /// defer cache-table DDL/purges for the whole `TxnOpen` window: a frame's
+    /// buffered writes can flush to the server at any point (chunk-flush) and
+    /// then hold row locks, so a racing `db_cache` DROP/DELETE would block until
     /// `CommitMark` — a permanent stall. `Recovering` holds no locks.
     pub(super) frame_state: FrameState,
     /// Fingerprints flagged for invalidation by the in-progress `Open`
