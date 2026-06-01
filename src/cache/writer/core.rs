@@ -33,6 +33,11 @@ use super::registration::WriterRegistration;
 
 /// CDC source-txn frame state on `WriterCdc`'s write connection (PGC-108).
 /// `Idle →Begin Active →write TxnOpen →Commit Idle`; `* →40P01 Recovering`.
+/// Preallocated capacity for the per-frame SQL write buffer (PGC-228). Fixed up
+/// front so the buffer never reallocates in steady state; also the byte
+/// threshold at which a frame's writes are chunk-flushed to bound memory.
+pub(super) const FRAME_BUF_CAPACITY: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FrameState {
     /// Between source transactions.
@@ -93,6 +98,17 @@ pub struct WriterCore {
     /// Set when a generation purge was skipped because a frame was open;
     /// flushed after the frame commits at `CommitMark`.
     pub(super) purge_pending: bool,
+    /// Buffered SQL for the in-progress frame's cache-table writes (PGC-228).
+    /// Statements are appended here instead of executed eagerly; the whole
+    /// `BEGIN; …; COMMIT` is flushed in one round-trip at `CommitMark` (or
+    /// chunk-flushed mid-frame when it exceeds `FRAME_BUF_CAPACITY`). Holds only
+    /// `cdc_write_conn` writes — invalidations/purges run out-of-band on
+    /// `db_cache`. Reused across frames; never reallocates in steady state.
+    pub(super) frame_buf: String,
+    /// Whether a chunk of `frame_buf` has already been flushed to
+    /// `cdc_write_conn` this frame (so the `BEGIN` is live on the server). Drives
+    /// whether `40P01` recovery must issue an explicit `ROLLBACK`.
+    pub(super) frame_chunk_flushed: bool,
 }
 
 impl WriterCore {
@@ -128,7 +144,24 @@ impl WriterCore {
             frame_invalidations: HashSet::new(),
             frame_relation_oids: HashSet::new(),
             purge_pending: false,
+            frame_buf: String::with_capacity(FRAME_BUF_CAPACITY),
+            frame_chunk_flushed: false,
         })
+    }
+
+    /// Buffer the frame's `BEGIN` on the first cache-table write (`Active →
+    /// TxnOpen`); idempotent for later writes. The actual `BEGIN` reaches the
+    /// server only when `frame_buf` is flushed. A write while `Idle` (no
+    /// preceding `Begin`) is a bug.
+    pub(super) fn frame_begin_ensure(&mut self) {
+        debug_assert!(
+            !matches!(self.frame_state, FrameState::Idle),
+            "cache-table write before Begin (frame not entered)"
+        );
+        if self.frame_state == FrameState::Active {
+            self.frame_buf.push_str("BEGIN; ");
+            self.frame_state = FrameState::TxnOpen;
+        }
     }
 
     /// Frame holds row locks (a `BEGIN` is open) — maintenance paths defer

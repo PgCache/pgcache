@@ -29,7 +29,7 @@ use super::super::types::{
     CachedQueryState, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
 };
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
-use super::core::{FrameState, WriterCore};
+use super::core::{FRAME_BUF_CAPACITY, FrameState, WriterCore};
 use super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
 use crate::pg;
 use crate::result::error_chain_format;
@@ -75,21 +75,6 @@ fn fault_cdc_deadlock_should_inject(core: &WriterCore) -> bool {
 #[cfg(not(feature = "fault-injection"))]
 fn fault_cdc_deadlock_should_inject(_core: &WriterCore) -> bool {
     false
-}
-
-/// Rows-affected count from a single-statement `simple_query` result. Returns
-/// the first `CommandComplete` count; 0 if none is present (e.g. statement
-/// affected nothing or returned only rows).
-fn simple_query_rows_affected(msgs: &[SimpleQueryMessage]) -> u64 {
-    msgs.iter()
-        .find_map(|m| {
-            if let SimpleQueryMessage::CommandComplete(n) = m {
-                Some(*n)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(0)
 }
 
 /// Boolean from a single-row `SELECT EXISTS (...)` `simple_query` result.
@@ -222,46 +207,56 @@ impl WriterCdc {
         })
     }
 
-    /// `BEGIN` on the first cache-table write of the frame (`Active →
-    /// TxnOpen`); idempotent for later writes. A write while `Idle` (no
-    /// preceding `Begin`) is a bug.
-    async fn frame_ensure(&mut self, core: &mut WriterCore) -> CacheResult<()> {
-        debug_assert!(
-            !matches!(core.frame_state, FrameState::Idle),
-            "cache-table write before Begin (frame not entered)"
-        );
-        if core.frame_state == FrameState::Active {
+    /// Finish a buffered statement: append the separator, then chunk-flush if
+    /// `frame_buf` has grown past `FRAME_BUF_CAPACITY` (bounds memory for large
+    /// source transactions). The chunk goes out inside the open frame txn
+    /// (`BEGIN` was buffered as the first write), which stays open server-side
+    /// until the `COMMIT` at `frame_commit`. The flag is set before the send so
+    /// `40P01` recovery knows a `BEGIN` reached the server.
+    async fn frame_write_finish(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        core.frame_buf.push_str("; ");
+        if core.frame_buf.len() >= FRAME_BUF_CAPACITY {
+            core.frame_chunk_flushed = true;
             self.cdc_write_conn
-                .batch_execute("BEGIN")
+                .batch_execute(&core.frame_buf)
                 .await
                 .map_into_report::<CacheError>()?;
-            core.frame_state = FrameState::TxnOpen;
+            core.frame_buf.clear();
         }
         Ok(())
     }
 
-    /// Commit the frame txn. A write-less frame stayed `Active` and commits
-    /// nothing (its invalidations flush separately at `CommitMark`).
+    /// Flush the frame's buffered writes as a single `BEGIN; …; COMMIT`
+    /// round-trip (PGC-228). A write-less frame stayed `Active` and flushes
+    /// nothing (its invalidations flush separately at `CommitMark`). If chunks
+    /// were already flushed, `frame_buf` holds only the tail + `COMMIT`.
     async fn frame_commit(&mut self, core: &mut WriterCore) -> CacheResult<()> {
         if core.frame_state == FrameState::TxnOpen {
+            core.frame_buf.push_str("COMMIT");
             self.cdc_write_conn
-                .batch_execute("COMMIT")
+                .batch_execute(&core.frame_buf)
                 .await
                 .map_into_report::<CacheError>()?;
+            core.frame_buf.clear();
             core.frame_state = FrameState::Idle;
         }
         Ok(())
     }
 
-    /// `40P01` aborted the whole frame txn: roll back (if a `BEGIN` was open)
-    /// and enter `Recovering` (recovery happens at `CommitMark`, PGC-147).
+    /// `40P01` aborted the frame: discard buffered writes, roll back the
+    /// server-side txn if a chunk had already opened one, and enter `Recovering`
+    /// (relation-level recovery happens at `CommitMark`, PGC-147).
     async fn frame_recover_enter(&mut self, core: &mut WriterCore) -> CacheResult<()> {
-        if core.frame_state == FrameState::TxnOpen {
+        // A fully-buffered frame never sent anything (a failed `BEGIN; …; COMMIT`
+        // batch auto-rolls-back), so only an already-flushed chunk leaves a live
+        // aborted txn block that needs an explicit ROLLBACK.
+        if core.frame_chunk_flushed {
             self.cdc_write_conn
                 .batch_execute("ROLLBACK")
                 .await
                 .map_into_report::<CacheError>()?;
         }
+        core.frame_buf.clear();
         core.frame_state = FrameState::Recovering;
         Ok(())
     }
@@ -364,6 +359,8 @@ impl WriterCdc {
                 );
                 trace!(xid, "cdc frame begin");
                 core.frame_state = FrameState::Active;
+                core.frame_buf.clear();
+                core.frame_chunk_flushed = false;
             }
             CdcCommand::TableRegister(table_metadata) => {
                 core.frame_relation_oids.insert(table_metadata.relation_oid);
@@ -431,9 +428,20 @@ impl WriterCdc {
                 match core.frame_state {
                     FrameState::TxnOpen => {
                         self.frame_invalidations_flush(core).await?;
-                        self.frame_commit(core)
+                        // The buffered writes flush as one BEGIN; …; COMMIT here
+                        // (PGC-228). A 40P01 now surfaces at flush, not per
+                        // statement: route it through frame_dml_result so the
+                        // frame enters Recovering, then run relation-level
+                        // recovery (same as a mid-frame deadlock would).
+                        let r = self.frame_commit(core).await;
+                        self.frame_dml_result(core, r)
                             .await
                             .attach_loc("cdc commit frame")?;
+                        if core.frame_state == FrameState::Recovering {
+                            self.frame_recover(core)
+                                .await
+                                .attach_loc("cdc recover frame at commit")?;
+                        }
                     }
                     // A frame can flag queries for invalidation without any
                     // in-place write (e.g. a growing-join insert excluded from
@@ -459,6 +467,8 @@ impl WriterCdc {
                 core.frame_state = FrameState::Idle;
                 core.frame_invalidations.clear();
                 core.frame_relation_oids.clear();
+                core.frame_buf.clear();
+                core.frame_chunk_flushed = false;
                 self.applied_lsn_advance(lsn);
                 // Frame is closed; flush maintenance that was deferred while it
                 // was open (it would have deadlocked on the frame's locks).
@@ -499,6 +509,29 @@ impl WriterCdc {
             #[allow(clippy::cast_precision_loss)]
             crate::metrics::handles().cdc.applied_lsn.set(lsn as f64);
         }
+    }
+
+    /// Buffer a PK-qualified delete of `row_data` from the relation's cache
+    /// table into the open frame (PGC-228), opening the frame txn if needed.
+    /// The relation is known-present by the time a handler reaches a delete, so
+    /// a missing entry is a hard `UnknownTable` error rather than a skip.
+    async fn frame_cache_delete(
+        &mut self,
+        core: &mut WriterCore,
+        relation_oid: u32,
+        row_data: &[Option<String>],
+    ) -> CacheResult<()> {
+        core.frame_begin_ensure();
+        let table_metadata = core
+            .cache
+            .tables
+            .get1(&relation_oid)
+            .ok_or(CacheError::UnknownTable {
+                oid: Some(relation_oid),
+                name: None,
+            })?;
+        self.cache_delete_into(&mut core.frame_buf, table_metadata, row_data)?;
+        self.frame_write_finish(core).await
     }
 
     /// Handle INSERT operation.
@@ -634,39 +667,13 @@ impl WriterCdc {
         }
 
         if !matched {
-            let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
-                error!("No table metadata found for relation_oid: {}", relation_oid);
-                return Err(CacheError::UnknownTable {
-                    oid: Some(relation_oid),
-                    name: None,
-                }
-                .into());
-            };
-
-            let delete_sql = self.cache_delete_sql(table_metadata, &new_row_data)?;
-            self.frame_ensure(core).await?;
-            self.cdc_write_conn
-                .batch_execute(delete_sql.as_str())
-                .await
-                .map_into_report::<CacheError>()?;
+            self.frame_cache_delete(core, relation_oid, &new_row_data)
+                .await?;
         }
 
+        // A non-empty `key_data` means the PK changed; delete the old PK too.
         if !key_data.is_empty() {
-            let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
-                error!("No table metadata found for relation_oid: {}", relation_oid);
-                return Err(CacheError::UnknownTable {
-                    oid: Some(relation_oid),
-                    name: None,
-                }
-                .into());
-            };
-
-            let delete_sql = self.cache_delete_sql(table_metadata, &key_data)?;
-            self.frame_ensure(core).await?;
-            self.cdc_write_conn
-                .batch_execute(delete_sql.as_str())
-                .await
-                .map_into_report::<CacheError>()?;
+            self.frame_cache_delete(core, relation_oid, &key_data).await?;
         }
 
         crate::metrics::handles()
@@ -691,27 +698,21 @@ impl WriterCdc {
         let start = Instant::now();
         crate::metrics::handles().cdc.handle_deletes.increment(1);
 
-        let table_metadata = match core.cache.tables.get1(&relation_oid) {
-            Some(metadata) => metadata,
-            None => {
-                error!("No table metadata found for relation_oid: {}", relation_oid);
-                crate::metrics::handles()
-                    .cdc
-                    .handle_delete_seconds
-                    .record(start.elapsed().as_secs_f64());
-                return Ok(());
-            }
-        };
+        if !core.cache.tables.contains_key1(&relation_oid) {
+            error!("No table metadata found for relation_oid: {}", relation_oid);
+            crate::metrics::handles()
+                .cdc
+                .handle_delete_seconds
+                .record(start.elapsed().as_secs_f64());
+            return Ok(());
+        }
 
-        let delete_sql = self.cache_delete_sql(table_metadata, &row_data)?;
-        self.frame_ensure(core).await?;
-        let rows_deleted = simple_query_rows_affected(
-            &self
-                .cdc_write_conn
-                .simple_query(delete_sql.as_str())
-                .await
-                .map_into_report::<CacheError>()?,
-        );
+        // Buffer the delete for the frame flush (PGC-228). The previous inline
+        // `rows_deleted` count gated only the freshness metric; with buffering
+        // there is no per-statement result, so freshness is now derived from the
+        // matched-but-not-invalidated query count instead of physical-row
+        // presence (a row absent from cache contributes 0 to either definition).
+        self.frame_cache_delete(core, relation_oid, &row_data).await?;
 
         // Check for subquery invalidations — removing a row can expand the
         // final result set for Exclusion/Scalar subquery tables
@@ -733,19 +734,17 @@ impl WriterCdc {
             core.frame_invalidations.extend(fp_list);
         }
 
-        if rows_deleted > 0 {
-            let total = core
-                .cache
-                .update_queries
-                .get(&relation_oid)
-                .map_or(0, |q| q.queries.len() as u64);
-            let freshness_count = total.saturating_sub(invalidation_count);
-            if freshness_count > 0 {
-                crate::metrics::handles()
-                    .cdc
-                    .freshness_hits
-                    .increment(freshness_count);
-            }
+        let total = core
+            .cache
+            .update_queries
+            .get(&relation_oid)
+            .map_or(0, |q| q.queries.len() as u64);
+        let freshness_count = total.saturating_sub(invalidation_count);
+        if freshness_count > 0 {
+            crate::metrics::handles()
+                .cdc
+                .freshness_hits
+                .increment(freshness_count);
         }
 
         crate::metrics::handles()
@@ -770,11 +769,9 @@ impl WriterCdc {
         relation_oids: &[u32],
     ) -> CacheResult<()> {
         if let Some(sql) = Self::truncate_sql_build(core, relation_oids.iter().copied()) {
-            self.frame_ensure(core).await?;
-            self.cdc_write_conn
-                .batch_execute(sql.as_str())
-                .await
-                .map_into_report::<CacheError>()?;
+            core.frame_begin_ensure();
+            core.frame_buf.push_str(&sql);
+            self.frame_write_finish(core).await?;
         }
 
         for oid in relation_oids {
@@ -1235,7 +1232,7 @@ impl WriterCdc {
     ) -> CacheResult<bool> {
         // Phase A: membership evaluation. The `core` borrow is confined to
         // this block so the in-frame write below doesn't hold it.
-        let (matched, upsert_sql) = {
+        let matched = {
             // No cached query references this relation → nothing to upsert.
             // Not an error (the relation simply isn't maintained in place).
             let Some(update_queries) = core.cache.update_queries.get(&relation_oid) else {
@@ -1329,18 +1326,22 @@ impl WriterCdc {
                 }
             }
 
-            let upsert_sql =
-                matched.then(|| self.cache_upsert_unconditional_sql(table_metadata, row_data));
-            (matched, upsert_sql)
+            matched
         };
 
-        // Phase B: single in-frame write.
-        if let Some(sql) = upsert_sql {
-            self.frame_ensure(core).await?;
-            self.cdc_write_conn
-                .batch_execute(sql.as_str())
-                .await
-                .map_into_report::<CacheError>()?;
+        // Phase B: single in-frame write, buffered for the frame flush (PGC-228).
+        if matched {
+            core.frame_begin_ensure();
+            let table_metadata =
+                core.cache
+                    .tables
+                    .get1(&relation_oid)
+                    .ok_or(CacheError::UnknownTable {
+                        oid: Some(relation_oid),
+                        name: None,
+                    })?;
+            self.cache_upsert_unconditional_into(&mut core.frame_buf, table_metadata, row_data);
+            self.frame_write_finish(core).await?;
         }
 
         Ok(matched)
@@ -1434,11 +1435,15 @@ impl WriterCdc {
     /// with no WHERE predicate. Used by the LocalEval fast path once the Rust
     /// evaluator has already decided the row belongs in cache.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(super) fn cache_upsert_unconditional_sql(
+    /// Append an unconditional upsert for `row_data` into `buf` (PGC-228:
+    /// builders write into the reused frame buffer instead of allocating a
+    /// per-statement `String`).
+    pub(super) fn cache_upsert_unconditional_into(
         &self,
+        buf: &mut String,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
-    ) -> String {
+    ) {
         let mut column_names = Vec::with_capacity(table_metadata.columns.len());
         let mut values = Vec::with_capacity(table_metadata.columns.len());
 
@@ -1456,44 +1461,42 @@ impl WriterCdc {
         let schema = &table_metadata.schema;
         let table = &table_metadata.name;
 
-        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
-        let _ = write!(sql, "INSERT INTO {schema}.{table} (");
+        let _ = write!(buf, "INSERT INTO {schema}.{table} (");
         for (i, col) in column_names.iter().enumerate() {
             if i > 0 {
-                sql.push_str(", ");
+                buf.push_str(", ");
             }
-            sql.push_str(col);
+            buf.push_str(col);
         }
-        sql.push_str(") VALUES (");
+        buf.push_str(") VALUES (");
         for (i, val) in values.iter().enumerate() {
             if i > 0 {
-                sql.push_str(", ");
+                buf.push_str(", ");
             }
-            sql.push_str(val);
+            buf.push_str(val);
         }
-        sql.push_str(") ON CONFLICT (");
+        buf.push_str(") ON CONFLICT (");
         for (i, pk) in table_metadata.primary_key_columns.iter().enumerate() {
             if i > 0 {
-                sql.push_str(", ");
+                buf.push_str(", ");
             }
-            sql.push_str(pk);
+            buf.push_str(pk);
         }
-        sql.push(')');
-        cdc_on_conflict_tail_append(&mut sql, &column_names, &table_metadata.primary_key_columns);
-
-        sql
+        buf.push(')');
+        cdc_on_conflict_tail_append(buf, &column_names, &table_metadata.primary_key_columns);
     }
 
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(super) fn cache_delete_sql(
+    /// Append a PK-qualified delete for `row_data` into `buf` (PGC-228).
+    pub(super) fn cache_delete_into(
         &self,
+        buf: &mut String,
         table_metadata: &TableMetadata,
         row_data: &[Option<String>],
-    ) -> CacheResult<String> {
-        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
+    ) -> CacheResult<()> {
         let _ = write!(
-            sql,
+            buf,
             "DELETE FROM {}.{} WHERE ",
             table_metadata.schema, table_metadata.name
         );
@@ -1507,9 +1510,9 @@ impl WriterCdc {
                         .as_deref()
                         .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
                     if has_pk {
-                        sql.push_str(" AND ");
+                        buf.push_str(" AND ");
                     }
-                    let _ = write!(sql, "{pk_column} = {value}");
+                    let _ = write!(buf, "{pk_column} = {value}");
                     has_pk = true;
                 }
             }
@@ -1520,7 +1523,7 @@ impl WriterCdc {
             return Err(CacheError::NoPrimaryKey.into());
         }
 
-        Ok(sql)
+        Ok(())
     }
 }
 
