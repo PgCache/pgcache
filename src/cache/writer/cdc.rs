@@ -550,27 +550,10 @@ impl WriterCdc {
         // Defer the actual invalidation to just before the frame COMMIT
         // (frame_invalidations_flush) so it is atomic with the maintenance
         // it accompanies rather than visible mid-frame.
-        let invalidation_count = fp_list.len() as u64;
         core.frame_invalidations.extend(fp_list);
 
-        let matched = self
-            .update_queries_execute_batch(core, relation_oid, &row_data)
+        self.update_queries_execute_batch(core, relation_oid, &row_data)
             .await?;
-
-        if matched {
-            let total = core
-                .cache
-                .update_queries
-                .get(&relation_oid)
-                .map_or(0, |q| q.queries.len() as u64);
-            let freshness_count = total.saturating_sub(invalidation_count);
-            if freshness_count > 0 {
-                crate::metrics::handles()
-                    .cdc
-                    .freshness_hits
-                    .increment(freshness_count);
-            }
-        }
 
         crate::metrics::handles()
             .cdc
@@ -607,7 +590,7 @@ impl WriterCdc {
             .get(&relation_oid)
             .is_some_and(|q| q.needs_change_eval());
 
-        let invalidation_count = if needs_change_eval {
+        if needs_change_eval {
             let row_changes = self
                 .query_row_changes(core, relation_oid, &new_row_data)
                 .await?;
@@ -621,33 +604,14 @@ impl WriterCdc {
                 Some(&key_data),
                 CdcOperation::Upsert,
             )?;
-            let invalidation_count = fp_list.len() as u64;
-            trace!("invalidation_count {}", invalidation_count);
+            trace!("invalidation_count {}", fp_list.len());
             // Deferred to frame_invalidations_flush (see handle_insert).
             core.frame_invalidations.extend(fp_list);
-            invalidation_count
-        } else {
-            0
-        };
+        }
 
         let matched = self
             .update_queries_execute_batch(core, relation_oid, &new_row_data)
             .await?;
-
-        if matched {
-            let total = core
-                .cache
-                .update_queries
-                .get(&relation_oid)
-                .map_or(0, |q| q.queries.len() as u64);
-            let freshness_count = total.saturating_sub(invalidation_count);
-            if freshness_count > 0 {
-                crate::metrics::handles()
-                    .cdc
-                    .freshness_hits
-                    .increment(freshness_count);
-            }
-        }
 
         if !matched {
             self.frame_cache_delete(core, relation_oid, &new_row_data)
@@ -691,17 +655,12 @@ impl WriterCdc {
             return Ok(());
         }
 
-        // Buffer the delete for the frame flush (PGC-228). The previous inline
-        // `rows_deleted` count gated only the freshness metric; with buffering
-        // there is no per-statement result, so freshness is now derived from the
-        // matched-but-not-invalidated query count instead of physical-row
-        // presence (a row absent from cache contributes 0 to either definition).
+        // Buffer the delete for the frame flush (PGC-228).
         self.frame_cache_delete(core, relation_oid, &row_data)
             .await?;
 
         // Check for subquery invalidations — removing a row can expand the
         // final result set for Exclusion/Scalar subquery tables
-        let mut invalidation_count = 0u64;
         if core.cache.update_queries.contains_key(&relation_oid) {
             let fp_list = self
                 .update_queries_check_invalidate(
@@ -714,22 +673,8 @@ impl WriterCdc {
                 )
                 .attach_loc("checking delete invalidations")?;
 
-            invalidation_count = fp_list.len() as u64;
             // Deferred to frame_invalidations_flush (see handle_insert).
             core.frame_invalidations.extend(fp_list);
-        }
-
-        let total = core
-            .cache
-            .update_queries
-            .get(&relation_oid)
-            .map_or(0, |q| q.queries.len() as u64);
-        let freshness_count = total.saturating_sub(invalidation_count);
-        if freshness_count > 0 {
-            crate::metrics::handles()
-                .cdc
-                .freshness_hits
-                .increment(freshness_count);
         }
 
         crate::metrics::handles()

@@ -97,7 +97,6 @@ pub mod names {
 
     // Cache performance metrics
     pub const CACHE_INVALIDATIONS: &str = "pgcache.cache.invalidations";
-    pub const CACHE_FRESHNESS_HITS: &str = "pgcache.cache.freshness_hits";
     pub const CACHE_CDC_LOCAL_EVAL_HITS: &str = "pgcache.cache.cdc_local_eval_hits";
     pub const CACHE_CDC_PG_EVAL_HITS: &str = "pgcache.cache.cdc_pg_eval_hits";
     pub const CACHE_EVICTIONS: &str = "pgcache.cache.evictions";
@@ -329,7 +328,6 @@ pub struct CdcHandles {
     pub flushed_lsn: Gauge,
     pub applied_lsn: Gauge,
     pub invalidations: Counter,
-    pub freshness_hits: Counter,
     pub local_eval_hits: Counter,
     pub pg_eval_hits: Counter,
     pub handle_inserts: Counter,
@@ -468,7 +466,6 @@ impl Handles {
                 flushed_lsn: metrics::gauge!(CDC_FLUSHED_LSN),
                 applied_lsn: metrics::gauge!(CDC_APPLIED_LSN),
                 invalidations: metrics::counter!(CACHE_INVALIDATIONS),
-                freshness_hits: metrics::counter!(CACHE_FRESHNESS_HITS),
                 local_eval_hits: metrics::counter!(CACHE_CDC_LOCAL_EVAL_HITS),
                 pg_eval_hits: metrics::counter!(CACHE_CDC_PG_EVAL_HITS),
                 handle_inserts: metrics::counter!(CACHE_HANDLE_INSERTS),
