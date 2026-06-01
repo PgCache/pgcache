@@ -470,7 +470,6 @@ impl WriterRegistration {
         // rather than skip them (PGC-227). Derived from the single source of
         // truth so the flag can't drift from the actual checks.
         update_query.change_dependent = update_query.update_invalidation_possible(table_name);
-        let change_dependent = update_query.change_dependent;
         // Index the per-table constraints for subsumption lookup. Skip
         // entries that are ineligible parents:
         // - has_limit: limited queries are excluded by `subsumption_check`.
@@ -497,8 +496,7 @@ impl WriterRegistration {
             .entry(relation_oid)
             .or_insert_with(|| UpdateQueries::new(relation_oid));
 
-        queries.queries.insert(fingerprint, update_query);
-        queries.change_dependent_account(change_dependent, true);
+        queries.query_insert(update_query);
         // Insert fingerprint into complexity_order at the correct position
         // (ascending by complexity, then by fingerprint for stability).
         let pos = queries
@@ -1189,9 +1187,7 @@ impl WriterRegistration {
                 // No cached_query but `update_queries_register` may have run
                 // before the failure — sweep orphan entries by fingerprint.
                 for mut entry in core.cache.update_queries.iter_mut() {
-                    if let Some(removed) = entry.queries.remove(&fingerprint) {
-                        entry.change_dependent_account(removed.change_dependent, false);
-                    }
+                    entry.query_remove(fingerprint);
                     entry.complexity_order.retain(|fp| *fp != fingerprint);
                     entry.subsumption.remove(fingerprint);
                 }

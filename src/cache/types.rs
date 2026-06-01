@@ -244,15 +244,42 @@ impl UpdateQueries {
         debug_assert_eq!(
             self.change_dependent_count,
             self.queries.values().filter(|q| q.change_dependent).count(),
-            "change_dependent_count desynced from queries — a change_dependent_account \
-             call was missed on insert/remove"
+            "change_dependent_count desynced from queries — insert/remove must go \
+             through query_insert/query_remove"
         );
         self.change_dependent_count > 0
     }
 
+    /// Insert (or replace) an update query, keeping `change_dependent_count` in
+    /// sync with `queries`. Returns the replaced entry, if any. Replacement is
+    /// real: the same fingerprint can be registered more than once for a
+    /// relation (e.g. a self-correlated subquery decorrelates into multiple
+    /// update queries over the same table), and the map is keyed by fingerprint.
+    pub fn query_insert(&mut self, query: UpdateQuery) -> Option<UpdateQuery> {
+        let change_dependent = query.change_dependent;
+        let prev = self.queries.insert(query.fingerprint, query);
+        if let Some(prev) = &prev {
+            self.change_dependent_account(prev.change_dependent, false);
+        }
+        self.change_dependent_account(change_dependent, true);
+        prev
+    }
+
+    /// Remove an update query by fingerprint, keeping `change_dependent_count`
+    /// in sync with `queries`. Returns the removed entry, if any.
+    pub fn query_remove(&mut self, fingerprint: u64) -> Option<UpdateQuery> {
+        let removed = self.queries.remove(&fingerprint);
+        if let Some(removed) = &removed {
+            self.change_dependent_account(removed.change_dependent, false);
+        }
+        removed
+    }
+
     /// Account for a query being added to / removed from the set. `added`
-    /// increments on insert, decrements on remove.
-    pub fn change_dependent_account(&mut self, change_dependent: bool, added: bool) {
+    /// increments on insert, decrements on remove. Private: callers mutate
+    /// `queries` only via `query_insert`/`query_remove`, which keep the count
+    /// in lockstep.
+    fn change_dependent_account(&mut self, change_dependent: bool, added: bool) {
         if !change_dependent {
             return;
         }
@@ -329,9 +356,7 @@ impl Cache {
     pub fn update_queries_remove_fingerprint(&mut self, fingerprint: u64, oids: &[u32]) {
         for oid in oids {
             if let Some(mut queries) = self.update_queries.get_mut(oid) {
-                if let Some(removed) = queries.queries.remove(&fingerprint) {
-                    queries.change_dependent_account(removed.change_dependent, false);
-                }
+                queries.query_remove(fingerprint);
                 queries.complexity_order.retain(|fp| *fp != fingerprint);
                 queries.subsumption.remove(fingerprint);
             }
