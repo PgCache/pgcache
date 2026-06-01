@@ -1154,20 +1154,27 @@ impl ConnectionState {
                         .windows(needle.len())
                         .position(|window| window == needle)
                     {
-                        // Remove needle in place using split/unsplit
-                        let mut tail = msg.data.split_off(pos);
-                        let after_needle = tail.split_off(needle.len());
-                        msg.data.unsplit(after_needle);
+                        // Post-strip length field (bytes 1-4, big-endian i32, excludes tag byte).
+                        // Computed before mutating so an out-of-range length (unreachable: auth
+                        // messages are tiny) degrades to forwarding the message unmodified rather
+                        // than panicking — the strip is best-effort anyway.
+                        if let Some(new_len) = msg
+                            .data
+                            .len()
+                            .checked_sub(needle.len() + 1)
+                            .and_then(|n| i32::try_from(n).ok())
+                        {
+                            // Remove needle in place using split/unsplit
+                            let mut tail = msg.data.split_off(pos);
+                            let after_needle = tail.split_off(needle.len());
+                            msg.data.unsplit(after_needle);
 
-                        // Update the length field (bytes 1-4, big-endian i32, excludes tag byte)
-                        // Safety: Message format guarantees at least 5 bytes (1 tag + 4 length)
-                        let new_len =
-                            i32::try_from(msg.data.len() - 1).expect("PG message size fits in i32");
-                        #[expect(
-                            clippy::indexing_slicing,
-                            reason = "PostgreSQL message format guarantees 5+ bytes"
-                        )]
-                        msg.data[1..5].copy_from_slice(&new_len.to_be_bytes());
+                            #[expect(
+                                clippy::indexing_slicing,
+                                reason = "PostgreSQL message format guarantees 5+ bytes"
+                            )]
+                            msg.data[1..5].copy_from_slice(&new_len.to_be_bytes());
+                        }
                     }
                 }
             }
