@@ -581,23 +581,38 @@ impl WriterCdc {
             return Ok(());
         }
 
-        let row_changes = self
-            .query_row_changes(core, relation_oid, &new_row_data)
-            .await?;
-        trace!("row_changes {:?}", row_changes);
+        // PGC-227: when no cached query over this relation can have its UPDATE
+        // invalidation depend on which columns changed or whether the row is
+        // cached, both `query_row_changes` (a SELECT round-trip) and the
+        // invalidation check are provably no-ops — skip them.
+        let needs_change_eval = core
+            .cache
+            .update_queries
+            .get(&relation_oid)
+            .is_some_and(|q| q.needs_change_eval());
 
-        let fp_list = self.update_queries_check_invalidate(
-            core,
-            relation_oid,
-            row_changes.as_ref(),
-            &new_row_data,
-            Some(&key_data),
-            CdcOperation::Upsert,
-        )?;
-        let invalidation_count = fp_list.len() as u64;
-        trace!("invalidation_count {}", invalidation_count);
-        // Deferred to frame_invalidations_flush (see handle_insert).
-        core.frame_invalidations.extend(fp_list);
+        let invalidation_count = if needs_change_eval {
+            let row_changes = self
+                .query_row_changes(core, relation_oid, &new_row_data)
+                .await?;
+            trace!("row_changes {:?}", row_changes);
+
+            let fp_list = self.update_queries_check_invalidate(
+                core,
+                relation_oid,
+                row_changes.as_ref(),
+                &new_row_data,
+                Some(&key_data),
+                CdcOperation::Upsert,
+            )?;
+            let invalidation_count = fp_list.len() as u64;
+            trace!("invalidation_count {}", invalidation_count);
+            // Deferred to frame_invalidations_flush (see handle_insert).
+            core.frame_invalidations.extend(fp_list);
+            invalidation_count
+        } else {
+            0
+        };
 
         let matched = self
             .update_queries_execute_concurrent(core, relation_oid, &new_row_data)
@@ -1159,30 +1174,37 @@ impl WriterCdc {
 
         let mut fp_list = Vec::new();
         for update_query in update_queries.iter_complexity_ordered() {
-            // Guard clause: handle uncached rows (INSERT or UPDATE where row not in cache)
-            if row_changes.is_none() {
-                if self.row_uncached_invalidation_check(
+            // `Some` → row is cached (UPDATE main path); `None` → row not cached
+            // (INSERT, DELETE, or UPDATE of an uncached row).
+            let invalidate = match row_changes {
+                Some(row_changes) => self.row_cached_invalidation_check(
+                    update_query,
+                    table_metadata,
+                    row_data,
+                    row_changes,
+                ),
+                None => self.row_uncached_invalidation_check(
                     update_query,
                     table_metadata,
                     row_data,
                     key_data,
                     operation,
-                ) {
-                    fp_list.push(update_query.fingerprint);
-                }
-                continue;
-            }
-
-            // Main path: handle cached rows (UPDATE where row exists in cache)
-            // row_changes is guaranteed to be Some here due to the guard clause above
-            if let Some(row_changes) = row_changes
-                && self.row_cached_invalidation_check(
-                    update_query,
-                    table_metadata,
-                    row_data,
-                    row_changes,
-                )
-            {
+                ),
+            };
+            if invalidate {
+                // Drift guard (PGC-227): on the UPDATE path (`Upsert`), a query
+                // that invalidates here MUST be `change_dependent`, or
+                // `handle_update` would have skipped this check and served
+                // stale. `update_invalidation_possible` is the single source of
+                // truth; this fails the moment a check branch diverges from it.
+                // DELETE has its own invalidation branches that fire
+                // independently of the flag, so scope the guard to `Upsert`.
+                debug_assert!(
+                    operation != CdcOperation::Upsert || update_query.change_dependent,
+                    "invalidation fired for a non-change_dependent query on the UPDATE \
+                     path: update_invalidation_possible is out of sync with \
+                     row_*_invalidation_check"
+                );
                 fp_list.push(update_query.fingerprint);
             }
         }

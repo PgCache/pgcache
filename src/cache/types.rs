@@ -165,6 +165,43 @@ pub struct UpdateQuery {
     /// Populated only when `has_limit`; consumed by row_cached_invalidation_check
     /// to detect updates that may demote a cached row out of the window (PGC-94).
     pub limit_window_columns: HashSet<EcoString>,
+    /// Whether a CDC UPDATE for this query can ever invalidate. When `false`,
+    /// `handle_update` skips the `query_row_changes` SELECT and the invalidation
+    /// check entirely (PGC-227). Set at registration from
+    /// `update_invalidation_possible` (the single source of truth — needs the
+    /// relation's table name).
+    pub change_dependent: bool,
+}
+
+impl UpdateQuery {
+    /// Whether a CDC UPDATE (`operation = Upsert`) for this query could ever
+    /// invalidate it: the static upper bound of `row_cached_invalidation_check`
+    /// ∪ `row_uncached_invalidation_check` over all possible row values. This is
+    /// the single source of truth for `change_dependent` (PGC-227); each clause
+    /// mirrors a check branch and the two must stay in lockstep — the
+    /// `debug_assert` in `update_queries_check_invalidate` enforces it at
+    /// runtime by failing if a check ever invalidates while this returns false.
+    pub fn update_invalidation_possible(&self, table_name: &str) -> bool {
+        // Cached path: Subquery / non-terminal outer join always invalidate.
+        matches!(
+            self.source,
+            UpdateQuerySource::Subquery(_) | UpdateQuerySource::OuterJoinOptional
+        )
+        // Cached path: a windowed FromClause query invalidates when a window
+        // column changes (PGC-94).
+        || (matches!(self.source, UpdateQuerySource::FromClause)
+            && self.has_limit
+            && !self.limit_window_columns.is_empty())
+        // Cached path: a join column on this table changing can invalidate.
+        || self.constraints.table_join_columns(table_name).next().is_some()
+        // Uncached path: any multi-table FromClause query invalidates on a row
+        // that newly satisfies the join — the partner side may not be cached,
+        // so in-place maintenance can't materialize it. Independent of whether
+        // the equivalence was recorded as `col = col`, so cross joins and
+        // expression/cast equi-joins land here rather than the join-column clause.
+        || (matches!(self.source, UpdateQuerySource::FromClause)
+            && !self.resolved.is_single_table())
+    }
 }
 
 /// Collection of update queries for a specific relation.
@@ -180,6 +217,13 @@ pub struct UpdateQueries {
     pub queries: HashMap<u64, UpdateQuery>,
     pub complexity_order: Vec<u64>,
     pub subsumption: SubsumptionIndex,
+    /// Count of queries with `change_dependent == true`. Maintained on
+    /// insert/remove via `change_dependent_account` so `needs_change_eval` is
+    /// O(1) on the CDC hot path. Derivable from `queries`; `needs_change_eval`
+    /// debug-asserts it against a recompute so a missed account call can't
+    /// silently desync (a missed increment risks stale reads, a missed
+    /// decrement disables the PGC-227 skip).
+    change_dependent_count: usize,
 }
 
 impl UpdateQueries {
@@ -189,6 +233,33 @@ impl UpdateQueries {
             queries: HashMap::new(),
             complexity_order: Vec::new(),
             subsumption: SubsumptionIndex::new(),
+            change_dependent_count: 0,
+        }
+    }
+
+    /// Whether any query over this relation needs `query_row_changes` to decide
+    /// a CDC UPDATE's invalidation. When false, `handle_update` skips the
+    /// SELECT and the invalidation check entirely (PGC-227).
+    pub fn needs_change_eval(&self) -> bool {
+        debug_assert_eq!(
+            self.change_dependent_count,
+            self.queries.values().filter(|q| q.change_dependent).count(),
+            "change_dependent_count desynced from queries — a change_dependent_account \
+             call was missed on insert/remove"
+        );
+        self.change_dependent_count > 0
+    }
+
+    /// Account for a query being added to / removed from the set. `added`
+    /// increments on insert, decrements on remove.
+    pub fn change_dependent_account(&mut self, change_dependent: bool, added: bool) {
+        if !change_dependent {
+            return;
+        }
+        if added {
+            self.change_dependent_count += 1;
+        } else {
+            self.change_dependent_count = self.change_dependent_count.saturating_sub(1);
         }
     }
 
@@ -258,7 +329,9 @@ impl Cache {
     pub fn update_queries_remove_fingerprint(&mut self, fingerprint: u64, oids: &[u32]) {
         for oid in oids {
             if let Some(mut queries) = self.update_queries.get_mut(oid) {
-                queries.queries.remove(&fingerprint);
+                if let Some(removed) = queries.queries.remove(&fingerprint) {
+                    queries.change_dependent_account(removed.change_dependent, false);
+                }
                 queries.complexity_order.retain(|fp| *fp != fingerprint);
                 queries.subsumption.remove(fingerprint);
             }

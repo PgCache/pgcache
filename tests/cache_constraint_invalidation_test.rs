@@ -772,3 +772,151 @@ async fn test_update_inclusive_subquery_non_pk_column_unconstrained_table_not_in
 
     Ok(())
 }
+
+/// PGC-227 regression: an UPDATE to an uncached row that newly satisfies an
+/// inner join must invalidate, even when the join condition is an *expression*
+/// equi-join (`a.id = b.parent_id + 1`) whose equivalence the constraint
+/// analyzer does not record as a column-to-column join.
+///
+/// The PGC-227 `change_dependent` optimization derives "this query can never
+/// have its UPDATE invalidation depend on the changed row" from
+/// `table_join_columns`, which only sees recorded `col = col` equivalences.
+/// An expression join records none, so `change_dependent` is false and
+/// `handle_update` skips the invalidation check. But the join is real: the
+/// updated `b` row newly matches an `a` row that is NOT in the cache (it was
+/// never part of the result), so the in-place upsert cannot add it — the only
+/// correct response is invalidation. Skipping it serves a stale, under-
+/// populated result.
+#[tokio::test]
+async fn test_expression_join_uncached_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table exprjoin_a (id integer primary key, label text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "create table exprjoin_b (id integer primary key, parent_id integer, note text)",
+        &[],
+    )
+    .await?;
+
+    // a row 8 ('eight') is intentionally NOT joined by any b row initially, so
+    // it never enters the cache.
+    ctx.query(
+        "insert into exprjoin_a (id, label) values (5, 'five'), (8, 'eight')",
+        &[],
+    )
+    .await?;
+    // b 100: parent_id 4 -> 4+1 = 5 -> matches a 5 (cached).
+    // b 200: parent_id 99 -> 99+1 = 100 -> matches no a (uncached).
+    ctx.query(
+        "insert into exprjoin_b (id, parent_id, note) \
+        values (100, 4, 'first'), (200, 99, 'second')",
+        &[],
+    )
+    .await?;
+
+    ctx.cdc_settle().await?;
+
+    let query_str = "select a.label, b.note \
+        from exprjoin_a a join exprjoin_b b on a.id = b.parent_id + 1 \
+        order by b.id";
+
+    // Prime the cache (only the a5/b100 pair matches initially).
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query_str).await?;
+    assert_eq!(res.len(), 3, "expected 1 data row initially");
+    assert_row_at(&res, 1, &[("label", "five"), ("note", "first")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+    ctx.cache_settle().await?;
+
+    // Confirm the expression join is actually cached (else the test proves
+    // nothing — a non-cacheable query always forwards to origin).
+    let _ = ctx.simple_query(query_str).await?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    // UPDATE b 200 so 7+1 = 8 now matches a 8 — an a row that is NOT cached.
+    // The row was uncached before the update, so the in-place upsert cannot
+    // materialize the new (a8, b200) pair; correctness requires invalidation.
+    ctx.origin_query("update exprjoin_b set parent_id = 7 where id = 200", &[])
+        .await?;
+
+    ctx.cdc_settle().await?;
+
+    // Correct result is now both pairs: (a5, b100) and (a8, b200).
+    let res = ctx.simple_query(query_str).await?;
+    assert_eq!(res.len(), 4, "expected 2 data rows after the update");
+    assert_row_at(&res, 1, &[("label", "five"), ("note", "first")])?;
+    assert_row_at(&res, 2, &[("label", "eight"), ("note", "second")])?;
+
+    Ok(())
+}
+
+/// PGC-227 regression (CROSS JOIN variant): an UPDATE that turns an empty
+/// cached result non-empty must invalidate. A cross-joined table has no
+/// recorded join columns, so `change_dependent` is false and `handle_update`
+/// skips invalidation. The in-place upsert cannot rescue it here: the prior
+/// result was EMPTY (no `c` row matched the constraint), so the partner table
+/// `a` has nothing in cache for the new row to cross with.
+#[tokio::test]
+async fn test_cross_join_uncached_update_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table crossj_a (id integer primary key, label text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "create table crossj_c (id integer primary key, val integer, note text)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "insert into crossj_a (id, label) values (1, 'A'), (2, 'B')",
+        &[],
+    )
+    .await?;
+    // No c row matches val = 7 initially -> the cached result is empty.
+    ctx.query(
+        "insert into crossj_c (id, val, note) values (10, 3, 'ten')",
+        &[],
+    )
+    .await?;
+
+    ctx.cdc_settle().await?;
+
+    let query_str = "select a.label, c.note \
+        from crossj_a a cross join crossj_c c where c.val = 7 \
+        order by a.id";
+
+    // Prime the cache with an empty result.
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query_str).await?;
+    assert_eq!(res.len(), 2, "expected 0 data rows initially");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+    ctx.cache_settle().await?;
+
+    let _ = ctx.simple_query(query_str).await?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    // UPDATE c 10 so val = 7 now matches -> the result becomes (A, ten), (B, ten).
+    ctx.origin_query("update crossj_c set val = 7 where id = 10", &[])
+        .await?;
+
+    ctx.cdc_settle().await?;
+
+    let res = ctx.simple_query(query_str).await?;
+    assert_eq!(res.len(), 4, "expected 2 data rows after the update");
+    assert_row_at(&res, 1, &[("label", "A"), ("note", "ten")])?;
+    assert_row_at(&res, 2, &[("label", "B"), ("note", "ten")])?;
+
+    Ok(())
+}
