@@ -68,6 +68,9 @@ hotpath-alloc = ["hotpath/hotpath-alloc"]
 # Test-only deterministic fault injection (e.g. forcing a CDC-frame 40P01 to
 # exercise PGC-147 recovery). Off by default; compiled out of normal builds.
 fault-injection = []
+# Heap allocation profiling: swaps the global allocator to dhat::Alloc and writes
+# dhat-heap.json on clean exit. Off by default; profiling/dev only.
+dhat-heap = ["dep:dhat"]
 
 [dependencies]
 arc-swap = "1.8.2"
@@ -116,6 +119,7 @@ ordered-float = "5.1.0"
 hotpath = { version = "0.15.0", optional = true }
 console-subscriber = { version = "0.5.0", optional = true }
 mimalloc = "0.1.49"
+dhat = { version = "0.3.3", optional = true }
 uuid = { version = "1.17.0", features = ["v4"] }
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "json"] }
 webpki-root-certs = "1.0.7"
