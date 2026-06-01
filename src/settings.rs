@@ -229,9 +229,12 @@ impl StaticConfigSnapshot {
 /// Shared handle for reading/updating dynamic config. Cloneable, lock-free reads.
 pub struct DynamicConfigHandle {
     inner: Arc<ArcSwap<DynamicConfig>>,
-    config_path: Option<PathBuf>,
+    // Arc-wrapped so cloning the handle (done per query when the cache
+    // coordinator clones `QueryCache`) is a refcount bump, not a deep copy of
+    // the static config. Both are set once at startup and never mutated.
+    config_path: Option<Arc<PathBuf>>,
     log_reload: Arc<Mutex<Option<LogReloadHandle>>>,
-    static_snapshot: Option<StaticConfigSnapshot>,
+    static_snapshot: Option<Arc<StaticConfigSnapshot>>,
 }
 
 impl Clone for DynamicConfigHandle {
@@ -262,9 +265,9 @@ impl DynamicConfigHandle {
     ) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(config)),
-            config_path,
+            config_path: config_path.map(Arc::new),
             log_reload: Arc::new(Mutex::new(None)),
-            static_snapshot,
+            static_snapshot: static_snapshot.map(Arc::new),
         }
     }
 
@@ -275,7 +278,7 @@ impl DynamicConfigHandle {
 
     /// Path to the TOML config file, if one was provided at startup.
     pub fn config_path(&self) -> Option<&Path> {
-        self.config_path.as_deref()
+        self.config_path.as_deref().map(PathBuf::as_path)
     }
 
     /// Check if the TOML config file has static fields that differ from the running config.
@@ -292,7 +295,7 @@ impl DynamicConfigHandle {
             return false;
         };
         let file_snapshot = StaticConfigSnapshot::from_toml(&config);
-        *snapshot != file_snapshot
+        **snapshot != file_snapshot
     }
 
     /// Query the effective log level from the tracing subscriber.
@@ -892,7 +895,8 @@ fn settings_build(
     settings.cdc.slot_name = settings.cdc.slot_name.to_ascii_lowercase();
 
     // Capture static config snapshot for restart-required detection
-    settings.dynamic.static_snapshot = Some(StaticConfigSnapshot::from_settings(&settings));
+    settings.dynamic.static_snapshot =
+        Some(Arc::new(StaticConfigSnapshot::from_settings(&settings)));
 
     Ok(settings)
 }
