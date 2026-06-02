@@ -76,12 +76,13 @@ async fn handle_worker_request(
     return_tx: Sender<CacheConnection>,
     mut msg: WorkerRequest,
     worker_metrics_tx: UnboundedSender<WorkerMetrics>,
+    state_view: Arc<CacheStateView>,
 ) {
     debug!("cache worker task spawn");
 
     msg.timing.worker_start_at = Some(Instant::now());
 
-    let reply = match handle_cached_query(conn, return_tx, &mut msg).await {
+    let reply = match handle_cached_query(conn, return_tx, &mut msg, &state_view).await {
         Ok((bytes_served, coalesced_outcomes)) => {
             let latency_us = msg
                 .timing
@@ -350,10 +351,17 @@ pub fn cache_run(
         // Spawn worker thread (executes cached queries - read-only)
         let (worker_tx, worker_rx) = unbounded_channel();
         let cancel_worker = cancel.child_token();
+        let state_view_worker = Arc::clone(&state_view);
         let _worker_handle = thread::Builder::new()
             .name("cache worker".to_owned())
-            .spawn_scoped(scope, || {
-                let result = worker_run(settings, worker_rx, worker_metrics_tx, cancel_worker);
+            .spawn_scoped(scope, move || {
+                let result = worker_run(
+                    settings,
+                    worker_rx,
+                    worker_metrics_tx,
+                    cancel_worker,
+                    state_view_worker,
+                );
                 if let Err(ref e) = result {
                     error!(
                         "worker thread exiting with error: {}",
@@ -514,6 +522,7 @@ fn worker_run(
     mut worker_rx: UnboundedReceiver<WorkerRequest>,
     worker_metrics_tx: UnboundedSender<WorkerMetrics>,
     cancel: CancellationToken,
+    state_view: Arc<CacheStateView>,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -557,8 +566,9 @@ fn worker_run(
                     // Spawn task with both the request and connection
                     let return_tx = conn_tx.clone();
                     let metrics_tx = worker_metrics_tx.clone();
+                    let state_view = Arc::clone(&state_view);
                     spawn_local(async move {
-                        handle_worker_request(conn, return_tx, msg, metrics_tx).await;
+                        handle_worker_request(conn, return_tx, msg, metrics_tx, state_view).await;
                     });
 
                     // Channel depth gauge; queue length never approaches 2^53.

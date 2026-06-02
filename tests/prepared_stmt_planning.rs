@@ -66,8 +66,16 @@ async fn prepared_stmt_planning_measure() -> Result<(), Error> {
         .await
         .map_err(Error::other)?;
 
+    // MODE=simple drives the text serve path (simple 'Q'); default exercises the
+    // binary/extended path. Both now route through the unified named-statement
+    // serve, so both should amortize planning.
+    let simple = std::env::var("MODE").is_ok_and(|m| m == "simple");
     for _ in 0..hits {
-        let _ = ctx.query(q, &[]).await?;
+        if simple {
+            let _ = ctx.simple_query(q).await?;
+        } else {
+            let _ = ctx.query(q, &[]).await?;
+        }
     }
 
     let rows = cache
@@ -81,7 +89,12 @@ async fn prepared_stmt_planning_measure() -> Result<(), Error> {
         .await
         .map_err(Error::other)?;
 
-    println!("\n=== cache-DB pg_stat_statements after {hits} binary cache hits ===");
+    let mode_label = if simple {
+        "simple/text"
+    } else {
+        "binary/extended"
+    };
+    println!("\n=== cache-DB pg_stat_statements after {hits} {mode_label} cache hits ===");
     for r in &rows {
         let calls: i64 = r.get("calls");
         let plans: i64 = r.get("plans");

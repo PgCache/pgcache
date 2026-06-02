@@ -1,4 +1,3 @@
-use std::fmt::Write as _;
 use std::time::Instant;
 
 use tokio::io::AsyncWriteExt;
@@ -11,17 +10,18 @@ use tokio_util::codec::FramedRead;
 use tracing::{debug, error, instrument, trace};
 
 use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe};
-use crate::pg::cache_connection::CacheConnection;
+use crate::pg::cache_connection::{CacheConnection, PrepareOutcome};
 use crate::pg::protocol::backend::PgBackendMessageType;
 use crate::pg::protocol::encode::{
     BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG,
 };
-use crate::query::ast::Deparse;
+use crate::query::ast::{Deparse, LimitClause, LiteralValue};
 
 use super::{
     CacheError, CacheResult,
     mv::{MvServe, mv_serve_sql},
     query_cache::{CoalescedClient, QueryType, WorkerRequest},
+    types::CacheStateView,
     write_queue::WriteQueue,
 };
 
@@ -229,302 +229,47 @@ impl Drop for ConnectionGuard {
     }
 }
 
-/// Returns the number of DataRow bytes served and coalesced client outcomes on success.
-#[instrument(skip_all)]
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub async fn handle_cached_query(
-    conn: CacheConnection,
-    return_tx: Sender<CacheConnection>,
-    msg: &mut WorkerRequest,
-) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
-    debug!("message query generation {}", msg.generation);
-
-    let (bytes_served, outcomes) = if msg.result_formats.first().is_none_or(|&f| f == 0) {
-        handle_cached_query_text(conn, return_tx, msg).await?
-    } else {
-        handle_cached_query_binary(conn, return_tx, msg).await?
-    };
-
-    debug!("cache hit");
-    Ok((bytes_served, outcomes))
+/// Render a per-request `LimitClause` into text for the `LIMIT $1 OFFSET $2`
+/// bind params. A present value binds its deparsed text (so an integer binds its
+/// value); an absent clause field binds NULL — which PG reads as no limit /
+/// offset 0. A non-integer value (e.g. a float-typed parameter) binds text that
+/// fails the `int8` coercion on the cache DB, erroring that hit so it forwards
+/// to origin rather than silently dropping the limit and over-returning rows.
+fn limit_params_render(limit: Option<&LimitClause>) -> (Option<String>, Option<String>) {
+    let count = limit
+        .and_then(|l| l.count.as_ref())
+        .map(literal_param_render);
+    let offset = limit
+        .and_then(|l| l.offset.as_ref())
+        .map(literal_param_render);
+    (count, offset)
 }
 
-/// Response state machine for the text (simple query) path.
+fn literal_param_render(value: &LiteralValue) -> String {
+    let mut text = String::new();
+    value.deparse(&mut text);
+    text
+}
+
+/// Response state machine for the unified serve path (text and binary clients;
+/// source-row uses a named prepared statement, MV an unnamed one). Result
+/// format (text/binary) is chosen per client; the message *sequence* is the
+/// same.
 ///
-/// A combined `SET gen; SELECT ...` produces:
-/// CommandComplete (SET) → RowDescription → DataRow* → CommandComplete (SELECT) → ReadyForQuery
+/// Pipelined: SET (simple query) + [Close] + Parse/Bind/[Describe('P')]/Execute/Sync
+/// produces: CommandComplete (SET) → ReadyForQuery → [CloseComplete →]
+/// ParseComplete → BindComplete → [RowDescription →] DataRow* →
+/// CommandComplete (SELECT) → ReadyForQuery. The leading Close (and its
+/// CloseComplete) appears when this serve's reconciliation pass closed an
+/// evicted statement — independent of whether a Parse was also sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextResponseState {
-    /// Waiting for SET CommandComplete
-    SetComplete,
-    /// Waiting for RowDescription (or DataRows if no rows)
-    RowDescription,
-    /// Streaming DataRow messages
-    DataRows,
-    /// Done — ReadyForQuery received
-    Done,
-}
-
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-async fn handle_cached_query_text(
-    conn: CacheConnection,
-    return_tx: Sender<CacheConnection>,
-    msg: &mut WorkerRequest,
-) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
-    let mut guard = ConnectionGuard::new(conn, return_tx);
-    let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
-
-    // Generate SQL query from resolved AST (with schema-qualified table names)
-    #[cfg(feature = "hotpath")]
-    let _m = hotpath::functions::MeasurementGuardSync::new("hcqt:deparse", false, false);
-
-    // Assemble the wire SQL into the connection's recycled buffer to avoid
-    // per-request allocations. Format differs between MV and source-row paths.
-    conn.sql_buf.clear();
-    if let MvServe::Mv(cols) = &msg.mv {
-        // MV fast path: SELECT <aliased cols> FROM pgcache_mv.q_<fp>
-        // [ORDER BY] [LIMIT]. No generation SET — MV tables are not
-        // pgcache_pgrx-tracked.
-        conn.sql_buf.push_str(&mv_serve_sql(
-            msg.fingerprint,
-            &msg.resolved,
-            msg.limit.as_ref(),
-            cols,
-        ));
-        conn.sql_buf.push(';');
-    } else {
-        write!(
-            conn.sql_buf,
-            "SET mem.query_generation = {}; ",
-            msg.generation
-        )
-        .expect("write to String");
-        conn.sql_buf.push_str(&msg.deparsed_sql);
-        if let Some(limit) = &msg.limit {
-            limit.deparse(&mut conn.sql_buf);
-        }
-        conn.sql_buf.push(';');
-    }
-
-    #[cfg(feature = "hotpath")]
-    drop(_m);
-
-    // Send query to cache database
-    #[cfg(feature = "hotpath")]
-    let _m = hotpath::functions::MeasurementGuardSync::new("hcqt:send_query", false, false);
-
-    conn.simple_query_send().await.inspect_err(|_| {
-        guard.poisoned = true;
-    })?;
-
-    #[cfg(feature = "hotpath")]
-    drop(_m);
-
-    // Create broadcast for coalesced clients (after query is sent, before streaming)
-    let mut broadcast = broadcast_setup(msg);
-
-    // Stream results to client
-    #[cfg(feature = "hotpath")]
-    let _m = hotpath::functions::MeasurementGuardSync::new("hcqt:stream", false, false);
-
-    let CacheConnection {
-        stream,
-        read_buf,
-        codec,
-        sql_buf,
-    } = conn;
-    let mut framed = FramedRead::new(stream, codec);
-    *framed.read_buffer_mut() = read_buf;
-
-    let query_type = msg.query_type;
-    let emit_rfq = msg.emit_rfq;
-    let has_parse = msg.has_parse;
-    let has_bind = msg.has_bind;
-    let pipeline_describe = msg.pipeline_describe;
-    let mut parameter_description = msg.parameter_description.take();
-    let client_socket = &mut msg.client_socket;
-
-    let mut write_queue = WriteQueue::new();
-
-    // Prepend ParseComplete / BindComplete for messages the proxy buffered
-    if has_parse {
-        push_and_broadcast(
-            &mut write_queue,
-            &broadcast,
-            Bytes::from_static(PARSE_COMPLETE_MSG),
-        );
-    }
-    if has_bind {
-        push_and_broadcast(
-            &mut write_queue,
-            &broadcast,
-            Bytes::from_static(BIND_COMPLETE_MSG),
-        );
-    }
-
-    // MV path: no SET statement was sent, so skip the SetComplete waiting state
-    // and start directly at RowDescription.
-    let mut state = if matches!(msg.mv, MvServe::Mv(_)) {
-        TextResponseState::RowDescription
-    } else {
-        TextResponseState::SetComplete
-    };
-    let mut bytes_served: usize = 0;
-
-    loop {
-        tokio::select! {
-            frame = framed.next() => {
-                let frame = match frame {
-                    Some(Ok(frame)) => frame,
-                    Some(Err(_)) | None => {
-                        guard.poisoned = true;
-                        if let Some(bc) = broadcast.take() {
-                            broadcast_error_reply(bc).await;
-                        }
-                        return Err(CacheError::InvalidMessage.into());
-                    }
-                };
-
-                #[cfg(feature = "hotpath")]
-                let _match = hotpath::functions::MeasurementGuardSync::new("hcqt:match", false, false);
-
-                match (state, frame.message_type) {
-                    (TextResponseState::SetComplete, PgBackendMessageType::CommandComplete) => {
-                        state = TextResponseState::RowDescription;
-                    }
-                    (TextResponseState::RowDescription, PgBackendMessageType::RowDescription) => {
-                        if query_type == QueryType::Simple {
-                            trace!("net: cache→client RowDescription ({} bytes, simple)", frame.data.len());
-                            push_and_broadcast(&mut write_queue, &broadcast, frame.data);
-                        } else if pipeline_describe != PipelineDescribe::None {
-                            if pipeline_describe == PipelineDescribe::Statement
-                                && let Some(param_desc) = parameter_description.take()
-                            {
-                                trace!("net: cache→client ParameterDescription ({} bytes, pipeline)", param_desc.len());
-                                push_and_broadcast(&mut write_queue, &broadcast, param_desc);
-                            }
-                            trace!("net: cache→client RowDescription ({} bytes, pipeline)", frame.data.len());
-                            push_and_broadcast(&mut write_queue, &broadcast, frame.data);
-                        } else {
-                            trace!("net: cache skip RowDescription ({} bytes, extended — no Describe in pipeline)", frame.data.len());
-                        }
-                        state = TextResponseState::DataRows;
-                    }
-                    (TextResponseState::DataRows, PgBackendMessageType::DataRows) => {
-                        trace!("net: cache→client DataRow ({} bytes)", frame.data.len());
-                        bytes_served += frame.data.len();
-                        push_and_broadcast(&mut write_queue, &broadcast, frame.data);
-                    }
-                    (TextResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
-                        trace!("net: cache→client CommandComplete ({} bytes)", frame.data.len());
-                        push_and_broadcast(&mut write_queue, &broadcast, frame.data);
-                        msg.timing.query_done_at = Some(Instant::now());
-                    }
-                    (_, PgBackendMessageType::ReadyForQuery) => {
-                        state = TextResponseState::Done;
-                    }
-                    (_, PgBackendMessageType::ErrorResponse) => {
-                        return Err(cache_error_response_handle(
-                            &mut guard,
-                            &frame.data,
-                            bytes_served,
-                            &mut broadcast,
-                        )
-                        .await);
-                    }
-                    _ => {}
-                }
-
-                #[cfg(feature = "hotpath")]
-                drop(_match);
-
-            }
-            result = client_socket.write_buf(&mut write_queue), if !write_queue.is_empty() =>
-            {
-                match result {
-                    Ok(cnt) => {
-                        trace!("net: cache→client flush (text, partial write, {} bytes)", cnt);
-                    }
-                    Err(_) => {
-                        guard.poisoned = true;
-                        error!("no client");
-                        if let Some(bc) = broadcast.take() {
-                            broadcast_error_reply(bc).await;
-                        }
-                        return Err(CacheError::Write.into());
-                    }
-                }
-            }
-        }
-
-        if state == TextResponseState::Done {
-            break;
-        }
-    }
-
-    // Cache DB response fully consumed — return connection to pool immediately
-    let parts = framed.into_parts();
-    guard.conn = Some(CacheConnection {
-        stream: parts.io,
-        read_buf: parts.read_buf,
-        codec: parts.codec,
-        sql_buf,
-    });
-    if let Err(e) = guard.release().await {
-        if let Some(bc) = broadcast.take() {
-            broadcast_error_reply(bc).await;
-        }
-        return Err(e);
-    }
-
-    // Append ReadyForQuery for simple queries (always) and extended queries whose
-    // trailing execute carries the Sync RFQ.
-    if query_type == QueryType::Simple || emit_rfq {
-        trace!("net: cache→client ReadyForQuery");
-        push_and_broadcast(
-            &mut write_queue,
-            &broadcast,
-            Bytes::from_static(READY_FOR_QUERY_IDLE_MSG),
-        );
-    }
-
-    // Tear down broadcast and collect coalesced outcomes
-    let outcomes = match broadcast.take() {
-        Some(bc) => broadcast_join(bc).await,
-        None => vec![],
-    };
-
-    // Final flush to primary client
-    if !write_queue.is_empty() {
-        trace!(
-            "net: cache→client final flush (text, {} bytes remaining)",
-            write_queue.remaining()
-        );
-        if let Err(e) = client_socket.write_all_buf(&mut write_queue).await {
-            error!("no client: {e}");
-            return Err(CacheError::Write.into());
-        }
-    }
-
-    msg.timing.response_written_at = Some(Instant::now());
-
-    #[cfg(feature = "hotpath")]
-    drop(_m);
-
-    Ok((bytes_served, outcomes))
-}
-
-/// Response state machine for the binary (pipelined extended query) path.
-///
-/// Pipelined: SET (simple query) + Parse/Bind/[Describe('P')]/Execute/Sync produces:
-/// CommandComplete (SET) → ReadyForQuery → ParseComplete → BindComplete →
-/// [RowDescription →] DataRow* → CommandComplete (SELECT) → ReadyForQuery
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BinaryResponseState {
+enum ServeResponseState {
     /// Waiting for SET CommandComplete
     SetComplete,
     /// Waiting for ReadyForQuery after SET
     SetReady,
+    /// Waiting for CloseComplete (only when a statement was evicted)
+    CloseComplete,
     /// Waiting for ParseComplete
     ParseComplete,
     /// Waiting for BindComplete
@@ -537,33 +282,75 @@ enum BinaryResponseState {
     Done,
 }
 
+/// Serve a cache hit: execute the cached query on a pooled cache-DB connection
+/// (a named prepared statement for source-row, unnamed extended for MV) and
+/// relay the response to the client in its requested format. Returns the DataRow
+/// bytes served and any coalesced client outcomes.
+#[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-async fn handle_cached_query_binary(
+pub async fn handle_cached_query(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     msg: &mut WorkerRequest,
+    state_view: &CacheStateView,
 ) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
+    debug!("message query generation {}", msg.generation);
     let mut guard = ConnectionGuard::new(conn, return_tx);
     let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
 
-    let include_describe = msg.pipeline_describe != PipelineDescribe::None;
+    // Serve in the client's result format (text/binary). Simple-query clients
+    // always expect a RowDescription, so request Describe from the cache DB even
+    // when no Describe message was pipelined.
+    let binary_results = msg.result_formats.first().is_some_and(|&f| f != 0);
+    let query_type = msg.query_type;
+    let include_describe =
+        query_type == QueryType::Simple || msg.pipeline_describe != PipelineDescribe::None;
 
+    // What was sent on the cache-DB extended query this hit, so the response
+    // state machine knows which completions to expect. The MV path always sends
+    // an unnamed Parse (no Close); the source-row path sends a Parse only on the
+    // first use of a fingerprint on this connection, plus a Close when that
+    // prepare evicted the connection's oldest statement.
+    let prepare: PrepareOutcome;
     if let MvServe::Mv(cols) = &msg.mv {
         // MV fast path: extended query only, no SET prefix.
         let sql = mv_serve_sql(msg.fingerprint, &msg.resolved, msg.limit.as_ref(), cols);
-        conn.extended_binary_query_send(&sql, include_describe)
+        conn.extended_query_unnamed_send(&sql, include_describe, binary_results)
             .await
             .inspect_err(|_| {
                 guard.poisoned = true;
             })?;
+        prepare = PrepareOutcome {
+            sent_parse: true,
+            sent_close: false,
+        };
     } else {
+        // One step of round-robin reconciliation: close a prepared statement
+        // whose query has been evicted from the cache (kept across invalidation,
+        // which leaves the entry in place). Self-tunes to the live working set —
+        // no cap. The Close is pipelined ahead of this serve's Parse/Bind.
+        let close_victim = conn
+            .prepared
+            .reconcile_one(|fp| state_view.cached_queries.contains_key(&fp));
+
+        // Named prepared statement with parameterized LIMIT/OFFSET — body is
+        // stable per fingerprint, so PG parses/plans once per connection and
+        // reuses across hits and across limit values.
         conn.sql_buf.clear();
         conn.sql_buf.push_str(&msg.deparsed_sql);
-        if let Some(limit) = &msg.limit {
-            limit.deparse(&mut conn.sql_buf);
-        }
+        conn.sql_buf.push_str(" LIMIT $1 OFFSET $2");
+        let (limit_text, offset_text) = limit_params_render(msg.limit.as_ref());
         let set_sql = format!("SET mem.query_generation = {}", msg.generation);
-        conn.pipelined_binary_query_send(&set_sql, include_describe)
+        prepare = conn
+            .pipelined_named_query_send(
+                msg.fingerprint,
+                &set_sql,
+                limit_text.as_deref(),
+                offset_text.as_deref(),
+                include_describe,
+                binary_results,
+                close_victim,
+            )
             .await
             .inspect_err(|_| {
                 guard.poisoned = true;
@@ -579,6 +366,7 @@ async fn handle_cached_query_binary(
         read_buf,
         codec,
         sql_buf,
+        prepared,
     } = conn;
     let mut framed = FramedRead::new(stream, codec);
     *framed.read_buffer_mut() = read_buf;
@@ -610,9 +398,9 @@ async fn handle_cached_query_binary(
     // MV path: no SET statement was sent, so skip SetComplete/SetReady and
     // start directly at ParseComplete (first message from the extended query).
     let mut state = if matches!(msg.mv, MvServe::Mv(_)) {
-        BinaryResponseState::ParseComplete
+        ServeResponseState::ParseComplete
     } else {
-        BinaryResponseState::SetComplete
+        ServeResponseState::SetComplete
     };
     let mut bytes_served: usize = 0;
 
@@ -631,48 +419,66 @@ async fn handle_cached_query_binary(
                 };
 
                 match (state, frame.message_type) {
-                    (BinaryResponseState::SetComplete, PgBackendMessageType::CommandComplete) => {
-                        state = BinaryResponseState::SetReady;
+                    (ServeResponseState::SetComplete, PgBackendMessageType::CommandComplete) => {
+                        state = ServeResponseState::SetReady;
                     }
-                    (BinaryResponseState::SetReady, PgBackendMessageType::ReadyForQuery) => {
-                        state = BinaryResponseState::ParseComplete;
-                    }
-                    (BinaryResponseState::ParseComplete, PgBackendMessageType::ParseComplete) => {
-                        state = BinaryResponseState::BindComplete;
-                    }
-                    (BinaryResponseState::BindComplete, PgBackendMessageType::BindComplete) => {
-                        state = if include_describe {
-                            BinaryResponseState::DescribeRow
+                    (ServeResponseState::SetReady, PgBackendMessageType::ReadyForQuery) => {
+                        // A Close (if a statement was evicted) precedes the
+                        // Parse; on statement reuse neither is sent, so skip
+                        // straight to Bind.
+                        state = if prepare.sent_close {
+                            ServeResponseState::CloseComplete
+                        } else if prepare.sent_parse {
+                            ServeResponseState::ParseComplete
                         } else {
-                            BinaryResponseState::DataRows
+                            ServeResponseState::BindComplete
                         };
                     }
-                    (BinaryResponseState::DescribeRow, PgBackendMessageType::RowDescription) => {
+                    (ServeResponseState::CloseComplete, PgBackendMessageType::CloseComplete) => {
+                        // A reconciliation Close can ride a reuse serve (no Parse),
+                        // so the Parse only follows when one was actually sent.
+                        state = if prepare.sent_parse {
+                            ServeResponseState::ParseComplete
+                        } else {
+                            ServeResponseState::BindComplete
+                        };
+                    }
+                    (ServeResponseState::ParseComplete, PgBackendMessageType::ParseComplete) => {
+                        state = ServeResponseState::BindComplete;
+                    }
+                    (ServeResponseState::BindComplete, PgBackendMessageType::BindComplete) => {
+                        state = if include_describe {
+                            ServeResponseState::DescribeRow
+                        } else {
+                            ServeResponseState::DataRows
+                        };
+                    }
+                    (ServeResponseState::DescribeRow, PgBackendMessageType::RowDescription) => {
                         if pipeline_describe == PipelineDescribe::Statement
                             && let Some(param_desc) = parameter_description.take()
                         {
-                            trace!("net: cache→client ParameterDescription (binary, {} bytes)", param_desc.len());
+                            trace!("net: cache→client ParameterDescription (serve, {} bytes)", param_desc.len());
                             push_and_broadcast(&mut write_queue, &broadcast, param_desc);
                         }
-                        trace!("net: cache→client RowDescription (binary, {} bytes)", frame.data.len());
+                        trace!("net: cache→client RowDescription (serve, {} bytes)", frame.data.len());
                         push_and_broadcast(&mut write_queue, &broadcast, frame.data);
-                        state = BinaryResponseState::DataRows;
+                        state = ServeResponseState::DataRows;
                     }
-                    (BinaryResponseState::DataRows, PgBackendMessageType::DataRows) => {
-                        trace!("net: cache→client DataRow (binary, {} bytes)", frame.data.len());
+                    (ServeResponseState::DataRows, PgBackendMessageType::DataRows) => {
+                        trace!("net: cache→client DataRow (serve, {} bytes)", frame.data.len());
                         bytes_served += frame.data.len();
                         push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                     }
-                    (BinaryResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
-                        trace!("net: cache→client CommandComplete (binary, {} bytes)", frame.data.len());
+                    (ServeResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
+                        trace!("net: cache→client CommandComplete (serve, {} bytes)", frame.data.len());
                         push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                         msg.timing.query_done_at = Some(Instant::now());
                     }
                     (_, PgBackendMessageType::ReadyForQuery)
-                        if state != BinaryResponseState::SetComplete
-                            && state != BinaryResponseState::SetReady =>
+                        if state != ServeResponseState::SetComplete
+                            && state != ServeResponseState::SetReady =>
                     {
-                        state = BinaryResponseState::Done;
+                        state = ServeResponseState::Done;
                     }
                     (_, PgBackendMessageType::ErrorResponse) => {
                         return Err(cache_error_response_handle(
@@ -690,7 +496,7 @@ async fn handle_cached_query_binary(
             {
                 match result {
                     Ok(cnt) => {
-                        trace!("net: cache→client flush (binary, partial write, {} bytes)", cnt);
+                        trace!("net: cache→client flush (serve, partial write, {} bytes)", cnt);
                     }
                     Err(_) => {
                         guard.poisoned = true;
@@ -704,7 +510,7 @@ async fn handle_cached_query_binary(
             }
         }
 
-        if state == BinaryResponseState::Done {
+        if state == ServeResponseState::Done {
             break;
         }
     }
@@ -716,6 +522,7 @@ async fn handle_cached_query_binary(
         read_buf: parts.read_buf,
         codec: parts.codec,
         sql_buf,
+        prepared,
     });
     if let Err(e) = guard.release().await {
         if let Some(bc) = broadcast.take() {
@@ -724,8 +531,10 @@ async fn handle_cached_query_binary(
         return Err(e);
     }
 
-    if emit_rfq {
-        trace!("net: cache→client ReadyForQuery (binary pipeline)");
+    // Simple-query clients always terminate with ReadyForQuery; extended clients
+    // do when their trailing Execute carried the Sync.
+    if query_type == QueryType::Simple || emit_rfq {
+        trace!("net: cache→client ReadyForQuery");
         push_and_broadcast(
             &mut write_queue,
             &broadcast,
@@ -740,7 +549,7 @@ async fn handle_cached_query_binary(
 
     if !write_queue.is_empty() {
         trace!(
-            "net: cache→client final flush (binary, {} bytes remaining)",
+            "net: cache→client final flush (serve, {} bytes remaining)",
             write_queue.remaining()
         );
         if let Err(e) = client_socket.write_all_buf(&mut write_queue).await {
@@ -751,6 +560,7 @@ async fn handle_cached_query_binary(
 
     msg.timing.response_written_at = Some(Instant::now());
 
+    debug!("cache hit");
     Ok((bytes_served, outcomes))
 }
 
@@ -775,6 +585,36 @@ mod tests {
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(&payload);
         frame
+    }
+
+    #[test]
+    fn limit_params_render_binds_value_and_never_drops_non_integers() {
+        // No clause → NULL params (no limit, offset 0).
+        assert_eq!(limit_params_render(None), (None, None));
+
+        // Integer count/offset bind their decimal value.
+        let int_limit = LimitClause {
+            count: Some(LiteralValue::Integer(5)),
+            offset: Some(LiteralValue::Integer(2)),
+        };
+        assert_eq!(
+            limit_params_render(Some(&int_limit)),
+            (Some("5".to_owned()), Some("2".to_owned()))
+        );
+
+        // PGC-229 review #1: a non-integer limit must still BIND (not render
+        // None, which would bind NULL and silently drop the limit, returning
+        // every row). It binds text that fails int8 coercion on the cache DB,
+        // erroring that hit so it forwards to origin.
+        let float_limit = LimitClause {
+            count: Some(LiteralValue::Float(
+                ordered_float::NotNan::new(3.7).expect("non-NaN test value"),
+            )),
+            offset: None,
+        };
+        let (count, offset) = limit_params_render(Some(&float_limit));
+        assert!(count.is_some(), "non-integer limit must bind, not drop");
+        assert_eq!(offset, None);
     }
 
     #[test]

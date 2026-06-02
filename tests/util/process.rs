@@ -115,7 +115,10 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
         .with_config_param("log_destination", "stderr")
         .with_config_param("log_directory", "/tmp/")
         .with_config_param("logging_collector", "on")
-        .with_config_param("shared_preload_libraries", "pgcache_pgrx,pg_stat_statements")
+        .with_config_param(
+            "shared_preload_libraries",
+            "pgcache_pgrx,pg_stat_statements",
+        )
         .start_async()
         .await;
 
