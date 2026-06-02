@@ -7,8 +7,8 @@ use crate::{
     query::{
         ast::{
             BinaryOp, CteRefNode, JoinNode, JoinQual, JoinType, LimitClause, LiteralValue, MultiOp,
-            QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode, SubLinkType, TableSource,
-            TableSubqueryNode, WhereExpr,
+            QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode, SubLinkType, TableNode,
+            TableSource, TableSubqueryNode, WhereExpr,
         },
         resolved::{
             ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectNode, ResolvedTableSource,
@@ -27,6 +27,8 @@ error_set! {
         UnsupportedWhereClause,
         NonImmutableFunction,
         HasLimit,
+        #[display("Query references a system catalog (pg_*)")]
+        SystemCatalogReference,
     }
 }
 
@@ -57,12 +59,42 @@ impl CacheableQuery {
         query: &QueryExpr,
         fv: &FunctionVolatilityMap,
     ) -> Result<Self, CacheabilityError> {
+        // System catalogs (pg_catalog, pg_toast, unqualified pg_* relations) can't
+        // be logically replicated, so registration against the cache db fails with
+        // "unacceptable schema name". Reject up front and forward to origin —
+        // e.g. psql's \d, which queries pg_class/pg_namespace.
+        references_system_catalog(query)?;
+
         is_cacheable_body(&query.body, fv)?;
 
         Ok(CacheableQuery {
             query: query.clone(),
         })
     }
+}
+
+/// Reject queries that reference a PostgreSQL system catalog.
+///
+/// The `pg_` prefix is reserved by PostgreSQL for system schemas and system
+/// relation names, so a match in either the schema or the table name marks a
+/// catalog reference. Covers nested subqueries and CTEs via full-tree traversal.
+fn references_system_catalog(query: &QueryExpr) -> Result<(), CacheabilityError> {
+    for table in query.nodes::<TableNode>() {
+        let is_catalog =
+            table.schema.as_deref().is_some_and(pg_prefixed) || pg_prefixed(&table.name);
+        if is_catalog {
+            return Err(CacheabilityError::SystemCatalogReference);
+        }
+    }
+    Ok(())
+}
+
+/// Whether `s` begins with PostgreSQL's reserved `pg_` prefix, ASCII
+/// case-insensitively and without allocating (vs `to_lowercase().starts_with`).
+fn pg_prefixed(s: &str) -> bool {
+    s.as_bytes()
+        .get(..3)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"pg_"))
 }
 
 /// Check if a query body is cacheable.
@@ -1424,6 +1456,38 @@ mod tests {
                 "should be cacheable: {sql} (err: {result:?})"
             );
         }
+    }
+
+    #[test]
+    fn test_system_catalog_reference_uncacheable() {
+        // psql's \d and friends query system catalogs, which can't be logically
+        // replicated or registered against the cache db.
+        let cases = [
+            "SELECT * FROM pg_catalog.pg_class",
+            "SELECT relname FROM pg_class",
+            "SELECT * FROM pg_namespace WHERE nspname = 'public'",
+            "SELECT * FROM pg_catalog.pg_attribute a JOIN pg_class c ON a.attrelid = c.oid",
+            "SELECT * FROM users WHERE id IN (SELECT oid FROM pg_class)",
+            "SELECT n.nspname FROM PG_NAMESPACE n",
+        ];
+        for sql in cases {
+            let result = check_cacheable(sql);
+            assert!(
+                matches!(result, Err(CacheabilityError::SystemCatalogReference)),
+                "should reject system catalog reference: {sql} (got {result:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_catalog_table_cacheable() {
+        // A user table whose name merely contains "pg" is not a catalog reference.
+        let sql = "SELECT * FROM pgbench_accounts WHERE aid = 1";
+        let result = check_cacheable(sql);
+        assert!(
+            result.is_ok(),
+            "table name containing 'pg' should be cacheable: {result:?}"
+        );
     }
 
     #[test]
