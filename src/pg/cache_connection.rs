@@ -12,7 +12,6 @@ use crate::settings::PgSettings;
 
 use super::protocol::PgMessage;
 use super::protocol::backend::{AUTHENTICATION_OK, PgBackendMessageCodec, PgBackendMessageType};
-use super::protocol::frontend::simple_query_message_build;
 
 /// Postgres `int8` (bigint) type OID, declared for the parameterized
 /// `LIMIT $1 OFFSET $2` placeholders so the planner doesn't have to infer it.
@@ -91,6 +90,10 @@ pub struct CacheConnection {
     /// cache hit (SET generation prefix + precomputed body + optional LIMIT),
     /// avoiding per-request String allocations.
     pub sql_buf: String,
+    /// Recycled wire-encode buffer. Every serve clears and rebuilds the pipelined
+    /// message group (SET + optional Close + Parse/Bind/Execute) here, so the
+    /// per-hit allocation is amortized to zero once it reaches steady-state size.
+    pub write_buf: BytesMut,
     /// Named prepared statements (`pgc_<fp>`) live on this connection, FIFO-capped.
     pub(crate) prepared: PreparedStatements,
 }
@@ -110,6 +113,7 @@ impl CacheConnection {
             read_buf: BytesMut::with_capacity(64 * 1024),
             codec: PgBackendMessageCodec::default(),
             sql_buf: String::with_capacity(1024),
+            write_buf: BytesMut::with_capacity(4096),
             prepared: PreparedStatements::new(),
         };
 
@@ -192,18 +196,20 @@ impl CacheConnection {
     /// later hits reuse the prepared statement, so PG skips parse/plan.
     ///
     /// `limit_text`/`offset_text` bind `$1`/`$2` as text (None → NULL, which PG
-    /// treats as no limit / offset 0).
+    /// treats as no limit / offset 0). The `SET mem.query_generation = N` prefix
+    /// is built inline from `generation` (no per-hit String).
     ///
     /// `close_victim`, when set, is a statement whose query was evicted (found by
     /// the caller's reconciliation pass); a `Close` for it is pipelined ahead of
     /// the Parse/Bind so its CloseComplete precedes the rest of the response.
     /// Returns a [`PrepareOutcome`] so the caller's response state machine knows
-    /// which completion messages to expect.
+    /// which completion messages to expect. The whole group is built into the
+    /// recycled `write_buf` and sent in one write.
     #[allow(clippy::too_many_arguments)]
     pub async fn pipelined_named_query_send(
         &mut self,
         fingerprint: u64,
-        set_sql: &str,
+        generation: u64,
         limit_text: Option<&str>,
         offset_text: Option<&str>,
         include_describe: bool,
@@ -216,15 +222,23 @@ impl CacheConnection {
             self.prepared.insert(fingerprint);
         }
 
-        let set_msg = simple_query_message_build(set_sql);
-        let mut buf = BytesMut::with_capacity(set_msg.len() + self.sql_buf.len() + 96);
-        buf.extend_from_slice(&set_msg);
+        self.write_buf.clear();
+
+        // SET mem.query_generation = <gen> as a simple query, built inline.
+        let mut gen_buf = itoa::Buffer::new();
+        let gen_text = gen_buf.format(generation);
+        frontend_msg_append(&mut self.write_buf, b'Q', |b| {
+            b.put_slice(b"SET mem.query_generation = ");
+            b.put_slice(gen_text.as_bytes());
+            b.put_u8(0);
+            Ok(())
+        })?;
 
         // Close the reconciled (evicted) statement ahead of the Parse/Bind so
         // its CloseComplete precedes the rest of the response.
         if let Some(victim_fp) = close_victim {
             let victim_name = statement_name_bytes(victim_fp);
-            frontend_msg_append(&mut buf, b'C', |b| {
+            frontend_msg_append(&mut self.write_buf, b'C', |b| {
                 b.put_u8(b'S'); // close a prepared statement
                 b.put_slice(&victim_name);
                 b.put_u8(0);
@@ -233,7 +247,7 @@ impl CacheConnection {
         }
 
         extended_query_build(
-            &mut buf,
+            &mut self.write_buf,
             &name,
             &self.sql_buf,
             send_parse,
@@ -244,7 +258,7 @@ impl CacheConnection {
         )?;
 
         self.stream
-            .write_all(&buf)
+            .write_all(&self.write_buf)
             .await
             .map_into_report::<CacheError>()?;
 
@@ -254,20 +268,20 @@ impl CacheConnection {
         })
     }
 
-    /// Extended-protocol serve with an *unnamed* statement and no parameters (MV
-    /// reads: no generation SET — MV tables aren't `pgcache_pgrx`-tracked — and
-    /// the LIMIT is baked into `select_sql`).
+    /// Extended-protocol serve with an *unnamed* statement and no parameters for
+    /// the SELECT in `self.sql_buf` (MV reads: no generation SET — MV tables
+    /// aren't `pgcache_pgrx`-tracked — and the LIMIT is baked into the SQL).
+    /// Built into the recycled `write_buf`.
     pub async fn extended_query_unnamed_send(
         &mut self,
-        select_sql: &str,
         include_describe: bool,
         binary_results: bool,
     ) -> CacheResult<()> {
-        let mut buf = BytesMut::with_capacity(select_sql.len() + 64);
+        self.write_buf.clear();
         extended_query_build(
-            &mut buf,
+            &mut self.write_buf,
             b"",
-            select_sql,
+            &self.sql_buf,
             true,
             &[],
             &[],
@@ -275,7 +289,7 @@ impl CacheConnection {
             binary_results,
         )?;
         self.stream
-            .write_all(&buf)
+            .write_all(&self.write_buf)
             .await
             .map_into_report::<CacheError>()
     }

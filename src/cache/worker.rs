@@ -15,11 +15,11 @@ use crate::pg::protocol::backend::PgBackendMessageType;
 use crate::pg::protocol::encode::{
     BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG,
 };
-use crate::query::ast::{Deparse, LimitClause, LiteralValue};
+use crate::query::ast::{Deparse, LiteralValue};
 
 use super::{
     CacheError, CacheResult,
-    mv::{MvServe, mv_serve_sql},
+    mv::{MvServe, mv_serve_sql_into},
     query_cache::{CoalescedClient, QueryType, WorkerRequest},
     types::CacheStateView,
     write_queue::WriteQueue,
@@ -229,26 +229,27 @@ impl Drop for ConnectionGuard {
     }
 }
 
-/// Render a per-request `LimitClause` into text for the `LIMIT $1 OFFSET $2`
-/// bind params. A present value binds its deparsed text (so an integer binds its
-/// value); an absent clause field binds NULL — which PG reads as no limit /
-/// offset 0. A non-integer value (e.g. a float-typed parameter) binds text that
-/// fails the `int8` coercion on the cache DB, erroring that hit so it forwards
-/// to origin rather than silently dropping the limit and over-returning rows.
-fn limit_params_render(limit: Option<&LimitClause>) -> (Option<String>, Option<String>) {
-    let count = limit
-        .and_then(|l| l.count.as_ref())
-        .map(literal_param_render);
-    let offset = limit
-        .and_then(|l| l.offset.as_ref())
-        .map(literal_param_render);
-    (count, offset)
-}
-
-fn literal_param_render(value: &LiteralValue) -> String {
-    let mut text = String::new();
-    value.deparse(&mut text);
-    text
+/// Render a `LIMIT`/`OFFSET` clause field into text for its `$1`/`$2` bind. An
+/// integer limit — virtually every real one — formats into the caller's stack
+/// `itoa::Buffer` with no allocation. Any other literal (e.g. a float) deparses
+/// into `other` (a heap `String`); it then fails the `int8` coercion on the
+/// cache DB, erroring that hit so it forwards to origin rather than silently
+/// dropping the limit and over-returning rows. `None` binds NULL (no limit /
+/// offset 0). The two scratch buffers are caller-owned so the returned `&str`
+/// outlives the bind.
+fn limit_bind_text<'a>(
+    value: Option<&LiteralValue>,
+    itoa_buf: &'a mut itoa::Buffer,
+    other: &'a mut String,
+) -> Option<&'a str> {
+    match value {
+        None => None,
+        Some(LiteralValue::Integer(n)) => Some(itoa_buf.format(*n)),
+        Some(v) => {
+            v.deparse(other);
+            Some(other.as_str())
+        }
+    }
 }
 
 /// Response state machine for the unified serve path (text and binary clients;
@@ -313,9 +314,16 @@ pub async fn handle_cached_query(
     // prepare evicted the connection's oldest statement.
     let prepare: PrepareOutcome;
     if let MvServe::Mv(cols) = &msg.mv {
-        // MV fast path: extended query only, no SET prefix.
-        let sql = mv_serve_sql(msg.fingerprint, &msg.resolved, msg.limit.as_ref(), cols);
-        conn.extended_query_unnamed_send(&sql, include_describe, binary_results)
+        // MV fast path: extended query only, no SET prefix. Render into the
+        // connection's recycled SQL buffer rather than a fresh String.
+        mv_serve_sql_into(
+            &mut conn.sql_buf,
+            msg.fingerprint,
+            &msg.resolved,
+            msg.limit.as_ref(),
+            cols,
+        );
+        conn.extended_query_unnamed_send(include_describe, binary_results)
             .await
             .inspect_err(|_| {
                 guard.poisoned = true;
@@ -339,14 +347,26 @@ pub async fn handle_cached_query(
         conn.sql_buf.clear();
         conn.sql_buf.push_str(&msg.deparsed_sql);
         conn.sql_buf.push_str(" LIMIT $1 OFFSET $2");
-        let (limit_text, offset_text) = limit_params_render(msg.limit.as_ref());
-        let set_sql = format!("SET mem.query_generation = {}", msg.generation);
+        let mut limit_itoa = itoa::Buffer::new();
+        let mut offset_itoa = itoa::Buffer::new();
+        let mut limit_other = String::new();
+        let mut offset_other = String::new();
+        let limit_text = limit_bind_text(
+            msg.limit.as_ref().and_then(|l| l.count.as_ref()),
+            &mut limit_itoa,
+            &mut limit_other,
+        );
+        let offset_text = limit_bind_text(
+            msg.limit.as_ref().and_then(|l| l.offset.as_ref()),
+            &mut offset_itoa,
+            &mut offset_other,
+        );
         prepare = conn
             .pipelined_named_query_send(
                 msg.fingerprint,
-                &set_sql,
-                limit_text.as_deref(),
-                offset_text.as_deref(),
+                msg.generation,
+                limit_text,
+                offset_text,
                 include_describe,
                 binary_results,
                 close_victim,
@@ -366,9 +386,14 @@ pub async fn handle_cached_query(
         read_buf,
         codec,
         sql_buf,
+        write_buf,
         prepared,
     } = conn;
-    let mut framed = FramedRead::new(stream, codec);
+    // `with_capacity(.., 0)` instead of `new` so FramedRead doesn't allocate its
+    // default 8 KiB read buffer — we immediately swap in the connection's
+    // recycled `read_buf`, which would otherwise drop that fresh allocation every
+    // hit.
+    let mut framed = FramedRead::with_capacity(stream, codec, 0);
     *framed.read_buffer_mut() = read_buf;
 
     let emit_rfq = msg.emit_rfq;
@@ -522,6 +547,7 @@ pub async fn handle_cached_query(
         read_buf: parts.read_buf,
         codec: parts.codec,
         sql_buf,
+        write_buf,
         prepared,
     });
     if let Err(e) = guard.release().await {
@@ -588,33 +614,41 @@ mod tests {
     }
 
     #[test]
-    fn limit_params_render_binds_value_and_never_drops_non_integers() {
-        // No clause → NULL params (no limit, offset 0).
-        assert_eq!(limit_params_render(None), (None, None));
+    fn limit_bind_text_binds_value_and_never_drops_non_integers() {
+        let mut itoa_buf = itoa::Buffer::new();
+        let mut other = String::new();
 
-        // Integer count/offset bind their decimal value.
-        let int_limit = LimitClause {
-            count: Some(LiteralValue::Integer(5)),
-            offset: Some(LiteralValue::Integer(2)),
-        };
+        // No clause field → NULL bind (no limit, offset 0).
+        assert_eq!(limit_bind_text(None, &mut itoa_buf, &mut other), None);
+
+        // Integer binds its decimal value (negatives included) with no alloc.
         assert_eq!(
-            limit_params_render(Some(&int_limit)),
-            (Some("5".to_owned()), Some("2".to_owned()))
+            limit_bind_text(
+                Some(&LiteralValue::Integer(5)),
+                &mut itoa_buf,
+                &mut other
+            ),
+            Some("5")
+        );
+        assert!(other.is_empty(), "integer path must not touch the heap buffer");
+        assert_eq!(
+            limit_bind_text(
+                Some(&LiteralValue::Integer(-2)),
+                &mut itoa_buf,
+                &mut other
+            ),
+            Some("-2")
         );
 
-        // PGC-229 review #1: a non-integer limit must still BIND (not render
-        // None, which would bind NULL and silently drop the limit, returning
-        // every row). It binds text that fails int8 coercion on the cache DB,
-        // erroring that hit so it forwards to origin.
-        let float_limit = LimitClause {
-            count: Some(LiteralValue::Float(
-                ordered_float::NotNan::new(3.7).expect("non-NaN test value"),
-            )),
-            offset: None,
-        };
-        let (count, offset) = limit_params_render(Some(&float_limit));
-        assert!(count.is_some(), "non-integer limit must bind, not drop");
-        assert_eq!(offset, None);
+        // PGC-229 review #1: a non-integer limit must still BIND (not None, which
+        // would bind NULL and silently drop the limit, returning every row). It
+        // binds text that fails int8 coercion on the cache DB, erroring that hit
+        // so it forwards to origin.
+        let float = LiteralValue::Float(
+            ordered_float::NotNan::new(3.7).expect("non-NaN test value"),
+        );
+        let bound = limit_bind_text(Some(&float), &mut itoa_buf, &mut other);
+        assert!(bound.is_some(), "non-integer limit must bind, not drop");
     }
 
     #[test]

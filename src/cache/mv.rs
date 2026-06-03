@@ -143,7 +143,9 @@ pub fn mv_table_name(fingerprint: u64) -> String {
     format!("pgcache_mv.q_{fingerprint}")
 }
 
-/// Build the serve-time SQL for reading from an MV table.
+/// Build the serve-time SQL for reading from an MV table, into a caller-provided
+/// buffer (cleared first) so the serve path can reuse the connection's recycled
+/// `sql_buf` rather than allocating a fresh `String` per cache hit.
 ///
 /// Shape: `SELECT * FROM <mv_table> [ORDER BY ...] [LIMIT ...]`.
 ///
@@ -169,14 +171,16 @@ pub fn mv_table_name(fingerprint: u64) -> String {
 /// `SELECT * FROM mv` returns rows in arbitrary physical order, so for user
 /// LIMIT < max_limit we need the re-sort to guarantee the correct top-M
 /// subset. No generation SET — MV tables are not `pgcache_pgrx`-tracked.
-pub fn mv_serve_sql(
+pub fn mv_serve_sql_into(
+    sql: &mut String,
     fingerprint: u64,
     resolved: &ResolvedQueryExpr,
     limit: Option<&LimitClause>,
     output_columns: &[EcoString],
-) -> String {
+) {
     let table = mv_table_name(fingerprint);
-    let mut sql = String::with_capacity(16 + table.len() + output_columns.len() * 24);
+    sql.clear();
+    sql.reserve(16 + table.len() + output_columns.len() * 24);
     // MV physical columns are positional (`c0..`) so duplicate output
     // names (e.g. two `count`) are storable; alias them back here. Empty
     // `output_columns` is a defensive fallback — a `Fresh` MV always has
@@ -198,10 +202,10 @@ pub fn mv_serve_sql(
     if !resolved.order_by.is_empty() {
         match &resolved.body {
             ResolvedQueryBody::Select(select) => {
-                mv_order_by_positional(&mut sql, &resolved.order_by, &select.columns);
+                mv_order_by_positional(sql, &resolved.order_by, &select.columns);
             }
             ResolvedQueryBody::SetOp(_) => {
-                mv_order_by_direct(&mut sql, &resolved.order_by);
+                mv_order_by_direct(sql, &resolved.order_by);
             }
             ResolvedQueryBody::Values(_) => {
                 unreachable!("MV fast path on Values body — classifier should have Skipped")
@@ -209,9 +213,8 @@ pub fn mv_serve_sql(
         }
     }
     if let Some(l) = limit {
-        l.deparse(&mut sql);
+        l.deparse(sql);
     }
-    sql
 }
 
 /// Emit `ORDER BY N ASC|DESC, ...` by looking each expression's 1-based
@@ -766,12 +769,16 @@ mod tests {
     /// which keeps the ORDER BY / LIMIT assertions below orthogonal to the
     /// aliased-projection tests.
     fn build_serve_sql(sql: &str) -> String {
-        mv_serve_sql(42, &resolve_for_serve(sql), None, &[])
+        let mut out = String::new();
+        mv_serve_sql_into(&mut out, 42, &resolve_for_serve(sql), None, &[]);
+        out
     }
 
     fn build_serve_sql_named(sql: &str, names: &[&str]) -> String {
         let names: Vec<EcoString> = names.iter().map(|n| EcoString::from(*n)).collect();
-        mv_serve_sql(42, &resolve_for_serve(sql), None, &names)
+        let mut out = String::new();
+        mv_serve_sql_into(&mut out, 42, &resolve_for_serve(sql), None, &names);
+        out
     }
 
     #[test]

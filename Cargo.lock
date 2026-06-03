@@ -2079,6 +2079,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "iddqd",
+ "itoa",
  "lexopt",
  "lru",
  "metrics",
