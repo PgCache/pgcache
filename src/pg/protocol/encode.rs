@@ -65,6 +65,7 @@ pub fn command_complete_encode(cnt: u64, buf: &mut BytesMut) {
 /// Fixed protocol messages as static byte slices — no heap allocation.
 pub const PARSE_COMPLETE_MSG: &[u8] = &[b'1', 0, 0, 0, 4];
 pub const BIND_COMPLETE_MSG: &[u8] = &[b'2', 0, 0, 0, 4];
+pub const CLOSE_COMPLETE_MSG: &[u8] = &[b'3', 0, 0, 0, 4];
 pub const READY_FOR_QUERY_IDLE_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
 
 #[instrument(skip_all)]

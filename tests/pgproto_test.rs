@@ -419,3 +419,96 @@ async fn test_pgproto_multi_parse_origin_prepared() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-234: a `Close(statement)` for a cache-served statement the origin never
+/// prepared is handled locally — pgcache synthesizes the CloseComplete and does
+/// not forward Close+Sync to origin. A `Close` for an origin-prepared statement
+/// still forwards. Both reach the client correctly. This raw-protocol flow can't
+/// be produced via tokio-postgres, which manages statement lifecycle itself.
+#[tokio::test]
+async fn test_pgproto_close_handled_locally() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE proto_test (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO proto_test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    let output = pgproto_run(ctx.cache_port, "tests/data/pgproto/close_local.data");
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&m, &after);
+
+    // Both Closes (local s2 + forwarded s1) return a CloseComplete to the client.
+    assert_eq!(
+        output.matches("CloseComplete").count(),
+        2,
+        "expected 2 CloseComplete (one synthesized, one from origin):\n{output}"
+    );
+    // The terminating ReadyForQuery is present (Sync handled, local or forwarded).
+    assert!(
+        output.contains("ReadyForQuery"),
+        "expected ReadyForQuery:\n{output}"
+    );
+    // Exactly one Close handled locally: s2 (synth-parsed, never origin_prepared).
+    // s1 was forwarded to origin (describe-cache miss), so its Close forwards.
+    assert_eq!(
+        delta.protocol_close_local, 1,
+        "expected exactly 1 locally-handled Close (s2), got {}:\n{output}",
+        delta.protocol_close_local
+    );
+    // Confirms the setup: s1 was a describe-cache miss (forwarded), s2 a hit (synth).
+    assert!(
+        delta.protocol_describe_cache_misses >= 1 && delta.protocol_describe_cache_hits >= 1,
+        "expected one describe miss (s1) and one hit (s2):\n{output}"
+    );
+
+    Ok(())
+}
+
+/// PGC-234 ordering: a deferred locally-handled Close must keep its place ahead
+/// of a following batch's responses in the same Sync group. Client sends
+/// Close(s2) then a Parse/Bind/Execute batch + Sync; the synthesized
+/// CloseComplete must appear before the batch's DataRows.
+#[tokio::test]
+async fn test_pgproto_close_then_batch_ordering() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE proto_test (id integer PRIMARY KEY, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO proto_test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    let output = pgproto_run(ctx.cache_port, "tests/data/pgproto/close_then_batch.data");
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&m, &after);
+
+    // The Close(s2) was handled locally (deferred), so CloseComplete is synthesized.
+    assert_eq!(
+        delta.protocol_close_local, 1,
+        "expected 1 locally-handled Close (s2), got {}:\n{output}",
+        delta.protocol_close_local
+    );
+    // Ordering: the synthesized CloseComplete must precede the batch's DataRows.
+    let close_at = output.find("CloseComplete");
+    let row_at = output.find("<= BE DataRow");
+    assert!(
+        matches!((close_at, row_at), (Some(c), Some(r)) if c < r),
+        "CloseComplete must precede the batch DataRows (close={close_at:?}, row={row_at:?}):\n{output}"
+    );
+
+    Ok(())
+}

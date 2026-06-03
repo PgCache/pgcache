@@ -42,6 +42,7 @@ use crate::{
             AUTHENTICATION_SASL, PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType,
             authentication_type, data_row_first_column, parameter_status_parse,
         },
+        encode::{CLOSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG},
         extended::{
             ParsedBindMessage, ParsedParseMessage, Portal, PreparedStatement, StatementType,
             parse_bind_message, parse_close_message, parse_describe_message, parse_execute_message,
@@ -592,6 +593,19 @@ struct ExtendedPending {
     /// on the forward-fallback path: extended entries carry no `Sync`, a simple
     /// `Query` already triggers its own `ReadyForQuery`.
     dispatch_is_extended: bool,
+
+    /// Count of `Close(statement)` messages handled locally (statement never
+    /// `origin_prepared`, so the origin never knew it) whose `CloseComplete` is
+    /// still owed to the client. Synthesized — and the counter reset — at the
+    /// next Sync (or before any origin forward, to preserve response order).
+    /// PGC-234: avoids forwarding useless Close+Sync round-trips to origin for
+    /// cache-served statements.
+    deferred_close_completes: u32,
+
+    /// Whether anything was forwarded to origin in the current Sync group (a
+    /// forwarded Close or a Flush). Gates the bare-Sync local-`ReadyForQuery`
+    /// optimization: only synthesize the RFQ when the group is purely local.
+    group_origin_forwarded: bool,
 }
 
 /// Everything needed to dispatch one execute as a cache slot, computed at Sync
@@ -654,6 +668,8 @@ impl ExtendedPending {
             pipeline_context: None,
             batch: VecDeque::new(),
             dispatch_is_extended: false,
+            deferred_close_completes: 0,
+            group_origin_forwarded: false,
         }
     }
 
@@ -1610,16 +1626,58 @@ impl ConnectionState {
         self.origin_write_buf.push_back(msg.data);
     }
 
-    /// Handle Close message — flush buffer to origin, clean up state, forward Close.
+    /// Emit any deferred `CloseComplete`s (PGC-234: locally-handled Closes of
+    /// statements the origin never prepared) as one ordered synth slot, so they
+    /// keep their place ahead of whatever origin/cache response follows. Returns
+    /// the count flushed.
+    fn deferred_close_completes_flush(&mut self) -> u32 {
+        let n = self.extended.deferred_close_completes;
+        if n > 0 {
+            self.extended.deferred_close_completes = 0;
+            let mut out = BytesMut::with_capacity(CLOSE_COMPLETE_MSG.len() * n as usize);
+            for _ in 0..n {
+                out.put_slice(CLOSE_COMPLETE_MSG);
+            }
+            self.egress.synth_push(out.freeze());
+        }
+        n
+    }
+
+    /// Handle Close message. A `Close(statement)` for a statement that was served
+    /// from cache and never prepared on the origin (`origin_prepared == false`)
+    /// is handled locally — the origin never knew it, so forwarding the Close (and
+    /// its paired Sync) is a useless round-trip (PGC-234). We defer the
+    /// `CloseComplete` (synthesized at the next Sync) and leave origin untouched.
+    /// Everything else forwards as before: origin-prepared statements, portals, a
+    /// Close mid-batch (`buffer` present), or once anything has already been
+    /// forwarded this group (so deferred completions can't reorder ahead of it).
     fn handle_close_message(&mut self, msg: PgFrontendMessage) {
-        self.extended_buffer_flush_to_origin();
         if let Ok(parsed) = parse_close_message(&msg.data) {
+            if parsed.close_type == b'S'
+                && self.extended.buffer.is_none()
+                && !self.extended.group_origin_forwarded
+                && self
+                    .prepared_statements
+                    .get(parsed.name.as_str())
+                    .is_some_and(|s| !s.origin_prepared)
+            {
+                self.statement_close(&parsed.name);
+                self.extended.deferred_close_completes += 1;
+                crate::metrics::handles().conn.close_local.increment(1);
+                return;
+            }
+            self.deferred_close_completes_flush();
+            self.extended_buffer_flush_to_origin();
             match parsed.close_type {
                 b'S' => self.statement_close(&parsed.name),
                 b'P' => self.portal_close(&parsed.name),
                 _ => {}
             }
+        } else {
+            self.deferred_close_completes_flush();
+            self.extended_buffer_flush_to_origin();
         }
+        self.extended.group_origin_forwarded = true;
         self.origin_write_buf.push_back(msg.data);
     }
 
@@ -1629,11 +1687,25 @@ impl ConnectionState {
     /// dispatched as its own cache slot (in order). Otherwise the batch is
     /// synthesized (Parse-only) or forwarded whole to origin.
     fn handle_sync_message(&mut self, msg: PgFrontendMessage) {
+        // Emit any deferred CloseCompletes (locally-handled Closes) as an ordered
+        // synth slot before this Sync's responses (PGC-234).
+        let local_closes = self.deferred_close_completes_flush();
+        let group_origin_forwarded = self.extended.group_origin_forwarded;
+        self.extended.group_origin_forwarded = false;
+
         let Some(buffer) = self.extended.buffer_take() else {
-            // Bare Sync; origin replies with one RFQ.
-            trace!("net: proxy→origin Sync (no buffer)");
-            self.egress.origin_open();
-            self.origin_write_buf.push_back(msg.data);
+            // Bare Sync. If this group only handled Closes locally (nothing was
+            // forwarded to origin), the origin has no pending work to ack —
+            // synthesize the ReadyForQuery instead of a useless round-trip.
+            if local_closes > 0 && !group_origin_forwarded {
+                trace!("net: bare Sync → synth ReadyForQuery (local closes only)");
+                self.egress
+                    .synth_push(Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+            } else {
+                trace!("net: proxy→origin Sync (no buffer)");
+                self.egress.origin_open();
+                self.origin_write_buf.push_back(msg.data);
+            }
             return;
         };
 
@@ -1865,6 +1937,10 @@ impl ConnectionState {
     /// Handle Flush message — forward buffer to origin, no cache attempt.
     /// Handles JDBC pattern: Parse/Bind/Describe/Flush then Execute/Sync.
     fn handle_flush_message(&mut self, msg: PgFrontendMessage) {
+        // Anything reaching origin must come after any deferred CloseCompletes,
+        // and marks the group as having origin work (PGC-234).
+        self.deferred_close_completes_flush();
+        self.extended.group_origin_forwarded = true;
         let Some(buffer) = self.extended.buffer_take() else {
             self.origin_write_buf.push_back(msg.data);
             return;

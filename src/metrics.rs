@@ -169,6 +169,9 @@ pub mod names {
     /// Bind+Execute forwards where pgcache prepended a lazy `Parse` because
     /// origin didn't yet know the statement.
     pub const PROTOCOL_LAZY_PARSE_FORWARDED: &str = "pgcache.protocol.lazy_parse_forwarded";
+    /// `Close(statement)` handled locally (statement never prepared on origin):
+    /// CloseComplete synthesized, Close+Sync not forwarded to origin (PGC-234).
+    pub const PROTOCOL_CLOSE_LOCAL: &str = "pgcache.protocol.close_local";
 
     // Writer thread instrumentation (PGC-117)
     /// Per-command handler latency. Labeled with `cmd` for each QueryCommand /
@@ -276,6 +279,7 @@ pub struct ConnHandles {
     pub describe_evictions: Counter,
     pub describe_invalidations: Counter,
     pub lazy_parse_forwarded: Counter,
+    pub close_local: Counter,
 }
 
 pub struct QueryHandles {
@@ -418,6 +422,7 @@ impl Handles {
                 describe_evictions: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_EVICTIONS),
                 describe_invalidations: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS),
                 lazy_parse_forwarded: metrics::counter!(PROTOCOL_LAZY_PARSE_FORWARDED),
+                close_local: metrics::counter!(PROTOCOL_CLOSE_LOCAL),
             },
             query: QueryHandles {
                 total: metrics::counter!(QUERIES_TOTAL),

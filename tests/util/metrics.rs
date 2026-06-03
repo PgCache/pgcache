@@ -34,6 +34,7 @@ pub struct MetricsSnapshot {
     pub protocol_describe_cache_hits: u64,
     pub protocol_describe_cache_misses: u64,
     pub protocol_lazy_parse_forwarded: u64,
+    pub protocol_close_local: u64,
     pub cache_hit_rate: f64,
     pub cacheability_rate: f64,
 }
@@ -87,6 +88,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut protocol_describe_cache_hits = 0u64;
     let mut protocol_describe_cache_misses = 0u64;
     let mut protocol_lazy_parse_forwarded = 0u64;
+    let mut protocol_close_local = 0u64;
 
     for line in response.lines() {
         // Skip comments and empty lines
@@ -124,6 +126,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_protocol_describe_cache_hits" => protocol_describe_cache_hits = value,
                 "pgcache_protocol_describe_cache_misses" => protocol_describe_cache_misses = value,
                 "pgcache_protocol_lazy_parse_forwarded" => protocol_lazy_parse_forwarded = value,
+                "pgcache_protocol_close_local" => protocol_close_local = value,
                 _ => {}
             }
         }
@@ -171,6 +174,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         protocol_describe_cache_hits,
         protocol_describe_cache_misses,
         protocol_lazy_parse_forwarded,
+        protocol_close_local,
         cache_hit_rate,
         cacheability_rate,
     })
@@ -209,6 +213,7 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
             - before.protocol_describe_cache_misses,
         protocol_lazy_parse_forwarded: after.protocol_lazy_parse_forwarded
             - before.protocol_lazy_parse_forwarded,
+        protocol_close_local: after.protocol_close_local - before.protocol_close_local,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

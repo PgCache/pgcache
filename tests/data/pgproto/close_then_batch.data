@@ -1,0 +1,20 @@
+# PGC-234 ordering: a locally-handled Close, deferred, must keep its place
+# ahead of a following batch's responses. s2 is parsed via describe-cache synth
+# (not origin_prepared), so Close(s2) is deferred; then a Parse/Bind/Execute
+# batch + Sync follows in the SAME group. The synthesized CloseComplete must be
+# emitted before the batch's responses (client sent the Close first).
+'P'	"s1"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'D'	'S'	"s1"
+'S'
+'Y'
+'P'	"s2"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'D'	'S'	"s2"
+'S'
+'Y'
+'C'	'S'	"s2"
+'P'	"s3"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'B'	""	"s3"	0	0	0
+'E'	""	0
+'S'
+'Y'
+'X'

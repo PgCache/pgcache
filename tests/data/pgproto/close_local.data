@@ -1,0 +1,23 @@
+# PGC-234: Close of a cache-served statement (parsed via the describe-cache
+# synth path, so never prepared on origin) is handled locally — pgcache
+# synthesizes the CloseComplete and does NOT forward Close+Sync to origin.
+#
+# s1: first Parse+Describe → describe-cache MISS → forwarded to origin →
+#     origin_prepared, so Close(s1) forwards to origin (CloseComplete from origin).
+# s2: same SQL → describe-cache HIT → synthesized locally → NOT origin_prepared,
+#     so Close(s2) is handled locally (CloseComplete synthesized).
+'P'	"s1"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'D'	'S'	"s1"
+'S'
+'Y'
+'P'	"s2"	"SELECT id, name FROM proto_test ORDER BY id"	0
+'D'	'S'	"s2"
+'S'
+'Y'
+'C'	'S'	"s2"
+'S'
+'Y'
+'C'	'S'	"s1"
+'S'
+'Y'
+'X'
