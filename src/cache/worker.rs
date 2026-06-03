@@ -257,18 +257,22 @@ fn limit_bind_text<'a>(
 /// format (text/binary) is chosen per client; the message *sequence* is the
 /// same.
 ///
-/// Pipelined: SET (simple query) + [Close] + Parse/Bind/[Describe('P')]/Execute/Sync
-/// produces: CommandComplete (SET) → ReadyForQuery → [CloseComplete →]
-/// ParseComplete → BindComplete → [RowDescription →] DataRow* →
-/// CommandComplete (SELECT) → ReadyForQuery. The leading Close (and its
-/// CloseComplete) appears when this serve's reconciliation pass closed an
-/// evicted statement — independent of whether a Parse was also sent.
+/// Source-row pipeline (PGC-235): set_config(generation) + [Close] +
+/// Parse/Bind/[Describe('P')]/Execute under one Sync, producing
+/// [SetGen ParseComplete →] SetGen BindComplete → SetGen DataRow → SetGen
+/// CommandComplete → [CloseComplete →] [SELECT ParseComplete →] BindComplete →
+/// [RowDescription →] DataRow* → CommandComplete (SELECT) → ReadyForQuery. The
+/// set_config response (a one-row SELECT) is consumed, not relayed; only the
+/// SELECT's BindComplete-onward reaches the client. MV path has no set_config
+/// prefix and starts at `ParseComplete`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServeResponseState {
-    /// Waiting for SET CommandComplete
-    SetComplete,
-    /// Waiting for ReadyForQuery after SET
-    SetReady,
+    /// Waiting for the set_config statement's ParseComplete (first serve only)
+    SetGenParse,
+    /// Waiting for the set_config statement's BindComplete
+    SetGenBind,
+    /// Consuming the set_config one-row result (DataRow then CommandComplete)
+    SetGenData,
     /// Waiting for CloseComplete (only when a statement was evicted)
     CloseComplete,
     /// Waiting for ParseComplete
@@ -329,6 +333,7 @@ pub async fn handle_cached_query(
                 guard.poisoned = true;
             })?;
         prepare = PrepareOutcome {
+            sent_setgen_parse: false,
             sent_parse: true,
             sent_close: false,
         };
@@ -388,6 +393,7 @@ pub async fn handle_cached_query(
         sql_buf,
         write_buf,
         prepared,
+        setgen_parsed,
     } = conn;
     // `with_capacity(.., 0)` instead of `new` so FramedRead doesn't allocate its
     // default 8 KiB read buffer — we immediately swap in the connection's
@@ -420,12 +426,15 @@ pub async fn handle_cached_query(
         );
     }
 
-    // MV path: no SET statement was sent, so skip SetComplete/SetReady and
-    // start directly at ParseComplete (first message from the extended query).
+    // MV path: no set_config prefix, so start at the SELECT's ParseComplete.
+    // Source-row path: consume the set_config response first — its Parse only on
+    // the first serve of this connection, otherwise straight to its BindComplete.
     let mut state = if matches!(msg.mv, MvServe::Mv(_)) {
         ServeResponseState::ParseComplete
+    } else if prepare.sent_setgen_parse {
+        ServeResponseState::SetGenParse
     } else {
-        ServeResponseState::SetComplete
+        ServeResponseState::SetGenBind
     };
     let mut bytes_served: usize = 0;
 
@@ -444,13 +453,18 @@ pub async fn handle_cached_query(
                 };
 
                 match (state, frame.message_type) {
-                    (ServeResponseState::SetComplete, PgBackendMessageType::CommandComplete) => {
-                        state = ServeResponseState::SetReady;
+                    (ServeResponseState::SetGenParse, PgBackendMessageType::ParseComplete) => {
+                        state = ServeResponseState::SetGenBind;
                     }
-                    (ServeResponseState::SetReady, PgBackendMessageType::ReadyForQuery) => {
-                        // A Close (if a statement was evicted) precedes the
-                        // Parse; on statement reuse neither is sent, so skip
-                        // straight to Bind.
+                    (ServeResponseState::SetGenBind, PgBackendMessageType::BindComplete) => {
+                        state = ServeResponseState::SetGenData;
+                    }
+                    // set_config returns one row; consume it without relaying.
+                    (ServeResponseState::SetGenData, PgBackendMessageType::DataRows) => {}
+                    (ServeResponseState::SetGenData, PgBackendMessageType::CommandComplete) => {
+                        // set_config done. A Close (if a statement was evicted)
+                        // precedes the SELECT; on statement reuse neither Close nor
+                        // Parse is sent, so skip straight to Bind.
                         state = if prepare.sent_close {
                             ServeResponseState::CloseComplete
                         } else if prepare.sent_parse {
@@ -499,9 +513,15 @@ pub async fn handle_cached_query(
                         push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                         msg.timing.query_done_at = Some(Instant::now());
                     }
+                    // Single trailing Sync → one terminal ReadyForQuery. It can't
+                    // arrive mid-set_config (those advance on Parse/Bind/Data/CC).
                     (_, PgBackendMessageType::ReadyForQuery)
-                        if state != ServeResponseState::SetComplete
-                            && state != ServeResponseState::SetReady =>
+                        if !matches!(
+                            state,
+                            ServeResponseState::SetGenParse
+                                | ServeResponseState::SetGenBind
+                                | ServeResponseState::SetGenData
+                        ) =>
                     {
                         state = ServeResponseState::Done;
                     }
@@ -549,6 +569,7 @@ pub async fn handle_cached_query(
         sql_buf,
         write_buf,
         prepared,
+        setgen_parsed,
     });
     if let Err(e) = guard.release().await {
         if let Some(bc) = broadcast.take() {

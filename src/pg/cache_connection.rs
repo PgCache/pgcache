@@ -16,6 +16,15 @@ use super::protocol::backend::{AUTHENTICATION_OK, PgBackendMessageCodec, PgBacke
 /// Postgres `int8` (bigint) type OID, declared for the parameterized
 /// `LIMIT $1 OFFSET $2` placeholders so the planner doesn't have to infer it.
 const INT8_OID: u32 = 20;
+/// Postgres `text` type OID, declared for the `set_config` value parameter.
+const TEXT_OID: u32 = 25;
+
+/// Prepared statement (one per connection) that stamps the query generation
+/// before a serve. `set_config(...)` takes a bound parameter (a bare `SET`
+/// can't), so this is parsed once and Bind+Execute'd per serve (PGC-235).
+/// `$1` is the generation as text; the GUC is integer-typed and coerces it.
+const SETGEN_STATEMENT_NAME: &[u8] = b"pgc_setgen";
+const SETGEN_SQL: &str = "SELECT set_config('mem.query_generation', $1, false)";
 
 /// Per-connection registry of named prepared statements. PG prepared statements
 /// are session-local, so each connection tracks its own. Statement lifecycle is
@@ -71,10 +80,13 @@ impl PreparedStatements {
 /// What `pipelined_named_query_send` put on the wire, so the caller's response
 /// state machine knows which completion messages to expect.
 pub struct PrepareOutcome {
-    /// A Parse was sent (expect a ParseComplete).
+    /// A Parse for the `set_config` generation-stamp statement was sent (expect a
+    /// ParseComplete before its BindComplete). First serve per connection only.
+    pub sent_setgen_parse: bool,
+    /// A Parse for the SELECT was sent (expect a ParseComplete).
     pub sent_parse: bool,
-    /// A Close for an evicted statement was sent ahead of the Parse (expect a
-    /// CloseComplete before the ParseComplete).
+    /// A Close for an evicted statement was sent ahead of the SELECT (expect a
+    /// CloseComplete before the SELECT's ParseComplete).
     pub sent_close: bool,
 }
 
@@ -87,15 +99,18 @@ pub struct CacheConnection {
     pub read_buf: BytesMut,
     pub codec: PgBackendMessageCodec,
     /// Recycled SQL assembly buffer. The worker clears and rewrites this on every
-    /// cache hit (SET generation prefix + precomputed body + optional LIMIT),
-    /// avoiding per-request String allocations.
+    /// cache hit (the SELECT body + optional `LIMIT $1 OFFSET $2`), avoiding
+    /// per-request String allocations.
     pub sql_buf: String,
     /// Recycled wire-encode buffer. Every serve clears and rebuilds the pipelined
-    /// message group (SET + optional Close + Parse/Bind/Execute) here, so the
-    /// per-hit allocation is amortized to zero once it reaches steady-state size.
+    /// message group (set_config + optional Close + Parse/Bind/Execute + Sync)
+    /// here, so the per-hit allocation is amortized to zero at steady state.
     pub write_buf: BytesMut,
     /// Named prepared statements (`pgc_<fp>`) live on this connection, FIFO-capped.
     pub(crate) prepared: PreparedStatements,
+    /// Whether the `pgc_setgen` generation-stamp statement has been Parsed on this
+    /// connection yet (parsed once, then Bind+Execute'd per serve — PGC-235).
+    pub(crate) setgen_parsed: bool,
 }
 
 impl CacheConnection {
@@ -115,6 +130,7 @@ impl CacheConnection {
             sql_buf: String::with_capacity(1024),
             write_buf: BytesMut::with_capacity(4096),
             prepared: PreparedStatements::new(),
+            setgen_parsed: false,
         };
 
         // Send startup message
@@ -189,22 +205,28 @@ impl CacheConnection {
         }
     }
 
-    /// Send a pipelined SET (simple query) + a *named* prepared-statement
+    /// Send a pipelined generation-stamp + a *named* prepared-statement
     /// Bind/Execute for the SELECT in `self.sql_buf` (which must already carry
-    /// the trailing `LIMIT $1 OFFSET $2` placeholders). A Parse is emitted only
-    /// the first time `fingerprint`'s statement is used on this connection;
-    /// later hits reuse the prepared statement, so PG skips parse/plan.
+    /// the trailing `LIMIT $1 OFFSET $2` placeholders), all under a single Sync.
     ///
-    /// `limit_text`/`offset_text` bind `$1`/`$2` as text (None → NULL, which PG
-    /// treats as no limit / offset 0). The `SET mem.query_generation = N` prefix
-    /// is built inline from `generation` (no per-hit String).
+    /// The generation is set via a prepared `SELECT set_config('mem.query_generation',
+    /// $1, false)` (PGC-235) rather than a per-hit simple-query `SET`: the
+    /// statement is parsed once per connection, and folding it into the same
+    /// extended pipeline as the SELECT removes the SET's per-hit parse/plan *and*
+    /// its separate implicit-transaction boundary. `pgcache_pgrx`'s CustomScan
+    /// reads the GUC at scan-begin to record scanned rows under the generation, so
+    /// this must run before the SELECT — pipeline order guarantees that.
     ///
-    /// `close_victim`, when set, is a statement whose query was evicted (found by
-    /// the caller's reconciliation pass); a `Close` for it is pipelined ahead of
-    /// the Parse/Bind so its CloseComplete precedes the rest of the response.
+    /// A Parse is emitted for the SELECT only the first time `fingerprint`'s
+    /// statement is used on this connection; the set_config Parse only the first
+    /// time anything is served on this connection. `limit_text`/`offset_text` bind
+    /// `$1`/`$2` as text (None → NULL = no limit / offset 0).
+    ///
+    /// `close_victim`, when set, is a statement whose query was evicted; a `Close`
+    /// for it is pipelined so its CloseComplete precedes the SELECT response.
     /// Returns a [`PrepareOutcome`] so the caller's response state machine knows
-    /// which completion messages to expect. The whole group is built into the
-    /// recycled `write_buf` and sent in one write.
+    /// which completion messages to expect. Built into the recycled `write_buf`,
+    /// sent in one write.
     #[allow(clippy::too_many_arguments)]
     pub async fn pipelined_named_query_send(
         &mut self,
@@ -221,21 +243,30 @@ impl CacheConnection {
         if send_parse {
             self.prepared.insert(fingerprint);
         }
+        let send_setgen_parse = !self.setgen_parsed;
+        self.setgen_parsed = true;
 
         self.write_buf.clear();
 
-        // SET mem.query_generation = <gen> as a simple query, built inline.
+        // Generation stamp: prepared `set_config(...)` (parse-on-first-use),
+        // bound to the generation as text, no Describe — its one-row result is
+        // consumed by the caller's state machine. No trailing Sync (shared).
         let mut gen_buf = itoa::Buffer::new();
         let gen_text = gen_buf.format(generation);
-        frontend_msg_append(&mut self.write_buf, b'Q', |b| {
-            b.put_slice(b"SET mem.query_generation = ");
-            b.put_slice(gen_text.as_bytes());
-            b.put_u8(0);
-            Ok(())
-        })?;
+        extended_query_build(
+            &mut self.write_buf,
+            SETGEN_STATEMENT_NAME,
+            SETGEN_SQL,
+            send_setgen_parse,
+            &[TEXT_OID],
+            &[Some(gen_text)],
+            false, // no Describe
+            false, // text result (consumed)
+            false, // no Sync — shared with the SELECT below
+        )?;
 
-        // Close the reconciled (evicted) statement ahead of the Parse/Bind so
-        // its CloseComplete precedes the rest of the response.
+        // Close the reconciled (evicted) statement ahead of the SELECT so its
+        // CloseComplete precedes the SELECT response.
         if let Some(victim_fp) = close_victim {
             let victim_name = statement_name_bytes(victim_fp);
             frontend_msg_append(&mut self.write_buf, b'C', |b| {
@@ -255,6 +286,7 @@ impl CacheConnection {
             &[limit_text, offset_text],
             include_describe,
             binary_results,
+            true, // single trailing Sync for the whole pipeline
         )?;
 
         self.stream
@@ -263,6 +295,7 @@ impl CacheConnection {
             .map_into_report::<CacheError>()?;
 
         Ok(PrepareOutcome {
+            sent_setgen_parse: send_setgen_parse,
             sent_parse: send_parse,
             sent_close: close_victim.is_some(),
         })
@@ -287,6 +320,7 @@ impl CacheConnection {
             &[],
             include_describe,
             binary_results,
+            true, // MV path is standalone — terminate with its own Sync
         )?;
         self.stream
             .write_all(&self.write_buf)
@@ -346,7 +380,7 @@ fn frontend_msg_append(
 /// Bind/Execute are sent, reusing the existing named statement. Bind sends
 /// `params` in text format (None = NULL) and selects the result format via
 /// `binary_results` (binary, vs all-text when false).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn extended_query_build(
     buf: &mut BytesMut,
     name: &[u8],
@@ -356,6 +390,7 @@ fn extended_query_build(
     params: &[Option<&str>],
     include_describe: bool,
     binary_results: bool,
+    include_sync: bool,
 ) -> CacheResult<()> {
     if send_parse {
         frontend_msg_append(buf, b'P', |b| {
@@ -410,7 +445,9 @@ fn extended_query_build(
         Ok(())
     })?;
 
-    frontend_msg_append(buf, b'S', |_| Ok(()))?; // Sync
+    if include_sync {
+        frontend_msg_append(buf, b'S', |_| Ok(()))?; // Sync
+    }
 
     Ok(())
 }
