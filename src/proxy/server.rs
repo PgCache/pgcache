@@ -29,6 +29,7 @@ struct ProxyCacheState<'scope> {
     handle: Option<thread::ScopedJoinHandle<'scope, CacheResult<()>>>,
     updater: CacheSenderUpdater,
     status_updater: StatusSenderUpdater,
+    fast_updater: CacheFastPathUpdater,
     /// Current sender for detecting when the cache thread exits via `.closed()`.
     current_tx: CacheSenderInner,
     shared_status: SharedProxyStatus,
@@ -43,6 +44,7 @@ impl<'scope> ProxyCacheState<'scope> {
         handle: thread::ScopedJoinHandle<'scope, CacheResult<()>>,
         updater: CacheSenderUpdater,
         status_updater: StatusSenderUpdater,
+        fast_updater: CacheFastPathUpdater,
         current_tx: CacheSenderInner,
         shared_status: SharedProxyStatus,
     ) -> Self {
@@ -50,6 +52,7 @@ impl<'scope> ProxyCacheState<'scope> {
             handle: Some(handle),
             updater,
             status_updater,
+            fast_updater,
             current_tx,
             shared_status,
             alive: true,
@@ -67,6 +70,7 @@ impl<'scope> ProxyCacheState<'scope> {
         // Mark cache as unavailable immediately so connections fall back to origin
         self.updater.sender_clear();
         self.status_updater.sender_clear();
+        self.fast_updater.clear();
 
         let attempts = self.attempts;
         match self.handle.take().map(|h| h.join()) {
@@ -101,11 +105,19 @@ impl<'scope> ProxyCacheState<'scope> {
         // Create a fresh status channel for the restarted cache
         let (new_status_tx, status_rx) = channel::<StatusRequest>(2);
 
-        if let Some((new_handle, new_tx)) =
-            cache_restart_attempt(scope, settings, pinned, cancel, status_rx).await
+        if let Some((new_handle, new_tx)) = cache_restart_attempt(
+            scope,
+            settings,
+            pinned,
+            cancel,
+            status_rx,
+            self.fast_updater.publisher(),
+        )
+        .await
         {
             self.handle = Some(new_handle);
-            // Update all subscribers with the new cache and status senders
+            // Update all subscribers with the new cache and status senders. The
+            // fast path is re-published by the restarted cache_run itself.
             self.updater.sender_update(new_tx.clone());
             self.status_updater.sender_update(new_status_tx);
             self.current_tx = new_tx;
@@ -147,7 +159,10 @@ impl<'scope> ProxyCacheState<'scope> {
 use super::SharedProxyStatus;
 use crate::{
     cache::query::CacheableQuery,
-    cache::{CacheResult, PinnedQuery, cache_run},
+    cache::{
+        CacheFastPathHandle, CacheFastPathPublisher, CacheFastPathUpdater, CacheResult,
+        PinnedQuery, cache_run,
+    },
     catalog::{FunctionVolatility, function_volatility_map_load},
     pg::{
         cdc::{replication_cleanup, replication_provision},
@@ -173,6 +188,7 @@ type Worker<'scope> = (
 #[derive(Clone)]
 struct WorkerResources {
     cache_sender: CacheSender,
+    fast_path: CacheFastPathHandle,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
 }
@@ -192,6 +208,7 @@ fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
                 settings,
                 rx,
                 resources.cache_sender,
+                resources.fast_path,
                 resources.tls_acceptor,
                 resources.func_volatility,
             )
@@ -244,6 +261,7 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
     pinned: &'settings [PinnedQuery],
     cancel: CancellationToken,
     status_rx: Receiver<StatusRequest>,
+    fast_publisher: CacheFastPathPublisher,
 ) -> Result<Cache<'scope>, std::io::Error> {
     let channel_size = (settings.num_workers * 50).max(MIN_CHANNEL_SIZE);
     let (cache_tx, cache_rx) = channel(channel_size);
@@ -251,7 +269,7 @@ fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
     let cache_handle = thread::Builder::new()
         .name("cache".to_owned())
         .spawn_scoped(scope, || {
-            cache_run(settings, cache_rx, pinned, cancel, status_rx)
+            cache_run(settings, cache_rx, pinned, cancel, status_rx, fast_publisher)
         })?;
 
     Ok((cache_handle, cache_tx))
@@ -266,13 +284,14 @@ async fn cache_restart_attempt<'scope, 'env: 'scope, 'settings: 'scope>(
     pinned: &'settings [PinnedQuery],
     cancel: CancellationToken,
     status_rx: Receiver<StatusRequest>,
+    fast_publisher: CacheFastPathPublisher,
 ) -> Option<Cache<'scope>> {
     if let Err(e) = replication_provision(settings).await {
         error!("replication provision failed: {:?}", e);
         return None;
     }
 
-    match cache_create(scope, settings, pinned, cancel, status_rx) {
+    match cache_create(scope, settings, pinned, cancel, status_rx, fast_publisher) {
         Ok(cache) => Some(cache),
         Err(e) => {
             error!("cache creation failed: {:?}", e);
@@ -422,16 +441,24 @@ pub fn proxy_run(
         // Create status channel for admin HTTP → cache writer communication
         let (status_tx, status_rx) = channel::<StatusRequest>(2);
 
-        let (cache_handle, cache_tx) =
-            cache_create(scope, settings, &pinned, cache_cancel.clone(), status_rx)
-                .map_into_report::<ConnectionError>()
-                .attach_loc("creating cache thread")?;
+        let (fast_updater, fast_path) = CacheFastPathUpdater::new();
+        let (cache_handle, cache_tx) = cache_create(
+            scope,
+            settings,
+            &pinned,
+            cache_cancel.clone(),
+            status_rx,
+            fast_updater.publisher(),
+        )
+        .map_into_report::<ConnectionError>()
+        .attach_loc("creating cache thread")?;
         let (updater, cache_sender) = CacheSenderUpdater::new(cache_tx.clone());
         let (status_updater, status_sender) = StatusSenderUpdater::new(status_tx);
         let mut cache_state = ProxyCacheState::new(
             cache_handle,
             updater,
             status_updater,
+            fast_updater,
             cache_tx,
             shared_proxy_status.clone(),
         );
@@ -460,6 +487,7 @@ pub fn proxy_run(
 
         let resources = WorkerResources {
             cache_sender,
+            fast_path,
             tls_acceptor,
             func_volatility,
         };
@@ -507,6 +535,7 @@ pub fn proxy_run(
                             settings,
                             WorkerResources {
                                 cache_sender: cache_state.updater.sender_subscribe(),
+                                fast_path: cache_state.fast_updater.subscribe(),
                                 ..resources.clone()
                             },
                         )?;

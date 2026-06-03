@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,8 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{
     cache::{
-        CacheError, CacheResult, MapIntoReport, PinnedQuery, ReportExt, StatusRequest,
+        CacheError, CacheFastPath, CacheFastPathPublisher, CacheResult, MapIntoReport,
+        PinnedQuery, ReportExt, StatusRequest,
         cdc::CdcProcessor,
         messages::{CacheOutcome, CacheReply, CdcCommand, CdcSignal, ProxyMessage, WriterNotify},
         query_cache::{QueryCache, QueryRequest, WorkerRequest, reply_forward},
@@ -291,6 +293,7 @@ pub fn cache_run(
     pinned: &[PinnedQuery],
     cancel: CancellationToken,
     status_rx: Receiver<StatusRequest>,
+    fast_publisher: CacheFastPathPublisher,
 ) -> CacheResult<()> {
     // Reset cache database before starting anything
     cache_database_reset(settings).attach_loc("resetting cache database")?;
@@ -403,7 +406,7 @@ pub fn cache_run(
             let qcache = QueryCache::new(
                 settings,
                 query_tx.clone(),
-                worker_tx,
+                worker_tx.clone(),
                 Arc::clone(&state_view),
             )
             .await
@@ -413,11 +416,21 @@ pub fn cache_run(
                 .pinned_queries_register(pinned)
                 .attach_loc("registering pinned queries")?;
 
-            LocalSet::new()
+            // CDC-liveness flag shared with connection threads' inline fast path.
+            let cdc_connected = Arc::new(AtomicBool::new(true));
+            // Advertise the fast path so connection threads can serve clean hits
+            // inline (skipping this coordinator). Retracted on exit below.
+            fast_publisher.publish(CacheFastPath {
+                state_view: Arc::clone(&state_view),
+                worker_tx: worker_tx.clone(),
+                dynamic: settings.dynamic.clone(),
+                cdc_connected: Arc::clone(&cdc_connected),
+            });
+
+            let loop_result = LocalSet::new()
                 .run_until(async move {
                     let mut cache_rx = cache_rx;
                     let mut worker_metrics_rx = worker_metrics_rx;
-                    let mut cdc_connected = true;
                     loop {
                         // Block until at least one message arrives
                         tokio::select! {
@@ -433,11 +446,11 @@ pub fn cache_run(
                                 match signal {
                                     Some(CdcSignal::Disconnected { last_flushed_lsn }) => {
                                         warn!("CDC disconnected (last_flushed_lsn: {last_flushed_lsn}), forwarding queries to origin");
-                                        cdc_connected = false;
+                                        cdc_connected.store(false, Ordering::Relaxed);
                                     }
                                     Some(CdcSignal::Reconnected) => {
                                         debug!("CDC reconnected, resuming cache dispatch");
-                                        cdc_connected = true;
+                                        cdc_connected.store(true, Ordering::Relaxed);
                                     }
                                     Some(CdcSignal::Fatal) | None => {
                                         error!("CDC fatal error or thread exited");
@@ -448,7 +461,7 @@ pub fn cache_run(
                             msg = cache_rx.recv() => {
                                 match msg {
                                     Some(proxy_msg) => {
-                                        if cdc_connected {
+                                        if cdc_connected.load(Ordering::Relaxed) {
                                             let mut qcache = qcache.clone();
                                             spawn_local(async move {
                                                 handle_proxy_message(&mut qcache, proxy_msg).await;
@@ -503,7 +516,12 @@ pub fn cache_run(
                     debug!("cache loop exiting");
                     Ok(())
                 })
-                .await
+                .await;
+
+            // Retract the fast path: connection threads fall back to the
+            // coordinator channel (also unavailable now), then to origin.
+            fast_publisher.clear();
+            loop_result
         })
     })
 }

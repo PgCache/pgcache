@@ -12,18 +12,19 @@ use tokio_util::bytes::BytesMut;
 use tracing::{error, info, instrument, trace};
 
 use crate::proxy::ClientSocket;
-use crate::query::ast::{LimitClause, QueryExpr, TableNode, query_expr_fingerprint};
+use crate::query::ast::{LimitClause, query_expr_fingerprint};
 use crate::result::error_chain_format;
-use crate::settings::{Allowlist, CachePolicy, DynamicConfig, DynamicConfigHandle, Settings};
+use crate::settings::{CachePolicy, DynamicConfig, DynamicConfigHandle, Settings};
 use crate::timing::{QueryTiming, duration_to_ns_u64};
 
 use super::{
     CacheError, CacheResult,
+    fast_path::{self, MvDecision, WorkerSendParts},
     messages::{
         AdmitAction, CacheOutcome, CacheReply, PipelineContext, PipelineDescribe, QueryCommand,
         SubsumptionResult,
     },
-    mv::{MvMeta, MvServe, MvState, ShapeGate},
+    mv::{MvMeta, MvServe, ShapeGate},
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
     types::{
         CacheStateView, CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics,
@@ -163,30 +164,11 @@ impl QueryCache {
         })
     }
 
-    /// Check whether all tables in the query are in the allowlist.
-    /// Returns true if no allowlist is configured (all tables allowed).
-    fn query_allowlist_check(allowlist: &Allowlist, query: &QueryExpr) -> bool {
-        let Some(entries) = allowlist else {
-            return true;
-        };
-        query.nodes::<TableNode>().all(|t| {
-            let table_name = t.name.to_lowercase();
-            let table_schema = t.schema.as_ref().map(|s| s.to_lowercase());
-            entries.iter().any(|(ws, wt)| {
-                *wt == table_name
-                    && match ws {
-                        Some(ws) => table_schema.as_deref() == Some(ws.as_str()),
-                        None => true,
-                    }
-            })
-        })
-    }
-
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, mut msg: QueryRequest) -> CacheResult<()> {
         let cfg = self.dynamic.load();
-        if !Self::query_allowlist_check(&cfg.allowed_tables_parsed, &msg.cacheable_query.query) {
+        if !fast_path::query_allowlist_check(&cfg.allowed_tables_parsed, &msg.cacheable_query.query) {
             crate::metrics::handles()
                 .query
                 .allowlist_skipped
@@ -344,14 +326,7 @@ impl QueryCache {
 
     /// Record a cache hit in per-query metrics.
     fn metrics_hit_record(&self, fingerprint: u64) {
-        self.state_view
-            .hits_since_gc
-            .fetch_add(1, Ordering::Relaxed);
-        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
-            m.hit_count += 1;
-            m.last_hit_at_ns =
-                NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
-        }
+        fast_path::metrics_hit_record(&self.state_view, fingerprint);
     }
 
     /// Credit stamped on a Pending entry at insert and on each re-hit. Sized to
@@ -375,11 +350,7 @@ impl QueryCache {
 
     /// Set the CLOCK reference bit for eviction tracking.
     fn clock_reference_set(&self, cache_policy: CachePolicy, fingerprint: &u64) {
-        if cache_policy == CachePolicy::Clock
-            && let Some(mut entry) = self.state_view.cached_queries.get_mut(fingerprint)
-        {
-            entry.referenced = true;
-        }
+        fast_path::clock_reference_set(&self.state_view, cache_policy, fingerprint);
     }
 
     /// Update a cached query's state in the shared view.
@@ -421,73 +392,18 @@ impl QueryCache {
     /// shared DashMap guard; the write guard is acquired only for the
     /// `Pending → Scheduled` flip.
     fn mv_dispatch_decide(&self, fingerprint: u64, rows_needed: Option<u64>) -> MvServe {
-        // Local outcome: `Fallthrough` is counted in `mv_fallthrough`;
-        // `NoMv` is not (Skipped/Ineligible/missing have no MV and never
-        // will). Exhaustive matching below means a future MvState variant
-        // forces a deliberate choice between the two.
-        enum Decision {
-            Hit(Arc<[EcoString]>),
-            Fallthrough,
-            NoMv,
-        }
-
-        let observed = self
-            .state_view
-            .cached_queries
-            .get(&fingerprint)
-            .map(|e| (e.mv.state, e.mv.output_columns.clone(), e.mv.limit));
-
-        let decision = match observed {
-            None => Decision::NoMv,
-            Some((MvState::Fresh, Some(cols), mv_limit))
-                if limit_is_sufficient(mv_limit, rows_needed) =>
-            {
-                Decision::Hit(cols)
-            }
-            // MV built at a smaller LIMIT than this variant needs.
-            Some((MvState::Fresh, Some(_), _)) => Decision::Fallthrough,
-            Some((MvState::Fresh, None, _)) => {
-                error!(
-                    fingerprint,
-                    "MV is Fresh but output columns were never captured; \
-                     serving from source rows"
-                );
-                Decision::Fallthrough
-            }
-            Some((MvState::Pending { has_table }, _, _)) => {
-                if let Some(cmd) = self.mv_schedule(fingerprint, has_table) {
+        match fast_path::mv_serve_decide(&self.state_view, fingerprint, rows_needed) {
+            MvDecision::Serve(mv) => mv,
+            // Coordinator owns `query_tx`: flip Pending → Scheduled and dispatch
+            // the build, then serve this request from source rows.
+            MvDecision::NeedsSchedule { has_table } => {
+                if let Some(cmd) = fast_path::mv_schedule(&self.state_view, fingerprint, has_table) {
                     let _ = self.query_tx.send(cmd);
                 }
-                Decision::Fallthrough
-            }
-            Some((MvState::Scheduled { .. }, _, _)) => Decision::Fallthrough,
-            Some((MvState::Skipped | MvState::Ineligible, _, _)) => Decision::NoMv,
-        };
-
-        match decision {
-            Decision::Hit(cols) => {
-                crate::metrics::handles().cache.mv_hits.increment(1);
-                MvServe::Mv(cols)
-            }
-            Decision::Fallthrough => {
                 crate::metrics::handles().cache.mv_fallthrough.increment(1);
                 MvServe::SourceRow
             }
-            Decision::NoMv => MvServe::SourceRow,
         }
-    }
-
-    /// Check-and-transition under write guard: `Pending { has_table } →
-    /// Scheduled { has_table }`. Returns the command to send when the
-    /// transition wins the race; `None` when another dispatch beat us or the
-    /// entry moved elsewhere.
-    fn mv_schedule(&self, fingerprint: u64, has_table: bool) -> Option<QueryCommand> {
-        let mut entry = self.state_view.cached_queries.get_mut(&fingerprint)?;
-        if entry.mv.state != (MvState::Pending { has_table }) {
-            return None;
-        }
-        entry.mv.state = MvState::Scheduled { has_table };
-        Some(QueryCommand::MvBuild { fingerprint })
     }
 
     /// Build and send a WorkerRequest with coalesced clients attached.
@@ -505,29 +421,9 @@ impl QueryCache {
         // `lookup_complete_at` is stamped earlier in `query_dispatch` (and
         // copied through coalesce drains), so it's already set on
         // `msg.timing` at this point.
-        let timing = msg.timing;
-
-        let (
-            emit_rfq,
-            has_parse,
-            has_bind,
-            pipeline_describe,
-            parameter_description,
-            forward_bytes,
-        ) = match msg.pipeline {
-            Some(pipeline) => (
-                pipeline.emit_rfq,
-                pipeline.has_parse,
-                pipeline.has_bind,
-                pipeline.describe,
-                pipeline.parameter_description,
-                Some(pipeline.buffered_bytes),
-            ),
-            None => (false, false, false, PipelineDescribe::None, None, None),
-        };
-
-        self.worker_tx
-            .send(WorkerRequest {
+        fast_path::worker_request_send(
+            &self.worker_tx,
+            WorkerSendParts {
                 fingerprint,
                 query_type: msg.query_type,
                 data: msg.data,
@@ -538,20 +434,12 @@ impl QueryCache {
                 result_formats: msg.result_formats,
                 client_socket: msg.client_socket,
                 reply_tx: msg.reply_tx,
-                timing,
+                timing: msg.timing,
                 limit: msg.cacheable_query.query.limit.clone(),
-                emit_rfq,
-                has_parse,
-                has_bind,
-                pipeline_describe,
-                parameter_description,
-                forward_bytes,
+                pipeline: msg.pipeline,
                 coalesced,
-            })
-            .map_err(|e| {
-                error!("worker send {e}");
-                CacheError::WorkerSend.into()
-            })
+            },
+        )
     }
 
     /// Build a CoalesceKey from a QueryRequest's pipeline context.

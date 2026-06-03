@@ -32,7 +32,7 @@ use tracing::{debug, error, instrument, trace, warn};
 
 use crate::{
     cache::{
-        CacheMessage, CacheOutcome, CacheReply, ProxyMessage, QueryParameters,
+        CacheFastPathHandle, CacheMessage, CacheOutcome, CacheReply, ProxyMessage, QueryParameters,
         messages::{PipelineContext, PipelineDescribe},
         query::CacheableQuery,
     },
@@ -2275,12 +2275,14 @@ fn forward_lazy_parse_install(
 
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     client_stream: ClientStream,
     addrs: Vec<SocketAddr>,
     ssl_mode: SslMode,
     server_name: &str,
     cache_sender: CacheSender,
+    fast_path: CacheFastPathHandle,
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
 ) -> ConnectionResult<()> {
@@ -2375,7 +2377,18 @@ async fn handle_connection(
                     pipeline: state.extended.pipeline_take(),
                 };
 
-                match cache_sender.send(proxy_msg).await {
+                // Hop-1 fast path: serve a clean hit inline (skip the coordinator
+                // thread) when the cache is up. Anything else returns the message
+                // for the coordinator to handle, identical to before.
+                let send_result = match fast_path.current() {
+                    Some(fp) => match fp.hit_dispatch_try(proxy_msg) {
+                        Ok(()) => Ok(()),
+                        Err(proxy_msg) => cache_sender.send(proxy_msg).await,
+                    },
+                    None => cache_sender.send(proxy_msg).await,
+                };
+
+                match send_result {
                     Ok(()) => {
                         // The write half is now with the worker. Await the reply,
                         // which returns it; origin messages buffer in egress
@@ -2440,6 +2453,7 @@ pub fn connection_run(
     settings: &Settings,
     mut rx: UnboundedReceiver<TcpStream>,
     cache_sender: CacheSender,
+    fast_path: CacheFastPathHandle,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
 ) -> ConnectionResult<()> {
@@ -2474,6 +2488,7 @@ pub fn connection_run(
                     let addrs = addrs.clone();
                     let server_name = server_name.clone();
                     let cache_sender = cache_sender.clone();
+                    let fast_path = fast_path.clone();
                     let tls_acceptor = tls_acceptor.clone();
                     let func_volatility = Arc::clone(&func_volatility);
                     let origin_database = origin_database.clone();
@@ -2505,6 +2520,7 @@ pub fn connection_run(
                             ssl_mode,
                             &server_name,
                             cache_sender,
+                            fast_path,
                             func_volatility,
                             origin_database,
                         )

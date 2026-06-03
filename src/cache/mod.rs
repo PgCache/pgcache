@@ -17,6 +17,7 @@ pub use crate::result::{MapIntoReport, ReportExt};
 
 // Module declarations
 mod cdc;
+mod fast_path;
 pub(crate) mod messages;
 pub(crate) mod mv;
 pub(crate) mod query;
@@ -30,6 +31,9 @@ mod write_queue;
 mod writer;
 
 // Re-export public types
+pub use fast_path::{
+    CacheFastPath, CacheFastPathHandle, CacheFastPathPublisher, CacheFastPathUpdater,
+};
 pub use messages::{
     CacheMessage, CacheOutcome, CacheReply, DataStreamState, ProxyMessage, QueryParameter,
     QueryParameters,
