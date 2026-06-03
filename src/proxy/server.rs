@@ -1,4 +1,4 @@
-use std::{collections::HashMap, mem, sync::Arc, thread, time::Duration};
+use std::{collections::HashMap, sync::Arc, thread};
 
 use ecow::EcoString;
 
@@ -6,163 +6,20 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use rootcause::Report;
 
 use crate::result::{MapIntoReport, ReportExt};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    runtime::Builder,
-    sync::mpsc::{Receiver, UnboundedSender, channel, unbounded_channel},
-    time::{Sleep, sleep},
-};
+use tokio::{net::TcpListener, runtime::Builder, sync::mpsc::channel};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, info, trace};
 
 use crate::cache::StatusRequest;
 use crate::metrics::admin_server_spawn;
 
-/// Initial backoff delay for cache restart attempts
-const INITIAL_BACKOFF_MS: u64 = 100;
-/// Maximum backoff delay (steady state) for cache restart attempts
-const STEADY_STATE_BACKOFF_MS: u64 = 60_000;
 /// Minimum buffer size for the proxy→cache command channel.
 const MIN_CHANNEL_SIZE: usize = 100;
-
-struct ProxyCacheState<'scope> {
-    handle: Option<thread::ScopedJoinHandle<'scope, CacheResult<()>>>,
-    updater: CacheSenderUpdater,
-    status_updater: StatusSenderUpdater,
-    fast_updater: CacheFastPathUpdater,
-    /// Current sender for detecting when the cache thread exits via `.closed()`.
-    current_tx: CacheSenderInner,
-    shared_status: SharedProxyStatus,
-    alive: bool,
-    attempts: u32,
-    backoff: Option<std::pin::Pin<Box<Sleep>>>,
-    backoff_ms: u64,
-}
-
-impl<'scope> ProxyCacheState<'scope> {
-    fn new(
-        handle: thread::ScopedJoinHandle<'scope, CacheResult<()>>,
-        updater: CacheSenderUpdater,
-        status_updater: StatusSenderUpdater,
-        fast_updater: CacheFastPathUpdater,
-        current_tx: CacheSenderInner,
-        shared_status: SharedProxyStatus,
-    ) -> Self {
-        Self {
-            handle: Some(handle),
-            updater,
-            status_updater,
-            fast_updater,
-            current_tx,
-            shared_status,
-            alive: true,
-            attempts: 0,
-            backoff: None,
-            backoff_ms: INITIAL_BACKOFF_MS,
-        }
-    }
-
-    fn handle_exit(&mut self) {
-        self.alive = false;
-        self.attempts += 1;
-        self.shared_status.status_set(ProxyStatus::Degraded);
-
-        // Mark cache as unavailable immediately so connections fall back to origin
-        self.updater.sender_clear();
-        self.status_updater.sender_clear();
-        self.fast_updater.clear();
-
-        let attempts = self.attempts;
-        match self.handle.take().map(|h| h.join()) {
-            None => error!("cache thread exited (attempt {attempts}): no join handle"),
-            Some(Err(_panic)) => {
-                error!("cache thread exited (attempt {attempts}): thread panicked")
-            }
-            Some(Ok(Ok(()))) => {
-                error!("cache thread exited (attempt {attempts}): unexpected clean exit")
-            }
-            Some(Ok(Err(e))) => error!("cache thread exited (attempt {attempts}): {e}"),
-        }
-
-        self.backoff_schedule();
-    }
-
-    async fn handle_backoff_expired<'env: 'scope, 'settings: 'scope>(
-        &mut self,
-        scope: &'scope thread::Scope<'scope, 'env>,
-        settings: &'settings Settings,
-        pinned: &'settings [PinnedQuery],
-        cancel: CancellationToken,
-    ) {
-        self.backoff = None;
-        self.attempts += 1;
-
-        debug!(
-            "backoff expired, attempting restart (attempt {})",
-            self.attempts
-        );
-
-        // Create a fresh status channel for the restarted cache
-        let (new_status_tx, status_rx) = channel::<StatusRequest>(2);
-
-        if let Some((new_handle, new_tx)) = cache_restart_attempt(
-            scope,
-            settings,
-            pinned,
-            cancel,
-            status_rx,
-            self.fast_updater.publisher(),
-        )
-        .await
-        {
-            self.handle = Some(new_handle);
-            // Update all subscribers with the new cache and status senders. The
-            // fast path is re-published by the restarted cache_run itself.
-            self.updater.sender_update(new_tx.clone());
-            self.status_updater.sender_update(new_status_tx);
-            self.current_tx = new_tx;
-            self.restart_reset();
-            debug!("cache thread restarted successfully");
-        } else {
-            self.backoff_increase();
-            debug!(
-                "restart failed, backing off {}ms before next attempt",
-                self.backoff_ms
-            );
-            self.backoff_schedule();
-        }
-    }
-
-    fn restart_reset(&mut self) {
-        self.alive = true;
-        self.attempts = 0;
-        self.backoff_ms = INITIAL_BACKOFF_MS;
-        self.shared_status.status_set(ProxyStatus::Normal);
-    }
-
-    fn backoff_schedule(&mut self) {
-        self.backoff = Some(Box::pin(sleep(Duration::from_millis(self.backoff_ms))));
-    }
-
-    fn backoff_increase(&mut self) {
-        self.backoff_ms = (self.backoff_ms * 2).min(STEADY_STATE_BACKOFF_MS);
-    }
-
-    async fn backoff_wait(backoff: &mut Option<std::pin::Pin<Box<Sleep>>>) {
-        match backoff {
-            Some(sleep) => sleep.as_mut().await,
-            None => std::future::pending().await,
-        }
-    }
-}
 
 use super::SharedProxyStatus;
 use crate::{
     cache::query::CacheableQuery,
-    cache::{
-        CacheFastPathHandle, CacheFastPathPublisher, CacheFastPathUpdater, CacheResult,
-        PinnedQuery, cache_run,
-    },
+    cache::{CacheFastPathUpdater, PinnedQuery, cache_setup},
     catalog::{FunctionVolatility, function_volatility_map_load},
     pg::{
         cdc::{replication_cleanup, replication_provision},
@@ -173,132 +30,9 @@ use crate::{
     telemetry, tls,
 };
 
-use super::cache_sender::CacheSenderInner;
 use super::{
-    CacheSender, CacheSenderUpdater, ConnectionError, ConnectionResult, ProxyStatus,
-    StatusSenderUpdater, connection_run,
+    CacheSenderUpdater, ConnectionError, ConnectionResult, StatusSenderUpdater, connection_task,
 };
-
-type Worker<'scope> = (
-    thread::ScopedJoinHandle<'scope, ConnectionResult<()>>,
-    UnboundedSender<TcpStream>,
-);
-
-/// Shared resources passed to worker threads.
-#[derive(Clone)]
-struct WorkerResources {
-    cache_sender: CacheSender,
-    fast_path: CacheFastPathHandle,
-    tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
-    func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
-}
-
-fn worker_create<'scope, 'env: 'scope, 'settings: 'scope>(
-    worker_id: usize,
-    scope: &'scope thread::Scope<'scope, 'env>,
-    settings: &'settings Settings,
-    resources: WorkerResources,
-) -> ConnectionResult<Worker<'scope>> {
-    let (tx, rx) = unbounded_channel::<TcpStream>();
-    let join = thread::Builder::new()
-        .name(format!("cnxt {worker_id}"))
-        .spawn_scoped(scope, move || {
-            connection_run(
-                worker_id,
-                settings,
-                rx,
-                resources.cache_sender,
-                resources.fast_path,
-                resources.tls_acceptor,
-                resources.func_volatility,
-            )
-        })
-        .map_into_report::<ConnectionError>()?;
-
-    Ok((join, tx))
-}
-
-fn workers_create_all<'scope, 'env: 'scope, 'settings: 'scope>(
-    scope: &'scope thread::Scope<'scope, 'env>,
-    settings: &'settings Settings,
-    resources: WorkerResources,
-) -> ConnectionResult<Vec<Worker<'scope>>> {
-    (0..settings.num_workers)
-        .map(|i| worker_create(i, scope, settings, resources.clone()))
-        .collect()
-}
-
-fn worker_ensure_alive<'scope, 'env: 'scope, 'settings: 'scope>(
-    workers: &mut [Worker<'scope>],
-    worker_index: usize,
-    scope: &'scope thread::Scope<'scope, 'env>,
-    settings: &'settings Settings,
-    resources: WorkerResources,
-) -> ConnectionResult<()> {
-    let Some(worker) = workers.get_mut(worker_index) else {
-        return Err(
-            ConnectionError::IoError(std::io::Error::other("worker index out of bounds")).into(),
-        );
-    };
-
-    if worker.0.is_finished() {
-        let new_worker = worker_create(worker_index, scope, settings, resources)?;
-        let old_worker = mem::replace(worker, new_worker);
-        let _ = old_worker.0.join();
-    }
-
-    Ok(())
-}
-
-type Cache<'scope> = (
-    thread::ScopedJoinHandle<'scope, CacheResult<()>>,
-    CacheSenderInner,
-);
-
-fn cache_create<'scope, 'env: 'scope, 'settings: 'scope>(
-    scope: &'scope thread::Scope<'scope, 'env>,
-    settings: &'settings Settings,
-    pinned: &'settings [PinnedQuery],
-    cancel: CancellationToken,
-    status_rx: Receiver<StatusRequest>,
-    fast_publisher: CacheFastPathPublisher,
-) -> Result<Cache<'scope>, std::io::Error> {
-    let channel_size = (settings.num_workers * 50).max(MIN_CHANNEL_SIZE);
-    let (cache_tx, cache_rx) = channel(channel_size);
-
-    let cache_handle = thread::Builder::new()
-        .name("cache".to_owned())
-        .spawn_scoped(scope, || {
-            cache_run(settings, cache_rx, pinned, cancel, status_rx, fast_publisher)
-        })?;
-
-    Ok((cache_handle, cache_tx))
-}
-
-/// Attempts to restart the cache thread.
-/// On success, returns Some with the new cache handle and sender.
-/// On failure, returns None.
-async fn cache_restart_attempt<'scope, 'env: 'scope, 'settings: 'scope>(
-    scope: &'scope thread::Scope<'scope, 'env>,
-    settings: &'settings Settings,
-    pinned: &'settings [PinnedQuery],
-    cancel: CancellationToken,
-    status_rx: Receiver<StatusRequest>,
-    fast_publisher: CacheFastPathPublisher,
-) -> Option<Cache<'scope>> {
-    if let Err(e) = replication_provision(settings).await {
-        error!("replication provision failed: {:?}", e);
-        return None;
-    }
-
-    match cache_create(scope, settings, pinned, cancel, status_rx, fast_publisher) {
-        Ok(cache) => Some(cache),
-        Err(e) => {
-            error!("cache creation failed: {:?}", e);
-            None
-        }
-    }
-}
 
 fn tls_config_load(settings: &Settings) -> ConnectionResult<Option<Arc<tls::TlsAcceptor>>> {
     match (&settings.tls_cert, &settings.tls_key) {
@@ -430,43 +164,47 @@ pub fn proxy_run(
     let pinned = pinned_queries_validate(settings, &func_volatility);
     drop(pre_rt);
 
+    // One shared multi-thread runtime hosts connections + coordinator + worker
+    // (PGC Option A probe). Writer and CDC remain dedicated threads.
+    let worker_threads = settings.num_workers.max(2);
+    let rt = Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .map_into_report::<ConnectionError>()?;
+
     thread::scope(|scope| {
-        let rt = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_into_report::<ConnectionError>()?;
-
-        let cache_cancel = cancel.child_token();
-
         // Create status channel for admin HTTP → cache writer communication
         let (status_tx, status_rx) = channel::<StatusRequest>(2);
 
+        let channel_size = (settings.num_workers * 50).max(MIN_CHANNEL_SIZE);
+        let (cache_tx, cache_rx) = channel(channel_size);
+
         let (fast_updater, fast_path) = CacheFastPathUpdater::new();
-        let (cache_handle, cache_tx) = cache_create(
+        cache_setup(
             scope,
             settings,
+            rt.handle().clone(),
+            cache_rx,
             &pinned,
-            cache_cancel.clone(),
+            cancel.child_token(),
             status_rx,
             fast_updater.publisher(),
         )
-        .map_into_report::<ConnectionError>()
-        .attach_loc("creating cache thread")?;
-        let (updater, cache_sender) = CacheSenderUpdater::new(cache_tx.clone());
-        let (status_updater, status_sender) = StatusSenderUpdater::new(status_tx);
-        let mut cache_state = ProxyCacheState::new(
-            cache_handle,
-            updater,
-            status_updater,
-            fast_updater,
-            cache_tx,
-            shared_proxy_status.clone(),
-        );
+        .map_err(|e| {
+            Report::from(ConnectionError::IoError(std::io::Error::other(format!(
+                "cache setup failed: {}",
+                e.current_context()
+            ))))
+        })
+        .attach_loc("setting up cache")?;
 
-        // Clone metrics handle for telemetry before admin server takes ownership
+        // Keep the updaters alive (restart hot-swap is deferred for the probe);
+        // connections hold subscriber handles.
+        let (_cache_updater, cache_sender) = CacheSenderUpdater::new(cache_tx);
+        let (_status_updater, status_sender) = StatusSenderUpdater::new(status_tx);
+
         let telemetry_metrics = metrics_handle.clone();
-
-        // Spawn admin HTTP server now that the status channel is available
         if let Some(ref m) = settings.metrics {
             admin_server_spawn(
                 m.socket,
@@ -480,22 +218,24 @@ pub fn proxy_run(
             .attach_loc("spawning admin server")?;
         }
 
-        // Spawn telemetry background thread
         telemetry::telemetry_spawn(settings.telemetry, cancel.child_token(), telemetry_metrics)
             .map_into_report::<ConnectionError>()
             .attach_loc("spawning telemetry thread")?;
 
-        let resources = WorkerResources {
-            cache_sender,
-            fast_path,
-            tls_acceptor,
-            func_volatility,
-        };
-
-        let mut workers = workers_create_all(scope, settings, resources.clone())?;
+        // Origin connection params, resolved once and cloned into each task.
+        let ssl_mode = settings.origin.ssl_mode;
+        let server_name = EcoString::from(settings.origin.host.as_str());
+        let origin_database = EcoString::from(settings.origin.database.as_str());
 
         debug!("accept loop");
         rt.block_on(async {
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((settings.origin.host.as_str(), settings.origin.port))
+                    .await
+                    .map_into_report::<ConnectionError>()
+                    .attach_loc("resolving origin host")?
+                    .collect();
+
             let listener = TcpListener::bind(&settings.listen.socket)
                 .await
                 .map_err(|e| {
@@ -506,14 +246,12 @@ pub fn proxy_run(
                 })?;
             info!("Listening to {}", &settings.listen.socket);
 
-            let mut cur_worker = 0;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         info!("proxy shutdown signal received");
                         break;
                     }
-                    // Branch 1: Accept new connections
                     result = listener.accept() => {
                         let (socket, _) = result.map_err(|e| {
                             Report::from(ConnectionError::IoError(std::io::Error::other(format!(
@@ -524,35 +262,17 @@ pub fn proxy_run(
                         crate::metrics::handles().conn.total.increment(1);
                         debug!("socket accepted");
 
-                        if let Some(worker) = workers.get(cur_worker) {
-                            let _ = worker.1.send(socket);
-                        }
-
-                        worker_ensure_alive(
-                            &mut workers,
-                            cur_worker,
-                            scope,
-                            settings,
-                            WorkerResources {
-                                cache_sender: cache_state.updater.sender_subscribe(),
-                                fast_path: cache_state.fast_updater.subscribe(),
-                                ..resources.clone()
-                            },
-                        )?;
-
-                        cur_worker = (cur_worker + 1) % settings.num_workers;
-                    }
-
-                    // Branch 2: Cache thread exited - initiate restart
-                    _ = cache_state.current_tx.closed(), if cache_state.alive => {
-                        cache_state.handle_exit();
-                    }
-
-                    // Branch 3: Backoff timer expired - retry restart
-                    _ = ProxyCacheState::backoff_wait(&mut cache_state.backoff) => {
-                        cache_state
-                            .handle_backoff_expired(scope, settings, &pinned, cache_cancel.child_token())
-                            .await;
+                        tokio::spawn(connection_task(
+                            socket,
+                            addrs.clone(),
+                            ssl_mode,
+                            server_name.clone(),
+                            cache_sender.clone(),
+                            fast_path.clone(),
+                            tls_acceptor.clone(),
+                            Arc::clone(&func_volatility),
+                            origin_database.clone(),
+                        ));
                     }
                 }
             }

@@ -6,11 +6,10 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 
 use tokio::{
-    runtime::Builder,
+    runtime::{Builder, Handle},
     sync::mpsc::{
         Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
     },
-    task::{LocalSet, spawn_local},
 };
 use tokio_postgres::{Config, NoTls};
 use tokio_util::sync::CancellationToken;
@@ -21,7 +20,10 @@ use crate::{
         CacheError, CacheFastPath, CacheFastPathPublisher, CacheResult, MapIntoReport,
         PinnedQuery, ReportExt, StatusRequest,
         cdc::CdcProcessor,
-        messages::{CacheOutcome, CacheReply, CdcCommand, CdcSignal, ProxyMessage, WriterNotify},
+        messages::{
+            CacheOutcome, CacheReply, CdcCommand, CdcSignal, ProxyMessage, QueryCommand,
+            WriterNotify,
+        },
         query_cache::{QueryCache, QueryRequest, WorkerRequest, reply_forward},
         types::{ActiveRelations, CacheStateView, WorkerMetrics},
         worker::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
@@ -285,245 +287,247 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
     })
 }
 
-/// Main cache runtime - handles proxy queries and CDC events
+/// Set up the cache subsystem (PGC Option A probe).
+///
+/// Writer and CDC stay dedicated `current_thread` threads (mutation
+/// serialization point + replication consumer, reached only via `Send`
+/// channels). The coordinator and worker run as tasks on the shared
+/// multi-thread runtime (`handle`) alongside the connection tasks, so the
+/// connection ↔ coordinator ↔ worker handoffs are intra-runtime run-queue
+/// pushes instead of cross-runtime eventfd wakeups.
+///
+/// Restart is deferred for the probe: a fatal failure here cancels the cache
+/// subsystem; connections keep running and degrade to origin-forward.
 #[instrument(skip_all)]
-pub fn cache_run(
-    settings: &Settings,
+#[allow(clippy::too_many_arguments)]
+pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    settings: &'settings Settings,
+    handle: Handle,
     cache_rx: Receiver<ProxyMessage>,
     pinned: &[PinnedQuery],
     cancel: CancellationToken,
     status_rx: Receiver<StatusRequest>,
     fast_publisher: CacheFastPathPublisher,
 ) -> CacheResult<()> {
-    // Reset cache database before starting anything
     cache_database_reset(settings).attach_loc("resetting cache database")?;
 
-    thread::scope(|scope| {
-        let rt = Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_into_report::<CacheError>()?;
+    let state_view = Arc::new(CacheStateView::new());
+    let active_relations: ActiveRelations =
+        Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
 
-        // Create shared state view for coordinator to read cache state
-        let state_view = Arc::new(CacheStateView::new());
+    // Cache-subsystem cancel (child of the root). Coordinator and worker share
+    // it so either can tear down the subsystem; writer/cdc get children so a
+    // subsystem cancel propagates to them.
+    let cache_cancel = cancel.child_token();
 
-        // Shared set of active relation OIDs (writer writes, CDC reads)
-        let active_relations: ActiveRelations =
-            Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
+    let (query_tx, query_rx) = unbounded_channel();
+    let (cdc_cmd_tx, cdc_cmd_rx) = unbounded_channel();
+    let (worker_metrics_tx, worker_metrics_rx) = unbounded_channel::<WorkerMetrics>();
+    let (notify_tx, notify_rx) = unbounded_channel::<WriterNotify>();
+    let (worker_tx, worker_rx) = unbounded_channel();
+    let (cdc_signal_tx, cdc_signal_rx) = unbounded_channel::<CdcSignal>();
 
-        // PGC-140: a writer exit must cancel cdc/worker too, else `thread::scope`
-        // never unwinds and the supervisor never restarts the cache. Shadow with a
-        // child token (not `cancel` — it's shared across restarts), drop-guarded.
-        let cancel = cancel.child_token();
-        let _cancel_guard = cancel.clone().drop_guard();
-
-        // Spawn writer thread (owns Cache, serializes all mutations)
-        // Two channels: one for query registration, one for CDC commands
-        let (query_tx, query_rx) = unbounded_channel();
-        let (cdc_cmd_tx, cdc_cmd_rx) = unbounded_channel();
-        let (worker_metrics_tx, worker_metrics_rx) = unbounded_channel::<WorkerMetrics>();
-        let (notify_tx, mut notify_rx) = unbounded_channel::<WriterNotify>();
-        let state_view_writer = Arc::clone(&state_view);
-        let active_relations_writer = Arc::clone(&active_relations);
-        let settings_writer = settings.clone();
-        let cancel_writer = cancel.child_token();
-        let _writer_handle = thread::Builder::new()
-            .name("cache writer".to_owned())
-            .spawn_scoped(scope, move || {
-                let result = writer_run(
-                    &settings_writer,
-                    query_rx,
-                    cdc_cmd_rx,
-                    state_view_writer,
-                    active_relations_writer,
-                    notify_tx,
-                    cancel_writer,
-                    status_rx,
+    // Writer thread (owns Cache, serializes all mutations).
+    let settings_writer = settings.clone();
+    let state_view_writer = Arc::clone(&state_view);
+    let active_relations_writer = Arc::clone(&active_relations);
+    let cancel_writer = cache_cancel.child_token();
+    thread::Builder::new()
+        .name("cache writer".to_owned())
+        .spawn_scoped(scope, move || {
+            let result = writer_run(
+                &settings_writer,
+                query_rx,
+                cdc_cmd_rx,
+                state_view_writer,
+                active_relations_writer,
+                notify_tx,
+                cancel_writer,
+                status_rx,
+            );
+            if let Err(ref e) = result {
+                error!(
+                    "writer thread exiting with error: {}",
+                    error_chain_format(e.current_context()),
                 );
-                if let Err(ref e) = result {
-                    error!(
-                        "writer thread exiting with error: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
-                result
-            })
-            .map_into_report::<CacheError>()
-            .attach_loc("spawning writer thread")?;
-
-        // Spawn worker thread (executes cached queries - read-only)
-        let (worker_tx, worker_rx) = unbounded_channel();
-        let cancel_worker = cancel.child_token();
-        let state_view_worker = Arc::clone(&state_view);
-        let _worker_handle = thread::Builder::new()
-            .name("cache worker".to_owned())
-            .spawn_scoped(scope, move || {
-                let result = worker_run(
-                    settings,
-                    worker_rx,
-                    worker_metrics_tx,
-                    cancel_worker,
-                    state_view_worker,
-                );
-                if let Err(ref e) = result {
-                    error!(
-                        "worker thread exiting with error: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
-                result
-            })
-            .map_into_report::<CacheError>()
-            .attach_loc("spawning worker thread")?;
-
-        // Spawn CDC thread -- sends CdcCommand directly to writer, signals coordinator
-        let (cdc_signal_tx, mut cdc_signal_rx) = unbounded_channel::<CdcSignal>();
-        let active_relations_cdc = Arc::clone(&active_relations);
-        let cancel_cdc = cancel.child_token();
-        let _cdc_handle = thread::Builder::new()
-            .name("cdc worker".to_owned())
-            .spawn_scoped(scope, move || {
-                let result = cdc_run(
-                    settings,
-                    cdc_cmd_tx,
-                    active_relations_cdc,
-                    cancel_cdc,
-                    cdc_signal_tx,
-                );
-                if let Err(ref e) = result {
-                    error!(
-                        "cdc thread exiting with error: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
-                result
-            })
-            .map_into_report::<CacheError>()
-            .attach_loc("spawning CDC thread")?;
-
-        debug!("cache loop");
-        rt.block_on(async {
-            let qcache = QueryCache::new(
-                settings,
-                query_tx.clone(),
-                worker_tx.clone(),
-                Arc::clone(&state_view),
-            )
-            .await
-            .attach_loc("creating query cache")?;
-
-            qcache
-                .pinned_queries_register(pinned)
-                .attach_loc("registering pinned queries")?;
-
-            // CDC-liveness flag shared with connection threads' inline fast path.
-            let cdc_connected = Arc::new(AtomicBool::new(true));
-            // Advertise the fast path so connection threads can serve clean hits
-            // inline (skipping this coordinator). Retracted on exit below.
-            fast_publisher.publish(CacheFastPath {
-                state_view: Arc::clone(&state_view),
-                worker_tx: worker_tx.clone(),
-                dynamic: settings.dynamic.clone(),
-                cdc_connected: Arc::clone(&cdc_connected),
-            });
-
-            let loop_result = LocalSet::new()
-                .run_until(async move {
-                    let mut cache_rx = cache_rx;
-                    let mut worker_metrics_rx = worker_metrics_rx;
-                    loop {
-                        // Block until at least one message arrives
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                debug!("cache coordinator shutdown signal received");
-                                break;
-                            }
-                            _ = query_tx.closed() => {
-                                error!("writer thread exited unexpectedly");
-                                return Err(CacheError::WriterFailure.into());
-                            }
-                            signal = cdc_signal_rx.recv() => {
-                                match signal {
-                                    Some(CdcSignal::Disconnected { last_flushed_lsn }) => {
-                                        warn!("CDC disconnected (last_flushed_lsn: {last_flushed_lsn}), forwarding queries to origin");
-                                        cdc_connected.store(false, Ordering::Relaxed);
-                                    }
-                                    Some(CdcSignal::Reconnected) => {
-                                        debug!("CDC reconnected, resuming cache dispatch");
-                                        cdc_connected.store(true, Ordering::Relaxed);
-                                    }
-                                    Some(CdcSignal::Fatal) | None => {
-                                        error!("CDC fatal error or thread exited");
-                                        return Err(CacheError::CdcFailure.into());
-                                    }
-                                }
-                            }
-                            msg = cache_rx.recv() => {
-                                match msg {
-                                    Some(proxy_msg) => {
-                                        if cdc_connected.load(Ordering::Relaxed) {
-                                            let mut qcache = qcache.clone();
-                                            spawn_local(async move {
-                                                handle_proxy_message(&mut qcache, proxy_msg).await;
-                                            });
-                                        } else {
-                                            // CDC is down; forward to origin to avoid serving stale data
-                                            let data = proxy_msg.message.into_data();
-                                            let _ = reply_forward(
-                                                proxy_msg.reply_tx,
-                                                proxy_msg.client_socket,
-                                                proxy_msg.pipeline,
-                                                data,
-                                                proxy_msg.timing,
-                                            );
-                                        }
-                                    }
-                                    None => {
-                                        debug!("proxy channel closed");
-                                        break;
-                                    }
-                                }
-                            }
-                            // Record worker metrics (cache-hit latency, bytes served)
-                            msg = worker_metrics_rx.recv() => {
-                                if let Some(wm) = msg {
-                                    worker_metrics_record(&state_view, wm);
-                                }
-                            }
-                            // Drain coalesced waiters when writer signals Ready/Failed
-                            notify = notify_rx.recv() => {
-                                match notify {
-                                    Some(WriterNotify::Ready { fingerprint, generation, resolved, deparsed_sql, max_limit }) => {
-                                        qcache.waiting_drain_ready(fingerprint, generation, resolved, deparsed_sql, max_limit);
-                                    }
-                                    Some(WriterNotify::Failed { fingerprint }) => {
-                                        qcache.waiting_drain_failed(fingerprint);
-                                    }
-                                    None => {
-                                        error!("writer notify channel closed");
-                                        return Err(CacheError::WriterFailure.into());
-                                    }
-                                }
-                            }
-                        }
-
-                        // Channel depth gauge; queue length never approaches 2^53.
-                        #[allow(clippy::cast_precision_loss)]
-                        crate::metrics::handles().state.queue_proxy_message
-                            .set(cache_rx.len() as f64);
-                    }
-
-                    debug!("cache loop exiting");
-                    Ok(())
-                })
-                .await;
-
-            // Retract the fast path: connection threads fall back to the
-            // coordinator channel (also unavailable now), then to origin.
-            fast_publisher.clear();
-            loop_result
+            }
+            result
         })
-    })
+        .map_into_report::<CacheError>()
+        .attach_loc("spawning writer thread")?;
+
+    // CDC thread (sends CdcCommand to writer, signals coordinator).
+    let active_relations_cdc = Arc::clone(&active_relations);
+    let cancel_cdc = cache_cancel.child_token();
+    thread::Builder::new()
+        .name("cdc worker".to_owned())
+        .spawn_scoped(scope, move || {
+            let result = cdc_run(
+                settings,
+                cdc_cmd_tx,
+                active_relations_cdc,
+                cancel_cdc,
+                cdc_signal_tx,
+            );
+            if let Err(ref e) = result {
+                error!(
+                    "cdc thread exiting with error: {}",
+                    error_chain_format(e.current_context()),
+                );
+            }
+            result
+        })
+        .map_into_report::<CacheError>()
+        .attach_loc("spawning CDC thread")?;
+
+    let cdc_connected = Arc::new(AtomicBool::new(true));
+
+    let qcache = handle
+        .block_on(QueryCache::new(
+            settings,
+            query_tx.clone(),
+            worker_tx.clone(),
+            Arc::clone(&state_view),
+        ))
+        .attach_loc("creating query cache")?;
+    qcache
+        .pinned_queries_register(pinned)
+        .attach_loc("registering pinned queries")?;
+
+    fast_publisher.publish(CacheFastPath {
+        state_view: Arc::clone(&state_view),
+        worker_tx,
+        dynamic: settings.dynamic.clone(),
+        cdc_connected: Arc::clone(&cdc_connected),
+    });
+
+    // Worker dispatcher + coordinator as tasks on the shared runtime. Serve
+    // tasks they spawn spread across all runtime threads.
+    handle.spawn(worker_loop(
+        settings.clone(),
+        worker_rx,
+        worker_metrics_tx,
+        cache_cancel.clone(),
+        Arc::clone(&state_view),
+    ));
+    handle.spawn(coordinator_loop(
+        qcache,
+        cache_rx,
+        cdc_signal_rx,
+        worker_metrics_rx,
+        notify_rx,
+        query_tx,
+        Arc::clone(&state_view),
+        cdc_connected,
+        cache_cancel,
+        fast_publisher,
+    ));
+
+    Ok(())
+}
+
+/// Coordinator task: routes non-fast-path queries, applies CDC-liveness
+/// gating, records worker metrics, and drains coalesced waiters. Runs on the
+/// shared runtime; dispatches `handle_proxy_message` via `tokio::spawn`.
+#[allow(clippy::too_many_arguments)]
+async fn coordinator_loop(
+    qcache: QueryCache,
+    mut cache_rx: Receiver<ProxyMessage>,
+    mut cdc_signal_rx: UnboundedReceiver<CdcSignal>,
+    mut worker_metrics_rx: UnboundedReceiver<WorkerMetrics>,
+    mut notify_rx: UnboundedReceiver<WriterNotify>,
+    query_tx: UnboundedSender<QueryCommand>,
+    state_view: Arc<CacheStateView>,
+    cdc_connected: Arc<AtomicBool>,
+    cancel: CancellationToken,
+    fast_publisher: CacheFastPathPublisher,
+) {
+    debug!("cache coordinator loop");
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                debug!("cache coordinator shutdown signal received");
+                break;
+            }
+            _ = query_tx.closed() => {
+                error!("writer thread exited unexpectedly");
+                cancel.cancel();
+                break;
+            }
+            signal = cdc_signal_rx.recv() => {
+                match signal {
+                    Some(CdcSignal::Disconnected { last_flushed_lsn }) => {
+                        warn!("CDC disconnected (last_flushed_lsn: {last_flushed_lsn}), forwarding queries to origin");
+                        cdc_connected.store(false, Ordering::Relaxed);
+                    }
+                    Some(CdcSignal::Reconnected) => {
+                        debug!("CDC reconnected, resuming cache dispatch");
+                        cdc_connected.store(true, Ordering::Relaxed);
+                    }
+                    Some(CdcSignal::Fatal) | None => {
+                        error!("CDC fatal error or thread exited");
+                        cancel.cancel();
+                        break;
+                    }
+                }
+            }
+            msg = cache_rx.recv() => {
+                match msg {
+                    Some(proxy_msg) => {
+                        if cdc_connected.load(Ordering::Relaxed) {
+                            let mut qcache = qcache.clone();
+                            tokio::spawn(async move {
+                                handle_proxy_message(&mut qcache, proxy_msg).await;
+                            });
+                        } else {
+                            // CDC is down; forward to origin to avoid serving stale data
+                            let data = proxy_msg.message.into_data();
+                            let _ = reply_forward(
+                                proxy_msg.reply_tx,
+                                proxy_msg.client_socket,
+                                proxy_msg.pipeline,
+                                data,
+                                proxy_msg.timing,
+                            );
+                        }
+                    }
+                    None => {
+                        debug!("proxy channel closed");
+                        break;
+                    }
+                }
+            }
+            msg = worker_metrics_rx.recv() => {
+                if let Some(wm) = msg {
+                    worker_metrics_record(&state_view, wm);
+                }
+            }
+            notify = notify_rx.recv() => {
+                match notify {
+                    Some(WriterNotify::Ready { fingerprint, generation, resolved, deparsed_sql, max_limit }) => {
+                        qcache.waiting_drain_ready(fingerprint, generation, resolved, deparsed_sql, max_limit);
+                    }
+                    Some(WriterNotify::Failed { fingerprint }) => {
+                        qcache.waiting_drain_failed(fingerprint);
+                    }
+                    None => {
+                        error!("writer notify channel closed");
+                        cancel.cancel();
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Channel depth gauge; queue length never approaches 2^53.
+        #[allow(clippy::cast_precision_loss)]
+        crate::metrics::handles().state.queue_proxy_message
+            .set(cache_rx.len() as f64);
+    }
+
+    debug!("cache coordinator loop exiting");
+    fast_publisher.clear();
 }
 
 /// Record worker-reported metrics (cache-hit latency, bytes served).
@@ -534,73 +538,74 @@ fn worker_metrics_record(state_view: &CacheStateView, wm: WorkerMetrics) {
     }
 }
 
-/// Worker runtime - executes cached queries against the database
-fn worker_run(
-    settings: &Settings,
+/// Worker dispatcher task: acquires a pooled cache-DB connection (the pool
+/// bounds serve concurrency) and spawns the serve onto the shared runtime, so
+/// serves spread across all runtime threads instead of one worker thread.
+async fn worker_loop(
+    settings: Settings,
     mut worker_rx: UnboundedReceiver<WorkerRequest>,
     worker_metrics_tx: UnboundedSender<WorkerMetrics>,
     cancel: CancellationToken,
     state_view: Arc<CacheStateView>,
-) -> CacheResult<()> {
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_into_report::<CacheError>()?;
+) {
+    debug!("cache worker loop");
+    let pool_size = (settings.num_workers * 2).max(MIN_POOL_SIZE);
+    let (conn_tx, mut conn_rx) = match connection_pool_create(&settings, pool_size).await {
+        Ok(pool) => pool,
+        Err(e) => {
+            error!(
+                "creating connection pool: {}",
+                error_chain_format(e.current_context())
+            );
+            cancel.cancel();
+            return;
+        }
+    };
 
-    debug!("worker loop");
-    rt.block_on(async {
-        let pool_size = (settings.num_workers * 2).max(MIN_POOL_SIZE);
-        let (conn_tx, mut conn_rx) = connection_pool_create(settings, pool_size)
-            .await
-            .attach_loc("creating connection pool")?;
+    loop {
+        // Block for at least one request
+        let mut msg = tokio::select! {
+            _ = cancel.cancelled() => {
+                debug!("cache worker shutdown signal received");
+                break;
+            }
+            msg = worker_rx.recv() => {
+                let Some(msg) = msg else { break };
+                msg
+            }
+        };
+        msg.timing.worker_received_at = Some(Instant::now());
 
-        LocalSet::new()
-            .run_until(async move {
-                loop {
-                    // Block for at least one request
-                    let mut msg = tokio::select! {
-                        _ = cancel.cancelled() => {
-                            debug!("cache worker shutdown signal received");
-                            break;
-                        }
-                        msg = worker_rx.recv() => {
-                            let Some(msg) = msg else { break };
-                            msg
-                        }
-                    };
-                    msg.timing.worker_received_at = Some(Instant::now());
+        // Wait for an available connection
+        let conn = if let Ok(conn) = conn_rx.try_recv() {
+            conn
+        } else {
+            let Some(conn) = conn_rx.recv().await else {
+                error!("cache connection pool closed");
+                cancel.cancel();
+                return;
+            };
+            conn
+        };
+        msg.timing.conn_acquired_at = Some(Instant::now());
 
-                    // Wait for an available connection
-                    let conn = if let Ok(conn) = conn_rx.try_recv() {
-                        conn
-                    } else {
-                        let Some(conn) = conn_rx.recv().await else {
-                            return Err(CacheError::NoConnection.into());
-                        };
-                        conn
-                    };
-                    msg.timing.conn_acquired_at = Some(Instant::now());
+        // Spawn the serve (request + connection) onto the shared runtime.
+        let return_tx = conn_tx.clone();
+        let metrics_tx = worker_metrics_tx.clone();
+        let state_view = Arc::clone(&state_view);
+        tokio::spawn(async move {
+            handle_worker_request(conn, return_tx, msg, metrics_tx, state_view).await;
+        });
 
-                    // Spawn task with both the request and connection
-                    let return_tx = conn_tx.clone();
-                    let metrics_tx = worker_metrics_tx.clone();
-                    let state_view = Arc::clone(&state_view);
-                    spawn_local(async move {
-                        handle_worker_request(conn, return_tx, msg, metrics_tx, state_view).await;
-                    });
+        // Channel depth gauge; queue length never approaches 2^53.
+        #[allow(clippy::cast_precision_loss)]
+        crate::metrics::handles()
+            .state
+            .queue_worker
+            .set(worker_rx.len() as f64);
+    }
 
-                    // Channel depth gauge; queue length never approaches 2^53.
-                    #[allow(clippy::cast_precision_loss)]
-                    crate::metrics::handles()
-                        .state
-                        .queue_worker
-                        .set(worker_rx.len() as f64);
-                }
-
-                Ok(())
-            })
-            .await
-    })
+    debug!("cache worker loop exiting");
 }
 
 /// Initial backoff for CDC reconnection attempts.

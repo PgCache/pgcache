@@ -24,7 +24,7 @@ use rootcause::Report;
 use crate::pg::cdc::PgCdcError;
 use crate::pg::protocol::ProtocolError;
 
-pub use connection::connection_run;
+pub use connection::connection_task;
 pub use server::proxy_run;
 
 error_set! {

@@ -1,8 +1,6 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -35,6 +33,40 @@ use super::{
 /// Minimum credit stamped on a Pending entry. Provides a survival floor during
 /// cold start (when `last_hits_per_gc` is zero) and for low-traffic workloads.
 const MIN_PENDING_CREDIT: u32 = 100;
+
+/// Test-only deterministic fault injection for the coalesce enqueue/drain race.
+/// The race window between observing `Loading` and enqueuing the waiter is a few
+/// microseconds and cannot be provoked probabilistically, so a stress test widens
+/// it here. Compiled out entirely unless built with `--features fault-injection`.
+#[cfg(feature = "fault-injection")]
+mod fault {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    static COALESCE_DELAY: AtomicBool = AtomicBool::new(false);
+
+    /// Arm from the environment (read once at `QueryCache` construction).
+    pub(super) fn init() {
+        if std::env::var_os("PGCACHE_FAULT_COALESCE_DELAY").is_some() {
+            COALESCE_DELAY.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// When armed, delay between the `Loading` observation and the enqueue so a
+    /// concurrently-completing population's drain reliably interleaves.
+    pub(super) async fn coalesce_enqueue_delay() {
+        if COALESCE_DELAY.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+async fn fault_coalesce_enqueue_delay() {
+    fault::coalesce_enqueue_delay().await;
+}
+#[cfg(not(feature = "fault-injection"))]
+async fn fault_coalesce_enqueue_delay() {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum QueryType {
@@ -132,7 +164,7 @@ pub struct QueryCache {
     worker_tx: UnboundedSender<WorkerRequest>,
     state_view: Arc<CacheStateView>,
     dynamic: DynamicConfigHandle,
-    waiting: Rc<RefCell<WaitingQueue>>,
+    waiting: Arc<Mutex<WaitingQueue>>,
 }
 
 impl QueryCache {
@@ -142,6 +174,8 @@ impl QueryCache {
         worker_tx: UnboundedSender<WorkerRequest>,
         state_view: Arc<CacheStateView>,
     ) -> CacheResult<Self> {
+        #[cfg(feature = "fault-injection")]
+        fault::init();
         let cfg = settings.dynamic.load();
         match &cfg.allowed_tables_parsed {
             Some(_entries) => {
@@ -160,7 +194,7 @@ impl QueryCache {
             worker_tx,
             state_view,
             dynamic: settings.dynamic.clone(),
-            waiting: Rc::new(RefCell::new(HashMap::new())),
+            waiting: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -188,7 +222,7 @@ impl QueryCache {
         let rows_needed = limit_rows_needed(&msg.cacheable_query.query.limit);
 
         let lookup_start = Instant::now();
-        let cache_entry = self
+        let mut cache_entry = self
             .state_view
             .cached_queries
             .get(&fingerprint)
@@ -203,96 +237,118 @@ impl QueryCache {
         // (forward_decision / coalesce_intake / coalesce_wait).
         msg.timing.lookup_complete_at = Some(Instant::now());
 
-        match &cache_entry {
-            // Cache hit: Ready with sufficient rows — serve from cache
-            Some(CachedQueryView {
-                state: CachedQueryState::Ready,
-                generation,
-                resolved: Some(resolved),
-                deparsed_sql: Some(deparsed_sql),
-                max_limit,
-                ..
-            }) if limit_is_sufficient(*max_limit, rows_needed) => {
-                self.metrics_hit_record(fingerprint);
-                self.clock_reference_set(cfg.cache_policy, &fingerprint);
-                // Decide MV fast path vs fallthrough based on current mv_state.
-                // Side effect: on Dirty, transitions to RebuildScheduled and sends
-                // QueryCommand::MvRebuild to the writer.
-                let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
-                self.worker_request_send(
-                    fingerprint,
-                    msg,
-                    Arc::clone(resolved),
-                    deparsed_sql.clone(),
-                    *generation,
-                    mv,
-                )
-            }
-
-            // Cache hit: Ready but insufficient rows — forward and request limit bump
-            Some(CachedQueryView {
-                state: CachedQueryState::Ready,
-                max_limit,
-                ..
-            }) => {
-                trace!("limit bump {fingerprint} cached={max_limit:?} needed={rows_needed:?}");
-                self.metrics_miss_record(fingerprint);
-                // Set Loading immediately to prevent duplicate LimitBump commands from racing
-                self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
-                reply_forward(
-                    msg.reply_tx,
-                    msg.client_socket,
-                    msg.pipeline,
-                    msg.data,
-                    msg.timing,
-                )?;
-                self.query_tx
-                    .send(QueryCommand::LimitBump {
+        // Retry loop: the `Loading` arm may observe (under the waiting lock) that
+        // the state has advanced since the snapshot above and fall through to
+        // re-dispatch against the fresh state. All other arms are terminal.
+        loop {
+            match &cache_entry {
+                // Cache hit: Ready with sufficient rows — serve from cache
+                Some(CachedQueryView {
+                    state: CachedQueryState::Ready,
+                    generation,
+                    resolved: Some(resolved),
+                    deparsed_sql: Some(deparsed_sql),
+                    max_limit,
+                    ..
+                }) if limit_is_sufficient(*max_limit, rows_needed) => {
+                    self.metrics_hit_record(fingerprint);
+                    self.clock_reference_set(cfg.cache_policy, &fingerprint);
+                    // Decide MV fast path vs fallthrough based on current mv_state.
+                    // Side effect: on Dirty, transitions to RebuildScheduled and sends
+                    // QueryCommand::MvRebuild to the writer.
+                    let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
+                    return self.worker_request_send(
                         fingerprint,
-                        max_limit: rows_needed,
-                    })
-                    .map_err(|_| CacheError::WorkerSend)?;
-                Ok(())
-            }
+                        msg,
+                        Arc::clone(resolved),
+                        deparsed_sql.clone(),
+                        *generation,
+                        mv,
+                    );
+                }
 
-            // Loading — coalesce: queue request for later dispatch from cache
-            Some(CachedQueryView {
-                state: CachedQueryState::Loading,
-                ..
-            }) => {
-                trace!("cache loading, coalesce {fingerprint}");
-                self.metrics_miss_record(fingerprint);
-                let key = Self::coalesce_key_from_request(&msg);
-                msg.timing.waiter_enqueued_at = Some(Instant::now());
-                self.waiting
-                    .borrow_mut()
-                    .entry(fingerprint)
-                    .or_default()
-                    .entry(key)
-                    .or_default()
-                    .push(msg);
-                #[allow(clippy::cast_precision_loss)]
-                // queue depth, never near 2^53
-                crate::metrics::handles()
-                    .cache
-                    .coalesce_waiting
-                    .set(self.waiting_count() as f64);
-                Ok(())
-            }
-
-            // Pending — hold request, check subsumption, increment hit count, admit if threshold reached
-            Some(CachedQueryView {
-                state: CachedQueryState::Pending { hit_count, .. },
-                ..
-            }) => {
-                let new_count = hit_count + 1;
-                trace!("pending {fingerprint} count={new_count}");
-
-                if new_count >= cfg.admission_threshold {
+                // Cache hit: Ready but insufficient rows — forward and request limit bump
+                Some(CachedQueryView {
+                    state: CachedQueryState::Ready,
+                    max_limit,
+                    ..
+                }) => {
+                    trace!("limit bump {fingerprint} cached={max_limit:?} needed={rows_needed:?}");
+                    self.metrics_miss_record(fingerprint);
+                    // Set Loading immediately to prevent duplicate LimitBump commands from racing
                     self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
-                    self.subsumption_await(msg, fingerprint, AdmitAction::Admit)
-                        .await
-                } else {
+                    reply_forward(
+                        msg.reply_tx,
+                        msg.client_socket,
+                        msg.pipeline,
+                        msg.data,
+                        msg.timing,
+                    )?;
+                    self.query_tx
+                        .send(QueryCommand::LimitBump {
+                            fingerprint,
+                            max_limit: rows_needed,
+                        })
+                        .map_err(|_| CacheError::WorkerSend)?;
+                    return Ok(());
+                }
+
+                // Loading — coalesce: queue request for later dispatch from cache.
+                // The state is re-checked under the waiting lock to avoid an
+                // orphaned waiter: the writer sets `Ready` before sending the
+                // notify that drains this queue, so if we still observe `Loading`
+                // while holding the lock, the drain has not yet removed our group
+                // (or will see us); otherwise we fall through and re-dispatch.
+                Some(CachedQueryView {
+                    state: CachedQueryState::Loading,
+                    ..
+                }) => {
+                    trace!("cache loading, coalesce {fingerprint}");
+                    fault_coalesce_enqueue_delay().await;
+                    let mut guard = self.waiting.lock().expect("lock waiting queue");
+                    let still_loading = self
+                        .state_view
+                        .cached_queries
+                        .get(&fingerprint)
+                        .map(|e| e.state)
+                        == Some(CachedQueryState::Loading);
+                    if still_loading {
+                        self.metrics_miss_record(fingerprint);
+                        let key = Self::coalesce_key_from_request(&msg);
+                        msg.timing.waiter_enqueued_at = Some(Instant::now());
+                        guard
+                            .entry(fingerprint)
+                            .or_default()
+                            .entry(key)
+                            .or_default()
+                            .push(msg);
+                        drop(guard);
+                        #[allow(clippy::cast_precision_loss)]
+                        // queue depth, never near 2^53
+                        crate::metrics::handles()
+                            .cache
+                            .coalesce_waiting
+                            .set(self.waiting_count() as f64);
+                        return Ok(());
+                    }
+                    drop(guard);
+                    // State advanced under the lock; re-read and re-dispatch.
+                }
+
+                // Pending — hold request, check subsumption, increment hit count, admit if threshold reached
+                Some(CachedQueryView {
+                    state: CachedQueryState::Pending { hit_count, .. },
+                    ..
+                }) => {
+                    let new_count = hit_count + 1;
+                    trace!("pending {fingerprint} count={new_count}");
+
+                    if new_count >= cfg.admission_threshold {
+                        self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
+                        return self
+                            .subsumption_await(msg, fingerprint, AdmitAction::Admit)
+                            .await;
+                    }
                     self.cached_query_state_set(
                         &fingerprint,
                         CachedQueryState::Pending {
@@ -300,27 +356,37 @@ impl QueryCache {
                             credit: self.pending_initial_credit(),
                         },
                     );
-                    self.subsumption_await(msg, fingerprint, AdmitAction::CheckOnly)
-                        .await
+                    return self
+                        .subsumption_await(msg, fingerprint, AdmitAction::CheckOnly)
+                        .await;
+                }
+
+                // Invalidated — hold request, check subsumption, fast-readmit (skip admission gate)
+                Some(CachedQueryView {
+                    state: CachedQueryState::Invalidated,
+                    ..
+                }) => {
+                    trace!("invalidated readmit {fingerprint}");
+                    self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
+                    return self
+                        .subsumption_await(msg, fingerprint, AdmitAction::Admit)
+                        .await;
+                }
+
+                // Cache miss — hold request, check subsumption
+                None => {
+                    trace!("cache miss {fingerprint}");
+                    return self.query_first_miss_handle(fingerprint, msg, &cfg).await;
                 }
             }
 
-            // Invalidated — hold request, check subsumption, fast-readmit (skip admission gate)
-            Some(CachedQueryView {
-                state: CachedQueryState::Invalidated,
-                ..
-            }) => {
-                trace!("invalidated readmit {fingerprint}");
-                self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
-                self.subsumption_await(msg, fingerprint, AdmitAction::Admit)
-                    .await
-            }
-
-            // Cache miss — hold request, check subsumption
-            None => {
-                trace!("cache miss {fingerprint}");
-                self.query_first_miss_handle(fingerprint, msg, &cfg).await
-            }
+            // Reached only when the Loading arm fell through: re-read the entry
+            // and re-dispatch against the now-current state.
+            cache_entry = self
+                .state_view
+                .cached_queries
+                .get(&fingerprint)
+                .map(|entry| entry.clone());
         }
     }
 
@@ -462,7 +528,8 @@ impl QueryCache {
     /// Total number of requests waiting across all coalescing groups.
     fn waiting_count(&self) -> usize {
         self.waiting
-            .borrow()
+            .lock()
+            .expect("lock waiting queue")
             .values()
             .flat_map(|groups| groups.values())
             .map(Vec::len)
@@ -480,7 +547,12 @@ impl QueryCache {
         deparsed_sql: EcoString,
         max_limit: Option<u64>,
     ) {
-        let Some(groups) = self.waiting.borrow_mut().remove(&fingerprint) else {
+        let Some(groups) = self
+            .waiting
+            .lock()
+            .expect("lock waiting queue")
+            .remove(&fingerprint)
+        else {
             return;
         };
 
@@ -572,7 +644,12 @@ impl QueryCache {
     /// Drain all coalesced waiters for a fingerprint that failed.
     /// Falls back to forwarding each waiter to origin.
     pub fn waiting_drain_failed(&self, fingerprint: u64) {
-        let Some(groups) = self.waiting.borrow_mut().remove(&fingerprint) else {
+        let Some(groups) = self
+            .waiting
+            .lock()
+            .expect("lock waiting queue")
+            .remove(&fingerprint)
+        else {
             return;
         };
 

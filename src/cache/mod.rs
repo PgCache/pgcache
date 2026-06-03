@@ -42,7 +42,7 @@ pub use mv::{
     MvMeta, MvServe, MvState, ShapeGate, mv_serve_sql_into, mv_state_initial, mv_table_name,
     shape_classify,
 };
-pub use runtime::cache_run;
+pub use runtime::cache_setup;
 pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
 };

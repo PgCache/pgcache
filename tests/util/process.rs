@@ -174,12 +174,12 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
 /// Spawn a pgcache process with the given extra CLI arguments.
 /// Copies the default config to a temp file so each process gets its own copy
 /// (prevents concurrent tests from corrupting the shared config via PUT /config).
-fn pgcache_spawn(
+fn pgcache_cmd(
     dbs: &TempDBs,
     listen_port: u16,
     metrics_port: u16,
     extra_args: &[&str],
-) -> PgCacheProcess {
+) -> Command {
     let listen_socket = format!("127.0.0.1:{}", listen_port);
     let metrics_socket = format!("127.0.0.1:{}", metrics_port);
 
@@ -217,6 +217,35 @@ fn pgcache_spawn(
         cmd.arg(arg);
     }
 
+    cmd
+}
+
+fn pgcache_spawn(
+    dbs: &TempDBs,
+    listen_port: u16,
+    metrics_port: u16,
+    extra_args: &[&str],
+) -> PgCacheProcess {
+    let child = pgcache_cmd(dbs, listen_port, metrics_port, extra_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run pgcache");
+
+    PgCacheProcess::new(child)
+}
+
+/// Spawn pgcache with extra environment variables (e.g. fault-injection arming).
+/// Env is set on the child process only, so it cannot leak to parallel tests.
+fn pgcache_spawn_env(
+    dbs: &TempDBs,
+    listen_port: u16,
+    metrics_port: u16,
+    extra_args: &[&str],
+    env: &[(&str, &str)],
+) -> PgCacheProcess {
+    let mut cmd = pgcache_cmd(dbs, listen_port, metrics_port, extra_args);
+    cmd.envs(env.iter().copied());
     let child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -250,6 +279,21 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, u16,
     let listen_port = find_available_port()?;
     let metrics_port = find_available_port()?;
     let mut pgcache = pgcache_spawn(dbs, listen_port, metrics_port, &["--cache_policy", "fifo"]);
+    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    let client = pgcache_client_connect(listen_port).await?;
+    Ok((pgcache, listen_port, metrics_port, client))
+}
+
+/// Connect to pgcache with fault-injection environment variables set on the
+/// child process (requires the binary built with `--features fault-injection`).
+pub async fn connect_pgcache_fault(
+    dbs: &TempDBs,
+    env: &[(&str, &str)],
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+    let listen_port = find_available_port()?;
+    let metrics_port = find_available_port()?;
+    let mut pgcache =
+        pgcache_spawn_env(dbs, listen_port, metrics_port, &["--cache_policy", "fifo"], env);
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
     let client = pgcache_client_connect(listen_port).await?;
     Ok((pgcache, listen_port, metrics_port, client))

@@ -17,11 +17,9 @@ use crate::catalog::FunctionVolatility;
 use rootcause::Report;
 use tokio::{
     io::AsyncWriteExt,
-    net::{TcpStream, lookup_host},
-    runtime::Builder,
+    net::TcpStream,
     select,
-    sync::{mpsc::UnboundedReceiver, oneshot},
-    task::{LocalSet, spawn_local},
+    sync::oneshot,
 };
 use tokio_stream::StreamExt;
 use tokio_util::{
@@ -55,7 +53,7 @@ use crate::{
     },
     proxy::egress::EgressQueue,
     query::ast::{AstError, QueryExpr, query_expr_convert_raw, query_expr_fingerprint},
-    settings::{Settings, SslMode},
+    settings::SslMode,
     telemetry::pg_version_set,
     timing::{QueryId, QueryTiming, timing_record},
     tls::{self},
@@ -66,7 +64,7 @@ use super::query::{Action, ForwardReason, handle_query};
 use super::search_path::{SearchPath, search_path_mutations_raw};
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
 use super::{CacheSender, ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
-use crate::result::{MapIntoReport, ReportExt};
+use crate::result::ReportExt;
 
 /// Guard that decrements active connections gauge when dropped.
 struct ActiveConnectionGuard;
@@ -2446,102 +2444,54 @@ async fn handle_connection(
     }
 }
 
+/// Handle one accepted client connection end-to-end (TLS negotiation + the
+/// proxy loop). Spawned per accept onto the shared multi-thread runtime.
 #[instrument(skip_all)]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub fn connection_run(
-    worker_id: usize,
-    settings: &Settings,
-    mut rx: UnboundedReceiver<TcpStream>,
+#[allow(clippy::too_many_arguments)]
+pub async fn connection_task(
+    socket: TcpStream,
+    addrs: Vec<SocketAddr>,
+    ssl_mode: SslMode,
+    server_name: EcoString,
     cache_sender: CacheSender,
     fast_path: CacheFastPathHandle,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
-) -> ConnectionResult<()> {
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_into_report::<ConnectionError>()
-        .attach_loc("creating connection runtime")?;
+    origin_database: EcoString,
+) {
+    debug!("task spawn");
 
-    // Extract settings for the connection loop
-    let ssl_mode = settings.origin.ssl_mode;
-    let server_name = settings.origin.host.clone();
-    let origin_database = EcoString::from(settings.origin.database.as_str());
+    // Negotiate client TLS if configured
+    let client_stream = match tls::client_tls_negotiate(socket, tls_acceptor.as_deref()).await {
+        Ok(tls::ClientTlsResult::Tls {
+            tcp_stream,
+            tls_state,
+        }) => ClientStream::tls(tcp_stream, tls_state),
+        Ok(tls::ClientTlsResult::Plain(stream)) => ClientStream::plain(stream),
+        Err(e) => {
+            crate::metrics::handles().conn.errors.increment(1);
+            error!("TLS negotiation failed: {}", e);
+            return;
+        }
+    };
 
-    debug!("handle connection start");
-    rt.block_on(async {
-        let addrs: Vec<SocketAddr> =
-            lookup_host((settings.origin.host.as_str(), settings.origin.port))
-                .await
-                .map_into_report::<ConnectionError>()
-                .attach_loc("resolving origin host")?
-                .collect();
+    let res = handle_connection(
+        client_stream,
+        addrs,
+        ssl_mode,
+        &server_name,
+        cache_sender,
+        fast_path,
+        func_volatility,
+        origin_database,
+    )
+    .await;
 
-        let queue_handle = crate::metrics::proxy_worker_queue_handle(worker_id);
-        LocalSet::new()
-            .run_until(async {
-                while let Some(socket) = rx.recv().await {
-                    // Channel depth gauge; queue length never approaches 2^53.
-                    #[allow(clippy::cast_precision_loss)]
-                    queue_handle.set(rx.len() as f64);
+    if let Err(e) = res {
+        error!("{}", e);
+        crate::metrics::handles().conn.errors.increment(1);
+    }
 
-                    let addrs = addrs.clone();
-                    let server_name = server_name.clone();
-                    let cache_sender = cache_sender.clone();
-                    let fast_path = fast_path.clone();
-                    let tls_acceptor = tls_acceptor.clone();
-                    let func_volatility = Arc::clone(&func_volatility);
-                    let origin_database = origin_database.clone();
-                    spawn_local(async move {
-                        debug!("task spawn");
-
-                        // Negotiate client TLS if configured
-                        let client_stream = match tls::client_tls_negotiate(
-                            socket,
-                            tls_acceptor.as_deref(),
-                        )
-                        .await
-                        {
-                            Ok(tls::ClientTlsResult::Tls {
-                                tcp_stream,
-                                tls_state,
-                            }) => ClientStream::tls(tcp_stream, tls_state),
-                            Ok(tls::ClientTlsResult::Plain(stream)) => ClientStream::plain(stream),
-                            Err(e) => {
-                                crate::metrics::handles().conn.errors.increment(1);
-                                error!("TLS negotiation failed: {}", e);
-                                return Ok(());
-                            }
-                        };
-
-                        let res = handle_connection(
-                            client_stream,
-                            addrs,
-                            ssl_mode,
-                            &server_name,
-                            cache_sender,
-                            fast_path,
-                            func_volatility,
-                            origin_database,
-                        )
-                        .await;
-
-                        if let Err(e) = res {
-                            error!("{}", e);
-                            crate::metrics::handles().conn.errors.increment(1);
-                            if matches!(e.current_context(), ConnectionError::CacheDead) {
-                                debug!("connection closed in degraded mode");
-                                return Err(io::Error::other("cache dead"));
-                            }
-                        }
-
-                        debug!("task done");
-                        Ok(())
-                    });
-                }
-
-                Ok(())
-            })
-            .await
-    })
+    debug!("task done");
 }

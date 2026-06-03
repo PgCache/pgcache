@@ -3,7 +3,7 @@ use std::time::Instant;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::Sender;
-use tokio::task::{JoinHandle, spawn_local};
+use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::bytes::{Buf, Bytes};
 use tokio_util::codec::FramedRead;
@@ -131,7 +131,7 @@ fn broadcast_setup(msg: &mut WorkerRequest) -> Option<BroadcastState> {
         .drain(..)
         .map(|mut client| {
             let mut rx = tx.subscribe();
-            spawn_local(async move {
+            tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
                         Ok(chunk) => {
@@ -437,6 +437,10 @@ pub async fn handle_cached_query(
         ServeResponseState::SetGenBind
     };
     let mut bytes_served: usize = 0;
+    // Set when a client write fails mid-serve. The cache-DB connection is still
+    // healthy, so rather than poison it we stop relaying and drain the remaining
+    // cache-DB response, returning the connection to the pool protocol-clean.
+    let mut client_gone = false;
 
     loop {
         tokio::select! {
@@ -537,22 +541,33 @@ pub async fn handle_cached_query(
                     _ => {}
                 }
             }
-            result = client_socket.write_buf(&mut write_queue), if !write_queue.is_empty() =>
+            result = client_socket.write_buf(&mut write_queue),
+                if !write_queue.is_empty() && !client_gone =>
             {
                 match result {
                     Ok(cnt) => {
                         trace!("net: cache→client flush (serve, partial write, {} bytes)", cnt);
                     }
                     Err(_) => {
-                        guard.poisoned = true;
-                        error!("no client");
+                        // Client went away mid-serve. The cache-DB connection is
+                        // healthy — do NOT poison it. Stop relaying, fail any
+                        // coalesced waiters, and keep reading the cache-DB
+                        // response to completion so the connection returns to the
+                        // pool protocol-clean (avoids serve-pool exhaustion).
+                        debug!("client write failed mid-serve; draining cache-DB response to preserve pooled connection");
+                        client_gone = true;
                         if let Some(bc) = broadcast.take() {
                             broadcast_error_reply(bc).await;
                         }
-                        return Err(CacheError::Write.into());
                     }
                 }
             }
+        }
+
+        // While draining for a departed client, discard the relay buffer so it
+        // can't grow with the rest of the response.
+        if client_gone {
+            write_queue.clear();
         }
 
         if state == ServeResponseState::Done {
@@ -576,6 +591,12 @@ pub async fn handle_cached_query(
             broadcast_error_reply(bc).await;
         }
         return Err(e);
+    }
+
+    // Client departed mid-serve: the connection has been drained and returned to
+    // the pool. Surface the write error without further client I/O.
+    if client_gone {
+        return Err(CacheError::Write.into());
     }
 
     // Simple-query clients always terminate with ReadyForQuery; extended clients

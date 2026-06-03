@@ -9,8 +9,8 @@ use super::http::http_get;
 use super::metrics::MetricsSnapshot;
 use super::process::{
     PgCacheProcess, TempDBs, connect_pgcache, connect_pgcache_allowlist, connect_pgcache_clock,
-    connect_pgcache_pinned, connect_pgcache_pinned_small_cache, connect_pgcache_small_cache,
-    start_databases,
+    connect_pgcache_fault, connect_pgcache_pinned, connect_pgcache_pinned_small_cache,
+    connect_pgcache_small_cache, start_databases,
 };
 
 /// Test context combining all resources needed for integration tests.
@@ -30,6 +30,22 @@ impl TestContext {
     pub async fn setup() -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) = connect_pgcache(&dbs).await?;
+        Ok(Self {
+            dbs,
+            pgcache,
+            cache_port,
+            metrics_port,
+            cache,
+            origin,
+        })
+    }
+
+    /// Set up a test context with fault-injection environment variables set on
+    /// the pgcache process (requires the binary built with `fault-injection`).
+    pub async fn setup_fault(env: &[(&str, &str)]) -> Result<Self, Error> {
+        let (dbs, origin) = start_databases().await?;
+        let (pgcache, cache_port, metrics_port, cache) =
+            connect_pgcache_fault(&dbs, env).await?;
         Ok(Self {
             dbs,
             pgcache,

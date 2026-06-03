@@ -78,6 +78,17 @@ impl WriteQueue {
         self.len == 0 && self.spill.is_empty()
     }
 
+    /// Drop all queued chunks (used when the client is gone and the remaining
+    /// cache-DB response is being drained rather than relayed).
+    pub fn clear(&mut self) {
+        for slot in &mut self.inline {
+            *slot = Bytes::new();
+        }
+        self.head = 0;
+        self.len = 0;
+        self.spill.clear();
+    }
+
     /// Mutable reference to the front (next-to-drain) chunk, if any.
     fn front_mut(&mut self) -> Option<&mut Bytes> {
         if self.len > 0 {
