@@ -153,6 +153,8 @@ pub mod names {
     // Request coalescing metrics
     pub const CACHE_COALESCE_WAITING: &str = "pgcache.cache.coalesce_waiting";
     pub const CACHE_COALESCE_SERVED: &str = "pgcache.cache.coalesce_served";
+    /// Successful cache-subsystem restarts performed by the supervisor.
+    pub const CACHE_RESTARTS_TOTAL: &str = "pgcache.cache.restarts_total";
 
     // Extended protocol metrics
     pub const PROTOCOL_SIMPLE_QUERIES: &str = "pgcache.protocol.simple_queries";
@@ -318,6 +320,8 @@ pub struct CacheHandles {
     pub mv_fallthrough: Counter,
     pub coalesce_waiting: Gauge,
     pub coalesce_served: Counter,
+    /// Incremented each time the supervisor rebuilds the cache subsystem.
+    pub restarts_total: Counter,
 }
 
 pub struct CdcHandles {
@@ -458,6 +462,7 @@ impl Handles {
                 mv_fallthrough: metrics::counter!(CACHE_MV_FALLTHROUGH),
                 coalesce_waiting: metrics::gauge!(CACHE_COALESCE_WAITING),
                 coalesce_served: metrics::counter!(CACHE_COALESCE_SERVED),
+                restarts_total: metrics::counter!(CACHE_RESTARTS_TOTAL),
             },
             cdc: CdcHandles {
                 events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),

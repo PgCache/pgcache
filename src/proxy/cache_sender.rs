@@ -43,6 +43,13 @@ impl StatusSenderUpdater {
         (Self { tx }, StatusSender { rx })
     }
 
+    /// Creates a new updater with no sender yet: status requests report the
+    /// cache as unavailable until the supervisor publishes the first generation.
+    pub fn new_pending() -> (Self, StatusSender) {
+        let (tx, rx) = watch::channel(None);
+        (Self { tx }, StatusSender { rx })
+    }
+
     /// Updates all subscribers with a new status sender (called on successful restart).
     pub fn sender_update(&self, new: StatusSenderInner) {
         let _ = self.tx.send(Some(new));

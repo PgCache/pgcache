@@ -13,12 +13,12 @@ use tokio::{
 };
 use tokio_postgres::{Config, NoTls};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     cache::{
-        CacheError, CacheResult, MapIntoReport, PinnedQuery, QueryCachePublisher, ReportExt,
-        StatusRequest,
+        CacheError, CacheResult, MapIntoReport, PinnedQuery, QueryCachePublisher,
+        QueryCacheUpdater, ReportExt, StatusRequest,
         cdc::CdcProcessor,
         messages::{CacheOutcome, CacheReply, CdcCommand, WriterNotify},
         query_cache::{QueryCache, WorkerRequest},
@@ -26,7 +26,11 @@ use crate::{
         worker::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
         writer::writer_run,
     },
-    pg::{cache_connection::CacheConnection, cdc::slot_confirmed_lsn},
+    pg::{
+        cache_connection::CacheConnection,
+        cdc::{replication_provision, slot_confirmed_lsn},
+    },
+    proxy::StatusSenderUpdater,
     result::error_chain_format,
     settings::Settings,
     timing::duration_to_us_u64,
@@ -250,17 +254,20 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
     })
 }
 
-/// Set up the cache subsystem (PGC Option A probe).
+/// Build one generation of the cache subsystem.
 ///
-/// Writer and CDC stay dedicated `current_thread` threads (mutation
+/// Writer and CDC are dedicated `current_thread` threads (mutation
 /// serialization point + replication consumer, reached only via `Send`
-/// channels). The coordinator and worker run as tasks on the shared
+/// channels). The worker and coalesce-drain run as tasks on the shared
 /// multi-thread runtime (`handle`) alongside the connection tasks, so the
-/// connection ↔ coordinator ↔ worker handoffs are intra-runtime run-queue
-/// pushes instead of cross-runtime eventfd wakeups.
+/// connection ↔ worker handoffs are intra-runtime run-queue pushes instead of
+/// cross-runtime eventfd wakeups.
 ///
-/// Restart is deferred for the probe: a fatal failure here cancels the cache
-/// subsystem; connections keep running and degrade to origin-forward.
+/// `cache_cancel` is owned by [`cache_supervise`]; any fatal failure in this
+/// generation cancels it, which tears down the writer/cdc threads and the
+/// runtime tasks. The returned scoped join handles let the supervisor reap the
+/// dead generation before building the next one. On partial-spawn failure the
+/// already-spawned threads are cancelled and joined before returning `Err`.
 #[instrument(skip_all)]
 #[allow(clippy::too_many_arguments)]
 pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
@@ -268,20 +275,25 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     settings: &'settings Settings,
     handle: Handle,
     pinned: &[PinnedQuery],
-    cancel: CancellationToken,
+    cache_cancel: CancellationToken,
     status_rx: Receiver<StatusRequest>,
     qcache_publisher: QueryCachePublisher,
-) -> CacheResult<()> {
+) -> CacheResult<Vec<thread::ScopedJoinHandle<'scope, CacheResult<()>>>> {
+    // Provision replication per generation: idempotent for the slot (created only
+    // if missing) and recreating the publication empty. On a restart this rebuilds
+    // a slot the origin lost, so the CDC thread can resume rather than zombie; if
+    // the origin is unreachable, this fails and the supervisor backs off and
+    // retries instead of bringing up a generation with dead CDC.
+    handle
+        .block_on(replication_provision(settings))
+        .map_err(|r| r.context_transform(|_| CacheError::CdcFailure))
+        .attach_loc("provisioning replication on origin")?;
+
     cache_database_reset(settings).attach_loc("resetting cache database")?;
 
     let state_view = Arc::new(CacheStateView::new());
     let active_relations: ActiveRelations =
         Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
-
-    // Cache-subsystem cancel (child of the root). The coalesce-drain task and
-    // worker share it so either can tear down the subsystem; writer/cdc get
-    // children so a subsystem cancel propagates to them.
-    let cache_cancel = cancel.child_token();
 
     let (query_tx, query_rx) = unbounded_channel();
     let (cdc_cmd_tx, cdc_cmd_rx) = unbounded_channel();
@@ -291,12 +303,13 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     // CDC-liveness flag: set by the CDC thread, read inline by every dispatch.
     let cdc_connected = Arc::new(AtomicBool::new(true));
 
-    // Writer thread (owns Cache, serializes all mutations).
+    // Writer thread (owns Cache, serializes all mutations). Gets a child of the
+    // subsystem cancel so a subsystem teardown propagates to it.
     let settings_writer = settings.clone();
     let state_view_writer = Arc::clone(&state_view);
     let active_relations_writer = Arc::clone(&active_relations);
     let cancel_writer = cache_cancel.child_token();
-    thread::Builder::new()
+    let writer_handle = thread::Builder::new()
         .name("cache writer".to_owned())
         .spawn_scoped(scope, move || {
             let result = writer_run(
@@ -326,7 +339,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     let active_relations_cdc = Arc::clone(&active_relations);
     let cancel_cdc = cache_cancel.clone();
     let cdc_connected_cdc = Arc::clone(&cdc_connected);
-    thread::Builder::new()
+    let cdc_handle = match thread::Builder::new()
         .name("cdc worker".to_owned())
         .spawn_scoped(scope, move || {
             let result = cdc_run(
@@ -343,11 +356,20 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
                 );
             }
             result
-        })
-        .map_into_report::<CacheError>()
-        .attach_loc("spawning CDC thread")?;
+        }) {
+        Ok(h) => h,
+        Err(e) => {
+            // Writer is already up; tear it down and reap before bailing.
+            cache_cancel.cancel();
+            let _ = writer_handle.join();
+            return Err(e)
+                .map_into_report::<CacheError>()
+                .attach_loc("spawning CDC thread");
+        }
+    };
 
-    let qcache = handle
+    // Remaining fallible setup; on error, tear down both threads and reap.
+    let qcache = match handle
         .block_on(QueryCache::new(
             settings,
             query_tx,
@@ -355,10 +377,21 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
             Arc::clone(&state_view),
             cdc_connected,
         ))
-        .attach_loc("creating query cache")?;
-    qcache
-        .pinned_queries_register(pinned)
-        .attach_loc("registering pinned queries")?;
+        .attach_loc("creating query cache")
+        .and_then(|qcache| {
+            qcache
+                .pinned_queries_register(pinned)
+                .attach_loc("registering pinned queries")?;
+            Ok(qcache)
+        }) {
+        Ok(qcache) => qcache,
+        Err(e) => {
+            cache_cancel.cancel();
+            let _ = writer_handle.join();
+            let _ = cdc_handle.join();
+            return Err(e);
+        }
+    };
 
     // Publish the cache for connection tasks to dispatch against inline.
     qcache_publisher.publish(qcache.clone());
@@ -379,7 +412,140 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         qcache_publisher,
     ));
 
-    Ok(())
+    Ok(vec![writer_handle, cdc_handle])
+}
+
+/// Initial backoff before rebuilding the cache subsystem after a failure.
+const RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+/// Maximum backoff between cache-subsystem restart attempts.
+const RESTART_MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// One generation of the cache subsystem: the cancel token that fires on its
+/// death and the scoped thread handles to reap once it does.
+pub struct CacheGeneration<'scope> {
+    cancel: CancellationToken,
+    handles: Vec<thread::ScopedJoinHandle<'scope, CacheResult<()>>>,
+}
+
+/// Build and publish a cache generation: a fresh cancel (child of root), a fresh
+/// status channel, then [`cache_setup`]. On success the status sender is swapped
+/// in so the admin server reaches the new writer.
+#[allow(clippy::too_many_arguments)]
+pub fn cache_generation_start<'scope, 'env: 'scope, 'settings: 'scope>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    settings: &'settings Settings,
+    handle: Handle,
+    pinned: &[PinnedQuery],
+    root_cancel: &CancellationToken,
+    qcache_updater: &QueryCacheUpdater,
+    status_updater: &StatusSenderUpdater,
+) -> CacheResult<CacheGeneration<'scope>> {
+    let cancel = root_cancel.child_token();
+    let (status_tx, status_rx) = channel::<StatusRequest>(2);
+    let handles = cache_setup(
+        scope,
+        settings,
+        handle,
+        pinned,
+        cancel.clone(),
+        status_rx,
+        qcache_updater.publisher(),
+    )?;
+    status_updater.sender_update(status_tx);
+    Ok(CacheGeneration { cancel, handles })
+}
+
+/// Supervise a running cache subsystem across restarts. Given the first
+/// generation (built fail-fast during startup, before the proxy accepts), parks
+/// until it dies, reaps it, then rebuilds with exponential backoff — repeating
+/// until root shutdown.
+///
+/// Runs on the proxy thread (it owns the inner `thread::scope` and both watch
+/// updaters). While a generation is down the `QueryCache`/status watches are
+/// cleared, so connections degrade to origin until the next publish.
+#[allow(clippy::too_many_arguments)]
+pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    settings: &'settings Settings,
+    handle: Handle,
+    pinned: &[PinnedQuery],
+    root_cancel: CancellationToken,
+    qcache_updater: &QueryCacheUpdater,
+    status_updater: &StatusSenderUpdater,
+    first: CacheGeneration<'scope>,
+) {
+    let mut generation = first;
+    let mut backoff = RESTART_INITIAL_BACKOFF;
+
+    loop {
+        // Park until this generation dies (or root shutdown, which also cancels
+        // this child token).
+        handle.block_on(generation.cancel.cancelled());
+
+        // Down: degrade connections to origin, then reap the dead generation's
+        // threads before the next DB reset.
+        qcache_updater.clear();
+        status_updater.sender_clear();
+        for h in generation.handles.drain(..) {
+            if let Ok(Err(e)) = h.join() {
+                error!(
+                    "cache thread exited: {}",
+                    error_chain_format(e.current_context()),
+                );
+            }
+        }
+        if root_cancel.is_cancelled() {
+            break;
+        }
+        warn!("cache subsystem exited; restarting");
+
+        // Rebuild with backoff, retrying until a generation comes up or shutdown.
+        generation = loop {
+            let interrupted = handle.block_on(async {
+                tokio::select! {
+                    _ = root_cancel.cancelled() => true,
+                    _ = tokio::time::sleep(backoff) => false,
+                }
+            });
+            if interrupted {
+                qcache_updater.clear();
+                status_updater.sender_clear();
+                debug!("cache supervisor exiting");
+                return;
+            }
+            backoff = (backoff * 2).min(RESTART_MAX_BACKOFF);
+
+            match cache_generation_start(
+                scope,
+                settings,
+                handle.clone(),
+                pinned,
+                &root_cancel,
+                qcache_updater,
+                status_updater,
+            ) {
+                Ok(next_gen) => {
+                    backoff = RESTART_INITIAL_BACKOFF;
+                    crate::metrics::handles().cache.restarts_total.increment(1);
+                    info!("cache subsystem restarted");
+                    break next_gen;
+                }
+                Err(e) => {
+                    error!(
+                        "cache restart failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                    qcache_updater.clear();
+                    status_updater.sender_clear();
+                }
+            }
+        };
+    }
+
+    // Supervisor exiting: ensure connections degrade.
+    qcache_updater.clear();
+    status_updater.sender_clear();
+    debug!("cache supervisor exiting");
 }
 
 /// Cold task that drains coalesced waiters when the writer reports a query

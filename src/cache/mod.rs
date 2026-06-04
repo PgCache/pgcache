@@ -40,7 +40,7 @@ pub use mv::{
     shape_classify,
 };
 pub use query_cache::{QueryCacheHandle, QueryCachePublisher, QueryCacheUpdater};
-pub use runtime::cache_setup;
+pub use runtime::{CacheGeneration, cache_generation_start, cache_supervise};
 pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
 };

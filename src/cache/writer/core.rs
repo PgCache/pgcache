@@ -31,6 +31,46 @@ use super::super::{
 use super::cdc::WriterCdc;
 use super::registration::WriterRegistration;
 
+/// Deterministic fault injection for the restart supervisor: kill the writer on
+/// a sentinel CDC insert so a test can drive a real subsystem death → rebuild.
+/// Compiled out entirely unless built with `--features fault-injection`.
+#[cfg(feature = "fault-injection")]
+pub(crate) mod fault {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A CDC insert carrying this value in any column trips the one-shot.
+    pub(crate) const WRITER_DIE_SENTINEL: &str = "__PGCACHE_WRITER_DIE__";
+
+    static ARMED: AtomicBool = AtomicBool::new(false);
+    static INIT: Once = Once::new();
+
+    /// Arm from the environment, once for the process (first generation).
+    pub(crate) fn init() {
+        INIT.call_once(|| {
+            if std::env::var_os("PGCACHE_FAULT_WRITER_DIE").is_some() {
+                ARMED.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// One-shot: fire when armed and a row carries the sentinel, then disarm so
+    /// the rebuilt generation (and the slot's redelivery of the same insert)
+    /// survives instead of looping.
+    pub(crate) fn writer_die_check(row_data: &[Option<String>]) -> bool {
+        if !ARMED.load(Ordering::Relaxed) {
+            return false;
+        }
+        let hit = row_data
+            .iter()
+            .any(|v| v.as_deref() == Some(WRITER_DIE_SENTINEL));
+        if hit {
+            ARMED.store(false, Ordering::Relaxed);
+        }
+        hit
+    }
+}
+
 /// Preallocated capacity for the per-frame SQL write buffer (PGC-228). Fixed up
 /// front so the buffer never reallocates in steady state; also the byte
 /// threshold at which a frame's writes are chunk-flushed to bound memory.
@@ -986,6 +1026,9 @@ pub fn writer_run(
                 let mut gauges_interval = tokio::time::interval(Duration::from_secs(1));
                 gauges_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+                #[cfg(feature = "fault-injection")]
+                fault::init();
+
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => {
@@ -1020,6 +1063,13 @@ pub fn writer_run(
                         msg = cdc_rx.recv() => {
                             match msg {
                                 Some(cmd) => {
+                                    #[cfg(feature = "fault-injection")]
+                                    if let CdcCommand::Insert { row_data, .. } = &cmd
+                                        && fault::writer_die_check(row_data)
+                                    {
+                                        error!("fault injection: writer exiting on sentinel CDC insert to exercise restart");
+                                        return Err(CacheError::CdcFailure.into());
+                                    }
                                     if let Err(e) =
                                         writer_cdc.cdc_command_handle(&mut core, cmd).await
                                     {

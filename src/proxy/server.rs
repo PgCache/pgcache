@@ -6,20 +6,19 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use rootcause::Report;
 
 use crate::result::{MapIntoReport, ReportExt};
-use tokio::{net::TcpListener, runtime::Builder, sync::mpsc::channel};
+use tokio::{net::TcpListener, runtime::Builder};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
 
-use crate::cache::StatusRequest;
 use crate::metrics::admin_server_spawn;
 
 use super::SharedProxyStatus;
 use crate::{
     cache::query::CacheableQuery,
-    cache::{PinnedQuery, QueryCacheUpdater, cache_setup},
+    cache::{PinnedQuery, QueryCacheUpdater, cache_generation_start, cache_supervise},
     catalog::{FunctionVolatility, function_volatility_map_load},
     pg::{
-        cdc::{replication_cleanup, replication_provision},
+        cdc::replication_cleanup,
         connect,
     },
     query::ast::{query_expr_convert_raw, query_expr_fingerprint},
@@ -154,7 +153,8 @@ pub fn proxy_run(
         .enable_all()
         .build()
         .map_into_report::<ConnectionError>()?;
-    let _ = pre_rt.block_on(async { replication_provision(settings).await });
+    // Replication provisioning now happens per cache generation in `cache_setup`,
+    // so a restart re-establishes a slot the origin lost.
     let func_volatility = pre_rt.block_on(function_volatility_load(settings))?;
     let pinned = pinned_queries_validate(settings, &func_volatility);
     drop(pre_rt);
@@ -169,32 +169,14 @@ pub fn proxy_run(
         .map_into_report::<ConnectionError>()?;
 
     thread::scope(|scope| {
-        // Create status channel for admin HTTP → cache writer communication
-        let (status_tx, status_rx) = channel::<StatusRequest>(2);
+        let rt_handle = rt.handle().clone();
 
-        // The cache publishes a QueryCache that connection tasks dispatch against
-        // inline (no central coordinator channel). The updater is kept alive so
-        // the handle survives; restart hot-swap is deferred for the probe.
+        // The cache publishes a QueryCache and a status sender via watch
+        // channels; connection tasks and the admin server pick them up, and the
+        // supervisor hot-swaps both across cache restarts. They start empty:
+        // connections degrade to origin until the first generation publishes.
         let (qcache_updater, qcache_handle) = QueryCacheUpdater::new();
-        cache_setup(
-            scope,
-            settings,
-            rt.handle().clone(),
-            &pinned,
-            cancel.child_token(),
-            status_rx,
-            qcache_updater.publisher(),
-        )
-        .map_err(|e| {
-            Report::from(ConnectionError::IoError(std::io::Error::other(format!(
-                "cache setup failed: {}",
-                e.current_context()
-            ))))
-        })
-        .attach_loc("setting up cache")?;
-
-        let _qcache_updater = qcache_updater;
-        let (_status_updater, status_sender) = StatusSenderUpdater::new(status_tx);
+        let (status_updater, status_sender) = StatusSenderUpdater::new_pending();
 
         let telemetry_metrics = metrics_handle.clone();
         if let Some(ref m) = settings.metrics {
@@ -214,96 +196,157 @@ pub fn proxy_run(
             .map_into_report::<ConnectionError>()
             .attach_loc("spawning telemetry thread")?;
 
+        // Build the first cache generation fail-fast, before accepting traffic,
+        // so "Listening" implies the cache is up (the supervisor then handles
+        // restarts for later generations). A failure here fails startup.
+        let first_generation = cache_generation_start(
+            scope,
+            settings,
+            rt_handle.clone(),
+            &pinned,
+            &cancel,
+            &qcache_updater,
+            &status_updater,
+        )
+        .map_err(|e| {
+            Report::from(ConnectionError::IoError(std::io::Error::other(format!(
+                "cache setup failed: {}",
+                e.current_context()
+            ))))
+        })
+        .attach_loc("setting up cache")?;
+
         // Origin connection params, resolved once and cloned into each task.
         let ssl_mode = settings.origin.ssl_mode;
         let server_name = EcoString::from(settings.origin.host.as_str());
         let origin_database = EcoString::from(settings.origin.database.as_str());
 
-        debug!("accept loop");
-        rt.block_on(async {
-            // Task-dump on SIGUSR2 (deadlock debugging). Build with
-            // `RUSTFLAGS="--cfg tokio_unstable" cargo build --features taskdump`
-            // (Linux x86_64/aarch64). On signal, logs every tokio task's
-            // suspended-await backtrace — works even when the runtime is wedged,
-            // since SIGUSR2 wakes this task via the io driver.
-            #[cfg(all(feature = "taskdump", tokio_unstable))]
-            {
-                let dump_handle = tokio::runtime::Handle::current();
-                tokio::spawn(async move {
-                    let mut sig = match tokio::signal::unix::signal(
-                        tokio::signal::unix::SignalKind::user_defined2(),
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("taskdump: failed to install SIGUSR2 handler: {e}");
-                            return;
-                        }
-                    };
-                    info!("taskdump: armed — send SIGUSR2 to dump tokio task backtraces");
-                    while sig.recv().await.is_some() {
-                        info!("taskdump: capturing task dump...");
-                        let dump = dump_handle.dump().await;
-                        let count = dump.tasks().iter().count();
-                        for (i, task) in dump.tasks().iter().enumerate() {
-                            info!("taskdump task[{i}] id={}:\n{}", task.id(), task.trace());
-                        }
-                        info!("taskdump: complete ({count} tasks)");
+        // Accept connections on a dedicated scoped thread so the proxy thread is
+        // free to run the cache restart supervisor. Connections dispatch against
+        // the published QueryCache (degrading to origin while it is down), so the
+        // accept loop is independent of cache-subsystem restarts. On exit it
+        // cancels the proxy token so the supervisor unwinds too.
+        let accept_cancel = cancel.clone();
+        let accept_rt = rt_handle.clone();
+        let accept_handle = thread::Builder::new()
+            .name("accept".to_owned())
+            .spawn_scoped(scope, move || {
+                debug!("accept loop");
+                let result = accept_rt.block_on(async {
+                    // Task-dump on SIGUSR2 (deadlock debugging). Build with
+                    // `RUSTFLAGS="--cfg tokio_unstable" cargo build --features taskdump`
+                    // (Linux x86_64/aarch64). On signal, logs every tokio task's
+                    // suspended-await backtrace — works even when the runtime is
+                    // wedged, since SIGUSR2 wakes this task via the io driver.
+                    #[cfg(all(feature = "taskdump", tokio_unstable))]
+                    {
+                        let dump_handle = tokio::runtime::Handle::current();
+                        tokio::spawn(async move {
+                            let mut sig = match tokio::signal::unix::signal(
+                                tokio::signal::unix::SignalKind::user_defined2(),
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    tracing::error!(
+                                        "taskdump: failed to install SIGUSR2 handler: {e}"
+                                    );
+                                    return;
+                                }
+                            };
+                            info!("taskdump: armed — send SIGUSR2 to dump tokio task backtraces");
+                            while sig.recv().await.is_some() {
+                                info!("taskdump: capturing task dump...");
+                                let dump = dump_handle.dump().await;
+                                let count = dump.tasks().iter().count();
+                                for (i, task) in dump.tasks().iter().enumerate() {
+                                    info!("taskdump task[{i}] id={}:\n{}", task.id(), task.trace());
+                                }
+                                info!("taskdump: complete ({count} tasks)");
+                            }
+                        });
                     }
-                });
-            }
 
-            let addrs: Vec<std::net::SocketAddr> =
-                tokio::net::lookup_host((settings.origin.host.as_str(), settings.origin.port))
+                    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((
+                        settings.origin.host.as_str(),
+                        settings.origin.port,
+                    ))
                     .await
                     .map_into_report::<ConnectionError>()
                     .attach_loc("resolving origin host")?
                     .collect();
 
-            let listener = TcpListener::bind(&settings.listen.socket)
-                .await
-                .map_err(|e| {
-                    Report::from(ConnectionError::IoError(std::io::Error::other(format!(
-                        "bind error [{}] {e}",
-                        &settings.listen.socket
-                    ))))
-                })?;
-            info!("Listening to {}", &settings.listen.socket);
-
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        info!("proxy shutdown signal received");
-                        break;
-                    }
-                    result = listener.accept() => {
-                        let (socket, _) = result.map_err(|e| {
+                    let listener = TcpListener::bind(&settings.listen.socket)
+                        .await
+                        .map_err(|e| {
                             Report::from(ConnectionError::IoError(std::io::Error::other(format!(
-                                "accept error: {e}"
+                                "bind error [{}] {e}",
+                                &settings.listen.socket
                             ))))
                         })?;
-                        let _ = socket.set_nodelay(true);
-                        crate::metrics::handles().conn.total.increment(1);
-                        debug!("socket accepted");
+                    info!("Listening to {}", &settings.listen.socket);
 
-                        tokio::spawn(connection_task(
-                            socket,
-                            addrs.clone(),
-                            ssl_mode,
-                            server_name.clone(),
-                            qcache_handle.clone(),
-                            tls_acceptor.clone(),
-                            Arc::clone(&func_volatility),
-                            origin_database.clone(),
-                        ));
+                    loop {
+                        tokio::select! {
+                            _ = accept_cancel.cancelled() => {
+                                info!("proxy shutdown signal received");
+                                break;
+                            }
+                            result = listener.accept() => {
+                                let (socket, _) = result.map_err(|e| {
+                                    Report::from(ConnectionError::IoError(std::io::Error::other(
+                                        format!("accept error: {e}"),
+                                    )))
+                                })?;
+                                let _ = socket.set_nodelay(true);
+                                crate::metrics::handles().conn.total.increment(1);
+                                debug!("socket accepted");
+
+                                tokio::spawn(connection_task(
+                                    socket,
+                                    addrs.clone(),
+                                    ssl_mode,
+                                    server_name.clone(),
+                                    qcache_handle.clone(),
+                                    tls_acceptor.clone(),
+                                    Arc::clone(&func_volatility),
+                                    origin_database.clone(),
+                                ));
+                            }
+                        }
                     }
-                }
-            }
 
-            replication_cleanup(settings)
-                .await
-                .map_err(|r| r.context_transform(ConnectionError::CdcError))
-                .attach_loc("cleaning up replication")?;
-            Ok(())
+                    replication_cleanup(settings)
+                        .await
+                        .map_err(|r| r.context_transform(ConnectionError::CdcError))
+                        .attach_loc("cleaning up replication")?;
+                    Ok(())
+                });
+                // Whether the accept loop stopped on shutdown or a startup error,
+                // cancel the proxy token so the supervisor unwinds and the proxy
+                // exits rather than restarting the cache forever against a dead
+                // accept loop.
+                accept_cancel.cancel();
+                result
+            })
+            .map_into_report::<ConnectionError>()
+            .attach_loc("spawning accept thread")?;
+
+        // Supervise the cache subsystem on the proxy thread: build a generation,
+        // wait for it to die, reap it, rebuild after backoff — until shutdown.
+        cache_supervise(
+            scope,
+            settings,
+            rt_handle,
+            &pinned,
+            cancel,
+            &qcache_updater,
+            &status_updater,
+            first_generation,
+        );
+
+        // Shutdown: drain the accept loop and surface its result.
+        accept_handle.join().unwrap_or_else(|_panic| {
+            Err(ConnectionError::IoError(std::io::Error::other("accept thread panicked")).into())
         })
     })
 }

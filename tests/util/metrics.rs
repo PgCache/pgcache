@@ -24,6 +24,7 @@ pub struct MetricsSnapshot {
     pub cache_invalidations: u64,
     pub cache_readmissions: u64,
     pub cache_coalesce_served: u64,
+    pub cache_restarts_total: u64,
     pub cache_mv_hits: u64,
     pub cache_mv_fallthrough: u64,
     pub cache_mv_rebuilds: u64,
@@ -78,6 +79,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut cache_invalidations = 0u64;
     let mut cache_readmissions = 0u64;
     let mut cache_coalesce_served = 0u64;
+    let mut cache_restarts_total = 0u64;
     let mut cache_mv_hits = 0u64;
     let mut cache_mv_fallthrough = 0u64;
     let mut cache_mv_rebuilds = 0u64;
@@ -116,6 +118,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_cache_invalidations" => cache_invalidations = value,
                 "pgcache_cache_readmissions" => cache_readmissions = value,
                 "pgcache_cache_coalesce_served" => cache_coalesce_served = value,
+                "pgcache_cache_restarts_total" => cache_restarts_total = value,
                 "pgcache_cache_mv_hits" => cache_mv_hits = value,
                 "pgcache_cache_mv_fallthrough" => cache_mv_fallthrough = value,
                 "pgcache_cache_mv_rebuilds" => cache_mv_rebuilds = value,
@@ -164,6 +167,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         cache_invalidations,
         cache_readmissions,
         cache_coalesce_served,
+        cache_restarts_total,
         cache_mv_hits,
         cache_mv_fallthrough,
         cache_mv_rebuilds,
@@ -198,6 +202,7 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         cache_invalidations: after.cache_invalidations - before.cache_invalidations,
         cache_readmissions: after.cache_readmissions - before.cache_readmissions,
         cache_coalesce_served: after.cache_coalesce_served - before.cache_coalesce_served,
+        cache_restarts_total: after.cache_restarts_total - before.cache_restarts_total,
         cache_mv_hits: after.cache_mv_hits - before.cache_mv_hits,
         cache_mv_fallthrough: after.cache_mv_fallthrough - before.cache_mv_fallthrough,
         cache_mv_rebuilds: after.cache_mv_rebuilds - before.cache_mv_rebuilds,
