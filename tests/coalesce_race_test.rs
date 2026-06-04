@@ -23,8 +23,7 @@ mod util;
 /// Built without the feature this is a plain concurrent-coalescing smoke test.
 #[tokio::test]
 async fn test_coalesce_enqueue_drain_race() -> Result<(), Error> {
-    let mut ctx =
-        TestContext::setup_fault(&[("PGCACHE_FAULT_COALESCE_DELAY", "1")]).await?;
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_COALESCE_DELAY", "1")]).await?;
 
     ctx.query(
         "CREATE TABLE race_test (id INTEGER PRIMARY KEY, data TEXT)",

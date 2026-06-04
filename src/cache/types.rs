@@ -420,13 +420,6 @@ impl QueryMetrics {
     }
 }
 
-/// Metrics sent from worker to coordinator after each cache hit.
-pub struct WorkerMetrics {
-    pub fingerprint: u64,
-    pub latency_us: u64,
-    pub bytes_served: u64,
-}
-
 /// Shared cache state for coordinator lookups and writer updates.
 /// Uses DashMap for per-shard locking — reads to one shard don't block
 /// writes to another, eliminating the global RwLock bottleneck.

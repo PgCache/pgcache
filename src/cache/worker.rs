@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -24,6 +24,10 @@ use super::{
     types::CacheStateView,
     write_queue::WriteQueue,
 };
+
+/// Max gap between cache-DB frames while draining a response for a departed
+/// primary client before the connection is treated as stalled and discarded.
+const DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Outcome of a coalesced client's write task.
 pub enum CoalescedOutcome {
@@ -549,18 +553,29 @@ pub async fn handle_cached_query(
                         trace!("net: cache→client flush (serve, partial write, {} bytes)", cnt);
                     }
                     Err(_) => {
-                        // Client went away mid-serve. The cache-DB connection is
-                        // healthy — do NOT poison it. Stop relaying, fail any
-                        // coalesced waiters, and keep reading the cache-DB
-                        // response to completion so the connection returns to the
-                        // pool protocol-clean (avoids serve-pool exhaustion).
-                        debug!("client write failed mid-serve; draining cache-DB response to preserve pooled connection");
+                        // Primary client went away mid-serve. The cache-DB
+                        // connection is healthy — do NOT poison it. Stop relaying
+                        // to the primary but keep reading (and broadcasting) the
+                        // rest of the response: coalesced waiters are independent
+                        // and must still be served. Draining to completion also
+                        // returns the connection to the pool protocol-clean
+                        // (avoids serve-pool exhaustion).
+                        debug!("primary client write failed mid-serve; draining cache-DB response, coalesced waiters still served");
                         client_gone = true;
-                        if let Some(bc) = broadcast.take() {
-                            broadcast_error_reply(bc).await;
-                        }
                     }
                 }
+            }
+            // Bound the drain: if the cache-DB goes silent while we're draining
+            // for a departed primary, the connection is mid-response and unsafe
+            // to reuse. Discard it (poison) rather than hold a pool slot forever
+            // (PGC-238 replenish heals the pool).
+            _ = tokio::time::sleep(DRAIN_STALL_TIMEOUT), if client_gone => {
+                debug!("cache-DB stalled while draining for departed client; discarding connection");
+                guard.poisoned = true;
+                if let Some(bc) = broadcast.take() {
+                    broadcast_error_reply(bc).await;
+                }
+                return Err(CacheError::Write.into());
             }
         }
 
@@ -593,12 +608,6 @@ pub async fn handle_cached_query(
         return Err(e);
     }
 
-    // Client departed mid-serve: the connection has been drained and returned to
-    // the pool. Surface the write error without further client I/O.
-    if client_gone {
-        return Err(CacheError::Write.into());
-    }
-
     // Simple-query clients always terminate with ReadyForQuery; extended clients
     // do when their trailing Execute carried the Sync.
     if query_type == QueryType::Simple || emit_rfq {
@@ -615,7 +624,9 @@ pub async fn handle_cached_query(
         None => vec![],
     };
 
-    if !write_queue.is_empty() {
+    // The primary socket is dead when client_gone; its buffered reply is moot.
+    // Coalesced waiters were served via the broadcast above.
+    if !client_gone && !write_queue.is_empty() {
         trace!(
             "net: cache→client final flush (serve, {} bytes remaining)",
             write_queue.remaining()
@@ -665,20 +676,15 @@ mod tests {
 
         // Integer binds its decimal value (negatives included) with no alloc.
         assert_eq!(
-            limit_bind_text(
-                Some(&LiteralValue::Integer(5)),
-                &mut itoa_buf,
-                &mut other
-            ),
+            limit_bind_text(Some(&LiteralValue::Integer(5)), &mut itoa_buf, &mut other),
             Some("5")
         );
-        assert!(other.is_empty(), "integer path must not touch the heap buffer");
+        assert!(
+            other.is_empty(),
+            "integer path must not touch the heap buffer"
+        );
         assert_eq!(
-            limit_bind_text(
-                Some(&LiteralValue::Integer(-2)),
-                &mut itoa_buf,
-                &mut other
-            ),
+            limit_bind_text(Some(&LiteralValue::Integer(-2)), &mut itoa_buf, &mut other),
             Some("-2")
         );
 
@@ -686,9 +692,8 @@ mod tests {
         // would bind NULL and silently drop the limit, returning every row). It
         // binds text that fails int8 coercion on the cache DB, erroring that hit
         // so it forwards to origin.
-        let float = LiteralValue::Float(
-            ordered_float::NotNan::new(3.7).expect("non-NaN test value"),
-        );
+        let float =
+            LiteralValue::Float(ordered_float::NotNan::new(3.7).expect("non-NaN test value"));
         let bound = limit_bind_text(Some(&float), &mut itoa_buf, &mut other);
         assert!(bound.is_some(), "non-integer limit must bind, not drop");
     }

@@ -17,15 +17,12 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{
     cache::{
-        CacheError, CacheFastPath, CacheFastPathPublisher, CacheResult, MapIntoReport,
-        PinnedQuery, ReportExt, StatusRequest,
+        CacheError, CacheResult, MapIntoReport, PinnedQuery, QueryCachePublisher, ReportExt,
+        StatusRequest,
         cdc::CdcProcessor,
-        messages::{
-            CacheOutcome, CacheReply, CdcCommand, CdcSignal, ProxyMessage, QueryCommand,
-            WriterNotify,
-        },
-        query_cache::{QueryCache, QueryRequest, WorkerRequest, reply_forward},
-        types::{ActiveRelations, CacheStateView, WorkerMetrics},
+        messages::{CacheOutcome, CacheReply, CdcCommand, WriterNotify},
+        query_cache::{QueryCache, WorkerRequest},
+        types::{ActiveRelations, CacheStateView},
         worker::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
         writer::writer_run,
     },
@@ -38,48 +35,12 @@ use crate::{
 /// Minimum number of connections in the cache worker pool.
 const MIN_POOL_SIZE: usize = 4;
 
-/// Handles a proxy message by converting it to a query request and dispatching it
-async fn handle_proxy_message(qcache: &mut QueryCache, proxy_msg: ProxyMessage) {
-    match proxy_msg.message.into_query_data() {
-        Ok(query_data) => {
-            let request = QueryRequest {
-                query_type: query_data.query_type,
-                data: query_data.data,
-                cacheable_query: query_data.cacheable_query,
-                result_formats: query_data.result_formats,
-                client_socket: proxy_msg.client_socket,
-                reply_tx: proxy_msg.reply_tx,
-                search_path: proxy_msg.search_path,
-                timing: proxy_msg.timing,
-                pipeline: proxy_msg.pipeline,
-            };
-            if let Err(e) = qcache.query_dispatch(request).await {
-                error!(
-                    "query dispatch failed: {}",
-                    error_chain_format(e.current_context()),
-                );
-            }
-        }
-        Err((e, data)) => {
-            debug!("forwarding to origin due to parameter conversion error: {e}");
-            let _ = reply_forward(
-                proxy_msg.reply_tx,
-                proxy_msg.client_socket,
-                proxy_msg.pipeline,
-                data,
-                proxy_msg.timing,
-            );
-        }
-    }
-}
-
 /// Handles a worker request by executing the query and sending the reply.
 /// Sends replies for both the primary client and any coalesced clients.
 async fn handle_worker_request(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     mut msg: WorkerRequest,
-    worker_metrics_tx: UnboundedSender<WorkerMetrics>,
     state_view: Arc<CacheStateView>,
 ) {
     debug!("cache worker task spawn");
@@ -93,11 +54,13 @@ async fn handle_worker_request(
                 .worker_start_at
                 .map(|s| duration_to_us_u64(s.elapsed()))
                 .unwrap_or(0);
-            let _ = worker_metrics_tx.send(WorkerMetrics {
-                fingerprint: msg.fingerprint,
+            // Record directly in the shared view (no coordinator hop).
+            worker_metrics_record(
+                &state_view,
+                msg.fingerprint,
                 latency_us,
-                bytes_served: bytes_served as u64,
-            });
+                bytes_served as u64,
+            );
 
             // Send replies to coalesced clients, returning each leased socket.
             for outcome in coalesced_outcomes {
@@ -304,11 +267,10 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     scope: &'scope thread::Scope<'scope, 'env>,
     settings: &'settings Settings,
     handle: Handle,
-    cache_rx: Receiver<ProxyMessage>,
     pinned: &[PinnedQuery],
     cancel: CancellationToken,
     status_rx: Receiver<StatusRequest>,
-    fast_publisher: CacheFastPathPublisher,
+    qcache_publisher: QueryCachePublisher,
 ) -> CacheResult<()> {
     cache_database_reset(settings).attach_loc("resetting cache database")?;
 
@@ -316,17 +278,18 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     let active_relations: ActiveRelations =
         Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
 
-    // Cache-subsystem cancel (child of the root). Coordinator and worker share
-    // it so either can tear down the subsystem; writer/cdc get children so a
-    // subsystem cancel propagates to them.
+    // Cache-subsystem cancel (child of the root). The coalesce-drain task and
+    // worker share it so either can tear down the subsystem; writer/cdc get
+    // children so a subsystem cancel propagates to them.
     let cache_cancel = cancel.child_token();
 
     let (query_tx, query_rx) = unbounded_channel();
     let (cdc_cmd_tx, cdc_cmd_rx) = unbounded_channel();
-    let (worker_metrics_tx, worker_metrics_rx) = unbounded_channel::<WorkerMetrics>();
     let (notify_tx, notify_rx) = unbounded_channel::<WriterNotify>();
     let (worker_tx, worker_rx) = unbounded_channel();
-    let (cdc_signal_tx, cdc_signal_rx) = unbounded_channel::<CdcSignal>();
+
+    // CDC-liveness flag: set by the CDC thread, read inline by every dispatch.
+    let cdc_connected = Arc::new(AtomicBool::new(true));
 
     // Writer thread (owns Cache, serializes all mutations).
     let settings_writer = settings.clone();
@@ -357,9 +320,12 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         .map_into_report::<CacheError>()
         .attach_loc("spawning writer thread")?;
 
-    // CDC thread (sends CdcCommand to writer, signals coordinator).
+    // CDC thread (sends CdcCommand to writer, sets the cdc_connected flag).
+    // Holds the subsystem cancel (not a child) so a fatal CDC error tears down
+    // the whole cache subsystem.
     let active_relations_cdc = Arc::clone(&active_relations);
-    let cancel_cdc = cache_cancel.child_token();
+    let cancel_cdc = cache_cancel.clone();
+    let cdc_connected_cdc = Arc::clone(&cdc_connected);
     thread::Builder::new()
         .name("cdc worker".to_owned())
         .spawn_scoped(scope, move || {
@@ -368,7 +334,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
                 cdc_cmd_tx,
                 active_relations_cdc,
                 cancel_cdc,
-                cdc_signal_tx,
+                cdc_connected_cdc,
             );
             if let Err(ref e) = result {
                 error!(
@@ -381,127 +347,56 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         .map_into_report::<CacheError>()
         .attach_loc("spawning CDC thread")?;
 
-    let cdc_connected = Arc::new(AtomicBool::new(true));
-
     let qcache = handle
         .block_on(QueryCache::new(
             settings,
-            query_tx.clone(),
-            worker_tx.clone(),
+            query_tx,
+            worker_tx,
             Arc::clone(&state_view),
+            cdc_connected,
         ))
         .attach_loc("creating query cache")?;
     qcache
         .pinned_queries_register(pinned)
         .attach_loc("registering pinned queries")?;
 
-    fast_publisher.publish(CacheFastPath {
-        state_view: Arc::clone(&state_view),
-        worker_tx,
-        dynamic: settings.dynamic.clone(),
-        cdc_connected: Arc::clone(&cdc_connected),
-    });
+    // Publish the cache for connection tasks to dispatch against inline.
+    qcache_publisher.publish(qcache.clone());
 
-    // Worker dispatcher + coordinator as tasks on the shared runtime. Serve
-    // tasks they spawn spread across all runtime threads.
+    // Worker dispatcher serves cache queries (spread across runtime threads);
+    // the coalesce-drain task dispatches coalesced waiters when the writer
+    // reports a query Ready/Failed. There is no central dispatch coordinator.
     handle.spawn(worker_loop(
         settings.clone(),
         worker_rx,
-        worker_metrics_tx,
         cache_cancel.clone(),
         Arc::clone(&state_view),
     ));
-    handle.spawn(coordinator_loop(
+    handle.spawn(coalesce_drain(
         qcache,
-        cache_rx,
-        cdc_signal_rx,
-        worker_metrics_rx,
         notify_rx,
-        query_tx,
-        Arc::clone(&state_view),
-        cdc_connected,
         cache_cancel,
-        fast_publisher,
+        qcache_publisher,
     ));
 
     Ok(())
 }
 
-/// Coordinator task: routes non-fast-path queries, applies CDC-liveness
-/// gating, records worker metrics, and drains coalesced waiters. Runs on the
-/// shared runtime; dispatches `handle_proxy_message` via `tokio::spawn`.
-#[allow(clippy::too_many_arguments)]
-async fn coordinator_loop(
+/// Cold task that drains coalesced waiters when the writer reports a query
+/// `Ready`/`Failed`. Off the dispatch hot path (fires once per registration
+/// completion, not per query). Retracts the published cache on exit.
+async fn coalesce_drain(
     qcache: QueryCache,
-    mut cache_rx: Receiver<ProxyMessage>,
-    mut cdc_signal_rx: UnboundedReceiver<CdcSignal>,
-    mut worker_metrics_rx: UnboundedReceiver<WorkerMetrics>,
     mut notify_rx: UnboundedReceiver<WriterNotify>,
-    query_tx: UnboundedSender<QueryCommand>,
-    state_view: Arc<CacheStateView>,
-    cdc_connected: Arc<AtomicBool>,
     cancel: CancellationToken,
-    fast_publisher: CacheFastPathPublisher,
+    qcache_publisher: QueryCachePublisher,
 ) {
-    debug!("cache coordinator loop");
+    debug!("coalesce drain loop");
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
-                debug!("cache coordinator shutdown signal received");
+                debug!("coalesce drain shutdown signal received");
                 break;
-            }
-            _ = query_tx.closed() => {
-                error!("writer thread exited unexpectedly");
-                cancel.cancel();
-                break;
-            }
-            signal = cdc_signal_rx.recv() => {
-                match signal {
-                    Some(CdcSignal::Disconnected { last_flushed_lsn }) => {
-                        warn!("CDC disconnected (last_flushed_lsn: {last_flushed_lsn}), forwarding queries to origin");
-                        cdc_connected.store(false, Ordering::Relaxed);
-                    }
-                    Some(CdcSignal::Reconnected) => {
-                        debug!("CDC reconnected, resuming cache dispatch");
-                        cdc_connected.store(true, Ordering::Relaxed);
-                    }
-                    Some(CdcSignal::Fatal) | None => {
-                        error!("CDC fatal error or thread exited");
-                        cancel.cancel();
-                        break;
-                    }
-                }
-            }
-            msg = cache_rx.recv() => {
-                match msg {
-                    Some(proxy_msg) => {
-                        if cdc_connected.load(Ordering::Relaxed) {
-                            let mut qcache = qcache.clone();
-                            tokio::spawn(async move {
-                                handle_proxy_message(&mut qcache, proxy_msg).await;
-                            });
-                        } else {
-                            // CDC is down; forward to origin to avoid serving stale data
-                            let data = proxy_msg.message.into_data();
-                            let _ = reply_forward(
-                                proxy_msg.reply_tx,
-                                proxy_msg.client_socket,
-                                proxy_msg.pipeline,
-                                data,
-                                proxy_msg.timing,
-                            );
-                        }
-                    }
-                    None => {
-                        debug!("proxy channel closed");
-                        break;
-                    }
-                }
-            }
-            msg = worker_metrics_rx.recv() => {
-                if let Some(wm) = msg {
-                    worker_metrics_record(&state_view, wm);
-                }
             }
             notify = notify_rx.recv() => {
                 match notify {
@@ -519,22 +414,22 @@ async fn coordinator_loop(
                 }
             }
         }
-
-        // Channel depth gauge; queue length never approaches 2^53.
-        #[allow(clippy::cast_precision_loss)]
-        crate::metrics::handles().state.queue_proxy_message
-            .set(cache_rx.len() as f64);
     }
 
-    debug!("cache coordinator loop exiting");
-    fast_publisher.clear();
+    debug!("coalesce drain loop exiting");
+    qcache_publisher.clear();
 }
 
 /// Record worker-reported metrics (cache-hit latency, bytes served).
-fn worker_metrics_record(state_view: &CacheStateView, wm: WorkerMetrics) {
-    if let Some(mut m) = state_view.metrics.get_mut(&wm.fingerprint) {
-        m.total_bytes_served += wm.bytes_served;
-        m.cache_hit_latency.saturating_record(wm.latency_us);
+fn worker_metrics_record(
+    state_view: &CacheStateView,
+    fingerprint: u64,
+    latency_us: u64,
+    bytes_served: u64,
+) {
+    if let Some(mut m) = state_view.metrics.get_mut(&fingerprint) {
+        m.total_bytes_served += bytes_served;
+        m.cache_hit_latency.saturating_record(latency_us);
     }
 }
 
@@ -544,7 +439,6 @@ fn worker_metrics_record(state_view: &CacheStateView, wm: WorkerMetrics) {
 async fn worker_loop(
     settings: Settings,
     mut worker_rx: UnboundedReceiver<WorkerRequest>,
-    worker_metrics_tx: UnboundedSender<WorkerMetrics>,
     cancel: CancellationToken,
     state_view: Arc<CacheStateView>,
 ) {
@@ -591,10 +485,9 @@ async fn worker_loop(
 
         // Spawn the serve (request + connection) onto the shared runtime.
         let return_tx = conn_tx.clone();
-        let metrics_tx = worker_metrics_tx.clone();
         let state_view = Arc::clone(&state_view);
         tokio::spawn(async move {
-            handle_worker_request(conn, return_tx, msg, metrics_tx, state_view).await;
+            handle_worker_request(conn, return_tx, msg, state_view).await;
         });
 
         // Channel depth gauge; queue length never approaches 2^53.
@@ -624,7 +517,7 @@ fn cdc_run(
     cdc_tx: UnboundedSender<CdcCommand>,
     active_relations: ActiveRelations,
     cancel: CancellationToken,
-    signal_tx: UnboundedSender<CdcSignal>,
+    cdc_connected: Arc<AtomicBool>,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -660,15 +553,8 @@ fn cdc_run(
                 ),
             }
 
-            // Signal coordinator to forward all queries to origin
-            if signal_tx
-                .send(CdcSignal::Disconnected {
-                    last_flushed_lsn: saved_lsn,
-                })
-                .is_err()
-            {
-                return Err(CacheError::CdcFailure.into());
-            }
+            // Forward all queries to origin while disconnected.
+            cdc_connected.store(false, Ordering::Relaxed);
 
             // Reconnect loop with exponential backoff
             let mut backoff = CDC_INITIAL_BACKOFF;
@@ -692,14 +578,14 @@ fn cdc_run(
                             error!(
                                 "slot advanced past our position: saved={saved_lsn}, confirmed={confirmed_lsn}"
                             );
-                            let _ = signal_tx.send(CdcSignal::Fatal);
+                            cancel.cancel();
                             return Err(CacheError::CdcFailure.into());
                         }
                         debug!("slot LSN verified: confirmed={confirmed_lsn}, saved={saved_lsn}");
                     }
                     Ok(None) => {
                         error!("replication slot no longer exists");
-                        let _ = signal_tx.send(CdcSignal::Fatal);
+                        cancel.cancel();
                         return Err(CacheError::CdcFailure.into());
                     }
                     Err(e) => {
@@ -723,9 +609,7 @@ fn cdc_run(
                     Ok(new_cdc) => {
                         cdc = new_cdc;
                         debug!("CDC reconnected");
-                        if signal_tx.send(CdcSignal::Reconnected).is_err() {
-                            return Err(CacheError::CdcFailure.into());
-                        }
+                        cdc_connected.store(true, Ordering::Relaxed);
                         break; // Back to outer loop to run the stream
                     }
                     Err(e) => {

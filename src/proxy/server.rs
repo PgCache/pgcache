@@ -13,13 +13,10 @@ use tracing::{debug, info, trace};
 use crate::cache::StatusRequest;
 use crate::metrics::admin_server_spawn;
 
-/// Minimum buffer size for the proxy→cache command channel.
-const MIN_CHANNEL_SIZE: usize = 100;
-
 use super::SharedProxyStatus;
 use crate::{
     cache::query::CacheableQuery,
-    cache::{CacheFastPathUpdater, PinnedQuery, cache_setup},
+    cache::{PinnedQuery, QueryCacheUpdater, cache_setup},
     catalog::{FunctionVolatility, function_volatility_map_load},
     pg::{
         cdc::{replication_cleanup, replication_provision},
@@ -30,9 +27,7 @@ use crate::{
     telemetry, tls,
 };
 
-use super::{
-    CacheSenderUpdater, ConnectionError, ConnectionResult, StatusSenderUpdater, connection_task,
-};
+use super::{ConnectionError, ConnectionResult, StatusSenderUpdater, connection_task};
 
 fn tls_config_load(settings: &Settings) -> ConnectionResult<Option<Arc<tls::TlsAcceptor>>> {
     match (&settings.tls_cert, &settings.tls_key) {
@@ -177,19 +172,18 @@ pub fn proxy_run(
         // Create status channel for admin HTTP → cache writer communication
         let (status_tx, status_rx) = channel::<StatusRequest>(2);
 
-        let channel_size = (settings.num_workers * 50).max(MIN_CHANNEL_SIZE);
-        let (cache_tx, cache_rx) = channel(channel_size);
-
-        let (fast_updater, fast_path) = CacheFastPathUpdater::new();
+        // The cache publishes a QueryCache that connection tasks dispatch against
+        // inline (no central coordinator channel). The updater is kept alive so
+        // the handle survives; restart hot-swap is deferred for the probe.
+        let (qcache_updater, qcache_handle) = QueryCacheUpdater::new();
         cache_setup(
             scope,
             settings,
             rt.handle().clone(),
-            cache_rx,
             &pinned,
             cancel.child_token(),
             status_rx,
-            fast_updater.publisher(),
+            qcache_updater.publisher(),
         )
         .map_err(|e| {
             Report::from(ConnectionError::IoError(std::io::Error::other(format!(
@@ -199,9 +193,7 @@ pub fn proxy_run(
         })
         .attach_loc("setting up cache")?;
 
-        // Keep the updaters alive (restart hot-swap is deferred for the probe);
-        // connections hold subscriber handles.
-        let (_cache_updater, cache_sender) = CacheSenderUpdater::new(cache_tx);
+        let _qcache_updater = qcache_updater;
         let (_status_updater, status_sender) = StatusSenderUpdater::new(status_tx);
 
         let telemetry_metrics = metrics_handle.clone();
@@ -298,8 +290,7 @@ pub fn proxy_run(
                             addrs.clone(),
                             ssl_mode,
                             server_name.clone(),
-                            cache_sender.clone(),
-                            fast_path.clone(),
+                            qcache_handle.clone(),
                             tls_acceptor.clone(),
                             Arc::clone(&func_volatility),
                             origin_database.clone(),

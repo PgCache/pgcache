@@ -44,8 +44,7 @@ impl TestContext {
     /// the pgcache process (requires the binary built with `fault-injection`).
     pub async fn setup_fault(env: &[(&str, &str)]) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
-        let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_fault(&dbs, env).await?;
+        let (pgcache, cache_port, metrics_port, cache) = connect_pgcache_fault(&dbs, env).await?;
         Ok(Self {
             dbs,
             pgcache,

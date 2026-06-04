@@ -15,12 +15,7 @@ use ecow::EcoString;
 use crate::catalog::FunctionVolatility;
 
 use rootcause::Report;
-use tokio::{
-    io::AsyncWriteExt,
-    net::TcpStream,
-    select,
-    sync::oneshot,
-};
+use tokio::{io::AsyncWriteExt, net::TcpStream, select, sync::oneshot};
 use tokio_stream::StreamExt;
 use tokio_util::{
     bytes::{Buf, BufMut, Bytes, BytesMut},
@@ -30,7 +25,7 @@ use tracing::{debug, error, instrument, trace, warn};
 
 use crate::{
     cache::{
-        CacheFastPathHandle, CacheMessage, CacheOutcome, CacheReply, ProxyMessage, QueryParameters,
+        CacheMessage, CacheOutcome, CacheReply, ProxyMessage, QueryCacheHandle, QueryParameters,
         messages::{PipelineContext, PipelineDescribe},
         query::CacheableQuery,
     },
@@ -63,7 +58,7 @@ use super::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
 use super::query::{Action, ForwardReason, handle_query};
 use super::search_path::{SearchPath, search_path_mutations_raw};
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
-use super::{CacheSender, ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
+use super::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::result::ReportExt;
 
 /// Guard that decrements active connections gauge when dropped.
@@ -2279,8 +2274,7 @@ async fn handle_connection(
     addrs: Vec<SocketAddr>,
     ssl_mode: SslMode,
     server_name: &str,
-    cache_sender: CacheSender,
-    fast_path: CacheFastPathHandle,
+    qcache: QueryCacheHandle,
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
 ) -> ConnectionResult<()> {
@@ -2375,22 +2369,16 @@ async fn handle_connection(
                     pipeline: state.extended.pipeline_take(),
                 };
 
-                // Hop-1 fast path: serve a clean hit inline (skip the coordinator
-                // thread) when the cache is up. Anything else returns the message
-                // for the coordinator to handle, identical to before.
-                let send_result = match fast_path.current() {
-                    Some(fp) => match fp.hit_dispatch_try(proxy_msg) {
-                        Ok(()) => Ok(()),
-                        Err(proxy_msg) => cache_sender.send(proxy_msg).await,
-                    },
-                    None => cache_sender.send(proxy_msg).await,
-                };
-
-                match send_result {
-                    Ok(()) => {
-                        // The write half is now with the worker. Await the reply,
-                        // which returns it; origin messages buffer in egress
+                // Inline dispatch: the connection dispatches against the shared
+                // QueryCache directly (no coordinator hop). A hit goes straight to
+                // the worker, a miss/coalesce/registration is handled inline; the
+                // reply (and the leased write half) comes back via `reply_rx`.
+                match qcache.current() {
+                    Some(mut qc) => {
+                        // The write half is now leased into the dispatch. Await the
+                        // reply, which returns it; origin messages buffer in egress
                         // meanwhile and flush once we are back in `Read`.
+                        qc.dispatch_proxy(proxy_msg).await;
                         match state
                             .cache_serve_wait(&mut origin_framed_read, &mut origin_write, reply_rx)
                             .await
@@ -2407,12 +2395,11 @@ async fn handle_connection(
                             }
                         }
                     }
-                    Err(e) => {
+                    None => {
                         // Cache is unavailable: recover the leased write half and
                         // fall back to proxying directly to origin.
                         debug!("cache unavailable");
                         state.proxy_status = ProxyStatus::Degraded;
-                        let proxy_msg = e.into_message();
                         socket = proxy_msg.client_socket;
                         // The cache slot is now serving (message already taken);
                         // forward this entry (lazy-Parsing if origin doesn't know
@@ -2454,8 +2441,7 @@ pub async fn connection_task(
     addrs: Vec<SocketAddr>,
     ssl_mode: SslMode,
     server_name: EcoString,
-    cache_sender: CacheSender,
-    fast_path: CacheFastPathHandle,
+    qcache: QueryCacheHandle,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
@@ -2481,8 +2467,7 @@ pub async fn connection_task(
         addrs,
         ssl_mode,
         &server_name,
-        cache_sender,
-        fast_path,
+        qcache,
         func_volatility,
         origin_database,
     )

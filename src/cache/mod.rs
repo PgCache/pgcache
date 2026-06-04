@@ -31,9 +31,6 @@ mod write_queue;
 mod writer;
 
 // Re-export public types
-pub use fast_path::{
-    CacheFastPath, CacheFastPathHandle, CacheFastPathPublisher, CacheFastPathUpdater,
-};
 pub use messages::{
     CacheMessage, CacheOutcome, CacheReply, DataStreamState, ProxyMessage, QueryParameter,
     QueryParameters,
@@ -42,6 +39,7 @@ pub use mv::{
     MvMeta, MvServe, MvState, ShapeGate, mv_serve_sql_into, mv_state_initial, mv_table_name,
     shape_classify,
 };
+pub use query_cache::{QueryCacheHandle, QueryCachePublisher, QueryCacheUpdater};
 pub use runtime::cache_setup;
 pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,

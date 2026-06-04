@@ -7,9 +7,7 @@ pub mod search_path;
 mod server;
 mod tls_stream;
 
-pub use cache_sender::{
-    CacheSendError, CacheSender, CacheSenderUpdater, StatusSender, StatusSenderUpdater,
-};
+pub use cache_sender::{StatusSender, StatusSenderUpdater};
 
 pub use client_stream::{ClientSocket, OwnedClientReadHalf};
 

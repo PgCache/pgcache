@@ -144,9 +144,10 @@ impl Buf for WriteQueue {
     fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
         let mut filled = 0;
         for i in 0..self.len {
-            let (Some(b), Some(slot)) =
-                (self.inline.get((self.head + i) % INLINE_CAP), dst.get_mut(filled))
-            else {
+            let (Some(b), Some(slot)) = (
+                self.inline.get((self.head + i) % INLINE_CAP),
+                dst.get_mut(filled),
+            ) else {
                 return filled;
             };
             *slot = IoSlice::new(b.chunk());
@@ -291,7 +292,10 @@ mod tests {
             q.advance(1);
             assert!(q.is_empty());
         }
-        assert!(q.spill.is_empty(), "draining stream must not allocate spill");
+        assert!(
+            q.spill.is_empty(),
+            "draining stream must not allocate spill"
+        );
     }
 
     /// Once anything has spilled, new pushes keep going to the spill even after
@@ -309,7 +313,11 @@ mod tests {
         // Free an inline slot, then push again: must still land in spill.
         q.advance(1); // drains inline front (byte 0)
         q.push(Bytes::from(vec![101]));
-        assert_eq!(q.spill.len(), 2, "push must trail into spill, not the freed slot");
+        assert_eq!(
+            q.spill.len(),
+            2,
+            "push must trail into spill, not the freed slot"
+        );
 
         // Remaining bytes drain in strict FIFO: 1..INLINE_CAP, then 100, 101.
         let mut got = Vec::new();

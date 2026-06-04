@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use dashmap::Entry;
+
 use ecow::EcoString;
-use tokio::sync::{mpsc::UnboundedSender, oneshot};
+use tokio::sync::{mpsc::UnboundedSender, oneshot, watch};
 use tokio_util::bytes::BytesMut;
-use tracing::{error, info, instrument, trace};
+use tracing::{debug, error, info, instrument, trace};
 
 use crate::proxy::ClientSocket;
 use crate::query::ast::{LimitClause, query_expr_fingerprint};
@@ -19,8 +21,8 @@ use super::{
     CacheError, CacheResult,
     fast_path::{self, MvDecision, WorkerSendParts},
     messages::{
-        AdmitAction, CacheOutcome, CacheReply, PipelineContext, PipelineDescribe, QueryCommand,
-        SubsumptionResult,
+        AdmitAction, CacheOutcome, CacheReply, PipelineContext, PipelineDescribe, ProxyMessage,
+        QueryCommand, SubsumptionResult,
     },
     mv::{MvMeta, MvServe, ShapeGate},
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
@@ -100,6 +102,75 @@ pub struct CoalescedClient {
 /// Inner key: CoalesceKey grouping requests that share identical response bytes.
 type WaitingQueue = HashMap<u64, HashMap<CoalesceKey, Vec<QueryRequest>>>;
 
+/// Coalescing wait queue with the enqueue/drain ordering invariant encapsulated.
+///
+/// The `Mutex` is private and [`enqueue_if_loading`](Self::enqueue_if_loading) is
+/// the only way to add a waiter — it re-checks the entry state *under the lock*
+/// and refuses to enqueue if the state has advanced. This makes the
+/// orphaned-waiter race unrepresentable: a waiter cannot be added after the
+/// `Ready` drain has run, because the writer sets `Ready` before sending the
+/// notify that drives [`drain`](Self::drain), and that drain removes under the
+/// same lock. Callers therefore cannot skip the re-check or get the
+/// waiting→cached_queries lock ordering wrong.
+pub(super) struct CoalesceQueue {
+    inner: Mutex<WaitingQueue>,
+}
+
+impl CoalesceQueue {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Enqueue `msg` as a coalesced waiter iff `fingerprint` is still `Loading`
+    /// (re-checked under the lock). Returns `Err(msg)` when the state has
+    /// advanced so the caller can re-dispatch against the current state.
+    // The large `Err` payload is intentional: it returns the message by move for
+    // re-dispatch. Boxing would allocate on the (rare) state-advanced path.
+    #[allow(clippy::result_large_err)]
+    fn enqueue_if_loading(
+        &self,
+        state_view: &CacheStateView,
+        fingerprint: u64,
+        key: CoalesceKey,
+        msg: QueryRequest,
+    ) -> Result<(), QueryRequest> {
+        let mut guard = self.inner.lock().expect("lock coalesce queue");
+        let still_loading = state_view.cached_queries.get(&fingerprint).map(|e| e.state)
+            == Some(CachedQueryState::Loading);
+        if !still_loading {
+            return Err(msg);
+        }
+        guard
+            .entry(fingerprint)
+            .or_default()
+            .entry(key)
+            .or_default()
+            .push(msg);
+        Ok(())
+    }
+
+    /// Remove and return all waiter groups for a fingerprint (Ready/Failed drain).
+    fn drain(&self, fingerprint: u64) -> Option<HashMap<CoalesceKey, Vec<QueryRequest>>> {
+        self.inner
+            .lock()
+            .expect("lock coalesce queue")
+            .remove(&fingerprint)
+    }
+
+    /// Total waiters across all groups (gauge).
+    fn waiter_count(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("lock coalesce queue")
+            .values()
+            .flat_map(|groups| groups.values())
+            .map(Vec::len)
+            .sum()
+    }
+}
+
 pub struct QueryRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
@@ -164,7 +235,71 @@ pub struct QueryCache {
     worker_tx: UnboundedSender<WorkerRequest>,
     state_view: Arc<CacheStateView>,
     dynamic: DynamicConfigHandle,
-    waiting: Arc<Mutex<WaitingQueue>>,
+    waiting: Arc<CoalesceQueue>,
+    /// CDC-liveness flag (set by the CDC thread). While CDC is down, queries are
+    /// forwarded to origin rather than served from cache, to avoid stale reads.
+    cdc_connected: Arc<AtomicBool>,
+}
+
+/// Connection-side handle to the current [`QueryCache`]. Hot-swaps across cache
+/// restarts via a `watch` channel; `None` before the cache is ready or while it
+/// is restarting (connections then forward to origin).
+#[derive(Clone)]
+pub struct QueryCacheHandle {
+    rx: watch::Receiver<Option<QueryCache>>,
+}
+
+impl QueryCacheHandle {
+    /// Snapshot the current cache, if it is up. The clone is cheap (channels +
+    /// `Arc`s) and gives the caller an owned `QueryCache` to dispatch against.
+    pub fn current(&self) -> Option<QueryCache> {
+        self.rx.borrow().clone()
+    }
+}
+
+/// Publish handle held by `cache_setup` to advertise its built `QueryCache`
+/// (and retract it on exit).
+pub struct QueryCachePublisher {
+    tx: watch::Sender<Option<QueryCache>>,
+}
+
+impl QueryCachePublisher {
+    pub fn publish(&self, qcache: QueryCache) {
+        let _ = self.tx.send(Some(qcache));
+    }
+
+    pub fn clear(&self) {
+        let _ = self.tx.send(None);
+    }
+}
+
+/// Supervisor-side owner of the `QueryCache` watch. Hands out subscriber handles
+/// for connection tasks and a publisher for `cache_setup`; clears on cache exit.
+pub struct QueryCacheUpdater {
+    tx: watch::Sender<Option<QueryCache>>,
+}
+
+impl QueryCacheUpdater {
+    pub fn new() -> (Self, QueryCacheHandle) {
+        let (tx, rx) = watch::channel(None);
+        (Self { tx }, QueryCacheHandle { rx })
+    }
+
+    pub fn publisher(&self) -> QueryCachePublisher {
+        QueryCachePublisher {
+            tx: self.tx.clone(),
+        }
+    }
+
+    pub fn subscribe(&self) -> QueryCacheHandle {
+        QueryCacheHandle {
+            rx: self.tx.subscribe(),
+        }
+    }
+
+    pub fn clear(&self) {
+        let _ = self.tx.send(None);
+    }
 }
 
 impl QueryCache {
@@ -173,6 +308,7 @@ impl QueryCache {
         query_tx: UnboundedSender<QueryCommand>,
         worker_tx: UnboundedSender<WorkerRequest>,
         state_view: Arc<CacheStateView>,
+        cdc_connected: Arc<AtomicBool>,
     ) -> CacheResult<Self> {
         #[cfg(feature = "fault-injection")]
         fault::init();
@@ -194,15 +330,68 @@ impl QueryCache {
             worker_tx,
             state_view,
             dynamic: settings.dynamic.clone(),
-            waiting: Arc::new(Mutex::new(HashMap::new())),
+            waiting: Arc::new(CoalesceQueue::new()),
+            cdc_connected,
         })
+    }
+
+    /// Inline dispatch entry point for a connection task. Applies CDC-liveness
+    /// gating, converts the proxy message (parameter substitution), and routes
+    /// to [`query_dispatch`](Self::query_dispatch). Replaces the former central
+    /// coordinator hop: every connection calls this directly.
+    pub async fn dispatch_proxy(&mut self, proxy_msg: ProxyMessage) {
+        if !self.cdc_connected.load(Ordering::Relaxed) {
+            // CDC down: forward to origin rather than serve possibly-stale data.
+            let data = proxy_msg.message.into_data();
+            let _ = reply_forward(
+                proxy_msg.reply_tx,
+                proxy_msg.client_socket,
+                proxy_msg.pipeline,
+                data,
+                proxy_msg.timing,
+            );
+            return;
+        }
+
+        match proxy_msg.message.into_query_data() {
+            Ok(query_data) => {
+                let request = QueryRequest {
+                    query_type: query_data.query_type,
+                    data: query_data.data,
+                    cacheable_query: query_data.cacheable_query,
+                    result_formats: query_data.result_formats,
+                    client_socket: proxy_msg.client_socket,
+                    reply_tx: proxy_msg.reply_tx,
+                    search_path: proxy_msg.search_path,
+                    timing: proxy_msg.timing,
+                    pipeline: proxy_msg.pipeline,
+                };
+                if let Err(e) = self.query_dispatch(request).await {
+                    error!(
+                        "query dispatch failed: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                }
+            }
+            Err((e, data)) => {
+                debug!("forwarding to origin due to parameter conversion error: {e}");
+                let _ = reply_forward(
+                    proxy_msg.reply_tx,
+                    proxy_msg.client_socket,
+                    proxy_msg.pipeline,
+                    data,
+                    proxy_msg.timing,
+                );
+            }
+        }
     }
 
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, mut msg: QueryRequest) -> CacheResult<()> {
         let cfg = self.dynamic.load();
-        if !fast_path::query_allowlist_check(&cfg.allowed_tables_parsed, &msg.cacheable_query.query) {
+        if !fast_path::query_allowlist_check(&cfg.allowed_tables_parsed, &msg.cacheable_query.query)
+        {
             crate::metrics::handles()
                 .query
                 .allowlist_skipped
@@ -274,23 +463,34 @@ impl QueryCache {
                     ..
                 }) => {
                     trace!("limit bump {fingerprint} cached={max_limit:?} needed={rows_needed:?}");
-                    self.metrics_miss_record(fingerprint);
-                    // Set Loading immediately to prevent duplicate LimitBump commands from racing
-                    self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
-                    reply_forward(
-                        msg.reply_tx,
-                        msg.client_socket,
-                        msg.pipeline,
-                        msg.data,
-                        msg.timing,
-                    )?;
-                    self.query_tx
-                        .send(QueryCommand::LimitBump {
-                            fingerprint,
-                            max_limit: rows_needed,
-                        })
-                        .map_err(|_| CacheError::WorkerSend)?;
-                    return Ok(());
+                    // CAS Ready(insufficient)→Loading: a single dispatch claims the
+                    // bump. If we lose (another bumper won, or a completed bump made
+                    // the entry sufficient), re-dispatch against the fresh state.
+                    if self.transition_if(
+                        fingerprint,
+                        |v| {
+                            matches!(v.state, CachedQueryState::Ready)
+                                && !limit_is_sufficient(v.max_limit, rows_needed)
+                        },
+                        CachedQueryState::Loading,
+                    ) {
+                        self.metrics_miss_record(fingerprint);
+                        reply_forward(
+                            msg.reply_tx,
+                            msg.client_socket,
+                            msg.pipeline,
+                            msg.data,
+                            msg.timing,
+                        )?;
+                        self.query_tx
+                            .send(QueryCommand::LimitBump {
+                                fingerprint,
+                                max_limit: rows_needed,
+                            })
+                            .map_err(|_| CacheError::WorkerSend)?;
+                        return Ok(());
+                    }
+                    // Lost the race; fall through to re-read and re-dispatch.
                 }
 
                 // Loading — coalesce: queue request for later dispatch from cache.
@@ -305,78 +505,81 @@ impl QueryCache {
                 }) => {
                     trace!("cache loading, coalesce {fingerprint}");
                     fault_coalesce_enqueue_delay().await;
-                    let mut guard = self.waiting.lock().expect("lock waiting queue");
-                    let still_loading = self
-                        .state_view
-                        .cached_queries
-                        .get(&fingerprint)
-                        .map(|e| e.state)
-                        == Some(CachedQueryState::Loading);
-                    if still_loading {
-                        self.metrics_miss_record(fingerprint);
-                        let key = Self::coalesce_key_from_request(&msg);
-                        msg.timing.waiter_enqueued_at = Some(Instant::now());
-                        guard
-                            .entry(fingerprint)
-                            .or_default()
-                            .entry(key)
-                            .or_default()
-                            .push(msg);
-                        drop(guard);
-                        #[allow(clippy::cast_precision_loss)]
-                        // queue depth, never near 2^53
-                        crate::metrics::handles()
-                            .cache
-                            .coalesce_waiting
-                            .set(self.waiting_count() as f64);
-                        return Ok(());
+                    let key = Self::coalesce_key_from_request(&msg);
+                    msg.timing.waiter_enqueued_at = Some(Instant::now());
+                    // `enqueue_if_loading` re-checks state under the lock; on
+                    // `Err` the state advanced and we re-dispatch the returned msg.
+                    match self
+                        .waiting
+                        .enqueue_if_loading(&self.state_view, fingerprint, key, msg)
+                    {
+                        Ok(()) => {
+                            self.metrics_miss_record(fingerprint);
+                            #[allow(clippy::cast_precision_loss)]
+                            // queue depth, never near 2^53
+                            crate::metrics::handles()
+                                .cache
+                                .coalesce_waiting
+                                .set(self.waiting.waiter_count() as f64);
+                            return Ok(());
+                        }
+                        Err(returned) => {
+                            msg = returned;
+                            // State advanced; fall through to re-read and re-dispatch.
+                        }
                     }
-                    drop(guard);
-                    // State advanced under the lock; re-read and re-dispatch.
                 }
 
-                // Pending — hold request, check subsumption, increment hit count, admit if threshold reached
+                // Pending — increment hit count under the guard and admit if the
+                // threshold is reached. The read-modify-write happens atomically in
+                // `pending_admit`; if the entry is no longer Pending we re-dispatch.
                 Some(CachedQueryView {
-                    state: CachedQueryState::Pending { hit_count, .. },
+                    state: CachedQueryState::Pending { .. },
                     ..
                 }) => {
-                    let new_count = hit_count + 1;
-                    trace!("pending {fingerprint} count={new_count}");
-
-                    if new_count >= cfg.admission_threshold {
-                        self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
-                        return self
-                            .subsumption_await(msg, fingerprint, AdmitAction::Admit)
-                            .await;
+                    trace!("pending {fingerprint}");
+                    let credit = self.pending_initial_credit();
+                    match self.pending_admit(fingerprint, cfg.admission_threshold, credit) {
+                        Some(action) => {
+                            return self.subsumption_await(msg, fingerprint, action).await;
+                        }
+                        None => {
+                            // No longer Pending; fall through to re-read and re-dispatch.
+                        }
                     }
-                    self.cached_query_state_set(
-                        &fingerprint,
-                        CachedQueryState::Pending {
-                            hit_count: new_count,
-                            credit: self.pending_initial_credit(),
-                        },
-                    );
-                    return self
-                        .subsumption_await(msg, fingerprint, AdmitAction::CheckOnly)
-                        .await;
                 }
 
-                // Invalidated — hold request, check subsumption, fast-readmit (skip admission gate)
+                // Invalidated — fast-readmit (skip admission gate). CAS the
+                // Invalidated→Loading transition so only one dispatch readmits.
                 Some(CachedQueryView {
                     state: CachedQueryState::Invalidated,
                     ..
                 }) => {
                     trace!("invalidated readmit {fingerprint}");
-                    self.cached_query_state_set(&fingerprint, CachedQueryState::Loading);
-                    return self
-                        .subsumption_await(msg, fingerprint, AdmitAction::Admit)
-                        .await;
+                    if self.transition_if(
+                        fingerprint,
+                        |v| matches!(v.state, CachedQueryState::Invalidated),
+                        CachedQueryState::Loading,
+                    ) {
+                        return self
+                            .subsumption_await(msg, fingerprint, AdmitAction::Admit)
+                            .await;
+                    }
+                    // Lost the race; fall through to re-read and re-dispatch.
                 }
 
-                // Cache miss — hold request, check subsumption
+                // Cache miss — claim the entry atomically; only the winner
+                // registers, losers re-dispatch against the now-present entry.
                 None => {
                     trace!("cache miss {fingerprint}");
-                    return self.query_first_miss_handle(fingerprint, msg, &cfg).await;
+                    match self.first_miss_claim(fingerprint, &cfg) {
+                        Some(action) => {
+                            return self.subsumption_await(msg, fingerprint, action).await;
+                        }
+                        None => {
+                            // Another dispatch inserted it first; fall through to retry.
+                        }
+                    }
                 }
             }
 
@@ -419,11 +622,89 @@ impl QueryCache {
         fast_path::clock_reference_set(&self.state_view, cache_policy, fingerprint);
     }
 
-    /// Update a cached query's state in the shared view.
-    fn cached_query_state_set(&self, fingerprint: &u64, state: CachedQueryState) {
-        if let Some(mut entry) = self.state_view.cached_queries.get_mut(fingerprint) {
-            entry.state = state;
+    /// Atomically transition `fingerprint` to `new` iff the entry still satisfies
+    /// `pred` *under the write guard*. Returns `true` if this caller performed the
+    /// transition, `false` if the entry advanced (the caller re-dispatches). This
+    /// is the compare-and-set that makes the cold dispatch arms race-safe under
+    /// the multi-thread runtime (cf. `fast_path::mv_schedule`).
+    fn transition_if(
+        &self,
+        fingerprint: u64,
+        pred: impl Fn(&CachedQueryView) -> bool,
+        new: CachedQueryState,
+    ) -> bool {
+        if let Some(mut entry) = self.state_view.cached_queries.get_mut(&fingerprint)
+            && pred(&entry)
+        {
+            entry.state = new;
+            return true;
         }
+        false
+    }
+
+    /// Under the write guard: if still `Pending`, increment the hit count and
+    /// either admit (→ `Loading`, returning `Admit`) or bump the credit
+    /// (returning `CheckOnly`). Returns `None` if the entry is no longer
+    /// `Pending` (the caller re-dispatches). Race-safe read-modify-write.
+    fn pending_admit(&self, fingerprint: u64, threshold: u32, credit: u32) -> Option<AdmitAction> {
+        let mut entry = self.state_view.cached_queries.get_mut(&fingerprint)?;
+        let CachedQueryState::Pending { hit_count, .. } = entry.state else {
+            return None;
+        };
+        let new_count = hit_count + 1;
+        if new_count >= threshold {
+            entry.state = CachedQueryState::Loading;
+            Some(AdmitAction::Admit)
+        } else {
+            entry.state = CachedQueryState::Pending {
+                hit_count: new_count,
+                credit,
+            };
+            Some(AdmitAction::CheckOnly)
+        }
+    }
+
+    /// Claim a cold fingerprint atomically: insert the initial cache view iff the
+    /// entry is vacant. Returns the `AdmitAction` to register with when this
+    /// caller won the insert; `None` if another dispatch already inserted it (the
+    /// caller re-dispatches against the now-present entry). Prevents concurrent
+    /// first-misses from double-registering.
+    fn first_miss_claim(&self, fingerprint: u64, cfg: &DynamicConfig) -> Option<AdmitAction> {
+        let immediate_admit = cfg.cache_policy == CachePolicy::Fifo || cfg.admission_threshold <= 1;
+        let (initial_state, action) = if immediate_admit {
+            (CachedQueryState::Loading, AdmitAction::Admit)
+        } else {
+            (
+                CachedQueryState::Pending {
+                    hit_count: 1,
+                    credit: self.pending_initial_credit(),
+                },
+                AdmitAction::CheckOnly,
+            )
+        };
+
+        match self.state_view.cached_queries.entry(fingerprint) {
+            Entry::Occupied(_) => return None, // lost the race; re-dispatch
+            Entry::Vacant(slot) => {
+                slot.insert(CachedQueryView {
+                    state: initial_state,
+                    generation: 0,
+                    resolved: None,
+                    deparsed_sql: None,
+                    max_limit: None,
+                    referenced: false,
+                    // Writer fills this in after resolution/classification.
+                    mv: MvMeta::new(ShapeGate::Skip, None),
+                });
+            }
+        }
+
+        let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
+        self.state_view
+            .metrics
+            .entry(fingerprint)
+            .or_insert_with(|| QueryMetrics::new(now));
+        Some(action)
     }
 
     /// Build and send a WorkerRequest for serving a query from cache.
@@ -463,7 +744,8 @@ impl QueryCache {
             // Coordinator owns `query_tx`: flip Pending → Scheduled and dispatch
             // the build, then serve this request from source rows.
             MvDecision::NeedsSchedule { has_table } => {
-                if let Some(cmd) = fast_path::mv_schedule(&self.state_view, fingerprint, has_table) {
+                if let Some(cmd) = fast_path::mv_schedule(&self.state_view, fingerprint, has_table)
+                {
                     let _ = self.query_tx.send(cmd);
                 }
                 crate::metrics::handles().cache.mv_fallthrough.increment(1);
@@ -527,13 +809,7 @@ impl QueryCache {
 
     /// Total number of requests waiting across all coalescing groups.
     fn waiting_count(&self) -> usize {
-        self.waiting
-            .lock()
-            .expect("lock waiting queue")
-            .values()
-            .flat_map(|groups| groups.values())
-            .map(Vec::len)
-            .sum()
+        self.waiting.waiter_count()
     }
 
     /// Drain all coalesced waiters for a fingerprint that became Ready.
@@ -547,12 +823,7 @@ impl QueryCache {
         deparsed_sql: EcoString,
         max_limit: Option<u64>,
     ) {
-        let Some(groups) = self
-            .waiting
-            .lock()
-            .expect("lock waiting queue")
-            .remove(&fingerprint)
-        else {
+        let Some(groups) = self.waiting.drain(fingerprint) else {
             return;
         };
 
@@ -644,12 +915,7 @@ impl QueryCache {
     /// Drain all coalesced waiters for a fingerprint that failed.
     /// Falls back to forwarding each waiter to origin.
     pub fn waiting_drain_failed(&self, fingerprint: u64) {
-        let Some(groups) = self
-            .waiting
-            .lock()
-            .expect("lock waiting queue")
-            .remove(&fingerprint)
-        else {
+        let Some(groups) = self.waiting.drain(fingerprint) else {
             return;
         };
 
@@ -746,13 +1012,28 @@ impl QueryCache {
     ) -> CacheResult<()> {
         let (subsumption_tx, subsumption_rx) = oneshot::channel();
 
-        self.query_register_send(
-            fingerprint,
-            Arc::clone(&msg.cacheable_query),
-            msg.search_path.clone(),
-            subsumption_tx,
-            admit_action,
-        )?;
+        if self
+            .query_register_send(
+                fingerprint,
+                Arc::clone(&msg.cacheable_query),
+                msg.search_path.clone(),
+                subsumption_tx,
+                admit_action,
+            )
+            .is_err()
+        {
+            // Writer channel closed (cache subsystem torn down or restarting):
+            // degrade by forwarding to origin rather than failing the client.
+            debug!("register channel closed; forwarding query to origin");
+            self.metrics_miss_record(fingerprint);
+            return reply_forward(
+                msg.reply_tx,
+                msg.client_socket,
+                msg.pipeline,
+                msg.data,
+                msg.timing,
+            );
+        }
 
         match subsumption_rx.await {
             Ok(SubsumptionResult::Subsumed {
@@ -778,55 +1059,6 @@ impl QueryCache {
                     msg.timing,
                 )
             }
-        }
-    }
-
-    /// Handle first cache miss: hold request, check subsumption.
-    /// Register immediately (FIFO/threshold≤1) or start Pending.
-    async fn query_first_miss_handle(
-        &self,
-        fingerprint: u64,
-        msg: QueryRequest,
-        cfg: &DynamicConfig,
-    ) -> CacheResult<()> {
-        let immediate_admit = cfg.cache_policy == CachePolicy::Fifo || cfg.admission_threshold <= 1;
-
-        let initial_state = if immediate_admit {
-            CachedQueryState::Loading
-        } else {
-            CachedQueryState::Pending {
-                hit_count: 1,
-                credit: self.pending_initial_credit(),
-            }
-        };
-
-        self.state_view.cached_queries.insert(
-            fingerprint,
-            CachedQueryView {
-                state: initial_state,
-                generation: 0,
-                resolved: None,
-                deparsed_sql: None,
-                max_limit: None,
-                referenced: false,
-                // Writer fills this in after resolution/classification.
-                mv: MvMeta::new(ShapeGate::Skip, None),
-            },
-        );
-        let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
-        self.state_view
-            .metrics
-            .entry(fingerprint)
-            .or_insert_with(|| QueryMetrics::new(now));
-
-        if immediate_admit {
-            trace!("send to writer {fingerprint}");
-            self.subsumption_await(msg, fingerprint, AdmitAction::Admit)
-                .await
-        } else {
-            trace!("pending new {fingerprint}");
-            self.subsumption_await(msg, fingerprint, AdmitAction::CheckOnly)
-                .await
         }
     }
 }
