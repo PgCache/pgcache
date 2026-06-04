@@ -229,6 +229,37 @@ pub fn proxy_run(
 
         debug!("accept loop");
         rt.block_on(async {
+            // Task-dump on SIGUSR2 (deadlock debugging). Build with
+            // `RUSTFLAGS="--cfg tokio_unstable" cargo build --features taskdump`
+            // (Linux x86_64/aarch64). On signal, logs every tokio task's
+            // suspended-await backtrace — works even when the runtime is wedged,
+            // since SIGUSR2 wakes this task via the io driver.
+            #[cfg(all(feature = "taskdump", tokio_unstable))]
+            {
+                let dump_handle = tokio::runtime::Handle::current();
+                tokio::spawn(async move {
+                    let mut sig = match tokio::signal::unix::signal(
+                        tokio::signal::unix::SignalKind::user_defined2(),
+                    ) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("taskdump: failed to install SIGUSR2 handler: {e}");
+                            return;
+                        }
+                    };
+                    info!("taskdump: armed — send SIGUSR2 to dump tokio task backtraces");
+                    while sig.recv().await.is_some() {
+                        info!("taskdump: capturing task dump...");
+                        let dump = dump_handle.dump().await;
+                        let count = dump.tasks().iter().count();
+                        for (i, task) in dump.tasks().iter().enumerate() {
+                            info!("taskdump task[{i}] id={}:\n{}", task.id(), task.trace());
+                        }
+                        info!("taskdump: complete ({count} tasks)");
+                    }
+                });
+            }
+
             let addrs: Vec<std::net::SocketAddr> =
                 tokio::net::lookup_host((settings.origin.host.as_str(), settings.origin.port))
                     .await

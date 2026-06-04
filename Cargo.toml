@@ -15,6 +15,10 @@ name = "pgcache_lib"
 path = "src/lib.rs"
 doctest = false
 
+[lints.rust]
+# `tokio_unstable` is set via RUSTFLAGS for the task-dump / console builds.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
 [lints.clippy]
 panic = "deny"
 string_slice = "deny"
@@ -71,6 +75,11 @@ fault-injection = []
 # Heap allocation profiling: swaps the global allocator to dhat::Alloc and writes
 # dhat-heap.json on clean exit. Off by default; profiling/dev only.
 dhat-heap = ["dep:dhat"]
+# Tokio task-dump on SIGUSR2 (deadlock debugging): logs every task's suspended
+# await backtrace. Build with `RUSTFLAGS="--cfg tokio_unstable" cargo build
+# --features taskdump` (the `tokio/taskdump` feature enables the dump API; the
+# `tokio_unstable` cfg is also required). Linux x86_64/aarch64 only.
+taskdump = ["tokio/taskdump"]
 
 [dependencies]
 arc-swap = "1.8.2"
