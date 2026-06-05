@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::{self, error::RecvError};
-use tokio::sync::mpsc::Sender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::bytes::{Buf, Bytes};
@@ -28,6 +28,40 @@ use super::{
 /// Max gap between cache-DB frames while draining a response for a departed
 /// primary client before the connection is treated as stalled and discarded.
 const DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Deterministic fault injection for serve-pool replenishment (PGC-238): poison
+/// the first N cache serves so a test can drive repeated poisoned discards and
+/// assert the pool refills. Compiled out unless built with `--features
+/// fault-injection`.
+#[cfg(feature = "fault-injection")]
+pub(crate) mod fault {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static POISON_SERVES: AtomicU64 = AtomicU64::new(0);
+    static INIT: Once = Once::new();
+
+    /// Arm from the environment (read once for the process).
+    pub(crate) fn init() {
+        INIT.call_once(|| {
+            if let Some(n) = std::env::var("PGCACHE_FAULT_POISON_SERVES")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                POISON_SERVES.store(n, Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// Returns true (consuming one) while serves remain to be poisoned.
+    pub(crate) fn poison_serve() -> bool {
+        POISON_SERVES
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+    }
+}
 
 /// Outcome of a coalesced client's write task.
 pub enum CoalescedOutcome {
@@ -190,18 +224,26 @@ async fn broadcast_error_reply(bc: BroadcastState) {
 ///
 /// Returns the connection via async `release()` on success.
 /// On error (drop without release), the connection is discarded if poisoned
-/// to avoid returning a connection with stale response data in its buffer.
+/// to avoid returning a connection with stale response data in its buffer; a
+/// replenish signal is sent so a fresh connection replaces it and the pool
+/// cannot permanently shrink (PGC-238).
 struct ConnectionGuard {
     conn: Option<CacheConnection>,
     return_tx: Sender<CacheConnection>,
+    replenish_tx: UnboundedSender<()>,
     poisoned: bool,
 }
 
 impl ConnectionGuard {
-    fn new(conn: CacheConnection, return_tx: Sender<CacheConnection>) -> Self {
+    fn new(
+        conn: CacheConnection,
+        return_tx: Sender<CacheConnection>,
+        replenish_tx: UnboundedSender<()>,
+    ) -> Self {
         Self {
             conn: Some(conn),
             return_tx,
+            replenish_tx,
             poisoned: false,
         }
     }
@@ -221,8 +263,11 @@ impl ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         if self.poisoned {
-            // Discard connection — may have unread response data
+            // Discard the connection — may have unread response data — and
+            // signal the replenish task to reconnect a replacement so the pool
+            // size stays constant (PGC-238).
             self.conn.take();
+            let _ = self.replenish_tx.send(());
             return;
         }
         if let Some(conn) = self.conn.take() {
@@ -300,11 +345,21 @@ enum ServeResponseState {
 pub async fn handle_cached_query(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
+    replenish_tx: UnboundedSender<()>,
     msg: &mut WorkerRequest,
     state_view: &CacheStateView,
 ) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
     debug!("message query generation {}", msg.generation);
-    let mut guard = ConnectionGuard::new(conn, return_tx);
+    let mut guard = ConnectionGuard::new(conn, return_tx, replenish_tx);
+
+    // Fault injection: poison this serve (discard the connection, fall through to
+    // origin) to exercise serve-pool replenishment under induced poison churn.
+    #[cfg(feature = "fault-injection")]
+    if fault::poison_serve() {
+        guard.poisoned = true;
+        return Err(CacheError::InvalidMessage.into());
+    }
+
     let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
 
     // Serve in the client's result format (text/binary). Simple-query clients

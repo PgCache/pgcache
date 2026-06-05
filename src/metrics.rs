@@ -153,6 +153,8 @@ pub mod names {
     pub const CACHE_COALESCE_SERVED: &str = "pgcache.cache.coalesce_served";
     /// Successful cache-subsystem restarts performed by the supervisor.
     pub const CACHE_RESTARTS_TOTAL: &str = "pgcache.cache.restarts_total";
+    /// Cache-DB serve-pool connections reconnected after a poisoned discard.
+    pub const CACHE_POOL_REPLENISHED: &str = "pgcache.cache.pool_replenished";
 
     // Extended protocol metrics
     pub const PROTOCOL_SIMPLE_QUERIES: &str = "pgcache.protocol.simple_queries";
@@ -320,6 +322,8 @@ pub struct CacheHandles {
     pub coalesce_served: Counter,
     /// Incremented each time the supervisor rebuilds the cache subsystem.
     pub restarts_total: Counter,
+    /// Incremented each time a discarded serve-pool connection is replaced.
+    pub pool_replenished: Counter,
 }
 
 pub struct CdcHandles {
@@ -460,6 +464,7 @@ impl Handles {
                 coalesce_waiting: metrics::gauge!(CACHE_COALESCE_WAITING),
                 coalesce_served: metrics::counter!(CACHE_COALESCE_SERVED),
                 restarts_total: metrics::counter!(CACHE_RESTARTS_TOTAL),
+                pool_replenished: metrics::counter!(CACHE_POOL_REPLENISHED),
             },
             cdc: CdcHandles {
                 events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),

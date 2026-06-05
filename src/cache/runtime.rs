@@ -39,11 +39,17 @@ use crate::{
 /// Minimum number of connections in the cache worker pool.
 const MIN_POOL_SIZE: usize = 4;
 
+/// Initial backoff before retrying a serve-pool reconnection.
+const POOL_REPLENISH_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+/// Maximum backoff between serve-pool reconnection attempts.
+const POOL_REPLENISH_MAX_BACKOFF: Duration = Duration::from_secs(10);
+
 /// Handles a worker request by executing the query and sending the reply.
 /// Sends replies for both the primary client and any coalesced clients.
 async fn handle_worker_request(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
+    replenish_tx: UnboundedSender<()>,
     mut msg: WorkerRequest,
     state_view: Arc<CacheStateView>,
 ) {
@@ -51,68 +57,69 @@ async fn handle_worker_request(
 
     msg.timing.worker_start_at = Some(Instant::now());
 
-    let reply = match handle_cached_query(conn, return_tx, &mut msg, &state_view).await {
-        Ok((bytes_served, coalesced_outcomes)) => {
-            let latency_us = msg
-                .timing
-                .worker_start_at
-                .map(|s| duration_to_us_u64(s.elapsed()))
-                .unwrap_or(0);
-            // Record directly in the shared view (no extra hop).
-            worker_metrics_record(
-                &state_view,
-                msg.fingerprint,
-                latency_us,
-                bytes_served as u64,
-            );
+    let reply =
+        match handle_cached_query(conn, return_tx, replenish_tx, &mut msg, &state_view).await {
+            Ok((bytes_served, coalesced_outcomes)) => {
+                let latency_us = msg
+                    .timing
+                    .worker_start_at
+                    .map(|s| duration_to_us_u64(s.elapsed()))
+                    .unwrap_or(0);
+                // Record directly in the shared view (no extra hop).
+                worker_metrics_record(
+                    &state_view,
+                    msg.fingerprint,
+                    latency_us,
+                    bytes_served as u64,
+                );
 
-            // Send replies to coalesced clients, returning each leased socket.
-            for outcome in coalesced_outcomes {
-                match outcome {
-                    CoalescedOutcome::Complete(client) => {
-                        let _ = client.reply_tx.send(CacheReply {
-                            socket: client.client_socket,
-                            outcome: CacheOutcome::Complete(Some(client.timing)),
-                        });
-                    }
-                    CoalescedOutcome::Failed(client) => {
-                        let _ = client.reply_tx.send(CacheReply {
-                            socket: client.client_socket,
-                            outcome: CacheOutcome::Error(client.data),
-                        });
+                // Send replies to coalesced clients, returning each leased socket.
+                for outcome in coalesced_outcomes {
+                    match outcome {
+                        CoalescedOutcome::Complete(client) => {
+                            let _ = client.reply_tx.send(CacheReply {
+                                socket: client.client_socket,
+                                outcome: CacheOutcome::Complete(Some(client.timing)),
+                            });
+                        }
+                        CoalescedOutcome::Failed(client) => {
+                            let _ = client.reply_tx.send(CacheReply {
+                                socket: client.client_socket,
+                                outcome: CacheOutcome::Error(client.data),
+                            });
+                        }
                     }
                 }
-            }
 
-            CacheReply {
-                socket: msg.client_socket,
-                outcome: CacheOutcome::Complete(Some(msg.timing)),
+                CacheReply {
+                    socket: msg.client_socket,
+                    outcome: CacheOutcome::Complete(Some(msg.timing)),
+                }
             }
-        }
-        Err(e) => {
-            // 42P01 is the expected eviction-window race; other SQLSTATEs are bugs.
-            let ctx = e.current_context();
-            let undefined_table = matches!(
-                ctx,
-                CacheError::CacheServerError { sqlstate: Some(s) }
-                    if *s == SQLSTATE_UNDEFINED_TABLE
-            );
-            if undefined_table {
-                debug!("cache hit fell through to origin (table dropped during eviction)");
-            } else {
-                error!("handle_cached_query failed: {}", error_chain_format(ctx));
+            Err(e) => {
+                // 42P01 is the expected eviction-window race; other SQLSTATEs are bugs.
+                let ctx = e.current_context();
+                let undefined_table = matches!(
+                    ctx,
+                    CacheError::CacheServerError { sqlstate: Some(s) }
+                        if *s == SQLSTATE_UNDEFINED_TABLE
+                );
+                if undefined_table {
+                    debug!("cache hit fell through to origin (table dropped during eviction)");
+                } else {
+                    error!("handle_cached_query failed: {}", error_chain_format(ctx));
+                }
+                // Coalesced clients already received Error replies inside the worker
+                let error_buf = msg
+                    .forward_bytes
+                    .take()
+                    .unwrap_or_else(|| msg.data.split_off(0));
+                CacheReply {
+                    socket: msg.client_socket,
+                    outcome: CacheOutcome::Error(error_buf),
+                }
             }
-            // Coalesced clients already received Error replies inside the worker
-            let error_buf = msg
-                .forward_bytes
-                .take()
-                .unwrap_or_else(|| msg.data.split_off(0));
-            CacheReply {
-                socket: msg.client_socket,
-                outcome: CacheOutcome::Error(error_buf),
-            }
-        }
-    };
+        };
 
     if msg.reply_tx.send(reply).is_err() {
         error!("failed to send reply: no receiver");
@@ -609,6 +616,8 @@ async fn worker_loop(
     state_view: Arc<CacheStateView>,
 ) {
     debug!("cache worker loop");
+    #[cfg(feature = "fault-injection")]
+    crate::cache::worker::fault::init();
     let pool_size = (settings.num_workers * 2).max(MIN_POOL_SIZE);
     let (conn_tx, mut conn_rx) = match connection_pool_create(&settings, pool_size).await {
         Ok(pool) => pool,
@@ -621,6 +630,17 @@ async fn worker_loop(
             return;
         }
     };
+
+    // Replenish channel: a poisoned-connection discard signals here, and
+    // `pool_replenish` reconnects a replacement so the pool stays at capacity
+    // (PGC-238). Unbounded — signals are unit-sized and bounded by pool_size.
+    let (replenish_tx, replenish_rx) = unbounded_channel::<()>();
+    tokio::spawn(pool_replenish(
+        settings.clone(),
+        conn_tx.clone(),
+        replenish_rx,
+        cancel.clone(),
+    ));
 
     loop {
         // Block for at least one request
@@ -651,9 +671,10 @@ async fn worker_loop(
 
         // Spawn the serve (request + connection) onto the shared runtime.
         let return_tx = conn_tx.clone();
+        let replenish_tx = replenish_tx.clone();
         let state_view = Arc::clone(&state_view);
         tokio::spawn(async move {
-            handle_worker_request(conn, return_tx, msg, state_view).await;
+            handle_worker_request(conn, return_tx, replenish_tx, msg, state_view).await;
         });
 
         // Channel depth gauge; queue length never approaches 2^53.
@@ -665,6 +686,63 @@ async fn worker_loop(
     }
 
     debug!("cache worker loop exiting");
+}
+
+/// Replenishes the cache-DB serve pool: each signal from a poisoned-connection
+/// discard triggers one reconnection, keeping the pool at `pool_size` so it can
+/// never permanently shrink (PGC-238). The bounded pool channel always has room
+/// for the replacement because the discard vacated a slot. Lives for the
+/// generation — cancelled on subsystem teardown, or exits when the last
+/// `replenish_tx` (worker loop + in-flight serves) drops.
+async fn pool_replenish(
+    settings: Settings,
+    conn_tx: Sender<CacheConnection>,
+    mut replenish_rx: UnboundedReceiver<()>,
+    cancel: CancellationToken,
+) {
+    debug!("pool replenish task");
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            signal = replenish_rx.recv() => {
+                if signal.is_none() {
+                    break;
+                }
+            }
+        }
+
+        // Reconnect with capped backoff; abandon on subsystem teardown.
+        let mut backoff = POOL_REPLENISH_INITIAL_BACKOFF;
+        let conn = loop {
+            match CacheConnection::connect(&settings.cache).await {
+                Ok(conn) => break Some(conn),
+                Err(e) => {
+                    error!(
+                        "serve-pool reconnect failed, retrying: {}",
+                        error_chain_format(e.current_context())
+                    );
+                    tokio::select! {
+                        _ = cancel.cancelled() => break None,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(POOL_REPLENISH_MAX_BACKOFF);
+                }
+            }
+        };
+        let Some(conn) = conn else { break };
+
+        // The discard freed a slot, so this send cannot block on a full pool;
+        // an error means the pool channel closed (teardown).
+        if conn_tx.send(conn).await.is_err() {
+            break;
+        }
+        crate::metrics::handles()
+            .cache
+            .pool_replenished
+            .increment(1);
+    }
+
+    debug!("pool replenish task exiting");
 }
 
 /// Initial backoff for CDC reconnection attempts.
