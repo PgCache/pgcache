@@ -15,12 +15,9 @@ use crate::metrics::admin_server_spawn;
 use super::SharedProxyStatus;
 use crate::{
     cache::query::CacheableQuery,
-    cache::{PinnedQuery, QueryCacheUpdater, cache_generation_start, cache_supervise},
+    cache::{CacheDispatchUpdater, PinnedQuery, cache_generation_start, cache_supervise},
     catalog::{FunctionVolatility, function_volatility_map_load},
-    pg::{
-        cdc::replication_cleanup,
-        connect,
-    },
+    pg::{cdc::replication_cleanup, connect},
     query::ast::{query_expr_convert_raw, query_expr_fingerprint},
     settings::Settings,
     telemetry, tls,
@@ -159,7 +156,7 @@ pub fn proxy_run(
     let pinned = pinned_queries_validate(settings, &func_volatility);
     drop(pre_rt);
 
-    // One shared multi-thread runtime hosts connections + coordinator + worker
+    // One shared multi-thread runtime hosts connection tasks + worker serves
     // (PGC Option A probe). Writer and CDC remain dedicated threads.
     let worker_threads = settings.num_workers.max(2);
     let rt = Builder::new_multi_thread()
@@ -171,11 +168,11 @@ pub fn proxy_run(
     thread::scope(|scope| {
         let rt_handle = rt.handle().clone();
 
-        // The cache publishes a QueryCache and a status sender via watch
+        // The cache publishes a CacheDispatch and a status sender via watch
         // channels; connection tasks and the admin server pick them up, and the
         // supervisor hot-swaps both across cache restarts. They start empty:
         // connections degrade to origin until the first generation publishes.
-        let (qcache_updater, qcache_handle) = QueryCacheUpdater::new();
+        let (dispatch_updater, dispatch_handle) = CacheDispatchUpdater::new();
         let (status_updater, status_sender) = StatusSenderUpdater::new_pending();
 
         let telemetry_metrics = metrics_handle.clone();
@@ -205,7 +202,7 @@ pub fn proxy_run(
             rt_handle.clone(),
             &pinned,
             &cancel,
-            &qcache_updater,
+            &dispatch_updater,
             &status_updater,
         )
         .map_err(|e| {
@@ -223,7 +220,7 @@ pub fn proxy_run(
 
         // Accept connections on a dedicated scoped thread so the proxy thread is
         // free to run the cache restart supervisor. Connections dispatch against
-        // the published QueryCache (degrading to origin while it is down), so the
+        // the published CacheDispatch (degrading to origin while it is down), so the
         // accept loop is independent of cache-subsystem restarts. On exit it
         // cancels the proxy token so the supervisor unwinds too.
         let accept_cancel = cancel.clone();
@@ -275,14 +272,14 @@ pub fn proxy_run(
                     .attach_loc("resolving origin host")?
                     .collect();
 
-                    let listener = TcpListener::bind(&settings.listen.socket)
-                        .await
-                        .map_err(|e| {
-                            Report::from(ConnectionError::IoError(std::io::Error::other(format!(
-                                "bind error [{}] {e}",
-                                &settings.listen.socket
-                            ))))
-                        })?;
+                    let listener =
+                        TcpListener::bind(&settings.listen.socket)
+                            .await
+                            .map_err(|e| {
+                                Report::from(ConnectionError::IoError(std::io::Error::other(
+                                    format!("bind error [{}] {e}", &settings.listen.socket),
+                                )))
+                            })?;
                     info!("Listening to {}", &settings.listen.socket);
 
                     loop {
@@ -306,7 +303,7 @@ pub fn proxy_run(
                                     addrs.clone(),
                                     ssl_mode,
                                     server_name.clone(),
-                                    qcache_handle.clone(),
+                                    dispatch_handle.clone(),
                                     tls_acceptor.clone(),
                                     Arc::clone(&func_volatility),
                                     origin_database.clone(),
@@ -339,7 +336,7 @@ pub fn proxy_run(
             rt_handle,
             &pinned,
             cancel,
-            &qcache_updater,
+            &dispatch_updater,
             &status_updater,
             first_generation,
         );

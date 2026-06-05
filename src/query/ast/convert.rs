@@ -15,7 +15,7 @@ pub fn select_node_fingerprint(node: &SelectNode) -> u64 {
 /// This is used for cache key generation.
 ///
 /// Intentionally excludes LIMIT/OFFSET so that queries differing only
-/// in LIMIT/OFFSET share a cache entry. The cache coordinator tracks
+/// in LIMIT/OFFSET share a cache entry. The cache dispatch tracks
 /// `max_limit` separately to decide when cached rows are sufficient.
 pub fn query_expr_fingerprint(query: &QueryExpr) -> u64 {
     let mut hasher = DefaultHasher::new();

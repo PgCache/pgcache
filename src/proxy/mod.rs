@@ -72,7 +72,7 @@ impl From<io::Error> for ConnectionError {
 ///
 /// These are the two serving-phase sub-states (the connection owns the client
 /// write half in both). The "worker is serving" phase is encoded as control
-/// flow in `connection_run` (the write half is lent to the worker and absent),
+/// flow in `handle_connection` (the write half is lent to the worker and absent),
 /// not as a variant — so "write to the client while it's lent" is
 /// unrepresentable.
 #[derive(Debug)]

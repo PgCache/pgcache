@@ -47,7 +47,7 @@ mod fault {
 
     static COALESCE_DELAY: AtomicBool = AtomicBool::new(false);
 
-    /// Arm from the environment (read once at `QueryCache` construction).
+    /// Arm from the environment (read once at `CacheDispatch` construction).
     pub(super) fn init() {
         if std::env::var_os("PGCACHE_FAULT_COALESCE_DELAY").is_some() {
             COALESCE_DELAY.store(true, Ordering::Relaxed);
@@ -199,7 +199,7 @@ pub struct WorkerRequest {
     /// Generation number for row tracking in pgcache_pgrx extension
     pub generation: u64,
     /// Serve from the MV (carrying its aliased output column names) or
-    /// from source rows. Decided by the coordinator at dispatch time.
+    /// from source rows. Decided on the dispatch path.
     pub mv: MvServe,
     pub result_formats: Vec<i16>,
     pub client_socket: ClientSocket,
@@ -228,9 +228,11 @@ pub struct WorkerRequest {
     pub coalesced: Vec<CoalescedClient>,
 }
 
-/// Query cache coordinator - routes queries and delegates writes to the writer thread.
+/// Per-connection inline dispatch against the cache: routes queries and
+/// delegates writes to the writer thread. `Send + Clone`; each connection holds
+/// one (via the watch handle) and dispatches against it directly.
 #[derive(Clone)]
-pub struct QueryCache {
+pub struct CacheDispatch {
     query_tx: UnboundedSender<QueryCommand>,
     worker_tx: UnboundedSender<WorkerRequest>,
     state_view: Arc<CacheStateView>,
@@ -241,31 +243,31 @@ pub struct QueryCache {
     cdc_connected: Arc<AtomicBool>,
 }
 
-/// Connection-side handle to the current [`QueryCache`]. Hot-swaps across cache
+/// Connection-side handle to the current [`CacheDispatch`]. Hot-swaps across cache
 /// restarts via a `watch` channel; `None` before the cache is ready or while it
 /// is restarting (connections then forward to origin).
 #[derive(Clone)]
-pub struct QueryCacheHandle {
-    rx: watch::Receiver<Option<QueryCache>>,
+pub struct CacheDispatchHandle {
+    rx: watch::Receiver<Option<CacheDispatch>>,
 }
 
-impl QueryCacheHandle {
+impl CacheDispatchHandle {
     /// Snapshot the current cache, if it is up. The clone is cheap (channels +
-    /// `Arc`s) and gives the caller an owned `QueryCache` to dispatch against.
-    pub fn current(&self) -> Option<QueryCache> {
+    /// `Arc`s) and gives the caller an owned `CacheDispatch` to dispatch against.
+    pub fn current(&self) -> Option<CacheDispatch> {
         self.rx.borrow().clone()
     }
 }
 
-/// Publish handle held by `cache_setup` to advertise its built `QueryCache`
+/// Publish handle held by `cache_setup` to advertise its built `CacheDispatch`
 /// (and retract it on exit).
-pub struct QueryCachePublisher {
-    tx: watch::Sender<Option<QueryCache>>,
+pub struct CacheDispatchPublisher {
+    tx: watch::Sender<Option<CacheDispatch>>,
 }
 
-impl QueryCachePublisher {
-    pub fn publish(&self, qcache: QueryCache) {
-        let _ = self.tx.send(Some(qcache));
+impl CacheDispatchPublisher {
+    pub fn publish(&self, dispatch: CacheDispatch) {
+        let _ = self.tx.send(Some(dispatch));
     }
 
     pub fn clear(&self) {
@@ -273,26 +275,26 @@ impl QueryCachePublisher {
     }
 }
 
-/// Supervisor-side owner of the `QueryCache` watch. Hands out subscriber handles
+/// Supervisor-side owner of the `CacheDispatch` watch. Hands out subscriber handles
 /// for connection tasks and a publisher for `cache_setup`; clears on cache exit.
-pub struct QueryCacheUpdater {
-    tx: watch::Sender<Option<QueryCache>>,
+pub struct CacheDispatchUpdater {
+    tx: watch::Sender<Option<CacheDispatch>>,
 }
 
-impl QueryCacheUpdater {
-    pub fn new() -> (Self, QueryCacheHandle) {
+impl CacheDispatchUpdater {
+    pub fn new() -> (Self, CacheDispatchHandle) {
         let (tx, rx) = watch::channel(None);
-        (Self { tx }, QueryCacheHandle { rx })
+        (Self { tx }, CacheDispatchHandle { rx })
     }
 
-    pub fn publisher(&self) -> QueryCachePublisher {
-        QueryCachePublisher {
+    pub fn publisher(&self) -> CacheDispatchPublisher {
+        CacheDispatchPublisher {
             tx: self.tx.clone(),
         }
     }
 
-    pub fn subscribe(&self) -> QueryCacheHandle {
-        QueryCacheHandle {
+    pub fn subscribe(&self) -> CacheDispatchHandle {
+        CacheDispatchHandle {
             rx: self.tx.subscribe(),
         }
     }
@@ -302,7 +304,7 @@ impl QueryCacheUpdater {
     }
 }
 
-impl QueryCache {
+impl CacheDispatch {
     pub async fn new(
         settings: &Settings,
         query_tx: UnboundedSender<QueryCommand>,
@@ -338,7 +340,7 @@ impl QueryCache {
     /// Inline dispatch entry point for a connection task. Applies CDC-liveness
     /// gating, converts the proxy message (parameter substitution), and routes
     /// to [`query_dispatch`](Self::query_dispatch). Replaces the former central
-    /// coordinator hop: every connection calls this directly.
+    /// dispatch hop: every connection calls this directly.
     pub async fn dispatch_proxy(&mut self, proxy_msg: ProxyMessage) {
         if !self.cdc_connected.load(Ordering::Relaxed) {
             // CDC down: forward to origin rather than serve possibly-stale data.
@@ -741,7 +743,7 @@ impl QueryCache {
     fn mv_dispatch_decide(&self, fingerprint: u64, rows_needed: Option<u64>) -> MvServe {
         match fast_path::mv_serve_decide(&self.state_view, fingerprint, rows_needed) {
             MvDecision::Serve(mv) => mv,
-            // Coordinator owns `query_tx`: flip Pending → Scheduled and dispatch
+            // CacheDispatch owns `query_tx`: flip Pending → Scheduled and dispatch
             // the build, then serve this request from source rows.
             MvDecision::NeedsSchedule { has_table } => {
                 if let Some(cmd) = fast_path::mv_schedule(&self.state_view, fingerprint, has_table)

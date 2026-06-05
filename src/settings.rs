@@ -229,8 +229,8 @@ impl StaticConfigSnapshot {
 /// Shared handle for reading/updating dynamic config. Cloneable, lock-free reads.
 pub struct DynamicConfigHandle {
     inner: Arc<ArcSwap<DynamicConfig>>,
-    // Arc-wrapped so cloning the handle (done per query when the cache
-    // coordinator clones `QueryCache`) is a refcount bump, not a deep copy of
+    // Arc-wrapped so cloning the handle (done per query when a connection
+    // clones `CacheDispatch`) is a refcount bump, not a deep copy of
     // the static config. Both are set once at startup and never mutated.
     config_path: Option<Arc<PathBuf>>,
     log_reload: Arc<Mutex<Option<LogReloadHandle>>>,

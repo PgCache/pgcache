@@ -13,7 +13,7 @@ use crate::timing::QueryTiming;
 
 use super::types::SharedResolved;
 
-/// Result of a subsumption check, sent from the writer back to the coordinator
+/// Result of a subsumption check, sent from the writer back to the dispatch
 /// via a oneshot channel included in the Register command.
 pub enum SubsumptionResult {
     /// Data already in cache. State is Ready, serve immediately.
@@ -26,7 +26,7 @@ pub enum SubsumptionResult {
     NotSubsumed,
 }
 
-/// Notifications from writer to coordinator for coalescing queue drain.
+/// Notifications from writer to dispatch for coalescing queue drain.
 pub enum WriterNotify {
     /// Population completed — query is Ready.
     Ready {
@@ -286,7 +286,7 @@ pub enum QueryCommand {
         cacheable_query: Arc<CacheableQuery>,
         search_path: Vec<EcoString>,
         started_at: Instant,
-        /// Writer sends subsumption result back so the coordinator can route the held request.
+        /// Writer sends subsumption result back so the dispatch can route the held request.
         subsumption_tx: oneshot::Sender<SubsumptionResult>,
         /// What to do when the query is not subsumed by existing cached data.
         admit_action: AdmitAction,
@@ -317,7 +317,7 @@ pub enum QueryCommand {
     Readmit { fingerprint: u64 },
 
     /// Build (or rebuild) the materialized result for a cached query. Sent by
-    /// the coordinator when it observes `mv_state == Pending { .. }` on a cache
+    /// the dispatch when it observes `mv_state == Pending { .. }` on a cache
     /// hit and transitions to `Scheduled { .. }`. The writer's handler branches
     /// on `has_table` to choose between `CREATE TABLE AS` (first build, may
     /// run the Measure size gate) and `BEGIN; TRUNCATE; INSERT; COMMIT`

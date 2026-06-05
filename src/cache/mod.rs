@@ -39,7 +39,7 @@ pub use mv::{
     MvMeta, MvServe, MvState, ShapeGate, mv_serve_sql_into, mv_state_initial, mv_table_name,
     shape_classify,
 };
-pub use query_cache::{QueryCacheHandle, QueryCachePublisher, QueryCacheUpdater};
+pub use query_cache::{CacheDispatchHandle, CacheDispatchPublisher, CacheDispatchUpdater};
 pub use runtime::{CacheGeneration, cache_generation_start, cache_supervise};
 pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,

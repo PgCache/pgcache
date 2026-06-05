@@ -788,7 +788,7 @@ impl WriterCdc {
         }
 
         // Update state view to Invalidated. Fold the MV dirty transition into
-        // the same get_mut block so coordinators observe both transitions
+        // the same get_mut block so dispatches observe both transitions
         // atomically — a reader that sees state=Invalidated never sees the MV
         // in a stale-Fresh state.
         if let Some(mut entry) = core.state_view.cached_queries.get_mut(&fingerprint) {

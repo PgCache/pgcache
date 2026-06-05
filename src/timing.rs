@@ -94,7 +94,7 @@ pub struct QueryDurations {
     /// Coalesce path: the actual wait — from joining the waiting list until
     /// the drain task picked up the group (waiter_enqueued_at →
     /// drain_started_at). Dominated by the population pipeline + writer's
-    /// Ready notify + coordinator drain pickup.
+    /// Ready notify + dispatch drain pickup.
     pub coalesce_wait_ns: Option<u64>,
     /// Total time from reception to completion
     pub total_ns: Option<u64>,

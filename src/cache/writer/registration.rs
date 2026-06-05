@@ -1166,7 +1166,7 @@ impl WriterRegistration {
 
     /// Clean up after a failed register/populate/readmit/limit-bump.
     ///
-    /// Always clears the coordinator-owned `state_view` entry and drains any
+    /// Always clears the dispatch-owned `state_view` entry and drains any
     /// coalesced `waiting` requests via `WriterNotify::Failed` — even when the
     /// fingerprint never made it into `cached_queries` (e.g. the resolver
     /// rejected the query). Without this, a failed Register would leave
@@ -1216,7 +1216,7 @@ impl WriterRegistration {
 
         // A larger max_limit means the existing MV (sized for the old max_limit)
         // is short of rows. Flip Fresh → Dirty before any other mutation so
-        // coordinators fall through while the new population runs.
+        // dispatches fall through while the new population runs.
         core.mv_dirty_mark(fingerprint);
 
         // Collect data needed before mutating

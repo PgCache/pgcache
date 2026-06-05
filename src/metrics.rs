@@ -227,11 +227,11 @@ pub mod names {
         "pgcache.query.stage.forward_decision_seconds";
     /// Coalesce path: lookup_complete_at → waiter_enqueued_at. Cache-thread
     /// book-keeping into the waiting map. Expected to be sub-microsecond;
-    /// non-zero values would point at coordinator contention.
+    /// non-zero values would point at dispatch contention.
     pub const QUERY_STAGE_COALESCE_INTAKE_SECONDS: &str =
         "pgcache.query.stage.coalesce_intake_seconds";
     /// Coalesce path: waiter_enqueued_at → drain_started_at. The actual wait
-    /// — population pipeline + writer Ready notify + coordinator drain
+    /// — population pipeline + writer Ready notify + dispatch drain
     /// pickup. The "we have a 2-second p95 even though population is 2 ms"
     /// signal lives here.
     pub const QUERY_STAGE_COALESCE_WAIT_SECONDS: &str = "pgcache.query.stage.coalesce_wait_seconds";

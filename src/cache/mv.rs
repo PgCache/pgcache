@@ -1,7 +1,7 @@
 //! Materialized query results.
 //!
 //! Types and helpers for the MV cache layer. The MV state machine is driven
-//! entirely from the writer task; the coordinator reads `MvState` to pick
+//! entirely from the writer task; the dispatch reads `MvState` to pick
 //! between the fast path (serve from MV table) and the fallthrough path
 //! (deparse resolved query against source-row cache).
 //!

@@ -25,7 +25,7 @@ use tracing::{debug, error, instrument, trace, warn};
 
 use crate::{
     cache::{
-        CacheMessage, CacheOutcome, CacheReply, ProxyMessage, QueryCacheHandle, QueryParameters,
+        CacheDispatchHandle, CacheMessage, CacheOutcome, CacheReply, ProxyMessage, QueryParameters,
         messages::{PipelineContext, PipelineDescribe},
         query::CacheableQuery,
     },
@@ -212,7 +212,7 @@ struct QueryTelemetry {
     origin_sent_at: Option<Instant>,
 
     /// Per-stage timing breakdown that travels with the query through the cache
-    /// pipeline (coordinator → worker) and back, only set for cache-path queries
+    /// pipeline (dispatch → worker) and back, only set for cache-path queries
     cache_timing: Option<QueryTiming>,
 }
 
@@ -2274,7 +2274,7 @@ async fn handle_connection(
     addrs: Vec<SocketAddr>,
     ssl_mode: SslMode,
     server_name: &str,
-    qcache: QueryCacheHandle,
+    dispatch_handle: CacheDispatchHandle,
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
 ) -> ConnectionResult<()> {
@@ -2370,15 +2370,15 @@ async fn handle_connection(
                 };
 
                 // Inline dispatch: the connection dispatches against the shared
-                // QueryCache directly (no coordinator hop). A hit goes straight to
+                // CacheDispatch directly (inline, no extra hop). A hit goes straight to
                 // the worker, a miss/coalesce/registration is handled inline; the
                 // reply (and the leased write half) comes back via `reply_rx`.
-                match qcache.current() {
-                    Some(mut qc) => {
+                match dispatch_handle.current() {
+                    Some(mut dispatch) => {
                         // The write half is now leased into the dispatch. Await the
                         // reply, which returns it; origin messages buffer in egress
                         // meanwhile and flush once we are back in `Read`.
-                        qc.dispatch_proxy(proxy_msg).await;
+                        dispatch.dispatch_proxy(proxy_msg).await;
                         match state
                             .cache_serve_wait(&mut origin_framed_read, &mut origin_write, reply_rx)
                             .await
@@ -2441,7 +2441,7 @@ pub async fn connection_task(
     addrs: Vec<SocketAddr>,
     ssl_mode: SslMode,
     server_name: EcoString,
-    qcache: QueryCacheHandle,
+    dispatch_handle: CacheDispatchHandle,
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
@@ -2467,7 +2467,7 @@ pub async fn connection_task(
         addrs,
         ssl_mode,
         &server_name,
-        qcache,
+        dispatch_handle,
         func_volatility,
         origin_database,
     )

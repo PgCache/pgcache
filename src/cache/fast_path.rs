@@ -1,6 +1,6 @@
 //! Shared cache-dispatch helpers.
 //!
-//! These functions are the building blocks of [`QueryCache::query_dispatch`]:
+//! These functions are the building blocks of [`CacheDispatch::query_dispatch`]:
 //! the allowlist check, the hit-path mutations (metrics, CLOCK bit), the MV
 //! serve decision, and the worker-request construction. They operate on the
 //! `Send` shared state ([`CacheStateView`], the worker channel) and are factored

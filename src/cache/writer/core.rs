@@ -124,7 +124,7 @@ pub struct WriterCore {
     /// invalidation to defer pinned readmits, by MV to schedule builds, and
     /// cloned to population workers so they can report Ready/Failed.
     pub(super) query_tx: UnboundedSender<QueryCommand>,
-    /// Notifications to coordinator for coalescing queue drain.
+    /// Notifications to dispatch for coalescing queue drain.
     pub(super) notify_tx: UnboundedSender<WriterNotify>,
     /// CDC source-transaction frame state (driven by
     /// `WriterCdc::frame_begin_ensure`/`frame_commit`/recovery through their
@@ -369,7 +369,7 @@ impl WriterCore {
     /// Set the shape-gate classification and derive the initial MvState for a
     /// cached query. Called once per fresh registration (not on readmit / limit
     /// bump, since classification is sticky). The state_view entry is expected
-    /// to exist — it is inserted by the coordinator before dispatching
+    /// to exist — it is inserted on the dispatch path before dispatching
     /// `QueryCommand::Register`.
     pub(super) fn mv_state_set(
         &self,
@@ -722,7 +722,7 @@ impl WriterCore {
     ///
     /// Four passes:
     /// - Snapshot the hit counter into `last_hits_per_gc`; the delta seeds
-    ///   coordinator-side Pending-credit sizing and decays existing credits.
+    ///   dispatch-side Pending-credit sizing and decays existing credits.
     /// - Invalidated, non-pinned entries in `cache.cached_queries` whose
     ///   generation is below the purge threshold (CLOCK-policy carryover
     ///   after CDC invalidation that wasn't readmitted).
@@ -1040,7 +1040,7 @@ pub fn writer_run(
                             core.state_gauges_update();
                             core.writer_scale_gauges_update();
                         }
-                        // Handle query commands from coordinator
+                        // Handle query commands from dispatch
                         msg = query_rx.recv() => {
                             match msg {
                                 Some(cmd) => {
@@ -1059,7 +1059,7 @@ pub fn writer_run(
                                 }
                             }
                         }
-                        // Handle CDC commands from coordinator
+                        // Handle CDC commands from the CDC thread
                         msg = cdc_rx.recv() => {
                             match msg {
                                 Some(cmd) => {

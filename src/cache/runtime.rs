@@ -17,11 +17,11 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     cache::{
-        CacheError, CacheResult, MapIntoReport, PinnedQuery, QueryCachePublisher,
-        QueryCacheUpdater, ReportExt, StatusRequest,
+        CacheDispatchPublisher, CacheDispatchUpdater, CacheError, CacheResult, MapIntoReport,
+        PinnedQuery, ReportExt, StatusRequest,
         cdc::CdcProcessor,
         messages::{CacheOutcome, CacheReply, CdcCommand, WriterNotify},
-        query_cache::{QueryCache, WorkerRequest},
+        query_cache::{CacheDispatch, WorkerRequest},
         types::{ActiveRelations, CacheStateView},
         worker::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
         writer::writer_run,
@@ -58,7 +58,7 @@ async fn handle_worker_request(
                 .worker_start_at
                 .map(|s| duration_to_us_u64(s.elapsed()))
                 .unwrap_or(0);
-            // Record directly in the shared view (no coordinator hop).
+            // Record directly in the shared view (no extra hop).
             worker_metrics_record(
                 &state_view,
                 msg.fingerprint,
@@ -277,7 +277,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     pinned: &[PinnedQuery],
     cache_cancel: CancellationToken,
     status_rx: Receiver<StatusRequest>,
-    qcache_publisher: QueryCachePublisher,
+    dispatch_publisher: CacheDispatchPublisher,
 ) -> CacheResult<Vec<thread::ScopedJoinHandle<'scope, CacheResult<()>>>> {
     // Provision replication per generation: idempotent for the slot (created only
     // if missing) and recreating the publication empty. On a restart this rebuilds
@@ -369,8 +369,8 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     };
 
     // Remaining fallible setup; on error, tear down both threads and reap.
-    let qcache = match handle
-        .block_on(QueryCache::new(
+    let dispatch = match handle
+        .block_on(CacheDispatch::new(
             settings,
             query_tx,
             worker_tx,
@@ -378,13 +378,13 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
             cdc_connected,
         ))
         .attach_loc("creating query cache")
-        .and_then(|qcache| {
-            qcache
+        .and_then(|dispatch| {
+            dispatch
                 .pinned_queries_register(pinned)
                 .attach_loc("registering pinned queries")?;
-            Ok(qcache)
+            Ok(dispatch)
         }) {
-        Ok(qcache) => qcache,
+        Ok(dispatch) => dispatch,
         Err(e) => {
             cache_cancel.cancel();
             let _ = writer_handle.join();
@@ -394,11 +394,11 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     };
 
     // Publish the cache for connection tasks to dispatch against inline.
-    qcache_publisher.publish(qcache.clone());
+    dispatch_publisher.publish(dispatch.clone());
 
     // Worker dispatcher serves cache queries (spread across runtime threads);
     // the coalesce-drain task dispatches coalesced waiters when the writer
-    // reports a query Ready/Failed. There is no central dispatch coordinator.
+    // reports a query Ready/Failed. There is no central dispatcher.
     handle.spawn(worker_loop(
         settings.clone(),
         worker_rx,
@@ -406,10 +406,10 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         Arc::clone(&state_view),
     ));
     handle.spawn(coalesce_drain(
-        qcache,
+        dispatch,
         notify_rx,
         cache_cancel,
-        qcache_publisher,
+        dispatch_publisher,
     ));
 
     Ok(vec![writer_handle, cdc_handle])
@@ -437,7 +437,7 @@ pub fn cache_generation_start<'scope, 'env: 'scope, 'settings: 'scope>(
     handle: Handle,
     pinned: &[PinnedQuery],
     root_cancel: &CancellationToken,
-    qcache_updater: &QueryCacheUpdater,
+    dispatch_updater: &CacheDispatchUpdater,
     status_updater: &StatusSenderUpdater,
 ) -> CacheResult<CacheGeneration<'scope>> {
     let cancel = root_cancel.child_token();
@@ -449,7 +449,7 @@ pub fn cache_generation_start<'scope, 'env: 'scope, 'settings: 'scope>(
         pinned,
         cancel.clone(),
         status_rx,
-        qcache_updater.publisher(),
+        dispatch_updater.publisher(),
     )?;
     status_updater.sender_update(status_tx);
     Ok(CacheGeneration { cancel, handles })
@@ -461,7 +461,7 @@ pub fn cache_generation_start<'scope, 'env: 'scope, 'settings: 'scope>(
 /// until root shutdown.
 ///
 /// Runs on the proxy thread (it owns the inner `thread::scope` and both watch
-/// updaters). While a generation is down the `QueryCache`/status watches are
+/// updaters). While a generation is down the `CacheDispatch`/status watches are
 /// cleared, so connections degrade to origin until the next publish.
 #[allow(clippy::too_many_arguments)]
 pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
@@ -470,7 +470,7 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
     handle: Handle,
     pinned: &[PinnedQuery],
     root_cancel: CancellationToken,
-    qcache_updater: &QueryCacheUpdater,
+    dispatch_updater: &CacheDispatchUpdater,
     status_updater: &StatusSenderUpdater,
     first: CacheGeneration<'scope>,
 ) {
@@ -484,7 +484,7 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
 
         // Down: degrade connections to origin, then reap the dead generation's
         // threads before the next DB reset.
-        qcache_updater.clear();
+        dispatch_updater.clear();
         status_updater.sender_clear();
         for h in generation.handles.drain(..) {
             if let Ok(Err(e)) = h.join() {
@@ -508,7 +508,7 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
                 }
             });
             if interrupted {
-                qcache_updater.clear();
+                dispatch_updater.clear();
                 status_updater.sender_clear();
                 debug!("cache supervisor exiting");
                 return;
@@ -521,7 +521,7 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
                 handle.clone(),
                 pinned,
                 &root_cancel,
-                qcache_updater,
+                dispatch_updater,
                 status_updater,
             ) {
                 Ok(next_gen) => {
@@ -535,7 +535,7 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
                         "cache restart failed: {}",
                         error_chain_format(e.current_context()),
                     );
-                    qcache_updater.clear();
+                    dispatch_updater.clear();
                     status_updater.sender_clear();
                 }
             }
@@ -543,7 +543,7 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
     }
 
     // Supervisor exiting: ensure connections degrade.
-    qcache_updater.clear();
+    dispatch_updater.clear();
     status_updater.sender_clear();
     debug!("cache supervisor exiting");
 }
@@ -552,10 +552,10 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
 /// `Ready`/`Failed`. Off the dispatch hot path (fires once per registration
 /// completion, not per query). Retracts the published cache on exit.
 async fn coalesce_drain(
-    qcache: QueryCache,
+    dispatch: CacheDispatch,
     mut notify_rx: UnboundedReceiver<WriterNotify>,
     cancel: CancellationToken,
-    qcache_publisher: QueryCachePublisher,
+    dispatch_publisher: CacheDispatchPublisher,
 ) {
     debug!("coalesce drain loop");
     loop {
@@ -567,10 +567,10 @@ async fn coalesce_drain(
             notify = notify_rx.recv() => {
                 match notify {
                     Some(WriterNotify::Ready { fingerprint, generation, resolved, deparsed_sql, max_limit }) => {
-                        qcache.waiting_drain_ready(fingerprint, generation, resolved, deparsed_sql, max_limit);
+                        dispatch.waiting_drain_ready(fingerprint, generation, resolved, deparsed_sql, max_limit);
                     }
                     Some(WriterNotify::Failed { fingerprint }) => {
-                        qcache.waiting_drain_failed(fingerprint);
+                        dispatch.waiting_drain_failed(fingerprint);
                     }
                     None => {
                         error!("writer notify channel closed");
@@ -583,7 +583,7 @@ async fn coalesce_drain(
     }
 
     debug!("coalesce drain loop exiting");
-    qcache_publisher.clear();
+    dispatch_publisher.clear();
 }
 
 /// Record worker-reported metrics (cache-hit latency, bytes served).

@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Shared resolved query expression, wrapped in Arc to avoid deep cloning
-/// on every cache hit (the coordinator→worker path).
+/// on every cache hit (the dispatch→worker path).
 pub type SharedResolved = Arc<ResolvedQueryExpr>;
 
 /// State of a cached query
@@ -27,7 +27,7 @@ pub type SharedResolved = Arc<ResolvedQueryExpr>;
 pub enum CachedQueryState {
     /// Seen but not yet admitted to cache. `hit_count` promotes at
     /// `admission_threshold`; `credit` is the decay budget — see
-    /// `QueryCache::pending_initial_credit`.
+    /// `CacheDispatch::pending_initial_credit`.
     Pending { hit_count: u32, credit: u32 },
     /// Admitted, population in progress
     Loading,
@@ -374,8 +374,8 @@ pub type ActiveRelations = Arc<ArcSwap<HashSet<u32>>>;
 /// for the duration of access. This means plain `u64` fields and the `Histogram`
 /// need no additional synchronization — the shard lock provides mutual exclusion.
 ///
-/// Only two threads write: coordinator (hit/miss/subsumption counts) and
-/// writer (all other fields including histogram recording from worker channel).
+/// Two writers: dispatch on connection tasks (hit/miss/subsumption counts) and
+/// the writer (all other fields including histogram recording from worker channel).
 pub struct QueryMetrics {
     pub hit_count: u64,
     pub miss_count: u64,
@@ -420,7 +420,7 @@ impl QueryMetrics {
     }
 }
 
-/// Shared cache state for coordinator lookups and writer updates.
+/// Shared cache state for dispatch lookups and writer updates.
 /// Uses DashMap for per-shard locking — reads to one shard don't block
 /// writes to another, eliminating the global RwLock bottleneck.
 pub struct CacheStateView {
@@ -428,10 +428,10 @@ pub struct CacheStateView {
     pub metrics: DashMap<u64, QueryMetrics>,
     pub started_at: Instant,
     /// Cache hits observed during the current GC interval. Incremented by the
-    /// coordinator on each Ready-state serve; snapshot-and-zeroed by the writer
+    /// dispatch on each Ready-state serve; snapshot-and-zeroed by the writer
     /// on the 1s GC tick. Drives the Pending-credit decay scheme.
     pub hits_since_gc: AtomicU32,
-    /// Previous GC tick's hit count, used by the coordinator to size the
+    /// Previous GC tick's hit count, used by the dispatch to size the
     /// initial credit stamped on new Pending entries (or on Pending re-hits).
     pub last_hits_per_gc: AtomicU32,
 }
@@ -458,7 +458,7 @@ impl CacheStateView {
     }
 }
 
-/// Lightweight view of a cached query for coordinator lookups.
+/// Lightweight view of a cached query for dispatch lookups.
 #[derive(Debug, Clone)]
 pub struct CachedQueryView {
     pub state: CachedQueryState,
@@ -471,7 +471,7 @@ pub struct CachedQueryView {
     pub deparsed_sql: Option<EcoString>,
     /// Maximum rows cached for this fingerprint (None = all rows)
     pub max_limit: Option<u64>,
-    /// CLOCK reference bit — set by coordinator on cache hit, read/cleared by writer during eviction
+    /// CLOCK reference bit — set by dispatch on cache hit, read/cleared by writer during eviction
     pub referenced: bool,
     /// MV shape classification, runtime state, and captured output column
     /// names — all written by the writer (registration / MV build).

@@ -42,10 +42,10 @@ struct MvBuildContext {
 }
 
 impl WriterCore {
-    /// Pinned queries bypass the coordinator-driven "first hit triggers MV
+    /// Pinned queries bypass the dispatch-driven "first hit triggers MV
     /// build" flow so they stay warm across startup and readmits. Called from
     /// the Ready handler. Performs the same check-and-transition the
-    /// coordinator would do on first hit and self-sends an `MvBuild` command.
+    /// dispatch would do on first hit and self-sends an `MvBuild` command.
     pub(super) fn mv_pinned_bootstrap(&self, fingerprint: u64) {
         let is_pinned = self
             .cache
@@ -67,7 +67,7 @@ impl WriterCore {
     }
 
     /// Handle `QueryCommand::MvBuild`. Precondition: `mv_state ==
-    /// Scheduled { .. }` (set by the coordinator or pinned bootstrap before
+    /// Scheduled { .. }` (set by the dispatch or pinned bootstrap before
     /// the command was enqueued) and source-row state `Ready`.
     ///
     /// Branches on `has_table`:
@@ -235,7 +235,7 @@ impl WriterCore {
     }
 
     /// Sum `count(*)` across the cache tables referenced by the fingerprint.
-    /// Used as the denominator of the Measure size gate under the coordinator-
+    /// Used as the denominator of the Measure size gate under the dispatch-
     /// driven first-pop flow (no population `row_count` available here).
     /// Returns 0 when relations cannot be resolved — causes the gate to fail,
     /// which is the safe default.
@@ -334,7 +334,7 @@ impl WriterCore {
     /// evicting cache entries that might still be useful. The table persists
     /// (empty) so the next rebuild's `BEGIN; TRUNCATE; INSERT; COMMIT` still
     /// hits an existing table; state stays `Pending { has_table: true }` so
-    /// coordinators keep falling through.
+    /// dispatches keep falling through.
     ///
     /// Does **not** touch `Scheduled { .. }` (writer's own queue has a build
     /// pending; truncating would churn) or `Fresh` (still serving the fast

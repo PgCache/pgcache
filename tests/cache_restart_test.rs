@@ -88,9 +88,17 @@ async fn test_cache_restart_recovers_after_writer_death() -> Result<(), Error> {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let before = ctx.metrics().await?;
-        assert_eq!(ctx.query(q, &[]).await?.len(), 10, "correct rows after restart");
+        assert_eq!(
+            ctx.query(q, &[]).await?.len(),
+            10,
+            "correct rows after restart"
+        );
         ctx.cache_settle().await?;
-        assert_eq!(ctx.query(q, &[]).await?.len(), 10, "correct rows after restart");
+        assert_eq!(
+            ctx.query(q, &[]).await?.len(),
+            10,
+            "correct rows after restart"
+        );
         if ctx.metrics().await?.queries_cache_hit > before.queries_cache_hit {
             break;
         }
