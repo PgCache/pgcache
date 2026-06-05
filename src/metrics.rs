@@ -131,8 +131,6 @@ pub mod names {
     pub const CACHE_WRITER_INTERNAL_QUEUE: &str = "pgcache.cache.writer_internal_queue";
     pub const CACHE_WORKER_QUEUE: &str = "pgcache.cache.worker_queue";
     pub const CACHE_POPULATION_WORKER_QUEUE: &str = "pgcache.cache.population_worker_queue";
-    pub const CACHE_PROXY_MESSAGE_QUEUE: &str = "pgcache.cache.proxy_message_queue";
-    pub const PROXY_WORKER_QUEUE: &str = "pgcache.proxy.worker_queue";
     pub const CACHE_HANDLE_INSERTS: &str = "pgcache.cache.handle_inserts";
     pub const CACHE_HANDLE_UPDATES: &str = "pgcache.cache.handle_updates";
     pub const CACHE_HANDLE_DELETES: &str = "pgcache.cache.handle_deletes";
@@ -407,7 +405,6 @@ pub struct StateHandles {
     pub queue_writer_cdc: Gauge,
     pub queue_writer_internal: Gauge,
     pub queue_worker: Gauge,
-    pub queue_proxy_message: Gauge,
 }
 
 impl Handles {
@@ -551,7 +548,6 @@ impl Handles {
                 queue_writer_cdc: metrics::gauge!(CACHE_WRITER_CDC_QUEUE),
                 queue_writer_internal: metrics::gauge!(CACHE_WRITER_INTERNAL_QUEUE),
                 queue_worker: metrics::gauge!(CACHE_WORKER_QUEUE),
-                queue_proxy_message: metrics::gauge!(CACHE_PROXY_MESSAGE_QUEUE),
             },
         }
     }
@@ -576,12 +572,6 @@ pub fn population_worker_handles(id: usize) -> (Histogram, Gauge) {
         metrics::histogram!(names::CACHE_POPULATION_WORKER_IDLE_SECONDS, "worker" => worker.clone()),
         metrics::gauge!(names::CACHE_POPULATION_WORKER_QUEUE, "worker" => worker),
     )
-}
-
-/// Per-worker proxy queue-depth gauge, labeled `worker={id}`. Dynamic label —
-/// resolve once per proxy worker and reuse across its accept loop.
-pub fn proxy_worker_queue_handle(id: usize) -> Gauge {
-    metrics::gauge!(names::PROXY_WORKER_QUEUE, "worker" => id.to_string())
 }
 
 /// Install the global Prometheus metrics recorder.

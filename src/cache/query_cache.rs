@@ -748,7 +748,6 @@ impl QueryCache {
                 {
                     let _ = self.query_tx.send(cmd);
                 }
-                crate::metrics::handles().cache.mv_fallthrough.increment(1);
                 MvServe::SourceRow
             }
         }

@@ -84,9 +84,9 @@ pub(crate) fn clock_reference_set(
 }
 
 /// Inspect `mv_state` to decide whether to serve from the MV fast path, source
-/// rows, or (Pending) defer to the dispatcher for scheduling. Counts
-/// `mv_hits`/`mv_fallthrough` for the decisions it resolves; the dispatcher
-/// counts the fallthrough for `NeedsSchedule`.
+/// rows, or (Pending) defer to the dispatcher for scheduling. The single site
+/// for `mv_hits`/`mv_fallthrough` counting — including the `Pending` case, which
+/// falls through to source rows while the dispatcher schedules the build.
 pub(crate) fn mv_serve_decide(
     state_view: &CacheStateView,
     fingerprint: u64,
@@ -117,7 +117,10 @@ pub(crate) fn mv_serve_decide(
             crate::metrics::handles().cache.mv_fallthrough.increment(1);
             MvDecision::Serve(MvServe::SourceRow)
         }
-        Some((MvState::Pending { has_table }, _, _)) => MvDecision::NeedsSchedule { has_table },
+        Some((MvState::Pending { has_table }, _, _)) => {
+            crate::metrics::handles().cache.mv_fallthrough.increment(1);
+            MvDecision::NeedsSchedule { has_table }
+        }
         Some((MvState::Scheduled { .. }, _, _)) => {
             crate::metrics::handles().cache.mv_fallthrough.increment(1);
             MvDecision::Serve(MvServe::SourceRow)
