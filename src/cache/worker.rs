@@ -19,15 +19,81 @@ use crate::query::ast::{Deparse, LiteralValue};
 
 use super::{
     CacheError, CacheResult,
-    mv::{MvServe, mv_serve_sql_into},
+    memo::{MEMO_CAPTURE_MIN_HITS, MemoCapture, MemoKey, MemoShape},
+    mv::{MvServe, MvState, mv_serve_sql_into},
     query_cache::{CoalescedClient, QueryType, WorkerRequest},
     types::CacheStateView,
     write_queue::WriteQueue,
 };
+use crate::query::resolved::ResolvedTableNode;
 
 /// Max gap between cache-DB frames while draining a response for a departed
 /// primary client before the connection is treated as stalled and discarded.
 const DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Decide whether this serve should be captured into the in-process result memo
+/// (PGC-236) and, if so, begin a capture — stamping the read relations' seqlock
+/// versions *before* the serve query is issued. Returns `None` for MV serves,
+/// disabled memoization, cold fingerprints, non-keyable shapes, or relations
+/// mid-write.
+///
+/// Serves with no RowDescription on the wire (a reused prepared statement —
+/// `Bind`/`Execute` only, no `Describe`) are captured too, with `rd_len == 0`.
+/// That core (`DataRow* + CommandComplete`) serves any request that doesn't want
+/// a RowDescription — i.e. the same reused-prepared-statement path the demo runs
+/// exclusively. Requests that *do* want a RowDescription fall through unless a
+/// later RowDescription-bearing serve upgrades the entry (see `memo_serve_plan`).
+fn memo_capture_begin(
+    state_view: &CacheStateView,
+    msg: &WorkerRequest,
+    binary: bool,
+) -> Option<MemoCapture> {
+    // Only source-row serves are memoized (MV-eligible queries stay in q_<fp>).
+    if !matches!(msg.mv, MvServe::SourceRow) {
+        return None;
+    }
+    // Mutually exclusive with MVs: memoize only the terminal MV-ineligible
+    // partition (Skip, or a Measure query whose size gate failed → Ineligible).
+    // A Measure query serves source rows while its MV is still Pending; memoizing
+    // that would shadow the MV once it's built. Both states are sticky, so a memo
+    // captured here never later acquires an MV.
+    let mv_ineligible = state_view
+        .cached_queries
+        .get(&msg.fingerprint)
+        .is_some_and(|v| matches!(v.mv.state, MvState::Skipped | MvState::Ineligible));
+    if !mv_ineligible {
+        return None;
+    }
+    let hits = state_view
+        .metrics
+        .get(&msg.fingerprint)
+        .map(|m| m.hit_count)
+        .unwrap_or(0);
+    if hits < MEMO_CAPTURE_MIN_HITS {
+        return None;
+    }
+    let shape = MemoShape::from_limit(&msg.limit)?;
+    // Every relation the query *reads*, via the AST walk — deliberately broader
+    // than the precomputed `CachedQuery.relation_oids` (which excludes subquery
+    // tables): a change to any read relation, subqueries included, must evict the
+    // snapshot, so this set must not be narrowed to that field.
+    let mut oids: Vec<u32> = msg
+        .resolved
+        .nodes::<ResolvedTableNode>()
+        .map(|t| t.relation_oid)
+        .collect();
+    oids.sort_unstable();
+    oids.dedup();
+    if oids.is_empty() {
+        return None;
+    }
+    let key = MemoKey {
+        fingerprint: msg.fingerprint,
+        binary,
+        shape,
+    };
+    MemoCapture::begin(&state_view.memo, key, &oids)
+}
 
 /// Deterministic fault injection for serve-pool replenishment (PGC-238): poison
 /// the first N cache serves so a test can drive repeated poisoned discards and
@@ -370,6 +436,10 @@ pub async fn handle_cached_query(
     let include_describe =
         query_type == QueryType::Simple || msg.pipeline_describe != PipelineDescribe::None;
 
+    // Begin a result-memo capture for hot source-row serves. Stamps read-relation
+    // versions now, before the serve query is issued (capture ordering invariant).
+    let mut memo_capture = memo_capture_begin(state_view, msg, binary_results);
+
     // What was sent on the cache-DB extended query this hit, so the response
     // state machine knows which completions to expect. The MV path always sends
     // an unnamed Parse (no Close); the source-row path sends a Parse only on the
@@ -563,16 +633,25 @@ pub async fn handle_cached_query(
                             push_and_broadcast(&mut write_queue, &broadcast, param_desc);
                         }
                         trace!("net: cache→client RowDescription (serve, {} bytes)", frame.data.len());
+                        if let Some(cap) = &mut memo_capture {
+                            cap.row_description_push(&frame.data);
+                        }
                         push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                         state = ServeResponseState::DataRows;
                     }
                     (ServeResponseState::DataRows, PgBackendMessageType::DataRows) => {
                         trace!("net: cache→client DataRow (serve, {} bytes)", frame.data.len());
                         bytes_served += frame.data.len();
+                        if let Some(cap) = &mut memo_capture {
+                            cap.data_push(&frame.data);
+                        }
                         push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                     }
                     (ServeResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
                         trace!("net: cache→client CommandComplete (serve, {} bytes)", frame.data.len());
+                        if let Some(cap) = &mut memo_capture {
+                            cap.command_complete_push(&frame.data);
+                        }
                         push_and_broadcast(&mut write_queue, &broadcast, frame.data);
                         msg.timing.query_done_at = Some(Instant::now());
                     }
@@ -693,6 +772,13 @@ pub async fn handle_cached_query(
     }
 
     msg.timing.response_written_at = Some(Instant::now());
+
+    // Store the captured snapshot iff the serve completed cleanly and no CDC
+    // change touched a read relation across the capture (re-checked in `finish`).
+    // Error paths returned earlier, so reaching here means a clean response.
+    if let Some(cap) = memo_capture {
+        cap.finish(&state_view.memo);
+    }
 
     debug!("cache hit");
     Ok((bytes_served, outcomes))

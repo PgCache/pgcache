@@ -121,6 +121,18 @@ pub mod names {
     /// off-thread builds (Option B) are needed.
     pub const CACHE_MV_BUILD_DURATION_SECONDS: &str = "pgcache.cache.mv_build_duration_seconds";
 
+    // In-process result memo metrics (PGC-236)
+    /// Cache hits served inline from the in-process memo (no worker hop / cache-DB).
+    pub const CACHE_MEMO_HITS: &str = "pgcache.cache.memo_hits";
+    /// Result snapshots stored into the memo by the capture path.
+    pub const CACHE_MEMO_CAPTURES: &str = "pgcache.cache.memo_captures";
+    /// Memo entries dropped (CDC-evicted via stale seqlock, or budget-reclaimed).
+    pub const CACHE_MEMO_EVICTIONS: &str = "pgcache.cache.memo_evictions";
+    /// Current number of live memo entries.
+    pub const CACHE_MEMO_ENTRIES: &str = "pgcache.cache.memo_entries";
+    /// Current total bytes held by the memo.
+    pub const CACHE_MEMO_BYTES: &str = "pgcache.cache.memo_bytes";
+
     // Cache state metrics (admission/eviction policy)
     pub const CACHE_QUERIES_PENDING: &str = "pgcache.cache.queries_pending";
     pub const CACHE_QUERIES_INVALIDATED: &str = "pgcache.cache.queries_invalidated";
@@ -320,6 +332,12 @@ pub struct CacheHandles {
     pub mv_fallthrough: Counter,
     pub coalesce_waiting: Gauge,
     pub coalesce_served: Counter,
+    /// In-process result memo (PGC-236).
+    pub memo_hits: Counter,
+    pub memo_captures: Counter,
+    pub memo_evictions: Counter,
+    pub memo_entries: Gauge,
+    pub memo_bytes: Gauge,
     /// Incremented each time the supervisor rebuilds the cache subsystem.
     pub restarts_total: Counter,
     /// Incremented each time a discarded serve-pool connection is replaced.
@@ -463,6 +481,11 @@ impl Handles {
                 mv_fallthrough: metrics::counter!(CACHE_MV_FALLTHROUGH),
                 coalesce_waiting: metrics::gauge!(CACHE_COALESCE_WAITING),
                 coalesce_served: metrics::counter!(CACHE_COALESCE_SERVED),
+                memo_hits: metrics::counter!(CACHE_MEMO_HITS),
+                memo_captures: metrics::counter!(CACHE_MEMO_CAPTURES),
+                memo_evictions: metrics::counter!(CACHE_MEMO_EVICTIONS),
+                memo_entries: metrics::gauge!(CACHE_MEMO_ENTRIES),
+                memo_bytes: metrics::gauge!(CACHE_MEMO_BYTES),
                 restarts_total: metrics::counter!(CACHE_RESTARTS_TOTAL),
                 pool_replenished: metrics::counter!(CACHE_POOL_REPLENISHED),
             },

@@ -298,7 +298,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
 
     cache_database_reset(settings).attach_loc("resetting cache database")?;
 
-    let state_view = Arc::new(CacheStateView::new());
+    let state_view = Arc::new(CacheStateView::new(settings.dynamic.clone()));
     let active_relations: ActiveRelations =
         Arc::new(ArcSwap::from_pointee(std::collections::HashSet::new()));
 

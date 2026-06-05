@@ -12,7 +12,9 @@ use hdrhistogram::Histogram;
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 
 use crate::{
-    cache::{mv::MvMeta, query::CacheableQuery, subsumption_index::SubsumptionIndex},
+    cache::{
+        memo::ResultMemo, mv::MvMeta, query::CacheableQuery, subsumption_index::SubsumptionIndex,
+    },
     catalog::TableMetadata,
     query::{ast::QueryExpr, constraints::QueryConstraints, resolved::ResolvedQueryExpr},
     settings::{DynamicConfigHandle, Settings},
@@ -434,6 +436,9 @@ pub struct CacheStateView {
     /// Previous GC tick's hit count, used by the dispatch to size the
     /// initial credit stamped on new Pending entries (or on Pending re-hits).
     pub last_hits_per_gc: AtomicU32,
+    /// In-process hot-result cache (PGC-236). Captured by the worker, served by
+    /// dispatch, evicted (slot-bumped) by the writer's CDC path.
+    pub memo: ResultMemo,
 }
 
 impl std::fmt::Debug for CacheStateView {
@@ -442,18 +447,20 @@ impl std::fmt::Debug for CacheStateView {
             .field("cached_queries", &self.cached_queries)
             .field("metrics_len", &self.metrics.len())
             .field("started_at", &self.started_at)
+            .field("memo_entries", &self.memo.len())
             .finish()
     }
 }
 
 impl CacheStateView {
-    pub fn new() -> Self {
+    pub fn new(dynamic: DynamicConfigHandle) -> Self {
         Self {
             cached_queries: DashMap::new(),
             metrics: DashMap::new(),
             started_at: Instant::now(),
             hits_since_gc: AtomicU32::new(0),
             last_hits_per_gc: AtomicU32::new(0),
+            memo: ResultMemo::new(dynamic),
         }
     }
 }

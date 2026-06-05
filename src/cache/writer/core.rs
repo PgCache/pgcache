@@ -1039,6 +1039,8 @@ pub fn writer_run(
                             core.stale_entries_cleanup();
                             core.state_gauges_update();
                             core.writer_scale_gauges_update();
+                            core.state_view.memo.gc();
+                            core.state_view.memo.metrics_publish();
                         }
                         // Handle query commands from dispatch
                         msg = query_rx.recv() => {

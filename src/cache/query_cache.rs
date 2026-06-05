@@ -7,10 +7,14 @@ use std::time::Instant;
 use dashmap::Entry;
 
 use ecow::EcoString;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc::UnboundedSender, oneshot, watch};
-use tokio_util::bytes::BytesMut;
+use tokio_util::bytes::{Buf, Bytes, BytesMut};
 use tracing::{debug, error, info, instrument, trace};
 
+use crate::pg::protocol::encode::{
+    BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG,
+};
 use crate::proxy::ClientSocket;
 use crate::query::ast::{LimitClause, query_expr_fingerprint};
 use crate::result::error_chain_format;
@@ -20,6 +24,7 @@ use crate::timing::{QueryTiming, duration_to_ns_u64};
 use super::{
     CacheError, CacheResult,
     fast_path::{self, MvDecision, WorkerSendParts},
+    memo::{MemoHit, MemoKey, MemoShape},
     messages::{
         AdmitAction, CacheOutcome, CacheReply, PipelineContext, PipelineDescribe, ProxyMessage,
         QueryCommand, SubsumptionResult,
@@ -30,6 +35,7 @@ use super::{
         CacheStateView, CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics,
         SharedResolved,
     },
+    write_queue::WriteQueue,
 };
 
 /// Minimum credit stamped on a Pending entry. Provides a survival floor during
@@ -226,6 +232,18 @@ pub struct WorkerRequest {
     /// Additional clients to receive the same response bytes.
     /// Empty for non-coalesced requests.
     pub coalesced: Vec<CoalescedClient>,
+}
+
+/// A pre-checked plan to serve a request from an in-process memo snapshot: the
+/// matched snapshot plus which envelope frames to regenerate around its core.
+struct MemoServe {
+    hit: MemoHit,
+    has_parse: bool,
+    has_bind: bool,
+    /// Whether the client expects a RowDescription (simple query, or extended
+    /// with Describe). When false the stored leading RowDescription is sliced off.
+    wants_row_description: bool,
+    emit_rfq: bool,
 }
 
 /// Per-connection inline dispatch against the cache: routes queries and
@@ -444,6 +462,12 @@ impl CacheDispatch {
                 }) if limit_is_sufficient(*max_limit, rows_needed) => {
                     self.metrics_hit_record(fingerprint);
                     self.clock_reference_set(cfg.cache_policy, &fingerprint);
+                    // In-process memo fast path: a live snapshot for this
+                    // (format, shape) is served inline here — no worker hop, no
+                    // cache-DB round trip. Misses fall through to the worker.
+                    if let Some(serve) = self.memo_serve_plan(fingerprint, &msg) {
+                        return self.memo_serve(msg, fingerprint, serve).await;
+                    }
                     // Decide MV fast path vs fallthrough based on current mv_state.
                     // Side effect: on Dirty, transitions to RebuildScheduled and sends
                     // QueryCommand::MvRebuild to the writer.
@@ -728,6 +752,117 @@ impl CacheDispatch {
             mv,
             vec![],
         )
+    }
+
+    /// Build a plan to serve this Ready hit from an in-process memo, or `None`
+    /// to fall through to the worker. Returns `None` for: memoization disabled,
+    /// a non-keyable LIMIT/OFFSET shape, cold-path extended (no pipeline), a
+    /// `Describe('S')` that needs a regenerated `ParameterDescription` (v1
+    /// skips), a memo miss, or a stale snapshot (dropped by `get`).
+    fn memo_serve_plan(&self, fingerprint: u64, msg: &QueryRequest) -> Option<MemoServe> {
+        if !self.state_view.memo.enabled() {
+            return None;
+        }
+        let (has_parse, has_bind, wants_row_description, emit_rfq) = match msg.query_type {
+            QueryType::Simple => (false, false, true, true),
+            QueryType::Extended => {
+                let pipeline = msg.pipeline.as_ref()?;
+                let wants_rd = match pipeline.describe {
+                    PipelineDescribe::Statement => return None,
+                    PipelineDescribe::Portal => true,
+                    PipelineDescribe::None => false,
+                };
+                (
+                    pipeline.has_parse,
+                    pipeline.has_bind,
+                    wants_rd,
+                    pipeline.emit_rfq,
+                )
+            }
+        };
+        let binary = msg.result_formats.first().is_some_and(|&f| f != 0);
+        let shape = MemoShape::from_limit(&msg.cacheable_query.query.limit)?;
+        let key = MemoKey {
+            fingerprint,
+            binary,
+            shape,
+        };
+        let hit = self.state_view.memo.get(&key)?;
+        // A captured snapshot always carries a RowDescription; guard anyway so a
+        // RowDescription-wanting client never gets a body with none.
+        if wants_row_description && hit.rd_len == 0 {
+            return None;
+        }
+        Some(MemoServe {
+            hit,
+            has_parse,
+            has_bind,
+            wants_row_description,
+            emit_rfq,
+        })
+    }
+
+    /// Serve a memo snapshot inline on the connection thread: regenerate the
+    /// per-client envelope (ParseComplete / BindComplete / ReadyForQuery) around
+    /// the cached core, slicing off the leading RowDescription when the client
+    /// doesn't expect one, write it to the client, and return the socket.
+    async fn memo_serve(
+        &self,
+        mut msg: QueryRequest,
+        fingerprint: u64,
+        serve: MemoServe,
+    ) -> CacheResult<()> {
+        let MemoServe {
+            hit,
+            has_parse,
+            has_bind,
+            wants_row_description,
+            emit_rfq,
+        } = serve;
+        // The cached core is a refcounted `Bytes`; push it around the small
+        // static envelope frames instead of memcpying the whole body. Slicing
+        // off the leading RowDescription is a zero-copy `Bytes::slice`.
+        let core: Bytes = if wants_row_description {
+            hit.core
+        } else {
+            hit.core.slice(hit.rd_len.min(hit.core.len())..)
+        };
+        let mut buf = WriteQueue::new();
+        if has_parse {
+            buf.push(Bytes::from_static(PARSE_COMPLETE_MSG));
+        }
+        if has_bind {
+            buf.push(Bytes::from_static(BIND_COMPLETE_MSG));
+        }
+        buf.push(core);
+        if emit_rfq {
+            buf.push(Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+        }
+
+        let served = buf.remaining() as u64;
+        trace!("memo serve {served} bytes inline");
+        crate::metrics::handles().cache.memo_hits.increment(1);
+        // Keep per-fingerprint served-byte volume in step with the worker path
+        // (worker_metrics_record), so served bytes don't appear to drop to zero
+        // as a fingerprint moves onto the memo fast path.
+        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+            m.total_bytes_served += served;
+        }
+        msg.timing.query_done_at = Some(Instant::now());
+        msg.timing.response_written_at = Some(Instant::now());
+        if let Err(e) = msg.client_socket.write_all_buf(&mut buf).await {
+            // The client is gone. Still reply `Complete` (not `Error`): the
+            // response was already (partially) written, so forwarding to origin
+            // would re-execute and double-respond; the connection detects the
+            // dead socket on its next use and tears down.
+            debug!("memo serve: client write failed: {e}");
+        }
+        msg.reply_tx
+            .send(CacheReply {
+                socket: msg.client_socket,
+                outcome: CacheOutcome::Complete(Some(msg.timing)),
+            })
+            .map_err(|_| CacheError::Reply.into())
     }
 
     /// Inspect `mv_state` to decide whether this dispatch serves from the MV

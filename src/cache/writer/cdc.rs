@@ -20,6 +20,7 @@ use crate::settings::{CachePolicy, Settings};
 
 use crate::query::evaluate::where_expr_evaluate;
 
+use super::super::memo::SlotKey;
 use super::super::messages::{CdcCommand, QueryCommand};
 use super::super::mv::MvState;
 use super::super::types::{
@@ -313,6 +314,53 @@ impl WriterCdc {
         Err(e)
     }
 
+    /// Apply a `CommitMark`: flush the frame's deferred invalidations and commit
+    /// (or recover) per its state. Extracted from the `CommitMark` handler so the
+    /// memo seqlock bracket can publish the post-commit version on every exit
+    /// path — including an error return from here.
+    async fn frame_finalize(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        match core.frame_state {
+            FrameState::TxnOpen => {
+                self.frame_invalidations_flush(core).await?;
+                // The buffered writes flush as one BEGIN; …; COMMIT here
+                // (PGC-228). A 40P01 now surfaces at flush, not per statement:
+                // route it through frame_dml_result so the frame enters
+                // Recovering, then run relation-level recovery (same as a
+                // mid-frame deadlock would).
+                let r = self.frame_commit(core).await;
+                self.frame_dml_result(core, r)
+                    .await
+                    .attach_loc("cdc commit frame")?;
+                if core.frame_state == FrameState::Recovering {
+                    self.frame_recover(core)
+                        .await
+                        .attach_loc("cdc recover frame at commit")?;
+                }
+            }
+            // A frame can flag queries for invalidation without any in-place
+            // write (e.g. a growing-join insert excluded from in-place
+            // maintenance) — no `BEGIN` was opened, but the flagged queries must
+            // still be invalidated here.
+            FrameState::Active => {
+                self.frame_invalidations_flush(core).await?;
+            }
+            FrameState::Recovering => {
+                // Relation-level recovery evicts every query over the affected
+                // relations — a superset of the selectively flagged fps, so the
+                // fp flush is subsumed.
+                self.frame_recover(core)
+                    .await
+                    .attach_loc("cdc recover frame")?;
+            }
+            // CommitMark without a preceding Begin: pgoutput always pairs them
+            // for published txns, so this is unreachable.
+            FrameState::Idle => {
+                debug_assert!(false, "CommitMark without a preceding Begin");
+            }
+        }
+        Ok(())
+    }
+
     /// Handle a CDC command, dispatching to the appropriate method.
     pub async fn cdc_command_handle(
         &mut self,
@@ -408,45 +456,40 @@ impl WriterCdc {
                 }
             }
             CdcCommand::CommitMark { lsn } => {
-                match core.frame_state {
-                    FrameState::TxnOpen => {
-                        self.frame_invalidations_flush(core).await?;
-                        // The buffered writes flush as one BEGIN; …; COMMIT here
-                        // (PGC-228). A 40P01 now surfaces at flush, not per
-                        // statement: route it through frame_dml_result so the
-                        // frame enters Recovering, then run relation-level
-                        // recovery (same as a mid-frame deadlock would).
-                        let r = self.frame_commit(core).await;
-                        self.frame_dml_result(core, r)
-                            .await
-                            .attach_loc("cdc commit frame")?;
-                        if core.frame_state == FrameState::Recovering {
-                            self.frame_recover(core)
-                                .await
-                                .attach_loc("cdc recover frame at commit")?;
-                        }
-                    }
-                    // A frame can flag queries for invalidation without any
-                    // in-place write (e.g. a growing-join insert excluded from
-                    // in-place maintenance) — no `BEGIN` was opened, but the
-                    // flagged queries must still be invalidated here.
-                    FrameState::Active => {
-                        self.frame_invalidations_flush(core).await?;
-                    }
-                    FrameState::Recovering => {
-                        // Relation-level recovery evicts every query over the
-                        // affected relations — a superset of the selectively
-                        // flagged fps, so the fp flush is subsumed.
-                        self.frame_recover(core)
-                            .await
-                            .attach_loc("cdc recover frame")?;
-                    }
-                    // CommitMark without a preceding Begin: pgoutput always
-                    // pairs them for published txns, so this is unreachable.
-                    FrameState::Idle => {
-                        debug_assert!(false, "CommitMark without a preceding Begin");
+                // In-process memo seqlock (PGC-236, rung 1): bracket the frame's
+                // visibility with begin (even→odd) before and end (odd→even)
+                // after, over every relation the frame touched, so any memo over
+                // them is invalidated atomically with the frame becoming visible.
+                // Conceptually the relation-granularity twin of the per-query MV
+                // dirty hooks in `frame_finalize`.
+                //
+                // Gated on the store being non-empty rather than on `enabled()`:
+                // when no memo exists there is nothing to bust, and (unlike an
+                // `enabled()` gate) this keeps the seqlock authoritative even
+                // while memoization is toggled off at runtime — a change landing
+                // during the disabled window still bumps the slot, so a later
+                // re-enable cannot serve a snapshot that predates it.
+                let memo_active = !core.state_view.memo.is_empty();
+                if memo_active {
+                    for &oid in &core.frame_relation_oids {
+                        core.state_view
+                            .memo
+                            .slot_dirty_begin(SlotKey::Relation(oid));
                     }
                 }
+
+                // Always publish the post-commit version (end the seqlock)
+                // before propagating any finalize error: a slot left odd would
+                // permanently disable memo serving for that relation on a live
+                // subsystem.
+                let finalize = self.frame_finalize(core).await;
+                if memo_active {
+                    for &oid in &core.frame_relation_oids {
+                        core.state_view.memo.slot_dirty_end(SlotKey::Relation(oid));
+                    }
+                }
+                finalize?;
+
                 core.frame_state = FrameState::Idle;
                 core.frame_invalidations.clear();
                 core.frame_relation_oids.clear();
