@@ -1220,7 +1220,7 @@ mod tests {
     fn test_table_subquery_node_nodes() {
         let ast = parse_query("SELECT * FROM (SELECT id FROM users) sub");
 
-        // TableSourceNodeIter traverses into subqueries
+        // try_for_each_node traverses into subqueries
         let subqueries: Vec<&TableSubqueryNode> = ast.nodes().collect();
         assert_eq!(subqueries.len(), 1);
 

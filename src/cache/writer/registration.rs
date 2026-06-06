@@ -13,7 +13,7 @@ use tracing::{debug, error, info, instrument, trace};
 
 use crate::cache::query::limit_rows_needed;
 use crate::catalog::{TableMetadata, aggregate_functions_load};
-use crate::query::ast::{Deparse, QueryBody, QueryExpr, TableNode};
+use crate::query::ast::{AstNode, Deparse, QueryBody, QueryExpr, TableNode};
 use crate::query::constraints::{
     TableConstraint, analyze_query_constraints, table_constraints_subsumed,
 };

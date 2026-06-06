@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 use tracing::error;
 
-use crate::query::ast::{QueryExpr, TableNode};
+use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::settings::{Allowlist, CachePolicy};
 use crate::timing::duration_to_ns_u64;
 
@@ -40,14 +40,14 @@ pub(crate) fn query_allowlist_check(allowlist: &Allowlist, query: &QueryExpr) ->
     };
     // Allowed iff every TableNode matches an allowlist entry: break on the
     // first non-matching table, so a clean walk (Continue) means "all allowed".
+    // Entries are lowercased at parse time; match without allocating a
+    // lowercased copy of each table/schema name on this serve-path walk.
     query
         .try_for_each_node::<TableNode, ()>(&mut |t| {
-            let table_name = t.name.to_lowercase();
-            let table_schema = t.schema.as_ref().map(|s| s.to_lowercase());
             let allowed = entries.iter().any(|(ws, wt)| {
-                *wt == table_name
+                eq_lowercased(wt, &t.name)
                     && match ws {
-                        Some(ws) => table_schema.as_deref() == Some(ws.as_str()),
+                        Some(ws) => t.schema.as_deref().is_some_and(|s| eq_lowercased(ws, s)),
                         None => true,
                     }
             });
@@ -58,6 +58,14 @@ pub(crate) fn query_allowlist_check(allowlist: &Allowlist, query: &QueryExpr) ->
             }
         })
         .is_continue()
+}
+
+/// Unicode case-insensitive equality without allocating. `lowered` must already
+/// be lowercased (allowlist entries are, at parse time); `raw` is lowercased
+/// lazily per character during the comparison. Equivalent to
+/// `lowered == raw.to_lowercase()` with no intermediate `String`.
+fn eq_lowercased(lowered: &str, raw: &str) -> bool {
+    lowered.chars().eq(raw.chars().flat_map(char::to_lowercase))
 }
 
 /// Record a cache hit in the shared view: bump the GC hit counter and the

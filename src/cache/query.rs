@@ -7,9 +7,9 @@ use crate::{
     catalog::FunctionVolatility,
     query::{
         ast::{
-            BinaryOp, CteRefNode, JoinNode, JoinQual, JoinType, LimitClause, LiteralValue, MultiOp,
-            QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode, SubLinkType, TableNode,
-            TableSource, TableSubqueryNode, WhereExpr,
+            AstNode, BinaryOp, CteRefNode, JoinNode, JoinQual, JoinType, LimitClause, LiteralValue,
+            MultiOp, QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode, SubLinkType,
+            TableNode, TableSource, TableSubqueryNode, WhereExpr,
         },
         resolved::{
             ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectNode, ResolvedTableSource,
@@ -80,7 +80,8 @@ impl CacheableQuery {
 /// relation names, so a match in either the schema or the table name marks a
 /// catalog reference. Covers nested subqueries and CTEs via full-tree traversal.
 fn references_system_catalog(query: &QueryExpr) -> Result<(), CacheabilityError> {
-    let references_catalog = query
+    // Break on the first catalog table; `.is_break()` ⇒ a reference was found.
+    if query
         .try_for_each_node::<TableNode, ()>(&mut |table| {
             let is_catalog =
                 table.schema.as_deref().is_some_and(pg_prefixed) || pg_prefixed(&table.name);
@@ -90,8 +91,8 @@ fn references_system_catalog(query: &QueryExpr) -> Result<(), CacheabilityError>
                 ControlFlow::Continue(())
             }
         })
-        .is_break();
-    if references_catalog {
+        .is_break()
+    {
         return Err(CacheabilityError::SystemCatalogReference);
     }
     Ok(())

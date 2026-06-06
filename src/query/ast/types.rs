@@ -11,55 +11,24 @@ use crate::query::cast::{CastTarget, cast_target_deparse};
 
 use super::Deparse;
 
-/// Generate the `nodes::<N>()` collecting wrapper for each AST type that has a
-/// `try_for_each_node`. The wrapper is pure boilerplate over the type-specific
-/// visitor; the visitor bodies stay hand-written for clarity.
-macro_rules! impl_ast_nodes {
-    ($($ty:ty),+ $(,)?) => {
-        $(
-            impl $ty {
-                /// Collect all nodes of type `N` within this subtree.
-                pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-                    let mut out = Vec::new();
-                    let _ = self.try_for_each_node::<N, ()>(&mut |n| {
-                        out.push(n);
-                        ControlFlow::Continue(())
-                    });
-                    out.into_iter()
-                }
-            }
-        )+
-    };
-}
+/// Traversable AST node. The zero-allocation `try_for_each_node` visitor is
+/// hand-written per type; `nodes()` is a provided collecting wrapper over it.
+pub trait AstNode {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B>;
 
-impl_ast_nodes!(
-    LiteralValue,
-    ColumnNode,
-    UnaryExpr,
-    BinaryExpr,
-    MultiExpr,
-    WhereExpr,
-    ValuesClause,
-    SelectNode,
-    SetOpNode,
-    QueryBody,
-    QueryExpr,
-    SelectColumns,
-    SelectColumn,
-    ArithmeticExpr,
-    ScalarExpr,
-    FunctionCall,
-    WindowSpec,
-    CaseExpr,
-    CaseWhen,
-    TableNode,
-    TableSubqueryNode,
-    CteRefNode,
-    JoinNode,
-    OrderByClause,
-    NullOrder,
-    OrderDirection,
-);
+    /// Collect all descendant nodes of type `N` (provided).
+    fn nodes<N: Any>(&self) -> impl Iterator<Item = &N> {
+        let mut out = Vec::new();
+        let _ = self.try_for_each_node::<N, ()>(&mut |n| {
+            out.push(n);
+            ControlFlow::Continue(())
+        });
+        out.into_iter()
+    }
+}
 
 // Core literal value types that can appear in SQL expressions.
 //
@@ -85,8 +54,8 @@ pub enum LiteralValue {
     Array(Vec<LiteralValue>, EcoString),
 }
 
-impl LiteralValue {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for LiteralValue {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -95,7 +64,9 @@ impl LiteralValue {
         }
         ControlFlow::Continue(())
     }
+}
 
+impl LiteralValue {
     /// Check if an Option<String> (from CDC row data) matches this LiteralValue.
     /// Parses the string value according to the type of this LiteralValue.
     pub fn matches(&self, row_value: &Option<String>) -> bool {
@@ -262,8 +233,8 @@ pub struct ColumnNode {
     pub column: EcoString,
 }
 
-impl ColumnNode {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for ColumnNode {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -434,8 +405,8 @@ pub struct UnaryExpr {
     pub expr: Box<WhereExpr>,
 }
 
-impl UnaryExpr {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for UnaryExpr {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -492,8 +463,8 @@ pub struct BinaryExpr {
     pub rexpr: Box<WhereExpr>, // right expression
 }
 
-impl BinaryExpr {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for BinaryExpr {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -504,7 +475,9 @@ impl BinaryExpr {
         self.rexpr.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
+}
 
+impl BinaryExpr {
     /// Whether a child expression needs parentheses to preserve semantics.
     /// This occurs when the child is a logical op with lower precedence than
     /// the parent (i.e., OR nested inside AND).
@@ -550,8 +523,8 @@ pub struct MultiExpr {
     pub exprs: Vec<WhereExpr>,
 }
 
-impl MultiExpr {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for MultiExpr {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -636,8 +609,8 @@ pub enum WhereExpr {
     },
 }
 
-impl WhereExpr {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for WhereExpr {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -660,7 +633,9 @@ impl WhereExpr {
         }
         ControlFlow::Continue(())
     }
+}
 
+impl WhereExpr {
     pub fn has_subqueries(&self) -> bool {
         match self {
             WhereExpr::Scalar(scalar) => scalar.has_subqueries(),
@@ -825,8 +800,8 @@ pub struct ValuesClause {
     pub rows: Vec<Vec<LiteralValue>>,
 }
 
-impl ValuesClause {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for ValuesClause {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -837,7 +812,9 @@ impl ValuesClause {
         }
         ControlFlow::Continue(())
     }
+}
 
+impl ValuesClause {
     pub fn has_subqueries(&self) -> bool {
         false // VALUES clauses contain only literals
     }
@@ -887,8 +864,8 @@ impl Default for SelectNode {
     }
 }
 
-impl SelectNode {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for SelectNode {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -907,7 +884,9 @@ impl SelectNode {
         }
         ControlFlow::Continue(())
     }
+}
 
+impl SelectNode {
     /// Return table nodes directly in this SELECT's FROM clause.
     /// Traverses JOINs but does NOT descend into subqueries.
     pub fn direct_table_nodes(&self) -> Vec<&TableNode> {
@@ -1006,8 +985,8 @@ pub struct SetOpNode {
     pub right: Box<QueryExpr>,
 }
 
-impl SetOpNode {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for SetOpNode {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1018,7 +997,9 @@ impl SetOpNode {
         self.right.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
+}
 
+impl SetOpNode {
     pub fn has_subqueries(&self) -> bool {
         self.left.has_subqueries() || self.right.has_subqueries()
     }
@@ -1046,8 +1027,8 @@ pub enum QueryBody {
     SetOp(SetOpNode),
 }
 
-impl QueryBody {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for QueryBody {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1061,7 +1042,9 @@ impl QueryBody {
         }
         ControlFlow::Continue(())
     }
+}
 
+impl QueryBody {
     pub fn has_subqueries(&self) -> bool {
         match self {
             QueryBody::Select(select) => select.has_subqueries(),
@@ -1128,8 +1111,8 @@ pub struct CteDefinition {
     pub materialization: CteMaterialization,
 }
 
-impl QueryExpr {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for QueryExpr {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1145,10 +1128,24 @@ impl QueryExpr {
         }
         ControlFlow::Continue(())
     }
+}
 
-    /// Check if query only references a single table
+impl QueryExpr {
+    /// Check if query only references a single table.
+    ///
+    /// Short-circuits on the second table via the visitor's early-exit rather
+    /// than collecting every `TableNode` into a `Vec` (which `nodes()` would).
     pub fn is_single_table(&self) -> bool {
-        self.nodes::<TableNode>().nth(1).is_none()
+        let mut count = 0u8;
+        self.try_for_each_node::<TableNode, ()>(&mut |_| {
+            count += 1;
+            if count >= 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_continue()
     }
 
     /// Check if query has a WHERE clause (only applies to SELECT bodies)
@@ -1310,8 +1307,8 @@ pub enum SelectColumns {
     Columns(Vec<SelectColumn>), // SELECT col1, col2, ... (includes Star entries)
 }
 
-impl SelectColumns {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for SelectColumns {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1328,7 +1325,9 @@ impl SelectColumns {
         }
         ControlFlow::Continue(())
     }
+}
 
+impl SelectColumns {
     /// Collect subquery branches from SELECT list with source tracking.
     /// All subqueries in a SELECT list are Scalar (must return single value).
     pub(crate) fn subquery_nodes_collect<'a>(
@@ -1391,7 +1390,16 @@ impl SelectColumn {
         }
     }
 
-    pub fn try_for_each_node<'a, N: Any, B>(
+    pub fn has_subqueries(&self) -> bool {
+        match self {
+            SelectColumn::Expr { expr, .. } => expr.has_subqueries(),
+            SelectColumn::Star(_) => false,
+        }
+    }
+}
+
+impl AstNode for SelectColumn {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1403,13 +1411,6 @@ impl SelectColumn {
             SelectColumn::Star(_) => {}
         }
         ControlFlow::Continue(())
-    }
-
-    pub fn has_subqueries(&self) -> bool {
-        match self {
-            SelectColumn::Expr { expr, .. } => expr.has_subqueries(),
-            SelectColumn::Star(_) => false,
-        }
     }
 }
 
@@ -1459,8 +1460,8 @@ pub struct ArithmeticExpr {
     pub right: Box<ScalarExpr>,
 }
 
-impl ArithmeticExpr {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for ArithmeticExpr {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1471,7 +1472,9 @@ impl ArithmeticExpr {
         self.right.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
+}
 
+impl ArithmeticExpr {
     pub fn has_subqueries(&self) -> bool {
         self.left.has_subqueries() || self.right.has_subqueries()
     }
@@ -1511,8 +1514,8 @@ pub enum ScalarExpr {
     },
 }
 
-impl ScalarExpr {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for ScalarExpr {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1535,7 +1538,9 @@ impl ScalarExpr {
         }
         ControlFlow::Continue(())
     }
+}
 
+impl ScalarExpr {
     pub fn has_subqueries(&self) -> bool {
         match self {
             ScalarExpr::Function(func) => func.has_subqueries(),
@@ -1653,8 +1658,8 @@ pub struct FunctionCall {
     pub over: Option<WindowSpec>,      // Window function OVER clause
 }
 
-impl FunctionCall {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for FunctionCall {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1675,7 +1680,9 @@ impl FunctionCall {
         }
         ControlFlow::Continue(())
     }
+}
 
+impl FunctionCall {
     /// Check if this function call contains sublinks/subqueries
     pub fn has_subqueries(&self) -> bool {
         self.args.iter().any(|arg| arg.has_subqueries())
@@ -1734,8 +1741,8 @@ pub struct WindowSpec {
     pub order_by: Vec<OrderByClause>,
 }
 
-impl WindowSpec {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for WindowSpec {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1750,7 +1757,9 @@ impl WindowSpec {
         }
         ControlFlow::Continue(())
     }
+}
 
+impl WindowSpec {
     /// Check if this window spec contains sublinks/subqueries
     pub fn has_subqueries(&self) -> bool {
         self.partition_by.iter().any(|p| p.has_subqueries())
@@ -1799,8 +1808,8 @@ pub struct CaseExpr {
     pub default: Option<Box<ScalarExpr>>,
 }
 
-impl CaseExpr {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for CaseExpr {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1818,7 +1827,9 @@ impl CaseExpr {
         }
         ControlFlow::Continue(())
     }
+}
 
+impl CaseExpr {
     /// Check if this CASE expression contains sublinks/subqueries
     pub fn has_subqueries(&self) -> bool {
         self.arg.as_ref().is_some_and(|a| a.has_subqueries())
@@ -1858,8 +1869,8 @@ pub struct CaseWhen {
     pub result: ScalarExpr,
 }
 
-impl CaseWhen {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for CaseWhen {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -1867,7 +1878,9 @@ impl CaseWhen {
         self.result.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
+}
 
+impl CaseWhen {
     pub fn has_subqueries(&self) -> bool {
         self.condition.has_subqueries() || self.result.has_subqueries()
     }
@@ -1919,7 +1932,7 @@ pub struct CteRefNode {
     pub alias: Option<TableAlias>,
 }
 
-impl TableSource {
+impl AstNode for TableSource {
     fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
@@ -1927,17 +1940,14 @@ impl TableSource {
         match self {
             TableSource::Table(table) => table.try_for_each_node(f)?,
             TableSource::Subquery(sub) => sub.try_for_each_node(f)?,
-            TableSource::Join(join) => {
-                if let Some(r) = (join as &dyn Any).downcast_ref::<N>() {
-                    f(r)?;
-                }
-                join.try_for_each_node(f)?;
-            }
+            TableSource::Join(join) => join.try_for_each_node(f)?,
             TableSource::CteRef(cte_ref) => cte_ref.try_for_each_node(f)?,
         }
         ControlFlow::Continue(())
     }
+}
 
+impl TableSource {
     /// Collect direct table nodes, traversing JOINs but not subqueries/CTEs.
     fn direct_table_nodes_collect<'a>(&'a self, tables: &mut Vec<&'a TableNode>) {
         match self {
@@ -2025,8 +2035,8 @@ pub struct TableNode {
     pub alias: Option<TableAlias>,
 }
 
-impl TableNode {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for TableNode {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -2063,8 +2073,8 @@ pub struct TableSubqueryNode {
     pub alias: Option<TableAlias>,
 }
 
-impl TableSubqueryNode {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for TableSubqueryNode {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -2096,8 +2106,8 @@ impl Deparse for TableSubqueryNode {
     }
 }
 
-impl CteRefNode {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for CteRefNode {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -2148,11 +2158,16 @@ pub struct JoinNode {
     pub qual: JoinQual,
 }
 
-impl JoinNode {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for JoinNode {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
+        // Self-visit like every other node type, so `nodes::<JoinNode>()` finds
+        // a join called on directly (not only joins nested under a TableSource).
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
         self.left.try_for_each_node(f)?;
         self.right.try_for_each_node(f)?;
         if let JoinQual::On(c) = &self.qual {
@@ -2240,8 +2255,8 @@ pub struct OrderByClause {
     pub null_order: NullOrder,
 }
 
-impl OrderByClause {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for OrderByClause {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -2272,8 +2287,8 @@ pub enum NullOrder {
     NullsLast,
 }
 
-impl NullOrder {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for NullOrder {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -2301,8 +2316,8 @@ pub enum OrderDirection {
     Desc,
 }
 
-impl OrderDirection {
-    pub fn try_for_each_node<'a, N: Any, B>(
+impl AstNode for OrderDirection {
+    fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {

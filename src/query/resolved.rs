@@ -8,8 +8,8 @@ use rootcause::Report;
 use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::catalog::ColumnMetadata;
 use crate::query::ast::{
-    ArithmeticOp, BinaryOp, Deparse, JoinType, LiteralValue, MultiOp, NullOrder, OrderDirection,
-    SetOpType, SubLinkType, TableAlias, UnaryOp, ValuesClause,
+    ArithmeticOp, AstNode, BinaryOp, Deparse, JoinType, LiteralValue, MultiOp, NullOrder,
+    OrderDirection, SetOpType, SubLinkType, TableAlias, UnaryOp, ValuesClause,
 };
 use crate::query::cast::{CastTarget, cast_target_deparse};
 
