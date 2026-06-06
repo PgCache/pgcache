@@ -24,10 +24,10 @@ pub(crate) mod mv;
 pub(crate) mod query;
 mod query_cache;
 mod runtime;
+mod serve;
 pub(crate) mod status;
 pub mod subsumption_index;
 mod types;
-mod worker;
 mod write_queue;
 mod writer;
 
@@ -83,7 +83,11 @@ error_set! {
     }
 
     SendError := {
-        WorkerSend,
+        /// The writer command channel (`query_tx`) is closed — the cache
+        /// subsystem is tearing down or restarting. Unrelated to the serve pool,
+        /// which degrades to origin-forward on a closed channel rather than
+        /// erroring.
+        WriterSend,
         Reply,
     }
 

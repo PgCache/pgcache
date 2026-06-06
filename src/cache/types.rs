@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Shared resolved query expression, wrapped in Arc to avoid deep cloning
-/// on every cache hit (the dispatch→worker path).
+/// on every cache hit (the dispatch→serve path).
 pub type SharedResolved = Arc<ResolvedQueryExpr>;
 
 /// State of a cached query
@@ -377,7 +377,7 @@ pub type ActiveRelations = Arc<ArcSwap<HashSet<u32>>>;
 /// need no additional synchronization — the shard lock provides mutual exclusion.
 ///
 /// Two writers: dispatch on connection tasks (hit/miss/subsumption counts) and
-/// the writer (all other fields including histogram recording from worker channel).
+/// the writer (all other fields including histogram recording from serve channel).
 pub struct QueryMetrics {
     pub hit_count: u64,
     pub miss_count: u64,
@@ -436,7 +436,7 @@ pub struct CacheStateView {
     /// Previous GC tick's hit count, used by the dispatch to size the
     /// initial credit stamped on new Pending entries (or on Pending re-hits).
     pub last_hits_per_gc: AtomicU32,
-    /// In-process hot-result cache (PGC-236). Captured by the worker, served by
+    /// In-process hot-result cache (PGC-236). Captured by the serve pool, served by
     /// dispatch, evicted (slot-bumped) by the writer's CDC path.
     pub memo: ResultMemo,
 }

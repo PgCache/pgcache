@@ -21,9 +21,9 @@ use crate::{
         PinnedQuery, ReportExt, StatusRequest,
         cdc::CdcProcessor,
         messages::{CacheOutcome, CacheReply, CdcCommand, WriterNotify},
-        query_cache::{CacheDispatch, WorkerRequest},
+        query_cache::{CacheDispatch, ServeRequest},
+        serve::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
         types::{ActiveRelations, CacheStateView},
-        worker::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
         writer::writer_run,
     },
     pg::{
@@ -36,7 +36,7 @@ use crate::{
     timing::duration_to_us_u64,
 };
 
-/// Minimum number of connections in the cache worker pool.
+/// Minimum number of connections in the cache serve pool.
 const MIN_POOL_SIZE: usize = 4;
 
 /// Initial backoff before retrying a serve-pool reconnection.
@@ -44,16 +44,16 @@ const POOL_REPLENISH_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 /// Maximum backoff between serve-pool reconnection attempts.
 const POOL_REPLENISH_MAX_BACKOFF: Duration = Duration::from_secs(10);
 
-/// Handles a worker request by executing the query and sending the reply.
+/// Handles a serve request by executing the query and sending the reply.
 /// Sends replies for both the primary client and any coalesced clients.
-async fn handle_worker_request(
+async fn handle_serve_request(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     replenish_tx: UnboundedSender<()>,
-    mut msg: WorkerRequest,
+    mut msg: ServeRequest,
     state_view: Arc<CacheStateView>,
 ) {
-    debug!("cache worker task spawn");
+    debug!("cache serve task spawn");
 
     msg.timing.worker_start_at = Some(Instant::now());
 
@@ -66,7 +66,7 @@ async fn handle_worker_request(
                     .map(|s| duration_to_us_u64(s.elapsed()))
                     .unwrap_or(0);
                 // Record directly in the shared view (no extra hop).
-                worker_metrics_record(
+                serve_metrics_record(
                     &state_view,
                     msg.fingerprint,
                     latency_us,
@@ -109,7 +109,7 @@ async fn handle_worker_request(
                 } else {
                     error!("handle_cached_query failed: {}", error_chain_format(ctx));
                 }
-                // Coalesced clients already received Error replies inside the worker
+                // Coalesced clients already received Error replies inside the serve path
                 let error_buf = msg
                     .forward_bytes
                     .take()
@@ -125,7 +125,7 @@ async fn handle_worker_request(
         error!("failed to send reply: no receiver");
     }
 
-    debug!("cache worker task done");
+    debug!("cache serve task done");
 }
 
 /// Creates cache database connections and returns them as a channel pair.
@@ -265,9 +265,9 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
 ///
 /// Writer and CDC are dedicated `current_thread` threads (mutation
 /// serialization point + replication consumer, reached only via `Send`
-/// channels). The worker and coalesce-drain run as tasks on the shared
+/// channels). The serve loop and coalesce-drain run as tasks on the shared
 /// multi-thread runtime (`handle`) alongside the connection tasks, so the
-/// connection ↔ worker handoffs are intra-runtime run-queue pushes instead of
+/// connection ↔ serve handoffs are intra-runtime run-queue pushes instead of
 /// cross-runtime eventfd wakeups.
 ///
 /// `cache_cancel` is owned by [`cache_supervise`]; any fatal failure in this
@@ -305,7 +305,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     let (query_tx, query_rx) = unbounded_channel();
     let (cdc_cmd_tx, cdc_cmd_rx) = unbounded_channel();
     let (notify_tx, notify_rx) = unbounded_channel::<WriterNotify>();
-    let (worker_tx, worker_rx) = unbounded_channel();
+    let (serve_tx, serve_rx) = unbounded_channel();
 
     // CDC-liveness flag: set by the CDC thread, read inline by every dispatch.
     let cdc_connected = Arc::new(AtomicBool::new(true));
@@ -380,7 +380,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         .block_on(CacheDispatch::new(
             settings,
             query_tx,
-            worker_tx,
+            serve_tx,
             Arc::clone(&state_view),
             cdc_connected,
         ))
@@ -406,9 +406,9 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     // Worker dispatcher serves cache queries (spread across runtime threads);
     // the coalesce-drain task dispatches coalesced waiters when the writer
     // reports a query Ready/Failed. There is no central dispatcher.
-    handle.spawn(worker_loop(
+    handle.spawn(serve_loop(
         settings.clone(),
-        worker_rx,
+        serve_rx,
         cache_cancel.clone(),
         Arc::clone(&state_view),
     ));
@@ -593,8 +593,8 @@ async fn coalesce_drain(
     dispatch_publisher.clear();
 }
 
-/// Record worker-reported metrics (cache-hit latency, bytes served).
-fn worker_metrics_record(
+/// Record serve-reported metrics (cache-hit latency, bytes served).
+fn serve_metrics_record(
     state_view: &CacheStateView,
     fingerprint: u64,
     latency_us: u64,
@@ -608,16 +608,16 @@ fn worker_metrics_record(
 
 /// Worker dispatcher task: acquires a pooled cache-DB connection (the pool
 /// bounds serve concurrency) and spawns the serve onto the shared runtime, so
-/// serves spread across all runtime threads instead of one worker thread.
-async fn worker_loop(
+/// serves spread across all runtime threads instead of one serve task.
+async fn serve_loop(
     settings: Settings,
-    mut worker_rx: UnboundedReceiver<WorkerRequest>,
+    mut serve_rx: UnboundedReceiver<ServeRequest>,
     cancel: CancellationToken,
     state_view: Arc<CacheStateView>,
 ) {
-    debug!("cache worker loop");
+    debug!("cache serve loop");
     #[cfg(feature = "fault-injection")]
-    crate::cache::worker::fault::init();
+    crate::cache::serve::fault::init();
     let pool_size = (settings.num_workers * 2).max(MIN_POOL_SIZE);
     let (conn_tx, mut conn_rx) = match connection_pool_create(&settings, pool_size).await {
         Ok(pool) => pool,
@@ -646,10 +646,10 @@ async fn worker_loop(
         // Block for at least one request
         let mut msg = tokio::select! {
             _ = cancel.cancelled() => {
-                debug!("cache worker shutdown signal received");
+                debug!("cache serve shutdown signal received");
                 break;
             }
-            msg = worker_rx.recv() => {
+            msg = serve_rx.recv() => {
                 let Some(msg) = msg else { break };
                 msg
             }
@@ -674,7 +674,7 @@ async fn worker_loop(
         let replenish_tx = replenish_tx.clone();
         let state_view = Arc::clone(&state_view);
         tokio::spawn(async move {
-            handle_worker_request(conn, return_tx, replenish_tx, msg, state_view).await;
+            handle_serve_request(conn, return_tx, replenish_tx, msg, state_view).await;
         });
 
         // Channel depth gauge; queue length never approaches 2^53.
@@ -682,10 +682,10 @@ async fn worker_loop(
         crate::metrics::handles()
             .state
             .queue_worker
-            .set(worker_rx.len() as f64);
+            .set(serve_rx.len() as f64);
     }
 
-    debug!("cache worker loop exiting");
+    debug!("cache serve loop exiting");
 }
 
 /// Replenishes the cache-DB serve pool: each signal from a poisoned-connection
@@ -693,7 +693,7 @@ async fn worker_loop(
 /// never permanently shrink (PGC-238). The bounded pool channel always has room
 /// for the replacement because the discard vacated a slot. Lives for the
 /// generation — cancelled on subsystem teardown, or exits when the last
-/// `replenish_tx` (worker loop + in-flight serves) drops.
+/// `replenish_tx` (serve loop + in-flight serves) drops.
 async fn pool_replenish(
     settings: Settings,
     conn_tx: Sender<CacheConnection>,

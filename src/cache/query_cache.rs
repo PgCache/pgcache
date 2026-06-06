@@ -8,7 +8,10 @@ use dashmap::Entry;
 
 use ecow::EcoString;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{mpsc::UnboundedSender, oneshot, watch};
+use tokio::sync::{
+    mpsc::{UnboundedSender, error::SendError},
+    oneshot, watch,
+};
 use tokio_util::bytes::{Buf, Bytes, BytesMut};
 use tracing::{debug, error, info, instrument, trace};
 
@@ -23,7 +26,7 @@ use crate::timing::{QueryTiming, duration_to_ns_u64};
 
 use super::{
     CacheError, CacheResult,
-    fast_path::{self, MvDecision, WorkerSendParts},
+    fast_path::{self, MvDecision},
     memo::{MemoHit, MemoKey, MemoShape},
     messages::{
         AdmitAction, CacheOutcome, CacheReply, PipelineContext, PipelineDescribe, ProxyMessage,
@@ -83,7 +86,7 @@ pub enum QueryType {
 }
 
 /// Key for grouping coalesced requests. Requests in the same group
-/// produce identical wire protocol bytes and can share a single worker execution.
+/// produce identical wire protocol bytes and can share a single serve execution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct CoalesceKey {
     query_type: QueryType,
@@ -95,7 +98,7 @@ struct CoalesceKey {
     limit: Option<LimitClause>,
 }
 
-/// A client waiting to receive coalesced response bytes from a shared worker execution.
+/// A client waiting to receive coalesced response bytes from a shared serve execution.
 pub struct CoalescedClient {
     pub client_socket: ClientSocket,
     pub reply_tx: oneshot::Sender<CacheReply>,
@@ -192,15 +195,15 @@ pub struct QueryRequest {
     pub pipeline: Option<PipelineContext>,
 }
 
-/// Request sent to cache worker for executing cached queries.
+/// Request sent to cache serve for executing cached queries.
 /// Contains the resolved AST with schema-qualified table names.
-pub struct WorkerRequest {
+pub struct ServeRequest {
     pub fingerprint: u64,
     pub query_type: QueryType,
     pub data: BytesMut,
     pub resolved: SharedResolved,
     /// Precomputed deparsed SQL body of `resolved`. Spliced into the SET +
-    /// body + LIMIT wire string the worker sends to the cache DB.
+    /// body + LIMIT wire string the serve pool sends to the cache DB.
     pub deparsed_sql: EcoString,
     /// Generation number for row tracking in pgcache_pgrx extension
     pub generation: u64,
@@ -214,7 +217,7 @@ pub struct WorkerRequest {
     pub timing: QueryTiming,
     /// Incoming query's LIMIT clause, appended to SQL at serve time
     pub limit: Option<LimitClause>,
-    /// Whether the worker should append ReadyForQuery after this execute's
+    /// Whether the serve path should append ReadyForQuery after this execute's
     /// response (the trailing execute of a Sync-terminated dispatch).
     pub emit_rfq: bool,
     /// Whether Parse was buffered in the pipeline.
@@ -227,7 +230,7 @@ pub struct WorkerRequest {
     pub pipeline_describe: PipelineDescribe,
     /// Stored ParameterDescription bytes for Describe('S') responses in the pipeline.
     pub parameter_description: Option<BytesMut>,
-    /// Buffered bytes for origin fallback on worker error.
+    /// Buffered bytes for origin fallback on serve error.
     pub forward_bytes: Option<BytesMut>,
     /// Additional clients to receive the same response bytes.
     /// Empty for non-coalesced requests.
@@ -252,7 +255,7 @@ struct MemoServe {
 #[derive(Clone)]
 pub struct CacheDispatch {
     query_tx: UnboundedSender<QueryCommand>,
-    worker_tx: UnboundedSender<WorkerRequest>,
+    serve_tx: UnboundedSender<ServeRequest>,
     state_view: Arc<CacheStateView>,
     dynamic: DynamicConfigHandle,
     waiting: Arc<CoalesceQueue>,
@@ -326,7 +329,7 @@ impl CacheDispatch {
     pub async fn new(
         settings: &Settings,
         query_tx: UnboundedSender<QueryCommand>,
-        worker_tx: UnboundedSender<WorkerRequest>,
+        serve_tx: UnboundedSender<ServeRequest>,
         state_view: Arc<CacheStateView>,
         cdc_connected: Arc<AtomicBool>,
     ) -> CacheResult<Self> {
@@ -347,7 +350,7 @@ impl CacheDispatch {
 
         Ok(Self {
             query_tx,
-            worker_tx,
+            serve_tx,
             state_view,
             dynamic: settings.dynamic.clone(),
             waiting: Arc::new(CoalesceQueue::new()),
@@ -462,24 +465,16 @@ impl CacheDispatch {
                 }) if limit_is_sufficient(*max_limit, rows_needed) => {
                     self.metrics_hit_record(fingerprint);
                     self.clock_reference_set(cfg.cache_policy, &fingerprint);
-                    // In-process memo fast path: a live snapshot for this
-                    // (format, shape) is served inline here — no worker hop, no
-                    // cache-DB round trip. Misses fall through to the worker.
-                    if let Some(serve) = self.memo_serve_plan(fingerprint, &msg) {
-                        return self.memo_serve(msg, fingerprint, serve).await;
-                    }
-                    // Decide MV fast path vs fallthrough based on current mv_state.
-                    // Side effect: on Dirty, transitions to RebuildScheduled and sends
-                    // QueryCommand::MvRebuild to the writer.
-                    let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
-                    return self.worker_request_send(
-                        fingerprint,
-                        msg,
-                        Arc::clone(resolved),
-                        deparsed_sql.clone(),
-                        *generation,
-                        mv,
-                    );
+                    return self
+                        .hit_serve(
+                            fingerprint,
+                            msg,
+                            Arc::clone(resolved),
+                            deparsed_sql.clone(),
+                            *generation,
+                            rows_needed,
+                        )
+                        .await;
                 }
 
                 // Cache hit: Ready but insufficient rows — forward and request limit bump
@@ -513,7 +508,7 @@ impl CacheDispatch {
                                 fingerprint,
                                 max_limit: rows_needed,
                             })
-                            .map_err(|_| CacheError::WorkerSend)?;
+                            .map_err(|_| CacheError::WriterSend)?;
                         return Ok(());
                     }
                     // Lost the race; fall through to re-read and re-dispatch.
@@ -733,8 +728,32 @@ impl CacheDispatch {
         Some(action)
     }
 
-    /// Build and send a WorkerRequest for serving a query from cache.
-    fn worker_request_send(
+    /// Build and send a ServeRequest for serving a query from cache.
+    /// Serve a Ready cache hit. Two backends for the same logical work: the
+    /// in-process memo (served inline on the connection thread — no serve hop,
+    /// no cache-DB round trip) when a live snapshot matches this request's
+    /// (format, shape), otherwise a pool serve (from the MV table or source
+    /// rows, decided here). Scoped to the single-request Ready path: coalesced
+    /// groups and subsumption serves dispatch to the serve pool directly.
+    async fn hit_serve(
+        &self,
+        fingerprint: u64,
+        msg: QueryRequest,
+        resolved: SharedResolved,
+        deparsed_sql: EcoString,
+        generation: u64,
+        rows_needed: Option<u64>,
+    ) -> CacheResult<()> {
+        if let Some(serve) = self.memo_serve_plan(fingerprint, &msg) {
+            return self.memo_serve(msg, fingerprint, serve).await;
+        }
+        // No memo: hand off to the serve pool. `mv_dispatch_decide` picks the MV fast
+        // path vs source-row fallthrough and, on a dirty MV, schedules a rebuild.
+        let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
+        self.pool_serve(fingerprint, msg, resolved, deparsed_sql, generation, mv)
+    }
+
+    fn pool_serve(
         &self,
         fingerprint: u64,
         msg: QueryRequest,
@@ -743,7 +762,7 @@ impl CacheDispatch {
         generation: u64,
         mv: MvServe,
     ) -> CacheResult<()> {
-        self.worker_request_send_with(
+        self.pool_serve_coalesced(
             fingerprint,
             msg,
             resolved,
@@ -755,7 +774,7 @@ impl CacheDispatch {
     }
 
     /// Build a plan to serve this Ready hit from an in-process memo, or `None`
-    /// to fall through to the worker. Returns `None` for: memoization disabled,
+    /// to fall through to the serve pool. Returns `None` for: memoization disabled,
     /// a non-keyable LIMIT/OFFSET shape, cold-path extended (no pipeline), a
     /// `Describe('S')` that needs a regenerated `ParameterDescription` (v1
     /// skips), a memo miss, or a stale snapshot (dropped by `get`).
@@ -842,8 +861,8 @@ impl CacheDispatch {
         let served = buf.remaining() as u64;
         trace!("memo serve {served} bytes inline");
         crate::metrics::handles().cache.memo_hits.increment(1);
-        // Keep per-fingerprint served-byte volume in step with the worker path
-        // (worker_metrics_record), so served bytes don't appear to drop to zero
+        // Keep per-fingerprint served-byte volume in step with the serve path
+        // (serve_metrics_record), so served bytes don't appear to drop to zero
         // as a fingerprint moves onto the memo fast path.
         if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
             m.total_bytes_served += served;
@@ -890,9 +909,9 @@ impl CacheDispatch {
         }
     }
 
-    /// Build and send a WorkerRequest with coalesced clients attached.
+    /// Build and send a ServeRequest with coalesced clients attached.
     #[allow(clippy::too_many_arguments)]
-    fn worker_request_send_with(
+    fn pool_serve_coalesced(
         &self,
         fingerprint: u64,
         msg: QueryRequest,
@@ -905,25 +924,57 @@ impl CacheDispatch {
         // `lookup_complete_at` is stamped earlier in `query_dispatch` (and
         // copied through coalesce drains), so it's already set on
         // `msg.timing` at this point.
-        fast_path::worker_request_send(
-            &self.worker_tx,
-            WorkerSendParts {
-                fingerprint,
-                query_type: msg.query_type,
-                data: msg.data,
-                resolved,
-                deparsed_sql,
-                generation,
-                mv,
-                result_formats: msg.result_formats,
-                client_socket: msg.client_socket,
-                reply_tx: msg.reply_tx,
-                timing: msg.timing,
-                limit: msg.cacheable_query.query.limit.clone(),
-                pipeline: msg.pipeline,
-                coalesced,
-            },
-        )
+        let (
+            emit_rfq,
+            has_parse,
+            has_bind,
+            pipeline_describe,
+            parameter_description,
+            forward_bytes,
+        ) = match msg.pipeline {
+            Some(pipeline) => (
+                pipeline.emit_rfq,
+                pipeline.has_parse,
+                pipeline.has_bind,
+                pipeline.describe,
+                pipeline.parameter_description,
+                Some(pipeline.buffered_bytes),
+            ),
+            None => (false, false, false, PipelineDescribe::None, None, None),
+        };
+
+        if let Err(SendError(req)) = self.serve_tx.send(ServeRequest {
+            fingerprint,
+            query_type: msg.query_type,
+            data: msg.data,
+            resolved,
+            deparsed_sql,
+            generation,
+            mv,
+            result_formats: msg.result_formats,
+            client_socket: msg.client_socket,
+            reply_tx: msg.reply_tx,
+            timing: msg.timing,
+            limit: msg.cacheable_query.query.limit.clone(),
+            emit_rfq,
+            has_parse,
+            has_bind,
+            pipeline_describe,
+            parameter_description,
+            forward_bytes,
+            coalesced,
+        }) {
+            // Worker channel closed (cache subsystem torn down or restarting):
+            // degrade gracefully by forwarding the query — and any coalesced
+            // waiters — to origin rather than surfacing a hard cache error.
+            debug!("serve channel closed; forwarding query to origin");
+            let buf = req.forward_bytes.unwrap_or(req.data);
+            let _ = reply_forward(req.reply_tx, req.client_socket, None, buf, req.timing);
+            for c in req.coalesced {
+                let _ = reply_forward(c.reply_tx, c.client_socket, None, c.data, c.timing);
+            }
+        }
+        Ok(())
     }
 
     /// Build a CoalesceKey from a QueryRequest's pipeline context.
@@ -949,7 +1000,7 @@ impl CacheDispatch {
     }
 
     /// Drain all coalesced waiters for a fingerprint that became Ready.
-    /// Each coalescing group dispatches a single worker request that broadcasts
+    /// Each coalescing group dispatches a single serve request that broadcasts
     /// response bytes to all clients in the group.
     pub fn waiting_drain_ready(
         &self,
@@ -1019,7 +1070,7 @@ impl CacheDispatch {
             // The group already passed `limit_is_sufficient(max_limit, primary_needed)`
             // above; reuse `primary_needed` as the rows-needed witness.
             let mv = self.mv_dispatch_decide(fingerprint, primary_needed);
-            if let Err(e) = self.worker_request_send_with(
+            if let Err(e) = self.pool_serve_coalesced(
                 fingerprint,
                 primary,
                 Arc::clone(&resolved),
@@ -1110,7 +1161,7 @@ impl CacheDispatch {
                     admit_action: AdmitAction::Admit,
                     pinned: true,
                 })
-                .map_err(|_| CacheError::WorkerSend)?;
+                .map_err(|_| CacheError::WriterSend)?;
         }
         Ok(())
     }
@@ -1134,7 +1185,7 @@ impl CacheDispatch {
                 admit_action,
                 pinned: false,
             })
-            .map_err(|_| CacheError::WorkerSend.into())
+            .map_err(|_| CacheError::WriterSend.into())
     }
 
     /// Hold a request, send Register with subsumption oneshot, and route
@@ -1183,7 +1234,7 @@ impl CacheDispatch {
                 // false and the serve goes through the fallthrough path.
                 let rows_needed = limit_rows_needed(&msg.cacheable_query.query.limit);
                 let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
-                self.worker_request_send(fingerprint, msg, resolved, deparsed_sql, generation, mv)
+                self.pool_serve(fingerprint, msg, resolved, deparsed_sql, generation, mv)
             }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
                 self.metrics_miss_record(fingerprint);

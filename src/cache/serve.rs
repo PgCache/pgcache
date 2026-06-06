@@ -21,7 +21,7 @@ use super::{
     CacheError, CacheResult,
     memo::{MEMO_CAPTURE_MIN_HITS, MemoCapture, MemoKey, MemoShape},
     mv::{MvServe, MvState, mv_serve_sql_into},
-    query_cache::{CoalescedClient, QueryType, WorkerRequest},
+    query_cache::{CoalescedClient, QueryType, ServeRequest},
     types::CacheStateView,
     write_queue::WriteQueue,
 };
@@ -45,7 +45,7 @@ const DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// later RowDescription-bearing serve upgrades the entry (see `memo_serve_plan`).
 fn memo_capture_begin(
     state_view: &CacheStateView,
-    msg: &WorkerRequest,
+    msg: &ServeRequest,
     binary: bool,
 ) -> Option<MemoCapture> {
     // Only source-row serves are memoized (MV-eligible queries stay in q_<fp>).
@@ -177,11 +177,11 @@ fn sqlstate_extract(frame_data: &[u8]) -> Option<[u8; 5]> {
 
 /// Handle an `ErrorResponse` from the cache DB on the hit path. Poisons the
 /// connection (the trailing ReadyForQuery would otherwise leak to the next
-/// user) and returns a typed error so `handle_worker_request` forwards to
+/// user) and returns a typed error so `handle_serve_request` forwards to
 /// origin via `CacheReply::Error`.
 ///
 /// Safe to call only when `bytes_served == 0` — the cache emits ErrorResponse
-/// before RowDescription/DataRow, so the worker hasn't streamed any cache
+/// before RowDescription/DataRow, so the serve pool has not streamed any cache
 /// payload toward the client yet. A mid-stream error would need a different
 /// recovery path.
 async fn cache_error_response_handle(
@@ -223,7 +223,7 @@ fn push_and_broadcast(
 
 /// Create broadcast channel and spawn per-client write tasks.
 /// Returns None if there are no coalesced clients.
-fn broadcast_setup(msg: &mut WorkerRequest) -> Option<BroadcastState> {
+fn broadcast_setup(msg: &mut ServeRequest) -> Option<BroadcastState> {
     if msg.coalesced.is_empty() {
         return None;
     }
@@ -412,7 +412,7 @@ pub async fn handle_cached_query(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     replenish_tx: UnboundedSender<()>,
-    msg: &mut WorkerRequest,
+    msg: &mut ServeRequest,
     state_view: &CacheStateView,
 ) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
     debug!("message query generation {}", msg.generation);

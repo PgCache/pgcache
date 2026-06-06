@@ -46,9 +46,9 @@ pub enum PipelineDescribe {
     /// No Describe in the pipeline
     #[default]
     None,
-    /// Describe('S') — worker should include ParameterDescription + RowDescription
+    /// Describe('S') — serve path should include ParameterDescription + RowDescription
     Statement,
-    /// Describe('P') — worker should include RowDescription only
+    /// Describe('P') — serve path should include RowDescription only
     Portal,
 }
 
@@ -69,7 +69,7 @@ pub struct PipelineContext {
     /// Whether Bind was buffered in this pipeline.
     /// False when Bind was flushed separately (e.g., JDBC Parse/Bind/Describe/Flush then Execute/Sync).
     pub has_bind: bool,
-    /// Whether the worker should append ReadyForQuery after this execute's
+    /// Whether the serve path should append ReadyForQuery after this execute's
     /// response. True for a Sync-terminated dispatch's trailing execute; false
     /// for non-trailing executes and Flush dispatches (one Sync ⇒ one RFQ).
     pub emit_rfq: bool,
@@ -188,7 +188,7 @@ pub enum DataStreamState {
 
 /// Reply sent from cache back to the proxy. Always returns the leased client
 /// write half (`socket`) so the connection can resume; `outcome` carries what
-/// the worker did. The socket return is kept orthogonal to the outcome so no
+/// the serve pool did. The socket return is kept orthogonal to the outcome so no
 /// path can forget it.
 #[derive(Debug)]
 pub struct CacheReply {
@@ -197,7 +197,7 @@ pub struct CacheReply {
     pub outcome: CacheOutcome,
 }
 
-/// What the worker did with a dispatched query (see [`CacheReply`]).
+/// What the serve pool did with a dispatched query (see [`CacheReply`]).
 #[derive(Debug)]
 pub enum CacheOutcome {
     /// Query completed successfully. Worker wrote the full response to the client.

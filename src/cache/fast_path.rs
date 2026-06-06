@@ -1,33 +1,24 @@
 //! Shared cache-dispatch helpers.
 //!
 //! These functions are the building blocks of [`CacheDispatch::query_dispatch`]:
-//! the allowlist check, the hit-path mutations (metrics, CLOCK bit), the MV
-//! serve decision, and the worker-request construction. They operate on the
-//! `Send` shared state ([`CacheStateView`], the worker channel) and are factored
-//! out so the dispatch logic stays readable.
+//! the allowlist check, the hit-path mutations (metrics, CLOCK bit), and the MV
+//! serve decision. They operate on the `Send` shared state ([`CacheStateView`])
+//! and are factored out so the dispatch logic stays readable.
 
 use std::num::NonZeroU64;
 use std::sync::atomic::Ordering;
 
-use ecow::EcoString;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::mpsc::error::SendError;
-use tokio::sync::oneshot;
-use tokio_util::bytes::BytesMut;
-use tracing::{debug, error};
+use tracing::error;
 
-use crate::proxy::ClientSocket;
-use crate::query::ast::{LimitClause, QueryExpr, TableNode};
+use crate::query::ast::{QueryExpr, TableNode};
 use crate::settings::{Allowlist, CachePolicy};
-use crate::timing::{QueryTiming, duration_to_ns_u64};
+use crate::timing::duration_to_ns_u64;
 
 use super::{
-    CacheResult,
-    messages::{CacheOutcome, CacheReply, PipelineContext, PipelineDescribe, QueryCommand},
+    messages::QueryCommand,
     mv::{MvServe, MvState},
     query::limit_is_sufficient,
-    query_cache::{CoalescedClient, QueryType, WorkerRequest},
-    types::{CacheStateView, SharedResolved},
+    types::CacheStateView,
 };
 
 /// MV serve decision.
@@ -145,92 +136,4 @@ pub(crate) fn mv_schedule(
     }
     entry.mv.state = MvState::Scheduled { has_table };
     Some(QueryCommand::MvBuild { fingerprint })
-}
-
-/// Fields for [`worker_request_send`].
-pub(crate) struct WorkerSendParts {
-    pub fingerprint: u64,
-    pub query_type: QueryType,
-    pub data: BytesMut,
-    pub resolved: SharedResolved,
-    pub deparsed_sql: EcoString,
-    pub generation: u64,
-    pub mv: MvServe,
-    pub result_formats: Vec<i16>,
-    pub client_socket: ClientSocket,
-    pub reply_tx: oneshot::Sender<CacheReply>,
-    pub timing: QueryTiming,
-    pub limit: Option<LimitClause>,
-    pub pipeline: Option<PipelineContext>,
-    pub coalesced: Vec<CoalescedClient>,
-}
-
-/// Build and send a [`WorkerRequest`] to serve a query from cache.
-pub(crate) fn worker_request_send(
-    worker_tx: &UnboundedSender<WorkerRequest>,
-    parts: WorkerSendParts,
-) -> CacheResult<()> {
-    let (emit_rfq, has_parse, has_bind, pipeline_describe, parameter_description, forward_bytes) =
-        match parts.pipeline {
-            Some(pipeline) => (
-                pipeline.emit_rfq,
-                pipeline.has_parse,
-                pipeline.has_bind,
-                pipeline.describe,
-                pipeline.parameter_description,
-                Some(pipeline.buffered_bytes),
-            ),
-            None => (false, false, false, PipelineDescribe::None, None, None),
-        };
-
-    if let Err(SendError(req)) = worker_tx.send(WorkerRequest {
-        fingerprint: parts.fingerprint,
-        query_type: parts.query_type,
-        data: parts.data,
-        resolved: parts.resolved,
-        deparsed_sql: parts.deparsed_sql,
-        generation: parts.generation,
-        mv: parts.mv,
-        result_formats: parts.result_formats,
-        client_socket: parts.client_socket,
-        reply_tx: parts.reply_tx,
-        timing: parts.timing,
-        limit: parts.limit,
-        emit_rfq,
-        has_parse,
-        has_bind,
-        pipeline_describe,
-        parameter_description,
-        forward_bytes,
-        coalesced: parts.coalesced,
-    }) {
-        // Worker channel closed (cache subsystem torn down or restarting):
-        // degrade gracefully by forwarding the query — and any coalesced
-        // waiters — to origin rather than surfacing a hard cache error.
-        debug!("worker channel closed; forwarding query to origin");
-        origin_forward(
-            req.reply_tx,
-            req.client_socket,
-            req.forward_bytes.unwrap_or(req.data),
-            req.timing,
-        );
-        for c in req.coalesced {
-            origin_forward(c.reply_tx, c.client_socket, c.data, c.timing);
-        }
-    }
-    Ok(())
-}
-
-/// Hand a query back to the connection for origin forwarding. A failed send
-/// means the client already departed, which is harmless here.
-fn origin_forward(
-    reply_tx: oneshot::Sender<CacheReply>,
-    socket: ClientSocket,
-    buf: BytesMut,
-    timing: QueryTiming,
-) {
-    let _ = reply_tx.send(CacheReply {
-        socket,
-        outcome: CacheOutcome::Forward(buf, timing),
-    });
 }
