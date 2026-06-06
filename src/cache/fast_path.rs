@@ -6,6 +6,7 @@
 //! and are factored out so the dispatch logic stays readable.
 
 use std::num::NonZeroU64;
+use std::ops::ControlFlow;
 use std::sync::atomic::Ordering;
 
 use tracing::error;
@@ -37,17 +38,26 @@ pub(crate) fn query_allowlist_check(allowlist: &Allowlist, query: &QueryExpr) ->
     let Some(entries) = allowlist else {
         return true;
     };
-    query.nodes::<TableNode>().all(|t| {
-        let table_name = t.name.to_lowercase();
-        let table_schema = t.schema.as_ref().map(|s| s.to_lowercase());
-        entries.iter().any(|(ws, wt)| {
-            *wt == table_name
-                && match ws {
-                    Some(ws) => table_schema.as_deref() == Some(ws.as_str()),
-                    None => true,
-                }
+    // Allowed iff every TableNode matches an allowlist entry: break on the
+    // first non-matching table, so a clean walk (Continue) means "all allowed".
+    query
+        .try_for_each_node::<TableNode, ()>(&mut |t| {
+            let table_name = t.name.to_lowercase();
+            let table_schema = t.schema.as_ref().map(|s| s.to_lowercase());
+            let allowed = entries.iter().any(|(ws, wt)| {
+                *wt == table_name
+                    && match ws {
+                        Some(ws) => table_schema.as_deref() == Some(ws.as_str()),
+                        None => true,
+                    }
+            });
+            if allowed {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
         })
-    })
+        .is_continue()
 }
 
 /// Record a cache hit in the shared view: bump the GC hit counter and the

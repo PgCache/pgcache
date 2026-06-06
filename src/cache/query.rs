@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
@@ -79,12 +80,19 @@ impl CacheableQuery {
 /// relation names, so a match in either the schema or the table name marks a
 /// catalog reference. Covers nested subqueries and CTEs via full-tree traversal.
 fn references_system_catalog(query: &QueryExpr) -> Result<(), CacheabilityError> {
-    for table in query.nodes::<TableNode>() {
-        let is_catalog =
-            table.schema.as_deref().is_some_and(pg_prefixed) || pg_prefixed(&table.name);
-        if is_catalog {
-            return Err(CacheabilityError::SystemCatalogReference);
-        }
+    let references_catalog = query
+        .try_for_each_node::<TableNode, ()>(&mut |table| {
+            let is_catalog =
+                table.schema.as_deref().is_some_and(pg_prefixed) || pg_prefixed(&table.name);
+            if is_catalog {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break();
+    if references_catalog {
+        return Err(CacheabilityError::SystemCatalogReference);
     }
     Ok(())
 }

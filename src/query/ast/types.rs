@@ -1,5 +1,5 @@
-use std::any::{Any, TypeId};
-use std::marker::PhantomData;
+use std::any::Any;
+use std::ops::ControlFlow;
 
 use ecow::EcoString;
 use ordered_float::NotNan;
@@ -10,6 +10,56 @@ use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::query::cast::{CastTarget, cast_target_deparse};
 
 use super::Deparse;
+
+/// Generate the `nodes::<N>()` collecting wrapper for each AST type that has a
+/// `try_for_each_node`. The wrapper is pure boilerplate over the type-specific
+/// visitor; the visitor bodies stay hand-written for clarity.
+macro_rules! impl_ast_nodes {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl $ty {
+                /// Collect all nodes of type `N` within this subtree.
+                pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
+                    let mut out = Vec::new();
+                    let _ = self.try_for_each_node::<N, ()>(&mut |n| {
+                        out.push(n);
+                        ControlFlow::Continue(())
+                    });
+                    out.into_iter()
+                }
+            }
+        )+
+    };
+}
+
+impl_ast_nodes!(
+    LiteralValue,
+    ColumnNode,
+    UnaryExpr,
+    BinaryExpr,
+    MultiExpr,
+    WhereExpr,
+    ValuesClause,
+    SelectNode,
+    SetOpNode,
+    QueryBody,
+    QueryExpr,
+    SelectColumns,
+    SelectColumn,
+    ArithmeticExpr,
+    ScalarExpr,
+    FunctionCall,
+    WindowSpec,
+    CaseExpr,
+    CaseWhen,
+    TableNode,
+    TableSubqueryNode,
+    CteRefNode,
+    JoinNode,
+    OrderByClause,
+    NullOrder,
+    OrderDirection,
+);
 
 // Core literal value types that can appear in SQL expressions.
 //
@@ -36,8 +86,14 @@ pub enum LiteralValue {
 }
 
 impl LiteralValue {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        (self as &dyn Any).downcast_ref::<N>().into_iter()
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        ControlFlow::Continue(())
     }
 
     /// Check if an Option<String> (from CDC row data) matches this LiteralValue.
@@ -207,8 +263,14 @@ pub struct ColumnNode {
 }
 
 impl ColumnNode {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        (self as &dyn Any).downcast_ref::<N>().into_iter()
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -373,10 +435,15 @@ pub struct UnaryExpr {
 }
 
 impl UnaryExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.expr.nodes();
-        current.chain(children)
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.expr.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -426,10 +493,16 @@ pub struct BinaryExpr {
 }
 
 impl BinaryExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.lexpr.nodes().chain(self.rexpr.nodes());
-        current.chain(children)
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.lexpr.try_for_each_node(f)?;
+        self.rexpr.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 
     /// Whether a child expression needs parentheses to preserve semantics.
@@ -478,10 +551,17 @@ pub struct MultiExpr {
 }
 
 impl MultiExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.exprs.iter().flat_map(|expr| expr.nodes());
-        current.chain(children)
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        for expr in &self.exprs {
+            expr.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -556,29 +636,29 @@ pub enum WhereExpr {
     },
 }
 
-pub type WhereExprNodeIter<'a, N> =
-    std::iter::Chain<std::option::IntoIter<&'a N>, Box<dyn Iterator<Item = &'a N> + 'a>>;
-
 impl WhereExpr {
-    /// Get all nodes of the given type within this WhereExpr tree
-    pub fn nodes<N: Any>(&self) -> WhereExprNodeIter<'_, N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-
-        let children: Box<dyn Iterator<Item = &N>> = match self {
-            WhereExpr::Scalar(scalar) => Box::new(scalar.nodes()),
-            WhereExpr::Unary(unary) => Box::new(unary.nodes()),
-            WhereExpr::Binary(binary) => Box::new(binary.nodes()),
-            WhereExpr::Multi(multi) => Box::new(multi.nodes()),
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        match self {
+            WhereExpr::Scalar(scalar) => scalar.try_for_each_node(f)?,
+            WhereExpr::Unary(unary) => unary.try_for_each_node(f)?,
+            WhereExpr::Binary(binary) => binary.try_for_each_node(f)?,
+            WhereExpr::Multi(multi) => multi.try_for_each_node(f)?,
             WhereExpr::Subquery {
                 query, test_expr, ..
             } => {
-                let query_nodes = query.nodes();
-                let test_nodes = test_expr.iter().flat_map(|e| e.nodes());
-                Box::new(query_nodes.chain(test_nodes))
+                query.try_for_each_node(f)?;
+                if let Some(e) = test_expr {
+                    e.try_for_each_node(f)?;
+                }
             }
-        };
-
-        current.chain(children)
+        }
+        ControlFlow::Continue(())
     }
 
     pub fn has_subqueries(&self) -> bool {
@@ -746,10 +826,16 @@ pub struct ValuesClause {
 }
 
 impl ValuesClause {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        self.rows
-            .iter()
-            .flat_map(|row| row.iter().flat_map(|v| v.nodes()))
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        for row in &self.rows {
+            for v in row {
+                v.try_for_each_node(f)?;
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     pub fn has_subqueries(&self) -> bool {
@@ -802,18 +888,24 @@ impl Default for SelectNode {
 }
 
 impl SelectNode {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> + '_ {
-        let columns_nodes = self.columns.nodes();
-        let from_nodes = self.from.iter().flat_map(|t| t.nodes());
-        let where_nodes = self.where_clause.iter().flat_map(|w| w.nodes());
-        let group_by_nodes = self.group_by.iter().flat_map(|c| c.nodes());
-        let having_nodes = self.having.iter().flat_map(|h| h.nodes());
-
-        columns_nodes
-            .chain(from_nodes)
-            .chain(where_nodes)
-            .chain(group_by_nodes)
-            .chain(having_nodes)
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        self.columns.try_for_each_node(f)?;
+        for t in &self.from {
+            t.try_for_each_node(f)?;
+        }
+        if let Some(w) = &self.where_clause {
+            w.try_for_each_node(f)?;
+        }
+        for c in &self.group_by {
+            c.try_for_each_node(f)?;
+        }
+        if let Some(h) = &self.having {
+            h.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 
     /// Return table nodes directly in this SELECT's FROM clause.
@@ -915,11 +1007,16 @@ pub struct SetOpNode {
 }
 
 impl SetOpNode {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let left_nodes = self.left.nodes();
-        let right_nodes = self.right.nodes();
-        Box::new(current.chain(left_nodes).chain(right_nodes))
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.left.try_for_each_node(f)?;
+        self.right.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 
     pub fn has_subqueries(&self) -> bool {
@@ -950,14 +1047,19 @@ pub enum QueryBody {
 }
 
 impl QueryBody {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children: Box<dyn Iterator<Item = &N> + '_> = match self {
-            QueryBody::Select(select) => Box::new(select.nodes()),
-            QueryBody::Values(values) => Box::new(values.nodes()),
-            QueryBody::SetOp(set_op) => set_op.nodes(),
-        };
-        Box::new(current.chain(children))
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        match self {
+            QueryBody::Select(select) => select.try_for_each_node(f)?,
+            QueryBody::Values(values) => values.try_for_each_node(f)?,
+            QueryBody::SetOp(set_op) => set_op.try_for_each_node(f)?,
+        }
+        ControlFlow::Continue(())
     }
 
     pub fn has_subqueries(&self) -> bool {
@@ -1027,17 +1129,21 @@ pub struct CteDefinition {
 }
 
 impl QueryExpr {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let cte_nodes = self.ctes.iter().flat_map(|c| c.query.nodes::<N>());
-        let body_nodes = self.body.nodes();
-        let order_by_nodes = self.order_by.iter().flat_map(|o| o.nodes());
-        Box::new(
-            current
-                .chain(cte_nodes)
-                .chain(body_nodes)
-                .chain(order_by_nodes),
-        )
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        for c in &self.ctes {
+            c.query.try_for_each_node(f)?;
+        }
+        self.body.try_for_each_node(f)?;
+        for o in &self.order_by {
+            o.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 
     /// Check if query only references a single table
@@ -1205,15 +1311,22 @@ pub enum SelectColumns {
 }
 
 impl SelectColumns {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-
-        let children: Box<dyn Iterator<Item = &N> + '_> = match self {
-            SelectColumns::None => Box::new(std::iter::empty()),
-            SelectColumns::Columns(columns) => Box::new(columns.iter().flat_map(|col| col.nodes())),
-        };
-
-        Box::new(current.chain(children))
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        match self {
+            SelectColumns::None => {}
+            SelectColumns::Columns(columns) => {
+                for col in columns {
+                    col.try_for_each_node(f)?;
+                }
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     /// Collect subquery branches from SELECT list with source tracking.
@@ -1278,15 +1391,18 @@ impl SelectColumn {
         }
     }
 
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = match self {
-            SelectColumn::Expr { expr, .. } => Some(expr.nodes()),
-            SelectColumn::Star(_) => None,
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
         }
-        .into_iter()
-        .flatten();
-        current.chain(children)
+        match self {
+            SelectColumn::Expr { expr, .. } => expr.try_for_each_node(f)?,
+            SelectColumn::Star(_) => {}
+        }
+        ControlFlow::Continue(())
     }
 
     pub fn has_subqueries(&self) -> bool {
@@ -1344,11 +1460,16 @@ pub struct ArithmeticExpr {
 }
 
 impl ArithmeticExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let left_children = self.left.nodes();
-        let right_children = self.right.nodes();
-        current.chain(left_children).chain(right_children)
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.left.try_for_each_node(f)?;
+        self.right.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 
     pub fn has_subqueries(&self) -> bool {
@@ -1391,20 +1512,28 @@ pub enum ScalarExpr {
 }
 
 impl ScalarExpr {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
         if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            return Box::new(std::iter::once(r));
+            f(r)?;
         }
         match self {
-            ScalarExpr::Column(col) => Box::new((col as &dyn Any).downcast_ref::<N>().into_iter()),
-            ScalarExpr::Function(func) => Box::new(func.nodes()),
-            ScalarExpr::Literal(lit) => Box::new((lit as &dyn Any).downcast_ref::<N>().into_iter()),
-            ScalarExpr::Case(case) => Box::new(case.nodes()),
-            ScalarExpr::Arithmetic(arith) => Box::new(arith.nodes()),
-            ScalarExpr::Subquery(query) => query.nodes(),
-            ScalarExpr::Array(elems) => Box::new(elems.iter().flat_map(|e| e.nodes())),
-            ScalarExpr::TypeCast { expr, .. } => expr.nodes(),
+            ScalarExpr::Column(col) => col.try_for_each_node(f)?,
+            ScalarExpr::Function(func) => func.try_for_each_node(f)?,
+            ScalarExpr::Literal(lit) => lit.try_for_each_node(f)?,
+            ScalarExpr::Case(case) => case.try_for_each_node(f)?,
+            ScalarExpr::Arithmetic(arith) => arith.try_for_each_node(f)?,
+            ScalarExpr::Subquery(query) => query.try_for_each_node(f)?,
+            ScalarExpr::Array(elems) => {
+                for e in elems {
+                    e.try_for_each_node(f)?;
+                }
+            }
+            ScalarExpr::TypeCast { expr, .. } => expr.try_for_each_node(f)?,
         }
+        ControlFlow::Continue(())
     }
 
     pub fn has_subqueries(&self) -> bool {
@@ -1525,17 +1654,26 @@ pub struct FunctionCall {
 }
 
 impl FunctionCall {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let arg_children = self.args.iter().flat_map(|arg| arg.nodes());
-        let agg_order_children = self.agg_order.iter().flat_map(|o| o.nodes());
-        let filter_children = self.agg_filter.iter().flat_map(|f| f.nodes());
-        let over_children = self.over.iter().flat_map(|w| w.nodes());
-        current
-            .chain(arg_children)
-            .chain(agg_order_children)
-            .chain(filter_children)
-            .chain(over_children)
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        for arg in &self.args {
+            arg.try_for_each_node(f)?;
+        }
+        for o in &self.agg_order {
+            o.try_for_each_node(f)?;
+        }
+        if let Some(filter) = &self.agg_filter {
+            filter.try_for_each_node(f)?;
+        }
+        if let Some(over) = &self.over {
+            over.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 
     /// Check if this function call contains sublinks/subqueries
@@ -1597,11 +1735,20 @@ pub struct WindowSpec {
 }
 
 impl WindowSpec {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let partition_children = self.partition_by.iter().flat_map(|p| p.nodes());
-        let order_children = self.order_by.iter().flat_map(|o| o.nodes());
-        current.chain(partition_children).chain(order_children)
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        for p in &self.partition_by {
+            p.try_for_each_node(f)?;
+        }
+        for o in &self.order_by {
+            o.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 
     /// Check if this window spec contains sublinks/subqueries
@@ -1653,15 +1800,23 @@ pub struct CaseExpr {
 }
 
 impl CaseExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let arg_nodes = self.arg.iter().flat_map(|a| a.nodes());
-        let when_nodes = self.whens.iter().flat_map(|w| w.nodes());
-        let default_nodes = self.default.iter().flat_map(|d| d.nodes());
-        current
-            .chain(arg_nodes)
-            .chain(when_nodes)
-            .chain(default_nodes)
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        if let Some(a) = &self.arg {
+            a.try_for_each_node(f)?;
+        }
+        for w in &self.whens {
+            w.try_for_each_node(f)?;
+        }
+        if let Some(d) = &self.default {
+            d.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 
     /// Check if this CASE expression contains sublinks/subqueries
@@ -1704,10 +1859,13 @@ pub struct CaseWhen {
 }
 
 impl CaseWhen {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let condition_nodes = self.condition.nodes();
-        let result_nodes = self.result.nodes();
-        condition_nodes.chain(result_nodes)
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        self.condition.try_for_each_node(f)?;
+        self.result.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 
     pub fn has_subqueries(&self) -> bool {
@@ -1762,13 +1920,22 @@ pub struct CteRefNode {
 }
 
 impl TableSource {
-    fn nodes<N: Any>(&self) -> TableSourceNodeIter<'_, N> {
-        TableSourceNodeIter {
-            source: Some(self),
-            join_iter: None,
-            subquery_iter: None,
-            _phantom: PhantomData,
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        match self {
+            TableSource::Table(table) => table.try_for_each_node(f)?,
+            TableSource::Subquery(sub) => sub.try_for_each_node(f)?,
+            TableSource::Join(join) => {
+                if let Some(r) = (join as &dyn Any).downcast_ref::<N>() {
+                    f(r)?;
+                }
+                join.try_for_each_node(f)?;
+            }
+            TableSource::CteRef(cte_ref) => cte_ref.try_for_each_node(f)?,
         }
+        ControlFlow::Continue(())
     }
 
     /// Collect direct table nodes, traversing JOINs but not subqueries/CTEs.
@@ -1851,97 +2018,6 @@ impl Deparse for TableSource {
     }
 }
 
-struct TableSourceNodeIter<'a, N> {
-    source: Option<&'a TableSource>,
-    join_iter: Option<Box<JoinNodeIter<'a, N>>>,
-    subquery_iter: Option<Box<dyn Iterator<Item = &'a N> + 'a>>,
-    _phantom: PhantomData<N>,
-}
-
-impl<'a, N: Any> Iterator for TableSourceNodeIter<'a, N> {
-    type Item = &'a N;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.source {
-            Some(TableSource::Table(table)) => {
-                self.source = None;
-                (table as &dyn Any).downcast_ref::<N>()
-            }
-            Some(TableSource::Subquery(sub)) => {
-                if let Some(iter) = &mut self.subquery_iter {
-                    if let Some(node) = iter.next() {
-                        return Some(node);
-                    } else {
-                        self.source = None;
-                        return None;
-                    }
-                }
-
-                let mut iter = sub.nodes();
-                if let Some(node) = iter.next() {
-                    self.subquery_iter = Some(iter);
-                    Some(node)
-                } else {
-                    self.source = None;
-                    None
-                }
-            }
-            Some(TableSource::Join(join)) => {
-                if let Some(iter) = &mut self.join_iter {
-                    // Continue with the existing join iterator
-                    if let Some(node) = iter.next() {
-                        return Some(node);
-                    } else {
-                        // Join iterator exhausted
-                        self.source = None;
-                        return None;
-                    }
-                }
-
-                // First time processing this join
-                // Check if we're looking for JoinNode types - if so, yield this join first
-                if TypeId::of::<N>() == TypeId::of::<JoinNode>()
-                    && let Some(this_join) = (join as &dyn Any).downcast_ref::<N>()
-                {
-                    // Yield this join, and set up iterator for children
-                    self.join_iter = Some(Box::new(join.nodes()));
-                    return Some(this_join);
-                }
-
-                // For other types (like TableNode), iterate through children
-                let mut iter = join.nodes();
-                if let Some(node) = iter.next() {
-                    self.join_iter = Some(Box::new(iter));
-                    Some(node)
-                } else {
-                    self.source = None;
-                    None
-                }
-            }
-            Some(TableSource::CteRef(cte_ref)) => {
-                if let Some(iter) = &mut self.subquery_iter {
-                    if let Some(node) = iter.next() {
-                        return Some(node);
-                    } else {
-                        self.source = None;
-                        return None;
-                    }
-                }
-
-                let mut iter = cte_ref.nodes();
-                if let Some(node) = iter.next() {
-                    self.subquery_iter = Some(iter);
-                    Some(node)
-                } else {
-                    self.source = None;
-                    None
-                }
-            }
-            None => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableNode {
     pub schema: Option<EcoString>,
@@ -1950,8 +2026,14 @@ pub struct TableNode {
 }
 
 impl TableNode {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        (self as &dyn Any).downcast_ref::<N>().into_iter()
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -1982,10 +2064,15 @@ pub struct TableSubqueryNode {
 }
 
 impl TableSubqueryNode {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.query.nodes();
-        Box::new(current.chain(children))
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.query.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -2010,10 +2097,15 @@ impl Deparse for TableSubqueryNode {
 }
 
 impl CteRefNode {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.query.nodes();
-        Box::new(current.chain(children))
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.query.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -2057,17 +2149,16 @@ pub struct JoinNode {
 }
 
 impl JoinNode {
-    pub fn nodes<N: Any>(&self) -> JoinNodeIter<'_, N> {
-        let condition_iter = match &self.qual {
-            JoinQual::On(c) => Some(c.nodes()),
-            JoinQual::Using(_) | JoinQual::Natural | JoinQual::Cross => None,
-        };
-        JoinNodeIter {
-            left_iter: self.left.nodes(),
-            right_iter: self.right.nodes(),
-            condition_iter,
-            _phantom: PhantomData,
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        self.left.try_for_each_node(f)?;
+        self.right.try_for_each_node(f)?;
+        if let JoinQual::On(c) = &self.qual {
+            c.try_for_each_node(f)?;
         }
+        ControlFlow::Continue(())
     }
 }
 
@@ -2104,36 +2195,6 @@ impl Deparse for JoinNode {
             JoinQual::Natural | JoinQual::Cross => {}
         }
         buf
-    }
-}
-
-pub struct JoinNodeIter<'a, N> {
-    left_iter: TableSourceNodeIter<'a, N>,
-    right_iter: TableSourceNodeIter<'a, N>,
-    condition_iter: Option<WhereExprNodeIter<'a, N>>,
-    _phantom: PhantomData<N>,
-}
-
-impl<'a, N: Any> Iterator for JoinNodeIter<'a, N> {
-    type Item = &'a N;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Try left iterator first
-        if let Some(item) = self.left_iter.next() {
-            return Some(item);
-        }
-
-        // Then try right iterator
-        if let Some(item) = self.right_iter.next() {
-            return Some(item);
-        }
-
-        // Finally try condition iterator
-        if let Some(ref mut condition_iter) = self.condition_iter {
-            condition_iter.next()
-        } else {
-            None
-        }
     }
 }
 
@@ -2180,10 +2241,15 @@ pub struct OrderByClause {
 }
 
 impl OrderByClause {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.expr.nodes();
-        Box::new(current.chain(children))
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.expr.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -2207,8 +2273,14 @@ pub enum NullOrder {
 }
 
 impl NullOrder {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        (self as &dyn Any).downcast_ref::<N>().into_iter()
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -2230,8 +2302,14 @@ pub enum OrderDirection {
 }
 
 impl OrderDirection {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        (self as &dyn Any).downcast_ref::<N>().into_iter()
+    pub fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
