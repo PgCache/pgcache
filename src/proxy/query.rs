@@ -66,7 +66,7 @@ pub(super) async fn handle_query(
             match convert_result {
                 Ok(query) => {
                     // Successfully parsed as SELECT
-                    match CacheableQuery::try_new(&query, func_volatility) {
+                    match CacheableQuery::try_new(query, func_volatility) {
                         Ok(cacheable_query) => {
                             let cacheable_query = Arc::new(cacheable_query);
                             fp_cache.insert(fingerprint, Ok(Arc::clone(&cacheable_query)));

@@ -1360,7 +1360,7 @@ mod classify_tests {
 
     fn resolve(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedQueryExpr {
         let query_expr = query_expr_parse(sql).expect("convert");
-        let cacheable = CacheableQuery::try_new(&query_expr, &HashMap::new()).expect("cacheable");
+        let cacheable = CacheableQuery::try_new(query_expr, &HashMap::new()).expect("cacheable");
         query_expr_resolve(&cacheable.query, tables, &["public"]).expect("resolve")
     }
 

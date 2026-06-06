@@ -116,14 +116,15 @@ fn pinned_queries_validate(
                     return None;
                 }
             };
-            let cacheable_query = match CacheableQuery::try_new(&query_expr, func_volatility) {
+            // Fingerprint before try_new takes ownership of query_expr.
+            let fingerprint = query_expr_fingerprint(&query_expr);
+            let cacheable_query = match CacheableQuery::try_new(query_expr, func_volatility) {
                 Ok(cq) => cq,
                 Err(e) => {
                     tracing::warn!("pinned query not cacheable, skipping: {sql} ({e})");
                     return None;
                 }
             };
-            let fingerprint = query_expr_fingerprint(&query_expr);
             info!("pinned query validated: {sql} (fingerprint: {fingerprint})");
             Some(PinnedQuery {
                 fingerprint,

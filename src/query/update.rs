@@ -81,7 +81,7 @@ mod tests {
     /// Helper to parse SQL and return a CacheableQuery
     fn parse_cacheable(sql: &str) -> CacheableQuery {
         let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
-        CacheableQuery::try_new(&query_expr, &HashMap::new()).expect("query to be cacheable")
+        CacheableQuery::try_new(query_expr, &HashMap::new()).expect("query to be cacheable")
     }
 
     /// Create test table metadata with given column names.

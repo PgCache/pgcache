@@ -678,7 +678,7 @@ mod tests {
 
         // Test that this SQL would be cacheable
         let query = query_expr_parse(&result.sql).unwrap();
-        let cacheable = CacheableQuery::try_new(&query, &HashMap::new());
+        let cacheable = CacheableQuery::try_new(query, &HashMap::new());
         assert!(
             cacheable.is_ok(),
             "Simple SELECT with equality should be cacheable"
@@ -714,7 +714,7 @@ mod tests {
         );
 
         // Verify cacheability check accepts it (non-correlated subqueries are now cacheable)
-        let cacheable_result = CacheableQuery::try_new(&query, &HashMap::new());
+        let cacheable_result = CacheableQuery::try_new(query, &HashMap::new());
         assert!(
             cacheable_result.is_ok(),
             "SELECT with non-correlated subquery should be cacheable"

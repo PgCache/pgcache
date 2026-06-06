@@ -1433,7 +1433,7 @@ impl ConnectionState {
     /// Map a parsed-and-converted query to its cacheability classification.
     fn statement_type_classify(&self, convert: Result<QueryExpr, AstError>) -> StatementType {
         match convert {
-            Ok(query) => match CacheableQuery::try_new(&query, &self.func_volatility) {
+            Ok(query) => match CacheableQuery::try_new(query, &self.func_volatility) {
                 Ok(cacheable_query) => StatementType::Cacheable(Arc::new(cacheable_query)),
                 Err(_) => StatementType::UncacheableSelect,
             },

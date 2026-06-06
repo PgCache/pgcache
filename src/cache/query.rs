@@ -56,20 +56,20 @@ impl CacheableQuery {
     /// Validates the query structure and ensures all functions in WHERE/FROM
     /// clauses are immutable. Functions in SELECT lists are always allowed.
     pub fn try_new(
-        query: &QueryExpr,
+        query: QueryExpr,
         fv: &FunctionVolatilityMap,
     ) -> Result<Self, CacheabilityError> {
         // System catalogs (pg_catalog, pg_toast, unqualified pg_* relations) can't
         // be logically replicated, so registration against the cache db fails with
         // "unacceptable schema name". Reject up front and forward to origin —
         // e.g. psql's \d, which queries pg_class/pg_namespace.
-        references_system_catalog(query)?;
+        references_system_catalog(&query)?;
 
         is_cacheable_body(&query.body, fv)?;
 
-        Ok(CacheableQuery {
-            query: query.clone(),
-        })
+        // Take ownership of the (freshly built, ephemeral) query rather than
+        // cloning the whole AST — the caller has no further use for it.
+        Ok(CacheableQuery { query })
     }
 }
 
@@ -648,7 +648,7 @@ mod tests {
     fn check_cacheable(sql: &str) -> Result<CacheableQuery, CacheabilityError> {
         let fv = test_func_volatility();
         let query_expr = query_expr_parse(sql).expect("convert");
-        CacheableQuery::try_new(&query_expr, &fv)
+        CacheableQuery::try_new(query_expr, &fv)
     }
 
     /// Create test table metadata with given column names.

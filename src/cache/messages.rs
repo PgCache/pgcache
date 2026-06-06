@@ -162,6 +162,18 @@ impl CacheMessage {
                 result_formats: Vec::new(),
             }),
             CacheMessage::QueryParameterized(data, cacheable_query, parameters, result_formats) => {
+                if parameters.is_empty() {
+                    // No bind parameters → nothing to substitute. Reuse the shared
+                    // CacheableQuery (Arc clone) instead of cloning the whole AST.
+                    // The convert-time constant fold already ran; the bind-time
+                    // fold only matters once a parameter has been substituted.
+                    return Ok(QueryData {
+                        data,
+                        cacheable_query,
+                        query_type: QueryType::Extended,
+                        result_formats,
+                    });
+                }
                 // Replace parameters in AST, producing a new QueryExpr
                 match query_expr_parameters_replace(&cacheable_query.query, &parameters) {
                     Ok(replaced_query) => Ok(QueryData {
