@@ -16,7 +16,7 @@ use crate::pg::protocol::backend::PgBackendMessageType;
 use crate::pg::protocol::encode::{
     BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG,
 };
-use crate::query::ast::{Deparse, LiteralValue};
+use crate::query::ast::{AstNode, Deparse, LiteralValue};
 use crate::timing::QueryTiming;
 
 use super::{

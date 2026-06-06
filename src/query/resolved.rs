@@ -1,5 +1,6 @@
 use std::any::Any;
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use ecow::EcoString;
 use error_set::error_set;
@@ -54,9 +55,15 @@ pub struct ResolvedTableNode {
     pub relation_oid: u32,
 }
 
-impl ResolvedTableNode {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        (self as &dyn Any).downcast_ref::<N>().into_iter()
+impl AstNode for ResolvedTableNode {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -116,9 +123,15 @@ impl std::hash::Hash for ResolvedColumnNode {
     }
 }
 
-impl ResolvedColumnNode {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        (self as &dyn Any).downcast_ref::<N>().into_iter()
+impl AstNode for ResolvedColumnNode {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -145,11 +158,16 @@ pub struct ResolvedUnaryExpr {
     pub expr: Box<ResolvedWhereExpr>,
 }
 
-impl ResolvedUnaryExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.expr.nodes();
-        current.chain(children)
+impl AstNode for ResolvedUnaryExpr {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.expr.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -161,11 +179,17 @@ pub struct ResolvedBinaryExpr {
     pub rexpr: Box<ResolvedWhereExpr>,
 }
 
-impl ResolvedBinaryExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.lexpr.nodes().chain(self.rexpr.nodes());
-        current.chain(children)
+impl AstNode for ResolvedBinaryExpr {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.lexpr.try_for_each_node(f)?;
+        self.rexpr.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -176,11 +200,18 @@ pub struct ResolvedMultiExpr {
     pub exprs: Vec<ResolvedWhereExpr>,
 }
 
-impl ResolvedMultiExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.exprs.iter().flat_map(|expr| expr.nodes());
-        current.chain(children)
+impl AstNode for ResolvedMultiExpr {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        for expr in &self.exprs {
+            expr.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -210,25 +241,33 @@ pub enum ResolvedWhereExpr {
     },
 }
 
-impl ResolvedWhereExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children: Box<dyn Iterator<Item = &'_ N>> = match self {
-            ResolvedWhereExpr::Scalar(scalar) => Box::new(scalar.nodes()),
-            ResolvedWhereExpr::Unary(unary) => Box::new(unary.nodes()),
-            ResolvedWhereExpr::Binary(binary) => Box::new(binary.nodes()),
-            ResolvedWhereExpr::Multi(multi) => Box::new(multi.nodes()),
+impl AstNode for ResolvedWhereExpr {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        match self {
+            ResolvedWhereExpr::Scalar(scalar) => scalar.try_for_each_node(f)?,
+            ResolvedWhereExpr::Unary(unary) => unary.try_for_each_node(f)?,
+            ResolvedWhereExpr::Binary(binary) => binary.try_for_each_node(f)?,
+            ResolvedWhereExpr::Multi(multi) => multi.try_for_each_node(f)?,
             ResolvedWhereExpr::Subquery {
                 query, test_expr, ..
             } => {
-                let query_nodes = query.nodes();
-                let test_nodes = test_expr.iter().flat_map(|e| e.nodes());
-                Box::new(query_nodes.chain(test_nodes))
+                query.try_for_each_node(f)?;
+                if let Some(e) = test_expr {
+                    e.try_for_each_node(f)?;
+                }
             }
-        };
-        current.chain(children)
+        }
+        ControlFlow::Continue(())
     }
+}
 
+impl ResolvedWhereExpr {
     /// Compute the maximum subquery nesting depth in this WHERE expression.
     /// Returns 0 if there are no subqueries.
     pub fn subquery_depth(&self) -> usize {
@@ -573,12 +612,17 @@ pub struct ResolvedArithmeticExpr {
     pub right: Box<ResolvedScalarExpr>,
 }
 
-impl ResolvedArithmeticExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let left_children = self.left.nodes();
-        let right_children = self.right.nodes();
-        current.chain(left_children).chain(right_children)
+impl AstNode for ResolvedArithmeticExpr {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.left.try_for_each_node(f)?;
+        self.right.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -631,18 +675,27 @@ pub struct ResolvedFunctionCall {
     pub over: Option<ResolvedWindowSpec>,
 }
 
-impl ResolvedFunctionCall {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let arg_nodes = self.args.iter().flat_map(|arg| arg.nodes());
-        let agg_order_nodes = self.agg_order.iter().flat_map(|o| o.nodes());
-        let filter_nodes = self.agg_filter.iter().flat_map(|f| f.nodes());
-        let over_nodes = self.over.iter().flat_map(|w| w.nodes());
-        current
-            .chain(arg_nodes)
-            .chain(agg_order_nodes)
-            .chain(filter_nodes)
-            .chain(over_nodes)
+impl AstNode for ResolvedFunctionCall {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        for arg in &self.args {
+            arg.try_for_each_node(f)?;
+        }
+        for o in &self.agg_order {
+            o.try_for_each_node(f)?;
+        }
+        if let Some(filter) = &self.agg_filter {
+            filter.try_for_each_node(f)?;
+        }
+        if let Some(w) = &self.over {
+            w.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -695,12 +748,21 @@ pub struct ResolvedWindowSpec {
     pub order_by: Vec<ResolvedOrderByClause>,
 }
 
-impl ResolvedWindowSpec {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let partition_children = self.partition_by.iter().flat_map(|p| p.nodes());
-        let order_children = self.order_by.iter().flat_map(|o| o.nodes());
-        current.chain(partition_children).chain(order_children)
+impl AstNode for ResolvedWindowSpec {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        for p in &self.partition_by {
+            p.try_for_each_node(f)?;
+        }
+        for o in &self.order_by {
+            o.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -753,23 +815,34 @@ pub struct ResolvedCaseWhen {
     pub result: ResolvedScalarExpr,
 }
 
-impl ResolvedScalarExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children: Box<dyn Iterator<Item = &'_ N>> = match self {
-            ResolvedScalarExpr::Column(col) => Box::new(col.nodes()),
-            ResolvedScalarExpr::Identifier(_) => Box::new(std::iter::empty()),
-            ResolvedScalarExpr::Literal(lit) => Box::new(lit.nodes()),
-            ResolvedScalarExpr::Function(func) => Box::new(func.nodes()),
-            ResolvedScalarExpr::Case(case) => Box::new(case.nodes()),
-            ResolvedScalarExpr::Arithmetic(arith) => Box::new(arith.nodes()),
-            ResolvedScalarExpr::Subquery(query, _) => Box::new(query.nodes()),
-            ResolvedScalarExpr::Array(elems) => Box::new(elems.iter().flat_map(|e| e.nodes())),
-            ResolvedScalarExpr::TypeCast { expr, .. } => Box::new(expr.nodes()),
-        };
-        current.chain(children)
+impl AstNode for ResolvedScalarExpr {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        match self {
+            ResolvedScalarExpr::Column(col) => col.try_for_each_node(f)?,
+            ResolvedScalarExpr::Identifier(_) => {}
+            ResolvedScalarExpr::Literal(lit) => lit.try_for_each_node(f)?,
+            ResolvedScalarExpr::Function(func) => func.try_for_each_node(f)?,
+            ResolvedScalarExpr::Case(case) => case.try_for_each_node(f)?,
+            ResolvedScalarExpr::Arithmetic(arith) => arith.try_for_each_node(f)?,
+            ResolvedScalarExpr::Subquery(query, _) => query.try_for_each_node(f)?,
+            ResolvedScalarExpr::Array(elems) => {
+                for e in elems {
+                    e.try_for_each_node(f)?;
+                }
+            }
+            ResolvedScalarExpr::TypeCast { expr, .. } => expr.try_for_each_node(f)?,
+        }
+        ControlFlow::Continue(())
     }
+}
 
+impl ResolvedScalarExpr {
     /// True when the expression tree contains a `Function` call whose name
     /// appears in `agg_fns`. Walks through CASE branches and arithmetic operands,
     /// but does not descend into scalar subqueries (an aggregate nested inside a
@@ -951,24 +1024,35 @@ impl ResolvedScalarExpr {
     }
 }
 
-impl ResolvedCaseExpr {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let arg_nodes = self.arg.iter().flat_map(|a| a.nodes());
-        let when_nodes = self.whens.iter().flat_map(|w| w.nodes());
-        let default_nodes = self.default.iter().flat_map(|d| d.nodes());
-        current
-            .chain(arg_nodes)
-            .chain(when_nodes)
-            .chain(default_nodes)
+impl AstNode for ResolvedCaseExpr {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        if let Some(a) = &self.arg {
+            a.try_for_each_node(f)?;
+        }
+        for w in &self.whens {
+            w.try_for_each_node(f)?;
+        }
+        if let Some(d) = &self.default {
+            d.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
-impl ResolvedCaseWhen {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let condition_nodes = self.condition.nodes();
-        let result_nodes = self.result.nodes();
-        condition_nodes.chain(result_nodes)
+impl AstNode for ResolvedCaseWhen {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        self.condition.try_for_each_node(f)?;
+        self.result.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -1038,13 +1122,20 @@ pub struct ResolvedSelectColumn {
     pub alias: Option<EcoString>,
 }
 
-impl ResolvedSelectColumn {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.expr.nodes();
-        current.chain(children)
+impl AstNode for ResolvedSelectColumn {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.expr.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
+}
 
+impl ResolvedSelectColumn {
     /// The column's output name — its alias if present, otherwise inferred
     /// from the expression (the column name for `Column` / `Identifier`).
     /// Returns `None` for unaliased function, literal, case, arithmetic, or
@@ -1089,18 +1180,27 @@ pub enum ResolvedSelectColumns {
     Columns(Vec<ResolvedSelectColumn>),
 }
 
-impl ResolvedSelectColumns {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children: Box<dyn Iterator<Item = &'_ N>> = match self {
-            ResolvedSelectColumns::None => Box::new(std::iter::empty()),
+impl AstNode for ResolvedSelectColumns {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        match self {
+            ResolvedSelectColumns::None => {}
             ResolvedSelectColumns::Columns(cols) => {
-                Box::new(cols.iter().flat_map(|col| col.nodes()))
+                for col in cols {
+                    col.try_for_each_node(f)?;
+                }
             }
-        };
-        current.chain(children)
+        }
+        ControlFlow::Continue(())
     }
+}
 
+impl ResolvedSelectColumns {
     /// Compute the maximum subquery nesting depth in the SELECT list.
     fn subquery_depth(&self) -> usize {
         match self {
@@ -1202,17 +1302,24 @@ pub enum ResolvedTableSource {
     Join(Box<ResolvedJoinNode>),
 }
 
-impl ResolvedTableSource {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children: Box<dyn Iterator<Item = &'_ N>> = match self {
-            ResolvedTableSource::Table(table) => Box::new(table.nodes()),
-            ResolvedTableSource::Subquery(subquery) => Box::new(subquery.nodes()),
-            ResolvedTableSource::Join(join) => Box::new(join.nodes()),
-        };
-        current.chain(children)
+impl AstNode for ResolvedTableSource {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        match self {
+            ResolvedTableSource::Table(table) => table.try_for_each_node(f)?,
+            ResolvedTableSource::Subquery(subquery) => subquery.try_for_each_node(f)?,
+            ResolvedTableSource::Join(join) => join.try_for_each_node(f)?,
+        }
+        ControlFlow::Continue(())
     }
+}
 
+impl ResolvedTableSource {
     /// Collect direct table nodes from this source, traversing JOINs but not subqueries.
     fn direct_table_nodes_collect<'a>(&'a self, tables: &mut Vec<&'a ResolvedTableNode>) {
         match self {
@@ -1313,11 +1420,16 @@ pub struct ResolvedTableSubqueryNode {
     pub subquery_kind: SubqueryKind,
 }
 
-impl ResolvedTableSubqueryNode {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.query.nodes();
-        Box::new(current.chain(children))
+impl AstNode for ResolvedTableSubqueryNode {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.query.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -1378,16 +1490,22 @@ impl ResolvedJoinNode {
             ResolvedJoinQual::Cross => None,
         }
     }
+}
 
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let left_nodes = self.left.nodes();
-        let right_nodes = self.right.nodes();
-        let condition_nodes = self.predicate().into_iter().flat_map(|c| c.nodes());
-        current
-            .chain(left_nodes)
-            .chain(right_nodes)
-            .chain(condition_nodes)
+impl AstNode for ResolvedJoinNode {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.left.try_for_each_node(f)?;
+        self.right.try_for_each_node(f)?;
+        if let Some(c) = self.predicate() {
+            c.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
 }
 
@@ -1439,11 +1557,16 @@ pub struct ResolvedOrderByClause {
     pub null_order: NullOrder,
 }
 
-impl ResolvedOrderByClause {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children = self.expr.nodes();
-        current.chain(children)
+impl AstNode for ResolvedOrderByClause {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.expr.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -1494,23 +1617,32 @@ impl Default for ResolvedSelectNode {
     }
 }
 
-impl ResolvedSelectNode {
-    pub fn nodes<N: Any>(&self) -> impl Iterator<Item = &'_ N> + '_ {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let columns_nodes = self.columns.nodes();
-        let from_nodes = self.from.iter().flat_map(|t| t.nodes());
-        let where_nodes = self.where_clause.iter().flat_map(|w| w.nodes());
-        let group_by_nodes = self.group_by.iter().flat_map(|c| c.nodes());
-        let having_nodes = self.having.iter().flat_map(|h| h.nodes());
-
-        current
-            .chain(columns_nodes)
-            .chain(from_nodes)
-            .chain(where_nodes)
-            .chain(group_by_nodes)
-            .chain(having_nodes)
+impl AstNode for ResolvedSelectNode {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.columns.try_for_each_node(f)?;
+        for t in &self.from {
+            t.try_for_each_node(f)?;
+        }
+        if let Some(w) = &self.where_clause {
+            w.try_for_each_node(f)?;
+        }
+        for c in &self.group_by {
+            c.try_for_each_node(f)?;
+        }
+        if let Some(h) = &self.having {
+            h.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
+}
 
+impl ResolvedSelectNode {
     /// Returns table nodes directly in the FROM clause, traversing JOINs but not
     /// entering subqueries (FROM-clause derived tables or WHERE-clause subqueries).
     ///
@@ -1623,12 +1755,17 @@ pub struct ResolvedSetOpNode {
     pub right: Box<ResolvedQueryExpr>,
 }
 
-impl ResolvedSetOpNode {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let left_nodes = self.left.nodes();
-        let right_nodes = self.right.nodes();
-        Box::new(current.chain(left_nodes).chain(right_nodes))
+impl AstNode for ResolvedSetOpNode {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.left.try_for_each_node(f)?;
+        self.right.try_for_each_node(f)?;
+        ControlFlow::Continue(())
     }
 }
 
@@ -1654,17 +1791,24 @@ pub enum ResolvedQueryBody {
     SetOp(ResolvedSetOpNode),
 }
 
-impl ResolvedQueryBody {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let children: Box<dyn Iterator<Item = &N> + '_> = match self {
-            ResolvedQueryBody::Select(select) => Box::new(select.nodes()),
-            ResolvedQueryBody::Values(values) => Box::new(values.nodes()),
-            ResolvedQueryBody::SetOp(set_op) => set_op.nodes(),
-        };
-        Box::new(current.chain(children))
+impl AstNode for ResolvedQueryBody {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        match self {
+            ResolvedQueryBody::Select(select) => select.try_for_each_node(f)?,
+            ResolvedQueryBody::Values(values) => values.try_for_each_node(f)?,
+            ResolvedQueryBody::SetOp(set_op) => set_op.try_for_each_node(f)?,
+        }
+        ControlFlow::Continue(())
     }
+}
 
+impl ResolvedQueryBody {
     /// SELECT-list columns if this body is a `Select`, else `None`. Set
     /// operations and VALUES bodies have no single SELECT scope.
     pub fn select_columns(&self) -> Option<&ResolvedSelectColumns> {
@@ -1703,14 +1847,23 @@ impl Default for ResolvedQueryExpr {
     }
 }
 
-impl ResolvedQueryExpr {
-    pub fn nodes<N: Any>(&self) -> Box<dyn Iterator<Item = &'_ N> + '_> {
-        let current = (self as &dyn Any).downcast_ref::<N>().into_iter();
-        let body_nodes = self.body.nodes();
-        let order_by_nodes = self.order_by.iter().flat_map(|o| o.nodes());
-        Box::new(current.chain(body_nodes).chain(order_by_nodes))
+impl AstNode for ResolvedQueryExpr {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.body.try_for_each_node(f)?;
+        for o in &self.order_by {
+            o.try_for_each_node(f)?;
+        }
+        ControlFlow::Continue(())
     }
+}
 
+impl ResolvedQueryExpr {
     /// Check if query only references a single table
     pub fn is_single_table(&self) -> bool {
         self.nodes::<ResolvedTableNode>().nth(1).is_none()

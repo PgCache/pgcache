@@ -1339,7 +1339,7 @@ mod tests {
 
     use tokio_postgres::types::Type;
 
-    use crate::query::ast::{BinaryOp, Deparse, JoinType, OrderDirection, SubLinkType};
+    use crate::query::ast::{AstNode, BinaryOp, Deparse, JoinType, OrderDirection, SubLinkType};
 
     use super::*;
 

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ecow::EcoString;
 
-use crate::query::ast::BinaryOp;
+use crate::query::ast::{AstNode, BinaryOp};
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedMultiExpr, ResolvedQueryBody,
     ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns, ResolvedSelectNode,
