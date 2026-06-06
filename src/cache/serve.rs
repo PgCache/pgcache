@@ -5,17 +5,19 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
-use tokio_util::bytes::{Buf, Bytes};
+use tokio_util::bytes::{Buf, Bytes, BytesMut};
 use tokio_util::codec::FramedRead;
 use tracing::{debug, error, instrument, trace};
 
 use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe};
 use crate::pg::cache_connection::{CacheConnection, PrepareOutcome};
+use crate::pg::protocol::PgMessage;
 use crate::pg::protocol::backend::PgBackendMessageType;
 use crate::pg::protocol::encode::{
     BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG,
 };
 use crate::query::ast::{Deparse, LiteralValue};
+use crate::timing::QueryTiming;
 
 use super::{
     CacheError, CacheResult,
@@ -438,81 +440,18 @@ pub async fn handle_cached_query(
 
     // Begin a result-memo capture for hot source-row serves. Stamps read-relation
     // versions now, before the serve query is issued (capture ordering invariant).
-    let mut memo_capture = memo_capture_begin(state_view, msg, binary_results);
+    let memo_capture = memo_capture_begin(state_view, msg, binary_results);
 
-    // What was sent on the cache-DB extended query this hit, so the response
-    // state machine knows which completions to expect. The MV path always sends
-    // an unnamed Parse (no Close); the source-row path sends a Parse only on the
-    // first use of a fingerprint on this connection, plus a Close when that
-    // prepare evicted the connection's oldest statement.
-    let prepare: PrepareOutcome;
-    if let MvServe::Mv(cols) = &msg.mv {
-        // MV fast path: extended query only, no SET prefix. Render into the
-        // connection's recycled SQL buffer rather than a fresh String.
-        mv_serve_sql_into(
-            &mut conn.sql_buf,
-            msg.fingerprint,
-            &msg.resolved,
-            msg.limit.as_ref(),
-            cols,
-        );
-        conn.extended_query_unnamed_send(include_describe, binary_results)
-            .await
-            .inspect_err(|_| {
-                guard.poisoned = true;
-            })?;
-        prepare = PrepareOutcome {
-            sent_setgen_parse: false,
-            sent_parse: true,
-            sent_close: false,
-        };
-    } else {
-        // One step of round-robin reconciliation: close a prepared statement
-        // whose query has been evicted from the cache (kept across invalidation,
-        // which leaves the entry in place). Self-tunes to the live working set —
-        // no cap. The Close is pipelined ahead of this serve's Parse/Bind.
-        let close_victim = conn
-            .prepared
-            .reconcile_one(|fp| state_view.cached_queries.contains_key(&fp));
-
-        // Named prepared statement with parameterized LIMIT/OFFSET — body is
-        // stable per fingerprint, so PG parses/plans once per connection and
-        // reuses across hits and across limit values.
-        conn.sql_buf.clear();
-        conn.sql_buf.push_str(&msg.deparsed_sql);
-        conn.sql_buf.push_str(" LIMIT $1 OFFSET $2");
-        let mut limit_itoa = itoa::Buffer::new();
-        let mut offset_itoa = itoa::Buffer::new();
-        let mut limit_other = String::new();
-        let mut offset_other = String::new();
-        let limit_text = limit_bind_text(
-            msg.limit.as_ref().and_then(|l| l.count.as_ref()),
-            &mut limit_itoa,
-            &mut limit_other,
-        );
-        let offset_text = limit_bind_text(
-            msg.limit.as_ref().and_then(|l| l.offset.as_ref()),
-            &mut offset_itoa,
-            &mut offset_other,
-        );
-        prepare = conn
-            .pipelined_named_query_send(
-                msg.fingerprint,
-                msg.generation,
-                limit_text,
-                offset_text,
-                include_describe,
-                binary_results,
-                close_victim,
-            )
-            .await
-            .inspect_err(|_| {
-                guard.poisoned = true;
-            })?;
-    }
+    // Issue the query on the cache-DB connection; `prepare` records what was sent
+    // so the response state machine knows which completions to expect.
+    let prepare = serve_query_send(&mut conn, msg, include_describe, binary_results, state_view)
+        .await
+        .inspect_err(|_| {
+            guard.poisoned = true;
+        })?;
 
     // Create broadcast for coalesced clients (after query is sent, before streaming)
-    let mut broadcast = broadcast_setup(msg);
+    let broadcast = broadcast_setup(msg);
 
     // Stream results to client
     let CacheConnection {
@@ -531,23 +470,19 @@ pub async fn handle_cached_query(
     let mut framed = FramedRead::with_capacity(stream, codec, 0);
     *framed.read_buffer_mut() = read_buf;
 
-    let emit_rfq = msg.emit_rfq;
-    let has_parse = msg.has_parse;
-    let has_bind = msg.has_bind;
-    let pipeline_describe = msg.pipeline_describe;
-    let mut parameter_description = msg.parameter_description.take();
+    let parameter_description = msg.parameter_description.take();
     let client_socket = &mut msg.client_socket;
 
     let mut write_queue = WriteQueue::new();
 
-    if has_parse {
+    if msg.has_parse {
         push_and_broadcast(
             &mut write_queue,
             &broadcast,
             Bytes::from_static(PARSE_COMPLETE_MSG),
         );
     }
-    if has_bind {
+    if msg.has_bind {
         push_and_broadcast(
             &mut write_queue,
             &broadcast,
@@ -558,14 +493,26 @@ pub async fn handle_cached_query(
     // MV path: no set_config prefix, so start at the SELECT's ParseComplete.
     // Source-row path: consume the set_config response first — its Parse only on
     // the first serve of this connection, otherwise straight to its BindComplete.
-    let mut state = if matches!(msg.mv, MvServe::Mv(_)) {
+    let initial_state = if matches!(msg.mv, MvServe::Mv(_)) {
         ServeResponseState::ParseComplete
     } else if prepare.sent_setgen_parse {
         ServeResponseState::SetGenParse
     } else {
         ServeResponseState::SetGenBind
     };
-    let mut bytes_served: usize = 0;
+
+    // Everything the response state machine touches, except the select-bound
+    // `write_queue` / `client_gone` locals (see `Relay`).
+    let mut relay = Relay {
+        state: initial_state,
+        broadcast,
+        memo_capture,
+        parameter_description,
+        bytes_served: 0,
+        prepare,
+        include_describe,
+        pipeline_describe: msg.pipeline_describe,
+    };
     // Set when a client write fails mid-serve. The cache-DB connection is still
     // healthy, so rather than poison it we stop relaying and drain the remaining
     // cache-DB response, returning the connection to the pool protocol-clean.
@@ -578,106 +525,14 @@ pub async fn handle_cached_query(
                     Some(Ok(frame)) => frame,
                     Some(Err(_)) | None => {
                         guard.poisoned = true;
-                        if let Some(bc) = broadcast.take() {
+                        if let Some(bc) = relay.broadcast.take() {
                             broadcast_error_reply(bc).await;
                         }
                         return Err(CacheError::InvalidMessage.into());
                     }
                 };
-
-                match (state, frame.message_type) {
-                    (ServeResponseState::SetGenParse, PgBackendMessageType::ParseComplete) => {
-                        state = ServeResponseState::SetGenBind;
-                    }
-                    (ServeResponseState::SetGenBind, PgBackendMessageType::BindComplete) => {
-                        state = ServeResponseState::SetGenData;
-                    }
-                    // set_config returns one row; consume it without relaying.
-                    (ServeResponseState::SetGenData, PgBackendMessageType::DataRows) => {}
-                    (ServeResponseState::SetGenData, PgBackendMessageType::CommandComplete) => {
-                        // set_config done. A Close (if a statement was evicted)
-                        // precedes the SELECT; on statement reuse neither Close nor
-                        // Parse is sent, so skip straight to Bind.
-                        state = if prepare.sent_close {
-                            ServeResponseState::CloseComplete
-                        } else if prepare.sent_parse {
-                            ServeResponseState::ParseComplete
-                        } else {
-                            ServeResponseState::BindComplete
-                        };
-                    }
-                    (ServeResponseState::CloseComplete, PgBackendMessageType::CloseComplete) => {
-                        // A reconciliation Close can ride a reuse serve (no Parse),
-                        // so the Parse only follows when one was actually sent.
-                        state = if prepare.sent_parse {
-                            ServeResponseState::ParseComplete
-                        } else {
-                            ServeResponseState::BindComplete
-                        };
-                    }
-                    (ServeResponseState::ParseComplete, PgBackendMessageType::ParseComplete) => {
-                        state = ServeResponseState::BindComplete;
-                    }
-                    (ServeResponseState::BindComplete, PgBackendMessageType::BindComplete) => {
-                        state = if include_describe {
-                            ServeResponseState::DescribeRow
-                        } else {
-                            ServeResponseState::DataRows
-                        };
-                    }
-                    (ServeResponseState::DescribeRow, PgBackendMessageType::RowDescription) => {
-                        if pipeline_describe == PipelineDescribe::Statement
-                            && let Some(param_desc) = parameter_description.take()
-                        {
-                            trace!("net: cache→client ParameterDescription (serve, {} bytes)", param_desc.len());
-                            push_and_broadcast(&mut write_queue, &broadcast, param_desc);
-                        }
-                        trace!("net: cache→client RowDescription (serve, {} bytes)", frame.data.len());
-                        if let Some(cap) = &mut memo_capture {
-                            cap.row_description_push(&frame.data);
-                        }
-                        push_and_broadcast(&mut write_queue, &broadcast, frame.data);
-                        state = ServeResponseState::DataRows;
-                    }
-                    (ServeResponseState::DataRows, PgBackendMessageType::DataRows) => {
-                        trace!("net: cache→client DataRow (serve, {} bytes)", frame.data.len());
-                        bytes_served += frame.data.len();
-                        if let Some(cap) = &mut memo_capture {
-                            cap.data_push(&frame.data);
-                        }
-                        push_and_broadcast(&mut write_queue, &broadcast, frame.data);
-                    }
-                    (ServeResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
-                        trace!("net: cache→client CommandComplete (serve, {} bytes)", frame.data.len());
-                        if let Some(cap) = &mut memo_capture {
-                            cap.command_complete_push(&frame.data);
-                        }
-                        push_and_broadcast(&mut write_queue, &broadcast, frame.data);
-                        msg.timing.query_done_at = Some(Instant::now());
-                    }
-                    // Single trailing Sync → one terminal ReadyForQuery. It can't
-                    // arrive mid-set_config (those advance on Parse/Bind/Data/CC).
-                    (_, PgBackendMessageType::ReadyForQuery)
-                        if !matches!(
-                            state,
-                            ServeResponseState::SetGenParse
-                                | ServeResponseState::SetGenBind
-                                | ServeResponseState::SetGenData
-                        ) =>
-                    {
-                        state = ServeResponseState::Done;
-                    }
-                    (_, PgBackendMessageType::ErrorResponse) => {
-                        return Err(cache_error_response_handle(
-                            &mut guard,
-                            &frame.data,
-                            bytes_served,
-                            &mut broadcast,
-                        )
-                        .await);
-                    }
-                    _ => {}
-                }
+                relay_frame_apply(&mut relay, frame, &mut write_queue, &mut guard, &mut msg.timing)
+                    .await?;
             }
             result = client_socket.write_buf(&mut write_queue),
                 if !write_queue.is_empty() && !client_gone =>
@@ -706,7 +561,7 @@ pub async fn handle_cached_query(
             _ = tokio::time::sleep(DRAIN_STALL_TIMEOUT), if client_gone => {
                 debug!("cache-DB stalled while draining for departed client; discarding connection");
                 guard.poisoned = true;
-                if let Some(bc) = broadcast.take() {
+                if let Some(bc) = relay.broadcast.take() {
                     broadcast_error_reply(bc).await;
                 }
                 return Err(CacheError::Write.into());
@@ -719,7 +574,7 @@ pub async fn handle_cached_query(
             write_queue.clear();
         }
 
-        if state == ServeResponseState::Done {
+        if relay.state == ServeResponseState::Done {
             break;
         }
     }
@@ -735,8 +590,236 @@ pub async fn handle_cached_query(
         prepared,
         setgen_parsed,
     });
+
+    serve_response_finish(guard, &mut write_queue, relay, msg, client_gone, state_view).await
+}
+
+/// Mutable relay state plus read-only config for one serve's response stream.
+/// Holds everything the response state machine touches *except* the two values
+/// bound by the `select!` loop (`write_queue`, `client_gone`), which stay loose
+/// locals so the read and write arms can borrow them independently.
+struct Relay {
+    state: ServeResponseState,
+    /// Broadcast handle for coalesced clients (`None` when not coalesced).
+    broadcast: Option<BroadcastState>,
+    /// In-flight memo capture (`None` when this serve isn't being memoized).
+    memo_capture: Option<MemoCapture>,
+    /// Pending Describe('S') ParameterDescription, relayed before RowDescription.
+    parameter_description: Option<BytesMut>,
+    bytes_served: usize,
+    // Read-only for the relay's duration:
+    prepare: PrepareOutcome,
+    include_describe: bool,
+    pipeline_describe: PipelineDescribe,
+}
+
+/// Advance the response state machine for one cache-DB frame: update `relay.state`,
+/// relay the frame to the primary client (and broadcast to coalesced clients),
+/// and feed the memo capture. Returns `Err` on a cache-DB `ErrorResponse` — the
+/// connection is poisoned and coalesced waiters get an error reply. The caller
+/// breaks the loop once `relay.state` reaches `Done`.
+async fn relay_frame_apply(
+    relay: &mut Relay,
+    frame: PgMessage<PgBackendMessageType>,
+    write_queue: &mut WriteQueue,
+    guard: &mut ConnectionGuard,
+    timing: &mut QueryTiming,
+) -> CacheResult<()> {
+    match (relay.state, frame.message_type) {
+        (ServeResponseState::SetGenParse, PgBackendMessageType::ParseComplete) => {
+            relay.state = ServeResponseState::SetGenBind;
+        }
+        (ServeResponseState::SetGenBind, PgBackendMessageType::BindComplete) => {
+            relay.state = ServeResponseState::SetGenData;
+        }
+        // set_config returns one row; consume it without relaying.
+        (ServeResponseState::SetGenData, PgBackendMessageType::DataRows) => {}
+        (ServeResponseState::SetGenData, PgBackendMessageType::CommandComplete) => {
+            // set_config done. A Close (if a statement was evicted) precedes the
+            // SELECT; on statement reuse neither Close nor Parse is sent, so skip
+            // straight to Bind.
+            relay.state = if relay.prepare.sent_close {
+                ServeResponseState::CloseComplete
+            } else if relay.prepare.sent_parse {
+                ServeResponseState::ParseComplete
+            } else {
+                ServeResponseState::BindComplete
+            };
+        }
+        (ServeResponseState::CloseComplete, PgBackendMessageType::CloseComplete) => {
+            // A reconciliation Close can ride a reuse serve (no Parse), so the
+            // Parse only follows when one was actually sent.
+            relay.state = if relay.prepare.sent_parse {
+                ServeResponseState::ParseComplete
+            } else {
+                ServeResponseState::BindComplete
+            };
+        }
+        (ServeResponseState::ParseComplete, PgBackendMessageType::ParseComplete) => {
+            relay.state = ServeResponseState::BindComplete;
+        }
+        (ServeResponseState::BindComplete, PgBackendMessageType::BindComplete) => {
+            relay.state = if relay.include_describe {
+                ServeResponseState::DescribeRow
+            } else {
+                ServeResponseState::DataRows
+            };
+        }
+        (ServeResponseState::DescribeRow, PgBackendMessageType::RowDescription) => {
+            if relay.pipeline_describe == PipelineDescribe::Statement
+                && let Some(param_desc) = relay.parameter_description.take()
+            {
+                trace!(
+                    "net: cache→client ParameterDescription (serve, {} bytes)",
+                    param_desc.len()
+                );
+                push_and_broadcast(write_queue, &relay.broadcast, param_desc);
+            }
+            trace!(
+                "net: cache→client RowDescription (serve, {} bytes)",
+                frame.data.len()
+            );
+            if let Some(cap) = &mut relay.memo_capture {
+                cap.row_description_push(&frame.data);
+            }
+            push_and_broadcast(write_queue, &relay.broadcast, frame.data);
+            relay.state = ServeResponseState::DataRows;
+        }
+        (ServeResponseState::DataRows, PgBackendMessageType::DataRows) => {
+            trace!(
+                "net: cache→client DataRow (serve, {} bytes)",
+                frame.data.len()
+            );
+            relay.bytes_served += frame.data.len();
+            if let Some(cap) = &mut relay.memo_capture {
+                cap.data_push(&frame.data);
+            }
+            push_and_broadcast(write_queue, &relay.broadcast, frame.data);
+        }
+        (ServeResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
+            trace!(
+                "net: cache→client CommandComplete (serve, {} bytes)",
+                frame.data.len()
+            );
+            if let Some(cap) = &mut relay.memo_capture {
+                cap.command_complete_push(&frame.data);
+            }
+            push_and_broadcast(write_queue, &relay.broadcast, frame.data);
+            timing.query_done_at = Some(Instant::now());
+        }
+        // Single trailing Sync → one terminal ReadyForQuery. It can't arrive
+        // mid-set_config (those advance on Parse/Bind/Data/CC).
+        (_, PgBackendMessageType::ReadyForQuery)
+            if !matches!(
+                relay.state,
+                ServeResponseState::SetGenParse
+                    | ServeResponseState::SetGenBind
+                    | ServeResponseState::SetGenData
+            ) =>
+        {
+            relay.state = ServeResponseState::Done;
+        }
+        (_, PgBackendMessageType::ErrorResponse) => {
+            return Err(cache_error_response_handle(
+                guard,
+                &frame.data,
+                relay.bytes_served,
+                &mut relay.broadcast,
+            )
+            .await);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Issue the cached query on the pooled cache-DB connection and return what was
+/// sent, so the response state machine knows which completions to expect. The MV
+/// fast path sends an unnamed extended query (no SET prefix); the source-row path
+/// sends a named prepared statement with parameterized LIMIT/OFFSET (a Parse only
+/// on first use of the fingerprint on this connection, plus a reconciliation
+/// Close when that prepare evicted the connection's oldest statement). The caller
+/// poisons the connection on error.
+async fn serve_query_send(
+    conn: &mut CacheConnection,
+    msg: &ServeRequest,
+    include_describe: bool,
+    binary_results: bool,
+    state_view: &CacheStateView,
+) -> CacheResult<PrepareOutcome> {
+    if let MvServe::Mv(cols) = &msg.mv {
+        // Render into the connection's recycled SQL buffer rather than a fresh
+        // String.
+        mv_serve_sql_into(
+            &mut conn.sql_buf,
+            msg.fingerprint,
+            &msg.resolved,
+            msg.limit.as_ref(),
+            cols,
+        );
+        conn.extended_query_unnamed_send(include_describe, binary_results)
+            .await?;
+        return Ok(PrepareOutcome {
+            sent_setgen_parse: false,
+            sent_parse: true,
+            sent_close: false,
+        });
+    }
+
+    // One step of round-robin reconciliation: close a prepared statement whose
+    // query has been evicted from the cache (kept across invalidation, which
+    // leaves the entry in place). Self-tunes to the live working set — no cap. The
+    // Close is pipelined ahead of this serve's Parse/Bind.
+    let close_victim = conn
+        .prepared
+        .reconcile_one(|fp| state_view.cached_queries.contains_key(&fp));
+
+    // Named prepared statement with parameterized LIMIT/OFFSET — body is stable
+    // per fingerprint, so PG parses/plans once per connection and reuses across
+    // hits and across limit values.
+    conn.sql_buf.clear();
+    conn.sql_buf.push_str(&msg.deparsed_sql);
+    conn.sql_buf.push_str(" LIMIT $1 OFFSET $2");
+    let mut limit_itoa = itoa::Buffer::new();
+    let mut offset_itoa = itoa::Buffer::new();
+    let mut limit_other = String::new();
+    let mut offset_other = String::new();
+    let limit_text = limit_bind_text(
+        msg.limit.as_ref().and_then(|l| l.count.as_ref()),
+        &mut limit_itoa,
+        &mut limit_other,
+    );
+    let offset_text = limit_bind_text(
+        msg.limit.as_ref().and_then(|l| l.offset.as_ref()),
+        &mut offset_itoa,
+        &mut offset_other,
+    );
+    conn.pipelined_named_query_send(
+        msg.fingerprint,
+        msg.generation,
+        limit_text,
+        offset_text,
+        include_describe,
+        binary_results,
+        close_victim,
+    )
+    .await
+}
+
+/// Finalize a completed serve: return the connection to the pool, append the
+/// trailing ReadyForQuery when the client expects one, join the coalesced
+/// broadcast, flush any buffered bytes to the primary, and store the memo
+/// capture. The connection must already be reattached to `guard`.
+async fn serve_response_finish(
+    guard: ConnectionGuard,
+    write_queue: &mut WriteQueue,
+    mut relay: Relay,
+    msg: &mut ServeRequest,
+    client_gone: bool,
+    state_view: &CacheStateView,
+) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
     if let Err(e) = guard.release().await {
-        if let Some(bc) = broadcast.take() {
+        if let Some(bc) = relay.broadcast.take() {
             broadcast_error_reply(bc).await;
         }
         return Err(e);
@@ -744,16 +827,16 @@ pub async fn handle_cached_query(
 
     // Simple-query clients always terminate with ReadyForQuery; extended clients
     // do when their trailing Execute carried the Sync.
-    if query_type == QueryType::Simple || emit_rfq {
+    if msg.query_type == QueryType::Simple || msg.emit_rfq {
         trace!("net: cache→client ReadyForQuery");
         push_and_broadcast(
-            &mut write_queue,
-            &broadcast,
+            write_queue,
+            &relay.broadcast,
             Bytes::from_static(READY_FOR_QUERY_IDLE_MSG),
         );
     }
 
-    let outcomes = match broadcast.take() {
+    let outcomes = match relay.broadcast.take() {
         Some(bc) => broadcast_join(bc).await,
         None => vec![],
     };
@@ -765,7 +848,7 @@ pub async fn handle_cached_query(
             "net: cache→client final flush (serve, {} bytes remaining)",
             write_queue.remaining()
         );
-        if let Err(e) = client_socket.write_all_buf(&mut write_queue).await {
+        if let Err(e) = msg.client_socket.write_all_buf(write_queue).await {
             error!("no client: {e}");
             return Err(CacheError::Write.into());
         }
@@ -776,12 +859,12 @@ pub async fn handle_cached_query(
     // Store the captured snapshot iff the serve completed cleanly and no CDC
     // change touched a read relation across the capture (re-checked in `finish`).
     // Error paths returned earlier, so reaching here means a clean response.
-    if let Some(cap) = memo_capture {
+    if let Some(cap) = relay.memo_capture {
         cap.finish(&state_view.memo);
     }
 
     debug!("cache hit");
-    Ok((bytes_served, outcomes))
+    Ok((relay.bytes_served, outcomes))
 }
 
 #[cfg(test)]
