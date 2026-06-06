@@ -6,7 +6,6 @@ use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::bytes::{Buf, Bytes, BytesMut};
-use tokio_util::codec::FramedRead;
 use tracing::{debug, error, instrument, trace};
 
 use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe};
@@ -453,22 +452,9 @@ pub async fn handle_cached_query(
     // Create broadcast for coalesced clients (after query is sent, before streaming)
     let broadcast = broadcast_setup(msg);
 
-    // Stream results to client
-    let CacheConnection {
-        stream,
-        read_buf,
-        codec,
-        sql_buf,
-        write_buf,
-        prepared,
-        setgen_parsed,
-    } = conn;
-    // `with_capacity(.., 0)` instead of `new` so FramedRead doesn't allocate its
-    // default 8 KiB read buffer — we immediately swap in the connection's
-    // recycled `read_buf`, which would otherwise drop that fresh allocation every
-    // hit.
-    let mut framed = FramedRead::with_capacity(stream, codec, 0);
-    *framed.read_buffer_mut() = read_buf;
+    // Stream results to client: move the read half into a FramedRead and park
+    // the rest of the connection to restore once the response is drained.
+    let (mut framed, parked) = conn.into_framed();
 
     let parameter_description = msg.parameter_description.take();
     let client_socket = &mut msg.client_socket;
@@ -580,16 +566,7 @@ pub async fn handle_cached_query(
     }
 
     // Cache DB response fully consumed — return connection to pool immediately
-    let parts = framed.into_parts();
-    guard.conn = Some(CacheConnection {
-        stream: parts.io,
-        read_buf: parts.read_buf,
-        codec: parts.codec,
-        sql_buf,
-        write_buf,
-        prepared,
-        setgen_parsed,
-    });
+    guard.conn = Some(CacheConnection::from_framed(framed, parked));
 
     serve_response_finish(guard, &mut write_queue, relay, msg, client_gone, state_view).await
 }

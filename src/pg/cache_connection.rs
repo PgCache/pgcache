@@ -4,7 +4,7 @@ use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::bytes::{BufMut, BytesMut};
-use tokio_util::codec::Decoder;
+use tokio_util::codec::{Decoder, FramedRead};
 use tracing::debug;
 
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
@@ -113,7 +113,60 @@ pub struct CacheConnection {
     pub(crate) setgen_parsed: bool,
 }
 
+/// The non-read-half state of a [`CacheConnection`], held aside while its read
+/// half is wrapped in a `FramedRead` for a serve and restored by
+/// [`CacheConnection::from_framed`]. Opaque to callers — they only carry it
+/// between [`CacheConnection::into_framed`] and `from_framed`.
+pub(crate) struct ParkedConnection {
+    sql_buf: String,
+    write_buf: BytesMut,
+    prepared: PreparedStatements,
+    setgen_parsed: bool,
+}
+
 impl CacheConnection {
+    /// Move the read half (`stream` + `codec`) into a `FramedRead`, reusing the
+    /// recycled `read_buf`, and return it alongside the parked rest of the
+    /// connection. `with_capacity(.., 0)` so `FramedRead` doesn't allocate its
+    /// default 8 KiB read buffer — we immediately swap in `read_buf`, which would
+    /// otherwise drop that fresh allocation every serve.
+    pub(crate) fn into_framed(
+        self,
+    ) -> (
+        FramedRead<TcpStream, PgBackendMessageCodec>,
+        ParkedConnection,
+    ) {
+        let mut framed = FramedRead::with_capacity(self.stream, self.codec, 0);
+        *framed.read_buffer_mut() = self.read_buf;
+        (
+            framed,
+            ParkedConnection {
+                sql_buf: self.sql_buf,
+                write_buf: self.write_buf,
+                prepared: self.prepared,
+                setgen_parsed: self.setgen_parsed,
+            },
+        )
+    }
+
+    /// Reassemble a `CacheConnection` from a `FramedRead` and the parked state
+    /// returned by [`into_framed`](Self::into_framed).
+    pub(crate) fn from_framed(
+        framed: FramedRead<TcpStream, PgBackendMessageCodec>,
+        parked: ParkedConnection,
+    ) -> Self {
+        let parts = framed.into_parts();
+        Self {
+            stream: parts.io,
+            read_buf: parts.read_buf,
+            codec: parts.codec,
+            sql_buf: parked.sql_buf,
+            write_buf: parked.write_buf,
+            prepared: parked.prepared,
+            setgen_parsed: parked.setgen_parsed,
+        }
+    }
+
     /// Connect to the cache database and complete the PG startup handshake.
     /// Assumes trust authentication (no password exchange).
     pub async fn connect(settings: &PgSettings) -> CacheResult<Self> {
