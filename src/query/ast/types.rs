@@ -4,6 +4,7 @@ use std::ops::ControlFlow;
 use ecow::EcoString;
 use ordered_float::NotNan;
 use postgres_protocol::escape;
+use smallvec::SmallVec;
 use strum_macros::AsRefStr;
 
 use crate::cache::{SubqueryKind, UpdateQuerySource};
@@ -845,7 +846,7 @@ impl Deparse for ValuesClause {
 pub struct SelectNode {
     pub distinct: bool,
     pub columns: SelectColumns,
-    pub from: Vec<TableSource>,
+    pub from: SmallVec<[TableSource; 1]>,
     pub where_clause: Option<WhereExpr>,
     pub group_by: Vec<ColumnNode>,
     pub having: Option<WhereExpr>,
@@ -856,7 +857,7 @@ impl Default for SelectNode {
         Self {
             distinct: false,
             columns: SelectColumns::None,
-            from: Vec::new(),
+            from: SmallVec::new(),
             where_clause: None,
             group_by: Vec::new(),
             having: None,
@@ -1076,7 +1077,7 @@ impl Deparse for QueryBody {
 pub struct QueryExpr {
     pub ctes: Vec<CteDefinition>,
     pub body: QueryBody,
-    pub order_by: Vec<OrderByClause>,
+    pub order_by: SmallVec<[OrderByClause; 1]>,
     pub limit: Option<LimitClause>,
 }
 
@@ -1085,7 +1086,7 @@ impl Default for QueryExpr {
         Self {
             ctes: Vec::new(),
             body: QueryBody::Values(ValuesClause::default()),
-            order_by: Vec::new(),
+            order_by: SmallVec::new(),
             limit: None,
         }
     }
@@ -1653,7 +1654,7 @@ pub struct FunctionCall {
     pub args: Vec<ScalarExpr>,
     pub agg_star: bool,                     // COUNT(*)
     pub agg_distinct: bool,                 // COUNT(DISTINCT col)
-    pub agg_order: Vec<OrderByClause>, // ORDER BY inside aggregate: string_agg(x, ',' ORDER BY x)
+    pub agg_order: Vec<OrderByClause>, // ORDER BY inside aggregate: string_agg(x, ',' ORDER BY x). Vec (not SmallVec): OrderByClause is recursively reachable here, so inline storage would be infinitely sized.
     pub agg_filter: Option<Box<WhereExpr>>, // FILTER (WHERE ...) per-aggregate predicate
     pub over: Option<WindowSpec>,      // Window function OVER clause
 }
@@ -1737,7 +1738,7 @@ impl Deparse for FunctionCall {
 pub struct WindowSpec {
     /// PARTITION BY columns
     pub partition_by: Vec<ScalarExpr>,
-    /// ORDER BY clauses
+    /// ORDER BY clauses. Vec (not SmallVec): recursively reachable, see `agg_order`.
     pub order_by: Vec<OrderByClause>,
 }
 

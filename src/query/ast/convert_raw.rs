@@ -329,9 +329,9 @@ unsafe fn select_columns_convert(target_list: *const pg::List) -> Result<SelectC
 unsafe fn from_clause_convert(
     from_clause: *const pg::List,
     ctx: &ParseContext,
-) -> Result<Vec<TableSource>, AstError> {
+) -> Result<SmallVec<[TableSource; 1]>, AstError> {
     unsafe {
-        let mut tables = Vec::new();
+        let mut tables = SmallVec::new();
         for from_node in list_nodes(from_clause) {
             tables.push(table_source_convert(from_node, "FROM clause", ctx)?);
         }
@@ -649,7 +649,7 @@ unsafe fn func_call_convert(func_call: *const pg::FuncCall) -> Result<FunctionCa
                 .collect::<Result<Vec<_>, _>>()?
         };
 
-        let agg_order = window_order_by_convert((*func_call).agg_order)?;
+        let agg_order = window_order_by_convert((*func_call).agg_order)?.into_vec();
 
         let agg_filter = match ((*func_call).agg_filter as NodePtr).is_null() {
             true => None,
@@ -680,7 +680,7 @@ unsafe fn window_def_convert(win_def: *const pg::WindowDef) -> Result<WindowSpec
         let partition_by = list_nodes((*win_def).partitionClause)
             .map(|n| scalar_expr_convert(n))
             .collect::<Result<Vec<_>, _>>()?;
-        let order_by = window_order_by_convert((*win_def).orderClause)?;
+        let order_by = window_order_by_convert((*win_def).orderClause)?.into_vec();
         Ok(WindowSpec {
             partition_by,
             order_by,
@@ -690,9 +690,9 @@ unsafe fn window_def_convert(win_def: *const pg::WindowDef) -> Result<WindowSpec
 
 unsafe fn window_order_by_convert(
     order_clause: *const pg::List,
-) -> Result<Vec<OrderByClause>, AstError> {
+) -> Result<SmallVec<[OrderByClause; 1]>, AstError> {
     unsafe {
-        let mut order_by = Vec::new();
+        let mut order_by = SmallVec::new();
         for sort_node in list_nodes(order_clause) {
             if node_tag(sort_node) != pg::NodeTag_T_SortBy {
                 return Err(AstError::UnsupportedFeature {
@@ -892,7 +892,7 @@ unsafe fn case_when_convert(node: NodePtr) -> Result<CaseWhen, AstError> {
 
 unsafe fn order_by_clause_convert(
     sort_clause: *const pg::List,
-) -> Result<Vec<OrderByClause>, AstError> {
+) -> Result<SmallVec<[OrderByClause; 1]>, AstError> {
     unsafe { window_order_by_convert(sort_clause) }
 }
 
