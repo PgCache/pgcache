@@ -168,14 +168,14 @@ impl SearchPath {
     ///
     /// Expands `SessionUser` to the provided session_user value.
     /// Skips `SessionUser` entries if session_user is `None`.
-    pub fn resolve<'a>(&'a self, session_user: Option<&'a str>) -> Vec<&'a str> {
-        self.0
-            .iter()
-            .filter_map(|entry| match entry {
-                SearchPathEntry::Schema(name) => Some(name.as_str()),
-                SearchPathEntry::SessionUser => session_user,
-            })
-            .collect()
+    pub fn resolve<'a>(
+        &'a self,
+        session_user: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a str> {
+        self.0.iter().filter_map(move |entry| match entry {
+            SearchPathEntry::Schema(name) => Some(name.as_str()),
+            SearchPathEntry::SessionUser => session_user,
+        })
     }
 }
 
@@ -309,21 +309,21 @@ mod tests {
     #[test]
     fn test_resolve_with_session_user() {
         let path = SearchPath::parse("$user, public");
-        let resolved = path.resolve(Some("alice"));
+        let resolved: Vec<&str> = path.resolve(Some("alice")).collect();
         assert_eq!(resolved, vec!["alice", "public"]);
     }
 
     #[test]
     fn test_resolve_without_session_user() {
         let path = SearchPath::parse("$user, public");
-        let resolved = path.resolve(None);
+        let resolved: Vec<&str> = path.resolve(None).collect();
         assert_eq!(resolved, vec!["public"]);
     }
 
     #[test]
     fn test_resolve_no_session_user_entry() {
         let path = SearchPath::parse("myschema, public");
-        let resolved = path.resolve(Some("alice"));
+        let resolved: Vec<&str> = path.resolve(Some("alice")).collect();
         assert_eq!(resolved, vec!["myschema", "public"]);
     }
 
@@ -331,7 +331,7 @@ mod tests {
     fn test_resolve_quoted_user_not_expanded() {
         // Quoted "$user" should stay as literal "$user", not expand to session user
         let path = SearchPath::parse(r#""$user", public"#);
-        let resolved = path.resolve(Some("alice"));
+        let resolved: Vec<&str> = path.resolve(Some("alice")).collect();
         assert_eq!(resolved, vec!["$user", "public"]);
     }
 

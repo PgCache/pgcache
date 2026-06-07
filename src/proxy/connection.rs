@@ -11,6 +11,7 @@ use std::{
 use lru::LruCache;
 
 use ecow::EcoString;
+use smallvec::SmallVec;
 
 use crate::catalog::FunctionVolatility;
 
@@ -190,12 +191,7 @@ impl SearchPathState {
     fn resolve(&self, session_user: Option<&str>) -> Option<Vec<EcoString>> {
         match self {
             Self::Unknown => None,
-            Self::Resolved(sp) => Some(
-                sp.resolve(session_user)
-                    .into_iter()
-                    .map(EcoString::from)
-                    .collect(),
-            ),
+            Self::Resolved(sp) => Some(sp.resolve(session_user).map(EcoString::from).collect()),
         }
     }
 }
@@ -436,9 +432,9 @@ struct Segment {
     describe: PipelineDescribe,
     /// Statement name of each Parse in this segment, in order. One per Parse —
     /// a dirty segment has several. Drives `pending_parse_statements` on forward.
-    parse_statement_names: Vec<EcoString>,
+    parse_statement_names: SmallVec<[EcoString; 1]>,
     /// Statement name of each Describe('S') in this segment, in order.
-    describe_statement_names: Vec<EcoString>,
+    describe_statement_names: SmallVec<[EcoString; 1]>,
     /// True once the segment holds more than one of any Parse/Bind/Describe —
     /// i.e. more than one executable's worth of prep. Such a segment can't be
     /// served from cache (the worker synthesizes exactly one ParseComplete /
@@ -460,8 +456,8 @@ struct ExecuteEntry {
     describe: PipelineDescribe,
     /// Statement name of each Parse / Describe('S') in this entry, in order.
     /// A clean (cacheable) entry has at most one of each.
-    parse_statement_names: Vec<EcoString>,
-    describe_statement_names: Vec<EcoString>,
+    parse_statement_names: SmallVec<[EcoString; 1]>,
+    describe_statement_names: SmallVec<[EcoString; 1]>,
     /// Carried from the segment: more than one P/B/D, so not cacheable.
     dirty: bool,
     /// Cacheable-query snapshot captured at Execute time, if this execute is a
@@ -486,7 +482,7 @@ impl ExecuteEntry {
 #[derive(Default)]
 struct ExtendedBuffer {
     /// Sealed executes, in arrival order. One per Execute message.
-    entries: Vec<ExecuteEntry>,
+    entries: SmallVec<[ExecuteEntry; 1]>,
     /// Messages accumulated since the last Execute (or batch start).
     pending: Segment,
 }
@@ -495,12 +491,12 @@ impl ExtendedBuffer {
     /// Seal the pending segment together with this Execute's bytes into an entry.
     fn pending_seal(
         &mut self,
-        execute_bytes: &[u8],
+        execute_bytes: Bytes,
         portal_name: Option<EcoString>,
         candidate: Option<CacheCandidate>,
     ) {
         let mut seg = std::mem::take(&mut self.pending);
-        seg.bytes.push(Bytes::copy_from_slice(execute_bytes));
+        seg.bytes.push(execute_bytes);
         self.entries.push(ExecuteEntry {
             bytes: seg.bytes,
             portal_name,
@@ -1542,7 +1538,7 @@ impl ConnectionState {
 
         self.extended
             .buffer_get_or_create()
-            .pending_seal(&msg.data, portal_name, candidate);
+            .pending_seal(msg.data.freeze(), portal_name, candidate);
         trace!("net: Execute buffered");
     }
 
@@ -1750,7 +1746,18 @@ impl ConnectionState {
     /// Build a dispatch context per entry, queue them, and begin the first slot.
     /// Caller guarantees [`Self::cache_batch_eligible`] (every entry has a
     /// candidate and the list is non-empty).
-    fn cache_batch_dispatch(&mut self, entries: Vec<ExecuteEntry>) {
+    fn cache_batch_dispatch(&mut self, entries: SmallVec<[ExecuteEntry; 1]>) {
+        // Common case: a single Parse/Bind/Describe/Execute. Begin it directly
+        // without allocating a batch queue (the trailing-most slots empty).
+        if entries.len() == 1 {
+            let mut entry = entries.into_iter().next().expect("one entry");
+            if let Some(candidate) = entry.candidate.take() {
+                self.extended.batch.clear();
+                self.cache_slot_begin(DispatchContext::build(entry, candidate, true));
+                self.proxy_mode = ProxyMode::OriginDrain;
+            }
+            return;
+        }
         let last = entries.len() - 1;
         let mut contexts = VecDeque::with_capacity(entries.len());
         for (i, mut entry) in entries.into_iter().enumerate() {
