@@ -29,8 +29,8 @@ use super::{
     fast_path::{self, MvDecision},
     memo::{MemoHit, MemoKey, MemoShape},
     messages::{
-        AdmitAction, CacheOutcome, CacheReply, PipelineContext, PipelineDescribe, ProxyMessage,
-        QueryCommand, SubsumptionResult,
+        AdmitAction, CacheOutcome, CacheReply, MessageSlices, PipelineContext, PipelineDescribe,
+        ProxyMessage, QueryCommand, SubsumptionResult, slices_concat,
     },
     mv::{MvMeta, MvServe, ShapeGate},
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
@@ -230,8 +230,9 @@ pub struct ServeRequest {
     pub pipeline_describe: PipelineDescribe,
     /// Stored ParameterDescription bytes for Describe('S') responses in the pipeline.
     pub parameter_description: Option<Bytes>,
-    /// Buffered bytes for origin fallback on serve error.
-    pub forward_bytes: Option<BytesMut>,
+    /// Buffered message slices for origin fallback on serve error. Concatenated
+    /// only on that (cold) path; a successful serve drops them untouched.
+    pub forward_bytes: Option<MessageSlices>,
     /// Additional clients to receive the same response bytes.
     /// Empty for non-coalesced requests.
     pub coalesced: Vec<CoalescedClient>,
@@ -968,7 +969,9 @@ impl CacheDispatch {
             // degrade gracefully by forwarding the query — and any coalesced
             // waiters — to origin rather than surfacing a hard cache error.
             debug!("serve channel closed; forwarding query to origin");
-            let buf = req.forward_bytes.unwrap_or(req.data);
+            let buf = req
+                .forward_bytes
+                .map_or(req.data, |slices| slices_concat(&slices));
             let _ = reply_forward(req.reply_tx, req.client_socket, None, buf, req.timing);
             for c in req.coalesced {
                 let _ = reply_forward(c.reply_tx, c.client_socket, None, c.data, c.timing);
@@ -1053,7 +1056,7 @@ impl CacheDispatch {
                 .into_iter()
                 .map(|msg| {
                     let fallback = match msg.pipeline {
-                        Some(pipeline) => pipeline.buffered_bytes,
+                        Some(pipeline) => slices_concat(&pipeline.buffered_bytes),
                         None => msg.data,
                     };
                     CoalescedClient {
@@ -1260,7 +1263,7 @@ pub(super) fn reply_forward(
     timing: QueryTiming,
 ) -> CacheResult<()> {
     let buf = match pipeline {
-        Some(pipeline) => pipeline.buffered_bytes,
+        Some(pipeline) => slices_concat(&pipeline.buffered_bytes),
         None => data,
     };
     reply_tx

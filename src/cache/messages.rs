@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ecow::EcoString;
+use smallvec::SmallVec;
 use tokio::sync::oneshot;
 use tokio_util::bytes::{Bytes, BytesMut};
 
@@ -52,13 +53,31 @@ pub enum PipelineDescribe {
     Portal,
 }
 
+/// Buffered extended-protocol message slices (Parse/Bind/Describe/Execute), one
+/// refcounted `Bytes` per message. Inline-stored for the common ≤4-message
+/// segment (cacheable shape) so accumulation never touches the heap; spills only
+/// for dirty multi-prep batches, which take the forward path anyway.
+pub(crate) type MessageSlices = SmallVec<[Bytes; 4]>;
+
+/// Concatenate refcounted message slices into one contiguous buffer, for the
+/// (cold) forward-to-origin / error fallback paths. Cache hits drop the slices
+/// without ever concatenating.
+pub(crate) fn slices_concat(slices: &[Bytes]) -> BytesMut {
+    let mut out = BytesMut::with_capacity(slices.iter().map(Bytes::len).sum());
+    for s in slices {
+        out.extend_from_slice(s);
+    }
+    out
+}
+
 /// Pipeline context for atomic extended query dispatch.
 /// Contains the raw Parse/Bind/Describe bytes buffered by the proxy,
 /// used for origin fallback on cache miss.
 pub struct PipelineContext {
-    /// All buffered messages (Parse + Bind + optional Describe) concatenated.
-    /// Forwarded to origin on cache miss (Forward reply).
-    pub buffered_bytes: BytesMut,
+    /// All buffered messages (Parse + Bind + optional Describe), one refcounted
+    /// slice per message in order. Concatenated and forwarded to origin only on
+    /// cache miss (Forward reply); dropped untouched on a hit.
+    pub buffered_bytes: MessageSlices,
     /// Whether the pipeline includes a Describe message.
     pub describe: PipelineDescribe,
     /// Stored ParameterDescription bytes for Describe('S') responses.

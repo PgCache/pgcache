@@ -2104,6 +2104,7 @@ dependencies = [
  "serde",
  "serde_json",
  "signal-hook",
+ "smallvec",
  "strum",
  "strum_macros",
  "tokio",

@@ -65,8 +65,9 @@ pub struct PreparedStatement {
     /// Raw Parse message bytes, stored for proactive origin forwarding.
     /// On cache hit for a named statement, origin never sees Parse — these
     /// bytes let the proxy send Parse+Sync to origin so subsequent Bind-only
-    /// or transaction paths work correctly.
-    pub parse_bytes: Option<BytesMut>,
+    /// or transaction paths work correctly. `Bytes` (refcounted, frozen from the
+    /// codec split) so storing it doesn't deep-copy the Parse message.
+    pub parse_bytes: Option<Bytes>,
 }
 
 /// Portal (bound prepared statement) stored in connection state

@@ -26,7 +26,7 @@ use tracing::{debug, error, instrument, trace, warn};
 use crate::{
     cache::{
         CacheDispatchHandle, CacheMessage, CacheOutcome, CacheReply, ProxyMessage, QueryParameters,
-        messages::{PipelineContext, PipelineDescribe},
+        messages::{MessageSlices, PipelineContext, PipelineDescribe, slices_concat},
         query::CacheableQuery,
     },
     pg::protocol::{
@@ -422,8 +422,12 @@ impl CacheCandidate {
 /// into an [`ExecuteEntry`] when an Execute arrives.
 #[derive(Default)]
 struct Segment {
-    /// Concatenated raw bytes of the segment's messages.
-    bytes: BytesMut,
+    /// Raw bytes of the segment's messages, one refcounted slice per message in
+    /// arrival order. Accumulating `Bytes` (zero-copy frozen from the codec
+    /// split) avoids deep-copying every Parse/Bind/Describe into a contiguous
+    /// buffer that is only ever needed on the (cold) forward path. Inline-stored
+    /// (`MessageSlices`) so the common segment never heap-allocates.
+    bytes: MessageSlices,
     /// Whether a Parse was buffered in this segment.
     has_parse: bool,
     /// Whether a Bind was buffered in this segment.
@@ -446,8 +450,9 @@ struct Segment {
 /// previous Execute (or batch start). Sealed at Execute; carries its own bytes
 /// so it can be dispatched independently (cached) or concatenated for forward.
 struct ExecuteEntry {
-    /// Raw bytes of this execute's Parse/Bind/Describe/Execute run.
-    bytes: BytesMut,
+    /// Raw bytes of this execute's Parse/Bind/Describe/Execute run, one
+    /// refcounted slice per message in order.
+    bytes: MessageSlices,
     /// Portal name from Execute (None if the Execute failed to parse).
     portal_name: Option<EcoString>,
     has_parse: bool,
@@ -495,7 +500,7 @@ impl ExtendedBuffer {
         candidate: Option<CacheCandidate>,
     ) {
         let mut seg = std::mem::take(&mut self.pending);
-        seg.bytes.extend_from_slice(execute_bytes);
+        seg.bytes.push(Bytes::copy_from_slice(execute_bytes));
         self.entries.push(ExecuteEntry {
             bytes: seg.bytes,
             portal_name,
@@ -531,13 +536,18 @@ impl ExtendedBuffer {
     }
 
     /// Concatenate all buffered bytes (entries in order, then the trailing
-    /// pending segment) into the wire stream as originally received.
+    /// pending segment) into the wire stream as originally received. Only the
+    /// (cold) forward path needs the contiguous form.
     fn bytes_concat(&self) -> BytesMut {
         let mut out = BytesMut::new();
         for entry in &self.entries {
-            out.extend_from_slice(&entry.bytes);
+            for slice in &entry.bytes {
+                out.extend_from_slice(slice);
+            }
         }
-        out.extend_from_slice(&self.pending.bytes);
+        for slice in &self.pending.bytes {
+            out.extend_from_slice(slice);
+        }
         out
     }
 
@@ -1382,7 +1392,7 @@ impl ConnectionState {
         let bytes = self
             .extended
             .pipeline_take()
-            .map_or_else(|| msg.into_data(), |p| p.buffered_bytes);
+            .map_or_else(|| msg.into_data(), |p| slices_concat(&p.buffered_bytes));
         self.forward_current_and_rest(bytes);
     }
 
@@ -1473,9 +1483,11 @@ impl ConnectionState {
                 Err(_) => StatementType::ParseError,
             };
 
-            let parse_bytes = msg.data.clone();
+            // Freeze the codec's zero-copy slice to `Bytes`; storing/buffering it
+            // is then a refcount bump instead of two deep copies.
+            let data = msg.data.freeze();
             let statement_name = parsed.statement_name.clone();
-            self.statement_store(parsed, sql_type, parse_bytes);
+            self.statement_store(parsed, sql_type, data.clone());
 
             let seg = &mut self.extended.buffer_get_or_create().pending;
             if seg.has_parse {
@@ -1483,7 +1495,7 @@ impl ConnectionState {
             }
             seg.has_parse = true;
             seg.parse_statement_names.push(statement_name);
-            seg.bytes.extend_from_slice(&msg.data);
+            seg.bytes.push(data);
             trace!("net: Parse buffered");
             return;
         }
@@ -1500,7 +1512,7 @@ impl ConnectionState {
                 seg.dirty = true;
             }
             seg.has_bind = true;
-            seg.bytes.extend_from_slice(&msg.data);
+            seg.bytes.push(msg.data.freeze());
             trace!("net: Bind buffered");
             return;
         }
@@ -1612,7 +1624,7 @@ impl ConnectionState {
                 _ => {}
             }
 
-            seg.bytes.extend_from_slice(&msg.data);
+            seg.bytes.push(msg.data.freeze());
             trace!("net: Describe buffered");
             return;
         }
@@ -1811,7 +1823,7 @@ impl ConnectionState {
                 .pending_describe_statements
                 .extend(next.describe_statement);
             self.origin_write_buf
-                .push_back(next.pipeline.buffered_bytes);
+                .push_back(slices_concat(&next.pipeline.buffered_bytes));
         }
         // A simple `Query` is self-terminating (origin emits its own RFQ);
         // only extended-pipeline entries need a synthesized Sync to close the
@@ -1960,7 +1972,7 @@ impl ConnectionState {
         &mut self,
         parsed: ParsedParseMessage,
         sql_type: StatementType,
-        parse_bytes: BytesMut,
+        parse_bytes: Bytes,
     ) {
         let client_parameter_oids = parsed.parameter_oids.clone();
         let stmt = PreparedStatement {
@@ -2257,7 +2269,9 @@ fn forward_lazy_parse_install(
     let Some(parse_bytes) = stmt.parse_bytes.clone() else {
         return;
     };
-    origin_write_buf.push_back(parse_bytes);
+    // Cold lazy-Parse forward: materialize the refcounted slice into the
+    // origin write queue (BytesMut).
+    origin_write_buf.push_back(slices_concat(std::slice::from_ref(&parse_bytes)));
     // The prepended Parse's ParseComplete is swallowed by the LazyParseInline
     // intercept (which marks origin_prepared) — it is NOT a client-awaited
     // response, so it must not be queued in pending_parse_statements.
@@ -2408,9 +2422,10 @@ async fn handle_connection(
                         // The cache slot is now serving (message already taken);
                         // forward this entry (lazy-Parsing if origin doesn't know
                         // its statement) plus the rest of the batch + one Sync.
-                        let bytes = proxy_msg
-                            .pipeline
-                            .map_or_else(|| proxy_msg.message.into_data(), |p| p.buffered_bytes);
+                        let bytes = proxy_msg.pipeline.map_or_else(
+                            || proxy_msg.message.into_data(),
+                            |p| slices_concat(&p.buffered_bytes),
+                        );
                         state.forward_current_and_rest(bytes);
                     }
                 }

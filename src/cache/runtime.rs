@@ -20,7 +20,7 @@ use crate::{
         CacheDispatchPublisher, CacheDispatchUpdater, CacheError, CacheResult, MapIntoReport,
         PinnedQuery, ReportExt, StatusRequest,
         cdc::CdcProcessor,
-        messages::{CacheOutcome, CacheReply, CdcCommand, WriterNotify},
+        messages::{CacheOutcome, CacheReply, CdcCommand, WriterNotify, slices_concat},
         query_cache::{CacheDispatch, ServeRequest},
         serve::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query},
         types::{ActiveRelations, CacheStateView},
@@ -113,7 +113,7 @@ async fn handle_serve_request(
                 let error_buf = msg
                     .forward_bytes
                     .take()
-                    .unwrap_or_else(|| msg.data.split_off(0));
+                    .map_or_else(|| msg.data.split_off(0), |slices| slices_concat(&slices));
                 CacheReply {
                     socket: msg.client_socket,
                     outcome: CacheOutcome::Error(error_buf),
