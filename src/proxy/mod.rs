@@ -13,7 +13,7 @@ pub use client_stream::{ClientSocket, OwnedClientReadHalf};
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use error_set::error_set;
 use nix::errno::Errno;
@@ -93,10 +93,18 @@ pub enum ProxyStatus {
     Degraded = 1,
 }
 
-/// Shared atomic wrapper for `ProxyStatus`.
-/// Written by the proxy accept loop, read by the HTTP server for `/readyz`.
+struct ProxyStatusInner {
+    status: AtomicU8,
+    /// Set once the proxy's TCP listener is bound. `/readyz` stays not-ready
+    /// until then, so clients don't race the bind (the listener binds only
+    /// after the ~hundreds-of-ms cache setup completes).
+    listening: AtomicBool,
+}
+
+/// Shared health/readiness signal for the proxy, read by the HTTP server for
+/// `/readyz`. `listening` is flipped by the accept loop after `bind`.
 #[derive(Clone)]
-pub struct SharedProxyStatus(Arc<AtomicU8>);
+pub struct SharedProxyStatus(Arc<ProxyStatusInner>);
 
 impl Default for SharedProxyStatus {
     fn default() -> Self {
@@ -106,21 +114,30 @@ impl Default for SharedProxyStatus {
 
 impl SharedProxyStatus {
     pub fn new() -> Self {
-        Self(Arc::new(AtomicU8::new(ProxyStatus::Normal as u8)))
+        Self(Arc::new(ProxyStatusInner {
+            status: AtomicU8::new(ProxyStatus::Normal as u8),
+            listening: AtomicBool::new(false),
+        }))
     }
 
     pub fn status_set(&self, status: ProxyStatus) {
-        self.0.store(status as u8, Ordering::Relaxed);
+        self.0.status.store(status as u8, Ordering::Relaxed);
     }
 
     pub fn status_get(&self) -> ProxyStatus {
-        match self.0.load(Ordering::Relaxed) {
+        match self.0.status.load(Ordering::Relaxed) {
             0 => ProxyStatus::Normal,
             _ => ProxyStatus::Degraded,
         }
     }
 
+    /// Mark the proxy listener as bound and accepting connections.
+    pub fn listening_set(&self) {
+        self.0.listening.store(true, Ordering::Release);
+    }
+
+    /// Ready once the listener is bound and the proxy is not degraded.
     pub fn is_ready(&self) -> bool {
-        self.status_get() == ProxyStatus::Normal
+        self.0.listening.load(Ordering::Acquire) && self.status_get() == ProxyStatus::Normal
     }
 }

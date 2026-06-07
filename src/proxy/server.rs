@@ -182,7 +182,7 @@ pub fn proxy_run(
                 m.socket,
                 metrics_handle,
                 cancel.child_token(),
-                shared_proxy_status,
+                shared_proxy_status.clone(),
                 status_sender,
                 settings.dynamic.clone(),
             )
@@ -226,6 +226,7 @@ pub fn proxy_run(
         // cancels the proxy token so the supervisor unwinds too.
         let accept_cancel = cancel.clone();
         let accept_rt = rt_handle.clone();
+        let accept_status = shared_proxy_status;
         let accept_handle = thread::Builder::new()
             .name("accept".to_owned())
             .spawn_scoped(scope, move || {
@@ -281,6 +282,10 @@ pub fn proxy_run(
                                     format!("bind error [{}] {e}", &settings.listen.socket),
                                 )))
                             })?;
+                    // Listener is bound — only now is the proxy ready to accept
+                    // connections, so flip `/readyz` to ready (it reports
+                    // not-ready through the preceding cache setup).
+                    accept_status.listening_set();
                     info!("Listening to {}", &settings.listen.socket);
 
                     loop {
