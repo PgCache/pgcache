@@ -62,7 +62,7 @@ pub struct PipelineContext {
     /// Whether the pipeline includes a Describe message.
     pub describe: PipelineDescribe,
     /// Stored ParameterDescription bytes for Describe('S') responses.
-    pub parameter_description: Option<BytesMut>,
+    pub parameter_description: Option<Bytes>,
     /// Whether Parse was buffered in this pipeline.
     /// False for Bind-only pipelines (named statement re-execution without Parse).
     pub has_parse: bool,

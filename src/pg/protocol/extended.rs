@@ -48,12 +48,14 @@ pub struct PreparedStatement {
     /// the describe-cache key so populate and lookup hash identically.
     pub client_parameter_oids: Vec<u32>,
     pub sql_type: StatementType,
-    /// Raw ParameterDescription bytes from origin, used for Describe('S') in pipeline.
-    pub parameter_description: Option<BytesMut>,
+    /// Raw ParameterDescription bytes from origin, used for Describe('S') in
+    /// pipeline. `Bytes` (not `BytesMut`): written once from origin, then only
+    /// read and cheaply (refcount) cloned into the describe cache and synth path.
+    pub parameter_description: Option<Bytes>,
     /// Raw RowDescription bytes from origin's Describe('S') response. `None`
     /// when origin returned `NoData`; pair with `describe_no_data` to
     /// distinguish "not yet captured" from "captured, no result columns".
-    pub row_description: Option<BytesMut>,
+    pub row_description: Option<Bytes>,
     /// Origin's Describe('S') response was `NoData`. See `row_description`.
     pub describe_no_data: bool,
     /// True when origin has acknowledged this statement (ParseComplete received).
@@ -440,7 +442,7 @@ pub fn parse_close_message(data: &BytesMut) -> ProtocolResult<ParsedCloseMessage
 /// Int16 - number of parameters
 /// For each parameter:
 ///     Int32 - OID of parameter data type
-pub fn parse_parameter_description(data: &BytesMut) -> ProtocolResult<ParsedParameterDescription> {
+pub fn parse_parameter_description(data: &[u8]) -> ProtocolResult<ParsedParameterDescription> {
     // Need at least 7 bytes: tag(1) + length(4) + param_count(2)
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(

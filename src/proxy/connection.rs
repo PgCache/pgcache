@@ -106,8 +106,8 @@ struct DescribeKey {
 /// `row_description` is `None` when origin returned `NoData`.
 #[derive(Debug, Clone)]
 struct DescribeCacheEntry {
-    parameter_description: BytesMut,
-    row_description: Option<BytesMut>,
+    parameter_description: Bytes,
+    row_description: Option<Bytes>,
 }
 
 /// Bounded per connection so dynamic-SQL workloads can't grow it unbounded.
@@ -402,7 +402,7 @@ struct CacheCandidate {
     parameters: QueryParameters,
     result_formats: Vec<i16>,
     /// ParameterDescription bytes, present only for a Describe('S') entry.
-    parameter_description: Option<BytesMut>,
+    parameter_description: Option<Bytes>,
     /// Target statement name (for the lazy-Parse-on-forward decision).
     statement_name: EcoString,
     /// Whether origin already knows the statement (no lazy Parse needed).
@@ -735,7 +735,7 @@ impl ExtendedPending {
                 stmt_name, parsed.parameter_oids
             );
             stmt.parameter_oids = parsed.parameter_oids;
-            stmt.parameter_description = Some(msg_data.clone());
+            stmt.parameter_description = Some(Bytes::copy_from_slice(msg_data));
         }
     }
 
@@ -749,7 +749,7 @@ impl ExtendedPending {
     ) -> Option<EcoString> {
         let stmt_name = self.pending_describe_statements.pop_front()?;
         let stmt = prepared_statements.get_mut(stmt_name.as_str())?;
-        stmt.row_description = Some(msg_data.clone());
+        stmt.row_description = Some(Bytes::copy_from_slice(msg_data));
         stmt.describe_no_data = false;
         Some(stmt_name)
     }
@@ -1880,9 +1880,13 @@ impl ConnectionState {
             crate::metrics::handles().conn.describe_misses.increment(1);
             return false;
         };
+        // Cheap (refcount) clones now that the describe metadata is `Bytes`.
         let parameter_description = entry.parameter_description.clone();
         let row_description = entry.row_description.clone();
-        let stmt_name = stmt_name.to_owned();
+        // `stmt_name` borrows `buffer` (aliases `self.extended`); detach it as an
+        // EcoString (inline for the short statement names clients use) so the
+        // `&mut self` populate below doesn't conflict with that borrow.
+        let stmt_name = EcoString::from(stmt_name);
 
         // Populate the freshly-Parsed statement with the cached Describe
         // metadata so a subsequent Bind+Execute can build a parameterized
@@ -1903,7 +1907,7 @@ impl ConnectionState {
 
         let mut out = BytesMut::with_capacity(
             5 + parameter_description.len()
-                + row_description.as_ref().map(BytesMut::len).unwrap_or(5)
+                + row_description.as_ref().map(Bytes::len).unwrap_or(5)
                 + 6,
         );
         // ParseComplete

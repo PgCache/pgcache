@@ -5,7 +5,7 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
-use tokio_util::bytes::{Buf, Bytes, BytesMut};
+use tokio_util::bytes::{Buf, Bytes};
 use tracing::{debug, error, instrument, trace};
 
 use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe};
@@ -582,7 +582,7 @@ struct Relay {
     /// In-flight memo capture (`None` when this serve isn't being memoized).
     memo_capture: Option<MemoCapture>,
     /// Pending Describe('S') ParameterDescription, relayed before RowDescription.
-    parameter_description: Option<BytesMut>,
+    parameter_description: Option<Bytes>,
     bytes_served: usize,
     // Read-only for the relay's duration:
     prepare: PrepareOutcome,

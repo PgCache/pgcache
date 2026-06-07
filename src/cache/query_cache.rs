@@ -229,7 +229,7 @@ pub struct ServeRequest {
     /// Whether the pipeline includes a Describe message and which type.
     pub pipeline_describe: PipelineDescribe,
     /// Stored ParameterDescription bytes for Describe('S') responses in the pipeline.
-    pub parameter_description: Option<BytesMut>,
+    pub parameter_description: Option<Bytes>,
     /// Buffered bytes for origin fallback on serve error.
     pub forward_bytes: Option<BytesMut>,
     /// Additional clients to receive the same response bytes.
