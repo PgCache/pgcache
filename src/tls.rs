@@ -272,6 +272,11 @@ pub enum ClientTlsResult {
     },
     /// Client wants plaintext (no SSLRequest sent or TLS not configured)
     Plain(TcpStream),
+    /// Peer closed the connection before sending any bytes. This is the common
+    /// shape of an L4/TCP health check (connect, then close). The caller should
+    /// drop the connection without dialing origin — otherwise every health probe
+    /// triggers and discards a full origin TLS handshake.
+    Closed,
 }
 
 /// Negotiate TLS with a PostgreSQL client
@@ -305,6 +310,12 @@ pub async fn client_tls_negotiate(
         .await
         .map_into_report::<TlsError>()?;
     tracing::debug!("client_tls_negotiate: peek returned {} bytes", n);
+
+    if n == 0 {
+        // Peer hung up before sending anything — typically an L4 health check.
+        tracing::debug!("client_tls_negotiate: peer closed before startup");
+        return Ok(ClientTlsResult::Closed);
+    }
 
     if n >= 8 && peek_buf == SSL_REQUEST {
         // Client sent SSLRequest - consume it

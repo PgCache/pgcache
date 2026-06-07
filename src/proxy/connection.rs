@@ -2523,6 +2523,12 @@ pub async fn connection_task(
             tls_state,
         }) => ClientStream::tls(tcp_stream, tls_state),
         Ok(tls::ClientTlsResult::Plain(stream)) => ClientStream::plain(stream),
+        Ok(tls::ClientTlsResult::Closed) => {
+            // Peer closed before sending anything (e.g. L4 health check). Drop it
+            // without dialing origin.
+            debug!("client closed before startup");
+            return;
+        }
         Err(e) => {
             crate::metrics::handles().conn.errors.increment(1);
             error!("TLS negotiation failed: {}", e);
