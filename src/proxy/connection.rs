@@ -48,7 +48,7 @@ use crate::{
         },
     },
     proxy::egress::EgressQueue,
-    query::ast::{AstError, QueryExpr, query_expr_convert_raw, query_expr_fingerprint},
+    query::ast::query_expr_fingerprint,
     settings::SslMode,
     telemetry::pg_version_set,
     timing::{QueryId, QueryTiming, timing_record},
@@ -56,7 +56,7 @@ use crate::{
 };
 
 use super::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
-use super::query::{Action, ForwardReason, handle_query};
+use super::query::{Action, ForwardReason, analyze, handle_query};
 use super::search_path::{SearchPath, search_path_mutations_raw};
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
 use super::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
@@ -1436,45 +1436,43 @@ impl ConnectionState {
         }
     }
 
-    /// Map a parsed-and-converted query to its cacheability classification.
-    fn statement_type_classify(&self, convert: Result<QueryExpr, AstError>) -> StatementType {
-        match convert {
-            Ok(query) => match CacheableQuery::try_new(query, &self.func_volatility) {
-                Ok(cacheable_query) => StatementType::Cacheable(Arc::new(cacheable_query)),
-                Err(_) => StatementType::UncacheableSelect,
-            },
-            Err(_) => StatementType::NonSelect,
+    /// Detect a search_path mutation in an extended-protocol Parse and mark the
+    /// cached search_path stale. Pre-PG18 only (PG18+ auto-reports search_path);
+    /// no piggyback for extended — the lazy SHOW-on-RFQ path handles rediscovery.
+    fn search_path_parse_inspect(&mut self, sql: &str) {
+        if self.search_path_auto_reported {
+            return;
+        }
+        if let Ok(mutations) =
+            pg_query::parse_raw_scoped(sql, |tree| unsafe { search_path_mutations_raw(tree) })
+            && mutations.any
+        {
+            debug!("search_path mutation detected in Parse");
+            self.search_path_mark_unknown();
         }
     }
 
     /// Handle Parse message — analyze cacheability, store statement, buffer bytes.
     fn handle_parse_message(&mut self, msg: PgFrontendMessage) {
         if let Ok(parsed) = parse_parse_message(&msg.data) {
-            // Single raw-tree parse (PGC-192): build the QueryExpr and — on
-            // pre-PG18, where search_path isn't auto-reported — detect a
-            // search_path mutation in the same walk. No protobuf round-trip.
-            // (Pessimistic: the client may or may not Execute the statement.
-            // Piggyback isn't attempted for extended protocol; a standalone
-            // SHOW is issued via the lazy path on the next RFQ.)
-            let check_search_path = !self.search_path_auto_reported;
-            let result = pg_query::parse_raw_scoped(&parsed.sql, |tree| unsafe {
-                let convert = query_expr_convert_raw(tree);
-                // search_path mutations are non-SELECT statements that the
-                // converter rejects, so the second walk is only needed when
-                // convert didn't yield a SELECT — the common cacheable-SELECT
-                // case skips it.
-                let mutates =
-                    check_search_path && convert.is_err() && search_path_mutations_raw(tree).any;
-                (convert, mutates)
-            });
-
-            let sql_type = match result {
-                Ok((convert, mutates)) => {
-                    if mutates {
-                        debug!("search_path mutation detected in Parse");
-                        self.search_path_mark_unknown();
-                    }
-                    self.statement_type_classify(convert)
+            // Cacheability analysis is memoized in `fingerprint_cache` (shared
+            // with the simple-query path); a hit skips the parse/convert/classify
+            // entirely. search_path mutation detection — which the inline parse
+            // used to fold in — isn't captured by that cache, so it's replayed
+            // for the non-SELECT statements that can mutate it (no piggyback for
+            // extended; a standalone SHOW is issued via the lazy path on RFQ).
+            let sql_type = match analyze(
+                &parsed.sql,
+                &mut self.fingerprint_cache,
+                &self.func_volatility,
+            ) {
+                Ok(Action::CacheCheck(ast)) => StatementType::Cacheable(ast),
+                Ok(Action::Forward(ForwardReason::UncacheableSelect)) => {
+                    StatementType::UncacheableSelect
+                }
+                Ok(Action::Forward(ForwardReason::UnsupportedStatement | ForwardReason::Invalid)) => {
+                    self.search_path_parse_inspect(&parsed.sql);
+                    StatementType::NonSelect
                 }
                 Err(_) => StatementType::ParseError,
             };

@@ -44,8 +44,20 @@ pub(super) async fn handle_query(
         .and_then(|b| str::from_utf8(b).ok())
         .ok_or(ParseError::InvalidUtf8)?;
 
+    analyze(query, fp_cache, func_volatility)
+}
+
+/// Cacheability analysis for a SQL string, memoized in `fp_cache` keyed on a
+/// hash of the text. On a hit the parse/convert/classify work is skipped
+/// entirely; on a miss the result (cacheable AST or forward reason) is cached.
+/// Shared by the simple-query and extended (Parse) paths.
+pub(super) fn analyze(
+    sql: &str,
+    fp_cache: &mut HashMap<u64, Result<Arc<CacheableQuery>, ForwardReason>>,
+    func_volatility: &HashMap<EcoString, FunctionVolatility>,
+) -> Result<Action, ParseError> {
     let mut hasher = DefaultHasher::new();
-    query.hash(&mut hasher);
+    sql.hash(&mut hasher);
     let fingerprint = hasher.finish();
 
     match fp_cache.get(&fingerprint) {
@@ -61,7 +73,7 @@ pub(super) async fn handle_query(
             // Build the QueryExpr straight off the raw parse tree, skipping the
             // protobuf serialize/decode round-trip (PGC-192).
             let convert_result =
-                pg_query::parse_raw_scoped(query, |tree| unsafe { query_expr_convert_raw(tree) })?;
+                pg_query::parse_raw_scoped(sql, |tree| unsafe { query_expr_convert_raw(tree) })?;
 
             match convert_result {
                 Ok(query) => {
