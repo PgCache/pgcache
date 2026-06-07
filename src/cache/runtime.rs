@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -462,6 +463,16 @@ pub fn cache_generation_start<'scope, 'env: 'scope, 'settings: 'scope>(
     Ok(CacheGeneration { cancel, handles })
 }
 
+/// Extract a human-readable message from a thread panic payload, which is
+/// `&str` for `panic!("literal")` and `String` for formatted panics.
+fn panic_message(panic: &(dyn Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("unknown panic payload")
+}
+
 /// Supervise a running cache subsystem across restarts. Given the first
 /// generation (built fail-fast during startup, before the proxy accepts), parks
 /// until it dies, reaps it, then rebuilds with exponential backoff — repeating
@@ -494,11 +505,16 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
         dispatch_updater.clear();
         status_updater.sender_clear();
         for h in generation.handles.drain(..) {
-            if let Ok(Err(e)) = h.join() {
-                error!(
+            match h.join() {
+                Ok(Err(e)) => error!(
                     "cache thread exited: {}",
                     error_chain_format(e.current_context()),
-                );
+                ),
+                // A panicked thread yields `Err` from `join()`; without this arm
+                // the panic was silently swallowed and the cache death left no
+                // trace in the logs.
+                Err(panic) => error!("cache thread panicked: {}", panic_message(panic.as_ref())),
+                Ok(Ok(())) => {}
             }
         }
         if root_cancel.is_cancelled() {

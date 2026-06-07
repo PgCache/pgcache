@@ -168,10 +168,7 @@ impl SearchPath {
     ///
     /// Expands `SessionUser` to the provided session_user value.
     /// Skips `SessionUser` entries if session_user is `None`.
-    pub fn resolve<'a>(
-        &'a self,
-        session_user: Option<&'a str>,
-    ) -> impl Iterator<Item = &'a str> {
+    pub fn resolve<'a>(&'a self, session_user: Option<&'a str>) -> impl Iterator<Item = &'a str> {
         self.0.iter().filter_map(move |entry| match entry {
             SearchPathEntry::Schema(name) => Some(name.as_str()),
             SearchPathEntry::SessionUser => session_user,

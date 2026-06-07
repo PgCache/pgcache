@@ -4,7 +4,10 @@ use std::{
     net::SocketAddr,
     num::NonZeroUsize,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -61,6 +64,31 @@ use super::search_path::{SearchPath, search_path_mutations_raw};
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
 use super::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::result::ReportExt;
+
+/// Process-global "log at most once per window" gate, shared across all
+/// connections. A flapping cache subsystem can drop one client per query; this
+/// keeps the operator-facing warning to a single line per window per call site
+/// rather than one per affected client. `last` is per-call-site state holding
+/// the last emit time in whole seconds since first use (`u64::MAX` = never).
+fn log_gate(last: &AtomicU64, window_secs: u64) -> bool {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    let now = START.elapsed().as_secs();
+    let prev = last.load(Ordering::Relaxed);
+    if prev != u64::MAX && now.wrapping_sub(prev) < window_secs {
+        return false;
+    }
+    last.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Window for the cache-down operator warnings, in seconds.
+const CACHE_DOWN_LOG_WINDOW_SECS: u64 = 5;
+
+/// Gate state: cache died with a query in flight (client connection dropped).
+static CACHE_DEAD_INFLIGHT_LOG: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Gate state: cache unavailable at dispatch (connections degraded to origin).
+static CACHE_DEGRADED_LOG: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Guard that decrements active connections gauge when dropped.
 struct ActiveConnectionGuard;
@@ -1470,7 +1498,9 @@ impl ConnectionState {
                 Ok(Action::Forward(ForwardReason::UncacheableSelect)) => {
                     StatementType::UncacheableSelect
                 }
-                Ok(Action::Forward(ForwardReason::UnsupportedStatement | ForwardReason::Invalid)) => {
+                Ok(Action::Forward(
+                    ForwardReason::UnsupportedStatement | ForwardReason::Invalid,
+                )) => {
                     self.search_path_parse_inspect(&parsed.sql);
                     StatementType::NonSelect
                 }
@@ -1534,9 +1564,11 @@ impl ConnectionState {
             .map_or(PipelineDescribe::None, |b| b.pending.describe);
         let candidate = self.execute_cache_candidate(portal_name.as_deref(), describe);
 
-        self.extended
-            .buffer_get_or_create()
-            .pending_seal(msg.data.freeze(), portal_name, candidate);
+        self.extended.buffer_get_or_create().pending_seal(
+            msg.data.freeze(),
+            portal_name,
+            candidate,
+        );
         trace!("net: Execute buffered");
     }
 
@@ -2178,7 +2210,14 @@ impl ConnectionState {
                             return Ok(reply.socket);
                         }
                         Err(_) => {
-                            debug!("cache channel closed");
+                            if log_gate(&CACHE_DEAD_INFLIGHT_LOG, CACHE_DOWN_LOG_WINDOW_SECS) {
+                                warn!(
+                                    "cache subsystem died with a query in flight; dropping client connection (root cause logged by the cache supervisor)"
+                                );
+                            } else {
+                                debug!("cache channel closed");
+                            }
+                            self.proxy_status = ProxyStatus::Degraded;
                             return Err(ConnectionError::CacheDead.into());
                         }
                     }
@@ -2422,6 +2461,11 @@ async fn handle_connection(
                         // Cache is unavailable: recover the leased write half and
                         // fall back to proxying directly to origin.
                         debug!("cache unavailable");
+                        if log_gate(&CACHE_DEGRADED_LOG, CACHE_DOWN_LOG_WINDOW_SECS) {
+                            warn!(
+                                "cache subsystem unavailable; forwarding connections directly to origin (root cause logged by the cache supervisor)"
+                            );
+                        }
                         state.proxy_status = ProxyStatus::Degraded;
                         socket = proxy_msg.client_socket;
                         // The cache slot is now serving (message already taken);

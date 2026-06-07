@@ -4,7 +4,7 @@ use rootcause::Report;
 use std::io;
 use tokio_postgres::config::ReplicationMode;
 use tokio_postgres::{Client, Error};
-use tracing::{debug, warn};
+use tracing::{debug, error};
 
 use crate::result::{MapIntoReport, ReportExt, error_chain_format};
 use crate::settings::{PgSettings, Settings};
@@ -170,7 +170,7 @@ pub async fn connect_replication(settings: &PgSettings, context: &str) -> Result
     );
     let result = config_connect(config, settings.ssl_mode, context).await;
     if let Err(ref e) = result {
-        warn!(
+        error!(
             "[{context}] replication connection failed to {}:{} db={} user={} ssl={:?}: {}",
             settings.host,
             settings.port,
@@ -179,6 +179,18 @@ pub async fn connect_replication(settings: &PgSettings, context: &str) -> Result
             settings.ssl_mode,
             error_chain_format(e),
         );
+        // Logical replication cannot run over a connection pooler (PgBouncer,
+        // Neon's `-pooler` endpoint, etc.). This is the most common CDC
+        // misconfiguration, so call it out explicitly rather than leaving the
+        // operator to decode a generic connection error.
+        if settings.host.contains("pooler") || settings.host.contains("pgbouncer") {
+            error!(
+                "[{context}] replication host {:?} looks like a connection pooler; logical \
+                 replication requires a direct connection — point replication at the origin's \
+                 direct (non-pooled) endpoint via REPLICATION_URL or REPLICATION_HOST",
+                settings.host,
+            );
+        }
     }
     result
 }
