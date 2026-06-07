@@ -10,6 +10,7 @@ use std::os::raw::c_void;
 
 use ecow::EcoString;
 use ordered_float::NotNan;
+use smallvec::SmallVec;
 
 use pg_query::pg_nodes as pg;
 
@@ -27,12 +28,12 @@ use super::*;
 /// callback, valid for the duration of this call.
 pub unsafe fn query_expr_convert_raw(tree_root: *const c_void) -> Result<QueryExpr, AstError> {
     unsafe {
-        let stmts: Vec<_> = list_nodes(tree_root as *const pg::List).collect();
-        let [raw_stmt] = stmts.as_slice() else {
+        let mut stmts = list_nodes(tree_root as *const pg::List);
+        let (Some(raw_stmt), None) = (stmts.next(), stmts.next()) else {
             return Err(AstError::MultipleStatements);
         };
 
-        let stmt = (*cast::<pg::RawStmt>(*raw_stmt)).stmt as NodePtr;
+        let stmt = (*cast::<pg::RawStmt>(raw_stmt)).stmt as NodePtr;
         if stmt.is_null() {
             return Err(AstError::MissingStatement);
         }
@@ -295,7 +296,7 @@ unsafe fn select_columns_convert(target_list: *const pg::List) -> Result<SelectC
             };
 
             if node_tag(val_node) == pg::NodeTag_T_ColumnRef {
-                let fields: Vec<_> =
+                let fields: SmallVec<[_; 4]> =
                     list_nodes((*cast::<pg::ColumnRef>(val_node)).fields).collect();
 
                 if let [field] = fields.as_slice()
@@ -800,27 +801,37 @@ unsafe fn aexpr_arithmetic_convert(aexpr: *const pg::A_Expr) -> Result<Arithmeti
     }
 }
 
+fn arithmetic_op_from_str(op: &str) -> Option<ArithmeticOp> {
+    match op {
+        "+" => Some(ArithmeticOp::Add),
+        "-" => Some(ArithmeticOp::Subtract),
+        "*" => Some(ArithmeticOp::Multiply),
+        "/" => Some(ArithmeticOp::Divide),
+        "%" => Some(ArithmeticOp::Modulo),
+        _ => None,
+    }
+}
+
+/// The single operator name from a (possibly multi-part) operator `List`, with
+/// no intermediate allocation. `None` for multi-part or unparseable names.
+unsafe fn operator_name_single<'a>(name: *const pg::List) -> Option<&'a str> {
+    unsafe {
+        let mut it = list_nodes(name);
+        match (it.next(), it.next()) {
+            (Some(node), None) => string_node_value(node),
+            _ => None,
+        }
+    }
+}
+
 unsafe fn arithmetic_op_extract(name: *const pg::List) -> Result<ArithmeticOp, AstError> {
     unsafe {
-        let names: Vec<_> = list_nodes(name).collect();
-        let [name_node] = names.as_slice() else {
-            return Err(AstError::UnsupportedFeature {
-                feature: "multi-part operator names in arithmetic".to_owned(),
-            });
-        };
-        match string_node_value(*name_node) {
-            Some("+") => Ok(ArithmeticOp::Add),
-            Some("-") => Ok(ArithmeticOp::Subtract),
-            Some("*") => Ok(ArithmeticOp::Multiply),
-            Some("/") => Ok(ArithmeticOp::Divide),
-            Some("%") => Ok(ArithmeticOp::Modulo),
-            Some(op) => Err(AstError::UnsupportedFeature {
-                feature: format!("arithmetic operator: {op}"),
-            }),
-            None => Err(AstError::UnsupportedFeature {
-                feature: "invalid operator name format".to_owned(),
-            }),
-        }
+        let op = operator_name_single(name).ok_or_else(|| AstError::UnsupportedFeature {
+            feature: "multi-part operator names in arithmetic".to_owned(),
+        })?;
+        arithmetic_op_from_str(op).ok_or_else(|| AstError::UnsupportedFeature {
+            feature: format!("arithmetic operator: {op}"),
+        })
     }
 }
 
@@ -1192,11 +1203,20 @@ unsafe fn a_expr_convert(expr: *const pg::A_Expr) -> Result<WhereExpr, WherePars
 
         match kind {
             pg::A_Expr_Kind_AEXPR_OP => {
-                if arithmetic_op_extract(name).is_ok() {
+                // Extract the operator name once and classify it, rather than
+                // speculatively running (and discarding) the arithmetic path.
+                let op_name = operator_name_single(name).ok_or_else(|| WhereParseError::Other {
+                    error: "Multi-part operator names not supported".to_owned(),
+                })?;
+                if arithmetic_op_from_str(op_name).is_some() {
                     let arith = aexpr_arithmetic_convert(expr)?;
                     return Ok(WhereExpr::Scalar(ScalarExpr::Arithmetic(arith)));
                 }
-                let op = operator_extract(name)?;
+                let op = binary_op_from_str(op_name).ok_or_else(|| {
+                    WhereParseError::UnsupportedOperator {
+                        operator: op_name.to_owned(),
+                    }
+                })?;
                 if lexpr.is_null() || rexpr.is_null() {
                     return Err(WhereParseError::MissingExpression);
                 }
@@ -1343,28 +1363,26 @@ unsafe fn like_operator_extract(name: *const pg::List) -> Result<BinaryOp, Where
     }
 }
 
+fn binary_op_from_str(op: &str) -> Option<BinaryOp> {
+    match op {
+        "=" => Some(BinaryOp::Equal),
+        "!=" | "<>" => Some(BinaryOp::NotEqual),
+        "<" => Some(BinaryOp::LessThan),
+        "<=" => Some(BinaryOp::LessThanOrEqual),
+        ">" => Some(BinaryOp::GreaterThan),
+        ">=" => Some(BinaryOp::GreaterThanOrEqual),
+        _ => None,
+    }
+}
+
 unsafe fn operator_extract(name: *const pg::List) -> Result<BinaryOp, WhereParseError> {
     unsafe {
-        let names: Vec<_> = list_nodes(name).collect();
-        let [name_node] = names.as_slice() else {
-            return Err(WhereParseError::Other {
-                error: "Multi-part operator names not supported".to_owned(),
-            });
-        };
-        match string_node_value(*name_node) {
-            Some("=") => Ok(BinaryOp::Equal),
-            Some("!=") | Some("<>") => Ok(BinaryOp::NotEqual),
-            Some("<") => Ok(BinaryOp::LessThan),
-            Some("<=") => Ok(BinaryOp::LessThanOrEqual),
-            Some(">") => Ok(BinaryOp::GreaterThan),
-            Some(">=") => Ok(BinaryOp::GreaterThanOrEqual),
-            Some(op) => Err(WhereParseError::UnsupportedOperator {
-                operator: op.to_owned(),
-            }),
-            None => Err(WhereParseError::Other {
-                error: "Invalid operator name format".to_owned(),
-            }),
-        }
+        let op = operator_name_single(name).ok_or_else(|| WhereParseError::Other {
+            error: "Multi-part operator names not supported".to_owned(),
+        })?;
+        binary_op_from_str(op).ok_or_else(|| WhereParseError::UnsupportedOperator {
+            operator: op.to_owned(),
+        })
     }
 }
 
