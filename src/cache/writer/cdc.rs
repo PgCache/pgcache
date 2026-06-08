@@ -573,8 +573,14 @@ impl WriterCdc {
         // Buffer the removed PK for any in-flight population over this relation
         // so its merge doesn't resurrect the row (PGC-250). Stamped with the
         // frame's commit LSN and recorded at CommitMark (the commit LSN isn't
-        // known yet); dropped if the frame rolls back.
-        let deleted_key = pk_body_render(table_metadata, row_data);
+        // known yet); dropped if the frame rolls back. Skip rendering the key
+        // entirely when no population is recording this relation (the steady
+        // state) — `record` would discard it anyway.
+        let deleted_key = if core.population_deleted_keys.is_recording(relation_oid) {
+            pk_body_render(table_metadata, row_data)
+        } else {
+            None
+        };
         self.cache_delete_into(&mut core.frame_buf, table_metadata, row_data)?;
         if let Some(key) = deleted_key {
             core.frame_deleted_keys.push((relation_oid, key));
@@ -773,6 +779,10 @@ impl WriterCdc {
             core.cache_table_invalidate(*oid)
                 .await
                 .attach_loc("invalidating queries on truncate")?;
+            // A population reading this relation has a pre-truncate snapshot; its
+            // merge would resurrect truncated rows. Abort it so it repopulates
+            // (PGC-250).
+            core.population_deleted_keys.mark_aborted(*oid);
         }
 
         Ok(())

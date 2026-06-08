@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use ecow::EcoString;
 use postgres_protocol::escape;
+use postgres_types::PgLsn;
 use rootcause::prelude::ResultExt;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
@@ -270,22 +271,12 @@ fn staging_table_name(fingerprint: u64, generation: u64, relation_oid: u32) -> E
 /// Origin WAL position as a `u64` byte offset (the same encoding as the
 /// replication stream's LSNs), captured after the population reads. Used as the
 /// upper-bound snapshot LSN for the deferred-Ready gate (PGC-250 Slice B).
-/// `pg_lsn - '0/0'` yields the byte offset as numeric; the `::int8` cast matches
-/// `last_applied_lsn`'s encoding (LSNs stay well under 2^63).
 async fn origin_snapshot_lsn(db_origin: &Client) -> CacheResult<u64> {
-    let msgs = db_origin
-        .simple_query("SELECT (pg_current_wal_insert_lsn() - '0/0'::pg_lsn)::int8")
+    let row = db_origin
+        .query_one("SELECT pg_current_wal_insert_lsn()", &[])
         .await
         .map_into_report::<CacheError>()?;
-    for msg in msgs {
-        if let SimpleQueryMessage::Row(row) = msg
-            && let Some(value) = row.get(0)
-            && let Ok(lsn) = value.parse::<u64>()
-        {
-            return Ok(lsn);
-        }
-    }
-    Err(CacheError::InvalidMessage.into())
+    Ok(u64::from(row.get::<_, PgLsn>(0)))
 }
 
 /// Pre-computed parts of the batched INSERT...ON CONFLICT statement.

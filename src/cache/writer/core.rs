@@ -1171,9 +1171,8 @@ pub fn writer_run(
                     // is keyed on the apply watermark, which advances on the CDC
                     // path, so re-check it on every quiescent iteration.
                     if core.frame_state == FrameState::Idle {
-                        let applied = writer_cdc.last_applied_lsn;
                         if !core.pending_merges.is_empty()
-                            && let Err(e) = registration.pending_merges_flush(&mut core, applied).await
+                            && let Err(e) = registration.pending_merges_flush(&mut core).await
                         {
                             error!(
                                 "population merge flush failed: {}",
@@ -1181,7 +1180,9 @@ pub fn writer_run(
                             );
                         }
                         if !core.pending_ready.is_empty()
-                            && let Err(e) = registration.pending_ready_flush(&mut core, applied).await
+                            && let Err(e) = registration
+                                .pending_ready_flush(&mut core, writer_cdc.last_applied_lsn)
+                                .await
                         {
                             error!(
                                 "deferred-ready flush failed: {}",

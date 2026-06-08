@@ -251,7 +251,7 @@ impl WriterRegistration {
         let reg = &crate::metrics::handles().reg;
         let cmd_handle = match &cmd {
             QueryCommand::Register { .. } => &reg.cmd_register,
-            QueryCommand::Ready { .. } | QueryCommand::Merge(_) => &reg.cmd_ready,
+            QueryCommand::Merge(_) => &reg.cmd_ready,
             QueryCommand::Failed { .. } => &reg.cmd_failed,
             QueryCommand::LimitBump { .. } => &reg.cmd_limit_bump,
             QueryCommand::Readmit { .. } => &reg.cmd_readmit,
@@ -303,16 +303,6 @@ impl WriterRegistration {
                     }
                     self.query_failed_cleanup(core, fingerprint);
                 }
-            }
-            QueryCommand::Ready {
-                fingerprint,
-                cached_bytes,
-                row_count,
-            } => {
-                self.query_ready_mark(core, fingerprint, cached_bytes, row_count);
-                core.mv_pinned_bootstrap(fingerprint);
-                core.cache.current_size = core.cache_size_load().await?;
-                core.eviction_run().await?;
             }
             QueryCommand::Merge(merge) => {
                 // Queue the merge; the writer loop drains it once no CDC frame
@@ -1191,42 +1181,24 @@ impl WriterRegistration {
     /// Drain queued population merges (PGC-250). Called from the writer loop
     /// only when no CDC frame is open, so the merge never races the CDC frame
     /// txn on the shared cache table. Each merge applies staging → cache (with
-    /// the deleted-key filter); the query is then either marked Ready (if the
-    /// apply watermark already reached its snapshot LSN) or deferred to
-    /// `pending_ready`, or failed if the deleted-key set overflowed / the merge
-    /// errored.
-    pub(super) async fn pending_merges_flush(
-        &self,
-        core: &mut WriterCore,
-        applied_lsn: u64,
-    ) -> CacheResult<()> {
+    /// the deleted-key filter); the query is then deferred to `pending_ready`
+    /// for the gate decision (run right after in the writer loop), or failed if
+    /// the deleted-key set overflowed / the merge errored.
+    pub(super) async fn pending_merges_flush(&self, core: &mut WriterCore) -> CacheResult<()> {
         let merges = std::mem::take(&mut core.pending_merges);
         for merge in merges {
             let fingerprint = merge.fingerprint;
             match core.population_merge_apply(&merge).await {
                 Ok(MergeOutcome::Merged) => {
                     core.population_deleted_keys.deactivate(fingerprint);
-                    if merge.snapshot_lsn <= applied_lsn {
-                        self.query_ready_finalize(
-                            core,
-                            fingerprint,
-                            merge.cached_bytes,
-                            merge.row_count,
-                        )
-                        .await?;
-                    } else {
-                        // Gate: data is staged, but CDC hasn't caught up to the
-                        // snapshot. Hold serving until the watermark reaches the
-                        // snapshot LSN (no backward-overwrite is ever observed),
-                        // and nudge the CDC thread to advance it promptly.
-                        core.pending_ready.push(PendingReady {
-                            fingerprint,
-                            snapshot_lsn: merge.snapshot_lsn,
-                            cached_bytes: merge.cached_bytes,
-                            row_count: merge.row_count,
-                        });
-                        core.watermark_nudge.notify_one();
-                    }
+                    // The serve-now-vs-hold gate is owned by pending_ready_flush
+                    // (run right after in the writer loop); always defer here.
+                    core.pending_ready.push(PendingReady {
+                        fingerprint,
+                        snapshot_lsn: merge.snapshot_lsn,
+                        cached_bytes: merge.cached_bytes,
+                        row_count: merge.row_count,
+                    });
                 }
                 Ok(MergeOutcome::Aborted) => {
                     debug!("population merge aborted (deleted-key overflow) {fingerprint}");

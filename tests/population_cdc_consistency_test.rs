@@ -155,6 +155,51 @@ async fn test_update_out_of_predicate_during_population_no_ghost_row() -> Result
     Ok(())
 }
 
+/// A TRUNCATE during population must not leave the pre-truncate snapshot rows in
+/// the cache: the population's merge is aborted (its snapshot predates the
+/// truncate) and the query repopulates from the now-empty table.
+#[tokio::test]
+async fn test_truncate_during_population_no_stale_rows() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", POPULATION_DELAY_MS)])
+            .await?;
+
+    ctx.simple_query("create table trunc_t (id int primary key, v text)")
+        .await?;
+    ctx.simple_query("insert into trunc_t (id, v) values (1, 'a'), (2, 'b'), (3, 'c')")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // Miss: population reads all three rows, then blocks (population delay).
+    let initial = ctx.simple_query("select id, v from trunc_t").await?;
+    assert_eq!(
+        row_count(&initial),
+        3,
+        "rows exist when population reads them"
+    );
+
+    // Truncate during the population window.
+    tokio::time::sleep(SNAPSHOT_SETTLE).await;
+    ctx.origin_query("truncate trunc_t", &[]).await?;
+    ctx.cdc_settle().await?;
+
+    // Let the delayed population finish (its merge must abort), then drain CDC.
+    ctx.cache_settle().await?;
+    ctx.cdc_settle().await?;
+
+    let origin = ctx.origin_query("select id, v from trunc_t", &[]).await?;
+    assert_eq!(origin.len(), 0, "table was truncated at origin");
+
+    let cached = ctx.simple_query("select id, v from trunc_t").await?;
+    assert_eq!(
+        row_count(&cached),
+        0,
+        "truncated rows resurrected by the population merge"
+    );
+
+    Ok(())
+}
+
 /// Slice B deferred-Ready gate: a population must not be served while CDC is
 /// behind the snapshot, or it would expose a transiently-stale cache during
 /// catch-up.

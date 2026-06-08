@@ -266,16 +266,6 @@ impl std::fmt::Debug for QueryCommand {
                 .debug_struct("Register")
                 .field("fingerprint", fingerprint)
                 .finish_non_exhaustive(),
-            Self::Ready {
-                fingerprint,
-                cached_bytes,
-                row_count,
-            } => f
-                .debug_struct("Ready")
-                .field("fingerprint", fingerprint)
-                .field("cached_bytes", cached_bytes)
-                .field("row_count", row_count)
-                .finish(),
             Self::Failed { fingerprint } => f
                 .debug_struct("Failed")
                 .field("fingerprint", fingerprint)
@@ -345,13 +335,6 @@ pub enum QueryCommand {
         admit_action: AdmitAction,
         /// Pinned queries are protected from eviction and auto-readmitted after invalidation.
         pinned: bool,
-    },
-
-    /// Query population completed successfully
-    Ready {
-        fingerprint: u64,
-        cached_bytes: usize,
-        row_count: u64,
     },
 
     /// Query population failed

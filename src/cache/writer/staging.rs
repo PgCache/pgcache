@@ -83,6 +83,15 @@ impl DeletedKeyEntry {
         };
         self.keys.retain(|_, lsn| *lsn > min_floor);
     }
+
+    /// Drop retained keys and abort every merge over this relation until the
+    /// last in-flight population leaves — for cap overflow (keys lost) or a
+    /// TRUNCATE (staged snapshots invalidated).
+    fn disable(&mut self) {
+        self.keys.clear();
+        self.keys.shrink_to_fit();
+        self.overflowed = true;
+    }
 }
 
 impl PopulationDeletedKeys {
@@ -136,14 +145,29 @@ impl PopulationDeletedKeys {
         }
         entry.keys.insert(key, lsn);
         if entry.keys.len() > POPULATION_DELETED_KEY_CAP {
-            entry.keys.clear();
-            entry.keys.shrink_to_fit();
-            entry.overflowed = true;
+            entry.disable();
             error!(
                 relation_oid,
                 "population deleted-key set overflowed cap {POPULATION_DELETED_KEY_CAP}; \
                  affected populations will repopulate"
             );
+        }
+    }
+
+    /// Whether any population is recording deletes for `relation_oid`. Lets the
+    /// CDC delete path skip rendering a key when nothing would consume it.
+    pub(super) fn is_recording(&self, relation_oid: u32) -> bool {
+        self.relations.contains_key(&relation_oid)
+    }
+
+    /// Abort in-flight population merges over `relation_oid` (e.g. on TRUNCATE):
+    /// their staged snapshot predates the event and would resurrect rows the
+    /// event removed, so the queries must repopulate from a fresh snapshot.
+    /// No-op if no population is recording the relation. Reuses the overflow
+    /// flag — same outcome (merge aborts until the last population leaves).
+    pub(super) fn mark_aborted(&mut self, relation_oid: u32) {
+        if let Some(entry) = self.relations.get_mut(&relation_oid) {
+            entry.disable();
         }
     }
 
