@@ -155,14 +155,20 @@ async fn test_update_out_of_predicate_during_population_no_ghost_row() -> Result
     Ok(())
 }
 
-/// A TRUNCATE during population must not leave the pre-truncate snapshot rows in
-/// the cache: the population's merge is aborted (its snapshot predates the
-/// truncate) and the query repopulates from the now-empty table.
+/// A TRUNCATE during population must not leave the pre-truncate snapshot rows
+/// in the shared cache table.
+///
+/// The truncate invalidates the populating query, so its *own* reads forward to
+/// origin and would hide a bad merge. But the merge's orphan rows survive in the
+/// shared cache table (a population is insert-only — repopulation never removes
+/// them) and resurface once the query repopulates and serves from cache again.
+/// So this repopulates and asserts on a cache *hit*. The abort watermark makes
+/// the merge abort instead of inserting the orphans. (Without the abort paths
+/// this test fails with the 3 pre-truncate rows resurrected — verified.)
 #[tokio::test]
-async fn test_truncate_during_population_no_stale_rows() -> Result<(), Error> {
+async fn test_truncate_during_population_no_resurrected_rows() -> Result<(), Error> {
     let mut ctx =
-        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", POPULATION_DELAY_MS)])
-            .await?;
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "1200")]).await?;
 
     ctx.simple_query("create table trunc_t (id int primary key, v text)")
         .await?;
@@ -170,7 +176,7 @@ async fn test_truncate_during_population_no_stale_rows() -> Result<(), Error> {
         .await?;
     ctx.cdc_settle().await?;
 
-    // Miss: population reads all three rows, then blocks (population delay).
+    // Miss: population reads the 3 rows, then blocks (population delay).
     let initial = ctx.simple_query("select id, v from trunc_t").await?;
     assert_eq!(
         row_count(&initial),
@@ -178,23 +184,28 @@ async fn test_truncate_during_population_no_stale_rows() -> Result<(), Error> {
         "rows exist when population reads them"
     );
 
-    // Truncate during the population window.
-    tokio::time::sleep(SNAPSHOT_SETTLE).await;
+    // Truncate during the population window: origin is now empty.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     ctx.origin_query("truncate trunc_t", &[]).await?;
     ctx.cdc_settle().await?;
 
-    // Let the delayed population finish (its merge must abort), then drain CDC.
-    ctx.cache_settle().await?;
+    // Let the delayed population finish (its merge must abort, not orphan the 3
+    // pre-truncate rows into the shared cache table).
+    ctx.cache_settle_with_timeout(Duration::from_secs(15))
+        .await?;
     ctx.cdc_settle().await?;
 
-    let origin = ctx.origin_query("select id, v from trunc_t", &[]).await?;
-    assert_eq!(origin.len(), 0, "table was truncated at origin");
-
+    // Repopulate and read a cache hit — a forward would mask orphan rows.
+    let _ = ctx.simple_query("select id, v from trunc_t").await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(15))
+        .await?;
+    let before = ctx.metrics().await?;
     let cached = ctx.simple_query("select id, v from trunc_t").await?;
+    assert_cache_hit(&mut ctx, before).await?;
     assert_eq!(
         row_count(&cached),
         0,
-        "truncated rows resurrected by the population merge"
+        "pre-truncate rows resurrected as orphans in the shared cache table"
     );
 
     Ok(())

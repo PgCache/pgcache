@@ -266,9 +266,13 @@ impl std::fmt::Debug for QueryCommand {
                 .debug_struct("Register")
                 .field("fingerprint", fingerprint)
                 .finish_non_exhaustive(),
-            Self::Failed { fingerprint } => f
+            Self::Failed {
+                fingerprint,
+                generation,
+            } => f
                 .debug_struct("Failed")
                 .field("fingerprint", fingerprint)
+                .field("generation", generation)
                 .finish(),
             Self::LimitBump {
                 fingerprint,
@@ -337,8 +341,10 @@ pub enum QueryCommand {
         pinned: bool,
     },
 
-    /// Query population failed
-    Failed { fingerprint: u64 },
+    /// Query population failed. `generation` identifies which population (a
+    /// query can have a superseded generation still in flight) so the writer
+    /// releases the right deleted-key tracking.
+    Failed { fingerprint: u64, generation: u64 },
 
     /// Bump the max_limit for a cached query and re-populate with higher limit.
     /// Sent when an incoming query needs more rows than currently cached.

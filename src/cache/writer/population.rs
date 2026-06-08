@@ -165,6 +165,7 @@ pub async fn population_worker(
                 if query_tx
                     .send(QueryCommand::Failed {
                         fingerprint: work.fingerprint,
+                        generation: work.generation,
                     })
                     .is_err()
                 {

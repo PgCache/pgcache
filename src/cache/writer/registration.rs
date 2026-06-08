@@ -310,7 +310,12 @@ impl WriterRegistration {
                 // the CDC writer's frame txn on the shared cache table.
                 core.pending_merges.push(merge);
             }
-            QueryCommand::Failed { fingerprint } => {
+            QueryCommand::Failed {
+                fingerprint,
+                generation,
+            } => {
+                core.population_deleted_keys
+                    .deactivate(fingerprint, generation);
                 self.query_failed_cleanup(core, fingerprint);
             }
             QueryCommand::LimitBump {
@@ -521,6 +526,7 @@ impl WriterRegistration {
         work: PopulationWork,
     ) -> CacheResult<()> {
         let fingerprint = work.fingerprint;
+        let generation = work.generation;
         // Begin recording CDC deletes for this population's relations *before*
         // the worker reads its snapshot (PGC-250). Released at merge or on
         // failure.
@@ -528,20 +534,26 @@ impl WriterRegistration {
         // Anchor floor: a lower bound on this population's snapshot LSN, used to
         // prune deleted keys it can no longer need (PGC-250).
         let anchor_floor = core.last_applied_lsn;
-        core.population_deleted_keys
-            .activate(fingerprint, &relation_oids, anchor_floor);
+        core.population_deleted_keys.activate(
+            fingerprint,
+            generation,
+            &relation_oids,
+            anchor_floor,
+        );
 
         let idx = self.populate_next;
         self.populate_next = (self.populate_next + 1) % self.populate_txs.len();
 
         let Some(tx) = self.populate_txs.get(idx) else {
-            core.population_deleted_keys.deactivate(fingerprint);
+            core.population_deleted_keys
+                .deactivate(fingerprint, generation);
             return Err(CacheError::Other.into());
         };
 
         if tx.send(work).is_err() {
             error!("population worker {idx} channel closed");
-            core.population_deleted_keys.deactivate(fingerprint);
+            core.population_deleted_keys
+                .deactivate(fingerprint, generation);
         }
 
         Ok(())
@@ -1188,22 +1200,37 @@ impl WriterRegistration {
         let merges = std::mem::take(&mut core.pending_merges);
         for merge in merges {
             let fingerprint = merge.fingerprint;
+            let generation = merge.generation;
+
+            // The query was evicted, invalidated, or superseded by a readmit
+            // (new generation) while this merge sat queued — don't insert
+            // orphan rows under a dead/superseded generation. Release tracking
+            // and drop staging; the successor population has its own entry.
+            if !core.population_is_current(fingerprint, generation) {
+                core.population_deleted_keys
+                    .deactivate(fingerprint, generation);
+                core.population_staging_drop(&merge.staged).await;
+                continue;
+            }
+
             match core.population_merge_apply(&merge).await {
                 Ok(MergeOutcome::Merged) => {
-                    core.population_deleted_keys.deactivate(fingerprint);
+                    core.population_deleted_keys
+                        .deactivate(fingerprint, generation);
                     // The serve-now-vs-hold gate is owned by pending_ready_flush
                     // (run right after in the writer loop); always defer here.
                     core.pending_ready.push(PendingReady {
                         fingerprint,
-                        generation: merge.generation,
+                        generation,
                         snapshot_lsn: merge.snapshot_lsn,
                         cached_bytes: merge.cached_bytes,
                         row_count: merge.row_count,
                     });
                 }
                 Ok(MergeOutcome::Aborted) => {
-                    debug!("population merge aborted (deleted-key overflow) {fingerprint}");
-                    // query_failed_cleanup deactivates the set.
+                    debug!("population merge aborted (overflow / truncate) {fingerprint}");
+                    core.population_deleted_keys
+                        .deactivate(fingerprint, generation);
                     self.query_failed_cleanup(core, fingerprint);
                 }
                 Err(e) => {
@@ -1211,6 +1238,8 @@ impl WriterRegistration {
                         "population merge failed for {fingerprint}: {}",
                         error_chain_format(e.current_context()),
                     );
+                    core.population_deleted_keys
+                        .deactivate(fingerprint, generation);
                     self.query_failed_cleanup(core, fingerprint);
                 }
             }
@@ -1283,10 +1312,9 @@ impl WriterRegistration {
     pub fn query_failed_cleanup(&self, core: &mut WriterCore, fingerprint: u64) {
         trace!("query_failed_cleanup {fingerprint}");
 
-        // Release any in-flight population deleted-key tracking (PGC-250). No-op
-        // if this fingerprint never dispatched a population.
-        core.population_deleted_keys.deactivate(fingerprint);
-
+        // Deleted-key tracking is released per `(fingerprint, generation)` by the
+        // population's terminal handler (Merge flush / Failed command), not here —
+        // this fingerprint may have a superseded generation still in flight.
         match core.cache.cached_queries.remove1(&fingerprint) {
             Some(query) => {
                 core.cache.generations.remove(&query.generation);

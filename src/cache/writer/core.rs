@@ -203,6 +203,16 @@ pub(super) struct PendingReady {
     pub(super) row_count: u64,
 }
 
+/// Whether a parked population (a queued merge or a gated ready entry) at
+/// `parked_generation` may still finalize. `live` is the current cached query's
+/// `(generation, invalidated)`, or `None` if it was evicted. Finalize only when
+/// the live query exists, hasn't been superseded by a readmit (generation
+/// bumped), and isn't invalidated — otherwise the parked entry is stale and
+/// finalizing it would mark a superseded/invalidated result Ready (PGC-250).
+fn population_finalize_allowed(live: Option<(u64, bool)>, parked_generation: u64) -> bool {
+    matches!(live, Some((generation, invalidated)) if generation == parked_generation && !invalidated)
+}
+
 impl WriterCore {
     pub async fn new(
         settings: &Settings,
@@ -254,10 +264,12 @@ impl WriterCore {
     /// hasn't been superseded by a readmit (generation bump), invalidated, or
     /// evicted while it waited (PGC-250).
     pub(super) fn population_is_current(&self, fingerprint: u64, generation: u64) -> bool {
-        self.cache
+        let live = self
+            .cache
             .cached_queries
             .get1(&fingerprint)
-            .is_some_and(|q| q.generation == generation && !q.invalidated)
+            .map(|q| (q.generation, q.invalidated));
+        population_finalize_allowed(live, generation)
     }
 
     /// Buffer the frame's `BEGIN` on the first cache-table write (`Active →
@@ -1233,4 +1245,33 @@ pub fn writer_run(
             })
             .await
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::population_finalize_allowed;
+
+    /// Live query at the parked generation, not invalidated → finalize.
+    #[test]
+    fn finalize_allowed_when_current() {
+        assert!(population_finalize_allowed(Some((5, false)), 5));
+    }
+
+    /// Readmit bumped the generation while the entry was parked → skip.
+    #[test]
+    fn finalize_skipped_after_readmit() {
+        assert!(!population_finalize_allowed(Some((8, false)), 5));
+    }
+
+    /// Query invalidated while parked (a growing change superseded it) → skip.
+    #[test]
+    fn finalize_skipped_when_invalidated() {
+        assert!(!population_finalize_allowed(Some((5, true)), 5));
+    }
+
+    /// Query evicted while parked → skip.
+    #[test]
+    fn finalize_skipped_when_evicted() {
+        assert!(!population_finalize_allowed(None, 5));
+    }
 }
