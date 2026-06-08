@@ -13,7 +13,7 @@
 //! permanently. `PopulationDeletedKeys` records every key CDC removes while a
 //! population over that relation is in flight; the merge filters those keys out.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use ecow::EcoString;
 use postgres_protocol::escape;
@@ -25,13 +25,14 @@ use super::super::messages::PopulationMerge;
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::core::WriterCore;
 
-/// Per-relation cap on retained distinct deleted-key tuples before the set
-/// overflows. A backstop against unbounded growth under sustained overlapping
-/// populations on a hot, high-delete relation (refcount never reaching 0) — on
-/// overflow the keys are dropped to free memory and every merge over the
-/// relation is aborted (the query repopulates with a fresh snapshot) until the
-/// last in-flight population deactivates. Slice B replaces this blunt cap with
-/// an LSN-anchored prune.
+/// Per-relation backstop cap on retained distinct deleted-key tuples. The
+/// primary bound is the LSN-anchored prune (`DeletedKeyEntry::prune`): a deleted
+/// key is dropped once every in-flight population's snapshot is at or after the
+/// delete, so the set is bounded by the oldest in-flight population's window.
+/// The cap only bites if a single population stays in flight long enough on a
+/// high-delete relation to accumulate this many keys; on overflow the keys are
+/// dropped and every merge over the relation is aborted (the query repopulates
+/// with a fresh snapshot) until the last in-flight population deactivates.
 const POPULATION_DELETED_KEY_CAP: usize = 100_000;
 
 /// Outcome of a population merge.
@@ -45,6 +46,14 @@ pub(super) enum MergeOutcome {
 
 /// Tracks primary keys removed by CDC while populations are in flight, per
 /// relation, so a population merge can filter out rows CDC already removed.
+///
+/// Each deleted key is stamped with the commit LSN at which it was removed, and
+/// each in-flight population contributes an *anchor floor* (a lower bound on its
+/// snapshot LSN). A delete at `lsn_d` only matters to a population whose
+/// snapshot predates it (`snapshot < lsn_d`); once every in-flight population's
+/// floor reaches `lsn_d`, the key is irrelevant and pruned. This bounds the set
+/// to the oldest in-flight population's window rather than letting it grow with
+/// total delete volume under sustained overlap.
 #[derive(Default)]
 pub(super) struct PopulationDeletedKeys {
     relations: HashMap<u32, DeletedKeyEntry>,
@@ -54,55 +63,78 @@ pub(super) struct PopulationDeletedKeys {
 
 #[derive(Default)]
 struct DeletedKeyEntry {
-    /// Number of in-flight populations over this relation.
-    refcount: usize,
-    /// Rendered PK tuple bodies (e.g. `42` or `'a','b'`).
-    keys: HashSet<EcoString>,
+    /// In-flight populations over this relation: fingerprint → anchor floor
+    /// (lower bound on the population's snapshot LSN). Empty ⇒ remove the entry.
+    floors: HashMap<u64, u64>,
+    /// Rendered PK tuple body (e.g. `42` or `'a','b'`) → commit LSN of the delete.
+    keys: HashMap<EcoString, u64>,
     /// Set once `keys` exceeds the cap; keys are dropped and merges abort until
-    /// `refcount` returns to 0.
+    /// the last in-flight population leaves.
     overflowed: bool,
+}
+
+impl DeletedKeyEntry {
+    /// Drop keys no in-flight population can still need: a delete at `lsn_d` is
+    /// irrelevant once every floor is `>= lsn_d` (every snapshot is at/after the
+    /// delete, so none read the row alive). Keeps keys with `lsn_d > min(floor)`.
+    fn prune(&mut self) {
+        let Some(min_floor) = self.floors.values().copied().min() else {
+            return;
+        };
+        self.keys.retain(|_, lsn| *lsn > min_floor);
+    }
 }
 
 impl PopulationDeletedKeys {
     /// Begin recording deletes for a population's relations. Called at dispatch,
     /// before the worker reads its snapshot — a delete CDC processed earlier has
     /// an LSN below the watermark, hence below the snapshot boundary, so its row
-    /// isn't in the snapshot and can't be resurrected. Idempotent per fingerprint.
-    pub(super) fn activate(&mut self, fingerprint: u64, relation_oids: &[u32]) {
+    /// isn't in the snapshot and can't be resurrected. `anchor_floor` is the
+    /// apply watermark at dispatch, a lower bound on this population's snapshot
+    /// LSN, used to prune keys it can no longer need. Idempotent per fingerprint.
+    pub(super) fn activate(&mut self, fingerprint: u64, relation_oids: &[u32], anchor_floor: u64) {
         if self.inflight.contains_key(&fingerprint) {
             return;
         }
         for &oid in relation_oids {
-            self.relations.entry(oid).or_default().refcount += 1;
+            self.relations
+                .entry(oid)
+                .or_default()
+                .floors
+                .insert(fingerprint, anchor_floor);
         }
         self.inflight.insert(fingerprint, relation_oids.to_vec());
     }
 
-    /// Stop recording for a population. Clears a relation's set once its last
-    /// in-flight population leaves.
+    /// Stop recording for a population: drop its floor and prune (its departure
+    /// may have raised the relation's min floor). Removes a relation's entry once
+    /// its last in-flight population leaves.
     pub(super) fn deactivate(&mut self, fingerprint: u64) {
         let Some(oids) = self.inflight.remove(&fingerprint) else {
             return;
         };
         for oid in oids {
             if let Some(entry) = self.relations.get_mut(&oid) {
-                entry.refcount = entry.refcount.saturating_sub(1);
-                if entry.refcount == 0 {
+                entry.floors.remove(&fingerprint);
+                if entry.floors.is_empty() {
                     self.relations.remove(&oid);
+                } else {
+                    entry.prune();
                 }
             }
         }
     }
 
-    /// Record a removed PK for `relation_oid` if a population is recording it.
-    pub(super) fn record(&mut self, relation_oid: u32, key: EcoString) {
+    /// Record a removed PK (stamped with the delete's commit LSN) for
+    /// `relation_oid` if a population is recording it.
+    pub(super) fn record(&mut self, relation_oid: u32, key: EcoString, lsn: u64) {
         let Some(entry) = self.relations.get_mut(&relation_oid) else {
             return;
         };
         if entry.overflowed {
             return;
         }
-        entry.keys.insert(key);
+        entry.keys.insert(key, lsn);
         if entry.keys.len() > POPULATION_DELETED_KEY_CAP {
             entry.keys.clear();
             entry.keys.shrink_to_fit();
@@ -129,7 +161,7 @@ impl PopulationDeletedKeys {
             return None;
         }
         let mut tuples = String::new();
-        for (i, key) in entry.keys.iter().enumerate() {
+        for (i, key) in entry.keys.keys().enumerate() {
             if i > 0 {
                 tuples.push(',');
             }
@@ -288,5 +320,72 @@ impl WriterCore {
         if let Err(e) = self.db_cache.batch_execute(&sql).await {
             error!("dropping staging table {staging}: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const REL: u32 = 10;
+
+    fn record(keys: &mut PopulationDeletedKeys, body: &str, lsn: u64) {
+        keys.record(REL, EcoString::from(body), lsn);
+    }
+
+    /// Deactivating a population raises the relation's min floor, pruning deletes
+    /// that predate every remaining in-flight population's snapshot.
+    #[test]
+    fn deactivate_prunes_below_min_floor() {
+        let mut keys = PopulationDeletedKeys::default();
+        keys.activate(1, &[REL], 100);
+        keys.activate(2, &[REL], 200);
+        record(&mut keys, "5", 50);
+        record(&mut keys, "15", 150);
+        record(&mut keys, "25", 250);
+
+        // Min floor is 100 (fp1); the merge still filters all three.
+        let before = keys.filter_predicate(REL, "(id)").expect("filter present");
+        assert!(before.contains("(5)") && before.contains("(15)") && before.contains("(25)"));
+
+        // fp1 leaves → min floor becomes 200 → deletes at LSN <= 200 are
+        // irrelevant to fp2 (snapshot >= 200) and pruned.
+        keys.deactivate(1);
+        let after = keys.filter_predicate(REL, "(id)").expect("filter present");
+        assert!(after.contains("(25)"), "kept recent delete: {after}");
+        assert!(
+            !after.contains("(5)") && !after.contains("(15)"),
+            "pruned stale deletes: {after}"
+        );
+    }
+
+    /// The relation's entry disappears once the last population leaves.
+    #[test]
+    fn deactivate_last_population_clears_entry() {
+        let mut keys = PopulationDeletedKeys::default();
+        keys.activate(1, &[REL], 100);
+        record(&mut keys, "5", 150);
+        keys.deactivate(1);
+        assert!(keys.filter_predicate(REL, "(id)").is_none());
+    }
+
+    /// Deletes for a relation no population is reading are dropped on the floor.
+    #[test]
+    fn record_without_active_population_is_noop() {
+        let mut keys = PopulationDeletedKeys::default();
+        record(&mut keys, "5", 150);
+        assert!(keys.filter_predicate(REL, "(id)").is_none());
+    }
+
+    /// Exceeding the cap drops keys and disables filtering (the merge aborts).
+    #[test]
+    fn overflow_disables_filtering() {
+        let mut keys = PopulationDeletedKeys::default();
+        keys.activate(1, &[REL], 0);
+        for i in 0..=POPULATION_DELETED_KEY_CAP {
+            record(&mut keys, &i.to_string(), 1);
+        }
+        assert!(keys.overflowed(REL));
+        assert!(keys.filter_predicate(REL, "(id)").is_none());
     }
 }

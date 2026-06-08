@@ -175,6 +175,15 @@ pub struct WriterCore {
     /// snapshot LSN is reached within a round-trip instead of waiting for the
     /// next periodic keepalive.
     pub(super) watermark_nudge: Arc<Notify>,
+    /// Mirror of `WriterCdc.last_applied_lsn`, updated as the CDC path advances
+    /// the watermark. Read at population dispatch to seed the deleted-key
+    /// anchor floor (a lower bound on the population's snapshot LSN).
+    pub(super) last_applied_lsn: u64,
+    /// PK tuple bodies removed by the in-progress CDC frame, drained at
+    /// `CommitMark` and recorded into `population_deleted_keys` stamped with the
+    /// frame's commit LSN (rolled-back frames clear it instead). Buffered because
+    /// the commit LSN isn't known until the frame commits.
+    pub(super) frame_deleted_keys: Vec<(u32, EcoString)>,
 }
 
 /// A population merged into the cache but withheld from serving until the CDC
@@ -226,6 +235,8 @@ impl WriterCore {
             pending_merges: Vec::new(),
             pending_ready: Vec::new(),
             watermark_nudge,
+            last_applied_lsn: 0,
+            frame_deleted_keys: Vec::new(),
         })
     }
 

@@ -242,6 +242,9 @@ impl WriterCdc {
                 .map_into_report::<CacheError>()?;
         }
         core.frame_buf.clear();
+        // Rolled-back deletes must not suppress population merges — the rows may
+        // still exist (PGC-250).
+        core.frame_deleted_keys.clear();
         core.frame_state = FrameState::Recovering;
         Ok(())
     }
@@ -393,6 +396,7 @@ impl WriterCdc {
                 core.frame_state = FrameState::Active;
                 core.frame_buf.clear();
                 core.frame_chunk_flushed = false;
+                core.frame_deleted_keys.clear();
             }
             CdcCommand::TableRegister(table_metadata) => {
                 core.frame_relation_oids.insert(table_metadata.relation_oid);
@@ -497,6 +501,14 @@ impl WriterCdc {
                 core.frame_buf.clear();
                 core.frame_chunk_flushed = false;
                 self.applied_lsn_advance(lsn);
+                core.last_applied_lsn = self.last_applied_lsn;
+                // Stamp this committed frame's deletes with its commit LSN and
+                // record them for in-flight populations (PGC-250). Empty if the
+                // frame rolled back (cleared on recovery).
+                let frame_deletes = std::mem::take(&mut core.frame_deleted_keys);
+                for (relation_oid, key) in frame_deletes {
+                    core.population_deleted_keys.record(relation_oid, key, lsn);
+                }
                 // Frame is closed; flush maintenance that was deferred while it
                 // was open (it would have deadlocked on the frame's locks).
                 if core.purge_pending {
@@ -517,6 +529,7 @@ impl WriterCdc {
                 );
                 if core.frame_state == FrameState::Idle {
                     self.applied_lsn_advance(lsn);
+                    core.last_applied_lsn = self.last_applied_lsn;
                 }
             }
         }
@@ -557,13 +570,14 @@ impl WriterCdc {
                     oid: Some(relation_oid),
                     name: None,
                 })?;
-        // Record the removed PK for any in-flight population over this relation
-        // so its merge doesn't resurrect the row (PGC-250). No-op when nothing
-        // is populating this relation.
+        // Buffer the removed PK for any in-flight population over this relation
+        // so its merge doesn't resurrect the row (PGC-250). Stamped with the
+        // frame's commit LSN and recorded at CommitMark (the commit LSN isn't
+        // known yet); dropped if the frame rolls back.
         let deleted_key = pk_body_render(table_metadata, row_data);
         self.cache_delete_into(&mut core.frame_buf, table_metadata, row_data)?;
         if let Some(key) = deleted_key {
-            core.population_deleted_keys.record(relation_oid, key);
+            core.frame_deleted_keys.push((relation_oid, key));
         }
         self.frame_write_finish(core).await
     }
