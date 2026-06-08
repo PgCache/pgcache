@@ -42,6 +42,13 @@ fn row_count(msgs: &[SimpleQueryMessage]) -> usize {
         .count()
 }
 
+fn first_value(msgs: &[SimpleQueryMessage]) -> Option<String> {
+    msgs.iter().find_map(|m| match m {
+        SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+        _ => None,
+    })
+}
+
 /// A DELETE applied during population must not leave a ghost row in the cache.
 #[tokio::test]
 async fn test_delete_during_population_no_ghost_row() -> Result<(), Error> {
@@ -143,6 +150,64 @@ async fn test_update_out_of_predicate_during_population_no_ghost_row() -> Result
         row_count(&cached),
         0,
         "ghost row: population resurrected a row that no longer matches the predicate"
+    );
+
+    Ok(())
+}
+
+/// Slice B deferred-Ready gate: a population must not be served while CDC is
+/// behind the snapshot, or it would expose a transiently-stale cache during
+/// catch-up.
+///
+/// Construction: population reads `v=10`; during the population window the row
+/// is updated to `v=20` at origin with CDC delivery delayed, so the merge
+/// stages the stale `v=10`. Without the gate the query goes Ready immediately
+/// and `cache_settle` returns at once with the stale value; with the gate
+/// `cache_settle` returns only after the watermark reaches the snapshot LSN —
+/// by which point CDC has applied the update — so the cache hit yields `20`.
+/// The single value distinguishes the two.
+#[tokio::test]
+async fn test_deferred_ready_gate_serves_caught_up_value() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[
+        ("PGCACHE_FAULT_POPULATION_DELAY_MS", "800"),
+        ("PGCACHE_FAULT_CDC_DELIVER_DELAY_MS", "300"),
+    ])
+    .await?;
+
+    ctx.simple_query("create table gate_t (id int primary key, v int)")
+        .await?;
+    ctx.simple_query("insert into gate_t (id, v) values (1, 10)")
+        .await?;
+    // No cached query yet, so the CDC delivery delay is inactive here.
+    ctx.cdc_settle().await?;
+
+    // Miss: population reads v=10, then blocks (population delay). Registering
+    // the query tracks the relation, which activates the CDC delivery delay.
+    let initial = ctx
+        .simple_query("select v from gate_t where id = 1")
+        .await?;
+    assert_eq!(first_value(&initial).as_deref(), Some("10"));
+
+    // Update during the population window — its CDC event is delayed, so the
+    // merge stages the stale v=10 while origin is already v=20.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    ctx.origin_query("update gate_t set v = 20 where id = 1", &[])
+        .await?;
+
+    // The gate holds the query non-Ready until the watermark catches up; allow a
+    // generous timeout for the delayed CDC stream to drain.
+    ctx.cache_settle_with_timeout(Duration::from_secs(20))
+        .await?;
+
+    let before = ctx.metrics().await?;
+    let served = ctx
+        .simple_query("select v from gate_t where id = 1")
+        .await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(
+        first_value(&served).as_deref(),
+        Some("20"),
+        "gate served a stale value: query went Ready before CDC caught up to the snapshot"
     );
 
     Ok(())

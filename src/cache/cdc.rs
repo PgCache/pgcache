@@ -21,6 +21,9 @@ use tokio_stream::StreamExt;
 use tokio_util::bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
+use std::sync::Arc;
+
+use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, trace};
 
@@ -32,6 +35,29 @@ use crate::settings::Settings;
 use super::{
     CacheError, CacheResult, MapIntoReport, ReportExt, messages::CdcCommand, types::ActiveRelations,
 };
+
+/// Test-only CDC delivery delay (fault-injection feature, PGC-250 Slice B).
+/// Once a relation is tracked, sleeps before processing each replication
+/// message, so the writer's apply watermark lags behind origin — exercising the
+/// deferred-Ready gate (a freshly populated query whose snapshot LSN is ahead of
+/// the watermark must forward to origin, not serve a transiently-stale cache).
+/// Gated on `active_relations` so setup (before any cached query) is unaffected.
+/// Compiled out without the feature.
+#[cfg(feature = "fault-injection")]
+async fn fault_cdc_deliver_delay(active_relations: &ActiveRelations) {
+    if active_relations.load().is_empty() {
+        return;
+    }
+    if let Some(ms) = std::env::var("PGCACHE_FAULT_CDC_DELIVER_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+    }
+}
+#[cfg(not(feature = "fault-injection"))]
+async fn fault_cdc_deliver_delay(_active_relations: &ActiveRelations) {}
 
 /// Handles Change Data Capture (CDC) processing from PostgreSQL logical replication.
 /// Processes replication messages and synchronizes changes with the cache database.
@@ -54,6 +80,11 @@ pub struct CdcProcessor {
     keep_alive_timer: Interval,
     last_flush_sent: Option<Instant>,
     keep_alive_sent_count: u64,
+    /// Signalled by the writer when a populated query is gated on the apply
+    /// watermark; prompts an immediate reply-requested standby status update so
+    /// the server returns its current `wal_end`, advancing the watermark within
+    /// a round-trip (PGC-250 Slice B).
+    watermark_nudge: Arc<Notify>,
 }
 
 impl CdcProcessor {
@@ -62,6 +93,7 @@ impl CdcProcessor {
         settings: &Settings,
         cdc_tx: UnboundedSender<CdcCommand>,
         active_relations: ActiveRelations,
+        watermark_nudge: Arc<Notify>,
     ) -> CacheResult<Self> {
         let origin_cdc_client = connect_replication(&settings.replication, "CDC replication")
             .await
@@ -84,6 +116,7 @@ impl CdcProcessor {
             keep_alive_timer: timer,
             last_flush_sent: None,
             keep_alive_sent_count: 0,
+            watermark_nudge,
         })
     }
 
@@ -118,6 +151,7 @@ impl CdcProcessor {
                 }
                 // Handle incoming replication messages
                 msg_result = stream.next() => {
+                    fault_cdc_deliver_delay(&self.active_relations).await;
                     trace!("cdc stream result {msg_result:?}");
                     match msg_result {
                         Some(Ok(msg)) => {
@@ -150,6 +184,17 @@ impl CdcProcessor {
                             error_chain_format(&e),
                         );
                         // Continue despite keep-alive errors (graceful degradation)
+                    }
+                }
+                // Writer is waiting on the apply watermark (a gated population).
+                // Request an immediate server keepalive so `wal_end` (hence the
+                // watermark) advances within a round-trip (PGC-250 Slice B).
+                _ = self.watermark_nudge.notified() => {
+                    if let Err(e) = self.send_standby_status_update(stream.as_mut(), true).await {
+                        error!(
+                            "Error sending reply-requested keep-alive: {}",
+                            error_chain_format(&e),
+                        );
                     }
                 }
             }

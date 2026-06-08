@@ -122,10 +122,11 @@ pub async fn population_worker(
         idle_start = Instant::now();
 
         match result {
-            Ok((cached_bytes, row_count, staged)) => {
+            Ok((cached_bytes, row_count, staged, snapshot_lsn)) => {
                 // Hand the staged snapshot to the writer, which merges it into
                 // the shared cache table when no CDC frame is open and then
-                // marks the query Ready (PGC-250).
+                // marks the query Ready once the watermark reaches the snapshot
+                // LSN (PGC-250).
                 if query_tx
                     .send(QueryCommand::Merge(PopulationMerge {
                         fingerprint: work.fingerprint,
@@ -133,6 +134,7 @@ pub async fn population_worker(
                         staged,
                         cached_bytes,
                         row_count,
+                        snapshot_lsn,
                     }))
                     .is_err()
                 {
@@ -189,7 +191,7 @@ async fn population_task(
     max_limit: Option<u64>,
     db_origin: Rc<Client>,
     db_cache: &Client,
-) -> CacheResult<(usize, u64, Vec<(u32, EcoString)>)> {
+) -> CacheResult<(usize, u64, Vec<(u32, EcoString)>, u64)> {
     // Generation stamping no longer happens here — it moves to the writer's
     // merge, which inserts the staged rows into the tracked shared table
     // (PGC-250).
@@ -246,12 +248,16 @@ async fn population_task(
         }
     }
 
+    // Capture the snapshot upper-bound LSN after all reads, for the
+    // deferred-Ready gate (PGC-250 Slice B).
+    let snapshot_lsn = origin_snapshot_lsn(&db_origin).await?;
+
     let task_elapsed = task_start.elapsed();
     trace!(
-        "population complete for query {fingerprint}, total_time={:?} bytes={total_bytes} rows={total_rows}",
+        "population complete for query {fingerprint}, total_time={:?} bytes={total_bytes} rows={total_rows} snapshot_lsn={snapshot_lsn}",
         task_elapsed
     );
-    Ok((total_bytes, total_rows, staged))
+    Ok((total_bytes, total_rows, staged, snapshot_lsn))
 }
 
 /// Deterministic name of a population's per-relation staging table in
@@ -259,6 +265,27 @@ async fn population_task(
 /// drops it), and across deadlock retries (each attempt recreates it fresh).
 fn staging_table_name(fingerprint: u64, generation: u64, relation_oid: u32) -> EcoString {
     EcoString::from(format!("stage_{fingerprint}_{generation}_{relation_oid}"))
+}
+
+/// Origin WAL position as a `u64` byte offset (the same encoding as the
+/// replication stream's LSNs), captured after the population reads. Used as the
+/// upper-bound snapshot LSN for the deferred-Ready gate (PGC-250 Slice B).
+/// `pg_lsn - '0/0'` yields the byte offset as numeric; the `::int8` cast matches
+/// `last_applied_lsn`'s encoding (LSNs stay well under 2^63).
+async fn origin_snapshot_lsn(db_origin: &Client) -> CacheResult<u64> {
+    let msgs = db_origin
+        .simple_query("SELECT (pg_current_wal_insert_lsn() - '0/0'::pg_lsn)::int8")
+        .await
+        .map_into_report::<CacheError>()?;
+    for msg in msgs {
+        if let SimpleQueryMessage::Row(row) = msg
+            && let Some(value) = row.get(0)
+            && let Ok(lsn) = value.parse::<u64>()
+        {
+            return Ok(lsn);
+        }
+    }
+    Err(CacheError::InvalidMessage.into())
 }
 
 /// Pre-computed parts of the batched INSERT...ON CONFLICT statement.

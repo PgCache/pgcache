@@ -323,12 +323,17 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     // CDC-liveness flag: set by the CDC thread, read inline by every dispatch.
     let cdc_connected = Arc::new(AtomicBool::new(true));
 
+    // Lets the writer prompt the CDC thread for an immediate keepalive when a
+    // populated query is gated on the apply watermark (PGC-250 Slice B).
+    let watermark_nudge = Arc::new(tokio::sync::Notify::new());
+
     // Writer thread (owns Cache, serializes all mutations). Gets a child of the
     // subsystem cancel so a subsystem teardown propagates to it.
     let settings_writer = settings.clone();
     let state_view_writer = Arc::clone(&state_view);
     let active_relations_writer = Arc::clone(&active_relations);
     let cancel_writer = cache_cancel.child_token();
+    let watermark_nudge_writer = Arc::clone(&watermark_nudge);
     let writer_handle = thread::Builder::new()
         .name("cache writer".to_owned())
         .spawn_scoped(scope, move || {
@@ -341,6 +346,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
                 notify_tx,
                 cancel_writer,
                 status_rx,
+                watermark_nudge_writer,
             );
             if let Err(ref e) = result {
                 error!(
@@ -359,6 +365,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     let active_relations_cdc = Arc::clone(&active_relations);
     let cancel_cdc = cache_cancel.clone();
     let cdc_connected_cdc = Arc::clone(&cdc_connected);
+    let watermark_nudge_cdc = Arc::clone(&watermark_nudge);
     let cdc_handle = match thread::Builder::new()
         .name("cdc worker".to_owned())
         .spawn_scoped(scope, move || {
@@ -368,6 +375,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
                 active_relations_cdc,
                 cancel_cdc,
                 cdc_connected_cdc,
+                watermark_nudge_cdc,
             );
             if let Err(ref e) = result {
                 error!(
@@ -790,6 +798,7 @@ fn cdc_run(
     active_relations: ActiveRelations,
     cancel: CancellationToken,
     cdc_connected: Arc<AtomicBool>,
+    watermark_nudge: Arc<tokio::sync::Notify>,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -798,10 +807,14 @@ fn cdc_run(
 
     debug!("cdc loop");
     rt.block_on(async {
-        let mut cdc =
-            CdcProcessor::new(settings, cdc_tx.clone(), Arc::clone(&active_relations))
-                .await
-                .attach_loc("initializing CDC processor")?;
+        let mut cdc = CdcProcessor::new(
+            settings,
+            cdc_tx.clone(),
+            Arc::clone(&active_relations),
+            Arc::clone(&watermark_nudge),
+        )
+        .await
+        .attach_loc("initializing CDC processor")?;
         debug!("CDC processor initialized, entering stream loop");
 
         loop {
@@ -875,6 +888,7 @@ fn cdc_run(
                     settings,
                     cdc_tx.clone(),
                     Arc::clone(&active_relations),
+                    Arc::clone(&watermark_nudge),
                 )
                 .await
                 {

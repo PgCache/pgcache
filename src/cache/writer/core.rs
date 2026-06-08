@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use ecow::EcoString;
 use tokio::runtime::Builder;
+use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use tokio::task::{LocalSet, yield_now};
 use tokio_postgres::Client;
@@ -165,6 +166,24 @@ pub struct WriterCore {
     /// `pending_merges_flush` after each command so a merge never runs while a
     /// CDC frame holds locks on the shared cache table.
     pub(super) pending_merges: Vec<PopulationMerge>,
+    /// Merged populations withheld from serving until the CDC apply watermark
+    /// reaches their snapshot LSN (PGC-250 Slice B). Drained by
+    /// `pending_ready_flush` as the watermark advances.
+    pub(super) pending_ready: Vec<PendingReady>,
+    /// Signals the CDC thread to request an immediate keepalive (reply-requested
+    /// standby status update), advancing `last_applied_lsn` so a gated query's
+    /// snapshot LSN is reached within a round-trip instead of waiting for the
+    /// next periodic keepalive.
+    pub(super) watermark_nudge: Arc<Notify>,
+}
+
+/// A population merged into the cache but withheld from serving until the CDC
+/// apply watermark reaches `snapshot_lsn` (PGC-250 Slice B).
+pub(super) struct PendingReady {
+    pub(super) fingerprint: u64,
+    pub(super) snapshot_lsn: u64,
+    pub(super) cached_bytes: usize,
+    pub(super) row_count: u64,
 }
 
 impl WriterCore {
@@ -174,6 +193,7 @@ impl WriterCore {
         active_relations: ActiveRelations,
         notify_tx: UnboundedSender<WriterNotify>,
         query_tx: UnboundedSender<QueryCommand>,
+        watermark_nudge: Arc<Notify>,
     ) -> CacheResult<Self> {
         let cache_client = pg::connect(&settings.cache, "writer cache")
             .await
@@ -204,6 +224,8 @@ impl WriterCore {
             frame_chunk_flushed: false,
             population_deleted_keys: PopulationDeletedKeys::default(),
             pending_merges: Vec::new(),
+            pending_ready: Vec::new(),
+            watermark_nudge,
         })
     }
 
@@ -1001,6 +1023,7 @@ pub fn writer_run(
     notify_tx: UnboundedSender<WriterNotify>,
     cancel: CancellationToken,
     mut status_rx: Receiver<StatusRequest>,
+    watermark_nudge: Arc<Notify>,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -1022,6 +1045,7 @@ pub fn writer_run(
                     active_relations,
                     notify_tx,
                     query_tx.clone(),
+                    watermark_nudge,
                 )
                 .await?;
                 let mut registration =
@@ -1129,18 +1153,30 @@ pub fn writer_run(
                         }
                     }
 
-                    // Drain population merges that are waiting for a quiescent
-                    // writer. Runs only when no CDC frame is open, so the merge
-                    // (on db_cache) never races the CDC writer's frame txn on the
-                    // shared cache table (PGC-250).
-                    if !core.pending_merges.is_empty()
-                        && core.frame_state == FrameState::Idle
-                        && let Err(e) = registration.pending_merges_flush(&mut core).await
-                    {
-                        error!(
-                            "population merge flush failed: {}",
-                            error_chain_format(e.current_context()),
-                        );
+                    // Drain population merges + deferred-Ready gates while the
+                    // writer is quiescent (no CDC frame open), so neither the
+                    // merge nor eviction (both on db_cache) races the CDC writer's
+                    // frame txn on the shared cache table (PGC-250). `pending_ready`
+                    // is keyed on the apply watermark, which advances on the CDC
+                    // path, so re-check it on every quiescent iteration.
+                    if core.frame_state == FrameState::Idle {
+                        let applied = writer_cdc.last_applied_lsn;
+                        if !core.pending_merges.is_empty()
+                            && let Err(e) = registration.pending_merges_flush(&mut core, applied).await
+                        {
+                            error!(
+                                "population merge flush failed: {}",
+                                error_chain_format(e.current_context()),
+                            );
+                        }
+                        if !core.pending_ready.is_empty()
+                            && let Err(e) = registration.pending_ready_flush(&mut core, applied).await
+                        {
+                            error!(
+                                "deferred-ready flush failed: {}",
+                                error_chain_format(e.current_context()),
+                            );
+                        }
                     }
 
                     // Channel depths are reported as f64 gauges; queue sizes never approach 2^53.

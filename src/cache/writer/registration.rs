@@ -39,7 +39,7 @@ use super::super::{
         UpdateQuerySource,
     },
 };
-use super::core::WriterCore;
+use super::core::{PendingReady, WriterCore};
 use super::population::population_worker;
 use super::staging::MergeOutcome;
 use crate::pg;
@@ -1188,19 +1188,42 @@ impl WriterRegistration {
     /// Drain queued population merges (PGC-250). Called from the writer loop
     /// only when no CDC frame is open, so the merge never races the CDC frame
     /// txn on the shared cache table. Each merge applies staging → cache (with
-    /// the deleted-key filter) and then marks the query Ready, or fails it if
-    /// the deleted-key set overflowed / the merge errored.
-    pub(super) async fn pending_merges_flush(&self, core: &mut WriterCore) -> CacheResult<()> {
+    /// the deleted-key filter); the query is then either marked Ready (if the
+    /// apply watermark already reached its snapshot LSN) or deferred to
+    /// `pending_ready`, or failed if the deleted-key set overflowed / the merge
+    /// errored.
+    pub(super) async fn pending_merges_flush(
+        &self,
+        core: &mut WriterCore,
+        applied_lsn: u64,
+    ) -> CacheResult<()> {
         let merges = std::mem::take(&mut core.pending_merges);
         for merge in merges {
             let fingerprint = merge.fingerprint;
             match core.population_merge_apply(&merge).await {
                 Ok(MergeOutcome::Merged) => {
                     core.population_deleted_keys.deactivate(fingerprint);
-                    self.query_ready_mark(core, fingerprint, merge.cached_bytes, merge.row_count);
-                    core.mv_pinned_bootstrap(fingerprint);
-                    core.cache.current_size = core.cache_size_load().await?;
-                    core.eviction_run().await?;
+                    if merge.snapshot_lsn <= applied_lsn {
+                        self.query_ready_finalize(
+                            core,
+                            fingerprint,
+                            merge.cached_bytes,
+                            merge.row_count,
+                        )
+                        .await?;
+                    } else {
+                        // Gate: data is staged, but CDC hasn't caught up to the
+                        // snapshot. Hold serving until the watermark reaches the
+                        // snapshot LSN (no backward-overwrite is ever observed),
+                        // and nudge the CDC thread to advance it promptly.
+                        core.pending_ready.push(PendingReady {
+                            fingerprint,
+                            snapshot_lsn: merge.snapshot_lsn,
+                            cached_bytes: merge.cached_bytes,
+                            row_count: merge.row_count,
+                        });
+                        core.watermark_nudge.notify_one();
+                    }
                 }
                 Ok(MergeOutcome::Aborted) => {
                     debug!("population merge aborted (deleted-key overflow) {fingerprint}");
@@ -1216,6 +1239,54 @@ impl WriterRegistration {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Promote merged-but-gated queries to Ready once the apply watermark has
+    /// reached their snapshot LSN (PGC-250 Slice B). Re-nudges the CDC thread
+    /// while anything is still waiting so the watermark keeps advancing.
+    pub(super) async fn pending_ready_flush(
+        &self,
+        core: &mut WriterCore,
+        applied_lsn: u64,
+    ) -> CacheResult<()> {
+        let entries = std::mem::take(&mut core.pending_ready);
+        let mut still_waiting = Vec::new();
+        for entry in entries {
+            if entry.snapshot_lsn <= applied_lsn {
+                self.query_ready_finalize(
+                    core,
+                    entry.fingerprint,
+                    entry.cached_bytes,
+                    entry.row_count,
+                )
+                .await?;
+            } else {
+                still_waiting.push(entry);
+            }
+        }
+        let remaining = !still_waiting.is_empty();
+        core.pending_ready = still_waiting;
+        if remaining {
+            core.watermark_nudge.notify_one();
+        }
+        Ok(())
+    }
+
+    /// Finalize a population: mark the query Ready and run the post-ready
+    /// bookkeeping (MV bootstrap, cache-size refresh, eviction). Shared by the
+    /// immediate and deferred (`pending_ready`) paths.
+    async fn query_ready_finalize(
+        &self,
+        core: &mut WriterCore,
+        fingerprint: u64,
+        cached_bytes: usize,
+        row_count: u64,
+    ) -> CacheResult<()> {
+        self.query_ready_mark(core, fingerprint, cached_bytes, row_count);
+        core.mv_pinned_bootstrap(fingerprint);
+        core.cache.current_size = core.cache_size_load().await?;
+        core.eviction_run().await?;
         Ok(())
     }
 

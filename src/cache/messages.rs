@@ -315,6 +315,11 @@ pub struct PopulationMerge {
     pub staged: Vec<(u32, EcoString)>,
     pub cached_bytes: usize,
     pub row_count: u64,
+    /// Origin WAL LSN captured after the population reads (upper bound on the
+    /// snapshot). The query is withheld from serving until the CDC apply
+    /// watermark reaches this, so catch-up never exposes a backward-overwrite
+    /// (PGC-250 Slice B).
+    pub snapshot_lsn: u64,
 }
 
 /// Controls what the writer does when a query is not subsumed.
