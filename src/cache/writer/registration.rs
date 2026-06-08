@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use ecow::EcoString;
@@ -209,6 +210,7 @@ impl WriterRegistration {
         settings: &Settings,
         db_origin: &Rc<Client>,
         query_tx: UnboundedSender<QueryCommand>,
+        registration_throttled: Arc<AtomicBool>,
     ) -> CacheResult<Self> {
         let aggregate_functions = aggregate_functions_load(db_origin)
             .await
@@ -229,9 +231,18 @@ impl WriterRegistration {
 
             let worker_db_origin = Rc::clone(db_origin);
             let worker_query_tx = query_tx.clone();
+            let worker_throttled = Arc::clone(&registration_throttled);
 
             spawn_local(async move {
-                population_worker(i, rx, worker_db_origin, cache_conn, worker_query_tx).await;
+                population_worker(
+                    i,
+                    rx,
+                    worker_db_origin,
+                    cache_conn,
+                    worker_query_tx,
+                    worker_throttled,
+                )
+                .await;
             });
         }
 

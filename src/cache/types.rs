@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -396,7 +396,8 @@ pub struct QueryMetrics {
     pub total_bytes_served: u64,
     /// Physical rows inserted during last population (sum across all branch tables)
     pub population_row_count: u64,
-    /// Cache-hit latency distribution (1us–60s, 2 significant figures)
+    /// Cache-hit latency distribution (µs, 2 significant figures). Auto-resizing
+    /// so it grows only as hits are recorded.
     pub cache_hit_latency: Histogram<u64>,
 }
 
@@ -416,8 +417,11 @@ impl QueryMetrics {
             last_population_duration_us: None,
             total_bytes_served: 0,
             population_row_count: 0,
+            // Auto-resizing (starts at a few hundred bytes, grows on record)
+            // rather than fixed-range — a fixed 1µs–60s bound pre-allocates
+            // ~20 KB per query, the dominant cost under high query cardinality.
             #[allow(clippy::unwrap_used)]
-            cache_hit_latency: Histogram::new_with_bounds(1, 60_000_000, 2).unwrap(),
+            cache_hit_latency: Histogram::new(2).unwrap(),
         }
     }
 }
@@ -439,6 +443,13 @@ pub struct CacheStateView {
     /// In-process hot-result cache (PGC-236). Captured by the serve pool, served by
     /// dispatch, evicted (slot-bumped) by the writer's CDC path.
     pub memo: ResultMemo,
+    /// Set by the memory monitor when used memory crosses the registration
+    /// budget high-water mark. While set, dispatch forwards brand-new (and
+    /// in-flight Loading) queries to origin instead of registering them, and
+    /// population workers skip the in-flight backlog — bounding memory growth.
+    /// Already-cached queries are unaffected. `Arc` so population workers can
+    /// share it; wait-free read on the hot path.
+    pub registration_throttled: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for CacheStateView {
@@ -460,6 +471,7 @@ impl CacheStateView {
             started_at: Instant::now(),
             hits_since_gc: AtomicU32::new(0),
             last_hits_per_gc: AtomicU32::new(0),
+            registration_throttled: Arc::new(AtomicBool::new(false)),
             memo: ResultMemo::new(dynamic),
         }
     }

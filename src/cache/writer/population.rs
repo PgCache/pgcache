@@ -26,6 +26,7 @@ use super::super::{
 };
 use super::PopulationWork;
 use super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Number of rows to batch per INSERT statement sent to the cache database.
 const POPULATION_INSERT_BATCH_SIZE: usize = 200;
@@ -67,12 +68,28 @@ pub async fn population_worker(
     db_origin: Rc<Client>,
     db_cache: Client,
     query_tx: UnboundedSender<QueryCommand>,
+    throttled: Arc<AtomicBool>,
 ) {
     debug!("population worker {id} started");
 
     let (idle_handle, queue_handle) = crate::metrics::population_worker_handles(id);
     let mut idle_start = Instant::now();
     while let Some(work) = rx.recv().await {
+        // Under memory pressure, skip populating the in-flight backlog: building
+        // these cache tables/rows is what overshoots the budget after dispatch
+        // stops admitting new queries. Fail them so `query_failed_cleanup`
+        // removes the query and forwards any coalesced waiters to origin.
+        if throttled.load(Ordering::Relaxed) {
+            crate::metrics::handles()
+                .cache
+                .registration_throttled_total
+                .increment(1);
+            let _ = query_tx.send(QueryCommand::Failed {
+                fingerprint: work.fingerprint,
+                generation: work.generation,
+            });
+            continue;
+        }
         // Time spent waiting on rx — recorded as a histogram so the `_sum`
         // gives cumulative idle time per worker (utilization signal) and the
         // quantiles surface variance. Pairs with task_seconds and wall clock

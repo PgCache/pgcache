@@ -161,6 +161,11 @@ pub struct DynamicConfig {
     /// Total-bytes budget for the in-process hot-result cache (PGC-236).
     /// 0 disables in-memory result memoization.
     pub memo_cache_size: usize,
+    /// Optional absolute ceiling (bytes) on pgcache's resident memory, used to
+    /// throttle new-query registration before the box runs out of RAM. When
+    /// `None`, the ceiling is derived dynamically as 80% of detected RAM. A
+    /// configured value can only lower the effective ceiling, never raise it.
+    pub memory_limit: Option<usize>,
 }
 
 const DEFAULT_ADMISSION_THRESHOLD: u32 = 1;
@@ -169,6 +174,7 @@ const DEFAULT_MV_SIZE_RATIO: u32 = 10;
 const DEFAULT_MEMO_CACHE_SIZE: usize = 64 * 1024 * 1024;
 
 impl DynamicConfig {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         cache_size: Option<usize>,
         cache_policy: Option<CachePolicy>,
@@ -177,6 +183,7 @@ impl DynamicConfig {
         log_level: Option<String>,
         mv_size_ratio: Option<u32>,
         memo_cache_size: Option<usize>,
+        memory_limit: Option<usize>,
     ) -> Self {
         Self {
             cache_size,
@@ -187,6 +194,7 @@ impl DynamicConfig {
             log_level,
             mv_size_ratio: mv_size_ratio.unwrap_or(DEFAULT_MV_SIZE_RATIO),
             memo_cache_size: memo_cache_size.unwrap_or(DEFAULT_MEMO_CACHE_SIZE),
+            memory_limit,
         }
     }
 }
@@ -350,7 +358,7 @@ impl DynamicConfigHandle {
     #[cfg(test)]
     pub fn test_default() -> Self {
         Self::new(
-            DynamicConfig::new(None, None, None, None, None, None, None),
+            DynamicConfig::new(None, None, None, None, None, None, None, None),
             None,
             None,
         )
@@ -378,6 +386,8 @@ pub struct DynamicConfigPatch {
     pub mv_size_ratio: Option<u32>,
     #[serde(default)]
     pub memo_cache_size: Option<usize>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
+    pub memory_limit: Option<Option<usize>>,
 }
 
 /// Deserialize a double-Option: absent → None, null → Some(None), value → Some(Some(v)).
@@ -418,6 +428,10 @@ impl DynamicConfigPatch {
             },
             mv_size_ratio: self.mv_size_ratio.unwrap_or(current.mv_size_ratio),
             memo_cache_size: self.memo_cache_size.unwrap_or(current.memo_cache_size),
+            memory_limit: match self.memory_limit {
+                Some(v) => v,
+                None => current.memory_limit,
+            },
         }
     }
 }
@@ -432,6 +446,7 @@ fn dynamic_config_from_toml(config: &SettingsToml) -> DynamicConfig {
         config.log_level.clone(),
         config.mv_size_ratio,
         config.memo_cache_size,
+        config.memory_limit,
     )
 }
 
@@ -483,6 +498,18 @@ pub fn config_file_dynamic_update(path: &Path, patch: &DynamicConfigPatch) -> Co
     if let Some(v) = &patch.memo_cache_size {
         let v_i64 = i64::try_from(*v).expect("memo cache size fits in i64");
         doc["memo_cache_size"] = toml_edit::value(v_i64);
+    }
+
+    if let Some(v) = &patch.memory_limit {
+        match v {
+            Some(limit) => {
+                let limit_i64 = i64::try_from(*limit).expect("memory limit fits in i64");
+                doc["memory_limit"] = toml_edit::value(limit_i64);
+            }
+            None => {
+                doc.remove("memory_limit");
+            }
+        }
     }
 
     if let Some(v) = &patch.allowed_tables {
@@ -634,6 +661,10 @@ struct SettingsToml {
     /// 0 disables in-memory result memoization. Defaults to 64 MiB.
     #[serde(default)]
     memo_cache_size: Option<usize>,
+    /// Optional absolute RSS ceiling (bytes) for registration throttling.
+    /// Omitted → 80% of detected RAM. Can only lower the effective ceiling.
+    #[serde(default)]
+    memory_limit: Option<usize>,
     /// Only cache queries referencing these tables.
     /// Supports both unqualified ("orders") and schema-qualified ("audit.orders") names.
     /// If omitted or empty, all tables are cacheable.
@@ -797,6 +828,7 @@ struct CliArgs {
     admission_threshold: Option<u32>,
     mv_size_ratio: Option<u32>,
     memo_cache_size: Option<usize>,
+    memory_limit: Option<usize>,
     allowed_tables: Option<String>,
     pinned_queries: Option<String>,
     pinned_tables: Option<String>,
@@ -854,6 +886,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("admission_threshold") => args.admission_threshold = Some(arg_parse(&mut parser)?),
             Long("mv_size_ratio") => args.mv_size_ratio = Some(arg_parse(&mut parser)?),
             Long("memo_cache_size") => args.memo_cache_size = Some(arg_parse(&mut parser)?),
+            Long("memory_limit") => args.memory_limit = Some(arg_parse(&mut parser)?),
             Long("allowed_tables") => args.allowed_tables = Some(arg_string(&mut parser)?),
             Long("pinned_queries") => args.pinned_queries = Some(arg_string(&mut parser)?),
             Long("pinned_tables") => args.pinned_tables = Some(arg_string(&mut parser)?),
@@ -911,6 +944,23 @@ fn memo_cache_size_resolve(cli: Option<usize>, toml_value: Option<usize>) -> Opt
         return Some(v);
     }
     if let Ok(v) = std::env::var("PGCACHE_MEMO_CACHE_SIZE")
+        && let Ok(parsed) = v.parse::<usize>()
+    {
+        return Some(parsed);
+    }
+    None
+}
+
+/// Resolve memory_limit from CLI > TOML > env var.
+/// Returns None to leave the ceiling at the dynamic 80%-of-RAM default.
+fn memory_limit_resolve(cli: Option<usize>, toml_value: Option<usize>) -> Option<usize> {
+    if let Some(v) = cli {
+        return Some(v);
+    }
+    if let Some(v) = toml_value {
+        return Some(v);
+    }
+    if let Ok(v) = std::env::var("PGCACHE_MEMORY_LIMIT")
         && let Ok(parsed) = v.parse::<usize>()
     {
         return Some(parsed);
@@ -987,6 +1037,7 @@ fn settings_build_with_config(
         args.log_level.or_else(|| config.log_level.clone()),
         mv_size_ratio_resolve(args.mv_size_ratio, config.mv_size_ratio),
         memo_cache_size_resolve(args.memo_cache_size, config.memo_cache_size),
+        memory_limit_resolve(args.memory_limit, config.memory_limit),
     );
 
     Ok(Settings {
@@ -1076,6 +1127,7 @@ fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
                 args.log_level,
                 mv_size_ratio_resolve(args.mv_size_ratio, None),
                 memo_cache_size_resolve(args.memo_cache_size, None),
+                memory_limit_resolve(args.memory_limit, None),
             ),
             None, // no config file in CLI-only mode
             None, // snapshot set in settings_build
@@ -1109,6 +1161,7 @@ impl Settings {
             [--admission_threshold N] (default: 1, clock policy only) \n \
             [--mv_size_ratio N] (default: 10, materialized view size gate) \n \
             [--memo_cache_size BYTES] (default: 64 MiB, in-process hot-result cache budget; 0 disables) \n \
+            [--memory_limit BYTES] (default: 80% of detected RAM; absolute ceiling for registration throttling, can only lower) \n \
             [--tls_cert CERT_FILE --tls_key KEY_FILE] \n \
             [--metrics_socket IP_AND_PORT] \n \
             [--allowed_tables TABLE1,TABLE2,...] (restrict caching to these tables) \n \
@@ -1660,6 +1713,7 @@ socket = "127.0.0.1:5434"
             admission_threshold: None,
             mv_size_ratio: None,
             memo_cache_size: None,
+            memory_limit: None,
             allowed_tables: None,
             pinned_queries: None,
             pinned_tables: None,
@@ -2115,6 +2169,7 @@ socket = "127.0.0.1:5434"
             Some("info".to_owned()),
             None,
             None,
+            None,
         )
     }
 
@@ -2129,6 +2184,7 @@ socket = "127.0.0.1:5434"
             log_level: None,
             mv_size_ratio: None,
             memo_cache_size: None,
+            memory_limit: None,
         };
         let result = patch.apply(&current);
         assert_eq!(result.cache_size, Some(1_000_000));
@@ -2150,6 +2206,7 @@ socket = "127.0.0.1:5434"
             log_level: Some(Some("debug".to_owned())),
             mv_size_ratio: Some(25),
             memo_cache_size: Some(8_000_000),
+            memory_limit: None,
         };
         let result = patch.apply(&current);
         assert_eq!(result.cache_size, Some(2_000_000));
@@ -2172,6 +2229,7 @@ socket = "127.0.0.1:5434"
             log_level: Some(None),
             mv_size_ratio: None,
             memo_cache_size: None,
+            memory_limit: None,
         };
         let result = patch.apply(&current);
         assert_eq!(result.cache_size, None);
@@ -2243,6 +2301,7 @@ socket = "127.0.0.1:6432"
             log_level: Some(None),
             mv_size_ratio: None,
             memo_cache_size: None,
+            memory_limit: None,
         };
         config_file_dynamic_update(&path, &patch).expect("update TOML");
 

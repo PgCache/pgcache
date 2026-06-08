@@ -1091,8 +1091,13 @@ pub fn writer_run(
                     watermark_nudge,
                 )
                 .await?;
-                let mut registration =
-                    WriterRegistration::new(settings, &core.db_origin, query_tx).await?;
+                let mut registration = WriterRegistration::new(
+                    settings,
+                    &core.db_origin,
+                    query_tx,
+                    Arc::clone(&core.state_view.registration_throttled),
+                )
+                .await?;
                 let mut writer_cdc = WriterCdc::new(settings).await?;
 
                 // Gauges (queries_loading/pending/invalidated, cache_size_bytes,

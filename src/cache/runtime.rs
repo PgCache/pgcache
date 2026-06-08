@@ -33,7 +33,7 @@ use crate::{
     },
     proxy::StatusSenderUpdater,
     result::error_chain_format,
-    settings::Settings,
+    settings::{DynamicConfigHandle, Settings},
     timing::duration_to_us_u64,
 };
 
@@ -433,6 +433,11 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         cache_cancel.clone(),
         Arc::clone(&state_view),
     ));
+    handle.spawn(memory_monitor(
+        Arc::clone(&state_view),
+        settings.dynamic.clone(),
+        cache_cancel.clone(),
+    ));
     handle.spawn(coalesce_drain(
         dispatch,
         notify_rx,
@@ -441,6 +446,73 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     ));
 
     Ok(vec![writer_handle, cdc_handle])
+}
+
+/// Samples whole-system used memory against the registration budget and toggles
+/// `state_view.registration_throttled` (with hysteresis) so dispatch degrades to
+/// origin-forwarding before the box exhausts RAM. "Used" is system-wide
+/// (`MemTotal - MemAvailable`, or the cgroup's `memory.current`), so it counts
+/// pgcache *and* the cache Postgres it manages — not just pgcache's own RSS. The
+/// budget is 80% of detected RAM (cgroup-aware), optionally lowered by
+/// `memory_limit`, minus the memo's reserved budget. No-op where memory can't be
+/// detected (non-Linux): the flag stays clear and registration is unbounded.
+#[allow(clippy::cast_precision_loss)] // byte gauges never exceed 2^52
+async fn memory_monitor(
+    state_view: Arc<CacheStateView>,
+    dynamic: DynamicConfigHandle,
+    cancel: CancellationToken,
+) {
+    const TICK: Duration = Duration::from_millis(500);
+    let cache = &crate::metrics::handles().cache;
+
+    let Some(total_ram) = crate::memory::total_budget_bytes() else {
+        debug!("memory monitor: RAM not detectable; registration throttling disabled");
+        return;
+    };
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(TICK) => {}
+        }
+
+        let Some(used) = crate::memory::system_used_bytes() else {
+            continue;
+        };
+
+        let throttled = state_view.registration_throttled.load(Ordering::Relaxed);
+        let decision = crate::memory::throttle_evaluate(
+            used,
+            total_ram,
+            dynamic.load().memory_limit.map(|l| l as u64),
+            state_view.memo.budget() as u64,
+            state_view.memo.total_bytes() as u64,
+            throttled,
+        );
+        let next = decision.throttled;
+        let high_mark = decision.high_mark;
+        if next != throttled {
+            state_view
+                .registration_throttled
+                .store(next, Ordering::Relaxed);
+            if next {
+                warn!(
+                    used_mb = used / 1_048_576,
+                    budget_mb = high_mark / 1_048_576,
+                    "memory pressure: throttling new-query registration (forwarding to origin)"
+                );
+            } else {
+                info!("memory pressure relieved: resuming query registration");
+            }
+        }
+
+        cache.memory_used_bytes.set(used as f64);
+        cache.memory_budget_bytes.set(high_mark as f64);
+        cache
+            .rss_bytes
+            .set(crate::memory::process_rss_bytes().unwrap_or(0) as f64);
+        cache.registration_throttled.set(f64::from(u8::from(next)));
+    }
 }
 
 /// Initial backoff before rebuilding the cache subsystem after a failure.

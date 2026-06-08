@@ -525,6 +525,26 @@ impl CacheDispatch {
                     state: CachedQueryState::Loading,
                     ..
                 }) => {
+                    // Under memory pressure this query's population is being
+                    // skipped (it won't become Ready), so forward to origin
+                    // rather than coalesce-wait on a load that won't complete.
+                    if self
+                        .state_view
+                        .registration_throttled
+                        .load(Ordering::Relaxed)
+                    {
+                        crate::metrics::handles()
+                            .cache
+                            .registration_throttled_total
+                            .increment(1);
+                        return reply_forward(
+                            msg.reply_tx,
+                            msg.client_socket,
+                            msg.pipeline,
+                            msg.data,
+                            msg.timing,
+                        );
+                    }
                     trace!("cache loading, coalesce {fingerprint}");
                     fault_coalesce_enqueue_delay().await;
                     let key = Self::coalesce_key_from_request(&msg);
@@ -594,6 +614,26 @@ impl CacheDispatch {
                 // registers, losers re-dispatch against the now-present entry.
                 None => {
                     trace!("cache miss {fingerprint}");
+                    // Under memory pressure, don't register a brand-new query
+                    // (each registration costs in-process memory). Forward it to
+                    // origin instead; already-tracked queries are unaffected.
+                    if self
+                        .state_view
+                        .registration_throttled
+                        .load(Ordering::Relaxed)
+                    {
+                        crate::metrics::handles()
+                            .cache
+                            .registration_throttled_total
+                            .increment(1);
+                        return reply_forward(
+                            msg.reply_tx,
+                            msg.client_socket,
+                            msg.pipeline,
+                            msg.data,
+                            msg.timing,
+                        );
+                    }
                     match self.first_miss_claim(fingerprint, &cfg) {
                         Some(action) => {
                             return self.subsumption_await(msg, fingerprint, action).await;

@@ -167,6 +167,17 @@ pub mod names {
     pub const CACHE_RESTARTS_TOTAL: &str = "pgcache.cache.restarts_total";
     /// Cache-DB serve-pool connections reconnected after a poisoned discard.
     pub const CACHE_POOL_REPLENISHED: &str = "pgcache.cache.pool_replenished";
+    /// Current resident set size of the pgcache process, in bytes.
+    pub const CACHE_RSS_BYTES: &str = "pgcache.cache.rss_bytes";
+    /// Whole-system used memory (pgcache + cache Postgres), in bytes.
+    pub const CACHE_MEMORY_USED_BYTES: &str = "pgcache.cache.memory_used_bytes";
+    /// Registration memory budget (used-memory high-water mark), in bytes.
+    pub const CACHE_MEMORY_BUDGET_BYTES: &str = "pgcache.cache.memory_budget_bytes";
+    /// 1 while new-query registration is throttled by memory pressure, else 0.
+    pub const CACHE_REGISTRATION_THROTTLED: &str = "pgcache.cache.registration_throttled";
+    /// Queries forwarded to origin (not registered) due to memory-pressure throttling.
+    pub const CACHE_REGISTRATION_THROTTLED_TOTAL: &str =
+        "pgcache.cache.registration_throttled_total";
 
     // Extended protocol metrics
     pub const PROTOCOL_SIMPLE_QUERIES: &str = "pgcache.protocol.simple_queries";
@@ -342,6 +353,12 @@ pub struct CacheHandles {
     pub restarts_total: Counter,
     /// Incremented each time a discarded serve-pool connection is replaced.
     pub pool_replenished: Counter,
+    /// Process RSS, system used memory, registration budget, and throttle state.
+    pub rss_bytes: Gauge,
+    pub memory_used_bytes: Gauge,
+    pub memory_budget_bytes: Gauge,
+    pub registration_throttled: Gauge,
+    pub registration_throttled_total: Counter,
 }
 
 pub struct CdcHandles {
@@ -488,6 +505,11 @@ impl Handles {
                 memo_bytes: metrics::gauge!(CACHE_MEMO_BYTES),
                 restarts_total: metrics::counter!(CACHE_RESTARTS_TOTAL),
                 pool_replenished: metrics::counter!(CACHE_POOL_REPLENISHED),
+                rss_bytes: metrics::gauge!(CACHE_RSS_BYTES),
+                memory_used_bytes: metrics::gauge!(CACHE_MEMORY_USED_BYTES),
+                memory_budget_bytes: metrics::gauge!(CACHE_MEMORY_BUDGET_BYTES),
+                registration_throttled: metrics::gauge!(CACHE_REGISTRATION_THROTTLED),
+                registration_throttled_total: metrics::counter!(CACHE_REGISTRATION_THROTTLED_TOTAL),
             },
             cdc: CdcHandles {
                 events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),

@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod catalog;
+pub mod memory;
 pub mod metrics;
 pub mod pg;
 pub mod proxy;
