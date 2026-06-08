@@ -1195,6 +1195,7 @@ impl WriterRegistration {
                     // (run right after in the writer loop); always defer here.
                     core.pending_ready.push(PendingReady {
                         fingerprint,
+                        generation: merge.generation,
                         snapshot_lsn: merge.snapshot_lsn,
                         cached_bytes: merge.cached_bytes,
                         row_count: merge.row_count,
@@ -1228,7 +1229,15 @@ impl WriterRegistration {
         let entries = std::mem::take(&mut core.pending_ready);
         let mut still_waiting = Vec::new();
         for entry in entries {
-            if entry.snapshot_lsn <= applied_lsn {
+            if entry.snapshot_lsn > applied_lsn {
+                still_waiting.push(entry);
+                continue;
+            }
+            // Drop the parked entry without serving if the query was superseded
+            // (readmit bumped the generation), invalidated, or evicted while it
+            // waited — finalizing would mark a stale/superseded result Ready
+            // (PGC-250). The successor population has its own pending entry.
+            if core.population_is_current(entry.fingerprint, entry.generation) {
                 self.query_ready_finalize(
                     core,
                     entry.fingerprint,
@@ -1236,8 +1245,6 @@ impl WriterRegistration {
                     entry.row_count,
                 )
                 .await?;
-            } else {
-                still_waiting.push(entry);
             }
         }
         let remaining = !still_waiting.is_empty();

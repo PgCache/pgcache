@@ -242,9 +242,11 @@ impl WriterCdc {
                 .map_into_report::<CacheError>()?;
         }
         core.frame_buf.clear();
-        // Rolled-back deletes must not suppress population merges — the rows may
-        // still exist (PGC-250).
+        // Rolled-back deletes/truncates must not affect population merges — the
+        // rows may still exist (PGC-250). The recovery's own truncate re-adds the
+        // affected relations in `frame_recover`.
         core.frame_deleted_keys.clear();
+        core.frame_truncated_relations.clear();
         core.frame_state = FrameState::Recovering;
         Ok(())
     }
@@ -287,6 +289,10 @@ impl WriterCdc {
                 .await
                 .attach_loc("recover: invalidating affected relation")?;
         }
+        // Like an explicit TRUNCATE, abort in-flight populations over these
+        // relations whose snapshot predates the recovery (PGC-250); stamped with
+        // the commit LSN at CommitMark.
+        core.frame_truncated_relations.extend(oids.iter().copied());
         if let Some(truncate) = Self::truncate_sql_build(core, oids.into_iter()) {
             self.cdc_write_conn
                 .batch_execute(&format!("BEGIN; {truncate}; COMMIT"))
@@ -397,6 +403,7 @@ impl WriterCdc {
                 core.frame_buf.clear();
                 core.frame_chunk_flushed = false;
                 core.frame_deleted_keys.clear();
+                core.frame_truncated_relations.clear();
             }
             CdcCommand::TableRegister(table_metadata) => {
                 core.frame_relation_oids.insert(table_metadata.relation_oid);
@@ -508,6 +515,12 @@ impl WriterCdc {
                 let frame_deletes = std::mem::take(&mut core.frame_deleted_keys);
                 for (relation_oid, key) in frame_deletes {
                     core.population_deleted_keys.record(relation_oid, key, lsn);
+                }
+                // Raise the abort watermark for relations this frame truncated /
+                // recovered, so older-snapshot population merges abort (PGC-250).
+                let frame_truncated = std::mem::take(&mut core.frame_truncated_relations);
+                for relation_oid in frame_truncated {
+                    core.population_deleted_keys.abort_below(relation_oid, lsn);
                 }
                 // Frame is closed; flush maintenance that was deferred while it
                 // was open (it would have deadlocked on the frame's locks).
@@ -779,10 +792,10 @@ impl WriterCdc {
             core.cache_table_invalidate(*oid)
                 .await
                 .attach_loc("invalidating queries on truncate")?;
-            // A population reading this relation has a pre-truncate snapshot; its
-            // merge would resurrect truncated rows. Abort it so it repopulates
-            // (PGC-250).
-            core.population_deleted_keys.mark_aborted(*oid);
+            // A population reading this relation with a pre-truncate snapshot
+            // would resurrect truncated rows on merge. Raise its abort watermark
+            // to the truncate's commit LSN at CommitMark (PGC-250).
+            core.frame_truncated_relations.push(*oid);
         }
 
         Ok(())

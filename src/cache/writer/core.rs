@@ -184,12 +184,20 @@ pub struct WriterCore {
     /// frame's commit LSN (rolled-back frames clear it instead). Buffered because
     /// the commit LSN isn't known until the frame commits.
     pub(super) frame_deleted_keys: Vec<(u32, EcoString)>,
+    /// Relations bulk-invalidated by the in-progress frame (TRUNCATE, or 40P01
+    /// recovery), drained at `CommitMark` to raise their deleted-key abort
+    /// watermark to the commit LSN — same commit-LSN-deferral as
+    /// `frame_deleted_keys`.
+    pub(super) frame_truncated_relations: Vec<u32>,
 }
 
 /// A population merged into the cache but withheld from serving until the CDC
 /// apply watermark reaches `snapshot_lsn` (PGC-250 Slice B).
 pub(super) struct PendingReady {
     pub(super) fingerprint: u64,
+    /// Generation this population populated. Guards against finalizing a stale
+    /// parked entry after the query was readmitted (generation bumped) while gated.
+    pub(super) generation: u64,
     pub(super) snapshot_lsn: u64,
     pub(super) cached_bytes: usize,
     pub(super) row_count: u64,
@@ -237,7 +245,19 @@ impl WriterCore {
             watermark_nudge,
             last_applied_lsn: 0,
             frame_deleted_keys: Vec::new(),
+            frame_truncated_relations: Vec::new(),
         })
+    }
+
+    /// Whether the population identified by `(fingerprint, generation)` is still
+    /// the live, non-invalidated cached query — i.e. a parked merge/ready entry
+    /// hasn't been superseded by a readmit (generation bump), invalidated, or
+    /// evicted while it waited (PGC-250).
+    pub(super) fn population_is_current(&self, fingerprint: u64, generation: u64) -> bool {
+        self.cache
+            .cached_queries
+            .get1(&fingerprint)
+            .is_some_and(|q| q.generation == generation && !q.invalidated)
     }
 
     /// Buffer the frame's `BEGIN` on the first cache-table write (`Active →

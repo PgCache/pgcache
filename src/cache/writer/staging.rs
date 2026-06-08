@@ -68,9 +68,14 @@ struct DeletedKeyEntry {
     floors: HashMap<u64, u64>,
     /// Rendered PK tuple body (e.g. `42` or `'a','b'`) → commit LSN of the delete.
     keys: HashMap<EcoString, u64>,
-    /// Set once `keys` exceeds the cap; keys are dropped and merges abort until
-    /// the last in-flight population leaves.
+    /// Set once `keys` exceeds the cap; keys are dropped and *every* merge over
+    /// the relation aborts (keys genuinely lost) until the last population leaves.
     overflowed: bool,
+    /// Highest LSN of a bulk invalidation (TRUNCATE, 40P01 recovery) over this
+    /// relation. A merge whose snapshot predates it would resurrect rows the
+    /// event removed, so it aborts; a population that snapshotted at/after it is
+    /// unaffected — so unlike `overflowed`, this self-clears for fresh snapshots.
+    aborted_below: u64,
 }
 
 impl DeletedKeyEntry {
@@ -84,13 +89,26 @@ impl DeletedKeyEntry {
         self.keys.retain(|_, lsn| *lsn > min_floor);
     }
 
-    /// Drop retained keys and abort every merge over this relation until the
-    /// last in-flight population leaves — for cap overflow (keys lost) or a
-    /// TRUNCATE (staged snapshots invalidated).
+    /// Cap overflow: keys are lost, so every merge over this relation must abort
+    /// until the last in-flight population leaves.
     fn disable(&mut self) {
         self.keys.clear();
         self.keys.shrink_to_fit();
         self.overflowed = true;
+    }
+
+    /// A bulk invalidation committed at `lsn` emptied/dropped rows; raise the
+    /// abort watermark and drop now-stale keys (anything `<= lsn` is below the
+    /// truncate and irrelevant to surviving post-event snapshots).
+    fn abort_below(&mut self, lsn: u64) {
+        self.aborted_below = self.aborted_below.max(lsn);
+        self.keys.retain(|_, key_lsn| *key_lsn > lsn);
+    }
+
+    /// Whether a merge whose snapshot is `snapshot_lsn` must abort: keys were
+    /// lost (overflow), or the snapshot predates a bulk invalidation.
+    fn should_abort(&self, snapshot_lsn: u64) -> bool {
+        self.overflowed || snapshot_lsn < self.aborted_below
     }
 }
 
@@ -160,21 +178,24 @@ impl PopulationDeletedKeys {
         self.relations.contains_key(&relation_oid)
     }
 
-    /// Abort in-flight population merges over `relation_oid` (e.g. on TRUNCATE):
-    /// their staged snapshot predates the event and would resurrect rows the
-    /// event removed, so the queries must repopulate from a fresh snapshot.
-    /// No-op if no population is recording the relation. Reuses the overflow
-    /// flag — same outcome (merge aborts until the last population leaves).
-    pub(super) fn mark_aborted(&mut self, relation_oid: u32) {
+    /// Raise the abort watermark for `relation_oid` to `lsn` — a bulk
+    /// invalidation (TRUNCATE / 40P01 recovery) committed there. Merges whose
+    /// snapshot predates `lsn` abort and repopulate; a population that
+    /// snapshotted at/after `lsn` is unaffected (it sees the empty table), so
+    /// this self-clears rather than blanket-aborting like overflow. No-op if no
+    /// population is recording the relation.
+    pub(super) fn abort_below(&mut self, relation_oid: u32, lsn: u64) {
         if let Some(entry) = self.relations.get_mut(&relation_oid) {
-            entry.disable();
+            entry.abort_below(lsn);
         }
     }
 
-    fn overflowed(&self, relation_oid: u32) -> bool {
+    /// Whether a merge over `relation_oid` with snapshot `snapshot_lsn` must
+    /// abort (cap overflow, or snapshot predates a bulk invalidation).
+    fn should_abort(&self, relation_oid: u32, snapshot_lsn: u64) -> bool {
         self.relations
             .get(&relation_oid)
-            .is_some_and(|e| e.overflowed)
+            .is_some_and(|e| e.should_abort(snapshot_lsn))
     }
 
     /// Build the `(<pk cols>) NOT IN (...)` predicate excluding recorded deletes,
@@ -299,13 +320,13 @@ impl WriterCore {
         &mut self,
         merge: &PopulationMerge,
     ) -> CacheResult<MergeOutcome> {
-        // If any relation's set overflowed we lost deleted keys and can't
-        // guarantee no resurrected rows — abort and let the query repopulate.
-        if merge
-            .staged
-            .iter()
-            .any(|(oid, _)| self.population_deleted_keys.overflowed(*oid))
-        {
+        // Abort if any relation lost keys (overflow) or was bulk-invalidated
+        // (TRUNCATE / recovery) at an LSN past this population's snapshot —
+        // merging would resurrect removed rows. Let the query repopulate.
+        if merge.staged.iter().any(|(oid, _)| {
+            self.population_deleted_keys
+                .should_abort(*oid, merge.snapshot_lsn)
+        }) {
             for (_, staging) in &merge.staged {
                 self.staging_drop(staging).await;
             }
@@ -401,15 +422,48 @@ mod tests {
         assert!(keys.filter_predicate(REL, "(id)").is_none());
     }
 
-    /// Exceeding the cap drops keys and disables filtering (the merge aborts).
+    /// Exceeding the cap drops keys and aborts every merge over the relation.
     #[test]
-    fn overflow_disables_filtering() {
+    fn overflow_aborts_and_disables_filtering() {
         let mut keys = PopulationDeletedKeys::default();
         keys.activate(1, &[REL], 0);
         for i in 0..=POPULATION_DELETED_KEY_CAP {
             record(&mut keys, &i.to_string(), 1);
         }
-        assert!(keys.overflowed(REL));
+        // Overflow aborts regardless of snapshot LSN, and there's no filter.
+        assert!(keys.should_abort(REL, u64::MAX));
         assert!(keys.filter_predicate(REL, "(id)").is_none());
+    }
+
+    /// A bulk invalidation aborts only merges whose snapshot predates it; a
+    /// population that snapshotted at/after it is unaffected (self-clearing),
+    /// and now-stale keys are pruned.
+    #[test]
+    fn abort_below_aborts_only_older_snapshots() {
+        let mut keys = PopulationDeletedKeys::default();
+        keys.activate(1, &[REL], 100);
+        record(&mut keys, "5", 150);
+        record(&mut keys, "25", 250);
+
+        keys.abort_below(REL, 200); // e.g. a TRUNCATE committed at LSN 200
+
+        // A population that read before the truncate must abort; one that read
+        // at/after it must not.
+        assert!(keys.should_abort(REL, 150), "pre-truncate snapshot aborts");
+        assert!(
+            !keys.should_abort(REL, 200),
+            "snapshot at the truncate is fine"
+        );
+        assert!(
+            !keys.should_abort(REL, 300),
+            "post-truncate snapshot is fine"
+        );
+
+        // Keys at/below the truncate LSN are pruned; later ones survive.
+        let filter = keys.filter_predicate(REL, "(id)").expect("filter present");
+        assert!(
+            filter.contains("(25)") && !filter.contains("(5)"),
+            "filter: {filter}"
+        );
     }
 }
