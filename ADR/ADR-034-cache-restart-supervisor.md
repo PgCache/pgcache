@@ -1,7 +1,7 @@
 # ADR-034: Cache Restart Supervisor
 
 ## Status
-Proposed (depends on ADR-033)
+Accepted (depends on ADR-033)
 
 ## Context
 ADR-033 collapsed serving onto a shared runtime and, in doing so, left only the writer and CDC consumer as dedicated threads — making the cache subsystem (writer + CDC threads plus the worker and coalesce-drain tasks) a single restartable unit. That ADR explicitly deferred the restart model: the probe did not respawn on backend failure. A fatal error anywhere in the subsystem cancelled it and connections degraded to origin-forward **permanently**, until the whole process was restarted.

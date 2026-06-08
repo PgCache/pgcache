@@ -1,7 +1,7 @@
 # ADR-033: Unified Serving Runtime
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 pgcache's serving path historically ran on several dedicated single-threaded executors: N connection threads, a central cache coordinator, and a cache worker — each its own `current_thread` Tokio runtime with a `LocalSet`. The stated reason was `!Send` state: pooled connections and cache structures were assumed to require thread-locality. A consequence is that a single cache hit hops across three runtimes (connection → coordinator → worker → connection), and each hop is a cross-runtime wake — an eventfd/condvar unpark plus a context switch. Profiling on the demo box attributed ~14% of process CPU to this handoff rather than useful work.
