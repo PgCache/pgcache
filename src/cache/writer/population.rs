@@ -34,6 +34,25 @@ const POPULATION_INSERT_BATCH_SIZE: usize = 200;
 const POPULATION_DEADLOCK_MAX_RETRIES: u32 = 5;
 const POPULATION_DEADLOCK_BACKOFF_BASE: Duration = Duration::from_millis(20);
 
+/// Test-only population delay (fault-injection feature, PGC-250). Sleeps after
+/// the origin snapshot has been read but before the rows are inserted into the
+/// cache, so a test can apply a CDC delete / update-out-of-predicate to the
+/// just-read rows during the gap and deterministically provoke the
+/// population-vs-CDC ordering hazard (ghost rows). Compiled out without the
+/// feature.
+#[cfg(feature = "fault-injection")]
+async fn fault_population_delay() {
+    if let Some(ms) = std::env::var("PGCACHE_FAULT_POPULATION_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        sleep(Duration::from_millis(ms)).await;
+    }
+}
+#[cfg(not(feature = "fault-injection"))]
+async fn fault_population_delay() {}
+
 /// Persistent population worker that processes work items from a channel.
 /// Each worker owns its own cache database connection.
 pub async fn population_worker(
@@ -369,6 +388,10 @@ async fn population_stream(
     };
 
     let insert = insert_statement_build(table, &row_description);
+
+    // Snapshot is fixed at query execution (RowDescription received above);
+    // rows are not yet in the cache. See PGC-250.
+    fault_population_delay().await;
 
     let mut cached_bytes: usize = 0;
     let mut row_count: u64 = 0;
