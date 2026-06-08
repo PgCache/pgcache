@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ecow::EcoString;
 use postgres_protocol::escape;
 use rootcause::prelude::ResultExt;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -17,7 +19,10 @@ use crate::query::ast::Deparse;
 use crate::query::resolved::{ResolvedSelectNode, ResolvedTableNode};
 use crate::query::transform::resolved_select_node_replace;
 
-use super::super::{CacheError, CacheResult, MapIntoReport, messages::QueryCommand};
+use super::super::{
+    CacheError, CacheResult, MapIntoReport,
+    messages::{PopulationMerge, QueryCommand},
+};
 use super::PopulationWork;
 use super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
 
@@ -117,19 +122,35 @@ pub async fn population_worker(
         idle_start = Instant::now();
 
         match result {
-            Ok((cached_bytes, row_count)) => {
+            Ok((cached_bytes, row_count, staged)) => {
+                // Hand the staged snapshot to the writer, which merges it into
+                // the shared cache table when no CDC frame is open and then
+                // marks the query Ready (PGC-250).
                 if query_tx
-                    .send(QueryCommand::Ready {
+                    .send(QueryCommand::Merge(PopulationMerge {
                         fingerprint: work.fingerprint,
+                        generation: work.generation,
+                        staged,
                         cached_bytes,
                         row_count,
-                    })
+                    }))
                     .is_err()
                 {
-                    error!("population worker {id}: failed to send QueryReady");
+                    error!("population worker {id}: failed to send QueryMerge");
                 }
             }
             Err(e) => {
+                // Drop any staging tables this population created — the writer
+                // only drops staging after a successful merge (PGC-250).
+                // Best-effort; a leak is swept by the next cache reset.
+                for table in &work.table_metadata {
+                    let staging =
+                        staging_table_name(work.fingerprint, work.generation, table.relation_oid);
+                    let _ = db_cache
+                        .batch_execute(&format!("DROP TABLE IF EXISTS pgcache_stage.{staging}"))
+                        .await;
+                }
+
                 // Log the bare SQLSTATE, not the error chain: the chain walker
                 // leaks the offending SQL via the PG DETAIL field (PGC-133).
                 let sqlstate = cache_error_sqlstate(e.current_context());
@@ -168,20 +189,19 @@ async fn population_task(
     max_limit: Option<u64>,
     db_origin: Rc<Client>,
     db_cache: &Client,
-) -> CacheResult<(usize, u64)> {
-    // Set generation for tracking triggers. Simple Query (one round-trip)
-    // rather than `execute` (Extended Query, Parse+Bind+Execute+Sync) — SET
-    // doesn't benefit from prepare, and the single-round-trip path more
-    // honestly reflects the trivial work being done.
-    let set_generation_sql = format!("SET mem.query_generation = {generation}");
-    db_cache
-        .simple_query(&set_generation_sql)
-        .await
-        .map_into_report::<CacheError>()?;
-
+) -> CacheResult<(usize, u64, Vec<(u32, EcoString)>)> {
+    // Generation stamping no longer happens here — it moves to the writer's
+    // merge, which inserts the staged rows into the tracked shared table
+    // (PGC-250).
     let mut total_bytes: usize = 0;
     let mut total_rows: u64 = 0;
     let task_start = Instant::now();
+
+    // Relations whose staging table has been (re)created this attempt: the first
+    // branch touching a relation starts it fresh; later branches append.
+    // Reset each attempt so a deadlock retry starts clean.
+    let mut reset: HashSet<u32> = HashSet::new();
+    let mut staged: Vec<(u32, EcoString)> = Vec::new();
 
     // Process each SELECT branch independently
     // For simple SELECT queries, there's just one branch
@@ -198,10 +218,14 @@ async fn population_task(
                     name: Some(table_node.name.to_string()),
                 })?;
 
+            let staging = staging_table_name(fingerprint, generation, table.relation_oid);
+            let fresh = reset.insert(table.relation_oid);
+
             let stream_start = Instant::now();
-            let (bytes, rows) =
-                population_stream(&db_origin, db_cache, table, table_node, branch, max_limit)
-                    .await?;
+            let (bytes, rows) = population_stream(
+                &db_origin, db_cache, table, table_node, branch, max_limit, &staging, fresh,
+            )
+            .await?;
             let stream_elapsed = stream_start.elapsed();
             crate::metrics::handles()
                 .reg
@@ -211,6 +235,10 @@ async fn population_task(
             total_bytes += bytes;
             total_rows += rows;
 
+            if fresh {
+                staged.push((table.relation_oid, staging));
+            }
+
             trace!(
                 "population table {}.{} elapsed={:?} bytes={bytes} rows={rows}",
                 table.schema, table.name, stream_elapsed
@@ -219,18 +247,18 @@ async fn population_task(
     }
 
     let task_elapsed = task_start.elapsed();
-
-    // Reset generation — same Simple Query rationale as the forward SET.
-    db_cache
-        .simple_query("SET mem.query_generation = 0")
-        .await
-        .map_into_report::<CacheError>()?;
-
     trace!(
         "population complete for query {fingerprint}, total_time={:?} bytes={total_bytes} rows={total_rows}",
         task_elapsed
     );
-    Ok((total_bytes, total_rows))
+    Ok((total_bytes, total_rows, staged))
+}
+
+/// Deterministic name of a population's per-relation staging table in
+/// `pgcache_stage`. Stable across the worker (loads it) and the writer (merges +
+/// drops it), and across deadlock retries (each attempt recreates it fresh).
+fn staging_table_name(fingerprint: u64, generation: u64, relation_oid: u32) -> EcoString {
+    EcoString::from(format!("stage_{fingerprint}_{generation}_{relation_oid}"))
 }
 
 /// Pre-computed parts of the batched INSERT...ON CONFLICT statement.
@@ -242,23 +270,21 @@ struct InsertStatement {
     num_columns: usize,
 }
 
-/// Build the INSERT statement template from the row description and table metadata.
+/// Build the staging INSERT template from the row description and table metadata.
 ///
-/// Pre-computes column lists, conflict clause, and primary key positions so that
-/// the streaming loop only needs to format value tuples.
+/// Targets the population's per-relation staging table in `pgcache_stage`. No
+/// `ON CONFLICT`: staging is a fresh per-population table, and re-stamping
+/// pre-existing rows with the query generation happens in the writer's merge,
+/// not here (PGC-250). `pkey_positions` is still computed to drop NULL-padded
+/// phantom rows from outer joins.
 fn insert_statement_build(
     table: &TableMetadata,
     row_description: &Arc<[SimpleColumn]>,
+    staging: &str,
 ) -> InsertStatement {
     let columns: Vec<String> = row_description
         .iter()
         .map(|c| format!("\"{}\"", c.name()))
-        .collect();
-
-    let pkey_columns: Vec<String> = table
-        .primary_key_columns
-        .iter()
-        .map(|c| format!("\"{c}\""))
         .collect();
 
     let pkey_positions: Vec<usize> = table
@@ -268,30 +294,10 @@ fn insert_statement_build(
         .collect();
 
     let columns_joined = columns.join(",");
-    let pkey_joined = pkey_columns.join(",");
-
-    // On conflict we don't overwrite existing rows: CDC keeps their values
-    // consistent with origin, so re-writing non-PK columns from EXCLUDED would
-    // be wasted work. The UPSERT's only job here is to fire
-    // `pgcache_track_modification` (an AFTER UPDATE trigger) so pre-existing
-    // rows get linked to this population's query generation. Writing each PK
-    // column to its own EXCLUDED value is a data no-op (the arbiter guarantees
-    // they're equal) that still fires the trigger; `DO NOTHING` would skip it
-    // and leave the row unlinked from this generation. Unqualified `<pk> =
-    // <pk>` on the RHS is ambiguous per PG 42702 — EXCLUDED qualifies it.
-    let self_assign = pkey_columns
-        .iter()
-        .map(|c| format!("{c} = EXCLUDED.{c}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let suffix = format!(" ON CONFLICT ({pkey_joined}) DO UPDATE SET {self_assign}");
 
     InsertStatement {
-        prefix: format!(
-            "INSERT INTO \"{}\".\"{}\"({columns_joined}) VALUES ",
-            table.schema, table.name
-        ),
-        suffix,
+        prefix: format!("INSERT INTO pgcache_stage.{staging}({columns_joined}) VALUES "),
+        suffix: String::new(),
         pkey_positions,
         num_columns: row_description.len(),
     }
@@ -345,12 +351,16 @@ fn row_to_tuple(
     Some((pk_key, tuple_buf.clone(), row_bytes))
 }
 
-/// Fetch data from origin and stream it into the cache database in batches.
+/// Fetch data from origin and stream it into the relation's staging table in
+/// batches (PGC-250).
 ///
-/// Streams rows from origin via SimpleQueryStream, batching INSERT...ON CONFLICT
-/// statements in groups of POPULATION_INSERT_BATCH_SIZE rows. This avoids materializing
-/// the entire result set in memory.
+/// Streams rows from origin via SimpleQueryStream, batching INSERTs into
+/// `pgcache_stage.<staging>` in groups of POPULATION_INSERT_BATCH_SIZE rows.
+/// This avoids materializing the entire result set in memory. When `fresh` (the
+/// first branch to touch this relation this attempt), the staging table is
+/// (re)created from the shared cache table's shape; later branches append.
 /// Returns `(cached_bytes, row_count)`.
+#[allow(clippy::too_many_arguments)]
 async fn population_stream(
     db_origin: &Client,
     db_cache: &Client,
@@ -358,7 +368,23 @@ async fn population_stream(
     table_node: &ResolvedTableNode,
     branch: &ResolvedSelectNode,
     max_limit: Option<u64>,
+    staging: &str,
+    fresh: bool,
 ) -> CacheResult<(usize, u64)> {
+    // Start this relation's staging table clean (drop a leftover from a prior
+    // attempt, then mirror the shared cache table's columns).
+    if fresh {
+        let create = format!(
+            "DROP TABLE IF EXISTS pgcache_stage.{staging}; \
+             CREATE TABLE pgcache_stage.{staging} (LIKE {}.{})",
+            table.schema, table.name
+        );
+        db_cache
+            .batch_execute(&create)
+            .await
+            .map_into_report::<CacheError>()?;
+    }
+
     // Build the SELECT query
     let select_columns = table.resolved_select_columns(table_node.alias.as_deref());
     let new_ast = resolved_select_node_replace(branch, select_columns);
@@ -387,7 +413,7 @@ async fn population_stream(
         None => return Ok((0, 0)),
     };
 
-    let insert = insert_statement_build(table, &row_description);
+    let insert = insert_statement_build(table, &row_description, staging);
 
     // Snapshot is fixed at query execution (RowDescription received above);
     // rows are not yet in the cache. See PGC-250.

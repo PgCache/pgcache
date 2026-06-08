@@ -4,6 +4,7 @@ mod deadlock;
 mod mv;
 mod population;
 mod registration;
+mod staging;
 mod table;
 
 pub use self::core::writer_run;

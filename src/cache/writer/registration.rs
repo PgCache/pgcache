@@ -41,6 +41,7 @@ use super::super::{
 };
 use super::core::WriterCore;
 use super::population::population_worker;
+use super::staging::MergeOutcome;
 use crate::pg;
 
 /// Minimum number of persistent population workers.
@@ -250,7 +251,7 @@ impl WriterRegistration {
         let reg = &crate::metrics::handles().reg;
         let cmd_handle = match &cmd {
             QueryCommand::Register { .. } => &reg.cmd_register,
-            QueryCommand::Ready { .. } => &reg.cmd_ready,
+            QueryCommand::Ready { .. } | QueryCommand::Merge(_) => &reg.cmd_ready,
             QueryCommand::Failed { .. } => &reg.cmd_failed,
             QueryCommand::LimitBump { .. } => &reg.cmd_limit_bump,
             QueryCommand::Readmit { .. } => &reg.cmd_readmit,
@@ -312,6 +313,12 @@ impl WriterRegistration {
                 core.mv_pinned_bootstrap(fingerprint);
                 core.cache.current_size = core.cache_size_load().await?;
                 core.eviction_run().await?;
+            }
+            QueryCommand::Merge(merge) => {
+                // Queue the merge; the writer loop drains it once no CDC frame
+                // is open (PGC-250). Running it here could be mid-frame, racing
+                // the CDC writer's frame txn on the shared cache table.
+                core.pending_merges.push(merge);
             }
             QueryCommand::Failed { fingerprint } => {
                 self.query_failed_cleanup(core, fingerprint);
@@ -518,16 +525,30 @@ impl WriterRegistration {
     }
 
     /// Dispatch population work to next worker using round-robin scheduling.
-    fn populate_work_dispatch(&mut self, work: PopulationWork) -> CacheResult<()> {
+    fn populate_work_dispatch(
+        &mut self,
+        core: &mut WriterCore,
+        work: PopulationWork,
+    ) -> CacheResult<()> {
+        let fingerprint = work.fingerprint;
+        // Begin recording CDC deletes for this population's relations *before*
+        // the worker reads its snapshot (PGC-250). Released at merge or on
+        // failure.
+        let relation_oids: Vec<u32> = work.table_metadata.iter().map(|t| t.relation_oid).collect();
+        core.population_deleted_keys
+            .activate(fingerprint, &relation_oids);
+
         let idx = self.populate_next;
         self.populate_next = (self.populate_next + 1) % self.populate_txs.len();
 
         let Some(tx) = self.populate_txs.get(idx) else {
+            core.population_deleted_keys.deactivate(fingerprint);
             return Err(CacheError::Other.into());
         };
 
         if tx.send(work).is_err() {
             error!("population worker {idx} channel closed");
+            core.population_deleted_keys.deactivate(fingerprint);
         }
 
         Ok(())
@@ -992,7 +1013,7 @@ impl WriterRegistration {
                             &fallback_resolved,
                             fallback_max_limit,
                         );
-                        self.populate_work_dispatch(work)?;
+                        self.populate_work_dispatch(core, work)?;
                         trace!("subsumption fallback: population queued {fingerprint}");
                     }
                     return Ok(());
@@ -1051,7 +1072,7 @@ impl WriterRegistration {
             &resolution.resolved,
             resolution.max_limit,
         );
-        self.populate_work_dispatch(work)?;
+        self.populate_work_dispatch(core, work)?;
         crate::metrics::handles()
             .reg
             .register_populate_dispatch
@@ -1106,7 +1127,7 @@ impl WriterRegistration {
 
         let work =
             self.population_work_build(core, fingerprint, new_generation, &resolved, max_limit);
-        self.populate_work_dispatch(work)?;
+        self.populate_work_dispatch(core, work)?;
         trace!("readmission population queued for query {fingerprint}");
         Ok(())
     }
@@ -1164,6 +1185,40 @@ impl WriterRegistration {
         }
     }
 
+    /// Drain queued population merges (PGC-250). Called from the writer loop
+    /// only when no CDC frame is open, so the merge never races the CDC frame
+    /// txn on the shared cache table. Each merge applies staging → cache (with
+    /// the deleted-key filter) and then marks the query Ready, or fails it if
+    /// the deleted-key set overflowed / the merge errored.
+    pub(super) async fn pending_merges_flush(&self, core: &mut WriterCore) -> CacheResult<()> {
+        let merges = std::mem::take(&mut core.pending_merges);
+        for merge in merges {
+            let fingerprint = merge.fingerprint;
+            match core.population_merge_apply(&merge).await {
+                Ok(MergeOutcome::Merged) => {
+                    core.population_deleted_keys.deactivate(fingerprint);
+                    self.query_ready_mark(core, fingerprint, merge.cached_bytes, merge.row_count);
+                    core.mv_pinned_bootstrap(fingerprint);
+                    core.cache.current_size = core.cache_size_load().await?;
+                    core.eviction_run().await?;
+                }
+                Ok(MergeOutcome::Aborted) => {
+                    debug!("population merge aborted (deleted-key overflow) {fingerprint}");
+                    // query_failed_cleanup deactivates the set.
+                    self.query_failed_cleanup(core, fingerprint);
+                }
+                Err(e) => {
+                    error!(
+                        "population merge failed for {fingerprint}: {}",
+                        error_chain_format(e.current_context()),
+                    );
+                    self.query_failed_cleanup(core, fingerprint);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Clean up after a failed register/populate/readmit/limit-bump.
     ///
     /// Always clears the dispatch-owned `state_view` entry and drains any
@@ -1174,6 +1229,10 @@ impl WriterRegistration {
     /// that fingerprint would coalesce into `waiting` and hang.
     pub fn query_failed_cleanup(&self, core: &mut WriterCore, fingerprint: u64) {
         trace!("query_failed_cleanup {fingerprint}");
+
+        // Release any in-flight population deleted-key tracking (PGC-250). No-op
+        // if this fingerprint never dispatched a population.
+        core.population_deleted_keys.deactivate(fingerprint);
 
         match core.cache.cached_queries.remove1(&fingerprint) {
             Some(query) => {
@@ -1276,7 +1335,7 @@ impl WriterRegistration {
 
         let work =
             self.population_work_build(core, fingerprint, new_generation, &resolved, new_max_limit);
-        self.populate_work_dispatch(work)?;
+        self.populate_work_dispatch(core, work)?;
         trace!("limit bump population queued for query {fingerprint}");
         Ok(())
     }

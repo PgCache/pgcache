@@ -29,6 +29,7 @@ use super::super::types::{
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::core::{FRAME_BUF_CAPACITY, FrameState, WriterCore};
 use super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
+use super::staging::pk_body_render;
 use crate::pg;
 use crate::result::error_chain_format;
 
@@ -556,7 +557,14 @@ impl WriterCdc {
                     oid: Some(relation_oid),
                     name: None,
                 })?;
+        // Record the removed PK for any in-flight population over this relation
+        // so its merge doesn't resurrect the row (PGC-250). No-op when nothing
+        // is populating this relation.
+        let deleted_key = pk_body_render(table_metadata, row_data);
         self.cache_delete_into(&mut core.frame_buf, table_metadata, row_data)?;
+        if let Some(key) = deleted_key {
+            core.population_deleted_keys.record(relation_oid, key);
+        }
         self.frame_write_finish(core).await
     }
 

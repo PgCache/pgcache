@@ -296,8 +296,25 @@ impl std::fmt::Debug for QueryCommand {
                 .debug_struct("MvBuild")
                 .field("fingerprint", fingerprint)
                 .finish(),
+            Self::Merge(m) => f
+                .debug_struct("Merge")
+                .field("fingerprint", &m.fingerprint)
+                .field("generation", &m.generation)
+                .field("relations", &m.staged.len())
+                .finish_non_exhaustive(),
         }
     }
+}
+
+/// Payload for `QueryCommand::Merge`: a population staged its snapshot and the
+/// writer must merge each relation's staging table into the shared cache table.
+pub struct PopulationMerge {
+    pub fingerprint: u64,
+    pub generation: u64,
+    /// `(relation_oid, staging table name in pgcache_stage)` per relation read.
+    pub staged: Vec<(u32, EcoString)>,
+    pub cached_bytes: usize,
+    pub row_count: u64,
 }
 
 /// Controls what the writer does when a query is not subsumed.
@@ -346,6 +363,12 @@ pub enum QueryCommand {
     /// Readmit a pinned query after CDC invalidation.
     /// Deferred via the writer's internal channel to avoid inline population during CDC processing.
     Readmit { fingerprint: u64 },
+
+    /// Population staged its origin snapshot into `pgcache_stage`. The writer
+    /// merges it into the shared cache table(s) — filtering rows CDC removed
+    /// during the population — when no CDC frame is open, then marks the query
+    /// Ready (PGC-250).
+    Merge(PopulationMerge),
 
     /// Build (or rebuild) the materialized result for a cached query. Sent by
     /// the dispatch when it observes `mv_state == Pending { .. }` on a cache

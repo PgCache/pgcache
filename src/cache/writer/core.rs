@@ -22,7 +22,7 @@ use crate::settings::{CachePolicy, Settings};
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::{CdcCommand, QueryCommand, WriterNotify},
+    messages::{CdcCommand, PopulationMerge, QueryCommand, WriterNotify},
     mv::{MvMeta, ShapeGate},
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
@@ -30,6 +30,7 @@ use super::super::{
 };
 use super::cdc::WriterCdc;
 use super::registration::WriterRegistration;
+use super::staging::PopulationDeletedKeys;
 
 /// Deterministic fault injection for the restart supervisor: kill the writer on
 /// a sentinel CDC insert so a test can drive a real subsystem death → rebuild.
@@ -156,6 +157,14 @@ pub struct WriterCore {
     /// `cdc_write_conn` this frame (so the `BEGIN` is live on the server). Drives
     /// whether `40P01` recovery must issue an explicit `ROLLBACK`.
     pub(super) frame_chunk_flushed: bool,
+    /// Keys CDC removed while populations are in flight, so a population merge
+    /// doesn't resurrect them (PGC-250). Activated at dispatch, recorded at
+    /// `frame_cache_delete`, consulted/cleared at merge.
+    pub(super) population_deleted_keys: PopulationDeletedKeys,
+    /// Population merges awaiting a quiescent (frame-Idle) writer. Drained by
+    /// `pending_merges_flush` after each command so a merge never runs while a
+    /// CDC frame holds locks on the shared cache table.
+    pub(super) pending_merges: Vec<PopulationMerge>,
 }
 
 impl WriterCore {
@@ -193,6 +202,8 @@ impl WriterCore {
             purge_pending: false,
             frame_buf: String::with_capacity(FRAME_BUF_CAPACITY),
             frame_chunk_flushed: false,
+            population_deleted_keys: PopulationDeletedKeys::default(),
+            pending_merges: Vec::new(),
         })
     }
 
@@ -1116,6 +1127,20 @@ pub fn writer_run(
                                 core.status_respond(req, writer_cdc.last_applied_lsn).await;
                             }
                         }
+                    }
+
+                    // Drain population merges that are waiting for a quiescent
+                    // writer. Runs only when no CDC frame is open, so the merge
+                    // (on db_cache) never races the CDC writer's frame txn on the
+                    // shared cache table (PGC-250).
+                    if !core.pending_merges.is_empty()
+                        && core.frame_state == FrameState::Idle
+                        && let Err(e) = registration.pending_merges_flush(&mut core).await
+                    {
+                        error!(
+                            "population merge flush failed: {}",
+                            error_chain_format(e.current_context()),
+                        );
                     }
 
                     // Channel depths are reported as f64 gauges; queue sizes never approach 2^53.

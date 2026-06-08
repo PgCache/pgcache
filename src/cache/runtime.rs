@@ -258,6 +258,18 @@ fn cache_database_reset(settings: &Settings) -> CacheResult<()> {
             .map_into_report::<CacheError>()
             .attach_loc("creating pgcache_mv schema")?;
 
+        // Dedicated schema for population staging tables (PGC-250). A population
+        // streams its origin snapshot into pgcache_stage.stage_<fp>_<gen>_<oid>,
+        // then the writer merges it into the shared cache table (filtering rows
+        // CDC removed during the population) when no CDC frame is open. Regular
+        // tables (not temp) so the writer's connection can read what a worker
+        // connection loaded. Swept by the DROP DATABASE on reset, like pgcache_mv.
+        cache_client
+            .execute("CREATE SCHEMA IF NOT EXISTS pgcache_stage", &[])
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("creating pgcache_stage schema")?;
+
         Ok(())
     })
 }

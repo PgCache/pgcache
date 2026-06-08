@@ -9,8 +9,8 @@
 //!
 //! These tests use the `PGCACHE_FAULT_POPULATION_DELAY_MS` fault hook (feature
 //! `fault-injection`) to sleep between population's snapshot read and its cache
-//! insert, making the race deterministic. They are expected to FAIL until the
-//! consistency work lands.
+//! insert, making the race deterministic. The Slice-A staging + deleted-key
+//! merge (PGC-250) is what keeps these green.
 //!
 //! Entirely fault-dependent: without the feature the population delay compiles
 //! out, the race can't be provoked, and the tests would pass inertly — so gate
@@ -60,7 +60,11 @@ async fn test_delete_during_population_no_ghost_row() -> Result<(), Error> {
     let initial = ctx
         .simple_query("select id, v from ghost_del where id = 1")
         .await?;
-    assert_eq!(row_count(&initial), 1, "row exists when population reads it");
+    assert_eq!(
+        row_count(&initial),
+        1,
+        "row exists when population reads it"
+    );
 
     // Population has its snapshot; delete the row at origin and let CDC apply
     // the delete before population reaches its insert.
