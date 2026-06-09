@@ -43,6 +43,12 @@ pub struct Cli {
     #[arg(long, default_value_t = 8)]
     pub snapshot_conns: usize,
 
+    /// Groups a single version-bump statement touches, in one transaction
+    /// (1 = single-group). N > 1 produces fat CDC frames (one source txn → N row
+    /// changes), the K dimension that set-based per-frame eval (PGC-241) targets.
+    #[arg(long, default_value_t = 1)]
+    pub bump_groups: usize,
+
     /// Number of normal (single-bump) groups, seeded at version 0.
     #[arg(long, default_value_t = 50)]
     pub groups: i32,

@@ -104,6 +104,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             scenario.clone(),
             seed ^ (0x1000 + i as u64),
             cli.write_think_ms,
+            cli.bump_groups,
             deadline,
         )));
     }

@@ -173,14 +173,16 @@ impl Scenario {
         }
     }
 
-    /// Version bump, `$1 = group_id`.
+    /// Version bump, `$1 = group_id[]` (one group, or N for a fat frame). One
+    /// statement / one transaction regardless of N, so it stays atomic per
+    /// group and the invariant holds.
     pub fn version_bump(&self) -> String {
         match self.variant {
             Variant::SingleTable => {
-                format!("UPDATE {TABLE} SET version = version + 1 WHERE group_id = $1")
+                format!("UPDATE {TABLE} SET version = version + 1 WHERE group_id = ANY($1)")
             }
             Variant::TwoTable => {
-                format!("UPDATE {GROUPS_TABLE} SET version = version + 1 WHERE group_id = $1")
+                format!("UPDATE {GROUPS_TABLE} SET version = version + 1 WHERE group_id = ANY($1)")
             }
         }
     }

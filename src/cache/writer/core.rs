@@ -78,6 +78,36 @@ pub(crate) mod fault {
 /// threshold at which a frame's writes are chunk-flushed to bound memory.
 pub(super) const FRAME_BUF_CAPACITY: usize = 256 * 1024;
 
+/// Maximum buffered row events per frame before a mid-frame partial replay —
+/// bounds frame memory the way `FRAME_BUF_CAPACITY` bounds `frame_buf`.
+/// Replaying a prefix early is exactly the per-arrival behavior, so ordering
+/// and results are unchanged.
+pub(super) const FRAME_ROWS_CAPACITY: usize = 4096;
+
+/// One buffered row event of the in-progress CDC frame (PGC-241). Events are
+/// collected at arrival and replayed at the `CommitMark` flush boundary, in
+/// arrival order — order is what makes the deferral pure: same-key sequences
+/// (an INSERT then DELETE of one PK) and TRUNCATE-vs-row interleavings emit
+/// exactly as per-arrival handling did.
+pub(super) enum FrameRowEvent {
+    Insert {
+        relation_oid: u32,
+        row_data: Vec<Option<String>>,
+    },
+    Update {
+        relation_oid: u32,
+        key_data: Vec<Option<String>>,
+        new_row_data: Vec<Option<String>>,
+    },
+    Delete {
+        relation_oid: u32,
+        row_data: Vec<Option<String>>,
+    },
+    Truncate {
+        relation_oids: Vec<u32>,
+    },
+}
+
 /// CDC source-txn frame state on `WriterCdc`'s write connection (PGC-108).
 /// `Idle →Begin Active →write TxnOpen →Commit Idle`; `* →40P01 Recovering`.
 /// Writes are buffered (PGC-228): a `BEGIN` and the cache-table statements
@@ -154,6 +184,11 @@ pub struct WriterCore {
     /// `cdc_write_conn` writes — invalidations/purges run out-of-band on
     /// `db_cache`. Reused across frames; never reallocates in steady state.
     pub(super) frame_buf: String,
+    /// The in-progress frame's row events, collected at arrival and replayed in
+    /// arrival order at the `CommitMark` flush (PGC-241: collect → evaluate →
+    /// emit at the flush boundary; partial replay at `FRAME_ROWS_CAPACITY`).
+    /// Buffer reused across frames.
+    pub(super) frame_rows: Vec<FrameRowEvent>,
     /// Whether a chunk of `frame_buf` has already been flushed to
     /// `cdc_write_conn` this frame (so the `BEGIN` is live on the server). Drives
     /// whether `40P01` recovery must issue an explicit `ROLLBACK`.
@@ -248,6 +283,7 @@ impl WriterCore {
             frame_relation_oids: HashSet::new(),
             purge_pending: false,
             frame_buf: String::with_capacity(FRAME_BUF_CAPACITY),
+            frame_rows: Vec::new(),
             frame_chunk_flushed: false,
             population_deleted_keys: PopulationDeletedKeys::default(),
             pending_merges: Vec::new(),

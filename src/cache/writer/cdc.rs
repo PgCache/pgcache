@@ -27,7 +27,7 @@ use super::super::types::{
     CachedQueryState, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
 };
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
-use super::core::{FRAME_BUF_CAPACITY, FrameState, WriterCore};
+use super::core::{FRAME_BUF_CAPACITY, FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, WriterCore};
 use super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
 use super::staging::pk_body_render;
 use crate::pg;
@@ -242,6 +242,9 @@ impl WriterCdc {
                 .map_into_report::<CacheError>()?;
         }
         core.frame_buf.clear();
+        // Unreplayed row events are dropped — relation-level recovery
+        // (evict + truncate) supersedes whatever they would have applied.
+        core.frame_rows.clear();
         // Rolled-back deletes/truncates must not affect population merges — the
         // rows may still exist (PGC-250). The recovery's own truncate re-adds the
         // affected relations in `frame_recover`.
@@ -324,11 +327,70 @@ impl WriterCdc {
         Err(e)
     }
 
+    /// Replay the frame's buffered row events through the per-row handlers, in
+    /// arrival order (PGC-241: collect at arrival, evaluate + emit at the flush
+    /// boundary). Arrival order is what makes the deferral pure: same-key
+    /// sequences (an INSERT then DELETE of one PK) and TRUNCATE-vs-row
+    /// interleavings emit exactly as per-arrival handling did. Handler errors
+    /// route through `frame_dml_result` (`40P01` → `Recovering`); once
+    /// `Recovering`, the remaining events are dropped, matching the per-arrival
+    /// path where post-deadlock commands skip handling.
+    async fn frame_rows_replay(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        let mut events = std::mem::take(&mut core.frame_rows);
+        for event in events.drain(..) {
+            if core.frame_state == FrameState::Recovering {
+                break;
+            }
+            let r = match event {
+                FrameRowEvent::Insert {
+                    relation_oid,
+                    row_data,
+                } => self.handle_insert(core, relation_oid, row_data).await,
+                FrameRowEvent::Update {
+                    relation_oid,
+                    key_data,
+                    new_row_data,
+                } => {
+                    self.handle_update(core, relation_oid, key_data, new_row_data)
+                        .await
+                }
+                FrameRowEvent::Delete {
+                    relation_oid,
+                    row_data,
+                } => self.handle_delete(core, relation_oid, row_data).await,
+                FrameRowEvent::Truncate { relation_oids } => {
+                    self.handle_truncate(core, &relation_oids).await
+                }
+            };
+            self.frame_dml_result(core, r)
+                .await
+                .attach_loc("cdc frame replay")?;
+        }
+        // Hand the drained buffer back so its capacity is reused across frames.
+        core.frame_rows = events;
+        Ok(())
+    }
+
+    /// Mid-frame partial replay once the event log reaches its cap, bounding
+    /// frame memory the way `frame_buf`'s chunk flush does.
+    async fn frame_rows_replay_if_full(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        if core.frame_rows.len() >= FRAME_ROWS_CAPACITY {
+            self.frame_rows_replay(core)
+                .await
+                .attach_loc("cdc mid-frame replay")?;
+        }
+        Ok(())
+    }
+
     /// Apply a `CommitMark`: flush the frame's deferred invalidations and commit
     /// (or recover) per its state. Extracted from the `CommitMark` handler so the
     /// memo seqlock bracket can publish the post-commit version on every exit
     /// path — including an error return from here.
     async fn frame_finalize(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        // Evaluate + emit the frame's buffered row events first (PGC-241): the
+        // replay is what can open the txn (`Active → TxnOpen`) or enter
+        // `Recovering`, so the state match below must run after it.
+        self.frame_rows_replay(core).await?;
         match core.frame_state {
             FrameState::TxnOpen => {
                 self.frame_invalidations_flush(core).await?;
@@ -401,6 +463,7 @@ impl WriterCdc {
                 trace!(xid, "cdc frame begin");
                 core.frame_state = FrameState::Active;
                 core.frame_buf.clear();
+                core.frame_rows.clear();
                 core.frame_chunk_flushed = false;
                 core.frame_deleted_keys.clear();
                 core.frame_truncated_relations.clear();
@@ -423,10 +486,11 @@ impl WriterCdc {
                             .await
                             .attach_loc("fault: injected cdc deadlock")?;
                     } else {
-                        let r = self.handle_insert(core, relation_oid, row_data).await;
-                        self.frame_dml_result(core, r)
-                            .await
-                            .attach_loc("cdc insert")?;
+                        core.frame_rows.push(FrameRowEvent::Insert {
+                            relation_oid,
+                            row_data,
+                        });
+                        self.frame_rows_replay_if_full(core).await?;
                     }
                 }
             }
@@ -437,12 +501,12 @@ impl WriterCdc {
             } => {
                 core.frame_relation_oids.insert(relation_oid);
                 if core.frame_state != FrameState::Recovering {
-                    let r = self
-                        .handle_update(core, relation_oid, key_data, row_data)
-                        .await;
-                    self.frame_dml_result(core, r)
-                        .await
-                        .attach_loc("cdc update")?;
+                    core.frame_rows.push(FrameRowEvent::Update {
+                        relation_oid,
+                        key_data,
+                        new_row_data: row_data,
+                    });
+                    self.frame_rows_replay_if_full(core).await?;
                 }
             }
             CdcCommand::Delete {
@@ -451,20 +515,19 @@ impl WriterCdc {
             } => {
                 core.frame_relation_oids.insert(relation_oid);
                 if core.frame_state != FrameState::Recovering {
-                    let r = self.handle_delete(core, relation_oid, row_data).await;
-                    self.frame_dml_result(core, r)
-                        .await
-                        .attach_loc("cdc delete")?;
+                    core.frame_rows.push(FrameRowEvent::Delete {
+                        relation_oid,
+                        row_data,
+                    });
+                    self.frame_rows_replay_if_full(core).await?;
                 }
             }
             CdcCommand::Truncate { relation_oids } => {
                 core.frame_relation_oids
                     .extend(relation_oids.iter().copied());
                 if core.frame_state != FrameState::Recovering {
-                    let r = self.handle_truncate(core, &relation_oids).await;
-                    self.frame_dml_result(core, r)
-                        .await
-                        .attach_loc("cdc truncate")?;
+                    core.frame_rows.push(FrameRowEvent::Truncate { relation_oids });
+                    self.frame_rows_replay_if_full(core).await?;
                 }
             }
             CdcCommand::CommitMark { lsn } => {
@@ -506,6 +569,7 @@ impl WriterCdc {
                 core.frame_invalidations.clear();
                 core.frame_relation_oids.clear();
                 core.frame_buf.clear();
+                core.frame_rows.clear();
                 core.frame_chunk_flushed = false;
                 self.applied_lsn_advance(lsn);
                 core.last_applied_lsn = self.last_applied_lsn;

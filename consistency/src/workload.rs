@@ -75,6 +75,7 @@ pub async fn writer_task(
     scenario: Scenario,
     seed: u64,
     think_ms: u64,
+    bump_groups: usize,
     deadline: Instant,
 ) -> Result<OpCounts> {
     let client = db::connect(&proxy_url).await?;
@@ -82,6 +83,9 @@ pub async fn writer_task(
     let mut counts = OpCounts::default();
     let groups = scenario.model.groups;
     let think = (think_ms > 0).then(|| Duration::from_millis(think_ms));
+    // A version bump touches this many groups in one statement/txn (>1 = fat
+    // CDC frame). Clamped to the normal-group count; paired groups are excluded.
+    let bump_span = bump_groups.clamp(1, groups as usize) as i32;
 
     let bump = client.prepare(&scenario.version_bump()).await?;
     let delete = client.prepare(&scenario.item_delete()).await?;
@@ -91,8 +95,11 @@ pub async fn writer_task(
     while Instant::now() < deadline {
         match write_op_pick(&mut rng) {
             WriteOp::VersionBump => {
-                let g = rng.random_range(0..groups);
-                db::execute_timed(&client, &bump, &[&g], "version bump").await?;
+                // Contiguous window of `bump_span` normal groups → a frame with
+                // that many row changes on the version table.
+                let start = rng.random_range(0..=(groups - bump_span));
+                let group_ids: Vec<i32> = (start..start + bump_span).collect();
+                db::execute_timed(&client, &bump, &[&group_ids], "version bump").await?;
                 counts.version_bump += 1;
             }
             WriteOp::CrossGroupTxn => {
