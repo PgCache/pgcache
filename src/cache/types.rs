@@ -173,6 +173,13 @@ pub struct UpdateQuery {
     /// `update_invalidation_possible` (the single source of truth — needs the
     /// relation's table name).
     pub change_dependent: bool,
+    /// Whether this query's PgEval membership can be evaluated for many CDC
+    /// rows in one multi-row VALUES statement (PGC-241). Requires per-row
+    /// independence: no GROUP BY / HAVING and no aggregates in the SELECT list
+    /// (those evaluate against the substituted rows *as a set*, so a multi-row
+    /// VALUES would change the per-row answer). Set at registration; only
+    /// meaningful for `eval_strategy == PgEval`.
+    pub pg_batchable: bool,
 }
 
 impl UpdateQuery {

@@ -32,4 +32,7 @@ pub use parameters::{query_expr_parameters_replace, select_node_parameters_repla
 pub use pushdown::predicate_pushdown_apply;
 pub(crate) use pushdown::{where_expr_conjuncts_join, where_expr_conjuncts_split};
 pub use select_node::{resolved_select_node_replace, resolved_select_node_update_replace};
-pub use values::resolved_select_node_table_replace_with_values;
+pub use values::{
+    resolved_select_node_table_replace_with_values,
+    resolved_select_node_table_replace_with_values_batch,
+};

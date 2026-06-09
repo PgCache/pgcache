@@ -192,8 +192,11 @@ async fn test_cdc_version_bump_after_delete_heals_mv() -> Result<(), Error> {
     ctx.origin_query("delete from mvh_items where id = 1002", &[])
         .await?;
     ctx.cdc_settle().await?;
-    ctx.origin_query("update mvh_groups set version = version + 1 where group_id = 1", &[])
-        .await?;
+    ctx.origin_query(
+        "update mvh_groups set version = version + 1 where group_id = 1",
+        &[],
+    )
+    .await?;
     ctx.cdc_settle().await?;
 
     let mut served_ids: Vec<i32> = Vec::new();
@@ -204,7 +207,9 @@ async fn test_cdc_version_bump_after_delete_heals_mv() -> Result<(), Error> {
             .iter()
             .filter_map(|m| match m {
                 SimpleQueryMessage::Row(r) => r.get(0).and_then(|s| s.parse::<i32>().ok()),
-                _ => None,
+                SimpleQueryMessage::CommandComplete(_)
+                | SimpleQueryMessage::RowDescription(_)
+                | _ => None,
             })
             .collect();
         served_ids.sort_unstable();
@@ -330,7 +335,9 @@ async fn test_cdc_pk_change_during_fresh_mv_leaves_no_ghost() -> Result<(), Erro
             .iter()
             .filter_map(|m| match m {
                 SimpleQueryMessage::Row(r) => r.get(0).and_then(|s| s.parse::<i32>().ok()),
-                _ => None,
+                SimpleQueryMessage::CommandComplete(_)
+                | SimpleQueryMessage::RowDescription(_)
+                | _ => None,
             })
             .collect();
         served_ids.sort_unstable();

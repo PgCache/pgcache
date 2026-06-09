@@ -92,7 +92,11 @@ impl GroupReader {
 /// result is a single atomic snapshot. Reading the two sides of a pair with
 /// separate queries would straddle a concurrent cross-group commit and look
 /// torn even when the cache is consistent — the pair check needs one snapshot.
-pub async fn pair_versions(client: &Client, sql: &str, pair_ids: &[i32]) -> Result<Vec<(i32, i32)>> {
+pub async fn pair_versions(
+    client: &Client,
+    sql: &str,
+    pair_ids: &[i32],
+) -> Result<Vec<(i32, i32)>> {
     let rows = db::query_timed(client, sql, &[&pair_ids], "paired-group read").await?;
     Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
 }

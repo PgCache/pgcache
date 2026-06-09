@@ -104,7 +104,8 @@ pub async fn writer_task(
             }
             WriteOp::CrossGroupTxn => {
                 let (a, b) = scenario.model.pairs[rng.random_range(0..scenario.model.pairs.len())];
-                db::batch_timed(&client, &scenario.cross_group_txn(a, b), "cross-group txn").await?;
+                db::batch_timed(&client, &scenario.cross_group_txn(a, b), "cross-group txn")
+                    .await?;
                 counts.cross_group_txn += 1;
             }
             WriteOp::Delete => {

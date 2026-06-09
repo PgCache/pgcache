@@ -93,7 +93,8 @@ pub async fn run(cli: Cli) -> Result<()> {
     // Pool connects only now: it prepares the per-group query, which provision
     // created the tables for above.
     let reader =
-        snapshot::GroupReader::connect(&stack.cache_url, cli.snapshot_conns, &per_group_sql).await?;
+        snapshot::GroupReader::connect(&stack.cache_url, cli.snapshot_conns, &per_group_sql)
+            .await?;
 
     let deadline = Instant::now() + Duration::from_secs(cli.duration_secs);
 
@@ -219,7 +220,12 @@ async fn snapshot_loop(
     interval_ms: u64,
 ) -> Result<u64> {
     let interval = Duration::from_millis(interval_ms);
-    let pair_ids: Vec<i32> = scenario.model.pairs.iter().flat_map(|&(a, b)| [a, b]).collect();
+    let pair_ids: Vec<i32> = scenario
+        .model
+        .pairs
+        .iter()
+        .flat_map(|&(a, b)| [a, b])
+        .collect();
     let mut tracker = MonotonicTracker::new();
     let mut snapshots = 0u64;
 
@@ -368,7 +374,10 @@ async fn writer_queue_depth(http: &reqwest::Client, metrics_url: &str) -> Result
         for name in NAMES {
             if let Some(rest) = line.strip_prefix(name)
                 && matches!(rest.chars().next(), Some(' ') | Some('{'))
-                && let Some(value) = rest.rsplit(' ').next().and_then(|v| v.trim().parse::<f64>().ok())
+                && let Some(value) = rest
+                    .rsplit(' ')
+                    .next()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
             {
                 sum += value;
             }

@@ -480,3 +480,96 @@ async fn test_cdc_frame_deadlock_recovery() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// One fat source transaction updating ~70 rows of a relation referenced by
+/// several join (PgEval) queries — exercises the batched per-segment
+/// membership eval (PGC-241) across the `PG_EVAL_ROW_CHUNK` (64) boundary and
+/// across multiple queries in one chunk, mixed with deletes and a join-key
+/// move so the ordered decide/emit pass runs every path. Correctness oracle:
+/// every per-group join query serves exactly what origin serves.
+#[tokio::test]
+async fn test_fat_frame_batched_membership_maintains_joins() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.simple_query("create table bm_groups (id int primary key, v int not null)")
+        .await?;
+    ctx.simple_query(
+        "create table bm_items (id int primary key, gid int not null, data int not null)",
+    )
+    .await?;
+    ctx.simple_query("insert into bm_groups (id, v) values (1, 10), (2, 20), (3, 30)")
+        .await?;
+    // 72 items, 24 per group: gid cycles 1,2,3.
+    ctx.simple_query(
+        "insert into bm_items (id, gid, data) \
+         select i, (i % 3) + 1, i from generate_series(1, 72) i",
+    )
+    .await?;
+    ctx.cdc_settle().await?;
+
+    let group_query = |g: i32| {
+        format!(
+            "select i.id, i.data, g.v from bm_items i \
+             join bm_groups g on i.gid = g.id where g.id = {g} order by i.id"
+        )
+    };
+
+    // Register + populate the three per-group join queries (PgEval, batchable).
+    for g in 1..=3 {
+        ctx.simple_query(&group_query(g)).await?;
+    }
+    ctx.cache_settle().await?;
+
+    // One source transaction: 70 data-only updates (in-place maintenance via
+    // batched membership), two deletes, and one join-key move (invalidates the
+    // affected groups). 73 row events in one frame.
+    let mut txn = String::from("BEGIN; ");
+    for id in 1..=70 {
+        txn.push_str(&format!(
+            "update bm_items set data = data + 1000 where id = {id}; "
+        ));
+    }
+    txn.push_str("delete from bm_items where id = 5; ");
+    txn.push_str("delete from bm_items where id = 40; ");
+    txn.push_str("update bm_items set gid = 2 where id = 10; ");
+    txn.push_str("COMMIT;");
+    ctx.origin.batch_execute(&txn).await.map_err(Error::other)?;
+    ctx.cdc_settle().await?;
+    ctx.cache_settle().await?;
+
+    // Every per-group join result must match origin exactly.
+    for g in 1..=3 {
+        let q = group_query(g);
+        let served = ctx.simple_query(&q).await?;
+        let origin_rows = ctx.origin_query(&q as &str, &[]).await?;
+        let served_rows: Vec<(String, String, String)> = served
+            .iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(row) => Some((
+                    row.get(0).unwrap_or_default().to_owned(),
+                    row.get(1).unwrap_or_default().to_owned(),
+                    row.get(2).unwrap_or_default().to_owned(),
+                )),
+                SimpleQueryMessage::CommandComplete(_)
+                | SimpleQueryMessage::RowDescription(_)
+                | _ => None,
+            })
+            .collect();
+        let expected: Vec<(String, String, String)> = origin_rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, i32>(0).to_string(),
+                    row.get::<_, i32>(1).to_string(),
+                    row.get::<_, i32>(2).to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            served_rows, expected,
+            "group {g} join result must match origin after the fat frame"
+        );
+    }
+
+    Ok(())
+}

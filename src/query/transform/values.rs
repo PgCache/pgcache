@@ -6,61 +6,52 @@ use crate::catalog::TableMetadata;
 use crate::query::ast::{LiteralValue, TableAlias, ValuesClause};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
-    ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource, ResolvedTableSubqueryNode,
-    ResolvedWhereExpr,
+    ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource,
+    ResolvedTableSubqueryNode, ResolvedWhereExpr,
 };
 
 use super::{AstTransformError, AstTransformResult};
 
-/// Replace `table_metadata`'s table source with a single-row `VALUES`
-/// (the CDC row), aliased as the table, so the query can be evaluated
-/// as an `EXISTS(...)` membership test for that row. Column references
-/// to the table across every clause are rewritten to the alias.
-pub fn resolved_select_node_table_replace_with_values(
+/// Synthetic leading column carrying each batched row's ordinal through the
+/// membership query (PGC-241). Prefixed to avoid colliding with real columns.
+pub const BATCH_IDX_COLUMN: &str = "__pgc_idx";
+
+/// Find the first table source matching `relation_oid` in the FROM tree and
+/// return its effective alias (explicit alias, else the table name).
+fn table_alias_find(
     resolved: &ResolvedSelectNode,
     table_metadata: &TableMetadata,
-    row_data: &[Option<String>],
-) -> AstTransformResult<ResolvedSelectNode> {
-    let mut resolved_new = resolved.clone();
-    let relation_oid = table_metadata.relation_oid;
-
-    // Find first matching table source by relation_oid and get the alias
-    let alias = {
-        let Some(first_from) = resolved_new.from.first() else {
-            return Err(AstTransformError::MissingTable.into());
-        };
-        let mut frontier = vec![first_from];
-        let mut found_alias: Option<EcoString> = None;
-        while let Some(cur) = frontier.pop() {
-            match cur {
-                ResolvedTableSource::Join(join) => {
-                    frontier.push(&join.left);
-                    frontier.push(&join.right);
-                }
-                ResolvedTableSource::Table(table) => {
-                    if table.relation_oid == relation_oid {
-                        found_alias = Some(EcoString::from(
-                            table.alias.as_deref().unwrap_or(&table_metadata.name),
-                        ));
-                        break;
-                    }
-                }
-                _ => (),
-            }
-        }
-        found_alias.ok_or_else(|| Report::from(AstTransformError::MissingTable))?
+) -> AstTransformResult<EcoString> {
+    let Some(first_from) = resolved.from.first() else {
+        return Err(AstTransformError::MissingTable.into());
     };
+    let mut frontier = vec![first_from];
+    while let Some(cur) = frontier.pop() {
+        match cur {
+            ResolvedTableSource::Join(join) => {
+                frontier.push(&join.left);
+                frontier.push(&join.right);
+            }
+            ResolvedTableSource::Table(table) => {
+                if table.relation_oid == table_metadata.relation_oid {
+                    return Ok(EcoString::from(
+                        table.alias.as_deref().unwrap_or(&table_metadata.name),
+                    ));
+                }
+            }
+            _ => (),
+        }
+    }
+    Err(Report::from(AstTransformError::MissingTable))
+}
 
-    // Update all column references for this table to use the alias
-    resolved_select_node_column_alias_update(
-        &mut resolved_new,
-        &table_metadata.schema,
-        &table_metadata.name,
-        &alias,
-    );
-
-    // Now replace the table source with a VALUES subquery
-    let Some(first_from) = resolved_new.from.first_mut() else {
+/// Find the first table source matching `relation_oid` in the FROM tree,
+/// mutably, for replacement.
+fn table_source_find_mut(
+    resolved: &mut ResolvedSelectNode,
+    relation_oid: u32,
+) -> AstTransformResult<&mut ResolvedTableSource> {
+    let Some(first_from) = resolved.from.first_mut() else {
         return Err(AstTransformError::MissingTable.into());
     };
     let mut frontier = vec![first_from];
@@ -80,14 +71,18 @@ pub fn resolved_select_node_table_replace_with_values(
             _ => (),
         }
     }
+    source_node.ok_or_else(|| Report::from(AstTransformError::MissingTable))
+}
 
-    let Some(source_node) = source_node else {
-        return Err(AstTransformError::MissingTable.into());
-    };
-
-    // Build VALUES clause from row_data and collect column names
+/// One VALUES row's literals for `row_data`, in `table_metadata` column order,
+/// with per-column casts (NULLs carry the column type). Appends the name of
+/// each emitted column to `column_names`.
+fn values_row_build(
+    table_metadata: &TableMetadata,
+    row_data: &[Option<String>],
+    column_names: &mut Vec<EcoString>,
+) -> Vec<LiteralValue> {
     let mut values = Vec::new();
-    let mut column_names: Vec<EcoString> = Vec::new();
     for column_meta in &table_metadata.columns {
         let position = column_meta.index();
         if let Some(row_value) = row_data.get(position) {
@@ -99,6 +94,35 @@ pub fn resolved_select_node_table_replace_with_values(
             column_names.push(EcoString::from(column_meta.name.as_str()));
         }
     }
+    values
+}
+
+/// Replace `table_metadata`'s table source with a single-row `VALUES`
+/// (the CDC row), aliased as the table, so the query can be evaluated
+/// as an `EXISTS(...)` membership test for that row. Column references
+/// to the table across every clause are rewritten to the alias.
+pub fn resolved_select_node_table_replace_with_values(
+    resolved: &ResolvedSelectNode,
+    table_metadata: &TableMetadata,
+    row_data: &[Option<String>],
+) -> AstTransformResult<ResolvedSelectNode> {
+    let mut resolved_new = resolved.clone();
+
+    let alias = table_alias_find(&resolved_new, table_metadata)?;
+
+    // Update all column references for this table to use the alias
+    resolved_select_node_column_alias_update(
+        &mut resolved_new,
+        &table_metadata.schema,
+        &table_metadata.name,
+        &alias,
+    );
+
+    let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
+
+    // Build VALUES clause from row_data and collect column names
+    let mut column_names: Vec<EcoString> = Vec::new();
+    let values = values_row_build(table_metadata, row_data, &mut column_names);
 
     *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
         query: Box::new(ResolvedQueryExpr {
@@ -112,6 +136,86 @@ pub fn resolved_select_node_table_replace_with_values(
         },
         subquery_kind: SubqueryKind::Inclusion,
     });
+
+    Ok(resolved_new)
+}
+
+/// Multi-row variant of [`resolved_select_node_table_replace_with_values`]
+/// for batched membership evaluation (PGC-241): the table source becomes a
+/// K-row `VALUES` where each row is prefixed with its ordinal in a synthetic
+/// [`BATCH_IDX_COLUMN`], and the projection is replaced with
+/// `SELECT <ord>, <BATCH_IDX_COLUMN>` so a `UNION ALL` of per-query arms
+/// returns the matching `(query ordinal, row index)` pairs in one statement.
+///
+/// Only valid for queries whose membership is per-row independent
+/// (`UpdateQuery::pg_batchable`): each VALUES row joins/filters independently,
+/// so projecting the surviving indexes is exactly the per-row `EXISTS` answer.
+pub fn resolved_select_node_table_replace_with_values_batch(
+    resolved: &ResolvedSelectNode,
+    table_metadata: &TableMetadata,
+    rows: &[&[Option<String>]],
+    query_ordinal: i64,
+) -> AstTransformResult<ResolvedSelectNode> {
+    let mut resolved_new = resolved.clone();
+
+    let alias = table_alias_find(&resolved_new, table_metadata)?;
+
+    resolved_select_node_column_alias_update(
+        &mut resolved_new,
+        &table_metadata.schema,
+        &table_metadata.name,
+        &alias,
+    );
+
+    let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
+
+    let mut column_names: Vec<EcoString> = vec![EcoString::from(BATCH_IDX_COLUMN)];
+    let mut value_rows = Vec::with_capacity(rows.len());
+    let mut names_scratch: Vec<EcoString> = Vec::new();
+    for (idx, row_data) in rows.iter().enumerate() {
+        names_scratch.clear();
+        // Row index is bounded by the caller's row-chunk size: never wraps.
+        #[allow(clippy::cast_possible_wrap)]
+        let mut values = vec![LiteralValue::Integer(idx as i64)];
+        values.extend(values_row_build(
+            table_metadata,
+            row_data,
+            &mut names_scratch,
+        ));
+        if column_names.len() == 1 {
+            column_names.append(&mut names_scratch);
+        }
+        value_rows.push(values);
+    }
+
+    *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
+        query: Box::new(ResolvedQueryExpr {
+            body: ResolvedQueryBody::Values(ValuesClause { rows: value_rows }),
+            order_by: vec![],
+            limit: None,
+        }),
+        alias: TableAlias {
+            name: alias,
+            columns: column_names,
+        },
+        subquery_kind: SubqueryKind::Inclusion,
+    });
+
+    // Replace the projection with `(query ordinal, row index)`: membership for
+    // a batchable query is "which VALUES rows survive the joins/filters", and
+    // the ordinal tags this arm's hits within a UNION ALL chunk. The original
+    // projection carries no membership semantics for batchable shapes (no
+    // aggregates / GROUP BY / HAVING by classification).
+    resolved_new.columns = ResolvedSelectColumns::Columns(vec![
+        ResolvedSelectColumn {
+            expr: ResolvedScalarExpr::Literal(LiteralValue::Integer(query_ordinal)),
+            alias: None,
+        },
+        ResolvedSelectColumn {
+            expr: ResolvedScalarExpr::Identifier(EcoString::from(BATCH_IDX_COLUMN)),
+            alias: None,
+        },
+    ]);
 
     Ok(resolved_new)
 }
@@ -631,6 +735,44 @@ mod tests {
         assert!(
             buf.contains("'1'::int4, NULL::text"),
             "NULL column should produce NULL::type: {buf}"
+        );
+    }
+
+    #[test]
+    fn test_batch_values_rows_idx_and_projection() {
+        let meta = table_metadata("users", 100, &[("id", "int4"), ("name", "text")]);
+        let node = select_node(
+            vec![resolved_table("users", 100, None)],
+            ResolvedSelectColumns::None,
+            None,
+        );
+        let row_a = vec![Some("1".to_owned()), Some("a".to_owned())];
+        let row_b = vec![Some("2".to_owned()), None];
+        let rows: Vec<&[Option<String>]> = vec![&row_a, &row_b];
+
+        let result = resolved_select_node_table_replace_with_values_batch(&node, &meta, &rows, 7)
+            .expect("batch replace");
+
+        let mut buf = String::new();
+        result.deparse(&mut buf);
+        // Each VALUES row is prefixed with its ordinal; NULLs keep their cast.
+        assert!(
+            buf.contains("0, '1'::int4, 'a'::text"),
+            "first row carries idx 0: {buf}"
+        );
+        assert!(
+            buf.contains("1, '2'::int4, NULL::text"),
+            "second row carries idx 1 with NULL cast: {buf}"
+        );
+        // The alias column list leads with the synthetic idx column.
+        assert!(
+            buf.contains(&format!("({BATCH_IDX_COLUMN}, id, name)")),
+            "alias columns lead with idx: {buf}"
+        );
+        // Projection is the (query ordinal, row idx) pair.
+        assert!(
+            buf.contains(&format!("SELECT 7, {BATCH_IDX_COLUMN}")),
+            "projection is (ordinal, idx): {buf}"
         );
     }
 

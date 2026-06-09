@@ -97,6 +97,49 @@ fn update_eval_strategy_classify(
     }
 }
 
+/// Whether a PgEval query's membership predicate stays per-row correct when
+/// evaluated for many CDC rows in one multi-row VALUES statement (PGC-241).
+///
+/// Per-row membership substitutes the changed table with *only that row*; a
+/// multi-row VALUES is equivalent iff each row's answer is independent of the
+/// others. GROUP BY / HAVING / SELECT-list aggregates evaluate against the
+/// substituted rows as a set, so they must stay on the per-row path. (LIMIT and
+/// ORDER BY never reach the predicate — `cache_predicate_into` deparses the
+/// select node only — and aggregates can't appear in WHERE.)
+///
+/// Relations appearing more than once (self-joins) are excluded: the VALUES
+/// transform's alias rewrite clobbers every occurrence's references to one
+/// alias, which can forward-reference a later FROM entry — invalid SQL. The
+/// per-row path has the same defect but only reaches it on paths the decide
+/// pass usually skips; batching pre-evaluates unfiltered, so it must not pick
+/// these up (PGC-256 tracks the underlying transform defect).
+fn pg_batchable_classify(
+    resolved: &ResolvedQueryExpr,
+    relation_oid: u32,
+    aggregate_functions: &HashSet<EcoString>,
+) -> bool {
+    let Some(select) = resolved.as_select() else {
+        return false;
+    };
+    if !select.group_by.is_empty() || select.having.is_some() {
+        return false;
+    }
+    if resolved
+        .nodes::<ResolvedTableNode>()
+        .filter(|t| t.relation_oid == relation_oid)
+        .count()
+        > 1
+    {
+        return false;
+    }
+    match &select.columns {
+        ResolvedSelectColumns::None => true,
+        ResolvedSelectColumns::Columns(cols) => cols
+            .iter()
+            .all(|c| !c.expr.has_aggregate(aggregate_functions)),
+    }
+}
+
 /// Collect column names on `table_name` that participate in the parent
 /// query's LIMIT-window definition: top-level ORDER BY, WHERE, and HAVING.
 ///
@@ -623,6 +666,8 @@ impl WriterRegistration {
                 .unwrap_or_default();
             let complexity = update_resolved.complexity();
             let eval_strategy = update_eval_strategy_classify(&update_resolved, source);
+            let pg_batchable = eval_strategy == UpdateEvalStrategy::PgEval
+                && pg_batchable_classify(&update_resolved, relation_oid, &self.aggregate_functions);
             // Walk the parent `resolved` — `update_resolved` has ORDER BY stripped.
             let limit_window_columns = if has_limit {
                 limit_window_columns_collect(resolved, table_node.name.as_str())
@@ -640,6 +685,7 @@ impl WriterRegistration {
                 limit_window_columns,
                 // Set authoritatively in update_query_register (needs table_name).
                 change_dependent: false,
+                pg_batchable,
             };
 
             self.update_query_register(core, relation_oid, table_node.name.as_str(), update_query);

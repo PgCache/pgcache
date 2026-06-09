@@ -196,7 +196,10 @@ mod tests {
     #[test]
     fn pair_check_accepts_equal_and_flags_unequal() {
         let pairs = vec![(100, 101)];
-        assert_eq!(pair_check(&HashMap::from([(100, 3), (101, 3)]), &pairs), None);
+        assert_eq!(
+            pair_check(&HashMap::from([(100, 3), (101, 3)]), &pairs),
+            None
+        );
         assert_eq!(
             pair_check(&HashMap::from([(100, 4), (101, 3)]), &pairs),
             Some(Violation::Pair {

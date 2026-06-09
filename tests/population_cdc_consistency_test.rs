@@ -274,7 +274,10 @@ async fn test_invalidation_drains_coalesced_waiters() -> Result<(), Error> {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(parked, "waiter never parked in the coalesce queue within 5s");
+    assert!(
+        parked,
+        "waiter never parked in the coalesce queue within 5s"
+    );
 
     // Grow the join at origin: invalidates the still-populating query, which
     // must drain the parked waiter to origin now — not 5s later when population

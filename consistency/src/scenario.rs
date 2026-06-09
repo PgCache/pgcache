@@ -62,7 +62,10 @@ impl Scenario {
                          data     int NOT NULL
                      );"
                 );
-                client.batch_execute(&ddl).await.context("provision single")?;
+                client
+                    .batch_execute(&ddl)
+                    .await
+                    .context("provision single")?;
                 seed_groups_rows(
                     client,
                     TABLE,
@@ -149,9 +152,9 @@ impl Scenario {
     /// Predicated probe over the lower-half `data` range → `(group_id, version)`.
     pub fn cross_group_select(&self, data_hi: i32) -> String {
         match self.variant {
-            Variant::SingleTable => format!(
-                "SELECT group_id, version FROM {TABLE} WHERE data BETWEEN 0 AND {data_hi}"
-            ),
+            Variant::SingleTable => {
+                format!("SELECT group_id, version FROM {TABLE} WHERE data BETWEEN 0 AND {data_hi}")
+            }
             Variant::TwoTable => format!(
                 "SELECT i.group_id, g.version \
                  FROM {TABLE} i JOIN {GROUPS_TABLE} g ON i.group_id = g.group_id \

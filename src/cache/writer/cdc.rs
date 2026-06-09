@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::time::Instant;
 
@@ -14,7 +14,10 @@ use crate::query::cast::cast_target_coerce_text;
 use crate::query::constraints::{QueryConstraints, TableConstraint};
 use crate::query::evaluate::{literal_compare, where_value_compare_string};
 use crate::query::resolved::ResolvedQueryExpr;
-use crate::query::transform::resolved_select_node_table_replace_with_values;
+use crate::query::transform::{
+    resolved_select_node_table_replace_with_values,
+    resolved_select_node_table_replace_with_values_batch,
+};
 
 use crate::settings::{CachePolicy, Settings};
 
@@ -39,6 +42,66 @@ const SQL_BUFFER_CAPACITY: usize = 1024;
 /// Max membership predicates combined into one `pg_eval_matches` query, bounding
 /// the combined query's parse/plan cost for relations with many PgEval queries.
 const PG_EVAL_CHUNK: usize = 32;
+
+/// Max CDC rows per batched membership statement (PGC-241). With inlined
+/// VALUES the per-statement SQL is ~`PG_EVAL_CHUNK × PG_EVAL_ROW_CHUNK ×
+/// row_width`, so this bounds statement size the way `FRAME_BUF_CAPACITY`
+/// bounds the frame buffer; round-trips collapse `K → ⌈K/64⌉` per query chunk.
+const PG_EVAL_ROW_CHUNK: usize = 64;
+
+/// Per-relation membership-eval rows of one segment: `(event index, row)`.
+type SegmentRows<'a> = HashMap<u32, Vec<(usize, &'a [Option<String>])>>;
+
+/// Batched PgEval membership for one segment of frame row events (PGC-241).
+/// Built by `segment_membership_eval`, consumed per event by the decide pass.
+#[derive(Default)]
+struct SegmentMembership {
+    /// Per relation: the fingerprints the batch covered. Queries outside this
+    /// set (non-batchable shapes) fall back to per-row eval.
+    relation_fps: HashMap<u32, HashSet<u64>>,
+    /// Event indexes whose row was in the batch (rows of unexpected arity stay
+    /// out and fall back to per-row eval).
+    covered: HashSet<usize>,
+    /// `(event index, fingerprint)` membership hits.
+    hits: HashSet<(usize, u64)>,
+}
+
+impl SegmentMembership {
+    /// The matrix view for one event, or `None` if the event wasn't batched
+    /// (relation had no batchable queries, or the row fell back).
+    fn view(&self, relation_oid: u32, event_idx: usize) -> Option<BatchEvalView<'_>> {
+        if !self.covered.contains(&event_idx) {
+            return None;
+        }
+        self.relation_fps
+            .get(&relation_oid)
+            .map(|fps| BatchEvalView {
+                fps,
+                hits: &self.hits,
+                event_idx,
+            })
+    }
+}
+
+/// One event's window into a [`SegmentMembership`] matrix.
+pub(super) struct BatchEvalView<'a> {
+    fps: &'a HashSet<u64>,
+    hits: &'a HashSet<(usize, u64)>,
+    event_idx: usize,
+}
+
+impl BatchEvalView<'_> {
+    /// Whether `fingerprint` was batch-evaluated (consult `hit` instead of a
+    /// per-row round-trip).
+    fn covers(&self, fingerprint: u64) -> bool {
+        self.fps.contains(&fingerprint)
+    }
+
+    /// Whether this event's row matched `fingerprint`'s predicate.
+    fn hit(&self, fingerprint: u64) -> bool {
+        self.hits.contains(&(self.event_idx, fingerprint))
+    }
+}
 
 /// Test-only deterministic fault injection (PGC-147). Compiled out entirely
 /// unless built with `--features fault-injection`; the writer-side CDC `40P01`
@@ -327,48 +390,239 @@ impl WriterCdc {
         Err(e)
     }
 
-    /// Replay the frame's buffered row events through the per-row handlers, in
-    /// arrival order (PGC-241: collect at arrival, evaluate + emit at the flush
-    /// boundary). Arrival order is what makes the deferral pure: same-key
-    /// sequences (an INSERT then DELETE of one PK) and TRUNCATE-vs-row
-    /// interleavings emit exactly as per-arrival handling did. Handler errors
-    /// route through `frame_dml_result` (`40P01` → `Recovering`); once
-    /// `Recovering`, the remaining events are dropped, matching the per-arrival
-    /// path where post-deadlock commands skip handling.
+    /// Replay the frame's buffered row events in arrival order (PGC-241:
+    /// collect at arrival, evaluate + emit at the flush boundary). Arrival
+    /// order is what makes the deferral pure: same-key sequences (an INSERT
+    /// then DELETE of one PK) and TRUNCATE-vs-row interleavings emit exactly
+    /// as per-arrival handling did.
+    ///
+    /// Events run in segments split at Truncate boundaries (a truncate evicts
+    /// queries over its relations, changing the update-query set). Each
+    /// segment's PgEval membership is batch-evaluated up front — one statement
+    /// per relation per row/query chunk instead of per row — and the ordered
+    /// decide/emit pass consumes the precomputed matrix. Handler errors route
+    /// through `frame_dml_result` (`40P01` → `Recovering`); once `Recovering`,
+    /// the remaining events are dropped, matching the per-arrival path where
+    /// post-deadlock commands skip handling.
     async fn frame_rows_replay(&mut self, core: &mut WriterCore) -> CacheResult<()> {
         let mut events = std::mem::take(&mut core.frame_rows);
-        for event in events.drain(..) {
-            if core.frame_state == FrameState::Recovering {
-                break;
+        let mut idx = 0;
+        while idx < events.len() && core.frame_state != FrameState::Recovering {
+            let segment_end = events
+                .get(idx..)
+                .into_iter()
+                .flatten()
+                .position(|e| matches!(e, FrameRowEvent::Truncate { .. }))
+                .map_or(events.len(), |p| idx + p);
+
+            if segment_end == idx {
+                // The event at `idx` is a Truncate — handle it alone.
+                if let Some(FrameRowEvent::Truncate { relation_oids }) = events.get(idx) {
+                    let r = self.handle_truncate(core, relation_oids).await;
+                    self.frame_dml_result(core, r)
+                        .await
+                        .attach_loc("cdc frame replay truncate")?;
+                }
+                idx += 1;
+                continue;
             }
-            let r = match event {
+
+            // Batched membership for the segment's rows (PGC-241), then the
+            // ordered decide/emit pass over the same events.
+            let segment = events.get(idx..segment_end).unwrap_or_default();
+            let membership = match self.segment_membership_eval(core, segment, idx).await {
+                Ok(m) => m,
+                Err(e) => {
+                    self.frame_dml_result(core, Err(e))
+                        .await
+                        .attach_loc("cdc segment membership eval")?;
+                    // Swallowed 40P01 → Recovering; the loop condition exits.
+                    continue;
+                }
+            };
+
+            let mut i = idx;
+            while i < segment_end && core.frame_state != FrameState::Recovering {
+                let Some(event) = events.get(i) else { break };
+                let r = match event {
+                    FrameRowEvent::Insert {
+                        relation_oid,
+                        row_data,
+                    } => {
+                        self.handle_insert(
+                            core,
+                            *relation_oid,
+                            row_data,
+                            membership.view(*relation_oid, i),
+                        )
+                        .await
+                    }
+                    FrameRowEvent::Update {
+                        relation_oid,
+                        key_data,
+                        new_row_data,
+                    } => {
+                        self.handle_update(
+                            core,
+                            *relation_oid,
+                            key_data,
+                            new_row_data,
+                            membership.view(*relation_oid, i),
+                        )
+                        .await
+                    }
+                    FrameRowEvent::Delete {
+                        relation_oid,
+                        row_data,
+                    } => self.handle_delete(core, *relation_oid, row_data).await,
+                    // Unreachable by construction (segments stop before a
+                    // Truncate); a no-op keeps this panic-free.
+                    FrameRowEvent::Truncate { .. } => Ok(()),
+                };
+                self.frame_dml_result(core, r)
+                    .await
+                    .attach_loc("cdc frame replay")?;
+                i += 1;
+            }
+            idx = segment_end;
+        }
+        // Hand the cleared buffer back so its capacity is reused across frames.
+        events.clear();
+        core.frame_rows = events;
+        Ok(())
+    }
+
+    /// Batch-evaluate PgEval membership for one segment of row events: per
+    /// relation, every batchable query (`UpdateQuery::pg_batchable`) is
+    /// evaluated against all the segment's rows in `UNION ALL`-combined
+    /// multi-row VALUES statements — `⌈rows/PG_EVAL_ROW_CHUNK⌉ ×
+    /// ⌈queries/PG_EVAL_CHUNK⌉` round-trips instead of one per row (PGC-241).
+    ///
+    /// The matrix is built unfiltered (no `frame_invalidations` / Fresh-MV
+    /// partition); the decide pass applies those — they evolve as earlier
+    /// events in the segment are decided. Reads run on `cache_eval_conn`'s
+    /// pre-transaction snapshot, identical to the per-row path.
+    async fn segment_membership_eval(
+        &mut self,
+        core: &WriterCore,
+        events: &[FrameRowEvent],
+        base_idx: usize,
+    ) -> CacheResult<SegmentMembership> {
+        let mut membership = SegmentMembership::default();
+
+        // Bucket membership-eval rows per relation: inserts and updates (new
+        // row image); deletes carry no membership question.
+        let mut rows_by_relation: SegmentRows<'_> = HashMap::new();
+        for (offset, event) in events.iter().enumerate() {
+            let (relation_oid, row): (u32, &[Option<String>]) = match event {
                 FrameRowEvent::Insert {
                     relation_oid,
                     row_data,
-                } => self.handle_insert(core, relation_oid, row_data).await,
+                } => (*relation_oid, row_data),
                 FrameRowEvent::Update {
                     relation_oid,
-                    key_data,
                     new_row_data,
-                } => {
-                    self.handle_update(core, relation_oid, key_data, new_row_data)
-                        .await
-                }
-                FrameRowEvent::Delete {
-                    relation_oid,
-                    row_data,
-                } => self.handle_delete(core, relation_oid, row_data).await,
-                FrameRowEvent::Truncate { relation_oids } => {
-                    self.handle_truncate(core, &relation_oids).await
-                }
+                    ..
+                } => (*relation_oid, new_row_data),
+                FrameRowEvent::Delete { .. } | FrameRowEvent::Truncate { .. } => continue,
             };
-            self.frame_dml_result(core, r)
-                .await
-                .attach_loc("cdc frame replay")?;
+            rows_by_relation
+                .entry(relation_oid)
+                .or_default()
+                .push((base_idx + offset, row));
         }
-        // Hand the drained buffer back so its capacity is reused across frames.
-        core.frame_rows = events;
-        Ok(())
+
+        for (relation_oid, rows) in rows_by_relation {
+            let Some(update_queries) = core.cache.update_queries.get(&relation_oid) else {
+                continue;
+            };
+            let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
+                continue;
+            };
+            let batchable: Vec<&UpdateQuery> = update_queries
+                .iter_complexity_ordered()
+                .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval && q.pg_batchable)
+                .collect();
+            if batchable.is_empty() {
+                continue;
+            }
+
+            // A multi-row VALUES needs uniform arity; rows narrower than the
+            // relation (e.g. truncated tuples) fall back to per-row eval by
+            // staying out of `covered`.
+            let full_width = table_metadata.columns.len();
+            let batch_rows: Vec<(usize, &[Option<String>])> = rows
+                .into_iter()
+                .filter(|(_, row)| row.len() == full_width)
+                .collect();
+            if batch_rows.is_empty() {
+                continue;
+            }
+
+            for row_chunk in batch_rows.chunks(PG_EVAL_ROW_CHUNK) {
+                let chunk_rows: Vec<&[Option<String>]> =
+                    row_chunk.iter().map(|(_, row)| *row).collect();
+                for query_chunk in batchable.chunks(PG_EVAL_CHUNK) {
+                    self.pg_eval_buf.clear();
+                    for (ordinal, update_query) in query_chunk.iter().enumerate() {
+                        if ordinal > 0 {
+                            self.pg_eval_buf.push_str(" UNION ALL ");
+                        }
+                        let select = update_query
+                            .resolved
+                            .as_select()
+                            .ok_or(CacheError::InvalidQuery)?;
+                        // Ordinal is bounded by PG_EVAL_CHUNK (32): never wraps.
+                        #[allow(clippy::cast_possible_wrap)]
+                        let batch_select = resolved_select_node_table_replace_with_values_batch(
+                            select,
+                            table_metadata,
+                            &chunk_rows,
+                            ordinal as i64,
+                        )
+                        .map_err(|e| e.context_transform(CacheError::from))?;
+                        Deparse::deparse(&batch_select, &mut self.pg_eval_buf);
+                    }
+
+                    let msgs = match self.cache_eval_conn.simple_query(&self.pg_eval_buf).await {
+                        Ok(m) => m,
+                        Err(e) => {
+                            error!("batched predicate eval error: {}", error_chain_format(&e));
+                            return Err(CacheError::PgError(e).into());
+                        }
+                    };
+                    crate::metrics::handles().cdc.pg_eval_hits.increment(1);
+                    for msg in msgs {
+                        let SimpleQueryMessage::Row(row) = msg else {
+                            continue;
+                        };
+                        let (Some(ordinal), Some(local_idx)) = (
+                            row.get(0).and_then(|v| v.parse::<usize>().ok()),
+                            row.get(1).and_then(|v| v.parse::<usize>().ok()),
+                        ) else {
+                            continue;
+                        };
+                        if let (Some(update_query), Some(&(event_idx, _))) =
+                            (query_chunk.get(ordinal), row_chunk.get(local_idx))
+                        {
+                            membership
+                                .hits
+                                .insert((event_idx, update_query.fingerprint));
+                        }
+                    }
+                }
+            }
+
+            membership
+                .covered
+                .extend(batch_rows.iter().map(|(event_idx, _)| *event_idx));
+            membership.relation_fps.insert(
+                relation_oid,
+                batchable.iter().map(|q| q.fingerprint).collect(),
+            );
+        }
+
+        Ok(membership)
     }
 
     /// Mid-frame partial replay once the event log reaches its cap, bounding
@@ -526,7 +780,8 @@ impl WriterCdc {
                 core.frame_relation_oids
                     .extend(relation_oids.iter().copied());
                 if core.frame_state != FrameState::Recovering {
-                    core.frame_rows.push(FrameRowEvent::Truncate { relation_oids });
+                    core.frame_rows
+                        .push(FrameRowEvent::Truncate { relation_oids });
                     self.frame_rows_replay_if_full(core).await?;
                 }
             }
@@ -672,7 +927,8 @@ impl WriterCdc {
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: Vec<Option<String>>,
+        row_data: &[Option<String>],
+        batch: Option<BatchEvalView<'_>>,
     ) -> CacheResult<()> {
         let start = Instant::now();
         crate::metrics::handles().cdc.handle_inserts.increment(1);
@@ -689,7 +945,7 @@ impl WriterCdc {
                 core,
                 relation_oid,
                 None,
-                &row_data,
+                row_data,
                 None,
                 CdcOperation::Upsert,
             )
@@ -700,7 +956,7 @@ impl WriterCdc {
         // it accompanies rather than visible mid-frame.
         core.frame_invalidations.extend(fp_list);
 
-        self.update_queries_execute_batch(core, relation_oid, &row_data)
+        self.update_queries_execute_batch(core, relation_oid, row_data, batch)
             .await?;
 
         crate::metrics::handles()
@@ -717,8 +973,9 @@ impl WriterCdc {
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        key_data: Vec<Option<String>>,
-        new_row_data: Vec<Option<String>>,
+        key_data: &[Option<String>],
+        new_row_data: &[Option<String>],
+        batch: Option<BatchEvalView<'_>>,
     ) -> CacheResult<()> {
         let start = Instant::now();
         crate::metrics::handles().cdc.handle_updates.increment(1);
@@ -740,7 +997,7 @@ impl WriterCdc {
 
         if needs_change_eval {
             let row_changes = self
-                .query_row_changes(core, relation_oid, &new_row_data)
+                .query_row_changes(core, relation_oid, new_row_data)
                 .await?;
             trace!("row_changes {:?}", row_changes);
 
@@ -748,8 +1005,8 @@ impl WriterCdc {
                 core,
                 relation_oid,
                 row_changes.as_ref(),
-                &new_row_data,
-                Some(&key_data),
+                new_row_data,
+                Some(key_data),
                 CdcOperation::Upsert,
             )?;
             trace!("invalidation_count {}", fp_list.len());
@@ -758,11 +1015,11 @@ impl WriterCdc {
         }
 
         let matched = self
-            .update_queries_execute_batch(core, relation_oid, &new_row_data)
+            .update_queries_execute_batch(core, relation_oid, new_row_data, batch)
             .await?;
 
         if !matched {
-            self.frame_cache_delete(core, relation_oid, &new_row_data)
+            self.frame_cache_delete(core, relation_oid, new_row_data)
                 .await?;
             // Row left all predicates: it may still sit in a Fresh MV that
             // materialized it, and the upsert path above didn't match (so didn't
@@ -774,7 +1031,7 @@ impl WriterCdc {
         // No MV dirty-mark here: the new-row upsert above already dirty-marked
         // every MV that matched the (unchanged-except-PK) row.
         if !key_data.is_empty() {
-            self.frame_cache_delete(core, relation_oid, &key_data)
+            self.frame_cache_delete(core, relation_oid, key_data)
                 .await?;
         }
 
@@ -795,7 +1052,7 @@ impl WriterCdc {
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: Vec<Option<String>>,
+        row_data: &[Option<String>],
     ) -> CacheResult<()> {
         let start = Instant::now();
         crate::metrics::handles().cdc.handle_deletes.increment(1);
@@ -810,7 +1067,7 @@ impl WriterCdc {
         }
 
         // Buffer the delete for the frame flush (PGC-228).
-        self.frame_cache_delete(core, relation_oid, &row_data)
+        self.frame_cache_delete(core, relation_oid, row_data)
             .await?;
 
         // A deleted row leaves stale rows in any Fresh MV that materialized it;
@@ -828,7 +1085,7 @@ impl WriterCdc {
                     core,
                     relation_oid,
                     None,
-                    &row_data,
+                    row_data,
                     None,
                     CdcOperation::Delete,
                 )
@@ -1330,6 +1587,7 @@ impl WriterCdc {
         core: &mut WriterCore,
         relation_oid: u32,
         row_data: &[Option<String>],
+        batch: Option<BatchEvalView<'_>>,
     ) -> CacheResult<bool> {
         // Phase A: membership evaluation. The `core` borrow is confined to
         // this block so the in-frame write below doesn't hold it.
@@ -1397,7 +1655,31 @@ impl WriterCdc {
                 .collect();
 
             if !pg_eval.is_empty() {
-                let (fresh_pg, rest_pg): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) = pg_eval
+                // Batch-covered queries consult the precomputed segment matrix
+                // (PGC-241) — no round-trip. `frame_invalidations` was already
+                // applied above (the matrix is built unfiltered); the Fresh-MV
+                // dirty-mark self-gates, mirroring the per-row fresh/rest split.
+                let (batched, fallback): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) = match &batch {
+                    Some(view) => pg_eval
+                        .into_iter()
+                        .partition(|q| view.covers(q.fingerprint)),
+                    None => (Vec::new(), pg_eval),
+                };
+                if let Some(view) = &batch {
+                    for update_query in &batched {
+                        if view.hit(update_query.fingerprint) {
+                            trace!(
+                                "update_queries batched pg-eval matched fingerprint {}",
+                                update_query.fingerprint
+                            );
+                            core.mv_dirty_mark(update_query.fingerprint);
+                            matched = true;
+                        }
+                    }
+                }
+
+                // Per-row fallback for non-batchable shapes / uncovered rows.
+                let (fresh_pg, rest_pg): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) = fallback
                     .into_iter()
                     .partition(|q| core.mv_is_fresh(q.fingerprint));
 
