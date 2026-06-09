@@ -32,7 +32,7 @@ use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::{AdmitAction, QueryCommand, SubsumptionResult, WriterNotify},
+    messages::{AdmitAction, QueryCommand, SubsumptionResult},
     mv::{ShapeGate, resolved_has_join, shape_classify},
     query::CacheableQuery,
     types::{
@@ -1346,7 +1346,7 @@ impl WriterRegistration {
         }
 
         core.state_view.cached_queries.remove(&fingerprint);
-        let _ = core.notify_tx.send(WriterNotify::Failed { fingerprint });
+        core.waiters_fail(fingerprint);
     }
 
     /// Handle a limit bump: re-populate with a higher limit.
@@ -1361,6 +1361,11 @@ impl WriterRegistration {
         new_max_limit: Option<u64>,
     ) -> CacheResult<()> {
         let Some(cached_query) = core.cache.cached_queries.get1(&fingerprint) else {
+            // Gone before the bump ran. No drain needed here: the only path that
+            // removes a fingerprint while it could hold parked waiters
+            // (cache_query_cdc_invalidate / cache_query_evict) already drained
+            // them via waiters_fail before removal. Relied-upon invariant — keep
+            // it true if new removal paths are added.
             trace!("limit bump: query {fingerprint} not found, skipping");
             return Ok(());
         };

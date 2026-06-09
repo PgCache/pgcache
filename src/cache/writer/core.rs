@@ -539,6 +539,16 @@ impl WriterCore {
         });
     }
 
+    /// Drain any coalesced waiters parked on `fingerprint` to origin (the
+    /// `Failed` counterpart to `state_ready_transition`). Call this whenever a
+    /// query is abandoned mid-population — invalidated, evicted, or its
+    /// register/populate failed: the `Ready` those waiters were parked on is
+    /// dead, and under sustained churn a successor `Ready` may never come, so
+    /// without this they hang forever. A no-op when nothing is parked.
+    pub(super) fn waiters_fail(&self, fingerprint: u64) {
+        let _ = self.notify_tx.send(WriterNotify::Failed { fingerprint });
+    }
+
     /// Update cache state gauges with current values.
     //
     // Counts and byte totals are converted to f64 for Prometheus gauges; gauges

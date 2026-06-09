@@ -18,7 +18,7 @@
 #![cfg(feature = "fault-injection")]
 
 use std::io::Error;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio_postgres::SimpleQueryMessage;
 
@@ -45,7 +45,7 @@ fn row_count(msgs: &[SimpleQueryMessage]) -> usize {
 fn first_value(msgs: &[SimpleQueryMessage]) -> Option<String> {
     msgs.iter().find_map(|m| match m {
         SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
-        _ => None,
+        SimpleQueryMessage::CommandComplete(_) | SimpleQueryMessage::RowDescription(_) | _ => None,
     })
 }
 
@@ -206,6 +206,100 @@ async fn test_truncate_during_population_no_resurrected_rows() -> Result<(), Err
         row_count(&cached),
         0,
         "pre-truncate rows resurrected as orphans in the shared cache table"
+    );
+
+    Ok(())
+}
+
+/// Population delay for the coalesce-drain test: long enough that "drained at
+/// invalidation" (the fix) and "drained only when population finally completes"
+/// (no fix) are cleanly separable in wall-clock time.
+const DRAIN_POPULATION_DELAY_MS: &str = "5000";
+
+/// A coalesced waiter parked on a population must be drained (forwarded to
+/// origin) at *invalidation*, not left parked until the population eventually
+/// completes — under sustained invalidation churn a successor Ready may never
+/// come, so a still-parked waiter hangs forever (found by the two-table
+/// consistency stress harness, PGC-252). The drain covers both the CDC
+/// invalidate path and `cache_query_evict`.
+///
+/// Distinguisher is timing, not just completion: the populating query is held
+/// open for 5s, a second connection parks as a coalesced waiter, then an insert
+/// that grows the join invalidates the query. With the drain the waiter returns
+/// at invalidation (well under 5s); without it the waiter is only freed when the
+/// 5s population finishes (or never). The assertion is that it returns in a
+/// fraction of the population delay.
+#[tokio::test]
+async fn test_invalidation_drains_coalesced_waiters() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[(
+        "PGCACHE_FAULT_POPULATION_DELAY_MS",
+        DRAIN_POPULATION_DELAY_MS,
+    )])
+    .await?;
+
+    ctx.simple_query("create table coal_g (id int primary key, v int)")
+        .await?;
+    ctx.simple_query("create table coal_i (id int primary key, gid int)")
+        .await?;
+    ctx.simple_query("insert into coal_g (id, v) values (1, 10)")
+        .await?;
+    ctx.simple_query("insert into coal_i (id, gid) values (1, 1), (2, 1)")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // Miss: registers the join query; population reads its snapshot, then blocks
+    // for 5s (fault delay) — the query sits in Loading the whole time.
+    let query = "select i.id, g.v from coal_i i join coal_g g on i.gid = g.id where g.id = 1";
+    let initial = ctx.simple_query(query).await?;
+    assert_eq!(row_count(&initial), 2, "join rows exist at registration");
+
+    // Park a second connection's request as a coalesced waiter on the Loading
+    // query.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let waiter_client = ctx.proxy_client_connect().await?;
+    let parked_at = Instant::now();
+    let waiter = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(15), waiter_client.simple_query(query)).await
+    });
+
+    // Deterministically wait until the waiter is actually parked (coalesce-queue
+    // gauge >= 1) before invalidating. A waiter that parks *after* invalidation
+    // would be forwarded via the enqueue-Err re-dispatch and never exercise the
+    // drain — the test would then pass without testing anything.
+    let mut parked = false;
+    for _ in 0..100 {
+        if ctx.metrics().await?.cache_coalesce_waiting >= 1 {
+            parked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(parked, "waiter never parked in the coalesce queue within 5s");
+
+    // Grow the join at origin: invalidates the still-populating query, which
+    // must drain the parked waiter to origin now — not 5s later when population
+    // completes.
+    ctx.origin_query("insert into coal_i (id, gid) values (3, 1)", &[])
+        .await?;
+
+    let timed = waiter.await.expect("waiter task panicked");
+    let elapsed = parked_at.elapsed();
+    let messages = timed
+        .unwrap_or_else(|_| panic!("parked waiter hung past 15s: invalidation did not drain it"))
+        .expect("waiter query failed");
+
+    // The drain must arrive at invalidation (~hundreds of ms), far short of the
+    // 5s population delay. A waiter freed only at population completion would
+    // land near 5s.
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "parked waiter returned after {elapsed:?}; invalidation did not drain the coalesce \
+         queue (it was freed only when the 5s population completed)"
+    );
+    assert_eq!(
+        row_count(&messages),
+        3,
+        "drained waiter serves origin's post-insert rows"
     );
 
     Ok(())

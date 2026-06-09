@@ -2143,6 +2143,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pgcache-consistency"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures-util",
+ "pgcache-conformance",
+ "rand 0.9.4",
+ "reqwest",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "pgtemp"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

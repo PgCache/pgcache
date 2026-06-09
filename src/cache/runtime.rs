@@ -664,8 +664,10 @@ pub fn cache_supervise<'scope, 'env: 'scope, 'settings: 'scope>(
 }
 
 /// Cold task that drains coalesced waiters when the writer reports a query
-/// `Ready`/`Failed`. Off the dispatch hot path (fires once per registration
-/// completion, not per query). Retracts the published cache on exit.
+/// `Ready`/`Failed`. Off the dispatch hot path. Fires on every population
+/// completion and on every invalidation/eviction (the latter can be per
+/// CDC-event under churn), so a `Failed` for a fingerprint with no parked
+/// waiters is a cheap no-op drain. Retracts the published cache on exit.
 async fn coalesce_drain(
     dispatch: CacheDispatch,
     mut notify_rx: UnboundedReceiver<WriterNotify>,

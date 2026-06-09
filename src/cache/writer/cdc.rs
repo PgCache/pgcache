@@ -831,7 +831,9 @@ impl WriterCdc {
         core: &mut WriterCore,
         fingerprint: u64,
     ) -> CacheResult<()> {
-        // Pinned queries: defer readmission to the writer event loop
+        // Pinned queries: defer readmission to the writer event loop. Still
+        // drain parked waiters — the readmit's Ready can itself be superseded
+        // under churn (waiting on it risks the same hang as the unpinned path).
         if core
             .cache
             .cached_queries
@@ -840,6 +842,7 @@ impl WriterCdc {
         {
             debug!("pinned query invalidated, deferring readmit {fingerprint}");
             let _ = core.query_tx.send(QueryCommand::Readmit { fingerprint });
+            core.waiters_fail(fingerprint);
             return Ok(());
         }
 
@@ -886,6 +889,9 @@ impl WriterCdc {
                 entry.mv.state = MvState::Pending { has_table: true };
             }
         }
+
+        // Drain coalesced waiters parked on this query's now-dead population.
+        core.waiters_fail(fingerprint);
 
         // Purge stale rows if generation threshold moved
         let new_threshold = core.cache.generation_purge_threshold();
@@ -1661,6 +1667,10 @@ impl WriterCore {
 
         // Remove from state view
         self.state_view.cached_queries.remove(&fingerprint);
+
+        // Drain coalesced waiters parked on the now-removed query (eviction can
+        // remove a Loading query whose waiters would otherwise never be drained).
+        self.waiters_fail(fingerprint);
 
         self.cache
             .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);
