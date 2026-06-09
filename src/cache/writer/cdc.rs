@@ -700,9 +700,15 @@ impl WriterCdc {
         if !matched {
             self.frame_cache_delete(core, relation_oid, &new_row_data)
                 .await?;
+            // Row left all predicates: it may still sit in a Fresh MV that
+            // materialized it, and the upsert path above didn't match (so didn't
+            // dirty-mark). Coarsely dirty the relation's Fresh MVs (PGC-254).
+            core.mv_dirty_mark_relation(relation_oid);
         }
 
         // A non-empty `key_data` means the PK changed; delete the old PK too.
+        // No MV dirty-mark here: the new-row upsert above already dirty-marked
+        // every MV that matched the (unchanged-except-PK) row.
         if !key_data.is_empty() {
             self.frame_cache_delete(core, relation_oid, &key_data)
                 .await?;
@@ -742,6 +748,13 @@ impl WriterCdc {
         // Buffer the delete for the frame flush (PGC-228).
         self.frame_cache_delete(core, relation_oid, &row_data)
             .await?;
+
+        // A deleted row leaves stale rows in any Fresh MV that materialized it;
+        // CDC removals never went through the upsert path's dirty-mark, so the
+        // MV would serve the deleted row forever. Coarsely dirty the relation's
+        // Fresh MVs (PGC-254 rung 1 — the delete tuple lacks the non-PK columns
+        // needed to identify which MVs actually contained the row).
+        core.mv_dirty_mark_relation(relation_oid);
 
         // Check for subquery invalidations — removing a row can expand the
         // final result set for Exclusion/Scalar subquery tables

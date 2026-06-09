@@ -315,6 +315,21 @@ impl WriterCore {
         }
     }
 
+    /// Dirty-mark every Fresh MV among the relation's update-queries (PGC-254
+    /// rung 1). Used on CDC removals (DELETE / UPDATE-out): unlike the upsert
+    /// path, we can't evaluate which queries actually contained the removed row
+    /// — REPLICA IDENTITY DEFAULT carries only the PK, not the non-PK columns a
+    /// predicate needs — so this is relation-level. `mv_dirty_mark` self-gates
+    /// on Fresh, and the rebuild is lazy; under delete-heavy load the MVs stay
+    /// Pending and the query serves from the (correct) source rows.
+    pub(super) fn mv_dirty_mark_relation(&self, relation_oid: u32) {
+        if let Some(update_queries) = self.cache.update_queries.get(&relation_oid) {
+            for query in update_queries.iter_complexity_ordered() {
+                self.mv_dirty_mark(query.fingerprint);
+            }
+        }
+    }
+
     /// Whether this query currently has a `Fresh` MV. Only `Fresh` queries
     /// need full CDC evaluation (so `mv_dirty_mark` can fire on a match);
     /// non-`Fresh` queries are short-circuitable in the membership check.
