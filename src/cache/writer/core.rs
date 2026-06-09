@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -77,6 +78,11 @@ pub(crate) mod fault {
 /// front so the buffer never reallocates in steady state; also the byte
 /// threshold at which a frame's writes are chunk-flushed to bound memory.
 pub(super) const FRAME_BUF_CAPACITY: usize = 256 * 1024;
+
+/// Max full evictions per periodic-tick `eviction_run` call (PGC-251). Bounds the
+/// single-threaded writer stall when reclaiming a large count-cap overshoot; the
+/// remainder is reclaimed on subsequent ticks.
+const EVICTION_TICK_BUDGET: usize = 512;
 
 /// Maximum buffered row events per frame before a mid-frame partial replay —
 /// bounds frame memory the way `FRAME_BUF_CAPACITY` bounds `frame_buf`.
@@ -257,6 +263,15 @@ pub struct WriterCore {
     /// UNCACHED (`row_changes = None`) or the entering-invalidation the
     /// per-frame flow produced is lost (PGC-242; `test_cache_join`'s PK flip).
     pub(super) batch_deleted_pks: HashSet<(u32, EcoString)>,
+    /// Cache PG data directory, discovered once at startup, for `statvfs` to
+    /// auto-size the disk eviction limit (PGC-251 Slice 2). `None` if it couldn't
+    /// be read (non-superuser, or not visible) — auto disk limit then disabled.
+    data_dir: Option<PathBuf>,
+    /// Last `statvfs` reading of the data directory's filesystem (total,
+    /// available) in bytes; refreshed on the 1 s tick. `disk_total == 0` means
+    /// "no reading" — `disk_limit_compute` then takes no auto limit.
+    disk_total: u64,
+    disk_available: u64,
 }
 
 /// A population merged into the cache but withheld from serving until the CDC
@@ -281,6 +296,25 @@ fn population_finalize_allowed(live: Option<(u64, bool)>, parked_generation: u64
     matches!(live, Some((generation, invalidated)) if generation == parked_generation && !invalidated)
 }
 
+/// Read the cache PG's `data_directory` so `statvfs` can size the disk limit
+/// against the real volume (PGC-251 Slice 2). `None` on any error (it's a
+/// superuser-only GUC) — the caller then disables the auto disk limit.
+async fn data_directory_query(client: &Client) -> Option<PathBuf> {
+    match client
+        .query_one("SELECT current_setting('data_directory')", &[])
+        .await
+    {
+        Ok(row) => {
+            let dir: String = row.get(0);
+            Some(PathBuf::from(dir))
+        }
+        Err(e) => {
+            debug!("data_directory query failed ({e}); disk auto-limit disabled");
+            None
+        }
+    }
+}
+
 impl WriterCore {
     pub async fn new(
         settings: &Settings,
@@ -298,6 +332,12 @@ impl WriterCore {
             .await
             .map_into_report::<CacheError>()
             .attach_loc("connecting to origin database")?;
+
+        let data_dir = data_directory_query(&cache_client).await;
+        let (disk_total, disk_available) = data_dir
+            .as_deref()
+            .and_then(crate::memory::disk_stats_bytes)
+            .unwrap_or((0, 0));
 
         Ok(Self {
             cache: Cache::new(settings),
@@ -331,6 +371,9 @@ impl WriterCore {
             batch_last_lsn: 0,
             frame_open: false,
             batch_deleted_pks: HashSet::new(),
+            data_dir,
+            disk_total,
+            disk_available,
         })
     }
 
@@ -631,10 +674,15 @@ impl WriterCore {
     #[allow(clippy::cast_precision_loss)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn state_gauges_update(&self) {
+        let registered = self.cache.cached_queries.len();
         crate::metrics::handles()
             .state
             .queries_registered
-            .set(self.cache.cached_queries.len() as f64);
+            .set(registered as f64);
+        // Publish for the memory monitor to size the count cap (PGC-251).
+        self.state_view
+            .registered_count
+            .store(registered, Ordering::Relaxed);
 
         {
             let mut loading_count = 0;
@@ -668,7 +716,7 @@ impl WriterCore {
             .state
             .size_bytes
             .set(self.cache.current_size as f64);
-        if let Some(limit) = self.cache.dynamic.load().cache_size {
+        if let Some(limit) = self.disk_limit_compute(self.cache.dynamic.load().cache_size) {
             crate::metrics::handles()
                 .state
                 .size_limit_bytes
@@ -729,9 +777,46 @@ impl WriterCore {
         Ok(usize::try_from(size).unwrap_or(0))
     }
 
+    /// Refresh the cached `statvfs` reading for the cache PG data directory,
+    /// used to auto-size the disk eviction limit (PGC-251 Slice 2). One syscall;
+    /// a no-op leaving the last reading if the data directory wasn't discovered
+    /// or can't be stat'd.
+    pub(super) fn disk_stats_refresh(&mut self) {
+        let Some(dir) = self.data_dir.as_deref() else {
+            return;
+        };
+        if let Some((total, available)) = crate::memory::disk_stats_bytes(dir) {
+            self.disk_total = total;
+            self.disk_available = available;
+        }
+    }
+
+    /// Effective disk-size eviction limit in bytes, or `None` for no disk-driven
+    /// eviction. An explicit `cache_size` config is a hard override; otherwise the
+    /// limit is auto-derived from live filesystem free space (PGC-251 Slice 2),
+    /// disabled only when no `statvfs` reading is available.
+    pub(super) fn disk_limit_compute(&self, cache_size: Option<usize>) -> Option<usize> {
+        if let Some(explicit) = cache_size {
+            return Some(explicit);
+        }
+        if self.disk_total == 0 {
+            return None;
+        }
+        let limit = crate::memory::disk_limit_auto(
+            self.cache.current_size as u64,
+            self.disk_total,
+            self.disk_available,
+        );
+        Some(usize::try_from(limit).unwrap_or(usize::MAX))
+    }
+
     /// Run eviction loop. For CLOCK policy, uses second-chance algorithm with reference bit.
     /// For FIFO policy, evicts the oldest-registered query.
-    pub(super) async fn eviction_run(&mut self) -> CacheResult<()> {
+    ///
+    /// `max_evictions` bounds full evictions per call (`None` = unbounded). The
+    /// periodic tick passes a bound so a large count-cap overshoot is reclaimed
+    /// gradually across ticks instead of stalling the single-threaded writer.
+    pub(super) async fn eviction_run(&mut self, max_evictions: Option<usize>) -> CacheResult<()> {
         // Defer while a CDC frame is open: cache_query_evict / generation_purge
         // would block on the frame's uncommitted cache-table locks. Eviction is
         // periodic/best-effort — the next Ready after the frame commits runs it.
@@ -743,12 +828,22 @@ impl WriterCore {
         const MAX_BUMPS: usize = 5;
         let mut bumps = 0;
         let mut pinned_skips = 0;
+        let mut evicted = 0usize;
 
         let cfg = self.cache.dynamic.load();
+        // Memory count cap (PGC-251): evict down to it independently of the disk
+        // limit. `usize::MAX` = uncapped (no count-driven eviction).
+        let count_cap = self.state_view.query_count_cap.load(Ordering::Relaxed);
+        // Disk-size limit: explicit `cache_size` override, else auto-derived from
+        // live free space (PGC-251 Slice 2). Snapshotted once; the loop drives
+        // current_size down against this fixed anchor.
+        let disk_limit = self.disk_limit_compute(cfg.cache_size);
 
         debug!(
             current_size = self.cache.current_size,
-            cache_size = ?cfg.cache_size,
+            disk_limit = ?disk_limit,
+            count = self.cache.cached_queries.len(),
+            count_cap,
             cache_policy = ?cfg.cache_policy,
             "eviction_run entry"
         );
@@ -756,12 +851,17 @@ impl WriterCore {
         // Pre-sweep: reclaim bytes held by Dirty MVs before considering live
         // entries for eviction. If this alone brings current_size under the
         // limit, the loop below exits immediately without evicting anything.
-        if cfg.cache_size.is_some_and(|s| self.cache.current_size > s) {
+        if disk_limit.is_some_and(|s| self.cache.current_size > s) {
             self.mv_dirty_sweep().await?;
             self.cache.current_size = self.cache_size_load().await?;
         }
 
-        while cfg.cache_size.is_some_and(|s| self.cache.current_size > s) {
+        loop {
+            let over_disk = disk_limit.is_some_and(|s| self.cache.current_size > s);
+            let over_count = self.cache.cached_queries.len() > count_cap;
+            if !over_disk && !over_count {
+                break;
+            }
             let Some(&min_gen) = self.cache.generations.first() else {
                 break;
             };
@@ -812,9 +912,17 @@ impl WriterCore {
             // trigger is what pgcache_total_size sums, so the next iteration's
             // cache_size_load needs the drain to observe a shrink.
             self.publication_dirty_drain().await?;
-            self.cache.current_size = self.cache_size_load().await?;
+            // Reload disk size only when the disk limit is active; the count-cap
+            // path needs no pgcache_total_size() round-trip per eviction.
+            if disk_limit.is_some() {
+                self.cache.current_size = self.cache_size_load().await?;
+            }
             bumps = 0;
             pinned_skips = 0;
+            evicted += 1;
+            if max_evictions.is_some_and(|m| evicted >= m) {
+                break;
+            }
         }
 
         // stale_entries_cleanup runs on the 1s gauges tick instead of here —
@@ -1204,11 +1312,23 @@ pub fn writer_run(
                             break;
                         }
                         _ = gauges_interval.tick() => {
+                            core.disk_stats_refresh();
                             core.stale_entries_cleanup();
                             core.state_gauges_update();
                             core.writer_scale_gauges_update();
                             core.state_view.memo.gc();
                             core.state_view.memo.metrics_publish();
+                            // Enforce the memory count cap independently of
+                            // registration: under throttle-freeze no Ready events
+                            // arrive, so the registration-path eviction can't run
+                            // (PGC-251). Bounded per tick; log-and-continue so a
+                            // periodic best-effort eviction never kills the writer.
+                            if let Err(e) = core.eviction_run(Some(EVICTION_TICK_BUDGET)).await {
+                                error!(
+                                    "periodic eviction failed: {}",
+                                    error_chain_format(e.current_context())
+                                );
+                            }
                         }
                         // Handle query commands from dispatch
                         msg = query_rx.recv() => {

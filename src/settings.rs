@@ -147,6 +147,10 @@ pub fn allowlist_parse(tables: &Option<Vec<String>>) -> Allowlist {
 /// Stored behind ArcSwap for lock-free reads on the hot path.
 #[derive(Debug, Clone, Serialize)]
 pub struct DynamicConfig {
+    /// Explicit disk-size budget (bytes) for cached data. When `None`, the limit
+    /// is auto-derived from the cache volume's live free space, keeping a reserve
+    /// free (PGC-251 Slice 2); a configured value is a hard override. Deprecated
+    /// in favour of the auto limit.
     pub cache_size: Option<usize>,
     pub cache_policy: CachePolicy,
     pub admission_threshold: u32,
@@ -1156,7 +1160,7 @@ impl Settings {
             --cdc_publication_name NAME --cdc_slot_name SLOT_NAME \n \
             --listen_socket IP_AND_PORT \n \
             --num_workers NUMBER \n \
-            [--cache_size BYTES] \n \
+            [--cache_size BYTES] (deprecated: hard disk-size override; default auto-derives from free disk) \n \
             [--cache_policy fifo|clock] (default: clock) \n \
             [--admission_threshold N] (default: 1, clock policy only) \n \
             [--mv_size_ratio N] (default: 10, materialized view size gate) \n \

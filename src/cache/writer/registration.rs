@@ -1362,7 +1362,7 @@ impl WriterRegistration {
         self.query_ready_mark(core, fingerprint, cached_bytes, row_count);
         core.mv_pinned_bootstrap(fingerprint);
         core.cache.current_size = core.cache_size_load().await?;
-        core.eviction_run().await?;
+        core.eviction_run(None).await?;
         Ok(())
     }
 

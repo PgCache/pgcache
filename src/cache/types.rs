@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -457,6 +457,19 @@ pub struct CacheStateView {
     /// Already-cached queries are unaffected. `Arc` so population workers can
     /// share it; wait-free read on the hot path.
     pub registration_throttled: Arc<AtomicBool>,
+    /// Authoritative registered (Ready) query count, published by the writer so
+    /// the memory monitor can size the count cap from a real measurement (PGC-251).
+    pub registered_count: Arc<AtomicUsize>,
+    /// Max registered queries that fit the memory budget, published by the
+    /// memory monitor and read by the writer's eviction loop. `usize::MAX` =
+    /// no cap (insufficient signal, or memory not detectable) (PGC-251).
+    pub query_count_cap: Arc<AtomicUsize>,
+    /// Set by the memory monitor under memory pressure; read by the serve loop to
+    /// gate connection recycling. Clear → no recycling (PGC-251 Slice 1d).
+    pub recycle_wanted: Arc<AtomicBool>,
+    /// Monotonic count of serve connections recycled, incremented by the serve
+    /// loop and read by the monitor to reset the peak after a full pool cycle.
+    pub recycle_count: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for CacheStateView {
@@ -479,6 +492,10 @@ impl CacheStateView {
             hits_since_gc: AtomicU32::new(0),
             last_hits_per_gc: AtomicU32::new(0),
             registration_throttled: Arc::new(AtomicBool::new(false)),
+            registered_count: Arc::new(AtomicUsize::new(0)),
+            query_count_cap: Arc::new(AtomicUsize::new(usize::MAX)),
+            recycle_wanted: Arc::new(AtomicBool::new(false)),
+            recycle_count: Arc::new(AtomicUsize::new(0)),
             memo: ResultMemo::new(dynamic),
         }
     }

@@ -169,6 +169,9 @@ pub mod names {
     pub const CACHE_RESTARTS_TOTAL: &str = "pgcache.cache.restarts_total";
     /// Cache-DB serve-pool connections reconnected after a poisoned discard.
     pub const CACHE_POOL_REPLENISHED: &str = "pgcache.cache.pool_replenished";
+    /// Cache-DB serve-pool connections recycled under memory pressure to reclaim
+    /// plan-cache RSS (PGC-251 Slice 1d).
+    pub const CACHE_POOL_RECYCLED: &str = "pgcache.cache.pool_recycled";
     /// Current resident set size of the pgcache process, in bytes.
     pub const CACHE_RSS_BYTES: &str = "pgcache.cache.rss_bytes";
     /// Whole-system used memory (pgcache + cache Postgres), in bytes.
@@ -180,6 +183,10 @@ pub mod names {
     /// Queries forwarded to origin (not registered) due to memory-pressure throttling.
     pub const CACHE_REGISTRATION_THROTTLED_TOTAL: &str =
         "pgcache.cache.registration_throttled_total";
+    /// Max registered queries that fit the memory budget (0 = uncapped) (PGC-251).
+    pub const CACHE_QUERY_COUNT_CAP: &str = "pgcache.cache.query_count_cap";
+    /// Measured per-query memory footprint, EWMA-smoothed bytes (PGC-251).
+    pub const CACHE_MARGINAL_BYTES_PER_QUERY: &str = "pgcache.cache.marginal_bytes_per_query";
 
     // Extended protocol metrics
     pub const PROTOCOL_SIMPLE_QUERIES: &str = "pgcache.protocol.simple_queries";
@@ -355,10 +362,15 @@ pub struct CacheHandles {
     pub restarts_total: Counter,
     /// Incremented each time a discarded serve-pool connection is replaced.
     pub pool_replenished: Counter,
+    /// Incremented each time a serve-pool connection is recycled for memory reclaim.
+    pub pool_recycled: Counter,
     /// Process RSS, system used memory, registration budget, and throttle state.
     pub rss_bytes: Gauge,
     pub memory_used_bytes: Gauge,
     pub memory_budget_bytes: Gauge,
+    /// Count-cap eviction signals (PGC-251).
+    pub query_count_cap: Gauge,
+    pub marginal_bytes_per_query: Gauge,
     pub registration_throttled: Gauge,
     pub registration_throttled_total: Counter,
 }
@@ -512,9 +524,12 @@ impl Handles {
                 memo_bytes: metrics::gauge!(CACHE_MEMO_BYTES),
                 restarts_total: metrics::counter!(CACHE_RESTARTS_TOTAL),
                 pool_replenished: metrics::counter!(CACHE_POOL_REPLENISHED),
+                pool_recycled: metrics::counter!(CACHE_POOL_RECYCLED),
                 rss_bytes: metrics::gauge!(CACHE_RSS_BYTES),
                 memory_used_bytes: metrics::gauge!(CACHE_MEMORY_USED_BYTES),
                 memory_budget_bytes: metrics::gauge!(CACHE_MEMORY_BUDGET_BYTES),
+                query_count_cap: metrics::gauge!(CACHE_QUERY_COUNT_CAP),
+                marginal_bytes_per_query: metrics::gauge!(CACHE_MARGINAL_BYTES_PER_QUERY),
                 registration_throttled: metrics::gauge!(CACHE_REGISTRATION_THROTTLED),
                 registration_throttled_total: metrics::counter!(CACHE_REGISTRATION_THROTTLED_TOTAL),
             },

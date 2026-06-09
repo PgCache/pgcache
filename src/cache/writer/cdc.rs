@@ -2068,14 +2068,12 @@ impl WriterCdc {
         // Purge stale rows if generation threshold moved
         let new_threshold = core.cache.generation_purge_threshold();
         if new_threshold > prev_generation_threshold {
-            let mut current_size = core.cache_size_load().await?;
-
-            if cfg.cache_size.is_some_and(|s| current_size > s) {
+            core.cache.current_size = core.cache_size_load().await?;
+            let disk_limit = core.disk_limit_compute(cfg.cache_size);
+            if disk_limit.is_some_and(|s| core.cache.current_size > s) {
                 core.generation_purge(new_threshold).await?;
-                current_size = core.cache_size_load().await?;
+                core.cache.current_size = core.cache_size_load().await?;
             }
-
-            core.cache.current_size = current_size as usize;
         }
 
         Ok(())
@@ -2866,15 +2864,12 @@ impl WriterCore {
         // Purge generations based on new threshold
         let new_threshold = self.cache.generation_purge_threshold();
         if new_threshold > prev_generation_threshold {
-            let cache_size = self.cache.dynamic.load().cache_size;
-            let mut current_size = self.cache_size_load().await?;
-
-            if cache_size.is_some_and(|s| current_size > s) {
+            self.cache.current_size = self.cache_size_load().await?;
+            let disk_limit = self.disk_limit_compute(self.cache.dynamic.load().cache_size);
+            if disk_limit.is_some_and(|s| self.cache.current_size > s) {
                 self.generation_purge(new_threshold).await?;
-                current_size = self.cache_size_load().await?;
+                self.cache.current_size = self.cache_size_load().await?;
             }
-
-            self.cache.current_size = current_size as usize;
         }
 
         Ok(())
