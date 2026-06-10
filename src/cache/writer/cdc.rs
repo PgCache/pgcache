@@ -1538,8 +1538,31 @@ impl WriterCdc {
         // it accompanies rather than visible mid-frame.
         core.frame_invalidations.extend(fp_list);
 
-        self.update_queries_execute_batch(core, relation_oid, row_data, batch)
+        let matched = self
+            .update_queries_execute_batch(core, relation_oid, row_data, batch)
             .await?;
+
+        // The inserted row is alive at origin: cancel any tracked deletion of
+        // its key so population merges don't omit it (PGC-260). When the key
+        // was tracked but no query matched (nothing upserted), write the row
+        // anyway — its presence in the shared table is what makes the
+        // cancellation safe in every merge interleaving (merges never
+        // overwrite, so neither an old-snapshot nor a new-snapshot population
+        // can regress it).
+        let tracked = core.population_deleted_key_cancel(relation_oid, row_data);
+        if tracked && !matched {
+            core.frame_begin_ensure();
+            let table_metadata =
+                core.cache
+                    .tables
+                    .get1(&relation_oid)
+                    .ok_or(CacheError::UnknownTable {
+                        oid: Some(relation_oid),
+                        name: None,
+                    })?;
+            self.cache_upsert_unconditional_into(&mut core.frame_buf, table_metadata, row_data);
+            self.frame_write_finish(core).await?;
+        }
 
         crate::metrics::handles()
             .cdc
@@ -1610,7 +1633,13 @@ impl WriterCdc {
             .update_queries_execute_batch(core, relation_oid, new_row_data, batch)
             .await?;
 
-        if !matched {
+        if matched {
+            // The upserted row supersedes any tracked deletion of its key —
+            // including a previously-deleted PK this row's new PK reuses
+            // (PGC-260). The update-out branch below deliberately does NOT
+            // cancel: it records the key itself (PGC-261 tracks that case).
+            core.population_deleted_key_cancel(relation_oid, new_row_data);
+        } else {
             self.frame_cache_delete(core, relation_oid, new_row_data)
                 .await?;
             // Row left all predicates: it may still sit in a Fresh MV that

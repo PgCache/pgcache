@@ -49,10 +49,25 @@ const POPULATION_DEADLOCK_BACKOFF_BASE: Duration = Duration::from_millis(20);
 /// feature.
 #[cfg(feature = "fault-injection")]
 async fn fault_population_delay() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     if let Some(ms) = std::env::var("PGCACHE_FAULT_POPULATION_DELAY_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
+    {
+        sleep(Duration::from_millis(ms)).await;
+    }
+
+    // One-shot variant: delays only the FIRST population. PGC-260 tests need a
+    // long-running guard population (keeps deleted-key tracking alive) while a
+    // later population runs undelayed inside the guard's window.
+    static DELAY_ONCE: AtomicBool = AtomicBool::new(true);
+    if let Some(ms) = std::env::var("PGCACHE_FAULT_POPULATION_DELAY_ONCE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        && DELAY_ONCE.swap(false, Ordering::Relaxed)
     {
         sleep(Duration::from_millis(ms)).await;
     }

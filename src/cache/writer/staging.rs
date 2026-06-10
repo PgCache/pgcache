@@ -192,6 +192,17 @@ impl PopulationDeletedKeys {
         self.relations.contains_key(&relation_oid)
     }
 
+    /// Drop a tracked key whose row CDC has re-written (PGC-260): the row is
+    /// alive at origin again, so filtering its key would make a population
+    /// merge omit a live row — while resurrection of the old version is
+    /// impossible anyway once the live row is in the shared cache table
+    /// (merges never overwrite). Returns whether the key was tracked.
+    pub(super) fn cancel(&mut self, relation_oid: u32, key: &str) -> bool {
+        self.relations
+            .get_mut(&relation_oid)
+            .is_some_and(|entry| entry.keys.remove(key).is_some())
+    }
+
     /// Raise the abort watermark for `relation_oid` to `lsn` — a bulk
     /// invalidation (TRUNCATE / 40P01 recovery) committed there. Merges whose
     /// snapshot predates `lsn` abort and repopulate; a population that
@@ -325,6 +336,43 @@ impl MergePlan {
 }
 
 impl WriterCore {
+    /// A CDC insert/update re-wrote the row at `row_data`'s PK — cancel any
+    /// tracked deletion of that key (PGC-260): the frame-pending entry (an
+    /// earlier delete in this frame nets out, in event order) and the recorded
+    /// set (deletes from earlier frames). A lingering key would make population
+    /// merges omit a legitimately live row. Returns whether anything was
+    /// tracked, so the insert path can force-upsert an otherwise-unmatched row
+    /// (the live row in the shared table is what makes cancellation safe).
+    pub(super) fn population_deleted_key_cancel(
+        &mut self,
+        relation_oid: u32,
+        row_data: &[Option<String>],
+    ) -> bool {
+        let pending = self
+            .frame_deleted_keys
+            .iter()
+            .any(|(oid, _)| *oid == relation_oid);
+        if !pending && !self.population_deleted_keys.is_recording(relation_oid) {
+            return false;
+        }
+        let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
+            return false;
+        };
+        let Some(key) = pk_body_render(table_metadata, row_data) else {
+            return false;
+        };
+        let mut tracked = false;
+        if pending {
+            self.frame_deleted_keys.retain(|(oid, pending_key)| {
+                let matches = *oid == relation_oid && *pending_key == key;
+                tracked |= matches;
+                !matches
+            });
+        }
+        tracked |= self.population_deleted_keys.cancel(relation_oid, &key);
+        tracked
+    }
+
     /// Merge one population's staging tables into the shared cache tables,
     /// filtering keys CDC removed during the population (PGC-250). Generation is
     /// stamped here (moved off the population worker). Best-effort drops staging

@@ -365,3 +365,110 @@ async fn test_deferred_ready_gate_serves_caught_up_value() -> Result<(), Error> 
 
     Ok(())
 }
+
+/// A PK deleted and then reinserted at origin must not be omitted from a later
+/// population's result (PGC-260). The delete is tracked while a guard
+/// population holds the deleted-key set open; the reinsert matches no live
+/// query at apply time, so without the fix the row is absent from the shared
+/// table AND the tracked key filters it out of the later population's merge —
+/// a persistent omission of a live row.
+#[tokio::test]
+async fn test_reinsert_during_population_included() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_ONCE_MS", "4000")]).await?;
+
+    ctx.simple_query("create table reins (id int primary key, flag text not null, v int not null)")
+        .await?;
+    ctx.simple_query("insert into reins (id, flag, v) values (1, 'guard', 1), (2, 'target', 10)")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // Guard query: its (one-shot-delayed) population keeps deleted-key
+    // tracking active for the relation across the whole scenario.
+    ctx.simple_query("select id, v from reins where flag = 'guard'")
+        .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Delete then reinsert the target row in separate source transactions.
+    // At apply time nothing live matches flag='target', so without the
+    // cancel + force-upsert the reinsert writes nothing.
+    ctx.origin_query("delete from reins where id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    ctx.origin_query(
+        "insert into reins (id, flag, v) values (2, 'target', 20)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_settle().await?;
+
+    // Now register the query that matches the reinserted row. Its population
+    // runs undelayed, merging while the guard is still in flight (the tracked
+    // key is not yet pruned).
+    let q = "select id, v from reins where flag = 'target'";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    let before = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(
+        row_count(&served),
+        1,
+        "reinserted live row omitted from the population result (PGC-260)"
+    );
+    assert_eq!(
+        first_value(&served).as_deref(),
+        Some("2"),
+        "served row should be id=2"
+    );
+
+    Ok(())
+}
+
+/// Same as above with the delete + reinsert in ONE source transaction: the
+/// frame-pending deleted key must net out against the same frame's reinsert
+/// (event order), recording nothing at commit.
+#[tokio::test]
+async fn test_reinsert_same_frame_during_population_included() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_ONCE_MS", "4000")]).await?;
+
+    ctx.simple_query(
+        "create table reins_f (id int primary key, flag text not null, v int not null)",
+    )
+    .await?;
+    ctx.simple_query("insert into reins_f (id, flag, v) values (1, 'guard', 1), (2, 'target', 10)")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    ctx.simple_query("select id, v from reins_f where flag = 'guard'")
+        .await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    ctx.origin
+        .batch_execute(
+            "BEGIN; \
+             delete from reins_f where id = 2; \
+             insert into reins_f (id, flag, v) values (2, 'target', 20); \
+             COMMIT;",
+        )
+        .await
+        .map_err(Error::other)?;
+    ctx.cdc_settle().await?;
+
+    let q = "select id, v from reins_f where flag = 'target'";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    let before = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(
+        row_count(&served),
+        1,
+        "reinserted live row omitted after same-frame delete+reinsert (PGC-260)"
+    );
+
+    Ok(())
+}
