@@ -99,6 +99,8 @@ pub mod names {
     pub const CACHE_INVALIDATIONS: &str = "pgcache.cache.invalidations";
     pub const CACHE_CDC_LOCAL_EVAL_HITS: &str = "pgcache.cache.cdc_local_eval_hits";
     pub const CACHE_CDC_PG_EVAL_HITS: &str = "pgcache.cache.cdc_pg_eval_hits";
+    pub const CACHE_CDC_PREPARED_HITS: &str = "pgcache.cache.cdc_prepared_hits";
+    pub const CACHE_CDC_PREPARED_MISSES: &str = "pgcache.cache.cdc_prepared_misses";
     pub const CACHE_EVICTIONS: &str = "pgcache.cache.evictions";
     pub const CACHE_READMISSIONS: &str = "pgcache.cache.readmissions";
     pub const CACHE_SUBSUMPTIONS: &str = "pgcache.cache.subsumptions";
@@ -375,6 +377,11 @@ pub struct CdcHandles {
     pub invalidations: Counter,
     pub local_eval_hits: Counter,
     pub pg_eval_hits: Counter,
+    /// Prepared-eval statement cache hits/misses (PGC-241 stage 4). Misses ≈
+    /// executions is the LRU-thrash tripwire: the live query working set
+    /// exceeds the cache capacity and prepare-per-use is making things worse.
+    pub prepared_hits: Counter,
+    pub prepared_misses: Counter,
     pub handle_inserts: Counter,
     pub handle_updates: Counter,
     pub handle_deletes: Counter,
@@ -525,6 +532,8 @@ impl Handles {
                 invalidations: metrics::counter!(CACHE_INVALIDATIONS),
                 local_eval_hits: metrics::counter!(CACHE_CDC_LOCAL_EVAL_HITS),
                 pg_eval_hits: metrics::counter!(CACHE_CDC_PG_EVAL_HITS),
+                prepared_hits: metrics::counter!(CACHE_CDC_PREPARED_HITS),
+                prepared_misses: metrics::counter!(CACHE_CDC_PREPARED_MISSES),
                 handle_inserts: metrics::counter!(CACHE_HANDLE_INSERTS),
                 handle_updates: metrics::counter!(CACHE_HANDLE_UPDATES),
                 handle_deletes: metrics::counter!(CACHE_HANDLE_DELETES),

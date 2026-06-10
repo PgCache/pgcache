@@ -1,11 +1,15 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::num::NonZeroUsize;
 use std::time::Instant;
 
 use ecow::EcoString;
+use futures_util::future;
+use lru::LruCache;
 use postgres_protocol::escape;
-use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow};
-use tracing::{debug, error, info, instrument, trace};
+use tokio_postgres::types::ToSql;
+use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow, Statement};
+use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::catalog::TableMetadata;
 
@@ -15,7 +19,8 @@ use crate::query::constraints::{QueryConstraints, TableConstraint};
 use crate::query::evaluate::{literal_compare, where_value_compare_string};
 use crate::query::resolved::ResolvedQueryExpr;
 use crate::query::transform::{
-    BATCH_IDX_COLUMN, resolved_select_node_table_replace_with_values,
+    BATCH_IDX_COLUMN, resolved_select_node_table_replace_with_unnest,
+    resolved_select_node_table_replace_with_values,
     resolved_select_node_table_replace_with_values_batch,
 };
 
@@ -48,6 +53,26 @@ const PG_EVAL_CHUNK: usize = 32;
 /// row_width`, so this bounds statement size the way `FRAME_BUF_CAPACITY`
 /// bounds the frame buffer; round-trips collapse `K → ⌈K/64⌉` per query chunk.
 const PG_EVAL_ROW_CHUNK: usize = 64;
+
+/// Prepared-eval statement cache bound (PGC-241 stage 4). Per-literal
+/// registration can produce thousands of live fingerprints; the LRU keeps the
+/// hot working set prepared and ages the rest out (which also closes them
+/// server-side). If `cdc_prepared_misses` tracks executions, the working set
+/// exceeds this and prepare-per-use is thrashing — raise it or gate on
+/// second use (until shape-parameterized update queries, PGC-257, collapse
+/// the cardinality).
+fn prepared_eval_cache_capacity() -> NonZeroUsize {
+    NonZeroUsize::new(512).unwrap_or(NonZeroUsize::MIN)
+}
+
+/// Statement-cache key for prepared membership eval. Deliberately a named
+/// type: when update queries become shape-parameterized (PGC-257) this swaps
+/// to `(relation, shape)` here, and the cache machinery carries over.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PreparedEvalKey {
+    relation_oid: u32,
+    fingerprint: u64,
+}
 
 /// Per-relation membership-eval rows of one segment: `(event index, row)`.
 type SegmentRows<'a> = HashMap<u32, Vec<(usize, &'a [Option<String>])>>;
@@ -208,6 +233,17 @@ pub(super) struct WriterCdc {
     /// row in `pg_eval_matches`/`pg_eval_any`. Lives for the writer's lifetime
     /// so steady-state membership evaluation allocates no SQL string.
     pg_eval_buf: String,
+    /// Prepared membership statements per (relation, query), LRU-bounded
+    /// (PGC-241 stage 4). Stale entries — evicted queries — age out on their
+    /// own (they are never selected for execution again), and dropping a
+    /// `Statement` closes it server-side, so the bound also caps the cache-PG
+    /// backend's plancache memory. Cleared per relation on `TableRegister`
+    /// (schema change); an execution error drops the entry and the call falls
+    /// back to the inlined-VALUES path (self-healing).
+    prepared_membership: LruCache<PreparedEvalKey, Statement>,
+    /// Prepared row-change statements per relation (same lifecycle). These run
+    /// on `WriterCore.db_cache`, matching the per-row `query_row_changes`.
+    prepared_row_change: LruCache<u32, Statement>,
 }
 
 /// Check that every WHERE constraint for `table_metadata` matches `row_data`.
@@ -288,6 +324,8 @@ impl WriterCdc {
             cdc_write_conn,
             last_applied_lsn: 0,
             pg_eval_buf: String::with_capacity(SQL_BUFFER_CAPACITY),
+            prepared_membership: LruCache::new(prepared_eval_cache_capacity()),
+            prepared_row_change: LruCache::new(prepared_eval_cache_capacity()),
         })
     }
 
@@ -695,53 +733,188 @@ impl WriterCdc {
         hits: &mut HashSet<(usize, u64)>,
     ) -> CacheResult<()> {
         for row_chunk in rows.chunks(PG_EVAL_ROW_CHUNK) {
-            let chunk_rows: Vec<&[Option<String>]> =
-                row_chunk.iter().map(|(_, row)| *row).collect();
-            for query_chunk in queries.chunks(PG_EVAL_CHUNK) {
-                self.pg_eval_buf.clear();
-                for (ordinal, update_query) in query_chunk.iter().enumerate() {
-                    if ordinal > 0 {
-                        self.pg_eval_buf.push_str(" UNION ALL ");
-                    }
-                    let select = update_query
-                        .resolved
-                        .as_select()
-                        .ok_or(CacheError::InvalidQuery)?;
-                    // Ordinal is bounded by PG_EVAL_CHUNK (32): never wraps.
-                    #[allow(clippy::cast_possible_wrap)]
-                    let batch_select = resolved_select_node_table_replace_with_values_batch(
-                        select,
-                        table_metadata,
-                        &chunk_rows,
-                        ordinal as i64,
-                    )
-                    .map_err(|e| e.context_transform(CacheError::from))?;
-                    Deparse::deparse(&batch_select, &mut self.pg_eval_buf);
-                }
+            // Prepared per-query statements, pipelined (PGC-241 stage 4);
+            // self-heal on failure: drop the cached statements and run the
+            // inlined-VALUES form for this chunk (re-prepare on next use).
+            if let Err(e) = self
+                .membership_chunk_prepared(table_metadata, queries, row_chunk, hits)
+                .await
+            {
+                warn!(
+                    "prepared membership eval failed; falling back to inline: {}",
+                    error_chain_format(e.current_context()),
+                );
+                self.membership_chunk_inline(table_metadata, queries, row_chunk, hits)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
 
-                let msgs = match self.cache_eval_conn.simple_query(&self.pg_eval_buf).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!("batched predicate eval error: {}", error_chain_format(&e));
-                        return Err(CacheError::PgError(e).into());
-                    }
+    /// Prepared per-query membership for one row chunk (PGC-241 stage 4): one
+    /// prepared statement per `(relation, query)` — shape fixed regardless of
+    /// row count — bound to shared array parameters and executed concurrently,
+    /// which tokio-postgres pipelines on `cache_eval_conn` in one flush.
+    async fn membership_chunk_prepared(
+        &mut self,
+        table_metadata: &TableMetadata,
+        queries: &[&UpdateQuery],
+        row_chunk: &[(usize, &[Option<String>])],
+        hits: &mut HashSet<(usize, u64)>,
+    ) -> CacheResult<()> {
+        // Shared params: $1 = row ordinals, $2.. = one text[] per column in
+        // `table_metadata.columns` order (must match the transform's
+        // parameter numbering).
+        // Chunk length is bounded by PG_EVAL_ROW_CHUNK (64): never wraps.
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let ordinals: Vec<i32> = (0..row_chunk.len() as i32).collect();
+        let column_arrays: Vec<Vec<Option<&str>>> = table_metadata
+            .columns
+            .iter()
+            .map(|column_meta| {
+                row_chunk
+                    .iter()
+                    .map(|(_, row)| row.get(column_meta.index()).and_then(|v| v.as_deref()))
+                    .collect()
+            })
+            .collect();
+        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(1 + column_arrays.len());
+        params.push(&ordinals);
+        for array in &column_arrays {
+            params.push(array);
+        }
+
+        // Get-or-prepare. Misses prepare sequentially (cold cost, amortized:
+        // steady state is all hits).
+        let mut statements: Vec<(u64, Statement)> = Vec::with_capacity(queries.len());
+        for update_query in queries {
+            let key = PreparedEvalKey {
+                relation_oid: table_metadata.relation_oid,
+                fingerprint: update_query.fingerprint,
+            };
+            let statement = if let Some(statement) = self.prepared_membership.get(&key) {
+                crate::metrics::handles().cdc.prepared_hits.increment(1);
+                statement.clone()
+            } else {
+                crate::metrics::handles().cdc.prepared_misses.increment(1);
+                let select = update_query
+                    .resolved
+                    .as_select()
+                    .ok_or(CacheError::InvalidQuery)?;
+                let unnest_select =
+                    resolved_select_node_table_replace_with_unnest(select, table_metadata)
+                        .map_err(|e| e.context_transform(CacheError::from))?;
+                self.pg_eval_buf.clear();
+                Deparse::deparse(&unnest_select, &mut self.pg_eval_buf);
+                let statement = self
+                    .cache_eval_conn
+                    .prepare(&self.pg_eval_buf)
+                    .await
+                    .map_into_report::<CacheError>()?;
+                self.prepared_membership.put(key, statement.clone());
+                statement
+            };
+            statements.push((update_query.fingerprint, statement));
+        }
+
+        // Concurrent execution = pipelined on the single connection.
+        let executions = future::join_all(
+            statements
+                .iter()
+                .map(|(_, statement)| self.cache_eval_conn.query(statement, &params)),
+        )
+        .await;
+        crate::metrics::handles()
+            .cdc
+            .pg_eval_hits
+            .increment(statements.len() as u64);
+
+        let mut first_error = None;
+        for ((fingerprint, _), execution) in statements.iter().zip(executions) {
+            let result_rows = match execution {
+                Ok(rows) => rows,
+                Err(e) => {
+                    // Self-heal: drop the (likely stale) statement; the caller
+                    // falls back to inline for this chunk.
+                    self.prepared_membership.pop(&PreparedEvalKey {
+                        relation_oid: table_metadata.relation_oid,
+                        fingerprint: *fingerprint,
+                    });
+                    first_error.get_or_insert(CacheError::PgError(e));
+                    continue;
+                }
+            };
+            for row in result_rows {
+                let Ok(local_idx) = row.try_get::<_, i32>(0) else {
+                    continue;
                 };
-                crate::metrics::handles().cdc.pg_eval_hits.increment(1);
-                for msg in msgs {
-                    let SimpleQueryMessage::Row(row) = msg else {
-                        continue;
-                    };
-                    let (Some(ordinal), Some(local_idx)) = (
-                        row.get(0).and_then(|v| v.parse::<usize>().ok()),
-                        row.get(1).and_then(|v| v.parse::<usize>().ok()),
-                    ) else {
-                        continue;
-                    };
-                    if let (Some(update_query), Some(&(event_idx, _))) =
-                        (query_chunk.get(ordinal), row_chunk.get(local_idx))
-                    {
-                        hits.insert((event_idx, update_query.fingerprint));
-                    }
+                #[allow(clippy::cast_sign_loss)] // ordinals are 0..chunk len
+                if let Some(&(event_idx, _)) = row_chunk.get(local_idx as usize) {
+                    hits.insert((event_idx, *fingerprint));
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
+    }
+
+    /// Inlined-VALUES membership for one row chunk: `UNION ALL`-combined arms
+    /// per `PG_EVAL_CHUNK` queries via `simple_query`. The fallback when the
+    /// prepared path fails (statement invalidated by DDL, etc.).
+    async fn membership_chunk_inline(
+        &mut self,
+        table_metadata: &TableMetadata,
+        queries: &[&UpdateQuery],
+        row_chunk: &[(usize, &[Option<String>])],
+        hits: &mut HashSet<(usize, u64)>,
+    ) -> CacheResult<()> {
+        let chunk_rows: Vec<&[Option<String>]> = row_chunk.iter().map(|(_, row)| *row).collect();
+        for query_chunk in queries.chunks(PG_EVAL_CHUNK) {
+            self.pg_eval_buf.clear();
+            for (ordinal, update_query) in query_chunk.iter().enumerate() {
+                if ordinal > 0 {
+                    self.pg_eval_buf.push_str(" UNION ALL ");
+                }
+                let select = update_query
+                    .resolved
+                    .as_select()
+                    .ok_or(CacheError::InvalidQuery)?;
+                // Ordinal is bounded by PG_EVAL_CHUNK (32): never wraps.
+                #[allow(clippy::cast_possible_wrap)]
+                let batch_select = resolved_select_node_table_replace_with_values_batch(
+                    select,
+                    table_metadata,
+                    &chunk_rows,
+                    ordinal as i64,
+                )
+                .map_err(|e| e.context_transform(CacheError::from))?;
+                Deparse::deparse(&batch_select, &mut self.pg_eval_buf);
+            }
+
+            let msgs = match self.cache_eval_conn.simple_query(&self.pg_eval_buf).await {
+                Ok(m) => m,
+                Err(e) => {
+                    error!("batched predicate eval error: {}", error_chain_format(&e));
+                    return Err(CacheError::PgError(e).into());
+                }
+            };
+            crate::metrics::handles().cdc.pg_eval_hits.increment(1);
+            for msg in msgs {
+                let SimpleQueryMessage::Row(row) = msg else {
+                    continue;
+                };
+                let (Some(ordinal), Some(local_idx)) = (
+                    row.get(0).and_then(|v| v.parse::<usize>().ok()),
+                    row.get(1).and_then(|v| v.parse::<usize>().ok()),
+                ) else {
+                    continue;
+                };
+                if let (Some(update_query), Some(&(event_idx, _))) =
+                    (query_chunk.get(ordinal), row_chunk.get(local_idx))
+                {
+                    hits.insert((event_idx, update_query.fingerprint));
                 }
             }
         }
@@ -807,71 +980,19 @@ impl WriterCdc {
                 .collect();
 
             for row_chunk in batch_rows.chunks(PG_EVAL_ROW_CHUNK) {
-                self.pg_eval_buf.clear();
-                self.pg_eval_buf.push_str("SELECT v.");
-                self.pg_eval_buf.push_str(BATCH_IDX_COLUMN);
-                for column_meta in &table_metadata.columns {
-                    let _ = write!(
-                        self.pg_eval_buf,
-                        ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
-                        name = column_meta.name
+                // Prepared per-relation statement (PGC-241 stage 4); self-heal
+                // on failure: drop the cached statement and run the inlined
+                // form for this chunk (re-prepare on next use).
+                if let Err(e) = self
+                    .row_change_chunk_prepared(core, table_metadata, row_chunk, membership)
+                    .await
+                {
+                    warn!(
+                        "prepared row-change eval failed; falling back to inline: {}",
+                        error_chain_format(e.current_context()),
                     );
-                }
-                self.pg_eval_buf.push_str(" FROM (VALUES ");
-                for (i, (_, row)) in row_chunk.iter().enumerate() {
-                    if i > 0 {
-                        self.pg_eval_buf.push_str(", ");
-                    }
-                    let _ = write!(self.pg_eval_buf, "({i}");
-                    for column_meta in &table_metadata.columns {
-                        let value = row
-                            .get(column_meta.index())
-                            .and_then(|v| v.as_deref())
-                            .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
-                        let _ = write!(self.pg_eval_buf, ", {value}::{}", column_meta.type_name);
-                    }
-                    self.pg_eval_buf.push(')');
-                }
-                let _ = write!(self.pg_eval_buf, ") AS v({BATCH_IDX_COLUMN}");
-                for column_meta in &table_metadata.columns {
-                    let _ = write!(self.pg_eval_buf, ", {}", column_meta.name);
-                }
-                let _ = write!(
-                    self.pg_eval_buf,
-                    ") JOIN {}.{} o ON ",
-                    table_metadata.schema, table_metadata.name
-                );
-                for (i, pk_column) in table_metadata.primary_key_columns.iter().enumerate() {
-                    if i > 0 {
-                        self.pg_eval_buf.push_str(" AND ");
-                    }
-                    let _ = write!(self.pg_eval_buf, "o.{pk_column} = v.{pk_column}");
-                }
-
-                let msgs = match core.db_cache.simple_query(&self.pg_eval_buf).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        error!("batched row-change eval error: {}", error_chain_format(&e));
-                        return Err(CacheError::PgError(e).into());
-                    }
-                };
-                for msg in msgs {
-                    let SimpleQueryMessage::Row(row) = msg else {
-                        continue;
-                    };
-                    let Some(local_idx) = row.get(0).and_then(|v| v.parse::<usize>().ok()) else {
-                        continue;
-                    };
-                    let Some(&(event_idx, _)) = row_chunk.get(local_idx) else {
-                        continue;
-                    };
-                    let mut changes = HashMap::with_capacity(row.len().saturating_sub(1));
-                    for (col_idx, col) in row.columns().iter().enumerate().skip(1) {
-                        // PG boolean text: "t"/"f"; treat non-"t" as false,
-                        // matching the per-row parse.
-                        changes.insert(EcoString::from(col.name()), row.get(col_idx) == Some("t"));
-                    }
-                    membership.row_changes.insert(event_idx, changes);
+                    self.row_change_chunk_inline(core, table_metadata, row_chunk, membership)
+                        .await?;
                 }
             }
 
@@ -880,6 +1001,195 @@ impl WriterCdc {
                 .extend(batch_rows.iter().map(|(event_idx, _)| *event_idx));
         }
 
+        Ok(())
+    }
+
+    /// Prepared row-change for one chunk: one statement per relation —
+    /// `unnest()` array params, shape fixed regardless of row count — on
+    /// `db_cache`, matching the per-row `query_row_changes` connection.
+    async fn row_change_chunk_prepared(
+        &mut self,
+        core: &WriterCore,
+        table_metadata: &TableMetadata,
+        row_chunk: &[(usize, &[Option<String>])],
+        membership: &mut SegmentMembership,
+    ) -> CacheResult<()> {
+        let relation_oid = table_metadata.relation_oid;
+        let statement = if let Some(statement) = self.prepared_row_change.get(&relation_oid) {
+            crate::metrics::handles().cdc.prepared_hits.increment(1);
+            statement.clone()
+        } else {
+            crate::metrics::handles().cdc.prepared_misses.increment(1);
+            self.pg_eval_buf.clear();
+            self.pg_eval_buf.push_str("SELECT v.");
+            self.pg_eval_buf.push_str(BATCH_IDX_COLUMN);
+            for column_meta in &table_metadata.columns {
+                let _ = write!(
+                    self.pg_eval_buf,
+                    ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
+                    name = column_meta.name
+                );
+            }
+            let _ = write!(
+                self.pg_eval_buf,
+                " FROM (SELECT unnest($1::int4[]) AS {BATCH_IDX_COLUMN}"
+            );
+            for (i, column_meta) in table_metadata.columns.iter().enumerate() {
+                let _ = write!(
+                    self.pg_eval_buf,
+                    ", unnest(${}::text[])::{} AS {}",
+                    i + 2,
+                    column_meta.type_name,
+                    column_meta.name
+                );
+            }
+            let _ = write!(
+                self.pg_eval_buf,
+                ") AS v JOIN {}.{} o ON ",
+                table_metadata.schema, table_metadata.name
+            );
+            for (i, pk_column) in table_metadata.primary_key_columns.iter().enumerate() {
+                if i > 0 {
+                    self.pg_eval_buf.push_str(" AND ");
+                }
+                let _ = write!(self.pg_eval_buf, "o.{pk_column} = v.{pk_column}");
+            }
+            let statement = core
+                .db_cache
+                .prepare(&self.pg_eval_buf)
+                .await
+                .map_into_report::<CacheError>()?;
+            self.prepared_row_change
+                .put(relation_oid, statement.clone());
+            statement
+        };
+
+        // Shared params, same construction/order as the membership batch.
+        // Chunk length is bounded by PG_EVAL_ROW_CHUNK (64): never wraps.
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        let ordinals: Vec<i32> = (0..row_chunk.len() as i32).collect();
+        let column_arrays: Vec<Vec<Option<&str>>> = table_metadata
+            .columns
+            .iter()
+            .map(|column_meta| {
+                row_chunk
+                    .iter()
+                    .map(|(_, row)| row.get(column_meta.index()).and_then(|v| v.as_deref()))
+                    .collect()
+            })
+            .collect();
+        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(1 + column_arrays.len());
+        params.push(&ordinals);
+        for array in &column_arrays {
+            params.push(array);
+        }
+
+        let result_rows = match core.db_cache.query(&statement, &params).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Self-heal: drop the (likely stale) statement; the caller
+                // falls back to inline for this chunk.
+                self.prepared_row_change.pop(&relation_oid);
+                return Err(CacheError::PgError(e).into());
+            }
+        };
+        for row in result_rows {
+            let Ok(local_idx) = row.try_get::<_, i32>(0) else {
+                continue;
+            };
+            #[allow(clippy::cast_sign_loss)] // ordinals are 0..chunk len
+            let Some(&(event_idx, _)) = row_chunk.get(local_idx as usize) else {
+                continue;
+            };
+            let mut changes = HashMap::with_capacity(row.len().saturating_sub(1));
+            for (col_idx, col) in row.columns().iter().enumerate().skip(1) {
+                // NULL can't occur (IS DISTINCT FROM is total); default false
+                // defensively, matching the per-row parse.
+                changes.insert(
+                    EcoString::from(col.name()),
+                    row.try_get::<_, bool>(col_idx).unwrap_or(false),
+                );
+            }
+            membership.row_changes.insert(event_idx, changes);
+        }
+        Ok(())
+    }
+
+    /// Inlined-VALUES row-change for one chunk via `simple_query` — the
+    /// fallback when the prepared path fails.
+    async fn row_change_chunk_inline(
+        &mut self,
+        core: &WriterCore,
+        table_metadata: &TableMetadata,
+        row_chunk: &[(usize, &[Option<String>])],
+        membership: &mut SegmentMembership,
+    ) -> CacheResult<()> {
+        self.pg_eval_buf.clear();
+        self.pg_eval_buf.push_str("SELECT v.");
+        self.pg_eval_buf.push_str(BATCH_IDX_COLUMN);
+        for column_meta in &table_metadata.columns {
+            let _ = write!(
+                self.pg_eval_buf,
+                ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
+                name = column_meta.name
+            );
+        }
+        self.pg_eval_buf.push_str(" FROM (VALUES ");
+        for (i, (_, row)) in row_chunk.iter().enumerate() {
+            if i > 0 {
+                self.pg_eval_buf.push_str(", ");
+            }
+            let _ = write!(self.pg_eval_buf, "({i}");
+            for column_meta in &table_metadata.columns {
+                let value = row
+                    .get(column_meta.index())
+                    .and_then(|v| v.as_deref())
+                    .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
+                let _ = write!(self.pg_eval_buf, ", {value}::{}", column_meta.type_name);
+            }
+            self.pg_eval_buf.push(')');
+        }
+        let _ = write!(self.pg_eval_buf, ") AS v({BATCH_IDX_COLUMN}");
+        for column_meta in &table_metadata.columns {
+            let _ = write!(self.pg_eval_buf, ", {}", column_meta.name);
+        }
+        let _ = write!(
+            self.pg_eval_buf,
+            ") JOIN {}.{} o ON ",
+            table_metadata.schema, table_metadata.name
+        );
+        for (i, pk_column) in table_metadata.primary_key_columns.iter().enumerate() {
+            if i > 0 {
+                self.pg_eval_buf.push_str(" AND ");
+            }
+            let _ = write!(self.pg_eval_buf, "o.{pk_column} = v.{pk_column}");
+        }
+
+        let msgs = match core.db_cache.simple_query(&self.pg_eval_buf).await {
+            Ok(m) => m,
+            Err(e) => {
+                error!("batched row-change eval error: {}", error_chain_format(&e));
+                return Err(CacheError::PgError(e).into());
+            }
+        };
+        for msg in msgs {
+            let SimpleQueryMessage::Row(row) = msg else {
+                continue;
+            };
+            let Some(local_idx) = row.get(0).and_then(|v| v.parse::<usize>().ok()) else {
+                continue;
+            };
+            let Some(&(event_idx, _)) = row_chunk.get(local_idx) else {
+                continue;
+            };
+            let mut changes = HashMap::with_capacity(row.len().saturating_sub(1));
+            for (col_idx, col) in row.columns().iter().enumerate().skip(1) {
+                // PG boolean text: "t"/"f"; treat non-"t" as false,
+                // matching the per-row parse.
+                changes.insert(EcoString::from(col.name()), row.get(col_idx) == Some("t"));
+            }
+            membership.row_changes.insert(event_idx, changes);
+        }
         Ok(())
     }
 
@@ -982,6 +1292,20 @@ impl WriterCdc {
             }
             CdcCommand::TableRegister(table_metadata) => {
                 core.frame_relation_oids.insert(table_metadata.relation_oid);
+                // Schema change: prepared eval SQL embeds the column list —
+                // drop the relation's cached statements so the next use
+                // re-prepares against the new shape.
+                let relation_oid = table_metadata.relation_oid;
+                self.prepared_row_change.pop(&relation_oid);
+                let stale: Vec<PreparedEvalKey> = self
+                    .prepared_membership
+                    .iter()
+                    .map(|(key, _)| *key)
+                    .filter(|key| key.relation_oid == relation_oid)
+                    .collect();
+                for key in stale {
+                    self.prepared_membership.pop(&key);
+                }
                 core.cache_table_register(table_metadata)
                     .await
                     .attach_loc("cdc table register")?;

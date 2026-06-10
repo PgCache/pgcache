@@ -268,6 +268,14 @@ impl WriterRegistration {
             let cache_conn = pg::connect(&settings.cache, &format!("population worker {i}"))
                 .await
                 .map_into_report::<CacheError>()?;
+            // Staging setup runs `DROP TABLE IF EXISTS` defensively before every
+            // CREATE; the table almost never exists (names embed the
+            // generation), so PG would emit a "does not exist, skipping" NOTICE
+            // per population — pure log noise. Suppress notices on this session.
+            cache_conn
+                .batch_execute("SET client_min_messages = warning")
+                .await
+                .map_into_report::<CacheError>()?;
 
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             populate_txs.push(tx);

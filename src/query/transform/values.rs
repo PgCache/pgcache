@@ -220,6 +220,86 @@ pub fn resolved_select_node_table_replace_with_values_batch(
     Ok(resolved_new)
 }
 
+/// Prepared-statement variant of the batch transform (PGC-241 stage 4): the
+/// table source becomes a from-less subselect of `unnest()` calls over array
+/// parameters, so the SQL shape is fixed regardless of row count and the
+/// statement can be prepared once per query and reused across frames:
+///
+/// ```sql
+/// (SELECT unnest($1::int4[]) AS __pgc_idx,
+///         unnest($2::text[])::int4 AS id, …) AS <alias>
+/// ```
+///
+/// `$1` carries the row ordinals; `$2..` one `text[]` per column in
+/// `table_metadata.columns` order (the binder must build arrays in the same
+/// order), with an element cast to the column type — the text→type conversion
+/// happens server-side exactly as the inlined literals' casts do. Multiple
+/// set-returning `unnest`s in a select list expand in lockstep for equal-length
+/// arrays. The projection is the surviving row ordinals.
+///
+/// The resolved AST has no FROM-function node, so the `unnest` expressions ride
+/// in [`LiteralValue::Parameter`], which deparses verbatim.
+pub fn resolved_select_node_table_replace_with_unnest(
+    resolved: &ResolvedSelectNode,
+    table_metadata: &TableMetadata,
+) -> AstTransformResult<ResolvedSelectNode> {
+    let mut resolved_new = resolved.clone();
+
+    let alias = table_alias_find(&resolved_new, table_metadata)?;
+
+    resolved_select_node_column_alias_update(
+        &mut resolved_new,
+        &table_metadata.schema,
+        &table_metadata.name,
+        &alias,
+    );
+
+    let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
+
+    let mut unnest_columns = Vec::with_capacity(table_metadata.columns.len() + 1);
+    unnest_columns.push(ResolvedSelectColumn {
+        expr: ResolvedScalarExpr::Literal(LiteralValue::Parameter(EcoString::from(
+            "unnest($1::int4[])",
+        ))),
+        alias: Some(EcoString::from(BATCH_IDX_COLUMN)),
+    });
+    for (i, column_meta) in table_metadata.columns.iter().enumerate() {
+        unnest_columns.push(ResolvedSelectColumn {
+            expr: ResolvedScalarExpr::Literal(LiteralValue::Parameter(EcoString::from(format!(
+                "unnest(${}::text[])::{}",
+                i + 2,
+                column_meta.type_name
+            )))),
+            alias: Some(EcoString::from(column_meta.name.as_str())),
+        });
+    }
+
+    *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
+        query: Box::new(ResolvedQueryExpr {
+            body: ResolvedQueryBody::Select(Box::new(ResolvedSelectNode {
+                columns: ResolvedSelectColumns::Columns(unnest_columns),
+                ..Default::default()
+            })),
+            order_by: vec![],
+            limit: None,
+        }),
+        // Column names flow from the inner select aliases; a bare table alias
+        // keeps refs like `<alias>.<col>` resolving.
+        alias: TableAlias {
+            name: alias,
+            columns: vec![],
+        },
+        subquery_kind: SubqueryKind::Inclusion,
+    });
+
+    resolved_new.columns = ResolvedSelectColumns::Columns(vec![ResolvedSelectColumn {
+        expr: ResolvedScalarExpr::Identifier(EcoString::from(BATCH_IDX_COLUMN)),
+        alias: None,
+    }]);
+
+    Ok(resolved_new)
+}
+
 /// Update all column references for a specific table to use an alias in a ResolvedSelectNode.
 fn resolved_select_node_column_alias_update(
     resolved: &mut ResolvedSelectNode,
@@ -735,6 +815,38 @@ mod tests {
         assert!(
             buf.contains("'1'::int4, NULL::text"),
             "NULL column should produce NULL::type: {buf}"
+        );
+    }
+
+    #[test]
+    fn test_unnest_replace_shape() {
+        let meta = table_metadata("users", 100, &[("id", "int4"), ("name", "text")]);
+        let node = select_node(
+            vec![resolved_table("users", 100, Some("u"))],
+            ResolvedSelectColumns::None,
+            None,
+        );
+
+        let result =
+            resolved_select_node_table_replace_with_unnest(&node, &meta).expect("unnest replace");
+
+        let mut sql = String::new();
+        result.deparse(&mut sql);
+        assert!(
+            sql.contains(&format!("unnest($1::int4[]) AS {BATCH_IDX_COLUMN}")),
+            "idx param first: {sql}"
+        );
+        assert!(
+            sql.contains("unnest($2::text[])::int4 AS id"),
+            "column param with element cast: {sql}"
+        );
+        assert!(
+            sql.contains("unnest($3::text[])::text AS name"),
+            "params follow column order: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("SELECT {BATCH_IDX_COLUMN} FROM")),
+            "projection is the surviving ordinals: {sql}"
         );
     }
 
