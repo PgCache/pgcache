@@ -106,6 +106,14 @@ pub(super) enum FrameRowEvent {
     Truncate {
         relation_oids: Vec<u32>,
     },
+    /// A source-transaction commit boundary (PGC-242). Carries the frame's
+    /// commit LSN so per-frame bookkeeping produced *during replay* — deleted
+    /// keys (PGC-250) and truncate abort watermarks — is stamped with the
+    /// right frame's LSN when the log spans multiple frames. Does not split
+    /// eval segments (cross-frame batching is the point).
+    Boundary {
+        commit_lsn: u64,
+    },
 }
 
 /// CDC source-txn frame state on `WriterCdc`'s write connection (PGC-108).

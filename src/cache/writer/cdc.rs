@@ -615,6 +615,19 @@ impl WriterCdc {
                     // Unreachable by construction (segments stop before a
                     // Truncate); a no-op keeps this panic-free.
                     FrameRowEvent::Truncate { .. } => (Ok(()), "cdc replay truncate"),
+                    // Frame commit boundary (PGC-242): stamp the bookkeeping
+                    // this frame's replay produced with its commit LSN.
+                    FrameRowEvent::Boundary { commit_lsn } => {
+                        let frame_deletes = std::mem::take(&mut core.frame_deleted_keys);
+                        for (rel, key) in frame_deletes {
+                            core.population_deleted_keys.record(rel, key, *commit_lsn);
+                        }
+                        let frame_truncated = std::mem::take(&mut core.frame_truncated_relations);
+                        for rel in frame_truncated {
+                            core.population_deleted_keys.abort_below(rel, *commit_lsn);
+                        }
+                        (Ok(()), "cdc replay boundary")
+                    }
                 };
                 self.frame_dml_result(core, r).await.attach_loc(loc)?;
                 i += 1;
@@ -673,7 +686,9 @@ impl WriterCdc {
                     new_row_data,
                     ..
                 } => (*relation_oid, new_row_data),
-                FrameRowEvent::Delete { .. } | FrameRowEvent::Truncate { .. } => continue,
+                FrameRowEvent::Delete { .. }
+                | FrameRowEvent::Truncate { .. }
+                | FrameRowEvent::Boundary { .. } => continue,
             };
             rows_by_relation
                 .entry(relation_oid)
@@ -1299,10 +1314,45 @@ impl WriterCdc {
             }
             CdcCommand::TableRegister(table_metadata) => {
                 core.frame_relation_oids.insert(table_metadata.relation_oid);
+                let relation_oid = table_metadata.relation_oid;
+                // A mid-frame Relation message whose metadata CHANGED (intra-txn
+                // DDL): buffered events for this relation were captured under
+                // the old column layout — replaying them under the new one
+                // misaligns position-based lookups, and replaying them first
+                // can't work either (their buffered SQL flushes only at
+                // CommitMark, after the recreate). Recovery semantics per
+                // relation instead: discard its buffered events; the
+                // registration's recreate evicts its queries and empties the
+                // table, and the abort watermark makes older-snapshot
+                // population merges abort — the relation rebuilds from origin,
+                // which already reflects the DDL. (An identical re-sent
+                // Relation — e.g. after a publication change — keeps events.)
+                let metadata_changed = core
+                    .cache
+                    .tables
+                    .get1(&relation_oid)
+                    .is_none_or(|current| !current.schema_eq(&table_metadata));
+                if metadata_changed && !core.frame_rows.is_empty() {
+                    let before = core.frame_rows.len();
+                    core.frame_rows.retain(|event| match event {
+                        FrameRowEvent::Insert {
+                            relation_oid: r, ..
+                        }
+                        | FrameRowEvent::Update {
+                            relation_oid: r, ..
+                        }
+                        | FrameRowEvent::Delete {
+                            relation_oid: r, ..
+                        } => *r != relation_oid,
+                        FrameRowEvent::Truncate { .. } | FrameRowEvent::Boundary { .. } => true,
+                    });
+                    if core.frame_rows.len() != before {
+                        core.frame_truncated_relations.push(relation_oid);
+                    }
+                }
                 // Schema change: prepared eval SQL embeds the column list —
                 // drop the relation's cached statements so the next use
                 // re-prepares against the new shape.
-                let relation_oid = table_metadata.relation_oid;
                 self.prepared_row_change.pop(&relation_oid);
                 let stale: Vec<PreparedEvalKey> = self
                     .prepared_membership
@@ -1375,6 +1425,14 @@ impl WriterCdc {
                 }
             }
             CdcCommand::CommitMark { lsn } => {
+                // The frame's commit boundary rides in the event log (PGC-242):
+                // deleted keys and truncate watermarks are produced *during
+                // replay* (`frame_cache_delete` runs in the decide pass), so
+                // the per-frame LSN context must travel with the events for
+                // logs that span multiple frames.
+                core.frame_rows
+                    .push(FrameRowEvent::Boundary { commit_lsn: lsn });
+
                 // In-process memo seqlock (PGC-236, rung 1): bracket the frame's
                 // visibility with begin (even→odd) before and end (odd→even)
                 // after, over every relation the frame touched, so any memo over
@@ -1417,15 +1475,16 @@ impl WriterCdc {
                 core.frame_chunk_flushed = false;
                 self.applied_lsn_advance(lsn);
                 core.last_applied_lsn = self.last_applied_lsn;
-                // Stamp this committed frame's deletes with its commit LSN and
-                // record them for in-flight populations (PGC-250). Empty if the
-                // frame rolled back (cleared on recovery).
+                // Per-frame deletes/truncates were stamped by the Boundary
+                // event during replay; this drain catches what replay didn't
+                // reach — recovery-added truncated relations, and pending
+                // entries from a frame that entered `Recovering` before its
+                // boundary (a no-op in the normal path, where the lists are
+                // already empty).
                 let frame_deletes = std::mem::take(&mut core.frame_deleted_keys);
                 for (relation_oid, key) in frame_deletes {
                     core.population_deleted_keys.record(relation_oid, key, lsn);
                 }
-                // Raise the abort watermark for relations this frame truncated /
-                // recovered, so older-snapshot population merges abort (PGC-250).
                 let frame_truncated = std::mem::take(&mut core.frame_truncated_relations);
                 for relation_oid in frame_truncated {
                     core.population_deleted_keys.abort_below(relation_oid, lsn);

@@ -635,3 +635,56 @@ async fn test_local_match_short_circuits_batched_pg_eval() -> Result<(), Error> 
 
     Ok(())
 }
+
+/// Canary for intra-txn DDL handling: a mid-transaction Relation message
+/// must not let buffered row events replay against the NEW table metadata
+/// (position-based lookups misalign old-shape tuples). The fix discards the
+/// relation's buffered events and lets the recreate + abort watermark rebuild
+/// from origin.
+///
+/// Note: the end state asserted here also survives WITHOUT the event drop in
+/// most orderings (the recreate's query eviction masks the misaligned replay)
+/// — the drop is defense in depth for the racy windows (a query registering
+/// between the DDL and CommitMark, or a recording population with async
+/// deactivation). This test's teeth are against regressions that break the
+/// flow outright (it caught a replay-before-register variant whose buffered
+/// old-shape SQL flushed against the recreated table).
+#[tokio::test]
+async fn test_intra_txn_ddl_does_not_misalign_buffered_events() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.simple_query(
+        "create table sf_ddl (id int primary key, a int not null, b int not null, c int not null)",
+    )
+    .await?;
+    ctx.simple_query("insert into sf_ddl (id, a, b, c) values (1, 10, 20, 30), (2, 11, 21, 31)")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "select id, a, c from sf_ddl order by id";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    // One source transaction: an update captured under the 4-column layout,
+    // then DDL (Relation message mid-frame), then an update under the new
+    // 3-column layout.
+    ctx.origin
+        .batch_execute(
+            "BEGIN; \
+             update sf_ddl set a = 100 where id = 1; \
+             alter table sf_ddl drop column b; \
+             update sf_ddl set c = 300 where id = 2; \
+             COMMIT;",
+        )
+        .await
+        .map_err(Error::other)?;
+    ctx.cdc_settle().await?;
+    // The schema change invalidates and repopulates the query.
+    ctx.cache_settle().await?;
+
+    let served = ctx.simple_query(q).await?;
+    assert_row_at(&served, 1, &[("id", "1"), ("a", "100"), ("c", "30")])?;
+    assert_row_at(&served, 2, &[("id", "2"), ("a", "11"), ("c", "300")])?;
+
+    Ok(())
+}
