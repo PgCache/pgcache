@@ -472,3 +472,68 @@ async fn test_reinsert_same_frame_during_population_included() -> Result<(), Err
 
     Ok(())
 }
+
+/// An update that moves a row out of every live predicate (update-out) while a
+/// population holds deleted-key tracking open must not block a later
+/// population from including the row (PGC-261): the row is alive at origin —
+/// under tracking it is upserted (new version) instead of deleted + recorded.
+/// The first query must still never serve the old version (control).
+#[tokio::test]
+async fn test_update_out_during_tracking_included_for_later_population() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_ONCE_MS", "4000")]).await?;
+
+    ctx.simple_query(
+        "create table upd_out (id int primary key, status text not null, v int not null)",
+    )
+    .await?;
+    ctx.simple_query(
+        "insert into upd_out (id, status, v) values (1, 'guard', 1), (2, 'active', 10)",
+    )
+    .await?;
+    ctx.cdc_settle().await?;
+
+    // Guard query: its (one-shot-delayed) population keeps deleted-key
+    // tracking active for the relation across the whole scenario.
+    ctx.simple_query("select id, v from upd_out where status = 'guard'")
+        .await?;
+    // The active-row query: caches id=2 before it leaves the predicate.
+    let qa = "select id, v from upd_out where status = 'active'";
+    ctx.simple_query(qa).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Move the row out of every live predicate. It is still alive at origin.
+    ctx.origin_query(
+        "update upd_out set status = 'archived', v = 20 where id = 2",
+        &[],
+    )
+    .await?;
+    ctx.cdc_settle().await?;
+
+    // A later query matching the new version populates while the guard is
+    // still in flight; its merge must include id=2.
+    let q2 = "select id, v from upd_out where status = 'archived'";
+    ctx.simple_query(q2).await?;
+    ctx.cache_settle().await?;
+
+    let before = ctx.metrics().await?;
+    let served = ctx.simple_query(q2).await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(
+        row_count(&served),
+        1,
+        "live update-out row omitted from the later population result (PGC-261)"
+    );
+
+    // Control: the old version must not be served to the original query.
+    let before = ctx.metrics().await?;
+    let served = ctx.simple_query(qa).await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(
+        row_count(&served),
+        0,
+        "stale old version served after update-out"
+    );
+
+    Ok(())
+}

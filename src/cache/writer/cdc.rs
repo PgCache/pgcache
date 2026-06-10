@@ -1465,6 +1465,27 @@ impl WriterCdc {
         }
     }
 
+    /// Buffer an unconditional upsert of `row_data` into the relation's cache
+    /// table in the open frame (PGC-228), opening the frame txn if needed.
+    async fn frame_cache_upsert(
+        &mut self,
+        core: &mut WriterCore,
+        relation_oid: u32,
+        row_data: &[Option<String>],
+    ) -> CacheResult<()> {
+        core.frame_begin_ensure();
+        let table_metadata =
+            core.cache
+                .tables
+                .get1(&relation_oid)
+                .ok_or(CacheError::UnknownTable {
+                    oid: Some(relation_oid),
+                    name: None,
+                })?;
+        self.cache_upsert_unconditional_into(&mut core.frame_buf, table_metadata, row_data);
+        self.frame_write_finish(core).await
+    }
+
     /// Buffer a PK-qualified delete of `row_data` from the relation's cache
     /// table into the open frame (PGC-228), opening the frame txn if needed.
     /// The relation is known-present by the time a handler reaches a delete, so
@@ -1551,17 +1572,8 @@ impl WriterCdc {
         // can regress it).
         let tracked = core.population_deleted_key_cancel(relation_oid, row_data);
         if tracked && !matched {
-            core.frame_begin_ensure();
-            let table_metadata =
-                core.cache
-                    .tables
-                    .get1(&relation_oid)
-                    .ok_or(CacheError::UnknownTable {
-                        oid: Some(relation_oid),
-                        name: None,
-                    })?;
-            self.cache_upsert_unconditional_into(&mut core.frame_buf, table_metadata, row_data);
-            self.frame_write_finish(core).await?;
+            self.frame_cache_upsert(core, relation_oid, row_data)
+                .await?;
         }
 
         crate::metrics::handles()
@@ -1636,12 +1648,26 @@ impl WriterCdc {
         if matched {
             // The upserted row supersedes any tracked deletion of its key —
             // including a previously-deleted PK this row's new PK reuses
-            // (PGC-260). The update-out branch below deliberately does NOT
-            // cancel: it records the key itself (PGC-261 tracks that case).
+            // (PGC-260).
             core.population_deleted_key_cancel(relation_oid, new_row_data);
         } else {
-            self.frame_cache_delete(core, relation_oid, new_row_data)
-                .await?;
+            // Update-out: the row left every live predicate, but it is still
+            // alive at origin. While populations are in flight, deleting it
+            // and recording its key would make a later population's merge omit
+            // a live row (PGC-261) — instead upsert the new version: serving
+            // re-evaluates predicates so nothing serves it, an old-snapshot
+            // merge can't resurrect the old version (merges never overwrite),
+            // and a later population finds it present. With no population in
+            // flight, keep the delete (shared-table leanness; the key record
+            // would be discarded anyway).
+            if core.population_deleted_keys.is_recording(relation_oid) {
+                core.population_deleted_key_cancel(relation_oid, new_row_data);
+                self.frame_cache_upsert(core, relation_oid, new_row_data)
+                    .await?;
+            } else {
+                self.frame_cache_delete(core, relation_oid, new_row_data)
+                    .await?;
+            }
             // Row left all predicates: it may still sit in a Fresh MV that
             // materialized it, and the upsert path above didn't match (so didn't
             // dirty-mark). Coarsely dirty the relation's Fresh MVs (PGC-254).
@@ -2330,17 +2356,8 @@ impl WriterCdc {
 
         // Phase B: single in-frame write, buffered for the frame flush (PGC-228).
         if matched {
-            core.frame_begin_ensure();
-            let table_metadata =
-                core.cache
-                    .tables
-                    .get1(&relation_oid)
-                    .ok_or(CacheError::UnknownTable {
-                        oid: Some(relation_oid),
-                        name: None,
-                    })?;
-            self.cache_upsert_unconditional_into(&mut core.frame_buf, table_metadata, row_data);
-            self.frame_write_finish(core).await?;
+            self.frame_cache_upsert(core, relation_oid, row_data)
+                .await?;
         }
 
         Ok(matched)
