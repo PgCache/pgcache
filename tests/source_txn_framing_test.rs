@@ -573,3 +573,65 @@ async fn test_fat_frame_batched_membership_maintains_joins() -> Result<(), Error
 
     Ok(())
 }
+
+/// A row matched by a LocalEval query must not trigger any PgEval round-trip
+/// for the relation's non-Fresh PgEval queries — the per-row path's
+/// `if !matched` short-circuit, preserved through the batched segment eval
+/// (PGC-241). Regression test for the pgbench mixed-workload slowdown where
+/// the unconditional batch evaluated every PgEval query per write event.
+#[tokio::test]
+async fn test_local_match_short_circuits_batched_pg_eval() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.simple_query(
+        "create table sc_main (id int primary key, grp int not null, data int not null)",
+    )
+    .await?;
+    ctx.simple_query("create table sc_other (id int primary key, ref int not null)")
+        .await?;
+    ctx.simple_query(
+        "insert into sc_main (id, grp, data) values (1, 1, 10), (2, 2, 20), (3, 1, 30)",
+    )
+    .await?;
+    ctx.simple_query("insert into sc_other (id, ref) values (1, 1), (2, 2)")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // LocalEval over sc_main (single table, simple predicate)…
+    ctx.simple_query("select id, data from sc_main where grp = 1")
+        .await?;
+    // …and a PgEval join over the same relation (non-Fresh: no MV at this size).
+    ctx.simple_query(
+        "select m.id, o.id from sc_main m join sc_other o on o.ref = m.grp where m.grp = 1",
+    )
+    .await?;
+    ctx.cache_settle().await?;
+
+    // A data-only update to a row the LocalEval query matches (grp=1): the
+    // local match decides the upsert, so the join's membership must not be
+    // evaluated at all — zero PgEval statements.
+    let before = ctx.metrics().await?;
+    ctx.origin_query("update sc_main set data = data + 1 where id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let after = ctx.metrics().await?;
+    assert_eq!(
+        after.cache_cdc_pg_eval_hits - before.cache_cdc_pg_eval_hits,
+        0,
+        "locally-matched row must not round-trip PgEval membership"
+    );
+
+    // Control: a row no LocalEval query matches (grp=2 is outside the local
+    // query's predicate) must evaluate the rest set — at least one statement.
+    let before = ctx.metrics().await?;
+    ctx.origin_query("update sc_main set data = data + 1 where id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let after = ctx.metrics().await?;
+    assert!(
+        after.cache_cdc_pg_eval_hits > before.cache_cdc_pg_eval_hits,
+        "unmatched row still evaluates the rest set"
+    );
+
+    Ok(())
+}

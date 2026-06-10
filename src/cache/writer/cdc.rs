@@ -57,12 +57,20 @@ type SegmentRows<'a> = HashMap<u32, Vec<(usize, &'a [Option<String>])>>;
 /// `segment_row_changes_eval`, consumed per event by the decide pass.
 #[derive(Default)]
 struct SegmentMembership {
-    /// Per relation: the fingerprints the membership batch covered. Queries
-    /// outside this set (non-batchable shapes) fall back to per-row eval.
-    relation_fps: HashMap<u32, HashSet<u64>>,
-    /// Event indexes whose row was in the membership batch (rows of unexpected
-    /// arity stay out and fall back to per-row eval).
+    /// Per relation: batchable Fresh-MV fingerprints, evaluated for every
+    /// `covered` event (Fresh queries are always fully evaluated so every
+    /// match dirty-marks — same as the per-row path).
+    relation_fresh_fps: HashMap<u32, HashSet<u64>>,
+    /// Per relation: batchable non-Fresh fingerprints, evaluated only for
+    /// `rest_covered` events (rows with no LocalEval match and no fresh hit) —
+    /// mirroring the per-row path's `if !matched` short-circuit, which does
+    /// zero PgEval round-trips for locally-matched rows.
+    relation_rest_fps: HashMap<u32, HashSet<u64>>,
+    /// Event indexes whose row was in the fresh membership batch (rows of
+    /// unexpected arity stay out and fall back to per-row eval).
     covered: HashSet<usize>,
+    /// Event indexes whose row was in the rest membership batch.
+    rest_covered: HashSet<usize>,
     /// `(event index, fingerprint)` membership hits.
     hits: HashSet<(usize, u64)>,
     /// Update events whose row-change SELECT was batched. Covered-but-absent
@@ -77,20 +85,26 @@ impl SegmentMembership {
     /// The matrix view for one event, or `None` if neither the membership nor
     /// the row-change batch covered it.
     fn view(&self, relation_oid: u32, event_idx: usize) -> Option<BatchEvalView<'_>> {
-        let fps = self
+        let fresh_fps = self
             .covered
             .contains(&event_idx)
-            .then(|| self.relation_fps.get(&relation_oid))
+            .then(|| self.relation_fresh_fps.get(&relation_oid))
+            .flatten();
+        let rest_fps = self
+            .rest_covered
+            .contains(&event_idx)
+            .then(|| self.relation_rest_fps.get(&relation_oid))
             .flatten();
         let row_change = self
             .row_change_covered
             .contains(&event_idx)
             .then(|| self.row_changes.get(&event_idx));
-        if fps.is_none() && row_change.is_none() {
+        if fresh_fps.is_none() && rest_fps.is_none() && row_change.is_none() {
             return None;
         }
         Some(BatchEvalView {
-            fps,
+            fresh_fps,
+            rest_fps,
             hits: &self.hits,
             event_idx,
             row_change,
@@ -100,7 +114,8 @@ impl SegmentMembership {
 
 /// One event's window into a [`SegmentMembership`] matrix.
 pub(super) struct BatchEvalView<'a> {
-    fps: Option<&'a HashSet<u64>>,
+    fresh_fps: Option<&'a HashSet<u64>>,
+    rest_fps: Option<&'a HashSet<u64>>,
     hits: &'a HashSet<(usize, u64)>,
     event_idx: usize,
     /// Outer `None` = row-change not batched for this event (fall back to the
@@ -110,9 +125,12 @@ pub(super) struct BatchEvalView<'a> {
 
 impl BatchEvalView<'_> {
     /// Whether `fingerprint` was batch-evaluated (consult `hit` instead of a
-    /// per-row round-trip).
+    /// per-row round-trip). A rest query outside both covered sets falls back
+    /// to the per-row path, whose `if !matched` guard skips it exactly as the
+    /// pre-batch flow did.
     fn covers(&self, fingerprint: u64) -> bool {
-        self.fps.is_some_and(|fps| fps.contains(&fingerprint))
+        self.fresh_fps.is_some_and(|fps| fps.contains(&fingerprint))
+            || self.rest_fps.is_some_and(|fps| fps.contains(&fingerprint))
     }
 
     /// Whether this event's row matched `fingerprint`'s predicate.
@@ -591,70 +609,143 @@ impl WriterCdc {
                 continue;
             }
 
-            for row_chunk in batch_rows.chunks(PG_EVAL_ROW_CHUNK) {
-                let chunk_rows: Vec<&[Option<String>]> =
-                    row_chunk.iter().map(|(_, row)| *row).collect();
-                for query_chunk in batchable.chunks(PG_EVAL_CHUNK) {
-                    self.pg_eval_buf.clear();
-                    for (ordinal, update_query) in query_chunk.iter().enumerate() {
-                        if ordinal > 0 {
-                            self.pg_eval_buf.push_str(" UNION ALL ");
-                        }
-                        let select = update_query
-                            .resolved
-                            .as_select()
-                            .ok_or(CacheError::InvalidQuery)?;
-                        // Ordinal is bounded by PG_EVAL_CHUNK (32): never wraps.
-                        #[allow(clippy::cast_possible_wrap)]
-                        let batch_select = resolved_select_node_table_replace_with_values_batch(
-                            select,
-                            table_metadata,
-                            &chunk_rows,
-                            ordinal as i64,
-                        )
-                        .map_err(|e| e.context_transform(CacheError::from))?;
-                        Deparse::deparse(&batch_select, &mut self.pg_eval_buf);
-                    }
+            // Mirror the per-row fresh/rest split: Fresh-MV queries are always
+            // fully evaluated (every match must dirty-mark)…
+            let (fresh, rest): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) = batchable
+                .into_iter()
+                .partition(|q| core.mv_is_fresh(q.fingerprint));
 
-                    let msgs = match self.cache_eval_conn.simple_query(&self.pg_eval_buf).await {
-                        Ok(m) => m,
-                        Err(e) => {
-                            error!("batched predicate eval error: {}", error_chain_format(&e));
-                            return Err(CacheError::PgError(e).into());
-                        }
-                    };
-                    crate::metrics::handles().cdc.pg_eval_hits.increment(1);
-                    for msg in msgs {
-                        let SimpleQueryMessage::Row(row) = msg else {
-                            continue;
-                        };
-                        let (Some(ordinal), Some(local_idx)) = (
-                            row.get(0).and_then(|v| v.parse::<usize>().ok()),
-                            row.get(1).and_then(|v| v.parse::<usize>().ok()),
-                        ) else {
-                            continue;
-                        };
-                        if let (Some(update_query), Some(&(event_idx, _))) =
-                            (query_chunk.get(ordinal), row_chunk.get(local_idx))
+            if !fresh.is_empty() {
+                self.membership_chunks_eval(
+                    table_metadata,
+                    &fresh,
+                    &batch_rows,
+                    &mut membership.hits,
+                )
+                .await?;
+            }
+
+            // …while rest queries only decide the shared-table upsert, so they
+            // are only worth evaluating for rows nothing else matched. Gating
+            // pre-pass: a row with a LocalEval match or a fresh hit needs no
+            // rest eval — the per-row path's `if !matched` short-circuit, which
+            // does zero PgEval round-trips for locally-matched rows. (A gating
+            // miss is safe: uncovered rows fall back to per-row `pg_eval_any`,
+            // itself guarded by `if !matched` at decide time.)
+            let rest_rows: Vec<(usize, &[Option<String>])> = if rest.is_empty() {
+                Vec::new()
+            } else {
+                batch_rows
+                    .iter()
+                    .filter(|(event_idx, row)| {
+                        if fresh
+                            .iter()
+                            .any(|q| membership.hits.contains(&(*event_idx, q.fingerprint)))
                         {
-                            membership
-                                .hits
-                                .insert((event_idx, update_query.fingerprint));
+                            return false;
                         }
-                    }
-                }
+                        !update_queries.iter_complexity_ordered().any(|q| {
+                            q.eval_strategy == UpdateEvalStrategy::LocalEval
+                                && !core.frame_invalidations.contains(&q.fingerprint)
+                                && update_query_matches_locally(q, table_metadata, row)
+                        })
+                    })
+                    .copied()
+                    .collect()
+            };
+            if !rest.is_empty() && !rest_rows.is_empty() {
+                self.membership_chunks_eval(
+                    table_metadata,
+                    &rest,
+                    &rest_rows,
+                    &mut membership.hits,
+                )
+                .await?;
             }
 
             membership
                 .covered
                 .extend(batch_rows.iter().map(|(event_idx, _)| *event_idx));
-            membership.relation_fps.insert(
-                relation_oid,
-                batchable.iter().map(|q| q.fingerprint).collect(),
-            );
+            membership
+                .rest_covered
+                .extend(rest_rows.iter().map(|(event_idx, _)| *event_idx));
+            if !fresh.is_empty() {
+                membership
+                    .relation_fresh_fps
+                    .insert(relation_oid, fresh.iter().map(|q| q.fingerprint).collect());
+            }
+            if !rest.is_empty() {
+                membership
+                    .relation_rest_fps
+                    .insert(relation_oid, rest.iter().map(|q| q.fingerprint).collect());
+            }
         }
 
         Ok(membership)
+    }
+
+    /// Evaluate `queries` against `rows` in `UNION ALL`-combined multi-row
+    /// VALUES statements (`PG_EVAL_ROW_CHUNK` rows × `PG_EVAL_CHUNK` queries per
+    /// statement), inserting `(event index, fingerprint)` matches into `hits`.
+    async fn membership_chunks_eval(
+        &mut self,
+        table_metadata: &TableMetadata,
+        queries: &[&UpdateQuery],
+        rows: &[(usize, &[Option<String>])],
+        hits: &mut HashSet<(usize, u64)>,
+    ) -> CacheResult<()> {
+        for row_chunk in rows.chunks(PG_EVAL_ROW_CHUNK) {
+            let chunk_rows: Vec<&[Option<String>]> =
+                row_chunk.iter().map(|(_, row)| *row).collect();
+            for query_chunk in queries.chunks(PG_EVAL_CHUNK) {
+                self.pg_eval_buf.clear();
+                for (ordinal, update_query) in query_chunk.iter().enumerate() {
+                    if ordinal > 0 {
+                        self.pg_eval_buf.push_str(" UNION ALL ");
+                    }
+                    let select = update_query
+                        .resolved
+                        .as_select()
+                        .ok_or(CacheError::InvalidQuery)?;
+                    // Ordinal is bounded by PG_EVAL_CHUNK (32): never wraps.
+                    #[allow(clippy::cast_possible_wrap)]
+                    let batch_select = resolved_select_node_table_replace_with_values_batch(
+                        select,
+                        table_metadata,
+                        &chunk_rows,
+                        ordinal as i64,
+                    )
+                    .map_err(|e| e.context_transform(CacheError::from))?;
+                    Deparse::deparse(&batch_select, &mut self.pg_eval_buf);
+                }
+
+                let msgs = match self.cache_eval_conn.simple_query(&self.pg_eval_buf).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!("batched predicate eval error: {}", error_chain_format(&e));
+                        return Err(CacheError::PgError(e).into());
+                    }
+                };
+                crate::metrics::handles().cdc.pg_eval_hits.increment(1);
+                for msg in msgs {
+                    let SimpleQueryMessage::Row(row) = msg else {
+                        continue;
+                    };
+                    let (Some(ordinal), Some(local_idx)) = (
+                        row.get(0).and_then(|v| v.parse::<usize>().ok()),
+                        row.get(1).and_then(|v| v.parse::<usize>().ok()),
+                    ) else {
+                        continue;
+                    };
+                    if let (Some(update_query), Some(&(event_idx, _))) =
+                        (query_chunk.get(ordinal), row_chunk.get(local_idx))
+                    {
+                        hits.insert((event_idx, update_query.fingerprint));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Batch the segment's row-change SELECTs (PGC-241 stage 3): per relation,
