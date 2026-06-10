@@ -1081,7 +1081,7 @@ impl WriterCdc {
                     self.pg_eval_buf,
                     ", unnest(${}::text[])::{} AS {}",
                     i + 2,
-                    column_meta.type_name,
+                    column_meta.cache_type_name,
                     column_meta.name
                 );
             }
@@ -1157,7 +1157,11 @@ impl WriterCdc {
                     .get(column_meta.index())
                     .and_then(|v| v.as_deref())
                     .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
-                let _ = write!(self.pg_eval_buf, ", {value}::{}", column_meta.type_name);
+                let _ = write!(
+                    self.pg_eval_buf,
+                    ", {value}::{}",
+                    column_meta.cache_type_name
+                );
             }
             self.pg_eval_buf.push(')');
         }
