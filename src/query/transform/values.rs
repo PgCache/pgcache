@@ -75,12 +75,12 @@ fn table_source_find_mut(
 }
 
 /// One VALUES row's literals for `row_data`, in `table_metadata` column order,
-/// with per-column casts (NULLs carry the column type). Appends the name of
-/// each emitted column to `column_names`.
+/// with per-column casts (NULLs carry the column type). Emits one literal per
+/// column position present in `row_data`; [`values_column_names`] yields the
+/// matching alias columns.
 fn values_row_build(
     table_metadata: &TableMetadata,
     row_data: &[Option<String>],
-    column_names: &mut Vec<EcoString>,
 ) -> Vec<LiteralValue> {
     let mut values = Vec::new();
     for column_meta in &table_metadata.columns {
@@ -91,10 +91,23 @@ fn values_row_build(
                 |v| LiteralValue::StringWithCast(v.into(), column_meta.type_name.clone()),
             );
             values.push(value);
-            column_names.push(EcoString::from(column_meta.name.as_str()));
         }
     }
     values
+}
+
+/// The alias column names matching [`values_row_build`]'s emitted literals:
+/// one per column position present in `row_data`, in column order.
+fn values_column_names(
+    table_metadata: &TableMetadata,
+    row_data: &[Option<String>],
+) -> Vec<EcoString> {
+    table_metadata
+        .columns
+        .iter()
+        .filter(|column_meta| row_data.get(column_meta.index()).is_some())
+        .map(|column_meta| EcoString::from(column_meta.name.as_str()))
+        .collect()
 }
 
 /// Replace `table_metadata`'s table source with a single-row `VALUES`
@@ -121,8 +134,8 @@ pub fn resolved_select_node_table_replace_with_values(
     let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
 
     // Build VALUES clause from row_data and collect column names
-    let mut column_names: Vec<EcoString> = Vec::new();
-    let values = values_row_build(table_metadata, row_data, &mut column_names);
+    let column_names = values_column_names(table_metadata, row_data);
+    let values = values_row_build(table_metadata, row_data);
 
     *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
         query: Box::new(ResolvedQueryExpr {
@@ -169,22 +182,22 @@ pub fn resolved_select_node_table_replace_with_values_batch(
 
     let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
 
-    let mut column_names: Vec<EcoString> = vec![EcoString::from(BATCH_IDX_COLUMN)];
+    // Batch rows are uniform full-width (the caller filters odd-arity rows
+    // out), so the alias columns are the relation's full column list.
+    let mut column_names: Vec<EcoString> = Vec::with_capacity(table_metadata.columns.len() + 1);
+    column_names.push(EcoString::from(BATCH_IDX_COLUMN));
+    column_names.extend(
+        table_metadata
+            .columns
+            .iter()
+            .map(|column_meta| EcoString::from(column_meta.name.as_str())),
+    );
     let mut value_rows = Vec::with_capacity(rows.len());
-    let mut names_scratch: Vec<EcoString> = Vec::new();
     for (idx, row_data) in rows.iter().enumerate() {
-        names_scratch.clear();
         // Row index is bounded by the caller's row-chunk size: never wraps.
         #[allow(clippy::cast_possible_wrap)]
         let mut values = vec![LiteralValue::Integer(idx as i64)];
-        values.extend(values_row_build(
-            table_metadata,
-            row_data,
-            &mut names_scratch,
-        ));
-        if column_names.len() == 1 {
-            column_names.append(&mut names_scratch);
-        }
+        values.extend(values_row_build(table_metadata, row_data));
         value_rows.push(values);
     }
 

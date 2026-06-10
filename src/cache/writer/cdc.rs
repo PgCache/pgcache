@@ -61,8 +61,66 @@ const PG_EVAL_ROW_CHUNK: usize = 64;
 /// exceeds this and prepare-per-use is thrashing — raise it or gate on
 /// second use (until shape-parameterized update queries, PGC-257, collapse
 /// the cardinality).
-fn prepared_eval_cache_capacity() -> NonZeroUsize {
-    NonZeroUsize::new(512).unwrap_or(NonZeroUsize::MIN)
+// Compile-time evaluated: cannot panic at runtime.
+const PREPARED_EVAL_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(512) {
+    Some(capacity) => capacity,
+    None => unreachable!(),
+};
+
+/// Shared array params for a prepared eval statement over one row chunk:
+/// `$1` = row ordinals, `$2..` = one `text[]` per column in
+/// `table_metadata.columns` order. The unnest transform's parameter numbering
+/// and the prepared row-change SQL builder both follow the same column order —
+/// this is the single place the binding contract is produced.
+fn chunk_arrays_build<'a>(
+    table_metadata: &TableMetadata,
+    row_chunk: &[(usize, &'a [Option<String>])],
+) -> (Vec<i32>, Vec<Vec<Option<&'a str>>>) {
+    // Chunk length is bounded by PG_EVAL_ROW_CHUNK (64): never wraps.
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    let ordinals: Vec<i32> = (0..row_chunk.len() as i32).collect();
+    let column_arrays = table_metadata
+        .columns
+        .iter()
+        .map(|column_meta| {
+            row_chunk
+                .iter()
+                .map(|(_, row)| row.get(column_meta.index()).and_then(|v| v.as_deref()))
+                .collect()
+        })
+        .collect();
+    (ordinals, column_arrays)
+}
+
+/// Append the row-change SELECT list — `SELECT v.<idx>, o.X IS DISTINCT FROM
+/// v.X AS X, …` — shared by the prepared and inline row-change builders so the
+/// changed-column contract can't drift between them.
+fn row_change_select_into(buf: &mut String, table_metadata: &TableMetadata) {
+    buf.push_str("SELECT v.");
+    buf.push_str(BATCH_IDX_COLUMN);
+    for column_meta in &table_metadata.columns {
+        let _ = write!(
+            buf,
+            ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
+            name = column_meta.name
+        );
+    }
+}
+
+/// Append the row-change PK join — ` JOIN <schema>.<table> o ON o.pk = v.pk…`
+/// — shared by the prepared and inline row-change builders.
+fn row_change_join_on_into(buf: &mut String, table_metadata: &TableMetadata) {
+    let _ = write!(
+        buf,
+        " JOIN {}.{} o ON ",
+        table_metadata.schema, table_metadata.name
+    );
+    for (i, pk_column) in table_metadata.primary_key_columns.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(" AND ");
+        }
+        let _ = write!(buf, "o.{pk_column} = v.{pk_column}");
+    }
 }
 
 /// Statement-cache key for prepared membership eval. Deliberately a named
@@ -324,8 +382,8 @@ impl WriterCdc {
             cdc_write_conn,
             last_applied_lsn: 0,
             pg_eval_buf: String::with_capacity(SQL_BUFFER_CAPACITY),
-            prepared_membership: LruCache::new(prepared_eval_cache_capacity()),
-            prepared_row_change: LruCache::new(prepared_eval_cache_capacity()),
+            prepared_membership: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),
+            prepared_row_change: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),
         })
     }
 
@@ -518,24 +576,25 @@ impl WriterCdc {
             let mut i = idx;
             while i < segment_end && core.frame_state != FrameState::Recovering {
                 let Some(event) = events.get(i) else { break };
-                let r = match event {
+                let (r, loc) = match event {
                     FrameRowEvent::Insert {
                         relation_oid,
                         row_data,
-                    } => {
+                    } => (
                         self.handle_insert(
                             core,
                             *relation_oid,
                             row_data,
                             membership.view(*relation_oid, i),
                         )
-                        .await
-                    }
+                        .await,
+                        "cdc replay insert",
+                    ),
                     FrameRowEvent::Update {
                         relation_oid,
                         key_data,
                         new_row_data,
-                    } => {
+                    } => (
                         self.handle_update(
                             core,
                             *relation_oid,
@@ -543,19 +602,21 @@ impl WriterCdc {
                             new_row_data,
                             membership.view(*relation_oid, i),
                         )
-                        .await
-                    }
+                        .await,
+                        "cdc replay update",
+                    ),
                     FrameRowEvent::Delete {
                         relation_oid,
                         row_data,
-                    } => self.handle_delete(core, *relation_oid, row_data).await,
+                    } => (
+                        self.handle_delete(core, *relation_oid, row_data).await,
+                        "cdc replay delete",
+                    ),
                     // Unreachable by construction (segments stop before a
                     // Truncate); a no-op keeps this panic-free.
-                    FrameRowEvent::Truncate { .. } => Ok(()),
+                    FrameRowEvent::Truncate { .. } => (Ok(()), "cdc replay truncate"),
                 };
-                self.frame_dml_result(core, r)
-                    .await
-                    .attach_loc("cdc frame replay")?;
+                self.frame_dml_result(core, r).await.attach_loc(loc)?;
                 i += 1;
             }
             idx = segment_end;
@@ -762,22 +823,7 @@ impl WriterCdc {
         row_chunk: &[(usize, &[Option<String>])],
         hits: &mut HashSet<(usize, u64)>,
     ) -> CacheResult<()> {
-        // Shared params: $1 = row ordinals, $2.. = one text[] per column in
-        // `table_metadata.columns` order (must match the transform's
-        // parameter numbering).
-        // Chunk length is bounded by PG_EVAL_ROW_CHUNK (64): never wraps.
-        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        let ordinals: Vec<i32> = (0..row_chunk.len() as i32).collect();
-        let column_arrays: Vec<Vec<Option<&str>>> = table_metadata
-            .columns
-            .iter()
-            .map(|column_meta| {
-                row_chunk
-                    .iter()
-                    .map(|(_, row)| row.get(column_meta.index()).and_then(|v| v.as_deref()))
-                    .collect()
-            })
-            .collect();
+        let (ordinals, column_arrays) = chunk_arrays_build(table_metadata, row_chunk);
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(1 + column_arrays.len());
         params.push(&ordinals);
         for array in &column_arrays {
@@ -824,11 +870,10 @@ impl WriterCdc {
                 .map(|(_, statement)| self.cache_eval_conn.query(statement, &params)),
         )
         .await;
-        crate::metrics::handles()
-            .cdc
-            .pg_eval_hits
-            .increment(statements.len() as u64);
 
+        // Counted per successful execution only: failed statements re-run via
+        // the inline fallback, which does its own counting.
+        let mut executed = 0u64;
         let mut first_error = None;
         for ((fingerprint, _), execution) in statements.iter().zip(executions) {
             let result_rows = match execution {
@@ -844,6 +889,7 @@ impl WriterCdc {
                     continue;
                 }
             };
+            executed += 1;
             for row in result_rows {
                 let Ok(local_idx) = row.try_get::<_, i32>(0) else {
                     continue;
@@ -854,6 +900,10 @@ impl WriterCdc {
                 }
             }
         }
+        crate::metrics::handles()
+            .cdc
+            .pg_eval_hits
+            .increment(executed);
         match first_error {
             Some(e) => Err(e.into()),
             None => Ok(()),
@@ -1021,15 +1071,7 @@ impl WriterCdc {
         } else {
             crate::metrics::handles().cdc.prepared_misses.increment(1);
             self.pg_eval_buf.clear();
-            self.pg_eval_buf.push_str("SELECT v.");
-            self.pg_eval_buf.push_str(BATCH_IDX_COLUMN);
-            for column_meta in &table_metadata.columns {
-                let _ = write!(
-                    self.pg_eval_buf,
-                    ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
-                    name = column_meta.name
-                );
-            }
+            row_change_select_into(&mut self.pg_eval_buf, table_metadata);
             let _ = write!(
                 self.pg_eval_buf,
                 " FROM (SELECT unnest($1::int4[]) AS {BATCH_IDX_COLUMN}"
@@ -1043,17 +1085,8 @@ impl WriterCdc {
                     column_meta.name
                 );
             }
-            let _ = write!(
-                self.pg_eval_buf,
-                ") AS v JOIN {}.{} o ON ",
-                table_metadata.schema, table_metadata.name
-            );
-            for (i, pk_column) in table_metadata.primary_key_columns.iter().enumerate() {
-                if i > 0 {
-                    self.pg_eval_buf.push_str(" AND ");
-                }
-                let _ = write!(self.pg_eval_buf, "o.{pk_column} = v.{pk_column}");
-            }
+            self.pg_eval_buf.push_str(") AS v");
+            row_change_join_on_into(&mut self.pg_eval_buf, table_metadata);
             let statement = core
                 .db_cache
                 .prepare(&self.pg_eval_buf)
@@ -1064,20 +1097,7 @@ impl WriterCdc {
             statement
         };
 
-        // Shared params, same construction/order as the membership batch.
-        // Chunk length is bounded by PG_EVAL_ROW_CHUNK (64): never wraps.
-        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-        let ordinals: Vec<i32> = (0..row_chunk.len() as i32).collect();
-        let column_arrays: Vec<Vec<Option<&str>>> = table_metadata
-            .columns
-            .iter()
-            .map(|column_meta| {
-                row_chunk
-                    .iter()
-                    .map(|(_, row)| row.get(column_meta.index()).and_then(|v| v.as_deref()))
-                    .collect()
-            })
-            .collect();
+        let (ordinals, column_arrays) = chunk_arrays_build(table_metadata, row_chunk);
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(1 + column_arrays.len());
         params.push(&ordinals);
         for array in &column_arrays {
@@ -1125,15 +1145,7 @@ impl WriterCdc {
         membership: &mut SegmentMembership,
     ) -> CacheResult<()> {
         self.pg_eval_buf.clear();
-        self.pg_eval_buf.push_str("SELECT v.");
-        self.pg_eval_buf.push_str(BATCH_IDX_COLUMN);
-        for column_meta in &table_metadata.columns {
-            let _ = write!(
-                self.pg_eval_buf,
-                ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
-                name = column_meta.name
-            );
-        }
+        row_change_select_into(&mut self.pg_eval_buf, table_metadata);
         self.pg_eval_buf.push_str(" FROM (VALUES ");
         for (i, (_, row)) in row_chunk.iter().enumerate() {
             if i > 0 {
@@ -1153,17 +1165,8 @@ impl WriterCdc {
         for column_meta in &table_metadata.columns {
             let _ = write!(self.pg_eval_buf, ", {}", column_meta.name);
         }
-        let _ = write!(
-            self.pg_eval_buf,
-            ") JOIN {}.{} o ON ",
-            table_metadata.schema, table_metadata.name
-        );
-        for (i, pk_column) in table_metadata.primary_key_columns.iter().enumerate() {
-            if i > 0 {
-                self.pg_eval_buf.push_str(" AND ");
-            }
-            let _ = write!(self.pg_eval_buf, "o.{pk_column} = v.{pk_column}");
-        }
+        self.pg_eval_buf.push(')');
+        row_change_join_on_into(&mut self.pg_eval_buf, table_metadata);
 
         let msgs = match core.db_cache.simple_query(&self.pg_eval_buf).await {
             Ok(m) => m,
