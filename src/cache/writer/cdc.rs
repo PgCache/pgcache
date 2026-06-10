@@ -1671,15 +1671,18 @@ impl WriterCdc {
                 self.frame_cache_delete(core, relation_oid, new_row_data)
                     .await?;
             }
-            // Row left all predicates: it may still sit in a Fresh MV that
-            // materialized it, and the upsert path above didn't match (so didn't
-            // dirty-mark). Coarsely dirty the relation's Fresh MVs (PGC-254).
-            core.mv_dirty_mark_relation(relation_oid);
         }
 
+        // Any update may move the row out of a Fresh MV's predicate, and only
+        // membership *hits* dirty-mark — a row leaving query A while still
+        // matching query B (`matched` above), or a PK-change with other
+        // columns changed, would otherwise leave A's MV serving the departed
+        // row forever (PGC-254/PGC-265; the old image isn't available to
+        // detect departure precisely — PGC-255 tracks precision). Coarsely
+        // dirty the relation's Fresh MVs; `mv_dirty_mark` self-gates on Fresh.
+        core.mv_dirty_mark_relation(relation_oid);
+
         // A non-empty `key_data` means the PK changed; delete the old PK too.
-        // No MV dirty-mark here: the new-row upsert above already dirty-marked
-        // every MV that matched the (unchanged-except-PK) row.
         if !key_data.is_empty() {
             self.frame_cache_delete(core, relation_oid, key_data)
                 .await?;

@@ -354,3 +354,89 @@ async fn test_cdc_pk_change_during_fresh_mv_leaves_no_ghost() -> Result<(), Erro
 
     Ok(())
 }
+
+/// PGC-265: an UPDATE that moves a row out of a Fresh MV's predicate while
+/// still matching a *different* query (`matched = true`) must dirty-mark the
+/// MV — only membership hits and full update-out did, so the departed row was
+/// served by the Fresh MV forever.
+#[tokio::test]
+async fn test_cdc_update_departure_during_fresh_mv_no_ghost() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.simple_query("create table mvd_groups (group_id int primary key, version int not null)")
+        .await?;
+    ctx.simple_query(
+        "create table mvd_items (id int primary key, group_id int not null, data int not null)",
+    )
+    .await?;
+    ctx.simple_query(
+        "insert into mvd_groups (group_id, version) select g, 0 from generate_series(1, 50) g",
+    )
+    .await?;
+    ctx.simple_query(
+        "insert into mvd_items (id, group_id, data) \
+         select 1000 + (g*2) + r, g, g*100 + r \
+         from generate_series(1, 50) g, generate_series(0, 1) r",
+    )
+    .await?;
+    // Group 1's items are ids 1002 and 1003 (data 100 and 101).
+    ctx.cdc_settle().await?;
+
+    // Per-group join queries with a non-join data predicate (so the departure
+    // update below changes no join column → no invalidation path fires)…
+    let group_query = |g: i32| {
+        format!(
+            "select i.id, g.version, i.data from mvd_items i \
+             join mvd_groups g on i.group_id = g.group_id \
+             where i.group_id = {g} and i.data < 100000"
+        )
+    };
+    // …plus a broad single-table query that keeps matching the updated row,
+    // making `matched = true` (the PGC-265 trigger).
+    ctx.simple_query("select id, data from mvd_items where data >= 0")
+        .await?;
+
+    for g in 1..=50 {
+        let _ = ctx.simple_query(&group_query(g)).await?;
+    }
+    ctx.cache_settle().await?;
+
+    let cache_db = connect_cache_db(&ctx.dbs).await?;
+    let query = group_query(1);
+    let mut mv_built = false;
+    for _ in 0..30 {
+        let _ = ctx.simple_query(&query).await?;
+        ctx.cache_settle().await?;
+        let n: i64 = cache_db
+            .query_one(
+                "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace \
+                 WHERE n.nspname='pgcache_mv' AND c.relkind='r'",
+                &[],
+            )
+            .await
+            .map_err(Error::other)?
+            .get(0);
+        if n >= 1 {
+            mv_built = true;
+            break;
+        }
+    }
+    assert!(mv_built, "per-group join MV never built");
+
+    // Move item 1002 out of the group query's data range. The broad query
+    // still matches (matched=true); no join column changed (no invalidation).
+    ctx.origin_query("update mvd_items set data = 200000 where id = 1002", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // The served result must drop the departed row: the update must have
+    // dirty-marked the MV (else it stays Fresh and serves id=1002 forever).
+    let served = ctx.simple_query(&query).await?;
+    assert_eq!(
+        row_count(&served),
+        1,
+        "ghost row: Fresh MV still serves the row that left its predicate (PGC-265)"
+    );
+
+    Ok(())
+}
