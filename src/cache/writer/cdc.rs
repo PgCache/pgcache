@@ -15,7 +15,7 @@ use crate::query::constraints::{QueryConstraints, TableConstraint};
 use crate::query::evaluate::{literal_compare, where_value_compare_string};
 use crate::query::resolved::ResolvedQueryExpr;
 use crate::query::transform::{
-    resolved_select_node_table_replace_with_values,
+    BATCH_IDX_COLUMN, resolved_select_node_table_replace_with_values,
     resolved_select_node_table_replace_with_values_batch,
 };
 
@@ -52,49 +52,67 @@ const PG_EVAL_ROW_CHUNK: usize = 64;
 /// Per-relation membership-eval rows of one segment: `(event index, row)`.
 type SegmentRows<'a> = HashMap<u32, Vec<(usize, &'a [Option<String>])>>;
 
-/// Batched PgEval membership for one segment of frame row events (PGC-241).
-/// Built by `segment_membership_eval`, consumed per event by the decide pass.
+/// Batched PgEval membership + row-change results for one segment of frame
+/// row events (PGC-241). Built by `segment_membership_eval` /
+/// `segment_row_changes_eval`, consumed per event by the decide pass.
 #[derive(Default)]
 struct SegmentMembership {
-    /// Per relation: the fingerprints the batch covered. Queries outside this
-    /// set (non-batchable shapes) fall back to per-row eval.
+    /// Per relation: the fingerprints the membership batch covered. Queries
+    /// outside this set (non-batchable shapes) fall back to per-row eval.
     relation_fps: HashMap<u32, HashSet<u64>>,
-    /// Event indexes whose row was in the batch (rows of unexpected arity stay
-    /// out and fall back to per-row eval).
+    /// Event indexes whose row was in the membership batch (rows of unexpected
+    /// arity stay out and fall back to per-row eval).
     covered: HashSet<usize>,
     /// `(event index, fingerprint)` membership hits.
     hits: HashSet<(usize, u64)>,
+    /// Update events whose row-change SELECT was batched. Covered-but-absent
+    /// from `row_changes` ⇒ the row isn't in the cache table (the per-row
+    /// `None` case).
+    row_change_covered: HashSet<usize>,
+    /// Per covered update event: column → changed (`IS DISTINCT FROM`).
+    row_changes: HashMap<usize, HashMap<EcoString, bool>>,
 }
 
 impl SegmentMembership {
-    /// The matrix view for one event, or `None` if the event wasn't batched
-    /// (relation had no batchable queries, or the row fell back).
+    /// The matrix view for one event, or `None` if neither the membership nor
+    /// the row-change batch covered it.
     fn view(&self, relation_oid: u32, event_idx: usize) -> Option<BatchEvalView<'_>> {
-        if !self.covered.contains(&event_idx) {
+        let fps = self
+            .covered
+            .contains(&event_idx)
+            .then(|| self.relation_fps.get(&relation_oid))
+            .flatten();
+        let row_change = self
+            .row_change_covered
+            .contains(&event_idx)
+            .then(|| self.row_changes.get(&event_idx));
+        if fps.is_none() && row_change.is_none() {
             return None;
         }
-        self.relation_fps
-            .get(&relation_oid)
-            .map(|fps| BatchEvalView {
-                fps,
-                hits: &self.hits,
-                event_idx,
-            })
+        Some(BatchEvalView {
+            fps,
+            hits: &self.hits,
+            event_idx,
+            row_change,
+        })
     }
 }
 
 /// One event's window into a [`SegmentMembership`] matrix.
 pub(super) struct BatchEvalView<'a> {
-    fps: &'a HashSet<u64>,
+    fps: Option<&'a HashSet<u64>>,
     hits: &'a HashSet<(usize, u64)>,
     event_idx: usize,
+    /// Outer `None` = row-change not batched for this event (fall back to the
+    /// per-row SELECT); `Some(inner)` mirrors `query_row_changes`' return.
+    row_change: Option<Option<&'a HashMap<EcoString, bool>>>,
 }
 
 impl BatchEvalView<'_> {
     /// Whether `fingerprint` was batch-evaluated (consult `hit` instead of a
     /// per-row round-trip).
     fn covers(&self, fingerprint: u64) -> bool {
-        self.fps.contains(&fingerprint)
+        self.fps.is_some_and(|fps| fps.contains(&fingerprint))
     }
 
     /// Whether this event's row matched `fingerprint`'s predicate.
@@ -430,12 +448,12 @@ impl WriterCdc {
             // Batched membership for the segment's rows (PGC-241), then the
             // ordered decide/emit pass over the same events.
             let segment = events.get(idx..segment_end).unwrap_or_default();
-            let membership = match self.segment_membership_eval(core, segment, idx).await {
+            let membership = match self.segment_eval(core, segment, idx).await {
                 Ok(m) => m,
                 Err(e) => {
                     self.frame_dml_result(core, Err(e))
                         .await
-                        .attach_loc("cdc segment membership eval")?;
+                        .attach_loc("cdc segment batch eval")?;
                     // Swallowed 40P01 → Recovering; the loop condition exits.
                     continue;
                 }
@@ -490,6 +508,20 @@ impl WriterCdc {
         events.clear();
         core.frame_rows = events;
         Ok(())
+    }
+
+    /// Run both batch passes for a segment: PgEval membership, then row-change
+    /// detection, into one [`SegmentMembership`] matrix (PGC-241).
+    async fn segment_eval(
+        &mut self,
+        core: &WriterCore,
+        events: &[FrameRowEvent],
+        base_idx: usize,
+    ) -> CacheResult<SegmentMembership> {
+        let mut membership = self.segment_membership_eval(core, events, base_idx).await?;
+        self.segment_row_changes_eval(core, events, base_idx, &mut membership)
+            .await?;
+        Ok(membership)
     }
 
     /// Batch-evaluate PgEval membership for one segment of row events: per
@@ -623,6 +655,141 @@ impl WriterCdc {
         }
 
         Ok(membership)
+    }
+
+    /// Batch the segment's row-change SELECTs (PGC-241 stage 3): per relation,
+    /// every update event's `col IS DISTINCT FROM <new>` comparison runs in one
+    /// statement per row chunk, joining the new tuples against the cache table
+    /// by PK — `⌈K/PG_EVAL_ROW_CHUNK⌉` round-trips instead of one per row. A
+    /// tuple absent from the join is the per-row "row not cached" (`None`)
+    /// case: covered-but-absent in the matrix.
+    ///
+    /// Runs on `db_cache` like the per-row `query_row_changes`; all of a
+    /// frame's reads see the same pre-frame committed state either way (the
+    /// frame's own writes are buffered, or sit uncommitted on
+    /// `cdc_write_conn`), so batching up front is snapshot-equivalent.
+    async fn segment_row_changes_eval(
+        &mut self,
+        core: &WriterCore,
+        events: &[FrameRowEvent],
+        base_idx: usize,
+        membership: &mut SegmentMembership,
+    ) -> CacheResult<()> {
+        let mut rows_by_relation: SegmentRows<'_> = HashMap::new();
+        for (offset, event) in events.iter().enumerate() {
+            let FrameRowEvent::Update {
+                relation_oid,
+                new_row_data,
+                ..
+            } = event
+            else {
+                continue;
+            };
+            // PGC-227: skip relations where no query's UPDATE invalidation
+            // depends on changed columns — handle_update never reads changes.
+            if !core
+                .cache
+                .update_queries
+                .get(relation_oid)
+                .is_some_and(|q| q.needs_change_eval())
+            {
+                continue;
+            }
+            rows_by_relation
+                .entry(*relation_oid)
+                .or_default()
+                .push((base_idx + offset, new_row_data));
+        }
+
+        for (relation_oid, rows) in rows_by_relation {
+            let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
+                continue;
+            };
+            if table_metadata.primary_key_columns.is_empty() {
+                continue;
+            }
+            // Uniform VALUES arity, as in the membership batch.
+            let full_width = table_metadata.columns.len();
+            let batch_rows: Vec<(usize, &[Option<String>])> = rows
+                .into_iter()
+                .filter(|(_, row)| row.len() == full_width)
+                .collect();
+
+            for row_chunk in batch_rows.chunks(PG_EVAL_ROW_CHUNK) {
+                self.pg_eval_buf.clear();
+                self.pg_eval_buf.push_str("SELECT v.");
+                self.pg_eval_buf.push_str(BATCH_IDX_COLUMN);
+                for column_meta in &table_metadata.columns {
+                    let _ = write!(
+                        self.pg_eval_buf,
+                        ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
+                        name = column_meta.name
+                    );
+                }
+                self.pg_eval_buf.push_str(" FROM (VALUES ");
+                for (i, (_, row)) in row_chunk.iter().enumerate() {
+                    if i > 0 {
+                        self.pg_eval_buf.push_str(", ");
+                    }
+                    let _ = write!(self.pg_eval_buf, "({i}");
+                    for column_meta in &table_metadata.columns {
+                        let value = row
+                            .get(column_meta.index())
+                            .and_then(|v| v.as_deref())
+                            .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
+                        let _ = write!(self.pg_eval_buf, ", {value}::{}", column_meta.type_name);
+                    }
+                    self.pg_eval_buf.push(')');
+                }
+                let _ = write!(self.pg_eval_buf, ") AS v({BATCH_IDX_COLUMN}");
+                for column_meta in &table_metadata.columns {
+                    let _ = write!(self.pg_eval_buf, ", {}", column_meta.name);
+                }
+                let _ = write!(
+                    self.pg_eval_buf,
+                    ") JOIN {}.{} o ON ",
+                    table_metadata.schema, table_metadata.name
+                );
+                for (i, pk_column) in table_metadata.primary_key_columns.iter().enumerate() {
+                    if i > 0 {
+                        self.pg_eval_buf.push_str(" AND ");
+                    }
+                    let _ = write!(self.pg_eval_buf, "o.{pk_column} = v.{pk_column}");
+                }
+
+                let msgs = match core.db_cache.simple_query(&self.pg_eval_buf).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!("batched row-change eval error: {}", error_chain_format(&e));
+                        return Err(CacheError::PgError(e).into());
+                    }
+                };
+                for msg in msgs {
+                    let SimpleQueryMessage::Row(row) = msg else {
+                        continue;
+                    };
+                    let Some(local_idx) = row.get(0).and_then(|v| v.parse::<usize>().ok()) else {
+                        continue;
+                    };
+                    let Some(&(event_idx, _)) = row_chunk.get(local_idx) else {
+                        continue;
+                    };
+                    let mut changes = HashMap::with_capacity(row.len().saturating_sub(1));
+                    for (col_idx, col) in row.columns().iter().enumerate().skip(1) {
+                        // PG boolean text: "t"/"f"; treat non-"t" as false,
+                        // matching the per-row parse.
+                        changes.insert(EcoString::from(col.name()), row.get(col_idx) == Some("t"));
+                    }
+                    membership.row_changes.insert(event_idx, changes);
+                }
+            }
+
+            membership
+                .row_change_covered
+                .extend(batch_rows.iter().map(|(event_idx, _)| *event_idx));
+        }
+
+        Ok(())
     }
 
     /// Mid-frame partial replay once the event log reaches its cap, bounding
@@ -996,15 +1163,25 @@ impl WriterCdc {
             .is_some_and(|q| q.needs_change_eval());
 
         if needs_change_eval {
-            let row_changes = self
-                .query_row_changes(core, relation_oid, new_row_data)
-                .await?;
+            // Batched row-change result if the segment eval covered this event
+            // (PGC-241 stage 3), else the per-row SELECT.
+            let row_changes_fallback;
+            let row_changes: Option<&HashMap<EcoString, bool>> =
+                match batch.as_ref().and_then(|view| view.row_change) {
+                    Some(batched) => batched,
+                    None => {
+                        row_changes_fallback = self
+                            .query_row_changes(core, relation_oid, new_row_data)
+                            .await?;
+                        row_changes_fallback.as_ref()
+                    }
+                };
             trace!("row_changes {:?}", row_changes);
 
             let fp_list = self.update_queries_check_invalidate(
                 core,
                 relation_oid,
-                row_changes.as_ref(),
+                row_changes,
                 new_row_data,
                 Some(key_data),
                 CdcOperation::Upsert,
