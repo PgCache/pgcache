@@ -146,15 +146,24 @@ const BATCH_FRAMES_MAX: usize = 256;
 /// `segment_row_changes_eval`, consumed per event by the decide pass.
 #[derive(Default)]
 struct SegmentMembership {
-    /// Per relation: batchable Fresh-MV fingerprints, evaluated for every
-    /// `covered` event (Fresh queries are always fully evaluated so every
-    /// match dirty-marks — same as the per-row path).
-    relation_fresh_fps: HashMap<u32, HashSet<u64>>,
-    /// Per relation: batchable non-Fresh fingerprints, evaluated only for
-    /// `rest_covered` events (rows with no LocalEval match and no fresh hit) —
-    /// mirroring the per-row path's `if !matched` short-circuit, which does
-    /// zero PgEval round-trips for locally-matched rows.
-    relation_rest_fps: HashMap<u32, HashSet<u64>>,
+    relations: HashMap<u32, RelationBatch>,
+}
+
+/// One relation's batched-eval results within a segment. Every event belongs
+/// to exactly one relation, so the coverage invariants (which fingerprints a
+/// covered event may consult) live inside one entry instead of across
+/// parallel collections.
+#[derive(Default)]
+struct RelationBatch {
+    /// Batchable Fresh-MV fingerprints, evaluated for every `covered` event
+    /// (Fresh queries are always fully evaluated so every match dirty-marks —
+    /// same as the per-row path).
+    fresh_fps: HashSet<u64>,
+    /// Batchable non-Fresh fingerprints, evaluated only for `rest_covered`
+    /// events (rows with no LocalEval match and no fresh hit) — mirroring the
+    /// per-row path's `if !matched` short-circuit, which does zero PgEval
+    /// round-trips for locally-matched rows.
+    rest_fps: HashSet<u64>,
     /// Event indexes whose row was in the fresh membership batch (rows of
     /// unexpected arity stay out and fall back to per-row eval).
     covered: HashSet<usize>,
@@ -174,27 +183,26 @@ impl SegmentMembership {
     /// The matrix view for one event, or `None` if neither the membership nor
     /// the row-change batch covered it.
     fn view(&self, relation_oid: u32, event_idx: usize) -> Option<BatchEvalView<'_>> {
-        let fresh_fps = self
+        let batch = self.relations.get(&relation_oid)?;
+        let fresh_fps = batch
             .covered
             .contains(&event_idx)
-            .then(|| self.relation_fresh_fps.get(&relation_oid))
-            .flatten();
-        let rest_fps = self
+            .then_some(&batch.fresh_fps);
+        let rest_fps = batch
             .rest_covered
             .contains(&event_idx)
-            .then(|| self.relation_rest_fps.get(&relation_oid))
-            .flatten();
-        let row_change = self
+            .then_some(&batch.rest_fps);
+        let row_change = batch
             .row_change_covered
             .contains(&event_idx)
-            .then(|| self.row_changes.get(&event_idx));
+            .then(|| batch.row_changes.get(&event_idx));
         if fresh_fps.is_none() && rest_fps.is_none() && row_change.is_none() {
             return None;
         }
         Some(BatchEvalView {
             fresh_fps,
             rest_fps,
-            hits: &self.hits,
+            hits: &batch.hits,
             event_idx,
             row_change,
         })
@@ -570,45 +578,49 @@ impl WriterCdc {
     /// the remaining events are dropped, matching the per-arrival path where
     /// post-deadlock commands skip handling.
     async fn frame_rows_replay(&mut self, core: &mut WriterCore) -> CacheResult<()> {
-        let mut events = std::mem::take(&mut core.frame_rows);
-        let mut idx = 0;
-        while idx < events.len() && core.frame_state != FrameState::Recovering {
-            let segment_end = events
-                .get(idx..)
-                .into_iter()
-                .flatten()
-                .position(|e| matches!(e, FrameRowEvent::Truncate { .. }))
-                .map_or(events.len(), |p| idx + p);
-
-            if segment_end == idx {
-                // The event at `idx` is a Truncate — handle it alone.
-                if let Some(FrameRowEvent::Truncate { relation_oids }) = events.get(idx) {
-                    let r = self.handle_truncate(core, relation_oids).await;
-                    self.frame_dml_result(core, r)
-                        .await
-                        .attach_loc("cdc frame replay truncate")?;
-                }
-                idx += 1;
-                continue;
+        let events = std::mem::take(&mut core.frame_rows);
+        // Segments end at (and include) each Truncate: a truncate evicts
+        // queries over its relations, changing the update-query set the batch
+        // eval is built from, so eval never spans one. `base` keeps the global
+        // event index — the identity the eval matrix is keyed by.
+        let mut base = 0;
+        'segments: for segment in
+            events.split_inclusive(|e| matches!(e, FrameRowEvent::Truncate { .. }))
+        {
+            if core.frame_state == FrameState::Recovering {
+                break;
             }
+            let (rows, trailing_truncate) = match segment.split_last() {
+                Some((FrameRowEvent::Truncate { relation_oids }, rows)) => {
+                    (rows, Some(relation_oids))
+                }
+                _ => (segment, None),
+            };
 
-            // Batched membership for the segment's rows (PGC-241), then the
-            // ordered decide/emit pass over the same events.
-            let segment = events.get(idx..segment_end).unwrap_or_default();
-            let membership = match self.segment_eval(core, segment, idx).await {
-                Ok(m) => m,
-                Err(e) => {
-                    self.frame_dml_result(core, Err(e))
-                        .await
-                        .attach_loc("cdc segment batch eval")?;
-                    // Swallowed 40P01 → Recovering; the loop condition exits.
-                    continue;
+            // Batched membership + row-change for the segment's rows
+            // (PGC-241), then the ordered decide/emit pass over the same
+            // events.
+            let membership = if rows.is_empty() {
+                SegmentMembership::default()
+            } else {
+                match self.segment_eval(core, rows, base).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        self.frame_dml_result(core, Err(e))
+                            .await
+                            .attach_loc("cdc segment batch eval")?;
+                        // Swallowed 40P01 → Recovering; the loop exits above.
+                        base += segment.len();
+                        continue;
+                    }
                 }
             };
 
-            let mut i = idx;
-            while i < segment_end && core.frame_state != FrameState::Recovering {
-                let Some(event) = events.get(i) else { break };
+            for (offset, event) in rows.iter().enumerate() {
+                if core.frame_state == FrameState::Recovering {
+                    break 'segments;
+                }
+                let i = base + offset;
                 let (r, loc) = match event {
                     FrameRowEvent::Insert {
                         relation_oid,
@@ -645,8 +657,8 @@ impl WriterCdc {
                         self.handle_delete(core, *relation_oid, row_data).await,
                         "cdc replay delete",
                     ),
-                    // Unreachable by construction (segments stop before a
-                    // Truncate); a no-op keeps this panic-free.
+                    // Unreachable by construction (`split_last` separated the
+                    // trailing Truncate); a no-op keeps this panic-free.
                     FrameRowEvent::Truncate { .. } => (Ok(()), "cdc replay truncate"),
                     // Frame commit boundary (PGC-242): stamp the bookkeeping
                     // this frame's replay produced with its commit LSN.
@@ -663,11 +675,20 @@ impl WriterCdc {
                     }
                 };
                 self.frame_dml_result(core, r).await.attach_loc(loc)?;
-                i += 1;
             }
-            idx = segment_end;
+
+            if let Some(relation_oids) = trailing_truncate
+                && core.frame_state != FrameState::Recovering
+            {
+                let r = self.handle_truncate(core, relation_oids).await;
+                self.frame_dml_result(core, r)
+                    .await
+                    .attach_loc("cdc frame replay truncate")?;
+            }
+            base += segment.len();
         }
         // Hand the cleared buffer back so its capacity is reused across frames.
+        let mut events = events;
         events.clear();
         core.frame_rows = events;
         Ok(())
@@ -762,14 +783,10 @@ impl WriterCdc {
                 .into_iter()
                 .partition(|q| core.mv_is_fresh(q.fingerprint));
 
+            let batch = membership.relations.entry(relation_oid).or_default();
             if !fresh.is_empty() {
-                self.membership_chunks_eval(
-                    table_metadata,
-                    &fresh,
-                    &batch_rows,
-                    &mut membership.hits,
-                )
-                .await?;
+                self.membership_chunks_eval(table_metadata, &fresh, &batch_rows, &mut batch.hits)
+                    .await?;
             }
 
             // …while rest queries only decide the shared-table upsert, so they
@@ -787,7 +804,7 @@ impl WriterCdc {
                     .filter(|(event_idx, row)| {
                         if fresh
                             .iter()
-                            .any(|q| membership.hits.contains(&(*event_idx, q.fingerprint)))
+                            .any(|q| batch.hits.contains(&(*event_idx, q.fingerprint)))
                         {
                             return false;
                         }
@@ -801,31 +818,18 @@ impl WriterCdc {
                     .collect()
             };
             if !rest.is_empty() && !rest_rows.is_empty() {
-                self.membership_chunks_eval(
-                    table_metadata,
-                    &rest,
-                    &rest_rows,
-                    &mut membership.hits,
-                )
-                .await?;
+                self.membership_chunks_eval(table_metadata, &rest, &rest_rows, &mut batch.hits)
+                    .await?;
             }
 
-            membership
+            batch
                 .covered
                 .extend(batch_rows.iter().map(|(event_idx, _)| *event_idx));
-            membership
+            batch
                 .rest_covered
                 .extend(rest_rows.iter().map(|(event_idx, _)| *event_idx));
-            if !fresh.is_empty() {
-                membership
-                    .relation_fresh_fps
-                    .insert(relation_oid, fresh.iter().map(|q| q.fingerprint).collect());
-            }
-            if !rest.is_empty() {
-                membership
-                    .relation_rest_fps
-                    .insert(relation_oid, rest.iter().map(|q| q.fingerprint).collect());
-            }
+            batch.fresh_fps = fresh.iter().map(|q| q.fingerprint).collect();
+            batch.rest_fps = rest.iter().map(|q| q.fingerprint).collect();
         }
 
         Ok(membership)
@@ -1077,24 +1081,25 @@ impl WriterCdc {
                 .filter(|(_, row)| row.len() == full_width)
                 .collect();
 
+            let batch = membership.relations.entry(relation_oid).or_default();
             for row_chunk in batch_rows.chunks(PG_EVAL_ROW_CHUNK) {
                 // Prepared per-relation statement (PGC-241 stage 4); self-heal
                 // on failure: drop the cached statement and run the inlined
                 // form for this chunk (re-prepare on next use).
                 if let Err(e) = self
-                    .row_change_chunk_prepared(core, table_metadata, row_chunk, membership)
+                    .row_change_chunk_prepared(core, table_metadata, row_chunk, batch)
                     .await
                 {
                     warn!(
                         "prepared row-change eval failed; falling back to inline: {}",
                         error_chain_format(e.current_context()),
                     );
-                    self.row_change_chunk_inline(core, table_metadata, row_chunk, membership)
+                    self.row_change_chunk_inline(core, table_metadata, row_chunk, batch)
                         .await?;
                 }
             }
 
-            membership
+            batch
                 .row_change_covered
                 .extend(batch_rows.iter().map(|(event_idx, _)| *event_idx));
         }
@@ -1110,7 +1115,7 @@ impl WriterCdc {
         core: &WriterCore,
         table_metadata: &TableMetadata,
         row_chunk: &[(usize, &[Option<String>])],
-        membership: &mut SegmentMembership,
+        batch: &mut RelationBatch,
     ) -> CacheResult<()> {
         let relation_oid = table_metadata.relation_oid;
         let statement = if let Some(statement) = self.prepared_row_change.get(&relation_oid) {
@@ -1178,7 +1183,7 @@ impl WriterCdc {
                     row.try_get::<_, bool>(col_idx).unwrap_or(false),
                 );
             }
-            membership.row_changes.insert(event_idx, changes);
+            batch.row_changes.insert(event_idx, changes);
         }
         Ok(())
     }
@@ -1190,7 +1195,7 @@ impl WriterCdc {
         core: &WriterCore,
         table_metadata: &TableMetadata,
         row_chunk: &[(usize, &[Option<String>])],
-        membership: &mut SegmentMembership,
+        batch: &mut RelationBatch,
     ) -> CacheResult<()> {
         self.pg_eval_buf.clear();
         row_change_select_into(&mut self.pg_eval_buf, table_metadata);
@@ -1243,7 +1248,7 @@ impl WriterCdc {
                 // matching the per-row parse.
                 changes.insert(EcoString::from(col.name()), row.get(col_idx) == Some("t"));
             }
-            membership.row_changes.insert(event_idx, changes);
+            batch.row_changes.insert(event_idx, changes);
         }
         Ok(())
     }
