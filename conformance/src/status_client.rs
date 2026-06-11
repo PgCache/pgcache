@@ -81,6 +81,14 @@ impl StatusClient {
         }
     }
 
+    /// Whether the spawned pgcache was built with the `fault-injection`
+    /// feature. Harnesses that set `PGCACHE_FAULT_*` env hooks must check
+    /// this: without the feature the hooks compile out and the run silently
+    /// exercises nothing.
+    pub async fn fault_injection(&self) -> Result<bool> {
+        Ok(self.fetch().await?.fault_injection)
+    }
+
     /// Fetch `/status` and reduce it to a [`StatusSnapshot`].
     pub async fn snapshot(&self) -> Result<StatusSnapshot> {
         let resp = self.fetch().await?;

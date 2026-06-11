@@ -12,6 +12,11 @@ pub struct StatusResponse {
     pub cache: CacheStatusData,
     pub cdc: CdcStatusData,
     pub queries: Vec<QueryStatusData>,
+    /// Whether this binary was built with the `fault-injection` feature.
+    /// Harnesses that request fault hooks check this to fail loudly instead
+    /// of silently exercising nothing.
+    #[serde(default)]
+    pub fault_injection: bool,
 }
 
 /// Cache subsystem state.

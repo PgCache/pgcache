@@ -1259,6 +1259,7 @@ impl WriterCore {
             cache: cache_status,
             cdc: CdcStatusData { last_applied_lsn },
             queries,
+            fault_injection: cfg!(feature = "fault-injection"),
         };
 
         let _ = req.reply_tx.send(response);

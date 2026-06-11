@@ -83,4 +83,21 @@ pub struct Cli {
     /// workspace. Useful for running the harness against an older build.
     #[arg(long)]
     pub pgcache_bin: Option<PathBuf>,
+
+    /// Artificial CDC apply lag in milliseconds: every CDC event is held this
+    /// long between decode and the writer, so the cache applies a fixed
+    /// interval in the past at full throughput. Widens the windows where
+    /// populations, merges, and serving race the writer — the conditions
+    /// consistency violations live in. Requires a pgcache built with
+    /// `--features fault-injection` (the run aborts loudly otherwise).
+    #[arg(long)]
+    pub cdc_lag_ms: Option<u64>,
+
+    /// Artificial population delay in milliseconds: every population sleeps
+    /// this long between its snapshot read and its insert, stretching the
+    /// window concurrent CDC mutations race against (PGC-250 territory).
+    /// Requires `--features fault-injection` (the run aborts loudly
+    /// otherwise).
+    #[arg(long)]
+    pub population_delay_ms: Option<u64>,
 }

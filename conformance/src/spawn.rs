@@ -24,6 +24,11 @@ pub struct SpawnOptions {
     pub workers: usize,
     pub log_level: String,
     pub ready_timeout: Duration,
+    /// Extra environment for the spawned pgcache (e.g. `PGCACHE_FAULT_*`
+    /// hooks — those require a binary built with `--features
+    /// fault-injection`; check `/status` `fault_injection` to fail loudly
+    /// instead of silently exercising nothing).
+    pub env: Vec<(String, String)>,
 }
 
 /// A running ephemeral stack: pgcache child + the two temp Postgres
@@ -247,6 +252,7 @@ impl SpawnedPgcache {
         tracing::info!(bin = %bin.display(), listen_port, metrics_port, "spawning pgcache");
         let child = Command::new(&bin)
             .args(&args)
+            .envs(opts.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_err))

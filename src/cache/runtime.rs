@@ -1,4 +1,6 @@
 use std::any::Any;
+#[cfg(feature = "fault-injection")]
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -1019,6 +1021,63 @@ async fn pool_replenish(
     debug!("pool replenish task exiting");
 }
 
+/// Test-only constant CDC apply lag (fault-injection feature): when
+/// `PGCACHE_FAULT_CDC_APPLY_LAG_MS` is set, every `CdcCommand` is held for
+/// that long between the decoder and the writer — the writer applies a fixed
+/// interval in the past at full throughput, simulating sustained writer lag
+/// (slot acks still run ahead of apply, exactly as with real lag). Identity
+/// pass-through when unset. Must be called inside a tokio runtime.
+#[cfg(feature = "fault-injection")]
+fn fault_cdc_apply_lag_relay(cdc_tx: UnboundedSender<CdcCommand>) -> UnboundedSender<CdcCommand> {
+    let Some(lag_ms) = std::env::var("PGCACHE_FAULT_CDC_APPLY_LAG_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    else {
+        return cdc_tx;
+    };
+    let lag = Duration::from_millis(lag_ms);
+    warn!(lag_ms, "fault: CDC apply-lag relay active");
+    let (relay_tx, mut relay_rx) = unbounded_channel::<CdcCommand>();
+    tokio::spawn(async move {
+        let mut held: VecDeque<(tokio::time::Instant, CdcCommand)> = VecDeque::new();
+        loop {
+            let due = held.front().map(|(t, _)| *t);
+            let head_due = async {
+                match due {
+                    Some(t) => tokio::time::sleep_until(t).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                cmd = relay_rx.recv() => match cmd {
+                    Some(cmd) => held.push_back((tokio::time::Instant::now() + lag, cmd)),
+                    // Decoder gone (teardown/restart): flush what's held —
+                    // the lag is moot once the stream has ended.
+                    None => break,
+                },
+                () = head_due => {
+                    if let Some((_, cmd)) = held.pop_front()
+                        && cdc_tx.send(cmd).is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        for (_, cmd) in held {
+            if cdc_tx.send(cmd).is_err() {
+                return;
+            }
+        }
+    });
+    relay_tx
+}
+#[cfg(not(feature = "fault-injection"))]
+fn fault_cdc_apply_lag_relay(cdc_tx: UnboundedSender<CdcCommand>) -> UnboundedSender<CdcCommand> {
+    cdc_tx
+}
+
 /// Initial backoff for CDC reconnection attempts.
 const CDC_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 /// Maximum backoff for CDC reconnection attempts.
@@ -1045,6 +1104,9 @@ fn cdc_run(
 
     debug!("cdc loop");
     rt.block_on(async {
+        // Shadowed for the whole stream/reconnect loop so a fault-injected
+        // apply lag covers reconnected processors too.
+        let cdc_tx = fault_cdc_apply_lag_relay(cdc_tx);
         let mut cdc = CdcProcessor::new(
             settings,
             cdc_tx.clone(),

@@ -46,19 +46,52 @@ pub async fn run(cli: Cli) -> Result<()> {
         writers = cli.writers,
         readers = cli.readers,
         duration_secs = cli.duration_secs,
+        cdc_lag_ms = cli.cdc_lag_ms,
+        population_delay_ms = cli.population_delay_ms,
         "starting consistency stress run (use --seed {seed} to reproduce)"
     );
+
+    let mut env = Vec::new();
+    if let Some(ms) = cli.cdc_lag_ms.filter(|ms| *ms > 0) {
+        env.push(("PGCACHE_FAULT_CDC_APPLY_LAG_MS".to_owned(), ms.to_string()));
+    }
+    if let Some(ms) = cli.population_delay_ms.filter(|ms| *ms > 0) {
+        env.push((
+            "PGCACHE_FAULT_POPULATION_DELAY_MS".to_owned(),
+            ms.to_string(),
+        ));
+    }
+    let faults_requested = !env.is_empty();
+    // Injected delays stretch every settle/converge phase; pad their budgets
+    // so a long configured lag isn't misreported as a hang.
+    let fault_slack =
+        Duration::from_millis(cli.cdc_lag_ms.unwrap_or(0) + cli.population_delay_ms.unwrap_or(0));
+    let settle_timeout = SETTLE_TIMEOUT + fault_slack;
+    let converge_timeout = CONVERGE_TIMEOUT + fault_slack;
 
     let stack = SpawnedPgcache::launch(SpawnOptions {
         pgcache_bin: cli.pgcache_bin.clone(),
         workers: cli.workers,
         log_level: cli.log_level.clone(),
         ready_timeout: READY_TIMEOUT,
+        env,
     })
     .await
     .context("launching pgcache stack")?;
 
     let status = StatusClient::new(stack.status_url.clone());
+    if faults_requested
+        && !status
+            .fault_injection()
+            .await
+            .context("checking /status for fault-injection support")?
+    {
+        bail!(
+            "--cdc-lag-ms / --population-delay-ms need fault hooks, but the spawned pgcache \
+             was built without them; rebuild with `cargo build --features fault-injection` \
+             (or point --pgcache-bin at a fault-enabled build)"
+        );
+    }
     let origin = db::connect(&stack.origin_url).await?;
     let proxy = db::connect(&stack.cache_url).await?;
 
@@ -76,7 +109,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     // Let CDC catch up with the seed, then warm the snapshot queries so the
     // loop reads cache hits.
-    settle(&status, origin_lsn(&origin).await?, SETTLE_TIMEOUT)
+    settle(&status, origin_lsn(&origin).await?, settle_timeout)
         .await
         .context("settling after seed")?;
     // Deliberately do NOT warm the per-group queries: they must populate
@@ -86,7 +119,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     // is warmed.
     snapshot::cross_group_probe(&proxy, &cross_sql).await?;
     status
-        .cache_settle(SETTLE_TIMEOUT)
+        .cache_settle(settle_timeout)
         .await
         .context("warming probe query")?;
 
@@ -184,6 +217,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         per_group_sql: &per_group_sql,
         full_sql: &full_sql,
         all_groups: &all_groups,
+        settle_timeout,
+        converge_timeout,
     };
     let final_rows = match equality_converge(&check).await {
         Ok(n) => n,
@@ -300,29 +335,32 @@ struct EqualityCheck<'a> {
     per_group_sql: &'a str,
     full_sql: &'a str,
     all_groups: &'a [i32],
+    /// Settle/converge budgets, padded by any injected fault delays.
+    settle_timeout: Duration,
+    converge_timeout: Duration,
 }
 
-/// Poll the final cache-vs-origin equality until it converges or
-/// [`CONVERGE_TIMEOUT`] elapses. Each round first drains everything that can
+/// Poll the final cache-vs-origin equality until it converges or the
+/// converge budget elapses. Each round first drains everything that can
 /// legitimately lag — the CDC watermark, in-flight populations, and the writer
 /// channel queues — so a surviving mismatch is a genuine, persistent divergence
 /// (a ghost row or lost update), not transient catch-up. Returns the converged
 /// row count.
 async fn equality_converge(c: &EqualityCheck<'_>) -> Result<usize> {
     let http = reqwest::Client::new();
-    let deadline = Instant::now() + CONVERGE_TIMEOUT;
+    let deadline = Instant::now() + c.converge_timeout;
     loop {
         // Progress-based: the run can legitimately bank a deep backlog
         // (cross-frame batching drains it in bulk after load stops), so only
         // a STALLED watermark is a failure — not a long healthy drain.
-        settle_while_progressing(c.status, origin_lsn(c.origin).await?, SETTLE_TIMEOUT)
+        settle_while_progressing(c.status, origin_lsn(c.origin).await?, c.settle_timeout)
             .await
             .context("final CDC settle")?;
         c.status
-            .cache_settle(SETTLE_TIMEOUT)
+            .cache_settle(c.settle_timeout)
             .await
             .context("final cache settle")?;
-        writer_queues_drain(&http, c.metrics_url, SETTLE_TIMEOUT)
+        writer_queues_drain(&http, c.metrics_url, c.settle_timeout)
             .await
             .context("final writer-queue drain")?;
 
@@ -338,9 +376,10 @@ async fn equality_converge(c: &EqualityCheck<'_>) -> Result<usize> {
         }
         if Instant::now() >= deadline {
             bail!(
-                "final cache/origin mismatch persisted for {CONVERGE_TIMEOUT:?} after settle + \
+                "final cache/origin mismatch persisted for {:?} after settle + \
                  queue drain (transient lag would have converged; a persistent divergence is a \
                  real consistency bug)\n  per-group: {}\n  full-table: {}",
+                c.converge_timeout,
                 per_group.as_deref().unwrap_or("ok"),
                 full_table.as_deref().unwrap_or("ok"),
             );

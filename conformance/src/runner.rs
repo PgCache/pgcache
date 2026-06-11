@@ -56,6 +56,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 workers: cli.pgcache_workers,
                 log_level: cli.pgcache_log_level.clone(),
                 ready_timeout: Duration::from_secs(cli.spawn_timeout_secs),
+                env: Vec::new(),
             })
             .await
             .context("launching ephemeral pgcache")?;
