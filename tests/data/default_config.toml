@@ -1,4 +1,7 @@
 num_workers = 2
+# Explicit disk limit so tests don't depend on the host disk's free space
+# (the auto-derived limit forces full eviction on a mostly-full volume).
+cache_size = 1073741824 # 1 GiB
 
 [origin]
 host = "localhost"

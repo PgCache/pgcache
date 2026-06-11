@@ -19,6 +19,7 @@
 //! BEGIN→messages→COMMIT → a single frame.
 
 use std::io::Error;
+#[cfg(feature = "fault-injection")]
 use std::time::Duration;
 
 use tokio_postgres::SimpleQueryMessage;
@@ -30,6 +31,7 @@ use crate::util::{assert_cache_hit, assert_cache_miss};
 mod util;
 
 /// First data cell of a single-row `SELECT count(*)` result.
+#[cfg(feature = "fault-injection")]
 fn row_count(msgs: &[SimpleQueryMessage]) -> usize {
     msgs.iter()
         .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
@@ -699,6 +701,7 @@ async fn test_intra_txn_ddl_does_not_misalign_buffered_events() -> Result<(), Er
 /// PGC-242: while frames accumulate (fault-held batch), the applied watermark
 /// must not advance and the cache must keep serving the pre-batch state; the
 /// flush applies all batched frames atomically.
+#[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn test_batch_holds_watermark_until_flush() -> Result<(), Error> {
     let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES", "3")]).await?;
@@ -752,6 +755,7 @@ async fn test_batch_holds_watermark_until_flush() -> Result<(), Error> {
 /// PGC-242: same-PK sequences across batched frames apply in arrival order —
 /// insert-then-delete nets to absent, delete-then-reinsert nets to the new
 /// row (the cross-frame extension of the within-frame ordering tests).
+#[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn test_batch_cross_frame_same_pk_sequences() -> Result<(), Error> {
     let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES", "4")]).await?;
@@ -794,6 +798,7 @@ async fn test_batch_cross_frame_same_pk_sequences() -> Result<(), Error> {
 /// PGC-242: a population's watermark gate must not deadlock against a held
 /// batch — the deferred-Ready nudge requests a keepalive, and KeepAliveMark
 /// forces a flush before advancing the watermark.
+#[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn test_batch_keepalive_forces_flush() -> Result<(), Error> {
     let mut ctx =
@@ -831,6 +836,7 @@ async fn test_batch_keepalive_forces_flush() -> Result<(), Error> {
 /// frames (A→B→A) — frame 2's diff against the pre-batch baseline sees "no
 /// change", but frame 1's flagged it; the union must invalidate/maintain
 /// correctly and the final served state must match origin.
+#[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn test_batch_value_revert_across_frames() -> Result<(), Error> {
     let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES", "3")]).await?;
@@ -867,6 +873,7 @@ async fn test_batch_value_revert_across_frames() -> Result<(), Error> {
 /// PGC-242: a 40P01 mid-batch recovers every relation any batched frame
 /// touched and advances the watermark past the whole batch — composing the
 /// PGC-147 recovery one-shot with a fault-held multi-frame batch.
+#[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn test_batch_deadlock_recovery_covers_all_frames() -> Result<(), Error> {
     unsafe { std::env::set_var("PGCACHE_FAULT_CDC_DEADLOCK_ONCE", "1") };
