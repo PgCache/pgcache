@@ -311,9 +311,11 @@ pub struct PopulationMerge {
     pub cached_bytes: usize,
     pub row_count: u64,
     /// Origin WAL LSN captured after the population reads (upper bound on the
-    /// snapshot). The query is withheld from serving until the CDC apply
-    /// watermark reaches this, so catch-up never exposes a backward-overwrite
-    /// (PGC-250 Slice B).
+    /// snapshot). The merge itself is withheld until the CDC apply watermark
+    /// reaches this (PGC-272, superseding the PGC-250 Slice B Ready-time
+    /// gate): snapshot-state rows entering the shared table early would be
+    /// served by already-Ready bystander queries as a torn mix of two origin
+    /// points in time.
     pub snapshot_lsn: u64,
 }
 

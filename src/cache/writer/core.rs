@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -249,14 +250,14 @@ pub struct WriterCore {
     /// doesn't resurrect them (PGC-250). Activated at dispatch, recorded at
     /// `frame_cache_delete`, consulted/cleared at merge.
     pub(super) population_deleted_keys: PopulationDeletedKeys,
-    /// Population merges awaiting a quiescent (frame-Idle) writer. Drained by
-    /// `pending_merges_flush` after each command so a merge never runs while a
-    /// CDC frame holds locks on the shared cache table.
-    pub(super) pending_merges: Vec<PopulationMerge>,
-    /// Merged populations withheld from serving until the CDC apply watermark
-    /// reaches their snapshot LSN (PGC-250 Slice B). Drained by
-    /// `pending_ready_flush` as the watermark advances.
-    pub(super) pending_ready: Vec<PendingReady>,
+    /// Population merges awaiting both a quiescent (frame-Idle) writer and the
+    /// CDC apply watermark reaching their snapshot LSN (PGC-272): a min-heap
+    /// on `(snapshot_lsn, generation)`, drained in deadline order by
+    /// `pending_merges_drain` as the watermark advances. Gating the merge —
+    /// not just Ready — keeps snapshot-state rows out of the shared table
+    /// until CDC has applied past the snapshot, so already-Ready bystander
+    /// queries can never serve a torn mix of two origin points in time.
+    pub(super) pending_merges: BinaryHeap<Reverse<PendingMerge>>,
     /// Signals the CDC thread to request an immediate keepalive (reply-requested
     /// standby status update), advancing `last_applied_lsn` so a gated query's
     /// snapshot LSN is reached within a round-trip instead of waiting for the
@@ -325,17 +326,40 @@ pub struct WriterCore {
     disk_available: u64,
 }
 
-/// A population merged into the cache but withheld from serving until the CDC
-/// apply watermark reaches `snapshot_lsn` (PGC-250 Slice B).
-pub(super) struct PendingReady {
-    pub(super) fingerprint: u64,
-    /// Generation this population populated. Guards against finalizing a stale
-    /// parked entry after the query was readmitted (generation bumped) while gated.
-    pub(super) generation: u64,
-    pub(super) snapshot_lsn: u64,
-    pub(super) cached_bytes: usize,
-    pub(super) row_count: u64,
+/// A queued population merge, ordered by its watermark deadline (PGC-272).
+/// The ordering key is `(snapshot_lsn, generation)`: `generation` comes from
+/// the single global monotonic counter, so the tuple is a total order even
+/// when two populations capture identical snapshot LSNs. Deliberately NOT
+/// `fingerprint` — two populations of one fingerprint at different
+/// generations can be in flight simultaneously and must not tie. The payload
+/// is excluded from the ordering.
+pub(super) struct PendingMerge(pub(super) PopulationMerge);
+
+impl PendingMerge {
+    fn key(&self) -> (u64, u64) {
+        (self.0.snapshot_lsn, self.0.generation)
+    }
 }
+
+impl Ord for PendingMerge {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl PartialOrd for PendingMerge {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for PendingMerge {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for PendingMerge {}
 
 /// Whether a parked population (a queued merge or a gated ready entry) at
 /// `parked_generation` may still finalize. `live` is the current cached query's
@@ -410,8 +434,7 @@ impl WriterCore {
             frame_rows: Vec::new(),
             frame_chunk_flushed: false,
             population_deleted_keys: PopulationDeletedKeys::default(),
-            pending_merges: Vec::new(),
-            pending_ready: Vec::new(),
+            pending_merges: BinaryHeap::new(),
             watermark_nudge,
             last_applied_lsn: 0,
             frame_deleted_keys: Vec::new(),
@@ -1466,31 +1489,23 @@ pub fn writer_run(
                         }
                     }
 
-                    // Drain population merges + deferred-Ready gates while the
-                    // writer is quiescent (no CDC frame open), so neither the
-                    // merge nor eviction (both on db_cache) races the CDC writer's
-                    // frame txn on the shared cache table (PGC-250). `pending_ready`
-                    // is keyed on the apply watermark, which advances on the CDC
-                    // path, so re-check it on every quiescent iteration.
-                    if core.frame_state == FrameState::Idle {
-                        if !core.pending_merges.is_empty()
-                            && let Err(e) = registration.pending_merges_flush(&mut core).await
-                        {
-                            error!(
-                                "population merge flush failed: {}",
-                                error_chain_format(e.current_context()),
-                            );
-                        }
-                        if !core.pending_ready.is_empty()
-                            && let Err(e) = registration
-                                .pending_ready_flush(&mut core, writer_cdc.last_applied_lsn)
-                                .await
-                        {
-                            error!(
-                                "deferred-ready flush failed: {}",
-                                error_chain_format(e.current_context()),
-                            );
-                        }
+                    // Drain population merges while the writer is quiescent
+                    // (no CDC frame open), so neither the merge nor eviction
+                    // (both on db_cache) races the CDC writer's frame txn on
+                    // the shared cache table (PGC-250). Each merge is
+                    // additionally gated on the apply watermark reaching its
+                    // snapshot LSN (PGC-272); the watermark advances on the
+                    // CDC path, so re-check on every quiescent iteration.
+                    if core.frame_state == FrameState::Idle
+                        && !core.pending_merges.is_empty()
+                        && let Err(e) = registration
+                            .pending_merges_drain(&mut core, writer_cdc.last_applied_lsn)
+                            .await
+                    {
+                        error!(
+                            "population merge drain failed: {}",
+                            error_chain_format(e.current_context()),
+                        );
                     }
 
                     // Channel depths are reported as f64 gauges; queue sizes never approach 2^53.

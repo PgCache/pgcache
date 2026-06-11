@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::rc::Rc;
@@ -40,7 +41,7 @@ use super::super::{
         UpdateQuerySource,
     },
 };
-use super::core::{PendingReady, WriterCore};
+use super::core::{PendingMerge, WriterCore};
 use super::population::population_worker;
 use super::staging::MergeOutcome;
 use crate::pg;
@@ -408,9 +409,10 @@ impl WriterRegistration {
             }
             QueryCommand::Merge(merge) => {
                 // Queue the merge; the writer loop drains it once no CDC frame
-                // is open (PGC-250). Running it here could be mid-frame, racing
-                // the CDC writer's frame txn on the shared cache table.
-                core.pending_merges.push(merge);
+                // is open (PGC-250) AND the apply watermark has reached its
+                // snapshot LSN (PGC-272). Running it here could be mid-frame,
+                // racing the CDC writer's frame txn on the shared cache table.
+                core.pending_merges.push(Reverse(PendingMerge(merge)));
             }
             QueryCommand::Failed {
                 fingerprint,
@@ -1299,42 +1301,69 @@ impl WriterRegistration {
         }
     }
 
-    /// Drain queued population merges (PGC-250). Called from the writer loop
-    /// only when no CDC frame is open, so the merge never races the CDC frame
-    /// txn on the shared cache table. Each merge applies staging → cache (with
-    /// the deleted-key filter); the query is then deferred to `pending_ready`
-    /// for the gate decision (run right after in the writer loop), or failed if
-    /// the deleted-key set overflowed / the merge errored.
-    pub(super) async fn pending_merges_flush(&self, core: &mut WriterCore) -> CacheResult<()> {
-        let merges = std::mem::take(&mut core.pending_merges);
-        for merge in merges {
-            let fingerprint = merge.fingerprint;
-            let generation = merge.generation;
+    /// Drain queued population merges in watermark-deadline order (PGC-250,
+    /// PGC-272). Called from the writer loop only when no CDC frame is open,
+    /// so a merge never races the CDC frame txn on the shared cache table.
+    ///
+    /// Each merge is additionally gated on the apply watermark reaching its
+    /// `snapshot_lsn`: snapshot-state rows must not enter the shared table
+    /// before CDC has applied past the snapshot, or already-Ready bystander
+    /// queries over the relation would serve a torn mix of two origin points
+    /// in time (PGC-272). The heap is a min-heap on that deadline, so one
+    /// peek decides whether anything is releasable.
+    ///
+    /// A successful merge marks the query Ready inline: the watermark is
+    /// already at/past the snapshot when the gate releases, so the old
+    /// deferred-Ready parking (PGC-250 Slice B) would be a no-op double-gate.
+    pub(super) async fn pending_merges_drain(
+        &self,
+        core: &mut WriterCore,
+        applied_lsn: u64,
+    ) -> CacheResult<()> {
+        loop {
+            let Some(Reverse(top)) = core.pending_merges.peek() else {
+                break;
+            };
+            let fingerprint = top.0.fingerprint;
+            let generation = top.0.generation;
+            let snapshot_lsn = top.0.snapshot_lsn;
 
-            // The query was evicted, invalidated, or superseded by a readmit
-            // (new generation) while this merge sat queued — don't insert
-            // orphan rows under a dead/superseded generation. Release tracking
-            // and drop staging; the successor population has its own entry.
+            // Tombstone check before the deadline check: a superseded /
+            // invalidated / evicted entry is droppable regardless of the
+            // watermark — release its tracking and staging now rather than
+            // holding them until a deadline that no longer matters. (Stale
+            // entries buried below a live top are reaped lazily when they
+            // surface.) The successor population has its own entry.
             if !core.population_is_current(fingerprint, generation) {
+                let Some(Reverse(PendingMerge(merge))) = core.pending_merges.pop() else {
+                    break;
+                };
                 core.population_deleted_keys
                     .deactivate(fingerprint, generation);
                 core.population_staging_drop(&merge.staged).await;
                 continue;
             }
 
+            // Earliest live deadline not reached: nothing below it can be
+            // releasable either.
+            if snapshot_lsn > applied_lsn {
+                break;
+            }
+
+            let Some(Reverse(PendingMerge(merge))) = core.pending_merges.pop() else {
+                break;
+            };
             match core.population_merge_apply(&merge).await {
                 Ok(MergeOutcome::Merged) => {
                     core.population_deleted_keys
                         .deactivate(fingerprint, generation);
-                    // The serve-now-vs-hold gate is owned by pending_ready_flush
-                    // (run right after in the writer loop); always defer here.
-                    core.pending_ready.push(PendingReady {
+                    self.query_ready_finalize(
+                        core,
                         fingerprint,
-                        generation,
-                        snapshot_lsn: merge.snapshot_lsn,
-                        cached_bytes: merge.cached_bytes,
-                        row_count: merge.row_count,
-                    });
+                        merge.cached_bytes,
+                        merge.row_count,
+                    )
+                    .await?;
                 }
                 Ok(MergeOutcome::Aborted) => {
                     debug!("population merge aborted (overflow / truncate) {fingerprint}");
@@ -1353,41 +1382,10 @@ impl WriterRegistration {
                 }
             }
         }
-        Ok(())
-    }
-
-    /// Promote merged-but-gated queries to Ready once the apply watermark has
-    /// reached their snapshot LSN (PGC-250 Slice B). Re-nudges the CDC thread
-    /// while anything is still waiting so the watermark keeps advancing.
-    pub(super) async fn pending_ready_flush(
-        &self,
-        core: &mut WriterCore,
-        applied_lsn: u64,
-    ) -> CacheResult<()> {
-        let entries = std::mem::take(&mut core.pending_ready);
-        let mut still_waiting = Vec::new();
-        for entry in entries {
-            if entry.snapshot_lsn > applied_lsn {
-                still_waiting.push(entry);
-                continue;
-            }
-            // Drop the parked entry without serving if the query was superseded
-            // (readmit bumped the generation), invalidated, or evicted while it
-            // waited — finalizing would mark a stale/superseded result Ready
-            // (PGC-250). The successor population has its own pending entry.
-            if core.population_is_current(entry.fingerprint, entry.generation) {
-                self.query_ready_finalize(
-                    core,
-                    entry.fingerprint,
-                    entry.cached_bytes,
-                    entry.row_count,
-                )
-                .await?;
-            }
-        }
-        let remaining = !still_waiting.is_empty();
-        core.pending_ready = still_waiting;
-        if remaining {
+        // Entries still gated: nudge the CDC thread for an immediate
+        // keepalive so the watermark advances within a round-trip instead of
+        // waiting for the periodic one.
+        if !core.pending_merges.is_empty() {
             core.watermark_nudge.notify_one();
         }
         Ok(())
