@@ -1,6 +1,7 @@
 //! Connection helper plus timeout-wrapped query/execute, so a stalled proxy
 //! read fails the run with a pinpointing error instead of hanging it forever.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -17,13 +18,26 @@ use tokio_postgres::{Client, NoTls, Row, ToStatement};
 // under an unthrottled debug-build run saturating the box.
 pub const OP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Set once the run starts killing the spawned stack: clients are still alive
+/// at that point, so their connection drivers end with errors that are expected
+/// teardown noise, not failures.
+static TEARDOWN: AtomicBool = AtomicBool::new(false);
+
+pub fn teardown_begin() {
+    TEARDOWN.store(true, Ordering::Relaxed);
+}
+
 pub async fn connect(url: &str) -> Result<Client> {
     let (client, connection) = tokio_postgres::connect(url, NoTls)
         .await
         .with_context(|| format!("connecting to {url}"))?;
     tokio::spawn(async move {
         if let Err(e) = connection.await {
-            tracing::error!(error = %e, "postgres connection ended");
+            if TEARDOWN.load(Ordering::Relaxed) {
+                tracing::debug!(error = %e, "postgres connection ended during teardown");
+            } else {
+                tracing::error!(error = %e, "postgres connection ended");
+            }
         }
     });
     Ok(client)

@@ -169,6 +169,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
     let snapshots = loop_result?;
     if let Some(e) = task_error {
+        db::teardown_begin();
         stack.shutdown().await;
         return Err(e);
     }
@@ -188,6 +189,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Ok(n) => n,
         Err(e) => {
             failure_diagnostics(&stack.metrics_url, &stack.origin_url, &stack.cache_db_url).await;
+            db::teardown_begin();
             stack.shutdown().await;
             return Err(e);
         }
@@ -206,6 +208,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         "consistency stress run passed"
     );
 
+    db::teardown_begin();
     stack.shutdown().await;
     Ok(())
 }
