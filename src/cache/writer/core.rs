@@ -232,6 +232,31 @@ pub struct WriterCore {
     /// watermark to the commit LSN — same commit-LSN-deferral as
     /// `frame_deleted_keys`.
     pub(super) frame_truncated_relations: Vec<u32>,
+    /// Relations bulk-invalidated outside replay (mid-batch intra-txn DDL
+    /// drops, 40P01 recovery), drained at the batch flush and stamped with the
+    /// flush LSN — an upper bound on the triggering frame's commit, which
+    /// over-aborts (safe) where a replay-boundary stamp could under-abort
+    /// (PGC-242).
+    pub(super) batch_truncated_relations: Vec<u32>,
+    /// Complete source frames accumulated in the current batch (PGC-242):
+    /// boundaries pushed since the last flush.
+    pub(super) batch_frames: usize,
+    /// Row events accumulated in the current batch, counted at push — survives
+    /// mid-frame partial replays draining `frame_rows`, so the flush size cap
+    /// sees the true batch size.
+    pub(super) batch_events: usize,
+    /// The last accumulated frame's commit LSN — the watermark target when a
+    /// flush is forced between CommitMarks (KeepAliveMark).
+    pub(super) batch_last_lsn: u64,
+    /// Whether a source frame is open (between `Begin` and `CommitMark`).
+    /// `frame_state` no longer distinguishes this once batches span frames.
+    pub(super) frame_open: bool,
+    /// PKs the current batch has deleted from cache tables (and not since
+    /// re-upserted). Row-change presence lookups read the pre-batch committed
+    /// state; a later frame updating one of these PKs must be classified
+    /// UNCACHED (`row_changes = None`) or the entering-invalidation the
+    /// per-frame flow produced is lost (PGC-242; `test_cache_join`'s PK flip).
+    pub(super) batch_deleted_pks: HashSet<(u32, EcoString)>,
 }
 
 /// A population merged into the cache but withheld from serving until the CDC
@@ -300,6 +325,12 @@ impl WriterCore {
             last_applied_lsn: 0,
             frame_deleted_keys: Vec::new(),
             frame_truncated_relations: Vec::new(),
+            batch_truncated_relations: Vec::new(),
+            batch_frames: 0,
+            batch_events: 0,
+            batch_last_lsn: 0,
+            frame_open: false,
+            batch_deleted_pks: HashSet::new(),
         })
     }
 
@@ -1209,8 +1240,14 @@ pub fn writer_run(
                                         error!("fault injection: writer exiting on sentinel CDC insert to exercise restart");
                                         return Err(CacheError::CdcFailure.into());
                                     }
-                                    if let Err(e) =
-                                        writer_cdc.cdc_command_handle(&mut core, cmd).await
+                                    // Queue depth after this command drives the
+                                    // batch flush decision (PGC-242): an empty
+                                    // queue flushes immediately; a backlog
+                                    // accumulates frames.
+                                    let queued = cdc_rx.len();
+                                    if let Err(e) = writer_cdc
+                                        .cdc_command_handle(&mut core, cmd, queued)
+                                        .await
                                     {
                                         // Propagate: tears down the cache
                                         // subsystem so the supervisor restart

@@ -135,6 +135,12 @@ struct PreparedEvalKey {
 /// Per-relation membership-eval rows of one segment: `(event index, row)`.
 type SegmentRows<'a> = HashMap<u32, Vec<(usize, &'a [Option<String>])>>;
 
+/// Max complete source frames accumulated per batch (PGC-242). The event cap
+/// (`FRAME_ROWS_CAPACITY`) usually triggers first for fat frames; this bounds
+/// the memo-bracket window and the 40P01 recovery blast radius for streams of
+/// tiny frames.
+const BATCH_FRAMES_MAX: usize = 256;
+
 /// Batched PgEval membership + row-change results for one segment of frame
 /// row events (PGC-241). Built by `segment_membership_eval` /
 /// `segment_row_changes_eval`, consumed per event by the decide pass.
@@ -232,6 +238,19 @@ mod fault {
 
     static CDC_DEADLOCK_ONCE: AtomicBool = AtomicBool::new(false);
 
+    /// Minimum batch size before the queue-empty flush trigger fires
+    /// (`PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES`), read once.
+    pub(super) fn hold_flush_frames() -> Option<usize> {
+        use std::sync::OnceLock;
+        static HOLD: OnceLock<Option<usize>> = OnceLock::new();
+        *HOLD.get_or_init(|| {
+            std::env::var("PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|n| *n > 0)
+        })
+    }
+
     /// Arm the one-shot from the environment (read once at writer startup).
     pub(super) fn init() {
         if std::env::var_os("PGCACHE_FAULT_CDC_DEADLOCK_ONCE").is_some() {
@@ -256,6 +275,19 @@ fn fault_cdc_deadlock_should_inject(core: &WriterCore) -> bool {
 }
 #[cfg(not(feature = "fault-injection"))]
 fn fault_cdc_deadlock_should_inject(_core: &WriterCore) -> bool {
+    false
+}
+
+/// Test-only flush hold (PGC-242): with `PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES=N`
+/// the queue-empty trigger is suppressed until N frames have accumulated, so
+/// tests can provoke deterministic multi-frame batches without real queue
+/// pressure. Size caps and `Recovering` still force a flush.
+#[cfg(feature = "fault-injection")]
+fn fault_cdc_hold_flush(batch_frames: usize) -> bool {
+    fault::hold_flush_frames().is_some_and(|n| batch_frames < n)
+}
+#[cfg(not(feature = "fault-injection"))]
+fn fault_cdc_hold_flush(_batch_frames: usize) -> bool {
     false
 }
 
@@ -445,6 +477,7 @@ impl WriterCdc {
         // affected relations in `frame_recover`.
         core.frame_deleted_keys.clear();
         core.frame_truncated_relations.clear();
+        core.batch_deleted_pks.clear();
         core.frame_state = FrameState::Recovering;
         Ok(())
     }
@@ -490,7 +523,7 @@ impl WriterCdc {
         // Like an explicit TRUNCATE, abort in-flight populations over these
         // relations whose snapshot predates the recovery (PGC-250); stamped with
         // the commit LSN at CommitMark.
-        core.frame_truncated_relations.extend(oids.iter().copied());
+        core.batch_truncated_relations.extend(oids.iter().copied());
         if let Some(truncate) = Self::truncate_sql_build(core, oids.into_iter()) {
             self.cdc_write_conn
                 .batch_execute(&format!("BEGIN; {truncate}; COMMIT"))
@@ -1226,6 +1259,87 @@ impl WriterCdc {
         Ok(())
     }
 
+    /// Flush the accumulated batch (PGC-242): memo-bracket the union of the
+    /// batched frames' relations, replay + commit the whole event log as one
+    /// cache transaction, advance the watermark to `lsn` (the last batched
+    /// frame's commit), and run the deferred bookkeeping. With an empty queue
+    /// every CommitMark flushes its own frame — the pre-batching behavior.
+    async fn batch_flush(&mut self, core: &mut WriterCore, lsn: u64) -> CacheResult<()> {
+        // In-process memo seqlock (PGC-236, rung 1): bracket the batch's
+        // visibility with begin (even→odd) before and end (odd→even) after,
+        // over every relation the batched frames touched, so any memo over
+        // them is invalidated atomically with the batch becoming visible.
+        // Conceptually the relation-granularity twin of the per-query MV
+        // dirty hooks in `frame_finalize`.
+        //
+        // Gated on the store being non-empty rather than on `enabled()`:
+        // when no memo exists there is nothing to bust, and (unlike an
+        // `enabled()` gate) this keeps the seqlock authoritative even
+        // while memoization is toggled off at runtime — a change landing
+        // during the disabled window still bumps the slot, so a later
+        // re-enable cannot serve a snapshot that predates it.
+        let memo_active = !core.state_view.memo.is_empty();
+        if memo_active {
+            for &oid in &core.frame_relation_oids {
+                core.state_view
+                    .memo
+                    .slot_dirty_begin(SlotKey::Relation(oid));
+            }
+        }
+
+        // Always publish the post-commit version (end the seqlock) before
+        // propagating any finalize error: a slot left odd would permanently
+        // disable memo serving for that relation on a live subsystem.
+        let finalize = self.frame_finalize(core).await;
+        if memo_active {
+            for &oid in &core.frame_relation_oids {
+                core.state_view.memo.slot_dirty_end(SlotKey::Relation(oid));
+            }
+        }
+        finalize?;
+
+        core.frame_state = FrameState::Idle;
+        core.frame_invalidations.clear();
+        core.frame_relation_oids.clear();
+        core.frame_buf.clear();
+        core.frame_rows.clear();
+        core.frame_chunk_flushed = false;
+        core.batch_frames = 0;
+        core.batch_events = 0;
+        core.batch_deleted_pks.clear();
+        self.applied_lsn_advance(lsn);
+        core.last_applied_lsn = self.last_applied_lsn;
+        // Per-frame deletes/truncates were stamped by Boundary events during
+        // replay; these drains catch what replay didn't reach — pending
+        // entries from a frame that entered `Recovering` before its boundary
+        // (no-ops in the normal path, where the lists are already empty).
+        let frame_deletes = std::mem::take(&mut core.frame_deleted_keys);
+        for (relation_oid, key) in frame_deletes {
+            core.population_deleted_keys.record(relation_oid, key, lsn);
+        }
+        let frame_truncated = std::mem::take(&mut core.frame_truncated_relations);
+        for relation_oid in frame_truncated {
+            core.population_deleted_keys.abort_below(relation_oid, lsn);
+        }
+        // Bulk invalidations recorded outside replay (mid-batch DDL drops,
+        // 40P01 recovery) — flush-LSN-stamped by design (an upper bound on
+        // the triggering frame's commit; over-aborts, never under-aborts).
+        let batch_truncated = std::mem::take(&mut core.batch_truncated_relations);
+        for relation_oid in batch_truncated {
+            core.population_deleted_keys.abort_below(relation_oid, lsn);
+        }
+        // The batch is closed; flush maintenance that was deferred while it
+        // was open (it would have deadlocked on the frame's locks).
+        if core.purge_pending {
+            let threshold = core.cache.generation_purge_threshold();
+            core.generation_purge(threshold)
+                .await
+                .attach_loc("deferred generation purge")?;
+            core.purge_pending = false;
+        }
+        Ok(())
+    }
+
     /// Apply a `CommitMark`: flush the frame's deferred invalidations and commit
     /// (or recover) per its state. Extracted from the `CommitMark` handler so the
     /// memo seqlock bracket can publish the post-commit version on every exit
@@ -1282,6 +1396,7 @@ impl WriterCdc {
         &mut self,
         core: &mut WriterCore,
         cmd: CdcCommand,
+        queued: usize,
     ) -> CacheResult<()> {
         let m = crate::metrics::handles();
         let cmd_handle = match &cmd {
@@ -1301,16 +1416,22 @@ impl WriterCdc {
         match cmd {
             CdcCommand::Begin { xid } => {
                 debug_assert!(
-                    matches!(core.frame_state, FrameState::Idle),
-                    "Begin within an active source-transaction frame"
+                    !core.frame_open,
+                    "Begin within an open source-transaction frame"
                 );
                 trace!(xid, "cdc frame begin");
-                core.frame_state = FrameState::Active;
-                core.frame_buf.clear();
-                core.frame_rows.clear();
-                core.frame_chunk_flushed = false;
-                core.frame_deleted_keys.clear();
-                core.frame_truncated_relations.clear();
+                core.frame_open = true;
+                // Reset only at a fresh batch — when accumulating (PGC-242)
+                // the log, buffers, and pending bookkeeping span frames.
+                if core.frame_state == FrameState::Idle {
+                    core.frame_state = FrameState::Active;
+                    core.frame_buf.clear();
+                    core.frame_rows.clear();
+                    core.frame_chunk_flushed = false;
+                    core.frame_deleted_keys.clear();
+                    core.frame_truncated_relations.clear();
+                    core.batch_deleted_pks.clear();
+                }
             }
             CdcCommand::TableRegister(table_metadata) => {
                 core.frame_relation_oids.insert(table_metadata.relation_oid);
@@ -1347,7 +1468,7 @@ impl WriterCdc {
                         FrameRowEvent::Truncate { .. } | FrameRowEvent::Boundary { .. } => true,
                     });
                     if core.frame_rows.len() != before {
-                        core.frame_truncated_relations.push(relation_oid);
+                        core.batch_truncated_relations.push(relation_oid);
                     }
                 }
                 // Schema change: prepared eval SQL embeds the column list —
@@ -1383,6 +1504,7 @@ impl WriterCdc {
                             relation_oid,
                             row_data,
                         });
+                        core.batch_events += 1;
                         self.frame_rows_replay_if_full(core).await?;
                     }
                 }
@@ -1399,6 +1521,7 @@ impl WriterCdc {
                         key_data,
                         new_row_data: row_data,
                     });
+                    core.batch_events += 1;
                     self.frame_rows_replay_if_full(core).await?;
                 }
             }
@@ -1412,6 +1535,7 @@ impl WriterCdc {
                         relation_oid,
                         row_data,
                     });
+                    core.batch_events += 1;
                     self.frame_rows_replay_if_full(core).await?;
                 }
             }
@@ -1421,6 +1545,7 @@ impl WriterCdc {
                 if core.frame_state != FrameState::Recovering {
                     core.frame_rows
                         .push(FrameRowEvent::Truncate { relation_oids });
+                    core.batch_events += 1;
                     self.frame_rows_replay_if_full(core).await?;
                 }
             }
@@ -1432,82 +1557,43 @@ impl WriterCdc {
                 // logs that span multiple frames.
                 core.frame_rows
                     .push(FrameRowEvent::Boundary { commit_lsn: lsn });
+                core.batch_frames += 1;
+                core.batch_last_lsn = lsn;
+                core.frame_open = false;
 
-                // In-process memo seqlock (PGC-236, rung 1): bracket the frame's
-                // visibility with begin (even→odd) before and end (odd→even)
-                // after, over every relation the frame touched, so any memo over
-                // them is invalidated atomically with the frame becoming visible.
-                // Conceptually the relation-granularity twin of the per-query MV
-                // dirty hooks in `frame_finalize`.
-                //
-                // Gated on the store being non-empty rather than on `enabled()`:
-                // when no memo exists there is nothing to bust, and (unlike an
-                // `enabled()` gate) this keeps the seqlock authoritative even
-                // while memoization is toggled off at runtime — a change landing
-                // during the disabled window still bumps the slot, so a later
-                // re-enable cannot serve a snapshot that predates it.
-                let memo_active = !core.state_view.memo.is_empty();
-                if memo_active {
-                    for &oid in &core.frame_relation_oids {
-                        core.state_view
-                            .memo
-                            .slot_dirty_begin(SlotKey::Relation(oid));
-                    }
-                }
-
-                // Always publish the post-commit version (end the seqlock)
-                // before propagating any finalize error: a slot left odd would
-                // permanently disable memo serving for that relation on a live
-                // subsystem.
-                let finalize = self.frame_finalize(core).await;
-                if memo_active {
-                    for &oid in &core.frame_relation_oids {
-                        core.state_view.memo.slot_dirty_end(SlotKey::Relation(oid));
-                    }
-                }
-                finalize?;
-
-                core.frame_state = FrameState::Idle;
-                core.frame_invalidations.clear();
-                core.frame_relation_oids.clear();
-                core.frame_buf.clear();
-                core.frame_rows.clear();
-                core.frame_chunk_flushed = false;
-                self.applied_lsn_advance(lsn);
-                core.last_applied_lsn = self.last_applied_lsn;
-                // Per-frame deletes/truncates were stamped by the Boundary
-                // event during replay; this drain catches what replay didn't
-                // reach — recovery-added truncated relations, and pending
-                // entries from a frame that entered `Recovering` before its
-                // boundary (a no-op in the normal path, where the lists are
-                // already empty).
-                let frame_deletes = std::mem::take(&mut core.frame_deleted_keys);
-                for (relation_oid, key) in frame_deletes {
-                    core.population_deleted_keys.record(relation_oid, key, lsn);
-                }
-                let frame_truncated = std::mem::take(&mut core.frame_truncated_relations);
-                for relation_oid in frame_truncated {
-                    core.population_deleted_keys.abort_below(relation_oid, lsn);
-                }
-                // Frame is closed; flush maintenance that was deferred while it
-                // was open (it would have deadlocked on the frame's locks).
-                if core.purge_pending {
-                    let threshold = core.cache.generation_purge_threshold();
-                    core.generation_purge(threshold)
-                        .await
-                        .attach_loc("deferred generation purge")?;
-                    core.purge_pending = false;
+                // Flush decision (PGC-242): an empty queue flushes immediately
+                // (caught up — today's per-frame behavior, zero added
+                // latency); a backlog accumulates, amortizing eval and commit
+                // round-trips over the frames that would otherwise wait in the
+                // queue anyway. `Recovering` flushes now (recovery semantics
+                // are batch-terminal), and the size caps bound memory, the
+                // memo-bracket window, and the recovery blast radius — they
+                // override a fault-injected hold; the queue-empty trigger
+                // respects it.
+                let flush = core.frame_state == FrameState::Recovering
+                    || core.batch_events >= FRAME_ROWS_CAPACITY
+                    || core.batch_frames >= BATCH_FRAMES_MAX
+                    || (queued == 0 && !fault_cdc_hold_flush(core.batch_frames));
+                if flush {
+                    self.batch_flush(core, lsn).await?;
                 }
             }
             CdcCommand::KeepAliveMark { lsn } => {
-                // Keepalives only arrive between source transactions, so the
-                // frame must be Idle. The guard keeps the watermark from
-                // advancing past an active frame if that ever breaks.
+                // Keepalives only arrive between source transactions, so no
+                // frame may be open. The guard keeps the watermark from
+                // advancing past an open frame if that ever breaks.
                 debug_assert!(
-                    core.frame_state == FrameState::Idle,
-                    "keepalive received with an active source-transaction frame"
+                    !core.frame_open,
+                    "keepalive received with an open source-transaction frame"
                 );
-                if core.frame_state == FrameState::Idle {
+                if !core.frame_open {
+                    // The keepalive LSN is past every accumulated frame:
+                    // flush first so the watermark never claims unapplied
+                    // events (PGC-242).
+                    if core.batch_frames > 0 {
+                        let up_to = core.batch_last_lsn;
+                        self.batch_flush(core, up_to).await?;
+                    }
                     self.applied_lsn_advance(lsn);
                     core.last_applied_lsn = self.last_applied_lsn;
                 }
@@ -1548,6 +1634,14 @@ impl WriterCdc {
                     oid: Some(relation_oid),
                     name: None,
                 })?;
+        // A re-upserted PK is present again for later batched frames' row-
+        // change classification (PGC-242). Gated: rendering is free when no
+        // batch deletes are outstanding.
+        if !core.batch_deleted_pks.is_empty()
+            && let Some(key) = pk_body_render(table_metadata, row_data)
+        {
+            core.batch_deleted_pks.remove(&(relation_oid, key));
+        }
         self.cache_upsert_unconditional_into(&mut core.frame_buf, table_metadata, row_data);
         self.frame_write_finish(core).await
     }
@@ -1582,6 +1676,15 @@ impl WriterCdc {
         } else {
             None
         };
+        // Track batch-deleted PKs so a later batched frame's row-change
+        // classification sees the deletion the pre-batch snapshot can't
+        // (PGC-242). Re-rendered when not already rendered for PGC-250.
+        if let Some(key) = deleted_key
+            .clone()
+            .or_else(|| pk_body_render(table_metadata, row_data))
+        {
+            core.batch_deleted_pks.insert((relation_oid, key));
+        }
         self.cache_delete_into(&mut core.frame_buf, table_metadata, row_data)?;
         if let Some(key) = deleted_key {
             core.frame_deleted_keys.push((relation_oid, key));
@@ -1679,10 +1782,23 @@ impl WriterCdc {
             .is_some_and(|q| q.needs_change_eval());
 
         if needs_change_eval {
+            // The batch deleted this PK after the pre-batch snapshot that the
+            // row-change lookups read: classify it UNCACHED so the
+            // entering-invalidation the per-frame flow produced still fires
+            // (PGC-242; lost otherwise on cross-frame delete/PK-flip + update).
+            let batch_deleted = !core.batch_deleted_pks.is_empty()
+                && core
+                    .cache
+                    .tables
+                    .get1(&relation_oid)
+                    .and_then(|table_metadata| pk_body_render(table_metadata, new_row_data))
+                    .is_some_and(|key| core.batch_deleted_pks.contains(&(relation_oid, key)));
             // Batched row-change result if the segment eval covered this event
             // (PGC-241 stage 3), else the per-row SELECT.
             let row_changes_fallback;
-            let row_changes: Option<&HashMap<EcoString, bool>> =
+            let row_changes: Option<&HashMap<EcoString, bool>> = if batch_deleted {
+                None
+            } else {
                 match batch.as_ref().and_then(|view| view.row_change) {
                     Some(batched) => batched,
                     None => {
@@ -1691,7 +1807,8 @@ impl WriterCdc {
                             .await?;
                         row_changes_fallback.as_ref()
                     }
-                };
+                }
+            };
             trace!("row_changes {:?}", row_changes);
 
             let fp_list = self.update_queries_check_invalidate(

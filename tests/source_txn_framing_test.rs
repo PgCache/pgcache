@@ -19,6 +19,7 @@
 //! BEGIN→messages→COMMIT → a single frame.
 
 use std::io::Error;
+use std::time::Duration;
 
 use tokio_postgres::SimpleQueryMessage;
 
@@ -29,6 +30,12 @@ use crate::util::{assert_cache_hit, assert_cache_miss};
 mod util;
 
 /// First data cell of a single-row `SELECT count(*)` result.
+fn row_count(msgs: &[SimpleQueryMessage]) -> usize {
+    msgs.iter()
+        .filter(|m| matches!(m, SimpleQueryMessage::Row(_)))
+        .count()
+}
+
 fn scalar_of(msgs: &[SimpleQueryMessage]) -> Option<String> {
     msgs.iter().find_map(|m| {
         if let SimpleQueryMessage::Row(r) = m {
@@ -685,6 +692,223 @@ async fn test_intra_txn_ddl_does_not_misalign_buffered_events() -> Result<(), Er
     let served = ctx.simple_query(q).await?;
     assert_row_at(&served, 1, &[("id", "1"), ("a", "100"), ("c", "30")])?;
     assert_row_at(&served, 2, &[("id", "2"), ("a", "11"), ("c", "300")])?;
+
+    Ok(())
+}
+
+/// PGC-242: while frames accumulate (fault-held batch), the applied watermark
+/// must not advance and the cache must keep serving the pre-batch state; the
+/// flush applies all batched frames atomically.
+#[tokio::test]
+async fn test_batch_holds_watermark_until_flush() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES", "3")]).await?;
+
+    ctx.simple_query("create table bt_w (id int primary key, v int not null)")
+        .await?;
+    ctx.simple_query("insert into bt_w (id, v) values (1, 10)")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "select id, v from bt_w order by id";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    // Two frames accumulate (hold = 3): the watermark must NOT advance and
+    // the cached query must keep serving the pre-batch state.
+    ctx.origin_query("update bt_w set v = 11 where id = 1", &[])
+        .await?;
+    ctx.origin_query("insert into bt_w (id, v) values (2, 20)", &[])
+        .await?;
+    assert!(
+        ctx.cdc_settle_with_timeout(Duration::from_secs(2))
+            .await
+            .is_err(),
+        "watermark advanced past unflushed batched frames"
+    );
+    let before = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(row_count(&served), 1, "batched frames visible before flush");
+    assert_row_at(&served, 1, &[("id", "1"), ("v", "10")])?;
+
+    // The third frame reaches the hold threshold: flush applies all three
+    // atomically and the watermark advances.
+    ctx.origin_query("insert into bt_w (id, v) values (3, 30)", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let before = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(
+        row_count(&served),
+        3,
+        "all batched frames visible after flush"
+    );
+    assert_row_at(&served, 1, &[("id", "1"), ("v", "11")])?;
+
+    Ok(())
+}
+
+/// PGC-242: same-PK sequences across batched frames apply in arrival order —
+/// insert-then-delete nets to absent, delete-then-reinsert nets to the new
+/// row (the cross-frame extension of the within-frame ordering tests).
+#[tokio::test]
+async fn test_batch_cross_frame_same_pk_sequences() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES", "4")]).await?;
+
+    ctx.simple_query("create table bt_pk (id int primary key, v text not null)")
+        .await?;
+    ctx.simple_query("insert into bt_pk (id, v) values (1, 'keep'), (2, 'old')")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "select id, v from bt_pk order by id";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    // Four frames in one batch: insert 10 then delete it (→ absent); delete 2
+    // then reinsert it with a new value (→ present, new value).
+    ctx.origin_query("insert into bt_pk (id, v) values (10, 'transient')", &[])
+        .await?;
+    ctx.origin_query("delete from bt_pk where id = 10", &[])
+        .await?;
+    ctx.origin_query("delete from bt_pk where id = 2", &[])
+        .await?;
+    ctx.origin_query("insert into bt_pk (id, v) values (2, 'new')", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    ctx.cache_settle().await?;
+
+    let served = ctx.simple_query(q).await?;
+    assert_eq!(
+        row_count(&served),
+        2,
+        "insert+delete nets out; reinsert survives"
+    );
+    assert_row_at(&served, 1, &[("id", "1"), ("v", "keep")])?;
+    assert_row_at(&served, 2, &[("id", "2"), ("v", "new")])?;
+
+    Ok(())
+}
+
+/// PGC-242: a population's watermark gate must not deadlock against a held
+/// batch — the deferred-Ready nudge requests a keepalive, and KeepAliveMark
+/// forces a flush before advancing the watermark.
+#[tokio::test]
+async fn test_batch_keepalive_forces_flush() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES", "100")]).await?;
+
+    ctx.simple_query("create table bt_ka (id int primary key, v int not null)")
+        .await?;
+    ctx.simple_query("insert into bt_ka (id, v) values (1, 10)")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // Open a batch the hold will never release on its own.
+    ctx.origin_query("update bt_ka set v = 11 where id = 1", &[])
+        .await?;
+    ctx.origin_query("insert into bt_ka (id, v) values (2, 20)", &[])
+        .await?;
+
+    // A new query populates; its deferred-Ready gate waits for the watermark,
+    // nudging a keepalive — which must flush the held batch.
+    let q = "select id, v from bt_ka order by id";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    let before = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(row_count(&served), 2);
+    assert_row_at(&served, 1, &[("id", "1"), ("v", "11")])?;
+    assert_row_at(&served, 2, &[("id", "2"), ("v", "20")])?;
+
+    Ok(())
+}
+
+/// PGC-242 + review-named case: an UPDATE that reverts a value across batched
+/// frames (A→B→A) — frame 2's diff against the pre-batch baseline sees "no
+/// change", but frame 1's flagged it; the union must invalidate/maintain
+/// correctly and the final served state must match origin.
+#[tokio::test]
+async fn test_batch_value_revert_across_frames() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES", "3")]).await?;
+
+    ctx.simple_query("create table bt_rev (id int primary key, v int not null)")
+        .await?;
+    ctx.simple_query("insert into bt_rev (id, v) values (1, 5), (2, 7)")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // A LIMIT query makes v a window column (change-dependent invalidation).
+    let q = "select id, v from bt_rev where v > 0 order by v, id limit 10";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    ctx.origin_query("update bt_rev set v = 99 where id = 1", &[])
+        .await?;
+    ctx.origin_query("update bt_rev set v = 5 where id = 1", &[])
+        .await?;
+    ctx.origin_query("insert into bt_rev (id, v) values (3, 8)", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    ctx.cache_settle().await?;
+
+    let served = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&served), 3);
+    assert_row_at(&served, 1, &[("id", "1"), ("v", "5")])?;
+    assert_row_at(&served, 2, &[("id", "2"), ("v", "7")])?;
+    assert_row_at(&served, 3, &[("id", "3"), ("v", "8")])?;
+
+    Ok(())
+}
+
+/// PGC-242: a 40P01 mid-batch recovers every relation any batched frame
+/// touched and advances the watermark past the whole batch — composing the
+/// PGC-147 recovery one-shot with a fault-held multi-frame batch.
+#[tokio::test]
+async fn test_batch_deadlock_recovery_covers_all_frames() -> Result<(), Error> {
+    unsafe { std::env::set_var("PGCACHE_FAULT_CDC_DEADLOCK_ONCE", "1") };
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES", "3")]).await?;
+    unsafe { std::env::remove_var("PGCACHE_FAULT_CDC_DEADLOCK_ONCE") };
+
+    ctx.simple_query("create table bt_rec_a (id int primary key, v int not null)")
+        .await?;
+    ctx.simple_query("create table bt_rec_b (id int primary key, v int not null)")
+        .await?;
+    ctx.simple_query("insert into bt_rec_a (id, v) values (1, 10)")
+        .await?;
+    ctx.simple_query("insert into bt_rec_b (id, v) values (1, 100)")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let qa = "select id, v from bt_rec_a order by id";
+    let qb = "select id, v from bt_rec_b order by id";
+    ctx.simple_query(qa).await?;
+    ctx.simple_query(qb).await?;
+    ctx.cache_settle().await?;
+
+    // Frame 1 touches bt_rec_a; frame 2's insert into bt_rec_b trips the
+    // injected deadlock (cached queries exist) → Recovering mid-batch; the
+    // frame's CommitMark force-flushes into recovery over BOTH relations.
+    ctx.origin_query("update bt_rec_a set v = 11 where id = 1", &[])
+        .await?;
+    ctx.origin_query("insert into bt_rec_b (id, v) values (2, 200)", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    // Recovery evicted the queries; repopulation restores correct state.
+    ctx.cache_settle().await?;
+
+    let served = ctx.simple_query(qa).await?;
+    assert_row_at(&served, 1, &[("id", "1"), ("v", "11")])?;
+    let served = ctx.simple_query(qb).await?;
+    assert_eq!(
+        row_count(&served),
+        2,
+        "recovered relation reflects the batch"
+    );
+    assert_row_at(&served, 2, &[("id", "2"), ("v", "200")])?;
 
     Ok(())
 }
