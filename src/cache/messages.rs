@@ -6,6 +6,7 @@ use smallvec::SmallVec;
 use tokio::sync::oneshot;
 use tokio_util::bytes::{Bytes, BytesMut};
 
+use super::reply::ReplySender;
 use super::{CacheError, Report, query::CacheableQuery, query_cache::QueryType};
 use crate::catalog::TableMetadata;
 use crate::proxy::ClientSocket;
@@ -248,7 +249,7 @@ pub struct ProxyMessage {
     pub message: CacheMessage,
     /// Socket for sending response data directly to the client
     pub client_socket: ClientSocket,
-    pub reply_tx: oneshot::Sender<CacheReply>,
+    pub reply_tx: ReplySender<CacheReply>,
     /// Resolved search_path for this connection (with $user expanded to session_user)
     pub search_path: Vec<EcoString>,
     /// Per-query timing data

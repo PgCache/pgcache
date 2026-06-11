@@ -23,6 +23,7 @@ pub(crate) mod messages;
 pub(crate) mod mv;
 pub(crate) mod query;
 mod query_cache;
+mod reply;
 mod runtime;
 mod serve;
 pub(crate) mod status;
@@ -41,6 +42,7 @@ pub use mv::{
     shape_classify,
 };
 pub use query_cache::{CacheDispatchHandle, CacheDispatchPublisher, CacheDispatchUpdater};
+pub use reply::{ReplySender, ReplySlot};
 pub use runtime::{CacheGeneration, cache_generation_start, cache_supervise};
 pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,

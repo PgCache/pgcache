@@ -19,7 +19,7 @@ use smallvec::SmallVec;
 use crate::catalog::FunctionVolatility;
 
 use rootcause::Report;
-use tokio::{io::AsyncWriteExt, net::TcpStream, select, sync::oneshot};
+use tokio::{io::AsyncWriteExt, net::TcpStream, select};
 use tokio_stream::StreamExt;
 use tokio_util::{
     bytes::{Buf, BufMut, Bytes, BytesMut},
@@ -30,6 +30,7 @@ use tracing::{debug, error, instrument, trace, warn};
 use crate::{
     cache::{
         CacheDispatchHandle, CacheMessage, CacheOutcome, CacheReply, ProxyMessage, QueryParameters,
+        ReplySlot,
         messages::{MessageSlices, PipelineContext, PipelineDescribe, slices_concat},
         query::CacheableQuery,
     },
@@ -2196,20 +2197,25 @@ impl ConnectionState {
         &mut self,
         origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
         origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
-        mut reply_rx: oneshot::Receiver<CacheReply>,
+        reply_slot: &ReplySlot<CacheReply>,
     ) -> ConnectionResult<ClientSocket> {
+        // One pinned `Notified` polled across the whole loop: recreating it per
+        // iteration would race with `notify_one` and drop the wakeup.
+        let notified = reply_slot.notified();
+        tokio::pin!(notified);
         loop {
             select! {
                 res = origin_read.next() => {
                     self.origin_read_dispatch(res)?;
                 }
-                reply = &mut reply_rx => {
-                    match reply {
-                        Ok(reply) => {
+                _ = &mut notified => {
+                    match reply_slot.take() {
+                        Some(reply) => {
                             self.handle_cache_outcome(reply.outcome);
                             return Ok(reply.socket);
                         }
-                        Err(_) => {
+                        None => {
+                            // Sender dropped without sending: cache died in flight.
                             if log_gate(&CACHE_DEAD_INFLIGHT_LOG, CACHE_DOWN_LOG_WINDOW_SECS) {
                                 warn!(
                                     "cache subsystem died with a query in flight; dropping client connection (root cause logged by the cache supervisor)"
@@ -2363,6 +2369,10 @@ async fn handle_connection(
 
     let mut state = ConnectionState::new(func_volatility, origin_database);
 
+    // Reused for every query's reply: allocated once here instead of a per-query
+    // oneshot, keeping the serve hot path allocation-free.
+    let reply_slot = Arc::new(ReplySlot::<CacheReply>::default());
+
     tokio::pin!(origin_framed_read);
     tokio::pin!(client_framed_read);
     tokio::pin!(origin_write);
@@ -2418,7 +2428,7 @@ async fn handle_connection(
 
                 crate::metrics::handles().query.cacheable.increment(1);
 
-                let (reply_tx, reply_rx) = oneshot::channel();
+                let reply_tx = reply_slot.sender();
                 let timing = state.telemetry.cache_timing_dispatch();
 
                 // Lease the owned write half to the worker for this query.
@@ -2442,7 +2452,11 @@ async fn handle_connection(
                         // meanwhile and flush once we are back in `Read`.
                         dispatch.dispatch_proxy(proxy_msg).await;
                         match state
-                            .cache_serve_wait(&mut origin_framed_read, &mut origin_write, reply_rx)
+                            .cache_serve_wait(
+                                &mut origin_framed_read,
+                                &mut origin_write,
+                                &reply_slot,
+                            )
                             .await
                         {
                             Ok(returned) => {

@@ -34,6 +34,7 @@ use super::{
     },
     mv::{MvMeta, MvServe, ShapeGate},
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
+    reply::ReplySender,
     types::{
         CacheStateView, CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics,
         SharedResolved,
@@ -101,7 +102,7 @@ struct CoalesceKey {
 /// A client waiting to receive coalesced response bytes from a shared serve execution.
 pub struct CoalescedClient {
     pub client_socket: ClientSocket,
-    pub reply_tx: oneshot::Sender<CacheReply>,
+    pub reply_tx: ReplySender<CacheReply>,
     pub timing: QueryTiming,
     /// Pre-computed origin fallback bytes (pipeline.buffered_bytes or raw data).
     pub data: BytesMut,
@@ -186,7 +187,7 @@ pub struct QueryRequest {
     pub cacheable_query: Arc<CacheableQuery>,
     pub result_formats: Vec<i16>,
     pub client_socket: ClientSocket,
-    pub reply_tx: oneshot::Sender<CacheReply>,
+    pub reply_tx: ReplySender<CacheReply>,
     /// Resolved search_path for schema resolution
     pub search_path: Vec<EcoString>,
     /// Per-query timing data
@@ -212,7 +213,7 @@ pub struct ServeRequest {
     pub mv: MvServe,
     pub result_formats: Vec<i16>,
     pub client_socket: ClientSocket,
-    pub reply_tx: oneshot::Sender<CacheReply>,
+    pub reply_tx: ReplySender<CacheReply>,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Incoming query's LIMIT clause, appended to SQL at serve time
@@ -1296,7 +1297,7 @@ impl CacheDispatch {
 /// Forward a query to origin by sending the reply through the oneshot channel.
 /// Returns the leased client write half to the connection.
 pub(super) fn reply_forward(
-    reply_tx: oneshot::Sender<CacheReply>,
+    reply_tx: ReplySender<CacheReply>,
     socket: ClientSocket,
     pipeline: Option<PipelineContext>,
     data: BytesMut,
