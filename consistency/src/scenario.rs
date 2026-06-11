@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use clap::ValueEnum;
 use tokio_postgres::Client;
 
-use crate::schema::{DATA_MAX, GROUPS_TABLE, Model, PAIR_GROUP_BASE, TABLE};
+use crate::schema::{DATA_MAX, GROUPS_TABLE, Model, PAIR_GROUP_BASE, PAYLOAD_EXPR, TABLE};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Variant {
@@ -59,8 +59,10 @@ impl Scenario {
                          id       int PRIMARY KEY DEFAULT nextval('stress_pk'),
                          group_id int NOT NULL,
                          version  int NOT NULL,
-                         data     int NOT NULL
-                     );"
+                         data     int NOT NULL,
+                         payload  text
+                     );
+                     ALTER TABLE {TABLE} ALTER COLUMN payload SET STORAGE EXTERNAL;"
                 );
                 client
                     .batch_execute(&ddl)
@@ -69,8 +71,8 @@ impl Scenario {
                 seed_groups_rows(
                     client,
                     TABLE,
-                    "group_id, version, data",
-                    &format!("g, 0, {data_expr}"),
+                    "group_id, version, data, payload",
+                    &format!("g, 0, {data_expr}, {PAYLOAD_EXPR}"),
                     groups,
                     last_pair,
                     rows_per_group,
@@ -90,8 +92,10 @@ impl Scenario {
                      CREATE TABLE {TABLE} (
                          id       int PRIMARY KEY DEFAULT nextval('stress_pk'),
                          group_id int NOT NULL REFERENCES {GROUPS_TABLE}(group_id),
-                         data     int NOT NULL
-                     );"
+                         data     int NOT NULL,
+                         payload  text
+                     );
+                     ALTER TABLE {TABLE} ALTER COLUMN payload SET STORAGE EXTERNAL;"
                 );
                 client.batch_execute(&ddl).await.context("provision two")?;
                 // Groups first (FK target), then items.
@@ -109,8 +113,8 @@ impl Scenario {
                 seed_groups_rows(
                     client,
                     TABLE,
-                    "group_id, data",
-                    &format!("g, {data_expr}"),
+                    "group_id, data, payload",
+                    &format!("g, {data_expr}, {PAYLOAD_EXPR}"),
                     groups,
                     last_pair,
                     rows_per_group,
@@ -121,14 +125,20 @@ impl Scenario {
         Ok(())
     }
 
-    /// `WHERE group_id = $1` → `(id, group_id, version, data)`.
+    /// `WHERE group_id = $1` → `(id, group_id, version, data, payload_len)`.
+    ///
+    /// `length(payload)` rides along so the equality checks catch TOAST
+    /// corruption (PGC-264): seeded payloads are out-of-line and never written
+    /// by the mix, so every row UPDATE elides them as unchanged-toast — a hole
+    /// applied as NULL would surface here as a length mismatch vs origin.
     pub fn per_group_select(&self) -> String {
         match self.variant {
-            Variant::SingleTable => {
-                format!("SELECT id, group_id, version, data FROM {TABLE} WHERE group_id = $1")
-            }
+            Variant::SingleTable => format!(
+                "SELECT id, group_id, version, data, length(payload) \
+                 FROM {TABLE} WHERE group_id = $1"
+            ),
             Variant::TwoTable => format!(
-                "SELECT i.id, i.group_id, g.version, i.data \
+                "SELECT i.id, i.group_id, g.version, i.data, length(i.payload) \
                  FROM {TABLE} i JOIN {GROUPS_TABLE} g ON i.group_id = g.group_id \
                  WHERE i.group_id = $1"
             ),
@@ -163,14 +173,15 @@ impl Scenario {
         }
     }
 
-    /// Whole-table read ordered by item id → `(id, group_id, version, data)`.
+    /// Whole-table read ordered by item id → `(id, group_id, version, data,
+    /// payload_len)`. See `per_group_select` for the payload-length rationale.
     pub fn full_table_select(&self) -> String {
         match self.variant {
-            Variant::SingleTable => {
-                format!("SELECT id, group_id, version, data FROM {TABLE} ORDER BY id")
-            }
+            Variant::SingleTable => format!(
+                "SELECT id, group_id, version, data, length(payload) FROM {TABLE} ORDER BY id"
+            ),
             Variant::TwoTable => format!(
-                "SELECT i.id, i.group_id, g.version, i.data \
+                "SELECT i.id, i.group_id, g.version, i.data, length(i.payload) \
                  FROM {TABLE} i JOIN {GROUPS_TABLE} g ON i.group_id = g.group_id ORDER BY i.id"
             ),
         }

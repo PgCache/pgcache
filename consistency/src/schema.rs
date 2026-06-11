@@ -22,6 +22,12 @@ pub const GROUPS_TABLE: &str = "stress_groups";
 /// selects the lower half of this range.
 pub const DATA_MAX: i32 = 1_000_000;
 
+/// Seed expression for the TOASTed `payload` column (PGC-264): ~3.2KB of
+/// random text, out-of-line under `STORAGE EXTERNAL` (no compression past the
+/// ~2KB threshold). The write mix never touches it, so every UPDATE of a
+/// seeded row elides it from the CDC image as unchanged-toast.
+pub const PAYLOAD_EXPR: &str = "repeat(md5(random()::text), 100)";
+
 /// First group id reserved for paired groups.
 pub const PAIR_GROUP_BASE: i32 = 1_000_000;
 

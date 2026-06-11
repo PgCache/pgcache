@@ -180,6 +180,12 @@ pub struct UpdateQuery {
     /// VALUES would change the per-row answer). Set at registration; only
     /// meaningful for `eval_strategy == PgEval`.
     pub pg_batchable: bool,
+    /// This relation's columns whose values CDC eval reads: WHERE, join
+    /// predicates, GROUP BY, HAVING — not the outer SELECT list. An
+    /// unchanged-toast UPDATE that elides one of these and can't be repaired
+    /// makes every eval verdict for this query untrustworthy, forcing
+    /// invalidation (PGC-264).
+    pub predicate_columns: HashSet<EcoString>,
 }
 
 impl UpdateQuery {

@@ -200,6 +200,46 @@ fn limit_window_columns_collect(
     cols
 }
 
+/// Collect column names on `table_name` whose values CDC eval reads for this
+/// update query: WHERE, from-source join predicates (including any nested
+/// subquery internals — over-collection errs toward invalidation, the safe
+/// direction), GROUP BY, and HAVING. The outer SELECT list is excluded: it
+/// never feeds a membership or invalidation verdict (PGC-264).
+fn predicate_columns_collect(resolved: &ResolvedQueryExpr, table_name: &str) -> HashSet<EcoString> {
+    let local_columns = |cols: &mut HashSet<EcoString>, node: &ResolvedColumnNode| {
+        if node.table.as_str() == table_name {
+            cols.insert(node.column.clone());
+        }
+    };
+    let mut cols = HashSet::new();
+    let Some(select) = resolved.as_select() else {
+        // Not a plain select (set-op branch): over-collect every reference.
+        for col in resolved.nodes::<ResolvedColumnNode>() {
+            local_columns(&mut cols, col);
+        }
+        return cols;
+    };
+    for source in &select.from {
+        for col in source.nodes::<ResolvedColumnNode>() {
+            local_columns(&mut cols, col);
+        }
+    }
+    if let Some(where_expr) = &select.where_clause {
+        for col in where_expr.nodes::<ResolvedColumnNode>() {
+            local_columns(&mut cols, col);
+        }
+    }
+    for col in &select.group_by {
+        local_columns(&mut cols, col);
+    }
+    if let Some(having) = &select.having {
+        for col in having.nodes::<ResolvedColumnNode>() {
+            local_columns(&mut cols, col);
+        }
+    }
+    cols
+}
+
 /// Intermediate result from resolving a query before subsumption check or population.
 struct QueryResolution {
     resolved: SharedResolved,
@@ -682,6 +722,9 @@ impl WriterRegistration {
             } else {
                 HashSet::new()
             };
+            // Walk `update_resolved`: it is the AST CDC eval actually runs.
+            let predicate_columns =
+                predicate_columns_collect(&update_resolved, table_node.name.as_str());
             let update_query = UpdateQuery {
                 fingerprint,
                 resolved: update_resolved,
@@ -694,6 +737,7 @@ impl WriterRegistration {
                 // Set authoritatively in update_query_register (needs table_name).
                 change_dependent: false,
                 pg_batchable,
+                predicate_columns,
             };
 
             self.update_query_register(core, relation_oid, table_node.name.as_str(), update_query);
@@ -1657,6 +1701,62 @@ mod classify_tests {
                 UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
             ),
             UpdateEvalStrategy::PgEval
+        );
+    }
+
+    // PGC-264: predicate_columns_collect feeds the toast-fallback gate — a
+    // collected column elided as unchanged-toast forces invalidation.
+
+    #[test]
+    fn test_predicate_columns_where_collected_select_list_excluded() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(make_table("t", 1, &["id", "name", "status", "age"]));
+        let resolved = resolve(
+            "SELECT name FROM t WHERE status = 'a' AND age > 'x'",
+            &tables,
+        );
+        let cols = predicate_columns_collect(&resolved, "t");
+        assert!(cols.contains("status"));
+        assert!(cols.contains("age"));
+        assert!(
+            !cols.contains("name"),
+            "SELECT-list-only column must be excluded"
+        );
+        assert!(!cols.contains("id"));
+    }
+
+    #[test]
+    fn test_predicate_columns_join_columns_collected_per_table() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(make_table("t", 1, &["id", "name", "status"]));
+        tables.insert_overwrite(make_table("u", 2, &["id", "t_id", "region"]));
+        let resolved = resolve(
+            "SELECT t.name FROM t JOIN u ON u.t_id = t.id WHERE u.region = 'x'",
+            &tables,
+        );
+        let t_cols = predicate_columns_collect(&resolved, "t");
+        assert!(t_cols.contains("id"), "join column collected");
+        assert!(!t_cols.contains("name"));
+        let u_cols = predicate_columns_collect(&resolved, "u");
+        assert!(u_cols.contains("t_id"));
+        assert!(u_cols.contains("region"));
+        assert!(!u_cols.contains("id"));
+    }
+
+    #[test]
+    fn test_predicate_columns_group_by_and_having_collected() {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(make_table("t", 1, &["id", "name", "status", "age"]));
+        let resolved = resolve(
+            "SELECT status, count(id) FROM t GROUP BY status HAVING count(age) > 1",
+            &tables,
+        );
+        let cols = predicate_columns_collect(&resolved, "t");
+        assert!(cols.contains("status"), "GROUP BY column collected");
+        assert!(cols.contains("age"), "HAVING column collected");
+        assert!(
+            !cols.contains("id"),
+            "aggregate arg only in the SELECT list must be excluded"
         );
     }
 }

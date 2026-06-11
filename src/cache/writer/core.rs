@@ -42,6 +42,8 @@ pub(crate) mod fault {
     use std::sync::Once;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use crate::cache::messages::CdcValue;
+
     /// A CDC insert carrying this value in any column trips the one-shot.
     pub(crate) const WRITER_DIE_SENTINEL: &str = "__PGCACHE_WRITER_DIE__";
 
@@ -60,13 +62,13 @@ pub(crate) mod fault {
     /// One-shot: fire when armed and a row carries the sentinel, then disarm so
     /// the rebuilt generation (and the slot's redelivery of the same insert)
     /// survives instead of looping.
-    pub(crate) fn writer_die_check(row_data: &[Option<String>]) -> bool {
+    pub(crate) fn writer_die_check(row_data: &[CdcValue]) -> bool {
         if !ARMED.load(Ordering::Relaxed) {
             return false;
         }
         let hit = row_data
             .iter()
-            .any(|v| v.as_deref() == Some(WRITER_DIE_SENTINEL));
+            .any(|v| matches!(v, CdcValue::Text(text) if text == WRITER_DIE_SENTINEL));
         if hit {
             ARMED.store(false, Ordering::Relaxed);
         }
@@ -104,6 +106,18 @@ pub(super) enum FrameRowEvent {
         relation_oid: u32,
         key_data: Vec<Option<String>>,
         new_row_data: Vec<Option<String>>,
+    },
+    /// An UPDATE whose unchanged-toast columns could not be repaired from the
+    /// cache table at arrival (row absent, or its pre-batch image untrusted —
+    /// PGC-264). Excluded from segment eval; the decide pass conservatively
+    /// invalidates affected queries instead of upserting the incomplete image.
+    /// `Toasted` values are already mapped to `None` in `new_row_data`;
+    /// `toasted_columns` names the elided columns.
+    UpdateToastFallback {
+        relation_oid: u32,
+        key_data: Vec<Option<String>>,
+        new_row_data: Vec<Option<String>>,
+        toasted_columns: Vec<EcoString>,
     },
     Delete {
         relation_oid: u32,
@@ -263,6 +277,17 @@ pub struct WriterCore {
     /// UNCACHED (`row_changes = None`) or the entering-invalidation the
     /// per-frame flow produced is lost (PGC-242; `test_cache_join`'s PK flip).
     pub(super) batch_deleted_pks: HashSet<(u32, EcoString)>,
+    /// PKs the current batch has upserted into cache tables. The toast-repair
+    /// SELECT (PGC-264) reads the pre-batch committed state; a toasted update
+    /// whose PK was already rewritten this batch must not trust that read and
+    /// takes the conservative fallback instead. Same lifecycle as
+    /// `batch_deleted_pks`.
+    pub(super) batch_dirty_pks: HashSet<(u32, EcoString)>,
+    /// Relations truncated or DDL-recreated in the current batch (PGC-264).
+    /// Their pre-batch committed images are wholesale untrustworthy as a
+    /// toast-repair source, dirty-PK tracking aside. Same lifecycle as
+    /// `batch_deleted_pks`.
+    pub(super) batch_toast_guard_oids: HashSet<u32>,
     /// Cache PG data directory, discovered once at startup, for `statvfs` to
     /// auto-size the disk eviction limit (PGC-251 Slice 2). `None` if it couldn't
     /// be read (non-superuser, or not visible) — auto disk limit then disabled.
@@ -371,6 +396,8 @@ impl WriterCore {
             batch_last_lsn: 0,
             frame_open: false,
             batch_deleted_pks: HashSet::new(),
+            batch_dirty_pks: HashSet::new(),
+            batch_toast_guard_oids: HashSet::new(),
             data_dir,
             disk_total,
             disk_available,

@@ -374,6 +374,44 @@ pub enum QueryCommand {
     MvBuild { fingerprint: u64 },
 }
 
+/// A single column value decoded from a pgoutput tuple (PGC-264).
+///
+/// `Toasted` is pgoutput's "unchanged TOASTed value" marker: the origin elides
+/// the value from UPDATE new-row images when the column didn't change, on the
+/// contract that the consumer already holds it. It must never be conflated
+/// with `Null` — doing so overwrites cached TOAST values with NULL.
+// String over EcoString (ADR-032 boundary exception): values arrive owned from
+// the wire and the downstream pipeline is Vec<Option<String>>; EcoString here
+// would force a per-value re-allocation at the conversion chokepoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CdcValue {
+    Null,
+    Text(String),
+    Toasted,
+}
+
+/// Convert decoded tuple values to the downstream row representation,
+/// reporting the column indexes that carried the unchanged-toast marker
+/// (`Toasted` maps to `None` in the output). Past the writer's repair step the
+/// indexes must be empty or handled — this is the only path from `CdcValue`
+/// rows to `Option<String>` rows.
+pub fn cdc_values_convert(values: Vec<CdcValue>) -> (Vec<Option<String>>, Vec<usize>) {
+    let mut toasted = Vec::new();
+    let row_data = values
+        .into_iter()
+        .enumerate()
+        .map(|(idx, value)| match value {
+            CdcValue::Null => None,
+            CdcValue::Text(text) => Some(text),
+            CdcValue::Toasted => {
+                toasted.push(idx);
+                None
+            }
+        })
+        .collect();
+    (row_data, toasted)
+}
+
 /// Commands for CDC mutations and relation tracking, sent to the writer thread
 #[derive(Debug)]
 pub enum CdcCommand {
@@ -390,20 +428,20 @@ pub enum CdcCommand {
     /// CDC Insert operation
     Insert {
         relation_oid: u32,
-        row_data: Vec<Option<String>>,
+        row_data: Vec<CdcValue>,
     },
 
     /// CDC Update operation
     Update {
         relation_oid: u32,
-        key_data: Vec<Option<String>>,
-        row_data: Vec<Option<String>>,
+        key_data: Vec<CdcValue>,
+        row_data: Vec<CdcValue>,
     },
 
     /// CDC Delete operation
     Delete {
         relation_oid: u32,
-        row_data: Vec<Option<String>>,
+        row_data: Vec<CdcValue>,
     },
 
     /// CDC Truncate operation
@@ -422,4 +460,33 @@ pub enum CdcCommand {
     /// `last_applied_lsn` watermark to advance during idle periods
     /// (no published-table transactions) so the gauge remains current.
     KeepAliveMark { lsn: u64 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cdc_values_convert_reports_toasted_indexes() {
+        let (row_data, toasted) = cdc_values_convert(vec![
+            CdcValue::Text("a".to_owned()),
+            CdcValue::Toasted,
+            CdcValue::Null,
+            CdcValue::Toasted,
+        ]);
+        assert_eq!(
+            row_data,
+            vec![Some("a".to_owned()), None, None, None],
+            "Toasted and Null both map to None in the row representation"
+        );
+        assert_eq!(toasted, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_cdc_values_convert_no_toast() {
+        let (row_data, toasted) =
+            cdc_values_convert(vec![CdcValue::Null, CdcValue::Text("b".to_owned())]);
+        assert_eq!(row_data, vec![None, Some("b".to_owned())]);
+        assert!(toasted.is_empty());
+    }
 }

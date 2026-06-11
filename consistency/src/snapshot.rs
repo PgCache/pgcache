@@ -20,13 +20,15 @@ use crate::schema::DATA_MAX;
 /// Upper bound of the cross-group read probe (lower half of the data range).
 pub const PROBE_DATA_HI: i32 = DATA_MAX / 2;
 
-/// `(id, group_id, version, data)` for every row across `groups`, read one
-/// group at a time through the per-group query shape.
-pub async fn per_group_rows(
-    client: &Client,
-    sql: &str,
-    groups: &[i32],
-) -> Result<Vec<(i32, i32, i32, i32)>> {
+/// One served item row: `(id, group_id, version, data, payload_len)`.
+/// `payload_len` is `length(payload)` — `None` only for rows inserted by the
+/// mix (seeded rows always carry a payload); a seeded row showing `None` in
+/// the cache but not at origin is TOAST corruption (PGC-264).
+pub type ItemRow = (i32, i32, i32, i32, Option<i32>);
+
+/// [`ItemRow`] for every row across `groups`, read one group at a time through
+/// the per-group query shape.
+pub async fn per_group_rows(client: &Client, sql: &str, groups: &[i32]) -> Result<Vec<ItemRow>> {
     let stmt = client.prepare(sql).await?;
     let mut out = Vec::new();
     for &g in groups {
@@ -35,15 +37,11 @@ pub async fn per_group_rows(
     Ok(out)
 }
 
-async fn group_query(
-    client: &Client,
-    stmt: &Statement,
-    group: i32,
-) -> Result<Vec<(i32, i32, i32, i32)>> {
+async fn group_query(client: &Client, stmt: &Statement, group: i32) -> Result<Vec<ItemRow>> {
     let rows = db::query_timed(client, stmt, &[&group], "per-group read").await?;
     Ok(rows
         .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
         .collect())
 }
 
@@ -71,7 +69,7 @@ impl GroupReader {
 
     /// Read every row across `groups`, distributing the groups round-robin over
     /// the pooled connections and running each connection's slice concurrently.
-    pub async fn read(&self, groups: &[i32]) -> Result<Vec<(i32, i32, i32, i32)>> {
+    pub async fn read(&self, groups: &[i32]) -> Result<Vec<ItemRow>> {
         let n = self.conns.len();
         let slices = self.conns.iter().enumerate().map(|(i, (client, stmt))| {
             let mine: Vec<i32> = groups.iter().copied().skip(i).step_by(n).collect();
@@ -108,28 +106,25 @@ pub async fn cross_group_probe(client: &Client, sql: &str) -> Result<Vec<(i32, i
     Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
 }
 
-/// `(id, group_id, version, data)` for every row, ordered by id — the whole
-/// table via a single scan, for the global cache-vs-origin equality check.
-pub async fn full_table(client: &Client, sql: &str) -> Result<Vec<(i32, i32, i32, i32)>> {
+/// [`ItemRow`] for every row, ordered by id — the whole table via a single
+/// scan, for the global cache-vs-origin equality check.
+pub async fn full_table(client: &Client, sql: &str) -> Result<Vec<ItemRow>> {
     let rows = db::query_timed(client, sql, &[], "full-table read").await?;
     Ok(rows
         .iter()
-        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3)))
+        .map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
         .collect())
 }
 
 /// Project per-group rows to the `(group_id, version)` pairs the invariants
 /// operate on.
-pub fn group_versions(rows: &[(i32, i32, i32, i32)]) -> Vec<(i32, i32)> {
-    rows.iter().map(|&(_, g, v, _)| (g, v)).collect()
+pub fn group_versions(rows: &[ItemRow]) -> Vec<(i32, i32)> {
+    rows.iter().map(|&(_, g, v, _, _)| (g, v)).collect()
 }
 
 /// Compare two row sets (sorting both first), returning a description of the
 /// first difference (or a count mismatch), or `None` if identical.
-pub fn equality_diff(
-    cache: &[(i32, i32, i32, i32)],
-    origin: &[(i32, i32, i32, i32)],
-) -> Option<String> {
+pub fn equality_diff(cache: &[ItemRow], origin: &[ItemRow]) -> Option<String> {
     let mut cache = cache.to_vec();
     let mut origin = origin.to_vec();
     cache.sort_unstable();

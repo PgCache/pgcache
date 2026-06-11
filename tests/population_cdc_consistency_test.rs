@@ -496,7 +496,11 @@ async fn test_insert_delete_same_frame_during_population_no_ghost_row() -> Resul
     let initial = ctx
         .simple_query("select id, v from ghost_idd where id = 1")
         .await?;
-    assert_eq!(row_count(&initial), 1, "row exists when population reads it");
+    assert_eq!(
+        row_count(&initial),
+        1,
+        "row exists when population reads it"
+    );
 
     // During the population delay, one source transaction rewrites then removes
     // the key: the delete→insert nets to cancelled mid-frame, so the trailing

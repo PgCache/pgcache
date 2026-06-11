@@ -101,6 +101,8 @@ pub mod names {
     pub const CACHE_CDC_PG_EVAL_HITS: &str = "pgcache.cache.cdc_pg_eval_hits";
     pub const CACHE_CDC_PREPARED_HITS: &str = "pgcache.cache.cdc_prepared_hits";
     pub const CACHE_CDC_PREPARED_MISSES: &str = "pgcache.cache.cdc_prepared_misses";
+    pub const CACHE_CDC_TOAST_REPAIRS: &str = "pgcache.cache.cdc_toast_repairs";
+    pub const CACHE_CDC_TOAST_FALLBACKS: &str = "pgcache.cache.cdc_toast_fallbacks";
     pub const CACHE_EVICTIONS: &str = "pgcache.cache.evictions";
     pub const CACHE_READMISSIONS: &str = "pgcache.cache.readmissions";
     pub const CACHE_SUBSUMPTIONS: &str = "pgcache.cache.subsumptions";
@@ -394,6 +396,11 @@ pub struct CdcHandles {
     /// exceeds the cache capacity and prepare-per-use is making things worse.
     pub prepared_hits: Counter,
     pub prepared_misses: Counter,
+    /// Unchanged-toast UPDATE images completed from the cache-table row
+    /// vs. routed to conservative invalidation (PGC-264). A high fallback
+    /// rate is the trigger for batched/overlay repair.
+    pub toast_repairs: Counter,
+    pub toast_fallbacks: Counter,
     pub handle_inserts: Counter,
     pub handle_updates: Counter,
     pub handle_deletes: Counter,
@@ -547,6 +554,8 @@ impl Handles {
                 invalidations: metrics::counter!(CACHE_INVALIDATIONS),
                 local_eval_hits: metrics::counter!(CACHE_CDC_LOCAL_EVAL_HITS),
                 pg_eval_hits: metrics::counter!(CACHE_CDC_PG_EVAL_HITS),
+                toast_repairs: metrics::counter!(CACHE_CDC_TOAST_REPAIRS),
+                toast_fallbacks: metrics::counter!(CACHE_CDC_TOAST_FALLBACKS),
                 prepared_hits: metrics::counter!(CACHE_CDC_PREPARED_HITS),
                 prepared_misses: metrics::counter!(CACHE_CDC_PREPARED_MISSES),
                 handle_inserts: metrics::counter!(CACHE_HANDLE_INSERTS),

@@ -33,7 +33,9 @@ use crate::result::error_chain_format;
 use crate::settings::Settings;
 
 use super::{
-    CacheError, CacheResult, MapIntoReport, ReportExt, messages::CdcCommand, types::ActiveRelations,
+    CacheError, CacheResult, MapIntoReport, ReportExt,
+    messages::{CdcCommand, CdcValue},
+    types::ActiveRelations,
 };
 
 /// Test-only CDC delivery delay (fault-injection feature, PGC-250 Slice B).
@@ -612,7 +614,7 @@ impl CdcProcessor {
     }
 
     /// Parse row data from InsertBody into a Vec of column values indexed by position.
-    fn parse_insert_row_data(&self, body: &InsertBody) -> Result<Vec<Option<String>>, Error> {
+    fn parse_insert_row_data(&self, body: &InsertBody) -> Result<Vec<CdcValue>, Error> {
         Ok(tuple_data_parse(body.tuple().tuple_data()))
     }
 
@@ -621,7 +623,7 @@ impl CdcProcessor {
     fn parse_update_row_data(
         &self,
         body: &UpdateBody,
-    ) -> Result<(Vec<Option<String>>, Vec<Option<String>>), Error> {
+    ) -> Result<(Vec<CdcValue>, Vec<CdcValue>), Error> {
         let new_row_data = tuple_data_parse(body.new_tuple().tuple_data());
 
         let key_data = body
@@ -633,7 +635,7 @@ impl CdcProcessor {
     }
 
     /// Parse row data from DeleteBody into a Vec of column values indexed by position.
-    fn parse_delete_row_data(&self, body: &DeleteBody) -> Result<Vec<Option<String>>, Error> {
+    fn parse_delete_row_data(&self, body: &DeleteBody) -> Result<Vec<CdcValue>, Error> {
         // DeleteBody contains either key_tuple (for tables with REPLICA IDENTITY USING INDEX)
         // or old_tuple (for tables with REPLICA IDENTITY FULL)
         let tuple = if let Some(key_tuple) = body.key_tuple() {
@@ -656,14 +658,38 @@ impl CdcProcessor {
     }
 }
 
-/// Convert a slice of replication TupleData into column value strings.
-fn tuple_data_parse(columns: &[TupleData]) -> Vec<Option<String>> {
+/// Convert a slice of replication TupleData into column values, preserving the
+/// unchanged-toast marker distinctly from NULL (PGC-264).
+fn tuple_data_parse(columns: &[TupleData]) -> Vec<CdcValue> {
     columns
         .iter()
         .map(|col| match col {
-            TupleData::Null | TupleData::UnchangedToast => None,
-            TupleData::Text(data) => Some(String::from_utf8_lossy(data).into_owned()),
+            TupleData::Null => CdcValue::Null,
+            TupleData::UnchangedToast => CdcValue::Toasted,
+            TupleData::Text(data) => CdcValue::Text(String::from_utf8_lossy(data).into_owned()),
             TupleData::Binary(_) => unreachable!("pgcache uses text-format replication"),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tuple_data_parse_preserves_unchanged_toast() {
+        let columns = [
+            TupleData::Null,
+            TupleData::UnchangedToast,
+            TupleData::Text("abc".as_bytes().into()),
+        ];
+        assert_eq!(
+            tuple_data_parse(&columns),
+            vec![
+                CdcValue::Null,
+                CdcValue::Toasted,
+                CdcValue::Text("abc".to_owned()),
+            ]
+        );
+    }
 }

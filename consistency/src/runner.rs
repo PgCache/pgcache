@@ -243,7 +243,19 @@ async fn snapshot_loop(
         let group_versions = snapshot::group_versions(&rows);
         let group_versions = match intra_snapshot_reduce(&group_versions) {
             Ok(map) => map,
-            Err(v) => return violation_fail(v),
+            Err(v) => {
+                // Forensics: the torn group's full served rows identify which
+                // rows are stale (e.g. a pk_update predecessor frozen at an
+                // old version next to its successor).
+                if let crate::invariants::Violation::Intra { group, .. } = &v {
+                    let torn: Vec<_> = rows.iter().filter(|r| r.1 == *group).collect();
+                    tracing::error!(
+                        ?torn,
+                        "torn group served rows (id, group_id, version, data, payload_len)"
+                    );
+                }
+                return violation_fail(v);
+            }
         };
         if let Some(v) = tracker.observe(&group_versions) {
             return violation_fail(v);

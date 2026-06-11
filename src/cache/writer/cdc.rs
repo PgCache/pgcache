@@ -29,7 +29,7 @@ use crate::settings::{CachePolicy, Settings};
 use crate::query::evaluate::where_expr_evaluate;
 
 use super::super::memo::SlotKey;
-use super::super::messages::{CdcCommand, QueryCommand};
+use super::super::messages::{CdcCommand, QueryCommand, cdc_values_convert};
 use super::super::mv::MvState;
 use super::super::types::{
     CachedQueryState, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
@@ -486,6 +486,8 @@ impl WriterCdc {
         core.frame_deleted_keys.clear();
         core.frame_truncated_relations.clear();
         core.batch_deleted_pks.clear();
+        core.batch_dirty_pks.clear();
+        core.batch_toast_guard_oids.clear();
         core.frame_state = FrameState::Recovering;
         Ok(())
     }
@@ -650,6 +652,22 @@ impl WriterCdc {
                         .await,
                         "cdc replay update",
                     ),
+                    FrameRowEvent::UpdateToastFallback {
+                        relation_oid,
+                        key_data,
+                        new_row_data,
+                        toasted_columns,
+                    } => (
+                        self.handle_update_toast_fallback(
+                            core,
+                            *relation_oid,
+                            key_data,
+                            new_row_data,
+                            toasted_columns,
+                        )
+                        .await,
+                        "cdc replay update toast fallback",
+                    ),
                     FrameRowEvent::Delete {
                         relation_oid,
                         row_data,
@@ -740,7 +758,11 @@ impl WriterCdc {
                     new_row_data,
                     ..
                 } => (*relation_oid, new_row_data),
-                FrameRowEvent::Delete { .. }
+                // UpdateToastFallback is excluded by design: its row image is
+                // incomplete, so the decide pass invalidates instead of
+                // evaluating membership from it (PGC-264).
+                FrameRowEvent::UpdateToastFallback { .. }
+                | FrameRowEvent::Delete { .. }
                 | FrameRowEvent::Truncate { .. }
                 | FrameRowEvent::Boundary { .. } => continue,
             };
@@ -1312,6 +1334,8 @@ impl WriterCdc {
         core.batch_frames = 0;
         core.batch_events = 0;
         core.batch_deleted_pks.clear();
+        core.batch_dirty_pks.clear();
+        core.batch_toast_guard_oids.clear();
         self.applied_lsn_advance(lsn);
         core.last_applied_lsn = self.last_applied_lsn;
         // Per-frame deletes/truncates were stamped by Boundary events during
@@ -1436,6 +1460,8 @@ impl WriterCdc {
                     core.frame_deleted_keys.clear();
                     core.frame_truncated_relations.clear();
                     core.batch_deleted_pks.clear();
+                    core.batch_dirty_pks.clear();
+                    core.batch_toast_guard_oids.clear();
                 }
             }
             CdcCommand::TableRegister(table_metadata) => {
@@ -1467,6 +1493,9 @@ impl WriterCdc {
                         | FrameRowEvent::Update {
                             relation_oid: r, ..
                         }
+                        | FrameRowEvent::UpdateToastFallback {
+                            relation_oid: r, ..
+                        }
                         | FrameRowEvent::Delete {
                             relation_oid: r, ..
                         } => *r != relation_oid,
@@ -1475,6 +1504,9 @@ impl WriterCdc {
                     if core.frame_rows.len() != before {
                         core.batch_truncated_relations.push(relation_oid);
                     }
+                    // The recreate empties the cache table: not a valid
+                    // toast-repair source for the rest of the batch (PGC-264).
+                    core.batch_toast_guard_oids.insert(relation_oid);
                 }
                 // Schema change: prepared eval SQL embeds the column list —
                 // drop the relation's cached statements so the next use
@@ -1505,12 +1537,22 @@ impl WriterCdc {
                             .await
                             .attach_loc("fault: injected cdc deadlock")?;
                     } else {
-                        core.frame_rows.push(FrameRowEvent::Insert {
-                            relation_oid,
-                            row_data,
-                        });
-                        core.batch_events += 1;
-                        self.frame_rows_replay_if_full(core).await?;
+                        let (row_data, toasted) = cdc_values_convert(row_data);
+                        // pgoutput never elides toast from INSERT images;
+                        // dropping the event keeps the NULL-holed row out of
+                        // the shared table (handle_insert's tracked-key upsert
+                        // would write it, and merges never overwrite).
+                        if !toasted.is_empty() {
+                            Self::toast_unexpected_invalidate(core, relation_oid, "insert");
+                        } else {
+                            Self::batch_dirty_pk_record(core, relation_oid, &row_data);
+                            core.frame_rows.push(FrameRowEvent::Insert {
+                                relation_oid,
+                                row_data,
+                            });
+                            core.batch_events += 1;
+                            self.frame_rows_replay_if_full(core).await?;
+                        }
                     }
                 }
             }
@@ -1521,13 +1563,28 @@ impl WriterCdc {
             } => {
                 core.frame_relation_oids.insert(relation_oid);
                 if core.frame_state != FrameState::Recovering {
-                    core.frame_rows.push(FrameRowEvent::Update {
-                        relation_oid,
-                        key_data,
-                        new_row_data: row_data,
-                    });
-                    core.batch_events += 1;
-                    self.frame_rows_replay_if_full(core).await?;
+                    let (key_data, key_toasted) = cdc_values_convert(key_data);
+                    let (new_row_data, toasted) = cdc_values_convert(row_data);
+                    // Key tuples carry real values under every replica
+                    // identity; a toasted one can't even key the old-PK delete.
+                    if !key_toasted.is_empty() {
+                        Self::toast_unexpected_invalidate(core, relation_oid, "update key tuple");
+                    } else {
+                        let event = if toasted.is_empty() {
+                            Self::batch_dirty_pk_record(core, relation_oid, &new_row_data);
+                            FrameRowEvent::Update {
+                                relation_oid,
+                                key_data,
+                                new_row_data,
+                            }
+                        } else {
+                            Self::toast_repair(core, relation_oid, key_data, new_row_data, &toasted)
+                                .await
+                        };
+                        core.frame_rows.push(event);
+                        core.batch_events += 1;
+                        self.frame_rows_replay_if_full(core).await?;
+                    }
                 }
             }
             CdcCommand::Delete {
@@ -1536,18 +1593,29 @@ impl WriterCdc {
             } => {
                 core.frame_relation_oids.insert(relation_oid);
                 if core.frame_state != FrameState::Recovering {
-                    core.frame_rows.push(FrameRowEvent::Delete {
-                        relation_oid,
-                        row_data,
-                    });
-                    core.batch_events += 1;
-                    self.frame_rows_replay_if_full(core).await?;
+                    let (row_data, toasted) = cdc_values_convert(row_data);
+                    // Delete images are key/old tuples — same reasoning as the
+                    // update key tuple above.
+                    if !toasted.is_empty() {
+                        Self::toast_unexpected_invalidate(core, relation_oid, "delete");
+                    } else {
+                        core.frame_rows.push(FrameRowEvent::Delete {
+                            relation_oid,
+                            row_data,
+                        });
+                        core.batch_events += 1;
+                        self.frame_rows_replay_if_full(core).await?;
+                    }
                 }
             }
             CdcCommand::Truncate { relation_oids } => {
                 core.frame_relation_oids
                     .extend(relation_oids.iter().copied());
                 if core.frame_state != FrameState::Recovering {
+                    // Truncated relations' pre-batch images are no longer a
+                    // valid toast-repair source (PGC-264).
+                    core.batch_toast_guard_oids
+                        .extend(relation_oids.iter().copied());
                     core.frame_rows
                         .push(FrameRowEvent::Truncate { relation_oids });
                     core.batch_events += 1;
@@ -1622,6 +1690,192 @@ impl WriterCdc {
         }
     }
 
+    /// Defensive (PGC-264): an unchanged-toast marker in a tuple that cannot
+    /// carry one per the pgoutput protocol (insert images, delete/key tuples).
+    /// The event is dropped by the caller; invalidating every query over the
+    /// relation keeps that safe.
+    fn toast_unexpected_invalidate(core: &mut WriterCore, relation_oid: u32, tuple_kind: &str) {
+        error!(
+            relation_oid,
+            tuple_kind, "unexpected unchanged-toast marker; invalidating relation queries"
+        );
+        if let Some(update_queries) = core.cache.update_queries.get(&relation_oid) {
+            core.frame_invalidations.extend(
+                update_queries
+                    .iter_complexity_ordered()
+                    .map(|q| q.fingerprint),
+            );
+        }
+        crate::metrics::handles().cdc.toast_fallbacks.increment(1);
+    }
+
+    /// Record an upserted row's PK so a later toast repair in this batch knows
+    /// the pre-batch committed image it reads is stale for that row (PGC-264).
+    /// Gated on the relation having a toastable column — only those relations
+    /// can see a toasted update, so only they ever consult the set.
+    fn batch_dirty_pk_record(
+        core: &mut WriterCore,
+        relation_oid: u32,
+        row_data: &[Option<String>],
+    ) {
+        let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
+            return;
+        };
+        if !table_metadata.has_toastable_column() {
+            return;
+        }
+        if let Some(key) = pk_body_render(table_metadata, row_data) {
+            core.batch_dirty_pks.insert((relation_oid, key));
+        }
+    }
+
+    /// Complete an UPDATE image whose unchanged-toast columns were elided
+    /// (PGC-264) by fetching them from the cache-table row: the writer applies
+    /// CDC in commit order, so that row is the origin pre-image, and
+    /// "unchanged" means pre == post for this event. Returns a plain `Update`
+    /// when repaired (or when the relation is unknown — handlers no-op), else
+    /// an `UpdateToastFallback` for the conservative decide-pass path: row
+    /// absent, PK unrenderable, pre-batch image untrusted (PK rewritten or
+    /// relation truncated/recreated earlier in this unflushed batch), or the
+    /// repair read failed (the slot is already acked at decode time, PGC-147,
+    /// so there is no redelivery to lean on — invalidation is the safe exit).
+    async fn toast_repair(
+        core: &mut WriterCore,
+        relation_oid: u32,
+        key_data: Vec<Option<String>>,
+        mut new_row_data: Vec<Option<String>>,
+        toasted: &[usize],
+    ) -> FrameRowEvent {
+        let metrics = &crate::metrics::handles().cdc;
+        let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
+            return FrameRowEvent::Update {
+                relation_oid,
+                key_data,
+                new_row_data,
+            };
+        };
+        let toasted_columns: Vec<EcoString> = table_metadata
+            .columns
+            .iter()
+            .filter(|c| toasted.contains(&c.index()))
+            .map(|c| c.name.clone())
+            .collect();
+
+        // SELECT column i corresponds to toasted[i]: ColumnStore iterates by
+        // ascending position and the toasted indexes are ascending. A width
+        // mismatch (metadata lagging the row image) can't repair.
+        let aligned = toasted_columns.len() == toasted.len();
+
+        // The cached copy the unchanged-toast marker refers to lives under the
+        // row's PRE-image key: when this UPDATE changed the PK (`key_data`
+        // non-empty), the source row is the old PK, not the new one.
+        let source_row: &[Option<String>] = if key_data.is_empty() {
+            &new_row_data
+        } else {
+            &key_data
+        };
+        let source_pk = pk_body_render(table_metadata, source_row);
+        let repaired = match &source_pk {
+            Some(key)
+                if aligned
+                    && !core.batch_toast_guard_oids.contains(&relation_oid)
+                    && !core.batch_dirty_pks.contains(&(relation_oid, key.clone())) =>
+            {
+                let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
+                sql.push_str("SELECT ");
+                for (i, column) in toasted_columns.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    sql.push_str(column);
+                }
+                let _ = write!(
+                    sql,
+                    " FROM {}.{} WHERE ",
+                    table_metadata.schema, table_metadata.name
+                );
+                let mut has_pk = false;
+                for pk_column in &table_metadata.primary_key_columns {
+                    if let Some(column_meta) = table_metadata.columns.get(pk_column.as_str())
+                        && let Some(row_value) = source_row.get(column_meta.index())
+                    {
+                        let value = row_value
+                            .as_deref()
+                            .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
+                        if has_pk {
+                            sql.push_str(" AND ");
+                        }
+                        let _ = write!(sql, "{pk_column} = {value}");
+                        has_pk = true;
+                    }
+                }
+                debug_assert!(has_pk, "pk_body_render succeeded but no PK rendered");
+                match core.db_cache.simple_query(&sql).await {
+                    Ok(msgs) => msgs.into_iter().find_map(|msg| {
+                        if let SimpleQueryMessage::Row(row) = msg {
+                            Some(row)
+                        } else {
+                            None
+                        }
+                    }),
+                    Err(e) => {
+                        error!(
+                            relation_oid,
+                            "toast repair read failed, falling back to invalidation: {e}"
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        // Repaired or not, both keys this event touches are rewritten (old PK
+        // deleted, new PK upserted/deleted) — later repairs must not trust
+        // their pre-batch images.
+        let pk_some = source_pk.is_some();
+        if let Some(key) = source_pk {
+            core.batch_dirty_pks.insert((relation_oid, key));
+        }
+        if !key_data.is_empty()
+            && let Some(key) = pk_body_render(table_metadata, &new_row_data)
+        {
+            core.batch_dirty_pks.insert((relation_oid, key));
+        }
+
+        match repaired {
+            Some(row) => {
+                for (i, &idx) in toasted.iter().enumerate() {
+                    if let Some(slot) = new_row_data.get_mut(idx) {
+                        *slot = row.get(i).map(str::to_owned);
+                    }
+                }
+                metrics.toast_repairs.increment(1);
+                FrameRowEvent::Update {
+                    relation_oid,
+                    key_data,
+                    new_row_data,
+                }
+            }
+            None => {
+                metrics.toast_fallbacks.increment(1);
+                debug!(
+                    relation_oid,
+                    aligned,
+                    pk_some,
+                    guarded = core.batch_toast_guard_oids.contains(&relation_oid),
+                    "toast repair fell back"
+                );
+                FrameRowEvent::UpdateToastFallback {
+                    relation_oid,
+                    key_data,
+                    new_row_data,
+                    toasted_columns,
+                }
+            }
+        }
+    }
+
     /// Buffer an unconditional upsert of `row_data` into the relation's cache
     /// table in the open frame (PGC-228), opening the frame txn if needed.
     async fn frame_cache_upsert(
@@ -1661,6 +1915,33 @@ impl WriterCdc {
         relation_oid: u32,
         row_data: &[Option<String>],
     ) -> CacheResult<()> {
+        self.frame_cache_delete_inner(core, relation_oid, row_data, true)
+            .await
+    }
+
+    /// `frame_cache_delete` without the PGC-250 lost-key record: for evicting
+    /// a row that is still alive at origin while every query over the relation
+    /// is being invalidated (toast fallback under active tracking, PGC-264).
+    /// Recording the key would make later populations' merges omit the live
+    /// row (PGC-261); the invalidations supersede the in-flight populations
+    /// (generation bump), so nothing can resurrect the evicted stale version.
+    async fn frame_cache_delete_unrecorded(
+        &mut self,
+        core: &mut WriterCore,
+        relation_oid: u32,
+        row_data: &[Option<String>],
+    ) -> CacheResult<()> {
+        self.frame_cache_delete_inner(core, relation_oid, row_data, false)
+            .await
+    }
+
+    async fn frame_cache_delete_inner(
+        &mut self,
+        core: &mut WriterCore,
+        relation_oid: u32,
+        row_data: &[Option<String>],
+        record_lost_key: bool,
+    ) -> CacheResult<()> {
         core.frame_begin_ensure();
         let table_metadata =
             core.cache
@@ -1676,11 +1957,12 @@ impl WriterCdc {
         // known yet); dropped if the frame rolls back. Skip rendering the key
         // entirely when no population is recording this relation (the steady
         // state) — `record` would discard it anyway.
-        let deleted_key = if core.population_deleted_keys.is_recording(relation_oid) {
-            pk_body_render(table_metadata, row_data)
-        } else {
-            None
-        };
+        let deleted_key =
+            if record_lost_key && core.population_deleted_keys.is_recording(relation_oid) {
+                pk_body_render(table_metadata, row_data)
+            } else {
+                None
+            };
         // Track batch-deleted PKs so a later batched frame's row-change
         // classification sees the deletion the pre-batch snapshot can't
         // (PGC-242). Re-rendered when not already rendered for PGC-250.
@@ -1877,6 +2159,172 @@ impl WriterCdc {
             .cdc
             .handle_update_seconds
             .record(start.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    /// Whether a query must be invalidated on the toast-fallback path without
+    /// (or regardless of) membership evaluation (PGC-264). The row may or may
+    /// not be cached and its column changes are unknowable, so this folds both
+    /// `row_cached_invalidation_check` (changes assumed) and
+    /// `row_uncached_invalidation_check` (Upsert) into their conservative
+    /// union. Queries passing this still get membership-evaluated by the
+    /// caller — a match invalidates too, since the incomplete image can't be
+    /// upserted.
+    fn toast_fallback_structural_invalidate(
+        update_query: &UpdateQuery,
+        table_metadata: &TableMetadata,
+        new_row_data: &[Option<String>],
+        key_data: &[Option<String>],
+        toasted_columns: &[EcoString],
+    ) -> bool {
+        // Constraint/predicate evaluation reads an elided column → nothing
+        // below (nor the caller's membership eval) can be trusted.
+        if update_query
+            .predicate_columns
+            .iter()
+            .any(|c| toasted_columns.contains(c))
+        {
+            return true;
+        }
+        match update_query.source {
+            // Always invalidated on a cached UPDATE (row_cached_invalidation_check).
+            UpdateQuerySource::Subquery(_) | UpdateQuerySource::OuterJoinOptional => true,
+            UpdateQuerySource::FromClause | UpdateQuerySource::OuterJoinTerminal => {
+                // Window-boundary columns may have changed; the replacement
+                // row is by definition uncached (PGC-94).
+                if update_query.has_limit {
+                    return true;
+                }
+                // Single-table: membership eval alone decides (the eval is
+                // trustworthy past the predicate_columns gate above).
+                if update_query.resolved.is_single_table() {
+                    return false;
+                }
+                // Multi-table: a join-column change can create join matches
+                // the cache tables can't see, so membership eval saying
+                // "no match" doesn't rule out growth. Mirror
+                // row_uncached_invalidation_check's relevance tests.
+                if update_query
+                    .constraints
+                    .table_constraints
+                    .contains_key(table_metadata.name.as_str())
+                {
+                    row_constraints_match(&update_query.constraints, table_metadata, new_row_data)
+                } else {
+                    !join_membership_unchanged(update_query, table_metadata, Some(key_data))
+                }
+            }
+        }
+    }
+
+    /// Conservative decide-pass path for an UPDATE whose unchanged-toast
+    /// columns could not be repaired (PGC-264). The image is incomplete: it
+    /// must never reach the shared cache table, and predicates over the elided
+    /// columns can't be evaluated.
+    ///
+    /// With no population recording the relation: invalidate every query that
+    /// might be affected (structural sensitivity, or membership match — the
+    /// matched row can't be upserted); provably unaffected queries need
+    /// nothing beyond the row's eviction.
+    ///
+    /// With recording active, the PGC-261 hazard applies: the row is alive at
+    /// origin, so deleting it with a lost-key record makes later populations'
+    /// merges omit it — including merges for queries registered *after* this
+    /// event, which no invalidation here can cover. Instead invalidate every
+    /// query over the relation (superseding their in-flight populations via
+    /// the generation bump) and evict the stale row without a record; later
+    /// populations snapshot post-update origin and merge cleanly.
+    #[instrument(skip_all)]
+    async fn handle_update_toast_fallback(
+        &mut self,
+        core: &mut WriterCore,
+        relation_oid: u32,
+        key_data: &[Option<String>],
+        new_row_data: &[Option<String>],
+        toasted_columns: &[EcoString],
+    ) -> CacheResult<()> {
+        // See handle_insert: an untracked relation's CDC is a benign skip.
+        if !core.cache.tables.contains_key1(&relation_oid) {
+            return Ok(());
+        }
+
+        let recording = core.population_deleted_keys.is_recording(relation_oid);
+        let mut fp_list: Vec<u64> = Vec::new();
+        if let (Some(update_queries), Some(table_metadata)) = (
+            core.cache.update_queries.get(&relation_oid),
+            core.cache.tables.get1(&relation_oid),
+        ) {
+            if recording {
+                fp_list.extend(
+                    update_queries
+                        .iter_complexity_ordered()
+                        .map(|q| q.fingerprint)
+                        .filter(|fp| !core.frame_invalidations.contains(fp)),
+                );
+            } else {
+                let mut pg_eval: Vec<&UpdateQuery> = Vec::new();
+                for update_query in update_queries.iter_complexity_ordered() {
+                    if core.frame_invalidations.contains(&update_query.fingerprint) {
+                        continue;
+                    }
+                    if Self::toast_fallback_structural_invalidate(
+                        update_query,
+                        table_metadata,
+                        new_row_data,
+                        key_data,
+                        toasted_columns,
+                    ) {
+                        fp_list.push(update_query.fingerprint);
+                        continue;
+                    }
+                    match update_query.eval_strategy {
+                        UpdateEvalStrategy::LocalEval => {
+                            if update_query_matches_locally(
+                                update_query,
+                                table_metadata,
+                                new_row_data,
+                            ) {
+                                fp_list.push(update_query.fingerprint);
+                            }
+                        }
+                        UpdateEvalStrategy::PgEval => pg_eval.push(update_query),
+                    }
+                }
+                if !pg_eval.is_empty() {
+                    let matched = self
+                        .pg_eval_matches(&pg_eval, table_metadata, new_row_data)
+                        .await
+                        .attach_loc("toast fallback membership eval")?;
+                    fp_list.extend(matched);
+                }
+            }
+        }
+        trace!(
+            relation_oid,
+            recording,
+            invalidations = fp_list.len(),
+            "toast fallback handled"
+        );
+        // Deferred to frame_invalidations_flush (see handle_insert).
+        core.frame_invalidations.extend(fp_list);
+
+        // Same coarse Fresh-MV rule as handle_update (PGC-254).
+        core.mv_dirty_mark_relation(relation_oid);
+
+        // The new-PK row is alive at origin: under recording its eviction must
+        // not be recorded (see doc comment). The old PK after a PK change is
+        // genuinely dead at origin, so that delete records normally.
+        if recording {
+            self.frame_cache_delete_unrecorded(core, relation_oid, new_row_data)
+                .await?;
+        } else {
+            self.frame_cache_delete(core, relation_oid, new_row_data)
+                .await?;
+        }
+        if !key_data.is_empty() {
+            self.frame_cache_delete(core, relation_oid, key_data)
+                .await?;
+        }
         Ok(())
     }
 
