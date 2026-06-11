@@ -473,6 +473,71 @@ async fn test_reinsert_same_frame_during_population_included() -> Result<(), Err
     Ok(())
 }
 
+/// Over-cancellation control (PGC-260): a same-frame delete→insert→delete nets
+/// to a *dead* key (event order: the trailing delete wins). That key must stay
+/// recorded so a population that snapshotted the row before the frame filters it
+/// out. If the mid-frame insert's cancellation lingered past the trailing
+/// delete, the snapshot row would be resurrected as a ghost. Mirror of the
+/// delete→insert "included" netting test in the opposite direction.
+#[tokio::test]
+async fn test_insert_delete_same_frame_during_population_no_ghost_row() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", POPULATION_DELAY_MS)])
+            .await?;
+
+    ctx.simple_query("create table ghost_idd (id int primary key, v text)")
+        .await?;
+    ctx.simple_query("insert into ghost_idd (id, v) values (1, 'a')")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // Cache miss: population reads its snapshot (id=1 present) then blocks on the
+    // fault delay before its insert.
+    let initial = ctx
+        .simple_query("select id, v from ghost_idd where id = 1")
+        .await?;
+    assert_eq!(row_count(&initial), 1, "row exists when population reads it");
+
+    // During the population delay, one source transaction rewrites then removes
+    // the key: the delete→insert nets to cancelled mid-frame, so the trailing
+    // delete must re-record it. Net effect at origin is dead.
+    tokio::time::sleep(SNAPSHOT_SETTLE).await;
+    ctx.origin
+        .batch_execute(
+            "BEGIN; \
+             delete from ghost_idd where id = 1; \
+             insert into ghost_idd (id, v) values (1, 'b'); \
+             delete from ghost_idd where id = 1; \
+             COMMIT;",
+        )
+        .await
+        .map_err(Error::other)?;
+    ctx.cdc_settle().await?;
+
+    // Let the delayed population finish (it inserts its snapshot row), then drain
+    // trailing CDC.
+    ctx.cache_settle().await?;
+    ctx.cdc_settle().await?;
+
+    let origin = ctx
+        .origin_query("select id, v from ghost_idd where id = 1", &[])
+        .await?;
+    assert_eq!(origin.len(), 0, "row is dead at origin after the frame");
+
+    let before = ctx.metrics().await?;
+    let cached = ctx
+        .simple_query("select id, v from ghost_idd where id = 1")
+        .await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(
+        row_count(&cached),
+        0,
+        "ghost row: net-dead same-frame key was over-cancelled and not filtered (PGC-260)"
+    );
+
+    Ok(())
+}
+
 /// An update that moves a row out of every live predicate (update-out) while a
 /// population holds deleted-key tracking open must not block a later
 /// population from including the row (PGC-261): the row is alive at origin —
