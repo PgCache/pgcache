@@ -53,8 +53,10 @@ async fn test_population_merge_does_not_expose_future_rows() -> Result<(), Error
     let mut ctx =
         TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_DELIVER_DELAY_MS", CDC_DELAY_MS)]).await?;
 
-    ctx.simple_query("create table merge_race (id int primary key, grp int not null, v int not null)")
-        .await?;
+    ctx.simple_query(
+        "create table merge_race (id int primary key, grp int not null, v int not null)",
+    )
+    .await?;
     ctx.simple_query("insert into merge_race (id, grp, v) values (1, 1, 1)")
         .await?;
     // The delivery delay is inactive until a cached query tracks the relation.
@@ -63,7 +65,8 @@ async fn test_population_merge_does_not_expose_future_rows() -> Result<(), Error
     // Q1: cached and Ready. Registering it arms the CDC delivery delay.
     let q1 = "select id, v from merge_race where grp = 1 order by id";
     ctx.simple_query(q1).await?;
-    ctx.cache_settle_with_timeout(Duration::from_secs(15)).await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(15))
+        .await?;
 
     // One origin transaction: update row A, create row B. Its CDC frame is
     // delayed several seconds; until it applies, the watermark-consistent

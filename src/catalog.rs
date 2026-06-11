@@ -116,34 +116,10 @@ impl TableMetadata {
             && self.columns == other.columns
     }
 
-    /// Whether any column's type can carry a TOASTed value (PGC-264).
-    /// Conservative by construction: only known fixed-width types are
-    /// excluded, so an unrecognized type counts as toastable — a whitelist
-    /// miss must cost a little bookkeeping, never correctness.
+    /// Whether any column can carry a TOASTed value (PGC-264); see
+    /// [`ColumnMetadata::is_toastable`].
     pub fn has_toastable_column(&self) -> bool {
-        self.columns.iter().any(|c| {
-            !matches!(
-                c.data_type,
-                Type::BOOL
-                    | Type::CHAR
-                    | Type::INT2
-                    | Type::INT4
-                    | Type::INT8
-                    | Type::OID
-                    | Type::FLOAT4
-                    | Type::FLOAT8
-                    | Type::MONEY
-                    | Type::DATE
-                    | Type::TIME
-                    | Type::TIMETZ
-                    | Type::TIMESTAMP
-                    | Type::TIMESTAMPTZ
-                    | Type::INTERVAL
-                    | Type::UUID
-                    | Type::MACADDR
-                    | Type::MACADDR8
-            )
-        })
+        self.columns.iter().any(ColumnMetadata::is_toastable)
     }
 
     /// Generate SELECT columns for all columns in this table.
@@ -254,6 +230,34 @@ impl ColumnMetadata {
     /// are not represented here.
     pub fn index(&self) -> usize {
         usize::try_from(self.position - 1).expect("user column position is >= 1")
+    }
+
+    /// Whether this column's type can carry a TOASTed value (PGC-264).
+    /// Conservative by construction: only known fixed-width types are
+    /// excluded, so an unrecognized type counts as toastable — a whitelist
+    /// miss must cost a little bookkeeping, never correctness.
+    pub fn is_toastable(&self) -> bool {
+        !matches!(
+            self.data_type,
+            Type::BOOL
+                | Type::CHAR
+                | Type::INT2
+                | Type::INT4
+                | Type::INT8
+                | Type::OID
+                | Type::FLOAT4
+                | Type::FLOAT8
+                | Type::MONEY
+                | Type::DATE
+                | Type::TIME
+                | Type::TIMETZ
+                | Type::TIMESTAMP
+                | Type::TIMESTAMPTZ
+                | Type::INTERVAL
+                | Type::UUID
+                | Type::MACADDR
+                | Type::MACADDR8
+        )
     }
 }
 

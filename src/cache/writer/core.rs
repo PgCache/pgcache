@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -107,8 +107,20 @@ pub(super) enum FrameRowEvent {
         key_data: Vec<Option<String>>,
         new_row_data: Vec<Option<String>>,
     },
-    /// An UPDATE whose unchanged-toast columns could not be repaired from the
-    /// cache table at arrival (row absent, or its pre-batch image untrusted —
+    /// An UPDATE whose image carries unchanged-toast markers, awaiting repair
+    /// (PGC-264). Resolved by the replay pre-pass (`toast_repair_events`) into
+    /// a plain `Update` (values from the batch overlay or the batched cache
+    /// lookup) or an `UpdateToastFallback` — no other consumer ever sees one.
+    /// `Toasted` values are already mapped to `None` in `new_row_data`;
+    /// `toasted` holds their column indexes.
+    UpdateToasted {
+        relation_oid: u32,
+        key_data: Vec<Option<String>>,
+        new_row_data: Vec<Option<String>>,
+        toasted: Vec<usize>,
+    },
+    /// An UPDATE whose unchanged-toast columns could not be repaired (row
+    /// absent from the cache table, or its in-batch state untrustworthy —
     /// PGC-264). Excluded from segment eval; the decide pass conservatively
     /// invalidates affected queries instead of upserting the incomplete image.
     /// `Toasted` values are already mapped to `None` in `new_row_data`;
@@ -134,6 +146,18 @@ pub(super) enum FrameRowEvent {
     Boundary {
         commit_lsn: u64,
     },
+}
+
+/// One entry of `batch_toast_overlay` (PGC-264): what this batch last did to
+/// a PK's toastable columns.
+pub(super) enum ToastOverlayEntry {
+    /// Toastable-column `(position, value)` pairs from the last in-batch
+    /// write of the row.
+    Values(Vec<(usize, Option<String>)>),
+    /// The PK was deleted this batch with no subsequent write. The pre-batch
+    /// image is stale, and origin cannot update a deleted row, so a toasted
+    /// update hitting this is defensive-fallback territory.
+    Deleted,
 }
 
 /// CDC source-txn frame state on `WriterCdc`'s write connection (PGC-108).
@@ -277,16 +301,18 @@ pub struct WriterCore {
     /// UNCACHED (`row_changes = None`) or the entering-invalidation the
     /// per-frame flow produced is lost (PGC-242; `test_cache_join`'s PK flip).
     pub(super) batch_deleted_pks: HashSet<(u32, EcoString)>,
-    /// PKs the current batch has upserted into cache tables. The toast-repair
-    /// SELECT (PGC-264) reads the pre-batch committed state; a toasted update
-    /// whose PK was already rewritten this batch must not trust that read and
-    /// takes the conservative fallback instead. Same lifecycle as
-    /// `batch_deleted_pks`.
-    pub(super) batch_dirty_pks: HashSet<(u32, EcoString)>,
+    /// Last in-batch write per PK of the toastable columns' values (PGC-264).
+    /// The toast-repair lookup reads the pre-batch committed state, which is
+    /// stale for any PK this batch has already written; the overlay supplies
+    /// the in-batch value instead (an in-memory repair, no fallback), and
+    /// `Deleted` tombstones block the stale lookup outright. Maintained in
+    /// arrival order by the replay pre-pass; only relations with a toastable
+    /// column pay for it. Same lifecycle as `batch_deleted_pks`.
+    pub(super) batch_toast_overlay: HashMap<(u32, EcoString), ToastOverlayEntry>,
     /// Relations truncated or DDL-recreated in the current batch (PGC-264).
     /// Their pre-batch committed images are wholesale untrustworthy as a
-    /// toast-repair source, dirty-PK tracking aside. Same lifecycle as
-    /// `batch_deleted_pks`.
+    /// toast-repair source; only overlay values written after the truncate
+    /// can repair. Same lifecycle as `batch_deleted_pks`.
     pub(super) batch_toast_guard_oids: HashSet<u32>,
     /// Cache PG data directory, discovered once at startup, for `statvfs` to
     /// auto-size the disk eviction limit (PGC-251 Slice 2). `None` if it couldn't
@@ -396,7 +422,7 @@ impl WriterCore {
             batch_last_lsn: 0,
             frame_open: false,
             batch_deleted_pks: HashSet::new(),
-            batch_dirty_pks: HashSet::new(),
+            batch_toast_overlay: HashMap::new(),
             batch_toast_guard_oids: HashSet::new(),
             data_dir,
             disk_total,
