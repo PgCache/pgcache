@@ -12,7 +12,10 @@ use tokio_postgres::{Client, NoTls, Row, ToStatement};
 /// even a cold miss forwards to origin promptly. Exceeding this means pgcache
 /// is stalled on that query (e.g. wedged under invalidation churn), which the
 /// harness should surface, not wait out.
-pub const OP_TIMEOUT: Duration = Duration::from_secs(20);
+// Generous: this guards the hangs-forever class (orphaned coalesce waiters,
+// PGC-253), not latency — transient reads in the tens of seconds are real
+// under an unthrottled debug-build run saturating the box.
+pub const OP_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn connect(url: &str) -> Result<Client> {
     let (client, connection) = tokio_postgres::connect(url, NoTls)

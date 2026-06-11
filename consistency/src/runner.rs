@@ -5,7 +5,7 @@ use std::ops::ControlFlow;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use pgcache_conformance::cdc_settling::{lsn_parse, settle};
+use pgcache_conformance::cdc_settling::{lsn_parse, settle, settle_while_progressing};
 use pgcache_conformance::poll::poll_until;
 use pgcache_conformance::spawn::{SpawnOptions, SpawnedPgcache};
 use pgcache_conformance::status_client::StatusClient;
@@ -164,6 +164,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
     }
 
+    if loop_result.is_err() || task_error.is_some() {
+        failure_diagnostics(&stack.metrics_url, &stack.origin_url, &stack.cache_db_url).await;
+    }
     let snapshots = loop_result?;
     if let Some(e) = task_error {
         stack.shutdown().await;
@@ -184,6 +187,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let final_rows = match equality_converge(&check).await {
         Ok(n) => n,
         Err(e) => {
+            failure_diagnostics(&stack.metrics_url, &stack.origin_url, &stack.cache_db_url).await;
             stack.shutdown().await;
             return Err(e);
         }
@@ -293,7 +297,10 @@ async fn equality_converge(c: &EqualityCheck<'_>) -> Result<usize> {
     let http = reqwest::Client::new();
     let deadline = Instant::now() + CONVERGE_TIMEOUT;
     loop {
-        settle(c.status, origin_lsn(c.origin).await?, SETTLE_TIMEOUT)
+        // Progress-based: the run can legitimately bank a deep backlog
+        // (cross-frame batching drains it in bulk after load stops), so only
+        // a STALLED watermark is a failure — not a long healthy drain.
+        settle_while_progressing(c.status, origin_lsn(c.origin).await?, SETTLE_TIMEOUT)
             .await
             .context("final CDC settle")?;
         c.status
@@ -349,6 +356,56 @@ async fn writer_queues_drain(
 }
 
 /// Sum of the three writer channel-queue gauges scraped from `/metrics`.
+/// Best-effort failure diagnostics: dump pgcache's key gauges and both
+/// databases' non-idle backends (with wait events) so an intermittent stall
+/// leaves evidence instead of just an op-timeout message.
+async fn failure_diagnostics(metrics_url: &str, origin_url: &str, cache_db_url: &str) {
+    // Per-query states: which fingerprints are non-Ready (and might hold
+    // parked coalesce waiters).
+    if let Ok(resp) = reqwest::get(metrics_url.replace("/metrics", "/status")).await
+        && let Ok(body) = resp.text().await
+    {
+        let head: String = body.chars().take(4000).collect();
+        tracing::error!("diagnostics /status: {head}");
+    }
+    if let Ok(resp) = reqwest::get(metrics_url).await
+        && let Ok(body) = resp.text().await
+    {
+        for line in body.lines() {
+            if line.starts_with("pgcache_cache_writer_cdc_queue")
+                || line.starts_with("pgcache_cdc_applied_lsn")
+                || line.starts_with("pgcache_cdc_received_lsn")
+                || line.starts_with("pgcache_cache_queries_loading")
+                || line.starts_with("pgcache_cache_coalesce_waiting")
+                || line.starts_with("pgcache_connections_active")
+            {
+                tracing::error!("diagnostics: {line}");
+            }
+        }
+    }
+    for (label, url) in [("origin", origin_url), ("cache-db", cache_db_url)] {
+        let Ok(client) = db::connect(url).await else {
+            continue;
+        };
+        let Ok(rows) = client
+            .query(
+                "select pid::text, coalesce(state,'-'),                  coalesce(wait_event_type,'-') || '/' || coalesce(wait_event,'-'),                  coalesce(round(extract(epoch from now()-query_start))::text,'-'),                  left(coalesce(query,''),120)                  from pg_stat_activity                  where state <> 'idle' and pid <> pg_backend_pid()",
+                &[],
+            )
+            .await
+        else {
+            continue;
+        };
+        for row in rows {
+            let (pid, state, wait, dur, q): (String, String, String, String, String) =
+                (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+            tracing::error!(
+                "diagnostics {label}: pid={pid} state={state} wait={wait} dur={dur}s q={q}"
+            );
+        }
+    }
+}
+
 async fn writer_queue_depth(http: &reqwest::Client, metrics_url: &str) -> Result<f64> {
     const NAMES: [&str; 3] = [
         "pgcache_cache_writer_query_queue",

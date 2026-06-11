@@ -38,6 +38,9 @@ pub struct SpawnedPgcache {
     _cache_db: PgTempDB,
     pub origin_url: String,
     pub cache_url: String,
+    /// The raw cache PostgreSQL (not the proxy) — for failure diagnostics
+    /// (`pg_stat_activity` of the backends pgcache itself holds).
+    pub cache_db_url: String,
     pub status_url: String,
     pub metrics_url: String,
     pub logs_file: PathBuf,
@@ -267,6 +270,7 @@ impl SpawnedPgcache {
             // Transparent proxy: clients connect to the listen port using
             // the origin database name and origin user (trust auth).
             cache_url: conn_url(&origin_user, listen_port, &origin_name),
+            cache_db_url: cache_admin_url.clone(),
             status_url,
             metrics_url,
             logs_file: log_path,

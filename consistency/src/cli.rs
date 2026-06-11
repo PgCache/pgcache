@@ -35,7 +35,12 @@ pub struct Cli {
     /// Caps the aggregate write rate so the single-threaded cache writer can
     /// keep up — needed for the two-table scenario, where each write also pays
     /// join-invalidation cost and unpaced writers outrun CDC apply.
-    #[arg(long, default_value_t = 0)]
+    ///
+    /// Default 5ms: enough pressure to bank a real CDC backlog (exercising
+    /// cross-frame batching, PGC-242) while keeping the post-run drain in
+    /// seconds rather than minutes; 0 (unpaced) outruns a debug-build writer
+    /// ~2:1 and banks 500k+ events over a 30s run.
+    #[arg(long, default_value_t = 5)]
     pub write_think_ms: u64,
 
     /// Connections the snapshot reader fans per-group reads across. Higher =
