@@ -9,6 +9,7 @@ use tokio_util::bytes::{Bytes, BytesMut};
 use super::reply::ReplySender;
 use super::{CacheError, Report, query::CacheableQuery, query_cache::QueryType};
 use crate::catalog::TableMetadata;
+use crate::pg::protocol::extended::ResultFormats;
 use crate::proxy::ClientSocket;
 use crate::query::transform::query_expr_parameters_replace;
 use crate::timing::QueryTiming;
@@ -100,7 +101,7 @@ pub struct QueryData {
     pub data: BytesMut,
     pub cacheable_query: Arc<CacheableQuery>,
     pub query_type: QueryType,
-    pub result_formats: Vec<i16>,
+    pub result_formats: ResultFormats,
 }
 
 /// Parameters passed into an extended query
@@ -158,7 +159,12 @@ pub struct QueryParameter {
 #[derive(Debug)]
 pub enum CacheMessage {
     Query(BytesMut, Arc<CacheableQuery>),
-    QueryParameterized(BytesMut, Arc<CacheableQuery>, QueryParameters, Vec<i16>),
+    QueryParameterized(
+        BytesMut,
+        Arc<CacheableQuery>,
+        QueryParameters,
+        ResultFormats,
+    ),
 }
 
 impl CacheMessage {
@@ -179,7 +185,7 @@ impl CacheMessage {
                 data,
                 cacheable_query,
                 query_type: QueryType::Simple,
-                result_formats: Vec::new(),
+                result_formats: ResultFormats::Implicit,
             }),
             CacheMessage::QueryParameterized(data, cacheable_query, parameters, result_formats) => {
                 if parameters.is_empty() {
@@ -251,7 +257,7 @@ pub struct ProxyMessage {
     pub client_socket: ClientSocket,
     pub reply_tx: ReplySender<CacheReply>,
     /// Resolved search_path for this connection (with $user expanded to session_user)
-    pub search_path: Vec<EcoString>,
+    pub search_path: Arc<[EcoString]>,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Pipeline context for atomic extended query dispatch.
@@ -338,7 +344,7 @@ pub enum QueryCommand {
     Register {
         fingerprint: u64,
         cacheable_query: Arc<CacheableQuery>,
-        search_path: Vec<EcoString>,
+        search_path: Arc<[EcoString]>,
         started_at: Instant,
         /// Writer sends subsumption result back so the dispatch can route the held request.
         subsumption_tx: oneshot::Sender<SubsumptionResult>,

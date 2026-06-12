@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ecow::EcoString;
 use tokio_util::bytes::{Buf, Bytes, BytesMut};
 
-use super::{ProtocolError, ProtocolResult};
+use super::{ByteString, ProtocolError, ProtocolResult};
 use crate::cache::query::CacheableQuery;
 
 /// Convert a wire-protocol count (`i16` or `i32`) into a `usize`, returning a parse
@@ -39,7 +39,9 @@ pub enum StatementType {
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
     pub name: EcoString,
-    pub sql: String,
+    /// `ByteString`: a refcounted view into the Parse frame, so storing and
+    /// cloning the SQL (e.g. into the describe-cache key) never copies it.
+    pub sql: ByteString,
     /// Parameter type OIDs as resolved by origin's `ParameterDescription`,
     /// falling back to the client-supplied OIDs until origin replies. Used
     /// for query fingerprinting under cacheable execution.
@@ -70,6 +72,33 @@ pub struct PreparedStatement {
     pub parse_bytes: Option<Bytes>,
 }
 
+/// Result-column format codes from a Bind message, collapsed to intent.
+///
+/// Per the protocol, zero codes means all-text, one code applies to every
+/// column, and N codes are per-column. N identical codes are collapsed to
+/// `Uniform` at parse time — they are wire-equivalent to a single code, and
+/// the collapse makes "is this uniform?" a variant check while keeping the
+/// common cases allocation-free.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum ResultFormats {
+    /// No format codes: all columns default to text.
+    #[default]
+    Implicit,
+    /// One format code for all columns (0 = text, 1 = binary).
+    Uniform(i16),
+    /// Genuinely mixed per-column format codes.
+    PerColumn(Vec<i16>),
+}
+
+impl ResultFormats {
+    /// Whether results were requested in binary format. `PerColumn` (mixed)
+    /// formats never reach the serve path — they disqualify the cache
+    /// candidate — so only `Uniform` can be binary.
+    pub fn is_binary(&self) -> bool {
+        matches!(self, Self::Uniform(code) if *code != 0)
+    }
+}
+
 /// Portal (bound prepared statement) stored in connection state
 #[derive(Debug, Clone)]
 pub struct Portal {
@@ -77,7 +106,7 @@ pub struct Portal {
     pub statement_name: EcoString,
     pub parameter_values: Vec<Option<Bytes>>,
     pub parameter_formats: Vec<i16>, // 0=text, 1=binary
-    pub result_formats: Vec<i16>,
+    pub result_formats: ResultFormats,
 }
 
 impl Portal {
@@ -92,7 +121,8 @@ impl Portal {
 #[derive(Debug, Clone)]
 pub struct ParsedParseMessage {
     pub statement_name: EcoString,
-    pub sql: String,
+    /// Zero-copy view into the Parse frame passed to `parse_parse_message`.
+    pub sql: ByteString,
     pub parameter_oids: Vec<u32>,
 }
 
@@ -103,7 +133,7 @@ pub struct ParsedBindMessage {
     pub statement_name: EcoString,
     pub parameter_formats: Vec<i16>,
     pub parameter_values: Vec<Option<Bytes>>,
-    pub result_formats: Vec<i16>,
+    pub result_formats: ResultFormats,
 }
 
 /// Parsed Execute message data
@@ -165,7 +195,7 @@ fn read_cstring<'a>(buf: &mut &'a [u8]) -> ProtocolResult<&'a str> {
 /// Int16 - number of parameter data types
 /// For each parameter:
 ///     Int32 - OID of parameter data type (0 = unspecified)
-pub fn parse_parse_message(data: &BytesMut) -> ProtocolResult<ParsedParseMessage> {
+pub fn parse_parse_message(data: &Bytes) -> ProtocolResult<ParsedParseMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -177,7 +207,14 @@ pub fn parse_parse_message(data: &BytesMut) -> ProtocolResult<ParsedParseMessage
     let mut buf = buf; // Skip message tag (1 byte) and length (4 bytes)
 
     let statement_name = read_cstring(&mut buf)?.into();
-    let sql = read_cstring(&mut buf)?.to_owned();
+    // Zero-copy: the SQL is a refcounted slice of the frame, not a fresh String.
+    let sql_str = read_cstring(&mut buf)?;
+    let sql = ByteString::from_utf8(data.slice_ref(sql_str.as_bytes())).map_err(|_| {
+        ProtocolError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid UTF-8 in SQL",
+        ))
+    })?;
 
     if buf.len() < 2 {
         return Err(ProtocolError::IoError(std::io::Error::new(
@@ -309,9 +346,9 @@ pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> 
         .into());
     }
     let result_format_count = count_to_usize(buf.get_i16(), "Bind result format count")?;
-    let mut result_formats = Vec::with_capacity(result_format_count);
+    let mut result_formats = ResultFormats::Implicit;
 
-    for _ in 0..result_format_count {
+    for index in 0..result_format_count {
         if buf.len() < 2 {
             return Err(ProtocolError::IoError(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
@@ -319,7 +356,20 @@ pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> 
             ))
             .into());
         }
-        result_formats.push(buf.get_i16());
+        let code = buf.get_i16();
+        result_formats = match result_formats {
+            ResultFormats::Implicit => ResultFormats::Uniform(code),
+            ResultFormats::Uniform(first) if first == code => ResultFormats::Uniform(first),
+            ResultFormats::Uniform(first) => {
+                let mut codes = vec![first; index];
+                codes.push(code);
+                ResultFormats::PerColumn(codes)
+            }
+            ResultFormats::PerColumn(mut codes) => {
+                codes.push(code);
+                ResultFormats::PerColumn(codes)
+            }
+        };
     }
 
     Ok(ParsedBindMessage {
@@ -499,7 +549,7 @@ mod tests {
         data.extend_from_slice(b"SELECT 1\0"); // SQL
         data.extend_from_slice(&[0, 0]); // 0 parameters
 
-        let result = parse_parse_message(&data).unwrap();
+        let result = parse_parse_message(&data.freeze()).unwrap();
         assert_eq!(result.statement_name, "stmt1");
         assert_eq!(result.sql, "SELECT 1");
         assert_eq!(result.parameter_oids.len(), 0);
@@ -517,7 +567,7 @@ mod tests {
         data.extend_from_slice(&[0, 0, 0, 23]); // OID 23 (int4)
         data.extend_from_slice(&[0, 0, 0, 25]); // OID 25 (text)
 
-        let result = parse_parse_message(&data).unwrap();
+        let result = parse_parse_message(&data.freeze()).unwrap();
         assert_eq!(result.statement_name, "");
         assert_eq!(result.sql, "SELECT $1, $2");
         assert_eq!(result.parameter_oids, vec![23, 25]);
@@ -545,7 +595,7 @@ mod tests {
         assert_eq!(result.parameter_formats, vec![0]);
         assert_eq!(result.parameter_values.len(), 1);
         assert_eq!(result.parameter_values[0], Some(Bytes::from_static(b"42")));
-        assert_eq!(result.result_formats, vec![0]);
+        assert_eq!(result.result_formats, ResultFormats::Uniform(0));
     }
 
     #[test]
@@ -659,7 +709,7 @@ mod tests {
         data.extend_from_slice(b"P");
         data.extend_from_slice(&[0, 0, 0, 10]);
 
-        let result = parse_parse_message(&data);
+        let result = parse_parse_message(&data.freeze());
         assert!(result.is_err());
     }
 
@@ -674,7 +724,7 @@ mod tests {
         data.extend_from_slice(&[0, 1]); // 1 parameter
         data.extend_from_slice(&[0, 0, 0, 23]); // OID 23 (int4)
 
-        let result = parse_parse_message(&data).unwrap();
+        let result = parse_parse_message(&data.freeze()).unwrap();
         assert_eq!(result.statement_name, "stmt1");
         assert_eq!(result.sql, "SELECT id, data FROM test WHERE id = $1");
         assert_eq!(result.parameter_oids, vec![23]);
@@ -701,7 +751,7 @@ mod tests {
         data.extend_from_slice(&[0, 1]); // 1 parameter
         data.extend_from_slice(&[0, 0, 0, 25]); // OID 25 (text)
 
-        let result = parse_parse_message(&data).unwrap();
+        let result = parse_parse_message(&data.freeze()).unwrap();
         assert_eq!(result.statement_name, "");
 
         // Test that this SQL parses and IS cacheable (non-correlated subquery)
@@ -736,7 +786,7 @@ mod tests {
         data.extend_from_slice(&[0, 0, 0, 23]); // OID 23 (int4)
         data.extend_from_slice(&[0, 0, 0, 25]); // OID 25 (text)
 
-        let result = parse_parse_message(&data).unwrap();
+        let result = parse_parse_message(&data.freeze()).unwrap();
 
         // Test that INSERT is not cacheable (not a SELECT)
         let cacheable_result = query_expr_parse(&result.sql);
@@ -753,7 +803,7 @@ mod tests {
             statement_name: "s1".into(),
             parameter_values: vec![Some(Bytes::from_static(b"42"))],
             parameter_formats: vec![0], // text format
-            result_formats: vec![0],
+            result_formats: ResultFormats::Uniform(0),
         };
 
         assert!(
@@ -769,7 +819,7 @@ mod tests {
             statement_name: "s1".into(),
             parameter_values: vec![Some(Bytes::from_static(&[0, 0, 0, 42]))],
             parameter_formats: vec![1], // binary format
-            result_formats: vec![0],
+            result_formats: ResultFormats::Uniform(0),
         };
 
         assert!(
@@ -788,7 +838,7 @@ mod tests {
                 Some(Bytes::from_static(&[0, 0, 0, 42])),
             ],
             parameter_formats: vec![0, 1], // text, then binary
-            result_formats: vec![0],
+            result_formats: ResultFormats::Uniform(0),
         };
 
         assert!(
@@ -804,7 +854,7 @@ mod tests {
             statement_name: "s1".into(),
             parameter_values: vec![],
             parameter_formats: vec![],
-            result_formats: vec![],
+            result_formats: ResultFormats::Implicit,
         };
 
         assert!(

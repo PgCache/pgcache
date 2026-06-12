@@ -407,7 +407,9 @@ enum ServeResponseState {
 /// (a named prepared statement for source-row, unnamed extended for MV) and
 /// relay the response to the client in its requested format. Returns the DataRow
 /// bytes served and any coalesced client outcomes.
-#[instrument(skip_all)]
+// Span at trace level: at info/debug the fmt layer allocates per-span
+// extensions, which would put one heap allocation on every cache hit.
+#[instrument(skip_all, level = "trace")]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub async fn handle_cached_query(
     conn: CacheConnection,
@@ -432,7 +434,7 @@ pub async fn handle_cached_query(
     // Serve in the client's result format (text/binary). Simple-query clients
     // always expect a RowDescription, so request Describe from the cache DB even
     // when no Describe message was pipelined.
-    let binary_results = msg.result_formats.first().is_some_and(|&f| f != 0);
+    let binary_results = msg.result_formats.is_binary();
     let query_type = msg.query_type;
     let include_describe =
         query_type == QueryType::Simple || msg.pipeline_describe != PipelineDescribe::None;

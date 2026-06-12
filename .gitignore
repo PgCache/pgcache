@@ -2,8 +2,8 @@
 /target
 codescene-cli.log
 profile.json.gz
-# dhat heap profile (written by the dhat-heap build / tests/dhat_profile.rs)
-dhat-heap.json
+# dhat heap profiles (written by the dhat-heap build / tests/dhat_profile.rs)
+dhat-heap*.json
 config.toml
 # pgcache-conformance JUnit output (--junit)
 /out.xml

@@ -18,6 +18,7 @@ use tracing::{debug, error, info, instrument, trace};
 use crate::pg::protocol::encode::{
     BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG,
 };
+use crate::pg::protocol::extended::ResultFormats;
 use crate::proxy::ClientSocket;
 use crate::query::ast::{LimitClause, query_expr_fingerprint};
 use crate::result::error_chain_format;
@@ -95,7 +96,7 @@ struct CoalesceKey {
     has_parse: bool,
     has_bind: bool,
     pipeline_describe: PipelineDescribe,
-    result_formats: Vec<i16>,
+    result_formats: ResultFormats,
     limit: Option<LimitClause>,
 }
 
@@ -185,11 +186,11 @@ pub struct QueryRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
     pub cacheable_query: Arc<CacheableQuery>,
-    pub result_formats: Vec<i16>,
+    pub result_formats: ResultFormats,
     pub client_socket: ClientSocket,
     pub reply_tx: ReplySender<CacheReply>,
     /// Resolved search_path for schema resolution
-    pub search_path: Vec<EcoString>,
+    pub search_path: Arc<[EcoString]>,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Pipeline context from the proxy (None for simple queries and cold-path extended)
@@ -211,7 +212,7 @@ pub struct ServeRequest {
     /// Serve from the MV (carrying its aliased output column names) or
     /// from source rows. Decided on the dispatch path.
     pub mv: MvServe,
-    pub result_formats: Vec<i16>,
+    pub result_formats: ResultFormats,
     pub client_socket: ClientSocket,
     pub reply_tx: ReplySender<CacheReply>,
     /// Per-query timing data
@@ -411,7 +412,9 @@ impl CacheDispatch {
         }
     }
 
-    #[instrument(skip_all)]
+    // Span at trace level: at info/debug the fmt layer allocates per-span
+    // extensions, which would put one heap allocation on every cache hit.
+    #[instrument(skip_all, level = "trace")]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, mut msg: QueryRequest) -> CacheResult<()> {
         let cfg = self.dynamic.load();
@@ -841,7 +844,7 @@ impl CacheDispatch {
                 )
             }
         };
-        let binary = msg.result_formats.first().is_some_and(|&f| f != 0);
+        let binary = msg.result_formats.is_binary();
         let shape = MemoShape::from_limit(&msg.cacheable_query.query.limit)?;
         let key = MemoKey {
             fingerprint,
@@ -1199,7 +1202,7 @@ impl CacheDispatch {
                 .send(QueryCommand::Register {
                     fingerprint: pq.fingerprint,
                     cacheable_query: Arc::clone(&pq.cacheable_query),
-                    search_path: vec!["public".into()],
+                    search_path: vec!["public".into()].into(),
                     started_at: Instant::now(),
                     subsumption_tx,
                     admit_action: AdmitAction::Admit,
@@ -1215,7 +1218,7 @@ impl CacheDispatch {
         &self,
         fingerprint: u64,
         cacheable_query: Arc<CacheableQuery>,
-        search_path: Vec<EcoString>,
+        search_path: Arc<[EcoString]>,
         subsumption_tx: oneshot::Sender<SubsumptionResult>,
         admit_action: AdmitAction,
     ) -> CacheResult<()> {
@@ -1247,7 +1250,7 @@ impl CacheDispatch {
             .query_register_send(
                 fingerprint,
                 Arc::clone(&msg.cacheable_query),
-                msg.search_path.clone(),
+                Arc::clone(&msg.search_path),
                 subsumption_tx,
                 admit_action,
             )

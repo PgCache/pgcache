@@ -35,16 +35,16 @@ use crate::{
         query::CacheableQuery,
     },
     pg::protocol::{
-        ProtocolError,
+        ByteString, ProtocolError,
         backend::{
             AUTHENTICATION_SASL, PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType,
             authentication_type, data_row_first_column, parameter_status_parse,
         },
-        encode::{CLOSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG},
+        encode::{CLOSE_COMPLETE_MSG, NO_DATA_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG},
         extended::{
-            ParsedBindMessage, ParsedParseMessage, Portal, PreparedStatement, StatementType,
-            parse_bind_message, parse_close_message, parse_describe_message, parse_execute_message,
-            parse_parameter_description, parse_parse_message,
+            ParsedBindMessage, ParsedParseMessage, Portal, PreparedStatement, ResultFormats,
+            StatementType, parse_bind_message, parse_close_message, parse_describe_message,
+            parse_execute_message, parse_parameter_description, parse_parse_message,
         },
         frontend::{
             PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType,
@@ -129,7 +129,7 @@ fn origin_stream_from_tls(tls_stream: tokio_rustls::client::TlsStream<TcpStream>
 /// into the key.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 struct DescribeKey {
-    sql: String,
+    sql: ByteString,
     parameter_oids: Vec<u32>,
 }
 
@@ -138,7 +138,17 @@ struct DescribeKey {
 struct DescribeCacheEntry {
     parameter_description: Bytes,
     row_description: Option<Bytes>,
+    /// Origin-resolved parameter OIDs, parsed once from `parameter_description`
+    /// at populate time (`None` if it didn't parse).
+    parameter_oids: Option<Vec<u32>>,
+    /// Pre-assembled ParseComplete + ParameterDescription + (RowDescription |
+    /// NoData) + ReadyForQuery('I') — a synth hit serves a refcount clone of
+    /// this instead of building the response per hit.
+    describe_response: Bytes,
 }
+
+/// Synth response for a Parse-only batch (no Describe): ParseComplete + RFQ('I').
+const PARSE_COMPLETE_RFQ_IDLE: &[u8] = &[b'1', 0, 0, 0, 4, b'Z', 0, 0, 0, 5, b'I'];
 
 /// Bounded per connection so dynamic-SQL workloads can't grow it unbounded.
 const DESCRIBE_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
@@ -211,16 +221,31 @@ enum SearchPathState {
     /// ParameterStatus on PG18+) resolves the value.
     Unknown,
 
-    /// search_path has been resolved (either from ParameterStatus or SHOW query)
-    Resolved(SearchPath),
+    /// search_path has been resolved (either from ParameterStatus or SHOW
+    /// query), pre-expanded ($user → session_user) and shared: dispatching a
+    /// cache query clones the Arc instead of collecting a fresh Vec per query.
+    Resolved(Arc<[EcoString]>),
 }
 
 impl SearchPathState {
-    /// Resolve the search_path if available, expanding $user to session_user.
-    fn resolve(&self, session_user: Option<&str>) -> Option<Vec<EcoString>> {
+    /// Build the resolved state from a raw search_path value, expanding $user
+    /// to session_user. session_user comes from the startup message, so it is
+    /// final before any of the transitions into this state.
+    fn resolved(value: &str, session_user: Option<&str>) -> Self {
+        let search_path = SearchPath::parse(value);
+        Self::Resolved(
+            search_path
+                .resolve(session_user)
+                .map(EcoString::from)
+                .collect(),
+        )
+    }
+
+    /// The resolved search_path, if available.
+    fn resolve(&self) -> Option<Arc<[EcoString]>> {
         match self {
             Self::Unknown => None,
-            Self::Resolved(sp) => Some(sp.resolve(session_user).map(EcoString::from).collect()),
+            Self::Resolved(search_path) => Some(Arc::clone(search_path)),
         }
     }
 }
@@ -425,7 +450,7 @@ const SYNC_MESSAGE: [u8; 5] = [b'S', 0, 0, 0, 4];
 struct CacheCandidate {
     cacheable_query: Arc<CacheableQuery>,
     parameters: QueryParameters,
-    result_formats: Vec<i16>,
+    result_formats: ResultFormats,
     /// ParameterDescription bytes, present only for a Describe('S') entry.
     parameter_description: Option<Bytes>,
     /// Target statement name (for the lazy-Parse-on-forward decision).
@@ -870,9 +895,31 @@ impl ConnectionState {
             sql: stmt.sql.clone(),
             parameter_oids: stmt.client_parameter_oids.clone(),
         };
+        let row_description = stmt.row_description.clone();
+        let mut describe_response = BytesMut::with_capacity(
+            PARSE_COMPLETE_MSG.len()
+                + parameter_description.len()
+                + row_description
+                    .as_ref()
+                    .map_or(NO_DATA_MSG.len(), Bytes::len)
+                + READY_FOR_QUERY_IDLE_MSG.len(),
+        );
+        describe_response.put_slice(PARSE_COMPLETE_MSG);
+        describe_response.put_slice(&parameter_description);
+        match &row_description {
+            Some(row_desc) => describe_response.put_slice(row_desc),
+            None => describe_response.put_slice(NO_DATA_MSG),
+        }
+        // RFQ('I') is safe to bake in: the synth path only fires outside a
+        // transaction (synth_eligible).
+        describe_response.put_slice(READY_FOR_QUERY_IDLE_MSG);
         let entry = DescribeCacheEntry {
+            parameter_oids: parse_parameter_description(&parameter_description)
+                .ok()
+                .map(|p| p.parameter_oids),
             parameter_description,
-            row_description: stmt.row_description.clone(),
+            row_description,
+            describe_response: describe_response.freeze(),
         };
         let was_at_capacity = self.describe_cache.len() == DESCRIBE_CACHE_CAPACITY.get();
         let replaced = self.describe_cache.put(key, entry).is_some();
@@ -1034,7 +1081,7 @@ impl ConnectionState {
                         if let Some(value) = data_row_first_column(&msg.data) {
                             debug!("received search_path from SHOW query: {}", value);
                             self.search_path_state =
-                                SearchPathState::Resolved(SearchPath::parse(value));
+                                SearchPathState::resolved(value, self.session_user.as_deref());
                         }
                     }
                     PgBackendMessageType::ReadyForQuery => {
@@ -1112,7 +1159,7 @@ impl ConnectionState {
                     if let Some(value) = data_row_first_column(&msg.data) {
                         debug!("piggyback: received search_path from SHOW: {}", value);
                         self.search_path_state =
-                            SearchPathState::Resolved(SearchPath::parse(value));
+                            SearchPathState::resolved(value, self.session_user.as_deref());
                         self.search_path_just_piggyback_resolved = true;
                     }
                     true
@@ -1164,7 +1211,7 @@ impl ConnectionState {
                             // skip the defensive SHOW machinery.
                             debug!("received search_path from ParameterStatus: {}", value);
                             self.search_path_state =
-                                SearchPathState::Resolved(SearchPath::parse(value));
+                                SearchPathState::resolved(value, self.session_user.as_deref());
                             self.search_path_auto_reported = true;
                         }
                         "server_version" => {
@@ -1483,7 +1530,10 @@ impl ConnectionState {
 
     /// Handle Parse message — analyze cacheability, store statement, buffer bytes.
     fn handle_parse_message(&mut self, msg: PgFrontendMessage) {
-        if let Ok(parsed) = parse_parse_message(&msg.data) {
+        // Freeze the codec's zero-copy slice up front so the parsed SQL can be
+        // a refcounted view into the frame instead of a fresh String.
+        let data = msg.data.freeze();
+        if let Ok(parsed) = parse_parse_message(&data) {
             // Cacheability analysis is memoized in `fingerprint_cache` (shared
             // with the simple-query path); a hit skips the parse/convert/classify
             // entirely. search_path mutation detection — which the inline parse
@@ -1508,9 +1558,6 @@ impl ConnectionState {
                 Err(_) => StatementType::ParseError,
             };
 
-            // Freeze the codec's zero-copy slice to `Bytes`; storing/buffering it
-            // is then a refcount bump instead of two deep copies.
-            let data = msg.data.freeze();
             let statement_name = parsed.statement_name.clone();
             self.statement_store(parsed, sql_type, data.clone());
 
@@ -1524,7 +1571,12 @@ impl ConnectionState {
             trace!("net: Parse buffered");
             return;
         }
-        self.origin_write_buf.push_back(msg.data);
+        // Parse failed: forward raw. No views of `data` exist on this path, so
+        // try_into_mut reclaims the buffer without copying.
+        self.origin_write_buf.push_back(
+            data.try_into_mut()
+                .unwrap_or_else(|b| BytesMut::from(&b[..])),
+        );
     }
 
     /// Handle Bind message — store portal, buffer bytes.
@@ -1585,12 +1637,7 @@ impl ConnectionState {
         let portal = self.portals.get(portal_name?)?;
 
         // Only handle implicit or uniform result formats
-        if portal.result_formats.len() > 1
-            && !portal
-                .result_formats
-                .windows(2)
-                .all(|w| matches!(w, [a, b] if a == b))
-        {
+        if let ResultFormats::PerColumn(_) = portal.result_formats {
             trace!("result format is not implicit or uniform");
             return None;
         }
@@ -1664,7 +1711,11 @@ impl ConnectionState {
     /// the count flushed.
     fn deferred_close_completes_flush(&mut self) -> u32 {
         let n = self.extended.deferred_close_completes;
-        if n > 0 {
+        if n == 1 {
+            self.extended.deferred_close_completes = 0;
+            self.egress
+                .synth_push(Bytes::from_static(CLOSE_COMPLETE_MSG));
+        } else if n > 1 {
             self.extended.deferred_close_completes = 0;
             let mut out = BytesMut::with_capacity(CLOSE_COMPLETE_MSG.len() * n as usize);
             for _ in 0..n {
@@ -1933,6 +1984,8 @@ impl ConnectionState {
         // Cheap (refcount) clones now that the describe metadata is `Bytes`.
         let parameter_description = entry.parameter_description.clone();
         let row_description = entry.row_description.clone();
+        let parameter_oids = entry.parameter_oids.clone();
+        let describe_response = entry.describe_response.clone();
         // `stmt_name` borrows `buffer` (aliases `self.extended`); detach it as an
         // EcoString (inline for the short statement names clients use) so the
         // `&mut self` populate below doesn't conflict with that borrow.
@@ -1941,42 +1994,26 @@ impl ConnectionState {
         // Populate the freshly-Parsed statement with the cached Describe
         // metadata so a subsequent Bind+Execute can build a parameterized
         // cache message without an origin round-trip.
-        let parsed_param_oids = parse_parameter_description(&parameter_description)
-            .ok()
-            .map(|p| p.parameter_oids);
         if let Some(stmt_mut) = self.prepared_statements.get_mut(stmt_name.as_str()) {
-            if let Some(oids) = parsed_param_oids {
+            if let Some(oids) = parameter_oids {
                 stmt_mut.parameter_oids = oids;
             }
-            stmt_mut.parameter_description = Some(parameter_description.clone());
-            stmt_mut.row_description = row_description.clone();
+            stmt_mut.parameter_description = Some(parameter_description);
             stmt_mut.describe_no_data = row_description.is_none();
+            stmt_mut.row_description = row_description;
         }
 
         crate::metrics::handles().conn.describe_hits.increment(1);
 
-        let mut out = BytesMut::with_capacity(
-            5 + parameter_description.len()
-                + row_description.as_ref().map(Bytes::len).unwrap_or(5)
-                + 6,
-        );
-        // ParseComplete
-        out.put_slice(&[b'1', 0, 0, 0, 4]);
-        if buffer.pending.describe == PipelineDescribe::Statement {
-            out.put_slice(&parameter_description);
-            if let Some(row_desc) = row_description {
-                out.put_slice(&row_desc);
-            } else {
-                // NoData: tag 'n', length 4 (length field only)
-                out.put_slice(&[b'n', 0, 0, 0, 4]);
-            }
-        }
-        // ReadyForQuery 'I' — synth_eligible excluded in_transaction.
-        out.put_slice(&[b'Z', 0, 0, 0, 5, b'I']);
+        let out = if buffer.pending.describe == PipelineDescribe::Statement {
+            describe_response
+        } else {
+            Bytes::from_static(PARSE_COMPLETE_RFQ_IDLE)
+        };
 
         // Enqueue as an ordered slot: the egress queue keeps it behind any
         // earlier in-flight origin response so the synth bytes can't jump ahead.
-        self.egress.synth_push(out.freeze());
+        self.egress.synth_push(out);
 
         true
     }
@@ -2416,10 +2453,7 @@ async fn handle_connection(
 
                 // The cache query is in hand and its slot is serving. Resolve
                 // search_path; if unknown, forward to origin instead of caching.
-                let Some(resolved_search_path) = state
-                    .search_path_state
-                    .resolve(state.session_user.as_deref())
-                else {
+                let Some(resolved_search_path) = state.search_path_state.resolve() else {
                     debug!("search_path unknown, forwarding to origin");
                     crate::metrics::handles().query.uncacheable.increment(1);
                     state.cache_slot_forward_to_origin(msg);
