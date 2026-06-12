@@ -1,11 +1,13 @@
-//! Off-thread MV build vs CDC race: a build whose query is dirtied while the
-//! build task is in flight must be discarded (`Building → BuildingDirty →
-//! Pending`), never flipped Fresh — flipping would serve an MV missing the
-//! concurrent change (a stale read).
+//! Off-thread MV build races, made deterministic with fault-injection holds
+//! (`PGCACHE_FAULT_MV_BUILD_HOLD_MS` widens the in-flight window):
 //!
-//! Requires the `fault-injection` build: `PGCACHE_FAULT_MV_BUILD_HOLD_MS`
-//! widens the in-flight window so the CDC change deterministically lands
-//! mid-build.
+//! - dirtied mid-build: the result must be discarded (`Building →
+//!   BuildingDirty → Pending`), never flipped Fresh — flipping would serve an
+//!   MV missing the concurrent change (a stale read).
+//! - evicted mid-build (`PGCACHE_FAULT_MV_EVICT_ON_BUILD`): the re-registered
+//!   incarnation's build defers behind the in-flight guard; the stale
+//!   completion is discarded, its table dropped, the deferred build
+//!   dispatched.
 
 #![cfg(feature = "fault-injection")]
 
@@ -22,6 +24,99 @@ const BUILD_HOLD_MS: &str = "1000";
 
 /// Settle timeout covering held builds (each build adds ~1s).
 const SETTLE: Duration = Duration::from_secs(20);
+
+/// Count tables in the `pgcache_mv` schema of the cache DB.
+async fn mv_table_count(dbs: &crate::util::TempDBs) -> Result<i64, Error> {
+    let client = crate::util::connect_cache_db(dbs).await?;
+    let row = client
+        .query_one(
+            "SELECT count(*) FROM pg_tables WHERE schemaname = 'pgcache_mv'",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+    Ok(row.get(0))
+}
+
+/// Eviction while a build task is in flight: the entry's MV-table drop is
+/// deferred (the build holds locks), the re-registered incarnation's build is
+/// deferred behind the in-flight guard, and the stale completion must discard
+/// its result, drop the stale table, and dispatch the deferred build — ending
+/// with exactly one MV table and a working fast path.
+#[tokio::test]
+async fn test_mv_build_evicted_mid_build_recovers() -> Result<(), Error> {
+    // Longer hold than the dirtied-in-flight test: build B must be scheduled
+    // while build A is still in flight for the dispatch to take the deferred
+    // path, and registration + settle of the re-registered incarnation has to
+    // fit inside A's hold window.
+    let mut ctx = TestContext::setup_fault(&[
+        ("PGCACHE_FAULT_MV_BUILD_HOLD_MS", "2500"),
+        ("PGCACHE_FAULT_MV_EVICT_ON_BUILD", "1"),
+    ])
+    .await?;
+
+    ctx.simple_query("CREATE TABLE mv_evict (id integer primary key, val text)")
+        .await?;
+    for i in 0..20 {
+        ctx.simple_query(&format!("INSERT INTO mv_evict VALUES ({i}, 'v{i}')"))
+            .await?;
+    }
+
+    let q = "SELECT count(*) FROM mv_evict";
+
+    // Register + populate the source-row cache.
+    let row = ctx.query_one(q, &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 20);
+    ctx.cache_settle_with_timeout(SETTLE).await?;
+
+    // Trigger hit: schedules build A. The writer dispatches it (task held
+    // ~2.5s) and the fault hook evicts the entry immediately after — the MV
+    // drop is deferred because the build holds the table.
+    let row = ctx.query_one(q, &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 20);
+
+    // Give the writer time to process the MvBuild command + fault eviction
+    // (microseconds of work; the margin is for command-queue latency).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The entry is gone: this query must MISS and re-register.
+    let m1 = ctx.metrics().await?;
+    let row = ctx.query_one(q, &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 20);
+    let m2 = ctx.metrics().await?;
+    assert_eq!(
+        metrics_delta(&m1, &m2).queries_cache_miss,
+        1,
+        "expected a miss after the fault eviction (hook did not fire?)"
+    );
+    ctx.cache_settle_with_timeout(SETTLE).await?;
+
+    // Hit the new incarnation: schedules build B, whose dispatch is deferred
+    // behind build A's in-flight guard. Build A then completes into the
+    // Scheduled state: its result is discarded, its table dropped, and B is
+    // dispatched (held ~2.5s again) and lands Fresh.
+    let row = ctx.query_one(q, &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 20);
+    ctx.cache_settle_with_timeout(SETTLE).await?;
+
+    // Fast path serves from the rebuilt MV; exactly one table on disk.
+    let m3 = ctx.metrics().await?;
+    let row = ctx.query_one(q, &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 20);
+    let m4 = ctx.metrics().await?;
+    let d = metrics_delta(&m3, &m4);
+    assert_eq!(
+        d.cache_mv_hits, 1,
+        "expected MV hit after recovery (got {d:?})"
+    );
+    assert_eq!(
+        mv_table_count(&ctx.dbs).await?,
+        1,
+        "expected exactly one MV table (stale build's table must be dropped)"
+    );
+
+    Ok(())
+}
 
 #[tokio::test]
 async fn test_mv_build_dirtied_in_flight_is_discarded() -> Result<(), Error> {

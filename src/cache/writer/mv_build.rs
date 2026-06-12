@@ -91,23 +91,64 @@ impl MvBuildPool {
         }
     }
 
-    /// Wait for a slot. Inner `None` (never-connected or discarded slot) and
-    /// closed-channel `None` (unreachable — `self` holds a sender) both mean
-    /// "no usable client": the caller connects.
-    async fn slot_take(&self) -> Option<Client> {
-        self.slot_rx.lock().await.recv().await.flatten()
-    }
-
-    /// Return a slot; pass `None` to discard a dead/poisoned connection.
-    /// `try_send` cannot fail: capacity equals the number of slots out.
-    fn slot_return(&self, client: Option<Client>) {
-        let _ = self.slot_tx.try_send(client);
+    /// Wait for a slot, wrapped in a guard that returns it on drop. The inner
+    /// `None` (never-connected or discarded slot) and a closed-channel `None`
+    /// (unreachable — `self` holds a sender) both mean "no usable client":
+    /// the caller connects.
+    async fn slot_acquire(&self) -> SlotGuard {
+        let content = self.slot_rx.lock().await.recv().await.flatten();
+        SlotGuard {
+            slot_tx: self.slot_tx.clone(),
+            content,
+        }
     }
 }
 
-/// Spawn one MV build onto the shared runtime. The task reports back via
-/// `MvBuildComplete` on the writer's internal channel; a send failure means
-/// the writer is gone (cache teardown) and the result is moot.
+/// Returns its slot to the pool on drop, so a panic or cancellation anywhere
+/// between checkout and return cannot shrink the pool (the slot comes back as
+/// `None` and reconnects at the next checkout). Mirrors the serve pool's
+/// `ConnectionGuard` safety property.
+struct SlotGuard {
+    slot_tx: Sender<Option<Client>>,
+    content: Option<Client>,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        // try_send cannot fail: capacity equals the number of slots out.
+        let _ = self.slot_tx.try_send(self.content.take());
+    }
+}
+
+/// Sends `MvBuildComplete` on drop, so the writer hears about every build —
+/// including one that panicked. The writer's in-flight guard blocks all
+/// future builds for the fingerprint until a completion arrives, so a lost
+/// completion would wedge the MV permanently.
+struct CompletionGuard {
+    query_tx: UnboundedSender<QueryCommand>,
+    fingerprint: u64,
+    /// `has_table` for the fallback `Failed` outcome when the task died
+    /// before producing one.
+    has_table: bool,
+    outcome: Option<MvBuildOutcome>,
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        let outcome = self.outcome.take().unwrap_or(MvBuildOutcome::Failed {
+            has_table: self.has_table,
+        });
+        // Send failure means the writer is gone (cache teardown); moot.
+        let _ = self.query_tx.send(QueryCommand::MvBuildComplete {
+            fingerprint: self.fingerprint,
+            outcome,
+        });
+    }
+}
+
+/// Spawn one MV build onto the shared runtime. The completion guard reports
+/// back via `MvBuildComplete` on the writer's internal channel even if the
+/// build panics.
 pub(super) fn mv_build_spawn(
     runtime: &Handle,
     pool: &Arc<MvBuildPool>,
@@ -116,33 +157,34 @@ pub(super) fn mv_build_spawn(
 ) {
     let pool = Arc::clone(pool);
     runtime.spawn(async move {
-        let fingerprint = ctx.fingerprint;
-        let outcome = mv_build_run(&pool, ctx).await;
-        let _ = query_tx.send(QueryCommand::MvBuildComplete {
-            fingerprint,
-            outcome,
-        });
+        let mut completion = CompletionGuard {
+            query_tx,
+            fingerprint: ctx.fingerprint,
+            has_table: ctx.has_table,
+            outcome: None,
+        };
+        completion.outcome = Some(mv_build_run(&pool, &ctx).await);
     });
 }
 
-/// Acquire a build slot + connection, run the build, return the slot.
-async fn mv_build_run(pool: &MvBuildPool, ctx: MvBuildContext) -> MvBuildOutcome {
+/// Acquire a build slot + connection, run the build; the guard returns the
+/// slot on every exit path.
+async fn mv_build_run(pool: &MvBuildPool, ctx: &MvBuildContext) -> MvBuildOutcome {
     fault_build_hold().await;
 
     // Queue gauge brackets the slot wait: per-fingerprint exclusivity makes
     // this the number of distinct MVs waiting for a build connection.
     let queue = &crate::metrics::handles().mv.build_queue;
     queue.increment(1.0);
-    let slot = pool.slot_take().await;
+    let mut slot = pool.slot_acquire().await;
     queue.decrement(1.0);
 
-    let client = match slot {
+    let client = match slot.content.take() {
         Some(c) if !c.is_closed() => c,
         _ => match pg::connect(&pool.settings, "mv build").await {
             Ok(c) => c,
             Err(e) => {
                 error!("mv build connect failed for {}: {e}", ctx.fingerprint);
-                pool.slot_return(None);
                 return MvBuildOutcome::Failed {
                     has_table: ctx.has_table,
                 };
@@ -150,8 +192,10 @@ async fn mv_build_run(pool: &MvBuildPool, ctx: MvBuildContext) -> MvBuildOutcome
         },
     };
 
-    let outcome = mv_build_execute(&client, &ctx).await;
-    pool.slot_return((!client.is_closed()).then_some(client));
+    let outcome = mv_build_execute(&client, ctx).await;
+    if !client.is_closed() {
+        slot.content = Some(client);
+    }
     outcome
 }
 

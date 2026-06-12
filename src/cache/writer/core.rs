@@ -227,6 +227,11 @@ pub struct WriterCore {
     /// Dedicated cache-DB connections for MV build tasks (also the build
     /// concurrency limit) — builds never borrow `db_cache` or serve-pool slots.
     pub(super) mv_build_pool: Arc<MvBuildPool>,
+    /// Fingerprints with a build task in flight. Enforces at most one build
+    /// per fingerprint ever (tasks share one MV table per fingerprint), even
+    /// across evict + re-register of the entry: a dispatch that finds its
+    /// fingerprint here defers, and the completion handler re-dispatches.
+    pub(super) mv_builds_inflight: HashSet<u64>,
     /// Notifications to dispatch for coalescing queue drain.
     pub(super) notify_tx: UnboundedSender<WriterNotify>,
     /// CDC source-transaction frame state (driven by
@@ -456,6 +461,7 @@ impl WriterCore {
             query_tx,
             runtime,
             mv_build_pool: Arc::new(MvBuildPool::new(settings.cache.clone())),
+            mv_builds_inflight: HashSet::new(),
             notify_tx,
             frame_state: FrameState::Idle,
             frame_invalidations: HashSet::new(),

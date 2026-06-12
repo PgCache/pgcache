@@ -276,6 +276,26 @@ fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
     (base_query, max_limit)
 }
 
+/// Test-only evict-mid-build (`PGCACHE_FAULT_MV_EVICT_ON_BUILD`): one-shot,
+/// consumed on the first `MvBuild` dispatch that actually launched a task, so
+/// a test can deterministically exercise eviction while a build is in flight
+/// (deferred re-dispatch + stale-completion discard). Always `false` unless
+/// built with `--features fault-injection`.
+#[cfg(feature = "fault-injection")]
+fn fault_mv_evict_on_build(core: &WriterCore, fingerprint: u64) -> bool {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ARMED: OnceLock<AtomicBool> = OnceLock::new();
+    let armed = ARMED.get_or_init(|| {
+        AtomicBool::new(std::env::var_os("PGCACHE_FAULT_MV_EVICT_ON_BUILD").is_some())
+    });
+    core.mv_builds_inflight.contains(&fingerprint) && armed.swap(false, Ordering::Relaxed)
+}
+#[cfg(not(feature = "fault-injection"))]
+fn fault_mv_evict_on_build(_core: &WriterCore, _fingerprint: u64) -> bool {
+    false
+}
+
 /// Owns the query registration / population path: consumes `QueryCommand`s
 /// and drives resolution, subsumption, population dispatch, and lifecycle
 /// transitions against the shared `WriterCore`. Holds the population worker
@@ -454,6 +474,18 @@ impl WriterRegistration {
             QueryCommand::MvBuild { fingerprint } => {
                 trace!("command mv build {fingerprint}");
                 core.mv_build_dispatch(fingerprint);
+                // Fault injection (evict-mid-build): evict the entry right
+                // after its build task launched, exercising the deferred
+                // re-dispatch + stale-completion discard path deterministically.
+                if fault_mv_evict_on_build(core, fingerprint) {
+                    error!("fault injection: evicting {fingerprint} mid-build");
+                    if let Err(e) = core.cache_query_evict(fingerprint).await {
+                        error!(
+                            "fault eviction failed for {fingerprint}: {}",
+                            error_chain_format(e.current_context()),
+                        );
+                    }
+                }
             }
             QueryCommand::MvBuildComplete {
                 fingerprint,

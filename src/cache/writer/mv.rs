@@ -61,12 +61,24 @@ impl WriterCore {
     /// Snapshot the build context, flip `Scheduled → Building`, and spawn the
     /// SQL onto the shared runtime. The build reports back via
     /// `MvBuildComplete`; `mv_build_complete` applies the terminal transition.
-    pub(super) fn mv_build_dispatch(&self, fingerprint: u64) {
+    ///
+    /// At most one build task per fingerprint may ever be in flight: build
+    /// tasks share one MV table per fingerprint, so a second task (possible
+    /// when the entry was evicted mid-build and re-registered) would race the
+    /// first at the SQL level. A dispatch that finds the fingerprint in
+    /// flight leaves the entry `Scheduled`; the completion handler
+    /// re-dispatches it.
+    pub(super) fn mv_build_dispatch(&mut self, fingerprint: u64) {
+        if self.mv_builds_inflight.contains(&fingerprint) {
+            trace!("mv build: deferred for {fingerprint} (prior build in flight)");
+            return;
+        }
         let Some(ctx) = self.mv_context_snapshot(fingerprint) else {
             trace!("mv build: precondition not met for {fingerprint}");
             crate::metrics::handles().mv.skipped_rebuilds.increment(1);
             return;
         };
+        self.mv_builds_inflight.insert(fingerprint);
         self.mv_state_transition(
             fingerprint,
             MvState::Building {
@@ -85,7 +97,24 @@ impl WriterCore {
     /// a finished build task. Running here (not in the task) serializes the
     /// `Fresh` flip against CDC dirty-marking — a build raced by a relevant
     /// change always lands in `BuildingDirty` first and is discarded.
-    pub(super) async fn mv_build_complete(&self, fingerprint: u64, outcome: MvBuildOutcome) {
+    ///
+    /// The in-flight guard means this completion belongs to the only build
+    /// that exists for the fingerprint. A state other than `Building*` means
+    /// the entry was evicted (and possibly re-registered) while the build
+    /// ran — the outcome is discarded and any table the build left behind is
+    /// dropped so the new incarnation starts clean.
+    pub(super) async fn mv_build_complete(&mut self, fingerprint: u64, outcome: MvBuildOutcome) {
+        self.mv_builds_inflight.remove(&fingerprint);
+
+        // Did the finished build leave a table on disk? `Built` always does;
+        // `Failed` only when it started against an existing table (a failed
+        // first build drops its own partial table in task cleanup, but a
+        // failed rebuild rolls back to the pre-existing table).
+        let table_remains = matches!(
+            outcome,
+            MvBuildOutcome::Built { .. } | MvBuildOutcome::Failed { has_table: true }
+        );
+
         let state = self
             .state_view
             .cached_queries
@@ -96,12 +125,53 @@ impl WriterCore {
             // Evicted during the build. Eviction skipped the MV drop (the
             // build held locks on the table); drop the orphan now that the
             // build has finished and released them.
-            if matches!(outcome, MvBuildOutcome::Built { .. }) {
+            if table_remains {
                 self.mv_table_drop(fingerprint).await;
             }
             return;
         };
 
+        match state {
+            MvState::Building { .. } | MvState::BuildingDirty { .. } => {
+                self.mv_build_outcome_apply(fingerprint, state, outcome)
+                    .await;
+            }
+            MvState::Scheduled { .. } => {
+                // The entry was evicted and re-registered mid-build, and its
+                // first hit re-scheduled while this build was still in
+                // flight (dispatch deferred on the in-flight guard). Discard
+                // this build's result and start the deferred one.
+                if table_remains {
+                    self.mv_table_drop(fingerprint).await;
+                }
+                trace!("mv build: stale completion for {fingerprint}, dispatching deferred build");
+                self.mv_build_dispatch(fingerprint);
+            }
+            MvState::Skipped | MvState::Ineligible | MvState::Pending { .. } | MvState::Fresh => {
+                // Entry was reset by a re-registration path while the build
+                // ran; the new entry expects no table. (`Fresh` is
+                // unreachable here — the new incarnation can't complete a
+                // build while this one held the in-flight guard — but is
+                // handled the same way for safety.)
+                debug!(
+                    "mv build: state moved to {state:?} during build for {fingerprint}, \
+                     discarding outcome"
+                );
+                if table_remains {
+                    self.mv_table_drop(fingerprint).await;
+                }
+            }
+        }
+    }
+
+    /// Apply a build outcome to the incarnation that started it (state is
+    /// `Building` or `BuildingDirty`).
+    async fn mv_build_outcome_apply(
+        &self,
+        fingerprint: u64,
+        state: MvState,
+        outcome: MvBuildOutcome,
+    ) {
         match outcome {
             MvBuildOutcome::Built {
                 output_columns,
@@ -123,37 +193,19 @@ impl WriterCore {
                     return;
                 }
 
-                match state {
-                    MvState::Building { .. } => {
-                        if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint)
-                        {
-                            view.mv.output_columns = Some(output_columns);
-                            view.mv.state = MvState::Fresh;
-                        }
-                        crate::metrics::handles().mv.rebuilds.increment(1);
-                        trace!("mv build: fresh for {fingerprint}");
+                if matches!(state, MvState::Building { .. }) {
+                    if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
+                        view.mv.output_columns = Some(output_columns);
+                        view.mv.state = MvState::Fresh;
                     }
-                    MvState::BuildingDirty { .. } => {
-                        // A CDC change relevant to this query landed while the
-                        // build was in flight; the table contents predate it.
-                        self.mv_state_transition(fingerprint, MvState::Pending { has_table: true });
-                        crate::metrics::handles().mv.skipped_rebuilds.increment(1);
-                        trace!("mv build: discarded (dirtied in flight) for {fingerprint}");
-                    }
-                    MvState::Skipped
-                    | MvState::Ineligible
-                    | MvState::Pending { .. }
-                    | MvState::Scheduled { .. }
-                    | MvState::Fresh => {
-                        // Entry was reset by a re-registration path (readmit /
-                        // re-register) while the build ran; the new entry
-                        // expects no table.
-                        debug!(
-                            "mv build: state moved to {state:?} during build for {fingerprint}, \
-                             dropping table"
-                        );
-                        self.mv_table_drop(fingerprint).await;
-                    }
+                    crate::metrics::handles().mv.rebuilds.increment(1);
+                    trace!("mv build: fresh for {fingerprint}");
+                } else {
+                    // BuildingDirty: a CDC change relevant to this query landed
+                    // while the build was in flight; the table contents predate it.
+                    self.mv_state_transition(fingerprint, MvState::Pending { has_table: true });
+                    crate::metrics::handles().mv.skipped_rebuilds.increment(1);
+                    trace!("mv build: discarded (dirtied in flight) for {fingerprint}");
                 }
             }
             MvBuildOutcome::Ineligible => {
@@ -163,12 +215,7 @@ impl WriterCore {
                 trace!("mv build: size gate failed for {fingerprint}");
             }
             MvBuildOutcome::Failed { has_table } => {
-                if matches!(
-                    state,
-                    MvState::Building { .. } | MvState::BuildingDirty { .. }
-                ) {
-                    self.mv_state_transition(fingerprint, MvState::Pending { has_table });
-                }
+                self.mv_state_transition(fingerprint, MvState::Pending { has_table });
             }
         }
     }
