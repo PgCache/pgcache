@@ -2,6 +2,7 @@ mod cdc;
 mod core;
 mod deadlock;
 mod mv;
+mod mv_build;
 mod population;
 mod registration;
 mod staging;

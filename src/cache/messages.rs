@@ -291,6 +291,10 @@ impl std::fmt::Debug for QueryCommand {
                 .debug_struct("MvBuild")
                 .field("fingerprint", fingerprint)
                 .finish(),
+            Self::MvBuildComplete { fingerprint, .. } => f
+                .debug_struct("MvBuildComplete")
+                .field("fingerprint", fingerprint)
+                .finish_non_exhaustive(),
             Self::Merge(m) => f
                 .debug_struct("Merge")
                 .field("fingerprint", &m.fingerprint)
@@ -369,11 +373,39 @@ pub enum QueryCommand {
 
     /// Build (or rebuild) the materialized result for a cached query. Sent by
     /// the dispatch when it observes `mv_state == Pending { .. }` on a cache
-    /// hit and transitions to `Scheduled { .. }`. The writer's handler branches
-    /// on `has_table` to choose between `CREATE TABLE AS` (first build, may
-    /// run the Measure size gate) and `BEGIN; TRUNCATE; INSERT; COMMIT`
-    /// (rebuild; gate is sticky).
+    /// hit and transitions to `Scheduled { .. }`. The writer's handler snapshots
+    /// the build context, flips to `Building { has_table }`, and spawns the SQL
+    /// onto the shared runtime; `has_table` chooses between `CREATE TABLE AS`
+    /// (first build, may run the Measure size gate) and
+    /// `BEGIN; TRUNCATE; INSERT; COMMIT` (rebuild; gate is sticky).
     MvBuild { fingerprint: u64 },
+
+    /// A spawned MV build task finished; the writer applies the state
+    /// transition. Keeping the flip on the writer serializes it against CDC
+    /// dirty-marking, so a build raced by a relevant change is always observed
+    /// as `BuildingDirty` here and discarded.
+    MvBuildComplete {
+        fingerprint: u64,
+        outcome: MvBuildOutcome,
+    },
+}
+
+/// Result of an off-thread MV build task. The task runs SQL only; all
+/// `MvState` transitions happen in the writer's `MvBuildComplete` handler.
+pub enum MvBuildOutcome {
+    /// Build batch committed; the MV table holds the result.
+    Built {
+        output_columns: Arc<[EcoString]>,
+        /// Build path taken (false = `CREATE TABLE AS` first build). On
+        /// success a table exists either way; this picks the metric label
+        /// and the first-build source-row-state recheck.
+        was_first_build: bool,
+    },
+    /// Measure size gate failed. Terminal for this cache entry.
+    Ineligible,
+    /// Build failed; the task already rolled back / dropped the partial
+    /// table. `has_table` is what remains on disk for the `Pending` reset.
+    Failed { has_table: bool },
 }
 
 /// A single column value decoded from a pgoutput tuple (PGC-264).

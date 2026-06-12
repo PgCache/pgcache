@@ -330,12 +330,21 @@ pub async fn cache_settle_at(metrics_port: u16, timeout: Duration) -> Result<(),
             .iter()
             .filter_map(|q| {
                 let state = q.get("state").and_then(serde_json::Value::as_str)?;
-                if state == "Loading" || state.starts_with("Pending") {
+                // MV builds run off the writer thread, so a /status response
+                // no longer implies a dispatched build has finished — treat
+                // scheduled/in-flight builds as unsettled work too.
+                let mv_state = q
+                    .get("mv_state")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let mv_in_flight =
+                    mv_state.starts_with("Scheduled") || mv_state.starts_with("Building");
+                if state == "Loading" || state.starts_with("Pending") || mv_in_flight {
                     let fp = q
                         .get("fingerprint")
                         .and_then(serde_json::Value::as_u64)
                         .unwrap_or(0);
-                    Some(format!("{fp}={state}"))
+                    Some(format!("{fp}={state}/mv:{mv_state}"))
                 } else {
                     None
                 }

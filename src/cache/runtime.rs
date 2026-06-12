@@ -343,6 +343,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     let active_relations_writer = Arc::clone(&active_relations);
     let cancel_writer = cache_cancel.child_token();
     let watermark_nudge_writer = Arc::clone(&watermark_nudge);
+    let shared_runtime_writer = handle.clone();
     let writer_handle = thread::Builder::new()
         .name("cache writer".to_owned())
         .spawn_scoped(scope, move || {
@@ -356,6 +357,7 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
                 cancel_writer,
                 status_rx,
                 watermark_nudge_writer,
+                shared_runtime_writer,
             );
             if let Err(ref e) = result {
                 error!(

@@ -359,6 +359,7 @@ impl WriterRegistration {
             QueryCommand::LimitBump { .. } => &reg.cmd_limit_bump,
             QueryCommand::Readmit { .. } => &reg.cmd_readmit,
             QueryCommand::MvBuild { .. } => &reg.cmd_mv_build,
+            QueryCommand::MvBuildComplete { .. } => &reg.cmd_mv_build_complete,
         };
         let handle_start = Instant::now();
         match cmd {
@@ -452,16 +453,14 @@ impl WriterRegistration {
             }
             QueryCommand::MvBuild { fingerprint } => {
                 trace!("command mv build {fingerprint}");
-                if let Err(e) = core.mv_build(fingerprint).await {
-                    error!(
-                        "mv build failed for {fingerprint}: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                    // The cache itself is intact and serving Ready; only the MV
-                    // build path failed. Revert to Pending so the next hit retries
-                    // (matches mv_build's own SQL-error fallback at writer/mv.rs).
-                    core.mv_build_failed_reset(fingerprint);
-                }
+                core.mv_build_dispatch(fingerprint);
+            }
+            QueryCommand::MvBuildComplete {
+                fingerprint,
+                outcome,
+            } => {
+                trace!("command mv build complete {fingerprint}");
+                core.mv_build_complete(fingerprint, outcome).await;
             }
         }
         // Publication dirty drain runs per-command because it's correctness

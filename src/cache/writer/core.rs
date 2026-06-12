@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ecow::EcoString;
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Handle};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use tokio::task::{LocalSet, yield_now};
@@ -32,6 +32,7 @@ use super::super::{
     },
 };
 use super::cdc::WriterCdc;
+use super::mv_build::MvBuildPool;
 use super::registration::WriterRegistration;
 use super::staging::PopulationDeletedKeys;
 
@@ -209,6 +210,12 @@ pub struct WriterCore {
     /// invalidation to defer pinned readmits, by MV to schedule builds, and
     /// cloned to population workers so they can report Ready/Failed.
     pub(super) query_tx: UnboundedSender<QueryCommand>,
+    /// Shared multi-thread runtime handle; MV build tasks are spawned here so
+    /// their SQL never blocks the writer's event loop.
+    pub(super) runtime: Handle,
+    /// Dedicated cache-DB connections for MV build tasks (also the build
+    /// concurrency limit) — builds never borrow `db_cache` or serve-pool slots.
+    pub(super) mv_build_pool: Arc<MvBuildPool>,
     /// Notifications to dispatch for coalescing queue drain.
     pub(super) notify_tx: UnboundedSender<WriterNotify>,
     /// CDC source-transaction frame state (driven by
@@ -391,6 +398,7 @@ async fn data_directory_query(client: &Client) -> Option<PathBuf> {
 }
 
 impl WriterCore {
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         settings: &Settings,
         state_view: Arc<CacheStateView>,
@@ -398,6 +406,7 @@ impl WriterCore {
         notify_tx: UnboundedSender<WriterNotify>,
         query_tx: UnboundedSender<QueryCommand>,
         watermark_nudge: Arc<Notify>,
+        runtime: Handle,
     ) -> CacheResult<Self> {
         let cache_client = pg::connect(&settings.cache, "writer cache")
             .await
@@ -425,6 +434,8 @@ impl WriterCore {
             publication_oids: HashSet::new(),
             relations_dirty: false,
             query_tx,
+            runtime,
+            mv_build_pool: Arc::new(MvBuildPool::new(settings.cache.clone())),
             notify_tx,
             frame_state: FrameState::Idle,
             frame_invalidations: HashSet::new(),
@@ -1186,12 +1197,17 @@ impl WriterCore {
                 })
                 .collect();
 
-            let state = self
+            let (state, mv_state) = self
                 .state_view
                 .cached_queries
                 .get(&q.fingerprint)
-                .map(|entry| format!("{:?}", entry.value().state))
-                .unwrap_or_else(|| "Unknown".to_owned());
+                .map(|entry| {
+                    (
+                        format!("{:?}", entry.value().state),
+                        format!("{:?}", entry.value().mv.state),
+                    )
+                })
+                .unwrap_or_else(|| ("Unknown".to_owned(), "Unknown".to_owned()));
 
             // Look up per-query metrics (shared read access)
             let metrics = self.state_view.metrics.get(&q.fingerprint);
@@ -1256,6 +1272,7 @@ impl WriterCore {
                 sql_preview,
                 tables,
                 state,
+                mv_state,
                 cached_bytes: q.cached_bytes,
                 max_limit: q.max_limit,
                 pinned: q.pinned,
@@ -1337,6 +1354,7 @@ pub fn writer_run(
     cancel: CancellationToken,
     mut status_rx: Receiver<StatusRequest>,
     watermark_nudge: Arc<Notify>,
+    shared_runtime: Handle,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -1359,6 +1377,7 @@ pub fn writer_run(
                     notify_tx,
                     query_tx.clone(),
                     watermark_nudge,
+                    shared_runtime,
                 )
                 .await?;
                 let mut registration = WriterRegistration::new(

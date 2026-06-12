@@ -130,7 +130,11 @@ pub(crate) fn mv_serve_decide(
             crate::metrics::handles().cache.mv_fallthrough.increment(1);
             MvDecision::NeedsSchedule { has_table }
         }
-        Some((MvState::Scheduled { .. }, _, _)) => {
+        Some((
+            MvState::Scheduled { .. } | MvState::Building { .. } | MvState::BuildingDirty { .. },
+            _,
+            _,
+        )) => {
             crate::metrics::handles().cache.mv_fallthrough.increment(1);
             MvDecision::Serve(MvServe::SourceRow)
         }

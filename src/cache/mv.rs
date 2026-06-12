@@ -74,6 +74,13 @@ pub enum MvState {
     /// the writer which build path to take (`CREATE TABLE AS` vs
     /// `TRUNCATE + INSERT`).
     Scheduled { has_table: bool },
+    /// Build task in flight on the shared runtime. `has_table` is the bit the
+    /// build started with (picks the reset target if the build fails).
+    Building { has_table: bool },
+    /// A CDC change dirtied the query while its build was in flight; the
+    /// build's result must be discarded at completion. `has_table` is
+    /// inherited from `Building`.
+    BuildingDirty { has_table: bool },
     /// Table exists and contents are fresh. Serve-path fast path.
     Fresh,
 }
@@ -85,8 +92,27 @@ impl MvState {
     pub fn has_table(self) -> bool {
         match self {
             MvState::Fresh => true,
-            MvState::Pending { has_table } | MvState::Scheduled { has_table } => has_table,
+            MvState::Pending { has_table }
+            | MvState::Scheduled { has_table }
+            | MvState::Building { has_table }
+            | MvState::BuildingDirty { has_table } => has_table,
             MvState::Skipped | MvState::Ineligible => false,
+        }
+    }
+
+    /// State after a relevant CDC change (insert/update/delete that could
+    /// affect the query's result), or `None` when the change has no effect.
+    /// `Fresh` loses its table-is-current claim; an in-flight build is marked
+    /// so its result is discarded at completion.
+    pub fn dirtied(self) -> Option<MvState> {
+        match self {
+            MvState::Fresh => Some(MvState::Pending { has_table: true }),
+            MvState::Building { has_table } => Some(MvState::BuildingDirty { has_table }),
+            MvState::Skipped
+            | MvState::Ineligible
+            | MvState::Pending { .. }
+            | MvState::Scheduled { .. }
+            | MvState::BuildingDirty { .. } => None,
         }
     }
 }
@@ -478,9 +504,38 @@ mod tests {
         assert!(!MvState::Ineligible.has_table());
         assert!(!MvState::Pending { has_table: false }.has_table());
         assert!(!MvState::Scheduled { has_table: false }.has_table());
+        assert!(!MvState::Building { has_table: false }.has_table());
+        assert!(!MvState::BuildingDirty { has_table: false }.has_table());
         assert!(MvState::Pending { has_table: true }.has_table());
         assert!(MvState::Scheduled { has_table: true }.has_table());
+        assert!(MvState::Building { has_table: true }.has_table());
+        assert!(MvState::BuildingDirty { has_table: true }.has_table());
         assert!(MvState::Fresh.has_table());
+    }
+
+    #[test]
+    fn dirtied_invalidates_fresh_and_marks_in_flight_builds() {
+        assert_eq!(
+            MvState::Fresh.dirtied(),
+            Some(MvState::Pending { has_table: true })
+        );
+        assert_eq!(
+            MvState::Building { has_table: false }.dirtied(),
+            Some(MvState::BuildingDirty { has_table: false })
+        );
+        assert_eq!(
+            MvState::Building { has_table: true }.dirtied(),
+            Some(MvState::BuildingDirty { has_table: true })
+        );
+    }
+
+    #[test]
+    fn dirtied_is_noop_for_already_dirty_or_terminal_states() {
+        assert_eq!(MvState::Skipped.dirtied(), None);
+        assert_eq!(MvState::Ineligible.dirtied(), None);
+        assert_eq!(MvState::Pending { has_table: true }.dirtied(), None);
+        assert_eq!(MvState::Scheduled { has_table: true }.dirtied(), None);
+        assert_eq!(MvState::BuildingDirty { has_table: true }.dirtied(), None);
     }
 
     // ==================== Classifier tests ====================

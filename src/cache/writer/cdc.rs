@@ -30,7 +30,6 @@ use crate::query::evaluate::where_expr_evaluate;
 
 use super::super::memo::SlotKey;
 use super::super::messages::{CdcCommand, QueryCommand, cdc_values_convert};
-use super::super::mv::MvState;
 use super::super::types::{
     CachedQueryState, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
 };
@@ -863,11 +862,12 @@ impl WriterCdc {
                 continue;
             }
 
-            // Mirror the per-row fresh/rest split: Fresh-MV queries are always
-            // fully evaluated (every match must dirty-mark)…
+            // Mirror the per-row fresh/rest split: dirtyable-MV queries
+            // (Fresh or Building) are always fully evaluated (every match
+            // must dirty-mark)…
             let (fresh, rest): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) = batchable
                 .into_iter()
-                .partition(|q| core.mv_is_fresh(q.fingerprint));
+                .partition(|q| core.mv_dirty_eval_required(q.fingerprint));
 
             let batch = membership.relations.entry(relation_oid).or_default();
             if !fresh.is_empty() {
@@ -2524,7 +2524,8 @@ impl WriterCdc {
         // columns changed, would otherwise leave A's MV serving the departed
         // row forever (PGC-254/PGC-265; the old image isn't available to
         // detect departure precisely — PGC-255 tracks precision). Coarsely
-        // dirty the relation's Fresh MVs; `mv_dirty_mark` self-gates on Fresh.
+        // dirty the relation's dirtyable MVs; `mv_dirty_mark` self-gates
+        // (Fresh and Building only).
         core.mv_dirty_mark_relation(relation_oid);
 
         // A non-empty `key_data` means the PK changed; delete the old PK too.
@@ -2883,8 +2884,8 @@ impl WriterCdc {
         if let Some(mut entry) = core.state_view.cached_queries.get_mut(&fingerprint) {
             entry.state = CachedQueryState::Invalidated;
             entry.referenced = false;
-            if entry.mv.state == MvState::Fresh {
-                entry.mv.state = MvState::Pending { has_table: true };
+            if let Some(dirtied) = entry.mv.state.dirtied() {
+                entry.mv.state = dirtied;
             }
         }
 
@@ -3343,7 +3344,7 @@ impl WriterCdc {
                 // Per-row fallback for non-batchable shapes / uncovered rows.
                 let (fresh_pg, rest_pg): (Vec<&UpdateQuery>, Vec<&UpdateQuery>) = fallback
                     .into_iter()
-                    .partition(|q| core.mv_is_fresh(q.fingerprint));
+                    .partition(|q| core.mv_dirty_eval_required(q.fingerprint));
 
                 let fresh_hits = self
                     .pg_eval_matches(&fresh_pg, table_metadata, row_data)

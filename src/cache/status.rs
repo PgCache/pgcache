@@ -55,6 +55,11 @@ pub struct QueryStatusData {
     pub sql_preview: String,
     pub tables: Vec<String>,
     pub state: String,
+    /// MV state machine position (`Debug` rendering of `MvState`). Settle
+    /// harnesses treat `Scheduled*` / `Building*` as in-flight work now that
+    /// builds run off the writer thread and aren't serialized with /status.
+    #[serde(default)]
+    pub mv_state: String,
     pub cached_bytes: usize,
     pub max_limit: Option<u64>,
     pub pinned: bool,

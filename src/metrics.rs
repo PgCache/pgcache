@@ -115,8 +115,9 @@ pub mod names {
     pub const CACHE_MV_FALLTHROUGH: &str = "pgcache.cache.mv_fallthrough";
     /// Rebuilds committed by the writer (Dirty → Fresh transitions).
     pub const CACHE_MV_REBUILDS: &str = "pgcache.cache.mv_rebuilds";
-    /// Rebuild messages the writer dropped because source-row state was not Ready
-    /// at the time of processing (transitioned back to Dirty).
+    /// Builds dropped without producing a Fresh MV: dispatch preconditions not
+    /// met (source-row state not Ready), or the build was dirtied by a CDC
+    /// change while its task was in flight and discarded at completion.
     pub const CACHE_MV_SKIPPED_REBUILDS: &str = "pgcache.cache.mv_skipped_rebuilds";
     /// Dirty MV tables truncated by the eviction pre-sweep.
     pub const CACHE_MV_DIRTY_TRUNCATES: &str = "pgcache.cache.mv_dirty_truncates";
@@ -435,6 +436,7 @@ pub struct RegHandles {
     pub cmd_limit_bump: Histogram,
     pub cmd_readmit: Histogram,
     pub cmd_mv_build: Histogram,
+    pub cmd_mv_build_complete: Histogram,
     pub register_resolve: Histogram,
     pub register_subsumption_check: Histogram,
     pub register_subsume: Histogram,
@@ -587,6 +589,7 @@ impl Handles {
                 cmd_limit_bump: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "limit_bump"),
                 cmd_readmit: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "readmit"),
                 cmd_mv_build: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build"),
+                cmd_mv_build_complete: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build_complete"),
                 register_resolve: metrics::histogram!(CACHE_WRITER_REGISTER_RESOLVE_SECONDS),
                 register_subsumption_check: metrics::histogram!(
                     CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS
