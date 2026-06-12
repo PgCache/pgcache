@@ -17,8 +17,8 @@ use std::time::Instant;
 
 use ecow::EcoString;
 use tokio::runtime::Handle;
-use tokio::sync::Semaphore;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender, channel};
 use tokio_postgres::{Client, SimpleQueryMessage};
 use tokio_stream::StreamExt;
 use tracing::{error, trace};
@@ -62,38 +62,46 @@ pub(super) struct MvBuildContext {
     pub mv_size_ratio: u64,
 }
 
-/// Lazily-connected pool of cache-DB connections for build tasks. The
-/// semaphore is the concurrency limit; clients reconnect on checkout when a
-/// prior build poisoned them. Dropped wholesale on cache-generation teardown.
+/// Pool of cache-DB connections for build tasks, using the codebase's bounded
+/// mpsc pool pattern (see `connection_pool_create` / serve pool): checkout is
+/// `recv()`, return is `send()`, and the channel capacity is the concurrency
+/// limit. Two adaptations for the build case: tasks are independent consumers
+/// (no single dispatcher), so the receiver sits behind a `Mutex`; and the
+/// channel carries `Option<Client>` slots pre-filled with `None` so
+/// connections open lazily on the shared runtime (eager creation in writer
+/// init would put the tokio-postgres driver tasks on the writer's runtime).
+/// A slot whose connection died returns as `None` and reconnects at the next
+/// checkout — slot count is conserved, so no replenish task is needed.
 pub(crate) struct MvBuildPool {
     settings: PgSettings,
-    permits: Semaphore,
-    idle: std::sync::Mutex<Vec<Client>>,
+    slot_tx: Sender<Option<Client>>,
+    slot_rx: Mutex<Receiver<Option<Client>>>,
 }
 
 impl MvBuildPool {
     pub(super) fn new(settings: PgSettings) -> Self {
+        let (slot_tx, slot_rx) = channel(MV_BUILD_CONNECTIONS);
+        for _ in 0..MV_BUILD_CONNECTIONS {
+            let _ = slot_tx.try_send(None);
+        }
         Self {
             settings,
-            permits: Semaphore::new(MV_BUILD_CONNECTIONS),
-            idle: std::sync::Mutex::new(Vec::with_capacity(MV_BUILD_CONNECTIONS)),
+            slot_tx,
+            slot_rx: Mutex::new(slot_rx),
         }
     }
 
-    fn client_take(&self) -> Option<Client> {
-        self.idle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop()
+    /// Wait for a slot. Inner `None` (never-connected or discarded slot) and
+    /// closed-channel `None` (unreachable — `self` holds a sender) both mean
+    /// "no usable client": the caller connects.
+    async fn slot_take(&self) -> Option<Client> {
+        self.slot_rx.lock().await.recv().await.flatten()
     }
 
-    fn client_return(&self, client: Client) {
-        if !client.is_closed() {
-            self.idle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(client);
-        }
+    /// Return a slot; pass `None` to discard a dead/poisoned connection.
+    /// `try_send` cannot fail: capacity equals the number of slots out.
+    fn slot_return(&self, client: Option<Client>) {
+        let _ = self.slot_tx.try_send(client);
     }
 }
 
@@ -117,23 +125,24 @@ pub(super) fn mv_build_spawn(
     });
 }
 
-/// Acquire a build slot + connection, run the build, return the connection.
+/// Acquire a build slot + connection, run the build, return the slot.
 async fn mv_build_run(pool: &MvBuildPool, ctx: MvBuildContext) -> MvBuildOutcome {
     fault_build_hold().await;
 
-    let Ok(_permit) = pool.permits.acquire().await else {
-        // Semaphore is never closed; unreachable in practice.
-        return MvBuildOutcome::Failed {
-            has_table: ctx.has_table,
-        };
-    };
+    // Queue gauge brackets the slot wait: per-fingerprint exclusivity makes
+    // this the number of distinct MVs waiting for a build connection.
+    let queue = &crate::metrics::handles().mv.build_queue;
+    queue.increment(1.0);
+    let slot = pool.slot_take().await;
+    queue.decrement(1.0);
 
-    let client = match pool.client_take() {
+    let client = match slot {
         Some(c) if !c.is_closed() => c,
         _ => match pg::connect(&pool.settings, "mv build").await {
             Ok(c) => c,
             Err(e) => {
                 error!("mv build connect failed for {}: {e}", ctx.fingerprint);
+                pool.slot_return(None);
                 return MvBuildOutcome::Failed {
                     has_table: ctx.has_table,
                 };
@@ -142,7 +151,7 @@ async fn mv_build_run(pool: &MvBuildPool, ctx: MvBuildContext) -> MvBuildOutcome
     };
 
     let outcome = mv_build_execute(&client, &ctx).await;
-    pool.client_return(client);
+    pool.slot_return((!client.is_closed()).then_some(client));
     outcome
 }
 

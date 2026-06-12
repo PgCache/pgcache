@@ -125,6 +125,10 @@ pub mod names {
     /// so operators can correlate with replication slot lag to decide whether
     /// off-thread builds (Option B) are needed.
     pub const CACHE_MV_BUILD_DURATION_SECONDS: &str = "pgcache.cache.mv_build_duration_seconds";
+    /// MV build tasks spawned and waiting for a build-pool connection. With
+    /// per-fingerprint exclusivity this counts distinct MVs queued for
+    /// rebuild; sustained growth means builds can't keep up with dirtying.
+    pub const CACHE_MV_BUILD_QUEUE: &str = "pgcache.cache.mv_build_queue";
 
     // In-process result memo metrics (PGC-236)
     /// Cache hits served inline from the in-process memo (no worker hop / cache-DB).
@@ -423,6 +427,7 @@ pub struct MvHandles {
     pub rebuilds: Counter,
     pub skipped_rebuilds: Counter,
     pub dirty_truncates: Counter,
+    pub build_queue: Gauge,
     // Build-duration histogram, one cached handle per `kind` label.
     pub build_first_pop: Histogram,
     pub build_rebuild: Histogram,
@@ -579,6 +584,7 @@ impl Handles {
                 rebuilds: metrics::counter!(CACHE_MV_REBUILDS),
                 skipped_rebuilds: metrics::counter!(CACHE_MV_SKIPPED_REBUILDS),
                 dirty_truncates: metrics::counter!(CACHE_MV_DIRTY_TRUNCATES),
+                build_queue: metrics::gauge!(CACHE_MV_BUILD_QUEUE),
                 build_first_pop: metrics::histogram!(CACHE_MV_BUILD_DURATION_SECONDS, "kind" => "first_pop"),
                 build_rebuild: metrics::histogram!(CACHE_MV_BUILD_DURATION_SECONDS, "kind" => "rebuild"),
             },
