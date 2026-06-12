@@ -1,5 +1,6 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
+use crate::pg::protocol::ByteString;
 use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
 use crate::query::cast::{
     CastTarget, canonicalize_comparison, cast_target_coerce_text,
@@ -17,7 +18,7 @@ use crate::query::resolved::{
 /// not present in the passed-in table metadata.
 pub fn where_expr_evaluate(
     expr: &ResolvedWhereExpr,
-    row_data: &[Option<String>],
+    row_data: &[Option<ByteString>],
     table_name: &str,
 ) -> bool {
     match expr {
@@ -60,7 +61,7 @@ pub fn where_expr_evaluate(
 /// Evaluate a comparison expression (column op value) against row data.
 fn expr_comparison_evaluate(
     binary_expr: &ResolvedBinaryExpr,
-    row_data: &[Option<String>],
+    row_data: &[Option<ByteString>],
     table_name: &str,
 ) -> bool {
     let Some((column_ref, target, op, value)) = canonicalize_comparison(binary_expr) else {
@@ -174,7 +175,7 @@ fn ordering_satisfies_op(ordering: std::cmp::Ordering, op: BinaryOp) -> bool {
 fn unary_expr_evaluate(
     op: &UnaryOp,
     expr: &ResolvedWhereExpr,
-    row_data: &[Option<String>],
+    row_data: &[Option<ByteString>],
     table_name: &str,
 ) -> bool {
     let value = if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = expr {
@@ -198,7 +199,7 @@ fn unary_expr_evaluate(
 /// the column references a different table than the row belongs to.
 fn column_value_get<'a>(
     col: &ResolvedColumnNode,
-    row_data: &'a [Option<String>],
+    row_data: &'a [Option<ByteString>],
     table_name: &str,
 ) -> Option<&'a str> {
     if col.table.as_str() != table_name {
@@ -218,7 +219,7 @@ enum ColumnRowValue<'a> {
 
 fn column_row_value_get<'a>(
     col: &ResolvedColumnNode,
-    row_data: &'a [Option<String>],
+    row_data: &'a [Option<ByteString>],
     table_name: &str,
 ) -> ColumnRowValue<'a> {
     if col.table.as_str() != table_name {
@@ -700,11 +701,7 @@ mod tests {
     #[test]
     fn expr_comparison_evaluate_string_match() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::Equal,
@@ -718,11 +715,7 @@ mod tests {
     #[test]
     fn expr_comparison_evaluate_string_no_match() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::Equal,
@@ -736,11 +729,7 @@ mod tests {
     #[test]
     fn expr_comparison_evaluate_integer_match() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("123".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::Equal,
@@ -754,7 +743,7 @@ mod tests {
     #[test]
     fn expr_comparison_evaluate_null_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".to_owned()), None, Some("true".to_owned())];
+        let row_data = vec![Some("1".into()), None, Some("true".into())];
 
         let expr = binary(
             BinaryOp::Equal,
@@ -768,11 +757,7 @@ mod tests {
     #[test]
     fn expr_comparison_evaluate_reverse_order() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
 
         // value = column (reverse order)
         let expr = binary(
@@ -791,11 +776,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_simple_equality() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary_expr(
             BinaryOp::Equal,
@@ -809,11 +790,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_and_operation_both_true() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("123".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary_expr(
             BinaryOp::And,
@@ -835,11 +812,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_and_operation_one_false() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("123".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary_expr(
             BinaryOp::And,
@@ -861,11 +834,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_or_operation_one_true() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("123".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary_expr(
             BinaryOp::Or,
@@ -887,11 +856,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_or_operation_both_false() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("123".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary_expr(
             BinaryOp::Or,
@@ -913,11 +878,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_greater_than() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("123".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary_expr(
             BinaryOp::GreaterThan,
@@ -931,11 +892,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_unsupported_expression_type() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("123".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
 
         let expr = ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Function(ResolvedFunctionCall {
             name: EcoString::from("upper"),
@@ -965,11 +922,7 @@ mod tests {
     fn where_expr_evaluate_identity_text_cast_matches() {
         // `name::text = 'john'` on a TEXT column — cast is identity, must match.
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
 
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
         let expr = binary_expr(
@@ -984,11 +937,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_identity_text_cast_no_match() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("alice".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("alice".into()), Some("true".into())];
 
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
         let expr = binary_expr(
@@ -1005,11 +954,7 @@ mod tests {
         // PGC-177: ::text on int column is identity — wire-text matches
         // canonical int→text exactly.
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("42".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("42".into()), Some("john".into()), Some("true".into())];
 
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "id")));
         let expr = binary_expr(
@@ -1026,11 +971,7 @@ mod tests {
         // bool wire-text is `t`/`f`; `::text` on bool returns `true`/`false`.
         // Not identity — evaluator must bail back to opaque (return false).
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("t".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("t".into())];
 
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(
             &table, "active",
@@ -1048,11 +989,7 @@ mod tests {
     fn where_expr_evaluate_identity_text_cast_rhs_position() {
         // `'john' = name::text` — cast on RHS, still must match.
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
 
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
         let expr = binary_expr(
@@ -1109,11 +1046,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_text_to_int4_coercion_matches() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("42".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("42".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1131,11 +1064,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_text_to_int4_coercion_no_match() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("42".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("42".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1154,11 +1083,7 @@ mod tests {
     fn where_expr_evaluate_text_to_int4_unparseable_row_excluded() {
         // `'abc'::int4` raises in postgres; here the row is excluded.
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("abc".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("abc".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1178,11 +1103,7 @@ mod tests {
         // ORM-generated `text_col::int = '42'` — string literal whose
         // content parses as int. Must coerce both sides to int and compare.
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("42".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("42".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1202,11 +1123,7 @@ mod tests {
         // Numerical compare avoids the lexicographic-string trap:
         // "100" < "42" by bytes, but 100 > 42 by value.
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("100".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("100".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1225,9 +1142,9 @@ mod tests {
     fn where_expr_evaluate_text_to_int8_wide_range_matches() {
         let table = test_table_metadata();
         let row_data = vec![
-            Some("1".to_owned()),
-            Some("9223372036854775807".to_owned()),
-            Some("true".to_owned()),
+            Some("1".into()),
+            Some("9223372036854775807".into()),
+            Some("true".into()),
         ];
 
         let cast_col = typecast(
@@ -1329,11 +1246,7 @@ mod tests {
     fn where_expr_evaluate_literal_lhs_less_than_column() {
         // SQL `WHERE 5 < id` with id=10 → true (5 < 10).
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("10".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("10".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary_expr(
             BinaryOp::LessThan,
@@ -1348,11 +1261,7 @@ mod tests {
     fn where_expr_evaluate_literal_lhs_greater_than_column() {
         // SQL `WHERE 5 > id` with id=10 → false (5 > 10 is false).
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("10".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("10".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary_expr(
             BinaryOp::GreaterThan,
@@ -1367,11 +1276,7 @@ mod tests {
     fn where_expr_evaluate_literal_lhs_less_than_column_no_match() {
         // SQL `WHERE 100 < id` with id=10 → false (100 < 10 is false).
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("10".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("10".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary_expr(
             BinaryOp::LessThan,
@@ -1387,11 +1292,7 @@ mod tests {
         // SQL `WHERE 5 < name::int4` with name="10" → true (5 < 10).
         // Same flip semantics on the cast-coercion path.
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("10".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("10".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1410,11 +1311,7 @@ mod tests {
     fn where_expr_evaluate_literal_lhs_greater_than_or_equal_column() {
         // SQL `WHERE 10 >= id` with id=10 → true (10 >= 10).
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("10".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("10".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary_expr(
             BinaryOp::GreaterThanOrEqual,
@@ -1432,11 +1329,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_text_to_bool_coercion_matches() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("true".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("true".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1454,11 +1347,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_text_to_bool_coercion_no_match() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("false".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("false".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1488,11 +1377,7 @@ mod tests {
             ("t", false, false),
             ("garbage", true, false),
         ] {
-            let row_data = vec![
-                Some("1".to_owned()),
-                Some(stored.to_owned()),
-                Some("true".to_owned()),
-            ];
+            let row_data = vec![Some("1".into()), Some(stored.into()), Some("true".into())];
             let cast_col = typecast(
                 CastTarget::Bool,
                 ResolvedScalarExpr::Column(resolved_column(&table, "name")),
@@ -1514,11 +1399,7 @@ mod tests {
     fn where_expr_evaluate_text_to_bool_with_string_literal() {
         // ORM-generated `text_col::bool = 't'` — string literal that parses as bool.
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("true".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("true".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1538,11 +1419,7 @@ mod tests {
         // Postgres coerces `1` → true / `0` → false in bool comparisons; our
         // evaluator mirrors that so the CDC fast path doesn't silently drop rows.
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("true".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("true".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1560,11 +1437,7 @@ mod tests {
     fn where_expr_evaluate_text_to_bool_inequality_op_rejected() {
         // `<` on bool isn't supported by the wedge — eval returns false.
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("true".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("true".into()), Some("true".into())];
 
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1582,9 +1455,9 @@ mod tests {
     fn where_expr_evaluate_text_to_bool_unparseable_row_excluded() {
         let table = test_table_metadata();
         let row_data = vec![
-            Some("1".to_owned()),
-            Some("garbage".to_owned()),
-            Some("true".to_owned()),
+            Some("1".into()),
+            Some("garbage".into()),
+            Some("true".into()),
         ];
 
         let cast_col = typecast(
@@ -1672,9 +1545,9 @@ mod tests {
     fn where_expr_evaluate_timestamp_to_date_coercion_matches() {
         let table = test_table_metadata_with_timestamp();
         let row_data = vec![
-            Some("1".to_owned()),
-            Some("alice".to_owned()),
-            Some("2024-01-15 23:45:00".to_owned()),
+            Some("1".into()),
+            Some("alice".into()),
+            Some("2024-01-15 23:45:00".into()),
             None,
         ];
 
@@ -1695,9 +1568,9 @@ mod tests {
     fn where_expr_evaluate_timestamp_to_date_coercion_no_match() {
         let table = test_table_metadata_with_timestamp();
         let row_data = vec![
-            Some("1".to_owned()),
-            Some("alice".to_owned()),
-            Some("2024-01-15 23:45:00".to_owned()),
+            Some("1".into()),
+            Some("alice".into()),
+            Some("2024-01-15 23:45:00".into()),
             None,
         ];
 
@@ -1718,9 +1591,9 @@ mod tests {
     fn where_expr_evaluate_timestamp_to_date_inequality_compares_chronologically() {
         let table = test_table_metadata_with_timestamp();
         let row_data = vec![
-            Some("1".to_owned()),
-            Some("alice".to_owned()),
-            Some("2024-03-15 09:00:00".to_owned()),
+            Some("1".into()),
+            Some("alice".into()),
+            Some("2024-03-15 09:00:00".into()),
             None,
         ];
 
@@ -1742,9 +1615,9 @@ mod tests {
         // Locks PGC-186 fix for the date path too: `'2024-01-01' < ts::date`.
         let table = test_table_metadata_with_timestamp();
         let row_data = vec![
-            Some("1".to_owned()),
-            Some("alice".to_owned()),
-            Some("2024-03-15 09:00:00".to_owned()),
+            Some("1".into()),
+            Some("alice".into()),
+            Some("2024-03-15 09:00:00".into()),
             None,
         ];
 
@@ -1768,9 +1641,9 @@ mod tests {
         // evaluator must compare it the same as a plain String literal.
         let table = test_table_metadata_with_timestamp();
         let row_data = vec![
-            Some("1".to_owned()),
-            Some("alice".to_owned()),
-            Some("2024-01-15 23:45:00".to_owned()),
+            Some("1".into()),
+            Some("alice".into()),
+            Some("2024-01-15 23:45:00".into()),
             None,
         ];
 
@@ -1884,11 +1757,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_true_with_true_value() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("t".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("t".into())];
 
         let expr = unary_expr(UnaryOp::IsTrue, col_expr(&table, "active"));
 
@@ -1898,11 +1767,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_true_with_false_value() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("f".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("f".into())];
 
         let expr = unary_expr(UnaryOp::IsTrue, col_expr(&table, "active"));
 
@@ -1912,7 +1777,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_true_with_null_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".to_owned()), Some("john".to_owned()), None];
+        let row_data = vec![Some("1".into()), Some("john".into()), None];
 
         let expr = unary_expr(UnaryOp::IsTrue, col_expr(&table, "active"));
 
@@ -1923,11 +1788,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_false_with_false_value() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("f".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("f".into())];
 
         let expr = unary_expr(UnaryOp::IsFalse, col_expr(&table, "active"));
 
@@ -1937,11 +1798,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_false_with_true_value() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("t".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("t".into())];
 
         let expr = unary_expr(UnaryOp::IsFalse, col_expr(&table, "active"));
 
@@ -1951,11 +1808,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_not_true_with_false_value() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("f".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("f".into())];
 
         let expr = unary_expr(UnaryOp::IsNotTrue, col_expr(&table, "active"));
 
@@ -1966,7 +1819,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_not_true_with_null_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".to_owned()), Some("john".to_owned()), None];
+        let row_data = vec![Some("1".into()), Some("john".into()), None];
 
         let expr = unary_expr(UnaryOp::IsNotTrue, col_expr(&table, "active"));
 
@@ -1977,11 +1830,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_not_false_with_true_value() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("t".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("t".into())];
 
         let expr = unary_expr(UnaryOp::IsNotFalse, col_expr(&table, "active"));
 
@@ -1991,7 +1840,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_not_false_with_null_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".to_owned()), Some("john".to_owned()), None];
+        let row_data = vec![Some("1".into()), Some("john".into()), None];
 
         let expr = unary_expr(UnaryOp::IsNotFalse, col_expr(&table, "active"));
 
@@ -2002,7 +1851,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_null_via_unary() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".to_owned()), Some("john".to_owned()), None];
+        let row_data = vec![Some("1".into()), Some("john".into()), None];
 
         let expr = unary_expr(UnaryOp::IsNull, col_expr(&table, "active"));
 
@@ -2012,11 +1861,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_not_null_via_unary() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("t".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("t".into())];
 
         let expr = unary_expr(UnaryOp::IsNotNull, col_expr(&table, "active"));
 
@@ -2030,11 +1875,7 @@ mod tests {
     #[test]
     fn expr_not_equal_evaluate_string_match() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::NotEqual,
@@ -2048,11 +1889,7 @@ mod tests {
     #[test]
     fn expr_not_equal_evaluate_string_no_match() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::NotEqual,
@@ -2066,11 +1903,7 @@ mod tests {
     #[test]
     fn expr_less_than_evaluate_integer_true() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("50".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("50".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::LessThan,
@@ -2084,11 +1917,7 @@ mod tests {
     #[test]
     fn expr_less_than_evaluate_integer_false() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("150".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("150".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::LessThan,
@@ -2102,11 +1931,7 @@ mod tests {
     #[test]
     fn expr_less_than_or_equal_evaluate_integer_equal() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("100".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("100".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::LessThanOrEqual,
@@ -2120,11 +1945,7 @@ mod tests {
     #[test]
     fn expr_less_than_or_equal_evaluate_integer_less() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("50".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("50".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::LessThanOrEqual,
@@ -2138,11 +1959,7 @@ mod tests {
     #[test]
     fn expr_less_than_or_equal_evaluate_integer_false() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("150".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("150".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::LessThanOrEqual,
@@ -2156,11 +1973,7 @@ mod tests {
     #[test]
     fn expr_greater_than_evaluate_integer_true() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("150".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("150".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::GreaterThan,
@@ -2174,11 +1987,7 @@ mod tests {
     #[test]
     fn expr_greater_than_evaluate_integer_false() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("50".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("50".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::GreaterThan,
@@ -2192,11 +2001,7 @@ mod tests {
     #[test]
     fn expr_greater_than_or_equal_evaluate_integer_equal() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("100".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("100".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::GreaterThanOrEqual,
@@ -2210,11 +2015,7 @@ mod tests {
     #[test]
     fn expr_greater_than_or_equal_evaluate_integer_greater() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("150".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("150".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::GreaterThanOrEqual,
@@ -2228,11 +2029,7 @@ mod tests {
     #[test]
     fn expr_greater_than_or_equal_evaluate_integer_false() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("50".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("50".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::GreaterThanOrEqual,
@@ -2264,10 +2061,10 @@ mod tests {
         table.columns = ColumnStore::new(cols);
 
         let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-            Some("99.50".to_owned()),
+            Some("1".into()),
+            Some("john".into()),
+            Some("true".into()),
+            Some("99.50".into()),
         ];
 
         let expr = binary(
@@ -2288,11 +2085,7 @@ mod tests {
     #[test]
     fn expr_comparison_evaluate_string_operations() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
 
         let expr = binary(
             BinaryOp::LessThan,
@@ -2312,7 +2105,7 @@ mod tests {
     #[test]
     fn expr_comparison_evaluate_null_handling() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".to_owned()), None, Some("true".to_owned())];
+        let row_data = vec![Some("1".into()), None, Some("true".into())];
 
         // NULL comparisons other than equality return false
         let expr = binary(
@@ -2348,11 +2141,7 @@ mod tests {
             val_expr(LiteralValue::Integer(1)),
         );
 
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
         assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
     }
 
@@ -2510,11 +2299,7 @@ mod tests {
             ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(other_col)),
         );
 
-        let row_data = vec![
-            Some("1".to_owned()),
-            Some("john".to_owned()),
-            Some("true".to_owned()),
-        ];
+        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
     }
 }

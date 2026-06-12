@@ -12,6 +12,7 @@ use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow, Statement};
 use tracing::{debug, error, info, instrument, trace, warn};
 
 use crate::catalog::TableMetadata;
+use crate::pg::protocol::ByteString;
 
 use crate::query::ast::{BinaryOp, Deparse};
 use crate::query::cast::cast_target_coerce_text;
@@ -53,16 +54,16 @@ struct PendingRepairSlot {
     /// Rendered source PK, for overlay bookkeeping.
     overlay_key: EcoString,
     /// Raw source-PK column values, for matching lookup result rows.
-    raw_pk: Vec<String>,
+    raw_pk: Vec<ByteString>,
 }
 
 /// Pass-1 outcome for one toasted update (PGC-264).
 enum ToastResolution {
     /// Overlay hit: the toasted positions' values to substitute.
-    Repaired(Vec<(usize, Option<String>)>),
+    Repaired(Vec<(usize, Option<ByteString>)>),
     /// No in-batch state: queue for the batched lookup, keyed by these raw
     /// source-PK values.
-    Queue(Vec<String>),
+    Queue(Vec<ByteString>),
     Fallback,
 }
 
@@ -96,7 +97,7 @@ const PREPARED_EVAL_CACHE_CAPACITY: NonZeroUsize = match NonZeroUsize::new(512) 
 /// this is the single place the binding contract is produced.
 fn chunk_arrays_build<'a>(
     table_metadata: &TableMetadata,
-    row_chunk: &[(usize, &'a [Option<String>])],
+    row_chunk: &[(usize, &'a [Option<ByteString>])],
 ) -> (Vec<i32>, Vec<Vec<Option<&'a str>>>) {
     // Chunk length is bounded by PG_EVAL_ROW_CHUNK (64): never wraps.
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -155,7 +156,7 @@ struct PreparedEvalKey {
 }
 
 /// Per-relation membership-eval rows of one segment: `(event index, row)`.
-type SegmentRows<'a> = HashMap<u32, Vec<(usize, &'a [Option<String>])>>;
+type SegmentRows<'a> = HashMap<u32, Vec<(usize, &'a [Option<ByteString>])>>;
 
 /// Max complete source frames accumulated per batch (PGC-242). The event cap
 /// (`FRAME_ROWS_CAPACITY`) usually triggers first for fat frames; this bounds
@@ -376,7 +377,7 @@ pub(super) struct WriterCdc {
 pub(super) fn row_constraints_match(
     constraints: &QueryConstraints,
     table_metadata: &TableMetadata,
-    row_data: &[Option<String>],
+    row_data: &[Option<ByteString>],
 ) -> bool {
     let Some(constraints) = constraints
         .table_constraints
@@ -508,7 +509,7 @@ impl WriterCdc {
         core.frame_deleted_keys.clear();
         core.frame_truncated_relations.clear();
         core.batch_deleted_pks.clear();
-        core.batch_toast_overlay.clear();
+        core.toast_overlay_reset();
         core.batch_toast_guard_oids.clear();
         core.frame_state = FrameState::Recovering;
         Ok(())
@@ -808,7 +809,7 @@ impl WriterCdc {
         // row image); deletes carry no membership question.
         let mut rows_by_relation: SegmentRows<'_> = HashMap::new();
         for (offset, event) in events.iter().enumerate() {
-            let (relation_oid, row): (u32, &[Option<String>]) = match event {
+            let (relation_oid, row): (u32, &[Option<ByteString>]) = match event {
                 FrameRowEvent::Insert {
                     relation_oid,
                     row_data,
@@ -854,7 +855,7 @@ impl WriterCdc {
             // relation (e.g. truncated tuples) fall back to per-row eval by
             // staying out of `covered`.
             let full_width = table_metadata.columns.len();
-            let batch_rows: Vec<(usize, &[Option<String>])> = rows
+            let batch_rows: Vec<(usize, &[Option<ByteString>])> = rows
                 .into_iter()
                 .filter(|(_, row)| row.len() == full_width)
                 .collect();
@@ -882,7 +883,7 @@ impl WriterCdc {
             // does zero PgEval round-trips for locally-matched rows. (A gating
             // miss is safe: uncovered rows fall back to per-row `pg_eval_any`,
             // itself guarded by `if !matched` at decide time.)
-            let rest_rows: Vec<(usize, &[Option<String>])> = if rest.is_empty() {
+            let rest_rows: Vec<(usize, &[Option<ByteString>])> = if rest.is_empty() {
                 Vec::new()
             } else {
                 batch_rows
@@ -928,7 +929,7 @@ impl WriterCdc {
         &mut self,
         table_metadata: &TableMetadata,
         queries: &[&UpdateQuery],
-        rows: &[(usize, &[Option<String>])],
+        rows: &[(usize, &[Option<ByteString>])],
         hits: &mut HashSet<(usize, u64)>,
     ) -> CacheResult<()> {
         for row_chunk in rows.chunks(PG_EVAL_ROW_CHUNK) {
@@ -958,7 +959,7 @@ impl WriterCdc {
         &mut self,
         table_metadata: &TableMetadata,
         queries: &[&UpdateQuery],
-        row_chunk: &[(usize, &[Option<String>])],
+        row_chunk: &[(usize, &[Option<ByteString>])],
         hits: &mut HashSet<(usize, u64)>,
     ) -> CacheResult<()> {
         let (ordinals, column_arrays) = chunk_arrays_build(table_metadata, row_chunk);
@@ -1055,10 +1056,11 @@ impl WriterCdc {
         &mut self,
         table_metadata: &TableMetadata,
         queries: &[&UpdateQuery],
-        row_chunk: &[(usize, &[Option<String>])],
+        row_chunk: &[(usize, &[Option<ByteString>])],
         hits: &mut HashSet<(usize, u64)>,
     ) -> CacheResult<()> {
-        let chunk_rows: Vec<&[Option<String>]> = row_chunk.iter().map(|(_, row)| *row).collect();
+        let chunk_rows: Vec<&[Option<ByteString>]> =
+            row_chunk.iter().map(|(_, row)| *row).collect();
         for query_chunk in queries.chunks(PG_EVAL_CHUNK) {
             self.pg_eval_buf.clear();
             for (ordinal, update_query) in query_chunk.iter().enumerate() {
@@ -1162,7 +1164,7 @@ impl WriterCdc {
             }
             // Uniform VALUES arity, as in the membership batch.
             let full_width = table_metadata.columns.len();
-            let batch_rows: Vec<(usize, &[Option<String>])> = rows
+            let batch_rows: Vec<(usize, &[Option<ByteString>])> = rows
                 .into_iter()
                 .filter(|(_, row)| row.len() == full_width)
                 .collect();
@@ -1200,7 +1202,7 @@ impl WriterCdc {
         &mut self,
         core: &WriterCore,
         table_metadata: &TableMetadata,
-        row_chunk: &[(usize, &[Option<String>])],
+        row_chunk: &[(usize, &[Option<ByteString>])],
         batch: &mut RelationBatch,
     ) -> CacheResult<()> {
         let relation_oid = table_metadata.relation_oid;
@@ -1280,7 +1282,7 @@ impl WriterCdc {
         &mut self,
         core: &WriterCore,
         table_metadata: &TableMetadata,
-        row_chunk: &[(usize, &[Option<String>])],
+        row_chunk: &[(usize, &[Option<ByteString>])],
         batch: &mut RelationBatch,
     ) -> CacheResult<()> {
         self.pg_eval_buf.clear();
@@ -1398,7 +1400,7 @@ impl WriterCdc {
         core.batch_frames = 0;
         core.batch_events = 0;
         core.batch_deleted_pks.clear();
-        core.batch_toast_overlay.clear();
+        core.toast_overlay_reset();
         core.batch_toast_guard_oids.clear();
         self.applied_lsn_advance(lsn);
         core.last_applied_lsn = self.last_applied_lsn;
@@ -1524,7 +1526,7 @@ impl WriterCdc {
                     core.frame_deleted_keys.clear();
                     core.frame_truncated_relations.clear();
                     core.batch_deleted_pks.clear();
-                    core.batch_toast_overlay.clear();
+                    core.toast_overlay_reset();
                     core.batch_toast_guard_oids.clear();
                 }
             }
@@ -1788,7 +1790,7 @@ impl WriterCdc {
     fn toast_overlay_record_write(
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) {
         let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
             return;
@@ -1799,14 +1801,20 @@ impl WriterCdc {
         let Some(key) = pk_body_render(table_metadata, row_data) else {
             return;
         };
-        let values: Vec<(usize, Option<String>)> = table_metadata
-            .columns
-            .iter()
-            .filter(|c| c.is_toastable())
-            .map(|c| (c.index(), row_data.get(c.index()).cloned().flatten()))
-            .collect();
-        core.batch_toast_overlay
+        // Reuse a pooled Vec (field access keeps the `core.cache` borrow of
+        // `table_metadata` disjoint from the pool and overlay borrows).
+        let mut values = core.toast_overlay_pool.pop().unwrap_or_default();
+        values.extend(
+            table_metadata
+                .columns
+                .iter()
+                .filter(|c| c.is_toastable())
+                .map(|c| (c.index(), row_data.get(c.index()).cloned().flatten())),
+        );
+        let displaced = core
+            .batch_toast_overlay
             .insert((relation_oid, key), ToastOverlayEntry::Values(values));
+        core.toast_overlay_recycle(displaced);
     }
 
     /// Tombstone a PK in the toast overlay (PGC-264): the row was deleted (or
@@ -1815,7 +1823,7 @@ impl WriterCdc {
     fn toast_overlay_record_delete(
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) {
         let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
             return;
@@ -1824,8 +1832,10 @@ impl WriterCdc {
             return;
         }
         if let Some(key) = pk_body_render(table_metadata, row_data) {
-            core.batch_toast_overlay
+            let displaced = core
+                .batch_toast_overlay
                 .insert((relation_oid, key), ToastOverlayEntry::Deleted);
+            core.toast_overlay_recycle(displaced);
         }
     }
 
@@ -1983,8 +1993,8 @@ impl WriterCdc {
         pending: &mut HashMap<u32, Vec<PendingRepairSlot>>,
         event_idx: usize,
         relation_oid: u32,
-        key_data: Vec<Option<String>>,
-        new_row_data: &mut Vec<Option<String>>,
+        key_data: Vec<Option<ByteString>>,
+        new_row_data: &mut Vec<Option<ByteString>>,
         toasted: Vec<usize>,
     ) -> FrameRowEvent {
         let metrics = &crate::metrics::handles().cdc;
@@ -2001,7 +2011,7 @@ impl WriterCdc {
         // the row's PRE-image key: when this UPDATE changed the PK
         // (`key_data` non-empty), the source row is the old PK.
         let pk_changed = !key_data.is_empty();
-        let source_row: &[Option<String>] = if pk_changed { &key_data } else { new_row_data };
+        let source_row: &[Option<ByteString>] = if pk_changed { &key_data } else { new_row_data };
         let source_pk = pk_body_render(table_metadata, source_row);
 
         let resolution = match &source_pk {
@@ -2009,7 +2019,7 @@ impl WriterCdc {
             Some(key) => match core.batch_toast_overlay.get(&(relation_oid, key.clone())) {
                 Some(ToastOverlayEntry::Values(values)) => {
                     let mut complete = true;
-                    let mut repaired: Vec<(usize, Option<String>)> =
+                    let mut repaired: Vec<(usize, Option<ByteString>)> =
                         Vec::with_capacity(toasted.len());
                     for &t in &toasted {
                         match values.iter().find(|(pos, _)| *pos == t) {
@@ -2030,7 +2040,7 @@ impl WriterCdc {
                 None => {
                     // Raw PK values for matching the lookup result; a NULL PK
                     // value can never match a lookup row, so fall back.
-                    let raw: Option<Vec<String>> = table_metadata
+                    let raw: Option<Vec<ByteString>> = table_metadata
                         .primary_key_columns
                         .iter()
                         .map(|pk_column| {
@@ -2108,8 +2118,8 @@ impl WriterCdc {
     fn toast_fallback_build(
         core: &mut WriterCore,
         relation_oid: u32,
-        key_data: Vec<Option<String>>,
-        new_row_data: Vec<Option<String>>,
+        key_data: Vec<Option<ByteString>>,
+        new_row_data: Vec<Option<ByteString>>,
         toasted: &[usize],
     ) -> FrameRowEvent {
         let toasted_columns: Vec<EcoString> = core
@@ -2146,7 +2156,7 @@ impl WriterCdc {
         core: &WriterCore,
         relation_oid: u32,
         pendings: &[PendingRepairSlot],
-    ) -> Option<HashMap<Vec<String>, Vec<(usize, Option<String>)>>> {
+    ) -> Option<HashMap<Vec<ByteString>, Vec<(usize, Option<ByteString>)>>> {
         let table_metadata = core.cache.tables.get1(&relation_oid)?;
         let pk_columns: Vec<&EcoString> = table_metadata
             .primary_key_columns
@@ -2197,7 +2207,7 @@ impl WriterCdc {
             sql.push_str(pk_columns.first()?);
         }
         sql.push_str(" IN (");
-        let mut seen: HashSet<&[String]> = HashSet::new();
+        let mut seen: HashSet<&[ByteString]> = HashSet::new();
         let mut first = true;
         for p in pendings {
             if !seen.insert(p.raw_pk.as_slice()) {
@@ -2229,15 +2239,15 @@ impl WriterCdc {
                     let SimpleQueryMessage::Row(row) = msg else {
                         continue;
                     };
-                    let key: Option<Vec<String>> = (0..pk_columns.len())
-                        .map(|i| row.get(i).map(str::to_owned))
+                    let key: Option<Vec<ByteString>> = (0..pk_columns.len())
+                        .map(|i| row.get(i).map(ByteString::from))
                         .collect();
                     let Some(key) = key else { continue };
-                    let values: Vec<(usize, Option<String>)> = toastable
+                    let values: Vec<(usize, Option<ByteString>)> = toastable
                         .iter()
                         .enumerate()
                         .map(|(j, (pos, _))| {
-                            (*pos, row.get(pk_columns.len() + j).map(str::to_owned))
+                            (*pos, row.get(pk_columns.len() + j).map(ByteString::from))
                         })
                         .collect();
                     rows.insert(key, values);
@@ -2260,7 +2270,7 @@ impl WriterCdc {
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         core.frame_begin_ensure();
         let table_metadata =
@@ -2291,7 +2301,7 @@ impl WriterCdc {
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         self.frame_cache_delete_inner(core, relation_oid, row_data, true)
             .await
@@ -2307,7 +2317,7 @@ impl WriterCdc {
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         self.frame_cache_delete_inner(core, relation_oid, row_data, false)
             .await
@@ -2317,7 +2327,7 @@ impl WriterCdc {
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
         record_lost_key: bool,
     ) -> CacheResult<()> {
         core.frame_begin_ensure();
@@ -2358,13 +2368,15 @@ impl WriterCdc {
     }
 
     /// Handle INSERT operation.
-    #[instrument(skip_all)]
+    // Trace level: at info/debug the fmt layer allocates per-span extensions,
+    // which would put a heap allocation on every CDC event.
+    #[instrument(skip_all, level = "trace")]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_insert(
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
         batch: Option<BatchEvalView<'_>>,
     ) -> CacheResult<()> {
         let start = Instant::now();
@@ -2418,14 +2430,16 @@ impl WriterCdc {
     }
 
     /// Handle UPDATE operation.
-    #[instrument(skip_all)]
+    // Trace level: at info/debug the fmt layer allocates per-span extensions,
+    // which would put a heap allocation on every CDC event.
+    #[instrument(skip_all, level = "trace")]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn handle_update(
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        key_data: &[Option<String>],
-        new_row_data: &[Option<String>],
+        key_data: &[Option<ByteString>],
+        new_row_data: &[Option<ByteString>],
         batch: Option<BatchEvalView<'_>>,
     ) -> CacheResult<()> {
         let start = Instant::now();
@@ -2552,8 +2566,8 @@ impl WriterCdc {
     fn toast_fallback_structural_invalidate(
         update_query: &UpdateQuery,
         table_metadata: &TableMetadata,
-        new_row_data: &[Option<String>],
-        key_data: &[Option<String>],
+        new_row_data: &[Option<ByteString>],
+        key_data: &[Option<ByteString>],
         toasted_columns: &[EcoString],
     ) -> bool {
         // Constraint/predicate evaluation reads an elided column → nothing
@@ -2613,13 +2627,15 @@ impl WriterCdc {
     /// query over the relation (superseding their in-flight populations via
     /// the generation bump) and evict the stale row without a record; later
     /// populations snapshot post-update origin and merge cleanly.
-    #[instrument(skip_all)]
+    // Trace level: at info/debug the fmt layer allocates per-span extensions,
+    // which would put a heap allocation on every CDC event.
+    #[instrument(skip_all, level = "trace")]
     async fn handle_update_toast_fallback(
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        key_data: &[Option<String>],
-        new_row_data: &[Option<String>],
+        key_data: &[Option<ByteString>],
+        new_row_data: &[Option<ByteString>],
         toasted_columns: &[EcoString],
     ) -> CacheResult<()> {
         // See handle_insert: an untracked relation's CDC is a benign skip.
@@ -2712,12 +2728,14 @@ impl WriterCdc {
     /// Deletes the row from cache tables and checks for subquery invalidations.
     /// For Exclusion subquery tables (NOT IN, NOT EXISTS), a DELETE shrinks the
     /// exclusion set, which grows the outer result set — requiring invalidation.
-    #[instrument(skip_all)]
+    // Trace level: at info/debug the fmt layer allocates per-span extensions,
+    // which would put a heap allocation on every CDC event.
+    #[instrument(skip_all, level = "trace")]
     pub async fn handle_delete(
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         let start = Instant::now();
         crate::metrics::handles().cdc.handle_deletes.increment(1);
@@ -2916,7 +2934,7 @@ impl WriterCdc {
         &self,
         core: &WriterCore,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> CacheResult<Option<HashMap<EcoString, bool>>> {
         let table_metadata =
             core.cache
@@ -3006,7 +3024,7 @@ impl WriterCdc {
         &self,
         constraints: &QueryConstraints,
         table_metadata: &TableMetadata,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> bool {
         row_constraints_match(constraints, table_metadata, row_data)
     }
@@ -3017,8 +3035,8 @@ impl WriterCdc {
         &self,
         update_query: &UpdateQuery,
         table_metadata: &TableMetadata,
-        row_data: &[Option<String>],
-        key_data: Option<&[Option<String>]>,
+        row_data: &[Option<ByteString>],
+        key_data: Option<&[Option<ByteString>]>,
         operation: CdcOperation,
     ) -> bool {
         match update_query.source {
@@ -3118,7 +3136,7 @@ impl WriterCdc {
         &self,
         update_query: &UpdateQuery,
         table_metadata: &TableMetadata,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
         row_changes: &HashMap<EcoString, bool>,
     ) -> bool {
         // Subquery and non-terminal outer join tables: always invalidate on
@@ -3177,8 +3195,8 @@ impl WriterCdc {
         core: &WriterCore,
         relation_oid: u32,
         row_changes: Option<&HashMap<EcoString, bool>>,
-        row_data: &[Option<String>],
-        key_data: Option<&[Option<String>]>,
+        row_data: &[Option<ByteString>],
+        key_data: Option<&[Option<ByteString>]>,
         operation: CdcOperation,
     ) -> CacheResult<Vec<u64>> {
         // No cached query references this relation (never registered, or all
@@ -3249,7 +3267,7 @@ impl WriterCdc {
         &mut self,
         core: &mut WriterCore,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
         batch: Option<BatchEvalView<'_>>,
     ) -> CacheResult<bool> {
         // Phase A: membership evaluation. The `core` borrow is confined to
@@ -3390,7 +3408,7 @@ impl WriterCdc {
         &mut self,
         queries: &[&UpdateQuery],
         table_metadata: &TableMetadata,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> CacheResult<Vec<u64>> {
         if queries.is_empty() {
             return Ok(Vec::new());
@@ -3440,7 +3458,7 @@ impl WriterCdc {
         &mut self,
         queries: &[&UpdateQuery],
         table_metadata: &TableMetadata,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> CacheResult<bool> {
         if queries.is_empty() {
             return Ok(false);
@@ -3502,7 +3520,7 @@ impl WriterCdc {
         buf: &mut String,
         resolved: &ResolvedQueryExpr,
         table_metadata: &TableMetadata,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         let resolved_select = resolved.as_select().ok_or(CacheError::InvalidQuery)?;
         let value_select = resolved_select_node_table_replace_with_values(
@@ -3526,38 +3544,42 @@ impl WriterCdc {
         &self,
         buf: &mut String,
         table_metadata: &TableMetadata,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) {
-        let mut column_names = Vec::with_capacity(table_metadata.columns.len());
-        let mut values = Vec::with_capacity(table_metadata.columns.len());
-
-        for column_meta in &table_metadata.columns {
-            let position = column_meta.index();
-            if let Some(row_value) = row_data.get(position) {
-                let value = row_value
-                    .as_deref()
-                    .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
-                column_names.push(column_meta.name.as_str());
-                values.push(value);
-            }
-        }
-
+        // Columns with a value in `row_data` are emitted in three passes
+        // (names, values, conflict tail) over the position-sorted column
+        // store, writing straight into `buf` — no per-event Vec or String.
         let schema = &table_metadata.schema;
         let table = &table_metadata.name;
 
         let _ = write!(buf, "INSERT INTO {schema}.{table} (");
-        for (i, col) in column_names.iter().enumerate() {
-            if i > 0 {
+        let mut first = true;
+        for column_meta in &table_metadata.columns {
+            if row_data.get(column_meta.index()).is_none() {
+                continue;
+            }
+            if !first {
                 buf.push_str(", ");
             }
-            buf.push_str(col);
+            buf.push_str(column_meta.name.as_str());
+            first = false;
         }
         buf.push_str(") VALUES (");
-        for (i, val) in values.iter().enumerate() {
-            if i > 0 {
+        let mut first = true;
+        for column_meta in &table_metadata.columns {
+            let Some(row_value) = row_data.get(column_meta.index()) else {
+                continue;
+            };
+            if !first {
                 buf.push_str(", ");
             }
-            buf.push_str(val);
+            match row_value.as_deref() {
+                Some(value) => {
+                    let _ = escape::escape_literal_into(value, buf);
+                }
+                None => buf.push_str("NULL"),
+            }
+            first = false;
         }
         buf.push_str(") ON CONFLICT (");
         for (i, pk) in table_metadata.primary_key_columns.iter().enumerate() {
@@ -3567,17 +3589,19 @@ impl WriterCdc {
             buf.push_str(pk);
         }
         buf.push(')');
-        cdc_on_conflict_tail_append(buf, &column_names, &table_metadata.primary_key_columns);
+        cdc_on_conflict_tail_append(buf, table_metadata, row_data);
     }
 
-    #[instrument(skip_all)]
+    // Trace level: at info/debug the fmt layer allocates per-span extensions,
+    // which would put a heap allocation on every CDC event.
+    #[instrument(skip_all, level = "trace")]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     /// Append a PK-qualified delete for `row_data` into `buf` (PGC-228).
     pub(super) fn cache_delete_into(
         &self,
         buf: &mut String,
         table_metadata: &TableMetadata,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         let _ = write!(
             buf,
@@ -3590,13 +3614,16 @@ impl WriterCdc {
             if let Some(column_meta) = table_metadata.columns.get(pk_column.as_str()) {
                 let position = column_meta.index();
                 if let Some(row_value) = row_data.get(position) {
-                    let value = row_value
-                        .as_deref()
-                        .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
                     if has_pk {
                         buf.push_str(" AND ");
                     }
-                    let _ = write!(buf, "{pk_column} = {value}");
+                    let _ = write!(buf, "{pk_column} = ");
+                    match row_value.as_deref() {
+                        Some(value) => {
+                            let _ = escape::escape_literal_into(value, buf);
+                        }
+                        None => buf.push_str("NULL"),
+                    }
                     has_pk = true;
                 }
             }
@@ -3710,26 +3737,31 @@ impl WriterCore {
 /// Assumes the caller has already emitted `INSERT INTO ... ON CONFLICT (<pk>)`.
 fn cdc_on_conflict_tail_append(
     sql: &mut String,
-    column_names: &[&str],
-    pkey_columns: &[EcoString],
+    table_metadata: &TableMetadata,
+    row_data: &[Option<ByteString>],
 ) {
-    let is_pk = |name: &str| pkey_columns.iter().any(|pk| pk.as_str() == name);
-    let has_non_pk = column_names.iter().any(|c| !is_pk(c));
-    if !has_non_pk {
-        sql.push_str(" DO NOTHING");
-        return;
-    }
-    sql.push_str(" DO UPDATE SET ");
+    let is_pk = |name: &str| {
+        table_metadata
+            .primary_key_columns
+            .iter()
+            .any(|pk| pk.as_str() == name)
+    };
     let mut first = true;
-    for col in column_names {
-        if is_pk(col) {
+    for column_meta in &table_metadata.columns {
+        if row_data.get(column_meta.index()).is_none() || is_pk(column_meta.name.as_str()) {
             continue;
         }
-        if !first {
+        if first {
+            sql.push_str(" DO UPDATE SET ");
+        } else {
             sql.push_str(", ");
         }
+        let col = column_meta.name.as_str();
         let _ = write!(sql, "{col} = EXCLUDED.{col}");
         first = false;
+    }
+    if first {
+        sql.push_str(" DO NOTHING");
     }
 }
 
@@ -3742,7 +3774,7 @@ fn cdc_on_conflict_tail_append(
 fn update_query_matches_locally(
     update_query: &UpdateQuery,
     table_metadata: &TableMetadata,
-    row_data: &[Option<String>],
+    row_data: &[Option<ByteString>],
 ) -> bool {
     let Some(select) = update_query.resolved.as_select() else {
         return false;
@@ -3759,7 +3791,7 @@ fn update_query_matches_locally(
 fn join_membership_unchanged(
     update_query: &UpdateQuery,
     table_metadata: &TableMetadata,
-    key_data: Option<&[Option<String>]>,
+    key_data: Option<&[Option<ByteString>]>,
 ) -> bool {
     let Some(key) = key_data else {
         return false;
@@ -3842,7 +3874,7 @@ mod tests {
     fn no_constraints_for_table_matches() {
         let table = fixture_table();
         let constraints = QueryConstraints::default();
-        let row = vec![Some("1".to_owned()), Some("alice".to_owned()), None];
+        let row = vec![Some("1".into()), Some("alice".into()), None];
         assert!(row_constraints_match(&constraints, &table, &row));
     }
 
@@ -3857,7 +3889,7 @@ mod tests {
                 LiteralValue::Integer(1),
             )],
         );
-        let row = vec![Some("1".to_owned()), Some("alice".to_owned()), None];
+        let row = vec![Some("1".into()), Some("alice".into()), None];
         assert!(row_constraints_match(&constraints, &table, &row));
     }
 
@@ -3872,7 +3904,7 @@ mod tests {
                 LiteralValue::Integer(1),
             )],
         );
-        let row = vec![Some("2".to_owned()), Some("alice".to_owned()), None];
+        let row = vec![Some("2".into()), Some("alice".into()), None];
         assert!(!row_constraints_match(&constraints, &table, &row));
     }
 
@@ -3892,7 +3924,7 @@ mod tests {
             )],
         );
         // name="42" coerces to Integer(42) → matches literal Integer(42).
-        let row = vec![Some("1".to_owned()), Some("42".to_owned()), None];
+        let row = vec![Some("1".into()), Some("42".into()), None];
         assert!(row_constraints_match(&constraints, &table, &row));
     }
 
@@ -3908,7 +3940,7 @@ mod tests {
                 LiteralValue::Integer(42),
             )],
         );
-        let row = vec![Some("1".to_owned()), Some("99".to_owned()), None];
+        let row = vec![Some("1".into()), Some("99".into()), None];
         assert!(!row_constraints_match(&constraints, &table, &row));
     }
 
@@ -3925,7 +3957,7 @@ mod tests {
                 LiteralValue::Integer(42),
             )],
         );
-        let row = vec![Some("1".to_owned()), Some("abc".to_owned()), None];
+        let row = vec![Some("1".into()), Some("abc".into()), None];
         assert!(!row_constraints_match(&constraints, &table, &row));
     }
 
@@ -3941,7 +3973,7 @@ mod tests {
                 LiteralValue::Boolean(true),
             )],
         );
-        let row = vec![Some("1".to_owned()), Some("yes".to_owned()), None];
+        let row = vec![Some("1".into()), Some("yes".into()), None];
         assert!(row_constraints_match(&constraints, &table, &row));
     }
 
@@ -3958,9 +3990,9 @@ mod tests {
             )],
         );
         let row = vec![
-            Some("1".to_owned()),
-            Some("alice".to_owned()),
-            Some("2024-01-15 09:00:00".to_owned()),
+            Some("1".into()),
+            Some("alice".into()),
+            Some("2024-01-15 09:00:00".into()),
         ];
         assert!(row_constraints_match(&constraints, &table, &row));
     }
@@ -3977,7 +4009,7 @@ mod tests {
                 LiteralValue::Integer(42),
             )],
         );
-        let row = vec![Some("1".to_owned()), None, None];
+        let row = vec![Some("1".into()), None, None];
         assert!(!row_constraints_match(&constraints, &table, &row));
     }
 
@@ -3995,7 +4027,7 @@ mod tests {
                 LiteralValue::Integer(100),
             )],
         );
-        let row = vec![Some("1".to_owned()), Some("500".to_owned()), None];
+        let row = vec![Some("1".into()), Some("500".into()), None];
         assert!(row_constraints_match(&constraints, &table, &row));
     }
 }

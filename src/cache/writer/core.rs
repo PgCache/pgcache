@@ -19,6 +19,7 @@ use crate::cache::status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
 };
 use crate::pg;
+use crate::pg::protocol::ByteString;
 use crate::query::ast::Deparse;
 use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, Settings};
@@ -88,6 +89,10 @@ pub(super) const FRAME_BUF_CAPACITY: usize = 256 * 1024;
 /// remainder is reclaimed on subsequent ticks.
 const EVICTION_TICK_BUDGET: usize = 512;
 
+/// Cap on recycled toast-overlay `Values` Vecs retained across batches, so an
+/// unusually large batch doesn't pin its peak overlay footprint forever.
+const TOAST_OVERLAY_POOL_MAX: usize = 4096;
+
 /// Maximum buffered row events per frame before a mid-frame partial replay —
 /// bounds frame memory the way `FRAME_BUF_CAPACITY` bounds `frame_buf`.
 /// Replaying a prefix early is exactly the per-arrival behavior, so ordering
@@ -102,12 +107,12 @@ pub(super) const FRAME_ROWS_CAPACITY: usize = 4096;
 pub(super) enum FrameRowEvent {
     Insert {
         relation_oid: u32,
-        row_data: Vec<Option<String>>,
+        row_data: Vec<Option<ByteString>>,
     },
     Update {
         relation_oid: u32,
-        key_data: Vec<Option<String>>,
-        new_row_data: Vec<Option<String>>,
+        key_data: Vec<Option<ByteString>>,
+        new_row_data: Vec<Option<ByteString>>,
     },
     /// An UPDATE whose image carries unchanged-toast markers, awaiting repair
     /// (PGC-264). Resolved by the replay pre-pass (`toast_repair_events`) into
@@ -117,8 +122,8 @@ pub(super) enum FrameRowEvent {
     /// `toasted` holds their column indexes.
     UpdateToasted {
         relation_oid: u32,
-        key_data: Vec<Option<String>>,
-        new_row_data: Vec<Option<String>>,
+        key_data: Vec<Option<ByteString>>,
+        new_row_data: Vec<Option<ByteString>>,
         toasted: Vec<usize>,
     },
     /// An UPDATE whose unchanged-toast columns could not be repaired (row
@@ -129,13 +134,13 @@ pub(super) enum FrameRowEvent {
     /// `toasted_columns` names the elided columns.
     UpdateToastFallback {
         relation_oid: u32,
-        key_data: Vec<Option<String>>,
-        new_row_data: Vec<Option<String>>,
+        key_data: Vec<Option<ByteString>>,
+        new_row_data: Vec<Option<ByteString>>,
         toasted_columns: Vec<EcoString>,
     },
     Delete {
         relation_oid: u32,
-        row_data: Vec<Option<String>>,
+        row_data: Vec<Option<ByteString>>,
     },
     Truncate {
         relation_oids: Vec<u32>,
@@ -155,7 +160,7 @@ pub(super) enum FrameRowEvent {
 pub(super) enum ToastOverlayEntry {
     /// Toastable-column `(position, value)` pairs from the last in-batch
     /// write of the row.
-    Values(Vec<(usize, Option<String>)>),
+    Values(Vec<(usize, Option<ByteString>)>),
     /// The PK was deleted this batch with no subsequent write. The pre-batch
     /// image is stale, and origin cannot update a deleted row, so a toasted
     /// update hitting this is defensive-fallback territory.
@@ -317,6 +322,11 @@ pub struct WriterCore {
     /// arrival order by the replay pre-pass; only relations with a toastable
     /// column pay for it. Same lifecycle as `batch_deleted_pks`.
     pub(super) batch_toast_overlay: HashMap<(u32, EcoString), ToastOverlayEntry>,
+    /// Recycled `ToastOverlayEntry::Values` allocations: batch reset harvests
+    /// cleared Vecs here instead of dropping them, so steady-state overlay
+    /// recording allocates no per-event Vec. Bounded by
+    /// [`TOAST_OVERLAY_POOL_MAX`].
+    pub(super) toast_overlay_pool: Vec<Vec<(usize, Option<ByteString>)>>,
     /// Relations truncated or DDL-recreated in the current batch (PGC-264).
     /// Their pre-batch committed images are wholesale untrustworthy as a
     /// toast-repair source; only overlay values written after the truncate
@@ -457,11 +467,38 @@ impl WriterCore {
             frame_open: false,
             batch_deleted_pks: HashSet::new(),
             batch_toast_overlay: HashMap::new(),
+            toast_overlay_pool: Vec::new(),
             batch_toast_guard_oids: HashSet::new(),
             data_dir,
             disk_total,
             disk_available,
         })
+    }
+
+    /// Clear the toast overlay at batch end, harvesting `Values` Vec
+    /// allocations into `toast_overlay_pool` for reuse by the next batch's
+    /// recording instead of dropping them.
+    pub(super) fn toast_overlay_reset(&mut self) {
+        for (_, entry) in self.batch_toast_overlay.drain() {
+            if self.toast_overlay_pool.len() >= TOAST_OVERLAY_POOL_MAX {
+                return;
+            }
+            if let ToastOverlayEntry::Values(mut values) = entry {
+                values.clear();
+                self.toast_overlay_pool.push(values);
+            }
+        }
+    }
+
+    /// Recycle a `Values` Vec displaced from `batch_toast_overlay` (a same-PK
+    /// rewrite or tombstone within one batch).
+    pub(super) fn toast_overlay_recycle(&mut self, entry: Option<ToastOverlayEntry>) {
+        if let Some(ToastOverlayEntry::Values(mut values)) = entry
+            && self.toast_overlay_pool.len() < TOAST_OVERLAY_POOL_MAX
+        {
+            values.clear();
+            self.toast_overlay_pool.push(values);
+        }
     }
 
     /// Whether the population identified by `(fingerprint, generation)` is still

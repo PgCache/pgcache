@@ -20,6 +20,7 @@ use postgres_protocol::escape;
 use tracing::error;
 
 use crate::catalog::TableMetadata;
+use crate::pg::protocol::ByteString;
 
 use super::super::messages::PopulationMerge;
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
@@ -248,27 +249,27 @@ impl PopulationDeletedKeys {
 /// renders PK values. `None` if no PK value is present.
 pub(super) fn pk_body_render(
     table_metadata: &TableMetadata,
-    row_data: &[Option<String>],
+    row_data: &[Option<ByteString>],
 ) -> Option<EcoString> {
-    let mut body = String::new();
+    // Escapes straight into the EcoString (inline storage for short keys):
+    // this runs per CDC event, so no intermediate String allocations.
+    let mut body = EcoString::new();
     let mut first = true;
     for pk_column in &table_metadata.primary_key_columns {
         let column_meta = table_metadata.columns.get(pk_column.as_str())?;
         let row_value = row_data.get(column_meta.index())?;
-        let literal = row_value
-            .as_deref()
-            .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
         if !first {
             body.push(',');
         }
-        body.push_str(&literal);
+        match row_value.as_deref() {
+            Some(value) => {
+                let _ = escape::escape_literal_into(value, &mut body);
+            }
+            None => body.push_str("NULL"),
+        }
         first = false;
     }
-    if first {
-        None
-    } else {
-        Some(EcoString::from(body))
-    }
+    if first { None } else { Some(body) }
 }
 
 /// Pre-rendered, owned SQL fragments for merging one relation's staging table
@@ -346,7 +347,7 @@ impl WriterCore {
     pub(super) fn population_deleted_key_cancel(
         &mut self,
         relation_oid: u32,
-        row_data: &[Option<String>],
+        row_data: &[Option<ByteString>],
     ) -> bool {
         let pending = self
             .frame_deleted_keys

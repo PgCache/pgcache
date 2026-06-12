@@ -3,6 +3,7 @@ use rootcause::Report;
 
 use crate::cache::SubqueryKind;
 use crate::catalog::TableMetadata;
+use crate::pg::protocol::ByteString;
 use crate::query::ast::{LiteralValue, TableAlias, ValuesClause};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
@@ -80,7 +81,7 @@ fn table_source_find_mut(
 /// matching alias columns.
 fn values_row_build(
     table_metadata: &TableMetadata,
-    row_data: &[Option<String>],
+    row_data: &[Option<ByteString>],
 ) -> Vec<LiteralValue> {
     let mut values = Vec::new();
     for column_meta in &table_metadata.columns {
@@ -100,7 +101,7 @@ fn values_row_build(
 /// one per column position present in `row_data`, in column order.
 fn values_column_names(
     table_metadata: &TableMetadata,
-    row_data: &[Option<String>],
+    row_data: &[Option<ByteString>],
 ) -> Vec<EcoString> {
     table_metadata
         .columns
@@ -117,7 +118,7 @@ fn values_column_names(
 pub fn resolved_select_node_table_replace_with_values(
     resolved: &ResolvedSelectNode,
     table_metadata: &TableMetadata,
-    row_data: &[Option<String>],
+    row_data: &[Option<ByteString>],
 ) -> AstTransformResult<ResolvedSelectNode> {
     let mut resolved_new = resolved.clone();
 
@@ -166,7 +167,7 @@ pub fn resolved_select_node_table_replace_with_values(
 pub fn resolved_select_node_table_replace_with_values_batch(
     resolved: &ResolvedSelectNode,
     table_metadata: &TableMetadata,
-    rows: &[&[Option<String>]],
+    rows: &[&[Option<ByteString>]],
     query_ordinal: i64,
 ) -> AstTransformResult<ResolvedSelectNode> {
     let mut resolved_new = resolved.clone();
@@ -626,10 +627,10 @@ mod tests {
         ));
         let j1 = table_metadata("j1_tbl", 5001, cols);
         let row = vec![
-            Some("1".to_owned()),
-            Some("4".to_owned()),
-            Some("one".to_owned()),
-            Some("1".to_owned()),
+            Some("1".into()),
+            Some("4".into()),
+            Some("one".into()),
+            Some("1".into()),
         ];
 
         let qe = query_expr_parse("SELECT * FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i)")
@@ -664,11 +665,7 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(table_metadata("onek", 6001, cols));
         let onek = table_metadata("onek", 6001, cols);
-        let row = vec![
-            Some("1".to_owned()),
-            Some("7".to_owned()),
-            Some("1".to_owned()),
-        ];
+        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
 
         let qe = query_expr_parse(
             "SELECT ten, count(*) FILTER (WHERE odd = 1) AS c FROM onek \
@@ -779,7 +776,7 @@ mod tests {
             ResolvedSelectColumns::None,
             None,
         );
-        let row = vec![Some("42".to_owned()), Some("alice".to_owned())];
+        let row = vec![Some("42".into()), Some("alice".into())];
 
         let result =
             resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
@@ -818,7 +815,7 @@ mod tests {
             ResolvedSelectColumns::None,
             None,
         );
-        let row = vec![Some("1".to_owned()), None];
+        let row = vec![Some("1".into()), None];
 
         let result =
             resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
@@ -871,9 +868,9 @@ mod tests {
             ResolvedSelectColumns::None,
             None,
         );
-        let row_a = vec![Some("1".to_owned()), Some("a".to_owned())];
-        let row_b = vec![Some("2".to_owned()), None];
-        let rows: Vec<&[Option<String>]> = vec![&row_a, &row_b];
+        let row_a = vec![Some("1".into()), Some("a".into())];
+        let row_b = vec![Some("2".into()), None];
+        let rows: Vec<&[Option<ByteString>]> = vec![&row_a, &row_b];
 
         let result = resolved_select_node_table_replace_with_values_batch(&node, &meta, &rows, 7)
             .expect("batch replace");
@@ -909,7 +906,7 @@ mod tests {
             ResolvedSelectColumns::None,
             None,
         );
-        let row = vec![Some("1".to_owned())];
+        let row = vec![Some("1".into())];
 
         let result =
             resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
@@ -930,7 +927,7 @@ mod tests {
     fn test_empty_from_returns_missing_table() {
         let meta = table_metadata("users", 100, &[("id", "int4")]);
         let node = select_node(vec![], ResolvedSelectColumns::None, None);
-        let row = vec![Some("1".to_owned())];
+        let row = vec![Some("1".into())];
 
         let err = resolved_select_node_table_replace_with_values(&node, &meta, &row)
             .map_err(|e| e.into_current_context())
@@ -951,7 +948,7 @@ mod tests {
             ResolvedSelectColumns::None,
             None,
         );
-        let row = vec![Some("1".to_owned())];
+        let row = vec![Some("1".into())];
 
         let err = resolved_select_node_table_replace_with_values(&node, &meta, &row)
             .map_err(|e| e.into_current_context())
@@ -984,7 +981,7 @@ mod tests {
             ResolvedSelectColumns::None,
             Some(where_clause),
         );
-        let row = vec![Some("42".to_owned()), Some("alice".to_owned())];
+        let row = vec![Some("42".into()), Some("alice".into())];
 
         let result =
             resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
@@ -1009,7 +1006,7 @@ mod tests {
 
         let meta = table_metadata("users", 100, &[("id", "int4")]);
         let node = select_node(vec![resolved_table("users", 100, None)], columns, None);
-        let row = vec![Some("42".to_owned())];
+        let row = vec![Some("42".into())];
 
         let result =
             resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
@@ -1041,7 +1038,7 @@ mod tests {
         }));
 
         let node = select_node(vec![join], ResolvedSelectColumns::None, None);
-        let row = vec![Some("7".to_owned()), Some("99.50".to_owned())];
+        let row = vec![Some("7".into()), Some("99.50".into())];
 
         let result =
             resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");

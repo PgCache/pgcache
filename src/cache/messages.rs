@@ -9,6 +9,7 @@ use tokio_util::bytes::{Bytes, BytesMut};
 use super::reply::ReplySender;
 use super::{CacheError, Report, query::CacheableQuery, query_cache::QueryType};
 use crate::catalog::TableMetadata;
+use crate::pg::protocol::ByteString;
 use crate::pg::protocol::extended::ResultFormats;
 use crate::proxy::ClientSocket;
 use crate::query::transform::query_expr_parameters_replace;
@@ -420,13 +421,13 @@ pub enum MvBuildOutcome {
 /// the value from UPDATE new-row images when the column didn't change, on the
 /// contract that the consumer already holds it. It must never be conflated
 /// with `Null` — doing so overwrites cached TOAST values with NULL.
-// String over EcoString (ADR-032 boundary exception): values arrive owned from
-// the wire and the downstream pipeline is Vec<Option<String>>; EcoString here
-// would force a per-value re-allocation at the conversion chokepoint.
+// ByteString (ADR-032 boundary exception): each value is a zero-copy
+// refcounted view into its replication frame, so decoding and cloning never
+// copy the text. The view pins its frame, which is bounded by the row size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CdcValue {
     Null,
-    Text(String),
+    Text(ByteString),
     Toasted,
 }
 
@@ -434,8 +435,8 @@ pub enum CdcValue {
 /// reporting the column indexes that carried the unchanged-toast marker
 /// (`Toasted` maps to `None` in the output). Past the writer's repair step the
 /// indexes must be empty or handled — this is the only path from `CdcValue`
-/// rows to `Option<String>` rows.
-pub fn cdc_values_convert(values: Vec<CdcValue>) -> (Vec<Option<String>>, Vec<usize>) {
+/// rows to `Option<ByteString>` rows.
+pub fn cdc_values_convert(values: Vec<CdcValue>) -> (Vec<Option<ByteString>>, Vec<usize>) {
     let mut toasted = Vec::new();
     let row_data = values
         .into_iter()
@@ -509,14 +510,14 @@ mod tests {
     #[test]
     fn test_cdc_values_convert_reports_toasted_indexes() {
         let (row_data, toasted) = cdc_values_convert(vec![
-            CdcValue::Text("a".to_owned()),
+            CdcValue::Text("a".into()),
             CdcValue::Toasted,
             CdcValue::Null,
             CdcValue::Toasted,
         ]);
         assert_eq!(
             row_data,
-            vec![Some("a".to_owned()), None, None, None],
+            vec![Some("a".into()), None, None, None],
             "Toasted and Null both map to None in the row representation"
         );
         assert_eq!(toasted, vec![1, 3]);
@@ -525,8 +526,8 @@ mod tests {
     #[test]
     fn test_cdc_values_convert_no_toast() {
         let (row_data, toasted) =
-            cdc_values_convert(vec![CdcValue::Null, CdcValue::Text("b".to_owned())]);
-        assert_eq!(row_data, vec![None, Some("b".to_owned())]);
+            cdc_values_convert(vec![CdcValue::Null, CdcValue::Text("b".into())]);
+        assert_eq!(row_data, vec![None, Some("b".into())]);
         assert!(toasted.is_empty());
     }
 }

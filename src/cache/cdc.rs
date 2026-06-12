@@ -29,6 +29,7 @@ use tracing::{debug, error, trace};
 
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata, cache_type_name_resolve};
 use crate::pg::cdc::connect_replication;
+use crate::pg::protocol::ByteString;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
 
@@ -661,15 +662,22 @@ impl CdcProcessor {
 /// Convert a slice of replication TupleData into column values, preserving the
 /// unchanged-toast marker distinctly from NULL (PGC-264).
 fn tuple_data_parse(columns: &[TupleData]) -> Vec<CdcValue> {
-    columns
-        .iter()
-        .map(|col| match col {
+    let mut values = Vec::with_capacity(columns.len());
+    for col in columns {
+        values.push(match col {
             TupleData::Null => CdcValue::Null,
             TupleData::UnchangedToast => CdcValue::Toasted,
-            TupleData::Text(data) => CdcValue::Text(String::from_utf8_lossy(data).into_owned()),
+            // Zero-copy: the value is a refcounted view of the replication
+            // frame. PG sends valid UTF-8 in text format; an invalid sequence
+            // falls back to a lossy copy rather than dropping the event.
+            TupleData::Text(data) => CdcValue::Text(
+                ByteString::from_utf8(data.clone())
+                    .unwrap_or_else(|_| ByteString::from(String::from_utf8_lossy(data).as_ref())),
+            ),
             TupleData::Binary(_) => unreachable!("pgcache uses text-format replication"),
-        })
-        .collect()
+        });
+    }
+    values
 }
 
 #[cfg(test)]
@@ -688,7 +696,7 @@ mod tests {
             vec![
                 CdcValue::Null,
                 CdcValue::Toasted,
-                CdcValue::Text("abc".to_owned()),
+                CdcValue::Text("abc".into()),
             ]
         );
     }

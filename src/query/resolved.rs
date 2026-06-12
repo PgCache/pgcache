@@ -1864,9 +1864,20 @@ impl AstNode for ResolvedQueryExpr {
 }
 
 impl ResolvedQueryExpr {
-    /// Check if query only references a single table
+    /// Check if query only references a single table. Walks via
+    /// `try_for_each_node` (short-circuiting on the second table) rather than
+    /// `nodes()`, which would collect every table node into a Vec — this runs
+    /// per CDC event on the update/delete paths.
     pub fn is_single_table(&self) -> bool {
-        self.nodes::<ResolvedTableNode>().nth(1).is_none()
+        let mut seen = false;
+        self.try_for_each_node::<ResolvedTableNode, ()>(&mut |_| {
+            if seen {
+                return ControlFlow::Break(());
+            }
+            seen = true;
+            ControlFlow::Continue(())
+        })
+        .is_continue()
     }
 
     /// Check if query has a WHERE clause (only applies to SELECT bodies)
