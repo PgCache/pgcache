@@ -11,7 +11,7 @@ use tracing::{debug, trace};
 use crate::{
     cache::query::CacheableQuery,
     catalog::FunctionVolatility,
-    id_hash::BuildIdHasher,
+    id_hash::{BuildIdHasher, impl_id_hashable},
     query::ast::{AstError, query_expr_convert_raw},
 };
 
@@ -27,6 +27,8 @@ use super::ParseError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct SqlTextHash(u64);
 
+impl_id_hashable!(SqlTextHash);
+
 impl SqlTextHash {
     /// Hash a SQL string's text.
     pub(super) fn of(sql: &str) -> Self {
@@ -36,10 +38,14 @@ impl SqlTextHash {
     }
 }
 
+/// `HashMap` keyed by `SqlTextHash` with the passthrough hasher (key is already
+/// a hash) — parallels the `FingerprintMap` aliases so the identity hasher and
+/// its key type travel together.
+pub(super) type SqlTextHashMap<V> = HashMap<SqlTextHash, V, BuildIdHasher<SqlTextHash>>;
+
 /// The proxy's per-connection cacheability memo: SQL text hash → cacheable AST
-/// or the reason to forward. Identity-hashed (the key is already a hash).
-pub(super) type CacheabilityCache =
-    HashMap<SqlTextHash, Result<Arc<CacheableQuery>, ForwardReason>, BuildIdHasher>;
+/// or the reason to forward.
+pub(super) type CacheabilityCache = SqlTextHashMap<Result<Arc<CacheableQuery>, ForwardReason>>;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ForwardReason {

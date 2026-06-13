@@ -20,7 +20,9 @@ pub use connect::{config_build, config_connect, connect};
 /// byte-distance arithmetic for replication lag are the intentional crossings.
 /// Not a hash — never key an identity-hashed map with it.
 #[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct Lsn(u64);
 
@@ -61,12 +63,6 @@ impl From<Lsn> for PgLsn {
 impl fmt::Display for Lsn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
-    }
-}
-
-impl fmt::Debug for Lsn {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Lsn({})", self.0)
     }
 }
 

@@ -39,7 +39,7 @@ impl WriterCore {
 
         for row in &rows {
             if relation_oid.is_none() {
-                relation_oid = Some(Oid::from_raw(row.get("relation_oid")));
+                relation_oid = Some(row.get("relation_oid"));
             }
 
             if schema.is_none() {
@@ -194,11 +194,11 @@ impl WriterCore {
 
         let row = self
             .db_origin
-            .query_opt(sql, &[&relation_oid.get()])
+            .query_opt(sql, &[&relation_oid])
             .await
             .map_into_report::<CacheError>()?;
 
-        Ok(row.map(|r| Oid::from_raw(r.get::<_, u32>(0))))
+        Ok(row.map(|r| r.get::<_, Oid>(0)))
     }
 
     #[instrument(skip_all)]
@@ -232,7 +232,7 @@ impl WriterCore {
 
         let rows = self
             .db_origin
-            .query(sql, &[&target_oid.get()])
+            .query(sql, &[&target_oid])
             .await
             .map_into_report::<CacheError>()?;
 

@@ -4,7 +4,7 @@ use std::fmt;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::id_hash::BuildIdHasher;
+use crate::id_hash::{BuildIdHasher, impl_id_hashable};
 
 /// A query fingerprint: a content hash of a `QueryExpr` (excluding LIMIT/OFFSET)
 /// produced by [`query_expr_fingerprint`](super::ast::query_expr_fingerprint).
@@ -20,9 +20,11 @@ use crate::id_hash::BuildIdHasher;
 /// `#[repr(transparent)]` with a single-field `Hash`, so a passthrough hasher
 /// over a `Fingerprint`-keyed map sees exactly the underlying `u64`.
 #[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Fingerprint(u64);
+
+impl_id_hashable!(Fingerprint);
 
 impl Fingerprint {
     /// Wrap a raw `u64` as a `Fingerprint`. Intentional and greppable — the
@@ -45,19 +47,13 @@ impl fmt::Display for Fingerprint {
     }
 }
 
-impl fmt::Debug for Fingerprint {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Fingerprint({})", self.0)
-    }
-}
-
 /// `HashMap` keyed by `Fingerprint` with the passthrough [`IdHasher`](crate::id_hash::IdHasher):
 /// the key is already a hash, so a lookup doesn't recompute one.
-pub type FingerprintMap<V> = HashMap<Fingerprint, V, BuildIdHasher>;
+pub type FingerprintMap<V> = HashMap<Fingerprint, V, BuildIdHasher<Fingerprint>>;
 /// `HashSet` of `Fingerprint` with the passthrough hasher.
-pub type FingerprintSet = HashSet<Fingerprint, BuildIdHasher>;
+pub type FingerprintSet = HashSet<Fingerprint, BuildIdHasher<Fingerprint>>;
 /// `DashMap` keyed by `Fingerprint` with the passthrough hasher.
-pub type FingerprintDashMap<V> = DashMap<Fingerprint, V, BuildIdHasher>;
+pub type FingerprintDashMap<V> = DashMap<Fingerprint, V, BuildIdHasher<Fingerprint>>;
 
 #[cfg(test)]
 mod tests {
@@ -70,7 +66,7 @@ mod tests {
     /// silently collide every key.
     #[test]
     fn test_fingerprint_identity_hashes_to_its_u64() {
-        let build = BuildIdHasher::default();
+        let build = BuildIdHasher::<Fingerprint>::default();
         for n in [0u64, 1, 0xdead_beef, u64::MAX] {
             assert_eq!(build.hash_one(Fingerprint::from_raw(n)), n);
         }
