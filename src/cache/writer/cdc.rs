@@ -1,4 +1,5 @@
 use crate::catalog::Oid;
+use crate::pg::Lsn;
 use crate::query::{Fingerprint, FingerprintSet};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -351,7 +352,7 @@ pub(super) struct WriterCdc {
     /// Highest LSN whose effects (cache mutations and invalidations) have been
     /// applied by this writer. Advances on `CommitMark` and `KeepAliveMark`,
     /// guaranteed transaction-aligned by mpsc ordering.
-    pub(super) last_applied_lsn: u64,
+    pub(super) last_applied_lsn: Lsn,
     /// Reused scratch buffer for the combined predicate `SELECT` built per CDC
     /// row in `pg_eval_matches`/`pg_eval_any`. Lives for the writer's lifetime
     /// so steady-state membership evaluation allocates no SQL string.
@@ -445,7 +446,7 @@ impl WriterCdc {
         Ok(Self {
             cache_eval_conn,
             cdc_write_conn,
-            last_applied_lsn: 0,
+            last_applied_lsn: Lsn::from_raw(0),
             pg_eval_buf: String::with_capacity(SQL_BUFFER_CAPACITY),
             prepared_membership: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),
             prepared_row_change: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),
@@ -1364,7 +1365,7 @@ impl WriterCdc {
     /// cache transaction, advance the watermark to `lsn` (the last batched
     /// frame's commit), and run the deferred bookkeeping. With an empty queue
     /// every CommitMark flushes its own frame — the pre-batching behavior.
-    async fn batch_flush(&mut self, core: &mut WriterCore, lsn: u64) -> CacheResult<()> {
+    async fn batch_flush(&mut self, core: &mut WriterCore, lsn: Lsn) -> CacheResult<()> {
         // In-process memo seqlock (PGC-236, rung 1): bracket the batch's
         // visibility with begin (even→odd) before and end (odd→even) after,
         // over every relation the batched frames touched, so any memo over
@@ -1776,12 +1777,15 @@ impl WriterCdc {
 
     /// Advance `last_applied_lsn` forward to `lsn`, updating the Prometheus
     /// gauge. No-op if `lsn` does not advance the watermark.
-    fn applied_lsn_advance(&mut self, lsn: u64) {
+    fn applied_lsn_advance(&mut self, lsn: Lsn) {
         if lsn > self.last_applied_lsn {
             self.last_applied_lsn = lsn;
             // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
             #[allow(clippy::cast_precision_loss)]
-            crate::metrics::handles().cdc.applied_lsn.set(lsn as f64);
+            crate::metrics::handles()
+                .cdc
+                .applied_lsn
+                .set(lsn.get() as f64);
         }
     }
 
@@ -1934,7 +1938,12 @@ impl WriterCdc {
                         key_data,
                         mut new_row_data,
                         toasted,
-                    } = std::mem::replace(event, FrameRowEvent::Boundary { commit_lsn: 0 })
+                    } = std::mem::replace(
+                        event,
+                        FrameRowEvent::Boundary {
+                            commit_lsn: Lsn::from_raw(0),
+                        },
+                    )
                     else {
                         continue;
                     };
@@ -1969,7 +1978,12 @@ impl WriterCdc {
                     key_data,
                     mut new_row_data,
                     toasted,
-                } = std::mem::replace(slot, FrameRowEvent::Boundary { commit_lsn: 0 })
+                } = std::mem::replace(
+                    slot,
+                    FrameRowEvent::Boundary {
+                        commit_lsn: Lsn::from_raw(0),
+                    },
+                )
                 else {
                     continue;
                 };

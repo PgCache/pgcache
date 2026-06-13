@@ -14,6 +14,7 @@
 //! population over that relation is in flight; the merge filters those keys out.
 
 use crate::catalog::Oid;
+use crate::pg::Lsn;
 use crate::query::Fingerprint;
 use std::collections::HashMap;
 
@@ -74,9 +75,9 @@ pub(super) struct PopulationDeletedKeys {
 struct DeletedKeyEntry {
     /// In-flight populations over this relation: population → anchor floor
     /// (lower bound on the population's snapshot LSN). Empty ⇒ remove the entry.
-    floors: HashMap<PopulationKey, u64>,
+    floors: HashMap<PopulationKey, Lsn>,
     /// Rendered PK tuple body (e.g. `42` or `'a','b'`) → commit LSN of the delete.
-    keys: HashMap<EcoString, u64>,
+    keys: HashMap<EcoString, Lsn>,
     /// Set once `keys` exceeds the cap; keys are dropped and *every* merge over
     /// the relation aborts (keys genuinely lost) until the last population leaves.
     overflowed: bool,
@@ -84,7 +85,7 @@ struct DeletedKeyEntry {
     /// relation. A merge whose snapshot predates it would resurrect rows the
     /// event removed, so it aborts; a population that snapshotted at/after it is
     /// unaffected — so unlike `overflowed`, this self-clears for fresh snapshots.
-    aborted_below: u64,
+    aborted_below: Lsn,
 }
 
 impl DeletedKeyEntry {
@@ -109,14 +110,14 @@ impl DeletedKeyEntry {
     /// A bulk invalidation committed at `lsn` emptied/dropped rows; raise the
     /// abort watermark and drop now-stale keys (anything `<= lsn` is below the
     /// truncate and irrelevant to surviving post-event snapshots).
-    fn abort_below(&mut self, lsn: u64) {
+    fn abort_below(&mut self, lsn: Lsn) {
         self.aborted_below = self.aborted_below.max(lsn);
         self.keys.retain(|_, key_lsn| *key_lsn > lsn);
     }
 
     /// Whether a merge whose snapshot is `snapshot_lsn` must abort: keys were
     /// lost (overflow), or the snapshot predates a bulk invalidation.
-    fn should_abort(&self, snapshot_lsn: u64) -> bool {
+    fn should_abort(&self, snapshot_lsn: Lsn) -> bool {
         self.overflowed || snapshot_lsn < self.aborted_below
     }
 }
@@ -133,7 +134,7 @@ impl PopulationDeletedKeys {
         fingerprint: Fingerprint,
         generation: u64,
         relation_oids: &[Oid],
-        anchor_floor: u64,
+        anchor_floor: Lsn,
     ) {
         let key = (fingerprint, generation);
         if self.inflight.contains_key(&key) {
@@ -171,7 +172,7 @@ impl PopulationDeletedKeys {
 
     /// Record a removed PK (stamped with the delete's commit LSN) for
     /// `relation_oid` if a population is recording it.
-    pub(super) fn record(&mut self, relation_oid: Oid, key: EcoString, lsn: u64) {
+    pub(super) fn record(&mut self, relation_oid: Oid, key: EcoString, lsn: Lsn) {
         let Some(entry) = self.relations.get_mut(&relation_oid) else {
             return;
         };
@@ -212,7 +213,7 @@ impl PopulationDeletedKeys {
     /// snapshotted at/after `lsn` is unaffected (it sees the empty table), so
     /// this self-clears rather than blanket-aborting like overflow. No-op if no
     /// population is recording the relation.
-    pub(super) fn abort_below(&mut self, relation_oid: Oid, lsn: u64) {
+    pub(super) fn abort_below(&mut self, relation_oid: Oid, lsn: Lsn) {
         if let Some(entry) = self.relations.get_mut(&relation_oid) {
             entry.abort_below(lsn);
         }
@@ -220,7 +221,7 @@ impl PopulationDeletedKeys {
 
     /// Whether a merge over `relation_oid` with snapshot `snapshot_lsn` must
     /// abort (cap overflow, or snapshot predates a bulk invalidation).
-    fn should_abort(&self, relation_oid: Oid, snapshot_lsn: u64) -> bool {
+    fn should_abort(&self, relation_oid: Oid, snapshot_lsn: Lsn) -> bool {
         self.relations
             .get(&relation_oid)
             .is_some_and(|e| e.should_abort(snapshot_lsn))
@@ -448,7 +449,7 @@ mod tests {
     const REL: Oid = Oid::from_raw(10);
     const GEN: u64 = 1;
 
-    fn record(keys: &mut PopulationDeletedKeys, body: &str, lsn: u64) {
+    fn record(keys: &mut PopulationDeletedKeys, body: &str, lsn: Lsn) {
         keys.record(REL, EcoString::from(body), lsn);
     }
 
@@ -457,11 +458,11 @@ mod tests {
     #[test]
     fn deactivate_prunes_below_min_floor() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], 100);
-        keys.activate(Fingerprint::from_raw(2), GEN, &[REL], 200);
-        record(&mut keys, "5", 50);
-        record(&mut keys, "15", 150);
-        record(&mut keys, "25", 250);
+        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(100));
+        keys.activate(Fingerprint::from_raw(2), GEN, &[REL], Lsn::from_raw(200));
+        record(&mut keys, "5", Lsn::from_raw(50));
+        record(&mut keys, "15", Lsn::from_raw(150));
+        record(&mut keys, "25", Lsn::from_raw(250));
 
         // Min floor is 100 (fp1); the merge still filters all three.
         let before = keys.filter_predicate(REL, "(id)").expect("filter present");
@@ -483,13 +484,13 @@ mod tests {
     #[test]
     fn generations_of_same_fingerprint_are_independent() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(Fingerprint::from_raw(7), 5, &[REL], 100); // gen 5, parked
-        keys.activate(Fingerprint::from_raw(7), 8, &[REL], 100); // gen 8, readmitted
+        keys.activate(Fingerprint::from_raw(7), 5, &[REL], Lsn::from_raw(100)); // gen 5, parked
+        keys.activate(Fingerprint::from_raw(7), 8, &[REL], Lsn::from_raw(100)); // gen 8, readmitted
 
         // gen 5 finishes; gen 8 must still be recording for the relation.
         keys.deactivate(Fingerprint::from_raw(7), 5);
         assert!(keys.is_recording(REL), "gen 8 still in flight");
-        record(&mut keys, "5", 150);
+        record(&mut keys, "5", Lsn::from_raw(150));
         assert!(
             keys.filter_predicate(REL, "(id)").is_some(),
             "gen 8 still records deletes"
@@ -504,8 +505,8 @@ mod tests {
     #[test]
     fn deactivate_last_population_clears_entry() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], 100);
-        record(&mut keys, "5", 150);
+        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(100));
+        record(&mut keys, "5", Lsn::from_raw(150));
         keys.deactivate(Fingerprint::from_raw(1), GEN);
         assert!(keys.filter_predicate(REL, "(id)").is_none());
     }
@@ -514,7 +515,7 @@ mod tests {
     #[test]
     fn record_without_active_population_is_noop() {
         let mut keys = PopulationDeletedKeys::default();
-        record(&mut keys, "5", 150);
+        record(&mut keys, "5", Lsn::from_raw(150));
         assert!(keys.filter_predicate(REL, "(id)").is_none());
     }
 
@@ -522,12 +523,12 @@ mod tests {
     #[test]
     fn overflow_aborts_and_disables_filtering() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], 0);
+        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(0));
         for i in 0..=POPULATION_DELETED_KEY_CAP {
-            record(&mut keys, &i.to_string(), 1);
+            record(&mut keys, &i.to_string(), Lsn::from_raw(1));
         }
         // Overflow aborts regardless of snapshot LSN, and there's no filter.
-        assert!(keys.should_abort(REL, u64::MAX));
+        assert!(keys.should_abort(REL, Lsn::from_raw(u64::MAX)));
         assert!(keys.filter_predicate(REL, "(id)").is_none());
     }
 
@@ -537,21 +538,24 @@ mod tests {
     #[test]
     fn abort_below_aborts_only_older_snapshots() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], 100);
-        record(&mut keys, "5", 150);
-        record(&mut keys, "25", 250);
+        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(100));
+        record(&mut keys, "5", Lsn::from_raw(150));
+        record(&mut keys, "25", Lsn::from_raw(250));
 
-        keys.abort_below(REL, 200); // e.g. a TRUNCATE committed at LSN 200
+        keys.abort_below(REL, Lsn::from_raw(200)); // e.g. a TRUNCATE committed at LSN 200
 
         // A population that read before the truncate must abort; one that read
         // at/after it must not.
-        assert!(keys.should_abort(REL, 150), "pre-truncate snapshot aborts");
         assert!(
-            !keys.should_abort(REL, 200),
+            keys.should_abort(REL, Lsn::from_raw(150)),
+            "pre-truncate snapshot aborts"
+        );
+        assert!(
+            !keys.should_abort(REL, Lsn::from_raw(200)),
             "snapshot at the truncate is fine"
         );
         assert!(
-            !keys.should_abort(REL, 300),
+            !keys.should_abort(REL, Lsn::from_raw(300)),
             "post-truncate snapshot is fine"
         );
 

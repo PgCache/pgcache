@@ -1,3 +1,4 @@
+use crate::pg::Lsn;
 use crate::query::Fingerprint;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -46,7 +47,7 @@ pub struct CdcStatusData {
     /// been fully applied by the writer. Advances on transaction commit
     /// markers and keep-alive markers delivered through the CDC command
     /// channel — guaranteed transaction-aligned.
-    pub last_applied_lsn: u64,
+    pub last_applied_lsn: Lsn,
 }
 
 /// Per-query status for a cached query.

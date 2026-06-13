@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::catalog::Oid;
+use crate::pg::Lsn;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ecow::EcoString;
@@ -74,13 +75,13 @@ pub struct CdcProcessor {
     /// Shared set of relation OIDs with active cached queries (maintained by writer).
     active_relations: ActiveRelations,
 
-    last_received_lsn: u64,
+    last_received_lsn: Lsn,
     /// Highest LSN whose XLogData has been decoded by this processor and
     /// whose CdcCommands have been enqueued to the writer. Distinct from
     /// the writer's `last_applied_lsn`, which only advances after the
     /// writer has actually executed the resulting cache mutations.
-    last_decoded_lsn: u64,
-    last_flushed_lsn: u64,
+    last_decoded_lsn: Lsn,
+    last_flushed_lsn: Lsn,
     keep_alive_timer: Interval,
     last_flush_sent: Option<Instant>,
     keep_alive_sent_count: u64,
@@ -114,9 +115,9 @@ impl CdcProcessor {
             slot_name: settings.cdc.slot_name.as_str().into(),
             cdc_tx,
             active_relations,
-            last_received_lsn: 0,
-            last_decoded_lsn: 0,
-            last_flushed_lsn: 0,
+            last_received_lsn: Lsn::from_raw(0),
+            last_decoded_lsn: Lsn::from_raw(0),
+            last_flushed_lsn: Lsn::from_raw(0),
             keep_alive_timer: timer,
             last_flush_sent: None,
             keep_alive_sent_count: 0,
@@ -125,7 +126,7 @@ impl CdcProcessor {
     }
 
     /// Returns the last LSN acknowledged to PostgreSQL.
-    pub fn last_flushed_lsn(&self) -> u64 {
+    pub fn last_flushed_lsn(&self) -> Lsn {
         self.last_flushed_lsn
     }
 
@@ -209,11 +210,14 @@ impl CdcProcessor {
 
     /// Updates the last received LSN from XLogData message and records lag metrics.
     async fn update_lsn(&mut self, xlog_data: &XLogDataBody<LogicalReplicationMessage>) {
-        let lsn = xlog_data.wal_start();
+        let lsn = Lsn::from_raw(xlog_data.wal_start());
         self.last_received_lsn = lsn;
         // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
         #[allow(clippy::cast_precision_loss)]
-        crate::metrics::handles().cdc.received_lsn.set(lsn as f64);
+        crate::metrics::handles()
+            .cdc
+            .received_lsn
+            .set(lsn.get() as f64);
 
         // Calculate time-based lag: difference between server timestamp and our current time
         let server_timestamp = xlog_data.timestamp();
@@ -225,8 +229,8 @@ impl CdcProcessor {
         crate::metrics::handles().cdc.lag_seconds.set(lag_seconds);
 
         // Byte-based lag: difference between WAL end and our last acknowledged position
-        let wal_end = xlog_data.wal_end();
-        let lag_bytes = wal_end.saturating_sub(self.last_flushed_lsn);
+        let wal_end = Lsn::from_raw(xlog_data.wal_end());
+        let lag_bytes = wal_end.saturating_bytes_since(self.last_flushed_lsn);
         #[allow(clippy::cast_precision_loss)]
         crate::metrics::handles()
             .cdc
@@ -301,7 +305,7 @@ impl CdcProcessor {
                 crate::metrics::handles()
                     .cdc
                     .flushed_lsn
-                    .set(decoded_lsn as f64);
+                    .set(decoded_lsn.get() as f64);
                 self.last_flush_sent = Some(Instant::now());
                 self.keep_alive_sent_count += 1;
                 let count = self.keep_alive_sent_count;
@@ -335,7 +339,7 @@ impl CdcProcessor {
         stream: std::pin::Pin<&mut LogicalReplicationStream>,
     ) -> Result<(), Error> {
         let reply_requested = keep_alive.reply() == 1;
-        let wal_end = keep_alive.wal_end();
+        let wal_end = Lsn::from_raw(keep_alive.wal_end());
 
         debug!(
             "Received keep-alive from PostgreSQL (wal_end: {}, reply_requested: {})",
@@ -352,7 +356,7 @@ impl CdcProcessor {
             crate::metrics::handles()
                 .cdc
                 .received_lsn
-                .set(wal_end as f64);
+                .set(wal_end.get() as f64);
 
             // Forward a keep-alive mark to the writer so its applied-LSN
             // watermark can advance during idle periods (no published-table
@@ -439,7 +443,7 @@ impl CdcProcessor {
     /// writer processes the mark, every mutation enqueued earlier in this
     /// transaction has been applied (mpsc preserves order).
     async fn process_commit(&self, body: &CommitBody) -> Result<(), Error> {
-        let lsn = body.end_lsn();
+        let lsn = Lsn::from_raw(body.end_lsn());
         if let Err(e) = self.cdc_tx.send(CdcCommand::CommitMark { lsn }) {
             error!("Failed to forward commit mark (lsn {lsn}) to writer: {e:?}");
         }

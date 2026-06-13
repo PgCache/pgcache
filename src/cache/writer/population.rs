@@ -1,4 +1,5 @@
 use crate::catalog::Oid;
+use crate::pg::Lsn;
 use crate::query::Fingerprint;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -227,7 +228,7 @@ async fn population_task(
     max_limit: Option<u64>,
     db_origin: Rc<Client>,
     db_cache: &Client,
-) -> CacheResult<(usize, u64, Vec<(Oid, EcoString)>, u64)> {
+) -> CacheResult<(usize, u64, Vec<(Oid, EcoString)>, Lsn)> {
     // Generation stamping no longer happens here — it moves to the writer's
     // merge, which inserts the staged rows into the tracked shared table
     // (PGC-250).
@@ -306,12 +307,12 @@ fn staging_table_name(fingerprint: Fingerprint, generation: u64, relation_oid: O
 /// Origin WAL position as a `u64` byte offset (the same encoding as the
 /// replication stream's LSNs), captured after the population reads. Used as the
 /// upper-bound snapshot LSN for the deferred-Ready gate (PGC-250 Slice B).
-async fn origin_snapshot_lsn(db_origin: &Client) -> CacheResult<u64> {
+async fn origin_snapshot_lsn(db_origin: &Client) -> CacheResult<Lsn> {
     let row = db_origin
         .query_one("SELECT pg_current_wal_insert_lsn()", &[])
         .await
         .map_into_report::<CacheError>()?;
-    Ok(u64::from(row.get::<_, PgLsn>(0)))
+    Ok(Lsn::from(row.get::<_, PgLsn>(0)))
 }
 
 /// Pre-computed parts of the batched INSERT...ON CONFLICT statement.

@@ -1,4 +1,5 @@
 use crate::catalog::Oid;
+use crate::pg::Lsn;
 use crate::query::{Fingerprint, FingerprintSet};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -159,7 +160,7 @@ pub(super) enum FrameRowEvent {
     /// right frame's LSN when the log spans multiple frames. Does not split
     /// eval segments (cross-frame batching is the point).
     Boundary {
-        commit_lsn: u64,
+        commit_lsn: Lsn,
     },
 }
 
@@ -300,7 +301,7 @@ pub struct WriterCore {
     /// Mirror of `WriterCdc.last_applied_lsn`, updated as the CDC path advances
     /// the watermark. Read at population dispatch to seed the deleted-key
     /// anchor floor (a lower bound on the population's snapshot LSN).
-    pub(super) last_applied_lsn: u64,
+    pub(super) last_applied_lsn: Lsn,
     /// PK tuple bodies removed by the in-progress CDC frame, drained at
     /// `CommitMark` and recorded into `population_deleted_keys` stamped with the
     /// frame's commit LSN (rolled-back frames clear it instead). Buffered because
@@ -326,7 +327,7 @@ pub struct WriterCore {
     pub(super) batch_events: usize,
     /// The last accumulated frame's commit LSN — the watermark target when a
     /// flush is forced between CommitMarks (KeepAliveMark).
-    pub(super) batch_last_lsn: u64,
+    pub(super) batch_last_lsn: Lsn,
     /// Whether a source frame is open (between `Begin` and `CommitMark`).
     /// `frame_state` no longer distinguishes this once batches span frames.
     pub(super) frame_open: bool,
@@ -379,7 +380,7 @@ pub struct WriterCore {
 pub(super) struct PendingMerge(pub(super) PopulationMerge);
 
 impl PendingMerge {
-    fn key(&self) -> (u64, u64) {
+    fn key(&self) -> (Lsn, u64) {
         (self.0.snapshot_lsn, self.0.generation)
     }
 }
@@ -485,13 +486,13 @@ impl WriterCore {
             population_deleted_keys: PopulationDeletedKeys::default(),
             pending_merges: BinaryHeap::new(),
             watermark_nudge,
-            last_applied_lsn: 0,
+            last_applied_lsn: Lsn::from_raw(0),
             frame_deleted_keys: Vec::new(),
             frame_truncated_relations: Vec::new(),
             batch_truncated_relations: Vec::new(),
             batch_frames: 0,
             batch_events: 0,
-            batch_last_lsn: 0,
+            batch_last_lsn: Lsn::from_raw(0),
             frame_open: false,
             batch_deleted_pks: HashSet::new(),
             batch_toast_overlay: HashMap::new(),
@@ -1305,7 +1306,7 @@ impl WriterCore {
     }
 
     /// Build and send a status response for an admin `/status` request.
-    async fn status_respond(&self, req: StatusRequest, last_applied_lsn: u64) {
+    async fn status_respond(&self, req: StatusRequest, last_applied_lsn: Lsn) {
         let cache = &self.cache;
 
         let (mut total_hits, mut total_misses) = (0u64, 0u64);

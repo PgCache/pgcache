@@ -1,4 +1,5 @@
 use crate::catalog::Oid;
+use crate::pg::Lsn;
 use crate::query::Fingerprint;
 use std::sync::Arc;
 use std::time::Instant;
@@ -329,7 +330,7 @@ pub struct PopulationMerge {
     /// gate): snapshot-state rows entering the shared table early would be
     /// served by already-Ready bystander queries as a torn mix of two origin
     /// points in time.
-    pub snapshot_lsn: u64,
+    pub snapshot_lsn: Lsn,
 }
 
 /// Controls what the writer does when a query is not subsumed.
@@ -502,14 +503,14 @@ pub enum CdcCommand {
     /// `end_lsn` of the commit record. The writer advances its
     /// `last_applied_lsn` watermark when it processes this command —
     /// guaranteeing the watermark is transaction-aligned.
-    CommitMark { lsn: u64 },
+    CommitMark { lsn: Lsn },
 
     /// Keep-alive marker. Emitted when the CDC processor receives a
     /// PrimaryKeepAlive whose `wal_end` advances past the previously
     /// observed position. Carries `wal_end`. Allows the writer's
     /// `last_applied_lsn` watermark to advance during idle periods
     /// (no published-table transactions) so the gauge remains current.
-    KeepAliveMark { lsn: u64 },
+    KeepAliveMark { lsn: Lsn },
 }
 
 #[cfg(test)]

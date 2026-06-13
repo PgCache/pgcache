@@ -1,4 +1,5 @@
 use crate::catalog::Oid;
+use crate::pg::Lsn;
 use crate::query::Fingerprint;
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -1351,7 +1352,7 @@ impl WriterRegistration {
     pub(super) async fn pending_merges_drain(
         &self,
         core: &mut WriterCore,
-        applied_lsn: u64,
+        applied_lsn: Lsn,
     ) -> CacheResult<()> {
         loop {
             let Some(Reverse(top)) = core.pending_merges.peek() else {
