@@ -432,25 +432,29 @@ pub enum CdcValue {
 }
 
 /// Convert decoded tuple values to the downstream row representation,
-/// reporting the column indexes that carried the unchanged-toast marker
-/// (`Toasted` maps to `None` in the output). Past the writer's repair step the
-/// indexes must be empty or handled — this is the only path from `CdcValue`
-/// rows to `Option<ByteString>` rows.
-pub fn cdc_values_convert(values: Vec<CdcValue>) -> (Vec<Option<ByteString>>, Vec<usize>) {
+/// appending to `row_data` (callers pass a recycled Vec so steady-state
+/// conversion allocates nothing) and reporting the column indexes that
+/// carried the unchanged-toast marker (`Toasted` maps to `None` in the
+/// output). Past the writer's repair step the indexes must be empty or
+/// handled — this is the only path from `CdcValue` rows to
+/// `Option<ByteString>` rows.
+pub fn cdc_values_convert(
+    values: Vec<CdcValue>,
+    row_data: &mut Vec<Option<ByteString>>,
+) -> Vec<usize> {
     let mut toasted = Vec::new();
-    let row_data = values
-        .into_iter()
-        .enumerate()
-        .map(|(idx, value)| match value {
+    row_data.reserve(values.len());
+    for (idx, value) in values.into_iter().enumerate() {
+        row_data.push(match value {
             CdcValue::Null => None,
             CdcValue::Text(text) => Some(text),
             CdcValue::Toasted => {
                 toasted.push(idx);
                 None
             }
-        })
-        .collect();
-    (row_data, toasted)
+        });
+    }
+    toasted
 }
 
 /// Commands for CDC mutations and relation tracking, sent to the writer thread
@@ -509,12 +513,16 @@ mod tests {
 
     #[test]
     fn test_cdc_values_convert_reports_toasted_indexes() {
-        let (row_data, toasted) = cdc_values_convert(vec![
-            CdcValue::Text("a".into()),
-            CdcValue::Toasted,
-            CdcValue::Null,
-            CdcValue::Toasted,
-        ]);
+        let mut row_data = Vec::new();
+        let toasted = cdc_values_convert(
+            vec![
+                CdcValue::Text("a".into()),
+                CdcValue::Toasted,
+                CdcValue::Null,
+                CdcValue::Toasted,
+            ],
+            &mut row_data,
+        );
         assert_eq!(
             row_data,
             vec![Some("a".into()), None, None, None],
@@ -525,8 +533,11 @@ mod tests {
 
     #[test]
     fn test_cdc_values_convert_no_toast() {
-        let (row_data, toasted) =
-            cdc_values_convert(vec![CdcValue::Null, CdcValue::Text("b".into())]);
+        let mut row_data = Vec::new();
+        let toasted = cdc_values_convert(
+            vec![CdcValue::Null, CdcValue::Text("b".into())],
+            &mut row_data,
+        );
         assert_eq!(row_data, vec![None, Some("b".into())]);
         assert!(toasted.is_empty());
     }

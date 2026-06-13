@@ -386,9 +386,9 @@ impl CdcProcessor {
                     LogicalReplicationMessage::Origin(body) => self.process_origin(&body).await,
                     LogicalReplicationMessage::Relation(body) => self.process_relation(&body).await,
                     LogicalReplicationMessage::Type(body) => self.process_type(&body).await,
-                    LogicalReplicationMessage::Insert(body) => self.process_insert(&body).await,
-                    LogicalReplicationMessage::Update(body) => self.process_update(&body).await,
-                    LogicalReplicationMessage::Delete(body) => self.process_delete(&body).await,
+                    LogicalReplicationMessage::Insert(body) => self.process_insert(body).await,
+                    LogicalReplicationMessage::Update(body) => self.process_update(body).await,
+                    LogicalReplicationMessage::Delete(body) => self.process_delete(body).await,
                     LogicalReplicationMessage::Truncate(body) => self.process_truncate(&body).await,
                     LogicalReplicationMessage::Message(_) | _ => {
                         debug!("unhandled replication message type");
@@ -471,7 +471,7 @@ impl CdcProcessor {
     }
 
     /// Processes insert messages with query-aware filtering.
-    async fn process_insert(&mut self, body: &InsertBody) -> Result<(), Error> {
+    async fn process_insert(&mut self, body: InsertBody) -> Result<(), Error> {
         crate::metrics::handles().cdc.inserts.increment(1);
         let relation_oid = body.rel_id();
 
@@ -496,7 +496,7 @@ impl CdcProcessor {
     }
 
     /// Processes update messages with query-aware filtering.
-    async fn process_update(&mut self, body: &UpdateBody) -> Result<(), Error> {
+    async fn process_update(&mut self, body: UpdateBody) -> Result<(), Error> {
         crate::metrics::handles().cdc.updates.increment(1);
         let relation_oid = body.rel_id();
 
@@ -522,7 +522,7 @@ impl CdcProcessor {
     }
 
     /// Processes delete messages with query-aware filtering.
-    async fn process_delete(&mut self, body: &DeleteBody) -> Result<(), Error> {
+    async fn process_delete(&mut self, body: DeleteBody) -> Result<(), Error> {
         crate::metrics::handles().cdc.deletes.increment(1);
         let relation_oid = body.rel_id();
 
@@ -615,41 +615,38 @@ impl CdcProcessor {
     }
 
     /// Parse row data from InsertBody into a Vec of column values indexed by position.
-    fn parse_insert_row_data(&self, body: &InsertBody) -> Result<Vec<CdcValue>, Error> {
-        Ok(tuple_data_parse(body.tuple().tuple_data()))
+    fn parse_insert_row_data(&self, body: InsertBody) -> Result<Vec<CdcValue>, Error> {
+        Ok(tuple_data_parse(body.into_tuple().into_data()))
     }
 
     /// Parse old and new row data from UpdateBody into Vecs of column values indexed by position.
     #[allow(clippy::type_complexity)]
     fn parse_update_row_data(
         &self,
-        body: &UpdateBody,
+        body: UpdateBody,
     ) -> Result<(Vec<CdcValue>, Vec<CdcValue>), Error> {
-        let new_row_data = tuple_data_parse(body.new_tuple().tuple_data());
+        let (key_tuple, _old_tuple, new_tuple) = body.into_tuples();
+        let new_row_data = tuple_data_parse(new_tuple.into_data());
 
-        let key_data = body
-            .key_tuple()
-            .map(|kt| tuple_data_parse(kt.tuple_data()))
+        let key_data = key_tuple
+            .map(|kt| tuple_data_parse(kt.into_data()))
             .unwrap_or_default();
 
         Ok((key_data, new_row_data))
     }
 
     /// Parse row data from DeleteBody into a Vec of column values indexed by position.
-    fn parse_delete_row_data(&self, body: &DeleteBody) -> Result<Vec<CdcValue>, Error> {
+    fn parse_delete_row_data(&self, body: DeleteBody) -> Result<Vec<CdcValue>, Error> {
         // DeleteBody contains either key_tuple (for tables with REPLICA IDENTITY USING INDEX)
         // or old_tuple (for tables with REPLICA IDENTITY FULL)
-        let tuple = if let Some(key_tuple) = body.key_tuple() {
-            key_tuple
-        } else if let Some(old_tuple) = body.old_tuple() {
-            old_tuple
-        } else {
+        let (key_tuple, old_tuple) = body.into_tuples();
+        let Some(tuple) = key_tuple.or(old_tuple) else {
             // No tuple data available (REPLICA IDENTITY NOTHING)
             error!("DELETE operation requires REPLICA IDENTITY FULL or USING INDEX, found NOTHING");
             return Ok(Vec::new());
         };
 
-        Ok(tuple_data_parse(tuple.tuple_data()))
+        Ok(tuple_data_parse(tuple.into_data()))
     }
 
     /// Check if there are any cached queries for a specific table by relation OID.
@@ -659,12 +656,23 @@ impl CdcProcessor {
     }
 }
 
-/// Convert a slice of replication TupleData into column values, preserving the
-/// unchanged-toast marker distinctly from NULL (PGC-264).
-fn tuple_data_parse(columns: &[TupleData]) -> Vec<CdcValue> {
-    let mut values = Vec::with_capacity(columns.len());
-    for col in columns {
-        values.push(match col {
+/// `tuple_data_parse` reuses the source Vec's allocation via the in-place
+/// collect specialization, which holds only while the element layouts match.
+/// A size change downgrades it to a silent per-event allocation — fail the
+/// build instead so the regression is visible.
+const _: () = assert!(
+    std::mem::size_of::<TupleData>() == std::mem::size_of::<CdcValue>()
+        && std::mem::align_of::<TupleData>() == std::mem::align_of::<CdcValue>(),
+);
+
+/// Convert replication TupleData into column values, preserving the
+/// unchanged-toast marker distinctly from NULL (PGC-264). Consumes the Vec so
+/// the conversion is in place — no per-event allocation (see the layout
+/// assertion above).
+fn tuple_data_parse(columns: Vec<TupleData>) -> Vec<CdcValue> {
+    columns
+        .into_iter()
+        .map(|col| match col {
             TupleData::Null => CdcValue::Null,
             TupleData::UnchangedToast => CdcValue::Toasted,
             // Zero-copy: the value is a refcounted view of the replication
@@ -672,12 +680,11 @@ fn tuple_data_parse(columns: &[TupleData]) -> Vec<CdcValue> {
             // falls back to a lossy copy rather than dropping the event.
             TupleData::Text(data) => CdcValue::Text(
                 ByteString::from_utf8(data.clone())
-                    .unwrap_or_else(|_| ByteString::from(String::from_utf8_lossy(data).as_ref())),
+                    .unwrap_or_else(|_| ByteString::from(String::from_utf8_lossy(&data).as_ref())),
             ),
             TupleData::Binary(_) => unreachable!("pgcache uses text-format replication"),
-        });
-    }
-    values
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -686,13 +693,13 @@ mod tests {
 
     #[test]
     fn test_tuple_data_parse_preserves_unchanged_toast() {
-        let columns = [
+        let columns = vec![
             TupleData::Null,
             TupleData::UnchangedToast,
             TupleData::Text("abc".as_bytes().into()),
         ];
         assert_eq!(
-            tuple_data_parse(&columns),
+            tuple_data_parse(columns),
             vec![
                 CdcValue::Null,
                 CdcValue::Toasted,

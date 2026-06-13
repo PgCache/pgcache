@@ -26,7 +26,9 @@ use crate::settings::{CachePolicy, Settings};
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::{CdcCommand, PopulationMerge, QueryCommand, WriterNotify},
+    messages::{
+        CdcCommand, CdcValue, PopulationMerge, QueryCommand, WriterNotify, cdc_values_convert,
+    },
     mv::{MvMeta, ShapeGate},
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
@@ -98,6 +100,10 @@ const TOAST_OVERLAY_POOL_MAX: usize = 4096;
 /// Replaying a prefix early is exactly the per-arrival behavior, so ordering
 /// and results are unchanged.
 pub(super) const FRAME_ROWS_CAPACITY: usize = 4096;
+
+/// Cap on recycled row Vecs (`cdc_values_convert` output). A replay drains at
+/// most `FRAME_ROWS_CAPACITY` events, each holding up to two row Vecs.
+const ROW_VEC_POOL_MAX: usize = 2 * FRAME_ROWS_CAPACITY;
 
 /// One buffered row event of the in-progress CDC frame (PGC-241). Events are
 /// collected at arrival and replayed at the `CommitMark` flush boundary, in
@@ -327,6 +333,10 @@ pub struct WriterCore {
     /// recording allocates no per-event Vec. Bounded by
     /// [`TOAST_OVERLAY_POOL_MAX`].
     pub(super) toast_overlay_pool: Vec<Vec<(usize, Option<ByteString>)>>,
+    /// Recycled row Vecs (`cdc_values_convert` output): replay-drained
+    /// `FrameRowEvent`s return their row vecs here so conversion reuses them
+    /// instead of allocating per event. Bounded by [`ROW_VEC_POOL_MAX`].
+    pub(super) row_vec_pool: Vec<Vec<Option<ByteString>>>,
     /// Relations truncated or DDL-recreated in the current batch (PGC-264).
     /// Their pre-batch committed images are wholesale untrustworthy as a
     /// toast-repair source; only overlay values written after the truncate
@@ -468,6 +478,7 @@ impl WriterCore {
             batch_deleted_pks: HashSet::new(),
             batch_toast_overlay: HashMap::new(),
             toast_overlay_pool: Vec::new(),
+            row_vec_pool: Vec::new(),
             batch_toast_guard_oids: HashSet::new(),
             data_dir,
             disk_total,
@@ -498,6 +509,54 @@ impl WriterCore {
         {
             values.clear();
             self.toast_overlay_pool.push(values);
+        }
+    }
+
+    /// `cdc_values_convert` into a recycled row Vec from `row_vec_pool`.
+    /// Empty inputs (an update with no key tuple) skip the pool — an empty
+    /// `Vec::new` never allocates.
+    pub(super) fn row_convert(
+        &mut self,
+        values: Vec<CdcValue>,
+    ) -> (Vec<Option<ByteString>>, Vec<usize>) {
+        if values.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let mut row_data = self.row_vec_pool.pop().unwrap_or_default();
+        let toasted = cdc_values_convert(values, &mut row_data);
+        (row_data, toasted)
+    }
+
+    /// Return a replay-drained event's row Vecs to `row_vec_pool`.
+    pub(super) fn row_vecs_recycle(&mut self, event: FrameRowEvent) {
+        let (first, second) = match event {
+            FrameRowEvent::Insert { row_data, .. } | FrameRowEvent::Delete { row_data, .. } => {
+                (Some(row_data), None)
+            }
+            FrameRowEvent::Update {
+                key_data,
+                new_row_data,
+                ..
+            }
+            | FrameRowEvent::UpdateToasted {
+                key_data,
+                new_row_data,
+                ..
+            }
+            | FrameRowEvent::UpdateToastFallback {
+                key_data,
+                new_row_data,
+                ..
+            } => (Some(key_data), Some(new_row_data)),
+            FrameRowEvent::Truncate { .. } | FrameRowEvent::Boundary { .. } => (None, None),
+        };
+        for mut row in [first, second].into_iter().flatten() {
+            // Empty key Vecs carry no allocation worth pooling.
+            if row.capacity() == 0 || self.row_vec_pool.len() >= ROW_VEC_POOL_MAX {
+                continue;
+            }
+            row.clear();
+            self.row_vec_pool.push(row);
         }
     }
 

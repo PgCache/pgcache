@@ -81,6 +81,9 @@ async fn dhat_cdc_apply_workload() -> Result<(), Error> {
 
     // Sanity-check the workload: raw CDC counters from the metrics endpoint,
     // so per-event allocation counts in the profile have a trusted denominator.
+    // NOTE: this scrape drains the run's buffered histogram samples into the
+    // Prometheus summary sketches in one go — the resulting sketches_ddsketch
+    // allocations in the heap profile are scrape cost, not apply-path cost.
     if let Ok((_, body)) = util::http_get(ctx.metrics_port, "/metrics").await {
         for line in body.lines() {
             if line.starts_with("pgcache_cdc_") && !line.starts_with('#') {

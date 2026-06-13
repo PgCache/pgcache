@@ -30,7 +30,7 @@ use crate::settings::{CachePolicy, Settings};
 use crate::query::evaluate::where_expr_evaluate;
 
 use super::super::memo::SlotKey;
-use super::super::messages::{CdcCommand, QueryCommand, cdc_values_convert};
+use super::super::messages::{CdcCommand, QueryCommand};
 use super::super::types::{
     CachedQueryState, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
 };
@@ -766,9 +766,12 @@ impl WriterCdc {
             }
             base += segment.len();
         }
-        // Hand the cleared buffer back so its capacity is reused across frames.
+        // Hand the cleared buffer back so its capacity is reused across
+        // frames, recycling each event's row Vecs into the pool on the way.
         let mut events = events;
-        events.clear();
+        for event in events.drain(..) {
+            core.row_vecs_recycle(event);
+        }
         core.frame_rows = events;
         Ok(())
     }
@@ -1606,7 +1609,7 @@ impl WriterCdc {
                             .await
                             .attach_loc("fault: injected cdc deadlock")?;
                     } else {
-                        let (row_data, toasted) = cdc_values_convert(row_data);
+                        let (row_data, toasted) = core.row_convert(row_data);
                         // pgoutput never elides toast from INSERT images;
                         // dropping the event keeps the NULL-holed row out of
                         // the shared table (handle_insert's tracked-key upsert
@@ -1631,8 +1634,8 @@ impl WriterCdc {
             } => {
                 core.frame_relation_oids.insert(relation_oid);
                 if core.frame_state != FrameState::Recovering {
-                    let (key_data, key_toasted) = cdc_values_convert(key_data);
-                    let (new_row_data, toasted) = cdc_values_convert(row_data);
+                    let (key_data, key_toasted) = core.row_convert(key_data);
+                    let (new_row_data, toasted) = core.row_convert(row_data);
                     // Key tuples carry real values under every replica
                     // identity; a toasted one can't even key the old-PK delete.
                     if !key_toasted.is_empty() {
@@ -1667,7 +1670,7 @@ impl WriterCdc {
             } => {
                 core.frame_relation_oids.insert(relation_oid);
                 if core.frame_state != FrameState::Recovering {
-                    let (row_data, toasted) = cdc_values_convert(row_data);
+                    let (row_data, toasted) = core.row_convert(row_data);
                     // Delete images are key/old tuples — same reasoning as the
                     // update key tuple above.
                     if !toasted.is_empty() {
