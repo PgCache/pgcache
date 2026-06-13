@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::catalog::Oid;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
@@ -662,7 +664,7 @@ mod tests {
 
     /// Create test table metadata with given column names.
     /// First column is the primary key (INT4), rest are TEXT.
-    fn test_table(name: &str, relation_oid: u32, column_names: &[&str]) -> TableMetadata {
+    fn test_table(name: &str, relation_oid: Oid, column_names: &[&str]) -> TableMetadata {
         let columns = ColumnStore::new(column_names.iter().enumerate().map(|(i, col_name)| {
             let is_pk = i == 0;
             ColumnMetadata {
@@ -1200,13 +1202,17 @@ mod tests {
     /// a(id, name, status), b(id, a_id, name, status, val, x), c(id, b_id, val, x)
     fn terminality_test_tables() -> BiHashMap<TableMetadata> {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table("a", 1, &["id", "name", "status"]));
+        tables.insert_overwrite(test_table("a", Oid::from_raw(1), &["id", "name", "status"]));
         tables.insert_overwrite(test_table(
             "b",
-            2,
+            Oid::from_raw(2),
             &["id", "a_id", "name", "status", "val", "x"],
         ));
-        tables.insert_overwrite(test_table("c", 3, &["id", "b_id", "val", "x"]));
+        tables.insert_overwrite(test_table(
+            "c",
+            Oid::from_raw(3),
+            &["id", "b_id", "val", "x"],
+        ));
         tables
     }
 
@@ -1366,7 +1372,7 @@ mod tests {
     #[test]
     fn test_no_join_no_optional() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table("users", 1, &["id", "name"]));
+        tables.insert_overwrite(test_table("users", Oid::from_raw(1), &["id", "name"]));
         let select = resolve_select("SELECT * FROM users WHERE id = 1", &tables);
         let (terminal, non_terminal) = outer_join_optional_tables(&select);
         assert!(terminal.is_empty());

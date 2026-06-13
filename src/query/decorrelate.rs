@@ -1,5 +1,7 @@
 use std::collections::HashSet;
 
+#[cfg(test)]
+use crate::catalog::Oid;
 use ecow::EcoString;
 use error_set::error_set;
 use rootcause::Report;
@@ -1550,7 +1552,7 @@ mod tests {
 
     /// Create test table metadata with given column names.
     /// First column is the primary key (INT4), rest are TEXT.
-    fn test_table(name: &str, relation_oid: u32, column_names: &[&str]) -> TableMetadata {
+    fn test_table(name: &str, relation_oid: Oid, column_names: &[&str]) -> TableMetadata {
         let columns = ColumnStore::new(column_names.iter().enumerate().map(|(i, col_name)| {
             let is_pk = i == 0;
             ColumnMetadata {
@@ -1577,29 +1579,37 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table(
             "employees",
-            1,
+            Oid::from_raw(1),
             &["id", "name", "dept_id", "status", "manager_id"],
         ));
         tables.insert_overwrite(test_table(
             "orders",
-            2,
+            Oid::from_raw(2),
             &["id", "emp_id", "status", "total", "customer_id"],
         ));
         tables.insert_overwrite(test_table(
             "departments",
-            3,
+            Oid::from_raw(3),
             &["id", "name", "location", "budget"],
         ));
         tables.insert_overwrite(test_table(
             "customers",
-            4,
+            Oid::from_raw(4),
             &["id", "name", "region", "emp_id"],
         ));
-        tables.insert_overwrite(test_table("users", 5, &["id", "name", "email", "status"]));
-        tables.insert_overwrite(test_table("active_users", 6, &["id", "user_id"]));
+        tables.insert_overwrite(test_table(
+            "users",
+            Oid::from_raw(5),
+            &["id", "name", "email", "status"],
+        ));
+        tables.insert_overwrite(test_table(
+            "active_users",
+            Oid::from_raw(6),
+            &["id", "user_id"],
+        ));
         tables.insert_overwrite(test_table(
             "projects",
-            7,
+            Oid::from_raw(7),
             &["id", "name", "dept_id", "status"],
         ));
         tables

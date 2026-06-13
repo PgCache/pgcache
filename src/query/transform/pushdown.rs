@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+#[cfg(test)]
+use crate::catalog::Oid;
 use ecow::EcoString;
 
 use crate::query::ast::{AstNode, BinaryOp};
@@ -382,7 +384,7 @@ mod tests {
 
     fn test_table_metadata_with_columns(
         name: &str,
-        relation_oid: u32,
+        relation_oid: Oid,
         column_names: &[&str],
     ) -> TableMetadata {
         let columns =
@@ -468,8 +470,16 @@ mod tests {
     #[test]
     fn test_union_pushdown_both_branches() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
-        tables.insert_overwrite(test_table_metadata_with_columns("t2", 1002, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t2",
+            Oid::from_raw(1002),
+            &["a", "b"],
+        ));
 
         let sql = "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
@@ -500,8 +510,16 @@ mod tests {
     #[test]
     fn test_union_column_alias_remapping() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
-        tables.insert_overwrite(test_table_metadata_with_columns("t2", 1002, &["c", "d"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t2",
+            Oid::from_raw(1002),
+            &["c", "d"],
+        ));
 
         let sql = "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT c, d FROM t2) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
@@ -534,8 +552,16 @@ mod tests {
     #[test]
     fn test_existing_where_anded() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
-        tables.insert_overwrite(test_table_metadata_with_columns("t2", 1002, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t2",
+            Oid::from_raw(1002),
+            &["a", "b"],
+        ));
 
         let sql = "SELECT * FROM (SELECT a, b FROM t1 WHERE b = 'y' UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
@@ -563,7 +589,11 @@ mod tests {
     #[test]
     fn test_non_scalar_expr_no_pushdown() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
 
         let sql = "SELECT * FROM (SELECT a, 42 AS val FROM t1) sub WHERE sub.val = 99";
         let result = resolve_and_pushdown(sql, &tables);
@@ -576,7 +606,11 @@ mod tests {
     #[test]
     fn test_group_by_no_pushdown() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
 
         let sql =
             "SELECT * FROM (SELECT a, count(b) AS cnt FROM t1 GROUP BY a) sub WHERE sub.a = 'x'";
@@ -592,7 +626,11 @@ mod tests {
     #[test]
     fn test_window_function_no_pushdown() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
 
         let sql = "SELECT * FROM (SELECT a, row_number() OVER (ORDER BY b) AS rn FROM t1) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
@@ -607,8 +645,16 @@ mod tests {
     #[test]
     fn test_multiple_conjuncts_all_pushed() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
-        tables.insert_overwrite(test_table_metadata_with_columns("t2", 1002, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t2",
+            Oid::from_raw(1002),
+            &["a", "b"],
+        ));
 
         let sql = "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x' AND sub.b = 'y'";
         let result = resolve_and_pushdown(sql, &tables);
@@ -638,7 +684,11 @@ mod tests {
     #[test]
     fn test_plain_subquery_pushdown() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
 
         let sql = "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
@@ -661,7 +711,11 @@ mod tests {
     #[test]
     fn test_no_subquery_unchanged() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
 
         let sql = "SELECT a, b FROM t1 WHERE a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
@@ -679,8 +733,16 @@ mod tests {
     #[test]
     fn test_predicate_with_subquery_not_pushed() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
-        tables.insert_overwrite(test_table_metadata_with_columns("t2", 1002, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t2",
+            Oid::from_raw(1002),
+            &["a", "b"],
+        ));
 
         let sql = "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a IN (SELECT a FROM t2)";
         let result = resolve_and_pushdown(sql, &tables);
@@ -695,7 +757,11 @@ mod tests {
     #[test]
     fn test_subquery_with_limit_not_pushed() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
 
         let sql = "SELECT * FROM (SELECT a, b FROM t1 LIMIT 10) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
@@ -744,8 +810,16 @@ mod tests {
     #[test]
     fn test_literal_columns_dont_block_pushdown() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
-        tables.insert_overwrite(test_table_metadata_with_columns("t2", 1002, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t2",
+            Oid::from_raw(1002),
+            &["a", "b"],
+        ));
 
         // Branches have literal columns (NULL, constants) alongside real columns.
         // Predicate only references a real column — should still push down.
@@ -783,8 +857,16 @@ mod tests {
     #[test]
     fn test_setop_branches_recurse() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns("t1", 1001, &["a", "b"]));
-        tables.insert_overwrite(test_table_metadata_with_columns("t2", 1002, &["a", "b"]));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t1",
+            Oid::from_raw(1001),
+            &["a", "b"],
+        ));
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            "t2",
+            Oid::from_raw(1002),
+            &["a", "b"],
+        ));
 
         // Top-level UNION; each branch has a FROM subquery with a pushable outer WHERE
         let sql = "\

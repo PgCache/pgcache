@@ -1,3 +1,4 @@
+use crate::catalog::Oid;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -48,7 +49,7 @@ pub struct CachedQuery {
     pub fingerprint: Fingerprint,
     /// Generation number assigned when query was registered (monotonically increasing)
     pub generation: u64,
-    pub relation_oids: Vec<u32>,
+    pub relation_oids: Vec<Oid>,
     pub query: QueryExpr,
     pub resolved: SharedResolved,
     /// Deparsed SQL body of the resolved query. Computed once at registration
@@ -231,7 +232,7 @@ impl UpdateQuery {
 /// `subsumption_check` for sub-linear candidate lookup (see PGC-119).
 #[derive(Debug)]
 pub struct UpdateQueries {
-    pub relation_oid: u32,
+    pub relation_oid: Oid,
     pub queries: FingerprintMap<UpdateQuery>,
     pub complexity_order: Vec<Fingerprint>,
     pub subsumption: SubsumptionIndex,
@@ -245,7 +246,7 @@ pub struct UpdateQueries {
 }
 
 impl UpdateQueries {
-    pub fn new(relation_oid: u32) -> Self {
+    pub fn new(relation_oid: Oid) -> Self {
         Self {
             relation_oid,
             queries: HashMap::default(),
@@ -318,7 +319,7 @@ impl UpdateQueries {
 }
 
 impl IdHashItem for UpdateQueries {
-    type Key<'a> = u32;
+    type Key<'a> = Oid;
 
     fn key(&self) -> Self::Key<'_> {
         self.relation_oid
@@ -371,7 +372,7 @@ impl Cache {
     /// No-op for OIDs without an `update_queries` entry. Also tears down the
     /// subsumption index entry so the lookup path doesn't return a stale
     /// candidate.
-    pub fn update_queries_remove_fingerprint(&mut self, fingerprint: Fingerprint, oids: &[u32]) {
+    pub fn update_queries_remove_fingerprint(&mut self, fingerprint: Fingerprint, oids: &[Oid]) {
         for oid in oids {
             if let Some(mut queries) = self.update_queries.get_mut(oid) {
                 queries.query_remove(fingerprint);
@@ -384,7 +385,7 @@ impl Cache {
 
 /// Shared set of relation OIDs that have active cached queries.
 /// Written by the writer thread, read by the CDC processor.
-pub type ActiveRelations = Arc<ArcSwap<HashSet<u32>>>;
+pub type ActiveRelations = Arc<ArcSwap<HashSet<Oid>>>;
 
 /// Per-query operational metrics.
 ///

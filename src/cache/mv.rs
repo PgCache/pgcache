@@ -7,6 +7,8 @@
 //!
 //! See `docs/materialized-results.md` for the full design.
 
+#[cfg(test)]
+use crate::catalog::Oid;
 use crate::query::Fingerprint;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -544,7 +546,7 @@ mod tests {
 
     // ==================== Classifier tests ====================
 
-    fn test_table(name: &str, oid: u32, cols: &[&str]) -> TableMetadata {
+    fn test_table(name: &str, oid: Oid, cols: &[&str]) -> TableMetadata {
         let columns = ColumnStore::new(cols.iter().enumerate().map(|(i, c)| {
             let is_pk = i == 0;
             ColumnMetadata {
@@ -569,8 +571,16 @@ mod tests {
 
     fn test_tables() -> BiHashMap<TableMetadata> {
         let mut t = BiHashMap::new();
-        t.insert_overwrite(test_table("orders", 1, &["id", "status", "total"]));
-        t.insert_overwrite(test_table("users", 2, &["id", "name", "email"]));
+        t.insert_overwrite(test_table(
+            "orders",
+            Oid::from_raw(1),
+            &["id", "status", "total"],
+        ));
+        t.insert_overwrite(test_table(
+            "users",
+            Oid::from_raw(2),
+            &["id", "name", "email"],
+        ));
         t
     }
 

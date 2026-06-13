@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use crate::catalog::Oid;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
@@ -78,7 +79,7 @@ fn memo_capture_begin(
     // than the precomputed `CachedQuery.relation_oids` (which excludes subquery
     // tables): a change to any read relation, subqueries included, must evict the
     // snapshot, so this set must not be narrowed to that field.
-    let mut oids: Vec<u32> = msg
+    let mut oids: Vec<Oid> = msg
         .resolved
         .nodes::<ResolvedTableNode>()
         .map(|t| t.relation_oid)

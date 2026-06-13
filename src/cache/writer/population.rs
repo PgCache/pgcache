@@ -1,3 +1,4 @@
+use crate::catalog::Oid;
 use crate::query::Fingerprint;
 use std::collections::HashSet;
 use std::fmt::Write;
@@ -226,7 +227,7 @@ async fn population_task(
     max_limit: Option<u64>,
     db_origin: Rc<Client>,
     db_cache: &Client,
-) -> CacheResult<(usize, u64, Vec<(u32, EcoString)>, u64)> {
+) -> CacheResult<(usize, u64, Vec<(Oid, EcoString)>, u64)> {
     // Generation stamping no longer happens here — it moves to the writer's
     // merge, which inserts the staged rows into the tracked shared table
     // (PGC-250).
@@ -237,8 +238,8 @@ async fn population_task(
     // Relations whose staging table has been (re)created this attempt: the first
     // branch touching a relation starts it fresh; later branches append.
     // Reset each attempt so a deadlock retry starts clean.
-    let mut reset: HashSet<u32> = HashSet::new();
-    let mut staged: Vec<(u32, EcoString)> = Vec::new();
+    let mut reset: HashSet<Oid> = HashSet::new();
+    let mut staged: Vec<(Oid, EcoString)> = Vec::new();
 
     // Process each SELECT branch independently
     // For simple SELECT queries, there's just one branch
@@ -298,7 +299,7 @@ async fn population_task(
 /// Deterministic name of a population's per-relation staging table in
 /// `pgcache_stage`. Stable across the worker (loads it) and the writer (merges +
 /// drops it), and across deadlock retries (each attempt recreates it fresh).
-fn staging_table_name(fingerprint: Fingerprint, generation: u64, relation_oid: u32) -> EcoString {
+fn staging_table_name(fingerprint: Fingerprint, generation: u64, relation_oid: Oid) -> EcoString {
     EcoString::from(format!("stage_{fingerprint}_{generation}_{relation_oid}"))
 }
 

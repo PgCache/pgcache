@@ -50,6 +50,7 @@
 //! The writer is single-threaded and processes frames serially, so `begin`/`end`
 //! are balanced per relation per frame and the version never sticks odd.
 
+use crate::catalog::Oid;
 use crate::query::Fingerprint;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -77,13 +78,13 @@ pub const MEMO_CAPTURE_MIN_HITS: u64 = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SlotKey {
     /// Any change (insert/update/delete) to this relation evicts. Rung 1.
-    Relation(u32),
+    Relation(Oid),
     /// A membership change (INSERT/DELETE) on this relation. Rung 2: a snapshot
     /// can always grow on insert / shrink on delete, so these always evict.
-    RelationMembership(u32),
+    RelationMembership(Oid),
     /// A specific column of this relation changed (`(relation_oid, attnum)`).
     /// Rung 2: evict only memos that read this column (SELECT list or WHERE).
-    RelationColumn(u32, u32),
+    RelationColumn(Oid, u32),
 }
 
 /// The result-shape component of a memo key. Cross-shape slicing is unsafe
@@ -374,7 +375,7 @@ impl MemoCapture {
     /// Begin a capture for `key` over `relation_oids`. Returns `None` when
     /// memoization is disabled or any read relation is mid-write (odd slot) —
     /// the caller skips capturing and serves normally.
-    pub fn begin(memo: &ResultMemo, key: MemoKey, relation_oids: &[u32]) -> Option<Self> {
+    pub fn begin(memo: &ResultMemo, key: MemoKey, relation_oids: &[Oid]) -> Option<Self> {
         if !memo.enabled() {
             return None;
         }
@@ -478,11 +479,17 @@ mod tests {
     #[test]
     fn test_slot_stamp_then_valid() {
         let m = memo(1 << 20);
-        let slots = [SlotKey::Relation(10), SlotKey::Relation(20)];
+        let slots = [
+            SlotKey::Relation(Oid::from_raw(10)),
+            SlotKey::Relation(Oid::from_raw(20)),
+        ];
         let stamped = stamp(&m, &slots);
         assert_eq!(
             *stamped,
-            [(SlotKey::Relation(10), 0), (SlotKey::Relation(20), 0)]
+            [
+                (SlotKey::Relation(Oid::from_raw(10)), 0),
+                (SlotKey::Relation(Oid::from_raw(20)), 0)
+            ]
         );
         assert!(m.slots_valid(&stamped), "unchanged versions stay valid");
     }
@@ -490,28 +497,31 @@ mod tests {
     #[test]
     fn test_dirty_cycle_invalidates_stamp() {
         let m = memo(1 << 20);
-        let slots = [SlotKey::Relation(10)];
+        let slots = [SlotKey::Relation(Oid::from_raw(10))];
         let stamped = stamp(&m, &slots);
-        m.slot_dirty_begin(SlotKey::Relation(10));
-        m.slot_dirty_end(SlotKey::Relation(10));
+        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
+        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10)));
         assert!(!m.slots_valid(&stamped), "a write cycle busts the stamp");
         // An unrelated relation's change does not bust it.
         let fresh = stamp(&m, &slots);
-        m.slot_dirty_begin(SlotKey::Relation(99));
-        m.slot_dirty_end(SlotKey::Relation(99));
+        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(99)));
+        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(99)));
         assert!(m.slots_valid(&fresh), "unrelated slot is independent");
     }
 
     #[test]
     fn test_stamp_skips_pending_slot() {
         let m = memo(1 << 20);
-        let slots = [SlotKey::Relation(10), SlotKey::Relation(20)];
-        m.slot_dirty_begin(SlotKey::Relation(20)); // odd: write in progress
+        let slots = [
+            SlotKey::Relation(Oid::from_raw(10)),
+            SlotKey::Relation(Oid::from_raw(20)),
+        ];
+        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(20))); // odd: write in progress
         assert!(
             m.slots_stamp(&slots).is_none(),
             "capture refuses to stamp while a dependency slot is mid-write"
         );
-        m.slot_dirty_end(SlotKey::Relation(20)); // even again
+        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(20))); // even again
         assert!(
             m.slots_stamp(&slots).is_some(),
             "stable once write completes"
@@ -524,8 +534,11 @@ mod tests {
         // instant the writer enters the pending phase, before COMMIT visibility.
         let m = memo(1 << 20);
         let k = key(1);
-        m.insert(k, entry(b"snapshot", &[(SlotKey::Relation(10), 0)]));
-        m.slot_dirty_begin(SlotKey::Relation(10)); // pre-commit, not yet ended
+        m.insert(
+            k,
+            entry(b"snapshot", &[(SlotKey::Relation(Oid::from_raw(10)), 0)]),
+        );
+        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10))); // pre-commit, not yet ended
         assert!(m.get(&k).is_none(), "pending (odd) version busts the memo");
     }
 
@@ -533,7 +546,10 @@ mod tests {
     fn test_insert_get_roundtrip() {
         let m = memo(1 << 20);
         let k = key(1);
-        assert!(m.insert(k, entry(b"core-bytes", &[(SlotKey::Relation(10), 0)])));
+        assert!(m.insert(
+            k,
+            entry(b"core-bytes", &[(SlotKey::Relation(Oid::from_raw(10)), 0)])
+        ));
         let hit = m.get(&k).expect("present and live");
         assert_eq!(&hit.core[..], b"core-bytes");
         assert_eq!(m.total_bytes(), b"core-bytes".len());
@@ -543,9 +559,12 @@ mod tests {
     fn test_get_evicts_after_dirty_cycle() {
         let m = memo(1 << 20);
         let k = key(1);
-        m.insert(k, entry(b"snapshot", &[(SlotKey::Relation(10), 0)]));
-        m.slot_dirty_begin(SlotKey::Relation(10));
-        m.slot_dirty_end(SlotKey::Relation(10));
+        m.insert(
+            k,
+            entry(b"snapshot", &[(SlotKey::Relation(Oid::from_raw(10)), 0)]),
+        );
+        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
+        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10)));
         assert!(m.get(&k).is_none(), "stale entry not served");
         assert_eq!(m.total_bytes(), 0, "stale entry reclaimed lazily on get");
         assert!(m.is_empty());
@@ -600,11 +619,17 @@ mod tests {
         let m = memo(1 << 20);
         let k = key(1);
         // Entry stamped at version 0, then the slot advances → stale.
-        m.insert(k, entry(b"old", &[(SlotKey::Relation(10), 0)]));
-        m.slot_dirty_begin(SlotKey::Relation(10));
-        m.slot_dirty_end(SlotKey::Relation(10)); // slot now 2
+        m.insert(
+            k,
+            entry(b"old", &[(SlotKey::Relation(Oid::from_raw(10)), 0)]),
+        );
+        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
+        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10))); // slot now 2
         // A capture re-inserts a fresh entry for the same key at the new version.
-        m.insert(k, entry(b"new", &[(SlotKey::Relation(10), 2)]));
+        m.insert(
+            k,
+            entry(b"new", &[(SlotKey::Relation(Oid::from_raw(10)), 2)]),
+        );
         // get serves the fresh entry and does not evict it.
         assert_eq!(&m.get(&k).expect("fresh served").core[..], b"new");
         assert!(m.get(&k).is_some(), "fresh entry not clobbered by get");
@@ -613,13 +638,16 @@ mod tests {
     #[test]
     fn test_gc_skips_when_unarmed() {
         let m = memo(1 << 20);
-        m.insert(key(1), entry(b"x", &[(SlotKey::Relation(10), 0)]));
+        m.insert(
+            key(1),
+            entry(b"x", &[(SlotKey::Relation(Oid::from_raw(10)), 0)]),
+        );
         // No slot bumped since insert → gc is a no-op, entry survives.
         m.gc();
         assert!(m.get(&key(1)).is_some(), "entry survives an unarmed gc");
         // A bump arms gc; the now-stale entry is swept.
-        m.slot_dirty_begin(SlotKey::Relation(10));
-        m.slot_dirty_end(SlotKey::Relation(10));
+        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
+        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10)));
         m.gc();
         assert!(m.is_empty(), "stale entry swept once gc is armed");
     }
@@ -627,10 +655,16 @@ mod tests {
     #[test]
     fn test_gc_sweeps_stale() {
         let m = memo(1 << 20);
-        m.insert(key(1), entry(b"aaa", &[(SlotKey::Relation(10), 0)]));
-        m.insert(key(2), entry(b"bbb", &[(SlotKey::Relation(20), 0)]));
-        m.slot_dirty_begin(SlotKey::Relation(10));
-        m.slot_dirty_end(SlotKey::Relation(10));
+        m.insert(
+            key(1),
+            entry(b"aaa", &[(SlotKey::Relation(Oid::from_raw(10)), 0)]),
+        );
+        m.insert(
+            key(2),
+            entry(b"bbb", &[(SlotKey::Relation(Oid::from_raw(20)), 0)]),
+        );
+        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
+        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10)));
         m.gc();
         assert!(m.get(&key(2)).is_some(), "live entry survives gc");
         assert_eq!(m.len(), 1);
@@ -671,8 +705,8 @@ mod tests {
     #[test]
     fn test_capture_roundtrip_and_rd_len() {
         let m = memo(1 << 20);
-        let mut cap =
-            MemoCapture::begin(&m, key(1), &[10, 20]).expect("relations stable, memo enabled");
+        let mut cap = MemoCapture::begin(&m, key(1), &[Oid::from_raw(10), Oid::from_raw(20)])
+            .expect("relations stable, memo enabled");
         cap.row_description_push(b"RD");
         cap.data_push(b"row1");
         cap.data_push(b"row2");
@@ -687,13 +721,14 @@ mod tests {
     #[test]
     fn test_capture_dropped_when_relation_changes_mid_serve() {
         let m = memo(1 << 20);
-        let mut cap = MemoCapture::begin(&m, key(1), &[10]).expect("stable at begin");
+        let mut cap =
+            MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).expect("stable at begin");
         cap.row_description_push(b"RD");
         cap.data_push(b"row");
         cap.command_complete_push(b"CC");
         // A CDC frame touches relation 10 during the serve.
-        m.slot_dirty_begin(SlotKey::Relation(10));
-        m.slot_dirty_end(SlotKey::Relation(10));
+        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10)));
+        m.slot_dirty_end(SlotKey::Relation(Oid::from_raw(10)));
         assert!(
             !cap.finish(&m),
             "stamp advanced → capture dropped, not stored"
@@ -704,9 +739,9 @@ mod tests {
     #[test]
     fn test_capture_skips_when_relation_mid_write() {
         let m = memo(1 << 20);
-        m.slot_dirty_begin(SlotKey::Relation(10)); // odd: write in progress
+        m.slot_dirty_begin(SlotKey::Relation(Oid::from_raw(10))); // odd: write in progress
         assert!(
-            MemoCapture::begin(&m, key(1), &[10]).is_none(),
+            MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).is_none(),
             "no capture started while a read relation is mid-write"
         );
     }
@@ -714,7 +749,7 @@ mod tests {
     #[test]
     fn test_capture_aborts_over_cap() {
         let m = memo(1 << 30);
-        let mut cap = MemoCapture::begin(&m, key(1), &[10]).expect("enabled");
+        let mut cap = MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).expect("enabled");
         cap.row_description_push(b"RD");
         cap.data_push(&vec![0u8; MAX_MEMO_ENTRY_BYTES + 1]);
         assert!(!cap.finish(&m), "oversized capture is dropped");
@@ -724,6 +759,6 @@ mod tests {
     #[test]
     fn test_capture_disabled_returns_none() {
         let m = memo(0);
-        assert!(MemoCapture::begin(&m, key(1), &[10]).is_none());
+        assert!(MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).is_none());
     }
 }

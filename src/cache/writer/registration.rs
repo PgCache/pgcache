@@ -1,3 +1,4 @@
+use crate::catalog::Oid;
 use crate::query::Fingerprint;
 use std::cmp::Reverse;
 use std::collections::HashSet;
@@ -117,7 +118,7 @@ fn update_eval_strategy_classify(
 /// these up (PGC-256 tracks the underlying transform defect).
 fn pg_batchable_classify(
     resolved: &ResolvedQueryExpr,
-    relation_oid: u32,
+    relation_oid: Oid,
     aggregate_functions: &HashSet<EcoString>,
 ) -> bool {
     let Some(select) = resolved.as_select() else {
@@ -248,7 +249,7 @@ struct QueryResolution {
     /// Deparsed SQL body of `resolved`. Computed once here and reused on the
     /// serving hot path; see `CachedQuery.deparsed_sql`.
     deparsed_sql: EcoString,
-    relation_oids: Vec<u32>,
+    relation_oids: Vec<Oid>,
     base_query: QueryExpr,
     max_limit: Option<u64>,
     /// MV cap, separate from `max_limit`. Set for join shapes only (the
@@ -551,7 +552,7 @@ impl WriterRegistration {
             .cloned()
             .collect();
 
-        let branch_relation_oids: Vec<u32> = branches
+        let branch_relation_oids: Vec<Oid> = branches
             .iter()
             .flat_map(|branch: &ResolvedSelectNode| branch.nodes::<ResolvedTableNode>())
             .map(|tn| tn.relation_oid)
@@ -595,7 +596,7 @@ impl WriterRegistration {
     fn update_query_register(
         &self,
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         table_name: &str,
         mut update_query: UpdateQuery,
     ) {
@@ -666,7 +667,7 @@ impl WriterRegistration {
         // Begin recording CDC deletes for this population's relations *before*
         // the worker reads its snapshot (PGC-250). Released at merge or on
         // failure.
-        let relation_oids: Vec<u32> = work.table_metadata.iter().map(|t| t.relation_oid).collect();
+        let relation_oids: Vec<Oid> = work.table_metadata.iter().map(|t| t.relation_oid).collect();
         // Anchor floor: a lower bound on this population's snapshot LSN, used to
         // prune deleted keys it can no longer need (PGC-250).
         let anchor_floor = core.last_applied_lsn;
@@ -729,7 +730,7 @@ impl WriterRegistration {
         fingerprint: Fingerprint,
         resolved: &SharedResolved,
         has_limit: bool,
-    ) -> CacheResult<Vec<u32>> {
+    ) -> CacheResult<Vec<Oid>> {
         let decorrelated = query_expr_decorrelate(resolved, &self.aggregate_functions)
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("decorrelating correlated subqueries")?;
@@ -787,7 +788,7 @@ impl WriterRegistration {
         &self,
         core: &mut WriterCore,
         fingerprint: Fingerprint,
-        relation_oids: Vec<u32>,
+        relation_oids: Vec<Oid>,
         base_query: QueryExpr,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
@@ -1619,7 +1620,7 @@ mod classify_tests {
     use crate::query::ast::query_expr_parse;
     use crate::query::resolved::query_expr_resolve;
 
-    fn make_table(name: &str, oid: u32, columns: &[&str]) -> TableMetadata {
+    fn make_table(name: &str, oid: Oid, columns: &[&str]) -> TableMetadata {
         let cols = ColumnStore::new(columns.iter().enumerate().map(|(i, c)| {
             let is_pk = i == 0;
             ColumnMetadata {
@@ -1650,7 +1651,11 @@ mod classify_tests {
 
     fn classify_single_table(sql: &str) -> UpdateEvalStrategy {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(make_table("t", 1, &["id", "name", "status", "age"]));
+        tables.insert_overwrite(make_table(
+            "t",
+            Oid::from_raw(1),
+            &["id", "name", "status", "age"],
+        ));
         let resolved = resolve(sql, &tables);
         update_eval_strategy_classify(&resolved, UpdateQuerySource::FromClause)
     }
@@ -1707,8 +1712,8 @@ mod classify_tests {
     #[test]
     fn multi_table_is_pg_eval() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(make_table("a", 1, &["id", "bid"]));
-        tables.insert_overwrite(make_table("b", 2, &["id", "name"]));
+        tables.insert_overwrite(make_table("a", Oid::from_raw(1), &["id", "bid"]));
+        tables.insert_overwrite(make_table("b", Oid::from_raw(2), &["id", "name"]));
         let resolved = resolve("SELECT * FROM a JOIN b ON a.bid = b.id", &tables);
         assert_eq!(
             update_eval_strategy_classify(&resolved, UpdateQuerySource::FromClause),
@@ -1721,7 +1726,7 @@ mod classify_tests {
         use crate::cache::SubqueryKind;
         let resolved = resolve("SELECT * FROM t WHERE id = 5", &{
             let mut tables = BiHashMap::new();
-            tables.insert_overwrite(make_table("t", 1, &["id", "name"]));
+            tables.insert_overwrite(make_table("t", Oid::from_raw(1), &["id", "name"]));
             tables
         });
         // Same query, but classified as a subquery-sourced update query
@@ -1740,7 +1745,11 @@ mod classify_tests {
     #[test]
     fn test_predicate_columns_where_collected_select_list_excluded() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(make_table("t", 1, &["id", "name", "status", "age"]));
+        tables.insert_overwrite(make_table(
+            "t",
+            Oid::from_raw(1),
+            &["id", "name", "status", "age"],
+        ));
         let resolved = resolve(
             "SELECT name FROM t WHERE status = 'a' AND age > 'x'",
             &tables,
@@ -1758,8 +1767,8 @@ mod classify_tests {
     #[test]
     fn test_predicate_columns_join_columns_collected_per_table() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(make_table("t", 1, &["id", "name", "status"]));
-        tables.insert_overwrite(make_table("u", 2, &["id", "t_id", "region"]));
+        tables.insert_overwrite(make_table("t", Oid::from_raw(1), &["id", "name", "status"]));
+        tables.insert_overwrite(make_table("u", Oid::from_raw(2), &["id", "t_id", "region"]));
         let resolved = resolve(
             "SELECT t.name FROM t JOIN u ON u.t_id = t.id WHERE u.region = 'x'",
             &tables,
@@ -1776,7 +1785,11 @@ mod classify_tests {
     #[test]
     fn test_predicate_columns_group_by_and_having_collected() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(make_table("t", 1, &["id", "name", "status", "age"]));
+        tables.insert_overwrite(make_table(
+            "t",
+            Oid::from_raw(1),
+            &["id", "name", "status", "age"],
+        ));
         let resolved = resolve(
             "SELECT status, count(id) FROM t GROUP BY status HAVING count(age) > 1",
             &tables,

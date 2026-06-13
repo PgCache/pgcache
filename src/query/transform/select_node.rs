@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::catalog::Oid;
 use crate::query::resolved::{ResolvedSelectColumns, ResolvedSelectNode};
 
 /// Replace SELECT columns in a ResolvedSelectNode for cache population fetches.
@@ -139,7 +141,7 @@ mod tests {
                 schema: "public".into(),
                 name: "orders".into(),
                 alias: None,
-                relation_oid: 12345,
+                relation_oid: Oid::from_raw(12345),
             })],
             ..Default::default()
         };

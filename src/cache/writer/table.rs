@@ -1,3 +1,4 @@
+use crate::catalog::Oid;
 use ecow::EcoString;
 use tokio_postgres::Row;
 use tokio_postgres::types::Type;
@@ -33,12 +34,12 @@ impl WriterCore {
 
         let mut primary_key_columns: Vec<EcoString> = Vec::new();
         let mut columns: Vec<ColumnMetadata> = Vec::with_capacity(rows.len());
-        let mut relation_oid: Option<u32> = None;
+        let mut relation_oid: Option<Oid> = None;
         let mut schema: Option<&str> = schema;
 
         for row in &rows {
             if relation_oid.is_none() {
-                relation_oid = Some(row.get("relation_oid"));
+                relation_oid = Some(Oid::from_raw(row.get("relation_oid")));
             }
 
             if schema.is_none() {
@@ -183,7 +184,7 @@ impl WriterCore {
     /// Find one child partition of a partitioned table, if any.
     /// Returns None for regular tables or partitioned tables with no children.
     #[instrument(skip_all)]
-    pub(super) async fn partition_child_find(&self, relation_oid: u32) -> CacheResult<Option<u32>> {
+    pub(super) async fn partition_child_find(&self, relation_oid: Oid) -> CacheResult<Option<Oid>> {
         let sql = r"
             SELECT inhrelid::oid
             FROM pg_inherits
@@ -193,17 +194,17 @@ impl WriterCore {
 
         let row = self
             .db_origin
-            .query_opt(sql, &[&relation_oid])
+            .query_opt(sql, &[&relation_oid.get()])
             .await
             .map_into_report::<CacheError>()?;
 
-        Ok(row.map(|r| r.get::<_, u32>(0)))
+        Ok(row.map(|r| Oid::from_raw(r.get::<_, u32>(0))))
     }
 
     #[instrument(skip_all)]
     pub(super) async fn query_table_indexes_get(
         &self,
-        relation_oid: u32,
+        relation_oid: Oid,
     ) -> CacheResult<Vec<IndexMetadata>> {
         // For partitioned tables, query indexes from a child partition.
         // Falls back to parent (works for regular tables and partitioned tables with no children).
@@ -231,7 +232,7 @@ impl WriterCore {
 
         let rows = self
             .db_origin
-            .query(sql, &[&target_oid])
+            .query(sql, &[&target_oid.get()])
             .await
             .map_into_report::<CacheError>()?;
 
@@ -369,7 +370,7 @@ impl WriterCore {
     /// Best-effort: logs and continues on DB failures rather than aborting
     /// the eviction path. Oids without metadata are silently skipped.
     #[instrument(skip(self, relation_oids))]
-    pub(super) async fn cache_tables_drop(&mut self, relation_oids: &[u32]) {
+    pub(super) async fn cache_tables_drop(&mut self, relation_oids: &[Oid]) {
         let mut quoted = Vec::with_capacity(relation_oids.len());
         for oid in relation_oids {
             if let Some(table) = self.cache.tables.remove1(oid) {

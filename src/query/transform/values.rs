@@ -1,3 +1,4 @@
+use crate::catalog::Oid;
 use ecow::EcoString;
 use rootcause::Report;
 
@@ -50,7 +51,7 @@ fn table_alias_find(
 /// mutably, for replacement.
 fn table_source_find_mut(
     resolved: &mut ResolvedSelectNode,
-    relation_oid: u32,
+    relation_oid: Oid,
 ) -> AstTransformResult<&mut ResolvedTableSource> {
     let Some(first_from) = resolved.from.first_mut() else {
         return Err(AstTransformError::MissingTable.into());
@@ -553,7 +554,7 @@ mod tests {
         }
     }
 
-    fn table_metadata(name: &str, oid: u32, cols: &[(&str, &str)]) -> TableMetadata {
+    fn table_metadata(name: &str, oid: Oid, cols: &[(&str, &str)]) -> TableMetadata {
         let columns =
             ColumnStore::new(cols.iter().enumerate().map(|(i, &(col_name, type_name))| {
                 column_metadata(
@@ -572,7 +573,7 @@ mod tests {
         }
     }
 
-    fn resolved_table(name: &str, oid: u32, alias: Option<&str>) -> ResolvedTableSource {
+    fn resolved_table(name: &str, oid: Oid, alias: Option<&str>) -> ResolvedTableSource {
         ResolvedTableSource::Table(ResolvedTableNode {
             schema: "public".into(),
             name: name.into(),
@@ -619,13 +620,13 @@ mod tests {
             ("j1_pk", "int4"),
         ];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("j1_tbl", 5001, cols));
+        tables.insert_overwrite(table_metadata("j1_tbl", Oid::from_raw(5001), cols));
         tables.insert_overwrite(table_metadata(
             "j2_tbl",
-            5002,
+            Oid::from_raw(5002),
             &[("i", "int4"), ("k", "int4"), ("j2_pk", "int4")],
         ));
-        let j1 = table_metadata("j1_tbl", 5001, cols);
+        let j1 = table_metadata("j1_tbl", Oid::from_raw(5001), cols);
         let row = vec![
             Some("1".into()),
             Some("4".into()),
@@ -663,8 +664,8 @@ mod tests {
     fn test_group_by_having_uses_subquery_alias() {
         let cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", 6001, cols));
-        let onek = table_metadata("onek", 6001, cols);
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), cols));
+        let onek = table_metadata("onek", Oid::from_raw(6001), cols);
         let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
 
         let qe = query_expr_parse(
@@ -706,8 +707,8 @@ mod tests {
         ];
         let cols2 = &[("i", "int4"), ("k", "int4"), ("j2_pk", "int4")];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("j1_tbl", 5001, cols1));
-        tables.insert_overwrite(table_metadata("j2_tbl", 5002, cols2));
+        tables.insert_overwrite(table_metadata("j1_tbl", Oid::from_raw(5001), cols1));
+        tables.insert_overwrite(table_metadata("j2_tbl", Oid::from_raw(5002), cols2));
 
         let resolve = |sql: &str| {
             let qe = query_expr_parse(sql).expect("convert");
@@ -770,9 +771,13 @@ mod tests {
 
     #[test]
     fn test_simple_table_replaced_with_values() {
-        let meta = table_metadata("users", 100, &[("id", "int4"), ("name", "text")]);
+        let meta = table_metadata(
+            "users",
+            Oid::from_raw(100),
+            &[("id", "int4"), ("name", "text")],
+        );
         let node = select_node(
-            vec![resolved_table("users", 100, None)],
+            vec![resolved_table("users", Oid::from_raw(100), None)],
             ResolvedSelectColumns::None,
             None,
         );
@@ -809,9 +814,13 @@ mod tests {
 
     #[test]
     fn test_null_values_produce_null_with_cast() {
-        let meta = table_metadata("users", 100, &[("id", "int4"), ("name", "text")]);
+        let meta = table_metadata(
+            "users",
+            Oid::from_raw(100),
+            &[("id", "int4"), ("name", "text")],
+        );
         let node = select_node(
-            vec![resolved_table("users", 100, None)],
+            vec![resolved_table("users", Oid::from_raw(100), None)],
             ResolvedSelectColumns::None,
             None,
         );
@@ -830,9 +839,13 @@ mod tests {
 
     #[test]
     fn test_unnest_replace_shape() {
-        let meta = table_metadata("users", 100, &[("id", "int4"), ("name", "text")]);
+        let meta = table_metadata(
+            "users",
+            Oid::from_raw(100),
+            &[("id", "int4"), ("name", "text")],
+        );
         let node = select_node(
-            vec![resolved_table("users", 100, Some("u"))],
+            vec![resolved_table("users", Oid::from_raw(100), Some("u"))],
             ResolvedSelectColumns::None,
             None,
         );
@@ -862,9 +875,13 @@ mod tests {
 
     #[test]
     fn test_batch_values_rows_idx_and_projection() {
-        let meta = table_metadata("users", 100, &[("id", "int4"), ("name", "text")]);
+        let meta = table_metadata(
+            "users",
+            Oid::from_raw(100),
+            &[("id", "int4"), ("name", "text")],
+        );
         let node = select_node(
-            vec![resolved_table("users", 100, None)],
+            vec![resolved_table("users", Oid::from_raw(100), None)],
             ResolvedSelectColumns::None,
             None,
         );
@@ -900,9 +917,9 @@ mod tests {
 
     #[test]
     fn test_explicit_alias_preserved() {
-        let meta = table_metadata("users", 100, &[("id", "int4")]);
+        let meta = table_metadata("users", Oid::from_raw(100), &[("id", "int4")]);
         let node = select_node(
-            vec![resolved_table("users", 100, Some("u"))],
+            vec![resolved_table("users", Oid::from_raw(100), Some("u"))],
             ResolvedSelectColumns::None,
             None,
         );
@@ -925,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_empty_from_returns_missing_table() {
-        let meta = table_metadata("users", 100, &[("id", "int4")]);
+        let meta = table_metadata("users", Oid::from_raw(100), &[("id", "int4")]);
         let node = select_node(vec![], ResolvedSelectColumns::None, None);
         let row = vec![Some("1".into())];
 
@@ -941,10 +958,10 @@ mod tests {
 
     #[test]
     fn test_non_matching_oid_returns_missing_table() {
-        let meta = table_metadata("users", 100, &[("id", "int4")]);
+        let meta = table_metadata("users", Oid::from_raw(100), &[("id", "int4")]);
         // FROM has a table with OID 999, but metadata says OID 100
         let node = select_node(
-            vec![resolved_table("users", 999, None)],
+            vec![resolved_table("users", Oid::from_raw(999), None)],
             ResolvedSelectColumns::None,
             None,
         );
@@ -975,9 +992,13 @@ mod tests {
             ))),
         });
 
-        let meta = table_metadata("users", 100, &[("id", "int4"), ("name", "text")]);
+        let meta = table_metadata(
+            "users",
+            Oid::from_raw(100),
+            &[("id", "int4"), ("name", "text")],
+        );
         let node = select_node(
-            vec![resolved_table("users", 100, None)],
+            vec![resolved_table("users", Oid::from_raw(100), None)],
             ResolvedSelectColumns::None,
             Some(where_clause),
         );
@@ -1004,8 +1025,12 @@ mod tests {
             alias: None,
         }]);
 
-        let meta = table_metadata("users", 100, &[("id", "int4")]);
-        let node = select_node(vec![resolved_table("users", 100, None)], columns, None);
+        let meta = table_metadata("users", Oid::from_raw(100), &[("id", "int4")]);
+        let node = select_node(
+            vec![resolved_table("users", Oid::from_raw(100), None)],
+            columns,
+            None,
+        );
         let row = vec![Some("42".into())];
 
         let result =
@@ -1028,12 +1053,16 @@ mod tests {
 
     #[test]
     fn test_table_inside_join_replaced() {
-        let meta = table_metadata("orders", 200, &[("id", "int4"), ("total", "text")]);
+        let meta = table_metadata(
+            "orders",
+            Oid::from_raw(200),
+            &[("id", "int4"), ("total", "text")],
+        );
 
         let join = ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
             join_type: JoinType::Inner,
-            left: resolved_table("users", 100, None),
-            right: resolved_table("orders", 200, None),
+            left: resolved_table("users", Oid::from_raw(100), None),
+            right: resolved_table("orders", Oid::from_raw(200), None),
             qual: ResolvedJoinQual::Cross,
         }));
 

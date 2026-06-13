@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::catalog::Oid;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
@@ -1136,7 +1138,7 @@ mod tests {
     }
 
     // Helper function to create test table metadata
-    fn test_table_metadata(name: &str, relation_oid: u32) -> TableMetadata {
+    fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
         let columns = ColumnStore::new([
             ColumnMetadata {
                 name: "id".into(),
@@ -1205,7 +1207,7 @@ mod tests {
     #[test]
     fn test_simple_constraint() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id = 1";
         let resolved = resolve_sql(sql, &tables);
@@ -1226,8 +1228,8 @@ mod tests {
     #[test]
     fn test_join_propagation() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("test", 1001));
-        tables.insert_overwrite(test_table_metadata("test_map", 1002));
+        tables.insert_overwrite(test_table_metadata("test", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("test_map", Oid::from_raw(1002)));
 
         let sql = "SELECT * FROM test t JOIN test_map tm ON tm.id = t.id WHERE t.id = 1";
         let resolved = resolve_sql(sql, &tables);
@@ -1263,11 +1265,11 @@ mod tests {
     #[test]
     fn test_transitive_propagation() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("a", 1001));
-        tables.insert_overwrite(test_table_metadata("b", 1002));
+        tables.insert_overwrite(test_table_metadata("a", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("b", Oid::from_raw(1002)));
 
         tables.insert_overwrite(TableMetadata {
-            relation_oid: 1003,
+            relation_oid: Oid::from_raw(1003),
             name: "c".into(),
             schema: "public".into(),
             primary_key_columns: vec!["id".into()],
@@ -1317,7 +1319,7 @@ mod tests {
     #[test]
     fn test_multiple_constraints() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id = 1 AND name = 'john'";
         let resolved = resolve_sql(sql, &tables);
@@ -1348,8 +1350,8 @@ mod tests {
     #[test]
     fn test_equivalence_in_where() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("a", 1001));
-        tables.insert_overwrite(test_table_metadata("b", 1002));
+        tables.insert_overwrite(test_table_metadata("a", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("b", Oid::from_raw(1002)));
 
         let sql = "SELECT * FROM a, b WHERE a.id = b.id AND a.id = 1";
         let resolved = resolve_sql(sql, &tables);
@@ -1376,7 +1378,7 @@ mod tests {
     #[test]
     fn test_no_propagation_with_or() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id = 1 OR id = 2";
         let resolved = resolve_sql(sql, &tables);
@@ -1390,7 +1392,7 @@ mod tests {
     #[test]
     fn test_self_join() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("test", 1001));
+        tables.insert_overwrite(test_table_metadata("test", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM test t1 JOIN test t2 ON t1.id = t2.id WHERE t1.id = 1";
         let resolved = resolve_sql(sql, &tables);
@@ -1415,8 +1417,8 @@ mod tests {
     #[test]
     fn test_subquery_extracts_outer_constraints() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("active_users", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("active_users", Oid::from_raw(1002)));
 
         let sql = "SELECT * FROM users WHERE id IN (SELECT id FROM active_users) AND id = 1";
         let resolved = resolve_sql(sql, &tables);
@@ -1436,7 +1438,7 @@ mod tests {
     #[test]
     fn test_derived_table_no_outer_constraints() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub";
         let resolved = resolve_sql(sql, &tables);
@@ -1452,8 +1454,8 @@ mod tests {
     #[test]
     fn test_scalar_subquery_extracts_outer_constraints() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let sql = "SELECT id, (SELECT COUNT(*) FROM orders) FROM users WHERE id = 1";
         let resolved = resolve_sql(sql, &tables);
@@ -1473,8 +1475,8 @@ mod tests {
     #[test]
     fn test_subquery_multiple_outer_constraints() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("active_users", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("active_users", Oid::from_raw(1002)));
 
         let sql = "SELECT * FROM users WHERE id IN (SELECT id FROM active_users) AND id = 1 AND name = 'alice'";
         let resolved = resolve_sql(sql, &tables);
@@ -1503,7 +1505,7 @@ mod tests {
     #[test]
     fn test_simple_inequality() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id > 5";
         let resolved = resolve_sql(sql, &tables);
@@ -1523,7 +1525,7 @@ mod tests {
     #[test]
     fn test_multiple_inequalities_same_column() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id > 5 AND id < 100";
         let resolved = resolve_sql(sql, &tables);
@@ -1550,7 +1552,7 @@ mod tests {
     #[test]
     fn test_reversed_operand() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // 5 < id is equivalent to id > 5
         let sql = "SELECT * FROM users WHERE 5 < id";
@@ -1571,7 +1573,7 @@ mod tests {
     #[test]
     fn test_not_equal() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE name != 'deleted'";
         let resolved = resolve_sql(sql, &tables);
@@ -1591,7 +1593,7 @@ mod tests {
     #[test]
     fn test_mixed_equality_and_inequality() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id = 1 AND name != 'deleted'";
         let resolved = resolve_sql(sql, &tables);
@@ -1618,8 +1620,8 @@ mod tests {
     #[test]
     fn test_inequality_propagation_through_join() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("a", 1001));
-        tables.insert_overwrite(test_table_metadata("b", 1002));
+        tables.insert_overwrite(test_table_metadata("a", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("b", Oid::from_raw(1002)));
 
         let sql = "SELECT * FROM a JOIN b ON a.id = b.id WHERE a.id > 5";
         let resolved = resolve_sql(sql, &tables);
@@ -1647,7 +1649,7 @@ mod tests {
     #[test]
     fn test_or_prevents_inequality_extraction() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id > 5 OR id < 2";
         let resolved = resolve_sql(sql, &tables);
@@ -1662,7 +1664,7 @@ mod tests {
     #[test]
     fn test_between() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id BETWEEN 100 AND 500";
         let resolved = resolve_sql(sql, &tables);
@@ -1689,7 +1691,7 @@ mod tests {
     #[test]
     fn test_between_with_and() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE name = 'alice' AND id BETWEEN 100 AND 500";
         let resolved = resolve_sql(sql, &tables);
@@ -1723,8 +1725,8 @@ mod tests {
     #[test]
     fn test_between_propagation_through_join() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("a", 1001));
-        tables.insert_overwrite(test_table_metadata("b", 1002));
+        tables.insert_overwrite(test_table_metadata("a", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("b", Oid::from_raw(1002)));
 
         let sql = "SELECT * FROM a JOIN b ON a.id = b.id WHERE a.id BETWEEN 1 AND 10";
         let resolved = resolve_sql(sql, &tables);
@@ -1766,7 +1768,7 @@ mod tests {
     #[test]
     fn test_not_between() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // NOT BETWEEN is an OR (id < 100 OR id > 500), so no constraints
         let sql = "SELECT * FROM users WHERE id NOT BETWEEN 100 AND 500";
@@ -1780,7 +1782,7 @@ mod tests {
     #[test]
     fn test_between_symmetric_reversed_bounds() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // Bounds are reversed (500, 100) — should normalize to (100, 500)
         let sql = "SELECT * FROM users WHERE id BETWEEN SYMMETRIC 500 AND 100";
@@ -1808,7 +1810,7 @@ mod tests {
     #[test]
     fn test_between_symmetric_already_ordered() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // Bounds already in order — same result as reversed
         let sql = "SELECT * FROM users WHERE id BETWEEN SYMMETRIC 100 AND 500";
@@ -1836,7 +1838,7 @@ mod tests {
     #[test]
     fn test_between_symmetric_with_parameter() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // Can't compare parameter with literal — skip extraction
         let sql = "SELECT * FROM users WHERE id BETWEEN SYMMETRIC $1 AND 500";
@@ -1850,7 +1852,7 @@ mod tests {
     #[test]
     fn test_not_between_symmetric() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // NOT BETWEEN SYMMETRIC is still an OR — no constraints
         let sql = "SELECT * FROM users WHERE id NOT BETWEEN SYMMETRIC 500 AND 100";
@@ -1867,7 +1869,7 @@ mod tests {
     fn test_subsumption_cached_no_constraints() {
         // Cached: SELECT * FROM users (no WHERE) → full scan covers everything
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql("SELECT * FROM users", &tables));
         let new =
@@ -1879,7 +1881,7 @@ mod tests {
     #[test]
     fn test_subsumption_same_equality() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
@@ -1893,7 +1895,7 @@ mod tests {
     fn test_subsumption_new_narrower() {
         // Cached has fewer equality constraints → new is narrower. Subsumed.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
@@ -1908,7 +1910,7 @@ mod tests {
     #[test]
     fn test_subsumption_different_values() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
@@ -1922,7 +1924,7 @@ mod tests {
     fn test_subsumption_cached_has_extra_constraint() {
         // Cached is narrower than new → not subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id = 1 AND name = 'alice'",
@@ -1938,7 +1940,7 @@ mod tests {
     fn test_subsumption_new_no_constraints() {
         // New has no constraints but cached does → new is broader, not subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 1", &tables));
@@ -1951,7 +1953,7 @@ mod tests {
     fn test_subsumption_range_tighter_lower() {
         // id > 10 implies id > 5 — subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 5", &tables));
@@ -1964,7 +1966,7 @@ mod tests {
     #[test]
     fn test_between_with_non_literal_bounds() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // Non-literal bound (column reference) — skip extraction
         let sql = "SELECT * FROM users WHERE id BETWEEN name AND 10";
@@ -1981,7 +1983,7 @@ mod tests {
     fn test_subsumption_range_looser_lower() {
         // id > 1 does NOT imply id > 3 — not subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 3", &tables));
@@ -1995,7 +1997,7 @@ mod tests {
     fn test_subsumption_range_exclusive_tighter_than_inclusive() {
         // id > 3 (exclusive) is tighter than id >= 3 (inclusive) — subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id >= 3", &tables));
@@ -2009,7 +2011,7 @@ mod tests {
     fn test_subsumption_range_same_inclusive_bound() {
         // id >= 3 subsumed by id >= 3
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id >= 3", &tables));
@@ -2023,7 +2025,7 @@ mod tests {
     fn test_subsumption_range_containment() {
         // id BETWEEN 5 AND 8 is contained in id >= 3 AND id <= 10
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id >= 3 AND id <= 10",
@@ -2041,7 +2043,7 @@ mod tests {
     fn test_subsumption_range_missing_upper() {
         // id > 50 has no upper bound, but cached has id < 100 — not subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id > 0 AND id < 100",
@@ -2057,7 +2059,7 @@ mod tests {
     fn test_subsumption_point_in_range() {
         // id = 5 is within id > 3
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 3", &tables));
@@ -2071,7 +2073,7 @@ mod tests {
     fn test_subsumption_point_outside_range() {
         // id = 2 is NOT within id > 3
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 3", &tables));
@@ -2085,7 +2087,7 @@ mod tests {
     fn test_subsumption_equal_not_subsumed_by_range() {
         // Cached = 5 (single point), new wants id > 3 (a range) — not subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 5", &tables));
@@ -2099,7 +2101,7 @@ mod tests {
     fn test_subsumption_not_equal_by_different_equal() {
         // Cached != 5, new = 3. 3 ≠ 5, so new's result is within cached's — subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
@@ -2113,7 +2115,7 @@ mod tests {
     fn test_subsumption_not_equal_by_same_equal() {
         // Cached != 5, new = 5 — 5 is excluded by cached. Not subsumed.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
@@ -2127,7 +2129,7 @@ mod tests {
     fn test_subsumption_not_equal_by_excluding_range() {
         // Cached != 5, new id > 10 — entire range excludes 5. Subsumed.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
@@ -2141,7 +2143,7 @@ mod tests {
     fn test_subsumption_not_equal_by_including_range() {
         // Cached != 5, new id > 3 — range includes 5. Not subsumed.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
@@ -2155,7 +2157,7 @@ mod tests {
     fn test_subsumption_not_equal_same() {
         // Cached != 5, new != 5 — same exclusion. Subsumed.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
@@ -2169,7 +2171,7 @@ mod tests {
     fn test_subsumption_not_equal_different() {
         // Cached != 5, new != 3 — different exclusions. Not subsumed.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id != 5", &tables));
@@ -2183,7 +2185,7 @@ mod tests {
     fn test_subsumption_mixed_columns() {
         // Both columns must be subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id > 3 AND name = 'alice'",
@@ -2201,7 +2203,7 @@ mod tests {
     fn test_subsumption_mixed_columns_mismatch() {
         // id subsumed but name differs — not subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id > 3 AND name = 'alice'",
@@ -2219,7 +2221,7 @@ mod tests {
     fn test_subsumption_contradictory_new() {
         // New has contradictory constraints (= 5 AND > 10) → Empty → trivially subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id = 5", &tables));
@@ -2235,7 +2237,7 @@ mod tests {
     fn test_subsumption_contradictory_cached() {
         // Cached has contradictory constraints → Empty → no data, not subsumed
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id = 5 AND id > 10",
@@ -2400,7 +2402,7 @@ mod tests {
     #[test]
     fn test_in_extraction() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id IN (1, 2, 3)";
         let resolved = resolve_sql(sql, &tables);
@@ -2421,7 +2423,7 @@ mod tests {
     #[test]
     fn test_in_with_and() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id IN (1, 2) AND name = 'alice'";
         let resolved = resolve_sql(sql, &tables);
@@ -2445,7 +2447,7 @@ mod tests {
     #[test]
     fn test_in_with_parameter_skipped() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id IN (1, $1)";
         let resolved = resolve_sql(sql, &tables);
@@ -2458,7 +2460,7 @@ mod tests {
     #[test]
     fn test_not_in_extraction() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users WHERE id NOT IN (1, 2, 3)";
         let resolved = resolve_sql(sql, &tables);
@@ -2491,8 +2493,8 @@ mod tests {
     #[test]
     fn test_in_propagation_through_join() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("a", 1001));
-        tables.insert_overwrite(test_table_metadata("b", 1002));
+        tables.insert_overwrite(test_table_metadata("a", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("b", Oid::from_raw(1002)));
 
         let sql = "SELECT * FROM a JOIN b ON a.id = b.id WHERE a.id IN (1, 2)";
         let resolved = resolve_sql(sql, &tables);
@@ -2519,7 +2521,7 @@ mod tests {
     fn test_subsumption_in_subset() {
         // IN (1,2,3) subsumed by IN (1,2) — subset
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id IN (1, 2, 3)",
@@ -2537,7 +2539,7 @@ mod tests {
     fn test_subsumption_in_point() {
         // IN (1,2,3) subsumed by = 2 — point in set
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id IN (1, 2, 3)",
@@ -2553,7 +2555,7 @@ mod tests {
     fn test_subsumption_in_not_subset() {
         // IN (1,2,3) NOT subsumed by IN (1,4) — 4 not in set
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id IN (1, 2, 3)",
@@ -2571,7 +2573,7 @@ mod tests {
     fn test_subsumption_range_subsumes_in() {
         // id > 0 subsumed by IN (1,2,3) — all values > 0
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached =
             analyze_query_constraints(&resolve_sql("SELECT * FROM users WHERE id > 0", &tables));
@@ -2587,7 +2589,7 @@ mod tests {
     fn test_subsumption_in_not_subsumes_range() {
         // IN (1,2,3) NOT subsumed by id > 0 — set is finite, range is infinite
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id IN (1, 2, 3)",
@@ -2602,7 +2604,7 @@ mod tests {
     #[test]
     fn test_subsumption_unconstrained_subsumes_in() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql("SELECT * FROM users", &tables));
         let new = analyze_query_constraints(&resolve_sql(
@@ -2719,7 +2721,7 @@ mod tests {
     #[test]
     fn test_no_where_clause_is_complete() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
         let resolved = resolve_sql("SELECT * FROM users", &tables);
 
         let constraints = analyze_query_constraints(&resolved);
@@ -2733,7 +2735,7 @@ mod tests {
     #[test]
     fn test_simple_equality_is_complete() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
         let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
 
         let constraints = analyze_query_constraints(&resolved);
@@ -2744,7 +2746,7 @@ mod tests {
     #[test]
     fn test_in_clause_is_complete() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
         let resolved = resolve_sql("SELECT * FROM users WHERE id IN (1, 2, 3)", &tables);
 
         let constraints = analyze_query_constraints(&resolved);
@@ -2758,7 +2760,7 @@ mod tests {
         // extracted as `ColumnConstraint::InSet` so cached ANY-queries can
         // subsume narrower ANY-queries on the same column.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
         let resolved = resolve_sql(
             "SELECT * FROM users WHERE id = ANY(ARRAY[1, 2, 3])",
             &tables,
@@ -2788,7 +2790,7 @@ mod tests {
         // must continue to fall back to "not subsumed" until/unless the
         // analyzer learns to handle disjunctions.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
         let resolved = resolve_sql("SELECT * FROM users WHERE id = 1 OR id = 2", &tables);
 
         let constraints = analyze_query_constraints(&resolved);
@@ -2801,7 +2803,7 @@ mod tests {
         // PGC-106 (option C) headline: cached `ANY([1,2,3])` should
         // subsume new `ANY([1])`.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id = ANY(ARRAY[1, 2, 3])",
@@ -2820,7 +2822,7 @@ mod tests {
         // The PGC-106 option-B scenario stays correct under option C:
         // disjoint arrays can't subsume each other.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id = ANY(ARRAY[1, 2])",
@@ -2838,7 +2840,7 @@ mod tests {
     fn test_subsumption_any_subsumes_equality() {
         // Cached `ANY([1,2,3])` should also subsume new `WHERE id = 2`.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id = ANY(ARRAY[1, 2, 3])",
@@ -2856,7 +2858,7 @@ mod tests {
         // "full-scan subsumes everything" case: cached query has no WHERE
         // clause, so analysis is complete AND `table_constraints` is empty.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql("SELECT * FROM users", &tables));
         let new =
@@ -2878,7 +2880,7 @@ mod tests {
         // `name::text = 'alice'` on a TEXT column must extract the same
         // ColumnConstraint::Comparison as `name = 'alice'` would.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let constraints = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE name::text = 'alice'",
@@ -2900,7 +2902,7 @@ mod tests {
         // Two queries that only differ by a redundant `::text` on a TEXT
         // column should subsume each other.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE name = 'alice'",
@@ -2921,7 +2923,7 @@ mod tests {
         // PGC-177: int → ::text is identity, so the constraint must be
         // extracted as `id = 42` for subsumption to work.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let constraints = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE id::text = '42'",
@@ -2943,7 +2945,7 @@ mod tests {
         // `name::numeric = 42` is a text → numeric coercion, not identity.
         // Analysis must remain incomplete so subsumption stays conservative.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let constraints = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE name::numeric = 42",
@@ -2981,7 +2983,7 @@ mod tests {
     #[test]
     fn test_text_to_int4_extracts_cast_comparison() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let constraints = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE name::int4 = 42",
@@ -3004,7 +3006,7 @@ mod tests {
         // Identical cast queries: both extract the same CastComparison,
         // subsumption holds.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE name::int4 = 42",
@@ -3025,7 +3027,7 @@ mod tests {
         // `WHERE name::int4 > 100` (cached) subsumes `WHERE name::int4 > 200`
         // (new) — every row in the new is also in the cached.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE name::int4 > 100",
@@ -3044,7 +3046,7 @@ mod tests {
         // `WHERE name::int4 > 200` (cached) does NOT subsume
         // `WHERE name::int4 > 100` (new) — new is broader.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE name::int4 > 200",
@@ -3063,7 +3065,7 @@ mod tests {
         // `name::int4 = 42` and `name::int8 = 42` are separate value domains;
         // neither query subsumes the other even though the value matches.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE name::int4 = 42",
@@ -3083,7 +3085,7 @@ mod tests {
         // different predicates — bare bytes vs int value. Subsumption must
         // not cross domains.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let cached = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users WHERE name = '42'",
@@ -3103,8 +3105,8 @@ mod tests {
         // `other_name::int4 = 5` — the cast doesn't follow equivalences
         // without knowing the other column's storage type is also castable.
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("users2", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("users2", Oid::from_raw(1002)));
 
         let constraints = analyze_query_constraints(&resolve_sql(
             "SELECT * FROM users u JOIN users2 u2 ON u.name = u2.name \

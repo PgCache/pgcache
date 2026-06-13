@@ -1,3 +1,4 @@
+use crate::catalog::Oid;
 use ecow::EcoString;
 use iddqd::BiHashMap;
 use rootcause::Report;
@@ -199,7 +200,7 @@ impl<'a> ResolutionScope<'a> {
         let columns = derived_table_columns_extract(resolved_query);
 
         let synthetic_metadata = TableMetadata {
-            relation_oid: 0,
+            relation_oid: Oid::from_raw(0),
             name: alias.into(),
             schema: "".into(),
             primary_key_columns: Vec::new(),
@@ -1372,13 +1373,13 @@ mod tests {
             schema: "public".into(),
             name: "users".into(),
             alias: Some("u".into()),
-            relation_oid: 12345,
+            relation_oid: Oid::from_raw(12345),
         };
 
         assert_eq!(table_node.schema, "public");
         assert_eq!(table_node.name, "users");
         assert_eq!(table_node.alias.as_deref(), Some("u"));
-        assert_eq!(table_node.relation_oid, 12345);
+        assert_eq!(table_node.relation_oid.get(), 12345);
     }
 
     #[test]
@@ -1420,7 +1421,7 @@ mod tests {
     }
 
     // Helper function to create test table metadata
-    fn test_table_metadata(name: &str, relation_oid: u32) -> TableMetadata {
+    fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
         let columns = ColumnStore::new([
             ColumnMetadata {
                 name: "id".into(),
@@ -1455,7 +1456,7 @@ mod tests {
     /// Create test table metadata with custom column names (all text type, first is PK).
     fn test_table_metadata_with_columns(
         name: &str,
-        relation_oid: u32,
+        relation_oid: Oid,
         column_names: &[&str],
     ) -> TableMetadata {
         let columns =
@@ -1486,7 +1487,7 @@ mod tests {
     #[test]
     fn test_table_resolve_simple() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT * FROM users", &tables);
 
@@ -1495,7 +1496,7 @@ mod tests {
             assert_eq!(table.schema, "public");
             assert_eq!(table.name, "users");
             assert_eq!(table.alias, None);
-            assert_eq!(table.relation_oid, 1001);
+            assert_eq!(table.relation_oid.get(), 1001);
         } else {
             panic!("Expected table source");
         }
@@ -1504,7 +1505,7 @@ mod tests {
     #[test]
     fn test_table_resolve_with_alias() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT * FROM users u", &tables);
 
@@ -1513,7 +1514,7 @@ mod tests {
             assert_eq!(table.schema, "public");
             assert_eq!(table.name, "users");
             assert_eq!(table.alias.as_deref(), Some("u"));
-            assert_eq!(table.relation_oid, 1001);
+            assert_eq!(table.relation_oid.get(), 1001);
         } else {
             panic!("Expected table source");
         }
@@ -1534,7 +1535,7 @@ mod tests {
     #[test]
     fn test_column_resolve_qualified() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT * FROM users WHERE users.id = 1", &tables);
 
@@ -1556,7 +1557,7 @@ mod tests {
     #[test]
     fn test_column_resolve_with_alias() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT * FROM users u WHERE u.name = 'john'", &tables);
 
@@ -1578,7 +1579,7 @@ mod tests {
     #[test]
     fn test_column_resolve_unqualified() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
 
@@ -1599,8 +1600,8 @@ mod tests {
     #[test]
     fn test_column_resolve_ambiguous() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         // Both tables have 'id' column, unqualified reference is ambiguous
         let node = parse_select_node("SELECT * FROM users, orders WHERE id = 1");
@@ -1615,7 +1616,7 @@ mod tests {
     #[test]
     fn test_select_star_expansion() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT * FROM users", &tables);
 
@@ -1639,7 +1640,7 @@ mod tests {
     #[test]
     fn test_select_specific_columns() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT id, name FROM users", &tables);
 
@@ -1668,7 +1669,7 @@ mod tests {
     #[test]
     fn test_select_star_with_column() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT *, name FROM users", &tables);
 
@@ -1697,8 +1698,8 @@ mod tests {
     #[test]
     fn test_select_qualified_star_with_column() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT u.*, o.name FROM users u JOIN orders o ON o.id = u.id",
@@ -1733,8 +1734,8 @@ mod tests {
     #[test]
     fn test_join_resolution() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT * FROM users JOIN orders ON users.id = orders.id",
@@ -1785,8 +1786,8 @@ mod tests {
     #[test]
     fn test_join_with_aliases() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT * FROM users u JOIN orders o ON u.id = o.id",
@@ -1836,7 +1837,7 @@ mod tests {
     #[test]
     fn test_where_expr_complex() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT * FROM users WHERE id = 1 AND name = 'john'",
@@ -1878,7 +1879,7 @@ mod tests {
     #[test]
     fn test_order_by_simple() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // `SELECT *` expands `name` into the output list, so the unqualified
         // ORDER BY matches the output name and resolves to `Identifier` — PG's
@@ -1904,7 +1905,7 @@ mod tests {
     #[test]
     fn test_order_by_multiple_columns() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_query(
             "SELECT users.name, users.id FROM users ORDER BY users.name ASC, users.id DESC",
@@ -1933,7 +1934,7 @@ mod tests {
     #[test]
     fn test_order_by_qualified_column() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_query("SELECT * FROM users u ORDER BY u.name DESC", &tables);
 
@@ -1954,7 +1955,7 @@ mod tests {
     #[test]
     fn test_order_by_select_alias() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT id, name AS display_name FROM users ORDER BY display_name DESC";
         let resolved = resolve_query(sql, &tables);
@@ -1970,7 +1971,7 @@ mod tests {
     #[test]
     fn test_order_by_aggregate_alias() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("orders", 1001));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1001)));
 
         // Aggregate functions produce no column-derivable output name, so only an
         // explicit alias lets ORDER BY reference them — this is the key demo case.
@@ -1987,7 +1988,7 @@ mod tests {
     #[test]
     fn test_order_by_qualified_does_not_match_alias() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // `u.name` is qualified — must resolve through the column path even if
         // an alias of the same name existed.
@@ -2007,8 +2008,8 @@ mod tests {
     #[test]
     fn test_order_by_with_join() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let sql =
             "SELECT * FROM users u JOIN orders o ON u.id = o.id ORDER BY u.name ASC, o.id DESC";
@@ -2037,7 +2038,7 @@ mod tests {
     #[test]
     fn test_order_by_unqualified_column() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // Select a column whose name doesn't appear in the output list to force
         // the unqualified ORDER BY through column resolution.
@@ -2057,7 +2058,7 @@ mod tests {
         use crate::query::ast::query_expr_parse;
 
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql = "SELECT * FROM users ORDER BY nonexistent_column ASC";
         let query_expr = query_expr_parse(sql).unwrap();
@@ -2141,7 +2142,7 @@ mod tests {
             schema: "public".into(),
             name: "users".into(),
             alias: Some("u".into()),
-            relation_oid: 1001,
+            relation_oid: Oid::from_raw(1001),
         }
         .deparse(&mut buf);
         assert_eq!(buf, " public.users u");
@@ -2155,7 +2156,7 @@ mod tests {
             schema: "public".into(),
             name: "users".into(),
             alias: None,
-            relation_oid: 1001,
+            relation_oid: Oid::from_raw(1001),
         }
         .deparse(&mut buf);
         assert_eq!(buf, " public.users");
@@ -2169,7 +2170,7 @@ mod tests {
             schema: "Public".into(),
             name: "Users".into(),
             alias: None,
-            relation_oid: 1001,
+            relation_oid: Oid::from_raw(1001),
         }
         .deparse(&mut buf);
         assert_eq!(buf, " \"Public\".\"Users\"");
@@ -2178,7 +2179,7 @@ mod tests {
     #[test]
     fn test_resolved_select_deparse_with_where() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
 
@@ -2195,7 +2196,7 @@ mod tests {
     #[test]
     fn test_resolved_select_deparse_with_alias() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT u.id, u.name FROM users u WHERE u.id = 1", &tables);
 
@@ -2212,8 +2213,8 @@ mod tests {
     #[test]
     fn test_resolved_select_deparse_join() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT u.id, o.name FROM users u JOIN orders o ON u.id = o.id WHERE u.id = 1",
@@ -2232,7 +2233,7 @@ mod tests {
     #[test]
     fn test_resolved_query_deparse_order_by() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_query("SELECT id FROM users u ORDER BY name DESC", &tables);
 
@@ -2245,7 +2246,7 @@ mod tests {
     #[test]
     fn test_resolved_select_deparse_count_star() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT COUNT(*) FROM users WHERE id = 1", &tables);
 
@@ -2261,7 +2262,7 @@ mod tests {
     #[test]
     fn test_resolved_select_deparse_count_distinct() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT COUNT(DISTINCT name) FROM users WHERE id = 1",
@@ -2280,7 +2281,7 @@ mod tests {
     #[test]
     fn test_resolved_select_deparse_case() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT CASE WHEN name = 'admin' THEN 1 ELSE 0 END FROM users WHERE id = 1",
@@ -2335,7 +2336,7 @@ mod tests {
     #[test]
     fn test_complexity_single_table_no_where() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT * FROM users", &tables);
 
@@ -2346,7 +2347,7 @@ mod tests {
     #[test]
     fn test_complexity_single_table_with_where() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
 
@@ -2357,7 +2358,7 @@ mod tests {
     #[test]
     fn test_complexity_single_table_multiple_predicates() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT * FROM users WHERE id = 1 AND name = 'john'",
@@ -2371,8 +2372,8 @@ mod tests {
     #[test]
     fn test_complexity_join_no_where() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT * FROM users JOIN orders ON users.id = orders.id",
@@ -2386,8 +2387,8 @@ mod tests {
     #[test]
     fn test_complexity_join_with_where() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT * FROM users JOIN orders ON users.id = orders.id WHERE users.id = 1",
@@ -2401,8 +2402,8 @@ mod tests {
     #[test]
     fn test_complexity_ordering() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         // Simple query: SELECT * FROM users
         let resolved1 = resolve_sql("SELECT * FROM users", &tables);
@@ -2424,8 +2425,8 @@ mod tests {
     #[test]
     fn test_complexity_subquery_depth() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         // No subquery: complexity = 1 predicate
         let flat = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
@@ -2450,9 +2451,9 @@ mod tests {
     #[test]
     fn test_complexity_nested_subquery_depth() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("products", 1001));
-        tables.insert_overwrite(test_table_metadata("stores", 1002));
-        tables.insert_overwrite(test_table_metadata("regions", 1003));
+        tables.insert_overwrite(test_table_metadata("products", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("stores", Oid::from_raw(1002)));
+        tables.insert_overwrite(test_table_metadata("regions", Oid::from_raw(1003)));
 
         // Double-nested: depth 2
         let double_nested = resolve_sql(
@@ -2490,7 +2491,7 @@ mod tests {
     #[test]
     fn test_complexity_from_subquery_depth() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // FROM subquery: depth 1
         let from_sub = resolve_sql(
@@ -2503,7 +2504,7 @@ mod tests {
     #[test]
     fn test_group_by_resolve_single_column() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT name FROM users GROUP BY name", &tables);
 
@@ -2516,7 +2517,7 @@ mod tests {
     #[test]
     fn test_group_by_resolve_multiple_columns() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT id, name FROM users GROUP BY id, name", &tables);
 
@@ -2528,7 +2529,7 @@ mod tests {
     #[test]
     fn test_group_by_resolve_qualified_column() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql("SELECT u.name FROM users u GROUP BY u.name", &tables);
 
@@ -2541,7 +2542,7 @@ mod tests {
     #[test]
     fn test_having_resolve() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT name FROM users GROUP BY name HAVING name = 'alice'",
@@ -2563,7 +2564,7 @@ mod tests {
     #[test]
     fn test_limit_resolve_count_only() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_query("SELECT * FROM users LIMIT 10", &tables);
 
@@ -2575,7 +2576,7 @@ mod tests {
     #[test]
     fn test_limit_resolve_offset_only() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_query("SELECT * FROM users OFFSET 5", &tables);
 
@@ -2587,7 +2588,7 @@ mod tests {
     #[test]
     fn test_limit_resolve_count_and_offset() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_query("SELECT * FROM users LIMIT 10 OFFSET 20", &tables);
 
@@ -2599,7 +2600,7 @@ mod tests {
     #[test]
     fn test_limit_resolve_parameterized() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_query("SELECT * FROM users LIMIT $1 OFFSET $2", &tables);
 
@@ -2612,7 +2613,7 @@ mod tests {
     #[test]
     fn test_no_limit_clause() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_query("SELECT * FROM users", &tables);
 
@@ -2622,7 +2623,7 @@ mod tests {
     #[test]
     fn test_combined_group_by_having_limit_resolve() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let sql =
             "SELECT name FROM users GROUP BY name HAVING name != 'test' ORDER BY name LIMIT 10";
@@ -2647,7 +2648,7 @@ mod tests {
     #[test]
     fn test_resolved_window_function() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // Use columns that exist in test_table_metadata: id, name
         let resolved = resolve_sql(
@@ -2678,7 +2679,7 @@ mod tests {
     #[test]
     fn test_resolved_window_function_deparse() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // Use columns that exist in test_table_metadata: id, name
         let resolved = resolve_sql(
@@ -2723,7 +2724,7 @@ mod tests {
                 schema: "public".into(),
                 name: "a".into(),
                 alias: None,
-                relation_oid: 1001,
+                relation_oid: Oid::from_raw(1001),
             })],
             ..Default::default()
         };
@@ -2733,7 +2734,7 @@ mod tests {
                 schema: "public".into(),
                 name: "b".into(),
                 alias: None,
-                relation_oid: 1002,
+                relation_oid: Oid::from_raw(1002),
             })],
             ..Default::default()
         };
@@ -2789,7 +2790,7 @@ mod tests {
                 schema: "public".into(),
                 name: "a".into(),
                 alias: None,
-                relation_oid: 1001,
+                relation_oid: Oid::from_raw(1001),
             })],
             ..Default::default()
         };
@@ -2799,7 +2800,7 @@ mod tests {
                 schema: "public".into(),
                 name: "b".into(),
                 alias: None,
-                relation_oid: 1002,
+                relation_oid: Oid::from_raw(1002),
             })],
             ..Default::default()
         };
@@ -2809,7 +2810,7 @@ mod tests {
                 schema: "public".into(),
                 name: "c".into(),
                 alias: None,
-                relation_oid: 1003,
+                relation_oid: Oid::from_raw(1003),
             })],
             ..Default::default()
         };
@@ -2862,8 +2863,8 @@ mod tests {
     fn test_where_subquery_in_resolution() {
         // Test resolving WHERE ... IN (SELECT ...) subquery
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("active_users", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("active_users", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
@@ -2896,7 +2897,7 @@ mod tests {
                         assert_eq!(inner_select.from.len(), 1);
                         if let ResolvedTableSource::Table(t) = &inner_select.from[0] {
                             assert_eq!(t.name, "active_users");
-                            assert_eq!(t.relation_oid, 1002);
+                            assert_eq!(t.relation_oid.get(), 1002);
                         } else {
                             panic!("Expected table source");
                         }
@@ -2915,8 +2916,8 @@ mod tests {
     fn test_where_subquery_exists_resolution() {
         // Test resolving WHERE EXISTS (SELECT ...) subquery
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("orders", 1001));
-        tables.insert_overwrite(test_table_metadata("items", 1002));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("items", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT * FROM orders WHERE EXISTS (SELECT id FROM items)",
@@ -2952,7 +2953,7 @@ mod tests {
     fn test_where_subquery_scalar_resolution() {
         // Test resolving scalar subquery in WHERE clause
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT * FROM users WHERE id > (SELECT id FROM users)",
@@ -2984,7 +2985,7 @@ mod tests {
     fn test_table_subquery_resolution() {
         // Test resolving subquery in FROM clause (derived table)
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // Note: Column resolution from subqueries is limited, but the subquery itself should resolve
         let node = parse_select_node("SELECT * FROM (SELECT id FROM users) AS sub");
@@ -3019,7 +3020,7 @@ mod tests {
     fn test_table_subquery_requires_alias() {
         // Test that table subquery without alias fails resolution
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         // Parse a query with subquery without alias
         // Note: PostgreSQL parser typically requires alias, but we should still handle the error
@@ -3035,8 +3036,8 @@ mod tests {
     fn test_subquery_nodes_traversal() {
         // Test that nodes() traverses into subqueries to find all tables
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("active_users", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("active_users", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
@@ -3063,7 +3064,7 @@ mod tests {
     fn test_subquery_nodes_traversal_derived_table() {
         // Test that nodes() traverses into FROM subqueries
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",
@@ -3080,8 +3081,8 @@ mod tests {
     fn test_subquery_nodes_traversal_scalar() {
         // Test that nodes() traverses into scalar subqueries in SELECT list
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("orders", 1001));
-        tables.insert_overwrite(test_table_metadata("users", 1002));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT id, (SELECT COUNT(*) FROM users) AS user_count FROM orders WHERE id = 1",
@@ -3108,9 +3109,9 @@ mod tests {
     fn test_subquery_nodes_traversal_nested() {
         // Test that nodes() traverses into nested subqueries
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("a", 1001));
-        tables.insert_overwrite(test_table_metadata("b", 1002));
-        tables.insert_overwrite(test_table_metadata("c", 1003));
+        tables.insert_overwrite(test_table_metadata("a", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("b", Oid::from_raw(1002)));
+        tables.insert_overwrite(test_table_metadata("c", Oid::from_raw(1003)));
 
         let resolved = resolve_sql(
             "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE id IN (SELECT id FROM c))",
@@ -3138,8 +3139,8 @@ mod tests {
     #[test]
     fn test_direct_table_nodes_excludes_where_subquery() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("active_users", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("active_users", Oid::from_raw(1002)));
 
         let resolved = resolve_sql(
             "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
@@ -3161,17 +3162,17 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns(
             "items",
-            1001,
+            Oid::from_raw(1001),
             &["id", "name", "category_id"],
         ));
         tables.insert_overwrite(test_table_metadata_with_columns(
             "inventory",
-            1002,
+            Oid::from_raw(1002),
             &["id", "item_id", "quantity"],
         ));
         tables.insert_overwrite(test_table_metadata_with_columns(
             "categories",
-            1003,
+            Oid::from_raw(1003),
             &["id", "name", "active"],
         ));
 
@@ -3203,7 +3204,7 @@ mod tests {
     #[test]
     fn test_direct_table_nodes_derived_table() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",
@@ -3230,8 +3231,8 @@ mod tests {
     #[test]
     fn test_correlated_exists_subquery_resolves() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("orders", 1001));
-        tables.insert_overwrite(test_table_metadata("items", 1002));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("items", Oid::from_raw(1002)));
 
         let node = parse_select_node(
             "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.id = orders.id)",
@@ -3250,8 +3251,8 @@ mod tests {
     #[test]
     fn test_correlated_in_subquery_resolves() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let node = parse_select_node(
             "SELECT * FROM users WHERE id IN (SELECT id FROM orders WHERE orders.name = users.name)",
@@ -3271,8 +3272,8 @@ mod tests {
     fn test_correlated_scalar_subquery_resolves() {
         // Scalar correlated subquery in SELECT list
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let node = parse_select_node(
             "SELECT id, (SELECT COUNT(*) FROM orders WHERE orders.id = users.id) FROM users",
@@ -3299,8 +3300,8 @@ mod tests {
     fn test_correlated_subquery_with_alias_resolves() {
         // Table alias in outer scope should be resolved to the aliased table
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("orders", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
 
         let node = parse_select_node(
             "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE orders.id = u.id)",
@@ -3323,12 +3324,12 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns(
             "users",
-            1001,
+            Oid::from_raw(1001),
             &["id", "email"],
         ));
         tables.insert_overwrite(test_table_metadata_with_columns(
             "orders",
-            1002,
+            Oid::from_raw(1002),
             &["id", "user_id", "total"],
         ));
 
@@ -3352,12 +3353,12 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns(
             "users",
-            1001,
+            Oid::from_raw(1001),
             &["id", "email"],
         ));
         tables.insert_overwrite(test_table_metadata_with_columns(
             "orders",
-            1002,
+            Oid::from_raw(1002),
             &["id", "user_id"],
         ));
 
@@ -3383,12 +3384,12 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns(
             "users",
-            1001,
+            Oid::from_raw(1001),
             &["id", "status"],
         ));
         tables.insert_overwrite(test_table_metadata_with_columns(
             "orders",
-            1002,
+            Oid::from_raw(1002),
             &["id", "amount"],
         ));
 
@@ -3417,8 +3418,8 @@ mod tests {
     fn test_non_correlated_subquery_has_empty_outer_refs() {
         // Non-correlated subquery should have outer_refs: []
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
-        tables.insert_overwrite(test_table_metadata("active_users", 1002));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+        tables.insert_overwrite(test_table_metadata("active_users", Oid::from_raw(1002)));
 
         let node =
             parse_select_node("SELECT * FROM users WHERE id IN (SELECT id FROM active_users)");
@@ -3441,12 +3442,12 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns(
             "departments",
-            1001,
+            Oid::from_raw(1001),
             &["id", "region"],
         ));
         tables.insert_overwrite(test_table_metadata_with_columns(
             "employees",
-            1002,
+            Oid::from_raw(1002),
             &["id", "dept_id", "region"],
         ));
 
@@ -3476,17 +3477,17 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns(
             "departments",
-            1001,
+            Oid::from_raw(1001),
             &["id", "name"],
         ));
         tables.insert_overwrite(test_table_metadata_with_columns(
             "employees",
-            1002,
+            Oid::from_raw(1002),
             &["id", "dept_id"],
         ));
         tables.insert_overwrite(test_table_metadata_with_columns(
             "projects",
-            1003,
+            Oid::from_raw(1003),
             &["id", "employee_id"],
         ));
 
@@ -3525,12 +3526,12 @@ mod tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table_metadata_with_columns(
             "users",
-            1001,
+            Oid::from_raw(1001),
             &["id", "name"],
         ));
         tables.insert_overwrite(test_table_metadata_with_columns(
             "orders",
-            1002,
+            Oid::from_raw(1002),
             &["id", "total"],
         ));
 
@@ -3569,7 +3570,7 @@ mod tests {
     #[test]
     fn test_having_filter_resolves() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT name FROM users GROUP BY name \
@@ -3589,7 +3590,7 @@ mod tests {
     #[test]
     fn test_having_distinct_resolves() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT name FROM users GROUP BY name HAVING COUNT(DISTINCT id) > 1",
@@ -3603,7 +3604,7 @@ mod tests {
     #[test]
     fn test_having_aggregate_order_by_resolves() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT id FROM users GROUP BY id \
@@ -3622,7 +3623,7 @@ mod tests {
     #[test]
     fn test_having_filter_resolved_deparse_contains_filter() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata("users", 1001));
+        tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
 
         let resolved = resolve_sql(
             "SELECT name FROM users GROUP BY name \

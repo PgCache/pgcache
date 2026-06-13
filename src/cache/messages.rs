@@ -1,3 +1,4 @@
+use crate::catalog::Oid;
 use crate::query::Fingerprint;
 use std::sync::Arc;
 use std::time::Instant;
@@ -319,7 +320,7 @@ pub struct PopulationMerge {
     pub fingerprint: Fingerprint,
     pub generation: u64,
     /// `(relation_oid, staging table name in pgcache_stage)` per relation read.
-    pub staged: Vec<(u32, EcoString)>,
+    pub staged: Vec<(Oid, EcoString)>,
     pub cached_bytes: usize,
     pub row_count: u64,
     /// Origin WAL LSN captured after the population reads (upper bound on the
@@ -476,25 +477,25 @@ pub enum CdcCommand {
 
     /// CDC Insert operation
     Insert {
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: Vec<CdcValue>,
     },
 
     /// CDC Update operation
     Update {
-        relation_oid: u32,
+        relation_oid: Oid,
         key_data: Vec<CdcValue>,
         row_data: Vec<CdcValue>,
     },
 
     /// CDC Delete operation
     Delete {
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: Vec<CdcValue>,
     },
 
     /// CDC Truncate operation
-    Truncate { relation_oids: Vec<u32> },
+    Truncate { relation_oids: Vec<Oid> },
 
     /// Transaction commit marker. Emitted by the CDC processor after all
     /// mutations from a single transaction have been sent. Carries the

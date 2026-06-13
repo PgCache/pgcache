@@ -1,5 +1,7 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
+#[cfg(test)]
+use crate::catalog::Oid;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
 use crate::query::cast::{
@@ -411,7 +413,7 @@ mod tests {
         TableMetadata {
             name: "test_table".into(),
             schema: "public".into(),
-            relation_oid: 12345,
+            relation_oid: Oid::from_raw(12345),
             primary_key_columns: vec!["id".into()],
             columns,
             indexes: Vec::new(),
@@ -463,7 +465,7 @@ mod tests {
         TableMetadata {
             name: "ts_table".into(),
             schema: "public".into(),
-            relation_oid: 23456,
+            relation_oid: Oid::from_raw(23456),
             primary_key_columns: vec!["id".into()],
             columns,
             indexes: Vec::new(),

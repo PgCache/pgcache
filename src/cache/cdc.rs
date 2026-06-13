@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::catalog::Oid;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ecow::EcoString;
@@ -473,7 +474,7 @@ impl CdcProcessor {
     /// Processes insert messages with query-aware filtering.
     async fn process_insert(&mut self, body: InsertBody) -> Result<(), Error> {
         crate::metrics::handles().cdc.inserts.increment(1);
-        let relation_oid = body.rel_id();
+        let relation_oid = Oid::from_raw(body.rel_id());
 
         // Check if there are any cached queries for this table
         if !self.is_relation_active(relation_oid) {
@@ -498,7 +499,7 @@ impl CdcProcessor {
     /// Processes update messages with query-aware filtering.
     async fn process_update(&mut self, body: UpdateBody) -> Result<(), Error> {
         crate::metrics::handles().cdc.updates.increment(1);
-        let relation_oid = body.rel_id();
+        let relation_oid = Oid::from_raw(body.rel_id());
 
         // Check if there are any cached queries for this table
         if !self.is_relation_active(relation_oid) {
@@ -524,7 +525,7 @@ impl CdcProcessor {
     /// Processes delete messages with query-aware filtering.
     async fn process_delete(&mut self, body: DeleteBody) -> Result<(), Error> {
         crate::metrics::handles().cdc.deletes.increment(1);
-        let relation_oid = body.rel_id();
+        let relation_oid = Oid::from_raw(body.rel_id());
 
         // Check if there are any cached queries for this table
         if !self.is_relation_active(relation_oid) {
@@ -548,8 +549,9 @@ impl CdcProcessor {
 
     /// Processes truncate messages.
     async fn process_truncate(&mut self, body: &TruncateBody) -> Result<(), Error> {
-        let mut ids: Vec<u32> = Vec::with_capacity(body.rel_ids().len());
+        let mut ids: Vec<Oid> = Vec::with_capacity(body.rel_ids().len());
         for &id in body.rel_ids() {
+            let id = Oid::from_raw(id);
             if self.is_relation_active(id) {
                 ids.push(id);
             }
@@ -566,7 +568,7 @@ impl CdcProcessor {
 
     /// Parse RelationBody into TableMetadata for cache registration.
     fn parse_relation_to_table_metadata(&self, relation_body: &RelationBody) -> TableMetadata {
-        let relation_oid = relation_body.rel_id();
+        let relation_oid = Oid::from_raw(relation_body.rel_id());
         let table_name: EcoString = relation_body.name().unwrap_or("unknown_table").into();
         let schema_name: EcoString = relation_body.namespace().unwrap_or("unknown_schema").into();
 
@@ -651,7 +653,7 @@ impl CdcProcessor {
 
     /// Check if there are any cached queries for a specific table by relation OID.
     /// Reads the shared active relations set maintained by the writer — no messaging needed.
-    fn is_relation_active(&self, relation_oid: u32) -> bool {
+    fn is_relation_active(&self, relation_oid: Oid) -> bool {
         self.active_relations.load().contains(&relation_oid)
     }
 }

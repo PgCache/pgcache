@@ -13,6 +13,7 @@
 //! permanently. `PopulationDeletedKeys` records every key CDC removes while a
 //! population over that relation is in flight; the merge filters those keys out.
 
+use crate::catalog::Oid;
 use crate::query::Fingerprint;
 use std::collections::HashMap;
 
@@ -64,9 +65,9 @@ type PopulationKey = (Fingerprint, u64);
 
 #[derive(Default)]
 pub(super) struct PopulationDeletedKeys {
-    relations: HashMap<u32, DeletedKeyEntry>,
+    relations: HashMap<Oid, DeletedKeyEntry>,
     /// population → relations it activated, so deactivate is exact.
-    inflight: HashMap<PopulationKey, Vec<u32>>,
+    inflight: HashMap<PopulationKey, Vec<Oid>>,
 }
 
 #[derive(Default)]
@@ -131,7 +132,7 @@ impl PopulationDeletedKeys {
         &mut self,
         fingerprint: Fingerprint,
         generation: u64,
-        relation_oids: &[u32],
+        relation_oids: &[Oid],
         anchor_floor: u64,
     ) {
         let key = (fingerprint, generation);
@@ -170,7 +171,7 @@ impl PopulationDeletedKeys {
 
     /// Record a removed PK (stamped with the delete's commit LSN) for
     /// `relation_oid` if a population is recording it.
-    pub(super) fn record(&mut self, relation_oid: u32, key: EcoString, lsn: u64) {
+    pub(super) fn record(&mut self, relation_oid: Oid, key: EcoString, lsn: u64) {
         let Some(entry) = self.relations.get_mut(&relation_oid) else {
             return;
         };
@@ -181,7 +182,7 @@ impl PopulationDeletedKeys {
         if entry.keys.len() > POPULATION_DELETED_KEY_CAP {
             entry.disable();
             error!(
-                relation_oid,
+                relation_oid = %relation_oid,
                 "population deleted-key set overflowed cap {POPULATION_DELETED_KEY_CAP}; \
                  affected populations will repopulate"
             );
@@ -190,7 +191,7 @@ impl PopulationDeletedKeys {
 
     /// Whether any population is recording deletes for `relation_oid`. Lets the
     /// CDC delete path skip rendering a key when nothing would consume it.
-    pub(super) fn is_recording(&self, relation_oid: u32) -> bool {
+    pub(super) fn is_recording(&self, relation_oid: Oid) -> bool {
         self.relations.contains_key(&relation_oid)
     }
 
@@ -199,7 +200,7 @@ impl PopulationDeletedKeys {
     /// merge omit a live row — while resurrection of the old version is
     /// impossible anyway once the live row is in the shared cache table
     /// (merges never overwrite). Returns whether the key was tracked.
-    pub(super) fn cancel(&mut self, relation_oid: u32, key: &str) -> bool {
+    pub(super) fn cancel(&mut self, relation_oid: Oid, key: &str) -> bool {
         self.relations
             .get_mut(&relation_oid)
             .is_some_and(|entry| entry.keys.remove(key).is_some())
@@ -211,7 +212,7 @@ impl PopulationDeletedKeys {
     /// snapshotted at/after `lsn` is unaffected (it sees the empty table), so
     /// this self-clears rather than blanket-aborting like overflow. No-op if no
     /// population is recording the relation.
-    pub(super) fn abort_below(&mut self, relation_oid: u32, lsn: u64) {
+    pub(super) fn abort_below(&mut self, relation_oid: Oid, lsn: u64) {
         if let Some(entry) = self.relations.get_mut(&relation_oid) {
             entry.abort_below(lsn);
         }
@@ -219,7 +220,7 @@ impl PopulationDeletedKeys {
 
     /// Whether a merge over `relation_oid` with snapshot `snapshot_lsn` must
     /// abort (cap overflow, or snapshot predates a bulk invalidation).
-    fn should_abort(&self, relation_oid: u32, snapshot_lsn: u64) -> bool {
+    fn should_abort(&self, relation_oid: Oid, snapshot_lsn: u64) -> bool {
         self.relations
             .get(&relation_oid)
             .is_some_and(|e| e.should_abort(snapshot_lsn))
@@ -227,7 +228,7 @@ impl PopulationDeletedKeys {
 
     /// Build the `(<pk cols>) NOT IN (...)` predicate excluding recorded deletes,
     /// or `None` when there's nothing to exclude.
-    fn filter_predicate(&self, relation_oid: u32, pk_columns_paren: &str) -> Option<String> {
+    fn filter_predicate(&self, relation_oid: Oid, pk_columns_paren: &str) -> Option<String> {
         let entry = self.relations.get(&relation_oid)?;
         if entry.overflowed || entry.keys.is_empty() {
             return None;
@@ -347,7 +348,7 @@ impl WriterCore {
     /// (the live row in the shared table is what makes cancellation safe).
     pub(super) fn population_deleted_key_cancel(
         &mut self,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
     ) -> bool {
         let pending = self
@@ -424,7 +425,7 @@ impl WriterCore {
 
     /// Drop all of a population's staging tables (used when a queued merge is
     /// abandoned because its query was evicted/superseded before draining).
-    pub(super) async fn population_staging_drop(&self, staged: &[(u32, EcoString)]) {
+    pub(super) async fn population_staging_drop(&self, staged: &[(Oid, EcoString)]) {
         for (_, staging) in staged {
             self.staging_drop(staging).await;
         }
@@ -444,7 +445,7 @@ impl WriterCore {
 mod tests {
     use super::*;
 
-    const REL: u32 = 10;
+    const REL: Oid = Oid::from_raw(10);
     const GEN: u64 = 1;
 
     fn record(keys: &mut PopulationDeletedKeys, body: &str, lsn: u64) {

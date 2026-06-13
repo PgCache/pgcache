@@ -1,3 +1,4 @@
+use crate::catalog::Oid;
 use crate::query::{Fingerprint, FingerprintSet};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -113,11 +114,11 @@ const ROW_VEC_POOL_MAX: usize = 2 * FRAME_ROWS_CAPACITY;
 /// exactly as per-arrival handling did.
 pub(super) enum FrameRowEvent {
     Insert {
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: Vec<Option<ByteString>>,
     },
     Update {
-        relation_oid: u32,
+        relation_oid: Oid,
         key_data: Vec<Option<ByteString>>,
         new_row_data: Vec<Option<ByteString>>,
     },
@@ -128,7 +129,7 @@ pub(super) enum FrameRowEvent {
     /// `Toasted` values are already mapped to `None` in `new_row_data`;
     /// `toasted` holds their column indexes.
     UpdateToasted {
-        relation_oid: u32,
+        relation_oid: Oid,
         key_data: Vec<Option<ByteString>>,
         new_row_data: Vec<Option<ByteString>>,
         toasted: Vec<usize>,
@@ -140,17 +141,17 @@ pub(super) enum FrameRowEvent {
     /// `Toasted` values are already mapped to `None` in `new_row_data`;
     /// `toasted_columns` names the elided columns.
     UpdateToastFallback {
-        relation_oid: u32,
+        relation_oid: Oid,
         key_data: Vec<Option<ByteString>>,
         new_row_data: Vec<Option<ByteString>>,
         toasted_columns: Vec<EcoString>,
     },
     Delete {
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: Vec<Option<ByteString>>,
     },
     Truncate {
-        relation_oids: Vec<u32>,
+        relation_oids: Vec<Oid>,
     },
     /// A source-transaction commit boundary (PGC-242). Carries the frame's
     /// commit LSN so per-frame bookkeeping produced *during replay* — deleted
@@ -211,11 +212,11 @@ pub struct WriterCore {
     /// relation. Pairs with `active_relations` — the snapshot is only
     /// updated on 0↔1 transitions instead of rebuilt by walking
     /// `cached_queries` on every register/evict.
-    relation_refcounts: std::collections::HashMap<u32, usize>,
+    relation_refcounts: std::collections::HashMap<Oid, usize>,
     /// Publication name for dynamic table management.
     publication_name: EcoString,
     /// OIDs currently in the publication (mirrors the origin-side state).
-    publication_oids: HashSet<u32>,
+    publication_oids: HashSet<Oid>,
     /// Set when a removal path changes active relations; drained by command handlers.
     pub(super) relations_dirty: bool,
     /// Loopback command channel into the writer select loop. Used by CDC
@@ -250,7 +251,7 @@ pub struct WriterCore {
     /// Relation OIDs touched by the in-progress frame, accumulated from frame
     /// start so a mid-frame `40P01` can invalidate+truncate every affected
     /// relation (commands applied before the deadlock were rolled back too).
-    pub(super) frame_relation_oids: HashSet<u32>,
+    pub(super) frame_relation_oids: HashSet<Oid>,
     /// Set when a generation purge was skipped because a frame was open;
     /// flushed after the frame commits at `CommitMark`.
     pub(super) purge_pending: bool,
@@ -278,7 +279,7 @@ pub struct WriterCore {
     /// Maintained at the single write chokepoint [`frame_begin_ensure`];
     /// cleared with `frame_buf` at every cache-txn boundary, never on a
     /// mid-txn chunk flush.
-    pub(super) frame_buf_relations: HashSet<u32>,
+    pub(super) frame_buf_relations: HashSet<Oid>,
     /// Keys CDC removed while populations are in flight, so a population merge
     /// doesn't resurrect them (PGC-250). Activated at dispatch, recorded at
     /// `frame_cache_delete`, consulted/cleared at merge.
@@ -304,18 +305,18 @@ pub struct WriterCore {
     /// `CommitMark` and recorded into `population_deleted_keys` stamped with the
     /// frame's commit LSN (rolled-back frames clear it instead). Buffered because
     /// the commit LSN isn't known until the frame commits.
-    pub(super) frame_deleted_keys: Vec<(u32, EcoString)>,
+    pub(super) frame_deleted_keys: Vec<(Oid, EcoString)>,
     /// Relations bulk-invalidated by the in-progress frame (TRUNCATE, or 40P01
     /// recovery), drained at `CommitMark` to raise their deleted-key abort
     /// watermark to the commit LSN — same commit-LSN-deferral as
     /// `frame_deleted_keys`.
-    pub(super) frame_truncated_relations: Vec<u32>,
+    pub(super) frame_truncated_relations: Vec<Oid>,
     /// Relations bulk-invalidated outside replay (mid-batch intra-txn DDL
     /// drops, 40P01 recovery), drained at the batch flush and stamped with the
     /// flush LSN — an upper bound on the triggering frame's commit, which
     /// over-aborts (safe) where a replay-boundary stamp could under-abort
     /// (PGC-242).
-    pub(super) batch_truncated_relations: Vec<u32>,
+    pub(super) batch_truncated_relations: Vec<Oid>,
     /// Complete source frames accumulated in the current batch (PGC-242):
     /// boundaries pushed since the last flush.
     pub(super) batch_frames: usize,
@@ -334,7 +335,7 @@ pub struct WriterCore {
     /// state; a later frame updating one of these PKs must be classified
     /// UNCACHED (`row_changes = None`) or the entering-invalidation the
     /// per-frame flow produced is lost (PGC-242; `test_cache_join`'s PK flip).
-    pub(super) batch_deleted_pks: HashSet<(u32, EcoString)>,
+    pub(super) batch_deleted_pks: HashSet<(Oid, EcoString)>,
     /// Last in-batch write per PK of the toastable columns' values (PGC-264).
     /// The toast-repair lookup reads the pre-batch committed state, which is
     /// stale for any PK this batch has already written; the overlay supplies
@@ -342,7 +343,7 @@ pub struct WriterCore {
     /// `Deleted` tombstones block the stale lookup outright. Maintained in
     /// arrival order by the replay pre-pass; only relations with a toastable
     /// column pay for it. Same lifecycle as `batch_deleted_pks`.
-    pub(super) batch_toast_overlay: HashMap<(u32, EcoString), ToastOverlayEntry>,
+    pub(super) batch_toast_overlay: HashMap<(Oid, EcoString), ToastOverlayEntry>,
     /// Recycled `ToastOverlayEntry::Values` allocations: batch reset harvests
     /// cleared Vecs here instead of dropping them, so steady-state overlay
     /// recording allocates no per-event Vec. Bounded by
@@ -356,7 +357,7 @@ pub struct WriterCore {
     /// Their pre-batch committed images are wholesale untrustworthy as a
     /// toast-repair source; only overlay values written after the truncate
     /// can repair. Same lifecycle as `batch_deleted_pks`.
-    pub(super) batch_toast_guard_oids: HashSet<u32>,
+    pub(super) batch_toast_guard_oids: HashSet<Oid>,
     /// Cache PG data directory, discovered once at startup, for `statvfs` to
     /// auto-size the disk eviction limit (PGC-251 Slice 2). `None` if it couldn't
     /// be read (non-superuser, or not visible) — auto disk limit then disabled.
@@ -527,7 +528,7 @@ impl WriterCore {
     /// overlay entries recorded under the old layout. The overlay is consulted
     /// before the guard during resolution, so dropping the stale entries (not
     /// just guarding) is what prevents a positional misrepair.
-    pub(super) fn toast_overlay_relation_invalidate(&mut self, relation_oid: u32) {
+    pub(super) fn toast_overlay_relation_invalidate(&mut self, relation_oid: Oid) {
         let pool = &mut self.toast_overlay_pool;
         self.batch_toast_overlay.retain(|(r, _), entry| {
             if *r != relation_oid {
@@ -627,7 +628,7 @@ impl WriterCore {
     /// buffer without marking its relation (the signal a mid-frame DDL uses to
     /// choose discard vs. frame recovery). Every buffer write goes through this
     /// chokepoint.
-    pub(super) fn frame_begin_ensure(&mut self, relations: impl IntoIterator<Item = u32>) {
+    pub(super) fn frame_begin_ensure(&mut self, relations: impl IntoIterator<Item = Oid>) {
         debug_assert!(
             !matches!(self.frame_state, FrameState::Idle),
             "cache-table write before Begin (frame not entered)"
@@ -656,8 +657,8 @@ impl WriterCore {
     /// may sync the publication inline for cases where the new relation
     /// must be in the publication before subsequent work (e.g., population
     /// fetches from origin).
-    pub(super) fn active_relations_acquire(&mut self, oids: &[u32]) -> bool {
-        let mut newly_active: Vec<u32> = Vec::new();
+    pub(super) fn active_relations_acquire(&mut self, oids: &[Oid]) -> bool {
+        let mut newly_active: Vec<Oid> = Vec::new();
         for &oid in oids {
             let count = self.relation_refcounts.entry(oid).or_insert(0);
             if *count == 0 {
@@ -683,8 +684,8 @@ impl WriterCore {
     /// to dropped relations are filtered out by the writer ignoring CDC
     /// events for relations not in `active_relations`. Returns `true` if
     /// the active set changed.
-    pub(super) fn active_relations_release(&mut self, oids: &[u32]) -> bool {
-        let mut newly_inactive: Vec<u32> = Vec::new();
+    pub(super) fn active_relations_release(&mut self, oids: &[Oid]) -> bool {
+        let mut newly_inactive: Vec<Oid> = Vec::new();
         for &oid in oids {
             if let Some(count) = self.relation_refcounts.get_mut(&oid) {
                 *count -= 1;
@@ -712,7 +713,7 @@ impl WriterCore {
     /// oid → schema.name from `cache.tables` — if we dropped first that
     /// lookup would return empty.
     pub(super) async fn publication_update(&mut self) -> CacheResult<()> {
-        let new_oids: HashSet<u32> = (**self.active_relations.load()).clone();
+        let new_oids: HashSet<Oid> = (**self.active_relations.load()).clone();
 
         if new_oids == self.publication_oids {
             // Already in sync. Clear the dirty flag so a deferred drain
@@ -721,7 +722,7 @@ impl WriterCore {
             return Ok(());
         }
 
-        let removed: Vec<u32> = self
+        let removed: Vec<Oid> = self
             .publication_oids
             .difference(&new_oids)
             .copied()
@@ -760,7 +761,7 @@ impl WriterCore {
     }
 
     /// Resolve a list of OIDs to a comma-separated `schema.table` string.
-    fn oids_to_table_list(&self, oids: &[u32]) -> String {
+    fn oids_to_table_list(&self, oids: &[Oid]) -> String {
         oids.iter()
             .filter_map(|oid| {
                 self.cache

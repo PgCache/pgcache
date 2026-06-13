@@ -5,13 +5,56 @@
 //! and the query resolution subsystem (for name resolution and type information).
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use ecow::EcoString;
 use iddqd::{BiHashItem, bi_upcast};
+use serde::{Deserialize, Serialize};
 use tokio_postgres::types::{Kind, Type};
 use tokio_postgres::{Client, Error};
 
 use crate::cache::CacheError;
+
+/// A PostgreSQL relation OID (`pg_class.oid`). A newtype over `u32` for type
+/// safety — oids share `u32`'s layout with column positions, counts, and other
+/// bare integers, and the compiler otherwise can't stop them being mixed.
+/// Construction is the explicit, greppable [`Oid::from_raw`]; there is
+/// deliberately no `From<u32>` or `Deref`, so every crossing from a raw `u32`
+/// (the CDC `rel_id`, a catalog query, the pgrx extension) is intentional.
+///
+/// Unlike a [`Fingerprint`](crate::query::Fingerprint), an oid is *sequential*,
+/// not a hash — Oid-keyed maps must use the default hasher, never the
+/// passthrough [`IdHasher`](crate::id_hash::IdHasher), or they would cluster.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Oid(u32);
+
+impl Oid {
+    /// Wrap a raw `u32` as an `Oid`. Intentional and greppable — the only entry
+    /// from an untyped `u32` (CDC `rel_id`, catalog queries, the pgrx
+    /// extension, and tests).
+    pub const fn from_raw(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// The underlying `u32`, for SQL parameters, the pgrx extension, and logs.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for Oid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl fmt::Debug for Oid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Oid({})", self.0)
+    }
+}
 
 use crate::query::ast::{ColumnNode, ScalarExpr, SelectColumn, SelectColumns, TableAlias};
 use crate::query::resolved::{
@@ -90,7 +133,7 @@ impl Eq for ColumnStore {}
 #[derive(Debug, Clone)]
 pub struct TableMetadata {
     /// PostgreSQL relation OID
-    pub relation_oid: u32,
+    pub relation_oid: Oid,
     /// Table name (unqualified)
     pub name: EcoString,
     /// Schema name (e.g., "public")
@@ -181,7 +224,7 @@ impl TableMetadata {
 }
 
 impl BiHashItem for TableMetadata {
-    type K1<'a> = u32;
+    type K1<'a> = Oid;
     type K2<'a> = (&'a str, &'a str);
 
     fn key1(&self) -> Self::K1<'_> {

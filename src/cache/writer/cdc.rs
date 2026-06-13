@@ -1,3 +1,4 @@
+use crate::catalog::Oid;
 use crate::query::{Fingerprint, FingerprintSet};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -152,12 +153,12 @@ fn row_change_join_on_into(buf: &mut String, table_metadata: &TableMetadata) {
 /// to `(relation, shape)` here, and the cache machinery carries over.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct PreparedEvalKey {
-    relation_oid: u32,
+    relation_oid: Oid,
     fingerprint: Fingerprint,
 }
 
 /// Per-relation membership-eval rows of one segment: `(event index, row)`.
-type SegmentRows<'a> = HashMap<u32, Vec<(usize, &'a [Option<ByteString>])>>;
+type SegmentRows<'a> = HashMap<Oid, Vec<(usize, &'a [Option<ByteString>])>>;
 
 /// Max complete source frames accumulated per batch (PGC-242). The event cap
 /// (`FRAME_ROWS_CAPACITY`) usually triggers first for fat frames; this bounds
@@ -170,7 +171,7 @@ const BATCH_FRAMES_MAX: usize = 256;
 /// `segment_row_changes_eval`, consumed per event by the decide pass.
 #[derive(Default)]
 struct SegmentMembership {
-    relations: HashMap<u32, RelationBatch>,
+    relations: HashMap<Oid, RelationBatch>,
 }
 
 /// One relation's batched-eval results within a segment. Every event belongs
@@ -206,7 +207,7 @@ struct RelationBatch {
 impl SegmentMembership {
     /// The matrix view for one event, or `None` if neither the membership nor
     /// the row-change batch covered it.
-    fn view(&self, relation_oid: u32, event_idx: usize) -> Option<BatchEvalView<'_>> {
+    fn view(&self, relation_oid: Oid, event_idx: usize) -> Option<BatchEvalView<'_>> {
         let batch = self.relations.get(&relation_oid)?;
         let fresh_fps = batch
             .covered
@@ -365,7 +366,7 @@ pub(super) struct WriterCdc {
     prepared_membership: LruCache<PreparedEvalKey, Statement>,
     /// Prepared row-change statements per relation (same lifecycle). These run
     /// on `WriterCore.db_cache`, matching the per-row `query_row_changes`.
-    prepared_row_change: LruCache<u32, Statement>,
+    prepared_row_change: LruCache<Oid, Statement>,
 }
 
 /// Check that every WHERE constraint for `table_metadata` matches `row_data`.
@@ -545,7 +546,7 @@ impl WriterCdc {
     /// the queries repopulate from origin anyway.
     async fn frame_recover(&mut self, core: &mut WriterCore) -> CacheResult<()> {
         // Collected out: `cache_table_invalidate` needs `&mut core`.
-        let oids: Vec<u32> = core.frame_relation_oids.iter().copied().collect();
+        let oids: Vec<Oid> = core.frame_relation_oids.iter().copied().collect();
         info!(
             relations = oids.len(),
             "cdc frame recovery: invalidating + truncating affected relations"
@@ -707,7 +708,7 @@ impl WriterCdc {
                         toasted,
                     } => {
                         debug_assert!(false, "UpdateToasted survived the repair pre-pass");
-                        error!(relation_oid, "unrepaired toasted update at decide time");
+                        error!(relation_oid = %relation_oid, "unrepaired toasted update at decide time");
                         let toasted_columns: Vec<EcoString> = core
                             .cache
                             .tables
@@ -815,7 +816,7 @@ impl WriterCdc {
         // row image); deletes carry no membership question.
         let mut rows_by_relation: SegmentRows<'_> = HashMap::new();
         for (offset, event) in events.iter().enumerate() {
-            let (relation_oid, row): (u32, &[Option<ByteString>]) = match event {
+            let (relation_oid, row): (Oid, &[Option<ByteString>]) = match event {
                 FrameRowEvent::Insert {
                     relation_oid,
                     row_data,
@@ -1788,9 +1789,9 @@ impl WriterCdc {
     /// carry one per the pgoutput protocol (insert images, delete/key tuples).
     /// The event is dropped by the caller; invalidating every query over the
     /// relation keeps that safe.
-    fn toast_unexpected_invalidate(core: &mut WriterCore, relation_oid: u32, tuple_kind: &str) {
+    fn toast_unexpected_invalidate(core: &mut WriterCore, relation_oid: Oid, tuple_kind: &str) {
         error!(
-            relation_oid,
+            relation_oid = %relation_oid,
             tuple_kind, "unexpected unchanged-toast marker; invalidating relation queries"
         );
         if let Some(update_queries) = core.cache.update_queries.get(&relation_oid) {
@@ -1810,7 +1811,7 @@ impl WriterCdc {
     /// update, so only they ever consult the overlay.
     fn toast_overlay_record_write(
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
     ) {
         let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
@@ -1853,7 +1854,7 @@ impl WriterCdc {
     /// used as a repair source.
     fn toast_overlay_record_delete(
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
     ) {
         let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
@@ -1895,7 +1896,7 @@ impl WriterCdc {
     /// No `UpdateToasted` remains in `events` afterwards.
     async fn toast_repair_events(core: &mut WriterCore, events: &mut [FrameRowEvent]) {
         let metrics = &crate::metrics::handles().cdc;
-        let mut pending: HashMap<u32, Vec<PendingRepairSlot>> = HashMap::new();
+        let mut pending: HashMap<Oid, Vec<PendingRepairSlot>> = HashMap::new();
 
         for (idx, event) in events.iter_mut().enumerate() {
             match event {
@@ -2052,9 +2053,9 @@ impl WriterCdc {
     #[allow(clippy::too_many_arguments)]
     fn toast_resolve_from_overlay(
         core: &mut WriterCore,
-        pending: &mut HashMap<u32, Vec<PendingRepairSlot>>,
+        pending: &mut HashMap<Oid, Vec<PendingRepairSlot>>,
         event_idx: usize,
-        relation_oid: u32,
+        relation_oid: Oid,
         key_data: Vec<Option<ByteString>>,
         new_row_data: &mut Vec<Option<ByteString>>,
         toasted: Vec<usize>,
@@ -2179,7 +2180,7 @@ impl WriterCdc {
     /// update, tombstoning its (to-be-deleted) row in the overlay.
     fn toast_fallback_build(
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         key_data: Vec<Option<ByteString>>,
         new_row_data: Vec<Option<ByteString>>,
         toasted: &[usize],
@@ -2201,7 +2202,7 @@ impl WriterCdc {
         // not trust either image.
         Self::toast_overlay_record_delete(core, relation_oid, &new_row_data);
         crate::metrics::handles().cdc.toast_fallbacks.increment(1);
-        debug!(relation_oid, "toast repair fell back");
+        debug!(relation_oid = %relation_oid, "toast repair fell back");
         FrameRowEvent::UpdateToastFallback {
             relation_oid,
             key_data,
@@ -2216,7 +2217,7 @@ impl WriterCdc {
     /// pairs, or `None` if the lookup failed (callers fall back).
     async fn toast_lookup_batch(
         core: &WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         pendings: &[PendingRepairSlot],
     ) -> Option<HashMap<Vec<ByteString>, Vec<(usize, Option<ByteString>)>>> {
         let table_metadata = core.cache.tables.get1(&relation_oid)?;
@@ -2318,7 +2319,7 @@ impl WriterCdc {
             }
             Err(e) => {
                 error!(
-                    relation_oid,
+                    relation_oid = %relation_oid,
                     "batched toast repair lookup failed, falling back to invalidation: {e}"
                 );
                 None
@@ -2331,7 +2332,7 @@ impl WriterCdc {
     async fn frame_cache_upsert(
         &mut self,
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         core.frame_begin_ensure([relation_oid]);
@@ -2362,7 +2363,7 @@ impl WriterCdc {
     async fn frame_cache_delete(
         &mut self,
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         self.frame_cache_delete_inner(core, relation_oid, row_data, true)
@@ -2378,7 +2379,7 @@ impl WriterCdc {
     async fn frame_cache_delete_unrecorded(
         &mut self,
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         self.frame_cache_delete_inner(core, relation_oid, row_data, false)
@@ -2388,7 +2389,7 @@ impl WriterCdc {
     async fn frame_cache_delete_inner(
         &mut self,
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
         record_lost_key: bool,
     ) -> CacheResult<()> {
@@ -2437,7 +2438,7 @@ impl WriterCdc {
     pub async fn handle_insert(
         &mut self,
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
         batch: Option<BatchEvalView<'_>>,
     ) -> CacheResult<()> {
@@ -2499,7 +2500,7 @@ impl WriterCdc {
     pub async fn handle_update(
         &mut self,
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         key_data: &[Option<ByteString>],
         new_row_data: &[Option<ByteString>],
         batch: Option<BatchEvalView<'_>>,
@@ -2695,7 +2696,7 @@ impl WriterCdc {
     async fn handle_update_toast_fallback(
         &mut self,
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         key_data: &[Option<ByteString>],
         new_row_data: &[Option<ByteString>],
         toasted_columns: &[EcoString],
@@ -2757,7 +2758,7 @@ impl WriterCdc {
             }
         }
         trace!(
-            relation_oid,
+            relation_oid = %relation_oid,
             recording,
             invalidations = fp_list.len(),
             "toast fallback handled"
@@ -2796,7 +2797,7 @@ impl WriterCdc {
     pub async fn handle_delete(
         &mut self,
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         let start = Instant::now();
@@ -2859,7 +2860,7 @@ impl WriterCdc {
     pub async fn handle_truncate(
         &mut self,
         core: &mut WriterCore,
-        relation_oids: &[u32],
+        relation_oids: &[Oid],
     ) -> CacheResult<()> {
         if let Some(sql) = Self::truncate_sql_build(core, relation_oids.iter().copied()) {
             core.frame_begin_ensure(relation_oids.iter().copied());
@@ -2883,7 +2884,7 @@ impl WriterCdc {
     /// Build `TRUNCATE <cache table>, ...` for the relations' cache tables,
     /// or `None` if none of the oids map to a known cache table. Shared by
     /// `handle_truncate` and the `40P01` recovery path.
-    fn truncate_sql_build(core: &WriterCore, oids: impl Iterator<Item = u32>) -> Option<String> {
+    fn truncate_sql_build(core: &WriterCore, oids: impl Iterator<Item = Oid>) -> Option<String> {
         let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
         sql.push_str("TRUNCATE ");
         let mut first = true;
@@ -2995,7 +2996,7 @@ impl WriterCdc {
     pub(super) async fn query_row_changes(
         &self,
         core: &WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<Option<HashMap<EcoString, bool>>> {
         let table_metadata =
@@ -3255,7 +3256,7 @@ impl WriterCdc {
     pub(super) fn update_queries_check_invalidate(
         &self,
         core: &WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_changes: Option<&HashMap<EcoString, bool>>,
         row_data: &[Option<ByteString>],
         key_data: Option<&[Option<ByteString>]>,
@@ -3328,7 +3329,7 @@ impl WriterCdc {
     pub(super) async fn update_queries_execute_batch(
         &mut self,
         core: &mut WriterCore,
-        relation_oid: u32,
+        relation_oid: Oid,
         row_data: &[Option<ByteString>],
         batch: Option<BatchEvalView<'_>>,
     ) -> CacheResult<bool> {
@@ -3702,7 +3703,7 @@ impl WriterCdc {
 
 impl WriterCore {
     /// Invalidate all cached queries that reference a table.
-    pub(super) async fn cache_table_invalidate(&mut self, relation_oid: u32) -> CacheResult<()> {
+    pub(super) async fn cache_table_invalidate(&mut self, relation_oid: Oid) -> CacheResult<()> {
         let fingerprints: Vec<Fingerprint> = self
             .cache
             .cached_queries
@@ -3917,7 +3918,7 @@ mod tests {
             },
         ]);
         TableMetadata {
-            relation_oid: 1001,
+            relation_oid: Oid::from_raw(1001),
             name: "users".into(),
             schema: "public".into(),
             primary_key_columns: vec!["id".into()],

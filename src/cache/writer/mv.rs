@@ -14,6 +14,7 @@
 //! discarded (the data a build reads is snapshot-consistent either way; the
 //! race is only about whether the table may claim to be current).
 
+use crate::catalog::Oid;
 use crate::query::Fingerprint;
 use std::sync::Arc;
 
@@ -328,7 +329,7 @@ impl WriterCore {
     /// predicate needs — so this is relation-level. `mv_dirty_mark` self-gates
     /// (Fresh and Building), and the rebuild is lazy; under delete-heavy load the MVs stay
     /// Pending and the query serves from the (correct) source rows.
-    pub(super) fn mv_dirty_mark_relation(&self, relation_oid: u32) {
+    pub(super) fn mv_dirty_mark_relation(&self, relation_oid: Oid) {
         if let Some(update_queries) = self.cache.update_queries.get(&relation_oid) {
             for query in update_queries.iter_complexity_ordered() {
                 self.mv_dirty_mark(query.fingerprint);

@@ -1,3 +1,4 @@
+use crate::catalog::Oid;
 use std::any::Any;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
@@ -52,7 +53,7 @@ pub struct ResolvedTableNode {
     /// Optional alias used in query
     pub alias: Option<EcoString>,
     /// Relation OID from catalog
-    pub relation_oid: u32,
+    pub relation_oid: Oid,
 }
 
 impl AstNode for ResolvedTableNode {

@@ -1,5 +1,6 @@
 use std::io;
 
+use crate::catalog::Oid;
 use error_set::error_set;
 use rootcause::Report;
 use tokio_postgres::Error;
@@ -101,7 +102,7 @@ error_set! {
     TableError := {
         #[display("Unknown Table: oid: {oid:?} name {name:?}")]
         UnknownTable {
-            oid: Option<u32>,
+            oid: Option<Oid>,
             name: Option<String>,
         },
         #[display("Unknown type OID {type_oid} ('{type_name}') for column '{column_name}' in table '{table_name}'")]
