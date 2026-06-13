@@ -11,6 +11,7 @@
 //! the ~2KB TOAST threshold is stored out-of-line deterministically.
 
 use std::io::Error;
+use std::time::Duration;
 
 use tokio_postgres::SimpleQueryMessage;
 
@@ -38,6 +39,32 @@ fn first_value(msgs: &[SimpleQueryMessage]) -> Option<String> {
         SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
         SimpleQueryMessage::CommandComplete(_) | SimpleQueryMessage::RowDescription(_) | _ => None,
     })
+}
+
+/// First row's first two column values.
+fn first_two_values(msgs: &[SimpleQueryMessage]) -> Option<(String, String)> {
+    msgs.iter().find_map(|m| match m {
+        SimpleQueryMessage::Row(row) => Some((
+            row.get(0).unwrap_or_default().to_owned(),
+            row.get(1).unwrap_or_default().to_owned(),
+        )),
+        SimpleQueryMessage::CommandComplete(_) | SimpleQueryMessage::RowDescription(_) | _ => None,
+    })
+}
+
+/// `a` and `b` are both out-of-line; the dual-column shape exercises repairs
+/// where one toasted update inline-rewrites a column the next one elides.
+async fn toast_two_column_table_create(ctx: &mut TestContext, table: &str) -> Result<(), Error> {
+    ctx.simple_query(&format!(
+        "create table {table} (id int primary key, a text, b text, n int)"
+    ))
+    .await?;
+    ctx.simple_query(&format!(
+        "alter table {table} alter column a set storage external, \
+         alter column b set storage external"
+    ))
+    .await?;
+    Ok(())
 }
 
 async fn toast_table_create(ctx: &mut TestContext, table: &str) -> Result<(), Error> {
@@ -259,6 +286,170 @@ async fn test_unchanged_toast_truncate_insert_update_same_transaction() -> Resul
         first_value(&served).as_deref(),
         Some(new.as_str()),
         "post-truncate update repaired from the pre-truncate image"
+    );
+
+    Ok(())
+}
+
+/// Two toasted updates of the same row in one source transaction: the first
+/// rewrites `a` inline while `b` is elided; the second elides both. Neither
+/// has an overlay entry when it queues, so the second's repair must chain
+/// through the first's post-image — repairing it from the pre-batch image
+/// would resurrect the old `a`.
+#[tokio::test]
+async fn test_unchanged_toast_two_toasted_updates_same_transaction() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    toast_two_column_table_create(&mut ctx, "toast_q").await?;
+
+    let a_old = big_value('x');
+    let a_new = big_value('y');
+    let b = big_value('z');
+    ctx.simple_query(&format!(
+        "insert into toast_q (id, a, b, n) values (1, '{a_old}', '{b}', 1)"
+    ))
+    .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "select a, b from toast_q where id = 1";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    let before = ctx.metrics().await?;
+    ctx.origin
+        .batch_execute(&format!(
+            "BEGIN; \
+             update toast_q set a = '{a_new}' where id = 1; \
+             update toast_q set n = 2 where id = 1; \
+             COMMIT;"
+        ))
+        .await
+        .map_err(Error::other)?;
+    ctx.cdc_settle().await?;
+
+    let read_before = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    let after = assert_cache_hit(&mut ctx, read_before).await?;
+    let (a_served, b_served) = first_two_values(&served).expect("row served");
+    assert_eq!(
+        a_served, a_new,
+        "second toasted update repaired `a` from the pre-batch image instead of \
+         the first update's post-image"
+    );
+    assert_eq!(b_served, b, "unchanged TOAST column corrupted");
+    assert_eq!(
+        after.cache_invalidations, before.cache_invalidations,
+        "repair chain fell back to invalidation"
+    );
+
+    Ok(())
+}
+
+/// Cross-replay-chunk variant: a filler relation's bulk update forces a
+/// mid-frame replay split (FRAME_ROWS_CAPACITY) between two toasted updates
+/// of the same row, so the second repairs from the batch overlay entry the
+/// first replay recorded. That entry must hold the first update's repaired
+/// post-image, not the pre-batch committed image.
+#[tokio::test]
+async fn test_unchanged_toast_repair_across_replay_chunks() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    toast_two_column_table_create(&mut ctx, "toast_x").await?;
+    ctx.simple_query("create table toast_filler (id int primary key, v int not null)")
+        .await?;
+    // Enough rows that one bulk update overflows FRAME_ROWS_CAPACITY (4096),
+    // splitting the frame into multiple replays.
+    ctx.simple_query("insert into toast_filler select g, 0 from generate_series(1, 4200) g")
+        .await?;
+
+    let a_old = big_value('x');
+    let a_new = big_value('y');
+    let b = big_value('z');
+    ctx.simple_query(&format!(
+        "insert into toast_x (id, a, b, n) values (1, '{a_old}', '{b}', 1)"
+    ))
+    .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "select a, b from toast_x where id = 1";
+    ctx.simple_query(q).await?;
+    // Track the filler relation so its events flow through the writer.
+    ctx.simple_query("select v from toast_filler where id = 1")
+        .await?;
+    ctx.cache_settle().await?;
+
+    let before = ctx.metrics().await?;
+    ctx.origin
+        .batch_execute(&format!(
+            "BEGIN; \
+             update toast_x set a = '{a_new}' where id = 1; \
+             update toast_filler set v = v + 1; \
+             update toast_x set n = 2 where id = 1; \
+             COMMIT;"
+        ))
+        .await
+        .map_err(Error::other)?;
+    ctx.cdc_settle_with_timeout(Duration::from_secs(30)).await?;
+
+    let read_before = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    let after = assert_cache_hit(&mut ctx, read_before).await?;
+    let (a_served, b_served) = first_two_values(&served).expect("row served");
+    assert_eq!(
+        a_served, a_new,
+        "overlay entry recorded the pre-batch image; later replay chunk \
+         repaired from stale values"
+    );
+    assert_eq!(b_served, b, "unchanged TOAST column corrupted");
+    assert_eq!(
+        after.cache_invalidations, before.cache_invalidations,
+        "repair chain fell back to invalidation"
+    );
+
+    Ok(())
+}
+
+/// A PK-changing toasted update followed by a toasted update of the new PK,
+/// in one transaction. The second can only repair through the pass-2 chain:
+/// the new PK has no pre-batch row and no overlay entry. Falling back would
+/// needlessly invalidate the query.
+#[tokio::test]
+async fn test_unchanged_toast_pk_change_then_toasted_update() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    toast_table_create(&mut ctx, "toast_pc").await?;
+
+    let big = big_value('x');
+    ctx.simple_query(&format!(
+        "insert into toast_pc (id, big, n, status) values (1, '{big}', 1, 'active')"
+    ))
+    .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "select big from toast_pc where status = 'active'";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    let before = ctx.metrics().await?;
+    ctx.origin
+        .batch_execute(
+            "BEGIN; \
+             update toast_pc set id = 2 where id = 1; \
+             update toast_pc set n = 2 where id = 2; \
+             COMMIT;",
+        )
+        .await
+        .map_err(Error::other)?;
+    ctx.cdc_settle().await?;
+
+    let read_before = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    let after = assert_cache_hit(&mut ctx, read_before).await?;
+    assert_eq!(
+        first_value(&served).as_deref(),
+        Some(big.as_str()),
+        "TOAST value lost across the PK-change repair chain"
+    );
+    assert_eq!(
+        after.cache_invalidations, before.cache_invalidations,
+        "repair chain fell back to invalidation"
     );
 
     Ok(())
