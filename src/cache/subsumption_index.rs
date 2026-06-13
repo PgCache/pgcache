@@ -14,7 +14,7 @@
 //! Lookup is **lossy-safe**: missed subsumption opportunities just mean we
 //! populate from origin instead of stamping existing rows.
 
-use crate::query::Fingerprint;
+use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -55,7 +55,7 @@ pub struct SubsumptionIndex {
     classes: HashMap<ColumnSet, SubsumptionClass>,
     /// Reverse lookup so `remove(fingerprint)` doesn't need to re-classify
     /// the caller's constraints.
-    membership: HashMap<Fingerprint, Membership>,
+    membership: FingerprintMap<Membership>,
 }
 
 #[derive(Debug)]
@@ -179,8 +179,8 @@ impl SubsumptionIndex {
     /// via hash lookup; complex-bucket parents are filtered per-column via
     /// `ComplexIndex` (PGC-129/189). Lossy-safe: may over-return, never
     /// under-returns a true subsumer.
-    pub fn candidates(&self, new_constraints: &[TableConstraint]) -> HashSet<Fingerprint> {
-        let mut candidates = HashSet::new();
+    pub fn candidates(&self, new_constraints: &[TableConstraint]) -> FingerprintSet {
+        let mut candidates = FingerprintSet::default();
         let new_class = classify(new_constraints);
         let (new_columns, new_values_opt) = match &new_class {
             Classification::EqualityPure { columns, values } => (columns, Some(values)),
@@ -550,12 +550,12 @@ impl ComplexIndex {
                 let Some(first) = iter.next() else {
                     return Vec::new();
                 };
-                let mut acc: HashSet<Fingerprint> = first.into_iter().collect();
+                let mut acc: FingerprintSet = first.into_iter().collect();
                 for column in iter {
                     if acc.is_empty() {
                         break;
                     }
-                    let other: HashSet<Fingerprint> = column.into_iter().collect();
+                    let other: FingerprintSet = column.into_iter().collect();
                     acc.retain(|fp| other.contains(fp));
                 }
                 acc.into_iter().collect()
@@ -759,18 +759,18 @@ impl ColumnIndex {
         };
         // InSet parents: the parent's set must be a superset — intersect the
         // inverted-index lists over every query value.
-        let mut members: HashSet<Fingerprint> = self
+        let mut members: FingerprintSet = self
             .inset
             .get(first)
-            .map_or_else(HashSet::new, |fps| fps.iter().copied().collect());
+            .map_or_else(FingerprintSet::default, |fps| fps.iter().copied().collect());
         for v in iter {
             if members.is_empty() {
                 break;
             }
-            let present: HashSet<Fingerprint> = self
+            let present: FingerprintSet = self
                 .inset
                 .get(v)
-                .map_or_else(HashSet::new, |fps| fps.iter().copied().collect());
+                .map_or_else(FingerprintSet::default, |fps| fps.iter().copied().collect());
             members.retain(|fp| present.contains(fp));
         }
         out.extend(members);
@@ -855,7 +855,7 @@ mod tests {
         Fingerprint::from_raw(n)
     }
 
-    fn fps<const N: usize>(a: [u64; N]) -> std::collections::HashSet<Fingerprint> {
+    fn fps<const N: usize>(a: [u64; N]) -> FingerprintSet {
         a.into_iter().map(Fingerprint::from_raw).collect()
     }
 

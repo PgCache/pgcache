@@ -1,4 +1,4 @@
-use crate::query::Fingerprint;
+use crate::query::{Fingerprint, FingerprintSet};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::num::NonZeroUsize;
@@ -182,12 +182,12 @@ struct RelationBatch {
     /// Batchable Fresh-MV fingerprints, evaluated for every `covered` event
     /// (Fresh queries are always fully evaluated so every match dirty-marks —
     /// same as the per-row path).
-    fresh_fps: HashSet<Fingerprint>,
+    fresh_fps: FingerprintSet,
     /// Batchable non-Fresh fingerprints, evaluated only for `rest_covered`
     /// events (rows with no LocalEval match and no fresh hit) — mirroring the
     /// per-row path's `if !matched` short-circuit, which does zero PgEval
     /// round-trips for locally-matched rows.
-    rest_fps: HashSet<Fingerprint>,
+    rest_fps: FingerprintSet,
     /// Event indexes whose row was in the fresh membership batch (rows of
     /// unexpected arity stay out and fall back to per-row eval).
     covered: HashSet<usize>,
@@ -235,8 +235,8 @@ impl SegmentMembership {
 
 /// One event's window into a [`SegmentMembership`] matrix.
 pub(super) struct BatchEvalView<'a> {
-    fresh_fps: Option<&'a HashSet<Fingerprint>>,
-    rest_fps: Option<&'a HashSet<Fingerprint>>,
+    fresh_fps: Option<&'a FingerprintSet>,
+    rest_fps: Option<&'a FingerprintSet>,
     hits: &'a HashSet<(usize, Fingerprint)>,
     event_idx: usize,
     /// Outer `None` = row-change not batched for this event (fall back to the

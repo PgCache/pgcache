@@ -1,4 +1,4 @@
-use crate::query::Fingerprint;
+use crate::query::{Fingerprint, FingerprintMap};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,7 +112,7 @@ pub struct CoalescedClient {
 
 /// Outer key: fingerprint (O(1) drain on Ready/Failed).
 /// Inner key: CoalesceKey grouping requests that share identical response bytes.
-type WaitingQueue = HashMap<Fingerprint, HashMap<CoalesceKey, Vec<QueryRequest>>>;
+type WaitingQueue = FingerprintMap<HashMap<CoalesceKey, Vec<QueryRequest>>>;
 
 /// Coalescing wait queue with the enqueue/drain ordering invariant encapsulated.
 ///
@@ -131,7 +131,7 @@ pub(super) struct CoalesceQueue {
 impl CoalesceQueue {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(HashMap::default()),
         }
     }
 

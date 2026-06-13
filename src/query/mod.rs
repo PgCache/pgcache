@@ -9,4 +9,4 @@ pub mod resolved;
 pub mod transform;
 pub mod update;
 
-pub use fingerprint::Fingerprint;
+pub use fingerprint::{Fingerprint, FingerprintDashMap, FingerprintMap, FingerprintSet};

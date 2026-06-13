@@ -1,4 +1,4 @@
-use crate::query::Fingerprint;
+use crate::query::{Fingerprint, FingerprintSet};
 use std::collections::{HashSet, VecDeque};
 use std::io;
 
@@ -40,14 +40,14 @@ pub(crate) struct PreparedStatements {
     /// (front = next to check).
     order: VecDeque<Fingerprint>,
     /// Membership set for O(1) lookup; mirrors `order`.
-    live: HashSet<Fingerprint>,
+    live: FingerprintSet,
 }
 
 impl PreparedStatements {
     fn new() -> Self {
         Self {
             order: VecDeque::new(),
-            live: HashSet::new(),
+            live: HashSet::default(),
         }
     }
 

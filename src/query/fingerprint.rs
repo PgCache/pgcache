@@ -1,6 +1,10 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+
+use crate::id_hash::BuildIdHasher;
 
 /// A query fingerprint: a content hash of a `QueryExpr` (excluding LIMIT/OFFSET)
 /// produced by [`query_expr_fingerprint`](super::ast::query_expr_fingerprint).
@@ -44,5 +48,31 @@ impl fmt::Display for Fingerprint {
 impl fmt::Debug for Fingerprint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Fingerprint({})", self.0)
+    }
+}
+
+/// `HashMap` keyed by `Fingerprint` with the passthrough [`IdHasher`](crate::id_hash::IdHasher):
+/// the key is already a hash, so a lookup doesn't recompute one.
+pub type FingerprintMap<V> = HashMap<Fingerprint, V, BuildIdHasher>;
+/// `HashSet` of `Fingerprint` with the passthrough hasher.
+pub type FingerprintSet = HashSet<Fingerprint, BuildIdHasher>;
+/// `DashMap` keyed by `Fingerprint` with the passthrough hasher.
+pub type FingerprintDashMap<V> = DashMap<Fingerprint, V, BuildIdHasher>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::hash::BuildHasher;
+
+    /// The load-bearing invariant for the identity-hashed maps: a `Fingerprint`
+    /// hashes (under the passthrough hasher) to exactly its own `u64`. If the
+    /// derive ever stopped routing through `write_u64`, identity hashing would
+    /// silently collide every key.
+    #[test]
+    fn test_fingerprint_identity_hashes_to_its_u64() {
+        let build = BuildIdHasher::default();
+        for n in [0u64, 1, 0xdead_beef, u64::MAX] {
+            assert_eq!(build.hash_one(Fingerprint::from_raw(n)), n);
+        }
     }
 }

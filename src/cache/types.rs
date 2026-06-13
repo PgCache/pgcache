@@ -17,7 +17,8 @@ use crate::{
     },
     catalog::TableMetadata,
     query::{
-        Fingerprint, ast::QueryExpr, constraints::QueryConstraints, resolved::ResolvedQueryExpr,
+        Fingerprint, FingerprintDashMap, FingerprintMap, ast::QueryExpr,
+        constraints::QueryConstraints, resolved::ResolvedQueryExpr,
     },
     settings::{DynamicConfigHandle, Settings},
 };
@@ -231,7 +232,7 @@ impl UpdateQuery {
 #[derive(Debug)]
 pub struct UpdateQueries {
     pub relation_oid: u32,
-    pub queries: HashMap<Fingerprint, UpdateQuery>,
+    pub queries: FingerprintMap<UpdateQuery>,
     pub complexity_order: Vec<Fingerprint>,
     pub subsumption: SubsumptionIndex,
     /// Count of queries with `change_dependent == true`. Maintained on
@@ -247,7 +248,7 @@ impl UpdateQueries {
     pub fn new(relation_oid: u32) -> Self {
         Self {
             relation_oid,
-            queries: HashMap::new(),
+            queries: HashMap::default(),
             complexity_order: Vec::new(),
             subsumption: SubsumptionIndex::new(),
             change_dependent_count: 0,
@@ -445,8 +446,8 @@ impl QueryMetrics {
 /// Uses DashMap for per-shard locking — reads to one shard don't block
 /// writes to another, eliminating the global RwLock bottleneck.
 pub struct CacheStateView {
-    pub cached_queries: DashMap<Fingerprint, CachedQueryView>,
-    pub metrics: DashMap<Fingerprint, QueryMetrics>,
+    pub cached_queries: FingerprintDashMap<CachedQueryView>,
+    pub metrics: FingerprintDashMap<QueryMetrics>,
     pub started_at: Instant,
     /// Cache hits observed during the current GC interval. Incremented by the
     /// dispatch on each Ready-state serve; snapshot-and-zeroed by the writer
@@ -494,8 +495,8 @@ impl std::fmt::Debug for CacheStateView {
 impl CacheStateView {
     pub fn new(dynamic: DynamicConfigHandle) -> Self {
         Self {
-            cached_queries: DashMap::new(),
-            metrics: DashMap::new(),
+            cached_queries: DashMap::default(),
+            metrics: DashMap::default(),
             started_at: Instant::now(),
             hits_since_gc: AtomicU32::new(0),
             last_hits_per_gc: AtomicU32::new(0),

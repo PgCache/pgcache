@@ -1,4 +1,4 @@
-use crate::query::Fingerprint;
+use crate::query::{Fingerprint, FingerprintSet};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -232,7 +232,7 @@ pub struct WriterCore {
     /// per fingerprint ever (tasks share one MV table per fingerprint), even
     /// across evict + re-register of the entry: a dispatch that finds its
     /// fingerprint here defers, and the completion handler re-dispatches.
-    pub(super) mv_builds_inflight: HashSet<Fingerprint>,
+    pub(super) mv_builds_inflight: FingerprintSet,
     /// Notifications to dispatch for coalescing queue drain.
     pub(super) notify_tx: UnboundedSender<WriterNotify>,
     /// CDC source-transaction frame state (driven by
@@ -246,7 +246,7 @@ pub struct WriterCore {
     /// Fingerprints flagged for invalidation by the in-progress `Open`
     /// frame's handlers, applied just before `frame_commit` (so invalidation
     /// is atomic with the maintenance it accompanies, not visible mid-frame).
-    pub(super) frame_invalidations: HashSet<Fingerprint>,
+    pub(super) frame_invalidations: FingerprintSet,
     /// Relation OIDs touched by the in-progress frame, accumulated from frame
     /// start so a mid-frame `40P01` can invalidate+truncate every affected
     /// relation (commands applied before the deadlock were rolled back too).
@@ -471,10 +471,10 @@ impl WriterCore {
             query_tx,
             runtime,
             mv_build_pool: Arc::new(MvBuildPool::new(settings.cache.clone())),
-            mv_builds_inflight: HashSet::new(),
+            mv_builds_inflight: HashSet::default(),
             notify_tx,
             frame_state: FrameState::Idle,
-            frame_invalidations: HashSet::new(),
+            frame_invalidations: HashSet::default(),
             frame_relation_oids: HashSet::new(),
             purge_pending: false,
             frame_buf: String::with_capacity(FRAME_BUF_CAPACITY),
