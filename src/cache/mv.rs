@@ -7,6 +7,7 @@
 //!
 //! See `docs/materialized-results.md` for the full design.
 
+use crate::query::Fingerprint;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -165,7 +166,7 @@ pub enum MvServe {
 /// Format the cache-DB table name for an MV keyed by fingerprint.
 /// Convention: `pgcache_mv.q_<fingerprint>`. The `q_` prefix keeps the
 /// identifier unquoted-safe (PostgreSQL requires a letter/underscore first).
-pub fn mv_table_name(fingerprint: u64) -> String {
+pub fn mv_table_name(fingerprint: Fingerprint) -> String {
     format!("pgcache_mv.q_{fingerprint}")
 }
 
@@ -199,7 +200,7 @@ pub fn mv_table_name(fingerprint: u64) -> String {
 /// subset. No generation SET — MV tables are not `pgcache_pgrx`-tracked.
 pub fn mv_serve_sql_into(
     sql: &mut String,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     resolved: &ResolvedQueryExpr,
     limit: Option<&LimitClause>,
     output_columns: &[EcoString],
@@ -473,9 +474,12 @@ mod tests {
 
     #[test]
     fn mv_table_name_format() {
-        assert_eq!(mv_table_name(0), "pgcache_mv.q_0");
-        assert_eq!(mv_table_name(42), "pgcache_mv.q_42");
-        assert_eq!(mv_table_name(u64::MAX), "pgcache_mv.q_18446744073709551615");
+        assert_eq!(mv_table_name(Fingerprint::from_raw(0)), "pgcache_mv.q_0");
+        assert_eq!(mv_table_name(Fingerprint::from_raw(42)), "pgcache_mv.q_42");
+        assert_eq!(
+            mv_table_name(Fingerprint::from_raw(u64::MAX)),
+            "pgcache_mv.q_18446744073709551615"
+        );
     }
 
     #[test]
@@ -825,14 +829,26 @@ mod tests {
     /// aliased-projection tests.
     fn build_serve_sql(sql: &str) -> String {
         let mut out = String::new();
-        mv_serve_sql_into(&mut out, 42, &resolve_for_serve(sql), None, &[]);
+        mv_serve_sql_into(
+            &mut out,
+            Fingerprint::from_raw(42),
+            &resolve_for_serve(sql),
+            None,
+            &[],
+        );
         out
     }
 
     fn build_serve_sql_named(sql: &str, names: &[&str]) -> String {
         let names: Vec<EcoString> = names.iter().map(|n| EcoString::from(*n)).collect();
         let mut out = String::new();
-        mv_serve_sql_into(&mut out, 42, &resolve_for_serve(sql), None, &names);
+        mv_serve_sql_into(
+            &mut out,
+            Fingerprint::from_raw(42),
+            &resolve_for_serve(sql),
+            None,
+            &names,
+        );
         out
     }
 

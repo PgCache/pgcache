@@ -16,7 +16,9 @@ use crate::{
         memo::ResultMemo, mv::MvMeta, query::CacheableQuery, subsumption_index::SubsumptionIndex,
     },
     catalog::TableMetadata,
-    query::{ast::QueryExpr, constraints::QueryConstraints, resolved::ResolvedQueryExpr},
+    query::{
+        Fingerprint, ast::QueryExpr, constraints::QueryConstraints, resolved::ResolvedQueryExpr,
+    },
     settings::{DynamicConfigHandle, Settings},
 };
 
@@ -42,7 +44,7 @@ pub enum CachedQueryState {
 /// A cached query with its metadata and state
 #[derive(Debug)]
 pub struct CachedQuery {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     /// Generation number assigned when query was registered (monotonically increasing)
     pub generation: u64,
     pub relation_oids: Vec<u32>,
@@ -68,7 +70,7 @@ pub struct CachedQuery {
 }
 
 impl BiHashItem for CachedQuery {
-    type K1<'a> = u64;
+    type K1<'a> = Fingerprint;
     type K2<'b> = u64;
 
     fn key1(&self) -> Self::K1<'_> {
@@ -149,7 +151,7 @@ pub enum UpdateQuerySource {
 #[derive(Debug, Clone)]
 pub struct UpdateQuery {
     /// Fingerprint of cached query that generated this update query
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     /// Resolved AST query
     pub resolved: ResolvedQueryExpr,
     /// Complexity score (lower = simpler = more likely to match = try first)
@@ -229,8 +231,8 @@ impl UpdateQuery {
 #[derive(Debug)]
 pub struct UpdateQueries {
     pub relation_oid: u32,
-    pub queries: HashMap<u64, UpdateQuery>,
-    pub complexity_order: Vec<u64>,
+    pub queries: HashMap<Fingerprint, UpdateQuery>,
+    pub complexity_order: Vec<Fingerprint>,
     pub subsumption: SubsumptionIndex,
     /// Count of queries with `change_dependent == true`. Maintained on
     /// insert/remove via `change_dependent_account` so `needs_change_eval` is
@@ -282,7 +284,7 @@ impl UpdateQueries {
 
     /// Remove an update query by fingerprint, keeping `change_dependent_count`
     /// in sync with `queries`. Returns the removed entry, if any.
-    pub fn query_remove(&mut self, fingerprint: u64) -> Option<UpdateQuery> {
+    pub fn query_remove(&mut self, fingerprint: Fingerprint) -> Option<UpdateQuery> {
         let removed = self.queries.remove(&fingerprint);
         if let Some(removed) = &removed {
             self.change_dependent_account(removed.change_dependent, false);
@@ -368,7 +370,7 @@ impl Cache {
     /// No-op for OIDs without an `update_queries` entry. Also tears down the
     /// subsumption index entry so the lookup path doesn't return a stale
     /// candidate.
-    pub fn update_queries_remove_fingerprint(&mut self, fingerprint: u64, oids: &[u32]) {
+    pub fn update_queries_remove_fingerprint(&mut self, fingerprint: Fingerprint, oids: &[u32]) {
         for oid in oids {
             if let Some(mut queries) = self.update_queries.get_mut(oid) {
                 queries.query_remove(fingerprint);
@@ -443,8 +445,8 @@ impl QueryMetrics {
 /// Uses DashMap for per-shard locking — reads to one shard don't block
 /// writes to another, eliminating the global RwLock bottleneck.
 pub struct CacheStateView {
-    pub cached_queries: DashMap<u64, CachedQueryView>,
-    pub metrics: DashMap<u64, QueryMetrics>,
+    pub cached_queries: DashMap<Fingerprint, CachedQueryView>,
+    pub metrics: DashMap<Fingerprint, QueryMetrics>,
     pub started_at: Instant,
     /// Cache hits observed during the current GC interval. Incremented by the
     /// dispatch on each Ready-state serve; snapshot-and-zeroed by the writer
@@ -529,6 +531,6 @@ pub struct CachedQueryView {
 
 /// A pre-validated pinned query, ready for registration.
 pub struct PinnedQuery {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub cacheable_query: Arc<CacheableQuery>,
 }

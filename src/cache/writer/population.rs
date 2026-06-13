@@ -1,3 +1,4 @@
+use crate::query::Fingerprint;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::rc::Rc;
@@ -218,7 +219,7 @@ pub async fn population_worker(
 /// different branches may reference different tables with different columns.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn population_task(
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     generation: u64,
     branches: &[ResolvedSelectNode],
     table_metadata: &[TableMetadata],
@@ -297,7 +298,7 @@ async fn population_task(
 /// Deterministic name of a population's per-relation staging table in
 /// `pgcache_stage`. Stable across the worker (loads it) and the writer (merges +
 /// drops it), and across deadlock retries (each attempt recreates it fresh).
-fn staging_table_name(fingerprint: u64, generation: u64, relation_oid: u32) -> EcoString {
+fn staging_table_name(fingerprint: Fingerprint, generation: u64, relation_oid: u32) -> EcoString {
     EcoString::from(format!("stage_{fingerprint}_{generation}_{relation_oid}"))
 }
 

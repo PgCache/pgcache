@@ -19,6 +19,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ecow::EcoString;
 
 use pgcache_lib::cache::subsumption_index::SubsumptionIndex;
+use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::ast::{BinaryOp, LiteralValue};
 use pgcache_lib::query::constraints::TableConstraint;
 
@@ -46,7 +47,7 @@ fn lt(c: &str, v: i64) -> TableConstraint {
 fn index_single_class(n: usize) -> SubsumptionIndex {
     let mut idx = SubsumptionIndex::new();
     for k in 0..n {
-        idx.insert(k as u64, &[gt("id", k as i64)]);
+        idx.insert(Fingerprint::from_raw(k as u64), &[gt("id", k as i64)]);
     }
     idx
 }
@@ -63,7 +64,10 @@ fn index_two_sided_class(n: usize) -> SubsumptionIndex {
     let mut idx = SubsumptionIndex::new();
     for k in 0..n {
         let k = k as i64;
-        idx.insert(k as u64, &[gt("id", k), lt("id", k + TWO_SIDED_WINDOW)]);
+        idx.insert(
+            Fingerprint::from_raw(k as u64),
+            &[gt("id", k), lt("id", k + TWO_SIDED_WINDOW)],
+        );
     }
     idx
 }

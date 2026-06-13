@@ -14,6 +14,7 @@
 //! Lookup is **lossy-safe**: missed subsumption opportunities just mean we
 //! populate from origin instead of stamping existing rows.
 
+use crate::query::Fingerprint;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -54,14 +55,14 @@ pub struct SubsumptionIndex {
     classes: HashMap<ColumnSet, SubsumptionClass>,
     /// Reverse lookup so `remove(fingerprint)` doesn't need to re-classify
     /// the caller's constraints.
-    membership: HashMap<u64, Membership>,
+    membership: HashMap<Fingerprint, Membership>,
 }
 
 #[derive(Debug)]
 struct SubsumptionClass {
     /// Fingerprints whose constraints on every class column are pure
     /// `Equal(v)`. Keyed by joint value tuple in class-column order.
-    equality: HashMap<Vec<LiteralValue>, Vec<u64>>,
+    equality: HashMap<Vec<LiteralValue>, Vec<Fingerprint>>,
     /// Fingerprints with at least one non-equality constraint on any class
     /// column. Indexed per-column for sub-linear candidate lookup (PGC-129).
     complex: ComplexIndex,
@@ -101,7 +102,7 @@ impl SubsumptionIndex {
     /// considered for subsumption (e.g. `has_limit=true`, multi-table
     /// parents). Those should not reach this method. Idempotent on the same
     /// `fingerprint`: previous membership is removed before re-indexing.
-    pub fn insert(&mut self, fingerprint: u64, table_constraints: &[TableConstraint]) {
+    pub fn insert(&mut self, fingerprint: Fingerprint, table_constraints: &[TableConstraint]) {
         if self.membership.contains_key(&fingerprint) {
             self.remove(fingerprint);
         }
@@ -144,7 +145,7 @@ impl SubsumptionIndex {
 
     /// Remove a query's entry. O(1) plus the per-bucket vector retain.
     /// Removal is a cold path (failure cleanup, eviction).
-    pub fn remove(&mut self, fingerprint: u64) {
+    pub fn remove(&mut self, fingerprint: Fingerprint) {
         let Some(membership) = self.membership.remove(&fingerprint) else {
             return;
         };
@@ -178,7 +179,7 @@ impl SubsumptionIndex {
     /// via hash lookup; complex-bucket parents are filtered per-column via
     /// `ComplexIndex` (PGC-129/189). Lossy-safe: may over-return, never
     /// under-returns a true subsumer.
-    pub fn candidates(&self, new_constraints: &[TableConstraint]) -> HashSet<u64> {
+    pub fn candidates(&self, new_constraints: &[TableConstraint]) -> HashSet<Fingerprint> {
         let mut candidates = HashSet::new();
         let new_class = classify(new_constraints);
         let (new_columns, new_values_opt) = match &new_class {
@@ -512,14 +513,14 @@ impl ComplexIndex {
         self.per_column.iter().map(|c| c.opaque.len()).sum()
     }
 
-    fn insert(&mut self, fingerprint: u64, ranges: &[ColumnRange]) {
+    fn insert(&mut self, fingerprint: Fingerprint, ranges: &[ColumnRange]) {
         for (column, range) in self.per_column.iter_mut().zip(ranges) {
             column.insert(fingerprint, range);
         }
         self.len += 1;
     }
 
-    fn remove(&mut self, fingerprint: u64, ranges: &[ColumnRange]) {
+    fn remove(&mut self, fingerprint: Fingerprint, ranges: &[ColumnRange]) {
         for (column, range) in self.per_column.iter_mut().zip(ranges) {
             column.remove(fingerprint, range);
         }
@@ -528,7 +529,7 @@ impl ComplexIndex {
 
     /// Candidate parents whose constraint on every column could subsume the
     /// query's. Intersects the per-column match sets, smallest first.
-    fn candidates(&self, query_ranges: &[ColumnRange]) -> Vec<u64> {
+    fn candidates(&self, query_ranges: &[ColumnRange]) -> Vec<Fingerprint> {
         if self.len == 0 {
             return Vec::new();
         }
@@ -539,7 +540,7 @@ impl ComplexIndex {
             // The caller dedups into its own set.
             ([column], [range]) => column.containing(range),
             (columns, ranges) => {
-                let mut per_column: Vec<Vec<u64>> = columns
+                let mut per_column: Vec<Vec<Fingerprint>> = columns
                     .iter()
                     .zip(ranges)
                     .map(|(column, range)| column.containing(range))
@@ -549,12 +550,12 @@ impl ComplexIndex {
                 let Some(first) = iter.next() else {
                     return Vec::new();
                 };
-                let mut acc: HashSet<u64> = first.into_iter().collect();
+                let mut acc: HashSet<Fingerprint> = first.into_iter().collect();
                 for column in iter {
                     if acc.is_empty() {
                         break;
                     }
-                    let other: HashSet<u64> = column.into_iter().collect();
+                    let other: HashSet<Fingerprint> = column.into_iter().collect();
                     acc.retain(|fp| other.contains(fp));
                 }
                 acc.into_iter().collect()
@@ -568,24 +569,24 @@ impl ComplexIndex {
 #[derive(Debug, Default)]
 struct ColumnIndex {
     /// `column = v` parents, keyed by value.
-    eq: HashMap<LiteralValue, Vec<u64>>,
+    eq: HashMap<LiteralValue, Vec<Fingerprint>>,
     /// `column IN (...)` parents — inverted: each member value maps to the
     /// parents whose set contains it.
-    inset: HashMap<LiteralValue, Vec<u64>>,
+    inset: HashMap<LiteralValue, Vec<Fingerprint>>,
     /// `column > v` / `>= v` parents, keyed by the lower bound.
-    range_lower: BTreeMap<LitKey, Vec<u64>>,
+    range_lower: BTreeMap<LitKey, Vec<Fingerprint>>,
     /// `column < v` / `<= v` parents, keyed by the upper bound.
-    range_upper: BTreeMap<LitKey, Vec<u64>>,
+    range_upper: BTreeMap<LitKey, Vec<Fingerprint>>,
     /// Two-sided range parents `(l, u)` (PGC-189), keyed by the lower bound
     /// with the upper bound inline so the lookup can filter during the walk
     /// — no intersection materialization.
-    range_both: BTreeMap<LitKey, Vec<(LitKey, u64)>>,
+    range_both: BTreeMap<LitKey, Vec<(LitKey, Fingerprint)>>,
     /// Linear fallback for shapes the structured buckets can't place.
-    opaque: Vec<u64>,
+    opaque: Vec<Fingerprint>,
 }
 
 impl ColumnIndex {
-    fn insert(&mut self, fingerprint: u64, range: &ColumnRange) {
+    fn insert(&mut self, fingerprint: Fingerprint, range: &ColumnRange) {
         match placement(range) {
             Placement::Eq(v) => self.eq.entry(v.clone()).or_default().push(fingerprint),
             Placement::InSet(set) => {
@@ -609,7 +610,7 @@ impl ColumnIndex {
         }
     }
 
-    fn remove(&mut self, fingerprint: u64, range: &ColumnRange) {
+    fn remove(&mut self, fingerprint: Fingerprint, range: &ColumnRange) {
         match placement(range) {
             Placement::Eq(v) => map_vec_remove(&mut self.eq, v, fingerprint),
             Placement::InSet(set) => {
@@ -633,8 +634,8 @@ impl ColumnIndex {
     /// Parents on this column whose range could subsume `query`'s range on
     /// the same column. May over-return (lossy-safe); the caller's precise
     /// `table_constraints_subsumed` rejects false candidates.
-    fn containing(&self, query: &ColumnRange) -> Vec<u64> {
-        let mut out: Vec<u64> = self.opaque.clone();
+    fn containing(&self, query: &ColumnRange) -> Vec<Fingerprint> {
+        let mut out: Vec<Fingerprint> = self.opaque.clone();
         match query {
             // Can't reason (`Unknown`), query covers nothing (`Empty` —
             // subsumed by all) or everything (`Unconstrained`): return the
@@ -678,14 +679,14 @@ impl ColumnIndex {
     }
 
     /// All fingerprints stored in `range_both`, across every key.
-    fn range_both_all(&self) -> impl Iterator<Item = u64> + '_ {
+    fn range_both_all(&self) -> impl Iterator<Item = Fingerprint> + '_ {
         self.range_both
             .values()
             .flat_map(|v| v.iter().map(|(_, fp)| *fp))
     }
 
     /// Every fingerprint on this column, across all sub-indexes.
-    fn extend_all(&self, out: &mut Vec<u64>) {
+    fn extend_all(&self, out: &mut Vec<Fingerprint>) {
         out.extend(self.eq.values().flatten());
         out.extend(self.inset.values().flatten());
         out.extend(self.range_lower.values().flatten());
@@ -701,7 +702,7 @@ impl ColumnIndex {
     /// The `range_both.is_empty()` early-out keeps V1 single-sided workloads
     /// from paying for V2's two-sided sub-index. Load-bearing for the V1
     /// midpoint bench.
-    fn extend_two_sided(&self, qlo: &LitKey, qhi: &LitKey, out: &mut Vec<u64>) {
+    fn extend_two_sided(&self, qlo: &LitKey, qhi: &LitKey, out: &mut Vec<Fingerprint>) {
         if self.range_both.is_empty() {
             return;
         }
@@ -717,7 +718,12 @@ impl ColumnIndex {
     /// `LiteralValue` entry point for `extend_two_sided`. Falls back to
     /// over-returning every two-sided parent if either bound isn't orderable.
     #[inline]
-    fn extend_two_sided_lit(&self, qlo: &LiteralValue, qhi: &LiteralValue, out: &mut Vec<u64>) {
+    fn extend_two_sided_lit(
+        &self,
+        qlo: &LiteralValue,
+        qhi: &LiteralValue,
+        out: &mut Vec<Fingerprint>,
+    ) {
         if self.range_both.is_empty() {
             return;
         }
@@ -729,7 +735,7 @@ impl ColumnIndex {
 
     /// `range_lower` parents `(l, +inf)` with `l <= bound`. A non-orderable
     /// bound can't probe the `BTreeMap`, so return the whole bucket.
-    fn extend_lower_covering(&self, bound: &LiteralValue, out: &mut Vec<u64>) {
+    fn extend_lower_covering(&self, bound: &LiteralValue, out: &mut Vec<Fingerprint>) {
         match LitKey::try_new(bound) {
             Some(key) => out.extend(self.range_lower.range(..=key).flat_map(|(_, f)| f)),
             None => out.extend(self.range_lower.values().flatten()),
@@ -737,7 +743,7 @@ impl ColumnIndex {
     }
 
     /// `range_upper` parents `(-inf, u)` with `u >= bound`.
-    fn extend_upper_covering(&self, bound: &LiteralValue, out: &mut Vec<u64>) {
+    fn extend_upper_covering(&self, bound: &LiteralValue, out: &mut Vec<Fingerprint>) {
         match LitKey::try_new(bound) {
             Some(key) => out.extend(self.range_upper.range(key..).flat_map(|(_, f)| f)),
             None => out.extend(self.range_upper.values().flatten()),
@@ -746,14 +752,14 @@ impl ColumnIndex {
 
     /// `InSet` query branch of `containing`: a parent subsumes it only if the
     /// parent's constraint covers every value in the set.
-    fn containing_inset(&self, set: &HashSet<LiteralValue>, out: &mut Vec<u64>) {
+    fn containing_inset(&self, set: &HashSet<LiteralValue>, out: &mut Vec<Fingerprint>) {
         let mut iter = set.iter();
         let Some(first) = iter.next() else {
             return;
         };
         // InSet parents: the parent's set must be a superset — intersect the
         // inverted-index lists over every query value.
-        let mut members: HashSet<u64> = self
+        let mut members: HashSet<Fingerprint> = self
             .inset
             .get(first)
             .map_or_else(HashSet::new, |fps| fps.iter().copied().collect());
@@ -761,7 +767,7 @@ impl ColumnIndex {
             if members.is_empty() {
                 break;
             }
-            let present: HashSet<u64> = self
+            let present: HashSet<Fingerprint> = self
                 .inset
                 .get(v)
                 .map_or_else(HashSet::new, |fps| fps.iter().copied().collect());
@@ -795,7 +801,11 @@ impl ColumnIndex {
 
 /// Remove `fp` from a `HashMap`-backed posting list, dropping the key when
 /// its list empties.
-fn map_vec_remove(map: &mut HashMap<LiteralValue, Vec<u64>>, key: &LiteralValue, fp: u64) {
+fn map_vec_remove(
+    map: &mut HashMap<LiteralValue, Vec<Fingerprint>>,
+    key: &LiteralValue,
+    fp: Fingerprint,
+) {
     if let Some(fps) = map.get_mut(key) {
         fps.retain(|x| *x != fp);
         if fps.is_empty() {
@@ -806,7 +816,7 @@ fn map_vec_remove(map: &mut HashMap<LiteralValue, Vec<u64>>, key: &LiteralValue,
 
 /// Remove `fp` from a `BTreeMap`-backed posting list, dropping the key when
 /// its list empties.
-fn btree_vec_remove(map: &mut BTreeMap<LitKey, Vec<u64>>, key: &LitKey, fp: u64) {
+fn btree_vec_remove(map: &mut BTreeMap<LitKey, Vec<Fingerprint>>, key: &LitKey, fp: Fingerprint) {
     if let Some(fps) = map.get_mut(key) {
         fps.retain(|x| *x != fp);
         if fps.is_empty() {
@@ -817,7 +827,11 @@ fn btree_vec_remove(map: &mut BTreeMap<LitKey, Vec<u64>>, key: &LitKey, fp: u64)
 
 /// Remove `fp` from a `BTreeMap`-backed `(other_bound, fp)` posting list,
 /// dropping the key when its list empties.
-fn btree_pair_remove(map: &mut BTreeMap<LitKey, Vec<(LitKey, u64)>>, key: &LitKey, fp: u64) {
+fn btree_pair_remove(
+    map: &mut BTreeMap<LitKey, Vec<(LitKey, Fingerprint)>>,
+    key: &LitKey,
+    fp: Fingerprint,
+) {
     if let Some(entries) = map.get_mut(key) {
         entries.retain(|(_, x)| *x != fp);
         if entries.is_empty() {
@@ -835,6 +849,14 @@ mod tests {
 
     fn col(s: &str) -> EcoString {
         EcoString::from(s)
+    }
+
+    fn fp(n: u64) -> Fingerprint {
+        Fingerprint::from_raw(n)
+    }
+
+    fn fps<const N: usize>(a: [u64; N]) -> std::collections::HashSet<Fingerprint> {
+        a.into_iter().map(Fingerprint::from_raw).collect()
     }
 
     fn int(n: i64) -> LiteralValue {
@@ -875,17 +897,17 @@ mod tests {
     #[test]
     fn equality_pure_exact_match() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[eq("id", int(42))]);
-        idx.insert(2, &[eq("id", int(99))]);
+        idx.insert(fp(1), &[eq("id", int(42))]);
+        idx.insert(fp(2), &[eq("id", int(99))]);
 
         let candidates = idx.candidates(&[eq("id", int(42))]);
-        assert_eq!(candidates, [1].into_iter().collect());
+        assert_eq!(candidates, fps([1]));
     }
 
     #[test]
     fn equality_pure_different_value_misses() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[eq("id", int(42))]);
+        idx.insert(fp(1), &[eq("id", int(42))]);
 
         let candidates = idx.candidates(&[eq("id", int(99))]);
         assert!(candidates.is_empty());
@@ -895,7 +917,7 @@ mod tests {
     fn parent_broader_via_subset_filter() {
         let mut idx = SubsumptionIndex::new();
         // Parent constrains only category=5 — class {category}
-        idx.insert(1, &[eq("category", int(5))]);
+        idx.insert(fp(1), &[eq("category", int(5))]);
 
         // New constrains category=5 AND status='active' — class {category, status}
         // Subset enumeration should include {category} and find the parent.
@@ -904,27 +926,27 @@ mod tests {
             eq("status", LiteralValue::String("active".into())),
         ];
         let candidates = idx.candidates(&new);
-        assert!(candidates.contains(&1));
+        assert!(candidates.contains(&fp(1)));
     }
 
     #[test]
     fn parent_with_unconstrained_column_finds_via_empty_class() {
         let mut idx = SubsumptionIndex::new();
         // Parent: full table scan, no constraints — class {}
-        idx.insert(1, &[]);
+        idx.insert(fp(1), &[]);
 
         // New: WHERE id = 42 — class {id}
         // Empty subset of {id} should hit the empty class and pull the parent.
         let candidates = idx.candidates(&[eq("id", int(42))]);
-        assert!(candidates.contains(&1));
+        assert!(candidates.contains(&fp(1)));
     }
 
     #[test]
     fn complex_constraint_lands_in_complex_bucket() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(100))]);
+        idx.insert(fp(1), &[gt("id", int(100))]);
         idx.insert(
-            2,
+            fp(2),
             &[any_of("status", vec![LiteralValue::String("a".into())])],
         );
 
@@ -934,25 +956,25 @@ mod tests {
         // Powerset of new's {id} = {{}, {id}}. Only {id} class will be hit;
         // parent 1 should be a candidate via complex scan.
         let candidates = idx.candidates(&[eq("id", int(200))]);
-        assert!(candidates.contains(&1));
-        assert!(!candidates.contains(&2)); // {status} ⊄ {id}, never visited
+        assert!(candidates.contains(&fp(1)));
+        assert!(!candidates.contains(&fp(2))); // {status} ⊄ {id}, never visited
     }
 
     #[test]
     fn mixed_equality_and_complex_both_returned() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[eq("id", int(42))]); // class {id}.equality[(42,)]
-        idx.insert(2, &[gt("id", int(0))]); // class {id}.complex
+        idx.insert(fp(1), &[eq("id", int(42))]); // class {id}.equality[(42,)]
+        idx.insert(fp(2), &[gt("id", int(0))]); // class {id}.complex
 
         let candidates = idx.candidates(&[eq("id", int(42))]);
-        assert_eq!(candidates, [1, 2].into_iter().collect());
+        assert_eq!(candidates, fps([1, 2]));
     }
 
     #[test]
     fn remove_drops_entry() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[eq("id", int(42))]);
-        idx.remove(1);
+        idx.insert(fp(1), &[eq("id", int(42))]);
+        idx.remove(fp(1));
 
         assert!(idx.candidates(&[eq("id", int(42))]).is_empty());
         assert_eq!(idx.classes_len(), 0);
@@ -961,24 +983,21 @@ mod tests {
     #[test]
     fn remove_keeps_unrelated_entries() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[eq("id", int(42))]);
-        idx.insert(2, &[eq("id", int(42))]);
-        idx.remove(1);
+        idx.insert(fp(1), &[eq("id", int(42))]);
+        idx.insert(fp(2), &[eq("id", int(42))]);
+        idx.remove(fp(1));
 
-        assert_eq!(
-            idx.candidates(&[eq("id", int(42))]),
-            [2].into_iter().collect()
-        );
+        assert_eq!(idx.candidates(&[eq("id", int(42))]), fps([2]));
     }
 
     #[test]
     fn column_order_does_not_affect_class_membership() {
         let mut idx = SubsumptionIndex::new();
         // Insert as [a, b]
-        idx.insert(1, &[eq("a", int(1)), eq("b", int(2))]);
+        idx.insert(fp(1), &[eq("a", int(1)), eq("b", int(2))]);
         // Lookup with [b, a] — same class.
         let candidates = idx.candidates(&[eq("b", int(2)), eq("a", int(1))]);
-        assert_eq!(candidates, [1].into_iter().collect());
+        assert_eq!(candidates, fps([1]));
     }
 
     #[test]
@@ -986,21 +1005,21 @@ mod tests {
         let mut idx = SubsumptionIndex::new();
         // WHERE a=1 AND a=2 — same column, conflicting values. Classifier
         // falls back to complex.
-        idx.insert(1, &[eq("a", int(1)), eq("a", int(2))]);
+        idx.insert(fp(1), &[eq("a", int(1)), eq("a", int(2))]);
         // Probing equality lookup with a=1 must not return this entry from
         // the equality bucket (it's in complex). But complex scan finds it.
         let candidates = idx.candidates(&[eq("a", int(1))]);
-        assert!(candidates.contains(&1));
+        assert!(candidates.contains(&fp(1)));
     }
 
     #[test]
     fn empty_new_query_finds_only_unconstrained_parents() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[]); // unconstrained — class {}
-        idx.insert(2, &[eq("id", int(42))]); // class {id}, not a subset of {}
+        idx.insert(fp(1), &[]); // unconstrained — class {}
+        idx.insert(fp(2), &[eq("id", int(42))]); // class {id}, not a subset of {}
 
         let candidates = idx.candidates(&[]);
-        assert_eq!(candidates, [1].into_iter().collect());
+        assert_eq!(candidates, fps([1]));
     }
 
     #[test]
@@ -1018,12 +1037,12 @@ mod tests {
     #[test]
     fn unconstrained_parent_subsumes_complex_new_range() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[]); // unconstrained — class {}
+        idx.insert(fp(1), &[]); // unconstrained — class {}
 
         // New has a range constraint, not equality. Classified as Complex.
         let candidates = idx.candidates(&[gt("id", int(10))]);
         assert!(
-            candidates.contains(&1),
+            candidates.contains(&fp(1)),
             "unconstrained parent should subsume any range query"
         );
     }
@@ -1031,11 +1050,11 @@ mod tests {
     #[test]
     fn unconstrained_parent_subsumes_complex_new_inset() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[]);
+        idx.insert(fp(1), &[]);
 
         let candidates = idx.candidates(&[any_of("id", vec![int(1), int(2), int(3)])]);
         assert!(
-            candidates.contains(&1),
+            candidates.contains(&fp(1)),
             "unconstrained parent should subsume any IN-set query"
         );
     }
@@ -1043,13 +1062,13 @@ mod tests {
     #[test]
     fn unconstrained_parent_subsumes_mixed_new() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[]);
+        idx.insert(fp(1), &[]);
 
         // Mix of equality and non-equality across columns. Classified Complex
         // (any non-equality constraint demotes the whole query to Complex).
         let candidates = idx.candidates(&[eq("a", int(5)), gt("b", int(10))]);
         assert!(
-            candidates.contains(&1),
+            candidates.contains(&fp(1)),
             "unconstrained parent should subsume mixed new queries"
         );
     }
@@ -1057,11 +1076,11 @@ mod tests {
     #[test]
     fn unconstrained_new_finds_unconstrained_parent() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[]);
-        idx.insert(2, &[eq("id", int(42))]);
+        idx.insert(fp(1), &[]);
+        idx.insert(fp(2), &[eq("id", int(42))]);
 
         let candidates = idx.candidates(&[]);
-        assert_eq!(candidates, [1].into_iter().collect());
+        assert_eq!(candidates, fps([1]));
     }
 
     // Idempotency: re-inserting the same fingerprint should replace the
@@ -1070,30 +1089,27 @@ mod tests {
     #[test]
     fn reinsert_same_fingerprint_replaces() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[eq("id", int(5))]);
+        idx.insert(fp(1), &[eq("id", int(5))]);
         // Same fingerprint, different value — lookup of old value misses.
-        idx.insert(1, &[eq("id", int(10))]);
+        idx.insert(fp(1), &[eq("id", int(10))]);
 
         assert!(idx.candidates(&[eq("id", int(5))]).is_empty());
-        assert_eq!(
-            idx.candidates(&[eq("id", int(10))]),
-            [1].into_iter().collect()
-        );
+        assert_eq!(idx.candidates(&[eq("id", int(10))]), fps([1]));
     }
 
     #[test]
     fn reinsert_changing_shape_replaces() {
         let mut idx = SubsumptionIndex::new();
         // Start as Equality-pure on {id}.
-        idx.insert(1, &[eq("id", int(5))]);
+        idx.insert(fp(1), &[eq("id", int(5))]);
         // Re-insert with a range — now Complex on {id}.
-        idx.insert(1, &[gt("id", int(0))]);
+        idx.insert(fp(1), &[gt("id", int(0))]);
 
         // Lookup of id=42: equality bucket has no (42,) entry (we replaced
         // the (5,) entry with a complex one), but the complex bucket is
         // always scanned for visited subsets, so the range parent is found.
         let candidates = idx.candidates(&[eq("id", int(42))]);
-        assert_eq!(candidates, [1].into_iter().collect());
+        assert_eq!(candidates, fps([1]));
         // The (5,) equality bucket should be gone (no entry for fp=1 in it).
         // Confirm by counting classes — there's only the {id} class with one
         // complex entry, no leftover empty equality buckets.
@@ -1103,8 +1119,8 @@ mod tests {
     #[test]
     fn remove_unconstrained_drops_empty_class() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[]);
-        idx.remove(1);
+        idx.insert(fp(1), &[]);
+        idx.remove(fp(1));
 
         assert_eq!(idx.classes_len(), 0);
         assert!(idx.candidates(&[]).is_empty());
@@ -1125,7 +1141,7 @@ mod tests {
     fn known_limitation_equality_parent_missed_by_complex_new() {
         let mut idx = SubsumptionIndex::new();
         // Parent: WHERE a = 5 — lives in class {a}.equality[(5,)]
-        idx.insert(1, &[eq("a", int(5))]);
+        idx.insert(fp(1), &[eq("a", int(5))]);
 
         // New: WHERE a = 5 AND b > 10 — Complex overall, columns {a, b}
         let new = vec![eq("a", int(5)), gt("b", int(10))];
@@ -1136,7 +1152,7 @@ mod tests {
         // currently misses this — see comment above. Update this test if the
         // limitation is removed (per-column equality detection in candidates).
         assert!(
-            !candidates.contains(&1),
+            !candidates.contains(&fp(1)),
             "limitation: equality parent in non-empty class not probed when new is Complex"
         );
     }
@@ -1170,28 +1186,28 @@ mod tests {
     #[test]
     fn range_parent_subsumes_equality_in_range() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(100))]);
+        idx.insert(fp(1), &[gt("id", int(100))]);
 
         // New: WHERE id = 200 — inside the parent's (100, +inf) range.
         let candidates = idx.candidates(&[eq("id", int(200))]);
-        assert!(candidates.contains(&1));
+        assert!(candidates.contains(&fp(1)));
     }
 
     #[test]
     fn range_parent_subsumes_narrower_range() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0))]);
+        idx.insert(fp(1), &[gt("id", int(0))]);
 
         // New: WHERE id > 50 — narrower than the parent's id > 0.
         let candidates = idx.candidates(&[gt("id", int(50))]);
-        assert!(candidates.contains(&1));
+        assert!(candidates.contains(&fp(1)));
     }
 
     #[test]
     fn inset_parent_subsumes_member_equality() {
         let mut idx = SubsumptionIndex::new();
         idx.insert(
-            1,
+            fp(1),
             &[any_of(
                 "status",
                 vec![
@@ -1203,25 +1219,25 @@ mod tests {
 
         // New: WHERE status = 'a' — a member of the parent's set.
         let candidates = idx.candidates(&[eq("status", LiteralValue::String("a".into()))]);
-        assert!(candidates.contains(&1));
+        assert!(candidates.contains(&fp(1)));
     }
 
     #[test]
     fn multi_column_complex_class_subsumer_returned() {
         let mut idx = SubsumptionIndex::new();
         // Parent: id > 10 AND region = 5 — class {id, region}, Complex.
-        idx.insert(1, &[gt("id", int(10)), eq("region", int(5))]);
+        idx.insert(fp(1), &[gt("id", int(10)), eq("region", int(5))]);
 
         // New: id > 20 AND region = 5 — narrower on id, same region.
         let candidates = idx.candidates(&[gt("id", int(20)), eq("region", int(5))]);
-        assert!(candidates.contains(&1));
+        assert!(candidates.contains(&fp(1)));
     }
 
     #[test]
     fn range_parent_in_subset_class_returned() {
         let mut idx = SubsumptionIndex::new();
         // Parent constrains only category — class {category}, Complex.
-        idx.insert(1, &[gt("category", int(5))]);
+        idx.insert(fp(1), &[gt("category", int(5))]);
 
         // New constrains category AND status — class {category, status}.
         // Subset enumeration must reach {category} and return the parent.
@@ -1230,7 +1246,7 @@ mod tests {
             eq("status", LiteralValue::String("x".into())),
         ];
         let candidates = idx.candidates(&new);
-        assert!(candidates.contains(&1));
+        assert!(candidates.contains(&fp(1)));
     }
 
     // PGC-129 V1 precision: the per-column index returns a *tight* candidate
@@ -1240,58 +1256,58 @@ mod tests {
     #[test]
     fn range_parent_excludes_out_of_range_equality() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(100))]);
+        idx.insert(fp(1), &[gt("id", int(100))]);
 
         // New: WHERE id = 50 — below the parent's (100, +inf) range.
         let candidates = idx.candidates(&[eq("id", int(50))]);
-        assert!(!candidates.contains(&1));
+        assert!(!candidates.contains(&fp(1)));
     }
 
     #[test]
     fn range_parent_excludes_broader_range() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(50))]);
+        idx.insert(fp(1), &[gt("id", int(50))]);
 
         // New: WHERE id > 10 — broader than the parent's id > 50.
         let candidates = idx.candidates(&[gt("id", int(10))]);
-        assert!(!candidates.contains(&1));
+        assert!(!candidates.contains(&fp(1)));
     }
 
     #[test]
     fn upper_range_parent_bounds_both_ways() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[lt("id", int(100))]);
+        idx.insert(fp(1), &[lt("id", int(100))]);
 
-        assert!(idx.candidates(&[eq("id", int(50))]).contains(&1));
-        assert!(!idx.candidates(&[eq("id", int(200))]).contains(&1));
+        assert!(idx.candidates(&[eq("id", int(50))]).contains(&fp(1)));
+        assert!(!idx.candidates(&[eq("id", int(200))]).contains(&fp(1)));
     }
 
     #[test]
     fn inset_parent_excludes_non_member() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[any_of("status", vec![text("a"), text("b")])]);
+        idx.insert(fp(1), &[any_of("status", vec![text("a"), text("b")])]);
 
-        assert!(idx.candidates(&[eq("status", text("b"))]).contains(&1));
-        assert!(!idx.candidates(&[eq("status", text("c"))]).contains(&1));
+        assert!(idx.candidates(&[eq("status", text("b"))]).contains(&fp(1)));
+        assert!(!idx.candidates(&[eq("status", text("c"))]).contains(&fp(1)));
     }
 
     #[test]
     fn inset_parent_subsumes_subset_inset_only() {
         let mut idx = SubsumptionIndex::new();
         idx.insert(
-            1,
+            fp(1),
             &[any_of("status", vec![text("a"), text("b"), text("c")])],
         );
 
         // Subset IN — subsumed.
         assert!(
             idx.candidates(&[any_of("status", vec![text("a"), text("b")])])
-                .contains(&1)
+                .contains(&fp(1))
         );
         // IN with a non-member — not subsumed.
         assert!(
             !idx.candidates(&[any_of("status", vec![text("a"), text("d")])])
-                .contains(&1)
+                .contains(&fp(1))
         );
     }
 
@@ -1299,11 +1315,11 @@ mod tests {
     fn multi_column_excludes_when_one_column_misses() {
         let mut idx = SubsumptionIndex::new();
         // Parent: id > 10 AND region = 5.
-        idx.insert(1, &[gt("id", int(10)), eq("region", int(5))]);
+        idx.insert(fp(1), &[gt("id", int(10)), eq("region", int(5))]);
 
         // id is covered (20 > 10) but region mismatches — must be excluded.
         let candidates = idx.candidates(&[gt("id", int(20)), eq("region", int(9))]);
-        assert!(!candidates.contains(&1));
+        assert!(!candidates.contains(&fp(1)));
     }
 
     #[test]
@@ -1311,17 +1327,17 @@ mod tests {
         // PGC-189: two-sided range parents go into `range_both`, not the
         // linear fallback. `complex_fallback_total` stays at zero.
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+        idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         assert_eq!(idx.complex_total(), 1);
         assert_eq!(idx.complex_fallback_total(), 0);
-        assert!(idx.candidates(&[eq("id", int(50))]).contains(&1));
+        assert!(idx.candidates(&[eq("id", int(50))]).contains(&fp(1)));
     }
 
     #[test]
     fn single_sided_range_avoids_fallback() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0))]);
+        idx.insert(fp(1), &[gt("id", int(0))]);
 
         assert_eq!(idx.complex_total(), 1);
         assert_eq!(idx.complex_fallback_total(), 0);
@@ -1330,8 +1346,8 @@ mod tests {
     #[test]
     fn remove_clears_range_parent() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(100))]);
-        idx.remove(1);
+        idx.insert(fp(1), &[gt("id", int(100))]);
+        idx.remove(fp(1));
 
         assert!(idx.candidates(&[eq("id", int(200))]).is_empty());
         assert_eq!(idx.complex_total(), 0);
@@ -1341,13 +1357,13 @@ mod tests {
     #[test]
     fn remove_one_range_parent_keeps_sibling() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(10))]);
-        idx.insert(2, &[gt("id", int(20))]);
-        idx.remove(1);
+        idx.insert(fp(1), &[gt("id", int(10))]);
+        idx.insert(fp(2), &[gt("id", int(20))]);
+        idx.remove(fp(1));
 
         let candidates = idx.candidates(&[eq("id", int(30))]);
-        assert!(!candidates.contains(&1));
-        assert!(candidates.contains(&2));
+        assert!(!candidates.contains(&fp(1)));
+        assert!(candidates.contains(&fp(2)));
         assert_eq!(idx.complex_total(), 1);
     }
 
@@ -1357,14 +1373,14 @@ mod tests {
         // `region`. Region's precise filter must still apply across columns.
         let mut idx = SubsumptionIndex::new();
         idx.insert(
-            1,
+            fp(1),
             &[gt("id", int(0)), lt("id", int(100)), eq("region", int(5))],
         );
 
         let hit = idx.candidates(&[eq("id", int(50)), eq("region", int(5))]);
-        assert!(hit.contains(&1));
+        assert!(hit.contains(&fp(1)));
         let miss = idx.candidates(&[eq("id", int(50)), eq("region", int(9))]);
-        assert!(!miss.contains(&1));
+        assert!(!miss.contains(&fp(1)));
     }
 
     // PGC-189: two-sided range parents have their own sub-index. Precision
@@ -1373,73 +1389,73 @@ mod tests {
     #[test]
     fn two_sided_parent_subsumes_interior_equality() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+        idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         // Inside the interval — covered.
-        assert!(idx.candidates(&[eq("id", int(50))]).contains(&1));
+        assert!(idx.candidates(&[eq("id", int(50))]).contains(&fp(1)));
     }
 
     #[test]
     fn two_sided_parent_excludes_outside_equality() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+        idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         // Outside on either side — not covered.
-        assert!(!idx.candidates(&[eq("id", int(200))]).contains(&1));
-        assert!(!idx.candidates(&[eq("id", int(-10))]).contains(&1));
+        assert!(!idx.candidates(&[eq("id", int(200))]).contains(&fp(1)));
+        assert!(!idx.candidates(&[eq("id", int(-10))]).contains(&fp(1)));
     }
 
     #[test]
     fn two_sided_parent_subsumes_narrower_two_sided_query() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+        idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         // Narrower interval — covered.
         let narrower = vec![gt("id", int(10)), lt("id", int(90))];
-        assert!(idx.candidates(&narrower).contains(&1));
+        assert!(idx.candidates(&narrower).contains(&fp(1)));
     }
 
     #[test]
     fn two_sided_parent_excludes_broader_two_sided_query() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(10)), lt("id", int(90))]);
+        idx.insert(fp(1), &[gt("id", int(10)), lt("id", int(90))]);
 
         // Broader interval (parent narrower than query) — not covered.
         let broader = vec![gt("id", int(0)), lt("id", int(100))];
-        assert!(!idx.candidates(&broader).contains(&1));
+        assert!(!idx.candidates(&broader).contains(&fp(1)));
     }
 
     #[test]
     fn two_sided_parent_excludes_partial_overlap() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+        idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         // Overlaps on the right but extends past the parent — not covered.
         let shifted_right = vec![gt("id", int(50)), lt("id", int(200))];
-        assert!(!idx.candidates(&shifted_right).contains(&1));
+        assert!(!idx.candidates(&shifted_right).contains(&fp(1)));
 
         // Overlaps on the left but extends past the parent — not covered.
         let shifted_left = vec![gt("id", int(-50)), lt("id", int(50))];
-        assert!(!idx.candidates(&shifted_left).contains(&1));
+        assert!(!idx.candidates(&shifted_left).contains(&fp(1)));
     }
 
     #[test]
     fn two_sided_parent_does_not_cover_single_sided_query() {
         // A finite-bound parent cannot cover a half-infinite query interval.
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
+        idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         // Query (50, +inf): parent's upper=100 < +inf — not covered.
-        assert!(!idx.candidates(&[gt("id", int(50))]).contains(&1));
+        assert!(!idx.candidates(&[gt("id", int(50))]).contains(&fp(1)));
         // Query (-inf, 50): parent's lower=0 > -inf — not covered.
-        assert!(!idx.candidates(&[lt("id", int(50))]).contains(&1));
+        assert!(!idx.candidates(&[lt("id", int(50))]).contains(&fp(1)));
     }
 
     #[test]
     fn two_sided_remove_clears_parent() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]);
-        idx.remove(1);
+        idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
+        idx.remove(fp(1));
 
         assert!(idx.candidates(&[eq("id", int(50))]).is_empty());
         assert_eq!(idx.complex_total(), 0);
@@ -1449,14 +1465,14 @@ mod tests {
     #[test]
     fn two_sided_remove_one_keeps_sibling() {
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0)), lt("id", int(50))]);
-        idx.insert(2, &[gt("id", int(0)), lt("id", int(100))]);
-        idx.remove(1);
+        idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(50))]);
+        idx.insert(fp(2), &[gt("id", int(0)), lt("id", int(100))]);
+        idx.remove(fp(1));
 
         // Query at id=75 — only parent 2 (which has upper=100) covers it.
         let candidates = idx.candidates(&[eq("id", int(75))]);
-        assert!(!candidates.contains(&1));
-        assert!(candidates.contains(&2));
+        assert!(!candidates.contains(&fp(1)));
+        assert!(candidates.contains(&fp(2)));
         assert_eq!(idx.complex_total(), 1);
     }
 
@@ -1464,17 +1480,17 @@ mod tests {
     fn two_sided_mixed_with_single_sided_class() {
         // Two-sided and single-sided parents coexisting on the same column.
         let mut idx = SubsumptionIndex::new();
-        idx.insert(1, &[gt("id", int(0)), lt("id", int(100))]); // (0, 100)
-        idx.insert(2, &[gt("id", int(20))]); // (20, +inf)
+        idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]); // (0, 100)
+        idx.insert(fp(2), &[gt("id", int(20))]); // (20, +inf)
 
         // id=50 covered by both.
         let mid = idx.candidates(&[eq("id", int(50))]);
-        assert!(mid.contains(&1));
-        assert!(mid.contains(&2));
+        assert!(mid.contains(&fp(1)));
+        assert!(mid.contains(&fp(2)));
 
         // id=200 covered only by the single-sided parent.
         let high = idx.candidates(&[eq("id", int(200))]);
-        assert!(!high.contains(&1));
-        assert!(high.contains(&2));
+        assert!(!high.contains(&fp(1)));
+        assert!(high.contains(&fp(2)));
     }
 }

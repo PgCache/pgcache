@@ -1,3 +1,4 @@
+use crate::query::Fingerprint;
 use std::any::Any;
 #[cfg(feature = "fault-injection")]
 use std::collections::VecDeque;
@@ -855,7 +856,7 @@ async fn coalesce_drain(
 /// Record serve-reported metrics (cache-hit latency, bytes served).
 fn serve_metrics_record(
     state_view: &CacheStateView,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     latency_us: u64,
     bytes_served: u64,
 ) {

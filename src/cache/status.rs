@@ -1,3 +1,4 @@
+use crate::query::Fingerprint;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -51,7 +52,7 @@ pub struct CdcStatusData {
 /// Per-query status for a cached query.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QueryStatusData {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub sql_preview: String,
     pub tables: Vec<String>,
     pub state: String,

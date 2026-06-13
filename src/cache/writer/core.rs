@@ -1,3 +1,4 @@
+use crate::query::Fingerprint;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -231,7 +232,7 @@ pub struct WriterCore {
     /// per fingerprint ever (tasks share one MV table per fingerprint), even
     /// across evict + re-register of the entry: a dispatch that finds its
     /// fingerprint here defers, and the completion handler re-dispatches.
-    pub(super) mv_builds_inflight: HashSet<u64>,
+    pub(super) mv_builds_inflight: HashSet<Fingerprint>,
     /// Notifications to dispatch for coalescing queue drain.
     pub(super) notify_tx: UnboundedSender<WriterNotify>,
     /// CDC source-transaction frame state (driven by
@@ -245,7 +246,7 @@ pub struct WriterCore {
     /// Fingerprints flagged for invalidation by the in-progress `Open`
     /// frame's handlers, applied just before `frame_commit` (so invalidation
     /// is atomic with the maintenance it accompanies, not visible mid-frame).
-    pub(super) frame_invalidations: HashSet<u64>,
+    pub(super) frame_invalidations: HashSet<Fingerprint>,
     /// Relation OIDs touched by the in-progress frame, accumulated from frame
     /// start so a mid-frame `40P01` can invalidate+truncate every affected
     /// relation (commands applied before the deadlock were rolled back too).
@@ -607,7 +608,7 @@ impl WriterCore {
     /// the live, non-invalidated cached query — i.e. a parked merge/ready entry
     /// hasn't been superseded by a readmit (generation bump), invalidated, or
     /// evicted while it waited (PGC-250).
-    pub(super) fn population_is_current(&self, fingerprint: u64, generation: u64) -> bool {
+    pub(super) fn population_is_current(&self, fingerprint: Fingerprint, generation: u64) -> bool {
         let live = self
             .cache
             .cached_queries
@@ -800,7 +801,7 @@ impl WriterCore {
     /// `QueryCommand::Register`.
     pub(super) fn mv_state_set(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         shape_gate: ShapeGate,
         mv_limit: Option<u64>,
     ) {
@@ -814,7 +815,7 @@ impl WriterCore {
     /// on Ready) aren't skipped.
     fn state_view_write(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         state: CachedQueryState,
         generation: u64,
         resolved: &SharedResolved,
@@ -847,7 +848,7 @@ impl WriterCore {
     /// transition); otherwise coalesced waiters stay stuck.
     pub(super) fn state_loading_transition(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         generation: u64,
         resolved: &SharedResolved,
         deparsed_sql: &EcoString,
@@ -867,7 +868,7 @@ impl WriterCore {
     /// coalesced waiters hung forever — always go through this wrapper.
     pub(super) fn state_ready_transition(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         generation: u64,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
@@ -896,7 +897,7 @@ impl WriterCore {
     /// register/populate failed: the `Ready` those waiters were parked on is
     /// dead, and under sustained churn a successor `Ready` may never come, so
     /// without this they hang forever. A no-op when nothing is parked.
-    pub(super) fn waiters_fail(&self, fingerprint: u64) {
+    pub(super) fn waiters_fail(&self, fingerprint: Fingerprint) {
         let _ = self.notify_tx.send(WriterNotify::Failed { fingerprint });
     }
 
@@ -1167,7 +1168,7 @@ impl WriterCore {
     /// Bump a cached query's generation to give it a second chance in CLOCK eviction.
     /// Re-executes the query against cache DB so the CustomScan tracker re-stamps
     /// dshash entries from old_gen to new_gen.
-    async fn cache_query_generation_bump(&mut self, fingerprint: u64) -> CacheResult<()> {
+    async fn cache_query_generation_bump(&mut self, fingerprint: Fingerprint) -> CacheResult<()> {
         let Some(query) = self.cache.cached_queries.get1(&fingerprint) else {
             return Ok(());
         };
@@ -1245,7 +1246,7 @@ impl WriterCore {
             .store(hit_delta, Ordering::Relaxed);
 
         // Remove invalidated entries from cached_queries that are below threshold
-        let stale_fingerprints: Vec<u64> = self
+        let stale_fingerprints: Vec<Fingerprint> = self
             .cache
             .cached_queries
             .iter()

@@ -1,3 +1,4 @@
+use crate::query::Fingerprint;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::num::NonZeroUsize;
@@ -152,7 +153,7 @@ fn row_change_join_on_into(buf: &mut String, table_metadata: &TableMetadata) {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct PreparedEvalKey {
     relation_oid: u32,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
 }
 
 /// Per-relation membership-eval rows of one segment: `(event index, row)`.
@@ -181,19 +182,19 @@ struct RelationBatch {
     /// Batchable Fresh-MV fingerprints, evaluated for every `covered` event
     /// (Fresh queries are always fully evaluated so every match dirty-marks —
     /// same as the per-row path).
-    fresh_fps: HashSet<u64>,
+    fresh_fps: HashSet<Fingerprint>,
     /// Batchable non-Fresh fingerprints, evaluated only for `rest_covered`
     /// events (rows with no LocalEval match and no fresh hit) — mirroring the
     /// per-row path's `if !matched` short-circuit, which does zero PgEval
     /// round-trips for locally-matched rows.
-    rest_fps: HashSet<u64>,
+    rest_fps: HashSet<Fingerprint>,
     /// Event indexes whose row was in the fresh membership batch (rows of
     /// unexpected arity stay out and fall back to per-row eval).
     covered: HashSet<usize>,
     /// Event indexes whose row was in the rest membership batch.
     rest_covered: HashSet<usize>,
     /// `(event index, fingerprint)` membership hits.
-    hits: HashSet<(usize, u64)>,
+    hits: HashSet<(usize, Fingerprint)>,
     /// Update events whose row-change SELECT was batched. Covered-but-absent
     /// from `row_changes` ⇒ the row isn't in the cache table (the per-row
     /// `None` case).
@@ -234,9 +235,9 @@ impl SegmentMembership {
 
 /// One event's window into a [`SegmentMembership`] matrix.
 pub(super) struct BatchEvalView<'a> {
-    fresh_fps: Option<&'a HashSet<u64>>,
-    rest_fps: Option<&'a HashSet<u64>>,
-    hits: &'a HashSet<(usize, u64)>,
+    fresh_fps: Option<&'a HashSet<Fingerprint>>,
+    rest_fps: Option<&'a HashSet<Fingerprint>>,
+    hits: &'a HashSet<(usize, Fingerprint)>,
     event_idx: usize,
     /// Outer `None` = row-change not batched for this event (fall back to the
     /// per-row SELECT); `Some(inner)` mirrors `query_row_changes`' return.
@@ -248,13 +249,13 @@ impl BatchEvalView<'_> {
     /// per-row round-trip). A rest query outside both covered sets falls back
     /// to the per-row path, whose `if !matched` guard skips it exactly as the
     /// pre-batch flow did.
-    fn covers(&self, fingerprint: u64) -> bool {
+    fn covers(&self, fingerprint: Fingerprint) -> bool {
         self.fresh_fps.is_some_and(|fps| fps.contains(&fingerprint))
             || self.rest_fps.is_some_and(|fps| fps.contains(&fingerprint))
     }
 
     /// Whether this event's row matched `fingerprint`'s predicate.
-    fn hit(&self, fingerprint: u64) -> bool {
+    fn hit(&self, fingerprint: Fingerprint) -> bool {
         self.hits.contains(&(self.event_idx, fingerprint))
     }
 }
@@ -526,7 +527,7 @@ impl WriterCdc {
         }
         // Collected out: `cache_query_cdc_invalidate` needs `&mut core`, so we
         // can't hold a borrow of `core.frame_invalidations` across the loop.
-        let fps: Vec<u64> = core.frame_invalidations.iter().copied().collect();
+        let fps: Vec<Fingerprint> = core.frame_invalidations.iter().copied().collect();
         let count = fps.len() as u64;
         for fp in fps {
             self.cache_query_cdc_invalidate(core, fp)
@@ -935,7 +936,7 @@ impl WriterCdc {
         table_metadata: &TableMetadata,
         queries: &[&UpdateQuery],
         rows: &[(usize, &[Option<ByteString>])],
-        hits: &mut HashSet<(usize, u64)>,
+        hits: &mut HashSet<(usize, Fingerprint)>,
     ) -> CacheResult<()> {
         for row_chunk in rows.chunks(PG_EVAL_ROW_CHUNK) {
             // Prepared per-query statements, pipelined (PGC-241 stage 4);
@@ -965,7 +966,7 @@ impl WriterCdc {
         table_metadata: &TableMetadata,
         queries: &[&UpdateQuery],
         row_chunk: &[(usize, &[Option<ByteString>])],
-        hits: &mut HashSet<(usize, u64)>,
+        hits: &mut HashSet<(usize, Fingerprint)>,
     ) -> CacheResult<()> {
         let (ordinals, column_arrays) = chunk_arrays_build(table_metadata, row_chunk);
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(1 + column_arrays.len());
@@ -976,7 +977,7 @@ impl WriterCdc {
 
         // Get-or-prepare. Misses prepare sequentially (cold cost, amortized:
         // steady state is all hits).
-        let mut statements: Vec<(u64, Statement)> = Vec::with_capacity(queries.len());
+        let mut statements: Vec<(Fingerprint, Statement)> = Vec::with_capacity(queries.len());
         for update_query in queries {
             let key = PreparedEvalKey {
                 relation_oid: table_metadata.relation_oid,
@@ -1062,7 +1063,7 @@ impl WriterCdc {
         table_metadata: &TableMetadata,
         queries: &[&UpdateQuery],
         row_chunk: &[(usize, &[Option<ByteString>])],
-        hits: &mut HashSet<(usize, u64)>,
+        hits: &mut HashSet<(usize, Fingerprint)>,
     ) -> CacheResult<()> {
         let chunk_rows: Vec<&[Option<ByteString>]> =
             row_chunk.iter().map(|(_, row)| *row).collect();
@@ -2705,7 +2706,7 @@ impl WriterCdc {
         }
 
         let recording = core.population_deleted_keys.is_recording(relation_oid);
-        let mut fp_list: Vec<u64> = Vec::new();
+        let mut fp_list: Vec<Fingerprint> = Vec::new();
         if let (Some(update_queries), Some(table_metadata)) = (
             core.cache.update_queries.get(&relation_oid),
             core.cache.tables.get1(&relation_oid),
@@ -2907,7 +2908,7 @@ impl WriterCdc {
     pub(super) async fn cache_query_cdc_invalidate(
         &self,
         core: &mut WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
     ) -> CacheResult<()> {
         // Pinned queries: defer readmission to the writer event loop. Still
         // drain parked waiters — the readmit's Ready can itself be superseded
@@ -3259,7 +3260,7 @@ impl WriterCdc {
         row_data: &[Option<ByteString>],
         key_data: Option<&[Option<ByteString>]>,
         operation: CdcOperation,
-    ) -> CacheResult<Vec<u64>> {
+    ) -> CacheResult<Vec<Fingerprint>> {
         // No cached query references this relation (never registered, or all
         // its queries were evicted) → nothing to invalidate. Not an error.
         let Some(update_queries) = core.cache.update_queries.get(&relation_oid) else {
@@ -3470,7 +3471,7 @@ impl WriterCdc {
         queries: &[&UpdateQuery],
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
-    ) -> CacheResult<Vec<u64>> {
+    ) -> CacheResult<Vec<Fingerprint>> {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
@@ -3702,7 +3703,7 @@ impl WriterCdc {
 impl WriterCore {
     /// Invalidate all cached queries that reference a table.
     pub(super) async fn cache_table_invalidate(&mut self, relation_oid: u32) -> CacheResult<()> {
-        let fingerprints: Vec<u64> = self
+        let fingerprints: Vec<Fingerprint> = self
             .cache
             .cached_queries
             .iter()
@@ -3719,14 +3720,14 @@ impl WriterCore {
     /// Fully evict a cached query: remove from all data structures and purge rows.
     /// Used by the eviction loop and schema-change (table) invalidation.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(super) async fn cache_query_evict(&mut self, fingerprint: u64) -> CacheResult<()> {
+    pub(super) async fn cache_query_evict(&mut self, fingerprint: Fingerprint) -> CacheResult<()> {
         let Some(query) = self.cache.cached_queries.remove1(&fingerprint) else {
-            trace!(fingerprint, "cache_query_evict: not found, skipping");
+            trace!(fingerprint = %fingerprint, "cache_query_evict: not found, skipping");
             return Ok(());
         };
 
         debug!(
-            fingerprint,
+            fingerprint = %fingerprint,
             generation = query.generation,
             relation_oids = ?query.relation_oids,
             "cache_query_evict entry"

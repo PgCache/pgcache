@@ -1,3 +1,4 @@
+use crate::query::Fingerprint;
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::num::NonZeroU64;
@@ -51,7 +52,7 @@ const MIN_POPULATE_POOL_SIZE: usize = 2;
 
 /// Work item for population worker pool.
 pub struct PopulationWork {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub generation: u64,
     pub table_metadata: Vec<TableMetadata>,
     /// SELECT branches extracted from the query at registration time.
@@ -282,7 +283,7 @@ fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
 /// (deferred re-dispatch + stale-completion discard). Always `false` unless
 /// built with `--features fault-injection`.
 #[cfg(feature = "fault-injection")]
-fn fault_mv_evict_on_build(core: &WriterCore, fingerprint: u64) -> bool {
+fn fault_mv_evict_on_build(core: &WriterCore, fingerprint: Fingerprint) -> bool {
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, Ordering};
     static ARMED: OnceLock<AtomicBool> = OnceLock::new();
@@ -292,7 +293,7 @@ fn fault_mv_evict_on_build(core: &WriterCore, fingerprint: u64) -> bool {
     core.mv_builds_inflight.contains(&fingerprint) && armed.swap(false, Ordering::Relaxed)
 }
 #[cfg(not(feature = "fault-injection"))]
-fn fault_mv_evict_on_build(_core: &WriterCore, _fingerprint: u64) -> bool {
+fn fault_mv_evict_on_build(_core: &WriterCore, _fingerprint: Fingerprint) -> bool {
     false
 }
 
@@ -529,7 +530,7 @@ impl WriterRegistration {
     fn population_work_build(
         &self,
         core: &WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         generation: u64,
         resolved: &SharedResolved,
         max_limit: Option<u64>,
@@ -725,7 +726,7 @@ impl WriterRegistration {
     fn update_queries_register(
         &self,
         core: &mut WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         resolved: &SharedResolved,
         has_limit: bool,
     ) -> CacheResult<Vec<u32>> {
@@ -785,7 +786,7 @@ impl WriterRegistration {
     fn cached_query_insert(
         &self,
         core: &mut WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         relation_oids: Vec<u32>,
         base_query: QueryExpr,
         resolved: SharedResolved,
@@ -826,7 +827,7 @@ impl WriterRegistration {
     async fn query_resolve(
         &self,
         core: &mut WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
     ) -> CacheResult<QueryResolution> {
@@ -975,7 +976,7 @@ impl WriterRegistration {
     async fn query_subsume(
         &self,
         core: &mut WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         resolution: QueryResolution,
         started_at: Instant,
         pinned: bool,
@@ -1079,7 +1080,7 @@ impl WriterRegistration {
     pub async fn query_register(
         &mut self,
         core: &mut WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
         started_at: Instant,
@@ -1234,7 +1235,7 @@ impl WriterRegistration {
     pub(super) async fn query_readmit(
         &mut self,
         core: &mut WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         started_at: Instant,
     ) -> CacheResult<()> {
         debug!("readmitting query {fingerprint}");
@@ -1284,7 +1285,7 @@ impl WriterRegistration {
     pub fn query_ready_mark(
         &self,
         core: &mut WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         cached_bytes: usize,
         row_count: u64,
     ) {
@@ -1428,7 +1429,7 @@ impl WriterRegistration {
     async fn query_ready_finalize(
         &self,
         core: &mut WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         cached_bytes: usize,
         row_count: u64,
     ) -> CacheResult<()> {
@@ -1447,7 +1448,7 @@ impl WriterRegistration {
     /// rejected the query). Without this, a failed Register would leave
     /// `state_view` stuck in `Loading` and every subsequent client request for
     /// that fingerprint would coalesce into `waiting` and hang.
-    pub fn query_failed_cleanup(&self, core: &mut WriterCore, fingerprint: u64) {
+    pub fn query_failed_cleanup(&self, core: &mut WriterCore, fingerprint: Fingerprint) {
         trace!("query_failed_cleanup {fingerprint}");
 
         // Deleted-key tracking is released per `(fingerprint, generation)` by the
@@ -1484,7 +1485,7 @@ impl WriterRegistration {
     pub async fn limit_bump_handle(
         &mut self,
         core: &mut WriterCore,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         new_max_limit: Option<u64>,
     ) -> CacheResult<()> {
         let Some(cached_query) = core.cache.cached_queries.get1(&fingerprint) else {

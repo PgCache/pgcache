@@ -5,6 +5,7 @@
 //! serve decision. They operate on the `Send` shared state ([`CacheStateView`])
 //! and are factored out so the dispatch logic stays readable.
 
+use crate::query::Fingerprint;
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
 use std::sync::atomic::Ordering;
@@ -71,7 +72,7 @@ fn eq_lowercased(lowered: &str, raw: &str) -> bool {
 /// Record a cache hit in the shared view: bump the GC hit counter and the
 /// per-query metrics. Concurrency-safe (atomic + DashMap shard locks); called
 /// inline from connection tasks.
-pub(crate) fn metrics_hit_record(state_view: &CacheStateView, fingerprint: u64) {
+pub(crate) fn metrics_hit_record(state_view: &CacheStateView, fingerprint: Fingerprint) {
     state_view.hits_since_gc.fetch_add(1, Ordering::Relaxed);
     if let Some(mut m) = state_view.metrics.get_mut(&fingerprint) {
         m.hit_count += 1;
@@ -83,7 +84,7 @@ pub(crate) fn metrics_hit_record(state_view: &CacheStateView, fingerprint: u64) 
 pub(crate) fn clock_reference_set(
     state_view: &CacheStateView,
     cache_policy: CachePolicy,
-    fingerprint: &u64,
+    fingerprint: &Fingerprint,
 ) {
     if cache_policy == CachePolicy::Clock
         && let Some(mut entry) = state_view.cached_queries.get_mut(fingerprint)
@@ -98,7 +99,7 @@ pub(crate) fn clock_reference_set(
 /// falls through to source rows while the dispatcher schedules the build.
 pub(crate) fn mv_serve_decide(
     state_view: &CacheStateView,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     rows_needed: Option<u64>,
 ) -> MvDecision {
     let observed = state_view
@@ -120,7 +121,7 @@ pub(crate) fn mv_serve_decide(
         }
         Some((MvState::Fresh, None, _)) => {
             error!(
-                fingerprint,
+                fingerprint = %fingerprint,
                 "MV is Fresh but output columns were never captured; serving from source rows"
             );
             crate::metrics::handles().cache.mv_fallthrough.increment(1);
@@ -149,7 +150,7 @@ pub(crate) fn mv_serve_decide(
 /// race; `None` when another dispatch beat us or the entry moved elsewhere.
 pub(crate) fn mv_schedule(
     state_view: &CacheStateView,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     has_table: bool,
 ) -> Option<QueryCommand> {
     let mut entry = state_view.cached_queries.get_mut(&fingerprint)?;

@@ -13,6 +13,7 @@
 //! permanently. `PopulationDeletedKeys` records every key CDC removes while a
 //! population over that relation is in flight; the merge filters those keys out.
 
+use crate::query::Fingerprint;
 use std::collections::HashMap;
 
 use ecow::EcoString;
@@ -59,7 +60,7 @@ pub(super) enum MergeOutcome {
 /// the pair (not fingerprint alone) keeps two populations of the same query —
 /// e.g. one parked post-merge while a readmit dispatches the next generation —
 /// tracked independently, so deactivating one never tears down the other.
-type PopulationKey = (u64, u64);
+type PopulationKey = (Fingerprint, u64);
 
 #[derive(Default)]
 pub(super) struct PopulationDeletedKeys {
@@ -128,7 +129,7 @@ impl PopulationDeletedKeys {
     /// LSN, used to prune keys it can no longer need. Idempotent per fingerprint.
     pub(super) fn activate(
         &mut self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         generation: u64,
         relation_oids: &[u32],
         anchor_floor: u64,
@@ -150,7 +151,7 @@ impl PopulationDeletedKeys {
     /// Stop recording for a population: drop its floor and prune (its departure
     /// may have raised the relation's min floor). Removes a relation's entry once
     /// its last in-flight population leaves.
-    pub(super) fn deactivate(&mut self, fingerprint: u64, generation: u64) {
+    pub(super) fn deactivate(&mut self, fingerprint: Fingerprint, generation: u64) {
         let key = (fingerprint, generation);
         let Some(oids) = self.inflight.remove(&key) else {
             return;
@@ -455,8 +456,8 @@ mod tests {
     #[test]
     fn deactivate_prunes_below_min_floor() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(1, GEN, &[REL], 100);
-        keys.activate(2, GEN, &[REL], 200);
+        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], 100);
+        keys.activate(Fingerprint::from_raw(2), GEN, &[REL], 200);
         record(&mut keys, "5", 50);
         record(&mut keys, "15", 150);
         record(&mut keys, "25", 250);
@@ -467,7 +468,7 @@ mod tests {
 
         // fp1 leaves → min floor becomes 200 → deletes at LSN <= 200 are
         // irrelevant to fp2 (snapshot >= 200) and pruned.
-        keys.deactivate(1, GEN);
+        keys.deactivate(Fingerprint::from_raw(1), GEN);
         let after = keys.filter_predicate(REL, "(id)").expect("filter present");
         assert!(after.contains("(25)"), "kept recent delete: {after}");
         assert!(
@@ -481,11 +482,11 @@ mod tests {
     #[test]
     fn generations_of_same_fingerprint_are_independent() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(7, 5, &[REL], 100); // gen 5, parked
-        keys.activate(7, 8, &[REL], 100); // gen 8, readmitted
+        keys.activate(Fingerprint::from_raw(7), 5, &[REL], 100); // gen 5, parked
+        keys.activate(Fingerprint::from_raw(7), 8, &[REL], 100); // gen 8, readmitted
 
         // gen 5 finishes; gen 8 must still be recording for the relation.
-        keys.deactivate(7, 5);
+        keys.deactivate(Fingerprint::from_raw(7), 5);
         assert!(keys.is_recording(REL), "gen 8 still in flight");
         record(&mut keys, "5", 150);
         assert!(
@@ -494,7 +495,7 @@ mod tests {
         );
 
         // Once gen 8 also leaves, the entry clears.
-        keys.deactivate(7, 8);
+        keys.deactivate(Fingerprint::from_raw(7), 8);
         assert!(!keys.is_recording(REL));
     }
 
@@ -502,9 +503,9 @@ mod tests {
     #[test]
     fn deactivate_last_population_clears_entry() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(1, GEN, &[REL], 100);
+        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], 100);
         record(&mut keys, "5", 150);
-        keys.deactivate(1, GEN);
+        keys.deactivate(Fingerprint::from_raw(1), GEN);
         assert!(keys.filter_predicate(REL, "(id)").is_none());
     }
 
@@ -520,7 +521,7 @@ mod tests {
     #[test]
     fn overflow_aborts_and_disables_filtering() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(1, GEN, &[REL], 0);
+        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], 0);
         for i in 0..=POPULATION_DELETED_KEY_CAP {
             record(&mut keys, &i.to_string(), 1);
         }
@@ -535,7 +536,7 @@ mod tests {
     #[test]
     fn abort_below_aborts_only_older_snapshots() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(1, GEN, &[REL], 100);
+        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], 100);
         record(&mut keys, "5", 150);
         record(&mut keys, "25", 250);
 

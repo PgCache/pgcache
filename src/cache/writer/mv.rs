@@ -14,6 +14,7 @@
 //! discarded (the data a build reads is snapshot-consistent either way; the
 //! race is only about whether the table may claim to be current).
 
+use crate::query::Fingerprint;
 use std::sync::Arc;
 
 use tracing::{debug, error, trace};
@@ -34,7 +35,7 @@ impl WriterCore {
     /// build" flow so they stay warm across startup and readmits. Called from
     /// the Ready handler. Performs the same check-and-transition the
     /// dispatch would do on first hit and self-sends an `MvBuild` command.
-    pub(super) fn mv_pinned_bootstrap(&self, fingerprint: u64) {
+    pub(super) fn mv_pinned_bootstrap(&self, fingerprint: Fingerprint) {
         let is_pinned = self
             .cache
             .cached_queries
@@ -68,7 +69,7 @@ impl WriterCore {
     /// first at the SQL level. A dispatch that finds the fingerprint in
     /// flight leaves the entry `Scheduled`; the completion handler
     /// re-dispatches it.
-    pub(super) fn mv_build_dispatch(&mut self, fingerprint: u64) {
+    pub(super) fn mv_build_dispatch(&mut self, fingerprint: Fingerprint) {
         if self.mv_builds_inflight.contains(&fingerprint) {
             trace!("mv build: deferred for {fingerprint} (prior build in flight)");
             return;
@@ -103,7 +104,11 @@ impl WriterCore {
     /// the entry was evicted (and possibly re-registered) while the build
     /// ran — the outcome is discarded and any table the build left behind is
     /// dropped so the new incarnation starts clean.
-    pub(super) async fn mv_build_complete(&mut self, fingerprint: u64, outcome: MvBuildOutcome) {
+    pub(super) async fn mv_build_complete(
+        &mut self,
+        fingerprint: Fingerprint,
+        outcome: MvBuildOutcome,
+    ) {
         self.mv_builds_inflight.remove(&fingerprint);
 
         // Did the finished build leave a table on disk? `Built` always does;
@@ -168,7 +173,7 @@ impl WriterCore {
     /// `Building` or `BuildingDirty`).
     async fn mv_build_outcome_apply(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         state: MvState,
         outcome: MvBuildOutcome,
     ) {
@@ -223,7 +228,7 @@ impl WriterCore {
     /// `DROP TABLE IF EXISTS` for a fingerprint's MV table on the writer's
     /// cache connection, logging failures. Safe to run from completion
     /// handling: the build task has finished, so no build locks are held.
-    async fn mv_table_drop(&self, fingerprint: u64) {
+    async fn mv_table_drop(&self, fingerprint: Fingerprint) {
         let mv_table = mv_table_name(fingerprint);
         if let Err(e) = self
             .db_cache
@@ -242,7 +247,7 @@ impl WriterCore {
     /// the writer-only catalog (`core.cache`). Returns None when the entry is
     /// missing, `mv_state` isn't `Scheduled { .. }`, or the source-row state
     /// isn't `Ready` (races resolved at the call site).
-    fn mv_context_snapshot(&self, fingerprint: u64) -> Option<MvBuildContext> {
+    fn mv_context_snapshot(&self, fingerprint: Fingerprint) -> Option<MvBuildContext> {
         let view = self.state_view.cached_queries.get(&fingerprint)?;
         let MvState::Scheduled { has_table } = view.mv.state else {
             return None;
@@ -295,7 +300,7 @@ impl WriterCore {
         })
     }
 
-    fn source_row_state_is_ready(&self, fingerprint: u64) -> bool {
+    fn source_row_state_is_ready(&self, fingerprint: Fingerprint) -> bool {
         self.state_view
             .cached_queries
             .get(&fingerprint)
@@ -308,7 +313,7 @@ impl WriterCore {
     ///
     /// Takes `&self` (mutation is via DashMap interior mutability) so callers
     /// holding `&self` in CDC paths don't need to become `&mut self`.
-    pub(super) fn mv_dirty_mark(&self, fingerprint: u64) {
+    pub(super) fn mv_dirty_mark(&self, fingerprint: Fingerprint) {
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint)
             && let Some(dirtied) = view.mv.state.dirtied()
         {
@@ -335,7 +340,7 @@ impl WriterCore {
     /// (`Fresh` or `Building`). Only these queries need full CDC evaluation
     /// (so `mv_dirty_mark` can fire on a match); other states are
     /// short-circuitable in the membership check.
-    pub(super) fn mv_dirty_eval_required(&self, fingerprint: u64) -> bool {
+    pub(super) fn mv_dirty_eval_required(&self, fingerprint: Fingerprint) -> bool {
         self.state_view
             .cached_queries
             .get(&fingerprint)
@@ -359,7 +364,7 @@ impl WriterCore {
     /// `Fresh` (still serving the fast path). Collects fingerprints into a
     /// Vec first so we don't hold a DashMap guard across awaits.
     pub(super) async fn mv_dirty_sweep(&self) -> CacheResult<()> {
-        let dirty: Vec<u64> = self
+        let dirty: Vec<Fingerprint> = self
             .state_view
             .cached_queries
             .iter()
@@ -396,7 +401,11 @@ impl WriterCore {
     /// table exists. Called from `cache_query_evict` before the `CachedQueryView`
     /// entry is removed. The caller is expected to pass the current `mv_state`
     /// read just before the evict (post-read the state_view entry will be gone).
-    pub(super) async fn mv_drop(&self, fingerprint: u64, mv_state: MvState) -> CacheResult<()> {
+    pub(super) async fn mv_drop(
+        &self,
+        fingerprint: Fingerprint,
+        mv_state: MvState,
+    ) -> CacheResult<()> {
         // An in-flight build task holds locks on the MV table; dropping now
         // would block the writer until the build finishes. Defer to the
         // MvBuildComplete handler, which drops the table when the entry is gone.
@@ -420,7 +429,7 @@ impl WriterCore {
 
     /// Mutate `mv_state` on the state_view entry. No-op when the entry is gone
     /// (evicted during the build).
-    fn mv_state_transition(&self, fingerprint: u64, new_state: MvState) {
+    fn mv_state_transition(&self, fingerprint: Fingerprint, new_state: MvState) {
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
             view.mv.state = new_state;
         }

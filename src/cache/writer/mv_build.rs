@@ -12,6 +12,7 @@
 //! against CDC dirty-marking (a build raced by a relevant change is observed
 //! as `BuildingDirty` and discarded).
 
+use crate::query::Fingerprint;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -44,7 +45,7 @@ const MV_BUILD_CONNECTIONS: usize = 2;
 /// Snapshot of everything a build task needs, taken on the writer (which can
 /// read `core.cache`) so the task touches only the cache DB.
 pub(super) struct MvBuildContext {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     /// Build path: `false` = `CREATE UNLOGGED TABLE AS` (first build, gate may
     /// run), `true` = `BEGIN; TRUNCATE; INSERT; COMMIT` (rebuild).
     pub has_table: bool,
@@ -126,7 +127,7 @@ impl Drop for SlotGuard {
 /// completion would wedge the MV permanently.
 struct CompletionGuard {
     query_tx: UnboundedSender<QueryCommand>,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     /// `has_table` for the fallback `Failed` outcome when the task died
     /// before producing one.
     has_table: bool,

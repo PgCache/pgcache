@@ -410,7 +410,7 @@ mod tests {
         ]));
         let result = pinned_queries_validate(&settings, &HashMap::new());
         assert_eq!(result.len(), 1);
-        assert_ne!(result[0].fingerprint, 0);
+        assert_ne!(result[0].fingerprint.get(), 0);
     }
 
     #[test]

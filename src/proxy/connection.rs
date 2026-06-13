@@ -52,7 +52,7 @@ use crate::{
         },
     },
     proxy::egress::EgressQueue,
-    query::ast::query_expr_fingerprint,
+    query::{Fingerprint, ast::query_expr_fingerprint},
     settings::SslMode,
     telemetry::pg_version_set,
     timing::{QueryId, QueryTiming, timing_record},
@@ -293,8 +293,8 @@ impl QueryTelemetry {
     }
 
     /// Create cache timing for a cacheable query.
-    fn cache_timing_start(&mut self, fingerprint: u64) {
-        let query_id = QueryId::new(fingerprint);
+    fn cache_timing_start(&mut self, fingerprint: Fingerprint) {
+        let query_id = QueryId::new(fingerprint.get());
         let received_at = self.client_received_at.unwrap_or_else(Instant::now);
         let mut timing = QueryTiming::new(query_id, received_at);
         timing.parsed_at = Some(Instant::now());
@@ -668,7 +668,7 @@ struct ExtendedPending {
 struct DispatchContext {
     msg: CacheMessage,
     pipeline: PipelineContext,
-    fingerprint: u64,
+    fingerprint: Fingerprint,
     lazy_parse: Option<EcoString>,
     parse_statement: Option<EcoString>,
     describe_statement: Option<EcoString>,

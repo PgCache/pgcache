@@ -50,6 +50,7 @@
 //! The writer is single-threaded and processes frames serially, so `begin`/`end`
 //! are balanced per relation per frame and the version never sticks odd.
 
+use crate::query::Fingerprint;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::{Bytes, BytesMut};
@@ -122,7 +123,7 @@ impl MemoShape {
 /// per `(result format, shape)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MemoKey {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     /// Result format negotiated at Bind: text (`false`) vs binary (`true`).
     pub binary: bool,
     pub shape: MemoShape,
@@ -461,7 +462,7 @@ mod tests {
 
     fn key(fp: u64) -> MemoKey {
         MemoKey {
-            fingerprint: fp,
+            fingerprint: Fingerprint::from_raw(fp),
             binary: false,
             shape: MemoShape {
                 limit: None,

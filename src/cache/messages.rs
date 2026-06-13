@@ -1,3 +1,4 @@
+use crate::query::Fingerprint;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -34,14 +35,14 @@ pub enum SubsumptionResult {
 pub enum WriterNotify {
     /// Population completed — query is Ready.
     Ready {
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         generation: u64,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
         max_limit: Option<u64>,
     },
     /// Population failed.
-    Failed { fingerprint: u64 },
+    Failed { fingerprint: Fingerprint },
 }
 
 /// Whether the pipeline includes a Describe and which type.
@@ -315,7 +316,7 @@ impl std::fmt::Debug for QueryCommand {
 /// Payload for `QueryCommand::Merge`: a population staged its snapshot and the
 /// writer must merge each relation's staging table into the shared cache table.
 pub struct PopulationMerge {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub generation: u64,
     /// `(relation_oid, staging table name in pgcache_stage)` per relation read.
     pub staged: Vec<(u32, EcoString)>,
@@ -343,7 +344,7 @@ pub enum QueryCommand {
     /// Register a new query. The writer checks subsumption and responds
     /// via `subsumption_tx` before optionally dispatching population.
     Register {
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         cacheable_query: Arc<CacheableQuery>,
         search_path: Arc<[EcoString]>,
         started_at: Instant,
@@ -358,19 +359,22 @@ pub enum QueryCommand {
     /// Query population failed. `generation` identifies which population (a
     /// query can have a superseded generation still in flight) so the writer
     /// releases the right deleted-key tracking.
-    Failed { fingerprint: u64, generation: u64 },
+    Failed {
+        fingerprint: Fingerprint,
+        generation: u64,
+    },
 
     /// Bump the max_limit for a cached query and re-populate with higher limit.
     /// Sent when an incoming query needs more rows than currently cached.
     LimitBump {
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         /// New max_limit value (None = unlimited)
         max_limit: Option<u64>,
     },
 
     /// Readmit a pinned query after CDC invalidation.
     /// Deferred via the writer's internal channel to avoid inline population during CDC processing.
-    Readmit { fingerprint: u64 },
+    Readmit { fingerprint: Fingerprint },
 
     /// Population staged its origin snapshot into `pgcache_stage`. The writer
     /// merges it into the shared cache table(s) — filtering rows CDC removed
@@ -385,14 +389,14 @@ pub enum QueryCommand {
     /// onto the shared runtime; `has_table` chooses between `CREATE TABLE AS`
     /// (first build, may run the Measure size gate) and
     /// `BEGIN; TRUNCATE; INSERT; COMMIT` (rebuild; gate is sticky).
-    MvBuild { fingerprint: u64 },
+    MvBuild { fingerprint: Fingerprint },
 
     /// A spawned MV build task finished; the writer applies the state
     /// transition. Keeping the flip on the writer serializes it against CDC
     /// dirty-marking, so a build raced by a relevant change is always observed
     /// as `BuildingDirty` here and discarded.
     MvBuildComplete {
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         outcome: MvBuildOutcome,
     },
 }

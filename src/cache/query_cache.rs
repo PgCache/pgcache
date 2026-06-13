@@ -1,3 +1,4 @@
+use crate::query::Fingerprint;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,7 +112,7 @@ pub struct CoalescedClient {
 
 /// Outer key: fingerprint (O(1) drain on Ready/Failed).
 /// Inner key: CoalesceKey grouping requests that share identical response bytes.
-type WaitingQueue = HashMap<u64, HashMap<CoalesceKey, Vec<QueryRequest>>>;
+type WaitingQueue = HashMap<Fingerprint, HashMap<CoalesceKey, Vec<QueryRequest>>>;
 
 /// Coalescing wait queue with the enqueue/drain ordering invariant encapsulated.
 ///
@@ -143,7 +144,7 @@ impl CoalesceQueue {
     fn enqueue_if_loading(
         &self,
         state_view: &CacheStateView,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         key: CoalesceKey,
         msg: QueryRequest,
     ) -> Result<(), QueryRequest> {
@@ -163,7 +164,7 @@ impl CoalesceQueue {
     }
 
     /// Remove and return all waiter groups for a fingerprint (Ready/Failed drain).
-    fn drain(&self, fingerprint: u64) -> Option<HashMap<CoalesceKey, Vec<QueryRequest>>> {
+    fn drain(&self, fingerprint: Fingerprint) -> Option<HashMap<CoalesceKey, Vec<QueryRequest>>> {
         self.inner
             .lock()
             .expect("lock coalesce queue")
@@ -200,7 +201,7 @@ pub struct QueryRequest {
 /// Request sent to cache serve for executing cached queries.
 /// Contains the resolved AST with schema-qualified table names.
 pub struct ServeRequest {
-    pub fingerprint: u64,
+    pub fingerprint: Fingerprint,
     pub query_type: QueryType,
     pub data: BytesMut,
     pub resolved: SharedResolved,
@@ -660,7 +661,7 @@ impl CacheDispatch {
     }
 
     /// Record a cache hit in per-query metrics.
-    fn metrics_hit_record(&self, fingerprint: u64) {
+    fn metrics_hit_record(&self, fingerprint: Fingerprint) {
         fast_path::metrics_hit_record(&self.state_view, fingerprint);
     }
 
@@ -677,14 +678,14 @@ impl CacheDispatch {
     }
 
     /// Record a cache miss in per-query metrics.
-    fn metrics_miss_record(&self, fingerprint: u64) {
+    fn metrics_miss_record(&self, fingerprint: Fingerprint) {
         if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
             m.miss_count += 1;
         }
     }
 
     /// Set the CLOCK reference bit for eviction tracking.
-    fn clock_reference_set(&self, cache_policy: CachePolicy, fingerprint: &u64) {
+    fn clock_reference_set(&self, cache_policy: CachePolicy, fingerprint: &Fingerprint) {
         fast_path::clock_reference_set(&self.state_view, cache_policy, fingerprint);
     }
 
@@ -695,7 +696,7 @@ impl CacheDispatch {
     /// the multi-thread runtime (cf. `fast_path::mv_schedule`).
     fn transition_if(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         pred: impl Fn(&CachedQueryView) -> bool,
         new: CachedQueryState,
     ) -> bool {
@@ -712,7 +713,12 @@ impl CacheDispatch {
     /// either admit (→ `Loading`, returning `Admit`) or bump the credit
     /// (returning `CheckOnly`). Returns `None` if the entry is no longer
     /// `Pending` (the caller re-dispatches). Race-safe read-modify-write.
-    fn pending_admit(&self, fingerprint: u64, threshold: u32, credit: u32) -> Option<AdmitAction> {
+    fn pending_admit(
+        &self,
+        fingerprint: Fingerprint,
+        threshold: u32,
+        credit: u32,
+    ) -> Option<AdmitAction> {
         let mut entry = self.state_view.cached_queries.get_mut(&fingerprint)?;
         let CachedQueryState::Pending { hit_count, .. } = entry.state else {
             return None;
@@ -735,7 +741,11 @@ impl CacheDispatch {
     /// caller won the insert; `None` if another dispatch already inserted it (the
     /// caller re-dispatches against the now-present entry). Prevents concurrent
     /// first-misses from double-registering.
-    fn first_miss_claim(&self, fingerprint: u64, cfg: &DynamicConfig) -> Option<AdmitAction> {
+    fn first_miss_claim(
+        &self,
+        fingerprint: Fingerprint,
+        cfg: &DynamicConfig,
+    ) -> Option<AdmitAction> {
         let immediate_admit = cfg.cache_policy == CachePolicy::Fifo || cfg.admission_threshold <= 1;
         let (initial_state, action) = if immediate_admit {
             (CachedQueryState::Loading, AdmitAction::Admit)
@@ -782,7 +792,7 @@ impl CacheDispatch {
     /// groups and subsumption serves dispatch to the serve pool directly.
     async fn hit_serve(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         msg: QueryRequest,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
@@ -800,7 +810,7 @@ impl CacheDispatch {
 
     fn pool_serve(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         msg: QueryRequest,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
@@ -823,7 +833,7 @@ impl CacheDispatch {
     /// a non-keyable LIMIT/OFFSET shape, cold-path extended (no pipeline), a
     /// `Describe('S')` that needs a regenerated `ParameterDescription` (v1
     /// skips), a memo miss, or a stale snapshot (dropped by `get`).
-    fn memo_serve_plan(&self, fingerprint: u64, msg: &QueryRequest) -> Option<MemoServe> {
+    fn memo_serve_plan(&self, fingerprint: Fingerprint, msg: &QueryRequest) -> Option<MemoServe> {
         if !self.state_view.memo.enabled() {
             return None;
         }
@@ -873,7 +883,7 @@ impl CacheDispatch {
     async fn memo_serve(
         &self,
         mut msg: QueryRequest,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         serve: MemoServe,
     ) -> CacheResult<()> {
         let MemoServe {
@@ -939,7 +949,7 @@ impl CacheDispatch {
     /// Fast path (Fresh / terminal / already-scheduled states) takes only a
     /// shared DashMap guard; the write guard is acquired only for the
     /// `Pending → Scheduled` flip.
-    fn mv_dispatch_decide(&self, fingerprint: u64, rows_needed: Option<u64>) -> MvServe {
+    fn mv_dispatch_decide(&self, fingerprint: Fingerprint, rows_needed: Option<u64>) -> MvServe {
         match fast_path::mv_serve_decide(&self.state_view, fingerprint, rows_needed) {
             MvDecision::Serve(mv) => mv,
             // CacheDispatch owns `query_tx`: flip Pending → Scheduled and dispatch
@@ -958,7 +968,7 @@ impl CacheDispatch {
     #[allow(clippy::too_many_arguments)]
     fn pool_serve_coalesced(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         msg: QueryRequest,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
@@ -1051,7 +1061,7 @@ impl CacheDispatch {
     /// response bytes to all clients in the group.
     pub fn waiting_drain_ready(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         generation: u64,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
@@ -1148,7 +1158,7 @@ impl CacheDispatch {
 
     /// Drain all coalesced waiters for a fingerprint that failed.
     /// Falls back to forwarding each waiter to origin.
-    pub fn waiting_drain_failed(&self, fingerprint: u64) {
+    pub fn waiting_drain_failed(&self, fingerprint: Fingerprint) {
         let Some(groups) = self.waiting.drain(fingerprint) else {
             return;
         };
@@ -1216,7 +1226,7 @@ impl CacheDispatch {
     /// Send a Register command to the writer thread with a subsumption oneshot.
     fn query_register_send(
         &self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         cacheable_query: Arc<CacheableQuery>,
         search_path: Arc<[EcoString]>,
         subsumption_tx: oneshot::Sender<SubsumptionResult>,
@@ -1241,7 +1251,7 @@ impl CacheDispatch {
     async fn subsumption_await(
         &self,
         msg: QueryRequest,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         admit_action: AdmitAction,
     ) -> CacheResult<()> {
         let (subsumption_tx, subsumption_rx) = oneshot::channel();

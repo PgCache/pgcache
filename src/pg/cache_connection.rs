@@ -1,3 +1,4 @@
+use crate::query::Fingerprint;
 use std::collections::{HashSet, VecDeque};
 use std::io;
 
@@ -37,9 +38,9 @@ const SETGEN_SQL: &str = "SELECT set_config('mem.query_generation', $1, false)";
 pub(crate) struct PreparedStatements {
     /// Prepared fingerprints; doubles as the round-robin reconciliation cursor
     /// (front = next to check).
-    order: VecDeque<u64>,
+    order: VecDeque<Fingerprint>,
     /// Membership set for O(1) lookup; mirrors `order`.
-    live: HashSet<u64>,
+    live: HashSet<Fingerprint>,
 }
 
 impl PreparedStatements {
@@ -50,12 +51,12 @@ impl PreparedStatements {
         }
     }
 
-    fn contains(&self, fingerprint: u64) -> bool {
+    fn contains(&self, fingerprint: Fingerprint) -> bool {
         self.live.contains(&fingerprint)
     }
 
     /// Record `fingerprint` as newly prepared on this connection.
-    fn insert(&mut self, fingerprint: u64) {
+    fn insert(&mut self, fingerprint: Fingerprint) {
         self.order.push_back(fingerprint);
         self.live.insert(fingerprint);
     }
@@ -64,7 +65,10 @@ impl PreparedStatements {
     /// statement against `is_live`. If still live, rotate it to the back and
     /// return `None`; if its query was evicted, drop it and return its
     /// fingerprint so the caller closes the statement on the cache DB.
-    pub(crate) fn reconcile_one(&mut self, is_live: impl Fn(u64) -> bool) -> Option<u64> {
+    pub(crate) fn reconcile_one(
+        &mut self,
+        is_live: impl Fn(Fingerprint) -> bool,
+    ) -> Option<Fingerprint> {
         let &fingerprint = self.order.front()?;
         if is_live(fingerprint) {
             self.order.rotate_left(1);
@@ -283,13 +287,13 @@ impl CacheConnection {
     #[allow(clippy::too_many_arguments)]
     pub async fn pipelined_named_query_send(
         &mut self,
-        fingerprint: u64,
+        fingerprint: Fingerprint,
         generation: u64,
         limit_text: Option<&str>,
         offset_text: Option<&str>,
         include_describe: bool,
         binary_results: bool,
-        close_victim: Option<u64>,
+        close_victim: Option<Fingerprint>,
     ) -> CacheResult<PrepareOutcome> {
         let send_parse = !self.prepared.contains(fingerprint);
         let name = statement_name_bytes(fingerprint);
@@ -513,7 +517,8 @@ const STATEMENT_NAME_LEN: usize = 20;
 /// Equivalent to `format!("pgc_{fingerprint:016x}")`. The fingerprint uniquely
 /// determines the SQL, so the name is a stable key and a re-registered identical
 /// query safely reuses any surviving statement.
-fn statement_name_bytes(fingerprint: u64) -> [u8; STATEMENT_NAME_LEN] {
+fn statement_name_bytes(fingerprint: Fingerprint) -> [u8; STATEMENT_NAME_LEN] {
+    let fingerprint = fingerprint.get();
     let mut name = [0u8; STATEMENT_NAME_LEN];
     let (prefix, hex) = name.split_at_mut(4);
     prefix.copy_from_slice(b"pgc_");
@@ -531,32 +536,43 @@ mod tests {
     #[test]
     fn prepared_statements_reconcile_keeps_live_closes_evicted() {
         let mut p = PreparedStatements::new();
-        p.insert(10);
-        p.insert(20);
-        p.insert(30); // order [10,20,30]
-        assert!(p.contains(10) && p.contains(20) && p.contains(30));
+        p.insert(Fingerprint::from_raw(10));
+        p.insert(Fingerprint::from_raw(20));
+        p.insert(Fingerprint::from_raw(30)); // order [10,20,30]
+        assert!(
+            p.contains(Fingerprint::from_raw(10))
+                && p.contains(Fingerprint::from_raw(20))
+                && p.contains(Fingerprint::from_raw(30))
+        );
 
         // All live → rotate, never close. order: [10,20,30] → [20,30,10] → [30,10,20].
         assert_eq!(p.reconcile_one(|_| true), None);
         assert_eq!(p.reconcile_one(|_| true), None);
-        assert!(p.contains(10) && p.contains(20) && p.contains(30));
+        assert!(
+            p.contains(Fingerprint::from_raw(10))
+                && p.contains(Fingerprint::from_raw(20))
+                && p.contains(Fingerprint::from_raw(30))
+        );
 
         // Front is now 30; mark it evicted → reconcile closes and drops it.
-        assert_eq!(p.reconcile_one(|fp| fp != 30), Some(30));
-        assert!(!p.contains(30));
-        assert!(p.contains(10) && p.contains(20));
+        assert_eq!(
+            p.reconcile_one(|fp| fp != Fingerprint::from_raw(30)),
+            Some(Fingerprint::from_raw(30))
+        );
+        assert!(!p.contains(Fingerprint::from_raw(30)));
+        assert!(p.contains(Fingerprint::from_raw(10)) && p.contains(Fingerprint::from_raw(20)));
 
         // Remaining are live → no more closes.
         assert_eq!(p.reconcile_one(|_| true), None);
         assert_eq!(p.reconcile_one(|_| true), None);
-        assert!(p.contains(10) && p.contains(20));
+        assert!(p.contains(Fingerprint::from_raw(10)) && p.contains(Fingerprint::from_raw(20)));
     }
 
     #[test]
     fn statement_name_bytes_matches_format() {
         for fp in [0u64, 1, 0xdead_beef, 0x0123_4567_89ab_cdef, u64::MAX] {
             let expected = format!("pgc_{fp:016x}");
-            let got = statement_name_bytes(fp);
+            let got = statement_name_bytes(Fingerprint::from_raw(fp));
             assert_eq!(
                 std::str::from_utf8(&got).expect("ascii name"),
                 expected,
