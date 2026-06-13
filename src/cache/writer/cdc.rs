@@ -481,6 +481,7 @@ impl WriterCdc {
                 .await
                 .map_into_report::<CacheError>()?;
             core.frame_buf.clear();
+            core.frame_buf_relations.clear();
             core.frame_state = FrameState::Idle;
         }
         Ok(())
@@ -500,6 +501,7 @@ impl WriterCdc {
                 .map_into_report::<CacheError>()?;
         }
         core.frame_buf.clear();
+        core.frame_buf_relations.clear();
         // Unreplayed row events are dropped — relation-level recovery
         // (evict + truncate) supersedes whatever they would have applied.
         core.frame_rows.clear();
@@ -1398,6 +1400,7 @@ impl WriterCdc {
         core.frame_invalidations.clear();
         core.frame_relation_oids.clear();
         core.frame_buf.clear();
+        core.frame_buf_relations.clear();
         core.frame_rows.clear();
         core.frame_chunk_flushed = false;
         core.batch_frames = 0;
@@ -1524,6 +1527,7 @@ impl WriterCdc {
                 if core.frame_state == FrameState::Idle {
                     core.frame_state = FrameState::Active;
                     core.frame_buf.clear();
+                    core.frame_buf_relations.clear();
                     core.frame_rows.clear();
                     core.frame_chunk_flushed = false;
                     core.frame_deleted_keys.clear();
@@ -1537,48 +1541,61 @@ impl WriterCdc {
                 core.frame_relation_oids.insert(table_metadata.relation_oid);
                 let relation_oid = table_metadata.relation_oid;
                 // A mid-frame Relation message whose metadata CHANGED (intra-txn
-                // DDL): buffered events for this relation were captured under
-                // the old column layout — replaying them under the new one
-                // misaligns position-based lookups, and replaying them first
-                // can't work either (their buffered SQL flushes only at
-                // CommitMark, after the recreate). Recovery semantics per
-                // relation instead: discard its buffered events; the
-                // registration's recreate evicts its queries and empties the
-                // table, and the abort watermark makes older-snapshot
-                // population merges abort — the relation rebuilds from origin,
-                // which already reflects the DDL. (An identical re-sent
-                // Relation — e.g. after a publication change — keeps events.)
+                // DDL): the relation's buffered events were captured under the
+                // old column layout, so replaying them after the recreate
+                // misaligns position-based lookups and references dropped
+                // columns. (An identical re-sent Relation — e.g. after a
+                // publication change — leaves everything in place.)
                 let metadata_changed = core
                     .cache
                     .tables
                     .get1(&relation_oid)
                     .is_none_or(|current| !current.schema_eq(&table_metadata));
-                if metadata_changed && !core.frame_rows.is_empty() {
-                    let before = core.frame_rows.len();
-                    core.frame_rows.retain(|event| match event {
-                        FrameRowEvent::Insert {
-                            relation_oid: r, ..
+                if metadata_changed {
+                    if core.frame_buf_relations.contains(&relation_oid) {
+                        // The relation's cache-table writes (naming the old
+                        // columns) are already committed to `frame_buf` or
+                        // executed in the open cache txn — a partial replay
+                        // moved them out of `frame_rows`, so discarding events
+                        // can't retract them, and at COMMIT they would run
+                        // against the recreated table and fail. Escalate to
+                        // frame recovery: roll the cache txn back and let
+                        // CommitMark invalidate + repopulate every relation the
+                        // frame touched from post-DDL origin (PGC-264).
+                        self.frame_recover_enter(core)
+                            .await
+                            .attach_loc("mid-frame DDL on a buffered relation")?;
+                    } else {
+                        // No buffered writes yet: the relation's events are all
+                        // still in `frame_rows`. Discard them and purge its
+                        // toast overlay (a different relation's partial replay
+                        // may have recorded a stale entry under the old layout);
+                        // the recreate evicts its queries and empties the table,
+                        // so it rebuilds from origin (PGC-264).
+                        core.toast_overlay_relation_invalidate(relation_oid);
+                        let before = core.frame_rows.len();
+                        core.frame_rows.retain(|event| match event {
+                            FrameRowEvent::Insert {
+                                relation_oid: r, ..
+                            }
+                            | FrameRowEvent::Update {
+                                relation_oid: r, ..
+                            }
+                            | FrameRowEvent::UpdateToasted {
+                                relation_oid: r, ..
+                            }
+                            | FrameRowEvent::UpdateToastFallback {
+                                relation_oid: r, ..
+                            }
+                            | FrameRowEvent::Delete {
+                                relation_oid: r, ..
+                            } => *r != relation_oid,
+                            FrameRowEvent::Truncate { .. } | FrameRowEvent::Boundary { .. } => true,
+                        });
+                        if core.frame_rows.len() != before {
+                            core.batch_truncated_relations.push(relation_oid);
                         }
-                        | FrameRowEvent::Update {
-                            relation_oid: r, ..
-                        }
-                        | FrameRowEvent::UpdateToasted {
-                            relation_oid: r, ..
-                        }
-                        | FrameRowEvent::UpdateToastFallback {
-                            relation_oid: r, ..
-                        }
-                        | FrameRowEvent::Delete {
-                            relation_oid: r, ..
-                        } => *r != relation_oid,
-                        FrameRowEvent::Truncate { .. } | FrameRowEvent::Boundary { .. } => true,
-                    });
-                    if core.frame_rows.len() != before {
-                        core.batch_truncated_relations.push(relation_oid);
                     }
-                    // The recreate empties the cache table: not a valid
-                    // toast-repair source for the rest of the batch (PGC-264).
-                    core.batch_toast_guard_oids.insert(relation_oid);
                 }
                 // Schema change: prepared eval SQL embeds the column list —
                 // drop the relation's cached statements so the next use
@@ -1905,8 +1922,7 @@ impl WriterCdc {
                 }
                 FrameRowEvent::Truncate { relation_oids } => {
                     for &oid in relation_oids.iter() {
-                        core.batch_toast_guard_oids.insert(oid);
-                        core.batch_toast_overlay.retain(|(r, _), _| *r != oid);
+                        core.toast_overlay_relation_invalidate(oid);
                     }
                 }
                 FrameRowEvent::Boundary { .. } | FrameRowEvent::UpdateToastFallback { .. } => {}
@@ -2317,7 +2333,7 @@ impl WriterCdc {
         relation_oid: u32,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
-        core.frame_begin_ensure();
+        core.frame_begin_ensure([relation_oid]);
         let table_metadata =
             core.cache
                 .tables
@@ -2375,7 +2391,7 @@ impl WriterCdc {
         row_data: &[Option<ByteString>],
         record_lost_key: bool,
     ) -> CacheResult<()> {
-        core.frame_begin_ensure();
+        core.frame_begin_ensure([relation_oid]);
         let table_metadata =
             core.cache
                 .tables
@@ -2845,7 +2861,7 @@ impl WriterCdc {
         relation_oids: &[u32],
     ) -> CacheResult<()> {
         if let Some(sql) = Self::truncate_sql_build(core, relation_oids.iter().copied()) {
-            core.frame_begin_ensure();
+            core.frame_begin_ensure(relation_oids.iter().copied());
             core.frame_buf.push_str(&sql);
             self.frame_write_finish(core).await?;
         }

@@ -19,7 +19,6 @@
 //! BEGIN→messages→COMMIT → a single frame.
 
 use std::io::Error;
-#[cfg(feature = "fault-injection")]
 use std::time::Duration;
 
 use tokio_postgres::SimpleQueryMessage;
@@ -694,6 +693,78 @@ async fn test_intra_txn_ddl_does_not_misalign_buffered_events() -> Result<(), Er
     let served = ctx.simple_query(q).await?;
     assert_row_at(&served, 1, &[("id", "1"), ("a", "100"), ("c", "30")])?;
     assert_row_at(&served, 2, &[("id", "2"), ("a", "11"), ("c", "300")])?;
+
+    Ok(())
+}
+
+/// Companion to the above for the case where a partial replay
+/// (FRAME_ROWS_CAPACITY) has already moved the DDL'd relation's writes into the
+/// frame buffer before the schema change arrives. Discarding `frame_rows`
+/// can't retract those buffered/executed old-layout writes, so at COMMIT they
+/// would run against the recreated table and abort the writer (a full cache
+/// reset). The writer must instead recover the frame in-band — roll the cache
+/// txn back and repopulate the frame's relations from post-DDL origin —
+/// keeping the rest of the cache warm.
+#[tokio::test]
+async fn test_intra_txn_ddl_after_partial_replay_recovers_in_band() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.simple_query(
+        "create table sf_ddlp (id int primary key, drop_me int not null, keep int not null, n int not null)",
+    )
+    .await?;
+    ctx.simple_query("insert into sf_ddlp (id, drop_me, keep, n) values (1, 9, 20, 1)")
+        .await?;
+    ctx.simple_query("create table sf_ddlp_filler (id int primary key, v int not null)")
+        .await?;
+    // Enough rows that one bulk update overflows FRAME_ROWS_CAPACITY (4096),
+    // forcing a partial replay before the DDL arrives.
+    ctx.simple_query("insert into sf_ddlp_filler select g, 0 from generate_series(1, 4200) g")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "select id, keep from sf_ddlp where id = 1";
+    ctx.simple_query(q).await?;
+    // Track the filler so its bulk update reaches the writer and splits the frame.
+    let qf = "select v from sf_ddlp_filler where id = 1";
+    ctx.simple_query(qf).await?;
+    ctx.cache_settle().await?;
+
+    let restarts_before = ctx.metrics().await?.cache_restarts_total;
+
+    // One transaction: an sf_ddlp update captured under the 4-column layout
+    // (replayed into the frame buffer when the filler overflows frame_rows),
+    // then DROP COLUMN, then another sf_ddlp update under the new layout.
+    ctx.origin
+        .batch_execute(
+            "BEGIN; \
+             update sf_ddlp set keep = 200, drop_me = 99 where id = 1; \
+             update sf_ddlp_filler set v = v + 1; \
+             alter table sf_ddlp drop column drop_me; \
+             update sf_ddlp set n = 2 where id = 1; \
+             COMMIT;",
+        )
+        .await
+        .map_err(Error::other)?;
+    ctx.cdc_settle_with_timeout(Duration::from_secs(30)).await?;
+    ctx.cache_settle().await?;
+
+    // In-band recovery: no writer death / cache reset.
+    assert_eq!(
+        ctx.metrics().await?.cache_restarts_total,
+        restarts_before,
+        "mid-frame DDL after a partial replay reset the whole cache instead of \
+         recovering the frame in-band"
+    );
+    // The DDL'd relation repopulates from post-DDL origin.
+    let served = ctx.simple_query(q).await?;
+    assert_row_at(&served, 1, &[("id", "1"), ("keep", "200")])?;
+    // Whole-frame recovery must not lose the other relation's committed change.
+    assert_eq!(
+        scalar_of(&ctx.simple_query(qf).await?).as_deref(),
+        Some("1"),
+        "filler relation lost its in-frame update after recovery"
+    );
 
     Ok(())
 }

@@ -269,6 +269,15 @@ pub struct WriterCore {
     /// `cdc_write_conn` this frame (so the `BEGIN` is live on the server). Drives
     /// whether `40P01` recovery must issue an explicit `ROLLBACK`.
     pub(super) frame_chunk_flushed: bool,
+    /// Relations whose cache-table writes are already in `frame_buf` (buffered
+    /// or chunk-executed) for the open cache txn — spans batched frames
+    /// (PGC-242). A mid-frame DDL recreating one of these can't be handled by
+    /// discarding `frame_rows` (the writes naming the old columns are already
+    /// committed to the buffer / executed), so it escalates to frame recovery.
+    /// Maintained at the single write chokepoint [`frame_begin_ensure`];
+    /// cleared with `frame_buf` at every cache-txn boundary, never on a
+    /// mid-txn chunk flush.
+    pub(super) frame_buf_relations: HashSet<u32>,
     /// Keys CDC removed while populations are in flight, so a population merge
     /// doesn't resurrect them (PGC-250). Activated at dispatch, recorded at
     /// `frame_cache_delete`, consulted/cleared at merge.
@@ -470,6 +479,7 @@ impl WriterCore {
             frame_buf: String::with_capacity(FRAME_BUF_CAPACITY),
             frame_rows: Vec::new(),
             frame_chunk_flushed: false,
+            frame_buf_relations: HashSet::new(),
             population_deleted_keys: PopulationDeletedKeys::default(),
             pending_merges: BinaryHeap::new(),
             watermark_nudge,
@@ -505,6 +515,33 @@ impl WriterCore {
                 self.toast_overlay_pool.push(values);
             }
         }
+    }
+
+    /// Invalidate a relation as a toast-repair source mid-batch (PGC-264):
+    /// drop its overlay entries (harvesting `Values` Vecs back into the pool)
+    /// and guard it so a later toasted update with no fresh in-batch write
+    /// falls back instead of repairing from a now-invalid image. Used when the
+    /// relation is truncated or DDL-recreated this batch — both empty (or
+    /// reshape) its cache table, voiding the pre-batch committed image and any
+    /// overlay entries recorded under the old layout. The overlay is consulted
+    /// before the guard during resolution, so dropping the stale entries (not
+    /// just guarding) is what prevents a positional misrepair.
+    pub(super) fn toast_overlay_relation_invalidate(&mut self, relation_oid: u32) {
+        let pool = &mut self.toast_overlay_pool;
+        self.batch_toast_overlay.retain(|(r, _), entry| {
+            if *r != relation_oid {
+                return true;
+            }
+            if let ToastOverlayEntry::Values(values) = entry
+                && pool.len() < TOAST_OVERLAY_POOL_MAX
+            {
+                let mut harvested = std::mem::take(values);
+                harvested.clear();
+                pool.push(harvested);
+            }
+            false
+        });
+        self.batch_toast_guard_oids.insert(relation_oid);
     }
 
     /// Recycle a `Values` Vec displaced from `batch_toast_overlay` (a same-PK
@@ -583,7 +620,13 @@ impl WriterCore {
     /// TxnOpen`); idempotent for later writes. The actual `BEGIN` reaches the
     /// server only when `frame_buf` is flushed. A write while `Idle` (no
     /// preceding `Begin`) is a bug.
-    pub(super) fn frame_begin_ensure(&mut self) {
+    ///
+    /// `relations` are the cache tables whose SQL the caller is about to append
+    /// — recorded into `frame_buf_relations` here so a write cannot reach the
+    /// buffer without marking its relation (the signal a mid-frame DDL uses to
+    /// choose discard vs. frame recovery). Every buffer write goes through this
+    /// chokepoint.
+    pub(super) fn frame_begin_ensure(&mut self, relations: impl IntoIterator<Item = u32>) {
         debug_assert!(
             !matches!(self.frame_state, FrameState::Idle),
             "cache-table write before Begin (frame not entered)"
@@ -592,6 +635,7 @@ impl WriterCore {
             self.frame_buf.push_str("BEGIN; ");
             self.frame_state = FrameState::TxnOpen;
         }
+        self.frame_buf_relations.extend(relations);
     }
 
     /// Frame holds row locks (a `BEGIN` is open) — maintenance paths defer
