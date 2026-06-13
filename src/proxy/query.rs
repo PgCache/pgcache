@@ -11,10 +11,35 @@ use tracing::{debug, trace};
 use crate::{
     cache::query::CacheableQuery,
     catalog::FunctionVolatility,
+    id_hash::BuildIdHasher,
     query::ast::{AstError, query_expr_convert_raw},
 };
 
 use super::ParseError;
+
+/// A hash of a SQL query's *text* (not its AST). Keys the proxy's cacheability
+/// memo — identical query text yields the same cacheability verdict, so the
+/// parse/convert/classify work is done once. Deliberately distinct from
+/// [`Fingerprint`](crate::query::Fingerprint), an AST content hash: different
+/// input, different domain, not interchangeable. Already a uniformly-distributed
+/// hash, so the memo uses the passthrough [`BuildIdHasher`].
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct SqlTextHash(u64);
+
+impl SqlTextHash {
+    /// Hash a SQL string's text.
+    pub(super) fn of(sql: &str) -> Self {
+        let mut hasher = DefaultHasher::new();
+        sql.hash(&mut hasher);
+        Self(hasher.finish())
+    }
+}
+
+/// The proxy's per-connection cacheability memo: SQL text hash → cacheable AST
+/// or the reason to forward. Identity-hashed (the key is already a hash).
+pub(super) type CacheabilityCache =
+    HashMap<SqlTextHash, Result<Arc<CacheableQuery>, ForwardReason>, BuildIdHasher>;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ForwardReason {
@@ -31,7 +56,7 @@ pub(super) enum Action {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) async fn handle_query(
     data: &BytesMut,
-    fp_cache: &mut HashMap<u64, Result<Arc<CacheableQuery>, ForwardReason>>,
+    cacheability_cache: &mut CacheabilityCache,
     func_volatility: &HashMap<EcoString, FunctionVolatility>,
 ) -> Result<Action, ParseError> {
     let len_bytes: [u8; 4] = data
@@ -44,23 +69,21 @@ pub(super) async fn handle_query(
         .and_then(|b| str::from_utf8(b).ok())
         .ok_or(ParseError::InvalidUtf8)?;
 
-    analyze(query, fp_cache, func_volatility)
+    analyze(query, cacheability_cache, func_volatility)
 }
 
-/// Cacheability analysis for a SQL string, memoized in `fp_cache` keyed on a
+/// Cacheability analysis for a SQL string, memoized in `cacheability_cache` keyed on a
 /// hash of the text. On a hit the parse/convert/classify work is skipped
 /// entirely; on a miss the result (cacheable AST or forward reason) is cached.
 /// Shared by the simple-query and extended (Parse) paths.
 pub(super) fn analyze(
     sql: &str,
-    fp_cache: &mut HashMap<u64, Result<Arc<CacheableQuery>, ForwardReason>>,
+    cacheability_cache: &mut CacheabilityCache,
     func_volatility: &HashMap<EcoString, FunctionVolatility>,
 ) -> Result<Action, ParseError> {
-    let mut hasher = DefaultHasher::new();
-    sql.hash(&mut hasher);
-    let fingerprint = hasher.finish();
+    let key = SqlTextHash::of(sql);
 
-    match fp_cache.get(&fingerprint) {
+    match cacheability_cache.get(&key) {
         Some(Ok(cacheable_query)) => {
             trace!("cache hit: cacheable true");
             Ok(Action::CacheCheck(Arc::clone(cacheable_query)))
@@ -81,13 +104,13 @@ pub(super) fn analyze(
                     match CacheableQuery::try_new(query, func_volatility) {
                         Ok(cacheable_query) => {
                             let cacheable_query = Arc::new(cacheable_query);
-                            fp_cache.insert(fingerprint, Ok(Arc::clone(&cacheable_query)));
+                            cacheability_cache.insert(key, Ok(Arc::clone(&cacheable_query)));
                             Ok(Action::CacheCheck(cacheable_query))
                         }
                         Err(cacheability_error) => {
                             debug!(%cacheability_error, "uncacheable SELECT");
                             let reason = ForwardReason::UncacheableSelect;
-                            fp_cache.insert(fingerprint, Err(reason));
+                            cacheability_cache.insert(key, Err(reason));
                             Ok(Action::Forward(reason))
                         }
                     }
@@ -114,7 +137,7 @@ pub(super) fn analyze(
                         }
                     };
 
-                    fp_cache.insert(fingerprint, Err(reason));
+                    cacheability_cache.insert(key, Err(reason));
 
                     Ok(Action::Forward(reason))
                 }

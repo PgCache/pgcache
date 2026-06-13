@@ -60,7 +60,7 @@ use crate::{
 };
 
 use super::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
-use super::query::{Action, ForwardReason, analyze, handle_query};
+use super::query::{Action, CacheabilityCache, ForwardReason, analyze, handle_query};
 use super::search_path::{SearchPath, search_path_mutations_raw};
 use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
 use super::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
@@ -372,7 +372,7 @@ pub(super) struct ConnectionState {
     flush_describe_pending: bool,
 
     /// Cache of query fingerprints to cacheability decisions
-    fingerprint_cache: HashMap<u64, Result<Arc<CacheableQuery>, ForwardReason>>,
+    cacheability_cache: CacheabilityCache,
 
     /// Whether the connection is currently in a transaction
     in_transaction: bool,
@@ -843,7 +843,7 @@ impl ConnectionState {
             origin_write_buf: VecDeque::new(),
             egress: EgressQueue::new(),
             flush_describe_pending: false,
-            fingerprint_cache: HashMap::new(),
+            cacheability_cache: CacheabilityCache::default(),
             in_transaction: false,
             proxy_mode: ProxyMode::Read,
             proxy_status: ProxyStatus::Normal,
@@ -969,7 +969,7 @@ impl ConnectionState {
                 if !self.in_transaction && !self.cache_disabled {
                     self.proxy_mode = match handle_query(
                         &msg.data,
-                        &mut self.fingerprint_cache,
+                        &mut self.cacheability_cache,
                         &self.func_volatility,
                     )
                     .await
@@ -1534,7 +1534,7 @@ impl ConnectionState {
         // a refcounted view into the frame instead of a fresh String.
         let data = msg.data.freeze();
         if let Ok(parsed) = parse_parse_message(&data) {
-            // Cacheability analysis is memoized in `fingerprint_cache` (shared
+            // Cacheability analysis is memoized in `cacheability_cache` (shared
             // with the simple-query path); a hit skips the parse/convert/classify
             // entirely. search_path mutation detection — which the inline parse
             // used to fold in — isn't captured by that cache, so it's replayed
@@ -1542,7 +1542,7 @@ impl ConnectionState {
             // extended; a standalone SHOW is issued via the lazy path on RFQ).
             let sql_type = match analyze(
                 &parsed.sql,
-                &mut self.fingerprint_cache,
+                &mut self.cacheability_cache,
                 &self.func_volatility,
             ) {
                 Ok(Action::CacheCheck(ast)) => StatementType::Cacheable(ast),
