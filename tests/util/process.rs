@@ -251,7 +251,7 @@ fn pgcache_spawn_env(
 }
 
 /// Connect a plain TCP client to pgcache.
-async fn pgcache_client_connect(listen_port: u16) -> Result<Client, Error> {
+pub async fn pgcache_client_connect(listen_port: u16) -> Result<Client, Error> {
     let (client, connection) = Config::new()
         .host("localhost")
         .port(listen_port)

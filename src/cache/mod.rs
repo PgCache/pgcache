@@ -42,7 +42,7 @@ pub use mv::{
     shape_classify,
 };
 pub use query_cache::{CacheDispatchHandle, CacheDispatchPublisher, CacheDispatchUpdater};
-pub use reply::{ReplySender, ReplySlot};
+pub use reply::{ReplySender, ReplySlot, ReplyState};
 pub use runtime::{CacheGeneration, cache_generation_start, cache_supervise};
 pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,

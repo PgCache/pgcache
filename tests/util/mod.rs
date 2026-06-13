@@ -26,7 +26,8 @@ pub use pgproto::pgproto_run;
 pub use process::{
     PgCacheProcess, TempDBs, connect_cache_db, connect_pgcache, connect_pgcache_allowlist,
     connect_pgcache_clock, connect_pgcache_pinned, connect_pgcache_pinned_small_cache,
-    connect_pgcache_small_cache, connect_pgcache_tls, proxy_wait_for_ready, start_databases,
+    connect_pgcache_small_cache, connect_pgcache_tls, pgcache_client_connect, proxy_wait_for_ready,
+    start_databases,
 };
 
 // --- Standalone helpers that don't belong to a specific submodule ---

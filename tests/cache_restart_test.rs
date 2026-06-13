@@ -5,7 +5,7 @@
 use std::io::Error;
 use std::time::{Duration, Instant};
 
-use crate::util::TestContext;
+use crate::util::{TestContext, http_get, pgcache_client_connect};
 
 mod util;
 
@@ -108,6 +108,146 @@ async fn test_cache_restart_recovers_after_writer_death() -> Result<(), Error> {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    Ok(())
+}
+
+/// A connection that dispatches a cacheable query while the cache is down must
+/// survive the cache's recovery. The dispatch-unavailable fallback discards an
+/// armed `ReplySender`, leaving a stale permit in the connection's reusable
+/// reply slot; the first query dispatched after recovery wakes on that permit
+/// and must read it as `Empty` and keep waiting — not misclassify it as
+/// cache-died-in-flight and drop a healthy client connection.
+///
+/// The post-recovery dispatch must be a worker-served HIT: misses and
+/// registrations are replied inline during dispatch, before the wait first
+/// polls, so the already-delivered reply masks the stale permit. A second
+/// connection re-warms the rebuilt cache so the planted connection's next
+/// dispatch goes to the worker asynchronously.
+#[tokio::test]
+async fn test_connection_survives_query_during_restart_window() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_WRITER_DIE", "1")]).await?;
+
+    ctx.simple_query("create table restart_w (id int primary key, data text)")
+        .await?;
+    ctx.simple_query("insert into restart_w values (1, 'a'), (2, 'b')")
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "select id, data from restart_w where id <= 2";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    // Kill the writer via the sentinel insert.
+    ctx.simple_query(&format!(
+        "insert into restart_w values (999, '{WRITER_DIE_SENTINEL}')"
+    ))
+    .await?;
+
+    // Wait for the death to be observable (/status 503s once the writer's
+    // status channel closes), then give the supervisor a beat to clear the
+    // dispatch. The down window stays open well past this: the supervisor
+    // sleeps its 500ms restart backoff before even starting the rebuild.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let (status, _) = http_get(ctx.metrics_port, "/status").await?;
+        if status == 503 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "/status never reported the cache down"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Down-window reads on the SAME connection: each takes the degraded
+    // forward (discarding an armed reply sender — the stale-permit plant) and
+    // must still serve correct rows from origin.
+    let before_window = ctx.metrics().await?;
+    for _ in 0..3 {
+        let served = ctx.simple_query(q).await?;
+        let rows = served
+            .iter()
+            .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+            .count();
+        assert_eq!(rows, 2, "wrong rows from the degraded forward");
+    }
+    let after_window = ctx.metrics().await?;
+    assert_eq!(
+        after_window.queries_cacheable - before_window.queries_cacheable,
+        3,
+        "down-window reads were not classified cacheable"
+    );
+    assert_eq!(
+        (after_window.queries_cache_hit
+            + after_window.queries_cache_miss
+            + after_window.queries_cache_error)
+            - (before_window.queries_cache_hit
+                + before_window.queries_cache_miss
+                + before_window.queries_cache_error),
+        0,
+        "a down-window read dispatched into the cache; the scenario did not \
+         exercise the degraded forward"
+    );
+
+    // Wait for the supervisor to rebuild.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if ctx.metrics().await?.cache_restarts_total >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cache subsystem did not restart after writer death"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Re-warm the rebuilt (cold) cache from a second connection until the
+    // query is a hit again. The planted connection stays idle so nothing
+    // absorbs its stale permit.
+    let warm = pgcache_client_connect(ctx.cache_port).await?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let before = ctx.metrics().await?;
+        warm.simple_query(q).await.map_err(Error::other)?;
+        if ctx.metrics().await?.queries_cache_hit > before.queries_cache_hit {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cache did not serve hits again after restart"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The planted connection's next dispatch is now an async worker hit. Its
+    // wait wakes first on the stale permit; reading it as `Empty` it re-arms
+    // and serves the hit. Under the bug the wait concludes
+    // cache-died-in-flight and tears the connection down — the worker has
+    // already written the rows to the leased client socket, so THIS query
+    // still returns fine; the death surfaces as an uncounted hit (the
+    // connection dies before `handle_cache_outcome`) and a dead connection
+    // for the follow-up query.
+    let before = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    let rows = served
+        .iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(rows, 2, "wrong rows after recovery");
+    let after = ctx.metrics().await?;
+    assert_eq!(
+        after.queries_cache_hit - before.queries_cache_hit,
+        1,
+        "post-recovery hit went uncounted: the connection died on the stale \
+         reply-slot permit (or the scenario no longer dispatches an async hit)"
+    );
+    ctx.simple_query(q)
+        .await
+        .expect("planted connection alive after the post-recovery hit");
 
     Ok(())
 }

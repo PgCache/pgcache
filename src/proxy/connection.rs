@@ -30,7 +30,7 @@ use tracing::{debug, error, instrument, trace, warn};
 use crate::{
     cache::{
         CacheDispatchHandle, CacheMessage, CacheOutcome, CacheReply, ProxyMessage, QueryParameters,
-        ReplySlot,
+        ReplySlot, ReplyState,
         messages::{MessageSlices, PipelineContext, PipelineDescribe, slices_concat},
         query::CacheableQuery,
     },
@@ -2247,11 +2247,11 @@ impl ConnectionState {
                 }
                 _ = &mut notified => {
                     match reply_slot.take() {
-                        Some(reply) => {
+                        ReplyState::Sent(reply) => {
                             self.handle_cache_outcome(reply.outcome);
                             return Ok(reply.socket);
                         }
-                        None => {
+                        ReplyState::Dropped => {
                             // Sender dropped without sending: cache died in flight.
                             if log_gate(&CACHE_DEAD_INFLIGHT_LOG, CACHE_DOWN_LOG_WINDOW_SECS) {
                                 warn!(
@@ -2262,6 +2262,14 @@ impl ConnectionState {
                             }
                             self.proxy_status = ProxyStatus::Degraded;
                             return Err(ConnectionError::CacheDead.into());
+                        }
+                        ReplyState::Empty => {
+                            // Stale permit from a sender dropped while no query
+                            // was waiting (dispatch-unavailable fallback): this
+                            // query's outcome is still pending. The completed
+                            // future must be replaced before polling again.
+                            debug!("stale reply-slot wakeup; re-arming");
+                            notified.set(reply_slot.notified());
                         }
                     }
                 }
@@ -2515,6 +2523,10 @@ async fn handle_connection(
                             );
                         }
                         state.proxy_status = ProxyStatus::Degraded;
+                        // The query never reaches a worker; disarm so dropping the
+                        // sender leaves no stale permit in the reusable reply slot
+                        // for the next query's wait to trip over.
+                        proxy_msg.reply_tx.disarm();
                         socket = proxy_msg.client_socket;
                         // The cache slot is now serving (message already taken);
                         // forward this entry (lazy-Parsing if origin doesn't know

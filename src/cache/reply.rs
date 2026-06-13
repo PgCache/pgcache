@@ -9,33 +9,61 @@
 //! [`ReplySender`] per query via [`ReplySlot::sender`]. The strict
 //! one-outstanding-query-per-connection invariant means the slot never holds
 //! more than one reply at a time, so reuse is sound.
+//!
+//! Because the `Notify` is reused, a permit can outlive its query: a sender
+//! dropped armed while the connection is NOT waiting (e.g. the
+//! dispatch-unavailable fallback forwards to origin and discards the
+//! `ProxyMessage`) stores a permit that the next query's wait consumes
+//! immediately. A bare wakeup therefore proves nothing — the receiver must
+//! consult [`ReplyState`]: minting resets it to `Empty`, so a wakeup that
+//! finds `Empty` is a stale permit to wait through, while `Dropped` is the
+//! genuine sender-died-in-flight signal. (`Arc::strong_count` cannot stand in
+//! for this: `Drop` notifies before the sender's `Arc` decrements, so a
+//! genuine drop can still show the sender alive at wake time.)
 
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 use tokio::sync::futures::Notified;
 
-/// Per-connection reusable reply channel. Allocated once; the `value` cell and
+/// What the receiver finds in the slot on wakeup.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReplyState<T> {
+    /// No delivery since the current query's sender was minted: the wakeup
+    /// was a stale permit from an earlier never-awaited sender. Re-arm and
+    /// keep waiting.
+    Empty,
+    /// The reply.
+    Sent(T),
+    /// The current query's sender was dropped without sending — the worker
+    /// died with the query in flight.
+    Dropped,
+}
+
+/// Per-connection reusable reply channel. Allocated once; the state cell and
 /// `Notify` are reused across every query on the connection.
 pub struct ReplySlot<T> {
-    value: Mutex<Option<T>>,
+    state: Mutex<ReplyState<T>>,
     notify: Notify,
 }
 
 // Manual impl: `#[derive(Default)]` would demand `T: Default`, but the slot
-// starts empty (`None`) for any `T`.
+// starts `Empty` for any `T`.
 impl<T> Default for ReplySlot<T> {
     fn default() -> Self {
         Self {
-            value: Mutex::new(None),
+            state: Mutex::new(ReplyState::Empty),
             notify: Notify::new(),
         }
     }
 }
 
 impl<T> ReplySlot<T> {
-    /// Mint a sender for one query. Refcount bump only — no allocation.
+    /// Mint a sender for one query, resetting the slot to `Empty` so leftover
+    /// state from a never-awaited predecessor can't masquerade as this
+    /// query's outcome. Refcount bump only — no allocation.
     pub fn sender(self: &Arc<Self>) -> ReplySender<T> {
+        *self.state.lock().expect("reply slot not poisoned") = ReplyState::Empty;
         ReplySender {
             slot: Arc::clone(self),
             armed: true,
@@ -43,16 +71,20 @@ impl<T> ReplySlot<T> {
     }
 
     /// Receiver-side future, polled in the connection's serve `select!`. Pin a
-    /// single instance across the whole loop and poll `&mut` it — recreating it
-    /// per iteration races with `notify_one` and loses wakeups.
+    /// single instance across the whole wait and poll `&mut` it — recreating
+    /// it per iteration races with `notify_one` and loses wakeups. (After a
+    /// completed poll it must be re-created; an `Empty` take is the one case
+    /// where the wait continues past a completion.)
     pub fn notified(&self) -> Notified<'_> {
         self.notify.notified()
     }
 
-    /// Take the delivered reply. `None` means the sender was dropped without
-    /// sending — the worker died with the query in flight.
-    pub fn take(&self) -> Option<T> {
-        self.value.lock().expect("reply slot not poisoned").take()
+    /// Take the slot state, leaving `Empty`.
+    pub fn take(&self) -> ReplyState<T> {
+        std::mem::replace(
+            &mut *self.state.lock().expect("reply slot not poisoned"),
+            ReplyState::Empty,
+        )
     }
 }
 
@@ -69,22 +101,36 @@ impl<T> ReplySender<T> {
     /// `oneshot::Sender::send`: returns `Err(reply)` if the receiver (the
     /// connection) has already gone away.
     pub fn send(mut self, reply: T) -> Result<(), T> {
+        self.armed = false;
         if Arc::strong_count(&self.slot) == 1 {
-            self.armed = false;
             return Err(reply);
         }
-        self.armed = false;
-        *self.slot.value.lock().expect("reply slot not poisoned") = Some(reply);
+        *self.slot.state.lock().expect("reply slot not poisoned") = ReplyState::Sent(reply);
         self.slot.notify.notify_one();
         Ok(())
+    }
+
+    /// Discard the sender without sending or signalling. The query never
+    /// reached a worker (e.g. the dispatch-unavailable fallback forwards it to
+    /// origin), so the connection is not waiting; this leaves the slot
+    /// untouched — no `Dropped` state, no `Notify` permit — so a later query's
+    /// wait has nothing to trip over. (The slot's mint-reset + `Empty` re-arm
+    /// still tolerate a *missed* disarm; this just keeps the common degraded
+    /// path from manufacturing a stale permit at all.)
+    pub fn disarm(mut self) {
+        self.armed = false;
     }
 }
 
 impl<T> Drop for ReplySender<T> {
     fn drop(&mut self) {
         if self.armed {
-            // Dropped without send: wake the receiver to a `None` take so the
-            // connection treats this as cache-died-in-flight rather than hanging.
+            // Dropped without send: record it and wake the receiver so the
+            // connection treats this as cache-died-in-flight rather than
+            // hanging. If no wait ever consumes this (the sender was
+            // discarded before dispatch), the next mint resets the state and
+            // the leftover permit surfaces as a harmless `Empty` wakeup.
+            *self.slot.state.lock().expect("reply slot not poisoned") = ReplyState::Dropped;
             self.slot.notify.notify_one();
         }
     }
@@ -100,7 +146,7 @@ mod tests {
         slot.sender().send(7).expect("receiver present");
 
         slot.notified().await;
-        assert_eq!(slot.take(), Some(7));
+        assert_eq!(slot.take(), ReplyState::Sent(7));
     }
 
     #[tokio::test]
@@ -114,17 +160,63 @@ mod tests {
         slot.sender().send(7).expect("receiver present");
 
         notified.await;
-        assert_eq!(slot.take(), Some(7));
+        assert_eq!(slot.take(), ReplyState::Sent(7));
     }
 
     #[tokio::test]
-    async fn test_drop_without_send_wakes_receiver_with_none() {
+    async fn test_drop_without_send_wakes_receiver_with_dropped() {
         let slot: Arc<ReplySlot<i32>> = Arc::new(ReplySlot::default());
         let sender = slot.sender();
         drop(sender);
 
         slot.notified().await;
-        assert_eq!(slot.take(), None);
+        assert_eq!(slot.take(), ReplyState::Dropped);
+    }
+
+    /// `disarm` (the discard path) leaves no permit and no state change, so a
+    /// later query's wait pends rather than waking on a stale permit.
+    #[tokio::test]
+    async fn test_disarm_leaves_no_permit() {
+        let slot: Arc<ReplySlot<i32>> = Arc::new(ReplySlot::default());
+        slot.sender().disarm();
+        assert_eq!(slot.take(), ReplyState::Empty);
+
+        // A fresh wait does not complete off a leftover permit; only the real
+        // send wakes it. `biased` polls the wait first, so a spurious permit
+        // would resolve it before the yield.
+        let sender = slot.sender();
+        let notified = slot.notified();
+        tokio::pin!(notified);
+        tokio::select! {
+            biased;
+            _ = &mut notified => panic!("disarm left a spurious permit"),
+            _ = tokio::task::yield_now() => {}
+        }
+        sender.send(7).expect("receiver present");
+        notified.await;
+        assert_eq!(slot.take(), ReplyState::Sent(7));
+    }
+
+    /// The stale-permit hazard: a sender dropped armed while nothing waits
+    /// (dispatch-unavailable fallback) leaves a stored permit. The next
+    /// query's wait wakes on it, must read `Empty` (not `Dropped` — minting
+    /// reset the state), re-arm, and still receive the real reply.
+    #[tokio::test]
+    async fn test_stale_permit_from_unwaited_drop_reads_empty_then_real_reply() {
+        let slot = Arc::new(ReplySlot::default());
+        drop(slot.sender());
+
+        let sender = slot.sender();
+        let notified = slot.notified();
+        tokio::pin!(notified);
+        notified.as_mut().await;
+        assert_eq!(slot.take(), ReplyState::Empty, "stale permit, not Dropped");
+
+        // Re-arm exactly as the connection's wait loop does.
+        notified.set(slot.notified());
+        sender.send(7).expect("receiver present");
+        notified.await;
+        assert_eq!(slot.take(), ReplyState::Sent(7));
     }
 
     #[tokio::test]
@@ -135,8 +227,8 @@ mod tests {
             tokio::pin!(notified);
             slot.sender().send(i).expect("receiver present");
             notified.await;
-            assert_eq!(slot.take(), Some(i));
-            assert_eq!(slot.take(), None, "slot cleared after take");
+            assert_eq!(slot.take(), ReplyState::Sent(i));
+            assert_eq!(slot.take(), ReplyState::Empty, "slot cleared after take");
         }
     }
 
