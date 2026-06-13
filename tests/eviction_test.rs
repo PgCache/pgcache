@@ -1,3 +1,9 @@
+//! Eviction is forced via the fault-injection count cap
+//! (`PGCACHE_FAULT_EVICTION_COUNT_CAP`), so this suite only builds with the
+//! `fault-injection` feature (PGC-276 removed the disk byte-cap that previously
+//! drove deterministic eviction in tests).
+#![cfg(feature = "fault-injection")]
+
 use std::io::Error;
 use std::time::Duration;
 
@@ -73,8 +79,8 @@ async fn publication_table_removed_wait(
 /// only the surviving queries' tables should remain in the publication.
 #[tokio::test]
 async fn test_eviction_removes_table_from_publication() -> Result<(), Error> {
-    // 200KB cache — fits ~2 populated tables, not 3
-    let mut ctx = TestContext::setup_small_cache(200 * 1024).await?;
+    // Count cap of 2 — holds 2 queries, so the 3rd registration evicts the oldest.
+    let mut ctx = TestContext::setup_small_cache(2).await?;
     let timeout = Duration::from_secs(5);
 
     // Create three tables with enough data to fill the cache.

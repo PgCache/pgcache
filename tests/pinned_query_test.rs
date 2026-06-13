@@ -144,17 +144,19 @@ async fn test_pinned_query_auto_readmit_after_cdc() -> Result<(), Error> {
     Ok(())
 }
 
-/// Test 3: Pinned query survives eviction when cache is full.
+/// Test 3: Pinned query survives eviction when the cache is full.
 ///
-/// Uses a small cache size so that registering additional non-pinned queries
-/// triggers eviction. The pinned query should survive while others are evicted.
+/// A count cap of 2 means registering additional non-pinned queries triggers
+/// eviction; the pinned query is bumped (never evicted) while others are.
+/// Eviction is forced via the fault-injection count cap (PGC-276).
+#[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn test_pinned_query_survives_eviction() -> Result<(), Error> {
     let pinned_sql = "SELECT id, data FROM pin_survive";
 
     let mut ctx = TestContext::setup_pinned_small_cache(
         pinned_sql,
-        200 * 1024, // 200KB — fits ~2 queries
+        2, // count cap: holds 2 queries, so further registrations evict
         |origin| async move {
             // Create the pinned table
             origin
@@ -215,8 +217,8 @@ async fn test_pinned_query_survives_eviction() -> Result<(), Error> {
     ctx.simple_query("SELECT id, data FROM evict_z").await?;
     ctx.cache_settle().await?;
 
-    // Extra wait for eviction to complete
-    ctx.cache_settle().await?;
+    // Eviction runs on the ~1s writer tick now (not per Ready); wait for it.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     // Take fresh metrics snapshot after eviction-fodder queries
     let m = ctx.metrics().await?;

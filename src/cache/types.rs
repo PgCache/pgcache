@@ -2,7 +2,7 @@ use crate::catalog::Oid;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -338,9 +338,6 @@ pub struct Cache {
     pub generation_counter: u64,
     /// Generations of active cached queries (for efficient min-tracking)
     pub generations: BTreeSet<u64>,
-    /// Size of currently cached data, updated after loading queries or purging data
-    /// Actual size can drift from this value because of CDC traffic
-    pub current_size: usize,
     /// Dynamic config handle for runtime-adjustable cache settings
     pub dynamic: DynamicConfigHandle,
 }
@@ -353,7 +350,6 @@ impl Cache {
             cached_queries: BiHashMap::new(),
             generation_counter: 0,
             generations: BTreeSet::new(),
-            current_size: 0,
             dynamic: settings.dynamic.clone(),
         }
     }
@@ -467,6 +463,13 @@ pub struct CacheStateView {
     /// Already-cached queries are unaffected. `Arc` so population workers can
     /// share it; wait-free read on the hot path.
     pub registration_throttled: Arc<AtomicBool>,
+    /// Set by the writer tick when the cache volume is under disk pressure
+    /// (free space below the reserve). While set, dispatch forwards brand-new
+    /// queries to origin instead of registering them — stopping cache growth
+    /// while the tick's escalating reclaim frees disk (PGC-276). Separate from
+    /// `registration_throttled` (memory) so the two pressures are independent;
+    /// dispatch ORs them.
+    pub disk_throttle: Arc<AtomicBool>,
     /// Authoritative registered (Ready) query count, published by the writer so
     /// the memory monitor can size the count cap from a real measurement (PGC-251).
     pub registered_count: Arc<AtomicUsize>,
@@ -502,12 +505,21 @@ impl CacheStateView {
             hits_since_gc: AtomicU32::new(0),
             last_hits_per_gc: AtomicU32::new(0),
             registration_throttled: Arc::new(AtomicBool::new(false)),
+            disk_throttle: Arc::new(AtomicBool::new(false)),
             registered_count: Arc::new(AtomicUsize::new(0)),
             query_count_cap: Arc::new(AtomicUsize::new(usize::MAX)),
             recycle_wanted: Arc::new(AtomicBool::new(false)),
             recycle_count: Arc::new(AtomicUsize::new(0)),
             memo: ResultMemo::new(dynamic),
         }
+    }
+
+    /// Whether dispatch should forward new queries to origin instead of
+    /// registering them — under memory pressure (`registration_throttled`) or
+    /// disk pressure (`disk_throttle`). Wait-free; on the hot path.
+    pub fn throttled(&self) -> bool {
+        self.registration_throttled.load(Ordering::Relaxed)
+            || self.disk_throttle.load(Ordering::Relaxed)
     }
 }
 

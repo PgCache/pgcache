@@ -164,8 +164,14 @@ pub mod names {
     // Cache state metrics
     pub const CACHE_QUERIES_REGISTERED: &str = "pgcache.cache.queries_registered";
     pub const CACHE_QUERIES_LOADING: &str = "pgcache.cache.queries_loading";
-    pub const CACHE_SIZE_BYTES: &str = "pgcache.cache.size_bytes";
-    pub const CACHE_SIZE_LIMIT_BYTES: &str = "pgcache.cache.size_limit_bytes";
+    // Cache-volume disk stats (statvfs, PGC-276). Whole-filesystem figures for
+    // the cache PG data directory — not cache-table-specific.
+    pub const CACHE_DISK_TOTAL_BYTES: &str = "pgcache.cache.disk_total_bytes";
+    pub const CACHE_DISK_AVAILABLE_BYTES: &str = "pgcache.cache.disk_available_bytes";
+    pub const CACHE_DISK_USED_BYTES: &str = "pgcache.cache.disk_used_bytes";
+    /// Effective disk-usage cap (explicit `disk_limit`, else auto from free space);
+    /// reclaim engages when `disk_used` exceeds it.
+    pub const CACHE_DISK_LIMIT_BYTES: &str = "pgcache.cache.disk_limit_bytes";
     pub const CACHE_GENERATION: &str = "pgcache.cache.generation";
     pub const CACHE_TABLES_TRACKED: &str = "pgcache.cache.tables_tracked";
 
@@ -463,8 +469,10 @@ pub struct StateHandles {
     pub queries_loading: Gauge,
     pub queries_pending: Gauge,
     pub queries_invalidated: Gauge,
-    pub size_bytes: Gauge,
-    pub size_limit_bytes: Gauge,
+    pub disk_total: Gauge,
+    pub disk_available: Gauge,
+    pub disk_used: Gauge,
+    pub disk_limit: Gauge,
     pub generation: Gauge,
     pub tables_tracked: Gauge,
     pub update_queries_total: Gauge,
@@ -624,8 +632,10 @@ impl Handles {
                 queries_loading: metrics::gauge!(CACHE_QUERIES_LOADING),
                 queries_pending: metrics::gauge!(CACHE_QUERIES_PENDING),
                 queries_invalidated: metrics::gauge!(CACHE_QUERIES_INVALIDATED),
-                size_bytes: metrics::gauge!(CACHE_SIZE_BYTES),
-                size_limit_bytes: metrics::gauge!(CACHE_SIZE_LIMIT_BYTES),
+                disk_total: metrics::gauge!(CACHE_DISK_TOTAL_BYTES),
+                disk_available: metrics::gauge!(CACHE_DISK_AVAILABLE_BYTES),
+                disk_used: metrics::gauge!(CACHE_DISK_USED_BYTES),
+                disk_limit: metrics::gauge!(CACHE_DISK_LIMIT_BYTES),
                 generation: metrics::gauge!(CACHE_GENERATION),
                 tables_tracked: metrics::gauge!(CACHE_TABLES_TRACKED),
                 update_queries_total: metrics::gauge!(CACHE_WRITER_UPDATE_QUERIES_TOTAL),

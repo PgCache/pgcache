@@ -1425,9 +1425,15 @@ impl WriterRegistration {
         Ok(())
     }
 
-    /// Finalize a population: mark the query Ready and run the post-ready
-    /// bookkeeping (MV bootstrap, cache-size refresh, eviction). Shared by the
-    /// immediate and deferred (`pending_ready`) paths.
+    /// Finalize a population: mark the query Ready and bootstrap any pinned MV.
+    /// Shared by the immediate and deferred (`pending_ready`) paths.
+    ///
+    /// Eviction is NOT done here: it runs on the 1s writer tick (`eviction_run`,
+    /// statvfs-driven). A per-Ready `SELECT pgcache_total_size()` round-trip
+    /// (O(#cache tables)) serialized the single-threaded writer and backed up the
+    /// population-merge queue under high-cardinality registration (PGC-276).
+    /// Deferring to the tick keeps Ready handling off the cache DB; eviction is
+    /// best-effort and the reserve headroom absorbs up to one tick of growth.
     async fn query_ready_finalize(
         &self,
         core: &mut WriterCore,
@@ -1437,8 +1443,6 @@ impl WriterRegistration {
     ) -> CacheResult<()> {
         self.query_ready_mark(core, fingerprint, cached_bytes, row_count);
         core.mv_pinned_bootstrap(fingerprint);
-        core.cache.current_size = core.cache_size_load().await?;
-        core.eviction_run(None).await?;
         Ok(())
     }
 

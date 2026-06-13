@@ -533,11 +533,7 @@ impl CacheDispatch {
                     // Under memory pressure this query's population is being
                     // skipped (it won't become Ready), so forward to origin
                     // rather than coalesce-wait on a load that won't complete.
-                    if self
-                        .state_view
-                        .registration_throttled
-                        .load(Ordering::Relaxed)
-                    {
+                    if self.state_view.throttled() {
                         crate::metrics::handles()
                             .cache
                             .registration_throttled_total
@@ -622,11 +618,7 @@ impl CacheDispatch {
                     // Under memory pressure, don't register a brand-new query
                     // (each registration costs in-process memory). Forward it to
                     // origin instead; already-tracked queries are unaffected.
-                    if self
-                        .state_view
-                        .registration_throttled
-                        .load(Ordering::Relaxed)
-                    {
+                    if self.state_view.throttled() {
                         crate::metrics::handles()
                             .cache
                             .registration_throttled_total

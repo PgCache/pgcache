@@ -259,26 +259,24 @@ pub fn disk_stats_bytes(_path: &std::path::Path) -> Option<(u64, u64)> {
     None
 }
 
-/// Auto-derive the cache disk-size limit from live filesystem stats, anchored on
-/// the current cache size: `limit = current_size + (available − reserve)`. As the
-/// cache grows by ΔS the available space falls by ΔS, so the limit holds steady at
-/// `(current_size + available) − reserve` — i.e. disk eviction engages exactly
-/// when free space drops below `reserve = clamp(fraction·total, floor, cap)`. The same
-/// live-anchor shape as the memory count cap. When free space is already below the
-/// reserve the limit drops below the current size, forcing eviction. PGC-251
-/// Slice 2.
-pub fn disk_limit_auto(current_size: u64, total: u64, available: u64) -> u64 {
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    let reserve =
-        ((total as f64 * DISK_RESERVE_FRACTION) as u64).clamp(DISK_RESERVE_FLOOR, DISK_RESERVE_CAP);
-    let limit = current_size as i128 + available as i128 - reserve as i128;
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let clamped = limit.max(0) as u64;
-    clamped
+/// Minimum free space to keep on the cache volume: `clamp(fraction·total, floor,
+/// cap)`. Disk eviction engages when live free space drops below this. Read from
+/// statvfs each tick; no cache-size measurement needed (PGC-251 Slice 2, PGC-276).
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+pub fn disk_reserve_auto(total: u64) -> u64 {
+    ((total as f64 * DISK_RESERVE_FRACTION) as u64).clamp(DISK_RESERVE_FLOOR, DISK_RESERVE_CAP)
+}
+
+/// Resolve the effective cache-volume usage cap: an explicit `disk_limit`
+/// config, else auto-derived to keep [`disk_reserve_auto`] free
+/// (`total − reserve`). The single place the optional config is defaulted, so
+/// the rest of the writer works with a concrete limit (PGC-276).
+pub fn disk_limit_resolve(total: u64, configured: Option<usize>) -> u64 {
+    configured.map_or_else(|| total.saturating_sub(disk_reserve_auto(total)), |l| l as u64)
 }
 
 // Pure parsing helpers, kept platform-independent so they are unit-testable on
@@ -661,38 +659,21 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_limit_room_to_grow() {
-        // 100 GiB total → reserve = clamp(5%, 1 GiB, 10 GiB) = 5 GiB. 10 GiB
-        // cached, 50 GiB free → limit = 10 + (50 − 5) = 55 GiB.
-        assert_eq!(super::disk_limit_auto(10 * GB, 100 * GB, 50 * GB), 55 * GB);
+    fn test_disk_reserve_fraction() {
+        // 100 GiB total → reserve = clamp(5%, 1 GiB, 10 GiB) = 5 GiB.
+        assert_eq!(super::disk_reserve_auto(100 * GB), 5 * GB);
     }
 
     #[test]
-    fn test_disk_limit_reserve_cap_applies() {
-        // 400 GiB total → 5% = 20 GiB > 10 GiB cap → reserve = 10 GiB. 5 GiB
-        // cached, 30 GiB free → limit = 5 + (30 − 10) = 25 GiB. Without the cap
-        // a mostly-full large volume pins the limit at 0 (empty cache forever).
-        assert_eq!(super::disk_limit_auto(5 * GB, 400 * GB, 30 * GB), 25 * GB);
+    fn test_disk_reserve_cap_applies() {
+        // 400 GiB total → 5% = 20 GiB > 10 GiB cap → reserve = 10 GiB. Without
+        // the cap a mostly-full large volume would never stop evicting.
+        assert_eq!(super::disk_reserve_auto(400 * GB), 10 * GB);
     }
 
     #[test]
-    fn test_disk_limit_reserve_floor_applies() {
-        // 4 GiB total → 5% = 0.2 GiB < 1 GiB floor → reserve = 1 GiB. 2 GiB
-        // cached, 1.5 GiB free → limit = 2 + (1.5 − 1) = 2.5 GiB.
-        assert_eq!(
-            super::disk_limit_auto(2 * GB, 4 * GB, 3 * GB / 2),
-            2 * GB + GB / 2
-        );
-    }
-
-    #[test]
-    fn test_disk_limit_below_reserve_forces_eviction() {
-        // Free (0.5 GiB) below the 1 GiB floor reserve → limit drops below the
-        // current size, so `current_size > limit` triggers disk eviction.
-        // 10 GiB total → 5% = 0.5 GiB → floor 1 GiB. 8 GiB cached, 0.5 GiB free →
-        // limit = 8 + (0.5 − 1) = 7.5 GiB.
-        let lim = super::disk_limit_auto(8 * GB, 10 * GB, GB / 2);
-        assert_eq!(lim, 8 * GB - GB / 2);
-        assert!(8 * GB > lim);
+    fn test_disk_reserve_floor_applies() {
+        // 4 GiB total → 5% = 0.2 GiB < 1 GiB floor → reserve = 1 GiB.
+        assert_eq!(super::disk_reserve_auto(4 * GB), GB);
     }
 }

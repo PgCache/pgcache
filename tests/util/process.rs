@@ -323,19 +323,21 @@ pub async fn connect_pgcache_clock(
     Ok((pgcache, listen_port, metrics_port, client))
 }
 
-/// Connect to pgcache with a small cache size to force eviction.
+/// Connect to pgcache that force-evicts down to `max_cached_queries` via the
+/// fault-injection count cap (requires `--features fault-injection`).
 pub async fn connect_pgcache_small_cache(
     dbs: &TempDBs,
-    cache_size: usize,
+    max_cached_queries: usize,
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
     let listen_port = find_available_port()?;
     let metrics_port = find_available_port()?;
-    let cache_size_str = cache_size.to_string();
-    let mut pgcache = pgcache_spawn(
+    let cap = max_cached_queries.to_string();
+    let mut pgcache = pgcache_spawn_env(
         dbs,
         listen_port,
         metrics_port,
-        &["--cache_policy", "fifo", "--cache_size", &cache_size_str],
+        &["--cache_policy", "fifo"],
+        &[("PGCACHE_FAULT_EVICTION_COUNT_CAP", &cap)],
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
     let client = pgcache_client_connect(listen_port).await?;
@@ -378,27 +380,23 @@ pub async fn connect_pgcache_pinned(
     Ok((pgcache, listen_port, metrics_port, client))
 }
 
-/// Connect to pgcache with pinned queries and a small cache size (FIFO policy).
+/// Connect to pgcache with pinned queries that force-evicts down to
+/// `max_cached_queries` via the fault-injection count cap (FIFO policy;
+/// requires `--features fault-injection`).
 pub async fn connect_pgcache_pinned_small_cache(
     dbs: &TempDBs,
     pinned_queries: &str,
-    cache_size: usize,
+    max_cached_queries: usize,
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
     let listen_port = find_available_port()?;
     let metrics_port = find_available_port()?;
-    let cache_size_str = cache_size.to_string();
-    let mut pgcache = pgcache_spawn(
+    let cap = max_cached_queries.to_string();
+    let mut pgcache = pgcache_spawn_env(
         dbs,
         listen_port,
         metrics_port,
-        &[
-            "--cache_policy",
-            "fifo",
-            "--pinned_queries",
-            pinned_queries,
-            "--cache_size",
-            &cache_size_str,
-        ],
+        &["--cache_policy", "fifo", "--pinned_queries", pinned_queries],
+        &[("PGCACHE_FAULT_EVICTION_COUNT_CAP", &cap)],
     );
     proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
     let client = pgcache_client_connect(listen_port).await?;

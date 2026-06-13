@@ -269,16 +269,15 @@ async fn test_truncate_invalidates_join_query() -> Result<(), Error> {
     Ok(())
 }
 
-/// Regression for the frame-vs-`db_cache` deadlock: a small cache (forces
-/// eviction) plus a join query plus a source transaction whose changes drive
-/// invalidation/eviction while the frame is open. Before the
-/// frame-deferred-maintenance fix this deadlocked the writer and `cdc_settle`
-/// timed out; it must now settle and return correct data.
+/// Regression for the frame-vs-`db_cache` deadlock: a join query plus a source
+/// transaction whose changes invalidate it while the frame is open, so the
+/// invalidation's physical cleanup (generation purge) would run on `db_cache`
+/// against the frame's locks. Before the frame-deferred-maintenance fix this
+/// deadlocked the writer and `cdc_settle` timed out; the cleanup must now defer
+/// to `CommitMark`, so this settles and returns correct data.
 #[tokio::test]
 async fn test_txn_invalidation_under_small_cache_no_deadlock() -> Result<(), Error> {
-    // ~256 KiB cache: small enough that population + CDC churn exercises the
-    // eviction path while a frame is open.
-    let mut ctx = TestContext::setup_small_cache(256 * 1024).await?;
+    let mut ctx = TestContext::setup().await?;
 
     ctx.query(
         "create table sf_dl_parent (id integer primary key, name text)",

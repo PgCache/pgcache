@@ -1,7 +1,9 @@
 num_workers = 2
-# Explicit disk limit so tests don't depend on the host disk's free space
-# (the auto-derived limit forces full eviction on a mostly-full volume).
-cache_size = 1073741824 # 1 GiB
+# `disk_limit` caps space used on the cache volume; a huge value effectively
+# disables disk-pressure handling so tests don't depend on host free space.
+# (The disk-pressure test forces pressure via a fault sentinel instead, and
+# eviction tests force eviction via the fault count cap.)
+disk_limit = 9223372036854775807
 
 [origin]
 host = "localhost"

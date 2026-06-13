@@ -55,11 +55,12 @@ impl TestContext {
         })
     }
 
-    /// Set up a test context with a small cache to force eviction.
-    pub async fn setup_small_cache(cache_size: usize) -> Result<Self, Error> {
+    /// Set up a test context that force-evicts down to `max_cached_queries` via
+    /// the fault-injection count cap (requires `--features fault-injection`).
+    pub async fn setup_small_cache(max_cached_queries: usize) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_small_cache(&dbs, cache_size).await?;
+            connect_pgcache_small_cache(&dbs, max_cached_queries).await?;
         Ok(Self {
             cache,
             origin,
@@ -124,10 +125,12 @@ impl TestContext {
         })
     }
 
-    /// Set up a test context with pinned queries and a small cache to force eviction.
+    /// Set up a test context with pinned queries that force-evicts down to
+    /// `max_cached_queries` via the fault-injection count cap (requires
+    /// `--features fault-injection`).
     pub async fn setup_pinned_small_cache<F, Fut>(
         pinned_queries: &str,
-        cache_size: usize,
+        max_cached_queries: usize,
         before_start: F,
     ) -> Result<Self, Error>
     where
@@ -137,7 +140,7 @@ impl TestContext {
         let (dbs, origin) = start_databases().await?;
         let origin = before_start(origin).await?;
         let (pgcache, cache_port, metrics_port, cache) =
-            connect_pgcache_pinned_small_cache(&dbs, pinned_queries, cache_size).await?;
+            connect_pgcache_pinned_small_cache(&dbs, pinned_queries, max_cached_queries).await?;
         Ok(Self {
             cache,
             origin,

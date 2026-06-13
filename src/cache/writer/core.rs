@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use tokio::task::{LocalSet, yield_now};
 use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, trace};
+use tracing::{debug, error, trace, warn};
 
 use crate::cache::status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
@@ -65,6 +65,24 @@ pub(crate) mod fault {
                 ARMED.store(true, Ordering::Relaxed);
             }
         });
+    }
+
+    /// Test override for the eviction count cap
+    /// (`PGCACHE_FAULT_EVICTION_COUNT_CAP`): forces count-driven eviction down to
+    /// N cached queries, so eviction tests don't need a disk byte-cap (PGC-276).
+    pub(crate) fn eviction_count_cap() -> Option<usize> {
+        std::env::var("PGCACHE_FAULT_EVICTION_COUNT_CAP")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    }
+
+    /// Force `disk_pressure()` true while a sentinel file exists. The env var
+    /// `PGCACHE_FAULT_DISK_PRESSURE` names the path; a test toggles pressure by
+    /// creating/removing it, exercising the throttle + escalating reclaim
+    /// deterministically without filling the host disk (PGC-276).
+    pub(crate) fn disk_pressure_forced() -> bool {
+        std::env::var_os("PGCACHE_FAULT_DISK_PRESSURE")
+            .is_some_and(|p| std::path::Path::new(&p).exists())
     }
 
     /// One-shot: fire when armed and a row carries the sentinel, then disarm so
@@ -365,9 +383,22 @@ pub struct WriterCore {
     data_dir: Option<PathBuf>,
     /// Last `statvfs` reading of the data directory's filesystem (total,
     /// available) in bytes; refreshed on the 1 s tick. `disk_total == 0` means
-    /// "no reading" — `disk_limit_compute` then takes no auto limit.
+    /// "no reading" — disk eviction is then disabled.
     disk_total: u64,
     disk_available: u64,
+    /// Effective cache-volume usage cap in bytes, resolved from the `disk_limit`
+    /// config (auto-derived when unset). Recomputed whenever the statvfs reading
+    /// refreshes, so the rest of the writer compares against a concrete value
+    /// rather than re-defaulting an `Option` (PGC-276).
+    disk_limit_effective: u64,
+    /// Consecutive 1 s ticks the cache volume has been under disk pressure,
+    /// driving the escalating reclaim ladder (purge → MV sweep → drop the
+    /// fewest-queries source table). Reset to 0 when pressure clears (PGC-276).
+    disk_pressure_ticks: u32,
+    /// Set after a dramatic source-table drop so the next tick skips reclaim,
+    /// giving the asynchronous disk reclaim time to land in the next `statvfs`
+    /// read before deciding to drop again (avoids lag-driven over-dropping).
+    disk_drop_backoff: bool,
 }
 
 /// A queued population merge, ordered by its watermark deadline (PGC-272).
@@ -459,6 +490,8 @@ impl WriterCore {
             .as_deref()
             .and_then(crate::memory::disk_stats_bytes)
             .unwrap_or((0, 0));
+        let disk_limit_effective =
+            crate::memory::disk_limit_resolve(disk_total, settings.dynamic.load().disk_limit);
 
         Ok(Self {
             cache: Cache::new(settings),
@@ -502,6 +535,9 @@ impl WriterCore {
             data_dir,
             disk_total,
             disk_available,
+            disk_limit_effective,
+            disk_pressure_ticks: 0,
+            disk_drop_backoff: false,
         })
     }
 
@@ -948,15 +984,15 @@ impl WriterCore {
                 .set(invalidated_count as f64);
         }
 
-        crate::metrics::handles()
-            .state
-            .size_bytes
-            .set(self.cache.current_size as f64);
-        if let Some(limit) = self.disk_limit_compute(self.cache.dynamic.load().cache_size) {
-            crate::metrics::handles()
-                .state
-                .size_limit_bytes
-                .set(limit as f64);
+        // Cache-volume disk stats and the used-level at which reclaim engages,
+        // from statvfs (PGC-276). Only meaningful once a reading exists.
+        #[allow(clippy::cast_precision_loss)]
+        if self.disk_total != 0 {
+            let state = &crate::metrics::handles().state;
+            state.disk_total.set(self.disk_total as f64);
+            state.disk_available.set(self.disk_available as f64);
+            state.disk_used.set(self.disk_used() as f64);
+            state.disk_limit.set(self.disk_limit_effective as f64);
         }
         crate::metrics::handles()
             .state
@@ -989,34 +1025,10 @@ impl WriterCore {
             .set(max_per_relation as f64);
     }
 
-    /// Utility function to get the size of the currently cached data.
-    ///
-    /// Returns the last known `current_size` *without querying* while a CDC
-    /// frame is open. `pgcache_total_size()` does `pg_total_relation_size`
-    /// (an `ACCESS SHARE` open) over the tracked cache tables; an in-frame
-    /// `TRUNCATE` holds `ACCESS EXCLUSIVE` on one of them, so the query would
-    /// block on the frame until `CommitMark` — a deadlock. The size is an
-    /// explicitly-drifting estimate and self-corrects on the next load once
-    /// the frame has committed.
-    #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(super) async fn cache_size_load(&mut self) -> CacheResult<usize> {
-        if self.frame_holds_locks() {
-            return Ok(self.cache.current_size);
-        }
-        let size: i64 = self
-            .db_cache
-            .query_one("SELECT pgcache_total_size()", &[])
-            .await
-            .map_into_report::<CacheError>()?
-            .get(0);
-
-        Ok(usize::try_from(size).unwrap_or(0))
-    }
-
-    /// Refresh the cached `statvfs` reading for the cache PG data directory,
-    /// used to auto-size the disk eviction limit (PGC-251 Slice 2). One syscall;
-    /// a no-op leaving the last reading if the data directory wasn't discovered
-    /// or can't be stat'd.
+    /// Refresh the cached `statvfs` reading for the cache PG data directory (one
+    /// syscall); a no-op leaving the last reading if the data directory wasn't
+    /// discovered or can't be stat'd. Disk usage is read from the filesystem,
+    /// not summed via `pgcache_total_size()` (PGC-276).
     pub(super) fn disk_stats_refresh(&mut self) {
         let Some(dir) = self.data_dir.as_deref() else {
             return;
@@ -1025,25 +1037,38 @@ impl WriterCore {
             self.disk_total = total;
             self.disk_available = available;
         }
+        // Re-resolve the effective cap (config may have changed via PUT /config,
+        // and the auto value tracks disk_total).
+        self.disk_limit_effective =
+            crate::memory::disk_limit_resolve(self.disk_total, self.cache.dynamic.load().disk_limit);
     }
 
-    /// Effective disk-size eviction limit in bytes, or `None` for no disk-driven
-    /// eviction. An explicit `cache_size` config is a hard override; otherwise the
-    /// limit is auto-derived from live filesystem free space (PGC-251 Slice 2),
-    /// disabled only when no `statvfs` reading is available.
-    pub(super) fn disk_limit_compute(&self, cache_size: Option<usize>) -> Option<usize> {
-        if let Some(explicit) = cache_size {
-            return Some(explicit);
+    /// Bytes in use on the cache volume (whole-filesystem, not cache-table
+    /// specific). Informational gauge value.
+    pub(super) fn disk_used(&self) -> u64 {
+        self.disk_total.saturating_sub(self.disk_available)
+    }
+
+    /// Whether the cache volume is under disk pressure — used bytes exceed the
+    /// effective `disk_limit`. `disk_total == 0` (no statvfs reading) disables
+    /// disk eviction. Best-effort: reclaim sheds a bounded amount per tick and
+    /// re-evaluates next tick, since DROP'd space is reclaimed asynchronously
+    /// (PGC-276).
+    pub(super) fn disk_pressure(&self) -> bool {
+        #[cfg(feature = "fault-injection")]
+        if fault::disk_pressure_forced() {
+            return true;
         }
-        if self.disk_total == 0 {
-            return None;
-        }
-        let limit = crate::memory::disk_limit_auto(
-            self.cache.current_size as u64,
-            self.disk_total,
-            self.disk_available,
-        );
-        Some(usize::try_from(limit).unwrap_or(usize::MAX))
+        self.disk_total != 0 && self.disk_used() > self.disk_limit_effective
+    }
+
+    /// The query-count cap eviction drives toward: the memory-derived cap
+    /// (PGC-251), tightened by the fault-injection override when set.
+    fn eviction_count_cap(&self) -> usize {
+        let cap = self.state_view.query_count_cap.load(Ordering::Relaxed);
+        #[cfg(feature = "fault-injection")]
+        let cap = fault::eviction_count_cap().map_or(cap, |o| cap.min(o));
+        cap
     }
 
     /// Run eviction loop. For CLOCK policy, uses second-chance algorithm with reference bit.
@@ -1067,35 +1092,20 @@ impl WriterCore {
         let mut evicted = 0usize;
 
         let cfg = self.cache.dynamic.load();
-        // Memory count cap (PGC-251): evict down to it independently of the disk
-        // limit. `usize::MAX` = uncapped (no count-driven eviction).
-        let count_cap = self.state_view.query_count_cap.load(Ordering::Relaxed);
-        // Disk-size limit: explicit `cache_size` override, else auto-derived from
-        // live free space (PGC-251 Slice 2). Snapshotted once; the loop drives
-        // current_size down against this fixed anchor.
-        let disk_limit = self.disk_limit_compute(cfg.cache_size);
+        // Memory count cap (PGC-251): evict down to it. `usize::MAX` = uncapped.
+        // Disk pressure is handled separately (throttle + escalating reclaim in
+        // `disk_pressure_handle`, PGC-276), not here.
+        let count_cap = self.eviction_count_cap();
 
         debug!(
-            current_size = self.cache.current_size,
-            disk_limit = ?disk_limit,
             count = self.cache.cached_queries.len(),
             count_cap,
             cache_policy = ?cfg.cache_policy,
             "eviction_run entry"
         );
 
-        // Pre-sweep: reclaim bytes held by Dirty MVs before considering live
-        // entries for eviction. If this alone brings current_size under the
-        // limit, the loop below exits immediately without evicting anything.
-        if disk_limit.is_some_and(|s| self.cache.current_size > s) {
-            self.mv_dirty_sweep().await?;
-            self.cache.current_size = self.cache_size_load().await?;
-        }
-
         loop {
-            let over_disk = disk_limit.is_some_and(|s| self.cache.current_size > s);
-            let over_count = self.cache.cached_queries.len() > count_cap;
-            if !over_disk && !over_count {
+            if self.cache.cached_queries.len() <= count_cap {
                 break;
             }
             let Some(&min_gen) = self.cache.generations.first() else {
@@ -1144,15 +1154,10 @@ impl WriterCore {
             // Evict (full removal) — cache_query_evict emits its own entry log
             crate::metrics::handles().state.evictions.increment(1);
             self.cache_query_evict(fingerprint).await?;
-            // publication_dirty_drain drops the orphaned cache tables; the
-            // trigger is what pgcache_total_size sums, so the next iteration's
-            // cache_size_load needs the drain to observe a shrink.
+            // publication_dirty_drain drops the orphaned cache tables; the freed
+            // disk space is reclaimed asynchronously and observed by a later
+            // tick's statvfs read, not measured here (PGC-276).
             self.publication_dirty_drain().await?;
-            // Reload disk size only when the disk limit is active; the count-cap
-            // path needs no pgcache_total_size() round-trip per eviction.
-            if disk_limit.is_some() {
-                self.cache.current_size = self.cache_size_load().await?;
-            }
             bumps = 0;
             pinned_skips = 0;
             evicted += 1;
@@ -1164,6 +1169,87 @@ impl WriterCore {
         // stale_entries_cleanup runs on the 1s gauges tick instead of here —
         // it is GC of dead Pending/Invalidated entries, not eviction-critical,
         // and its O(cached_queries) scan would dominate Ready handling.
+        Ok(())
+    }
+
+    /// Disk-pressure handling on the 1 s tick (PGC-276). Disk is cheap and
+    /// plentiful, so hitting the reserve is treated as an emergency ("don't fill
+    /// the volume"): set the `disk_throttle` flag so dispatch stops admitting new
+    /// queries, then take one escalating reclaim step per tick.
+    ///
+    /// Reclaim can't be a tight loop — `DROP TABLE` frees disk asynchronously and
+    /// statvfs won't reflect it until a later read — so we pace it: rung 1 purges
+    /// dead-generation rows, rung 2 sweeps Dirty MVs, rung 3+ drops the
+    /// fewest-queries source table (least collateral). After a rung-3 drop we
+    /// skip one tick so the freed space lands in statvfs before deciding again.
+    pub(super) async fn disk_pressure_handle(&mut self) -> CacheResult<()> {
+        let pressure = self.disk_pressure();
+        self.state_view
+            .disk_throttle
+            .store(pressure, Ordering::Relaxed);
+        if !pressure {
+            self.disk_pressure_ticks = 0;
+            self.disk_drop_backoff = false;
+            return Ok(());
+        }
+        // Reclaim mutates db_cache (purge/evict/drop); defer while a frame holds
+        // cache-table locks — the throttle alone holds the line until it commits.
+        if self.frame_holds_locks() {
+            return Ok(());
+        }
+        // One-tick backoff after a dramatic drop so the async reclaim shows up in
+        // statvfs before we consider dropping another table.
+        if self.disk_drop_backoff {
+            self.disk_drop_backoff = false;
+            return Ok(());
+        }
+
+        self.disk_pressure_ticks = self.disk_pressure_ticks.saturating_add(1);
+        match self.disk_pressure_ticks {
+            1 => {
+                // Rung 1: reclaim disk held by superseded generations (no query impact).
+                let threshold = self.cache.generation_purge_threshold();
+                self.generation_purge(threshold).await?;
+            }
+            2 => {
+                // Rung 2: truncate Dirty MV tables (queries fall back to source eval).
+                self.mv_dirty_sweep().await?;
+            }
+            _ => {
+                // Rung 3+: drop the fewest-queries source table — coarse, but disk
+                // pressure is an emergency. Back off a tick afterwards.
+                self.disk_reclaim_drop_smallest().await?;
+                self.disk_drop_backoff = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// Emergency reclaim: drop the source cache table referenced by the fewest
+    /// cached queries (least collateral) by evicting all of its queries — the
+    /// last release leaves the table unreferenced, and `publication_dirty_drain`
+    /// drops it, freeing disk. No-op when the cache is empty.
+    async fn disk_reclaim_drop_smallest(&mut self) -> CacheResult<()> {
+        let fingerprints = self
+            .cache
+            .update_queries
+            .iter()
+            .filter(|entry| !entry.queries.is_empty())
+            .min_by_key(|entry| entry.queries.len())
+            .map(|entry| entry.queries.keys().copied().collect::<Vec<Fingerprint>>());
+        let Some(fingerprints) = fingerprints else {
+            return Ok(());
+        };
+        warn!(
+            query_count = fingerprints.len(),
+            "disk pressure: dropping the fewest-queries source table and invalidating its queries"
+        );
+        for fingerprint in fingerprints {
+            crate::metrics::handles().state.evictions.increment(1);
+            self.cache_query_evict(fingerprint).await?;
+        }
+        // Drop the now-unreferenced source cache table(s), freeing disk.
+        self.publication_dirty_drain().await?;
         Ok(())
     }
 
@@ -1317,8 +1403,8 @@ impl WriterCore {
 
         let dynamic = cache.dynamic.load();
         let cache_status = CacheStatusData {
-            size_bytes: cache.current_size,
-            size_limit_bytes: dynamic.cache_size,
+            size_bytes: usize::try_from(self.disk_used()).unwrap_or(usize::MAX),
+            size_limit_bytes: Some(usize::try_from(self.disk_limit_effective).unwrap_or(usize::MAX)),
             generation: cache.generation_counter,
             tables_tracked: cache.tables.len(),
             policy: format!("{:?}", dynamic.cache_policy),
@@ -1459,9 +1545,7 @@ impl WriterCore {
     ///
     /// Returns `Ok(0)` *without purging* while a CDC frame is open (the purge
     /// is deferred to `CommitMark`). Callers must not treat that `0` as
-    /// "nothing to reclaim" — e.g. a following `cache_size_load` will read a
-    /// pre-purge size. The size estimate is allowed to drift and self-corrects
-    /// once the deferred purge runs.
+    /// "nothing to reclaim" — the deferred purge runs once the frame commits.
     pub(super) async fn generation_purge(&mut self, threshold: u64) -> CacheResult<i64> {
         // Defer while a CDC frame is open: pgcache_purge_rows DELETEs source
         // cache-table rows on db_cache, which would block on the frame's
@@ -1538,7 +1622,7 @@ pub fn writer_run(
                 .await?;
                 let mut writer_cdc = WriterCdc::new(settings).await?;
 
-                // Gauges (queries_loading/pending/invalidated, cache_size_bytes,
+                // Gauges (queries_loading/pending/invalidated, disk_used_bytes,
                 // generation, tables_tracked, update_queries_total/max) used to
                 // be emitted from every query/CDC command. state_gauges_update
                 // iterates the entire state_view DashMap, which dominated
@@ -1563,14 +1647,21 @@ pub fn writer_run(
                             core.writer_scale_gauges_update();
                             core.state_view.memo.gc();
                             core.state_view.memo.metrics_publish();
+                            // Eviction runs only here now (not per Ready, PGC-276).
                             // Enforce the memory count cap independently of
                             // registration: under throttle-freeze no Ready events
-                            // arrive, so the registration-path eviction can't run
-                            // (PGC-251). Bounded per tick; log-and-continue so a
+                            // arrive (PGC-251). Bounded per tick; log-and-continue so a
                             // periodic best-effort eviction never kills the writer.
                             if let Err(e) = core.eviction_run(Some(EVICTION_TICK_BUDGET)).await {
                                 error!(
                                     "periodic eviction failed: {}",
+                                    error_chain_format(e.current_context())
+                                );
+                            }
+                            // Disk-pressure throttle + escalating reclaim (PGC-276).
+                            if let Err(e) = core.disk_pressure_handle().await {
+                                error!(
+                                    "disk pressure handling failed: {}",
                                     error_chain_format(e.current_context())
                                 );
                             }

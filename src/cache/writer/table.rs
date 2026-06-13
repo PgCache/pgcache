@@ -362,10 +362,8 @@ impl WriterCore {
     }
 
     /// Drop the source-row cache tables for `relation_oids` and remove their
-    /// metadata. Dropping the table also drops its
-    /// `pgcache_track_modification` trigger, which is what
-    /// `pgcache_total_size` sums — without this, evicted tables keep
-    /// contributing to the cache-size accounting.
+    /// metadata. Dropping the table unlinks its files, returning the disk space
+    /// to the cache volume (observed by a later tick's statvfs read, PGC-276).
     ///
     /// Best-effort: logs and continues on DB failures rather than aborting
     /// the eviction path. Oids without metadata are silently skipped.

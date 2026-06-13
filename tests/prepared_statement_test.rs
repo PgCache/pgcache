@@ -115,11 +115,13 @@ async fn test_binary_limit_offset_params() -> Result<(), Error> {
 /// evicted, continuing to serve a live query drives that close path on the pool
 /// connections — if the CloseComplete handling desynced a connection, these
 /// serves would return wrong data, error, or hang.
+// Eviction is forced via the fault-injection count cap, so this test only
+// builds with the `fault-injection` feature (PGC-276).
+#[cfg(feature = "fault-injection")]
 #[tokio::test]
 async fn test_binary_reconciliation_closes_evicted_statement() -> Result<(), Error> {
-    // 200KB cache — fits ~2 populated tables, forcing FIFO eviction of the
-    // oldest (ps_a) when later tables are registered.
-    let mut ctx = TestContext::setup_small_cache(200 * 1024).await?;
+    // Count cap of 2 — registering a 3rd query evicts the oldest (ps_a).
+    let mut ctx = TestContext::setup_small_cache(2).await?;
 
     for table in &["ps_a", "ps_b", "ps_c"] {
         ctx.query(
@@ -147,6 +149,9 @@ async fn test_binary_reconciliation_closes_evicted_statement() -> Result<(), Err
     ctx.query("SELECT id, data FROM ps_b", &[]).await?;
     ctx.query("SELECT id, data FROM ps_c", &[]).await?;
     ctx.cache_settle().await?;
+    // Eviction runs on the ~1s writer tick now (not per Ready); wait for it so
+    // ps_a is actually evicted before driving the reconciliation path.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
     // Keep serving a live query: each serve reconciles one statement, so the
     // connection(s) holding ps_a's evicted statement close it (CloseComplete

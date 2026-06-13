@@ -2987,15 +2987,11 @@ impl WriterCdc {
         // Drain coalesced waiters parked on this query's now-dead population.
         core.waiters_fail(fingerprint);
 
-        // Purge stale rows if generation threshold moved
+        // Purge stale rows if the generation threshold moved and the cache
+        // volume is under disk pressure (statvfs, PGC-276).
         let new_threshold = core.cache.generation_purge_threshold();
-        if new_threshold > prev_generation_threshold {
-            core.cache.current_size = core.cache_size_load().await?;
-            let disk_limit = core.disk_limit_compute(cfg.cache_size);
-            if disk_limit.is_some_and(|s| core.cache.current_size > s) {
-                core.generation_purge(new_threshold).await?;
-                core.cache.current_size = core.cache_size_load().await?;
-            }
+        if new_threshold > prev_generation_threshold && core.disk_pressure() {
+            core.generation_purge(new_threshold).await?;
         }
 
         Ok(())
@@ -3792,15 +3788,11 @@ impl WriterCore {
         self.cache
             .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);
 
-        // Purge generations based on new threshold
+        // Purge generations when the threshold moved and the cache volume is
+        // under disk pressure (statvfs, PGC-276).
         let new_threshold = self.cache.generation_purge_threshold();
-        if new_threshold > prev_generation_threshold {
-            self.cache.current_size = self.cache_size_load().await?;
-            let disk_limit = self.disk_limit_compute(self.cache.dynamic.load().cache_size);
-            if disk_limit.is_some_and(|s| self.cache.current_size > s) {
-                self.generation_purge(new_threshold).await?;
-                self.cache.current_size = self.cache_size_load().await?;
-            }
+        if new_threshold > prev_generation_threshold && self.disk_pressure() {
+            self.generation_purge(new_threshold).await?;
         }
 
         Ok(())
