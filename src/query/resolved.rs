@@ -1262,7 +1262,9 @@ impl Deparse for ResolvedSelectColumn {
         self.expr.deparse(buf);
         if let Some(alias) = &self.alias {
             buf.push_str(" AS ");
-            buf.push_str(alias);
+            // Quote aliases that need it (spaces, uppercase, keywords); a raw
+            // push emits invalid SQL for `AS "Correlated Field"` (PGC-284).
+            alias.deparse(buf);
         }
         buf
     }
