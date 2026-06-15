@@ -675,16 +675,133 @@ unsafe fn func_call_convert(func_call: *const pg::FuncCall) -> Result<FunctionCa
     }
 }
 
+// Window `frameOptions` bitmask from PostgreSQL `parsenodes.h`. libpg_query
+// exposes these only as C `#define`s, which bindgen does not emit, so they are
+// mirrored here.
+const FRAMEOPTION_NONDEFAULT: i32 = 0x00001;
+const FRAMEOPTION_RANGE: i32 = 0x00002;
+const FRAMEOPTION_ROWS: i32 = 0x00004;
+const FRAMEOPTION_GROUPS: i32 = 0x00008;
+const FRAMEOPTION_START_UNBOUNDED_PRECEDING: i32 = 0x00020;
+const FRAMEOPTION_END_UNBOUNDED_FOLLOWING: i32 = 0x00100;
+const FRAMEOPTION_START_CURRENT_ROW: i32 = 0x00200;
+const FRAMEOPTION_END_CURRENT_ROW: i32 = 0x00400;
+const FRAMEOPTION_START_OFFSET_PRECEDING: i32 = 0x00800;
+const FRAMEOPTION_END_OFFSET_PRECEDING: i32 = 0x01000;
+const FRAMEOPTION_START_OFFSET_FOLLOWING: i32 = 0x02000;
+const FRAMEOPTION_END_OFFSET_FOLLOWING: i32 = 0x04000;
+const FRAMEOPTION_EXCLUDE_CURRENT_ROW: i32 = 0x08000;
+const FRAMEOPTION_EXCLUDE_GROUP: i32 = 0x10000;
+const FRAMEOPTION_EXCLUDE_TIES: i32 = 0x20000;
+
 unsafe fn window_def_convert(win_def: *const pg::WindowDef) -> Result<WindowSpec, AstError> {
     unsafe {
         let partition_by = list_nodes((*win_def).partitionClause)
             .map(|n| scalar_expr_convert(n))
             .collect::<Result<Vec<_>, _>>()?;
         let order_by = window_order_by_convert((*win_def).orderClause)?.into_vec();
+        let frame = window_frame_convert(win_def)?;
         Ok(WindowSpec {
             partition_by,
             order_by,
+            frame,
         })
+    }
+}
+
+/// Decode the frame clause from a `WindowDef`. Returns `None` for the SQL
+/// default frame (`NONDEFAULT` bit clear). Dropping a non-default frame is a
+/// silent wrong result (PGC-279), so every explicit frame must round-trip.
+unsafe fn window_frame_convert(
+    win_def: *const pg::WindowDef,
+) -> Result<Option<WindowFrame>, AstError> {
+    unsafe {
+        let opts = (*win_def).frameOptions;
+        if opts & FRAMEOPTION_NONDEFAULT == 0 {
+            return Ok(None);
+        }
+        let mode = if opts & FRAMEOPTION_RANGE != 0 {
+            FrameMode::Range
+        } else if opts & FRAMEOPTION_ROWS != 0 {
+            FrameMode::Rows
+        } else if opts & FRAMEOPTION_GROUPS != 0 {
+            FrameMode::Groups
+        } else {
+            return Err(AstError::UnsupportedFeature {
+                feature: format!("window frame mode (frameOptions={opts:#x})"),
+            });
+        };
+        let start = frame_bound_convert(
+            opts,
+            (*win_def).startOffset as NodePtr,
+            FRAMEOPTION_START_UNBOUNDED_PRECEDING,
+            FRAMEOPTION_START_CURRENT_ROW,
+            FRAMEOPTION_START_OFFSET_PRECEDING,
+            FRAMEOPTION_START_OFFSET_FOLLOWING,
+            // START_UNBOUNDED_FOLLOWING is disallowed by PostgreSQL as a start.
+            0,
+            "start",
+        )?;
+        let end = frame_bound_convert(
+            opts,
+            (*win_def).endOffset as NodePtr,
+            // END_UNBOUNDED_PRECEDING is disallowed by PostgreSQL as an end.
+            0,
+            FRAMEOPTION_END_CURRENT_ROW,
+            FRAMEOPTION_END_OFFSET_PRECEDING,
+            FRAMEOPTION_END_OFFSET_FOLLOWING,
+            FRAMEOPTION_END_UNBOUNDED_FOLLOWING,
+            "end",
+        )?;
+        let exclusion = if opts & FRAMEOPTION_EXCLUDE_CURRENT_ROW != 0 {
+            FrameExclusion::CurrentRow
+        } else if opts & FRAMEOPTION_EXCLUDE_GROUP != 0 {
+            FrameExclusion::Group
+        } else if opts & FRAMEOPTION_EXCLUDE_TIES != 0 {
+            FrameExclusion::Ties
+        } else {
+            FrameExclusion::NoOthers
+        };
+        Ok(Some(WindowFrame {
+            mode,
+            start,
+            end,
+            exclusion,
+        }))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn frame_bound_convert(
+    opts: i32,
+    offset: NodePtr,
+    unbounded_preceding: i32,
+    current_row: i32,
+    offset_preceding: i32,
+    offset_following: i32,
+    unbounded_following: i32,
+    which: &str,
+) -> Result<FrameBound, AstError> {
+    unsafe {
+        if unbounded_preceding != 0 && opts & unbounded_preceding != 0 {
+            Ok(FrameBound::UnboundedPreceding)
+        } else if unbounded_following != 0 && opts & unbounded_following != 0 {
+            Ok(FrameBound::UnboundedFollowing)
+        } else if opts & current_row != 0 {
+            Ok(FrameBound::CurrentRow)
+        } else if opts & offset_preceding != 0 {
+            Ok(FrameBound::OffsetPreceding(Box::new(scalar_expr_convert(
+                offset,
+            )?)))
+        } else if opts & offset_following != 0 {
+            Ok(FrameBound::OffsetFollowing(Box::new(scalar_expr_convert(
+                offset,
+            )?)))
+        } else {
+            Err(AstError::UnsupportedFeature {
+                feature: format!("window frame {which} bound (frameOptions={opts:#x})"),
+            })
+        }
     }
 }
 

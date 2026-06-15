@@ -7,17 +7,18 @@ use tokio_postgres::types::Type;
 use crate::cache::SubqueryKind;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
 use crate::query::ast::{
-    BinaryOp, ColumnNode, JoinQual, JoinType, LimitClause, LiteralValue, OrderByClause, QueryBody,
-    QueryExpr, ScalarExpr, SelectColumn, SelectColumns, SelectNode, TableAlias, TableNode,
-    TableSource, WhereExpr, WindowSpec,
+    BinaryOp, ColumnNode, FrameBound, JoinQual, JoinType, LimitClause, LiteralValue, OrderByClause,
+    QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns, SelectNode, TableAlias,
+    TableNode, TableSource, WhereExpr, WindowFrame, WindowSpec,
 };
 use crate::query::resolved::{
     ResolveError, ResolveResult, ResolvedArithmeticExpr, ResolvedBinaryExpr, ResolvedCaseExpr,
-    ResolvedCaseWhen, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode, ResolvedJoinQual,
-    ResolvedLimitClause, ResolvedMultiExpr, ResolvedOrderByClause, ResolvedQueryBody,
-    ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
-    ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource,
-    ResolvedTableSubqueryNode, ResolvedUnaryExpr, ResolvedWhereExpr, ResolvedWindowSpec,
+    ResolvedCaseWhen, ResolvedColumnNode, ResolvedFrameBound, ResolvedFunctionCall,
+    ResolvedJoinNode, ResolvedJoinQual, ResolvedLimitClause, ResolvedMultiExpr,
+    ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
+    ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode,
+    ResolvedTableNode, ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedUnaryExpr,
+    ResolvedWhereExpr, ResolvedWindowFrame, ResolvedWindowSpec,
 };
 use crate::query::transform::where_expr_conjuncts_join;
 
@@ -933,9 +934,43 @@ fn window_spec_resolve(
             null_order: clause.null_order,
         });
     }
+    let frame = match &window_spec.frame {
+        Some(frame) => Some(window_frame_resolve(frame, scope)?),
+        None => None,
+    };
     Ok(ResolvedWindowSpec {
         partition_by,
         order_by,
+        frame,
+    })
+}
+
+fn window_frame_resolve(
+    frame: &WindowFrame,
+    scope: &mut ResolutionScope<'_>,
+) -> ResolveResult<ResolvedWindowFrame> {
+    Ok(ResolvedWindowFrame {
+        mode: frame.mode,
+        start: frame_bound_resolve(&frame.start, scope)?,
+        end: frame_bound_resolve(&frame.end, scope)?,
+        exclusion: frame.exclusion,
+    })
+}
+
+fn frame_bound_resolve(
+    bound: &FrameBound,
+    scope: &mut ResolutionScope<'_>,
+) -> ResolveResult<ResolvedFrameBound> {
+    Ok(match bound {
+        FrameBound::UnboundedPreceding => ResolvedFrameBound::UnboundedPreceding,
+        FrameBound::CurrentRow => ResolvedFrameBound::CurrentRow,
+        FrameBound::UnboundedFollowing => ResolvedFrameBound::UnboundedFollowing,
+        FrameBound::OffsetPreceding(e) => {
+            ResolvedFrameBound::OffsetPreceding(Box::new(scalar_expr_resolve(e, scope)?))
+        }
+        FrameBound::OffsetFollowing(e) => {
+            ResolvedFrameBound::OffsetFollowing(Box::new(scalar_expr_resolve(e, scope)?))
+        }
     })
 }
 

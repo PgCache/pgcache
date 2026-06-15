@@ -10,8 +10,8 @@ use rootcause::Report;
 use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::catalog::ColumnMetadata;
 use crate::query::ast::{
-    ArithmeticOp, AstNode, BinaryOp, Deparse, JoinType, LiteralValue, MultiOp, NullOrder,
-    OrderDirection, SetOpType, SubLinkType, TableAlias, UnaryOp, ValuesClause,
+    ArithmeticOp, AstNode, BinaryOp, Deparse, FrameExclusion, FrameMode, JoinType, LiteralValue,
+    MultiOp, NullOrder, OrderDirection, SetOpType, SubLinkType, TableAlias, UnaryOp, ValuesClause,
 };
 use crate::query::cast::{CastTarget, cast_target_deparse};
 
@@ -747,6 +747,8 @@ pub struct ResolvedWindowSpec {
     pub partition_by: Vec<ResolvedScalarExpr>,
     /// ORDER BY clauses
     pub order_by: Vec<ResolvedOrderByClause>,
+    /// Frame clause; `None` is the SQL default frame (see `ast::WindowSpec`).
+    pub frame: Option<ResolvedWindowFrame>,
 }
 
 impl AstNode for ResolvedWindowSpec {
@@ -763,7 +765,95 @@ impl AstNode for ResolvedWindowSpec {
         for o in &self.order_by {
             o.try_for_each_node(f)?;
         }
+        if let Some(frame) = &self.frame {
+            frame.try_for_each_node(f)?;
+        }
         ControlFlow::Continue(())
+    }
+}
+
+/// Resolved window frame — mirrors `ast::WindowFrame`. `mode`/`exclusion` are
+/// the shared AST enums (no expressions to resolve).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedWindowFrame {
+    pub mode: FrameMode,
+    pub start: ResolvedFrameBound,
+    pub end: ResolvedFrameBound,
+    pub exclusion: FrameExclusion,
+}
+
+impl AstNode for ResolvedWindowFrame {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.start.try_for_each_node(f)?;
+        self.end.try_for_each_node(f)?;
+        ControlFlow::Continue(())
+    }
+}
+
+impl Deparse for ResolvedWindowFrame {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.mode.deparse(buf);
+        buf.push_str(" BETWEEN ");
+        self.start.deparse(buf);
+        buf.push_str(" AND ");
+        self.end.deparse(buf);
+        self.exclusion.deparse(buf);
+        buf
+    }
+}
+
+/// Resolved frame bound — mirrors `ast::FrameBound`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResolvedFrameBound {
+    UnboundedPreceding,
+    OffsetPreceding(Box<ResolvedScalarExpr>),
+    CurrentRow,
+    OffsetFollowing(Box<ResolvedScalarExpr>),
+    UnboundedFollowing,
+}
+
+impl AstNode for ResolvedFrameBound {
+    fn try_for_each_node<'a, N: Any, B>(
+        &'a self,
+        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        match self {
+            ResolvedFrameBound::OffsetPreceding(e) | ResolvedFrameBound::OffsetFollowing(e) => {
+                e.try_for_each_node(f)?;
+            }
+            ResolvedFrameBound::UnboundedPreceding
+            | ResolvedFrameBound::CurrentRow
+            | ResolvedFrameBound::UnboundedFollowing => {}
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+impl Deparse for ResolvedFrameBound {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self {
+            ResolvedFrameBound::UnboundedPreceding => buf.push_str("UNBOUNDED PRECEDING"),
+            ResolvedFrameBound::CurrentRow => buf.push_str("CURRENT ROW"),
+            ResolvedFrameBound::UnboundedFollowing => buf.push_str("UNBOUNDED FOLLOWING"),
+            ResolvedFrameBound::OffsetPreceding(e) => {
+                e.deparse(buf);
+                buf.push_str(" PRECEDING");
+            }
+            ResolvedFrameBound::OffsetFollowing(e) => {
+                e.deparse(buf);
+                buf.push_str(" FOLLOWING");
+            }
+        }
+        buf
     }
 }
 
@@ -790,6 +880,12 @@ impl Deparse for ResolvedWindowSpec {
                 clause.deparse(buf);
                 sep = ", ";
             }
+        }
+        if let Some(frame) = &self.frame {
+            if !self.partition_by.is_empty() || !self.order_by.is_empty() {
+                buf.push(' ');
+            }
+            frame.deparse(buf);
         }
         buf.push(')');
         buf

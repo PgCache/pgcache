@@ -2082,6 +2082,7 @@ mod tests {
                     direction: OrderDirection::Asc,
                     null_order: NullOrder::Default,
                 }],
+                frame: None,
             }),
         };
         let mut buf = String::new();
@@ -2089,6 +2090,70 @@ mod tests {
         assert_eq!(
             buf,
             "SUM(amount) OVER (PARTITION BY category ORDER BY date ASC)"
+        );
+    }
+
+    /// Deparse the OVER clause of the first SELECT-list function in `sql`.
+    fn parse_over_deparse(sql: &str) -> String {
+        let select = parse_select(sql);
+        let SelectColumns::Columns(columns) = &select.columns else {
+            panic!("expected columns");
+        };
+        let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star column") else {
+            panic!("expected function");
+        };
+        let mut buf = String::new();
+        func.over.as_ref().expect("OVER clause").deparse(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn test_window_frame_rows_unbounded_roundtrip() {
+        // The single-bound shorthand normalizes to the explicit BETWEEN form.
+        assert_eq!(
+            parse_over_deparse("SELECT sum(a) OVER (ORDER BY b ROWS UNBOUNDED PRECEDING) FROM t",),
+            "(ORDER BY b ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)"
+        );
+    }
+
+    #[test]
+    fn test_window_frame_rows_between_following_roundtrip() {
+        assert_eq!(
+            parse_over_deparse(
+                "SELECT sum(a) OVER (ORDER BY b ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t",
+            ),
+            "(ORDER BY b ASC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)"
+        );
+    }
+
+    #[test]
+    fn test_window_frame_range_full_partition_roundtrip() {
+        assert_eq!(
+            parse_over_deparse(
+                "SELECT last_value(a) OVER (ORDER BY b \
+                 RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t",
+            ),
+            "(ORDER BY b ASC RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"
+        );
+    }
+
+    #[test]
+    fn test_window_frame_groups_exclude_roundtrip() {
+        assert_eq!(
+            parse_over_deparse(
+                "SELECT count(*) OVER (ORDER BY b \
+                 GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM t",
+            ),
+            "(ORDER BY b ASC GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE TIES)"
+        );
+    }
+
+    #[test]
+    fn test_window_default_frame_emits_nothing() {
+        // No explicit frame → no frame text (PostgreSQL's default applies).
+        assert_eq!(
+            parse_over_deparse("SELECT sum(a) OVER (ORDER BY b) FROM t"),
+            "(ORDER BY b ASC)"
         );
     }
 

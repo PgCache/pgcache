@@ -18,8 +18,8 @@
 //! Both default to no-ops so a pass only implements the hooks it uses.
 
 use crate::query::ast::{
-    JoinQual, LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns,
-    SelectNode, TableSource, WhereExpr,
+    FrameBound, JoinQual, LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
+    SelectColumns, SelectNode, TableSource, WhereExpr,
 };
 
 /// A mutable visitor over a `QueryExpr` tree.
@@ -160,6 +160,21 @@ fn where_expr_walk_mut<W: QueryWalkerMut>(
     Ok(())
 }
 
+fn frame_bound_walk_mut<W: QueryWalkerMut>(
+    bound: &mut FrameBound,
+    walker: &mut W,
+) -> Result<(), W::Error> {
+    match bound {
+        FrameBound::OffsetPreceding(e) | FrameBound::OffsetFollowing(e) => {
+            scalar_expr_walk_mut(e, walker)?;
+        }
+        FrameBound::UnboundedPreceding
+        | FrameBound::CurrentRow
+        | FrameBound::UnboundedFollowing => {}
+    }
+    Ok(())
+}
+
 fn scalar_expr_walk_mut<W: QueryWalkerMut>(
     expr: &mut ScalarExpr,
     walker: &mut W,
@@ -186,6 +201,10 @@ fn scalar_expr_walk_mut<W: QueryWalkerMut>(
                 }
                 for clause in &mut over.order_by {
                     scalar_expr_walk_mut(&mut clause.expr, walker)?;
+                }
+                if let Some(frame) = &mut over.frame {
+                    frame_bound_walk_mut(&mut frame.start, walker)?;
+                    frame_bound_walk_mut(&mut frame.end, walker)?;
                 }
             }
         }
