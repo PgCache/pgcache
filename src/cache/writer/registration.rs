@@ -1342,6 +1342,10 @@ impl WriterRegistration {
 
             core.state_ready_transition(fingerprint, generation, resolved, deparsed_sql, max_limit);
 
+            // One unit of drained registration work, for the adaptive-gate
+            // drain-rate (capacity) estimate (PGC-277).
+            core.state_view.reg_gate.completed_inc();
+
             trace!(
                 "cached query ready, cached_bytes={cached_bytes} rows={row_count} {fingerprint}"
             );

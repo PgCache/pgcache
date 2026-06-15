@@ -1771,6 +1771,13 @@ pub fn writer_run(
                         );
                     }
 
+                    // Fold the writer backlog into the adaptive-gate window every
+                    // iteration (PGC-277): catches the drain-to-empty moments the
+                    // controller's coarse tick would miss. The internal channel
+                    // (population completions) is the backlog that saturates first.
+                    let internal_depth = internal_rx.len();
+                    core.state_view.reg_gate.queue_observe(internal_depth);
+
                     // Channel depths are reported as f64 gauges; queue sizes never approach 2^53.
                     #[allow(clippy::cast_precision_loss)]
                     {
@@ -1785,7 +1792,7 @@ pub fn writer_run(
                         crate::metrics::handles()
                             .state
                             .queue_writer_internal
-                            .set(internal_rx.len() as f64);
+                            .set(internal_depth as f64);
                     }
                 }
 

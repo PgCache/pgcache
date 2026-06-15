@@ -211,6 +211,13 @@ pub mod names {
     /// Serves that finished with unconsumed bytes still in the connection read
     /// buffer — a response desync caught at its source (PGC-278).
     pub const CACHE_SERVE_DIRTY_RETURN_TOTAL: &str = "pgcache.cache.serve_dirty_return_total";
+    /// BBR-lite adaptive registration gate (PGC-277): paced admit rate (reg/s),
+    /// the windowed-max drain-rate capacity estimate (BtlBw), the backlog window
+    /// min (standing-queue signal), and the latest drain-rate sample.
+    pub const CACHE_REG_GATE_RATE: &str = "pgcache.cache.reg_gate_rate";
+    pub const CACHE_REG_GATE_BTLBW: &str = "pgcache.cache.reg_gate_btlbw";
+    pub const CACHE_REG_GATE_QUEUE_MIN: &str = "pgcache.cache.reg_gate_queue_min";
+    pub const CACHE_REG_GATE_DRAIN_RATE: &str = "pgcache.cache.reg_gate_drain_rate";
 
     // Extended protocol metrics
     pub const PROTOCOL_SIMPLE_QUERIES: &str = "pgcache.protocol.simple_queries";
@@ -402,6 +409,11 @@ pub struct CacheHandles {
     pub pool_available: Gauge,
     pub serve_stall_total: Counter,
     pub serve_dirty_return_total: Counter,
+    /// Adaptive registration gate (PGC-277).
+    pub reg_gate_rate: Gauge,
+    pub reg_gate_btlbw: Gauge,
+    pub reg_gate_queue_min: Gauge,
+    pub reg_gate_drain_rate: Gauge,
 }
 
 pub struct CdcHandles {
@@ -574,6 +586,10 @@ impl Handles {
                 pool_available: metrics::gauge!(CACHE_POOL_AVAILABLE),
                 serve_stall_total: metrics::counter!(CACHE_SERVE_STALL_TOTAL),
                 serve_dirty_return_total: metrics::counter!(CACHE_SERVE_DIRTY_RETURN_TOTAL),
+                reg_gate_rate: metrics::gauge!(CACHE_REG_GATE_RATE),
+                reg_gate_btlbw: metrics::gauge!(CACHE_REG_GATE_BTLBW),
+                reg_gate_queue_min: metrics::gauge!(CACHE_REG_GATE_QUEUE_MIN),
+                reg_gate_drain_rate: metrics::gauge!(CACHE_REG_GATE_DRAIN_RATE),
             },
             cdc: CdcHandles {
                 events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),

@@ -1,6 +1,5 @@
 use crate::query::Fingerprint;
 use std::any::Any;
-#[cfg(feature = "fault-injection")]
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -454,6 +453,10 @@ pub fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         serve_pool_size,
         cache_cancel.clone(),
     ));
+    handle.spawn(reg_gate_controller(
+        Arc::clone(&state_view),
+        cache_cancel.clone(),
+    ));
     handle.spawn(coalesce_drain(
         dispatch,
         notify_rx,
@@ -621,6 +624,112 @@ async fn memory_monitor(
         } else {
             published_cap as f64
         });
+    }
+}
+
+/// BBR-lite adaptive registration gate controller (PGC-277).
+///
+/// Models the single-threaded writer like a TCP bottleneck: its **drain rate**
+/// (registrations reaching Ready per second) is the "bandwidth", its **backlog
+/// depth** is the "queue". Each tick the controller:
+///  1. samples the drain rate and keeps a windowed **max** of it — the estimate
+///     of the writer's sustainable registration rate (BBR's `BtlBw`);
+///  2. reads the writer's backlog window **min** — `~0` means the writer drained
+///     (healthy), `> floor` means a standing queue (saturated) (BBR's `RTprop`
+///     signal, but observed directly, so no ProbeRTT drain phase is needed);
+///  3. paces the admit rate `reg_gate.reg_rate` at `BtlBw × gain`, probing the
+///     gain above 1 while healthy to discover more capacity and trimming below 1
+///     while a queue stands. There is no rate ceiling — when the writer keeps up
+///     the rate rises freely; the only floor is `R_MIN` so registration never
+///     fully stalls.
+///
+/// The dispatch token bucket reads `reg_rate` and forwards-without-registering
+/// when it is empty, so the storm is paced to what the writer can actually drain.
+async fn reg_gate_controller(state_view: Arc<CacheStateView>, cancel: CancellationToken) {
+    const TICK: Duration = Duration::from_millis(250);
+    /// Pace before any drain sample exists. Low enough to blunt the cold-start
+    /// storm; the startup ramp grows it to the knee within a few ticks.
+    const R_BOOTSTRAP: f64 = 100.0;
+    /// Floor the paced rate never drops below — registration always makes some
+    /// progress even under sustained backlog.
+    const R_MIN: f64 = 20.0;
+    /// Backlog at or below this counts as "drained" (writer kept up). The internal
+    /// queue oscillates to ~0 between bursts when healthy.
+    const DRAIN_FLOOR: usize = 8;
+    /// Drain-rate max-filter memory: BW_WINDOW × TICK (= 10s at 250ms), à la BBR.
+    const BW_WINDOW: usize = 40;
+    /// Additive-increase step (reg/s per tick) while the writer is keeping up —
+    /// probes for more capacity. AIMD: gentle up, multiplicative down.
+    const R_STEP: f64 = 50.0;
+    /// Multiplicative back-off applied each tick the backlog is *growing* — we are
+    /// admitting faster than the writer drains. BBR's inflight cap, observed
+    /// directly via the backlog instead of inferred from RTT.
+    const R_BACKOFF: f64 = 0.75;
+
+    let gate = &state_view.reg_gate;
+    let mut bw_window: VecDeque<f64> = VecDeque::with_capacity(BW_WINDOW);
+    let mut last_completed = gate.completed_count();
+    // Paced admit rate (state): AIMD toward the writer's sustainable rate.
+    let mut rate = R_BOOTSTRAP;
+    // Previous window backlog floor, for the grow/drain trend.
+    let mut prev_qmin = 0usize;
+
+    // Pace from the first cold-start query, before the controller has any signal.
+    gate.rate_set(R_BOOTSTRAP);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(TICK) => {}
+        }
+
+        let completed = gate.completed_count();
+        let drained = completed.saturating_sub(last_completed);
+        last_completed = completed;
+        #[allow(clippy::cast_precision_loss)]
+        let drain_rate = drained as f64 / TICK.as_secs_f64();
+
+        let (qmin, qmax) = gate.window_take();
+
+        // No registration load this window: hold the rate rather than probe into a
+        // void or deflate the capacity estimate with a spurious 0 sample.
+        if qmax == 0 {
+            continue;
+        }
+
+        bw_window.push_back(drain_rate);
+        if bw_window.len() > BW_WINDOW {
+            bw_window.pop_front();
+        }
+        // BtlBw analog: windowed max of the observed drain rate. Observability
+        // only — the single-thread drain rate is too bursty to *pace* at directly
+        // (it latches transient peaks above the sustainable rate), so control is
+        // driven by the backlog trend below, not by this estimate.
+        let capacity_est = bw_window.iter().copied().fold(0.0_f64, f64::max);
+
+        // Backlog trend (BBR's queue signal, observed directly):
+        //  - growing above the drain floor ⇒ admitting faster than the writer
+        //    drains ⇒ multiplicative back-off;
+        //  - fully drained ⇒ writer keeping up ⇒ additive probe for more;
+        //  - standing but shrinking ⇒ backlog clearing ⇒ hold (avoid windup —
+        //    don't keep cutting while a transient backlog drains at the current rate).
+        if qmin > DRAIN_FLOOR && qmin >= prev_qmin {
+            rate *= R_BACKOFF;
+        } else if qmin <= DRAIN_FLOOR {
+            rate += R_STEP;
+        }
+        prev_qmin = qmin;
+        rate = rate.max(R_MIN);
+        gate.rate_set(rate);
+
+        #[allow(clippy::cast_precision_loss)]
+        {
+            let m = &crate::metrics::handles().cache;
+            m.reg_gate_rate.set(rate);
+            m.reg_gate_btlbw.set(capacity_est);
+            m.reg_gate_queue_min.set(qmin as f64);
+            m.reg_gate_drain_rate.set(drain_rate);
+        }
     }
 }
 

@@ -208,6 +208,14 @@ fn pgcache_cmd(dbs: &TempDBs, listen_port: u16, metrics_port: u16, extra_args: &
         .arg("--log_level")
         .arg("info");
 
+    // Pin the PGC-277 registration admission gate open by default: every
+    // integration test predates the gate and assumes deterministic
+    // registration of its working set. A test that exercises the gate itself
+    // overrides this (env set later wins). Without it, a test that registers a
+    // burst of fingerprints (e.g. origin_traffic's warmup) is throttled and
+    // serves spurious misses.
+    cmd.env("PGCACHE_REG_RATE", "1000000");
+
     for arg in extra_args {
         cmd.arg(arg);
     }

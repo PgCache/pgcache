@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dashmap::Entry;
 
@@ -38,7 +38,7 @@ use super::{
     query::{CacheableQuery, limit_is_sufficient, limit_rows_needed},
     reply::ReplySender,
     types::{
-        CacheStateView, CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics,
+        CacheStateView, CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics, RegGate,
         SharedResolved,
     },
     write_queue::WriteQueue,
@@ -266,6 +266,70 @@ pub struct CacheDispatch {
     /// CDC-liveness flag (set by the CDC thread). While CDC is down, queries are
     /// forwarded to origin rather than served from cache, to avoid stale reads.
     cdc_connected: Arc<AtomicBool>,
+    /// PGC-277 prototype: caps the new-registration admit rate.
+    reg_bucket: Arc<RegRateBucket>,
+}
+
+/// Token bucket pacing new-query registration admission (PGC-277). The refill
+/// rate is the BBR-lite controller's `reg_gate.reg_rate` (registrations/sec),
+/// read fresh on every `try_take`; `try_take` consumes one token per admitted
+/// registration and a denied caller forwards to origin without registering.
+/// Burst is ~0.5s of the current rate so brief bursts pass but the sustained
+/// rate is held to what the writer can drain. `PGCACHE_REG_RATE` pins a fixed
+/// rate instead of the controller (testing/override).
+struct RegRateBucket {
+    inner: Mutex<(f64, Instant)>,
+    gate: Arc<RegGate>,
+    fixed_override: Option<f64>,
+}
+
+impl RegRateBucket {
+    fn new(gate: Arc<RegGate>) -> Self {
+        let fixed_override = std::env::var("PGCACHE_REG_RATE")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|r| *r > 0.0);
+        if let Some(rate) = fixed_override {
+            info!("registration rate FIXED override: {rate}/s (PGC-277 test)");
+        }
+        Self {
+            // Start full: seed the refill clock in the past so the first
+            // finite-rate `try_take` accrues a full burst. An empty start
+            // spuriously denied cold-start registrations (forwarded uncached);
+            // the rate, not an empty bucket, is what paces a storm.
+            inner: Mutex::new((
+                0.0,
+                Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now),
+            )),
+            gate,
+            fixed_override,
+        }
+    }
+
+    fn try_take(&self) -> bool {
+        let rate = self.fixed_override.unwrap_or_else(|| self.gate.rate());
+        // Ungated until the controller has set a finite rate (admit all).
+        if !rate.is_finite() {
+            return true;
+        }
+        if rate <= 0.0 {
+            return false;
+        }
+        let burst = (rate * 0.5).max(8.0);
+        let mut g = self.inner.lock().expect("lock registration bucket");
+        let now = Instant::now();
+        let elapsed = now.duration_since(g.1).as_secs_f64();
+        g.1 = now;
+        g.0 = (g.0 + elapsed * rate).min(burst);
+        if g.0 >= 1.0 {
+            g.0 -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// Connection-side handle to the current [`CacheDispatch`]. Hot-swaps across cache
@@ -352,6 +416,7 @@ impl CacheDispatch {
             None => info!("table allowlist disabled, all tables cacheable"),
         }
 
+        let reg_bucket = Arc::new(RegRateBucket::new(Arc::clone(&state_view.reg_gate)));
         Ok(Self {
             query_tx,
             serve_tx,
@@ -359,6 +424,7 @@ impl CacheDispatch {
             dynamic: settings.dynamic.clone(),
             waiting: Arc::new(CoalesceQueue::new()),
             cdc_connected,
+            reg_bucket,
         })
     }
 
@@ -619,6 +685,22 @@ impl CacheDispatch {
                     // (each registration costs in-process memory). Forward it to
                     // origin instead; already-tracked queries are unaffected.
                     if self.state_view.throttled() {
+                        crate::metrics::handles()
+                            .cache
+                            .registration_throttled_total
+                            .increment(1);
+                        return reply_forward(
+                            msg.reply_tx,
+                            msg.client_socket,
+                            msg.pipeline,
+                            msg.data,
+                            msg.timing,
+                        );
+                    }
+                    // PGC-277 prototype: cap the new-registration rate so the
+                    // population storm can't saturate the box. No token -> forward
+                    // to origin without registering (origin is the source of truth).
+                    if !self.reg_bucket.try_take() {
                         crate::metrics::handles()
                             .cache
                             .registration_throttled_total
