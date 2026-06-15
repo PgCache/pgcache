@@ -1160,7 +1160,14 @@ fn cdc_run(
                 // earlier position, so we'll receive everything from saved_lsn forward.
                 // confirmed > saved means the slot was externally advanced — events may
                 // have been skipped.
-                match slot_confirmed_lsn(settings).await {
+                let slot_check = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!("CDC cancelled during slot LSN check");
+                        return Ok(());
+                    }
+                    r = slot_confirmed_lsn(settings) => r,
+                };
+                match slot_check {
                     Ok(Some(confirmed_lsn)) => {
                         if confirmed_lsn > saved_lsn {
                             error!(
@@ -1187,14 +1194,19 @@ fn cdc_run(
                 }
 
                 // LSN matches — attempt to re-establish the replication connection
-                match CdcProcessor::new(
-                    settings,
-                    cdc_tx.clone(),
-                    Arc::clone(&active_relations),
-                    Arc::clone(&watermark_nudge),
-                )
-                .await
-                {
+                let reconnect = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        debug!("CDC cancelled during reconnect");
+                        return Ok(());
+                    }
+                    r = CdcProcessor::new(
+                        settings,
+                        cdc_tx.clone(),
+                        Arc::clone(&active_relations),
+                        Arc::clone(&watermark_nudge),
+                    ) => r,
+                };
+                match reconnect {
                     Ok(new_cdc) => {
                         cdc = new_cdc;
                         debug!("CDC reconnected");
