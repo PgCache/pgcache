@@ -22,7 +22,7 @@ use crate::query::ast::{AstNode, Deparse, QueryBody, QueryExpr, TableNode};
 use crate::query::constraints::{
     TableConstraint, analyze_query_constraints, table_constraints_subsumed,
 };
-use crate::query::decorrelate::{DecorrelateError, query_expr_decorrelate};
+use crate::query::decorrelate::query_expr_decorrelate;
 use crate::query::evaluate::resolved_where_expr_supported;
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns,
@@ -411,17 +411,24 @@ impl WriterRegistration {
                     )
                     .await
                 {
-                    // Some registration failures are routing decisions (the
-                    // query simply isn't cacheable and is forwarded to origin),
-                    // not faults — log at debug so swallowed-error scanners
-                    // don't treat an expected forward as a fault. A table with
-                    // no primary key surfaces as `UnknownTable` (PGC-135, the
-                    // documented "forwarded silently" path); a correlated
-                    // subquery that can't be decorrelated as `NonDecorrelatable`.
+                    // Most registration failures are routing decisions (the
+                    // query isn't cacheable and is forwarded to origin), not
+                    // faults — log at debug so swallowed-error scanners don't
+                    // treat an expected forward as a fault. A table with no
+                    // primary key surfaces as `UnknownTable` (PGC-135, the
+                    // documented "forwarded silently" path); a query the
+                    // resolver can't model (ambiguous self-join columns,
+                    // USING/NATURAL qualifiers, etc.) as a `ResolveError`; a
+                    // correlated subquery that can't be decorrelated as a
+                    // `DecorrelateError`. A forwarded query still returns the
+                    // correct result; a wrong cached result is caught by the
+                    // result-diff path, and "should have cached" by routing
+                    // assertions — neither relies on this error log.
                     let ctx = e.current_context();
                     if matches!(
                         ctx,
-                        CacheError::DecorrelateError(DecorrelateError::NonDecorrelatable { .. })
+                        CacheError::DecorrelateError(_)
+                            | CacheError::ResolveError(_)
                             | CacheError::UnknownTable { .. }
                     ) {
                         debug!(
