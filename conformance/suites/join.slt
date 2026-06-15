@@ -1,8 +1,9 @@
 # Curated port of PostgreSQL src/test/regress/sql/join.sql — the
 # join-semantics core (correlation names, CROSS / INNER / USING /
-# NATURAL / non-equi / OUTER joins). Run against the j1_tbl / j2_tbl
-# fixtures (loaded by the harness before this suite; surrogate *_pk
-# columns appended — see conformance/src/fixtures.rs).
+# NATURAL / non-equi / OUTER joins, plus int4/int8 outer-join NULL
+# padding and multiway joins). Run against the j1_tbl / j2_tbl /
+# int4_tbl / int8_tbl / onek fixtures (loaded by the harness before this
+# suite; surrogate *_pk columns appended — see conformance/src/fixtures.rs).
 #
 # Origin is the oracle: no results are inlined. Each query runs on
 # origin and pgcache and the result sets are compared, plus the pgcache
@@ -17,13 +18,16 @@
 #     so those tests would assert alias arithmetic rather than join
 #     correctness. (Both engines stay consistent, but the test loses its
 #     point.)
-#   * tenk1 / int4_tbl / int8_tbl / multiway (t1,t2,t3) / nullability
-#     (x,y) sections are deferred to a follow-up port.
+#   * tenk1 sections are almost entirely EXPLAIN/planner tests; the few
+#     result-bearing multiway shapes are adapted to onek rather than
+#     vendoring a 10k-row table.
+#   * The int4_tbl / int8_tbl, multiway, and nullability sections are
+#     ported below against the int fixtures — outer-join NULL padding via
+#     non-matching keys covers the nullability cases without separate
+#     x/y tables.
 #
-# Routing is annotated `any` for v1 (correctness-first). The end-to-end
-# run establishes which shapes pgcache actually caches; annotations are
-# then tightened per shape to lock that behavior as the regression
-# baseline.
+# Routing is annotated per shape (cached / passthrough) to lock pgcache's
+# actual behavior as the regression baseline.
 
 #
 # CORRELATION NAMES — table/column aliases.
@@ -148,3 +152,80 @@ SELECT *
 query TTTTT
 SELECT *
   FROM j1_tbl LEFT JOIN j2_tbl USING (i) WHERE (i = 1);
+
+#
+# int8_tbl equi self-join — duplicate q1 values produce a small product.
+#
+
+# pgcache: cached
+query TTT
+SELECT a.q1, a.q2, b.q2
+  FROM int8_tbl a JOIN int8_tbl b ON a.q1 = b.q1
+  ORDER BY a.q1, a.q2, b.q2;
+
+#
+# int4 / int8 outer joins — the keys never match, so the outer side is
+# entirely NULL-padded (the upstream nullability coverage).
+#
+
+# LEFT JOIN: every int4 row kept, int8 columns NULL.
+# pgcache: cached
+query TT
+SELECT i4.f1, i8.q2
+  FROM int4_tbl i4 LEFT JOIN int8_tbl i8 ON i4.f1 = i8.q1
+  ORDER BY i4.f1;
+
+# RIGHT JOIN: every int8 row kept, int4 column NULL.
+# pgcache: cached
+query TTT
+SELECT i4.f1, i8.q1, i8.q2
+  FROM int4_tbl i4 RIGHT JOIN int8_tbl i8 ON i4.f1 = i8.q1
+  ORDER BY i8.q1, i8.q2;
+
+# Anti-join via LEFT JOIN ... IS NULL on the inner side.
+# pgcache: cached
+query T
+SELECT i4.f1
+  FROM int4_tbl i4 LEFT JOIN int8_tbl i8 ON i4.f1 = i8.q1
+  WHERE i8.q1 IS NULL
+  ORDER BY i4.f1;
+
+# Non-equi join — forwarded.
+# pgcache: passthrough
+query TT
+SELECT i4.f1, i8.q1
+  FROM int4_tbl i4 JOIN int8_tbl i8 ON i4.f1 < i8.q1
+  ORDER BY i4.f1, i8.q1;
+
+# FULL OUTER — both sides optional, forwarded.
+# pgcache: passthrough
+query TT
+SELECT i4.f1, i8.q1
+  FROM int4_tbl i4 FULL OUTER JOIN int8_tbl i8 ON i4.f1 = i8.q1
+  ORDER BY i4.f1, i8.q1;
+
+#
+# Multiway joins.
+#
+
+# Nested outer joins: the NULL from the first LEFT JOIN cascades into the
+# second join condition.
+# pgcache: cached
+query TTT
+SELECT i4.f1, a.q1, b.q2
+  FROM int4_tbl i4
+       LEFT JOIN int8_tbl a ON i4.f1 = a.q1
+       LEFT JOIN int8_tbl b ON a.q2 = b.q1
+  ORDER BY i4.f1;
+
+# Three-way inner join over onek (adapted from the upstream tenk1
+# multiway shapes). unique1/unique2 are unique, so each step matches one
+# row; bounded by the predicate on the first table.
+# pgcache: cached
+query TTT
+SELECT a.unique1, b.unique1, c.unique1
+  FROM onek a
+       JOIN onek b ON a.unique2 = b.unique1
+       JOIN onek c ON b.unique2 = c.unique1
+  WHERE a.unique1 < 3
+  ORDER BY a.unique1, b.unique1, c.unique1;

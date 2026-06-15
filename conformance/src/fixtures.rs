@@ -85,6 +85,37 @@ const J2_TBL_DATA: &str = "INSERT INTO j2_tbl (i, k, j2_pk) VALUES
     (NULL, NULL, 8),
     (NULL, 0, 9)";
 
+/// `int4_tbl` / `int8_tbl` from `src/test/regress/sql/test_setup.sql`,
+/// the integer fixtures the upstream join suite uses for outer-join NULL
+/// padding, non-equi joins, and overflow-edge values. Upstream they have
+/// no key; a surrogate `*_pk` is appended (pgcache caches only tables
+/// with a PK — PGC-135). Suites select explicit columns, so the surrogate
+/// never appears in compared output.
+const INT4_TBL_DDL: &str = "CREATE TABLE int4_tbl (
+    f1      integer,
+    int4_pk integer PRIMARY KEY
+)";
+
+const INT4_TBL_DATA: &str = "INSERT INTO int4_tbl (f1, int4_pk) VALUES
+    (0, 1),
+    (123456, 2),
+    (-123456, 3),
+    (2147483647, 4),
+    (-2147483647, 5)";
+
+const INT8_TBL_DDL: &str = "CREATE TABLE int8_tbl (
+    q1      bigint,
+    q2      bigint,
+    int8_pk integer PRIMARY KEY
+)";
+
+const INT8_TBL_DATA: &str = "INSERT INTO int8_tbl (q1, q2, int8_pk) VALUES
+    (123, 456, 1),
+    (123, 4567890123456789, 2),
+    (4567890123456789, 123, 3),
+    (4567890123456789, 4567890123456789, 4),
+    (4567890123456789, -4567890123456789, 5)";
+
 /// `foo` from `src/test/regress/sql/select.sql` (the ORDER BY / NULLS
 /// section). Upstream `foo (f1 int)` with rows `(42),(3),(10),(7),
 /// (null),(null),(1)`. A surrogate `foo_pk` is appended (pgcache caches
@@ -161,6 +192,8 @@ pub async fn join_tables_load(client: &Client, publication: Option<&str>) -> Res
     for (table, ddl, data) in [
         ("j1_tbl", J1_TBL_DDL, J1_TBL_DATA),
         ("j2_tbl", J2_TBL_DDL, J2_TBL_DATA),
+        ("int4_tbl", INT4_TBL_DDL, INT4_TBL_DATA),
+        ("int8_tbl", INT8_TBL_DDL, INT8_TBL_DATA),
     ] {
         client
             .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
