@@ -68,7 +68,8 @@ SELECT unique1 FROM b ORDER BY unique1;
 # Multiple CTEs joined together.
 #
 
-# pgcache: cached
+# j1_tbl/j2_tbl are keyless (verbatim upstream) — forwarded.
+# pgcache: passthrough
 query TT
 WITH a AS (SELECT i, k FROM j2_tbl),
      b AS (SELECT i, j FROM j1_tbl)

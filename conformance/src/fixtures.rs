@@ -166,15 +166,23 @@ pub async fn join_tables_load(client: &Client, publication: Option<&str>) -> Res
         .batch_execute("DROP TABLE IF EXISTS j1_tbl, j2_tbl, t1, t2, t3, x, y CASCADE")
         .await
         .context("dropping existing join fixtures")?;
-    let tables = [("j1_tbl", J1_TBL_DDL, J1_TBL_DATA), ("j2_tbl", J2_TBL_DDL, J2_TBL_DATA)]
-        .into_iter()
-        .chain(JOIN_AUX_TABLES.iter().copied());
-    for (table, ddl, data) in tables {
+    // j1_tbl/j2_tbl are keyless → forwarded, and a keyless table must not
+    // enter the CDC publication (pgcache's decoder stalls on changes for a
+    // relation with no replica identity). The keyed aux tables are published.
+    let tables = [
+        ("j1_tbl", J1_TBL_DDL, J1_TBL_DATA, false),
+        ("j2_tbl", J2_TBL_DDL, J2_TBL_DATA, false),
+    ]
+    .into_iter()
+    .chain(JOIN_AUX_TABLES.iter().map(|(t, d, i)| (*t, *d, *i, true)));
+    for (table, ddl, data, publish) in tables {
         client
             .batch_execute(ddl)
             .await
             .with_context(|| format!("creating {table}"))?;
-        publication_table_ensure(client, publication, table).await?;
+        if publish {
+            publication_table_ensure(client, publication, table).await?;
+        }
         client
             .batch_execute(data)
             .await
@@ -481,6 +489,33 @@ pub async fn aggregates_tables_load(client: &Client, publication: Option<&str>) 
     table_copy(client, "bool_test", BOOL_TEST_DATA).await?;
 
     tracing::info!("loaded aggregate fixtures");
+    Ok(())
+}
+
+/// `subselect_tbl` from `src/test/regress/sql/subselect.sql`. Upstream is
+/// keyless; `(f1, f2)` is unique, so a composite PRIMARY KEY is added for
+/// cache coverage (PGC-135). NB: row-constructor IN-subqueries over a
+/// composite-PK table currently hang population (PGC-285).
+pub async fn subselect_tables_load(client: &Client, publication: Option<&str>) -> Result<()> {
+    client
+        .batch_execute("DROP TABLE IF EXISTS subselect_tbl CASCADE")
+        .await
+        .context("dropping existing subselect_tbl")?;
+    client
+        .batch_execute(
+            "CREATE TABLE subselect_tbl (f1 integer, f2 integer, f3 float, PRIMARY KEY (f1, f2))",
+        )
+        .await
+        .context("creating subselect_tbl")?;
+    publication_table_ensure(client, publication, "subselect_tbl").await?;
+    client
+        .batch_execute(
+            "INSERT INTO subselect_tbl VALUES (1,2,3),(2,3,4),(3,4,5),(1,1,1),\
+             (2,2,2),(3,3,3),(6,7,8),(8,9,NULL)",
+        )
+        .await
+        .context("loading subselect_tbl")?;
+    tracing::info!(table = "subselect_tbl", "loaded subselect fixture");
     Ok(())
 }
 

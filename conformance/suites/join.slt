@@ -1,231 +1,341 @@
-# Curated port of PostgreSQL src/test/regress/sql/join.sql — the
-# join-semantics core (correlation names, CROSS / INNER / USING /
-# NATURAL / non-equi / OUTER joins, plus int4/int8 outer-join NULL
-# padding and multiway joins). Run against the j1_tbl / j2_tbl /
-# int4_tbl / int8_tbl / onek fixtures (loaded by the harness before this
-# suite; surrogate *_pk columns appended — see conformance/src/fixtures.rs).
+# Faithful port of PostgreSQL src/test/regress/sql/join.sql — the
+# result-bearing join-semantics selects, whether pgcache caches or
+# forwards them. Run against j1_tbl/j2_tbl (verbatim, keyless → forward),
+# the t1/t2/t3 multiway and x/y nullability fixtures, and the shared
+# test_setup tables (onek, tenk1, int4_tbl, int8_tbl, float8_tbl).
 #
-# Origin is the oracle: no results are inlined. Each query runs on
-# origin and pgcache and the result sets are compared, plus the pgcache
-# log is scanned for swallowed errors.
+# Origin is the oracle: no results inlined. Compared row-wise with a
+# top-level ORDER BY, else as a sorted multiset; the pgcache log is
+# scanned for swallowed errors. Routing annotated per shape.
 #
-# Scope deviations from upstream join.sql:
-#   * EXPLAIN / planner-internal sections (self-join removal, placeholder
-#     vars, hash-join multi-key) are omitted — they assert plans, not
-#     result sets, and don't exercise pgcache's cache/invalidate path.
-#   * Positional column-alias-arity curiosities over CROSS JOIN are
-#     omitted: the appended surrogate column shifts ordinal positions,
-#     so those tests would assert alias arithmetic rather than join
-#     correctness. (Both engines stay consistent, but the test loses its
-#     point.)
-#   * tenk1 sections are almost entirely EXPLAIN/planner tests; the few
-#     result-bearing multiway shapes are adapted to onek rather than
-#     vendoring a 10k-row table.
-#   * The int4_tbl / int8_tbl, multiway, and nullability sections are
-#     ported below against the int fixtures — outer-join NULL padding via
-#     non-matching keys covers the nullability cases without separate
-#     x/y tables.
+# Excluded from upstream join.sql (cannot be result-diffed, or out of
+# scope):
+#   * The large planner sections — join removal, unique self-join
+#     removal, LATERAL planner tests, partition-wise join, memoize,
+#     parameterized paths, GEQO — are EXPLAIN-driven and build dozens of
+#     bespoke per-test temp tables; they assert plans, not join results.
+#   * EXPLAIN blocks throughout.
+#   * Error-expecting selects (the USING-alias scope `-- error` cases,
+#     ambiguous-column cases).
+#   * b_star / inheritance-hierarchy joins (a_star..f_star fixtures) and
+#     the `onerow` 0-column helper.
 #
-# Routing is annotated per shape (cached / passthrough) to lock pgcache's
-# actual behavior as the regression baseline.
+# j1_tbl/j2_tbl are keyless (verbatim upstream) so every j-table join
+# forwards; cache coverage for joins comes from the keyed t1/t2/t3, x/y,
+# onek, and tenk1 fixtures.
+#
+# Four queries are kept correctly-red on PGC-283 (USING/NATURAL joins over
+# derived tables cache a wrong result). The x/y self-joins forward via
+# PGC-256 (self-join column-alias resolution) and are annotated passthrough.
 
 #
 # CORRELATION NAMES — table/column aliases.
 #
 
-# A comma-join of column-alias-list tables with the join predicate in
-# WHERE — pgcache forwards this shape (not cached).
+# pgcache: passthrough
+query TTT
+SELECT * FROM j1_tbl AS tx;
+
+# pgcache: passthrough
+query TTT
+SELECT * FROM j1_tbl tx;
+
+# pgcache: passthrough
+query TTT
+SELECT * FROM j1_tbl AS t1 (a, b, c);
+
+# pgcache: passthrough
+query TTT
+SELECT * FROM j1_tbl t1 (a, b, c);
+
+# pgcache: passthrough
+query TTTTT
+SELECT * FROM j1_tbl t1 (a, b, c), j2_tbl t2 (d, e);
+
+# Comma join with the predicate in WHERE (PGC-143).
 # pgcache: passthrough
 query TT
-SELECT t1.a, t2.e
-  FROM j1_tbl t1 (a, b, c), j2_tbl t2 (d, e)
-  WHERE t1.a = t2.d;
+SELECT t1.a, t2.e FROM j1_tbl t1 (a, b, c), j2_tbl t2 (d, e) WHERE t1.a = t2.d;
 
 #
-# CROSS JOIN — degenerates into an unqualified inner join.
+# CROSS JOIN.
 #
 
-# pgcache: cached
+# pgcache: passthrough
+query TTTTT
+SELECT * FROM j1_tbl CROSS JOIN j2_tbl;
+
+# pgcache: passthrough
 query TTT
-SELECT t1.i, k, t
-  FROM j1_tbl t1 CROSS JOIN j2_tbl t2;
+SELECT t1.i, k, t FROM j1_tbl t1 CROSS JOIN j2_tbl t2;
+
+# pgcache: passthrough
+query TTT
+SELECT ii, tt, kk FROM (j1_tbl CROSS JOIN j2_tbl) AS tx (ii, jj, tt, ii2, kk);
+
+# pgcache: passthrough
+query TTT
+SELECT tx.ii, tx.jj, tx.kk
+  FROM (j1_tbl t1 (a, b, c) CROSS JOIN j2_tbl t2 (d, e)) AS tx (ii, jj, tt, ii2, kk);
+
+# pgcache: passthrough
+query TTTTTTT
+SELECT * FROM j1_tbl CROSS JOIN j2_tbl a CROSS JOIN j2_tbl b;
 
 #
-# INNER JOIN with USING — the joined column appears once.
+# INNER JOIN with USING.
 #
 
-# pgcache: cached
+# pgcache: passthrough
 query TTTTT
-SELECT *
-  FROM j1_tbl INNER JOIN j2_tbl USING (i);
+SELECT * FROM j1_tbl INNER JOIN j2_tbl USING (i);
 
-# Same as above, slightly different syntax.
-# pgcache: cached
+# pgcache: passthrough
 query TTTTT
-SELECT *
-  FROM j1_tbl JOIN j2_tbl USING (i);
+SELECT * FROM j1_tbl JOIN j2_tbl USING (i);
 
-#
-# NATURAL JOIN — inner equi-join on all same-named columns. The
-# surrogate PKs are distinctly named (j1_pk / j2_pk), so the only
-# common column is `i`, exactly as upstream.
-#
+# pgcache: passthrough
+query TTTT
+SELECT * FROM j1_tbl t1 (a, b, c) JOIN j2_tbl t2 (a, d) USING (a) ORDER BY a, d;
 
-# pgcache: cached
+# pgcache: passthrough
+query TTTT
+SELECT * FROM j1_tbl t1 (a, b, c) JOIN j2_tbl t2 (a, b) USING (b) ORDER BY b, t1.a;
+
+# Join-alias forms (the `-- ok` cases; the `-- error` scope cases omitted).
+# pgcache: passthrough
 query TTTTT
-SELECT *
-  FROM j1_tbl NATURAL JOIN j2_tbl;
+SELECT * FROM j1_tbl JOIN j2_tbl USING (i) WHERE j1_tbl.t = 'one';
 
-# Renamed so the common column is the aliased `a`.
-# pgcache: cached
+# pgcache: passthrough
 query TTTTT
-SELECT *
-  FROM j1_tbl t1 (a, b, c) NATURAL JOIN j2_tbl t2 (a, d);
+SELECT * FROM j1_tbl JOIN j2_tbl USING (i) AS x WHERE j1_tbl.t = 'one';
+
+# pgcache: passthrough
+query TTTTT
+SELECT * FROM j1_tbl JOIN j2_tbl USING (i) AS x WHERE x.i = 1;
+
+# pgcache: passthrough
+query TTTTT
+SELECT x.* FROM j1_tbl JOIN j2_tbl USING (i) AS x WHERE j1_tbl.t = 'one';
+
+# pgcache: passthrough
+query T
+SELECT row_to_json(x.*) FROM j1_tbl JOIN j2_tbl USING (i) AS x WHERE j1_tbl.t = 'one';
 
 #
-# INNER JOIN with ON.
+# NATURAL JOIN.
 #
 
-# pgcache: cached
-query TTTTTT
-SELECT *
-  FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i);
+# pgcache: passthrough
+query TTTT
+SELECT * FROM j1_tbl NATURAL JOIN j2_tbl;
 
-# pgcache: cached
-query TTTTTT
-SELECT *
-  FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.k);
+# pgcache: passthrough
+query TTTT
+SELECT * FROM j1_tbl t1 (a, b, c) NATURAL JOIN j2_tbl t2 (a, d);
+
+# pgcache: passthrough
+query TTTT
+SELECT * FROM j1_tbl t1 (a, b, c) NATURAL JOIN j2_tbl t2 (d, a);
+
+# pgcache: passthrough
+query TTTTT
+SELECT * FROM j1_tbl t1 (a, b) NATURAL JOIN j2_tbl t2 (a);
 
 #
-# Non-equi-join.
+# INNER JOIN with ON / non-equi.
 #
 
 # pgcache: passthrough
 query TTTTTT
-SELECT *
-  FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i <= j2_tbl.k);
+SELECT * FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i);
+
+# pgcache: passthrough
+query TTTTTT
+SELECT * FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.k);
+
+# pgcache: passthrough
+query TTTTTT
+SELECT * FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i <= j2_tbl.k);
 
 #
 # OUTER joins (OUTER is a noise word).
 #
 
-# pgcache: cached
+# pgcache: passthrough
 query TTTTT
-SELECT *
-  FROM j1_tbl LEFT OUTER JOIN j2_tbl USING (i)
-  ORDER BY i, k, t;
-
-# pgcache: cached
-query TTTTT
-SELECT *
-  FROM j1_tbl LEFT JOIN j2_tbl USING (i)
-  ORDER BY i, k, t;
-
-# pgcache: cached
-query TTTTT
-SELECT *
-  FROM j1_tbl RIGHT OUTER JOIN j2_tbl USING (i);
-
-# pgcache: cached
-query TTTTT
-SELECT *
-  FROM j1_tbl RIGHT JOIN j2_tbl USING (i);
+SELECT * FROM j1_tbl LEFT OUTER JOIN j2_tbl USING (i) ORDER BY i, k, t;
 
 # pgcache: passthrough
 query TTTTT
-SELECT *
-  FROM j1_tbl FULL OUTER JOIN j2_tbl USING (i)
-  ORDER BY i, k, t;
+SELECT * FROM j1_tbl LEFT JOIN j2_tbl USING (i) ORDER BY i, k, t;
 
 # pgcache: passthrough
 query TTTTT
-SELECT *
-  FROM j1_tbl FULL JOIN j2_tbl USING (i)
-  ORDER BY i, k, t;
+SELECT * FROM j1_tbl RIGHT OUTER JOIN j2_tbl USING (i);
 
-# pgcache: cached
+# pgcache: passthrough
 query TTTTT
-SELECT *
-  FROM j1_tbl LEFT JOIN j2_tbl USING (i) WHERE (k = 1);
+SELECT * FROM j1_tbl RIGHT JOIN j2_tbl USING (i);
 
-# pgcache: cached
+# pgcache: passthrough
 query TTTTT
-SELECT *
-  FROM j1_tbl LEFT JOIN j2_tbl USING (i) WHERE (i = 1);
+SELECT * FROM j1_tbl FULL OUTER JOIN j2_tbl USING (i) ORDER BY i, k, t;
+
+# pgcache: passthrough
+query TTTTT
+SELECT * FROM j1_tbl FULL JOIN j2_tbl USING (i) ORDER BY i, k, t;
+
+# pgcache: passthrough
+query TTTTT
+SELECT * FROM j1_tbl LEFT JOIN j2_tbl USING (i) WHERE (k = 1);
+
+# pgcache: passthrough
+query TTTTT
+SELECT * FROM j1_tbl LEFT JOIN j2_tbl USING (i) WHERE (i = 1);
 
 #
-# int8_tbl equi self-join — duplicate q1 values produce a small product.
+# Multiway full join and join/subquery interactions (t1/t2/t3).
 #
 
+# USING/NATURAL over derived tables (subqueries) is cached but returns a
+# wrong result — PGC-283 (correctly red). The INNER/LEFT/NATURAL-INNER/
+# NATURAL-LEFT forms below cache-and-diverge; the FULL forms forward.
+
+# pgcache: passthrough
+query TTTT
+SELECT * FROM t1 FULL JOIN t2 USING (name) FULL JOIN t3 USING (name);
+
+# PGC-283 (correctly red)
 # pgcache: cached
 query TTT
-SELECT a.q1, a.q2, b.q2
-  FROM int8_tbl a JOIN int8_tbl b ON a.q1 = b.q1
-  ORDER BY a.q1, a.q2, b.q2;
+SELECT * FROM (SELECT * FROM t2) AS s2 INNER JOIN (SELECT * FROM t3) s3 USING (name);
+
+# PGC-283 (correctly red)
+# pgcache: cached
+query TTT
+SELECT * FROM (SELECT * FROM t2) AS s2 LEFT JOIN (SELECT * FROM t3) s3 USING (name);
+
+# pgcache: passthrough
+query TTT
+SELECT * FROM (SELECT * FROM t2) AS s2 FULL JOIN (SELECT * FROM t3) s3 USING (name);
+
+# NATURAL joins over subqueries with non-nullable constant columns.
+# PGC-283 (correctly red)
+# pgcache: cached
+query TTTTT
+SELECT * FROM
+  (SELECT name, n AS s2_n, 2 AS s2_2 FROM t2) AS s2
+  NATURAL INNER JOIN
+  (SELECT name, n AS s3_n, 3 AS s3_2 FROM t3) s3;
+
+# PGC-283 (correctly red)
+# pgcache: cached
+query TTTTT
+SELECT * FROM
+  (SELECT name, n AS s2_n, 2 AS s2_2 FROM t2) AS s2
+  NATURAL LEFT JOIN
+  (SELECT name, n AS s3_n, 3 AS s3_2 FROM t3) s3;
+
+# pgcache: passthrough
+query TTTTT
+SELECT * FROM
+  (SELECT name, n AS s2_n, 2 AS s2_2 FROM t2) AS s2
+  NATURAL FULL JOIN
+  (SELECT name, n AS s3_n, 3 AS s3_2 FROM t3) s3;
+
+# 3-way natural join over subqueries — forwarded (USING/NATURAL not yet
+# cacheable for this shape).
+# pgcache: passthrough
+query TTTTTTT
+SELECT * FROM
+  (SELECT name, n AS s1_n, 1 AS s1_1 FROM t1) AS s1
+  NATURAL INNER JOIN
+  (SELECT name, n AS s2_n, 2 AS s2_2 FROM t2) AS s2
+  NATURAL INNER JOIN
+  (SELECT name, n AS s3_n, 3 AS s3_2 FROM t3) s3;
+
+# pgcache: passthrough
+query TTTTTTT
+SELECT * FROM
+  (SELECT name, n AS s1_n, 1 AS s1_1 FROM t1) AS s1
+  NATURAL FULL JOIN
+  (SELECT name, n AS s2_n, 2 AS s2_2 FROM t2) AS s2
+  NATURAL FULL JOIN
+  (SELECT name, n AS s3_n, 3 AS s3_2 FROM t3) s3;
+
+# Constants as join keys.
+# pgcache: passthrough
+query TTTT
+SELECT * FROM
+  (SELECT name, n AS s1_n FROM t1) AS s1
+  FULL JOIN
+  (SELECT name, 2 AS s2_n FROM t2) AS s2
+  ON (s1_n = s2_n);
 
 #
-# int4 / int8 outer joins — the keys never match, so the outer side is
-# entirely NULL-padded (the upstream nullability coverage).
+# Propagation of nullability constraints into sub-joins (x/y). The outer
+# joins below forward; the self-joins additionally hit PGC-256 (self-join
+# column-alias resolution).
 #
 
-# LEFT JOIN: every int4 row kept, int8 columns NULL.
 # pgcache: cached
 query TT
-SELECT i4.f1, i8.q2
-  FROM int4_tbl i4 LEFT JOIN int8_tbl i8 ON i4.f1 = i8.q1
-  ORDER BY i4.f1;
+SELECT * FROM x ORDER BY x1;
 
-# RIGHT JOIN: every int8 row kept, int4 column NULL.
 # pgcache: cached
-query TTT
-SELECT i4.f1, i8.q1, i8.q2
-  FROM int4_tbl i4 RIGHT JOIN int8_tbl i8 ON i4.f1 = i8.q1
-  ORDER BY i8.q1, i8.q2;
-
-# Anti-join via LEFT JOIN ... IS NULL on the inner side.
-# pgcache: cached
-query T
-SELECT i4.f1
-  FROM int4_tbl i4 LEFT JOIN int8_tbl i8 ON i4.f1 = i8.q1
-  WHERE i8.q1 IS NULL
-  ORDER BY i4.f1;
-
-# Non-equi join — forwarded.
-# pgcache: passthrough
 query TT
-SELECT i4.f1, i8.q1
-  FROM int4_tbl i4 JOIN int8_tbl i8 ON i4.f1 < i8.q1
-  ORDER BY i4.f1, i8.q1;
+SELECT * FROM y ORDER BY y1;
 
-# FULL OUTER — both sides optional, forwarded.
 # pgcache: passthrough
-query TT
-SELECT i4.f1, i8.q1
-  FROM int4_tbl i4 FULL OUTER JOIN int8_tbl i8 ON i4.f1 = i8.q1
-  ORDER BY i4.f1, i8.q1;
+query TTTT
+SELECT * FROM x LEFT JOIN y ON (x1 = y1 AND x2 IS NOT NULL) ORDER BY x1, y1;
+
+# pgcache: passthrough
+query TTTT
+SELECT * FROM x LEFT JOIN y ON (x1 = y1 AND y2 IS NOT NULL) ORDER BY x1, y1;
+
+# pgcache: passthrough
+query TTTTTT
+SELECT * FROM (x LEFT JOIN y ON (x1 = y1)) LEFT JOIN x xx(xx1,xx2)
+ON (x1 = xx1) ORDER BY x1, y1;
+
+# pgcache: passthrough
+query TTTTTT
+SELECT * FROM (x LEFT JOIN y ON (x1 = y1)) LEFT JOIN x xx(xx1,xx2)
+ON (x1 = xx1 AND x2 IS NOT NULL) ORDER BY x1, y1;
+
+# These should NOT give the same answers as above (WHERE vs ON).
+# pgcache: passthrough
+query TTTTTT
+SELECT * FROM (x LEFT JOIN y ON (x1 = y1)) LEFT JOIN x xx(xx1,xx2)
+ON (x1 = xx1) WHERE (x2 IS NOT NULL) ORDER BY x1, y1;
+
+# pgcache: passthrough
+query TTTTTT
+SELECT * FROM (x LEFT JOIN y ON (x1 = y1)) LEFT JOIN x xx(xx1,xx2)
+ON (x1 = xx1) WHERE (y2 IS NOT NULL) ORDER BY x1, y1;
 
 #
-# Multiway joins.
+# tenk1 IN-subquery regression checks.
 #
 
-# Nested outer joins: the NULL from the first LEFT JOIN cascades into the
-# second join condition.
 # pgcache: cached
-query TTT
-SELECT i4.f1, a.q1, b.q2
-  FROM int4_tbl i4
-       LEFT JOIN int8_tbl a ON i4.f1 = a.q1
-       LEFT JOIN int8_tbl b ON a.q2 = b.q1
-  ORDER BY i4.f1;
+query I
+SELECT count(*) FROM tenk1 a WHERE unique1 IN
+  (SELECT unique1 FROM tenk1 b JOIN tenk1 c USING (unique1) WHERE b.unique2 = 42);
 
-# Three-way inner join over onek (adapted from the upstream tenk1
-# multiway shapes). unique1/unique2 are unique, so each step matches one
-# row; bounded by the predicate on the first table.
-# pgcache: cached
-query TTT
-SELECT a.unique1, b.unique1, c.unique1
-  FROM onek a
-       JOIN onek b ON a.unique2 = b.unique1
-       JOIN onek c ON b.unique2 = c.unique1
-  WHERE a.unique1 < 3
-  ORDER BY a.unique1, b.unique1, c.unique1;
+# pgcache: passthrough
+query I
+SELECT count(*) FROM tenk1 x WHERE
+  x.unique1 IN (SELECT a.f1 FROM int4_tbl a, float8_tbl b WHERE a.f1 = b.f1) AND
+  x.unique1 = 0 AND
+  x.unique1 IN (SELECT aa.f1 FROM int4_tbl aa, float8_tbl bb WHERE aa.f1 = bb.f1);
+
+# Empty-FROM subquery underneath an outer join.
+# pgcache: passthrough
+query TTTT
+SELECT * FROM int8_tbl i1 LEFT JOIN (int8_tbl i2 JOIN
+  (SELECT 123 AS x) ss ON i2.q1 = x) ON i1.q2 = i2.q2
+ORDER BY 1, 2;
