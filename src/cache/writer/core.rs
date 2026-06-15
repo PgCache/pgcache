@@ -1039,8 +1039,10 @@ impl WriterCore {
         }
         // Re-resolve the effective cap (config may have changed via PUT /config,
         // and the auto value tracks disk_total).
-        self.disk_limit_effective =
-            crate::memory::disk_limit_resolve(self.disk_total, self.cache.dynamic.load().disk_limit);
+        self.disk_limit_effective = crate::memory::disk_limit_resolve(
+            self.disk_total,
+            self.cache.dynamic.load().disk_limit,
+        );
     }
 
     /// Bytes in use on the cache volume (whole-filesystem, not cache-table
@@ -1404,7 +1406,9 @@ impl WriterCore {
         let dynamic = cache.dynamic.load();
         let cache_status = CacheStatusData {
             size_bytes: usize::try_from(self.disk_used()).unwrap_or(usize::MAX),
-            size_limit_bytes: Some(usize::try_from(self.disk_limit_effective).unwrap_or(usize::MAX)),
+            size_limit_bytes: Some(
+                usize::try_from(self.disk_limit_effective).unwrap_or(usize::MAX),
+            ),
             generation: cache.generation_counter,
             tables_tracked: cache.tables.len(),
             policy: format!("{:?}", dynamic.cache_policy),

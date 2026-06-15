@@ -276,7 +276,10 @@ pub fn disk_reserve_auto(total: u64) -> u64 {
 /// (`total − reserve`). The single place the optional config is defaulted, so
 /// the rest of the writer works with a concrete limit (PGC-276).
 pub fn disk_limit_resolve(total: u64, configured: Option<usize>) -> u64 {
-    configured.map_or_else(|| total.saturating_sub(disk_reserve_auto(total)), |l| l as u64)
+    configured.map_or_else(
+        || total.saturating_sub(disk_reserve_auto(total)),
+        |l| l as u64,
+    )
 }
 
 // Pure parsing helpers, kept platform-independent so they are unit-testable on
