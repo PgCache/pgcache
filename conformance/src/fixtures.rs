@@ -437,6 +437,48 @@ pub async fn test_setup_load(client: &Client, publication: Option<&str>) -> Resu
     Ok(())
 }
 
+const AGG_DATA: &str = include_str!("../data/agg.data");
+
+/// bool_test rows from aggregates.sql (the upstream `COPY ... NULL 'null'`
+/// block, rewritten with the standard `\N` null marker). No natural key.
+const BOOL_TEST_DATA: &str = "TRUE\t\\N\tFALSE\t\\N\nFALSE\tTRUE\t\\N\t\\N\n\\N\tTRUE\tFALSE\t\\N\n";
+
+/// `aggtest` / `regr_test` / `bool_test` from
+/// `src/test/regress/sql/aggregates.sql`. `aggtest.a` and `regr_test.x`
+/// are unique, so a PRIMARY KEY is added (cacheable); `bool_test` has
+/// nullable, non-unique columns and forwards.
+pub async fn aggregates_tables_load(client: &Client, publication: Option<&str>) -> Result<()> {
+    client
+        .batch_execute("DROP TABLE IF EXISTS aggtest, regr_test, bool_test CASCADE")
+        .await
+        .context("dropping existing aggregate fixtures")?;
+
+    client
+        .batch_execute("CREATE TABLE aggtest (a int2 PRIMARY KEY, b float4)")
+        .await
+        .context("creating aggtest")?;
+    publication_table_ensure(client, publication, "aggtest").await?;
+    table_copy(client, "aggtest", AGG_DATA).await?;
+
+    client
+        .batch_execute(
+            "CREATE TABLE regr_test (x float8 PRIMARY KEY, y float8); \
+             INSERT INTO regr_test VALUES (10,150),(20,250),(30,350),(80,540),(100,200)",
+        )
+        .await
+        .context("creating regr_test")?;
+    publication_table_ensure(client, publication, "regr_test").await?;
+
+    client
+        .batch_execute("CREATE TABLE bool_test (b1 bool, b2 bool, b3 bool, b4 bool)")
+        .await
+        .context("creating bool_test")?;
+    table_copy(client, "bool_test", BOOL_TEST_DATA).await?;
+
+    tracing::info!("loaded aggregate fixtures");
+    Ok(())
+}
+
 /// Create and populate `foo` on origin (idempotent) and add it to
 /// pgcache's publication, so the select suite's NULL-ordering queries
 /// are cached. Mirrors [`join_tables_load`].
