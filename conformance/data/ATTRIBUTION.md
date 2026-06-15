@@ -1,13 +1,21 @@
 # Vendored test data
 
-`onek.data` is copied verbatim from the PostgreSQL source tree:
+The `.data` files are copied verbatim from the PostgreSQL source tree
+(`src/test/regress/data/`, https://github.com/postgres/postgres):
 
-- Upstream path: `src/test/regress/data/onek.data`
-- Source: https://github.com/postgres/postgres
-- The `onek` table schema is taken from `src/test/regress/sql/test_setup.sql`,
-  with one deliberate deviation: a `PRIMARY KEY (unique1)` is added (not
-  present upstream) because pgcache only caches tables that have a
-  primary key (tracked in PGC-135). The vendored data is unmodified.
+- `onek.data`, `tenk.data` — the `onek` / `tenk1` pseudo-random tables.
+- `person.data`, `emp.data`, `student.data`, `stud_emp.data` — the
+  `person` table-inheritance chain.
+- `streets.data` — the `road` (geometric `path`) table.
+
+The table schemas are taken from `src/test/regress/sql/test_setup.sql`
+(replicated in `conformance/src/fixtures.rs::test_setup_load`), with one
+deliberate deviation: a `PRIMARY KEY` is added on the naturally-unique
+column(s) of the cacheable tables (`onek`/`onek2`/`tenk1`/`tenk2.unique1`,
+the `int*`/`float8`/`text` single-value tables) — not present upstream —
+because pgcache only caches tables that have a primary key (PGC-135).
+Keyless tables (char/varchar/point, the person chain, road) are kept
+verbatim and forward. All vendored data is unmodified.
 
 The `j1_tbl` / `j2_tbl` fixtures (defined inline in
 `conformance/src/fixtures.rs`, not as a data file) are the `J1_TBL` /

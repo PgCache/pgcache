@@ -85,37 +85,6 @@ const J2_TBL_DATA: &str = "INSERT INTO j2_tbl (i, k, j2_pk) VALUES
     (NULL, NULL, 8),
     (NULL, 0, 9)";
 
-/// `int4_tbl` / `int8_tbl` from `src/test/regress/sql/test_setup.sql`,
-/// the integer fixtures the upstream join suite uses for outer-join NULL
-/// padding, non-equi joins, and overflow-edge values. Upstream they have
-/// no key; a surrogate `*_pk` is appended (pgcache caches only tables
-/// with a PK — PGC-135). Suites select explicit columns, so the surrogate
-/// never appears in compared output.
-const INT4_TBL_DDL: &str = "CREATE TABLE int4_tbl (
-    f1      integer,
-    int4_pk integer PRIMARY KEY
-)";
-
-const INT4_TBL_DATA: &str = "INSERT INTO int4_tbl (f1, int4_pk) VALUES
-    (0, 1),
-    (123456, 2),
-    (-123456, 3),
-    (2147483647, 4),
-    (-2147483647, 5)";
-
-const INT8_TBL_DDL: &str = "CREATE TABLE int8_tbl (
-    q1      bigint,
-    q2      bigint,
-    int8_pk integer PRIMARY KEY
-)";
-
-const INT8_TBL_DATA: &str = "INSERT INTO int8_tbl (q1, q2, int8_pk) VALUES
-    (123, 456, 1),
-    (123, 4567890123456789, 2),
-    (4567890123456789, 123, 3),
-    (4567890123456789, 4567890123456789, 4),
-    (4567890123456789, -4567890123456789, 5)";
-
 /// `foo` from `src/test/regress/sql/select.sql` (the ORDER BY / NULLS
 /// section). Upstream `foo (f1 int)` with rows `(42),(3),(10),(7),
 /// (null),(null),(1)`. A surrogate `foo_pk` is appended (pgcache caches
@@ -192,8 +161,6 @@ pub async fn join_tables_load(client: &Client, publication: Option<&str>) -> Res
     for (table, ddl, data) in [
         ("j1_tbl", J1_TBL_DDL, J1_TBL_DATA),
         ("j2_tbl", J2_TBL_DDL, J2_TBL_DATA),
-        ("int4_tbl", INT4_TBL_DDL, INT4_TBL_DATA),
-        ("int8_tbl", INT8_TBL_DDL, INT8_TBL_DATA),
     ] {
         client
             .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
@@ -210,6 +177,263 @@ pub async fn join_tables_load(client: &Client, publication: Option<&str>) -> Res
             .with_context(|| format!("loading {table} data"))?;
         tracing::info!(table, "loaded join fixture");
     }
+    Ok(())
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Shared regression environment (src/test/regress/sql/test_setup.sql).
+//
+// These tables are referenced by the bulk of the regress query files. Data
+// is verbatim from upstream (inline tables) or the vendored COPY data files
+// (tenk/person/emp/student/stud_emp/streets). The only deviation from
+// upstream is a PRIMARY KEY added on naturally-unique columns (onek2 /
+// tenk1 / tenk2 unique1, the int/float/text single-value tables) so those
+// tables are cacheable — pgcache forwards PK-less tables, which is correct
+// but leaves the cache path unexercised. Tables with no natural key
+// (char/varchar/point, the person inheritance chain, the road path tables)
+// are kept verbatim and simply forward. Indexes, tablespaces, and the C
+// helper functions from test_setup.sql are omitted: indexes/tablespaces
+// affect only plans (not results), and the C functions need a compiled
+// regress.so used solely by the catalog-sanity tests, not the query files.
+// ──────────────────────────────────────────────────────────────────────
+
+const TENK_DATA: &str = include_str!("../data/tenk.data");
+const PERSON_DATA: &str = include_str!("../data/person.data");
+const EMP_DATA: &str = include_str!("../data/emp.data");
+const STUDENT_DATA: &str = include_str!("../data/student.data");
+const STUD_EMP_DATA: &str = include_str!("../data/stud_emp.data");
+const STREETS_DATA: &str = include_str!("../data/streets.data");
+
+/// Inline-INSERT shared tables (verbatim values from test_setup.sql; a PK
+/// is added on unique columns). `(table, ddl, insert, publish)` — only
+/// PK-bearing tables are added to the CDC publication; the keyless ones
+/// (char/varchar/point) forward, and point's geometric type must not enter
+/// the replication stream.
+const INLINE_TABLES: &[(&str, &str, &str, bool)] = &[
+    (
+        "char_tbl",
+        "CREATE TABLE char_tbl (f1 char(4))",
+        "INSERT INTO char_tbl (f1) VALUES ('a'),('ab'),('abcd'),('abcd    ')",
+        false,
+    ),
+    (
+        "float8_tbl",
+        "CREATE TABLE float8_tbl (f1 float8 PRIMARY KEY)",
+        "INSERT INTO float8_tbl(f1) VALUES \
+         ('0.0'),('-34.84'),('-1004.30'),('-1.2345678901234e+200'),('-1.2345678901234e-200')",
+        true,
+    ),
+    (
+        "int2_tbl",
+        "CREATE TABLE int2_tbl (f1 int2 PRIMARY KEY)",
+        "INSERT INTO int2_tbl(f1) VALUES ('0   '),('  1234 '),('    -1234'),('32767'),('-32767')",
+        true,
+    ),
+    (
+        "int4_tbl",
+        "CREATE TABLE int4_tbl (f1 int4 PRIMARY KEY)",
+        "INSERT INTO int4_tbl(f1) VALUES ('   0  '),('123456     '),('    -123456'),\
+         ('2147483647'),('-2147483647')",
+        true,
+    ),
+    (
+        "int8_tbl",
+        "CREATE TABLE int8_tbl (q1 int8, q2 int8, PRIMARY KEY (q1, q2))",
+        "INSERT INTO int8_tbl VALUES ('  123   ','  456'),('123   ','4567890123456789'),\
+         ('4567890123456789','123'),(+4567890123456789,'4567890123456789'),\
+         ('+4567890123456789','-4567890123456789')",
+        true,
+    ),
+    (
+        "point_tbl",
+        "CREATE TABLE point_tbl (f1 point)",
+        "INSERT INTO point_tbl(f1) VALUES ('(0.0,0.0)'),('(-10.0,0.0)'),('(-3.0,4.0)'),\
+         ('(5.1, 34.5)'),('(-5.0,-12.0)'),('(1e-300,-1e-300)'),('(1e+300,Inf)'),\
+         ('(Inf,1e+300)'),(' ( Nan , NaN ) '),('10.0,10.0')",
+        false,
+    ),
+    (
+        "text_tbl",
+        "CREATE TABLE text_tbl (f1 text PRIMARY KEY)",
+        "INSERT INTO text_tbl VALUES ('doh!'),('hi de ho neighbor')",
+        true,
+    ),
+    (
+        "varchar_tbl",
+        "CREATE TABLE varchar_tbl (f1 varchar(4))",
+        "INSERT INTO varchar_tbl (f1) VALUES ('a'),('ab'),('abcd'),('abcd    ')",
+        false,
+    ),
+];
+
+/// `tenk1` mirrors `onek`'s 16-column schema (a synthetic `PRIMARY KEY
+/// (unique1)` added so it is cacheable); 10000 rows from the vendored
+/// `tenk.data` (COPY text format).
+const TENK1_DDL: &str = "CREATE TABLE tenk1 (
+    unique1     int4 PRIMARY KEY,
+    unique2     int4,
+    two         int4,
+    four        int4,
+    ten         int4,
+    twenty      int4,
+    hundred     int4,
+    thousand    int4,
+    twothousand int4,
+    fivethous   int4,
+    tenthous    int4,
+    odd         int4,
+    even        int4,
+    stringu1    name,
+    stringu2    name,
+    string4     name
+)";
+
+/// COPY-from-file shared tables. The person inheritance chain and the road
+/// path tables have no natural key (forwarded). `(table, ddl, data)`.
+const COPY_TABLES: &[(&str, &str, &str)] = &[
+    (
+        "person",
+        "CREATE TABLE person (name text, age int4, location point)",
+        PERSON_DATA,
+    ),
+    (
+        "emp",
+        "CREATE TABLE emp (salary int4, manager name) INHERITS (person)",
+        EMP_DATA,
+    ),
+    (
+        "student",
+        "CREATE TABLE student (gpa float8) INHERITS (person)",
+        STUDENT_DATA,
+    ),
+    (
+        "stud_emp",
+        "CREATE TABLE stud_emp (percent int4) INHERITS (emp, student)",
+        STUD_EMP_DATA,
+    ),
+    (
+        "road",
+        "CREATE TABLE road (name text, thepath path)",
+        STREETS_DATA,
+    ),
+];
+
+/// COPY rows from `data` into `table` (text format, as test_setup.sql does).
+async fn table_copy(client: &Client, table: &str, data: &str) -> Result<()> {
+    let sink = client
+        .copy_in::<_, Bytes>(&format!("COPY {table} FROM STDIN"))
+        .await
+        .with_context(|| format!("starting COPY {table}"))?;
+    pin_mut!(sink);
+    sink.send(Bytes::copy_from_slice(data.as_bytes()))
+        .await
+        .with_context(|| format!("streaming {table} data"))?;
+    let rows = sink
+        .finish()
+        .await
+        .with_context(|| format!("finishing COPY {table}"))?;
+    tracing::info!(table, rows, "loaded test_setup fixture");
+    Ok(())
+}
+
+/// Build the shared regression environment from `test_setup.sql`. Assumes
+/// [`onek_load`] has already run (`onek2` is a copy of `onek`).
+pub async fn test_setup_load(client: &Client, publication: Option<&str>) -> Result<()> {
+    // Drop in reverse dependency order (inheritance children first).
+    client
+        .batch_execute(
+            "DROP TABLE IF EXISTS shighway, ihighway, road, stud_emp, student, emp, person, \
+             tenk2, tenk1, onek2, char_tbl, float8_tbl, int2_tbl, int4_tbl, int8_tbl, \
+             point_tbl, text_tbl, varchar_tbl CASCADE",
+        )
+        .await
+        .context("dropping existing test_setup tables")?;
+
+    for (table, ddl, insert, publish) in INLINE_TABLES {
+        client
+            .batch_execute(ddl)
+            .await
+            .with_context(|| format!("creating {table}"))?;
+        if *publish {
+            publication_table_ensure(client, publication, table).await?;
+        }
+        client
+            .batch_execute(insert)
+            .await
+            .with_context(|| format!("loading {table}"))?;
+    }
+
+    // tenk1 (COPY) + tenk2 (copy of tenk1).
+    client
+        .batch_execute(TENK1_DDL)
+        .await
+        .context("creating tenk1")?;
+    publication_table_ensure(client, publication, "tenk1").await?;
+    table_copy(client, "tenk1", TENK_DATA).await?;
+
+    client
+        .batch_execute("CREATE TABLE tenk2 AS SELECT * FROM tenk1")
+        .await
+        .context("creating tenk2")?;
+    client
+        .batch_execute("ALTER TABLE tenk2 ADD PRIMARY KEY (unique1)")
+        .await
+        .context("keying tenk2")?;
+    publication_table_ensure(client, publication, "tenk2").await?;
+
+    // onek2 (copy of onek, loaded by onek_load).
+    client
+        .batch_execute("CREATE TABLE onek2 AS SELECT * FROM onek")
+        .await
+        .context("creating onek2")?;
+    client
+        .batch_execute("ALTER TABLE onek2 ADD PRIMARY KEY (unique1)")
+        .await
+        .context("keying onek2")?;
+    publication_table_ensure(client, publication, "onek2").await?;
+
+    // person inheritance chain + road path tables (no PK → forwarded; not
+    // added to the publication).
+    for (table, ddl, data) in COPY_TABLES {
+        client
+            .batch_execute(ddl)
+            .await
+            .with_context(|| format!("creating {table}"))?;
+        table_copy(client, table, data).await?;
+    }
+    client
+        .batch_execute(
+            "CREATE TABLE ihighway () INHERITS (road); \
+             INSERT INTO ihighway SELECT * FROM ONLY road WHERE name ~ 'I- .*'; \
+             CREATE TABLE shighway (surface text) INHERITS (road); \
+             INSERT INTO shighway SELECT *, 'asphalt' FROM ONLY road WHERE name ~ 'State Hwy.*'",
+        )
+        .await
+        .context("creating highway tables")?;
+
+    // SQL-defined types and helper functions (the C functions are omitted —
+    // see the section comment).
+    client
+        .batch_execute(
+            "CREATE TYPE stoplight AS ENUM ('red', 'yellow', 'green'); \
+             CREATE TYPE float8range AS RANGE (subtype = float8, subtype_diff = float8mi); \
+             CREATE TYPE textrange AS RANGE (subtype = text, collation = \"C\")",
+        )
+        .await
+        .context("creating regress types")?;
+    client
+        .batch_execute(
+            "CREATE FUNCTION fipshash(bytea) RETURNS text \
+               STRICT IMMUTABLE PARALLEL SAFE LEAKPROOF \
+               RETURN substr(encode(sha256($1), 'hex'), 1, 32); \
+             CREATE FUNCTION fipshash(text) RETURNS text \
+               STRICT IMMUTABLE PARALLEL SAFE LEAKPROOF \
+               RETURN substr(encode(sha256($1::bytea), 'hex'), 1, 32)",
+        )
+        .await
+        .context("creating fipshash functions")?;
+
+    tracing::info!("loaded test_setup shared environment");
     Ok(())
 }
 

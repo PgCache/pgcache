@@ -88,6 +88,9 @@ pub async fn run(cli: Cli) -> Result<()> {
     fixtures::onek_load(origin.client(), ep.publication.as_deref())
         .await
         .context("loading onek fixture")?;
+    fixtures::test_setup_load(origin.client(), ep.publication.as_deref())
+        .await
+        .context("loading test_setup shared environment")?;
     fixtures::join_tables_load(origin.client(), ep.publication.as_deref())
         .await
         .context("loading join fixtures")?;
