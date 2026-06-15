@@ -39,51 +39,55 @@ const ONEK_DDL: &str = "CREATE TABLE onek (
 /// 1000 rows, tab-delimited, in PostgreSQL COPY text format.
 const ONEK_DATA: &str = include_str!("../data/onek.data");
 
-/// `J1_TBL` / `J2_TBL` from `src/test/regress/sql/join.sql`. Upstream
-/// these have no key and contain NULLs and a duplicate `(5, -5)` row, so
-/// no natural primary key exists. A surrogate `*_pk` column is appended
-/// last (pgcache only caches tables with a PK — PGC-135). The name is
-/// distinct per table so `NATURAL JOIN`, which couples on common column
-/// names, still couples only on `i` exactly as upstream. `SELECT *`
-/// includes the surrogate, but the harness compares pgcache against
-/// origin (the oracle), not against upstream golden output, so the extra
-/// column is consistent on both sides.
-const J1_TBL_DDL: &str = "CREATE TABLE j1_tbl (
-    i     integer,
-    j     integer,
-    t     text,
-    j1_pk integer PRIMARY KEY
-)";
+/// `J1_TBL` / `J2_TBL` from `src/test/regress/sql/join.sql`, verbatim.
+/// These have NULLs and a duplicate `(5,-5)` row, so no natural key
+/// exists — they forward (no PK). Kept at their exact upstream column
+/// count so the column-alias-list tests (`J1_TBL t1 (a, b, c)`) work.
+const J1_TBL_DDL: &str = "CREATE TABLE j1_tbl (i integer, j integer, t text)";
 
-const J1_TBL_DATA: &str = "INSERT INTO j1_tbl (i, j, t, j1_pk) VALUES
-    (1, 4, 'one', 1),
-    (2, 3, 'two', 2),
-    (3, 2, 'three', 3),
-    (4, 1, 'four', 4),
-    (5, 0, 'five', 5),
-    (6, 6, 'six', 6),
-    (7, 7, 'seven', 7),
-    (8, 8, 'eight', 8),
-    (0, NULL, 'zero', 9),
-    (NULL, NULL, 'null', 10),
-    (NULL, 0, 'zero', 11)";
+const J1_TBL_DATA: &str = "INSERT INTO j1_tbl VALUES
+    (1, 4, 'one'), (2, 3, 'two'), (3, 2, 'three'), (4, 1, 'four'),
+    (5, 0, 'five'), (6, 6, 'six'), (7, 7, 'seven'), (8, 8, 'eight'),
+    (0, NULL, 'zero'), (NULL, NULL, 'null'), (NULL, 0, 'zero')";
 
-const J2_TBL_DDL: &str = "CREATE TABLE j2_tbl (
-    i     integer,
-    k     integer,
-    j2_pk integer PRIMARY KEY
-)";
+const J2_TBL_DDL: &str = "CREATE TABLE j2_tbl (i integer, k integer)";
 
-const J2_TBL_DATA: &str = "INSERT INTO j2_tbl (i, k, j2_pk) VALUES
-    (1, -1, 1),
-    (2, 2, 2),
-    (3, -3, 3),
-    (2, 4, 4),
-    (5, -5, 5),
-    (5, -5, 6),
-    (0, NULL, 7),
-    (NULL, NULL, 8),
-    (NULL, 0, 9)";
+const J2_TBL_DATA: &str = "INSERT INTO j2_tbl VALUES
+    (1, -1), (2, 2), (3, -3), (2, 4), (5, -5), (5, -5),
+    (0, NULL), (NULL, NULL), (NULL, 0)";
+
+/// `t1`/`t2`/`t3` (multiway/natural-join section) and `x`/`y` (outer-join
+/// nullability section) from join.sql. A PRIMARY KEY is added on the
+/// naturally-unique column (`name`, `x1`/`y1`) for cache coverage; no
+/// extra column is introduced, so the column-alias tests still line up.
+/// `(table, ddl, insert)`.
+const JOIN_AUX_TABLES: &[(&str, &str, &str)] = &[
+    (
+        "t1",
+        "CREATE TABLE t1 (name text PRIMARY KEY, n integer)",
+        "INSERT INTO t1 VALUES ('bb', 11)",
+    ),
+    (
+        "t2",
+        "CREATE TABLE t2 (name text PRIMARY KEY, n integer)",
+        "INSERT INTO t2 VALUES ('bb', 12), ('cc', 22), ('ee', 42)",
+    ),
+    (
+        "t3",
+        "CREATE TABLE t3 (name text PRIMARY KEY, n integer)",
+        "INSERT INTO t3 VALUES ('bb', 13), ('cc', 23), ('dd', 33)",
+    ),
+    (
+        "x",
+        "CREATE TABLE x (x1 integer PRIMARY KEY, x2 integer)",
+        "INSERT INTO x VALUES (1,11), (2,22), (3,NULL), (4,44), (5,NULL)",
+    ),
+    (
+        "y",
+        "CREATE TABLE y (y1 integer PRIMARY KEY, y2 integer)",
+        "INSERT INTO y VALUES (1,111), (2,222), (3,333), (4,NULL)",
+    ),
+];
 
 /// `foo` from `src/test/regress/sql/select.sql` (the ORDER BY / NULLS
 /// section). Upstream `foo (f1 int)` with rows `(42),(3),(10),(7),
@@ -158,14 +162,14 @@ async fn publication_table_ensure(
 /// `cached` routing. Mirrors [`onek_load`]; data is small enough to
 /// inline rather than vendor a file.
 pub async fn join_tables_load(client: &Client, publication: Option<&str>) -> Result<()> {
-    for (table, ddl, data) in [
-        ("j1_tbl", J1_TBL_DDL, J1_TBL_DATA),
-        ("j2_tbl", J2_TBL_DDL, J2_TBL_DATA),
-    ] {
-        client
-            .batch_execute(&format!("DROP TABLE IF EXISTS {table}"))
-            .await
-            .with_context(|| format!("dropping any existing {table}"))?;
+    client
+        .batch_execute("DROP TABLE IF EXISTS j1_tbl, j2_tbl, t1, t2, t3, x, y CASCADE")
+        .await
+        .context("dropping existing join fixtures")?;
+    let tables = [("j1_tbl", J1_TBL_DDL, J1_TBL_DATA), ("j2_tbl", J2_TBL_DDL, J2_TBL_DATA)]
+        .into_iter()
+        .chain(JOIN_AUX_TABLES.iter().copied());
+    for (table, ddl, data) in tables {
         client
             .batch_execute(ddl)
             .await
@@ -441,7 +445,8 @@ const AGG_DATA: &str = include_str!("../data/agg.data");
 
 /// bool_test rows from aggregates.sql (the upstream `COPY ... NULL 'null'`
 /// block, rewritten with the standard `\N` null marker). No natural key.
-const BOOL_TEST_DATA: &str = "TRUE\t\\N\tFALSE\t\\N\nFALSE\tTRUE\t\\N\t\\N\n\\N\tTRUE\tFALSE\t\\N\n";
+const BOOL_TEST_DATA: &str =
+    "TRUE\t\\N\tFALSE\t\\N\nFALSE\tTRUE\t\\N\t\\N\n\\N\tTRUE\tFALSE\t\\N\n";
 
 /// `aggtest` / `regr_test` / `bool_test` from
 /// `src/test/regress/sql/aggregates.sql`. `aggtest.a` and `regr_test.x`

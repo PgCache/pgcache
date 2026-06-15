@@ -1,0 +1,368 @@
+# Faithful port of PostgreSQL src/test/regress/sql/aggregates.sql — the
+# result-bearing aggregate-semantics selects, whether pgcache caches or
+# forwards them. Run against the test_setup fixtures (onek, tenk1,
+# int4_tbl, int8_tbl, student) plus the aggregate fixtures (aggtest,
+# regr_test, bool_test) loaded before this suite.
+#
+# Origin is the oracle: no results are inlined. Each statement runs on
+# origin and pgcache and the result sets are compared (row-wise with a
+# top-level ORDER BY, else sorted multiset); the pgcache log is scanned
+# for swallowed errors. Routing is annotated per shape.
+#
+# Excluded from upstream aggregates.sql (cannot be result-diffed, or out
+# of scope):
+#   * User-defined / custom CREATE AGGREGATE sections (newavg, sum2,
+#     aggfns/aggfstr, my_avg/my_sum, balk, rwagg, the ordered-set custom
+#     aggs, agg_view) — need DDL/C functions.
+#   * Parallel-aggregation and hash-aggregation-spill sections
+#     (pagg_test, agg_data_2k/20k, agg_hash_*, btg, group_agg_pk) and the
+#     redundant-GROUP-BY / ORDER-BY-pathkey / indexscan-optimization
+#     sections — EXPLAIN/planner tests, not result sets.
+#   * minmaxtest inheritance tree and partitioned p_t1 — EXPLAIN-focused.
+#   * Error-expecting selects (nested-aggregate errors, the "should fail"
+#     correlated HAVING) and the booland_statefunc/boolor_statefunc
+#     internal transition-state probes.
+#   * bitwise_test (bit_and/or/xor) — deferred: bit-string type + the
+#     `COPY ... NULL 'null'` representation.
+#   * The exhaustive var_pop/stddev × {inf,nan} × {float4,float8,numeric}
+#     scalar permutations are sampled (same shape, different literals).
+#
+# The FILTER section is adapted to onek (upstream's FILTER cases are
+# EXPLAIN-only); it is the PGC-102 / PGC-136 regression coverage folded
+# in from the former aggregates_filter.slt.
+#
+# Two queries are kept correctly-red as living regressions on bugs this
+# port surfaced: PGC-281 (sum() over float4 widened to float8 in cache)
+# and PGC-282 (constant-argument aggregate MV build fails).
+
+#
+# Basic aggregates: avg / sum / max / min.
+#
+
+# pgcache: cached
+query R
+SELECT avg(four) AS avg_1 FROM onek;
+
+# pgcache: cached
+query R
+SELECT avg(a) AS avg_32 FROM aggtest WHERE a < 100;
+
+# pgcache: cached
+query R
+SELECT avg(b)::numeric(10,3) AS avg_107_943 FROM aggtest;
+
+# student is keyless / inheritance — forwarded.
+# pgcache: passthrough
+query R
+SELECT avg(gpa) AS avg_3_4 FROM ONLY student;
+
+# pgcache: cached
+query I
+SELECT sum(four) AS sum_1500 FROM onek;
+
+# pgcache: cached
+query I
+SELECT sum(a) AS sum_198 FROM aggtest;
+
+# PGC-281 (correctly red): sum() over a float4 column is widened to
+# float8 precision in the cache, diverging from origin's float4.
+# pgcache: cached
+query R
+SELECT sum(b) AS avg_431_773 FROM aggtest;
+
+# pgcache: cached
+query I
+SELECT max(four) AS max_3 FROM onek;
+
+# pgcache: cached
+query I
+SELECT max(a) AS max_100 FROM aggtest;
+
+# pgcache: cached
+query R
+SELECT max(aggtest.b) AS max_324_78 FROM aggtest;
+
+# pgcache: passthrough
+query R
+SELECT max(student.gpa) AS max_3_7 FROM student;
+
+# any_value over a VALUES list.
+# pgcache: passthrough
+query I
+SELECT any_value(v) FROM (VALUES (1), (2), (3)) AS v (v);
+
+# pgcache: passthrough
+query I
+SELECT any_value(v) FROM (VALUES (NULL), (1), (2)) AS v (v);
+
+#
+# stddev / variance (float8 and numeric).
+#
+
+# pgcache: cached
+query R
+SELECT stddev_pop(b) FROM aggtest;
+
+# pgcache: cached
+query R
+SELECT stddev_samp(b) FROM aggtest;
+
+# pgcache: cached
+query R
+SELECT var_pop(b) FROM aggtest;
+
+# pgcache: cached
+query R
+SELECT var_samp(b) FROM aggtest;
+
+# pgcache: cached
+query R
+SELECT stddev_pop(b::numeric) FROM aggtest;
+
+# pgcache: cached
+query R
+SELECT var_samp(b::numeric) FROM aggtest;
+
+# Single-tuple / infinite / NaN inputs (sampled — see header).
+# pgcache: passthrough
+query RR
+SELECT var_pop(1.0::float8), var_samp(2.0::float8);
+
+# pgcache: passthrough
+query RR
+SELECT var_pop('inf'::float8), var_samp('inf'::float8);
+
+# pgcache: passthrough
+query RR
+SELECT var_pop('nan'::numeric), var_samp('nan'::numeric);
+
+# pgcache: passthrough
+query RRR
+SELECT sum(x::float8), avg(x::float8), var_pop(x::float8)
+FROM (VALUES ('1'), ('infinity')) v(x);
+
+# pgcache: passthrough
+query RRR
+SELECT sum(x::numeric), avg(x::numeric), var_pop(x::numeric)
+FROM (VALUES ('-infinity'), ('infinity')) v(x);
+
+# Accuracy with a large input offset.
+# pgcache: passthrough
+query RR
+SELECT avg(x::float8), var_pop(x::float8)
+FROM (VALUES (100000003), (100000004), (100000006), (100000007)) v(x);
+
+#
+# SQL2003 binary (regression) aggregates over aggtest and regr_test.
+#
+
+# pgcache: cached
+query I
+SELECT regr_count(b, a) FROM aggtest;
+
+# pgcache: cached
+query R
+SELECT regr_sxx(b, a) FROM aggtest;
+
+# pgcache: cached
+query RR
+SELECT regr_avgx(b, a), regr_avgy(b, a) FROM aggtest;
+
+# pgcache: cached
+query RR
+SELECT regr_slope(b, a), regr_intercept(b, a) FROM aggtest;
+
+# pgcache: cached
+query RR
+SELECT covar_pop(b, a), covar_samp(b, a) FROM aggtest;
+
+# pgcache: cached
+query R
+SELECT corr(b, a) FROM aggtest;
+
+# pgcache: cached
+query IRRRR
+SELECT count(*), sum(x), regr_sxx(y,x), sum(y), regr_syy(y,x) FROM regr_test;
+
+# Scalar aggregate with no FROM — forwarded.
+# pgcache: passthrough
+query RR
+SELECT covar_pop(1::float8,2::float8), covar_samp(3::float8,4::float8);
+
+#
+# Null / NaN inputs via generate_series (SRF source — forwarded).
+#
+
+# pgcache: passthrough
+query I
+SELECT sum(null::int4) FROM generate_series(1,3);
+
+# pgcache: passthrough
+query R
+SELECT avg(null::float8) FROM generate_series(1,3);
+
+# pgcache: passthrough
+query R
+SELECT sum('NaN'::numeric) FROM generate_series(1,3);
+
+#
+# count / DISTINCT / GROUP BY.
+#
+
+# pgcache: cached
+query I
+SELECT count(four) AS cnt_1000 FROM onek;
+
+# pgcache: cached
+query I
+SELECT count(DISTINCT four) AS cnt_4 FROM onek;
+
+# pgcache: cached
+query III
+SELECT ten, count(*), sum(four) FROM onek GROUP BY ten ORDER BY ten;
+
+# pgcache: cached
+query III
+SELECT ten, count(four), sum(DISTINCT four) FROM onek GROUP BY ten ORDER BY ten;
+
+# Outer-level aggregate referenced in a correlated HAVING subquery.
+# pgcache: passthrough
+query II
+SELECT ten, sum(distinct four) FROM onek a
+GROUP BY ten
+HAVING EXISTS (SELECT 1 FROM onek b WHERE sum(distinct a.four) = b.four)
+ORDER BY ten;
+
+#
+# Boolean aggregates over bool_test (keyless — forwarded).
+#
+
+# pgcache: passthrough
+query TTTTTT
+SELECT bool_and(b1), bool_and(b2), bool_and(b3), bool_and(b4),
+       bool_and(NOT b2), bool_and(NOT b3)
+FROM bool_test;
+
+# pgcache: passthrough
+query TTTTTT
+SELECT every(b1), every(b2), every(b3), every(b4),
+       every(NOT b2), every(NOT b3)
+FROM bool_test;
+
+# pgcache: passthrough
+query TTTTTT
+SELECT bool_or(b1), bool_or(b2), bool_or(b3), bool_or(b4),
+       bool_or(NOT b2), bool_or(NOT b3)
+FROM bool_test;
+
+#
+# min / max over tenk1 (the optimizable-into-indexscan section; EXPLAINs
+# dropped, the result selects kept).
+#
+
+# pgcache: cached
+query I
+SELECT distinct max(unique2) FROM tenk1;
+
+# pgcache: cached
+query I
+SELECT max(unique2) FROM tenk1 ORDER BY 1;
+
+# pgcache: cached
+query I
+SELECT max(unique2) FROM tenk1 ORDER BY max(unique2);
+
+# generate_series in the SELECT list (set-returning) alongside an aggregate.
+# pgcache: cached
+query II
+SELECT max(unique2), generate_series(1,3) AS g FROM tenk1 ORDER BY g DESC;
+
+# Constant aggregate argument — PGC-282 (correctly red): the MV build
+# fails (pgcache_pgrx tracker rejects the T_ResultState scan node), so
+# the query forwards and the swallowed-error scan flags it.
+# pgcache: cached
+query I
+SELECT max(100) FROM tenk1;
+
+# Correlated scalar subquery with DISTINCT min (bug #18465 shape).
+# pgcache: cached
+query II
+SELECT f1, (SELECT distinct min(t1.f1) FROM int4_tbl t1 WHERE t1.f1 = t0.f1)
+FROM int4_tbl t0 ORDER BY f1;
+
+#
+# array_agg with DISTINCT and/or ORDER BY over VALUES lists (forwarded).
+#
+
+# pgcache: passthrough
+query T
+SELECT array_agg(a ORDER BY b) FROM (VALUES (1,4),(2,3),(3,1),(4,2)) v(a,b);
+
+# pgcache: passthrough
+query T
+SELECT array_agg(a ORDER BY a DESC) FROM (VALUES (1,4),(2,3),(3,1),(4,2)) v(a,b);
+
+# pgcache: passthrough
+query T
+SELECT array_agg(b ORDER BY a DESC) FROM (VALUES (1,4),(2,3),(3,1),(4,2)) v(a,b);
+
+# pgcache: passthrough
+query T
+SELECT array_agg(distinct a) FROM (VALUES (1),(2),(1),(3),(NULL),(2)) v(a);
+
+# pgcache: passthrough
+query T
+SELECT array_agg(distinct a ORDER BY a) FROM (VALUES (1),(2),(1),(3),(NULL),(2)) v(a);
+
+# pgcache: passthrough
+query T
+SELECT array_agg(distinct a ORDER BY a DESC NULLS LAST)
+FROM (VALUES (1),(2),(1),(3),(NULL),(2)) v(a);
+
+#
+# FILTER clause — adapted to onek (PGC-102 / PGC-136 regression).
+#
+
+# PGC-102: count(*) with a FILTER predicate (the original wrong-result shape).
+# pgcache: cached
+query I
+SELECT count(*) FILTER (WHERE four = 1) FROM onek;
+
+# pgcache: cached
+query I
+SELECT sum(four) FILTER (WHERE ten > 5) FROM onek;
+
+# Two FILTERed aggregates whose columns both derive the name "count" (PGC-136).
+# pgcache: cached
+query II
+SELECT count(*) FILTER (WHERE hundred < 50),
+       count(*) FILTER (WHERE hundred >= 50)
+FROM onek;
+
+# pgcache: cached
+query II
+SELECT ten, count(*) FILTER (WHERE odd = 1) AS odd_cnt
+FROM onek GROUP BY ten ORDER BY ten;
+
+# pgcache: cached
+query R
+SELECT avg(unique1) FILTER (WHERE unique1 > 500) FROM onek;
+
+# pgcache: cached
+query II
+SELECT max(unique2) FILTER (WHERE two = 0) AS mx,
+       min(unique2) FILTER (WHERE two = 1) AS mn
+FROM onek;
+
+# pgcache: cached
+query I
+SELECT count(DISTINCT hundred) FILTER (WHERE ten = 0) FROM onek;
+
+# pgcache: cached
+query II
+SELECT four, sum(unique1) FILTER (WHERE unique1 < 100) AS s
+FROM onek GROUP BY four ORDER BY four;
+
+# pgcache: cached
+query I
+SELECT count(*) FILTER (WHERE stringu1 < 'N') FROM onek;
