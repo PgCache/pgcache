@@ -98,7 +98,7 @@ impl StatusClient {
             .iter()
             .map(|q| {
                 (
-                    q.fingerprint,
+                    q.fingerprint.get(),
                     QueryCounters {
                         hit_count: q.hit_count,
                         miss_count: q.miss_count,
@@ -108,7 +108,7 @@ impl StatusClient {
             .collect();
 
         Ok(StatusSnapshot {
-            last_applied_lsn: resp.cdc.last_applied_lsn,
+            last_applied_lsn: resp.cdc.last_applied_lsn.get(),
             queries,
         })
     }

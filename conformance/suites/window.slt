@@ -1,0 +1,166 @@
+# Curated port of PostgreSQL src/test/regress/sql/window.sql — the
+# window-function result-correctness core: ranking (row_number / rank /
+# dense_rank / ntile), window aggregates (sum / avg / count over
+# PARTITION BY / ORDER BY / empty windows), and value functions (lag /
+# lead / first_value / last_value). Run against the `onek` fixture
+# (loaded by the harness before this suite).
+#
+# Origin is the oracle: no results are inlined. Each query runs on
+# origin and pgcache and the result sets are compared, plus the pgcache
+# log is scanned for swallowed errors. Every query carries a stable
+# outer `ORDER BY unique1` (unique1 is the PK / unique) so the compared
+# row order is deterministic; window expressions either order by the
+# unique `unique1` (so there are no implementation-defined peer breaks)
+# or use rank-family functions that assign ties deterministically.
+#
+# Scope deviations from upstream window.sql:
+#   * It is built on `empsalary` / `tenk1` / generate_series and is
+#     largely EXPLAIN / planner-internal (WindowAgg plan shapes, run
+#     conditions, frame-mode planner paths) — adapted to `onek`, results
+#     only.
+#   * `WINDOW` over GROUP BY, RANGE/GROUPS frames with type-specific
+#     offsets, EXCLUDE, and SRF/LATERAL sections are deferred.
+#
+# Harness-found defects (kept correctly-red as living regressions, same
+# pattern as select.slt vs PGC-144 and subselect.slt vs PGC-146/147):
+#   * PGC-279 — explicit frame clauses (ROWS/RANGE BETWEEN) are silently
+#     dropped at convert time; pgcache computes against PostgreSQL's
+#     default RANGE..CURRENT ROW frame → wrong cached result.
+#   * PGC-280 — named windows (WINDOW w AS (...)) are silently dropped;
+#     `OVER w` becomes `OVER ()` → wrong cached result.
+
+#
+# Ranking functions. ORDER BY a unique column for row_number/ntile (no
+# peer ambiguity); rank/dense_rank over low-cardinality columns to
+# exercise ties deterministically.
+#
+
+# pgcache: any
+query TT
+SELECT unique1, row_number() OVER (ORDER BY unique1)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+# pgcache: any
+query TTT
+SELECT unique1, four, rank() OVER (ORDER BY four)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+# pgcache: any
+query TTT
+SELECT unique1, four, dense_rank() OVER (ORDER BY four)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+# pgcache: any
+query TT
+SELECT unique1, ntile(4) OVER (ORDER BY unique1)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+# PARTITION BY with a per-partition unique ORDER BY — row_number is
+# deterministic within each partition.
+# pgcache: any
+query TTT
+SELECT unique1, four, row_number() OVER (PARTITION BY four ORDER BY unique1)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+#
+# Window aggregates. Default frame (RANGE UNBOUNDED PRECEDING .. CURRENT
+# ROW) matches pgcache's no-frame emission, so these are expected
+# correct.
+#
+
+# Whole-partition aggregate (no ORDER BY → frame is the full partition).
+# pgcache: any
+query TTT
+SELECT unique1, two, count(*) OVER (PARTITION BY two)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+# pgcache: any
+query TTT
+SELECT unique1, four, sum(unique1) OVER (PARTITION BY four)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+# Running aggregate over a unique ORDER BY — default frame, no peers.
+# pgcache: any
+query TT
+SELECT unique1, sum(unique1) OVER (ORDER BY unique1)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+# pgcache: any
+query TTT
+SELECT unique1, ten, avg(unique1) OVER (PARTITION BY ten ORDER BY unique1)
+  FROM onek WHERE unique1 < 20 ORDER BY unique1;
+
+# Empty OVER () — aggregate over the entire result.
+# pgcache: any
+query TTT
+SELECT unique1, count(*) OVER (), sum(unique1) OVER ()
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+#
+# Value functions. lag/lead are frame-independent; first_value over the
+# default frame returns the partition's first row (frame start is
+# UNBOUNDED PRECEDING), so all are expected correct.
+#
+
+# pgcache: any
+query TTT
+SELECT unique1, lag(unique1) OVER (ORDER BY unique1),
+       lead(unique1) OVER (ORDER BY unique1)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+# pgcache: any
+query TTT
+SELECT unique1, four, first_value(unique1) OVER (PARTITION BY four ORDER BY unique1)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+#
+# Explicit frame clauses — PGC-279 (silently dropped). pgcache computes
+# against the default RANGE..CURRENT ROW frame, so these are wrong
+# cached results until PGC-279 is fixed.
+#
+
+# last_value over the full partition frame: origin returns the partition
+# maximum (9) for every row; pgcache (default frame) returns the current
+# row's value.
+# pgcache: any
+query TT
+SELECT unique1, last_value(unique1) OVER (ORDER BY unique1
+         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+# Moving-window sum (1 preceding .. 1 following): differs from the
+# default running sum that pgcache produces after dropping the frame.
+# pgcache: any
+query TT
+SELECT unique1, sum(unique1) OVER (ORDER BY unique1
+         ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+# pgcache: any
+query TTT
+SELECT unique1, four, last_value(unique1) OVER (PARTITION BY four ORDER BY unique1
+         ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+  FROM onek WHERE unique1 < 10 ORDER BY unique1;
+
+#
+# Named windows — PGC-280 (silently dropped). `OVER w` becomes
+# `OVER ()`, so these are wrong cached results until PGC-280 is fixed.
+#
+
+# Running sum via a named window: origin orders by unique1; pgcache
+# (OVER ()) returns the whole-result total for every row.
+# pgcache: any
+query TT
+SELECT unique1, sum(unique1) OVER w
+  FROM onek WHERE unique1 < 10
+  WINDOW w AS (ORDER BY unique1)
+  ORDER BY unique1;
+
+# Partitioned rank via a named window: origin ranks within four;
+# pgcache (OVER (), no ORDER BY) assigns rank 1 to every row.
+# pgcache: any
+query TTT
+SELECT unique1, four, rank() OVER w
+  FROM onek WHERE unique1 < 10
+  WINDOW w AS (PARTITION BY four ORDER BY unique1)
+  ORDER BY unique1;
