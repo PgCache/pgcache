@@ -952,8 +952,18 @@ async fn serve_loop(
         let return_tx = conn_tx.clone();
         let replenish_tx = replenish_tx.clone();
         let state_view = Arc::clone(&state_view);
+        // Serve-pool liveness gauges (PGC-278): a drained pool with serves still
+        // in flight is the freeze signature. `pool_available` is read after this
+        // serve's connection was taken, so it reflects what's left.
+        #[allow(clippy::cast_precision_loss)]
+        crate::metrics::handles()
+            .cache
+            .pool_available
+            .set(conn_rx.len() as f64);
+        crate::metrics::handles().cache.serves_in_flight.increment(1.0);
         tokio::spawn(async move {
             handle_serve_request(conn, return_tx, replenish_tx, msg, state_view).await;
+            crate::metrics::handles().cache.serves_in_flight.decrement(1.0);
         });
 
         // Channel depth gauge; queue length never approaches 2^53.

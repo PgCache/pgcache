@@ -200,6 +200,17 @@ pub mod names {
     pub const CACHE_QUERY_COUNT_CAP: &str = "pgcache.cache.query_count_cap";
     /// Measured per-query memory footprint, EWMA-smoothed bytes (PGC-251).
     pub const CACHE_MARGINAL_BYTES_PER_QUERY: &str = "pgcache.cache.marginal_bytes_per_query";
+    /// Cache-DB serves currently executing (hold a pool connection, not yet returned).
+    pub const CACHE_SERVES_IN_FLIGHT: &str = "pgcache.cache.serves_in_flight";
+    /// Idle (available) cache-DB serve-pool connections. A sustained 0 with serves
+    /// in flight is pool exhaustion (PGC-278).
+    pub const CACHE_POOL_AVAILABLE: &str = "pgcache.cache.pool_available";
+    /// Serves that exceeded the stall deadline (poisoned + forwarded to origin) —
+    /// a stuck cache-DB read or a response desync (PGC-278).
+    pub const CACHE_SERVE_STALL_TOTAL: &str = "pgcache.cache.serve_stall_total";
+    /// Serves that finished with unconsumed bytes still in the connection read
+    /// buffer — a response desync caught at its source (PGC-278).
+    pub const CACHE_SERVE_DIRTY_RETURN_TOTAL: &str = "pgcache.cache.serve_dirty_return_total";
 
     // Extended protocol metrics
     pub const PROTOCOL_SIMPLE_QUERIES: &str = "pgcache.protocol.simple_queries";
@@ -386,6 +397,11 @@ pub struct CacheHandles {
     pub marginal_bytes_per_query: Gauge,
     pub registration_throttled: Gauge,
     pub registration_throttled_total: Counter,
+    /// Serve-pool liveness observability (PGC-278).
+    pub serves_in_flight: Gauge,
+    pub pool_available: Gauge,
+    pub serve_stall_total: Counter,
+    pub serve_dirty_return_total: Counter,
 }
 
 pub struct CdcHandles {
@@ -554,6 +570,10 @@ impl Handles {
                 marginal_bytes_per_query: metrics::gauge!(CACHE_MARGINAL_BYTES_PER_QUERY),
                 registration_throttled: metrics::gauge!(CACHE_REGISTRATION_THROTTLED),
                 registration_throttled_total: metrics::counter!(CACHE_REGISTRATION_THROTTLED_TOTAL),
+                serves_in_flight: metrics::gauge!(CACHE_SERVES_IN_FLIGHT),
+                pool_available: metrics::gauge!(CACHE_POOL_AVAILABLE),
+                serve_stall_total: metrics::counter!(CACHE_SERVE_STALL_TOTAL),
+                serve_dirty_return_total: metrics::counter!(CACHE_SERVE_DIRTY_RETURN_TOTAL),
             },
             cdc: CdcHandles {
                 events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),

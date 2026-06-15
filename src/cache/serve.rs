@@ -7,7 +7,7 @@ use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::bytes::{Buf, Bytes};
-use tracing::{debug, error, instrument, trace};
+use tracing::{debug, error, instrument, trace, warn};
 
 use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe};
 use crate::pg::cache_connection::{CacheConnection, PrepareOutcome};
@@ -32,6 +32,12 @@ use crate::query::resolved::ResolvedTableNode;
 /// Max gap between cache-DB frames while draining a response for a departed
 /// primary client before the connection is treated as stalled and discarded.
 const DRAIN_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total wall-clock budget for a single cache-hit serve (PGC-278). A serve that
+/// exceeds this — a stalled cache-DB read or a response desync that parks on
+/// `framed.next()` forever — is poisoned (discard + replenish) and forwarded to
+/// origin, so a stuck serve can never permanently strand a pool connection.
+const SERVE_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Decide whether this serve should be captured into the in-process result memo
 /// (PGC-236) and, if so, begin a capture — stamping the read relations' seqlock
@@ -507,8 +513,36 @@ pub async fn handle_cached_query(
     // cache-DB response, returning the connection to the pool protocol-clean.
     let mut client_gone = false;
 
+    // PGC-278: bound the whole serve. The primary read arm (`framed.next()`) has
+    // no per-read timeout, so a stalled cache-DB connection or a response desync
+    // would park here forever holding the pooled connection. On the deadline,
+    // poison (discard + replenish) and forward to origin.
+    let serve_deadline = tokio::time::Instant::now() + SERVE_STALL_TIMEOUT;
+
     loop {
         tokio::select! {
+            _ = tokio::time::sleep_until(serve_deadline) => {
+                warn!(
+                    fingerprint = %msg.fingerprint,
+                    state = ?relay.state,
+                    bytes_served = relay.bytes_served,
+                    client_gone,
+                    has_parse = msg.has_parse,
+                    has_bind = msg.has_bind,
+                    include_describe,
+                    mv = matches!(msg.mv, MvServe::Mv(_)),
+                    sent_setgen_parse = relay.prepare.sent_setgen_parse,
+                    sent_parse = relay.prepare.sent_parse,
+                    sent_close = relay.prepare.sent_close,
+                    "cache serve exceeded stall deadline; poisoning connection and forwarding to origin (PGC-278)"
+                );
+                crate::metrics::handles().cache.serve_stall_total.increment(1);
+                guard.poisoned = true;
+                if let Some(bc) = relay.broadcast.take() {
+                    broadcast_error_reply(bc).await;
+                }
+                return Err(CacheError::Write.into());
+            }
             frame = framed.next() => {
                 let frame = match frame {
                     Some(Ok(frame)) => frame,
@@ -568,8 +602,42 @@ pub async fn handle_cached_query(
         }
     }
 
-    // Cache DB response fully consumed — return connection to pool immediately
-    guard.conn = Some(CacheConnection::from_framed(framed, parked));
+    // PGC-278: the response is fully consumed at `Done` — the single trailing
+    // Sync means `ReadyForQuery` is the last frame, and no next response arrives
+    // until this connection serves again. Any bytes still buffered are therefore
+    // a response desync introduced by THIS serve (the state machine consumed the
+    // wrong number of frames for its pipeline shape). Discard the connection
+    // (poison ⇒ replenish) rather than hand the leftover frame to the next
+    // borrower, and record it at its source. The client's reply is unaffected —
+    // it already received a complete response.
+    let residual = framed.read_buffer().len();
+    if residual > 0 {
+        let lead = framed.read_buffer().first().copied().map(char::from);
+        warn!(
+            fingerprint = %msg.fingerprint,
+            residual_bytes = residual,
+            ?lead,
+            has_parse = msg.has_parse,
+            has_bind = msg.has_bind,
+            include_describe,
+            mv = matches!(msg.mv, MvServe::Mv(_)),
+            sent_setgen_parse = relay.prepare.sent_setgen_parse,
+            sent_parse = relay.prepare.sent_parse,
+            sent_close = relay.prepare.sent_close,
+            "serve left unconsumed cache-DB bytes after ReadyForQuery (response desync); discarding connection (PGC-278)"
+        );
+        crate::metrics::handles()
+            .cache
+            .serve_dirty_return_total
+            .increment(1);
+        guard.poisoned = true;
+        // Drop the dirty connection; the poisoned guard's `Drop` replenishes.
+        drop(framed);
+        drop(parked);
+    } else {
+        // Clean — return the connection to the pool immediately.
+        guard.conn = Some(CacheConnection::from_framed(framed, parked));
+    }
 
     serve_response_finish(guard, &mut write_queue, relay, msg, client_gone, state_view).await
 }
