@@ -6,6 +6,7 @@
 
 #![allow(clippy::wildcard_enum_match_arm)]
 
+use std::collections::HashMap;
 use std::os::raw::c_void;
 
 use ecow::EcoString;
@@ -47,6 +48,7 @@ pub unsafe fn query_expr_convert_raw(tree_root: *const c_void) -> Result<QueryEx
             }
         };
 
+        window_refs_assert_resolved(&query)?;
         query_expr_constant_fold(&mut query);
         Ok(query)
     }
@@ -217,7 +219,9 @@ unsafe fn select_stmt_to_select_node(
     ctx: &ParseContext,
 ) -> Result<SelectNode, AstError> {
     unsafe {
-        let columns = select_columns_convert((*select_stmt).targetList)?;
+        let mut columns = select_columns_convert((*select_stmt).targetList)?;
+        let window_defs = window_clause_extract((*select_stmt).windowClause)?;
+        select_columns_window_refs_resolve(&mut columns, &window_defs)?;
         let from = from_clause_convert((*select_stmt).fromClause, ctx)?;
         let where_clause = match ((*select_stmt).whereClause as NodePtr).is_null() {
             true => None,
@@ -694,8 +698,35 @@ const FRAMEOPTION_EXCLUDE_CURRENT_ROW: i32 = 0x08000;
 const FRAMEOPTION_EXCLUDE_GROUP: i32 = 0x10000;
 const FRAMEOPTION_EXCLUDE_TIES: i32 = 0x20000;
 
+/// Convert a function's `OVER` clause. A bare `OVER w` (`name` set, no inline
+/// clauses) becomes a deferred reference resolved later against the SELECT's
+/// `WINDOW` clause (PGC-280); an inline `OVER (...)` is converted directly.
 unsafe fn window_def_convert(win_def: *const pg::WindowDef) -> Result<WindowSpec, AstError> {
     unsafe {
+        let name = cstr((*win_def).name);
+        if !name.is_empty() {
+            return Ok(WindowSpec {
+                partition_by: Vec::new(),
+                order_by: Vec::new(),
+                frame: None,
+                ref_name: Some(EcoString::from(name)),
+            });
+        }
+        window_spec_from_clauses(win_def)
+    }
+}
+
+/// Convert the inline PARTITION BY / ORDER BY / frame clauses of a `WindowDef`,
+/// ignoring its `name` (used both for `OVER (...)` and for the definitions in a
+/// `WINDOW` clause). `OVER (w ...)` frame inheritance (`refname`) is not
+/// supported and forwards.
+unsafe fn window_spec_from_clauses(win_def: *const pg::WindowDef) -> Result<WindowSpec, AstError> {
+    unsafe {
+        if !cstr((*win_def).refname).is_empty() {
+            return Err(AstError::UnsupportedFeature {
+                feature: "window definition inheriting another window".to_owned(),
+            });
+        }
         let partition_by = list_nodes((*win_def).partitionClause)
             .map(|n| scalar_expr_convert(n))
             .collect::<Result<Vec<_>, _>>()?;
@@ -705,8 +736,112 @@ unsafe fn window_def_convert(win_def: *const pg::WindowDef) -> Result<WindowSpec
             partition_by,
             order_by,
             frame,
+            ref_name: None,
         })
     }
+}
+
+/// Build the `name → WindowSpec` map from a SELECT's `WINDOW` clause, so that
+/// `OVER w` references can be resolved to their definitions (PGC-280).
+unsafe fn window_clause_extract(
+    window_clause: *const pg::List,
+) -> Result<HashMap<EcoString, WindowSpec>, AstError> {
+    unsafe {
+        let mut defs = HashMap::new();
+        for node in list_nodes(window_clause) {
+            if node_tag(node) != pg::NodeTag_T_WindowDef {
+                return Err(AstError::UnsupportedFeature {
+                    feature: format!("WINDOW clause node type: {:?}", node_tag(node)),
+                });
+            }
+            let win_def = cast::<pg::WindowDef>(node);
+            let name = cstr((*win_def).name);
+            if name.is_empty() {
+                return Err(AstError::UnsupportedFeature {
+                    feature: "unnamed WINDOW clause entry".to_owned(),
+                });
+            }
+            defs.insert(EcoString::from(name), window_spec_from_clauses(win_def)?);
+        }
+        Ok(defs)
+    }
+}
+
+/// Replace `OVER w` references in the SELECT list with their definitions
+/// (PGC-280). An unresolved reference left behind is caught by
+/// `window_refs_assert_resolved` and forwards the whole query.
+fn select_columns_window_refs_resolve(
+    columns: &mut SelectColumns,
+    defs: &HashMap<EcoString, WindowSpec>,
+) -> Result<(), AstError> {
+    if let SelectColumns::Columns(cols) = columns {
+        for col in cols {
+            if let SelectColumn::Expr { expr, .. } = col {
+                scalar_expr_window_refs_resolve(expr, defs)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scalar_expr_window_refs_resolve(
+    expr: &mut ScalarExpr,
+    defs: &HashMap<EcoString, WindowSpec>,
+) -> Result<(), AstError> {
+    match expr {
+        ScalarExpr::Function(func) => {
+            if let Some(over) = &mut func.over
+                && let Some(name) = over.ref_name.take()
+            {
+                *over = defs
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| AstError::UnsupportedFeature {
+                        feature: format!("reference to undefined window {name}"),
+                    })?;
+            }
+            for arg in &mut func.args {
+                scalar_expr_window_refs_resolve(arg, defs)?;
+            }
+        }
+        ScalarExpr::Arithmetic(arith) => {
+            scalar_expr_window_refs_resolve(&mut arith.left, defs)?;
+            scalar_expr_window_refs_resolve(&mut arith.right, defs)?;
+        }
+        ScalarExpr::Case(case) => {
+            if let Some(arg) = &mut case.arg {
+                scalar_expr_window_refs_resolve(arg, defs)?;
+            }
+            for when in &mut case.whens {
+                scalar_expr_window_refs_resolve(&mut when.result, defs)?;
+            }
+            if let Some(default) = &mut case.default {
+                scalar_expr_window_refs_resolve(default, defs)?;
+            }
+        }
+        ScalarExpr::Array(elems) => {
+            for e in elems {
+                scalar_expr_window_refs_resolve(e, defs)?;
+            }
+        }
+        ScalarExpr::TypeCast { expr, .. } => {
+            scalar_expr_window_refs_resolve(expr, defs)?;
+        }
+        ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Subquery(_) => {}
+    }
+    Ok(())
+}
+
+/// Fail loud on any window reference the SELECT-list resolution did not reach
+/// (e.g. `OVER w` in ORDER BY). Returning an error forwards the query, so an
+/// unresolved reference never silently deparses to `OVER ()` (PGC-280).
+fn window_refs_assert_resolved(query: &QueryExpr) -> Result<(), AstError> {
+    if query.nodes::<WindowSpec>().any(|w| w.ref_name.is_some()) {
+        return Err(AstError::UnsupportedFeature {
+            feature: "window reference outside the SELECT list".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Decode the frame clause from a `WindowDef`. Returns `None` for the SQL

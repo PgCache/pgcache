@@ -1744,6 +1744,11 @@ pub struct WindowSpec {
     /// frame (RANGE UNBOUNDED PRECEDING .. CURRENT ROW); dropping a non-default
     /// frame silently changes results (PGC-279), so it must round-trip.
     pub frame: Option<WindowFrame>,
+    /// Converter-internal: the name in `OVER w` before it is resolved against
+    /// the SELECT's `WINDOW` clause (PGC-280). Always `None` on a WindowSpec
+    /// that escapes conversion — `query_expr_convert_raw` forwards any query
+    /// with an unresolved reference rather than serving `OVER ()`.
+    pub ref_name: Option<EcoString>,
 }
 
 impl AstNode for WindowSpec {

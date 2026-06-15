@@ -2083,6 +2083,7 @@ mod tests {
                     null_order: NullOrder::Default,
                 }],
                 frame: None,
+                ref_name: None,
             }),
         };
         let mut buf = String::new();
@@ -2155,6 +2156,35 @@ mod tests {
             parse_over_deparse("SELECT sum(a) OVER (ORDER BY b) FROM t"),
             "(ORDER BY b ASC)"
         );
+    }
+
+    #[test]
+    fn test_named_window_resolves_to_definition() {
+        // `OVER w` is inlined from the WINDOW clause (PGC-280).
+        assert_eq!(
+            parse_over_deparse(
+                "SELECT sum(a) OVER w FROM t WINDOW w AS (PARTITION BY b ORDER BY c)",
+            ),
+            "(PARTITION BY b ORDER BY c ASC)"
+        );
+    }
+
+    #[test]
+    fn test_named_window_with_frame_resolves() {
+        assert_eq!(
+            parse_over_deparse(
+                "SELECT last_value(a) OVER w FROM t \
+                 WINDOW w AS (ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+            ),
+            "(ORDER BY b ASC ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)"
+        );
+    }
+
+    #[test]
+    fn test_undefined_window_reference_forwards() {
+        // No WINDOW clause defines `w` → conversion fails so the query forwards
+        // rather than silently deparsing to `OVER ()`.
+        assert!(query_expr_parse("SELECT rank() OVER w FROM t").is_err());
     }
 
     #[test]
