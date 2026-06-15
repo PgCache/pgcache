@@ -411,15 +411,21 @@ impl WriterRegistration {
                     )
                     .await
                 {
-                    // Non-decorrelatable subqueries are a routing decision
-                    // (forward to origin), not a fault — log at debug.
+                    // Some registration failures are routing decisions (the
+                    // query simply isn't cacheable and is forwarded to origin),
+                    // not faults — log at debug so swallowed-error scanners
+                    // don't treat an expected forward as a fault. A table with
+                    // no primary key surfaces as `UnknownTable` (PGC-135, the
+                    // documented "forwarded silently" path); a correlated
+                    // subquery that can't be decorrelated as `NonDecorrelatable`.
                     let ctx = e.current_context();
                     if matches!(
                         ctx,
                         CacheError::DecorrelateError(DecorrelateError::NonDecorrelatable { .. })
+                            | CacheError::UnknownTable { .. }
                     ) {
                         debug!(
-                            "query {fingerprint} forwarded (not decorrelatable): {}",
+                            "query {fingerprint} forwarded (not cacheable): {}",
                             error_chain_format(ctx),
                         );
                     } else {
