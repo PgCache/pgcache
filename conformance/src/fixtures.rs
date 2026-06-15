@@ -519,6 +519,64 @@ pub async fn subselect_tables_load(client: &Client, publication: Option<&str>) -
     Ok(())
 }
 
+/// `department` from `src/test/regress/sql/with.sql` — the canonical
+/// hierarchical fixture for recursive-CTE tree traversal. `id` is the
+/// PRIMARY KEY (upstream also self-references via FK, dropped here as it
+/// doesn't affect the queries).
+pub async fn with_tables_load(client: &Client, publication: Option<&str>) -> Result<()> {
+    client
+        .batch_execute("DROP TABLE IF EXISTS department CASCADE")
+        .await
+        .context("dropping existing department")?;
+    client
+        .batch_execute(
+            "CREATE TABLE department (id integer PRIMARY KEY, parent_department integer, name text)",
+        )
+        .await
+        .context("creating department")?;
+    publication_table_ensure(client, publication, "department").await?;
+    client
+        .batch_execute(
+            "INSERT INTO department VALUES (0,NULL,'ROOT'),(1,0,'A'),(2,1,'B'),(3,2,'C'),\
+             (4,2,'D'),(5,0,'E'),(6,4,'F'),(7,5,'G')",
+        )
+        .await
+        .context("loading department")?;
+    tracing::info!(table = "department", "loaded with fixture");
+    Ok(())
+}
+
+/// `empsalary` from `src/test/regress/sql/window.sql` — the canonical
+/// window-function fixture. `empno` is unique, so it is the PRIMARY KEY
+/// (upstream is keyless) for cache coverage.
+pub async fn window_tables_load(client: &Client, publication: Option<&str>) -> Result<()> {
+    client
+        .batch_execute("DROP TABLE IF EXISTS empsalary CASCADE")
+        .await
+        .context("dropping existing empsalary")?;
+    client
+        .batch_execute(
+            "CREATE TABLE empsalary (depname varchar, empno bigint PRIMARY KEY, \
+             salary int, enroll_date date)",
+        )
+        .await
+        .context("creating empsalary")?;
+    publication_table_ensure(client, publication, "empsalary").await?;
+    client
+        .batch_execute(
+            "INSERT INTO empsalary VALUES \
+             ('develop',10,5200,'2007-08-01'),('sales',1,5000,'2006-10-01'),\
+             ('personnel',5,3500,'2007-12-10'),('sales',4,4800,'2007-08-08'),\
+             ('personnel',2,3900,'2006-12-23'),('develop',7,4200,'2008-01-01'),\
+             ('develop',9,4500,'2008-01-01'),('sales',3,4800,'2007-08-01'),\
+             ('develop',8,6000,'2006-10-01'),('develop',11,5200,'2007-08-15')",
+        )
+        .await
+        .context("loading empsalary")?;
+    tracing::info!(table = "empsalary", "loaded window fixture");
+    Ok(())
+}
+
 /// Create and populate `foo` on origin (idempotent) and add it to
 /// pgcache's publication, so the select suite's NULL-ordering queries
 /// are cached. Mirrors [`join_tables_load`].

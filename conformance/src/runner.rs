@@ -103,6 +103,12 @@ pub async fn run(cli: Cli) -> Result<()> {
     fixtures::subselect_tables_load(origin.client(), ep.publication.as_deref())
         .await
         .context("loading subselect fixtures")?;
+    fixtures::window_tables_load(origin.client(), ep.publication.as_deref())
+        .await
+        .context("loading window fixtures")?;
+    fixtures::with_tables_load(origin.client(), ep.publication.as_deref())
+        .await
+        .context("loading with fixtures")?;
 
     let status = StatusClient::new(ep.status_url);
     let mut log_tailer = match &ep.logs_file {

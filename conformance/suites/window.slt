@@ -13,13 +13,24 @@
 # unique `unique1` (so there are no implementation-defined peer breaks)
 # or use rank-family functions that assign ties deterministically.
 #
+# The first sections are adapted to `onek` (unique-ordered) for
+# deterministic frames/ranking; the final section is the faithful
+# upstream `empsalary` fixture (ranking, named windows, window-over-
+# aggregate).
+#
 # Scope deviations from upstream window.sql:
-#   * It is built on `empsalary` / `tenk1` / generate_series and is
-#     largely EXPLAIN / planner-internal (WindowAgg plan shapes, run
-#     conditions, frame-mode planner paths) — adapted to `onek`, results
-#     only.
-#   * `WINDOW` over GROUP BY, RANGE/GROUPS frames with type-specific
-#     offsets, EXCLUDE, and SRF/LATERAL sections are deferred.
+#   * EXPLAIN / planner-internal sections (WindowAgg plan shapes, run
+#     conditions, frame-mode planner paths) — omitted.
+#   * Upstream's tenk1 frame/value tests order by non-unique columns
+#     (ten/four) and rely on the regress harness's fixed single-threaded
+#     scan order, so `ROWS` frames, `lag`/`lead`, `ntile`, and
+#     `row_number` over ties are non-deterministic across two independent
+#     engines (origin vs pgcache) — those are omitted; the deterministic
+#     equivalents over the unique `onek.unique1` are kept below. Only
+#     peer-based functions (rank/dense_rank/percent_rank/cume_dist and
+#     RANGE/GROUPS frames) are ported over non-unique orders.
+#   * numerics/datetimes typed-offset RANGE frames and SRF/LATERAL
+#     sections are deferred.
 #
 # Two silent-drop defects this suite first surfaced are now fixed and
 # the queries below cache correctly (regression coverage):
@@ -164,3 +175,56 @@ SELECT unique1, four, rank() OVER w
   FROM onek WHERE unique1 < 10
   WINDOW w AS (PARTITION BY four ORDER BY unique1)
   ORDER BY unique1;
+
+#
+# Faithful empsalary section (the canonical upstream window fixture).
+# Ranking, named windows, window-over-aggregate. Outer ORDER BY includes
+# empno (the PK) so ties don't make the row order ambiguous; the window
+# functions are peer-based (rank family) so their values are deterministic.
+#
+
+# pgcache: cached
+query TTTT
+SELECT depname, empno, salary, sum(salary) OVER (PARTITION BY depname)
+  FROM empsalary ORDER BY depname, empno;
+
+# pgcache: cached
+query TTTT
+SELECT depname, empno, salary, rank() OVER (PARTITION BY depname ORDER BY salary)
+  FROM empsalary ORDER BY depname, salary, empno;
+
+# Named window.
+# pgcache: cached
+query TTTT
+SELECT depname, empno, salary, sum(salary) OVER w
+  FROM empsalary WINDOW w AS (PARTITION BY depname) ORDER BY depname, empno;
+
+# pgcache: cached
+query TTTT
+SELECT depname, empno, salary, rank() OVER w
+  FROM empsalary WINDOW w AS (PARTITION BY depname ORDER BY salary)
+  ORDER BY depname, salary, empno;
+
+# Distribution functions (peer-based — deterministic over ties).
+# pgcache: cached
+query TTTR
+SELECT depname, empno, salary, percent_rank() OVER (PARTITION BY depname ORDER BY salary)
+  FROM empsalary ORDER BY depname, salary, empno;
+
+# pgcache: cached
+query TTTR
+SELECT depname, empno, salary, cume_dist() OVER (PARTITION BY depname ORDER BY salary)
+  FROM empsalary ORDER BY depname, salary, empno;
+
+# Window function over an aggregate, with GROUP BY (distinct group sums).
+# pgcache: cached
+query TTI
+SELECT depname, sum(salary) AS s, rank() OVER (ORDER BY sum(salary) DESC)
+  FROM empsalary GROUP BY depname ORDER BY depname;
+
+# Two identically-defined windows under different names.
+# pgcache: cached
+query TII
+SELECT salary, sum(salary) OVER w1, count(*) OVER w2
+  FROM empsalary WINDOW w1 AS (ORDER BY salary), w2 AS (ORDER BY salary)
+  ORDER BY salary, empno;
