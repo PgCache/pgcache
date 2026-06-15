@@ -519,6 +519,33 @@ pub async fn subselect_tables_load(client: &Client, publication: Option<&str>) -
     Ok(())
 }
 
+/// `case_tbl` / `case2_tbl` from `src/test/regress/sql/case.sql`.
+/// `case_tbl.i` is unique → PRIMARY KEY (cacheable); `case2_tbl` has
+/// duplicate/NULL keys → keyless, forwarded.
+pub async fn case_tables_load(client: &Client, publication: Option<&str>) -> Result<()> {
+    client
+        .batch_execute("DROP TABLE IF EXISTS case_tbl, case2_tbl CASCADE")
+        .await
+        .context("dropping existing case fixtures")?;
+    client
+        .batch_execute(
+            "CREATE TABLE case_tbl (i integer PRIMARY KEY, f double precision); \
+             INSERT INTO case_tbl VALUES (1,10.1),(2,20.2),(3,-30.3),(4,NULL)",
+        )
+        .await
+        .context("creating case_tbl")?;
+    publication_table_ensure(client, publication, "case_tbl").await?;
+    client
+        .batch_execute(
+            "CREATE TABLE case2_tbl (i integer, j integer); \
+             INSERT INTO case2_tbl VALUES (1,-1),(2,-2),(3,-3),(2,-4),(1,NULL),(NULL,-6)",
+        )
+        .await
+        .context("creating case2_tbl")?;
+    tracing::info!("loaded case fixtures");
+    Ok(())
+}
+
 /// `department` from `src/test/regress/sql/with.sql` — the canonical
 /// hierarchical fixture for recursive-CTE tree traversal. `id` is the
 /// PRIMARY KEY (upstream also self-references via FK, dropped here as it

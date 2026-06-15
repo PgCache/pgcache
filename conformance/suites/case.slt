@@ -1,0 +1,110 @@
+# Faithful port of PostgreSQL src/test/regress/sql/case.sql — CASE /
+# COALESCE / NULLIF result-correctness. Run against case_tbl (keyed) and
+# case2_tbl (keyless) loaded before this suite.
+#
+# Origin is the oracle: no results inlined; compared row-wise with a
+# top-level ORDER BY, else as a sorted multiset; the pgcache log is
+# scanned for swallowed errors. Routing annotated per shape.
+#
+# Excluded from upstream case.sql (documented): the UPDATE … SET i = CASE
+# statements (DML) and every SELECT after them (they read mutated data);
+# the constant-subexpression EXPLAIN checks; and the nested-CASE /
+# domain / custom-operator / enum / array-coerce sections (they need
+# CREATE FUNCTION/DOMAIN/OPERATOR/TYPE). The `random()` "no matches" case
+# is non-deterministic and omitted.
+
+#
+# Simplest CASE examples without tables (forwarded — no FROM).
+#
+
+# pgcache: passthrough
+query TT
+SELECT '3' AS "One", CASE WHEN 1 < 2 THEN 3 END AS "Simple WHEN";
+
+# pgcache: passthrough
+query TT
+SELECT '<NULL>' AS "One", CASE WHEN 1 > 2 THEN 3 END AS "Simple default";
+
+# pgcache: passthrough
+query TT
+SELECT '3' AS "One", CASE WHEN 1 < 2 THEN 3 ELSE 4 END AS "Simple ELSE";
+
+# pgcache: passthrough
+query TT
+SELECT '4' AS "One", CASE WHEN 1 > 2 THEN 3 ELSE 4 END AS "ELSE default";
+
+# pgcache: passthrough
+query TT
+SELECT '6' AS "One",
+  CASE WHEN 1 > 2 THEN 3 WHEN 4 < 5 THEN 6 ELSE 7 END AS "Two WHEN with default";
+
+# Folding shouldn't evaluate unreachable subexpressions (1/0 not hit).
+# pgcache: passthrough
+query T
+SELECT CASE WHEN 1=0 THEN 1/0 WHEN 1=1 THEN 1 ELSE 2/0 END;
+
+# pgcache: passthrough
+query T
+SELECT CASE 1 WHEN 0 THEN 1/0 WHEN 1 THEN 1 ELSE 2/0 END;
+
+# Untyped literal in the test expression.
+# pgcache: passthrough
+query T
+SELECT CASE 'a' WHEN 'a' THEN 1 ELSE 2 END;
+
+#
+# CASE expressions over a table.
+#
+
+# pgcache: cached
+query TT
+SELECT i, CASE WHEN i >= 3 THEN i END AS "ge3_or_null" FROM case_tbl ORDER BY i;
+
+# pgcache: cached
+query TT
+SELECT i, CASE WHEN i >= 3 THEN (i + i) ELSE i END AS "math" FROM case_tbl ORDER BY i;
+
+# pgcache: cached
+query TT
+SELECT i AS "Value",
+  CASE WHEN (i < 0) THEN 'small'
+       WHEN (i = 0) THEN 'zero'
+       WHEN (i = 1) THEN 'one'
+       WHEN (i = 2) THEN 'two'
+       ELSE 'big' END AS "Category"
+  FROM case_tbl ORDER BY i;
+
+# (Upstream's `CASE WHEN i > 100 THEN 1/0 ELSE 0 END FROM case_tbl` is
+# omitted: PostgreSQL folds the constant `1/0` in the potentially-reachable
+# arm and errors at plan time — an error-expecting case, not a result.)
+
+#
+# NULLIF / COALESCE — shorthand CASE forms. COALESCE/NULLIF in WHERE are
+# forwarded.
+#
+
+# pgcache: passthrough
+query TT
+SELECT * FROM case_tbl WHERE COALESCE(f, i) = 4;
+
+# pgcache: passthrough
+query TT
+SELECT * FROM case_tbl WHERE NULLIF(f, i) = 2;
+
+# COALESCE over a comma join (keyless case2_tbl) — forwarded.
+# pgcache: passthrough
+query T
+SELECT COALESCE(a.f, b.i, b.j) FROM case_tbl a, case2_tbl b;
+
+# pgcache: passthrough
+query TTTT
+SELECT * FROM case_tbl a, case2_tbl b WHERE COALESCE(a.f, b.i, b.j) = 2;
+
+# pgcache: passthrough
+query TT
+SELECT NULLIF(a.i, b.i) AS "NULLIF(a.i,b.i)", NULLIF(b.i, 4) AS "NULLIF(b.i,4)"
+  FROM case_tbl a, case2_tbl b;
+
+# pgcache: passthrough
+query TTTT
+SELECT * FROM case_tbl a, case2_tbl b WHERE COALESCE(f, b.i) = 2;
