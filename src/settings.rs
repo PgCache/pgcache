@@ -178,8 +178,22 @@ pub struct DynamicConfig {
 
 const DEFAULT_ADMISSION_THRESHOLD: u32 = 1;
 const DEFAULT_MV_SIZE_RATIO: u32 = 10;
-/// Default total-bytes budget for the in-process hot-result cache: 64 MiB.
+/// Floor (and RAM-undetectable fallback) for the in-process hot-result cache
+/// budget: 64 MiB.
 const DEFAULT_MEMO_CACHE_SIZE: usize = 64 * 1024 * 1024;
+/// Fraction of the detected memory budget used as the memo default (PROTOTYPE,
+/// PGC-277). The memo competes for the same throttle ceiling as registration by
+/// its actual footprint, so this is a soft ceiling on the hot-result cache.
+const MEMO_RAM_FRACTION_DIVISOR: u64 = 4;
+
+/// RAM-relative default memo budget: 1/[`MEMO_RAM_FRACTION_DIVISOR`] of the
+/// detected memory budget, floored at [`DEFAULT_MEMO_CACHE_SIZE`]. Falls back to
+/// the floor when RAM is undetectable (non-Linux/non-macOS).
+fn memo_default() -> usize {
+    crate::memory::total_budget_bytes()
+        .and_then(|b| usize::try_from(b / MEMO_RAM_FRACTION_DIVISOR).ok())
+        .map_or(DEFAULT_MEMO_CACHE_SIZE, |v| v.max(DEFAULT_MEMO_CACHE_SIZE))
+}
 
 impl DynamicConfig {
     #[allow(clippy::too_many_arguments)]
@@ -202,7 +216,7 @@ impl DynamicConfig {
             allowed_tables,
             log_level,
             mv_size_ratio: mv_size_ratio.unwrap_or(DEFAULT_MV_SIZE_RATIO),
-            memo_cache_size: memo_cache_size.unwrap_or(DEFAULT_MEMO_CACHE_SIZE),
+            memo_cache_size: memo_cache_size.unwrap_or_else(memo_default),
             memory_limit,
             disk_limit,
         }

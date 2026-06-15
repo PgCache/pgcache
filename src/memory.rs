@@ -45,28 +45,27 @@ pub struct ThrottleDecision {
     pub throttled: bool,
     /// The used-memory high-water mark above which registration throttles.
     pub high_mark: u64,
-    /// The effective memory ceiling (80% RAM, lowered by `memory_limit`), before
-    /// the memo reserve. The count cap budgets against this.
+    /// The effective memory ceiling (80% RAM, lowered by `memory_limit`), which
+    /// is also the throttle high mark. The count cap budgets against this.
     pub ceiling: u64,
 }
 
 /// Pure throttle evaluation, driving `cache::runtime::memory_monitor`. `used` is
-/// whole-system used memory (pgcache + the cache Postgres). The ceiling is 80%
-/// of `total_ram`, only ever *lowered* by `memory_limit`; the memo's unfilled
-/// budget is reserved on top; and a 2%-of-ceiling hysteresis band (only relevant
-/// when already throttled) keeps the flag from flapping.
+/// whole-system used memory (pgcache + the cache Postgres), which already counts
+/// the memo's *actual* resident bytes — so the memo competes for the same ceiling
+/// as registration by its real footprint, with no separate unfilled-budget
+/// reserve (PROTOTYPE). The ceiling is 80% of `total_ram`, only ever *lowered* by
+/// `memory_limit`; a 2%-of-ceiling hysteresis band (only relevant when already
+/// throttled) keeps the flag from flapping.
 pub fn throttle_evaluate(
     used: u64,
     total_ram: u64,
     memory_limit: Option<u64>,
-    memo_budget: u64,
-    memo_used: u64,
     currently_throttled: bool,
 ) -> ThrottleDecision {
     let default_ceiling = total_ram / 5 * 4; // 80%, exact-division form
     let ceiling = memory_limit.map_or(default_ceiling, |l| l.min(default_ceiling));
-    let memo_reserve = memo_budget.saturating_sub(memo_used);
-    let high_mark = ceiling.saturating_sub(memo_reserve);
+    let high_mark = ceiling;
     let low_mark = high_mark.saturating_sub(ceiling / 100 * 2);
     let throttled = if currently_throttled {
         used > low_mark
@@ -398,7 +397,36 @@ mod sys {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(not(target_os = "linux"), target_os = "macos"))]
+mod sys {
+    pub fn process_rss_bytes() -> Option<u64> {
+        None
+    }
+
+    /// Host RAM via `sysctl -n hw.memsize`. macOS has no cgroup limit, so this
+    /// is the whole budget. Lets the RAM-relative memo default exercise locally;
+    /// the other introspection points stay `None`, so the registration monitor
+    /// (which needs `system_used_bytes`) remains disabled on the dev box. Shells
+    /// out rather than add a `libc` FFI dep — this prototype path is queried once
+    /// at startup.
+    pub fn total_budget_bytes() -> Option<u64> {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        let size: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
+        (size > 0).then_some(size)
+    }
+
+    pub fn system_used_bytes() -> Option<u64> {
+        None
+    }
+    pub fn system_private_bytes() -> Option<u64> {
+        None
+    }
+}
+
+#[cfg(all(not(target_os = "linux"), not(target_os = "macos")))]
 mod sys {
     pub fn process_rss_bytes() -> Option<u64> {
         None
@@ -457,21 +485,21 @@ mod tests {
 
     #[test]
     fn test_throttle_below_budget_not_throttled() {
-        let d = super::throttle_evaluate(GB, 10 * GB, None, 0, 0, false);
+        let d = super::throttle_evaluate(GB, 10 * GB, None, false);
         assert_eq!(d.high_mark, 8 * GB); // 80% of 10 GB
         assert!(!d.throttled);
     }
 
     #[test]
     fn test_throttle_above_eighty_percent() {
-        let d = super::throttle_evaluate(9 * GB, 10 * GB, None, 0, 0, false);
+        let d = super::throttle_evaluate(9 * GB, 10 * GB, None, false);
         assert!(d.throttled);
     }
 
     #[test]
     fn test_memory_limit_lowers_ceiling() {
         // limit 2 GB pulls the ceiling well below 80% of 10 GB.
-        let d = super::throttle_evaluate(3 * GB, 10 * GB, Some(2 * GB), 0, 0, false);
+        let d = super::throttle_evaluate(3 * GB, 10 * GB, Some(2 * GB), false);
         assert_eq!(d.high_mark, 2 * GB);
         assert!(d.throttled);
     }
@@ -479,21 +507,20 @@ mod tests {
     #[test]
     fn test_memory_limit_cannot_raise_ceiling() {
         // A limit above 80% of RAM is ignored; ceiling stays at 8 GB.
-        let d = super::throttle_evaluate(7 * GB, 10 * GB, Some(100 * GB), 0, 0, false);
+        let d = super::throttle_evaluate(7 * GB, 10 * GB, Some(100 * GB), false);
         assert_eq!(d.high_mark, 8 * GB);
         assert!(!d.throttled);
     }
 
     #[test]
-    fn test_memo_budget_reserved() {
-        // Reserving a 4 GB memo budget pulls the high mark from 8 GB to 4 GB.
-        let d = super::throttle_evaluate(5 * GB, 10 * GB, None, 4 * GB, 0, false);
-        assert_eq!(d.high_mark, 4 * GB);
-        assert!(d.throttled);
-        // Once the memo has filled its budget, nothing is reserved.
-        let d = super::throttle_evaluate(5 * GB, 10 * GB, None, 4 * GB, 4 * GB, false);
+    fn test_high_mark_is_ceiling() {
+        // The high mark is the bare ceiling now — the memo's actual footprint
+        // shows up in `used` instead of being pre-reserved (PROTOTYPE).
+        let d = super::throttle_evaluate(7 * GB, 10 * GB, None, false);
         assert_eq!(d.high_mark, 8 * GB);
         assert!(!d.throttled);
+        let d = super::throttle_evaluate(8 * GB + 1, 10 * GB, None, false);
+        assert!(d.throttled);
     }
 
     #[test]
@@ -501,9 +528,9 @@ mod tests {
         // high_mark = 8 GB, low_mark = 8 GB - 2% of 8 GB = 7.84 GB.
         let rss = 8 * GB - GB / 10; // 7.9 GB, between low and high marks
         // Not yet throttled: below the high mark, stays off.
-        assert!(!super::throttle_evaluate(rss, 10 * GB, None, 0, 0, false).throttled);
+        assert!(!super::throttle_evaluate(rss, 10 * GB, None, false).throttled);
         // Already throttled: above the low mark, stays on.
-        assert!(super::throttle_evaluate(rss, 10 * GB, None, 0, 0, true).throttled);
+        assert!(super::throttle_evaluate(rss, 10 * GB, None, true).throttled);
     }
 
     const MB: u64 = 1 << 20;

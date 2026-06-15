@@ -3781,6 +3781,17 @@ impl WriterCore {
         // Remove from state view
         self.state_view.cached_queries.remove(&fingerprint);
 
+        // The memo is deliberately NOT swept here. Memo entries turn over via
+        // relation slot bumps (any CDC write to a read relation evicts them), so
+        // eviction without a data change leaves a correctness-safe orphan: the
+        // entry is still gated by its slot stamps (cannot serve stale) and is
+        // bounded by the memo byte budget (a full store rejects new captures, no
+        // leak). It clears on the next write to its relation, or serves for free
+        // if the fingerprint is re-registered while unchanged. Coupling memo
+        // removal to eviction would need a fingerprint→keys index, not just an
+        // O(n) scan per eviction — deferred until orphan accumulation under a
+        // write-light, high-cardinality workload is shown to matter (PGC-277).
+
         // Drain coalesced waiters parked on the now-removed query (eviction can
         // remove a Loading query whose waiters would otherwise never be drained).
         self.waiters_fail(fingerprint);

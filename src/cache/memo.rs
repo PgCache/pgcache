@@ -64,10 +64,12 @@ use crate::settings::DynamicConfigHandle;
 /// backend targets the small/stable results that dominate source-row traffic.
 const MAX_MEMO_ENTRY_BYTES: usize = 128 * 1024;
 
-/// A fingerprint is memoized only after this many hits, so one-shot queries
-/// don't churn the bounded store. Hits are counted at dispatch (every serve),
-/// so the Nth serve is the first capture candidate.
-pub const MEMO_CAPTURE_MIN_HITS: u64 = 4;
+/// A fingerprint is memoized from its first eligible serve. Capture only happens
+/// for already-cacheable source-row serves and the store is byte-bounded, so a
+/// higher gate mainly delays relief: under a high-cardinality registration storm
+/// it leaves most cache hits on the serve pool until each key clears the gate.
+/// Capturing on the first serve maximizes serve-pool relief (PGC-277).
+pub const MEMO_CAPTURE_MIN_HITS: u64 = 1;
 
 /// A dependency slot a memoized result is invalidated against. The CDC path
 /// bumps slots; a memo stamps the slots it read and is served only while every

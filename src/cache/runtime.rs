@@ -525,8 +525,6 @@ async fn memory_monitor(
             used,
             total_ram,
             dynamic.load().memory_limit.map(|l| l as u64),
-            state_view.memo.budget() as u64,
-            state_view.memo.total_bytes() as u64,
             throttled,
         );
         let next = decision.throttled;
@@ -1069,10 +1067,16 @@ async fn serve_loop(
             .cache
             .pool_available
             .set(conn_rx.len() as f64);
-        crate::metrics::handles().cache.serves_in_flight.increment(1.0);
+        crate::metrics::handles()
+            .cache
+            .serves_in_flight
+            .increment(1.0);
         tokio::spawn(async move {
             handle_serve_request(conn, return_tx, replenish_tx, msg, state_view).await;
-            crate::metrics::handles().cache.serves_in_flight.decrement(1.0);
+            crate::metrics::handles()
+                .cache
+                .serves_in_flight
+                .decrement(1.0);
         });
 
         // Channel depth gauge; queue length never approaches 2^53.
