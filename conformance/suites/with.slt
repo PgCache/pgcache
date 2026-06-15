@@ -1,0 +1,138 @@
+# Curated port of PostgreSQL src/test/regress/sql/with.sql — the
+# common-table-expression (WITH) result-correctness core: simple CTEs,
+# CTEs containing aggregates/joins, chained and multiply-referenced
+# CTEs, the MATERIALIZED / NOT MATERIALIZED hints, and WITH RECURSIVE.
+# Run against the `onek` / `j1_tbl` / `j2_tbl` fixtures (loaded by the
+# harness before this suite).
+#
+# Origin is the oracle: no results are inlined. Each query runs on
+# origin and pgcache and the result sets are compared, plus the pgcache
+# log is scanned for swallowed errors. Every query carries a stable
+# outer ORDER BY (on a unique column) so the compared row order is
+# deterministic.
+#
+# Scope deviations from upstream with.sql:
+#   * It is overwhelmingly WITH RECURSIVE (graph/tree traversals, fib,
+#     etc.) and data-modifying CTEs (`WITH x AS (INSERT ... RETURNING)`).
+#     pgcache forwards both — recursive CTEs are rejected at convert
+#     (UnsupportedFeature) and data-modifying CTEs are writes — so a
+#     representative recursive sample is kept as passthrough coverage and
+#     the read-only CTE shapes are adapted to onek/j-tables.
+#   * Data-modifying CTEs are omitted: they are single-statement writes
+#     and this harness runs each statement on both origin and pgcache,
+#     which would double-apply.
+#   * EXPLAIN / planner-internal (inlining decisions, CTE scan costs)
+#     sections assert plans, not results — omitted.
+
+#
+# Simple CTE: filter/project a single table, then read it.
+#
+
+# pgcache: cached
+query TT
+WITH c AS (SELECT unique1, ten FROM onek WHERE unique1 < 10)
+SELECT unique1, ten FROM c ORDER BY unique1;
+
+# Outer query filters the CTE further.
+# pgcache: cached
+query T
+WITH c AS (SELECT unique1, ten FROM onek)
+SELECT unique1 FROM c WHERE ten = 0 ORDER BY unique1;
+
+#
+# CTE containing an aggregate / GROUP BY (the CTE body is a reducer).
+#
+
+# pgcache: cached
+query TT
+WITH c AS (SELECT ten, count(*) AS n FROM onek GROUP BY ten)
+SELECT ten, n FROM c ORDER BY ten;
+
+# Aggregate CTE with an outer predicate over the aggregated column.
+# pgcache: cached
+query TT
+WITH c AS (SELECT four, count(*) AS n FROM onek GROUP BY four)
+SELECT four, n FROM c WHERE n > 0 ORDER BY four;
+
+#
+# Chained CTEs: a later CTE reads an earlier one.
+#
+
+# pgcache: cached
+query T
+WITH a AS (SELECT unique1, ten FROM onek WHERE unique1 < 20),
+     b AS (SELECT unique1 FROM a WHERE ten = 0)
+SELECT unique1 FROM b ORDER BY unique1;
+
+#
+# Multiple CTEs joined together.
+#
+
+# pgcache: cached
+query TT
+WITH a AS (SELECT i, k FROM j2_tbl),
+     b AS (SELECT i, j FROM j1_tbl)
+SELECT a.k, b.j FROM a JOIN b ON a.i = b.i ORDER BY a.k, b.j;
+
+#
+# A single CTE referenced twice (self-join over the CTE).
+#
+
+# pgcache: cached
+query TT
+WITH c AS (SELECT unique1, two FROM onek WHERE unique1 < 6)
+SELECT x.unique1, y.unique1
+  FROM c x JOIN c y ON x.two = y.two
+  ORDER BY x.unique1, y.unique1;
+
+#
+# CTE joined with a base table.
+#
+
+# pgcache: cached
+query TT
+WITH c AS (SELECT unique1, ten FROM onek WHERE unique1 < 50)
+SELECT c.unique1, o.unique2
+  FROM c JOIN onek o ON c.unique1 = o.unique1
+  WHERE c.ten = 0
+  ORDER BY c.unique1;
+
+#
+# MATERIALIZED / NOT MATERIALIZED hints — results are identical to the
+# unhinted form (the hint only affects the optimizer).
+#
+
+# pgcache: cached
+query T
+WITH c AS MATERIALIZED (SELECT unique1 FROM onek WHERE unique1 < 5)
+SELECT unique1 FROM c ORDER BY unique1;
+
+# pgcache: cached
+query T
+WITH c AS NOT MATERIALIZED (SELECT unique1 FROM onek WHERE unique1 < 5)
+SELECT unique1 FROM c ORDER BY unique1;
+
+#
+# WITH RECURSIVE — rejected at convert and forwarded; correctness is
+# checked against origin.
+#
+
+# Counter: generates 1..5 with no table dependency.
+# pgcache: passthrough
+query T
+WITH RECURSIVE t(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM t WHERE n < 5
+)
+SELECT n FROM t ORDER BY n;
+
+# Recursive walk seeded from a base table.
+# pgcache: passthrough
+query T
+WITH RECURSIVE c(u) AS (
+  SELECT unique1 FROM onek WHERE unique1 = 0
+  UNION ALL
+  SELECT u + 1 FROM c WHERE u < 10
+)
+SELECT u FROM c ORDER BY u;
