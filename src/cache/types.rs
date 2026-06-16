@@ -13,13 +13,12 @@ use hdrhistogram::Histogram;
 use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
 
 use crate::{
-    cache::{
-        memo::ResultMemo, mv::MvMeta, query::CacheableQuery, subsumption_index::SubsumptionIndex,
-    },
+    cache::{memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::TableMetadata,
     query::{
         Fingerprint, FingerprintDashMap, FingerprintMap, ast::QueryExpr,
-        constraints::QueryConstraints, resolved::ResolvedQueryExpr,
+        constraint_index::ConstraintIndex, constraints::QueryConstraints,
+        resolved::ResolvedQueryExpr,
     },
     settings::{DynamicConfigHandle, Settings},
 };
@@ -235,7 +234,15 @@ pub struct UpdateQueries {
     pub relation_oid: Oid,
     pub queries: FingerprintMap<UpdateQuery>,
     pub complexity_order: Vec<Fingerprint>,
-    pub subsumption: SubsumptionIndex,
+    pub subsumption: ConstraintIndex<Fingerprint>,
+    /// Separate instantiation of the same `ConstraintIndex` structure, indexing
+    /// the per-table constraints of this relation's LocalEval update-queries.
+    /// Used by `update_queries_execute_batch` to narrow the per-row matcher to
+    /// candidate queries instead of scanning every query. Unlike `subsumption`,
+    /// this holds the *full* LocalEval population: queries with no/partial
+    /// extractable constraints land in the unconstrained class and are returned
+    /// for every row, so narrowing never drops a true match (no stale reads).
+    pub local_eval_index: ConstraintIndex<Fingerprint>,
     /// Count of queries with `change_dependent == true`. Maintained on
     /// insert/remove via `change_dependent_account` so `needs_change_eval` is
     /// O(1) on the CDC hot path. Derivable from `queries`; `needs_change_eval`
@@ -251,7 +258,8 @@ impl UpdateQueries {
             relation_oid,
             queries: HashMap::default(),
             complexity_order: Vec::new(),
-            subsumption: SubsumptionIndex::new(),
+            subsumption: ConstraintIndex::new(),
+            local_eval_index: ConstraintIndex::new(),
             change_dependent_count: 0,
         }
     }
@@ -374,6 +382,7 @@ impl Cache {
                 queries.query_remove(fingerprint);
                 queries.complexity_order.retain(|fp| *fp != fingerprint);
                 queries.subsumption.remove(fingerprint);
+                queries.local_eval_index.remove(fingerprint);
             }
         }
     }

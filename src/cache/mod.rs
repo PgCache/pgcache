@@ -28,7 +28,6 @@ mod reply;
 mod runtime;
 mod serve;
 pub(crate) mod status;
-pub mod subsumption_index;
 mod types;
 mod write_queue;
 mod writer;

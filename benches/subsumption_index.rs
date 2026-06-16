@@ -1,4 +1,4 @@
-//! Baseline benchmarks for `SubsumptionIndex` complex-bucket lookup.
+//! Baseline benchmarks for `ConstraintIndex` complex-bucket lookup.
 //!
 //! Two workload families:
 //!
@@ -18,8 +18,8 @@ use std::hint::black_box;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ecow::EcoString;
 
-use pgcache_lib::cache::subsumption_index::SubsumptionIndex;
 use pgcache_lib::query::Fingerprint;
+use pgcache_lib::query::constraint_index::ConstraintIndex;
 use pgcache_lib::query::ast::{BinaryOp, LiteralValue};
 use pgcache_lib::query::constraints::TableConstraint;
 
@@ -44,8 +44,8 @@ fn lt(c: &str, v: i64) -> TableConstraint {
 }
 
 /// Build an index of `n` single-sided range parents, all in class `{id}`.
-fn index_single_class(n: usize) -> SubsumptionIndex {
-    let mut idx = SubsumptionIndex::new();
+fn index_single_class(n: usize) -> ConstraintIndex<Fingerprint> {
+    let mut idx = ConstraintIndex::<Fingerprint>::new();
     for k in 0..n {
         idx.insert(Fingerprint::from_raw(k as u64), &[gt("id", k as i64)]);
     }
@@ -60,8 +60,8 @@ const TWO_SIDED_WINDOW: i64 = 100;
 /// Build an index of `n` two-sided range parents `WHERE id > k AND id < k+W`,
 /// all in class `{id}`. Under V1 these all collapse to the per-column `opaque`
 /// linear-fallback bucket.
-fn index_two_sided_class(n: usize) -> SubsumptionIndex {
-    let mut idx = SubsumptionIndex::new();
+fn index_two_sided_class(n: usize) -> ConstraintIndex<Fingerprint> {
+    let mut idx = ConstraintIndex::<Fingerprint>::new();
     for k in 0..n {
         let k = k as i64;
         idx.insert(

@@ -643,6 +643,21 @@ impl WriterRegistration {
                 .unwrap_or_default()
         });
 
+        // The LocalEval matcher index holds the *full* LocalEval population, so
+        // no `has_limit`/`where_analysis_complete` gating: a query with empty
+        // extracted constraints lands in the unconstrained class and is a
+        // candidate for every row, which keeps the narrowing from dropping a
+        // true match (no stale reads). Extracted constraints are necessary
+        // conditions (OR/unhandled shapes extract nothing), so narrowing is sound.
+        let local_eval_tcs = (update_query.eval_strategy == UpdateEvalStrategy::LocalEval).then(|| {
+            update_query
+                .constraints
+                .table_constraints
+                .get(table_name)
+                .cloned()
+                .unwrap_or_default()
+        });
+
         let mut queries = core
             .cache
             .update_queries
@@ -667,6 +682,9 @@ impl WriterRegistration {
 
         if let Some(tcs) = table_constraints {
             queries.subsumption.insert(fingerprint, &tcs);
+        }
+        if let Some(tcs) = local_eval_tcs {
+            queries.local_eval_index.insert(fingerprint, &tcs);
         }
     }
 
@@ -1492,6 +1510,7 @@ impl WriterRegistration {
                     entry.query_remove(fingerprint);
                     entry.complexity_order.retain(|fp| *fp != fingerprint);
                     entry.subsumption.remove(fingerprint);
+                    entry.local_eval_index.remove(fingerprint);
                 }
             }
         }

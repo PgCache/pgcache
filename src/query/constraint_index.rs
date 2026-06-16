@@ -1,27 +1,37 @@
-//! Sub-linear subsumption candidate lookup.
+//! Sub-linear per-relation constraint-containment index.
 //!
-//! Replaces the linear scan over `UpdateQueries.queries` previously done by
-//! `subsumption_check`. See PGC-119 for V0 and PGC-129 for V1.
+//! Indexes entries (keyed by an id type `K`) by their per-table constraints,
+//! and answers "which entries' constraints could contain a given query's
+//! constraints" sub-linearly. Subsumption candidate lookup is the first
+//! consumer (replacing the linear scan over `UpdateQueries.queries` previously
+//! done by `subsumption_check`); see PGC-119 for V0 and PGC-129 for V1.
 //!
-//! For each table, queries are partitioned by their constraint-column set.
-//! Within a class, equality-pure queries are hash-indexed by the joint
-//! value tuple. Queries with any non-equality constraint (Range/IN/etc.) go
+//! For each table, entries are partitioned by their constraint-column set.
+//! Within a class, equality-pure entries are hash-indexed by the joint
+//! value tuple. Entries with any non-equality constraint (Range/IN/etc.) go
 //! to a `ComplexIndex`: one `ColumnIndex` per class column, each
-//! partitioning parents by constraint shape (`eq` / `inset` / `range_lower`
+//! partitioning entries by constraint shape (`eq` / `inset` / `range_lower`
 //! / `range_upper` / `range_both` / `opaque` fallback). `candidates` runs a
 //! per-column containment lookup and intersects the results.
 //!
-//! Lookup is **lossy-safe**: missed subsumption opportunities just mean we
+//! Lookup is **lossy-safe**: missed containment opportunities just mean we
 //! populate from origin instead of stamping existing rows.
 
-use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
-use std::cmp::Ordering;
+use crate::catalog::TableMetadata;
+use crate::id_hash::{BuildIdHasher, IdHashable};
+use crate::pg::protocol::ByteString;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ecow::EcoString;
+use ordered_float::NotNan;
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{ColumnRange, TableConstraint, column_range_build};
+
+/// `HashMap` keyed by an id type with the passthrough identity hasher.
+type IdMap<K, V> = HashMap<K, V, BuildIdHasher<K>>;
+/// `HashSet` of an id type with the passthrough identity hasher.
+type IdSet<K> = HashSet<K, BuildIdHasher<K>>;
 
 /// Sorted, deduplicated set of column names — canonical key for a
 /// subsumption class. Two queries constraining the same columns hash to
@@ -49,26 +59,35 @@ impl ColumnSet {
     }
 }
 
-/// Sub-linear subsumption candidate lookup.
-#[derive(Debug, Default)]
-pub struct SubsumptionIndex {
-    classes: HashMap<ColumnSet, SubsumptionClass>,
-    /// Reverse lookup so `remove(fingerprint)` doesn't need to re-classify
-    /// the caller's constraints.
-    membership: FingerprintMap<Membership>,
+/// Sub-linear per-relation constraint-containment index.
+#[derive(Debug)]
+pub struct ConstraintIndex<K> {
+    classes: HashMap<ColumnSet, SubsumptionClass<K>>,
+    /// Reverse lookup so `remove(id)` doesn't need to re-classify the
+    /// caller's constraints.
+    membership: IdMap<K, Membership>,
+}
+
+impl<K: IdHashable + Copy> Default for ConstraintIndex<K> {
+    fn default() -> Self {
+        Self {
+            classes: HashMap::new(),
+            membership: IdMap::default(),
+        }
+    }
 }
 
 #[derive(Debug)]
-struct SubsumptionClass {
-    /// Fingerprints whose constraints on every class column are pure
-    /// `Equal(v)`. Keyed by joint value tuple in class-column order.
-    equality: HashMap<Vec<LiteralValue>, Vec<Fingerprint>>,
-    /// Fingerprints with at least one non-equality constraint on any class
+struct SubsumptionClass<K> {
+    /// Entries whose constraints on every class column are pure `Equal(v)`.
+    /// Keyed by joint value tuple in class-column order.
+    equality: HashMap<Vec<ValueKey>, Vec<K>>,
+    /// Entries with at least one non-equality constraint on any class
     /// column. Indexed per-column for sub-linear candidate lookup (PGC-129).
-    complex: ComplexIndex,
+    complex: ComplexIndex<K>,
 }
 
-impl SubsumptionClass {
+impl<K: IdHashable + Copy> SubsumptionClass<K> {
     fn new(num_columns: usize) -> Self {
         Self {
             equality: HashMap::new(),
@@ -85,13 +104,13 @@ struct Membership {
 
 #[derive(Debug)]
 enum MembershipPayload {
-    Equality(Vec<LiteralValue>),
+    Equality(Vec<ValueKey>),
     /// Per-column ranges, in class-column order — lets `remove` locate the
     /// fingerprint in each `ColumnIndex` without re-classifying constraints.
     Complex(Vec<ColumnRange>),
 }
 
-impl SubsumptionIndex {
+impl<K: IdHashable + Copy> ConstraintIndex<K> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -102,7 +121,7 @@ impl SubsumptionIndex {
     /// considered for subsumption (e.g. `has_limit=true`, multi-table
     /// parents). Those should not reach this method. Idempotent on the same
     /// `fingerprint`: previous membership is removed before re-indexing.
-    pub fn insert(&mut self, fingerprint: Fingerprint, table_constraints: &[TableConstraint]) {
+    pub fn insert(&mut self, fingerprint: K, table_constraints: &[TableConstraint]) {
         if self.membership.contains_key(&fingerprint) {
             self.remove(fingerprint);
         }
@@ -145,7 +164,7 @@ impl SubsumptionIndex {
 
     /// Remove a query's entry. O(1) plus the per-bucket vector retain.
     /// Removal is a cold path (failure cleanup, eviction).
-    pub fn remove(&mut self, fingerprint: Fingerprint) {
+    pub fn remove(&mut self, fingerprint: K) {
         let Some(membership) = self.membership.remove(&fingerprint) else {
             return;
         };
@@ -179,8 +198,8 @@ impl SubsumptionIndex {
     /// via hash lookup; complex-bucket parents are filtered per-column via
     /// `ComplexIndex` (PGC-129/189). Lossy-safe: may over-return, never
     /// under-returns a true subsumer.
-    pub fn candidates(&self, new_constraints: &[TableConstraint]) -> FingerprintSet {
-        let mut candidates = FingerprintSet::default();
+    pub fn candidates(&self, new_constraints: &[TableConstraint]) -> IdSet<K> {
+        let mut candidates = IdSet::default();
         let new_class = classify(new_constraints);
         let (new_columns, new_values_opt) = match &new_class {
             Classification::EqualityPure { columns, values } => (columns, Some(values)),
@@ -215,6 +234,76 @@ impl SubsumptionIndex {
         candidates
     }
 
+    /// Candidate entries whose constraints a single row satisfies. Unlike
+    /// [`candidates`](Self::candidates) — a region probe over a *query's*
+    /// constraints — this is a point probe: the row is an `Equal`-on-every-
+    /// column degenerate query, enumerated over the existing classes rather
+    /// than the powerset of a (potentially wide) row.
+    ///
+    /// `col_forms` supplies, for a column, the row value's keyable
+    /// interpretations as `Equal` forms (typically [`row_value_forms`]): a
+    /// numeric wire value yields both its `String` and `Float` forms, since an
+    /// entry on that column may be keyed under either (`val = 42` vs the
+    /// identity-`::text`-stripped `val = '42'`). All forms are probed and
+    /// unioned. `[ColumnRange::Unknown]` (SQL NULL, unchanged-TOAST, absent)
+    /// is a wildcard that matches every entry constraining the column, so this
+    /// **never under-returns** — load-bearing for the CDC/memo consumers,
+    /// where a miss is a stale read, not just a lost optimization.
+    pub(crate) fn candidates_point<F>(&self, col_forms_fn: F) -> IdSet<K>
+    where
+        F: Fn(&str) -> Vec<ColumnRange>,
+    {
+        let mut candidates = IdSet::default();
+        for (column_set, class) in &self.classes {
+            let col_forms: Vec<Vec<ColumnRange>> = column_set
+                .columns()
+                .iter()
+                .map(|c| col_forms_fn(c.as_str()))
+                .collect();
+            // Equality-pure entries (in `class.equality`) are reachable only
+            // through this bucket. Per column, collect the `ValueKey`s of its
+            // `Equal` forms; an empty set (Unknown / non-keyable) is a wildcard
+            // for that position. All columns keyed → probe the small cartesian
+            // product of joint tuples; any wildcard → scan the bucket, matching
+            // non-wildcard positions against their key sets.
+            let key_sets: Vec<Vec<ValueKey>> = col_forms
+                .iter()
+                .map(|forms| {
+                    forms
+                        .iter()
+                        .filter_map(|r| match r {
+                            ColumnRange::Equal(v) => ValueKey::try_new(v),
+                            ColumnRange::Unknown
+                            | ColumnRange::Unconstrained
+                            | ColumnRange::Empty
+                            | ColumnRange::InSet(_)
+                            | ColumnRange::Range { .. } => None,
+                        })
+                        .collect()
+                })
+                .collect();
+            if key_sets.iter().all(|ks| !ks.is_empty()) {
+                for tuple in value_key_product(&key_sets) {
+                    if let Some(fps) = class.equality.get(&tuple) {
+                        candidates.extend(fps);
+                    }
+                }
+            } else {
+                for (tuple, fps) in &class.equality {
+                    let matches = key_sets
+                        .iter()
+                        .zip(tuple)
+                        .all(|(ks, t)| ks.is_empty() || ks.contains(t));
+                    if matches {
+                        candidates.extend(fps);
+                    }
+                }
+            }
+            candidates.extend(class.complex.candidates_point(&col_forms));
+        }
+        candidates
+    }
+
     /// Number of column-set classes across all entries. Useful for metrics
     /// and for sanity-checking the partitioning fan-out.
     pub fn classes_len(&self) -> usize {
@@ -243,7 +332,7 @@ impl SubsumptionIndex {
 enum Classification {
     EqualityPure {
         columns: ColumnSet,
-        values: Vec<LiteralValue>,
+        values: Vec<ValueKey>,
     },
     Complex {
         columns: ColumnSet,
@@ -288,12 +377,18 @@ fn classify(constraints: &[TableConstraint]) -> Classification {
     let columns = ColumnSet::new(all_columns.into_iter().collect());
 
     if !complex && equality.len() == columns.len() {
-        let values: Vec<LiteralValue> = columns
+        // A value that can't form a `ValueKey` (e.g. an `Equal(Null)`) can't
+        // sit in the equality hash bucket; fall back to Complex so the
+        // opaque/range path handles it.
+        let values: Option<Vec<ValueKey>> = columns
             .columns()
             .iter()
-            .map(|c| equality.remove(c).expect("equality maps every column"))
+            .map(|c| ValueKey::try_new(&equality.remove(c).expect("equality maps every column")))
             .collect();
-        Classification::EqualityPure { columns, values }
+        match values {
+            Some(values) => Classification::EqualityPure { columns, values },
+            None => Classification::Complex { columns },
+        }
     } else {
         Classification::Complex { columns }
     }
@@ -322,9 +417,9 @@ fn column_set_powerset(set: &ColumnSet) -> Vec<ColumnSet> {
 /// `full_columns` and `subset` are sorted; we walk in lockstep.
 fn project_values(
     full_columns: &ColumnSet,
-    full_values: &[LiteralValue],
+    full_values: &[ValueKey],
     subset: &ColumnSet,
-) -> Option<Vec<LiteralValue>> {
+) -> Option<Vec<ValueKey>> {
     let mut result = Vec::with_capacity(subset.len());
     let mut full_iter = full_columns.columns().iter().zip(full_values);
     for sub_col in subset.columns() {
@@ -337,6 +432,26 @@ fn project_values(
         }
     }
     Some(result)
+}
+
+/// Cartesian product of per-column key sets, for the point-probe equality
+/// lookup. Empty input → one empty tuple (the unconstrained class). Each
+/// column carries ≤3 forms and classes have few columns, so the product stays
+/// tiny.
+fn value_key_product(key_sets: &[Vec<ValueKey>]) -> Vec<Vec<ValueKey>> {
+    let mut result: Vec<Vec<ValueKey>> = vec![Vec::new()];
+    for ks in key_sets {
+        let mut next = Vec::with_capacity(result.len() * ks.len());
+        for prefix in &result {
+            for k in ks {
+                let mut tuple = prefix.clone();
+                tuple.push(k.clone());
+                next.push(tuple);
+            }
+        }
+        result = next;
+    }
+    result
 }
 
 // ============================================================================
@@ -385,14 +500,14 @@ fn column_ranges(constraints: &[TableConstraint], columns: &ColumnSet) -> Vec<Co
 
 /// Which `ColumnIndex` sub-structure a column range belongs in.
 enum Placement<'a> {
-    Eq(&'a LiteralValue),
+    Eq(ValueKey),
     InSet(&'a HashSet<LiteralValue>),
-    RangeLower(LitKey),
-    RangeUpper(LitKey),
+    RangeLower(ValueKey),
+    RangeUpper(ValueKey),
     /// Two-sided range with orderable bounds (PGC-189).
     RangeBoth {
-        lower: LitKey,
-        upper: LitKey,
+        lower: ValueKey,
+        upper: ValueKey,
     },
     Opaque,
 }
@@ -404,17 +519,26 @@ enum Placement<'a> {
 /// fallback.
 fn placement(range: &ColumnRange) -> Placement<'_> {
     match range {
-        ColumnRange::Equal(v) => Placement::Eq(v),
-        ColumnRange::InSet(set) => Placement::InSet(set),
+        ColumnRange::Equal(v) => ValueKey::try_new(v).map_or(Placement::Opaque, Placement::Eq),
+        // All members must be keyable for the inverted `inset` index; one
+        // unkeyable member routes the whole constraint to `opaque`
+        // (deterministic, so insert and remove agree).
+        ColumnRange::InSet(set) => {
+            if set.iter().all(|v| ValueKey::try_new(v).is_some()) {
+                Placement::InSet(set)
+            } else {
+                Placement::Opaque
+            }
+        }
         ColumnRange::Range { lower, upper, .. } => match (lower, upper) {
             (Some(lb), None) => {
-                LitKey::try_new(&lb.value).map_or(Placement::Opaque, Placement::RangeLower)
+                ValueKey::try_new(&lb.value).map_or(Placement::Opaque, Placement::RangeLower)
             }
             (None, Some(ub)) => {
-                LitKey::try_new(&ub.value).map_or(Placement::Opaque, Placement::RangeUpper)
+                ValueKey::try_new(&ub.value).map_or(Placement::Opaque, Placement::RangeUpper)
             }
             (Some(lb), Some(ub)) => {
-                match (LitKey::try_new(&lb.value), LitKey::try_new(&ub.value)) {
+                match (ValueKey::try_new(&lb.value), ValueKey::try_new(&ub.value)) {
                     (Some(lower), Some(upper)) => Placement::RangeBoth { lower, upper },
                     _ => Placement::Opaque,
                 }
@@ -425,57 +549,44 @@ fn placement(range: &ColumnRange) -> Placement<'_> {
     }
 }
 
-/// A `LiteralValue` wrapped with a total order, for use as a `BTreeMap` key.
-/// Only constructible for orderable value kinds (`Integer`, `Float`,
-/// `String`, `StringWithCast`). A column holds a single type, so all keys in
-/// any one `BTreeMap` share a variant and compare meaningfully.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LitKey(LiteralValue);
+/// Canonical, totally-ordered bucket key. Collapses `Integer(n)` and
+/// `Float(n)` to a single numeric key so a row value coerced to either variant
+/// probes the same bucket — load-bearing for the point probe, where a missed
+/// entry is a stale read, not just a lost optimization. Integers past 2^53 may
+/// share one `f64`, which only ever over-returns (the caller's precise check
+/// rejects); it never drops a true match.
+///
+/// `String` and `StringWithCast` both key by their string content; non-keyable
+/// values (`Null`, `Parameter`, `Array`) route to the `opaque` fallback.
+/// Derived `Ord` orders by variant first (`Num` < `Str` < `Bool`), then by
+/// value — `Bool` never reaches a range `BTreeMap`, and a single column never
+/// mixes `Num`/`Str` meaningfully.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum ValueKey {
+    Num(NotNan<f64>),
+    Str(EcoString),
+    Bool(bool),
+}
 
-impl LitKey {
+impl ValueKey {
     fn try_new(v: &LiteralValue) -> Option<Self> {
-        matches!(
-            v,
-            LiteralValue::Integer(_)
-                | LiteralValue::Float(_)
-                | LiteralValue::String(_)
-                | LiteralValue::StringWithCast(..)
-        )
-        .then(|| Self(v.clone()))
-    }
-}
-
-/// Stable discriminant for cross-type ordering — only exercised if a column
-/// ever mixes types, which it should not.
-fn lit_tag(v: &LiteralValue) -> u8 {
-    match v {
-        LiteralValue::Integer(_) => 0,
-        LiteralValue::Float(_) => 1,
-        LiteralValue::String(_) => 2,
-        LiteralValue::StringWithCast(..) => 3,
-        LiteralValue::Boolean(_)
-        | LiteralValue::Null
-        | LiteralValue::NullWithCast(_)
-        | LiteralValue::Parameter(_)
-        | LiteralValue::Array(..) => 4,
-    }
-}
-
-impl Ord for LitKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        match (&self.0, &other.0) {
-            (LiteralValue::Integer(a), LiteralValue::Integer(b)) => a.cmp(b),
-            (LiteralValue::Float(a), LiteralValue::Float(b)) => a.cmp(b),
-            (LiteralValue::String(a), LiteralValue::String(b)) => a.cmp(b),
-            (LiteralValue::StringWithCast(a, _), LiteralValue::StringWithCast(b, _)) => a.cmp(b),
-            _ => lit_tag(&self.0).cmp(&lit_tag(&other.0)),
+        match v {
+            // Integers past 2^53 may share an f64 — see the type doc; only
+            // over-returns, never drops a true match.
+            #[allow(clippy::cast_precision_loss)]
+            LiteralValue::Integer(n) => {
+                Some(ValueKey::Num(NotNan::new(*n as f64).expect("i64 as f64 is never NaN")))
+            }
+            LiteralValue::Float(f) => Some(ValueKey::Num(*f)),
+            LiteralValue::String(s) | LiteralValue::StringWithCast(s, _) => {
+                Some(ValueKey::Str(s.clone()))
+            }
+            LiteralValue::Boolean(b) => Some(ValueKey::Bool(*b)),
+            LiteralValue::Null
+            | LiteralValue::NullWithCast(_)
+            | LiteralValue::Parameter(_)
+            | LiteralValue::Array(..) => None,
         }
-    }
-}
-
-impl PartialOrd for LitKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -483,14 +594,14 @@ impl PartialOrd for LitKey {
 /// `ColumnIndex` per class column; `candidates` intersects their per-column
 /// match sets.
 #[derive(Debug)]
-struct ComplexIndex {
+struct ComplexIndex<K> {
     /// Parallel to the class's sorted column set.
-    per_column: Vec<ColumnIndex>,
+    per_column: Vec<ColumnIndex<K>>,
     /// Distinct fingerprints indexed — each appears once per column.
     len: usize,
 }
 
-impl ComplexIndex {
+impl<K: IdHashable + Copy> ComplexIndex<K> {
     fn new(num_columns: usize) -> Self {
         Self {
             per_column: (0..num_columns).map(|_| ColumnIndex::default()).collect(),
@@ -513,14 +624,14 @@ impl ComplexIndex {
         self.per_column.iter().map(|c| c.opaque.len()).sum()
     }
 
-    fn insert(&mut self, fingerprint: Fingerprint, ranges: &[ColumnRange]) {
+    fn insert(&mut self, fingerprint: K, ranges: &[ColumnRange]) {
         for (column, range) in self.per_column.iter_mut().zip(ranges) {
             column.insert(fingerprint, range);
         }
         self.len += 1;
     }
 
-    fn remove(&mut self, fingerprint: Fingerprint, ranges: &[ColumnRange]) {
+    fn remove(&mut self, fingerprint: K, ranges: &[ColumnRange]) {
         for (column, range) in self.per_column.iter_mut().zip(ranges) {
             column.remove(fingerprint, range);
         }
@@ -529,7 +640,7 @@ impl ComplexIndex {
 
     /// Candidate parents whose constraint on every column could subsume the
     /// query's. Intersects the per-column match sets, smallest first.
-    fn candidates(&self, query_ranges: &[ColumnRange]) -> Vec<Fingerprint> {
+    fn candidates(&self, query_ranges: &[ColumnRange]) -> Vec<K> {
         if self.len == 0 {
             return Vec::new();
         }
@@ -540,7 +651,7 @@ impl ComplexIndex {
             // The caller dedups into its own set.
             ([column], [range]) => column.containing(range),
             (columns, ranges) => {
-                let mut per_column: Vec<Vec<Fingerprint>> = columns
+                let mut per_column: Vec<Vec<K>> = columns
                     .iter()
                     .zip(ranges)
                     .map(|(column, range)| column.containing(range))
@@ -550,12 +661,62 @@ impl ComplexIndex {
                 let Some(first) = iter.next() else {
                     return Vec::new();
                 };
-                let mut acc: FingerprintSet = first.into_iter().collect();
+                let mut acc: IdSet<K> = first.into_iter().collect();
                 for column in iter {
                     if acc.is_empty() {
                         break;
                     }
-                    let other: FingerprintSet = column.into_iter().collect();
+                    let other: IdSet<K> = column.into_iter().collect();
+                    acc.retain(|fp| other.contains(fp));
+                }
+                acc.into_iter().collect()
+            }
+        }
+    }
+
+    /// Point-probe variant: each column supplies a list of `ColumnRange` forms
+    /// (the row value's keyable interpretations). Union `containing` over a
+    /// column's forms, then intersect across columns — mirrors `candidates`'
+    /// smallest-first intersection. A `[Unknown]` column unions to every entry
+    /// on that column (wildcard, no filtering).
+    fn candidates_point(&self, col_forms: &[Vec<ColumnRange>]) -> Vec<K> {
+        if self.len == 0 {
+            return Vec::new();
+        }
+        match self.per_column.as_slice() {
+            [] => Vec::new(),
+            // Single-column class: concatenate the per-form match sets — the
+            // caller dedups into its own set.
+            [column] => col_forms
+                .first()
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .flat_map(|form| column.containing(form))
+                .collect(),
+            columns => {
+                let mut per_column: Vec<Vec<K>> = columns
+                    .iter()
+                    .zip(col_forms)
+                    .map(|(column, forms)| {
+                        let mut set: IdSet<K> = IdSet::default();
+                        for form in forms {
+                            set.extend(column.containing(form));
+                        }
+                        set.into_iter().collect::<Vec<K>>()
+                    })
+                    .collect();
+                per_column.sort_by_key(|fps| fps.len());
+                let mut iter = per_column.into_iter();
+                let Some(first) = iter.next() else {
+                    return Vec::new();
+                };
+                let mut acc: IdSet<K> = first.into_iter().collect();
+                for column in iter {
+                    if acc.is_empty() {
+                        break;
+                    }
+                    let other: IdSet<K> = column.into_iter().collect();
                     acc.retain(|fp| other.contains(fp));
                 }
                 acc.into_iter().collect()
@@ -566,32 +727,48 @@ impl ComplexIndex {
 
 /// Index over one class column's complex parents, partitioned by constraint
 /// shape so containment lookups avoid scanning the whole class.
-#[derive(Debug, Default)]
-struct ColumnIndex {
+#[derive(Debug)]
+struct ColumnIndex<K> {
     /// `column = v` parents, keyed by value.
-    eq: HashMap<LiteralValue, Vec<Fingerprint>>,
+    eq: HashMap<ValueKey, Vec<K>>,
     /// `column IN (...)` parents — inverted: each member value maps to the
     /// parents whose set contains it.
-    inset: HashMap<LiteralValue, Vec<Fingerprint>>,
+    inset: HashMap<ValueKey, Vec<K>>,
     /// `column > v` / `>= v` parents, keyed by the lower bound.
-    range_lower: BTreeMap<LitKey, Vec<Fingerprint>>,
+    range_lower: BTreeMap<ValueKey, Vec<K>>,
     /// `column < v` / `<= v` parents, keyed by the upper bound.
-    range_upper: BTreeMap<LitKey, Vec<Fingerprint>>,
+    range_upper: BTreeMap<ValueKey, Vec<K>>,
     /// Two-sided range parents `(l, u)` (PGC-189), keyed by the lower bound
     /// with the upper bound inline so the lookup can filter during the walk
     /// — no intersection materialization.
-    range_both: BTreeMap<LitKey, Vec<(LitKey, Fingerprint)>>,
+    range_both: BTreeMap<ValueKey, Vec<(ValueKey, K)>>,
     /// Linear fallback for shapes the structured buckets can't place.
-    opaque: Vec<Fingerprint>,
+    opaque: Vec<K>,
 }
 
-impl ColumnIndex {
-    fn insert(&mut self, fingerprint: Fingerprint, range: &ColumnRange) {
+// Hand-written so the bound is `K: ` nothing, not the `K: Default` a derive
+// would demand — no field needs `K: Default`.
+impl<K> Default for ColumnIndex<K> {
+    fn default() -> Self {
+        Self {
+            eq: HashMap::new(),
+            inset: HashMap::new(),
+            range_lower: BTreeMap::new(),
+            range_upper: BTreeMap::new(),
+            range_both: BTreeMap::new(),
+            opaque: Vec::new(),
+        }
+    }
+}
+
+impl<K: IdHashable + Copy> ColumnIndex<K> {
+    fn insert(&mut self, fingerprint: K, range: &ColumnRange) {
         match placement(range) {
-            Placement::Eq(v) => self.eq.entry(v.clone()).or_default().push(fingerprint),
+            Placement::Eq(key) => self.eq.entry(key).or_default().push(fingerprint),
             Placement::InSet(set) => {
                 for v in set {
-                    self.inset.entry(v.clone()).or_default().push(fingerprint);
+                    let key = ValueKey::try_new(v).expect("InSet members are keyable");
+                    self.inset.entry(key).or_default().push(fingerprint);
                 }
             }
             Placement::RangeLower(key) => {
@@ -610,12 +787,13 @@ impl ColumnIndex {
         }
     }
 
-    fn remove(&mut self, fingerprint: Fingerprint, range: &ColumnRange) {
+    fn remove(&mut self, fingerprint: K, range: &ColumnRange) {
         match placement(range) {
-            Placement::Eq(v) => map_vec_remove(&mut self.eq, v, fingerprint),
+            Placement::Eq(key) => map_vec_remove(&mut self.eq, &key, fingerprint),
             Placement::InSet(set) => {
                 for v in set {
-                    map_vec_remove(&mut self.inset, v, fingerprint);
+                    let key = ValueKey::try_new(v).expect("InSet members are keyable");
+                    map_vec_remove(&mut self.inset, &key, fingerprint);
                 }
             }
             Placement::RangeLower(key) => {
@@ -634,8 +812,8 @@ impl ColumnIndex {
     /// Parents on this column whose range could subsume `query`'s range on
     /// the same column. May over-return (lossy-safe); the caller's precise
     /// `table_constraints_subsumed` rejects false candidates.
-    fn containing(&self, query: &ColumnRange) -> Vec<Fingerprint> {
-        let mut out: Vec<Fingerprint> = self.opaque.clone();
+    fn containing(&self, query: &ColumnRange) -> Vec<K> {
+        let mut out: Vec<K> = self.opaque.clone();
         match query {
             // Can't reason (`Unknown`), query covers nothing (`Empty` —
             // subsumed by all) or everything (`Unconstrained`): return the
@@ -644,16 +822,22 @@ impl ColumnIndex {
                 self.extend_all(&mut out);
             }
             ColumnRange::Equal(v) => {
-                if let Some(fps) = self.eq.get(v) {
-                    out.extend(fps);
+                if let Some(key) = ValueKey::try_new(v) {
+                    if let Some(fps) = self.eq.get(&key) {
+                        out.extend(fps);
+                    }
+                    if let Some(fps) = self.inset.get(&key) {
+                        out.extend(fps);
+                    }
+                    // Range parents whose interval contains the point `v`.
+                    self.extend_lower_covering(v, &mut out);
+                    self.extend_upper_covering(v, &mut out);
+                    self.extend_two_sided_lit(v, v, &mut out);
+                } else {
+                    // Non-keyable point (`Null` etc.) — can't reason; return
+                    // the whole column bucket conservatively.
+                    self.extend_all(&mut out);
                 }
-                if let Some(fps) = self.inset.get(v) {
-                    out.extend(fps);
-                }
-                // Range parents whose interval contains the point `v`.
-                self.extend_lower_covering(v, &mut out);
-                self.extend_upper_covering(v, &mut out);
-                self.extend_two_sided_lit(v, v, &mut out);
             }
             ColumnRange::InSet(set) => self.containing_inset(set, &mut out),
             ColumnRange::Range { lower, upper, .. } => {
@@ -679,14 +863,14 @@ impl ColumnIndex {
     }
 
     /// All fingerprints stored in `range_both`, across every key.
-    fn range_both_all(&self) -> impl Iterator<Item = Fingerprint> + '_ {
+    fn range_both_all(&self) -> impl Iterator<Item = K> + '_ {
         self.range_both
             .values()
             .flat_map(|v| v.iter().map(|(_, fp)| *fp))
     }
 
     /// Every fingerprint on this column, across all sub-indexes.
-    fn extend_all(&self, out: &mut Vec<Fingerprint>) {
+    fn extend_all(&self, out: &mut Vec<K>) {
         out.extend(self.eq.values().flatten());
         out.extend(self.inset.values().flatten());
         out.extend(self.range_lower.values().flatten());
@@ -702,7 +886,7 @@ impl ColumnIndex {
     /// The `range_both.is_empty()` early-out keeps V1 single-sided workloads
     /// from paying for V2's two-sided sub-index. Load-bearing for the V1
     /// midpoint bench.
-    fn extend_two_sided(&self, qlo: &LitKey, qhi: &LitKey, out: &mut Vec<Fingerprint>) {
+    fn extend_two_sided(&self, qlo: &ValueKey, qhi: &ValueKey, out: &mut Vec<K>) {
         if self.range_both.is_empty() {
             return;
         }
@@ -722,12 +906,12 @@ impl ColumnIndex {
         &self,
         qlo: &LiteralValue,
         qhi: &LiteralValue,
-        out: &mut Vec<Fingerprint>,
+        out: &mut Vec<K>,
     ) {
         if self.range_both.is_empty() {
             return;
         }
-        match (LitKey::try_new(qlo), LitKey::try_new(qhi)) {
+        match (ValueKey::try_new(qlo), ValueKey::try_new(qhi)) {
             (Some(qlo_key), Some(qhi_key)) => self.extend_two_sided(&qlo_key, &qhi_key, out),
             _ => out.extend(self.range_both_all()),
         }
@@ -735,16 +919,16 @@ impl ColumnIndex {
 
     /// `range_lower` parents `(l, +inf)` with `l <= bound`. A non-orderable
     /// bound can't probe the `BTreeMap`, so return the whole bucket.
-    fn extend_lower_covering(&self, bound: &LiteralValue, out: &mut Vec<Fingerprint>) {
-        match LitKey::try_new(bound) {
+    fn extend_lower_covering(&self, bound: &LiteralValue, out: &mut Vec<K>) {
+        match ValueKey::try_new(bound) {
             Some(key) => out.extend(self.range_lower.range(..=key).flat_map(|(_, f)| f)),
             None => out.extend(self.range_lower.values().flatten()),
         }
     }
 
     /// `range_upper` parents `(-inf, u)` with `u >= bound`.
-    fn extend_upper_covering(&self, bound: &LiteralValue, out: &mut Vec<Fingerprint>) {
-        match LitKey::try_new(bound) {
+    fn extend_upper_covering(&self, bound: &LiteralValue, out: &mut Vec<K>) {
+        match ValueKey::try_new(bound) {
             Some(key) => out.extend(self.range_upper.range(key..).flat_map(|(_, f)| f)),
             None => out.extend(self.range_upper.values().flatten()),
         }
@@ -752,60 +936,52 @@ impl ColumnIndex {
 
     /// `InSet` query branch of `containing`: a parent subsumes it only if the
     /// parent's constraint covers every value in the set.
-    fn containing_inset(&self, set: &HashSet<LiteralValue>, out: &mut Vec<Fingerprint>) {
-        let mut iter = set.iter();
+    fn containing_inset(&self, set: &HashSet<LiteralValue>, out: &mut Vec<K>) {
+        // Any non-keyable member means we can't reason about the set
+        // precisely — return the whole bucket conservatively.
+        let Some(keys): Option<Vec<ValueKey>> = set.iter().map(ValueKey::try_new).collect() else {
+            self.extend_all(out);
+            return;
+        };
+        let mut iter = keys.iter();
         let Some(first) = iter.next() else {
             return;
         };
         // InSet parents: the parent's set must be a superset — intersect the
         // inverted-index lists over every query value.
-        let mut members: FingerprintSet = self
+        let mut members: IdSet<K> = self
             .inset
             .get(first)
-            .map_or_else(FingerprintSet::default, |fps| fps.iter().copied().collect());
+            .map_or_else(IdSet::default, |fps| fps.iter().copied().collect());
         for v in iter {
             if members.is_empty() {
                 break;
             }
-            let present: FingerprintSet = self
+            let present: IdSet<K> = self
                 .inset
                 .get(v)
-                .map_or_else(FingerprintSet::default, |fps| fps.iter().copied().collect());
+                .map_or_else(IdSet::default, |fps| fps.iter().copied().collect());
             members.retain(|fp| present.contains(fp));
         }
         out.extend(members);
         // A single-value IN is an equality in disguise.
-        if set.len() == 1
+        if keys.len() == 1
             && let Some(fps) = self.eq.get(first)
         {
             out.extend(fps);
         }
         // Range parents must cover the closed interval [min, max] of the set.
-        let keys: Option<Vec<LitKey>> = set.iter().map(LitKey::try_new).collect();
-        match keys {
-            Some(keys) => {
-                let min = keys.iter().min().expect("set is non-empty");
-                let max = keys.iter().max().expect("set is non-empty");
-                out.extend(self.range_lower.range(..=min.clone()).flat_map(|(_, f)| f));
-                out.extend(self.range_upper.range(max.clone()..).flat_map(|(_, f)| f));
-                self.extend_two_sided(min, max, out);
-            }
-            None => {
-                out.extend(self.range_lower.values().flatten());
-                out.extend(self.range_upper.values().flatten());
-                out.extend(self.range_both_all());
-            }
-        }
+        let min = keys.iter().min().expect("set is non-empty");
+        let max = keys.iter().max().expect("set is non-empty");
+        out.extend(self.range_lower.range(..=min.clone()).flat_map(|(_, f)| f));
+        out.extend(self.range_upper.range(max.clone()..).flat_map(|(_, f)| f));
+        self.extend_two_sided(min, max, out);
     }
 }
 
 /// Remove `fp` from a `HashMap`-backed posting list, dropping the key when
 /// its list empties.
-fn map_vec_remove(
-    map: &mut HashMap<LiteralValue, Vec<Fingerprint>>,
-    key: &LiteralValue,
-    fp: Fingerprint,
-) {
+fn map_vec_remove<K: Copy + Eq>(map: &mut HashMap<ValueKey, Vec<K>>, key: &ValueKey, fp: K) {
     if let Some(fps) = map.get_mut(key) {
         fps.retain(|x| *x != fp);
         if fps.is_empty() {
@@ -816,7 +992,7 @@ fn map_vec_remove(
 
 /// Remove `fp` from a `BTreeMap`-backed posting list, dropping the key when
 /// its list empties.
-fn btree_vec_remove(map: &mut BTreeMap<LitKey, Vec<Fingerprint>>, key: &LitKey, fp: Fingerprint) {
+fn btree_vec_remove<K: Copy + Eq>(map: &mut BTreeMap<ValueKey, Vec<K>>, key: &ValueKey, fp: K) {
     if let Some(fps) = map.get_mut(key) {
         fps.retain(|x| *x != fp);
         if fps.is_empty() {
@@ -827,10 +1003,10 @@ fn btree_vec_remove(map: &mut BTreeMap<LitKey, Vec<Fingerprint>>, key: &LitKey, 
 
 /// Remove `fp` from a `BTreeMap`-backed `(other_bound, fp)` posting list,
 /// dropping the key when its list empties.
-fn btree_pair_remove(
-    map: &mut BTreeMap<LitKey, Vec<(LitKey, Fingerprint)>>,
-    key: &LitKey,
-    fp: Fingerprint,
+fn btree_pair_remove<K: Copy + Eq>(
+    map: &mut BTreeMap<ValueKey, Vec<(ValueKey, K)>>,
+    key: &ValueKey,
+    fp: K,
 ) {
     if let Some(entries) = map.get_mut(key) {
         entries.retain(|(_, x)| *x != fp);
@@ -840,11 +1016,53 @@ fn btree_pair_remove(
     }
 }
 
+/// Coerce a CDC row's value for `column` into the point-probe forms: every
+/// keyable interpretation of the wire text, as `Equal` ranges. A present
+/// value always yields its lexical `String` form, plus a `Float` form when it
+/// parses numerically and a `Boolean` form when it is `t`/`f`. Probing all
+/// forms (unioned) is what keeps the probe correct regardless of how the
+/// matching entry's literal was typed — a numeric column can hold a
+/// `String`-keyed entry via an identity `::text` cast (`val::text = '42'`
+/// strips to `Comparison(val, Eq, String("42"))`), and a `String` row form
+/// finds it while the `Float` form finds the ordinary `val = 42` entry.
+///
+/// An absent column, SQL NULL, or unchanged-TOAST yields `[Unknown]` — a
+/// wildcard that matches every entry constraining the column (conservative,
+/// never under-returns). The forms mirror `where_value_compare_string`'s row
+/// interpretation, so the precise check downstream agrees.
+pub(crate) fn row_value_forms(
+    table_metadata: &TableMetadata,
+    row_data: &[Option<ByteString>],
+    column: &str,
+) -> Vec<ColumnRange> {
+    let Some(meta) = table_metadata.columns.get(column) else {
+        return vec![ColumnRange::Unknown];
+    };
+    let Some(Some(bytes)) = row_data.get(meta.index()) else {
+        return vec![ColumnRange::Unknown];
+    };
+    let text = bytes.as_str();
+    let mut forms = Vec::with_capacity(2);
+    forms.push(ColumnRange::Equal(LiteralValue::String(text.into())));
+    if let Some(n) = text.parse::<f64>().ok().and_then(|x| NotNan::new(x).ok()) {
+        forms.push(ColumnRange::Equal(LiteralValue::Float(n)));
+    }
+    match text {
+        "t" | "true" => forms.push(ColumnRange::Equal(LiteralValue::Boolean(true))),
+        "f" | "false" => forms.push(ColumnRange::Equal(LiteralValue::Boolean(false))),
+        _ => {}
+    }
+    forms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::{ColumnMetadata, ColumnStore, Oid, TableMetadata};
     use crate::query::ast::{BinaryOp, LiteralValue};
     use crate::query::cast::CastTarget;
+    use tokio_postgres::types::Type;
+    use crate::query::{Fingerprint, FingerprintSet};
     use ecow::EcoString;
 
     fn col(s: &str) -> EcoString {
@@ -887,16 +1105,65 @@ mod tests {
         TableConstraint::CastComparison(col(c), cast, BinaryOp::Equal, v)
     }
 
+    fn float_lit(x: f64) -> LiteralValue {
+        LiteralValue::Float(NotNan::new(x).unwrap())
+    }
+
+    fn bs(s: &str) -> Option<ByteString> {
+        Some(ByteString::from_utf8(bytes::Bytes::copy_from_slice(s.as_bytes())).expect("utf8"))
+    }
+
+    /// `[id int4 (pk), name text, active bool]` — row layout `[id, name, active]`.
+    fn point_table() -> TableMetadata {
+        let columns = ColumnStore::new([
+            ColumnMetadata {
+                name: "id".into(),
+                position: 1,
+                type_oid: 23,
+                data_type: Type::INT4,
+                type_name: "integer".into(),
+                cache_type_name: "int4".into(),
+                is_primary_key: true,
+            },
+            ColumnMetadata {
+                name: "name".into(),
+                position: 2,
+                type_oid: 25,
+                data_type: Type::TEXT,
+                type_name: "text".into(),
+                cache_type_name: "text".into(),
+                is_primary_key: false,
+            },
+            ColumnMetadata {
+                name: "active".into(),
+                position: 3,
+                type_oid: 16,
+                data_type: Type::BOOL,
+                type_name: "boolean".into(),
+                cache_type_name: "bool".into(),
+                is_primary_key: false,
+            },
+        ]);
+        TableMetadata {
+            name: "t".into(),
+            schema: "public".into(),
+            relation_oid: Oid::from_raw(1),
+            primary_key_columns: vec!["id".into()],
+            columns,
+            indexes: Vec::new(),
+        }
+    }
+
     #[test]
     fn empty_index_has_no_candidates() {
-        let idx = SubsumptionIndex::new();
+        let idx = ConstraintIndex::<Fingerprint>::new();
         let candidates = idx.candidates(&[eq("id", int(42))]);
         assert!(candidates.is_empty());
     }
 
     #[test]
     fn equality_pure_exact_match() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[eq("id", int(42))]);
         idx.insert(fp(2), &[eq("id", int(99))]);
 
@@ -906,7 +1173,7 @@ mod tests {
 
     #[test]
     fn equality_pure_different_value_misses() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[eq("id", int(42))]);
 
         let candidates = idx.candidates(&[eq("id", int(99))]);
@@ -915,7 +1182,7 @@ mod tests {
 
     #[test]
     fn parent_broader_via_subset_filter() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         // Parent constrains only category=5 — class {category}
         idx.insert(fp(1), &[eq("category", int(5))]);
 
@@ -931,7 +1198,7 @@ mod tests {
 
     #[test]
     fn parent_with_unconstrained_column_finds_via_empty_class() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         // Parent: full table scan, no constraints — class {}
         idx.insert(fp(1), &[]);
 
@@ -943,7 +1210,7 @@ mod tests {
 
     #[test]
     fn complex_constraint_lands_in_complex_bucket() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(100))]);
         idx.insert(
             fp(2),
@@ -962,7 +1229,7 @@ mod tests {
 
     #[test]
     fn mixed_equality_and_complex_both_returned() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[eq("id", int(42))]); // class {id}.equality[(42,)]
         idx.insert(fp(2), &[gt("id", int(0))]); // class {id}.complex
 
@@ -972,7 +1239,7 @@ mod tests {
 
     #[test]
     fn remove_drops_entry() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[eq("id", int(42))]);
         idx.remove(fp(1));
 
@@ -982,7 +1249,7 @@ mod tests {
 
     #[test]
     fn remove_keeps_unrelated_entries() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[eq("id", int(42))]);
         idx.insert(fp(2), &[eq("id", int(42))]);
         idx.remove(fp(1));
@@ -992,7 +1259,7 @@ mod tests {
 
     #[test]
     fn column_order_does_not_affect_class_membership() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         // Insert as [a, b]
         idx.insert(fp(1), &[eq("a", int(1)), eq("b", int(2))]);
         // Lookup with [b, a] — same class.
@@ -1002,7 +1269,7 @@ mod tests {
 
     #[test]
     fn contradictory_equality_lands_in_complex() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         // WHERE a=1 AND a=2 — same column, conflicting values. Classifier
         // falls back to complex.
         idx.insert(fp(1), &[eq("a", int(1)), eq("a", int(2))]);
@@ -1014,7 +1281,7 @@ mod tests {
 
     #[test]
     fn empty_new_query_finds_only_unconstrained_parents() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[]); // unconstrained — class {}
         idx.insert(fp(2), &[eq("id", int(42))]); // class {id}, not a subset of {}
 
@@ -1036,7 +1303,7 @@ mod tests {
 
     #[test]
     fn unconstrained_parent_subsumes_complex_new_range() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[]); // unconstrained — class {}
 
         // New has a range constraint, not equality. Classified as Complex.
@@ -1049,7 +1316,7 @@ mod tests {
 
     #[test]
     fn unconstrained_parent_subsumes_complex_new_inset() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[]);
 
         let candidates = idx.candidates(&[any_of("id", vec![int(1), int(2), int(3)])]);
@@ -1061,7 +1328,7 @@ mod tests {
 
     #[test]
     fn unconstrained_parent_subsumes_mixed_new() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[]);
 
         // Mix of equality and non-equality across columns. Classified Complex
@@ -1075,7 +1342,7 @@ mod tests {
 
     #[test]
     fn unconstrained_new_finds_unconstrained_parent() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[]);
         idx.insert(fp(2), &[eq("id", int(42))]);
 
@@ -1088,7 +1355,7 @@ mod tests {
 
     #[test]
     fn reinsert_same_fingerprint_replaces() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[eq("id", int(5))]);
         // Same fingerprint, different value — lookup of old value misses.
         idx.insert(fp(1), &[eq("id", int(10))]);
@@ -1099,7 +1366,7 @@ mod tests {
 
     #[test]
     fn reinsert_changing_shape_replaces() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         // Start as Equality-pure on {id}.
         idx.insert(fp(1), &[eq("id", int(5))]);
         // Re-insert with a range — now Complex on {id}.
@@ -1118,7 +1385,7 @@ mod tests {
 
     #[test]
     fn remove_unconstrained_drops_empty_class() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[]);
         idx.remove(fp(1));
 
@@ -1139,7 +1406,7 @@ mod tests {
     // an equality bucket of a non-empty class AND new is overall complex.
     #[test]
     fn known_limitation_equality_parent_missed_by_complex_new() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         // Parent: WHERE a = 5 — lives in class {a}.equality[(5,)]
         idx.insert(fp(1), &[eq("a", int(5))]);
 
@@ -1185,7 +1452,7 @@ mod tests {
 
     #[test]
     fn range_parent_subsumes_equality_in_range() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(100))]);
 
         // New: WHERE id = 200 — inside the parent's (100, +inf) range.
@@ -1195,7 +1462,7 @@ mod tests {
 
     #[test]
     fn range_parent_subsumes_narrower_range() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0))]);
 
         // New: WHERE id > 50 — narrower than the parent's id > 0.
@@ -1205,7 +1472,7 @@ mod tests {
 
     #[test]
     fn inset_parent_subsumes_member_equality() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(
             fp(1),
             &[any_of(
@@ -1224,7 +1491,7 @@ mod tests {
 
     #[test]
     fn multi_column_complex_class_subsumer_returned() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         // Parent: id > 10 AND region = 5 — class {id, region}, Complex.
         idx.insert(fp(1), &[gt("id", int(10)), eq("region", int(5))]);
 
@@ -1235,7 +1502,7 @@ mod tests {
 
     #[test]
     fn range_parent_in_subset_class_returned() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         // Parent constrains only category — class {category}, Complex.
         idx.insert(fp(1), &[gt("category", int(5))]);
 
@@ -1255,7 +1522,7 @@ mod tests {
 
     #[test]
     fn range_parent_excludes_out_of_range_equality() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(100))]);
 
         // New: WHERE id = 50 — below the parent's (100, +inf) range.
@@ -1265,7 +1532,7 @@ mod tests {
 
     #[test]
     fn range_parent_excludes_broader_range() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(50))]);
 
         // New: WHERE id > 10 — broader than the parent's id > 50.
@@ -1275,7 +1542,7 @@ mod tests {
 
     #[test]
     fn upper_range_parent_bounds_both_ways() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[lt("id", int(100))]);
 
         assert!(idx.candidates(&[eq("id", int(50))]).contains(&fp(1)));
@@ -1284,7 +1551,7 @@ mod tests {
 
     #[test]
     fn inset_parent_excludes_non_member() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[any_of("status", vec![text("a"), text("b")])]);
 
         assert!(idx.candidates(&[eq("status", text("b"))]).contains(&fp(1)));
@@ -1293,7 +1560,7 @@ mod tests {
 
     #[test]
     fn inset_parent_subsumes_subset_inset_only() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(
             fp(1),
             &[any_of("status", vec![text("a"), text("b"), text("c")])],
@@ -1313,7 +1580,7 @@ mod tests {
 
     #[test]
     fn multi_column_excludes_when_one_column_misses() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         // Parent: id > 10 AND region = 5.
         idx.insert(fp(1), &[gt("id", int(10)), eq("region", int(5))]);
 
@@ -1326,7 +1593,7 @@ mod tests {
     fn two_sided_range_avoids_opaque_fallback() {
         // PGC-189: two-sided range parents go into `range_both`, not the
         // linear fallback. `complex_fallback_total` stays at zero.
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         assert_eq!(idx.complex_total(), 1);
@@ -1336,7 +1603,7 @@ mod tests {
 
     #[test]
     fn single_sided_range_avoids_fallback() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0))]);
 
         assert_eq!(idx.complex_total(), 1);
@@ -1345,7 +1612,7 @@ mod tests {
 
     #[test]
     fn remove_clears_range_parent() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(100))]);
         idx.remove(fp(1));
 
@@ -1356,7 +1623,7 @@ mod tests {
 
     #[test]
     fn remove_one_range_parent_keeps_sibling() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(10))]);
         idx.insert(fp(2), &[gt("id", int(20))]);
         idx.remove(fp(1));
@@ -1371,7 +1638,7 @@ mod tests {
     fn two_sided_column_does_not_mask_sibling() {
         // Parent: two-sided range on `id` (range_both), clean equality on
         // `region`. Region's precise filter must still apply across columns.
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(
             fp(1),
             &[gt("id", int(0)), lt("id", int(100)), eq("region", int(5))],
@@ -1388,7 +1655,7 @@ mod tests {
 
     #[test]
     fn two_sided_parent_subsumes_interior_equality() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         // Inside the interval — covered.
@@ -1397,7 +1664,7 @@ mod tests {
 
     #[test]
     fn two_sided_parent_excludes_outside_equality() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         // Outside on either side — not covered.
@@ -1407,7 +1674,7 @@ mod tests {
 
     #[test]
     fn two_sided_parent_subsumes_narrower_two_sided_query() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         // Narrower interval — covered.
@@ -1417,7 +1684,7 @@ mod tests {
 
     #[test]
     fn two_sided_parent_excludes_broader_two_sided_query() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(10)), lt("id", int(90))]);
 
         // Broader interval (parent narrower than query) — not covered.
@@ -1427,7 +1694,7 @@ mod tests {
 
     #[test]
     fn two_sided_parent_excludes_partial_overlap() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         // Overlaps on the right but extends past the parent — not covered.
@@ -1442,7 +1709,7 @@ mod tests {
     #[test]
     fn two_sided_parent_does_not_cover_single_sided_query() {
         // A finite-bound parent cannot cover a half-infinite query interval.
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
 
         // Query (50, +inf): parent's upper=100 < +inf — not covered.
@@ -1453,7 +1720,7 @@ mod tests {
 
     #[test]
     fn two_sided_remove_clears_parent() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]);
         idx.remove(fp(1));
 
@@ -1464,7 +1731,7 @@ mod tests {
 
     #[test]
     fn two_sided_remove_one_keeps_sibling() {
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(50))]);
         idx.insert(fp(2), &[gt("id", int(0)), lt("id", int(100))]);
         idx.remove(fp(1));
@@ -1479,7 +1746,7 @@ mod tests {
     #[test]
     fn two_sided_mixed_with_single_sided_class() {
         // Two-sided and single-sided parents coexisting on the same column.
-        let mut idx = SubsumptionIndex::new();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("id", int(0)), lt("id", int(100))]); // (0, 100)
         idx.insert(fp(2), &[gt("id", int(20))]); // (20, +inf)
 
@@ -1492,5 +1759,193 @@ mod tests {
         let high = idx.candidates(&[eq("id", int(200))]);
         assert!(!high.contains(&fp(1)));
         assert!(high.contains(&fp(2)));
+    }
+
+    // Option A: `Integer(n)` and `Float(n)` collapse to one canonical key, so
+    // the index returns cross-variant numeric candidates (no under-return).
+
+    #[test]
+    fn numeric_unification_equality_cross_variant() {
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[eq("id", int(200))]);
+        assert!(
+            idx.candidates(&[eq("id", float_lit(200.0))]).contains(&fp(1)),
+            "Float(200.0) probe must find an Integer(200) entry"
+        );
+
+        let mut idx2 = ConstraintIndex::<Fingerprint>::new();
+        idx2.insert(fp(2), &[eq("id", float_lit(200.0))]);
+        assert!(
+            idx2.candidates(&[eq("id", int(200))]).contains(&fp(2)),
+            "Integer(200) probe must find a Float(200.0) entry"
+        );
+    }
+
+    #[test]
+    fn numeric_unification_range_cross_variant() {
+        // Integer lower-bound range, Float point probe.
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[gt("price", int(10))]);
+        assert!(idx.candidates(&[eq("price", float_lit(50.0))]).contains(&fp(1)));
+        assert!(!idx.candidates(&[eq("price", float_lit(5.0))]).contains(&fp(1)));
+
+        // Float upper-bound range, Integer point probe.
+        let mut idx2 = ConstraintIndex::<Fingerprint>::new();
+        idx2.insert(fp(2), &[lt("price", float_lit(100.0))]);
+        assert!(idx2.candidates(&[eq("price", int(50))]).contains(&fp(2)));
+        assert!(!idx2.candidates(&[eq("price", int(200))]).contains(&fp(2)));
+    }
+
+    // Point probe: the row is an `Equal`-on-every-column degenerate query.
+
+    #[test]
+    fn point_probe_basic() {
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[eq("id", int(200))]);
+        idx.insert(fp(2), &[eq("id", int(999))]);
+        idx.insert(fp(3), &[]); // unconstrained — matches every row
+
+        let got = idx.candidates_point(|c| match c {
+            "id" => vec![ColumnRange::Equal(int(200))],
+            _ => vec![ColumnRange::Unknown],
+        });
+        assert!(got.contains(&fp(1)));
+        assert!(got.contains(&fp(3)));
+        assert!(!got.contains(&fp(2)), "id=999 must be excluded for a id=200 row");
+    }
+
+    #[test]
+    fn point_probe_unknown_is_conservative() {
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[eq("id", int(200))]); // equality-pure bucket
+        idx.insert(fp(2), &[gt("id", int(100))]); // complex bucket
+
+        // An `Unknown` column (NULL / unchanged-TOAST) must return every entry
+        // constraining it — both buckets — never drop one.
+        let got = idx.candidates_point(|_| vec![ColumnRange::Unknown]);
+        assert!(got.contains(&fp(1)), "equality-pure entry must not be dropped under Unknown");
+        assert!(got.contains(&fp(2)), "complex entry must not be dropped under Unknown");
+    }
+
+    #[test]
+    fn point_probe_partial_unknown_filters_known_columns() {
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        // Two-column equality-pure entries on {id, region}.
+        idx.insert(fp(1), &[eq("id", int(1)), eq("region", int(5))]);
+        idx.insert(fp(2), &[eq("id", int(2)), eq("region", int(5))]);
+
+        // region pinned to 5, id unknown: both match on the pinned column.
+        let got = idx.candidates_point(|c| match c {
+            "region" => vec![ColumnRange::Equal(int(5))],
+            _ => vec![ColumnRange::Unknown],
+        });
+        assert!(got.contains(&fp(1)));
+        assert!(got.contains(&fp(2)));
+
+        // region pinned to a non-matching value excludes both.
+        let none = idx.candidates_point(|c| match c {
+            "region" => vec![ColumnRange::Equal(int(9))],
+            _ => vec![ColumnRange::Unknown],
+        });
+        assert!(none.is_empty());
+    }
+
+    // `row_value_forms`: every keyable interpretation of the wire text.
+
+    fn has_str_form(forms: &[ColumnRange], s: &str) -> bool {
+        forms.iter().any(|r| matches!(r, ColumnRange::Equal(LiteralValue::String(v)) if v == s))
+    }
+    fn has_num_form(forms: &[ColumnRange], x: f64) -> bool {
+        forms.iter().any(
+            |r| matches!(r, ColumnRange::Equal(LiteralValue::Float(n)) if *n == NotNan::new(x).unwrap()),
+        )
+    }
+
+    #[test]
+    fn row_value_forms_coercion() {
+        let t = point_table();
+        let row = [bs("200"), bs("alice"), bs("t")];
+
+        // numeric column "200" → BOTH the String and Float forms (an entry may
+        // be keyed under either, e.g. `id = 200` vs `id::text = '200'`).
+        let id = row_value_forms(&t, &row, "id");
+        assert!(has_str_form(&id, "200"));
+        assert!(has_num_form(&id, 200.0));
+
+        // text column "alice" → String form only (not numerically parseable).
+        let name = row_value_forms(&t, &row, "name");
+        assert!(has_str_form(&name, "alice"));
+        assert!(!name.iter().any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_)))));
+
+        // bool column "t" → String("t") plus Boolean(true).
+        let active = row_value_forms(&t, &row, "active");
+        assert!(has_str_form(&active, "t"));
+        assert!(
+            active
+                .iter()
+                .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Boolean(true))))
+        );
+
+        // SQL NULL / absent column → [Unknown] (wildcard).
+        let null_row = [None, bs("bob"), bs("f")];
+        assert!(matches!(row_value_forms(&t, &null_row, "id").as_slice(), [ColumnRange::Unknown]));
+        assert!(matches!(row_value_forms(&t, &row, "nope").as_slice(), [ColumnRange::Unknown]));
+
+        // numeric-looking-but-textual: a non-numeric text yields only String.
+        let bad_row = [bs("abc"), bs("bob"), bs("f")];
+        let bad = row_value_forms(&t, &bad_row, "id");
+        assert!(has_str_form(&bad, "abc"));
+        assert!(!bad.iter().any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_)))));
+    }
+
+    #[test]
+    fn row_value_forms_drives_point_probe() {
+        let t = point_table();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[eq("id", int(200))]);
+        idx.insert(fp(2), &[eq("id", int(7))]);
+
+        let row = [bs("200"), bs("alice"), bs("t")];
+        let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
+        assert!(got.contains(&fp(1)));
+        assert!(!got.contains(&fp(2)));
+    }
+
+    // Regression: a numeric column can hold a String-literal constraint via an
+    // identity `::text` cast (`val::text = '42'` → `Comparison(val, Eq,
+    // String("42"))`). The point probe must find it through the String form,
+    // while still finding ordinary `Num`-keyed entries through the Float form.
+
+    #[test]
+    fn point_probe_numeric_column_string_literal_equality() {
+        let t = point_table();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[eq("id", text("200"))]); // id::text = '200' → String
+        idx.insert(fp(2), &[eq("id", int(200))]); // id = 200 → Num
+        idx.insert(fp(3), &[eq("id", text("7"))]); // non-matching String
+
+        let row = [bs("200"), bs("alice"), bs("t")];
+        let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
+        assert!(got.contains(&fp(1)), "String('200') entry found via the String form");
+        assert!(got.contains(&fp(2)), "Integer(200) entry found via the Float form");
+        assert!(!got.contains(&fp(3)), "String('7') entry must not match a '200' row");
+    }
+
+    #[test]
+    fn point_probe_numeric_column_string_literal_range() {
+        // A String-keyed range walks the lexicographic `Str` region; a '42'
+        // row must satisfy `> '10'` lexicographically and not be under-returned.
+        let t = point_table();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[gt("id", text("10"))]); // id::text > '10'
+
+        let row = [bs("42"), bs("alice"), bs("t")];
+        let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
+        assert!(got.contains(&fp(1)), "'42' > '10' lexicographically — must be a candidate");
+
+        // A row whose text is lexicographically below '10' must be excluded.
+        let row_lo = [bs("09"), bs("alice"), bs("t")];
+        let got_lo = idx.candidates_point(|c| row_value_forms(&t, &row_lo, c));
+        assert!(!got_lo.contains(&fp(1)), "'09' < '10' lexicographically");
     }
 }

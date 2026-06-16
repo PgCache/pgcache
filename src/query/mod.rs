@@ -1,5 +1,6 @@
 pub mod ast;
 pub mod cast;
+pub mod constraint_index;
 pub mod constraints;
 pub mod decorrelate;
 pub mod evaluate;

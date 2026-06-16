@@ -19,6 +19,7 @@ use crate::pg::protocol::ByteString;
 
 use crate::query::ast::{BinaryOp, Deparse};
 use crate::query::cast::cast_target_coerce_text;
+use crate::query::constraint_index::row_value_forms;
 use crate::query::constraints::{QueryConstraints, TableConstraint};
 use crate::query::evaluate::{literal_compare, where_value_compare_string};
 use crate::query::resolved::ResolvedQueryExpr;
@@ -3372,25 +3373,34 @@ impl WriterCdc {
             // first). Cheap, so always evaluated in full; `mv_dirty_mark`
             // self-gates on `Fresh`.
             let mut local_hit = false;
-            for update_query in update_queries.iter_complexity_ordered() {
+            // Narrow to candidate queries whose extracted constraints the row
+            // could satisfy, instead of scanning every query. The index holds
+            // the full LocalEval population (unconstrained queries are
+            // always-candidates), so this never drops a true match.
+            let local_candidates = update_queries
+                .local_eval_index
+                .candidates_point(|col| row_value_forms(table_metadata, row_data, col));
+            for fingerprint in local_candidates {
                 // Flagged for invalidation this frame → not maintained in
                 // place (it forwards to origin and repopulates). Matches the
                 // pre-deferral ordering, where the inline invalidate ran
                 // before this executor so such queries were already excluded.
-                if core.frame_invalidations.contains(&update_query.fingerprint) {
+                if core.frame_invalidations.contains(&fingerprint) {
                     continue;
                 }
-                if update_query.eval_strategy != UpdateEvalStrategy::LocalEval {
+                let Some(update_query) = update_queries.queries.get(&fingerprint) else {
                     continue;
-                }
+                };
+                debug_assert_eq!(
+                    update_query.eval_strategy,
+                    UpdateEvalStrategy::LocalEval,
+                    "local_eval_index must only hold LocalEval queries"
+                );
                 if !update_query_matches_locally(update_query, table_metadata, row_data) {
                     continue;
                 }
-                trace!(
-                    "update_queries local-eval matched fingerprint {}",
-                    update_query.fingerprint
-                );
-                core.mv_dirty_mark(update_query.fingerprint);
+                trace!("update_queries local-eval matched fingerprint {fingerprint}");
+                core.mv_dirty_mark(fingerprint);
                 matched = true;
                 local_hit = true;
             }
