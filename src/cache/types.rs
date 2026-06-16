@@ -469,6 +469,18 @@ pub struct RegGate {
     /// Writer backlog window max since reset. `0` ⇒ no registration load this
     /// window (the controller holds `reg_rate` rather than probing into a void).
     queue_max: AtomicUsize,
+    /// Population in-flight: queries in `Loading` (admitted, populating, not yet
+    /// Ready). Published by the writer's gauge tick from the authoritative state
+    /// scan (so it never drifts). The second congestion signal — the writer's
+    /// command queue (`queue_min`) catches writer-stage congestion; this catches
+    /// population-stage congestion (`spawn_local` origin SELECTs), which on a
+    /// remote origin is the binding constraint the command queue is blind to.
+    loading: AtomicUsize,
+    /// Monotonic count of registrations the token bucket *denied* (shed to
+    /// origin). The controller probes the rate up only when this advanced — i.e.
+    /// demand is bumping against the rate — so a partly-warm cache (low miss/
+    /// registration load) can't drift the rate up into a low-demand void.
+    denied: AtomicU64,
 }
 
 impl RegGate {
@@ -478,6 +490,8 @@ impl RegGate {
             completed: AtomicU64::new(0),
             queue_min: AtomicUsize::new(usize::MAX),
             queue_max: AtomicUsize::new(0),
+            loading: AtomicUsize::new(0),
+            denied: AtomicU64::new(0),
         }
     }
 
@@ -513,6 +527,27 @@ impl RegGate {
         let max = self.queue_max.swap(0, Ordering::Relaxed);
         let min = self.queue_min.swap(usize::MAX, Ordering::Relaxed);
         (if min == usize::MAX { 0 } else { min }, max)
+    }
+
+    /// Writer gauge tick: publish the authoritative `Loading` count (population
+    /// in-flight) from the state scan.
+    pub fn loading_set(&self, count: usize) {
+        self.loading.store(count, Ordering::Relaxed);
+    }
+
+    /// Controller: current population in-flight (queries still populating).
+    pub fn loading_get(&self) -> usize {
+        self.loading.load(Ordering::Relaxed)
+    }
+
+    /// Dispatch: the token bucket denied a registration (shed to origin).
+    pub fn denied_inc(&self) {
+        self.denied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Controller: monotonic denied count, for the per-window shed delta.
+    pub fn denied_count(&self) -> u64 {
+        self.denied.load(Ordering::Relaxed)
     }
 }
 

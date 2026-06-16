@@ -974,6 +974,9 @@ impl WriterCore {
                 .state
                 .queries_loading
                 .set(loading_count as f64);
+            // Feed the adaptive gate its population-stage congestion signal
+            // (PGC-277): the authoritative in-flight count, no drift.
+            self.state_view.reg_gate.loading_set(loading_count);
             crate::metrics::handles()
                 .state
                 .queries_pending

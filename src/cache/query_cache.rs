@@ -327,6 +327,9 @@ impl RegRateBucket {
             g.0 -= 1.0;
             true
         } else {
+            // Demand exceeded the rate — record the shed so the controller knows
+            // it is rate-limited (and may probe up); otherwise it holds.
+            self.gate.denied_inc();
             false
         }
     }

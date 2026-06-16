@@ -218,6 +218,7 @@ pub mod names {
     pub const CACHE_REG_GATE_BTLBW: &str = "pgcache.cache.reg_gate_btlbw";
     pub const CACHE_REG_GATE_QUEUE_MIN: &str = "pgcache.cache.reg_gate_queue_min";
     pub const CACHE_REG_GATE_DRAIN_RATE: &str = "pgcache.cache.reg_gate_drain_rate";
+    pub const CACHE_REG_GATE_LOADING: &str = "pgcache.cache.reg_gate_loading";
 
     // Extended protocol metrics
     pub const PROTOCOL_SIMPLE_QUERIES: &str = "pgcache.protocol.simple_queries";
@@ -414,6 +415,7 @@ pub struct CacheHandles {
     pub reg_gate_btlbw: Gauge,
     pub reg_gate_queue_min: Gauge,
     pub reg_gate_drain_rate: Gauge,
+    pub reg_gate_loading: Gauge,
 }
 
 pub struct CdcHandles {
@@ -590,6 +592,7 @@ impl Handles {
                 reg_gate_btlbw: metrics::gauge!(CACHE_REG_GATE_BTLBW),
                 reg_gate_queue_min: metrics::gauge!(CACHE_REG_GATE_QUEUE_MIN),
                 reg_gate_drain_rate: metrics::gauge!(CACHE_REG_GATE_DRAIN_RATE),
+                reg_gate_loading: metrics::gauge!(CACHE_REG_GATE_LOADING),
             },
             cdc: CdcHandles {
                 events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),
