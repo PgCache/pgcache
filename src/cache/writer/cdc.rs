@@ -2507,12 +2507,22 @@ impl WriterCdc {
         // it accompanies rather than visible mid-frame.
         core.frame_invalidations.extend(fp_list);
 
+        // Probe the LocalEval index once; both the in-place matcher and the memo
+        // eviction pass below consume the same candidate set.
+        let local_candidates = local_eval_candidates(core, relation_oid, row_data);
         let matched = self
-            .update_queries_execute_batch(core, relation_oid, row_data, batch)
+            .update_queries_execute_batch(core, relation_oid, row_data, batch, &local_candidates)
             .await?;
 
         // Rung 3b: evict memos this insert grows into (predicate-matched).
-        memo_frame_accumulate(core, relation_oid, MemoOp::Insert, row_data, None);
+        memo_frame_accumulate(
+            core,
+            relation_oid,
+            MemoOp::Insert,
+            row_data,
+            None,
+            &local_candidates,
+        );
 
         // The inserted row is alive at origin: cancel any tracked deletion of
         // its key so population merges don't omit it (PGC-260). When the key
@@ -2554,6 +2564,10 @@ impl WriterCdc {
         if !core.cache.tables.contains_key1(&relation_oid) {
             return Ok(());
         }
+
+        // Probe the LocalEval index once; the memo eviction pass and the in-place
+        // matcher (`update_queries_execute_batch` below) share this candidate set.
+        let local_candidates = local_eval_candidates(core, relation_oid, new_row_data);
 
         // PGC-227: when no cached query over this relation can have its UPDATE
         // invalidation depend on which columns changed or whether the row is
@@ -2614,15 +2628,23 @@ impl WriterCdc {
                 MemoOp::Update,
                 new_row_data,
                 row_changes,
+                &local_candidates,
             );
         } else {
             // No `row_changes` computed (PGC-227 skip): a membership flip-out is
             // undetectable, so memo eviction is conservative for this relation.
-            memo_frame_accumulate(core, relation_oid, MemoOp::Update, new_row_data, None);
+            memo_frame_accumulate(
+                core,
+                relation_oid,
+                MemoOp::Update,
+                new_row_data,
+                None,
+                &local_candidates,
+            );
         }
 
         let matched = self
-            .update_queries_execute_batch(core, relation_oid, new_row_data, batch)
+            .update_queries_execute_batch(core, relation_oid, new_row_data, batch, &local_candidates)
             .await?;
 
         if matched {
@@ -2873,7 +2895,15 @@ impl WriterCdc {
 
         // Rung 3b: the delete's old image is PK-only, so a non-PK WHERE can't be
         // probed — conservatively evict every memo over the relation.
-        memo_frame_accumulate(core, relation_oid, MemoOp::Delete, row_data, None);
+        // Delete eviction is conservative (no candidate probe needed).
+        memo_frame_accumulate(
+            core,
+            relation_oid,
+            MemoOp::Delete,
+            row_data,
+            None,
+            &FingerprintSet::default(),
+        );
 
         // A deleted row leaves stale rows in any Fresh MV that materialized it;
         // CDC removals never went through the upsert path's dirty-mark, so the
@@ -3387,6 +3417,7 @@ impl WriterCdc {
         relation_oid: Oid,
         row_data: &[Option<ByteString>],
         batch: Option<BatchEvalView<'_>>,
+        local_candidates: &FingerprintSet,
     ) -> CacheResult<bool> {
         // Phase A: membership evaluation. The `core` borrow is confined to
         // this block so the in-frame write below doesn't hold it.
@@ -3417,14 +3448,11 @@ impl WriterCdc {
             // first). Cheap, so always evaluated in full; `mv_dirty_mark`
             // self-gates on `Fresh`.
             let mut local_hit = false;
-            // Narrow to candidate queries whose extracted constraints the row
-            // could satisfy, instead of scanning every query. The index holds
-            // the full LocalEval population (unconstrained queries are
-            // always-candidates), so this never drops a true match.
-            let local_candidates = update_queries
-                .local_eval_index
-                .candidates_point(|col| row_value_forms(table_metadata, row_data, col));
-            for fingerprint in local_candidates {
+            // Candidate queries whose extracted constraints the row could
+            // satisfy (computed once by the caller, shared with the memo pass).
+            // The index holds the full LocalEval population (unconstrained
+            // queries are always-candidates), so this never drops a true match.
+            for &fingerprint in local_candidates {
                 // Flagged for invalidation this frame → not maintained in
                 // place (it forwards to origin and repopulates). Matches the
                 // pre-deferral ordering, where the inline invalidate ran
@@ -3907,6 +3935,26 @@ enum MemoOp {
     Delete,
 }
 
+/// Compute the LocalEval candidate fingerprints for a CDC row once, so the
+/// in-place matcher (`update_queries_execute_batch`) and the memo-eviction pass
+/// (`memo_frame_accumulate`) share one `candidates_point` probe instead of each
+/// running its own. Empty when the relation has no cached queries.
+fn local_eval_candidates(
+    core: &WriterCore,
+    relation_oid: Oid,
+    row: &[Option<ByteString>],
+) -> FingerprintSet {
+    match (
+        core.cache.update_queries.get(&relation_oid),
+        core.cache.tables.get1(&relation_oid),
+    ) {
+        (Some(uqs), Some(table_metadata)) => uqs
+            .local_eval_index
+            .candidates_point(|c| row_value_forms(table_metadata, row, c)),
+        _ => FingerprintSet::default(),
+    }
+}
+
 /// Accumulate the memoized fingerprints whose in-process snapshot this CDC row
 /// change affects into `frame_memo_evictions` (rung 3b); the frame flush bumps
 /// `SlotKey::Memo(F)` for the set, so eviction is predicate-matched rather than
@@ -3925,6 +3973,7 @@ fn memo_frame_accumulate(
     op: MemoOp,
     new_row: &[Option<ByteString>],
     row_changes: Option<&HashMap<EcoString, bool>>,
+    local_candidates: &FingerprintSet,
 ) {
     if core.state_view.memo.is_empty() {
         return;
@@ -3949,9 +3998,6 @@ fn memo_frame_accumulate(
             core.frame_memo_evictions.extend(memo_over_r);
             return;
         };
-        let candidates = uqs
-            .local_eval_index
-            .candidates_point(|c| row_value_forms(table_metadata, new_row, c));
         memo_over_r
             .iter()
             .filter(|&f| {
@@ -3961,7 +4007,7 @@ fn memo_frame_accumulate(
                 if uq.eval_strategy != UpdateEvalStrategy::LocalEval {
                     return true; // PgEval (complex / multi-table): conservative
                 }
-                let new_match = candidates.contains(f)
+                let new_match = local_candidates.contains(f)
                     && update_query_matches_locally(uq, table_metadata, new_row);
                 match (&op, row_changes) {
                     (MemoOp::Insert, _) => new_match,
