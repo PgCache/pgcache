@@ -553,7 +553,10 @@ impl WriterCdc {
             relations = oids.len(),
             "cdc frame recovery: invalidating + truncating affected relations"
         );
-        // Evict first so no query can read a mid-truncate cache table.
+        // Evict first so no query can read a mid-truncate cache table. Memos
+        // need no separate handling: eviction removes the query from
+        // `cached_queries`, so it is not Ready and its orphan memo is unreachable
+        // (re-captured on re-register) — exactly as for a normal TRUNCATE.
         for oid in &oids {
             core.cache_table_invalidate(*oid)
                 .await
@@ -1380,13 +1383,29 @@ impl WriterCdc {
         // while memoization is toggled off at runtime — a change landing
         // during the disabled window still bumps the slot, so a later
         // re-enable cannot serve a snapshot that predates it.
+        // Replay the buffered row events first (PGC-241): this opens the cache
+        // txn (`Active → TxnOpen`) or enters `Recovering`, and — for rung 3b —
+        // runs the per-row handlers that accumulate the predicate-matched
+        // `frame_memo_evictions`. It MUST precede the memo seqlock `begin` below
+        // so begin/end bracket the identical (now-final) eviction set across the
+        // commit. Buffered writes go to `frame_buf`; the COMMIT is in
+        // `frame_finalize`, which the bracket spans.
+        self.frame_rows_replay(core).await?;
+
         let memo_active = !core.state_view.memo.is_empty();
+        // Rung 3b: bump `Memo(F)` only for the predicate-matched eviction set
+        // (`frame_memo_evictions`) — a change that doesn't touch a memo's
+        // predicate/membership leaves it intact. The `Relation` slot is still
+        // bumped for every touched relation as the capture-window guard.
         if memo_active {
             for &oid in &core.frame_relation_oids {
                 core.state_view
                     .memo
                     .slot_dirty_begin(SlotKey::Relation(oid));
             }
+        }
+        for &fp in &core.frame_memo_evictions {
+            core.state_view.memo.slot_dirty_begin(SlotKey::Memo(fp));
         }
 
         // Always publish the post-commit version (end the seqlock) before
@@ -1398,10 +1417,14 @@ impl WriterCdc {
                 core.state_view.memo.slot_dirty_end(SlotKey::Relation(oid));
             }
         }
+        for &fp in &core.frame_memo_evictions {
+            core.state_view.memo.slot_dirty_end(SlotKey::Memo(fp));
+        }
         finalize?;
 
         core.frame_state = FrameState::Idle;
         core.frame_invalidations.clear();
+        core.frame_memo_evictions.clear();
         core.frame_relation_oids.clear();
         core.frame_buf.clear();
         core.frame_buf_relations.clear();
@@ -1449,11 +1472,12 @@ impl WriterCdc {
     /// (or recover) per its state. Extracted from the `CommitMark` handler so the
     /// memo seqlock bracket can publish the post-commit version on every exit
     /// path — including an error return from here.
+    /// Commit (or recover) the frame. The caller (`batch_flush`) must have
+    /// already run `frame_rows_replay` — that opens the txn (`Active → TxnOpen`)
+    /// or enters `Recovering` and, for rung 3b, accumulates
+    /// `frame_memo_evictions` — so the memo seqlock bracket sees the final
+    /// state/eviction-set before the commit this performs.
     async fn frame_finalize(&mut self, core: &mut WriterCore) -> CacheResult<()> {
-        // Evaluate + emit the frame's buffered row events first (PGC-241): the
-        // replay is what can open the txn (`Active → TxnOpen`) or enter
-        // `Recovering`, so the state match below must run after it.
-        self.frame_rows_replay(core).await?;
         match core.frame_state {
             FrameState::TxnOpen => {
                 self.frame_invalidations_flush(core).await?;
@@ -2487,6 +2511,9 @@ impl WriterCdc {
             .update_queries_execute_batch(core, relation_oid, row_data, batch)
             .await?;
 
+        // Rung 3b: evict memos this insert grows into (predicate-matched).
+        memo_frame_accumulate(core, relation_oid, MemoOp::Insert, row_data, None);
+
         // The inserted row is alive at origin: cancel any tracked deletion of
         // its key so population merges don't omit it (PGC-260). When the key
         // was tracked but no query matched (nothing upserted), write the row
@@ -2579,6 +2606,19 @@ impl WriterCdc {
             trace!("invalidation_count {}", fp_list.len());
             // Deferred to frame_invalidations_flush (see handle_insert).
             core.frame_invalidations.extend(fp_list);
+            // Rung 3b: predicate-matched memo eviction with the changed-column
+            // set available (precise grow / flip-out / projected-value change).
+            memo_frame_accumulate(
+                core,
+                relation_oid,
+                MemoOp::Update,
+                new_row_data,
+                row_changes,
+            );
+        } else {
+            // No `row_changes` computed (PGC-227 skip): a membership flip-out is
+            // undetectable, so memo eviction is conservative for this relation.
+            memo_frame_accumulate(core, relation_oid, MemoOp::Update, new_row_data, None);
         }
 
         let matched = self
@@ -2830,6 +2870,10 @@ impl WriterCdc {
         // Buffer the delete for the frame flush (PGC-228).
         self.frame_cache_delete(core, relation_oid, row_data)
             .await?;
+
+        // Rung 3b: the delete's old image is PK-only, so a non-PK WHERE can't be
+        // probed — conservatively evict every memo over the relation.
+        memo_frame_accumulate(core, relation_oid, MemoOp::Delete, row_data, None);
 
         // A deleted row leaves stale rows in any Fresh MV that materialized it;
         // CDC removals never went through the upsert path's dirty-mark, so the
@@ -3791,16 +3835,17 @@ impl WriterCore {
         // Remove from state view
         self.state_view.cached_queries.remove(&fingerprint);
 
-        // The memo is deliberately NOT swept here. Memo entries turn over via
-        // relation slot bumps (any CDC write to a read relation evicts them), so
-        // eviction without a data change leaves a correctness-safe orphan: the
-        // entry is still gated by its slot stamps (cannot serve stale) and is
-        // bounded by the memo byte budget (a full store rejects new captures, no
-        // leak). It clears on the next write to its relation, or serves for free
-        // if the fingerprint is re-registered while unchanged. Coupling memo
-        // removal to eviction would need a fingerprint→keys index, not just an
-        // O(n) scan per eviction — deferred until orphan accumulation under a
-        // write-light, high-cardinality workload is shown to matter (PGC-277).
+        // The memo is deliberately NOT swept here. An evicted query is removed
+        // from `cached_queries`, so it is no longer Ready and its orphan memo is
+        // never reached by the serve path (`memo_serve_plan` runs only on the
+        // Ready hit path). When the query re-registers and is served again, that
+        // serve re-captures and replaces the orphan under the same `MemoKey`. So
+        // eviction leaves a correctness-safe orphan: unreachable until replaced,
+        // and bounded by the memo byte budget (a full store rejects new captures,
+        // no leak). Coupling memo removal to query eviction would need a
+        // fingerprint→keys index, not just an O(n) scan per eviction — deferred
+        // until orphan accumulation under a write-light, high-cardinality
+        // workload is shown to matter (PGC-277).
 
         // Drain coalesced waiters parked on the now-removed query (eviction can
         // remove a Loading query whose waiters would otherwise never be drained).
@@ -3853,6 +3898,88 @@ fn cdc_on_conflict_tail_append(
     if first {
         sql.push_str(" DO NOTHING");
     }
+}
+
+/// CDC operation kind for memo eviction accumulation (rung 3b).
+enum MemoOp {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// Accumulate the memoized fingerprints whose in-process snapshot this CDC row
+/// change affects into `frame_memo_evictions` (rung 3b); the frame flush bumps
+/// `SlotKey::Memo(F)` for the set, so eviction is predicate-matched rather than
+/// relation-coarse.
+///
+/// Correctness bar: never under-evict (a miss is a stale read). Conservative
+/// (evict every memo over the relation) for: DELETE (the old image is PK-only
+/// under REPLICA IDENTITY DEFAULT, so a non-PK WHERE can't be probed), PgEval
+/// memos (complex / multi-table membership), and UPDATE without `row_changes`
+/// (a membership flip-out is undetectable without the changed-column set). The
+/// precise path applies only to `LocalEval` memos, which are single-table by
+/// construction — so `update_query_matches_locally` fully decides membership.
+fn memo_frame_accumulate(
+    core: &mut WriterCore,
+    relation_oid: Oid,
+    op: MemoOp,
+    new_row: &[Option<ByteString>],
+    row_changes: Option<&HashMap<EcoString, bool>>,
+) {
+    if core.state_view.memo.is_empty() {
+        return;
+    }
+    let memo_over_r = core
+        .state_view
+        .memo
+        .fingerprints_for_relations([&relation_oid]);
+    if memo_over_r.is_empty() {
+        return;
+    }
+    if matches!(op, MemoOp::Delete) {
+        core.frame_memo_evictions.extend(memo_over_r);
+        return;
+    }
+    let evict: Vec<Fingerprint> = {
+        let Some(uqs) = core.cache.update_queries.get(&relation_oid) else {
+            core.frame_memo_evictions.extend(memo_over_r);
+            return;
+        };
+        let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
+            core.frame_memo_evictions.extend(memo_over_r);
+            return;
+        };
+        let candidates = uqs
+            .local_eval_index
+            .candidates_point(|c| row_value_forms(table_metadata, new_row, c));
+        memo_over_r
+            .iter()
+            .filter(|&f| {
+                let Some(uq) = uqs.queries.get(f) else {
+                    return true; // memoized but no update-query: conservative
+                };
+                if uq.eval_strategy != UpdateEvalStrategy::LocalEval {
+                    return true; // PgEval (complex / multi-table): conservative
+                }
+                let new_match = candidates.contains(f)
+                    && update_query_matches_locally(uq, table_metadata, new_row);
+                match (&op, row_changes) {
+                    (MemoOp::Insert, _) => new_match,
+                    (MemoOp::Update, Some(rc)) => {
+                        new_match
+                            || uq
+                                .predicate_columns
+                                .iter()
+                                .any(|c| rc.get(c.as_str()).copied().unwrap_or(false))
+                    }
+                    (MemoOp::Update, None) => true,
+                    (MemoOp::Delete, _) => true,
+                }
+            })
+            .copied()
+            .collect()
+    };
+    core.frame_memo_evictions.extend(evict);
 }
 
 /// Evaluate a LocalEval update query's WHERE against the CDC row.

@@ -27,6 +27,7 @@ use ordered_float::NotNan;
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{ColumnRange, TableConstraint, column_range_build};
+use crate::query::evaluate::pg_bool_parse;
 
 /// `HashMap` keyed by an id type with the passthrough identity hasher.
 type IdMap<K, V> = HashMap<K, V, BuildIdHasher<K>>;
@@ -1047,10 +1048,8 @@ pub(crate) fn row_value_forms(
     if let Some(n) = text.parse::<f64>().ok().and_then(|x| NotNan::new(x).ok()) {
         forms.push(ColumnRange::Equal(LiteralValue::Float(n)));
     }
-    match text {
-        "t" | "true" => forms.push(ColumnRange::Equal(LiteralValue::Boolean(true))),
-        "f" | "false" => forms.push(ColumnRange::Equal(LiteralValue::Boolean(false))),
-        _ => {}
+    if let Some(b) = pg_bool_parse(text) {
+        forms.push(ColumnRange::Equal(LiteralValue::Boolean(b)));
     }
     forms
 }

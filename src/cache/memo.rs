@@ -51,7 +51,7 @@
 //! are balanced per relation per frame and the version never sticks odd.
 
 use crate::catalog::Oid;
-use crate::query::Fingerprint;
+use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::{Bytes, BytesMut};
@@ -75,17 +75,25 @@ pub const MEMO_CAPTURE_MIN_HITS: u64 = 1;
 /// bumps slots; a memo stamps the slots it read and is served only while every
 /// stamped epoch still matches.
 ///
-/// Rung 1 uses [`SlotKey::Relation`] exclusively. The remaining variants are the
-/// rung-2 (column-aware) refinement and are not yet bumped or stamped.
+/// Rung 3 (PGC-248) stamps [`SlotKey::Memo`] per fingerprint as the entry's only
+/// serve-time dependency, so a change evicts only the memos it actually affects.
+/// [`SlotKey::Relation`] is retained as the *capture-window guard*: the CDC frame
+/// still bumps it for every touched relation (begin/end), and a capture re-checks
+/// it at finish, so a frame committing mid-capture drops the snapshot even for a
+/// fingerprint not yet in the membership map. It is NOT stored in `MemoEntry`, so
+/// it never busts a stored entry. The `RelationMembership`/`RelationColumn`
+/// variants remain reserved (unused).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SlotKey {
-    /// Any change (insert/update/delete) to this relation evicts. Rung 1.
+    /// Per-fingerprint eviction slot (rung 3). The only slot a memo stamps.
+    Memo(Fingerprint),
+    /// Capture-window guard: bumped for every touched relation each frame and
+    /// re-checked at capture finish, but not stored in the entry (rung 3).
     Relation(Oid),
-    /// A membership change (INSERT/DELETE) on this relation. Rung 2: a snapshot
-    /// can always grow on insert / shrink on delete, so these always evict.
+    /// A membership change (INSERT/DELETE) on this relation. Reserved (unused).
     RelationMembership(Oid),
     /// A specific column of this relation changed (`(relation_oid, attnum)`).
-    /// Rung 2: evict only memos that read this column (SELECT list or WHERE).
+    /// Reserved (unused).
     RelationColumn(Oid, u32),
 }
 
@@ -144,8 +152,13 @@ pub struct MemoEntry {
     /// none was captured). Serve writes the whole buffer for a request that
     /// wants a RowDescription, or `core[rd_len..]` for one that does not.
     pub rd_len: usize,
-    /// Slots stamped at capture; the entry is live while all still match.
+    /// Slots stamped at capture; the entry is live while all still match. Holds
+    /// only the [`SlotKey::Memo`] slot (rung 3) — never a `Relation` guard slot.
     pub stamped: Box<[(SlotKey, u64)]>,
+    /// Relations this query reads. Used to maintain `relation_fingerprints` on
+    /// insert/removal so the CDC path can find which memos a touched relation
+    /// covers.
+    pub relations: Box<[Oid]>,
 }
 
 impl MemoEntry {
@@ -167,6 +180,13 @@ pub struct MemoHit {
 pub struct ResultMemo {
     entries: DashMap<MemoKey, MemoEntry>,
     slot_epochs: DashMap<SlotKey, u64>,
+    /// Per-(relation, fingerprint) refcount of live entries, so the CDC frame
+    /// can find which memoized fingerprints a touched relation covers. A
+    /// fingerprint can have several entries (distinct format/shape), hence the
+    /// count. Over-counting (a stale entry) only causes a harmless extra
+    /// `Memo` bump; under-counting would miss an eviction, so every removal
+    /// path decrements.
+    relation_fingerprints: DashMap<Oid, FingerprintMap<usize>>,
     total_bytes: AtomicUsize,
     /// Set when a slot is bumped (an entry may have become stale); cleared by
     /// `gc`. Lets the periodic sweep skip the full scan when nothing changed
@@ -180,6 +200,7 @@ impl ResultMemo {
         Self {
             entries: DashMap::new(),
             slot_epochs: DashMap::new(),
+            relation_fingerprints: DashMap::new(),
             total_bytes: AtomicUsize::new(0),
             gc_pending: AtomicBool::new(false),
             dynamic,
@@ -260,6 +281,7 @@ impl ResultMemo {
             .remove_if(key, |_, v| !self.slots_valid(&v.stamped))
         {
             self.bytes_reclaim(removed.size());
+            self.rel_decr(&removed.relations, key.fingerprint);
         }
         None
     }
@@ -290,18 +312,71 @@ impl ResultMemo {
             return false;
         }
 
+        // Increment before the map insert (and decrement any replaced entry
+        // after) so a concurrent reader never sees the fingerprint's count dip
+        // to zero while a live entry exists.
+        let fp = key.fingerprint;
+        self.rel_incr(&entry.relations, fp);
         if let Some(prev) = self.entries.insert(key, entry) {
             self.total_bytes.fetch_sub(prev.size(), Ordering::Relaxed);
+            self.rel_decr(&prev.relations, fp);
         }
         self.total_bytes.fetch_add(size, Ordering::Relaxed);
         crate::metrics::handles().cache.memo_captures.increment(1);
         true
     }
 
+    /// Increment the (relation, fingerprint) refcount for each relation.
+    fn rel_incr(&self, relations: &[Oid], fp: Fingerprint) {
+        for &oid in relations {
+            *self
+                .relation_fingerprints
+                .entry(oid)
+                .or_default()
+                .entry(fp)
+                .or_insert(0) += 1;
+        }
+    }
+
+    /// Decrement the (relation, fingerprint) refcount, dropping empty buckets.
+    fn rel_decr(&self, relations: &[Oid], fp: Fingerprint) {
+        for &oid in relations {
+            if let Some(mut inner) = self.relation_fingerprints.get_mut(&oid)
+                && let Some(count) = inner.get_mut(&fp)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    inner.remove(&fp);
+                }
+            }
+            // Re-checks emptiness under the shard lock, so a concurrent
+            // `rel_incr` that re-populated the bucket isn't dropped.
+            self.relation_fingerprints
+                .remove_if(&oid, |_, inner| inner.is_empty());
+        }
+    }
+
+    /// Memoized fingerprints with a live entry over any of `oids`. The CDC frame
+    /// bumps `SlotKey::Memo` for these. May transiently over-include a
+    /// just-removed fingerprint (harmless extra bump), never under-include.
+    pub fn fingerprints_for_relations<'a>(
+        &self,
+        oids: impl IntoIterator<Item = &'a Oid>,
+    ) -> FingerprintSet {
+        let mut out = FingerprintSet::default();
+        for oid in oids {
+            if let Some(inner) = self.relation_fingerprints.get(oid) {
+                out.extend(inner.keys().copied());
+            }
+        }
+        out
+    }
+
     /// Remove an entry, returning its byte accounting to the budget.
     pub fn remove(&self, key: &MemoKey) {
         if let Some((_, entry)) = self.entries.remove(key) {
             self.bytes_reclaim(entry.size());
+            self.rel_decr(&entry.relations, key.fingerprint);
         }
     }
 
@@ -371,6 +446,9 @@ pub struct MemoCapture {
     /// Set once the accumulated bytes exceed the per-entry cap; the capture is
     /// then a no-op through `finish`.
     aborted: bool,
+    /// Relations read by the query, recorded for the stored entry's membership
+    /// bookkeeping.
+    relations: Box<[Oid]>,
 }
 
 impl MemoCapture {
@@ -381,10 +459,15 @@ impl MemoCapture {
         if !memo.enabled() {
             return None;
         }
-        let slots: Vec<SlotKey> = relation_oids
+        // Stamp the per-fingerprint `Memo` slot (the serve-time dependency) plus
+        // every read relation's `Relation` guard slot; `finish` re-checks the
+        // whole set, so a frame committing mid-capture on a read relation drops
+        // the snapshot even for a fingerprint not yet in the membership map.
+        let mut slots: Vec<SlotKey> = relation_oids
             .iter()
             .map(|&oid| SlotKey::Relation(oid))
             .collect();
+        slots.push(SlotKey::Memo(key.fingerprint));
         let stamped = memo.slots_stamp(&slots)?;
         Some(MemoCapture {
             key,
@@ -392,6 +475,7 @@ impl MemoCapture {
             buf: BytesMut::new(),
             rd_len: 0,
             aborted: false,
+            relations: relation_oids.into(),
         })
     }
 
@@ -432,12 +516,22 @@ impl MemoCapture {
         if self.aborted || !memo.slots_valid(&self.stamped) {
             return false;
         }
+        // The entry stamps ONLY its `Memo` slot — serving is per-fingerprint
+        // precise. The `Relation` versions in `self.stamped` were the
+        // capture-window guard (re-checked above), not a serve dependency.
+        let stamped: Box<[(SlotKey, u64)]> = self
+            .stamped
+            .iter()
+            .copied()
+            .filter(|(slot, _)| matches!(slot, SlotKey::Memo(_)))
+            .collect();
         memo.insert(
             self.key,
             MemoEntry {
                 core: self.buf.freeze(),
                 rd_len: self.rd_len,
-                stamped: self.stamped,
+                stamped,
+                relations: self.relations,
             },
         )
     }
@@ -460,6 +554,7 @@ mod tests {
             core: Bytes::copy_from_slice(bytes),
             rd_len: 0,
             stamped: stamped.into(),
+            relations: Box::from([]),
         }
     }
 
@@ -476,6 +571,75 @@ mod tests {
 
     fn stamp(m: &ResultMemo, slots: &[SlotKey]) -> Box<[(SlotKey, u64)]> {
         m.slots_stamp(slots).expect("slots stable")
+    }
+
+    #[test]
+    fn test_capture_stamps_only_memo_slot_and_tracks_membership() {
+        let m = memo(1 << 20);
+        let oid = Oid::from_raw(10);
+        let k = key(7);
+
+        let mut cap = MemoCapture::begin(&m, k, &[oid]).expect("capture begins");
+        cap.row_description_push(b"rd");
+        cap.command_complete_push(b"cc");
+        assert!(cap.finish(&m), "capture finishes");
+
+        // Stored entry depends only on its per-fingerprint Memo slot — never a
+        // Relation guard slot.
+        let stored = m.entries.get(&k).expect("entry stored");
+        assert_eq!(stored.stamped.len(), 1);
+        assert_eq!(stored.stamped[0].0, SlotKey::Memo(Fingerprint::from_raw(7)));
+        drop(stored);
+
+        // Membership map resolves the relation to the fingerprint.
+        assert_eq!(
+            m.fingerprints_for_relations(&[oid]),
+            [Fingerprint::from_raw(7)].into_iter().collect()
+        );
+
+        // Removal clears membership.
+        m.remove(&k);
+        assert!(m.fingerprints_for_relations(&[oid]).is_empty());
+    }
+
+    /// The create-memo vs. frame-update race: a frame that commits on a relation
+    /// the in-flight capture reads must drop the capture — even when the frame
+    /// does NOT bump that fingerprint's own `Memo` slot (rung 3b leaves it alone
+    /// for a change that doesn't match the query). The `Relation` capture-window
+    /// guard — stamped at `begin`, re-checked at `finish`, never stored in the
+    /// entry — is what closes the race; per-fingerprint slots alone would store a
+    /// snapshot predating the commit.
+    #[test]
+    fn test_capture_dropped_when_read_relation_written_mid_window() {
+        let m = memo(1 << 20);
+        let oid = Oid::from_raw(10);
+        let k = key(7);
+
+        let mut cap = MemoCapture::begin(&m, k, &[oid]).expect("capture begins");
+        cap.row_description_push(b"rd");
+        cap.command_complete_push(b"cc");
+
+        // A frame commits on the read relation mid-window, bumping only the
+        // `Relation` guard — the per-fingerprint `Memo(7)` slot is untouched, as
+        // it would be for a non-matching change.
+        m.slot_dirty_begin(SlotKey::Relation(oid));
+        m.slot_dirty_end(SlotKey::Relation(oid));
+        assert_eq!(
+            m.slot_version(SlotKey::Memo(Fingerprint::from_raw(7))),
+            0,
+            "the fingerprint's own Memo slot was not bumped"
+        );
+
+        // The capture must drop rather than store a snapshot predating the commit.
+        assert!(
+            !cap.finish(&m),
+            "a capture over a relation written mid-window must drop"
+        );
+        assert!(m.entries.get(&k).is_none(), "nothing stored");
+        assert!(
+            m.fingerprints_for_relations(&[oid]).is_empty(),
+            "a dropped capture leaves no membership"
+        );
     }
 
     #[test]

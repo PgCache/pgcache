@@ -267,6 +267,11 @@ pub struct WriterCore {
     /// frame's handlers, applied just before `frame_commit` (so invalidation
     /// is atomic with the maintenance it accompanies, not visible mid-frame).
     pub(super) frame_invalidations: FingerprintSet,
+    /// Memoized fingerprints whose in-process snapshot the in-progress frame's
+    /// row changes affect (rung 3b). Bumped via `SlotKey::Memo` at the frame
+    /// flush so eviction is predicate-matched, not relation-coarse: a change
+    /// that doesn't touch a memo's predicate/membership leaves it intact.
+    pub(super) frame_memo_evictions: FingerprintSet,
     /// Relation OIDs touched by the in-progress frame, accumulated from frame
     /// start so a mid-frame `40P01` can invalidate+truncate every affected
     /// relation (commands applied before the deadlock were rolled back too).
@@ -510,6 +515,7 @@ impl WriterCore {
             notify_tx,
             frame_state: FrameState::Idle,
             frame_invalidations: HashSet::default(),
+            frame_memo_evictions: HashSet::default(),
             frame_relation_oids: HashSet::new(),
             purge_pending: false,
             frame_buf: String::with_capacity(FRAME_BUF_CAPACITY),

@@ -235,6 +235,18 @@ fn column_row_value_get<'a>(
     }
 }
 
+/// Parse a PostgreSQL boolean wire-text value to a `bool`: the canonical
+/// `t`/`f`, plus the spelled-out `true`/`false`. `None` for anything else. The
+/// single source of truth for boolean wire-text spellings, shared with the
+/// constraint-index row probe so the two can't drift.
+pub fn pg_bool_parse(text: &str) -> Option<bool> {
+    match text {
+        "t" | "true" => Some(true),
+        "f" | "false" => Some(false),
+        _ => None,
+    }
+}
+
 /// Compare a string value from row data with a LiteralValue using the specified operator.
 pub fn where_value_compare_string(
     filter_value: &LiteralValue,
@@ -268,13 +280,7 @@ pub fn where_value_compare_string(
             }
         }
         LiteralValue::Boolean(filter_bool) => {
-            // PostgreSQL sends booleans as "t"/"f" in text protocol
-            let row_bool = match row_value_str {
-                "t" | "true" => Some(true),
-                "f" | "false" => Some(false),
-                _ => None,
-            };
-            if let Some(row_bool) = row_bool {
+            if let Some(row_bool) = pg_bool_parse(row_value_str) {
                 match op {
                     BinaryOp::Equal => row_bool == *filter_bool,
                     BinaryOp::NotEqual => row_bool != *filter_bool,
