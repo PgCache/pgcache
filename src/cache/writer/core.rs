@@ -14,6 +14,7 @@ use tokio::runtime::{Builder, Handle};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use tokio::task::{LocalSet, yield_now};
+use postgres_types::PgLsn;
 use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};
@@ -125,6 +126,14 @@ pub(super) const FRAME_ROWS_CAPACITY: usize = 4096;
 /// Cap on recycled row Vecs (`cdc_values_convert` output). A replay drains at
 /// most `FRAME_ROWS_CAPACITY` events, each holding up to two row Vecs.
 const ROW_VEC_POOL_MAX: usize = 2 * FRAME_ROWS_CAPACITY;
+
+/// How long a population merge may stay gated on the apply watermark before the
+/// writer forces an origin WAL flush (`origin_flush_force`) to make its snapshot
+/// LSN reachable (PGC-290). Above the nudge→keepalive round-trip so a healthy
+/// active origin, where the flush pointer catches up on its own, never triggers
+/// a marker; the cost is at most this much extra ready-latency on a stalled
+/// (idle / async-commit) origin.
+pub(super) const MERGE_FLUSH_FORCE_AFTER: Duration = Duration::from_millis(100);
 
 /// One buffered row event of the in-progress CDC frame (PGC-241). Events are
 /// collected at arrival and replayed at the `CommitMark` flush boundary, in
@@ -321,6 +330,15 @@ pub struct WriterCore {
     /// snapshot LSN is reached within a round-trip instead of waiting for the
     /// next periodic keepalive.
     pub(super) watermark_nudge: Arc<Notify>,
+    /// When the earliest gated population merge first became gated, or `None`
+    /// when nothing is gated. Times the grace window before `origin_flush_force`
+    /// is used to make a stuck snapshot LSN reachable (PGC-290).
+    pub(super) merge_stall_since: Option<std::time::Instant>,
+    /// LSN of the last `origin_flush_force` marker. A merge whose snapshot LSN is
+    /// at or below this has already had the flush pointer forced past it, so it
+    /// needs no further marker — this gates re-emits to roughly one per stuck
+    /// wave rather than one per gated merge (PGC-290).
+    pub(super) last_flush_marker_lsn: Lsn,
     /// Mirror of `WriterCdc.last_applied_lsn`, updated as the CDC path advances
     /// the watermark. Read at population dispatch to seed the deleted-key
     /// anchor floor (a lower bound on the population's snapshot LSN).
@@ -489,6 +507,15 @@ impl WriterCore {
             .await
             .map_into_report::<CacheError>()
             .attach_loc("connecting to origin database")?;
+        // `origin_flush_force` relies on its marker's commit flushing WAL before
+        // returning, so its LSN is reachable by the apply watermark (PGC-290).
+        // This is the only session that writes the marker; reads/DDL here are
+        // unaffected by the durability setting.
+        origin_client
+            .batch_execute("SET synchronous_commit = on")
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("setting synchronous_commit on writer origin")?;
 
         let data_dir = data_directory_query(&cache_client).await;
         let (disk_total, disk_available) = data_dir
@@ -525,6 +552,8 @@ impl WriterCore {
             population_deleted_keys: PopulationDeletedKeys::default(),
             pending_merges: BinaryHeap::new(),
             watermark_nudge,
+            merge_stall_since: None,
+            last_flush_marker_lsn: Lsn::from_raw(0),
             last_applied_lsn: Lsn::from_raw(0),
             frame_deleted_keys: Vec::new(),
             frame_truncated_relations: Vec::new(),
@@ -755,6 +784,26 @@ impl WriterCore {
     /// after the ALTER PUBLICATION, because `oids_to_table_list` resolves
     /// oid → schema.name from `cache.tables` — if we dropped first that
     /// lookup would return empty.
+    /// Force the origin to flush WAL past a stuck merge snapshot.
+    ///
+    /// Emits a tiny transactional logical-decoding marker; the session's
+    /// `synchronous_commit = on` flushes WAL through it before the call returns,
+    /// advancing the flush pointer (and so, via the decoder + keepalive, the
+    /// apply watermark) past every snapshot LSN at or below the marker. The
+    /// marker is later in WAL than any gated snapshot, so one marker unsticks the
+    /// whole gated backlog. It is not streamed to pgcache (no `messages` option)
+    /// and a `Message` record is ignored if it ever arrived. Returns the marker
+    /// LSN. See PGC-290.
+    pub(super) async fn origin_flush_force(&self) -> CacheResult<Lsn> {
+        let row = self
+            .db_origin
+            .query_one("SELECT pg_logical_emit_message(true, 'pgcache', '')", &[])
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("forcing origin WAL flush")?;
+        Ok(Lsn::from(row.get::<_, PgLsn>(0)))
+    }
+
     pub(super) async fn publication_update(&mut self) -> CacheResult<()> {
         let new_oids: HashSet<Oid> = (**self.active_relations.load()).clone();
 
@@ -1654,6 +1703,21 @@ pub fn writer_run(
                             break;
                         }
                         _ = gauges_interval.tick() => {
+                            // Diagnose merge-gate stalls (PGC-290): if merges are
+                            // parked, report why the drain gate (frame_state ==
+                            // Idle && watermark >= min snapshot_lsn) is not firing.
+                            if !core.pending_merges.is_empty() {
+                                let min_snap =
+                                    core.pending_merges.peek().map(|Reverse(m)| m.0.snapshot_lsn);
+                                debug!(
+                                    "merge-gate: frame_state={:?} frame_open={} pending={} min_snapshot_lsn={:?} watermark={:?}",
+                                    core.frame_state,
+                                    core.frame_open,
+                                    core.pending_merges.len(),
+                                    min_snap,
+                                    writer_cdc.last_applied_lsn,
+                                );
+                            }
                             core.disk_stats_refresh();
                             core.stale_entries_cleanup();
                             core.state_gauges_update();

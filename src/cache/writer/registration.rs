@@ -44,7 +44,7 @@ use super::super::{
         UpdateQuerySource,
     },
 };
-use super::core::{PendingMerge, WriterCore};
+use super::core::{MERGE_FLUSH_FORCE_AFTER, PendingMerge, WriterCore};
 use super::population::population_worker;
 use super::staging::MergeOutcome;
 use crate::pg;
@@ -1389,6 +1389,7 @@ impl WriterRegistration {
         core: &mut WriterCore,
         applied_lsn: Lsn,
     ) -> CacheResult<()> {
+        let mut merged_any = false;
         loop {
             let Some(Reverse(top)) = core.pending_merges.peek() else {
                 break;
@@ -1424,6 +1425,7 @@ impl WriterRegistration {
             };
             match core.population_merge_apply(&merge).await {
                 Ok(MergeOutcome::Merged) => {
+                    merged_any = true;
                     core.population_deleted_keys
                         .deactivate(fingerprint, generation);
                     self.query_ready_finalize(
@@ -1451,11 +1453,33 @@ impl WriterRegistration {
                 }
             }
         }
-        // Entries still gated: nudge the CDC thread for an immediate
-        // keepalive so the watermark advances within a round-trip instead of
-        // waiting for the periodic one.
-        if !core.pending_merges.is_empty() {
-            core.watermark_nudge.notify_one();
+        // A released merge means the watermark is advancing on its own; restart
+        // the stall clock so the grace window times the *current* gated head.
+        if merged_any {
+            core.merge_stall_since = None;
+        }
+
+        // Peek the gated head and drop the borrow before mutating `core`.
+        let gated_snapshot_lsn = core
+            .pending_merges
+            .peek()
+            .map(|Reverse(top)| top.0.snapshot_lsn);
+        match gated_snapshot_lsn {
+            // Top still gated (the loop broke at the deadline check). Nudge for
+            // an immediate keepalive, and once it has been stuck past the grace
+            // window, force an origin WAL flush so its snapshot LSN becomes
+            // reachable (PGC-290). `last_flush_marker_lsn` suppresses re-emits
+            // once a marker already covers the gated backlog.
+            Some(snapshot_lsn) => {
+                core.watermark_nudge.notify_one();
+                let stalled_since = *core.merge_stall_since.get_or_insert_with(Instant::now);
+                if stalled_since.elapsed() >= MERGE_FLUSH_FORCE_AFTER
+                    && snapshot_lsn > core.last_flush_marker_lsn
+                {
+                    core.last_flush_marker_lsn = core.origin_flush_force().await?;
+                }
+            }
+            None => core.merge_stall_since = None,
         }
         Ok(())
     }

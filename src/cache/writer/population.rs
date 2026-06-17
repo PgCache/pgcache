@@ -306,7 +306,20 @@ fn staging_table_name(fingerprint: Fingerprint, generation: u64, relation_oid: O
 
 /// Origin WAL position as a `u64` byte offset (the same encoding as the
 /// replication stream's LSNs), captured after the population reads. Used as the
-/// upper-bound snapshot LSN for the deferred-Ready gate (PGC-250 Slice B).
+/// merge-gate snapshot LSN (PGC-272).
+///
+/// Uses the insert LSN (`pg_current_wal_insert_lsn`): it is always at or past
+/// the commit LSN of every committed, read-visible row, so the gate holds the
+/// merge until CDC has applied past everything the reads could have seen —
+/// correct even under `synchronous_commit=off`, where a read-visible row's WAL
+/// may not yet be flushed (a flush-LSN snapshot can fall *below* such a row's
+/// commit and release the merge too early — PGC-290).
+///
+/// The insert pointer can sit ahead of the flushed/streamed position the apply
+/// watermark reaches, so on an idle origin this LSN may not be reached by normal
+/// stream progress (PGC-289). Reachability is restored on demand by the writer's
+/// `origin_flush_force` (`core.rs`), which advances the origin flush pointer past
+/// a stuck snapshot only when a merge has been gated past the grace window.
 async fn origin_snapshot_lsn(db_origin: &Client) -> CacheResult<Lsn> {
     let row = db_origin
         .query_one("SELECT pg_current_wal_insert_lsn()", &[])

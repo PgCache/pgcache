@@ -148,6 +148,16 @@ impl CdcProcessor {
 
         debug!("Starting CDC replication stream with keep-alive intervals");
 
+        // One pinned `Notified` reused across the loop: recreating it per
+        // iteration drops the permit a `notify_one` left when a sibling branch
+        // (e.g. `stream.next`) wins the select, so a writer's watermark nudge is
+        // lost and the gated population waits for the 30s keepalive (PGC-289).
+        // Clone the `Arc` to a local so the borrow does not conflict with the
+        // `&mut self` branches. Mirrors `cache_serve_wait` / `reply.rs`.
+        let watermark_nudge = Arc::clone(&self.watermark_nudge);
+        let nudge = watermark_nudge.notified();
+        tokio::pin!(nudge);
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -194,7 +204,12 @@ impl CdcProcessor {
                 // Writer is waiting on the apply watermark (a gated population).
                 // Request an immediate server keepalive so `wal_end` (hence the
                 // watermark) advances within a round-trip (PGC-250 Slice B).
-                _ = self.watermark_nudge.notified() => {
+                _ = &mut nudge => {
+                    // Re-arm before the await so a nudge arriving during the
+                    // send is not missed; coalescing a burst into one keepalive
+                    // is fine — it advances the watermark for every snapshot
+                    // <= wal_end.
+                    nudge.set(watermark_nudge.notified());
                     if let Err(e) = self.send_standby_status_update(stream.as_mut(), true).await {
                         error!(
                             "Error sending reply-requested keep-alive: {}",
