@@ -462,7 +462,7 @@ async fn population_stream(
     if fresh {
         let create = format!(
             "DROP TABLE IF EXISTS pgcache_stage.{staging}; \
-             CREATE TABLE pgcache_stage.{staging} (LIKE {}.{})",
+             CREATE UNLOGGED TABLE pgcache_stage.{staging} (LIKE {}.{})",
             table.schema, table.name
         );
         db_cache
