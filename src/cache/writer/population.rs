@@ -147,10 +147,10 @@ pub async fn population_worker(
         let result = loop {
             let r = population_task(
                 work.fingerprint,
-                work.generation,
                 &work.branches,
                 &work.table_metadata,
                 work.max_limit,
+                &work.staging,
                 &db_origin,
                 &db_cache,
             )
@@ -164,6 +164,13 @@ pub async fn population_worker(
                     "population worker {id}: query {} deadlocked, retry {attempt}/{POPULATION_DEADLOCK_MAX_RETRIES} after {backoff:?}",
                     work.fingerprint,
                 );
+                // Empty any partial load before re-streaming: the pool slot isn't
+                // recreated between attempts (PGC-293), so clear it explicitly.
+                for (_, staging, _) in &work.staging {
+                    let _ = db_cache
+                        .batch_execute(&format!("DELETE FROM pgcache_stage.{staging}"))
+                        .await;
+                }
                 sleep(backoff).await;
                 continue;
             }
@@ -197,16 +204,9 @@ pub async fn population_worker(
                 }
             }
             Err(e) => {
-                // Drop any staging tables this population created — the writer
-                // only drops staging after a successful merge (PGC-250).
-                // Best-effort; a leak is swept by the next cache reset.
-                for table in &work.table_metadata {
-                    let staging =
-                        staging_table_name(work.fingerprint, work.generation, table.relation_oid);
-                    let _ = db_cache
-                        .batch_execute(&format!("DROP TABLE IF EXISTS pgcache_stage.{staging}"))
-                        .await;
-                }
+                // Staging tables are returned to the pool by the writer's
+                // `Failed` handler (`staging_checkin`) — the worker no longer
+                // drops them (PGC-293).
 
                 // Log the bare SQLSTATE, not the error chain: the chain walker
                 // leaks the offending SQL via the PG DETAIL field (PGC-133).
@@ -241,10 +241,10 @@ pub async fn population_worker(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 async fn population_task(
     fingerprint: Fingerprint,
-    generation: u64,
     branches: &[ResolvedSelectNode],
     table_metadata: &[TableMetadata],
     max_limit: Option<u64>,
+    staging_tables: &[(Oid, EcoString, bool)],
     db_origin: &Client,
     db_cache: &Client,
 ) -> CacheResult<(usize, u64, Vec<(Oid, EcoString)>, Lsn)> {
@@ -276,12 +276,23 @@ async fn population_task(
                     name: Some(table_node.name.to_string()),
                 })?;
 
-            let staging = staging_table_name(fingerprint, generation, table.relation_oid);
+            // The staging table for this relation was checked out from the pool
+            // at dispatch (PGC-293); `needs_create` is set only for a freshly
+            // minted slot.
+            let (staging, needs_create) = staging_tables
+                .iter()
+                .find(|(oid, _, _)| *oid == table.relation_oid)
+                .map(|(_, name, nc)| (name.clone(), *nc))
+                .ok_or(CacheError::UnknownTable {
+                    oid: Some(table.relation_oid),
+                    name: Some(table.name.to_string()),
+                })?;
             let fresh = reset.insert(table.relation_oid);
 
             let stream_start = Instant::now();
             let (bytes, rows) = population_stream(
                 db_origin, db_cache, table, table_node, branch, max_limit, &staging, fresh,
+                needs_create,
             )
             .await?;
             let stream_elapsed = stream_start.elapsed();
@@ -314,13 +325,6 @@ async fn population_task(
         task_elapsed
     );
     Ok((total_bytes, total_rows, staged, snapshot_lsn))
-}
-
-/// Deterministic name of a population's per-relation staging table in
-/// `pgcache_stage`. Stable across the worker (loads it) and the writer (merges +
-/// drops it), and across deadlock retries (each attempt recreates it fresh).
-fn staging_table_name(fingerprint: Fingerprint, generation: u64, relation_oid: Oid) -> EcoString {
-    EcoString::from(format!("stage_{fingerprint}_{generation}_{relation_oid}"))
 }
 
 /// Origin WAL position as a `u64` byte offset (the same encoding as the
@@ -456,13 +460,17 @@ async fn population_stream(
     max_limit: Option<u64>,
     staging: &str,
     fresh: bool,
+    needs_create: bool,
 ) -> CacheResult<(usize, u64)> {
-    // Start this relation's staging table clean (drop a leftover from a prior
-    // attempt, then mirror the shared cache table's columns).
-    if fresh {
+    // A freshly minted pool slot is created on first touch; a reused slot is
+    // already an empty table (the writer empties it on check-in — PGC-293; bloat
+    // is left to autovacuum), so no DDL runs per population. `IF NOT EXISTS`
+    // keeps a deadlock
+    // retry (which re-streams from `fresh`) from re-creating the slot it made on
+    // the first attempt.
+    if fresh && needs_create {
         let create = format!(
-            "DROP TABLE IF EXISTS pgcache_stage.{staging}; \
-             CREATE UNLOGGED TABLE pgcache_stage.{staging} (LIKE {}.{})",
+            "CREATE UNLOGGED TABLE IF NOT EXISTS pgcache_stage.{staging} (LIKE {}.{})",
             table.schema, table.name
         );
         db_cache

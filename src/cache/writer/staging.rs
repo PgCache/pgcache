@@ -247,6 +247,112 @@ impl PopulationDeletedKeys {
     }
 }
 
+/// Per-relation pool of reusable population staging tables (PGC-293).
+///
+/// Each population checks out one staging table per relation it reads — at
+/// dispatch, writer-side — loads it, and the writer returns it (emptied) to the
+/// free-list after the merge. Tables are minted once per slot
+/// (`CREATE … IF NOT EXISTS`) and reused via `DELETE`, never `DROP`/`CREATE` per
+/// population, so a population emits no DDL — hence no relcache/plan-cache
+/// invalidation, the per-population cost that collapses write-mixed throughput at
+/// high query cardinality (PGC-294). The pool grows to the peak number of
+/// concurrently in-flight populations per relation.
+///
+/// Single-threaded: workers and the writer share one `LocalSet` thread, so plain
+/// maps suffice (no locking). The `pgcache_stage` schema is dropped wholesale on
+/// a cache-database reset, which recreates `WriterCore` and hence this pool.
+#[derive(Default)]
+pub(super) struct StagingPool {
+    /// Empty tables ready for reuse, per relation (bloat reclaimed by autovacuum).
+    free: HashMap<Oid, Vec<EcoString>>,
+    /// Next slot id per relation, for minting new table names.
+    next_slot: HashMap<Oid, u32>,
+    /// Per-relation shape epoch, bumped on a relation schema change
+    /// (`relation_epoch_bump`). A staging table is `CREATE (LIKE cache_table)`
+    /// once and reused; on a schema change the cache table is recreated with a
+    /// new column shape, so any pooled table minted under an earlier epoch has
+    /// the wrong columns and must not be reused — it is dropped at check-in.
+    epoch: HashMap<Oid, u32>,
+    /// Tables a population currently holds, keyed by `(fingerprint, generation)`,
+    /// so the writer can return them on any terminal path (merge / abort /
+    /// failure / dispatch-fail). Each carries the relation's epoch at checkout.
+    checked_out: HashMap<PopulationKey, Vec<StagingHold>>,
+}
+
+/// One staging table a population holds: `(relation, table_name, epoch_at_checkout)`.
+type StagingHold = (Oid, EcoString, u32);
+
+impl StagingPool {
+    /// Check out one staging table per relation for a population. Reuses a free
+    /// (empty) table when one is available, else mints a new slot
+    /// (`needs_create`). Returns `(relation, table, needs_create)` per relation
+    /// for the work item.
+    pub(super) fn checkout(
+        &mut self,
+        fingerprint: Fingerprint,
+        generation: u64,
+        relation_oids: &[Oid],
+    ) -> Vec<(Oid, EcoString, bool)> {
+        let mut out = Vec::with_capacity(relation_oids.len());
+        let mut held = Vec::with_capacity(relation_oids.len());
+        for &oid in relation_oids {
+            let epoch = *self.epoch.get(&oid).unwrap_or(&0);
+            let (table, needs_create) = match self.free.get_mut(&oid).and_then(Vec::pop) {
+                Some(table) => (table, false),
+                None => {
+                    let slot = self.next_slot.entry(oid).or_default();
+                    let table = EcoString::from(format!("stage_{oid}_{slot}"));
+                    *slot += 1;
+                    (table, true)
+                }
+            };
+            held.push((oid, table.clone(), epoch));
+            out.push((oid, table, needs_create));
+        }
+        // A `(fingerprint, generation)` is dispatched once; a double checkout
+        // would leak the prior hold's tables.
+        let prev = self.checked_out.insert((fingerprint, generation), held);
+        debug_assert!(prev.is_none(), "staging pool double checkout {fingerprint}/{generation}");
+        out
+    }
+
+    /// Take the tables a population holds, for return to the pool. Empty if the
+    /// population was never checked out. Each entry carries the epoch at checkout.
+    fn take(&mut self, fingerprint: Fingerprint, generation: u64) -> Vec<StagingHold> {
+        self.checked_out
+            .remove(&(fingerprint, generation))
+            .unwrap_or_default()
+    }
+
+    /// Return an emptied table to its relation's free-list.
+    fn release(&mut self, oid: Oid, table: EcoString) {
+        self.free.entry(oid).or_default().push(table);
+    }
+
+    /// Whether `epoch` (stamped on a checked-out table at checkout) is still the
+    /// relation's current shape epoch. A stale epoch means the relation's schema
+    /// changed since checkout, so the table's columns are wrong and it must be
+    /// dropped rather than reused.
+    fn epoch_current(&self, oid: Oid, epoch: u32) -> bool {
+        *self.epoch.get(&oid).unwrap_or(&0) == epoch
+    }
+
+    /// Bump a relation's shape epoch on a schema change and return its now-stale
+    /// free tables so the caller can drop them. Tables still checked out from the
+    /// old epoch are dropped when they check in (`epoch_current` returns false).
+    fn relation_epoch_bump(&mut self, oid: Oid) -> Vec<EcoString> {
+        *self.epoch.entry(oid).or_default() += 1;
+        self.free.remove(&oid).unwrap_or_default()
+    }
+
+    /// Drop a population's checkout without returning the tables (rare
+    /// dispatch-failure / shutdown path; a freshly minted slot was never created,
+    /// and a reused table is orphaned until the next cache reset).
+    pub(super) fn forget(&mut self, fingerprint: Fingerprint, generation: u64) {
+        self.checked_out.remove(&(fingerprint, generation));
+    }
+}
+
 /// Render a row's primary-key values as a tuple body (escaped literals joined by
 /// `,`), matching how the staging columns were loaded and how `cache_delete_into`
 /// renders PK values. `None` if no PK value is present.
@@ -321,14 +427,22 @@ impl MergePlan {
 
     fn merge_sql(&self, staging: &str, generation: u64, filter: Option<&str>) -> String {
         let where_clause = filter.map_or_else(String::new, |f| format!(" WHERE {f}"));
+        // Drain staging with a `DELETE … RETURNING` CTE rather than `SELECT` +
+        // a later `DROP TABLE` (PGC-293): the rows feed the upsert and the table
+        // is left empty for pooled reuse, so a population emits *no* DDL — and
+        // thus no relcache/plan-cache invalidation, the per-population cost that
+        // collapses write-mixed throughput at high query cardinality (PGC-294).
+        // The DELETE drains every row; the filter (CDC-removed keys) gates only
+        // which drained rows are reinserted, so the table still ends empty.
         // DISTINCT ON the PK collapses duplicate keys a set-operation query can
         // stage (same relation in multiple branches) — without it the upsert
         // would error "ON CONFLICT cannot affect row a second time". The full
         // row is identical per PK under a snapshot, so the pick is immaterial.
         format!(
             "SET mem.query_generation = {generation}; \
+             WITH d AS (DELETE FROM pgcache_stage.{staging} RETURNING {cols}) \
              INSERT INTO {schema}.{name} ({cols}) \
-             SELECT DISTINCT ON {pk} {cols} FROM pgcache_stage.{staging}{where_clause} {conflict}; \
+             SELECT DISTINCT ON {pk} {cols} FROM d{where_clause} {conflict}; \
              SET mem.query_generation = 0",
             schema = self.schema,
             name = self.name,
@@ -388,14 +502,12 @@ impl WriterCore {
     ) -> CacheResult<MergeOutcome> {
         // Abort if any relation lost keys (overflow) or was bulk-invalidated
         // (TRUNCATE / recovery) at an LSN past this population's snapshot —
-        // merging would resurrect removed rows. Let the query repopulate.
+        // merging would resurrect removed rows. Let the query repopulate. The
+        // caller returns the staging tables to the pool (`staging_checkin`).
         if merge.staged.iter().any(|(oid, _)| {
             self.population_deleted_keys
                 .should_abort(*oid, merge.snapshot_lsn)
         }) {
-            for (_, staging) in &merge.staged {
-                self.staging_drop(staging).await;
-            }
             return Ok(MergeOutcome::Aborted);
         }
 
@@ -403,8 +515,8 @@ impl WriterCore {
             let plan = {
                 // Scope the metadata borrow so it doesn't span the await below.
                 let Some(table) = self.cache.tables.get1(relation_oid) else {
-                    // Relation evicted mid-population; nothing to merge into.
-                    self.staging_drop(staging).await;
+                    // Relation evicted mid-population; nothing to merge into. The
+                    // staging table is emptied + returned by the caller.
                     continue;
                 };
                 MergePlan::build(table)
@@ -419,25 +531,63 @@ impl WriterCore {
                 .await
                 .map_into_report::<CacheError>()
                 .attach_loc("population merge")?;
-            self.staging_drop(staging).await;
         }
         Ok(MergeOutcome::Merged)
     }
 
-    /// Drop all of a population's staging tables (used when a queued merge is
-    /// abandoned because its query was evicted/superseded before draining).
-    pub(super) async fn population_staging_drop(&self, staged: &[(Oid, EcoString)]) {
-        for (_, staging) in staged {
-            self.staging_drop(staging).await;
+    /// Return a population's staging tables to the pool (PGC-293): empty each
+    /// (idempotent — the merge's `DELETE … RETURNING` may have already drained
+    /// it), then release to the free-list. `DELETE` is pure DML, so check-in
+    /// emits no relcache invalidation — important because under high cached-plan
+    /// cardinality (PGC-294) every relcache invalidation costs an O(plans)
+    /// `PlanCacheRelCallback` scan. Bloat from the dead tuples is left to
+    /// autovacuum, which for near-empty staging tables fires only after ~50 dead
+    /// tuples accumulate — i.e. batched across many reuses — so it can't run a
+    /// per-population vacuum (a per-population VACUUM, like VACUUM FULL, re-emits
+    /// the very invalidation this scheme avoids). Called on every terminal path
+    /// (merge / abort / failure / abandoned). Best-effort — a leak is recovered
+    /// by the next cache reset.
+    pub(super) async fn staging_checkin(&mut self, fingerprint: Fingerprint, generation: u64) {
+        for (oid, staging, epoch) in self.staging_pool.take(fingerprint, generation) {
+            // A relation schema change since checkout makes this table's shape
+            // stale (`epoch_current` false) — drop it rather than reuse it.
+            if !self.staging_pool.epoch_current(oid, epoch) {
+                if let Err(e) = self
+                    .db_cache
+                    .batch_execute(&format!("DROP TABLE IF EXISTS pgcache_stage.{staging}"))
+                    .await
+                {
+                    error!("staging checkin: dropping stale {staging}: {e}");
+                }
+                continue;
+            }
+            if let Err(e) = self
+                .db_cache
+                .batch_execute(&format!("DELETE FROM pgcache_stage.{staging}"))
+                .await
+            {
+                error!("staging checkin: emptying {staging}: {e}");
+            }
+            self.staging_pool.release(oid, staging);
         }
     }
 
-    /// Best-effort drop of a staging table. A leak here is recovered by the next
-    /// cache-database reset (the whole `pgcache_stage` schema is dropped).
-    async fn staging_drop(&self, staging: &str) {
-        let sql = format!("DROP TABLE IF EXISTS pgcache_stage.{staging}");
-        if let Err(e) = self.db_cache.batch_execute(&sql).await {
-            error!("dropping staging table {staging}: {e}");
+    /// Invalidate a relation's pooled staging tables on a schema change
+    /// (PGC-293): bump the relation's epoch and drop its now-stale free tables.
+    /// Pooled tables are `CREATE (LIKE cache_table)` once; when the cache table
+    /// is recreated with a new shape, reusing an old-shape staging table would
+    /// merge misaligned columns, so they must be discarded. Runs only on the
+    /// (rare) schema-change path — which already recreates the cache table — so
+    /// the drops don't reintroduce per-population DDL.
+    pub(super) async fn staging_pool_relation_purge(&mut self, relation_oid: Oid) {
+        for staging in self.staging_pool.relation_epoch_bump(relation_oid) {
+            if let Err(e) = self
+                .db_cache
+                .batch_execute(&format!("DROP TABLE IF EXISTS pgcache_stage.{staging}"))
+                .await
+            {
+                error!("staging pool purge: dropping {staging}: {e}");
+            }
         }
     }
 }
@@ -565,5 +715,63 @@ mod tests {
             filter.contains("(25)") && !filter.contains("(5)"),
             "filter: {filter}"
         );
+    }
+
+    /// A returned table is reused by the next checkout (no recreate).
+    #[test]
+    fn test_staging_pool_reuses_freed_table() {
+        let mut pool = StagingPool::default();
+        let fp = Fingerprint::from_raw(1);
+
+        let out = pool.checkout(fp, 1, &[REL]);
+        let (oid, name, needs_create) = out[0].clone();
+        assert_eq!(oid, REL);
+        assert!(needs_create, "first checkout mints a new slot");
+
+        for (o, t, _epoch) in pool.take(fp, 1) {
+            pool.release(o, t);
+        }
+
+        let out2 = pool.checkout(fp, 2, &[REL]);
+        let (_, name2, needs_create2) = out2[0].clone();
+        assert_eq!(name2, name, "reuses the freed table");
+        assert!(!needs_create2, "reused table is not recreated");
+    }
+
+    /// A relation schema change bumps the epoch, so a table checked out under the
+    /// old epoch is detected as stale (dropped at check-in, not reused).
+    #[test]
+    fn test_staging_pool_epoch_marks_checked_out_table_stale() {
+        let mut pool = StagingPool::default();
+        let fp = Fingerprint::from_raw(1);
+
+        pool.checkout(fp, 1, &[REL]);
+        let held = pool.take(fp, 1);
+        let (oid, _name, epoch_at_checkout) = held[0].clone();
+        assert!(pool.epoch_current(oid, epoch_at_checkout));
+
+        // Schema change: the checked-out table's epoch is now stale.
+        let stale_free = pool.relation_epoch_bump(REL);
+        assert!(stale_free.is_empty(), "the only table is checked out, not free");
+        assert!(!pool.epoch_current(oid, epoch_at_checkout));
+    }
+
+    /// A schema change returns the relation's free tables for dropping and clears
+    /// the free-list, so the next checkout mints a fresh (correct-shape) slot.
+    #[test]
+    fn test_staging_pool_epoch_bump_returns_and_clears_free() {
+        let mut pool = StagingPool::default();
+        let fp = Fingerprint::from_raw(1);
+
+        let name = pool.checkout(fp, 1, &[REL])[0].1.clone();
+        for (o, t, _epoch) in pool.take(fp, 1) {
+            pool.release(o, t);
+        }
+
+        let stale = pool.relation_epoch_bump(REL);
+        assert_eq!(stale, vec![name], "schema change returns free tables to drop");
+
+        let out = pool.checkout(fp, 2, &[REL]);
+        assert!(out[0].2, "after purge the next checkout mints a fresh slot");
     }
 }

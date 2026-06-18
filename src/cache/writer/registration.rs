@@ -63,6 +63,11 @@ pub struct PopulationWork {
     pub branches: Vec<ResolvedSelectNode>,
     /// Maximum rows to fetch during population. `None` = fetch all rows.
     pub max_limit: Option<u64>,
+    /// Staging table per relation, checked out from the pool at dispatch
+    /// (PGC-293): `(relation_oid, table_name, needs_create)`. The worker loads
+    /// these instead of minting per-population names; `needs_create` is set only
+    /// for a freshly minted slot (the worker `CREATE … IF NOT EXISTS`es it).
+    pub staging: Vec<(Oid, EcoString, bool)>,
     /// Stamped at construction; used by the population worker to record
     /// `pgcache.cache.population.wait_seconds`.
     pub enqueued_at: Instant,
@@ -465,6 +470,9 @@ impl WriterRegistration {
             } => {
                 core.population_deleted_keys
                     .deactivate(fingerprint, generation);
+                // Return the population's staging tables to the pool (PGC-293):
+                // the worker no longer drops them on failure.
+                core.staging_checkin(fingerprint, generation).await;
                 self.query_failed_cleanup(core, fingerprint);
             }
             QueryCommand::LimitBump {
@@ -593,6 +601,8 @@ impl WriterRegistration {
             table_metadata,
             branches,
             max_limit,
+            // Filled in at dispatch from the staging pool (needs `&mut core`).
+            staging: Vec::new(),
             enqueued_at: Instant::now(),
         }
     }
@@ -683,7 +693,7 @@ impl WriterRegistration {
     fn populate_work_dispatch(
         &mut self,
         core: &mut WriterCore,
-        work: PopulationWork,
+        mut work: PopulationWork,
     ) -> CacheResult<()> {
         let fingerprint = work.fingerprint;
         let generation = work.generation;
@@ -700,6 +710,11 @@ impl WriterRegistration {
             &relation_oids,
             anchor_floor,
         );
+        // Check out a reusable staging table per relation (PGC-293); the writer
+        // returns them to the pool at merge / failure.
+        work.staging = core
+            .staging_pool
+            .checkout(fingerprint, generation, &relation_oids);
 
         let idx = self.populate_next;
         self.populate_next = (self.populate_next + 1) % self.populate_txs.len();
@@ -707,6 +722,7 @@ impl WriterRegistration {
         let Some(tx) = self.populate_txs.get(idx) else {
             core.population_deleted_keys
                 .deactivate(fingerprint, generation);
+            core.staging_pool.forget(fingerprint, generation);
             return Err(CacheError::Other.into());
         };
 
@@ -714,6 +730,7 @@ impl WriterRegistration {
             error!("population worker {idx} channel closed");
             core.population_deleted_keys
                 .deactivate(fingerprint, generation);
+            core.staging_pool.forget(fingerprint, generation);
         }
 
         Ok(())
@@ -1396,12 +1413,12 @@ impl WriterRegistration {
             // entries buried below a live top are reaped lazily when they
             // surface.) The successor population has its own entry.
             if !core.population_is_current(fingerprint, generation) {
-                let Some(Reverse(PendingMerge(merge))) = core.pending_merges.pop() else {
+                let Some(Reverse(PendingMerge(_))) = core.pending_merges.pop() else {
                     break;
                 };
                 core.population_deleted_keys
                     .deactivate(fingerprint, generation);
-                core.population_staging_drop(&merge.staged).await;
+                core.staging_checkin(fingerprint, generation).await;
                 continue;
             }
 
@@ -1414,7 +1431,12 @@ impl WriterRegistration {
             let Some(Reverse(PendingMerge(merge))) = core.pending_merges.pop() else {
                 break;
             };
-            match core.population_merge_apply(&merge).await {
+            let outcome = core.population_merge_apply(&merge).await;
+            // Return the population's staging tables to the pool (PGC-293)
+            // regardless of outcome, before any `?` below could short-circuit
+            // the drain and leak them.
+            core.staging_checkin(merge.fingerprint, merge.generation).await;
+            match outcome {
                 Ok(MergeOutcome::Merged) => {
                     merged_any = true;
                     core.population_deleted_keys
@@ -1646,6 +1668,10 @@ impl WriterCore {
             );
 
             self.cache_table_invalidate(relation_oid).await?;
+            // The cache table is about to be recreated with a new shape; discard
+            // the relation's pooled staging tables so no population reuses an
+            // old-shape one (PGC-293 review).
+            self.staging_pool_relation_purge(relation_oid).await;
         }
 
         if table_metadata.indexes.is_empty() {

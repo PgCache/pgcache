@@ -41,7 +41,7 @@ use super::super::{
 use super::cdc::WriterCdc;
 use super::mv_build::MvBuildPool;
 use super::registration::WriterRegistration;
-use super::staging::PopulationDeletedKeys;
+use super::staging::{PopulationDeletedKeys, StagingPool};
 
 /// Deterministic fault injection for the restart supervisor: kill the writer on
 /// a sentinel CDC insert so a test can drive a real subsystem death → rebuild.
@@ -317,6 +317,10 @@ pub struct WriterCore {
     /// doesn't resurrect them (PGC-250). Activated at dispatch, recorded at
     /// `frame_cache_delete`, consulted/cleared at merge.
     pub(super) population_deleted_keys: PopulationDeletedKeys,
+    /// Per-relation pool of reusable population staging tables (PGC-293):
+    /// checked out at dispatch, returned (emptied + vacuumed) at merge, so a
+    /// population emits no DDL.
+    pub(super) staging_pool: StagingPool,
     /// Population merges awaiting both a quiescent (frame-Idle) writer and the
     /// CDC apply watermark reaching their snapshot LSN (PGC-272): a min-heap
     /// on `(snapshot_lsn, generation)`, drained in deadline order by
@@ -550,6 +554,7 @@ impl WriterCore {
             frame_chunk_flushed: false,
             frame_buf_relations: HashSet::new(),
             population_deleted_keys: PopulationDeletedKeys::default(),
+            staging_pool: StagingPool::default(),
             pending_merges: BinaryHeap::new(),
             watermark_nudge,
             merge_stall_since: None,
