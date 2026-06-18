@@ -19,8 +19,8 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ecow::EcoString;
 
 use pgcache_lib::query::Fingerprint;
-use pgcache_lib::query::constraint_index::ConstraintIndex;
 use pgcache_lib::query::ast::{BinaryOp, LiteralValue};
+use pgcache_lib::query::constraint_index::ConstraintIndex;
 use pgcache_lib::query::constraints::TableConstraint;
 
 const SIZES: [usize; 4] = [64, 256, 1024, 4096];

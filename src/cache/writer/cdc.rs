@@ -2644,7 +2644,13 @@ impl WriterCdc {
         }
 
         let matched = self
-            .update_queries_execute_batch(core, relation_oid, new_row_data, batch, &local_candidates)
+            .update_queries_execute_batch(
+                core,
+                relation_oid,
+                new_row_data,
+                batch,
+                &local_candidates,
+            )
             .await?;
 
         if matched {

@@ -657,14 +657,15 @@ impl WriterRegistration {
         // candidate for every row, which keeps the narrowing from dropping a
         // true match (no stale reads). Extracted constraints are necessary
         // conditions (OR/unhandled shapes extract nothing), so narrowing is sound.
-        let local_eval_tcs = (update_query.eval_strategy == UpdateEvalStrategy::LocalEval).then(|| {
-            update_query
-                .constraints
-                .table_constraints
-                .get(table_name)
-                .cloned()
-                .unwrap_or_default()
-        });
+        let local_eval_tcs =
+            (update_query.eval_strategy == UpdateEvalStrategy::LocalEval).then(|| {
+                update_query
+                    .constraints
+                    .table_constraints
+                    .get(table_name)
+                    .cloned()
+                    .unwrap_or_default()
+            });
 
         let mut queries = core
             .cache

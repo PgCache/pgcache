@@ -333,7 +333,11 @@ async fn test_memo_survives_unrelated_insert() -> Result<(), Error> {
         .simple_query("select id, val from memo_unrel where val = 42")
         .await?;
     assert_row_at(&res, 1, &[("id", "1"), ("val", "42")])?;
-    assert_eq!(res.len(), 3, "result unchanged: RowDescription + 1 row + CC");
+    assert_eq!(
+        res.len(),
+        3,
+        "result unchanged: RowDescription + 1 row + CC"
+    );
     let after = ctx.metrics().await?;
     assert!(
         after.cache_memo_hits > before.cache_memo_hits,
@@ -421,7 +425,11 @@ async fn test_memo_evicted_on_delete() -> Result<(), Error> {
     ctx.query("insert into memo_del values (1, 42), (2, 42)", &[])
         .await?;
 
-    warm_until_memoized(&mut ctx, "select id from memo_del where val = 42 order by id").await?;
+    warm_until_memoized(
+        &mut ctx,
+        "select id from memo_del where val = 42 order by id",
+    )
+    .await?;
 
     ctx.origin_query("delete from memo_del where id = 2", &[])
         .await?;
@@ -433,7 +441,11 @@ async fn test_memo_evicted_on_delete() -> Result<(), Error> {
         .simple_query("select id from memo_del where val = 42 order by id")
         .await?;
     assert_row_at(&res, 1, &[("id", "1")])?;
-    assert_eq!(res.len(), 3, "deleted row gone: RowDescription + 1 row + CommandComplete");
+    assert_eq!(
+        res.len(),
+        3,
+        "deleted row gone: RowDescription + 1 row + CommandComplete"
+    );
     Ok(())
 }
 
@@ -470,7 +482,11 @@ async fn test_memo_busted_by_deadlock_recovery() -> Result<(), Error> {
     let res = ctx
         .simple_query("select id, val from memo_recover where val = 42")
         .await?;
-    assert_eq!(res.len(), 2, "empty result: RowDescription + CommandComplete");
+    assert_eq!(
+        res.len(),
+        2,
+        "empty result: RowDescription + CommandComplete"
+    );
     let after = ctx.metrics().await?;
     assert_eq!(
         after.cache_memo_hits, before.cache_memo_hits,

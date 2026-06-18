@@ -69,6 +69,14 @@ pub const CLOSE_COMPLETE_MSG: &[u8] = &[b'3', 0, 0, 0, 4];
 pub const NO_DATA_MSG: &[u8] = &[b'n', 0, 0, 0, 4];
 pub const READY_FOR_QUERY_IDLE_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
 
+/// Fixed `ErrorResponse` for a cache serve that already streamed bytes to the
+/// client and so cannot be transparently forwarded to origin (PGC-291). Fields:
+/// Severity=ERROR, SQLSTATE=58000 (system_error), generic message (no SQL
+/// leaked). Static bytes — no allocation on the serve path. Layout is validated
+/// against `error_response_frame` in the serve tests.
+pub const SERVE_ERROR_MSG: &[u8] =
+    b"E\x00\x00\x00\x30SERROR\x00C58000\x00Mpgcache: cache serve failed\x00\x00";
+
 #[instrument(skip_all)]
 pub fn ready_for_query_encode(buf: &mut BytesMut) {
     buf.put_u8(READY_FOR_QUERY_TAG);

@@ -10,11 +10,11 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ecow::EcoString;
+use postgres_types::PgLsn;
 use tokio::runtime::{Builder, Handle};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
 use tokio::task::{LocalSet, yield_now};
-use postgres_types::PgLsn;
 use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace, warn};

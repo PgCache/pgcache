@@ -575,9 +575,9 @@ impl ValueKey {
             // Integers past 2^53 may share an f64 — see the type doc; only
             // over-returns, never drops a true match.
             #[allow(clippy::cast_precision_loss)]
-            LiteralValue::Integer(n) => {
-                Some(ValueKey::Num(NotNan::new(*n as f64).expect("i64 as f64 is never NaN")))
-            }
+            LiteralValue::Integer(n) => Some(ValueKey::Num(
+                NotNan::new(*n as f64).expect("i64 as f64 is never NaN"),
+            )),
             LiteralValue::Float(f) => Some(ValueKey::Num(*f)),
             LiteralValue::String(s) | LiteralValue::StringWithCast(s, _) => {
                 Some(ValueKey::Str(s.clone()))
@@ -903,12 +903,7 @@ impl<K: IdHashable + Copy> ColumnIndex<K> {
     /// `LiteralValue` entry point for `extend_two_sided`. Falls back to
     /// over-returning every two-sided parent if either bound isn't orderable.
     #[inline]
-    fn extend_two_sided_lit(
-        &self,
-        qlo: &LiteralValue,
-        qhi: &LiteralValue,
-        out: &mut Vec<K>,
-    ) {
+    fn extend_two_sided_lit(&self, qlo: &LiteralValue, qhi: &LiteralValue, out: &mut Vec<K>) {
         if self.range_both.is_empty() {
             return;
         }
@@ -1060,9 +1055,9 @@ mod tests {
     use crate::catalog::{ColumnMetadata, ColumnStore, Oid, TableMetadata};
     use crate::query::ast::{BinaryOp, LiteralValue};
     use crate::query::cast::CastTarget;
-    use tokio_postgres::types::Type;
     use crate::query::{Fingerprint, FingerprintSet};
     use ecow::EcoString;
+    use tokio_postgres::types::Type;
 
     fn col(s: &str) -> EcoString {
         EcoString::from(s)
@@ -1768,7 +1763,8 @@ mod tests {
         let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[eq("id", int(200))]);
         assert!(
-            idx.candidates(&[eq("id", float_lit(200.0))]).contains(&fp(1)),
+            idx.candidates(&[eq("id", float_lit(200.0))])
+                .contains(&fp(1)),
             "Float(200.0) probe must find an Integer(200) entry"
         );
 
@@ -1785,8 +1781,14 @@ mod tests {
         // Integer lower-bound range, Float point probe.
         let mut idx = ConstraintIndex::<Fingerprint>::new();
         idx.insert(fp(1), &[gt("price", int(10))]);
-        assert!(idx.candidates(&[eq("price", float_lit(50.0))]).contains(&fp(1)));
-        assert!(!idx.candidates(&[eq("price", float_lit(5.0))]).contains(&fp(1)));
+        assert!(
+            idx.candidates(&[eq("price", float_lit(50.0))])
+                .contains(&fp(1))
+        );
+        assert!(
+            !idx.candidates(&[eq("price", float_lit(5.0))])
+                .contains(&fp(1))
+        );
 
         // Float upper-bound range, Integer point probe.
         let mut idx2 = ConstraintIndex::<Fingerprint>::new();
@@ -1810,7 +1812,10 @@ mod tests {
         });
         assert!(got.contains(&fp(1)));
         assert!(got.contains(&fp(3)));
-        assert!(!got.contains(&fp(2)), "id=999 must be excluded for a id=200 row");
+        assert!(
+            !got.contains(&fp(2)),
+            "id=999 must be excluded for a id=200 row"
+        );
     }
 
     #[test]
@@ -1822,8 +1827,14 @@ mod tests {
         // An `Unknown` column (NULL / unchanged-TOAST) must return every entry
         // constraining it — both buckets — never drop one.
         let got = idx.candidates_point(|_| vec![ColumnRange::Unknown]);
-        assert!(got.contains(&fp(1)), "equality-pure entry must not be dropped under Unknown");
-        assert!(got.contains(&fp(2)), "complex entry must not be dropped under Unknown");
+        assert!(
+            got.contains(&fp(1)),
+            "equality-pure entry must not be dropped under Unknown"
+        );
+        assert!(
+            got.contains(&fp(2)),
+            "complex entry must not be dropped under Unknown"
+        );
     }
 
     #[test]
@@ -1852,7 +1863,9 @@ mod tests {
     // `row_value_forms`: every keyable interpretation of the wire text.
 
     fn has_str_form(forms: &[ColumnRange], s: &str) -> bool {
-        forms.iter().any(|r| matches!(r, ColumnRange::Equal(LiteralValue::String(v)) if v == s))
+        forms
+            .iter()
+            .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::String(v)) if v == s))
     }
     fn has_num_form(forms: &[ColumnRange], x: f64) -> bool {
         forms.iter().any(
@@ -1874,7 +1887,11 @@ mod tests {
         // text column "alice" → String form only (not numerically parseable).
         let name = row_value_forms(&t, &row, "name");
         assert!(has_str_form(&name, "alice"));
-        assert!(!name.iter().any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_)))));
+        assert!(
+            !name
+                .iter()
+                .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_))))
+        );
 
         // bool column "t" → String("t") plus Boolean(true).
         let active = row_value_forms(&t, &row, "active");
@@ -1887,14 +1904,23 @@ mod tests {
 
         // SQL NULL / absent column → [Unknown] (wildcard).
         let null_row = [None, bs("bob"), bs("f")];
-        assert!(matches!(row_value_forms(&t, &null_row, "id").as_slice(), [ColumnRange::Unknown]));
-        assert!(matches!(row_value_forms(&t, &row, "nope").as_slice(), [ColumnRange::Unknown]));
+        assert!(matches!(
+            row_value_forms(&t, &null_row, "id").as_slice(),
+            [ColumnRange::Unknown]
+        ));
+        assert!(matches!(
+            row_value_forms(&t, &row, "nope").as_slice(),
+            [ColumnRange::Unknown]
+        ));
 
         // numeric-looking-but-textual: a non-numeric text yields only String.
         let bad_row = [bs("abc"), bs("bob"), bs("f")];
         let bad = row_value_forms(&t, &bad_row, "id");
         assert!(has_str_form(&bad, "abc"));
-        assert!(!bad.iter().any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_)))));
+        assert!(
+            !bad.iter()
+                .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_))))
+        );
     }
 
     #[test]
@@ -1925,9 +1951,18 @@ mod tests {
 
         let row = [bs("200"), bs("alice"), bs("t")];
         let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
-        assert!(got.contains(&fp(1)), "String('200') entry found via the String form");
-        assert!(got.contains(&fp(2)), "Integer(200) entry found via the Float form");
-        assert!(!got.contains(&fp(3)), "String('7') entry must not match a '200' row");
+        assert!(
+            got.contains(&fp(1)),
+            "String('200') entry found via the String form"
+        );
+        assert!(
+            got.contains(&fp(2)),
+            "Integer(200) entry found via the Float form"
+        );
+        assert!(
+            !got.contains(&fp(3)),
+            "String('7') entry must not match a '200' row"
+        );
     }
 
     #[test]
@@ -1940,7 +1975,10 @@ mod tests {
 
         let row = [bs("42"), bs("alice"), bs("t")];
         let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
-        assert!(got.contains(&fp(1)), "'42' > '10' lexicographically — must be a candidate");
+        assert!(
+            got.contains(&fp(1)),
+            "'42' > '10' lexicographically — must be a candidate"
+        );
 
         // A row whose text is lexicographically below '10' must be excluded.
         let row_lo = [bs("09"), bs("alice"), bs("t")];

@@ -14,7 +14,7 @@ use crate::pg::cache_connection::{CacheConnection, PrepareOutcome};
 use crate::pg::protocol::PgMessage;
 use crate::pg::protocol::backend::PgBackendMessageType;
 use crate::pg::protocol::encode::{
-    BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG,
+    BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG, SERVE_ERROR_MSG,
 };
 use crate::query::ast::{AstNode, Deparse, LiteralValue};
 use crate::timing::QueryTiming;
@@ -294,6 +294,37 @@ async fn broadcast_error_reply(bc: BroadcastState) {
     }
 }
 
+/// PGC-291: resolve a serve failure under the A+C invariant. If any byte already
+/// reached the client (`client_bytes_sent`), the serve can no longer fall back to
+/// origin — origin would replay the already-sent prefix (e.g. a duplicate
+/// `BindComplete`) and desync the client. Terminate this entry on the client with
+/// a synthetic `ErrorResponse` (plus `ReadyForQuery` when the client sent a Sync)
+/// and return `Ok`. Otherwise nothing is on the wire, so return `forward_error`
+/// and the caller forwards to origin transparently.
+///
+/// Termination reuses the existing queue with static bytes — no allocation.
+/// Best-effort: if the client is already gone the write just fails and the
+/// connection is torn down.
+async fn serve_failure_resolve<W: tokio::io::AsyncWrite + Unpin>(
+    client_bytes_sent: bool,
+    client_socket: &mut W,
+    write_queue: &mut WriteQueue,
+    emit_rfq: bool,
+    bytes_served: usize,
+    forward_error: rootcause::Report<CacheError>,
+) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
+    if !client_bytes_sent {
+        return Err(forward_error);
+    }
+    write_queue.clear();
+    write_queue.push(Bytes::from_static(SERVE_ERROR_MSG));
+    if emit_rfq {
+        write_queue.push(Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+    }
+    let _ = client_socket.write_all_buf(write_queue).await;
+    Ok((bytes_served, Vec::new()))
+}
+
 /// Guard that ensures a connection is returned to the pool.
 ///
 /// Returns the connection via async `release()` on success.
@@ -445,6 +476,10 @@ pub async fn handle_cached_query(
     let query_type = msg.query_type;
     let include_describe =
         query_type == QueryType::Simple || msg.pipeline_describe != PipelineDescribe::None;
+    // Captured before the `client_socket` borrow below so the post-commit error
+    // path (PGC-291) can decide whether to append a ReadyForQuery: the client
+    // expects one iff it terminated this entry with a Sync (or is simple-query).
+    let emit_rfq = query_type == QueryType::Simple || msg.emit_rfq;
 
     // Begin a result-memo capture for hot source-row serves. Stamps read-relation
     // versions now, before the serve query is issued (capture ordering invariant).
@@ -513,6 +548,18 @@ pub async fn handle_cached_query(
     // cache-DB response, returning the connection to the pool protocol-clean.
     let mut client_gone = false;
 
+    // PGC-291. Two flags enforce the invariant "a serve that has put bytes on the
+    // client wire can never be transparently forwarded to origin" (origin would
+    // replay the already-sent prefix — e.g. a duplicate BindComplete — desyncing
+    // the client). `committed` defers the first client flush until the cache-DB
+    // confirms the query plan (relay reaches the data phase), so a stall/error
+    // *before* that leaves nothing on the wire and forwards cleanly.
+    // `client_bytes_sent` records whether any byte actually reached the client; if
+    // so, a later failure terminates the entry with a synthetic ErrorResponse
+    // instead of forwarding.
+    let mut committed = false;
+    let mut client_bytes_sent = false;
+
     // PGC-278: bound the whole serve. The primary read arm (`framed.next()`) has
     // no per-read timeout, so a stalled cache-DB connection or a response desync
     // would park here forever holding the pooled connection. On the deadline,
@@ -534,14 +581,17 @@ pub async fn handle_cached_query(
                     sent_setgen_parse = relay.prepare.sent_setgen_parse,
                     sent_parse = relay.prepare.sent_parse,
                     sent_close = relay.prepare.sent_close,
-                    "cache serve exceeded stall deadline; poisoning connection and forwarding to origin (PGC-278)"
+                    "cache serve exceeded stall deadline; poisoning connection; forwarding to origin if no bytes sent, else erroring the client (PGC-278/PGC-291)"
                 );
                 crate::metrics::handles().cache.serve_stall_total.increment(1);
                 guard.poisoned = true;
                 if let Some(bc) = relay.broadcast.take() {
                     broadcast_error_reply(bc).await;
                 }
-                return Err(CacheError::Write.into());
+                return serve_failure_resolve(
+                    client_bytes_sent, client_socket, &mut write_queue, emit_rfq,
+                    relay.bytes_served, CacheError::Write.into(),
+                ).await;
             }
             frame = framed.next() => {
                 let frame = match frame {
@@ -551,17 +601,33 @@ pub async fn handle_cached_query(
                         if let Some(bc) = relay.broadcast.take() {
                             broadcast_error_reply(bc).await;
                         }
-                        return Err(CacheError::InvalidMessage.into());
+                        return serve_failure_resolve(
+                            client_bytes_sent, client_socket, &mut write_queue, emit_rfq,
+                            relay.bytes_served, CacheError::InvalidMessage.into(),
+                        ).await;
                     }
                 };
-                relay_frame_apply(&mut relay, frame, &mut write_queue, &mut guard, &mut msg.timing)
-                    .await?;
+                // relay_frame_apply errors only on a cache-DB ErrorResponse, where
+                // it has already poisoned the guard and replied to coalesced
+                // waiters. Same PGC-291 invariant: forward only if nothing was sent.
+                if let Err(e) =
+                    relay_frame_apply(&mut relay, frame, &mut write_queue, &mut guard, &mut msg.timing)
+                        .await
+                {
+                    return serve_failure_resolve(
+                        client_bytes_sent, client_socket, &mut write_queue, emit_rfq,
+                        relay.bytes_served, e,
+                    ).await;
+                }
             }
             result = client_socket.write_buf(&mut write_queue),
-                if !write_queue.is_empty() && !client_gone =>
+                if committed && !write_queue.is_empty() && !client_gone =>
             {
                 match result {
                     Ok(cnt) => {
+                        if cnt > 0 {
+                            client_bytes_sent = true;
+                        }
                         trace!("net: cache→client flush (serve, partial write, {} bytes)", cnt);
                     }
                     Err(_) => {
@@ -589,6 +655,18 @@ pub async fn handle_cached_query(
                 }
                 return Err(CacheError::Write.into());
             }
+        }
+
+        // PGC-291: once the relay reaches the data phase the cache-DB has
+        // confirmed the query plan (BindComplete) and rows/CommandComplete are
+        // imminent — commit, releasing the buffered response prefix to flush.
+        // Before this point write_queue stays unflushed, so a stall/error
+        // forwards transparently with nothing on the client wire.
+        if matches!(
+            relay.state,
+            ServeResponseState::DataRows | ServeResponseState::Done
+        ) {
+            committed = true;
         }
 
         // While draining for a departed client, discard the relay buffer so it
@@ -936,6 +1014,18 @@ mod tests {
         frame.extend_from_slice(&len.to_be_bytes());
         frame.extend_from_slice(&payload);
         frame
+    }
+
+    /// The hand-encoded static `SERVE_ERROR_MSG` (PGC-291) must be a well-formed
+    /// ErrorResponse — guard against an encoding typo in the byte literal.
+    #[test]
+    fn test_serve_error_msg_layout() {
+        let expected = error_response_frame(&[
+            (b'S', b"ERROR"),
+            (b'C', b"58000"),
+            (b'M', b"pgcache: cache serve failed"),
+        ]);
+        assert_eq!(SERVE_ERROR_MSG, expected.as_slice());
     }
 
     #[test]
