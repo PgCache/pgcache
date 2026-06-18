@@ -631,41 +631,25 @@ impl WriterRegistration {
         // rather than skip them (PGC-227). Derived from the single source of
         // truth so the flag can't drift from the actual checks.
         update_query.change_dependent = update_query.update_invalidation_possible(table_name);
-        // Index the per-table constraints for subsumption lookup. Skip
-        // entries that are ineligible parents:
+        // Per-table constraints, shared by both indexes. Queries with empty
+        // per-table constraints (full-table scans, OR/unhandled WHERE shapes)
+        // are indexed with `&[]` — the broadest class, in the empty `ColumnSet`.
+        let table_constraints = update_query
+            .constraints
+            .table_constraints
+            .get(table_name)
+            .cloned()
+            .unwrap_or_default();
+        // `eval_index` holds the *full* update-query population (PGC-292) — every
+        // query regardless of eval strategy or `has_limit` — so a query with no
+        // extractable constraints is a candidate for every row and narrowing
+        // never drops a true match (no stale reads). `subsumption` indexes the
+        // same constraints but only for eligible parents:
         // - has_limit: limited queries are excluded by `subsumption_check`.
-        // - !where_analysis_complete: the WHERE clause couldn't be fully
-        //   analyzed, so we can't reason about coverage (PGC-106). The
-        //   detailed check would reject these anyway; skipping the index
-        //   entry saves a per-lookup candidate visit.
-        // Queries with empty per-table constraints (full-table scans) are
-        // indexed with `&[]` — they're the broadest subsumers and live in
-        // the empty `ColumnSet` class.
-        let index_eligible = !has_limit && update_query.constraints.where_analysis_complete;
-        let table_constraints = index_eligible.then(|| {
-            update_query
-                .constraints
-                .table_constraints
-                .get(table_name)
-                .cloned()
-                .unwrap_or_default()
-        });
-
-        // The LocalEval matcher index holds the *full* LocalEval population, so
-        // no `has_limit`/`where_analysis_complete` gating: a query with empty
-        // extracted constraints lands in the unconstrained class and is a
-        // candidate for every row, which keeps the narrowing from dropping a
-        // true match (no stale reads). Extracted constraints are necessary
-        // conditions (OR/unhandled shapes extract nothing), so narrowing is sound.
-        let local_eval_tcs =
-            (update_query.eval_strategy == UpdateEvalStrategy::LocalEval).then(|| {
-                update_query
-                    .constraints
-                    .table_constraints
-                    .get(table_name)
-                    .cloned()
-                    .unwrap_or_default()
-            });
+        // - !where_analysis_complete: the WHERE couldn't be fully analyzed, so
+        //   coverage isn't reasonable (PGC-106); the detailed check would reject
+        //   these anyway, and skipping saves a per-lookup candidate visit.
+        let can_subsume = !has_limit && update_query.constraints.where_analysis_complete;
 
         let mut queries = core
             .cache
@@ -689,12 +673,10 @@ impl WriterRegistration {
             .unwrap_or_else(|p| p);
         queries.complexity_order.insert(pos, fingerprint);
 
-        if let Some(tcs) = table_constraints {
-            queries.subsumption.insert(fingerprint, &tcs);
+        if can_subsume {
+            queries.subsumption.insert(fingerprint, &table_constraints);
         }
-        if let Some(tcs) = local_eval_tcs {
-            queries.local_eval_index.insert(fingerprint, &tcs);
-        }
+        queries.eval_index.insert(fingerprint, &table_constraints);
     }
 
     /// Dispatch population work to next worker using round-robin scheduling.
@@ -1543,7 +1525,7 @@ impl WriterRegistration {
                     entry.query_remove(fingerprint);
                     entry.complexity_order.retain(|fp| *fp != fingerprint);
                     entry.subsumption.remove(fingerprint);
-                    entry.local_eval_index.remove(fingerprint);
+                    entry.eval_index.remove(fingerprint);
                 }
             }
         }

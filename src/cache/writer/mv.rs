@@ -15,7 +15,10 @@
 //! race is only about whether the table may claim to be current).
 
 use crate::catalog::Oid;
+use crate::pg::protocol::ByteString;
 use crate::query::Fingerprint;
+use crate::query::constraint_index::row_value_forms;
+use crate::query::constraints::ColumnRange;
 use std::sync::Arc;
 
 use tracing::{debug, error, trace};
@@ -322,18 +325,50 @@ impl WriterCore {
         }
     }
 
-    /// Dirty-mark every dirtyable MV among the relation's update-queries (PGC-254
-    /// rung 1). Used on CDC removals (DELETE / UPDATE-out): unlike the upsert
-    /// path, we can't evaluate which queries actually contained the removed row
-    /// — REPLICA IDENTITY DEFAULT carries only the PK, not the non-PK columns a
-    /// predicate needs — so this is relation-level. `mv_dirty_mark` self-gates
-    /// (Fresh and Building), and the rebuild is lazy; under delete-heavy load the MVs stay
-    /// Pending and the query serves from the (correct) source rows.
-    pub(super) fn mv_dirty_mark_relation(&self, relation_oid: Oid) {
-        if let Some(update_queries) = self.cache.update_queries.get(&relation_oid) {
-            for query in update_queries.iter_complexity_ordered() {
-                self.mv_dirty_mark(query.fingerprint);
-            }
+    /// Dirty-mark every dirtyable MV whose constraints the removed row could
+    /// satisfy, via a point-probe over the relation's `eval_index` (PGC-292) —
+    /// O(candidates) instead of O(queries-on-relation). Used on CDC removals
+    /// (DELETE / UPDATE-out / PK-change): the old image can't be evaluated
+    /// precisely (under REPLICA IDENTITY DEFAULT it carries only the PK), so
+    /// non-PK columns probe as `Unknown` — a wildcard matching every query
+    /// constraining that column, so a query the row may have departed on a
+    /// changed non-PK column is still marked (never under-returns; preserves the
+    /// PGC-254/265 departure-safety the prior relation-wide scan provided).
+    /// `mv_dirty_mark` self-gates (Fresh and Building only).
+    ///
+    /// `pk_only` forces non-PK columns to `Unknown` even when `old_row` carries
+    /// values for them: UPDATE / UPDATE-out pass the *new* tuple (the old non-PK
+    /// values are gone), so only its PK is trustworthy. DELETE passes the genuine
+    /// old image with `pk_only = false` — exact under REPLICA IDENTITY FULL,
+    /// PK-only (via absent-column `Unknown`) under DEFAULT.
+    pub(super) fn mv_dirty_mark_removed_row(
+        &self,
+        relation_oid: Oid,
+        old_row: &[Option<ByteString>],
+        pk_only: bool,
+    ) {
+        let candidates = {
+            let Some(update_queries) = self.cache.update_queries.get(&relation_oid) else {
+                return;
+            };
+            let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
+                return;
+            };
+            update_queries.eval_index.candidates_point(|column| {
+                if pk_only
+                    && !table_metadata
+                        .columns
+                        .get(column)
+                        .is_some_and(|m| m.is_primary_key)
+                {
+                    vec![ColumnRange::Unknown]
+                } else {
+                    row_value_forms(table_metadata, old_row, column)
+                }
+            })
+        };
+        for fingerprint in candidates {
+            self.mv_dirty_mark(fingerprint);
         }
     }
 

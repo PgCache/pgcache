@@ -235,14 +235,15 @@ pub struct UpdateQueries {
     pub queries: FingerprintMap<UpdateQuery>,
     pub complexity_order: Vec<Fingerprint>,
     pub subsumption: ConstraintIndex<Fingerprint>,
-    /// Separate instantiation of the same `ConstraintIndex` structure, indexing
-    /// the per-table constraints of this relation's LocalEval update-queries.
-    /// Used by `update_queries_execute_batch` to narrow the per-row matcher to
-    /// candidate queries instead of scanning every query. Unlike `subsumption`,
-    /// this holds the *full* LocalEval population: queries with no/partial
-    /// extractable constraints land in the unconstrained class and are returned
-    /// for every row, so narrowing never drops a true match (no stale reads).
-    pub local_eval_index: ConstraintIndex<Fingerprint>,
+    /// Per-table constraint index over the *full* update-query population of
+    /// this relation — LocalEval and PgEval alike (PGC-292). Probed point-wise
+    /// (`candidates_point`) to narrow CDC per-row work: the upsert matcher
+    /// (`update_queries_execute_batch`, which filters to LocalEval after the
+    /// probe), the memo-eviction pass, and `mv_dirty_mark_removed_row`. Queries
+    /// with no/partial extractable constraints land in the unconstrained class
+    /// and are returned for every row, so narrowing never drops a true match
+    /// (no stale reads).
+    pub eval_index: ConstraintIndex<Fingerprint>,
     /// Count of queries with `change_dependent == true`. Maintained on
     /// insert/remove via `change_dependent_account` so `needs_change_eval` is
     /// O(1) on the CDC hot path. Derivable from `queries`; `needs_change_eval`
@@ -259,7 +260,7 @@ impl UpdateQueries {
             queries: HashMap::default(),
             complexity_order: Vec::new(),
             subsumption: ConstraintIndex::new(),
-            local_eval_index: ConstraintIndex::new(),
+            eval_index: ConstraintIndex::new(),
             change_dependent_count: 0,
         }
     }
@@ -382,7 +383,7 @@ impl Cache {
                 queries.query_remove(fingerprint);
                 queries.complexity_order.retain(|fp| *fp != fingerprint);
                 queries.subsumption.remove(fingerprint);
-                queries.local_eval_index.remove(fingerprint);
+                queries.eval_index.remove(fingerprint);
             }
         }
     }

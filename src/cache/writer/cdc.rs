@@ -2509,7 +2509,7 @@ impl WriterCdc {
 
         // Probe the LocalEval index once; both the in-place matcher and the memo
         // eviction pass below consume the same candidate set.
-        let local_candidates = local_eval_candidates(core, relation_oid, row_data);
+        let local_candidates = eval_candidates(core, relation_oid, row_data);
         let matched = self
             .update_queries_execute_batch(core, relation_oid, row_data, batch, &local_candidates)
             .await?;
@@ -2567,7 +2567,7 @@ impl WriterCdc {
 
         // Probe the LocalEval index once; the memo eviction pass and the in-place
         // matcher (`update_queries_execute_batch` below) share this candidate set.
-        let local_candidates = local_eval_candidates(core, relation_oid, new_row_data);
+        let local_candidates = eval_candidates(core, relation_oid, new_row_data);
 
         // PGC-227: when no cached query over this relation can have its UPDATE
         // invalidation depend on which columns changed or whether the row is
@@ -2680,13 +2680,22 @@ impl WriterCdc {
 
         // Any update may move the row out of a Fresh MV's predicate, and only
         // membership *hits* dirty-mark — a row leaving query A while still
-        // matching query B (`matched` above), or a PK-change with other
-        // columns changed, would otherwise leave A's MV serving the departed
-        // row forever (PGC-254/PGC-265; the old image isn't available to
-        // detect departure precisely — PGC-255 tracks precision). Coarsely
-        // dirty the relation's dirtyable MVs; `mv_dirty_mark` self-gates
-        // (Fresh and Building only).
-        core.mv_dirty_mark_relation(relation_oid);
+        // matching query B (`matched` above), or a PK-change with other columns
+        // changed, would otherwise leave A's MV serving the departed row forever
+        // (PGC-254/PGC-265; the old image isn't available to detect departure
+        // precisely — PGC-255 tracks precision). Probe the eval index on the old
+        // PK (PK-only: the old non-PK values are gone, so any non-PK predicate
+        // matches conservatively via the `Unknown` wildcard) and dirty-mark the
+        // candidates; `mv_dirty_mark` self-gates (Fresh and Building only).
+        core.mv_dirty_mark_removed_row(
+            relation_oid,
+            if key_data.is_empty() {
+                new_row_data
+            } else {
+                key_data
+            },
+            true,
+        );
 
         // A non-empty `key_data` means the PK changed; delete the old PK too.
         if !key_data.is_empty() {
@@ -2849,8 +2858,17 @@ impl WriterCdc {
         // Deferred to frame_invalidations_flush (see handle_insert).
         core.frame_invalidations.extend(fp_list);
 
-        // Same coarse Fresh-MV rule as handle_update (PGC-254).
-        core.mv_dirty_mark_relation(relation_oid);
+        // Same Fresh-MV rule as handle_update (PGC-254), narrowed via the
+        // eval-index probe (PGC-292). Old non-PK values are gone, so PK-only.
+        core.mv_dirty_mark_removed_row(
+            relation_oid,
+            if key_data.is_empty() {
+                new_row_data
+            } else {
+                key_data
+            },
+            true,
+        );
 
         // The new-PK row is alive at origin: under recording its eviction must
         // not be recorded (see doc comment). The old PK after a PK change is
@@ -2913,10 +2931,11 @@ impl WriterCdc {
 
         // A deleted row leaves stale rows in any Fresh MV that materialized it;
         // CDC removals never went through the upsert path's dirty-mark, so the
-        // MV would serve the deleted row forever. Coarsely dirty the relation's
-        // Fresh MVs (PGC-254 rung 1 — the delete tuple lacks the non-PK columns
-        // needed to identify which MVs actually contained the row).
-        core.mv_dirty_mark_relation(relation_oid);
+        // MV would serve the deleted row forever. Probe the eval index on the
+        // delete tuple (PGC-292): it's the genuine old image, so `pk_only=false`
+        // uses whatever columns it carries — exact under REPLICA IDENTITY FULL,
+        // PK-only (non-PK absent → `Unknown` wildcard) under DEFAULT (PGC-254).
+        core.mv_dirty_mark_removed_row(relation_oid, row_data, false);
 
         // Check for subquery invalidations — removing a row can expand the
         // final result set for Exclusion/Scalar subquery tables
@@ -3469,11 +3488,12 @@ impl WriterCdc {
                 let Some(update_query) = update_queries.queries.get(&fingerprint) else {
                     continue;
                 };
-                debug_assert_eq!(
-                    update_query.eval_strategy,
-                    UpdateEvalStrategy::LocalEval,
-                    "local_eval_index must only hold LocalEval queries"
-                );
+                // The eval index holds the full population (PGC-292); the local
+                // matcher only handles LocalEval — PgEval candidates are matched
+                // by the separate PgEval path below.
+                if update_query.eval_strategy != UpdateEvalStrategy::LocalEval {
+                    continue;
+                }
                 if !update_query_matches_locally(update_query, table_metadata, row_data) {
                     continue;
                 }
@@ -3941,11 +3961,12 @@ enum MemoOp {
     Delete,
 }
 
-/// Compute the LocalEval candidate fingerprints for a CDC row once, so the
-/// in-place matcher (`update_queries_execute_batch`) and the memo-eviction pass
-/// (`memo_frame_accumulate`) share one `candidates_point` probe instead of each
-/// running its own. Empty when the relation has no cached queries.
-fn local_eval_candidates(
+/// Candidate fingerprints whose extracted constraints a CDC row could satisfy,
+/// probed once over the relation's full `eval_index` so the in-place matcher
+/// (`update_queries_execute_batch`, which filters to LocalEval) and the
+/// memo-eviction pass (`memo_frame_accumulate`) share one `candidates_point`
+/// probe. Empty when the relation has no cached queries.
+fn eval_candidates(
     core: &WriterCore,
     relation_oid: Oid,
     row: &[Option<ByteString>],
@@ -3955,7 +3976,7 @@ fn local_eval_candidates(
         core.cache.tables.get1(&relation_oid),
     ) {
         (Some(uqs), Some(table_metadata)) => uqs
-            .local_eval_index
+            .eval_index
             .candidates_point(|c| row_value_forms(table_metadata, row, c)),
         _ => FingerprintSet::default(),
     }
