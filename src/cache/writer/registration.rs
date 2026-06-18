@@ -1,6 +1,6 @@
 use crate::catalog::Oid;
 use crate::pg::Lsn;
-use crate::query::Fingerprint;
+use crate::query::{Fingerprint, QueryShape, query_shape_derive};
 use std::cmp::Reverse;
 use std::collections::HashSet;
 use std::num::NonZeroU64;
@@ -255,6 +255,9 @@ struct QueryResolution {
     /// Deparsed SQL body of `resolved`. Computed once here and reused on the
     /// serving hot path; see `CachedQuery.deparsed_sql`.
     deparsed_sql: EcoString,
+    /// Parameterized serve shape of `resolved` (PGC-294), computed alongside
+    /// `deparsed_sql`; see `CachedQuery.serve_shape`.
+    serve_shape: QueryShape,
     relation_oids: Vec<Oid>,
     base_query: QueryExpr,
     max_limit: Option<u64>,
@@ -832,6 +835,7 @@ impl WriterRegistration {
         base_query: QueryExpr,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
+        serve_shape: QueryShape,
         max_limit: Option<u64>,
         started_at: Instant,
         pinned: bool,
@@ -852,6 +856,7 @@ impl WriterRegistration {
             query: base_query,
             resolved,
             deparsed_sql,
+            serve_shape,
             max_limit,
             cached_bytes: 0,
             registration_started_at: Some(started_at),
@@ -896,6 +901,10 @@ impl WriterRegistration {
             .resolve_deparse
             .record(deparse_start.elapsed().as_secs_f64());
 
+        // Parameterized shape (PGC-294): the per-shape serve statement + binds,
+        // derived from the same resolved AST. Additive to the fingerprint.
+        let serve_shape = query_shape_derive(&resolved);
+
         // Classify the shape once here; `query_register` and MV setup both reuse
         // the result via `QueryResolution.shape_gate` to avoid re-running
         // decorrelation + classification.
@@ -931,6 +940,7 @@ impl WriterRegistration {
         Ok(QueryResolution {
             resolved,
             deparsed_sql,
+            serve_shape,
             relation_oids,
             base_query,
             max_limit,
@@ -1031,6 +1041,7 @@ impl WriterRegistration {
             resolution.base_query,
             Arc::clone(&resolution.resolved),
             resolution.deparsed_sql.clone(),
+            resolution.serve_shape.clone(),
             resolution.max_limit,
             started_at,
             pinned,
@@ -1230,6 +1241,7 @@ impl WriterRegistration {
             resolution.base_query,
             Arc::clone(&resolution.resolved),
             resolution.deparsed_sql,
+            resolution.serve_shape,
             resolution.max_limit,
             started_at,
             pinned,

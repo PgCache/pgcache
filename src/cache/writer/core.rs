@@ -920,6 +920,14 @@ impl WriterCore {
         deparsed_sql: &EcoString,
         max_limit: Option<u64>,
     ) {
+        // The serve shape mirrors `CachedQuery.serve_shape`; the cached query is
+        // already inserted at every transition, so read it from there rather
+        // than thread it through every transition caller (PGC-294).
+        let serve_shape = self
+            .cache
+            .cached_queries
+            .get1(&fingerprint)
+            .map(|q| q.serve_shape.clone());
         self.state_view
             .cached_queries
             .entry(fingerprint)
@@ -928,6 +936,7 @@ impl WriterCore {
                 v.generation = generation;
                 v.resolved = Some(Arc::clone(resolved));
                 v.deparsed_sql = Some(deparsed_sql.clone());
+                v.serve_shape = serve_shape.clone();
                 v.max_limit = max_limit;
                 v.referenced = false;
             })
@@ -936,6 +945,7 @@ impl WriterCore {
                 generation,
                 resolved: Some(Arc::clone(resolved)),
                 deparsed_sql: Some(deparsed_sql.clone()),
+                serve_shape,
                 max_limit,
                 referenced: false,
                 mv: MvMeta::new(ShapeGate::Skip, None),

@@ -1,4 +1,4 @@
-use crate::query::{Fingerprint, FingerprintMap};
+use crate::query::{Fingerprint, FingerprintMap, QueryShape};
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -208,6 +208,10 @@ pub struct ServeRequest {
     /// Precomputed deparsed SQL body of `resolved`. Spliced into the SET +
     /// body + LIMIT wire string the serve pool sends to the cache DB.
     pub deparsed_sql: EcoString,
+    /// Parameterized serve shape (literal-free SQL + ordered literal values).
+    /// `Some` for source-row serves (the shape-keyed prepared-statement path);
+    /// `None` for MV-backed serves, which keep the `deparsed_sql` path (PGC-294).
+    pub serve_shape: Option<QueryShape>,
     /// Generation number for row tracking in pgcache_pgrx extension
     pub generation: u64,
     /// Serve from the MV (carrying its aliased output column names) or
@@ -535,6 +539,7 @@ impl CacheDispatch {
                     generation,
                     resolved: Some(resolved),
                     deparsed_sql: Some(deparsed_sql),
+                    serve_shape,
                     max_limit,
                     ..
                 }) if limit_is_sufficient(*max_limit, rows_needed) => {
@@ -546,6 +551,7 @@ impl CacheDispatch {
                             msg,
                             Arc::clone(resolved),
                             deparsed_sql.clone(),
+                            serve_shape.clone(),
                             *generation,
                             rows_needed,
                         )
@@ -844,6 +850,7 @@ impl CacheDispatch {
                     generation: 0,
                     resolved: None,
                     deparsed_sql: None,
+                    serve_shape: None,
                     max_limit: None,
                     referenced: false,
                     // Writer fills this in after resolution/classification.
@@ -867,12 +874,14 @@ impl CacheDispatch {
     /// (format, shape), otherwise a pool serve (from the MV table or source
     /// rows, decided here). Scoped to the single-request Ready path: coalesced
     /// groups and subsumption serves dispatch to the serve pool directly.
+    #[allow(clippy::too_many_arguments)]
     async fn hit_serve(
         &self,
         fingerprint: Fingerprint,
         msg: QueryRequest,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
+        serve_shape: Option<QueryShape>,
         generation: u64,
         rows_needed: Option<u64>,
     ) -> CacheResult<()> {
@@ -882,15 +891,17 @@ impl CacheDispatch {
         // No memo: hand off to the serve pool. `mv_dispatch_decide` picks the MV fast
         // path vs source-row fallthrough and, on a dirty MV, schedules a rebuild.
         let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
-        self.pool_serve(fingerprint, msg, resolved, deparsed_sql, generation, mv)
+        self.pool_serve(fingerprint, msg, resolved, deparsed_sql, serve_shape, generation, mv)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pool_serve(
         &self,
         fingerprint: Fingerprint,
         msg: QueryRequest,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
+        serve_shape: Option<QueryShape>,
         generation: u64,
         mv: MvServe,
     ) -> CacheResult<()> {
@@ -899,6 +910,7 @@ impl CacheDispatch {
             msg,
             resolved,
             deparsed_sql,
+            serve_shape,
             generation,
             mv,
             vec![],
@@ -1049,6 +1061,7 @@ impl CacheDispatch {
         msg: QueryRequest,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
+        serve_shape: Option<QueryShape>,
         generation: u64,
         mv: MvServe,
         coalesced: Vec<CoalescedClient>,
@@ -1081,6 +1094,7 @@ impl CacheDispatch {
             data: msg.data,
             resolved,
             deparsed_sql,
+            serve_shape,
             generation,
             mv,
             result_formats: msg.result_formats,
@@ -1148,6 +1162,15 @@ impl CacheDispatch {
             return;
         };
 
+        // The entry is Ready at drain time, so its propagated serve shape (if any)
+        // is present; read it once for the whole drain rather than threading it
+        // through the WriterNotify::Ready message.
+        let serve_shape = self
+            .state_view
+            .cached_queries
+            .get(&fingerprint)
+            .and_then(|v| v.serve_shape.clone());
+
         let mut served = 0u64;
         for (_key, mut waiters) in groups {
             // Stamp drain_started_at on every waiter (including the one that
@@ -1209,6 +1232,7 @@ impl CacheDispatch {
                 primary,
                 Arc::clone(&resolved),
                 deparsed_sql.clone(),
+                serve_shape.clone(),
                 generation,
                 mv,
                 coalesced,
@@ -1272,6 +1296,7 @@ impl CacheDispatch {
                     generation: 0,
                     resolved: None,
                     deparsed_sql: None,
+                    serve_shape: None,
                     max_limit: None,
                     referenced: false,
                     // Writer fills this in after resolution/classification.
@@ -1368,7 +1393,7 @@ impl CacheDispatch {
                 // false and the serve goes through the fallthrough path.
                 let rows_needed = limit_rows_needed(&msg.cacheable_query.query.limit);
                 let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
-                self.pool_serve(fingerprint, msg, resolved, deparsed_sql, generation, mv)
+                self.pool_serve(fingerprint, msg, resolved, deparsed_sql, None, generation, mv)
             }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
                 self.metrics_miss_record(fingerprint);

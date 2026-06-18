@@ -4,6 +4,7 @@
 
 mod binary;
 mod replace;
+mod resolved_parameterize;
 mod text;
 
 use crate::cache::QueryParameter;
@@ -12,6 +13,7 @@ use crate::query::ast::LiteralValue;
 use super::AstTransformResult;
 
 pub use replace::{query_expr_parameters_replace, select_node_parameters_replace};
+pub use resolved_parameterize::resolved_query_expr_parameterize;
 
 fn parameter_to_literal(param: &QueryParameter) -> AstTransformResult<LiteralValue> {
     match &param.value {

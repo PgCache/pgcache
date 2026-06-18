@@ -7,7 +7,9 @@ pub mod evaluate;
 pub mod fingerprint;
 pub mod resolve;
 pub mod resolved;
+pub mod shape;
 pub mod transform;
 pub mod update;
 
 pub use fingerprint::{Fingerprint, FingerprintDashMap, FingerprintMap, FingerprintSet};
+pub use shape::{QueryShape, ShapeKey, query_shape_derive};

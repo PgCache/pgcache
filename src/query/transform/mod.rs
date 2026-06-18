@@ -28,7 +28,9 @@ error_set! {
 pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
 pub use constant_fold::query_expr_constant_fold;
-pub use parameters::{query_expr_parameters_replace, select_node_parameters_replace};
+pub use parameters::{
+    query_expr_parameters_replace, resolved_query_expr_parameterize, select_node_parameters_replace,
+};
 pub use pushdown::predicate_pushdown_apply;
 pub(crate) use pushdown::{where_expr_conjuncts_join, where_expr_conjuncts_split};
 pub use select_node::{resolved_select_node_replace, resolved_select_node_update_replace};

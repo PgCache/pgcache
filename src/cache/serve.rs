@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use crate::catalog::Oid;
@@ -17,6 +18,7 @@ use crate::pg::protocol::encode::{
     BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG, SERVE_ERROR_MSG,
 };
 use crate::query::ast::{AstNode, Deparse, LiteralValue};
+use crate::query::query_shape_derive;
 use crate::timing::QueryTiming;
 
 use super::{
@@ -487,7 +489,7 @@ pub async fn handle_cached_query(
 
     // Issue the query on the cache-DB connection; `prepare` records what was sent
     // so the response state machine knows which completions to expect.
-    let prepare = serve_query_send(&mut conn, msg, include_describe, binary_results, state_view)
+    let prepare = serve_query_send(&mut conn, msg, include_describe, binary_results)
         .await
         .inspect_err(|_| {
             guard.poisoned = true;
@@ -862,16 +864,15 @@ async fn relay_frame_apply(
 /// Issue the cached query on the pooled cache-DB connection and return what was
 /// sent, so the response state machine knows which completions to expect. The MV
 /// fast path sends an unnamed extended query (no SET prefix); the source-row path
-/// sends a named prepared statement with parameterized LIMIT/OFFSET (a Parse only
-/// on first use of the fingerprint on this connection, plus a reconciliation
-/// Close when that prepare evicted the connection's oldest statement). The caller
-/// poisons the connection on error.
+/// sends a shape-keyed named prepared statement with parameterized literals +
+/// LIMIT/OFFSET (a Parse only on first use of the shape on this connection, plus a
+/// Close when preparing it evicted the FIFO cap's oldest shape). The caller poisons
+/// the connection on error.
 async fn serve_query_send(
     conn: &mut CacheConnection,
     msg: &ServeRequest,
     include_describe: bool,
     binary_results: bool,
-    state_view: &CacheStateView,
 ) -> CacheResult<PrepareOutcome> {
     if let MvServe::Mv(cols) = &msg.mv {
         // Render into the connection's recycled SQL buffer rather than a fresh
@@ -892,20 +893,32 @@ async fn serve_query_send(
         });
     }
 
-    // One step of round-robin reconciliation: close a prepared statement whose
-    // query has been evicted from the cache (kept across invalidation, which
-    // leaves the entry in place). Self-tunes to the live working set — no cap. The
-    // Close is pipelined ahead of this serve's Parse/Bind.
-    let close_victim = conn
-        .prepared
-        .reconcile_one(|fp| state_view.cached_queries.contains_key(&fp));
+    // Source-row serve via a shape-keyed prepared statement (PGC-294): the shape
+    // SQL carries `$1..$k` placeholders for its literals, so a single plan is
+    // shared by every query of this shape regardless of literal values (collapsing
+    // the per-literal plan explosion that drove relcache-invalidation storms).
+    // Most hits carry a precomputed shape; subsumed serves have none and derive it
+    // from the resolved query here (cold path).
+    let derived_shape;
+    let shape = match &msg.serve_shape {
+        Some(shape) => shape,
+        None => {
+            derived_shape = query_shape_derive(msg.resolved.as_ref());
+            &derived_shape
+        }
+    };
 
-    // Named prepared statement with parameterized LIMIT/OFFSET — body is stable
-    // per fingerprint, so PG parses/plans once per connection and reuses across
-    // hits and across limit values.
+    // Shape body, then the trailing `LIMIT $(k+1) OFFSET $(k+2)` placeholders.
     conn.sql_buf.clear();
-    conn.sql_buf.push_str(&msg.deparsed_sql);
-    conn.sql_buf.push_str(" LIMIT $1 OFFSET $2");
+    conn.sql_buf.push_str(&shape.sql);
+    let literal_count = shape.literals.len();
+    let _ = write!(
+        conn.sql_buf,
+        " LIMIT ${} OFFSET ${}",
+        literal_count + 1,
+        literal_count + 2
+    );
+
     let mut limit_itoa = itoa::Buffer::new();
     let mut offset_itoa = itoa::Buffer::new();
     let mut limit_other = String::new();
@@ -921,13 +934,13 @@ async fn serve_query_send(
         &mut offset_other,
     );
     conn.pipelined_named_query_send(
-        msg.fingerprint,
+        shape.key,
         msg.generation,
+        &shape.literals,
         limit_text,
         offset_text,
         include_describe,
         binary_results,
-        close_victim,
     )
     .await
 }

@@ -16,7 +16,7 @@ use crate::{
     cache::{memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::TableMetadata,
     query::{
-        Fingerprint, FingerprintDashMap, FingerprintMap, ast::QueryExpr,
+        Fingerprint, FingerprintDashMap, FingerprintMap, QueryShape, ast::QueryExpr,
         constraint_index::ConstraintIndex, constraints::QueryConstraints,
         resolved::ResolvedQueryExpr,
     },
@@ -56,6 +56,11 @@ pub struct CachedQuery {
     /// Excludes LIMIT (which varies per request) and the `SET mem.query_generation`
     /// prefix.
     pub deparsed_sql: EcoString,
+    /// Parameterized serve shape (PGC-294): `deparsed_sql` with literals replaced
+    /// by `$N` placeholders, plus its key and the bound literals. Built alongside
+    /// the (unchanged) fingerprint; lets the serve path share one prepared
+    /// statement per shape across all fingerprints that differ only in literals.
+    pub serve_shape: QueryShape,
     /// Maximum rows cached for this fingerprint.
     /// `None` = all rows cached (query seen without LIMIT, or OFFSET-only).
     /// `Some(n)` = up to `n` rows cached (max LIMIT+OFFSET across all variants seen).
@@ -663,6 +668,9 @@ pub struct CachedQueryView {
     /// Precomputed deparsed SQL body (mirrors `CachedQuery.deparsed_sql`).
     /// None while Loading; Some once the view transitions to Ready.
     pub deparsed_sql: Option<EcoString>,
+    /// Parameterized serve shape (mirrors `CachedQuery.serve_shape`, PGC-294).
+    /// None while Loading; Some once the view transitions to Ready.
+    pub serve_shape: Option<QueryShape>,
     /// Maximum rows cached for this fingerprint (None = all rows)
     pub max_limit: Option<u64>,
     /// CLOCK reference bit — set by dispatch on cache hit, read/cleared by writer during eviction

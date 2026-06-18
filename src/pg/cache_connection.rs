@@ -1,7 +1,10 @@
-use crate::query::{Fingerprint, FingerprintSet};
+use crate::query::ShapeKey;
+use crate::query::ast::LiteralValue;
 use std::collections::{HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::io;
 
+use ecow::EcoString;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::bytes::{BufMut, BytesMut};
@@ -27,20 +30,27 @@ const TEXT_OID: u32 = 25;
 const SETGEN_STATEMENT_NAME: &[u8] = b"pgc_setgen";
 const SETGEN_SQL: &str = "SELECT set_config('mem.query_generation', $1, false)";
 
-/// Per-connection registry of named prepared statements. PG prepared statements
-/// are session-local, so each connection tracks its own. Statement lifecycle is
-/// decoupled from cache eviction and self-tuning to the workload: there is no
-/// cap. Each serve runs one step of round-robin reconciliation against the live
-/// cache (see [`PreparedStatements::reconcile_one`]) — statements whose query is
-/// still cached are kept (however many thousands), and statements whose query
-/// was evicted are closed. A re-registered identical query reuses its statement
-/// while present.
+/// FIFO cap on named prepared statements per connection. Statements key by query
+/// *shape* (PGC-294), so the working set is bounded by query-shape diversity —
+/// tens to low hundreds, regardless of literal cardinality — not by the per-
+/// literal fingerprint count (which the old per-fingerprint registry had to
+/// actively reconcile to bound). The cap never trips in practice; it is a
+/// backstop for a pathologically long-lived connection that serves an unbounded
+/// stream of distinct shapes.
+const PREPARED_STATEMENT_CAP: usize = 512;
+
+/// Per-connection registry of named prepared statements, keyed by [`ShapeKey`].
+/// PG prepared statements are session-local, so each connection tracks its own.
+/// A shape statement queries the shared per-relation cache tables and stays valid
+/// while the relation is cached; query eviction does not invalidate it, and a
+/// schema change evicts every query on the relation (so the statement is simply
+/// never executed again and ages out via the FIFO cap). Lifecycle is therefore
+/// decoupled from cache eviction — no per-serve reconciliation against the cache.
 pub(crate) struct PreparedStatements {
-    /// Prepared fingerprints; doubles as the round-robin reconciliation cursor
-    /// (front = next to check).
-    order: VecDeque<Fingerprint>,
+    /// Prepared shapes in insertion order; front = oldest (first to evict).
+    order: VecDeque<ShapeKey>,
     /// Membership set for O(1) lookup; mirrors `order`.
-    live: FingerprintSet,
+    live: HashSet<ShapeKey>,
 }
 
 impl PreparedStatements {
@@ -51,32 +61,24 @@ impl PreparedStatements {
         }
     }
 
-    fn contains(&self, fingerprint: Fingerprint) -> bool {
-        self.live.contains(&fingerprint)
+    fn contains(&self, key: ShapeKey) -> bool {
+        self.live.contains(&key)
     }
 
-    /// Record `fingerprint` as newly prepared on this connection.
-    fn insert(&mut self, fingerprint: Fingerprint) {
-        self.order.push_back(fingerprint);
-        self.live.insert(fingerprint);
-    }
-
-    /// One bounded step of round-robin reconciliation: check the oldest tracked
-    /// statement against `is_live`. If still live, rotate it to the back and
-    /// return `None`; if its query was evicted, drop it and return its
-    /// fingerprint so the caller closes the statement on the cache DB.
-    pub(crate) fn reconcile_one(
-        &mut self,
-        is_live: impl Fn(Fingerprint) -> bool,
-    ) -> Option<Fingerprint> {
-        let &fingerprint = self.order.front()?;
-        if is_live(fingerprint) {
-            self.order.rotate_left(1);
-            None
+    /// Record `key` as newly prepared on this connection. If that pushes the
+    /// registry past [`PREPARED_STATEMENT_CAP`], evict the oldest shape and return
+    /// its key so the caller closes that statement on the cache DB.
+    fn insert(&mut self, key: ShapeKey) -> Option<ShapeKey> {
+        self.order.push_back(key);
+        self.live.insert(key);
+        if self.order.len() > PREPARED_STATEMENT_CAP {
+            let evicted = self.order.pop_front();
+            if let Some(evicted) = evicted {
+                self.live.remove(&evicted);
+            }
+            evicted
         } else {
-            self.order.pop_front();
-            self.live.remove(&fingerprint);
-            Some(fingerprint)
+            None
         }
     }
 }
@@ -89,8 +91,8 @@ pub struct PrepareOutcome {
     pub sent_setgen_parse: bool,
     /// A Parse for the SELECT was sent (expect a ParseComplete).
     pub sent_parse: bool,
-    /// A Close for an evicted statement was sent ahead of the SELECT (expect a
-    /// CloseComplete before the SELECT's ParseComplete).
+    /// A Close for a FIFO-evicted shape statement was sent ahead of the SELECT
+    /// (expect a CloseComplete before the SELECT's ParseComplete).
     pub sent_close: bool,
 }
 
@@ -274,32 +276,40 @@ impl CacheConnection {
     /// reads the GUC at scan-begin to record scanned rows under the generation, so
     /// this must run before the SELECT — pipeline order guarantees that.
     ///
-    /// A Parse is emitted for the SELECT only the first time `fingerprint`'s
-    /// statement is used on this connection; the set_config Parse only the first
-    /// time anything is served on this connection. `limit_text`/`offset_text` bind
-    /// `$1`/`$2` as text (None → NULL = no limit / offset 0).
+    /// The SELECT in `self.sql_buf` is the shape SQL, carrying `$1..$k` for the
+    /// shape's literals followed by `$(k+1)`/`$(k+2)` for `LIMIT`/`OFFSET`.
+    /// `literal_params` binds `$1..$k` (text format, all non-NULL by construction);
+    /// `limit_text`/`offset_text` bind the trailing two (None → NULL = no limit /
+    /// offset 0). The literal params are Parsed with type OID 0 (inferred from
+    /// context); the LIMIT/OFFSET pair is typed `int8`.
     ///
-    /// `close_victim`, when set, is a statement whose query was evicted; a `Close`
-    /// for it is pipelined so its CloseComplete precedes the SELECT response.
-    /// Returns a [`PrepareOutcome`] so the caller's response state machine knows
-    /// which completion messages to expect. Built into the recycled `write_buf`,
-    /// sent in one write.
+    /// A Parse is emitted for the SELECT only the first time `shape_key`'s statement
+    /// is used on this connection; the set_config Parse only the first time anything
+    /// is served on this connection.
+    ///
+    /// If preparing this shape evicts the oldest shape from the FIFO cap, a `Close`
+    /// for the evicted statement is pipelined so its CloseComplete precedes the
+    /// SELECT response. Returns a [`PrepareOutcome`] so the caller's response state
+    /// machine knows which completion messages to expect. Built into the recycled
+    /// `write_buf`, sent in one write.
     #[allow(clippy::too_many_arguments)]
     pub async fn pipelined_named_query_send(
         &mut self,
-        fingerprint: Fingerprint,
+        shape_key: ShapeKey,
         generation: u64,
+        literals: &[LiteralValue],
         limit_text: Option<&str>,
         offset_text: Option<&str>,
         include_describe: bool,
         binary_results: bool,
-        close_victim: Option<Fingerprint>,
     ) -> CacheResult<PrepareOutcome> {
-        let send_parse = !self.prepared.contains(fingerprint);
-        let name = statement_name_bytes(fingerprint);
-        if send_parse {
-            self.prepared.insert(fingerprint);
-        }
+        let send_parse = !self.prepared.contains(shape_key);
+        let name = statement_name_bytes(shape_key);
+        let close_victim = if send_parse {
+            self.prepared.insert(shape_key)
+        } else {
+            None
+        };
         let send_setgen_parse = !self.setgen_parsed;
         self.setgen_parsed = true;
 
@@ -315,6 +325,7 @@ impl CacheConnection {
             SETGEN_STATEMENT_NAME,
             SETGEN_SQL,
             send_setgen_parse,
+            &[],
             &[TEXT_OID],
             &[Some(gen_text)],
             false, // no Describe
@@ -322,10 +333,10 @@ impl CacheConnection {
             false, // no Sync — shared with the SELECT below
         )?;
 
-        // Close the reconciled (evicted) statement ahead of the SELECT so its
+        // Close the FIFO-evicted shape statement ahead of the SELECT so its
         // CloseComplete precedes the SELECT response.
-        if let Some(victim_fp) = close_victim {
-            let victim_name = statement_name_bytes(victim_fp);
+        if let Some(victim_key) = close_victim {
+            let victim_name = statement_name_bytes(victim_key);
             frontend_msg_append(&mut self.write_buf, b'C', |b| {
                 b.put_u8(b'S'); // close a prepared statement
                 b.put_slice(&victim_name);
@@ -334,11 +345,15 @@ impl CacheConnection {
             })?;
         }
 
+        // Params: the shape's `$1..$k` literals (rendered inline, OID 0 inferred)
+        // then `LIMIT`/`OFFSET` typed `int8`. Borrowed slices only — no per-hit
+        // allocation.
         extended_query_build(
             &mut self.write_buf,
             &name,
             &self.sql_buf,
             send_parse,
+            literals,
             &[INT8_OID, INT8_OID],
             &[limit_text, offset_text],
             include_describe,
@@ -373,6 +388,7 @@ impl CacheConnection {
             b"",
             &self.sql_buf,
             true,
+            &[],
             &[],
             &[],
             include_describe,
@@ -430,33 +446,80 @@ fn frontend_msg_append(
     Ok(())
 }
 
+/// Append a text-format Bind parameter (4-byte length + raw bytes) to `buf`.
+fn bind_text_write(buf: &mut BytesMut, bytes: &[u8]) -> CacheResult<()> {
+    let len = i32::try_from(bytes.len()).map_err(|_| CacheError::InvalidMessage)?;
+    buf.put_i32(len);
+    buf.put_slice(bytes);
+    Ok(())
+}
+
+/// Append a shape literal as a text-format Bind parameter — the raw value, not a
+/// SQL literal (no quoting). Renders directly into `buf` to keep the serve hot
+/// path allocation-free (int/bool/string render without a heap value; only the
+/// rare `Float` path uses an inline `EcoString`). Only the four forms
+/// `literal_is_parameterizable` admits reach a shape's literals; any other is a
+/// logic error and binds empty under a debug assertion.
+fn bind_value_write(buf: &mut BytesMut, literal: &LiteralValue) -> CacheResult<()> {
+    match literal {
+        LiteralValue::String(s) => bind_text_write(buf, s.as_bytes()),
+        LiteralValue::Integer(i) => {
+            let mut itoa_buf = itoa::Buffer::new();
+            bind_text_write(buf, itoa_buf.format(*i).as_bytes())
+        }
+        LiteralValue::Boolean(v) => bind_text_write(buf, if *v { b"t" } else { b"f" }),
+        LiteralValue::Float(f) => {
+            let mut s = EcoString::new();
+            let _ = write!(s, "{}", f.into_inner());
+            bind_text_write(buf, s.as_bytes())
+        }
+        LiteralValue::StringWithCast(..)
+        | LiteralValue::Array(..)
+        | LiteralValue::Null
+        | LiteralValue::NullWithCast(_)
+        | LiteralValue::Parameter(_) => {
+            debug_assert!(false, "non-parameterizable literal in shape binds");
+            bind_text_write(buf, b"")
+        }
+    }
+}
+
 /// Build a Parse + Bind + [Describe('P')] + Execute + Sync message group into
 /// `buf`. `name` is the prepared-statement name (empty slice = unnamed). When
-/// `send_parse` is true a Parse declaring `param_oids` is emitted (first use of a
-/// named statement, or every time for an unnamed one); otherwise only
-/// Bind/Execute are sent, reusing the existing named statement. Bind sends
-/// `params` in text format (None = NULL) and selects the result format via
-/// `binary_results` (binary, vs all-text when false).
+/// `send_parse` is true a Parse is emitted (first use of a named statement, or
+/// every time for an unnamed one); otherwise only Bind/Execute are sent, reusing
+/// the existing named statement.
+///
+/// Two param groups, bound in order: `literal_params` (the shape's `$1..$k`,
+/// rendered inline as text with type OID 0 — inferred from context) followed by
+/// `tail_params` (text, None = NULL) typed by `tail_param_oids` — kept as
+/// borrowed slices so the serve hot path allocates nothing per hit. The result
+/// format is binary when `binary_results`, else all-text.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn extended_query_build(
     buf: &mut BytesMut,
     name: &[u8],
     sql: &str,
     send_parse: bool,
-    param_oids: &[u32],
-    params: &[Option<&str>],
+    literal_params: &[LiteralValue],
+    tail_param_oids: &[u32],
+    tail_params: &[Option<&str>],
     include_describe: bool,
     binary_results: bool,
     include_sync: bool,
 ) -> CacheResult<()> {
+    let param_count = literal_params.len() + tail_params.len();
     if send_parse {
         frontend_msg_append(buf, b'P', |b| {
             b.put_slice(name);
             b.put_u8(0); // statement name terminator
             b.put_slice(sql.as_bytes());
             b.put_u8(0); // SQL terminator
-            b.put_i16(i16::try_from(param_oids.len()).map_err(|_| CacheError::InvalidMessage)?);
-            for &oid in param_oids {
+            b.put_i16(i16::try_from(param_count).map_err(|_| CacheError::InvalidMessage)?);
+            for _ in 0..literal_params.len() {
+                b.put_u32(0); // inferred from context
+            }
+            for &oid in tail_param_oids {
                 b.put_u32(oid);
             }
             Ok(())
@@ -468,14 +531,13 @@ fn extended_query_build(
         b.put_slice(name);
         b.put_u8(0); // statement name terminator
         b.put_i16(0); // zero param format codes → all params text
-        b.put_i16(i16::try_from(params.len()).map_err(|_| CacheError::InvalidMessage)?);
-        for value in params {
+        b.put_i16(i16::try_from(param_count).map_err(|_| CacheError::InvalidMessage)?);
+        for literal in literal_params {
+            bind_value_write(b, literal)?;
+        }
+        for value in tail_params {
             match *value {
-                Some(s) => {
-                    let len = i32::try_from(s.len()).map_err(|_| CacheError::InvalidMessage)?;
-                    b.put_i32(len);
-                    b.put_slice(s.as_bytes());
-                }
+                Some(s) => bind_text_write(b, s.as_bytes())?,
                 None => b.put_i32(-1), // NULL
             }
         }
@@ -512,18 +574,18 @@ fn extended_query_build(
 /// Length of a prepared-statement name: `pgc_` + 16 hex digits.
 const STATEMENT_NAME_LEN: usize = 20;
 
-/// Deterministic prepared-statement name for a query fingerprint, formatted into
-/// a fixed stack buffer to avoid a per-hit heap allocation on the serve path.
-/// Equivalent to `format!("pgc_{fingerprint:016x}")`. The fingerprint uniquely
-/// determines the SQL, so the name is a stable key and a re-registered identical
-/// query safely reuses any surviving statement.
-fn statement_name_bytes(fingerprint: Fingerprint) -> [u8; STATEMENT_NAME_LEN] {
-    let fingerprint = fingerprint.get();
+/// Deterministic prepared-statement name for a query shape, formatted into a
+/// fixed stack buffer to avoid a per-hit heap allocation on the serve path.
+/// Equivalent to `format!("pgc_{:016x}", shape_key.raw())`. The shape key uniquely
+/// determines the parameterized SQL, so the name is a stable key shared by every
+/// query of that shape.
+fn statement_name_bytes(shape_key: ShapeKey) -> [u8; STATEMENT_NAME_LEN] {
+    let key = shape_key.raw();
     let mut name = [0u8; STATEMENT_NAME_LEN];
     let (prefix, hex) = name.split_at_mut(4);
     prefix.copy_from_slice(b"pgc_");
     for (i, slot) in hex.iter_mut().enumerate() {
-        let nibble = (fingerprint >> ((15 - i) * 4)) & 0xf;
+        let nibble = (key >> ((15 - i) * 4)) & 0xf;
         *slot = char::from_digit(nibble as u32, 16).unwrap_or('0') as u8;
     }
     name
@@ -534,49 +596,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepared_statements_reconcile_keeps_live_closes_evicted() {
+    fn prepared_statements_insert_tracks_membership_no_eviction_under_cap() {
         let mut p = PreparedStatements::new();
-        p.insert(Fingerprint::from_raw(10));
-        p.insert(Fingerprint::from_raw(20));
-        p.insert(Fingerprint::from_raw(30)); // order [10,20,30]
+        assert_eq!(p.insert(ShapeKey::from_raw(10)), None);
+        assert_eq!(p.insert(ShapeKey::from_raw(20)), None);
+        assert_eq!(p.insert(ShapeKey::from_raw(30)), None);
         assert!(
-            p.contains(Fingerprint::from_raw(10))
-                && p.contains(Fingerprint::from_raw(20))
-                && p.contains(Fingerprint::from_raw(30))
+            p.contains(ShapeKey::from_raw(10))
+                && p.contains(ShapeKey::from_raw(20))
+                && p.contains(ShapeKey::from_raw(30))
         );
+        assert!(!p.contains(ShapeKey::from_raw(40)));
+    }
 
-        // All live → rotate, never close. order: [10,20,30] → [20,30,10] → [30,10,20].
-        assert_eq!(p.reconcile_one(|_| true), None);
-        assert_eq!(p.reconcile_one(|_| true), None);
-        assert!(
-            p.contains(Fingerprint::from_raw(10))
-                && p.contains(Fingerprint::from_raw(20))
-                && p.contains(Fingerprint::from_raw(30))
-        );
-
-        // Front is now 30; mark it evicted → reconcile closes and drops it.
+    #[test]
+    fn prepared_statements_evicts_oldest_at_cap() {
+        let mut p = PreparedStatements::new();
+        for i in 0..PREPARED_STATEMENT_CAP as u64 {
+            assert_eq!(p.insert(ShapeKey::from_raw(i)), None);
+        }
+        // One past the cap evicts the oldest (shape 0), returned for the caller to
+        // close; everything else stays.
         assert_eq!(
-            p.reconcile_one(|fp| fp != Fingerprint::from_raw(30)),
-            Some(Fingerprint::from_raw(30))
+            p.insert(ShapeKey::from_raw(PREPARED_STATEMENT_CAP as u64)),
+            Some(ShapeKey::from_raw(0))
         );
-        assert!(!p.contains(Fingerprint::from_raw(30)));
-        assert!(p.contains(Fingerprint::from_raw(10)) && p.contains(Fingerprint::from_raw(20)));
-
-        // Remaining are live → no more closes.
-        assert_eq!(p.reconcile_one(|_| true), None);
-        assert_eq!(p.reconcile_one(|_| true), None);
-        assert!(p.contains(Fingerprint::from_raw(10)) && p.contains(Fingerprint::from_raw(20)));
+        assert!(!p.contains(ShapeKey::from_raw(0)));
+        assert!(p.contains(ShapeKey::from_raw(1)));
+        assert!(p.contains(ShapeKey::from_raw(PREPARED_STATEMENT_CAP as u64)));
     }
 
     #[test]
     fn statement_name_bytes_matches_format() {
-        for fp in [0u64, 1, 0xdead_beef, 0x0123_4567_89ab_cdef, u64::MAX] {
-            let expected = format!("pgc_{fp:016x}");
-            let got = statement_name_bytes(Fingerprint::from_raw(fp));
+        for key in [0u64, 1, 0xdead_beef, 0x0123_4567_89ab_cdef, u64::MAX] {
+            let expected = format!("pgc_{key:016x}");
+            let got = statement_name_bytes(ShapeKey::from_raw(key));
             assert_eq!(
                 std::str::from_utf8(&got).expect("ascii name"),
                 expected,
-                "fingerprint {fp:#x}"
+                "shape key {key:#x}"
             );
         }
     }
