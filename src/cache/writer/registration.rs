@@ -341,10 +341,17 @@ impl WriterRegistration {
                 .await
                 .map_into_report::<CacheError>()?;
 
+            // Each worker reads from origin on its own connection so the origin
+            // executes population SELECTs concurrently rather than serializing
+            // them on one shared backend.
+            let origin_conn = pg::connect(&settings.origin, &format!("population origin {i}"))
+                .await
+                .map_into_report::<CacheError>()?;
+
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
             populate_txs.push(tx);
 
-            let worker_db_origin = Rc::clone(db_origin);
+            let worker_origin_settings = settings.origin.clone();
             let worker_query_tx = query_tx.clone();
             let worker_throttled = Arc::clone(&registration_throttled);
 
@@ -352,7 +359,8 @@ impl WriterRegistration {
                 population_worker(
                     i,
                     rx,
-                    worker_db_origin,
+                    origin_conn,
+                    worker_origin_settings,
                     cache_conn,
                     worker_query_tx,
                     worker_throttled,

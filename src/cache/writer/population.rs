@@ -1,9 +1,9 @@
 use crate::catalog::Oid;
 use crate::pg::Lsn;
 use crate::query::Fingerprint;
+use crate::settings::PgSettings;
 use std::collections::HashSet;
 use std::fmt::Write;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -83,7 +83,8 @@ async fn fault_population_delay() {}
 pub async fn population_worker(
     id: usize,
     mut rx: UnboundedReceiver<PopulationWork>,
-    db_origin: Rc<Client>,
+    mut db_origin: Client,
+    origin_settings: PgSettings,
     db_cache: Client,
     query_tx: UnboundedSender<QueryCommand>,
     throttled: Arc<AtomicBool>,
@@ -123,6 +124,24 @@ pub async fn population_worker(
             .population_wait
             .record(work.enqueued_at.elapsed().as_secs_f64());
 
+        // A dropped origin connection only surfaces on the next work item (a
+        // mid-population drop fails that population, which forwards to origin).
+        // Reconnect before reading so the worker self-heals instead of failing
+        // every population until the cache subsystem restarts.
+        if db_origin.is_closed() {
+            match crate::pg::connect(&origin_settings, &format!("population origin {id}")).await {
+                Ok(c) => db_origin = c,
+                Err(e) => {
+                    error!("population worker {id}: origin reconnect failed: {e}");
+                    let _ = query_tx.send(QueryCommand::Failed {
+                        fingerprint: work.fingerprint,
+                        generation: work.generation,
+                    });
+                    continue;
+                }
+            }
+        }
+
         let task_start = Instant::now();
         let mut attempt: u32 = 0;
         let result = loop {
@@ -132,7 +151,7 @@ pub async fn population_worker(
                 &work.branches,
                 &work.table_metadata,
                 work.max_limit,
-                Rc::clone(&db_origin),
+                &db_origin,
                 &db_cache,
             )
             .await;
@@ -226,7 +245,7 @@ async fn population_task(
     branches: &[ResolvedSelectNode],
     table_metadata: &[TableMetadata],
     max_limit: Option<u64>,
-    db_origin: Rc<Client>,
+    db_origin: &Client,
     db_cache: &Client,
 ) -> CacheResult<(usize, u64, Vec<(Oid, EcoString)>, Lsn)> {
     // Generation stamping no longer happens here — it moves to the writer's
@@ -262,7 +281,7 @@ async fn population_task(
 
             let stream_start = Instant::now();
             let (bytes, rows) = population_stream(
-                &db_origin, db_cache, table, table_node, branch, max_limit, &staging, fresh,
+                db_origin, db_cache, table, table_node, branch, max_limit, &staging, fresh,
             )
             .await?;
             let stream_elapsed = stream_start.elapsed();
@@ -287,7 +306,7 @@ async fn population_task(
 
     // Capture the snapshot upper-bound LSN after all reads, for the
     // deferred-Ready gate (PGC-250 Slice B).
-    let snapshot_lsn = origin_snapshot_lsn(&db_origin).await?;
+    let snapshot_lsn = origin_snapshot_lsn(db_origin).await?;
 
     let task_elapsed = task_start.elapsed();
     trace!(
