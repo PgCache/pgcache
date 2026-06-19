@@ -15,6 +15,8 @@ use super::super::core::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, WriterC
 use super::super::staging::pk_body_render;
 
 use super::*;
+use crate::catalog::TableMetadata;
+use crate::pg::Lsn;
 
 impl WriterCdc {
     /// Handle a CDC command, dispatching to the appropriate method.
@@ -63,81 +65,7 @@ impl WriterCdc {
                 }
             }
             CdcCommand::TableRegister(table_metadata) => {
-                core.frame_relation_oids.insert(table_metadata.relation_oid);
-                let relation_oid = table_metadata.relation_oid;
-                // A mid-frame Relation message whose metadata CHANGED (intra-txn
-                // DDL): the relation's buffered events were captured under the
-                // old column layout, so replaying them after the recreate
-                // misaligns position-based lookups and references dropped
-                // columns. (An identical re-sent Relation — e.g. after a
-                // publication change — leaves everything in place.)
-                let metadata_changed = core
-                    .cache
-                    .tables
-                    .get1(&relation_oid)
-                    .is_none_or(|current| !current.schema_eq(&table_metadata));
-                if metadata_changed {
-                    if core.frame_buf_relations.contains(&relation_oid) {
-                        // The relation's cache-table writes (naming the old
-                        // columns) are already committed to `frame_buf` or
-                        // executed in the open cache txn — a partial replay
-                        // moved them out of `frame_rows`, so discarding events
-                        // can't retract them, and at COMMIT they would run
-                        // against the recreated table and fail. Escalate to
-                        // frame recovery: roll the cache txn back and let
-                        // CommitMark invalidate + repopulate every relation the
-                        // frame touched from post-DDL origin (PGC-264).
-                        self.frame_recover_enter(core)
-                            .await
-                            .attach_loc("mid-frame DDL on a buffered relation")?;
-                    } else {
-                        // No buffered writes yet: the relation's events are all
-                        // still in `frame_rows`. Discard them and purge its
-                        // toast overlay (a different relation's partial replay
-                        // may have recorded a stale entry under the old layout);
-                        // the recreate evicts its queries and empties the table,
-                        // so it rebuilds from origin (PGC-264).
-                        core.toast_overlay_relation_invalidate(relation_oid);
-                        let before = core.frame_rows.len();
-                        core.frame_rows.retain(|event| match event {
-                            FrameRowEvent::Insert {
-                                relation_oid: r, ..
-                            }
-                            | FrameRowEvent::Update {
-                                relation_oid: r, ..
-                            }
-                            | FrameRowEvent::UpdateToasted {
-                                relation_oid: r, ..
-                            }
-                            | FrameRowEvent::UpdateToastFallback {
-                                relation_oid: r, ..
-                            }
-                            | FrameRowEvent::Delete {
-                                relation_oid: r, ..
-                            } => *r != relation_oid,
-                            FrameRowEvent::Truncate { .. } | FrameRowEvent::Boundary { .. } => true,
-                        });
-                        if core.frame_rows.len() != before {
-                            core.batch_truncated_relations.push(relation_oid);
-                        }
-                    }
-                }
-                // Schema change: prepared eval SQL embeds the column list —
-                // drop the relation's cached statements so the next use
-                // re-prepares against the new shape.
-                self.prepared_row_change.pop(&relation_oid);
-                let stale: Vec<PreparedEvalKey> = self
-                    .prepared_membership
-                    .iter()
-                    .map(|(key, _)| *key)
-                    .filter(|key| key.relation_oid == relation_oid)
-                    .collect();
-                for key in stale {
-                    self.prepared_membership.pop(&key);
-                }
-                core.cache_table_register(table_metadata)
-                    .await
-                    .attach_loc("cdc table register")?;
+                self.table_register_handle(core, table_metadata).await?;
             }
             CdcCommand::Insert {
                 relation_oid,
@@ -241,33 +169,7 @@ impl WriterCdc {
                 }
             }
             CdcCommand::CommitMark { lsn } => {
-                // The frame's commit boundary rides in the event log (PGC-242):
-                // deleted keys and truncate watermarks are produced *during
-                // replay* (`frame_cache_delete` runs in the decide pass), so
-                // the per-frame LSN context must travel with the events for
-                // logs that span multiple frames.
-                core.frame_rows
-                    .push(FrameRowEvent::Boundary { commit_lsn: lsn });
-                core.batch_frames += 1;
-                core.batch_last_lsn = lsn;
-                core.frame_open = false;
-
-                // Flush decision (PGC-242): an empty queue flushes immediately
-                // (caught up — today's per-frame behavior, zero added
-                // latency); a backlog accumulates, amortizing eval and commit
-                // round-trips over the frames that would otherwise wait in the
-                // queue anyway. `Recovering` flushes now (recovery semantics
-                // are batch-terminal), and the size caps bound memory, the
-                // memo-bracket window, and the recovery blast radius — they
-                // override a fault-injected hold; the queue-empty trigger
-                // respects it.
-                let flush = core.frame_state == FrameState::Recovering
-                    || core.batch_events >= FRAME_ROWS_CAPACITY
-                    || core.batch_frames >= BATCH_FRAMES_MAX
-                    || (queued == 0 && !fault_cdc_hold_flush(core.batch_frames));
-                if flush {
-                    self.batch_flush(core, lsn).await?;
-                }
+                self.commit_mark_handle(core, lsn, queued).await?;
             }
             CdcCommand::KeepAliveMark { lsn } => {
                 // Keepalives only arrive between source transactions, so no
@@ -294,6 +196,125 @@ impl WriterCdc {
         // (frame just committed) and KeepAlive (no frame).
         core.publication_dirty_drain().await?;
         cmd_handle.record(handle_start.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    pub(super) async fn table_register_handle(
+        &mut self,
+        core: &mut WriterCore,
+        table_metadata: TableMetadata,
+    ) -> CacheResult<()> {
+        core.frame_relation_oids.insert(table_metadata.relation_oid);
+        let relation_oid = table_metadata.relation_oid;
+        // A mid-frame Relation message whose metadata CHANGED (intra-txn
+        // DDL): the relation's buffered events were captured under the
+        // old column layout, so replaying them after the recreate
+        // misaligns position-based lookups and references dropped
+        // columns. (An identical re-sent Relation — e.g. after a
+        // publication change — leaves everything in place.)
+        let metadata_changed = core
+            .cache
+            .tables
+            .get1(&relation_oid)
+            .is_none_or(|current| !current.schema_eq(&table_metadata));
+        if metadata_changed {
+            if core.frame_buf_relations.contains(&relation_oid) {
+                // The relation's cache-table writes (naming the old
+                // columns) are already committed to `frame_buf` or
+                // executed in the open cache txn — a partial replay
+                // moved them out of `frame_rows`, so discarding events
+                // can't retract them, and at COMMIT they would run
+                // against the recreated table and fail. Escalate to
+                // frame recovery: roll the cache txn back and let
+                // CommitMark invalidate + repopulate every relation the
+                // frame touched from post-DDL origin (PGC-264).
+                self.frame_recover_enter(core)
+                    .await
+                    .attach_loc("mid-frame DDL on a buffered relation")?;
+            } else {
+                // No buffered writes yet: the relation's events are all
+                // still in `frame_rows`. Discard them and purge its
+                // toast overlay (a different relation's partial replay
+                // may have recorded a stale entry under the old layout);
+                // the recreate evicts its queries and empties the table,
+                // so it rebuilds from origin (PGC-264).
+                core.toast_overlay_relation_invalidate(relation_oid);
+                let before = core.frame_rows.len();
+                core.frame_rows.retain(|event| match event {
+                    FrameRowEvent::Insert {
+                        relation_oid: r, ..
+                    }
+                    | FrameRowEvent::Update {
+                        relation_oid: r, ..
+                    }
+                    | FrameRowEvent::UpdateToasted {
+                        relation_oid: r, ..
+                    }
+                    | FrameRowEvent::UpdateToastFallback {
+                        relation_oid: r, ..
+                    }
+                    | FrameRowEvent::Delete {
+                        relation_oid: r, ..
+                    } => *r != relation_oid,
+                    FrameRowEvent::Truncate { .. } | FrameRowEvent::Boundary { .. } => true,
+                });
+                if core.frame_rows.len() != before {
+                    core.batch_truncated_relations.push(relation_oid);
+                }
+            }
+        }
+        // Schema change: prepared eval SQL embeds the column list —
+        // drop the relation's cached statements so the next use
+        // re-prepares against the new shape.
+        self.prepared_row_change.pop(&relation_oid);
+        let stale: Vec<PreparedEvalKey> = self
+            .prepared_membership
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|key| key.relation_oid == relation_oid)
+            .collect();
+        for key in stale {
+            self.prepared_membership.pop(&key);
+        }
+        core.cache_table_register(table_metadata)
+            .await
+            .attach_loc("cdc table register")?;
+        Ok(())
+    }
+
+    pub(super) async fn commit_mark_handle(
+        &mut self,
+        core: &mut WriterCore,
+        lsn: Lsn,
+        queued: usize,
+    ) -> CacheResult<()> {
+        // The frame's commit boundary rides in the event log (PGC-242):
+        // deleted keys and truncate watermarks are produced *during
+        // replay* (`frame_cache_delete` runs in the decide pass), so
+        // the per-frame LSN context must travel with the events for
+        // logs that span multiple frames.
+        core.frame_rows
+            .push(FrameRowEvent::Boundary { commit_lsn: lsn });
+        core.batch_frames += 1;
+        core.batch_last_lsn = lsn;
+        core.frame_open = false;
+
+        // Flush decision (PGC-242): an empty queue flushes immediately
+        // (caught up — today's per-frame behavior, zero added
+        // latency); a backlog accumulates, amortizing eval and commit
+        // round-trips over the frames that would otherwise wait in the
+        // queue anyway. `Recovering` flushes now (recovery semantics
+        // are batch-terminal), and the size caps bound memory, the
+        // memo-bracket window, and the recovery blast radius — they
+        // override a fault-injected hold; the queue-empty trigger
+        // respects it.
+        let flush = core.frame_state == FrameState::Recovering
+            || core.batch_events >= FRAME_ROWS_CAPACITY
+            || core.batch_frames >= BATCH_FRAMES_MAX
+            || (queued == 0 && !fault_cdc_hold_flush(core.batch_frames));
+        if flush {
+            self.batch_flush(core, lsn).await?;
+        }
         Ok(())
     }
 

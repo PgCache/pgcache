@@ -474,17 +474,6 @@ impl WriterCdc {
         Ok(None)
     }
 
-    /// Check if all WHERE constraints for a table match the given row values.
-    /// Returns true if all constraints match (or no constraints exist for this table).
-    fn row_constraints_match(
-        &self,
-        constraints: &QueryConstraints,
-        table_metadata: &TableMetadata,
-        row_data: &[Option<ByteString>],
-    ) -> bool {
-        row_constraints_match(constraints, table_metadata, row_data)
-    }
-
     /// Determine if a query should be invalidated when the row is not currently cached.
     /// Returns true if the query should be invalidated.
     fn row_uncached_invalidation_check(
@@ -528,7 +517,7 @@ impl WriterCdc {
                     !join_membership_unchanged(update_query, table_metadata, key_data)
                 } else {
                     // Check if row matches table constraints - invalidate only if it matches
-                    self.row_constraints_match(&update_query.constraints, table_metadata, row_data)
+                    row_constraints_match(&update_query.constraints, table_metadata, row_data)
                 }
             }
             UpdateQuerySource::Subquery(kind) => {
@@ -543,7 +532,7 @@ impl WriterCdc {
                 let row_added = if !has_table_constraints {
                     !join_membership_unchanged(update_query, table_metadata, key_data)
                 } else {
-                    self.row_constraints_match(&update_query.constraints, table_metadata, row_data)
+                    row_constraints_match(&update_query.constraints, table_metadata, row_data)
                 };
 
                 // Check constraints — if row doesn't match constraints for this
@@ -581,7 +570,7 @@ impl WriterCdc {
                 // cascade to affect other tables' result set membership (e.g. a
                 // new match may activate a downstream join path that was previously
                 // NULL-padded). Invalidate if the row is relevant to this query.
-                self.row_constraints_match(&update_query.constraints, table_metadata, row_data)
+                row_constraints_match(&update_query.constraints, table_metadata, row_data)
             }
         }
     }
@@ -635,7 +624,7 @@ impl WriterCdc {
             }
 
             // Check constraints - skip if row doesn't match
-            if !self.row_constraints_match(&update_query.constraints, table_metadata, row_data) {
+            if !row_constraints_match(&update_query.constraints, table_metadata, row_data) {
                 continue;
             }
 
