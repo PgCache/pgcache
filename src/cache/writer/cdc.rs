@@ -3507,9 +3507,15 @@ impl WriterCdc {
             }
 
             // PgEval (the expensive set): only Fresh-MV queries need full
-            // evaluation (to dirty-mark matches); the rest short-circuit.
-            let pg_eval: Vec<&UpdateQuery> = update_queries
-                .iter_complexity_ordered()
+            // evaluation (to dirty-mark matches); the rest short-circuit. Built
+            // from the shared per-row candidate probe rather than a full sweep of
+            // the relation's queries: `eval_index` holds the whole population
+            // (LocalEval and PgEval alike), so `local_candidates` already contains
+            // every PgEval query this row could match — narrowing here never drops
+            // a true match, exactly as for the LocalEval loop above (PGC-292).
+            let pg_eval: Vec<&UpdateQuery> = local_candidates
+                .iter()
+                .filter_map(|fp| update_queries.queries.get(fp))
                 .filter(|q| {
                     q.eval_strategy == UpdateEvalStrategy::PgEval
                         && !core.frame_invalidations.contains(&q.fingerprint)
