@@ -1918,3 +1918,103 @@ mod tests {
         assert!(!population_finalize_allowed(None, 5));
     }
 }
+
+impl WriterCore {
+    /// Invalidate all cached queries that reference a table.
+    pub(super) async fn cache_table_invalidate(&mut self, relation_oid: Oid) -> CacheResult<()> {
+        let fingerprints: Vec<Fingerprint> = self
+            .cache
+            .cached_queries
+            .iter()
+            .filter(|q| q.relation_oids.contains(&relation_oid))
+            .map(|q| q.fingerprint)
+            .collect();
+
+        for fp in fingerprints {
+            self.cache_query_evict(fp).await?;
+        }
+        Ok(())
+    }
+
+    /// Fully evict a cached query: remove from all data structures and purge rows.
+    /// Used by the eviction loop and schema-change (table) invalidation.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    pub(super) async fn cache_query_evict(&mut self, fingerprint: Fingerprint) -> CacheResult<()> {
+        let Some(query) = self.cache.cached_queries.remove1(&fingerprint) else {
+            trace!(fingerprint = %fingerprint, "cache_query_evict: not found, skipping");
+            return Ok(());
+        };
+
+        debug!(
+            fingerprint = %fingerprint,
+            generation = query.generation,
+            relation_oids = ?query.relation_oids,
+            "cache_query_evict entry"
+        );
+        if let Some(mut m) = self.state_view.metrics.get_mut(&fingerprint) {
+            m.eviction_count += 1;
+            m.cached_since_ns = None;
+        }
+        // Removal paths defer publication sync to the end-of-command drain
+        // (publication_dirty_drain) — stale subscriptions to the dropped
+        // oid are filtered out by the writer ignoring its CDC events.
+        self.active_relations_release(&query.relation_oids);
+
+        let prev_generation_threshold = self.cache.generation_purge_threshold();
+
+        // Remove generation from tracking
+        self.cache.generations.remove(&query.generation);
+
+        // Drop the MV table (if any) before removing the state_view entry so we
+        // can read the mv_state. Errors are logged but don't abort the eviction.
+        // Unlike the other db_cache maintenance, this is NOT frame-deferred:
+        // MV tables (pgcache_mv schema) are never written by the frame, which
+        // only touches source cache tables — so a DROP here can't deadlock on
+        // the frame's locks even when reached in-frame (e.g. via truncate
+        // invalidation).
+        let mv_state = self
+            .state_view
+            .cached_queries
+            .get(&fingerprint)
+            .map(|v| v.mv.state);
+        if let Some(mv_state) = mv_state
+            && let Err(e) = self.mv_drop(fingerprint, mv_state).await
+        {
+            error!(
+                "mv drop on eviction failed for {fingerprint}: {}",
+                error_chain_format(e.current_context()),
+            );
+        }
+
+        // Remove from state view
+        self.state_view.cached_queries.remove(&fingerprint);
+
+        // The memo is deliberately NOT swept here. An evicted query is removed
+        // from `cached_queries`, so it is no longer Ready and its orphan memo is
+        // never reached by the serve path (`memo_serve_plan` runs only on the
+        // Ready hit path). When the query re-registers and is served again, that
+        // serve re-captures and replaces the orphan under the same `MemoKey`. So
+        // eviction leaves a correctness-safe orphan: unreachable until replaced,
+        // and bounded by the memo byte budget (a full store rejects new captures,
+        // no leak). Coupling memo removal to query eviction would need a
+        // fingerprint→keys index, not just an O(n) scan per eviction — deferred
+        // until orphan accumulation under a write-light, high-cardinality
+        // workload is shown to matter (PGC-277).
+
+        // Drain coalesced waiters parked on the now-removed query (eviction can
+        // remove a Loading query whose waiters would otherwise never be drained).
+        self.waiters_fail(fingerprint);
+
+        self.cache
+            .update_queries_remove_fingerprint(fingerprint, &query.relation_oids);
+
+        // Purge generations when the threshold moved and the cache volume is
+        // under disk pressure (statvfs, PGC-276).
+        let new_threshold = self.cache.generation_purge_threshold();
+        if new_threshold > prev_generation_threshold && self.disk_pressure() {
+            self.generation_purge(new_threshold).await?;
+        }
+
+        Ok(())
+    }
+}
