@@ -74,7 +74,10 @@ pub fn resolved_query_expr_parameterize(
                 // `len()` is the count before this push, so the first literal
                 // becomes `$1` and binds to `literals[0]`.
                 let placeholder = EcoString::from(format!("${}", literals.len() + 1));
-                literals.push(std::mem::replace(literal, LiteralValue::Parameter(placeholder)));
+                literals.push(std::mem::replace(
+                    literal,
+                    LiteralValue::Parameter(placeholder),
+                ));
             }
         };
         query_expr_walk(&mut shaped, &mut visit);
@@ -321,12 +324,10 @@ mod tests {
     /// the serve-side prepared-statement sharing relies on.
     #[test]
     fn test_resolved_parameterize_shape_shared() {
-        let (a, _) = resolved_query_expr_parameterize(&resolve(
-            "SELECT id FROM users WHERE name = 'user1'",
-        ));
-        let (b, _) = resolved_query_expr_parameterize(&resolve(
-            "SELECT id FROM users WHERE name = 'user2'",
-        ));
+        let (a, _) =
+            resolved_query_expr_parameterize(&resolve("SELECT id FROM users WHERE name = 'user1'"));
+        let (b, _) =
+            resolved_query_expr_parameterize(&resolve("SELECT id FROM users WHERE name = 'user2'"));
         assert_eq!(deparse(&a), deparse(&b));
         assert!(deparse(&a).contains("$1"));
         assert!(!deparse(&a).contains("user1"));
@@ -360,5 +361,24 @@ mod tests {
             "SELECT id, name FROM users WHERE id = 3 ORDER BY 1",
         ));
         assert_eq!(literals, vec![LiteralValue::Integer(3)]);
+    }
+
+    /// Pins the ORDER BY split (PGC-322): a predicate-position literal (the
+    /// HAVING comparison) is parameterized, while a query-level `ORDER BY 1`
+    /// (positional) is left inline. The walk descends predicate-position
+    /// expressions, including aggregate internals (args / aggregate ORDER BY)
+    /// reached through them, but never the query-level ORDER BY.
+    #[test]
+    fn test_resolved_parameterize_having_predicate_but_not_order_by() {
+        let (shaped, literals) = resolved_query_expr_parameterize(&resolve(
+            "SELECT id FROM users GROUP BY id HAVING count(*) > 0 ORDER BY 1",
+        ));
+        // Only HAVING's `0` is parameterized; the positional `ORDER BY 1` is not.
+        assert_eq!(literals, vec![LiteralValue::Integer(0)]);
+        let sql = deparse(&shaped);
+        assert!(
+            sql.contains("ORDER BY 1"),
+            "positional ORDER BY stays inline: {sql}"
+        );
     }
 }

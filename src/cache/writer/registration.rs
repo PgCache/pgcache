@@ -1430,7 +1430,8 @@ impl WriterRegistration {
             // Return the population's staging tables to the pool (PGC-293)
             // regardless of outcome, before any `?` below could short-circuit
             // the drain and leak them.
-            core.staging_checkin(merge.fingerprint, merge.generation).await;
+            core.staging_checkin(merge.fingerprint, merge.generation)
+                .await;
             match outcome {
                 Ok(MergeOutcome::Merged) => {
                     merged_any = true;

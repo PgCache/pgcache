@@ -312,7 +312,10 @@ impl StagingPool {
         // A `(fingerprint, generation)` is dispatched once; a double checkout
         // would leak the prior hold's tables.
         let prev = self.checked_out.insert((fingerprint, generation), held);
-        debug_assert!(prev.is_none(), "staging pool double checkout {fingerprint}/{generation}");
+        debug_assert!(
+            prev.is_none(),
+            "staging pool double checkout {fingerprint}/{generation}"
+        );
         out
     }
 
@@ -752,7 +755,10 @@ mod tests {
 
         // Schema change: the checked-out table's epoch is now stale.
         let stale_free = pool.relation_epoch_bump(REL);
-        assert!(stale_free.is_empty(), "the only table is checked out, not free");
+        assert!(
+            stale_free.is_empty(),
+            "the only table is checked out, not free"
+        );
         assert!(!pool.epoch_current(oid, epoch_at_checkout));
     }
 
@@ -769,7 +775,11 @@ mod tests {
         }
 
         let stale = pool.relation_epoch_bump(REL);
-        assert_eq!(stale, vec![name], "schema change returns free tables to drop");
+        assert_eq!(
+            stale,
+            vec![name],
+            "schema change returns free tables to drop"
+        );
 
         let out = pool.checkout(fp, 2, &[REL]);
         assert!(out[0].2, "after purge the next checkout mints a fresh slot");

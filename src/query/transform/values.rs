@@ -692,6 +692,122 @@ mod tests {
         );
     }
 
+    // ==================== Nested-subquery scope characterization ====================
+    //
+    // The replaced table is always a *top-level* FROM entry, so references to
+    // it inside a nested subquery are correlated outer-references. The current
+    // alias rewrite is asymmetric by depth: the top-level handler covers
+    // WHERE/columns/GROUP BY/HAVING/JOIN-ON, but the nested-subquery handler
+    // covers only WHERE/columns/ORDER BY. The three tests below pin that
+    // asymmetry; the GROUP BY/HAVING/JOIN-ON gaps are the PGC-139/145 failure
+    // class one scope deeper, deferred to PGC-322 (the resolution there must
+    // also weigh that a name-based rewrite can mis-touch a shadowing inner
+    // instance of the same table). When PGC-322 lands, the two "gap" tests
+    // flip from `contains` to `!contains` deliberately.
+
+    /// CURRENT behavior: a correlated reference to the CDC'd table inside a
+    /// nested subquery's WHERE *is* rewritten to the VALUES-subquery alias.
+    #[test]
+    fn test_nested_subquery_where_correlated_ref_rewritten() {
+        let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
+        let dept_cols = &[("k", "int4"), ("v", "int4")];
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols));
+        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols));
+        let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
+        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
+
+        let qe = query_expr_parse(
+            "SELECT unique1 FROM onek WHERE EXISTS \
+             (SELECT 1 FROM dept WHERE dept.k = onek.ten)",
+        )
+        .expect("convert");
+        let QueryBody::Select(node) = qe.body else {
+            panic!("expected SELECT");
+        };
+        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
+        let replaced = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
+            .expect("replace");
+        let mut sql = String::new();
+        Deparse::deparse(&replaced, &mut sql);
+
+        assert!(
+            !sql.contains("public.onek"),
+            "nested WHERE correlated ref must be aliased; got: {sql}"
+        );
+    }
+
+    /// KNOWN GAP (PGC-322): a correlated reference to the CDC'd table inside a
+    /// nested subquery's HAVING is NOT rewritten — the nested-subquery handler
+    /// skips HAVING. The surviving `public.onek.ten` dangles against the
+    /// aliased FROM entry. The correct behavior would rewrite it to `onek.ten`.
+    #[test]
+    fn test_nested_subquery_having_correlated_ref_not_rewritten() {
+        let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
+        let dept_cols = &[("k", "int4"), ("v", "int4")];
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols));
+        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols));
+        let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
+        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
+
+        let qe = query_expr_parse(
+            "SELECT unique1 FROM onek WHERE EXISTS \
+             (SELECT 1 FROM dept GROUP BY dept.k HAVING count(*) > onek.ten)",
+        )
+        .expect("convert");
+        let QueryBody::Select(node) = qe.body else {
+            panic!("expected SELECT");
+        };
+        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
+        let replaced = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
+            .expect("replace");
+        let mut sql = String::new();
+        Deparse::deparse(&replaced, &mut sql);
+
+        assert!(
+            sql.contains("public.onek.ten"),
+            "expected the nested HAVING ref to remain un-aliased (current gap); got: {sql}"
+        );
+    }
+
+    /// KNOWN GAP (PGC-322): a correlated reference to the CDC'd table inside a
+    /// nested subquery's inner JOIN-ON is NOT rewritten — the nested-subquery
+    /// handler does not descend a subquery's FROM at all. This is the gap with
+    /// the highest shadowing risk to weigh in PGC-322, since a subquery's own
+    /// FROM is where a same-named inner instance would be introduced.
+    #[test]
+    fn test_nested_subquery_join_on_correlated_ref_not_rewritten() {
+        let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
+        let dept_cols = &[("k", "int4"), ("v", "int4")];
+        let emp_cols = &[("k", "int4"), ("w", "int4")];
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols));
+        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols));
+        tables.insert_overwrite(table_metadata("emp", Oid::from_raw(6003), emp_cols));
+        let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
+        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
+
+        let qe = query_expr_parse(
+            "SELECT unique1 FROM onek WHERE EXISTS \
+             (SELECT 1 FROM dept JOIN emp ON emp.k = onek.ten)",
+        )
+        .expect("convert");
+        let QueryBody::Select(node) = qe.body else {
+            panic!("expected SELECT");
+        };
+        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
+        let replaced = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
+            .expect("replace");
+        let mut sql = String::new();
+        Deparse::deparse(&replaced, &mut sql);
+
+        assert!(
+            sql.contains("public.onek.ten"),
+            "expected the nested JOIN-ON ref to remain un-aliased (current gap); got: {sql}"
+        );
+    }
+
     /// USING/NATURAL deparse **verbatim** (so Postgres performs the
     /// column merge — matching origin's `SELECT *` width / unqualified
     /// refs), while carrying a synthesized equi-`predicate` for

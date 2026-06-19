@@ -856,7 +856,8 @@ impl WriterCdc {
                 continue;
             };
             let batchable: Vec<&UpdateQuery> = update_queries
-                .queries.values()
+                .queries
+                .values()
                 .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval && q.pg_batchable)
                 .collect();
             if batchable.is_empty() {
@@ -1824,11 +1825,8 @@ impl WriterCdc {
             tuple_kind, "unexpected unchanged-toast marker; invalidating relation queries"
         );
         if let Some(update_queries) = core.cache.update_queries.get(&relation_oid) {
-            core.frame_invalidations.extend(
-                update_queries
-                    .queries.values()
-                    .map(|q| q.fingerprint),
-            );
+            core.frame_invalidations
+                .extend(update_queries.queries.values().map(|q| q.fingerprint));
         }
         crate::metrics::handles().cdc.toast_fallbacks.increment(1);
     }
@@ -2807,7 +2805,8 @@ impl WriterCdc {
             if recording {
                 fp_list.extend(
                     update_queries
-                        .queries.values()
+                        .queries
+                        .values()
                         .map(|q| q.fingerprint)
                         .filter(|fp| !core.frame_invalidations.contains(fp)),
                 );

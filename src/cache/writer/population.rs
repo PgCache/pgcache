@@ -291,7 +291,14 @@ async fn population_task(
 
             let stream_start = Instant::now();
             let (bytes, rows) = population_stream(
-                db_origin, db_cache, table, table_node, branch, max_limit, &staging, fresh,
+                db_origin,
+                db_cache,
+                table,
+                table_node,
+                branch,
+                max_limit,
+                &staging,
+                fresh,
                 needs_create,
             )
             .await?;

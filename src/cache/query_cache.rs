@@ -891,7 +891,15 @@ impl CacheDispatch {
         // No memo: hand off to the serve pool. `mv_dispatch_decide` picks the MV fast
         // path vs source-row fallthrough and, on a dirty MV, schedules a rebuild.
         let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
-        self.pool_serve(fingerprint, msg, resolved, deparsed_sql, serve_shape, generation, mv)
+        self.pool_serve(
+            fingerprint,
+            msg,
+            resolved,
+            deparsed_sql,
+            serve_shape,
+            generation,
+            mv,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1393,7 +1401,15 @@ impl CacheDispatch {
                 // false and the serve goes through the fallthrough path.
                 let rows_needed = limit_rows_needed(&msg.cacheable_query.query.limit);
                 let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
-                self.pool_serve(fingerprint, msg, resolved, deparsed_sql, None, generation, mv)
+                self.pool_serve(
+                    fingerprint,
+                    msg,
+                    resolved,
+                    deparsed_sql,
+                    None,
+                    generation,
+                    mv,
+                )
             }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
                 self.metrics_miss_record(fingerprint);

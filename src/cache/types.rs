@@ -316,7 +316,6 @@ impl UpdateQueries {
             self.change_dependent_count = self.change_dependent_count.saturating_sub(1);
         }
     }
-
 }
 
 impl IdHashItem for UpdateQueries {
