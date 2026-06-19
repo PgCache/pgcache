@@ -856,7 +856,7 @@ impl WriterCdc {
                 continue;
             };
             let batchable: Vec<&UpdateQuery> = update_queries
-                .iter_complexity_ordered()
+                .queries.values()
                 .filter(|q| q.eval_strategy == UpdateEvalStrategy::PgEval && q.pg_batchable)
                 .collect();
             if batchable.is_empty() {
@@ -907,7 +907,7 @@ impl WriterCdc {
                         {
                             return false;
                         }
-                        !update_queries.iter_complexity_ordered().any(|q| {
+                        !update_queries.queries.values().any(|q| {
                             q.eval_strategy == UpdateEvalStrategy::LocalEval
                                 && !core.frame_invalidations.contains(&q.fingerprint)
                                 && update_query_matches_locally(q, table_metadata, row)
@@ -1826,7 +1826,7 @@ impl WriterCdc {
         if let Some(update_queries) = core.cache.update_queries.get(&relation_oid) {
             core.frame_invalidations.extend(
                 update_queries
-                    .iter_complexity_ordered()
+                    .queries.values()
                     .map(|q| q.fingerprint),
             );
         }
@@ -2807,13 +2807,13 @@ impl WriterCdc {
             if recording {
                 fp_list.extend(
                     update_queries
-                        .iter_complexity_ordered()
+                        .queries.values()
                         .map(|q| q.fingerprint)
                         .filter(|fp| !core.frame_invalidations.contains(fp)),
                 );
             } else {
                 let mut pg_eval: Vec<&UpdateQuery> = Vec::new();
-                for update_query in update_queries.iter_complexity_ordered() {
+                for update_query in update_queries.queries.values() {
                     if core.frame_invalidations.contains(&update_query.fingerprint) {
                         continue;
                     }
@@ -3382,7 +3382,7 @@ impl WriterCdc {
         };
 
         let mut fp_list = Vec::new();
-        for update_query in update_queries.iter_complexity_ordered() {
+        for update_query in update_queries.queries.values() {
             // `Some` → row is cached (UPDATE main path); `None` → row not cached
             // (INSERT, DELETE, or UPDATE of an uncached row).
             let invalidate = match row_changes {

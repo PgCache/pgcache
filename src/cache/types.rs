@@ -160,8 +160,6 @@ pub struct UpdateQuery {
     pub fingerprint: Fingerprint,
     /// Resolved AST query
     pub resolved: ResolvedQueryExpr,
-    /// Complexity score (lower = simpler = more likely to match = try first)
-    pub complexity: usize,
     /// Whether this table was found directly in FROM or inside a subquery
     pub source: UpdateQuerySource,
     /// WHERE clause constraints for CDC invalidation filtering
@@ -229,16 +227,13 @@ impl UpdateQuery {
 
 /// Collection of update queries for a specific relation.
 ///
-/// `queries` is keyed by fingerprint for O(1) lookup. `complexity_order`
-/// holds the same fingerprints in complexity-ascending order so CDC can keep
-/// the "try simplest first" iteration property. `subsumption` is a typed
+/// `queries` is keyed by fingerprint for O(1) lookup. `subsumption` is a typed
 /// index over the queries' WHERE-clause constraints used by
 /// `subsumption_check` for sub-linear candidate lookup (see PGC-119).
 #[derive(Debug)]
 pub struct UpdateQueries {
     pub relation_oid: Oid,
     pub queries: FingerprintMap<UpdateQuery>,
-    pub complexity_order: Vec<Fingerprint>,
     pub subsumption: ConstraintIndex<Fingerprint>,
     /// Per-table constraint index over the *full* update-query population of
     /// this relation — LocalEval and PgEval alike (PGC-292). Probed point-wise
@@ -263,7 +258,6 @@ impl UpdateQueries {
         Self {
             relation_oid,
             queries: HashMap::default(),
-            complexity_order: Vec::new(),
             subsumption: ConstraintIndex::new(),
             eval_index: ConstraintIndex::new(),
             change_dependent_count: 0,
@@ -323,13 +317,6 @@ impl UpdateQueries {
         }
     }
 
-    /// Iterate update queries in complexity-ascending order. CDC code paths
-    /// rely on this ordering to try simpler queries first.
-    pub fn iter_complexity_ordered(&self) -> impl Iterator<Item = &UpdateQuery> {
-        self.complexity_order
-            .iter()
-            .filter_map(|fp| self.queries.get(fp))
-    }
 }
 
 impl IdHashItem for UpdateQueries {
@@ -386,7 +373,6 @@ impl Cache {
         for oid in oids {
             if let Some(mut queries) = self.update_queries.get_mut(oid) {
                 queries.query_remove(fingerprint);
-                queries.complexity_order.retain(|fp| *fp != fingerprint);
                 queries.subsumption.remove(fingerprint);
                 queries.eval_index.remove(fingerprint);
             }

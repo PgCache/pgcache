@@ -636,7 +636,6 @@ impl WriterRegistration {
         mut update_query: UpdateQuery,
     ) {
         let fingerprint = update_query.fingerprint;
-        let complexity = update_query.complexity;
         let has_limit = update_query.has_limit;
 
         // Whether a CDC UPDATE for this query can ever invalidate — i.e. whether
@@ -671,20 +670,6 @@ impl WriterRegistration {
             .or_insert_with(|| UpdateQueries::new(relation_oid));
 
         queries.query_insert(update_query);
-        // Insert fingerprint into complexity_order at the correct position
-        // (ascending by complexity, then by fingerprint for stability).
-        let pos = queries
-            .complexity_order
-            .binary_search_by(|fp| {
-                let c = queries
-                    .queries
-                    .get(fp)
-                    .map(|q| q.complexity)
-                    .unwrap_or(usize::MAX);
-                c.cmp(&complexity).then_with(|| fp.cmp(&fingerprint))
-            })
-            .unwrap_or_else(|p| p);
-        queries.complexity_order.insert(pos, fingerprint);
 
         if can_subsume {
             queries.subsumption.insert(fingerprint, &table_constraints);
@@ -790,7 +775,6 @@ impl WriterRegistration {
                 .as_select()
                 .map(analyze_query_constraints)
                 .unwrap_or_default();
-            let complexity = update_resolved.complexity();
             let eval_strategy = update_eval_strategy_classify(&update_resolved, source);
             let pg_batchable = eval_strategy == UpdateEvalStrategy::PgEval
                 && pg_batchable_classify(&update_resolved, relation_oid, &self.aggregate_functions);
@@ -806,7 +790,6 @@ impl WriterRegistration {
             let update_query = UpdateQuery {
                 fingerprint,
                 resolved: update_resolved,
-                complexity,
                 source,
                 constraints,
                 has_limit,
@@ -1557,7 +1540,6 @@ impl WriterRegistration {
                 // before the failure — sweep orphan entries by fingerprint.
                 for mut entry in core.cache.update_queries.iter_mut() {
                     entry.query_remove(fingerprint);
-                    entry.complexity_order.retain(|fp| *fp != fingerprint);
                     entry.subsumption.remove(fingerprint);
                     entry.eval_index.remove(fingerprint);
                 }
