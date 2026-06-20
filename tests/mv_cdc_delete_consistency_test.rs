@@ -35,10 +35,6 @@ async fn test_cdc_delete_during_fresh_mv_leaves_no_ghost() -> Result<(), Error> 
         "create table mvg_items (id int primary key, group_id int not null, data int not null)",
     )
     .await?;
-    // Many groups so the source table is large (the MV size gate is
-    // `result_rows × ratio ≤ source_rows`, ratio=10; the per-group result is 2
-    // rows, so the source needs ≥ 20 rows for the join MV to be built — exactly
-    // the geometry of the stress harness).
     ctx.simple_query(
         "insert into mvg_groups (group_id, version) \
          select g, 0 from generate_series(1, 50) g",
@@ -53,20 +49,23 @@ async fn test_cdc_delete_during_fresh_mv_leaves_no_ghost() -> Result<(), Error> 
     // The two items of group 1 get ids 1002 and 1003.
     ctx.cdc_settle().await?;
 
+    // The `row_number()` window function makes the join an unconditional
+    // materialization candidate (`ShapeGate::Materialize`), bypassing the size
+    // gate — a plain projecting join can't pass it (its predicate-scoped source
+    // count equals the result count). The window annotates but preserves rows,
+    // so the per-group result is still the group's 2 item rows and the ghost
+    // assertions are unchanged.
     let group_query = |g: i32| {
         format!(
-            "select i.id, g.version, i.data from mvg_items i \
-             join mvg_groups g on i.group_id = g.group_id where i.group_id = {g}"
+            "select i.id, g.version, i.data, row_number() over (order by i.id) \
+             from mvg_items i join mvg_groups g on i.group_id = g.group_id \
+             where i.group_id = {g}"
         )
     };
     let query = group_query(1);
 
-    // Warm every per-group query so the *shared* mvg_items source cache table
-    // accumulates all groups' rows (~100). The MV size gate is
-    // `result_rows × ratio ≤ source_rows` against that shared table, so a
-    // per-group result of 2 rows needs the shared table large to pass — exactly
-    // why the 100-group stress harness builds MVs but a single small query
-    // doesn't.
+    // Warm every per-group query so the shared mvg_items source cache table
+    // accumulates all groups' rows before group 1's MV is built.
     for g in 1..=50 {
         let _ = ctx.simple_query(&group_query(g)).await?;
     }
@@ -152,10 +151,13 @@ async fn test_cdc_version_bump_after_delete_heals_mv() -> Result<(), Error> {
     .await?;
     ctx.cdc_settle().await?;
 
+    // Window function → `ShapeGate::Materialize`, so the join MV is built
+    // unconditionally (see the delete test for the rationale).
     let group_query = |g: i32| {
         format!(
-            "select i.id, g.version, i.data from mvh_items i \
-             join mvh_groups g on i.group_id = g.group_id where i.group_id = {g}"
+            "select i.id, g.version, i.data, row_number() over (order by i.id) \
+             from mvh_items i join mvh_groups g on i.group_id = g.group_id \
+             where i.group_id = {g}"
         )
     };
     let query = group_query(1);
@@ -255,10 +257,13 @@ async fn test_cdc_pk_change_during_fresh_mv_leaves_no_ghost() -> Result<(), Erro
     .await?;
     ctx.cdc_settle().await?;
 
+    // Window function → `ShapeGate::Materialize`, so the join MV is built
+    // unconditionally (see the delete test for the rationale).
     let group_query = |g: i32| {
         format!(
-            "select i.id, g.version, i.data from mvp_items i \
-             join mvp_groups g on i.group_id = g.group_id where i.group_id = {g}"
+            "select i.id, g.version, i.data, row_number() over (order by i.id) \
+             from mvp_items i join mvp_groups g on i.group_id = g.group_id \
+             where i.group_id = {g}"
         )
     };
     let query = group_query(1);
@@ -383,11 +388,13 @@ async fn test_cdc_update_departure_during_fresh_mv_no_ghost() -> Result<(), Erro
     ctx.cdc_settle().await?;
 
     // Per-group join queries with a non-join data predicate (so the departure
-    // update below changes no join column → no invalidation path fires)…
+    // update below changes no join column → no invalidation path fires). The
+    // `row_number()` window forces `ShapeGate::Materialize` so the join MV is
+    // built unconditionally (see the delete test for the rationale).
     let group_query = |g: i32| {
         format!(
-            "select i.id, g.version, i.data from mvd_items i \
-             join mvd_groups g on i.group_id = g.group_id \
+            "select i.id, g.version, i.data, row_number() over (order by i.id) \
+             from mvd_items i join mvd_groups g on i.group_id = g.group_id \
              where i.group_id = {g} and i.data < 100000"
         )
     };

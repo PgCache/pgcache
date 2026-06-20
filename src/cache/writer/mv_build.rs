@@ -25,7 +25,11 @@ use tokio_stream::StreamExt;
 use tracing::{error, trace};
 
 use crate::pg;
-use crate::query::ast::Deparse;
+use crate::query::ast::{Deparse, LiteralValue};
+use crate::query::resolved::{
+    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
+    ResolvedSelectColumns, ResolvedSelectNode,
+};
 use crate::result::error_chain_format;
 use crate::settings::PgSettings;
 
@@ -56,9 +60,6 @@ pub(super) struct MvBuildContext {
     pub resolved: SharedResolved,
     /// Captured by a previous build; `None` means describe before building.
     pub output_columns: Option<Arc<[EcoString]>>,
-    /// `(schema, name)` of the referenced cache tables — the Measure gate's
-    /// denominator. Populated only when the gate will run.
-    pub gate_tables: Vec<(EcoString, EcoString)>,
     /// `mv_size_ratio` read from dynamic config at dispatch time.
     pub mv_size_ratio: u64,
 }
@@ -336,30 +337,76 @@ async fn mv_gate_passes(client: &Client, ctx: &MvBuildContext) -> CacheResult<bo
     }
 }
 
-/// Sum `count(*)` across the cache tables referenced by the fingerprint
-/// (snapshotted into `ctx.gate_tables` at dispatch). Used as the denominator
-/// of the Measure size gate. An empty table list yields 0 — causes the gate
-/// to fail, which is the safe default.
+/// SQL for the Measure-gate denominator: a `count(*)` over the source query's
+/// *input* rows — the rows that feed the aggregate — NOT the whole table.
+///
+/// For a top-level aggregate SELECT, strips the projection/aggregation
+/// (GROUP BY/HAVING) and the outer ORDER BY/LIMIT, keeping FROM + WHERE + JOINs,
+/// so `count(*) FROM posts WHERE owneruserid=$1` counts the predicate-matching
+/// rows (index-scoped), not all of `posts`. Wrapping the *un-stripped* aggregate
+/// would count its single result row instead and defeat the gate.
+///
+/// For non-SELECT bodies (set-op / VALUES) it wraps the whole query directly —
+/// still predicate-scoped, never a whole-table scan. That's conservative for
+/// set-ops whose branches aggregate (counts the result, not the input, so the
+/// gate fails safe); PGC-329 tracks branch-aware handling.
+fn mv_source_count_sql(resolved: &ResolvedQueryExpr) -> String {
+    let inner = match &resolved.body {
+        ResolvedQueryBody::Select(select) => {
+            // Constant projection, no DISTINCT: counts scanned rows (including
+            // join fan-out) — the work the query does.
+            let stripped = ResolvedSelectNode {
+                distinct: false,
+                columns: ResolvedSelectColumns::Columns(vec![ResolvedSelectColumn {
+                    expr: ResolvedScalarExpr::Literal(LiteralValue::Integer(1)),
+                    alias: None,
+                }]),
+                from: select.from.clone(),
+                where_clause: select.where_clause.clone(),
+                group_by: vec![],
+                having: None,
+            };
+            ResolvedQueryExpr {
+                body: ResolvedQueryBody::Select(Box::new(stripped)),
+                order_by: vec![],
+                limit: None,
+            }
+        }
+        // Set-op / VALUES: count the query's own rows (outer ORDER BY/LIMIT
+        // dropped to match the SELECT path's pre-LIMIT input count).
+        ResolvedQueryBody::Values(_) | ResolvedQueryBody::SetOp(_) => ResolvedQueryExpr {
+            body: resolved.body.clone(),
+            order_by: vec![],
+            limit: None,
+        },
+    };
+    let mut sql = String::with_capacity(256);
+    sql.push_str("SELECT count(*) FROM (");
+    inner.deparse(&mut sql);
+    sql.push_str(") _mv_gate_denom");
+    sql
+}
+
+/// Denominator of the Measure size gate: the source query's predicate-scoped
+/// input row count (see `mv_source_count_sql`).
 async fn mv_source_rows_count(client: &Client, ctx: &MvBuildContext) -> CacheResult<u64> {
-    let mut total: u64 = 0;
-    for (schema, name) in &ctx.gate_tables {
-        let sql = format!("SELECT count(*) FROM \"{schema}\".\"{name}\"");
-        let row = client
-            .query_one(&sql, &[])
-            .await
-            .map_into_report::<CacheError>()
-            .attach_loc("counting cache table rows for MV size gate")?;
-        total = total.saturating_add(u64::try_from(row.get::<_, i64>(0)).unwrap_or(0));
-    }
-    Ok(total)
+    let sql = mv_source_count_sql(&ctx.resolved);
+    let row = client
+        .query_one(&sql, &[])
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("counting MV size-gate source rows")?;
+    Ok(u64::try_from(row.get::<_, i64>(0)).unwrap_or(0))
 }
 
 /// Measure-gate: `result_rows × mv_size_ratio ≤ source_rows`.
 ///
-/// Runs `SELECT count(*) FROM (<query> LIMIT max_limit) x` against the
-/// source-row cache with the query's current generation set so the count
-/// sees the consistent snapshot. The LIMIT keeps the gate consistent with
-/// what would actually be stored (MV is capped at `max_limit`).
+/// The numerator (`SELECT count(*) FROM (<query> LIMIT max_limit) x`) is the
+/// rows that would be stored; the LIMIT caps it at `max_limit` to match the MV.
+/// `mem.query_generation` is set/reset around it for source-row generation
+/// bookkeeping (a GC mechanism — not read-consistency). `source_rows` (the
+/// predicate-scoped denominator) is computed by the caller and needs no
+/// generation.
 async fn mv_size_gate_passes(
     client: &Client,
     ctx: &MvBuildContext,
@@ -373,7 +420,6 @@ async fn mv_size_gate_passes(
         .attach_loc("setting query generation for MV size gate")?;
 
     let count_sql = mv_count_sql(ctx);
-
     let result = client.query_one(&count_sql, &[]).await;
 
     // Always reset generation, even on failure.
@@ -475,3 +521,120 @@ async fn fault_build_hold() {
 }
 #[cfg(not(feature = "fault-injection"))]
 async fn fault_build_hold() {}
+
+#[cfg(test)]
+mod tests {
+    use iddqd::BiHashMap;
+    use tokio_postgres::types::Type;
+
+    use super::*;
+    use crate::catalog::{ColumnMetadata, ColumnStore, Oid, TableMetadata};
+    use crate::query::ast::{
+        AstNode, ColumnNode, FunctionCall, QueryExpr, SelectNode, TableNode, query_expr_parse,
+    };
+    use crate::query::resolved::query_expr_resolve;
+
+    fn test_table(name: &str, oid: Oid, cols: &[&str]) -> TableMetadata {
+        let columns = ColumnStore::new(cols.iter().enumerate().map(|(i, c)| {
+            let is_pk = i == 0;
+            ColumnMetadata {
+                name: (*c).into(),
+                position: i16::try_from(i + 1).expect("column position fits in i16"),
+                type_oid: if is_pk { 23 } else { 25 },
+                data_type: if is_pk { Type::INT4 } else { Type::TEXT },
+                type_name: if is_pk { "int4" } else { "text" }.into(),
+                cache_type_name: if is_pk { "int4" } else { "text" }.into(),
+                is_primary_key: is_pk,
+            }
+        }));
+        TableMetadata {
+            relation_oid: oid,
+            name: name.into(),
+            schema: "public".into(),
+            primary_key_columns: vec![cols[0].into()],
+            columns,
+            indexes: Vec::new(),
+        }
+    }
+
+    fn test_tables() -> BiHashMap<TableMetadata> {
+        let mut t = BiHashMap::new();
+        t.insert_overwrite(test_table("orders", Oid::from_raw(1), &["id", "status", "total"]));
+        t.insert_overwrite(test_table("users", Oid::from_raw(2), &["id", "name", "email"]));
+        t
+    }
+
+    /// Build the Measure-gate denominator for `sql` and re-parse it into an AST
+    /// so tests assert on nodes, not raw text.
+    fn denom_ast(sql: &str) -> QueryExpr {
+        let ast = query_expr_parse(sql).expect("parse source");
+        let resolved =
+            query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve source");
+        let denom = mv_source_count_sql(&resolved);
+        query_expr_parse(&denom).expect("denominator SQL re-parses")
+    }
+
+    /// Count of `count()` aggregate calls anywhere in the AST.
+    fn count_aggs(ast: &QueryExpr) -> usize {
+        ast.nodes::<FunctionCall>()
+            .filter(|f| f.name.eq_ignore_ascii_case("count"))
+            .count()
+    }
+
+    /// The WHERE predicate survives (the bug dropped it) and the inner aggregate
+    /// is gone — only the wrapper `count(*)` remains.
+    #[test]
+    fn test_denominator_keeps_predicate_drops_aggregate() {
+        let ast = denom_ast("SELECT count(*) FROM orders WHERE status = 'open'");
+        assert!(
+            ast.nodes::<ColumnNode>().any(|c| c.column == "status"),
+            "predicate column `status` must survive in the denominator"
+        );
+        assert!(
+            ast.nodes::<TableNode>().any(|t| t.name == "orders"),
+            "source table must survive"
+        );
+        assert_eq!(count_aggs(&ast), 1, "only the wrapper count() remains");
+    }
+
+    /// GROUP BY is stripped so the count is over scanned input rows, not groups.
+    #[test]
+    fn test_denominator_strips_group_by() {
+        let ast = denom_ast(
+            "SELECT status, count(*) FROM orders WHERE status = 'open' GROUP BY status",
+        );
+        assert!(
+            ast.nodes::<SelectNode>().all(|s| s.group_by.is_empty()),
+            "no SELECT node may carry GROUP BY"
+        );
+        assert!(ast.nodes::<ColumnNode>().any(|c| c.column == "status"));
+        assert_eq!(count_aggs(&ast), 1);
+    }
+
+    /// Outer ORDER BY / LIMIT are stripped from the denominator (the inner
+    /// row-source query carries neither).
+    #[test]
+    fn test_denominator_strips_order_and_limit() {
+        let ast = denom_ast("SELECT count(*) FROM orders WHERE status = 'open' LIMIT 5");
+        assert!(
+            ast.nodes::<QueryExpr>()
+                .all(|q| q.limit.is_none() && q.order_by.is_empty()),
+            "no query node may carry ORDER BY / LIMIT"
+        );
+    }
+
+    /// Non-SELECT bodies (set-op) take the conservative wrap-the-whole-query
+    /// form: both branches' source tables survive, only the wrapper `count(*)`,
+    /// and the outer LIMIT is dropped — never a whole-table scan.
+    #[test]
+    fn test_denominator_wraps_non_select() {
+        let ast = denom_ast("SELECT id FROM orders UNION SELECT id FROM users");
+        assert!(ast.nodes::<TableNode>().any(|t| t.name == "orders"));
+        assert!(ast.nodes::<TableNode>().any(|t| t.name == "users"));
+        assert_eq!(count_aggs(&ast), 1, "only the wrapper count()");
+        assert!(
+            ast.nodes::<QueryExpr>().all(|q| q.limit.is_none()),
+            "outer LIMIT dropped"
+        );
+    }
+}

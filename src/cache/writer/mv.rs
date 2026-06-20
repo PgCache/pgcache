@@ -28,7 +28,7 @@ use crate::result::error_chain_format;
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{MvBuildOutcome, QueryCommand},
-    mv::{MvState, ShapeGate, mv_table_name},
+    mv::{MvState, mv_table_name},
     types::CachedQueryState,
 };
 use super::core::WriterCore;
@@ -268,29 +268,6 @@ impl WriterCore {
         let output_columns = view.mv.output_columns.as_ref().map(Arc::clone);
         drop(view);
 
-        // Measure-gate denominator tables, resolved from the writer-only
-        // catalog here because the task can't read `core.cache`. An empty
-        // list makes the gate fail — the safe default.
-        let gate_tables = if !has_table && shape_gate == ShapeGate::Measure {
-            self.cache
-                .cached_queries
-                .get1(&fingerprint)
-                .map(|q| {
-                    q.relation_oids
-                        .iter()
-                        .filter_map(|oid| {
-                            self.cache
-                                .tables
-                                .get1(oid)
-                                .map(|t| (t.schema.clone(), t.name.clone()))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
         Some(MvBuildContext {
             fingerprint,
             has_table,
@@ -299,7 +276,6 @@ impl WriterCore {
             generation,
             resolved,
             output_columns,
-            gate_tables,
             mv_size_ratio: u64::from(self.cache.dynamic.load().mv_size_ratio),
         })
     }
