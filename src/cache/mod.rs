@@ -18,12 +18,14 @@ pub use crate::result::{MapIntoReport, ReportExt};
 
 // Module declarations
 mod cdc;
+mod coalesce_queue;
 mod fast_path;
 pub(crate) mod memo;
 pub(crate) mod messages;
 pub(crate) mod mv;
 pub(crate) mod query;
 mod query_cache;
+mod reg_bucket;
 mod reply;
 mod runtime;
 mod serve;
