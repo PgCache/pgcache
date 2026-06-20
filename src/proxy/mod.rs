@@ -2,6 +2,7 @@ mod cache_sender;
 mod client_stream;
 mod connection;
 mod egress;
+mod origin_stream;
 mod query;
 pub mod search_path;
 mod server;
