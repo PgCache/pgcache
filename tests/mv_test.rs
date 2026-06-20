@@ -225,184 +225,6 @@ async fn test_mv_groupby_measure_hits() -> Result<(), Error> {
     Ok(())
 }
 
-/// Window functions → Materialize classification. The MV is created
-/// unconditionally (no size gate — window results justify materialization on
-/// pure compute grounds regardless of cardinality), and serves from the MV
-/// fast path on subsequent queries. Exercises both `rank() OVER (ORDER BY ...)`
-/// and `sum(x) OVER (PARTITION BY ...)` to cover the two common window shapes.
-#[tokio::test]
-async fn test_mv_window_materialize() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
-
-    // Use separate tables for each window query so neither subsumes the other
-    // via shared source-row cache (see Future Work: "MV first-pop for subsumed
-    // queries" — the subsumption fast-path skips MV first-pop).
-    ctx.query(
-        "CREATE TABLE mv_win_rank (id integer primary key, value integer not null)",
-        &[],
-    )
-    .await?;
-    ctx.query(
-        "CREATE TABLE mv_win_sum (id integer primary key, category text not null, value integer not null)",
-        &[],
-    )
-    .await?;
-
-    // Materialize bypasses the size gate, so row count doesn't need to satisfy
-    // `result_rows × mv_size_ratio ≤ source_rows`.
-    for (id, val) in &[(1, 10), (2, 20), (3, 30), (4, 15), (5, 25), (6, 50)] {
-        ctx.query(
-            "INSERT INTO mv_win_rank (id, value) VALUES ($1, $2)",
-            &[id, val],
-        )
-        .await?;
-    }
-    for (id, cat, val) in &[
-        (1, "a", 10),
-        (2, "a", 20),
-        (3, "a", 30),
-        (4, "b", 15),
-        (5, "b", 25),
-        (6, "c", 50),
-    ] {
-        ctx.query(
-            "INSERT INTO mv_win_sum (id, category, value) VALUES ($1, $2, $3)",
-            &[id, cat, val],
-        )
-        .await?;
-    }
-
-    // ---- rank() OVER (ORDER BY value) — single partition, value-ordered rank.
-    let rank_sql = "SELECT id, value, rank() OVER (ORDER BY value) FROM mv_win_rank";
-
-    // First query: cache miss → source-row population → Materialize first-pop.
-    let res = ctx.simple_query(rank_sql).await?;
-    let rows1: Vec<(i32, i32, i64)> = res
-        .iter()
-        .filter_map(|m| match m {
-            tokio_postgres::SimpleQueryMessage::Row(r) => Some((
-                r.get(0).unwrap().parse().unwrap(),
-                r.get(1).unwrap().parse().unwrap(),
-                r.get(2).unwrap().parse().unwrap(),
-            )),
-            tokio_postgres::SimpleQueryMessage::CommandComplete(_)
-            | tokio_postgres::SimpleQueryMessage::RowDescription(_)
-            | _ => None,
-        })
-        .collect();
-    assert_eq!(rows1.len(), 6);
-    // Sort by rank (distinct values → ranks 1..=6) so assertions are
-    // order-independent (physical order from origin is undefined).
-    // values sorted: 10 < 15 < 20 < 25 < 30 < 50
-    //   id=1 val=10 rank=1, id=4 val=15 rank=2, id=2 val=20 rank=3,
-    //   id=5 val=25 rank=4, id=3 val=30 rank=5, id=6 val=50 rank=6
-    let mut rows1_sorted = rows1.clone();
-    rows1_sorted.sort_by_key(|(_, _, rank)| *rank);
-    assert_eq!(
-        rows1_sorted,
-        vec![
-            (1, 10, 1),
-            (4, 15, 2),
-            (2, 20, 3),
-            (5, 25, 4),
-            (3, 30, 5),
-            (6, 50, 6),
-        ]
-    );
-
-    ctx.cache_settle().await?;
-    assert_eq!(
-        mv_table_count(&ctx.dbs).await?,
-        0,
-        "MV not built until first cache hit triggers MvFirstPop"
-    );
-
-    // Second query: cache hit on MeasurePending → schedules MvFirstPop, falls through.
-    let _ = ctx.simple_query(rank_sql).await?;
-    ctx.cache_settle().await?;
-    assert_eq!(
-        mv_table_count(&ctx.dbs).await?,
-        1,
-        "Materialize (window fn) must produce an MV table unconditionally"
-    );
-
-    // Third query: MV fast-path hit.
-    let m1 = ctx.metrics().await?;
-    let res = ctx.simple_query(rank_sql).await?;
-    let n_rows = res
-        .iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count();
-    assert_eq!(n_rows, 6);
-    let m2 = ctx.metrics().await?;
-    let d = metrics_delta(&m1, &m2);
-    assert_eq!(
-        d.cache_mv_hits, 1,
-        "expected MV hit for window function query"
-    );
-    assert_eq!(d.cache_mv_fallthrough, 0);
-
-    // ---- sum(value) OVER (PARTITION BY category) — per-partition sum.
-    let sum_sql = "SELECT id, category, sum(value) OVER (PARTITION BY category) FROM mv_win_sum";
-
-    let res = ctx.simple_query(sum_sql).await?;
-    let rows: Vec<(i32, String, i64)> = res
-        .iter()
-        .filter_map(|m| match m {
-            tokio_postgres::SimpleQueryMessage::Row(r) => Some((
-                r.get(0).unwrap().parse().unwrap(),
-                r.get(1).unwrap().to_owned(),
-                r.get(2).unwrap().parse().unwrap(),
-            )),
-            tokio_postgres::SimpleQueryMessage::CommandComplete(_)
-            | tokio_postgres::SimpleQueryMessage::RowDescription(_)
-            | _ => None,
-        })
-        .collect();
-    assert_eq!(rows.len(), 6);
-    // Partition sums: a → 10+20+30=60, b → 15+25=40, c → 50.
-    // Every row in a partition has the same partition sum.
-    for (id, cat, sum) in &rows {
-        let expected_sum: i64 = match cat.as_str() {
-            "a" => 60,
-            "b" => 40,
-            "c" => 50,
-            _ => panic!("unexpected category {cat} (id={id})"),
-        };
-        assert_eq!(*sum, expected_sum, "partition sum for {cat} (id={id})");
-    }
-
-    ctx.cache_settle().await?;
-    assert_eq!(
-        mv_table_count(&ctx.dbs).await?,
-        1,
-        "sum query's MV not built until first cache hit triggers MvFirstPop"
-    );
-
-    // Second sum query: cache hit on MeasurePending → schedules MvFirstPop, falls through.
-    let _ = ctx.simple_query(sum_sql).await?;
-    ctx.cache_settle().await?;
-    assert_eq!(
-        mv_table_count(&ctx.dbs).await?,
-        2,
-        "each distinct fingerprint gets its own MV"
-    );
-
-    // Third sum query: MV hit.
-    let m3 = ctx.metrics().await?;
-    let res = ctx.simple_query(sum_sql).await?;
-    let n_rows = res
-        .iter()
-        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
-        .count();
-    assert_eq!(n_rows, 6);
-    let m4 = ctx.metrics().await?;
-    let d = metrics_delta(&m3, &m4);
-    assert_eq!(d.cache_mv_hits, 1, "expected MV hit for sum window query");
-
-    Ok(())
-}
-
 /// Plain filter/projection — shape classifier returns Skip, so no MV table
 /// is ever created and cache hits never increment MV metrics beyond fallthrough.
 #[tokio::test]
@@ -1095,6 +917,53 @@ async fn test_cdc_short_circuit_preserves_fresh_and_upsert() -> Result<(), Error
         rows_count(&mut ctx, rows).await?,
         13,
         "grp=2 row must not affect the grp=1 rows query"
+    );
+
+    Ok(())
+}
+
+/// A `Gated` query that becomes Ready via *subsumption* (not its own
+/// population) must still materialize. Subsumed queries don't populate, so they
+/// have no population row-count; the gate has to fall back to counting the cache
+/// or it would reject every subsumed MV candidate. Regression for the
+/// subsumption blind spot in the population-row-count gate (PGC-330).
+#[tokio::test]
+async fn test_subsumed_query_still_materializes() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE sub_mv (id integer primary key, owner integer not null)",
+        &[],
+    )
+    .await?;
+    for id in 1..=100 {
+        ctx.query("INSERT INTO sub_mv VALUES ($1, 8)", &[&id])
+            .await?;
+    }
+    ctx.cdc_settle().await?;
+
+    // Broad single-table query caches all of sub_mv (Ready, non-limited) — this
+    // makes the narrower aggregate below a subsumption candidate.
+    let _ = ctx.query_one("SELECT count(*) FROM sub_mv", &[]).await?;
+    ctx.cache_settle().await?;
+
+    // Narrower Gated aggregate over the same relation → subsumed, so it has no
+    // population row-count. First hit schedules the MV build; the gate must fall
+    // back to a cache count (100) and admit (1 × ratio ≤ 100).
+    let narrow = "SELECT count(*) FROM sub_mv WHERE owner = 8";
+    let row = ctx.query_one(narrow, &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 100);
+    ctx.cache_settle().await?;
+
+    // Next hit must be served from the MV — proving it built despite subsumption.
+    let m_before = ctx.metrics().await?;
+    let row = ctx.query_one(narrow, &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 100);
+    let m_after = ctx.metrics().await?;
+    let d = metrics_delta(&m_before, &m_after);
+    assert!(
+        d.cache_mv_hits >= 1,
+        "subsumed Gated query must still materialize via the cache-count fallback (delta {d:?})"
     );
 
     Ok(())

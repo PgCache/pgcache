@@ -268,6 +268,17 @@ impl WriterCore {
         let output_columns = view.mv.output_columns.as_ref().map(Arc::clone);
         drop(view);
 
+        // Real source-row count from the origin population (set at ready-mark).
+        // `0`/absent means the query reached Ready without self-populating
+        // (subsumed, etc.) — treat as unmeasured so the gate counts the cache.
+        let populated_rows = self
+            .state_view
+            .metrics
+            .get(&fingerprint)
+            .map(|m| m.population_row_count)
+            .filter(|&n| n > 0);
+
+        let dynamic = self.cache.dynamic.load();
         Some(MvBuildContext {
             fingerprint,
             has_table,
@@ -276,7 +287,9 @@ impl WriterCore {
             generation,
             resolved,
             output_columns,
-            mv_size_ratio: u64::from(self.cache.dynamic.load().mv_size_ratio),
+            populated_rows,
+            mv_size_ratio: u64::from(dynamic.mv_size_ratio),
+            mv_compute_min_rows: dynamic.mv_compute_min_rows,
         })
     }
 

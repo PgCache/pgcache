@@ -37,7 +37,7 @@ use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{AdmitAction, QueryCommand, SubsumptionResult},
-    mv::{ShapeGate, resolved_has_join, shape_classify},
+    mv::{ShapeGate, resolved_has_join, resolved_has_window, shape_classify},
     query::CacheableQuery,
     types::{CachedQuery, QueryMetrics, SharedResolved},
     update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQuerySource},
@@ -902,9 +902,11 @@ impl WriterRegistration {
             user_max_limit
         };
 
-        // `mv_limit` caps the MV body, independent of the population cap.
-        // Only joins benefit; other reducers already collapse their input.
-        let mv_limit = if matches!(shape_gate, ShapeGate::Measure) && resolved_has_join(&resolved) {
+        // `mv_limit` caps the MV body to a top-N, independent of the population
+        // cap. Only joins benefit (other reducers already collapse their input),
+        // and never window functions — a windowed MV must store the full result
+        // because the window depends on the whole partition.
+        let mv_limit = if resolved_has_join(&resolved) && !resolved_has_window(&resolved) {
             user_max_limit
         } else {
             None

@@ -287,6 +287,22 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, u16,
     Ok((pgcache, listen_port, metrics_port, client))
 }
 
+/// Connect to pgcache with extra CLI args appended after the default
+/// `--cache_policy fifo` (e.g. per-test gate thresholds).
+pub async fn connect_pgcache_args(
+    dbs: &TempDBs,
+    extra_args: &[&str],
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+    let listen_port = find_available_port()?;
+    let metrics_port = find_available_port()?;
+    let mut args: Vec<&str> = vec!["--cache_policy", "fifo"];
+    args.extend_from_slice(extra_args);
+    let mut pgcache = pgcache_spawn(dbs, listen_port, metrics_port, &args);
+    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    let client = pgcache_client_connect(listen_port).await?;
+    Ok((pgcache, listen_port, metrics_port, client))
+}
+
 /// Connect to pgcache with fault-injection environment variables set on the
 /// child process (requires the binary built with `--features fault-injection`).
 pub async fn connect_pgcache_fault(

@@ -28,14 +28,15 @@ use crate::query::resolved::{
 /// + re-registration is the only way to re-classify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShapeGate {
-    /// Materialize unconditionally; skip the size gate.
-    /// Reserved for window functions — recomputing partition/sort on every
-    /// serve is expensive regardless of cardinality.
-    Materialize,
-    /// Shape suggests reduction is possible; apply the size gate at first
-    /// population. Aggregates, GROUP BY, HAVING, DISTINCT.
-    Measure,
-    /// Shape rules out benefit; never materialize.
+    /// Shape can benefit from an MV — it does non-trivial recompute (join,
+    /// window, aggregate, GROUP BY, HAVING, DISTINCT, dedup set-op). Admission is
+    /// decided at first build by two independent tests, materialize if *either*
+    /// passes (see `mv_build`): row reduction (`result × ratio ≤ source rows`)
+    /// OR compute avoidance (`source rows ≥ compute threshold`).
+    Gated,
+    /// Shape rules out benefit; never materialize. Single-table plain projection
+    /// (the source-row cache already holds exactly these rows), `UNION ALL`
+    /// (trivial concat of cached branches), and `VALUES`.
     Skip,
 }
 
@@ -51,7 +52,7 @@ impl ShapeGate {
     /// returns 3, not the real count). Plain projection (`Skip`) is safe
     /// because result rows = source rows, so LIMIT translates one-to-one.
     pub fn is_reducer(self) -> bool {
-        matches!(self, ShapeGate::Materialize | ShapeGate::Measure)
+        matches!(self, ShapeGate::Gated)
     }
 }
 
@@ -64,12 +65,13 @@ impl ShapeGate {
 pub enum MvState {
     /// `ShapeGate::Skip` — never materialize. Terminal.
     Skipped,
-    /// `ShapeGate::Measure` size gate evaluated and failed. Terminal — never
-    /// materialize for the life of this cache entry.
+    /// The first-build gate (row-reduction OR compute-avoidance test) evaluated
+    /// and neither passed. Terminal — never materialize for the life of this
+    /// cache entry.
     Ineligible,
     /// Should have a fresh MV but doesn't. `has_table` distinguishes the two
     /// sub-cases: `false` = never built (first build pending, includes the
-    /// Measure gate check); `true` = stale table from a prior Fresh flipped
+    /// first-build gate check); `true` = stale table from a prior Fresh flipped
     /// by CDC invalidation or LimitBump (rebuild pending).
     Pending { has_table: bool },
     /// Build command sent to writer, writer hasn't processed yet. `has_table`
@@ -125,7 +127,7 @@ impl MvState {
 pub fn mv_state_initial(gate: ShapeGate) -> MvState {
     match gate {
         ShapeGate::Skip => MvState::Skipped,
-        ShapeGate::Measure | ShapeGate::Materialize => MvState::Pending { has_table: false },
+        ShapeGate::Gated => MvState::Pending { has_table: false },
     }
 }
 
@@ -356,36 +358,30 @@ pub fn shape_classify(
         ResolvedQueryBody::Values(_) => return ShapeGate::Skip,
 
         ResolvedQueryBody::SetOp(setop) => {
-            // UNION ALL is strictly additive — no dedup, no reduction. Branches
+            // UNION ALL is strictly additive — no dedup, no compute. Branches
             // are already cached; concatenating them at serve time is two seq
-            // scans, cheap. MV would duplicate storage without saving compute.
+            // scans, cheap. MV would duplicate storage without saving anything.
             if setop.op == SetOpType::Union && setop.all {
                 return ShapeGate::Skip;
             }
-            // UNION (dedup), INTERSECT [ALL], EXCEPT [ALL] all reduce the
-            // result to ≤ sum/min/left of branches — candidates for Measure.
-            // Size gate at first build decides whether reduction is enough
-            // to justify storage.
-            ShapeGate::Measure
+            // UNION (dedup), INTERSECT [ALL], EXCEPT [ALL] do real dedup work and
+            // can reduce the result — the build-time gates decide.
+            ShapeGate::Gated
         }
 
         ResolvedQueryBody::Select(select) => {
-            if columns_any(&select.columns, &scalar_expr_has_window) {
-                // Window function → Materialize unconditionally (expensive on
-                // pure compute grounds, even when result cardinality matches
-                // source cardinality).
-                ShapeGate::Materialize
-            } else if select.distinct
+            // Any non-trivial recompute — window, aggregate/GROUP BY/HAVING/
+            // DISTINCT, or a join — can earn an MV. The two build-time gates
+            // (row reduction OR compute avoidance) decide whether it actually
+            // does; classification only fences off shapes that can never benefit.
+            let computes = columns_any(&select.columns, &scalar_expr_has_window)
+                || select.distinct
                 || !select.group_by.is_empty()
                 || select.having.is_some()
                 || columns_any(&select.columns, &|e| e.has_aggregate(aggregate_functions))
-            {
-                // Reducing / transforming shape → Measure.
-                ShapeGate::Measure
-            } else if select_has_join(select) {
-                // Join result is generally far smaller than its inputs; size
-                // gate decides whether the reduction justifies storage.
-                ShapeGate::Measure
+                || select_has_join(select);
+            if computes {
+                ShapeGate::Gated
             } else {
                 // Single-table plain filter/projection — source-row cache
                 // already stores exactly these rows; MV would duplicate it.
@@ -419,6 +415,16 @@ fn select_has_join(select: &ResolvedSelectNode) -> bool {
 pub fn resolved_has_join(resolved: &ResolvedQueryExpr) -> bool {
     match &resolved.body {
         ResolvedQueryBody::Select(s) => select_has_join(s),
+        ResolvedQueryBody::SetOp(_) | ResolvedQueryBody::Values(_) => false,
+    }
+}
+
+/// Top-level SELECT projects a window function. A window MV must store the whole
+/// result (the window depends on the full partition), so it's excluded from the
+/// join top-N `mv_limit` cap even when it also contains a join.
+pub fn resolved_has_window(resolved: &ResolvedQueryExpr) -> bool {
+    match &resolved.body {
+        ResolvedQueryBody::Select(s) => columns_any(&s.columns, &scalar_expr_has_window),
         ResolvedQueryBody::SetOp(_) | ResolvedQueryBody::Values(_) => false,
     }
 }
@@ -488,19 +494,14 @@ mod tests {
     fn mv_state_initial_maps_from_gate() {
         assert_eq!(mv_state_initial(ShapeGate::Skip), MvState::Skipped);
         assert_eq!(
-            mv_state_initial(ShapeGate::Measure),
-            MvState::Pending { has_table: false }
-        );
-        assert_eq!(
-            mv_state_initial(ShapeGate::Materialize),
+            mv_state_initial(ShapeGate::Gated),
             MvState::Pending { has_table: false }
         );
     }
 
     #[test]
     fn is_reducer_matches_non_projection_shapes() {
-        assert!(ShapeGate::Materialize.is_reducer());
-        assert!(ShapeGate::Measure.is_reducer());
+        assert!(ShapeGate::Gated.is_reducer());
         assert!(!ShapeGate::Skip.is_reducer());
     }
 
@@ -620,65 +621,62 @@ mod tests {
     }
 
     #[test]
-    fn classify_bare_aggregate_is_measure() {
-        assert_eq!(classify("SELECT count(*) FROM orders"), ShapeGate::Measure);
-        assert_eq!(
-            classify("SELECT sum(total) FROM orders"),
-            ShapeGate::Measure
-        );
+    fn classify_bare_aggregate_is_gated() {
+        assert_eq!(classify("SELECT count(*) FROM orders"), ShapeGate::Gated);
+        assert_eq!(classify("SELECT sum(total) FROM orders"), ShapeGate::Gated);
     }
 
     #[test]
-    fn classify_group_by_is_measure() {
+    fn classify_group_by_is_gated() {
         assert_eq!(
             classify("SELECT status, count(*) FROM orders GROUP BY status"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_having_is_measure() {
-        // HAVING on a GROUP BY query — Measure via either signal.
+    fn classify_having_is_gated() {
+        // HAVING on a GROUP BY query — row reduction via either signal.
         assert_eq!(
             classify("SELECT status, count(*) FROM orders GROUP BY status HAVING count(*) > 5"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_distinct_is_measure() {
+    fn classify_distinct_is_gated() {
         assert_eq!(
             classify("SELECT DISTINCT status FROM orders"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_window_function_is_materialize() {
+    fn classify_window_function_is_gated() {
         assert_eq!(
             classify("SELECT id, row_number() OVER (ORDER BY total) FROM orders"),
-            ShapeGate::Materialize
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_window_takes_precedence_over_measure() {
-        // Even with GROUP BY, a window function forces Materialize (window is the
-        // compute-expensive signal; Measure is a size-reduction signal).
+    fn classify_window_with_group_by_is_gated() {
+        // Even with GROUP BY, a window function plus GROUP BY is still Gated (the window
+        // compute-expensive signal; row reduction is the size signal).
         assert_eq!(
             classify(
                 "SELECT status, count(*), row_number() OVER (ORDER BY status) \
                  FROM orders GROUP BY status"
             ),
-            ShapeGate::Materialize
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_union_dedup_is_measure() {
+    fn classify_union_dedup_is_gated() {
         assert_eq!(
             classify("SELECT id FROM orders UNION SELECT id FROM users"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
@@ -692,36 +690,36 @@ mod tests {
     }
 
     #[test]
-    fn classify_intersect_is_measure() {
+    fn classify_intersect_is_gated() {
         assert_eq!(
             classify("SELECT id FROM orders INTERSECT SELECT id FROM users"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
         assert_eq!(
             classify("SELECT id FROM orders INTERSECT ALL SELECT id FROM users"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_except_is_measure() {
+    fn classify_except_is_gated() {
         assert_eq!(
             classify("SELECT id FROM orders EXCEPT SELECT id FROM users"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
         assert_eq!(
             classify("SELECT id FROM orders EXCEPT ALL SELECT id FROM users"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_setop_order_by_identifier_in_select_is_measure() {
+    fn classify_setop_order_by_identifier_in_select_is_gated() {
         // `id` appears in the left branch's SELECT list; the set-op's output
         // column is named `id`, so `ORDER BY id` is serveable against the MV.
         assert_eq!(
             classify("SELECT id FROM orders UNION SELECT id FROM users ORDER BY id DESC"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
@@ -736,21 +734,21 @@ mod tests {
     }
 
     #[test]
-    fn classify_aggregate_inside_case_is_measure() {
+    fn classify_aggregate_inside_case_is_gated() {
         // Aggregate nested inside CASE branch should still be detected.
         assert_eq!(
             classify(
                 "SELECT CASE WHEN status = 'open' THEN count(*) ELSE 0 END \
                  FROM orders GROUP BY status"
             ),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_aggregate_in_subquery_does_not_measure_outer() {
+    fn classify_aggregate_in_subquery_does_not_reduce_outer() {
         // A scalar subquery with count() in the SELECT list doesn't make the
-        // outer query Measure — the outer query is a plain projection over orders.
+        // outer query a reduction shape — it.s a plain projection over orders.
         assert_eq!(
             classify("SELECT id, (SELECT count(*) FROM users) AS user_count FROM orders"),
             ShapeGate::Skip
@@ -758,51 +756,52 @@ mod tests {
     }
 
     #[test]
-    fn classify_join_without_aggregate_is_measure() {
-        // A join's result is generally far smaller than its joined inputs;
-        // the size gate (with the user's LIMIT folded in via mv_limit at
-        // registration) decides whether it's worth materializing.
+    fn classify_join_without_aggregate_is_gated() {
+        // A plain join's result is the same predicate-scoped rows it scans, so
+        // the row-reduction gate can't apply; its MV value is avoiding the
+        // re-join, gated on input size (PGC-330).
         assert_eq!(
             classify("SELECT o.id, u.name FROM orders o JOIN users u ON o.id = u.id"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_join_with_aggregate_is_measure() {
+    fn classify_join_with_aggregate_is_gated() {
+        // The aggregate signal wins over the join: this reduces rows.
         assert_eq!(
             classify(
                 "SELECT u.id, count(o.id) FROM users u \
                  JOIN orders o ON u.id = o.id GROUP BY u.id"
             ),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
     // ==================== ORDER BY interaction ====================
 
     #[test]
-    fn classify_measure_with_order_by_selected_aggregate_is_measure() {
+    fn classify_gated_with_order_by_selected_aggregate_is_gated() {
         // ORDER BY count(*) — count(*) is in SELECT, position lookup succeeds.
         assert_eq!(
             classify(
                 "SELECT status, count(*) FROM orders GROUP BY status \
                  ORDER BY count(*) DESC"
             ),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_measure_with_order_by_selected_group_column_is_measure() {
+    fn classify_gated_with_order_by_selected_group_column_is_gated() {
         assert_eq!(
             classify("SELECT status, count(*) FROM orders GROUP BY status ORDER BY status"),
-            ShapeGate::Measure
+            ShapeGate::Gated
         );
     }
 
     #[test]
-    fn classify_measure_with_order_by_not_in_select_downgrades_to_skip() {
+    fn classify_gated_aggregate_order_by_not_in_select_downgrades_to_skip() {
         // ORDER BY sum(total) where sum is NOT in SELECT list — can't preserve
         // the sort into the MV (sum is not a stored column). Downgrade to Skip.
         assert_eq!(
@@ -815,8 +814,8 @@ mod tests {
     }
 
     #[test]
-    fn classify_materialize_with_order_by_not_in_select_downgrades_to_skip() {
-        // Window functions force Materialize, but ORDER BY must still resolve
+    fn classify_gated_window_order_by_not_in_select_downgrades_to_skip() {
+        // Window functions are Gated, but ORDER BY must still resolve
         // against the SELECT list.
         assert_eq!(
             classify(

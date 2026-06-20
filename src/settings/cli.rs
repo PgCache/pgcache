@@ -180,6 +180,7 @@ pub(super) struct CliArgs {
     pub(super) cache_policy: Option<CachePolicy>,
     pub(super) admission_threshold: Option<u32>,
     pub(super) mv_size_ratio: Option<u32>,
+    pub(super) mv_compute_min_rows: Option<u64>,
     pub(super) memo_cache_size: Option<usize>,
     pub(super) memory_limit: Option<usize>,
     pub(super) disk_limit: Option<usize>,
@@ -239,6 +240,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("cache_policy") => args.cache_policy = Some(arg_enum(&mut parser)?),
             Long("admission_threshold") => args.admission_threshold = Some(arg_parse(&mut parser)?),
             Long("mv_size_ratio") => args.mv_size_ratio = Some(arg_parse(&mut parser)?),
+            Long("mv_compute_min_rows") => args.mv_compute_min_rows = Some(arg_parse(&mut parser)?),
             Long("memo_cache_size") => args.memo_cache_size = Some(arg_parse(&mut parser)?),
             Long("memory_limit") => args.memory_limit = Some(arg_parse(&mut parser)?),
             Long("disk_limit") => args.disk_limit = Some(arg_parse(&mut parser)?),
@@ -283,6 +285,24 @@ fn mv_size_ratio_resolve(cli: Option<u32>, toml_value: Option<u32>) -> Option<u3
     }
     if let Ok(v) = std::env::var("PGCACHE_MV_SIZE_RATIO")
         && let Ok(parsed) = v.parse::<u32>()
+    {
+        return Some(parsed);
+    }
+    None
+}
+
+/// Resolve mv_compute_min_rows from CLI > TOML > env var.
+/// Returns None to fall through to `DEFAULT_MV_COMPUTE_MIN_ROWS` in
+/// `DynamicConfig::new`.
+fn mv_compute_min_rows_resolve(cli: Option<u64>, toml_value: Option<u64>) -> Option<u64> {
+    if let Some(v) = cli {
+        return Some(v);
+    }
+    if let Some(v) = toml_value {
+        return Some(v);
+    }
+    if let Ok(v) = std::env::var("PGCACHE_MV_COMPUTE_MIN_ROWS")
+        && let Ok(parsed) = v.parse::<u64>()
     {
         return Some(parsed);
     }
@@ -417,6 +437,7 @@ pub(super) fn settings_build_with_config(
         csv_parse(args.allowed_tables).or(config.allowed_tables.take()),
         args.log_level.or_else(|| config.log_level.clone()),
         mv_size_ratio_resolve(args.mv_size_ratio, config.mv_size_ratio),
+        mv_compute_min_rows_resolve(args.mv_compute_min_rows, config.mv_compute_min_rows),
         memo_cache_size_resolve(args.memo_cache_size, config.memo_cache_size),
         memory_limit_resolve(args.memory_limit, config.memory_limit),
         disk_limit_resolve(args.disk_limit, config.disk_limit),
@@ -509,6 +530,7 @@ pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
                 csv_parse(args.allowed_tables),
                 args.log_level,
                 mv_size_ratio_resolve(args.mv_size_ratio, None),
+                mv_compute_min_rows_resolve(args.mv_compute_min_rows, None),
                 memo_cache_size_resolve(args.memo_cache_size, None),
                 memory_limit_resolve(args.memory_limit, None),
                 disk_limit_resolve(args.disk_limit, None),
@@ -544,6 +566,7 @@ impl Settings {
             [--cache_policy fifo|clock] (default: clock) \n \
             [--admission_threshold N] (default: 1, clock policy only) \n \
             [--mv_size_ratio N] (default: 10, materialized view size gate) \n \
+            [--mv_compute_min_rows N] (default: 1000, ComputeAvoid MV gate threshold in source rows) \n \
             [--memo_cache_size BYTES] (default: 64 MiB, in-process hot-result cache budget; 0 disables) \n \
             [--memory_limit BYTES] (default: 80% of detected RAM; absolute ceiling for registration throttling, can only lower) \n \
             [--disk_limit BYTES] (default: auto from free disk; cap on cache-volume space used before throttling + table drops) \n \

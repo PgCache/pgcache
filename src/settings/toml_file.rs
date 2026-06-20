@@ -16,6 +16,7 @@ fn dynamic_config_from_toml(config: &SettingsToml) -> DynamicConfig {
         config.allowed_tables.clone(),
         config.log_level.clone(),
         config.mv_size_ratio,
+        config.mv_compute_min_rows,
         config.memo_cache_size,
         config.memory_limit,
         config.disk_limit,
@@ -65,6 +66,11 @@ pub fn config_file_dynamic_update(path: &Path, patch: &DynamicConfigPatch) -> Co
 
     if let Some(ratio) = &patch.mv_size_ratio {
         doc["mv_size_ratio"] = toml_edit::value(*ratio as i64);
+    }
+
+    if let Some(min_rows) = &patch.mv_compute_min_rows {
+        let v_i64 = i64::try_from(*min_rows).expect("mv_compute_min_rows fits in i64");
+        doc["mv_compute_min_rows"] = toml_edit::value(v_i64);
     }
 
     if let Some(v) = &patch.memo_cache_size {

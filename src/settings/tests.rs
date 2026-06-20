@@ -538,6 +538,7 @@ fn base_toml_config() -> SettingsToml {
         cache_policy: None,
         admission_threshold: None,
         mv_size_ratio: None,
+        mv_compute_min_rows: None,
         memo_cache_size: None,
         memory_limit: None,
         disk_limit: None,
@@ -998,6 +999,7 @@ fn base_dynamic_config() -> DynamicConfig {
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1011,6 +1013,7 @@ fn config_patch_apply_empty_preserves_current() {
         allowed_tables: None,
         log_level: None,
         mv_size_ratio: None,
+        mv_compute_min_rows: None,
         memo_cache_size: None,
         memory_limit: None,
         disk_limit: None,
@@ -1022,6 +1025,7 @@ fn config_patch_apply_empty_preserves_current() {
     assert_eq!(result.allowed_tables, Some(vec!["public.users".to_owned()]));
     assert_eq!(result.log_level, Some("info".to_owned()));
     assert_eq!(result.mv_size_ratio, DEFAULT_MV_SIZE_RATIO);
+    assert_eq!(result.mv_compute_min_rows, DEFAULT_MV_COMPUTE_MIN_ROWS);
 }
 
 #[test]
@@ -1034,6 +1038,7 @@ fn config_patch_apply_set_values() {
         allowed_tables: Some(Some(vec!["orders".to_owned()])),
         log_level: Some(Some("debug".to_owned())),
         mv_size_ratio: Some(25),
+        mv_compute_min_rows: Some(2000),
         memo_cache_size: Some(8_000_000),
         memory_limit: None,
         disk_limit: None,
@@ -1046,6 +1051,7 @@ fn config_patch_apply_set_values() {
     assert_eq!(result.allowed_tables, Some(vec!["orders".to_owned()]));
     assert_eq!(result.log_level, Some("debug".to_owned()));
     assert_eq!(result.mv_size_ratio, 25);
+    assert_eq!(result.mv_compute_min_rows, 2000);
 }
 
 #[test]
@@ -1058,6 +1064,7 @@ fn config_patch_apply_unset_optional_fields() {
         allowed_tables: Some(None),
         log_level: Some(None),
         mv_size_ratio: None,
+        mv_compute_min_rows: None,
         memo_cache_size: None,
         memory_limit: None,
         disk_limit: None,
@@ -1131,6 +1138,7 @@ socket = "127.0.0.1:6432"
         allowed_tables: None,
         log_level: Some(None),
         mv_size_ratio: None,
+        mv_compute_min_rows: None,
         memo_cache_size: None,
         memory_limit: None,
         disk_limit: None,

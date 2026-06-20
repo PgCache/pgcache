@@ -26,6 +26,10 @@ pub struct DynamicConfig {
     /// iff `result_rows × mv_size_ratio ≤ source_rows` at first population.
     /// Sticky: retuning affects future first-population decisions only.
     pub mv_size_ratio: u32,
+    /// Materialized-view compute-avoidance gate: a `Gated` query is materialized
+    /// iff its origin-population source-row count is `>= mv_compute_min_rows`.
+    /// Sticky: retuning affects future first-population decisions only.
+    pub mv_compute_min_rows: u64,
     /// Total-bytes budget for the in-process hot-result cache (PGC-236).
     /// 0 disables in-memory result memoization.
     pub memo_cache_size: usize,
@@ -45,6 +49,8 @@ pub struct DynamicConfig {
 const DEFAULT_ADMISSION_THRESHOLD: u32 = 1;
 
 pub(super) const DEFAULT_MV_SIZE_RATIO: u32 = 10;
+
+pub(super) const DEFAULT_MV_COMPUTE_MIN_ROWS: u64 = 1000;
 
 /// Floor (and RAM-undetectable fallback) for the in-process hot-result cache
 /// budget: 64 MiB.
@@ -73,6 +79,7 @@ impl DynamicConfig {
         allowed_tables: Option<Vec<String>>,
         log_level: Option<String>,
         mv_size_ratio: Option<u32>,
+        mv_compute_min_rows: Option<u64>,
         memo_cache_size: Option<usize>,
         memory_limit: Option<usize>,
         disk_limit: Option<usize>,
@@ -85,6 +92,7 @@ impl DynamicConfig {
             allowed_tables,
             log_level,
             mv_size_ratio: mv_size_ratio.unwrap_or(DEFAULT_MV_SIZE_RATIO),
+            mv_compute_min_rows: mv_compute_min_rows.unwrap_or(DEFAULT_MV_COMPUTE_MIN_ROWS),
             memo_cache_size: memo_cache_size.unwrap_or_else(memo_default),
             memory_limit,
             disk_limit,
@@ -252,7 +260,7 @@ impl DynamicConfigHandle {
     #[cfg(test)]
     pub fn test_default() -> Self {
         Self::new(
-            DynamicConfig::new(None, None, None, None, None, None, None, None, None),
+            DynamicConfig::new(None, None, None, None, None, None, None, None, None, None),
             None,
             None,
         )
@@ -278,6 +286,8 @@ pub struct DynamicConfigPatch {
     pub log_level: Option<Option<String>>,
     #[serde(default)]
     pub mv_size_ratio: Option<u32>,
+    #[serde(default)]
+    pub mv_compute_min_rows: Option<u64>,
     #[serde(default)]
     pub memo_cache_size: Option<usize>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
@@ -323,6 +333,9 @@ impl DynamicConfigPatch {
                 None => current.log_level.clone(),
             },
             mv_size_ratio: self.mv_size_ratio.unwrap_or(current.mv_size_ratio),
+            mv_compute_min_rows: self
+                .mv_compute_min_rows
+                .unwrap_or(current.mv_compute_min_rows),
             memo_cache_size: self.memo_cache_size.unwrap_or(current.memo_cache_size),
             memory_limit: match self.memory_limit {
                 Some(v) => v,

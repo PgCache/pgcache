@@ -212,6 +212,11 @@ struct SettingsToml {
     /// Defaults to 10.
     #[serde(default)]
     mv_size_ratio: Option<u32>,
+    /// Materialized-view compute-avoidance gate: a `Gated` query is materialized
+    /// iff its origin-population source-row count is `>= mv_compute_min_rows`.
+    /// Defaults to 1000.
+    #[serde(default)]
+    mv_compute_min_rows: Option<u64>,
     /// Total-bytes budget for the in-process hot-result cache (PGC-236).
     /// 0 disables in-memory result memoization. Defaults to 64 MiB.
     #[serde(default)]

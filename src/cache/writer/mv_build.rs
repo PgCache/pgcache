@@ -60,8 +60,14 @@ pub(super) struct MvBuildContext {
     pub resolved: SharedResolved,
     /// Captured by a previous build; `None` means describe before building.
     pub output_columns: Option<Arc<[EcoString]>>,
+    /// Real source-row count from the origin population, when the query
+    /// self-populated. `None` when it became Ready without populating (subsumed,
+    /// or other non-population paths) — the gate then counts the cache itself.
+    pub populated_rows: Option<u64>,
     /// `mv_size_ratio` read from dynamic config at dispatch time.
     pub mv_size_ratio: u64,
+    /// ComputeAvoid row threshold from dynamic config at dispatch time.
+    pub mv_compute_min_rows: u64,
 }
 
 /// Pool of cache-DB connections for build tasks, using the codebase's bounded
@@ -323,20 +329,69 @@ async fn mv_output_columns(client: &Client, ctx: &MvBuildContext) -> CacheResult
     }
 }
 
-/// Run the Measure size gate (no-op for Materialize / Skip defensively).
-/// Called only before a first build — rebuilds inherit the sticky gate
-/// result via classification not re-running.
+/// First-build gate. `Skip` never materializes; a `Gated` shape materializes if
+/// EITHER admission test passes (PGC-330):
+///
+/// - **compute avoidance**: `populated_rows >= mv_compute_min_rows` — the input
+///   is large enough that re-running the join/window/aggregate per serve is worth
+///   avoiding, regardless of how much it reduces.
+/// - **row reduction**: `result_rows * mv_size_ratio <= populated_rows` — the
+///   result is a large enough reduction of its input to be worth storing.
+///
+/// The source-row count is the origin population count when the query
+/// self-populated (free, no query); otherwise — subsumed, or any path that
+/// reached Ready without populating — it falls back to a bounded predicate-scoped
+/// `count(*)` against the cache (off the serve path). The reduction test also
+/// needs the result count, so it's only run when compute avoidance hasn't
+/// already admitted the build.
+///
+/// Called only before a first build — rebuilds inherit the sticky gate result.
 async fn mv_gate_passes(client: &Client, ctx: &MvBuildContext) -> CacheResult<bool> {
-    match ctx.shape_gate {
-        ShapeGate::Materialize => Ok(true),
-        ShapeGate::Skip => Ok(false),
-        ShapeGate::Measure => {
-            let source_rows = mv_source_rows_count(client, ctx).await?;
-            mv_size_gate_passes(client, ctx, source_rows).await
-        }
+    if ctx.shape_gate == ShapeGate::Skip {
+        return Ok(false);
     }
+    let source_rows = match ctx.populated_rows {
+        Some(n) => n,
+        None => mv_source_rows_count(client, ctx).await?,
+    };
+    let admit = if source_rows >= ctx.mv_compute_min_rows {
+        true
+    } else {
+        let result_rows = mv_result_count(client, ctx).await?;
+        result_rows.saturating_mul(ctx.mv_size_ratio) <= source_rows
+    };
+    let mv = &crate::metrics::handles().mv;
+    if admit {
+        mv.gate_admit.increment(1);
+    } else {
+        mv.gate_reject.increment(1);
+    }
+    Ok(admit)
 }
 
+/// Result-row count — the reduction test's numerator: `count(*)` over the MV
+/// body, capped by `max_limit`. `mem.query_generation` is set/reset around it
+/// because source rows are generation-filtered (a GC mechanism, not
+/// read-consistency).
+async fn mv_result_count(client: &Client, ctx: &MvBuildContext) -> CacheResult<u64> {
+    let set_gen = format!("SET mem.query_generation = {}", ctx.generation);
+    client
+        .batch_execute(&set_gen)
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("setting query generation for MV gate")?;
+
+    let count_sql = mv_count_sql(ctx);
+    let result = client.query_one(&count_sql, &[]).await;
+
+    // Always reset generation, even on failure.
+    let _ = client.batch_execute("SET mem.query_generation = 0").await;
+
+    let row = result
+        .map_into_report::<CacheError>()
+        .attach_loc("executing MV gate result count")?;
+    Ok(u64::try_from(row.get::<_, i64>(0)).unwrap_or(0))
+}
 /// Row source whose count is the Measure-gate denominator: the source query's
 /// *input* rows — the rows that feed the result — NOT the result itself.
 ///
@@ -405,40 +460,6 @@ async fn mv_source_rows_count(client: &Client, ctx: &MvBuildContext) -> CacheRes
         .map_into_report::<CacheError>()
         .attach_loc("counting MV size-gate source rows")?;
     Ok(u64::try_from(row.get::<_, i64>(0)).unwrap_or(0))
-}
-
-/// Measure-gate: `result_rows × mv_size_ratio ≤ source_rows`.
-///
-/// The numerator (`SELECT count(*) FROM (<query> LIMIT max_limit) x`) is the
-/// rows that would be stored; the LIMIT caps it at `max_limit` to match the MV.
-/// `mem.query_generation` is set/reset around it for source-row generation
-/// bookkeeping (a GC mechanism — not read-consistency). `source_rows` (the
-/// predicate-scoped denominator) is computed by the caller and needs no
-/// generation.
-async fn mv_size_gate_passes(
-    client: &Client,
-    ctx: &MvBuildContext,
-    source_rows: u64,
-) -> CacheResult<bool> {
-    let set_gen = format!("SET mem.query_generation = {}", ctx.generation);
-    client
-        .batch_execute(&set_gen)
-        .await
-        .map_into_report::<CacheError>()
-        .attach_loc("setting query generation for MV size gate")?;
-
-    let count_sql = mv_count_sql(ctx);
-    let result = client.query_one(&count_sql, &[]).await;
-
-    // Always reset generation, even on failure.
-    let _ = client.batch_execute("SET mem.query_generation = 0").await;
-
-    let row = result
-        .map_into_report::<CacheError>()
-        .attach_loc("executing MV size gate count")?;
-    let result_rows = u64::try_from(row.get::<_, i64>(0)).unwrap_or(0);
-
-    Ok(result_rows.saturating_mul(ctx.mv_size_ratio) <= source_rows)
 }
 
 /// Append the resolved query body (including any ORDER BY) and the MV's

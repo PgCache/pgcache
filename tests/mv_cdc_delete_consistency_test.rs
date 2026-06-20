@@ -27,7 +27,7 @@ fn row_count(msgs: &[SimpleQueryMessage]) -> usize {
 /// The served cache hit must drop the deleted row; the MV must not retain it.
 #[tokio::test]
 async fn test_cdc_delete_during_fresh_mv_leaves_no_ghost() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
+    let mut ctx = TestContext::setup_with_args(&["--mv_compute_min_rows", "0"]).await?;
 
     ctx.simple_query("create table mvg_groups (group_id int primary key, version int not null)")
         .await?;
@@ -131,7 +131,7 @@ async fn test_cdc_delete_during_fresh_mv_leaves_no_ghost() -> Result<(), Error> 
 /// written, and the source-row full-table query stays clean.
 #[tokio::test]
 async fn test_cdc_version_bump_after_delete_heals_mv() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
+    let mut ctx = TestContext::setup_with_args(&["--mv_compute_min_rows", "0"]).await?;
 
     ctx.simple_query("create table mvh_groups (group_id int primary key, version int not null)")
         .await?;
@@ -236,7 +236,7 @@ async fn test_cdc_version_bump_after_delete_heals_mv() -> Result<(), Error> {
 /// persistent bug to the pure-DELETE path where no compensating upsert fires.
 #[tokio::test]
 async fn test_cdc_pk_change_during_fresh_mv_leaves_no_ghost() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
+    let mut ctx = TestContext::setup_with_args(&["--mv_compute_min_rows", "0"]).await?;
 
     ctx.simple_query("create table mvp_groups (group_id int primary key, version int not null)")
         .await?;
@@ -366,7 +366,7 @@ async fn test_cdc_pk_change_during_fresh_mv_leaves_no_ghost() -> Result<(), Erro
 /// served by the Fresh MV forever.
 #[tokio::test]
 async fn test_cdc_update_departure_during_fresh_mv_no_ghost() -> Result<(), Error> {
-    let mut ctx = TestContext::setup().await?;
+    let mut ctx = TestContext::setup_with_args(&["--mv_compute_min_rows", "0"]).await?;
 
     ctx.simple_query("create table mvd_groups (group_id int primary key, version int not null)")
         .await?;

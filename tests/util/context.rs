@@ -8,9 +8,9 @@ use super::http::http_get;
 
 use super::metrics::MetricsSnapshot;
 use super::process::{
-    PgCacheProcess, TempDBs, connect_pgcache, connect_pgcache_allowlist, connect_pgcache_clock,
-    connect_pgcache_fault, connect_pgcache_pinned, connect_pgcache_pinned_small_cache,
-    connect_pgcache_small_cache, start_databases,
+    PgCacheProcess, TempDBs, connect_pgcache, connect_pgcache_allowlist, connect_pgcache_args,
+    connect_pgcache_clock, connect_pgcache_fault, connect_pgcache_pinned,
+    connect_pgcache_pinned_small_cache, connect_pgcache_small_cache, start_databases,
 };
 
 /// Test context combining all resources needed for integration tests.
@@ -30,6 +30,23 @@ impl TestContext {
     pub async fn setup() -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) = connect_pgcache(&dbs).await?;
+        Ok(Self {
+            dbs,
+            pgcache,
+            cache_port,
+            metrics_port,
+            cache,
+            origin,
+        })
+    }
+
+    /// Set up a test context with extra pgcache CLI args (e.g.
+    /// `--mv_compute_min_rows 0` to force MV materialization of `Gated` shapes
+    /// regardless of size).
+    pub async fn setup_with_args(extra_args: &[&str]) -> Result<Self, Error> {
+        let (dbs, origin) = start_databases().await?;
+        let (pgcache, cache_port, metrics_port, cache) =
+            connect_pgcache_args(&dbs, extra_args).await?;
         Ok(Self {
             dbs,
             pgcache,
