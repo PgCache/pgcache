@@ -14,6 +14,17 @@ use super::super::search_path::{SearchPath, search_path_mutations_raw};
 
 use super::*;
 
+/// Extract the SQL text (without the trailing null) from a simple-query
+/// `'Q'` message body. Returns `None` if the frame is malformed or the text
+/// is not valid UTF-8.
+fn query_message_sql(data: &BytesMut) -> Option<&str> {
+    // Frame layout: tag(1) | len(4) | sql(N) | nul(1); len counts itself+body,
+    // so the SQL text (excluding the nul) lies at bytes 5..len_field.
+    let len_bytes: [u8; 4] = data.get(1..5)?.try_into().ok()?;
+    let msg_len = u32::from_be_bytes(len_bytes) as usize;
+    str::from_utf8(data.get(5..msg_len)?).ok()
+}
+
 /// State machine for intercepting origin responses that shouldn't reach the client.
 /// Only one intercept can be active at a time.
 pub(in crate::proxy::connection) enum OriginIntercept {

@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use tokio_util::bytes::{BufMut, Bytes, BytesMut};
 
 use crate::pg::protocol::{
@@ -7,6 +9,10 @@ use crate::pg::protocol::{
 };
 
 use super::*;
+
+/// Bounded per connection so dynamic-SQL workloads can't grow it unbounded.
+pub(in crate::proxy::connection) const DESCRIBE_CACHE_CAPACITY: NonZeroUsize =
+    NonZeroUsize::new(256).unwrap();
 
 /// A given SQL can have different `ParameterDescription` responses depending
 /// on the OID hints the client supplied in its `Parse` message, so both go

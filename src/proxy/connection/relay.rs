@@ -3,7 +3,11 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 
 use lru::LruCache;
@@ -51,6 +55,40 @@ use super::super::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::result::ReportExt;
 
 use super::*;
+
+/// Process-global "log at most once per window" gate, shared across all
+/// connections. A flapping cache subsystem can drop one client per query; this
+/// keeps the operator-facing warning to a single line per window per call site
+/// rather than one per affected client. `last` is per-call-site state holding
+/// the last emit time in whole seconds since first use (`u64::MAX` = never).
+fn log_gate(last: &AtomicU64, window_secs: u64) -> bool {
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+    let now = START.elapsed().as_secs();
+    let prev = last.load(Ordering::Relaxed);
+    if prev != u64::MAX && now.wrapping_sub(prev) < window_secs {
+        return false;
+    }
+    last.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+/// Window for the cache-down operator warnings, in seconds.
+const CACHE_DOWN_LOG_WINDOW_SECS: u64 = 5;
+
+/// Gate state: cache died with a query in flight (client connection dropped).
+static CACHE_DEAD_INFLIGHT_LOG: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Gate state: cache unavailable at dispatch (connections degraded to origin).
+static CACHE_DEGRADED_LOG: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Guard that decrements active connections gauge when dropped.
+struct ActiveConnectionGuard;
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        crate::metrics::handles().conn.active.decrement(1.0);
+    }
+}
 
 /// Prepend a `Parse` to `origin_write_buf` when origin doesn't yet know the
 /// statement. No-op if origin already knows it, if no `parse_bytes` were

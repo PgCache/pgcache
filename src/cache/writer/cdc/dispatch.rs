@@ -6,11 +6,15 @@ use std::time::Instant;
 use ecow::EcoString;
 use tracing::{error, instrument, trace};
 
+use lru::LruCache;
+
+use crate::pg;
 use crate::pg::protocol::ByteString;
+use crate::settings::Settings;
 
 use super::super::super::messages::CdcCommand;
 use super::super::super::types::{UpdateEvalStrategy, UpdateQuery};
-use super::super::super::{CacheError, CacheResult, ReportExt};
+use super::super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::super::core::WriterCore;
 use super::super::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState};
 use super::super::staging::pk_body_render;
@@ -893,4 +897,93 @@ impl WriterCdc {
 
         Ok(())
     }
+}
+
+impl WriterCdc {
+    pub async fn new(settings: &Settings) -> CacheResult<Self> {
+        let cache_eval_conn = pg::connect(&settings.cache, "cache eval")
+            .await
+            .map_into_report::<CacheError>()?;
+
+        let cdc_write_conn = pg::connect(&settings.cache, "cdc write")
+            .await
+            .map_into_report::<CacheError>()?;
+
+        #[cfg(feature = "fault-injection")]
+        fault::init();
+
+        Ok(Self {
+            cache_eval_conn,
+            cdc_write_conn,
+            last_applied_lsn: Lsn::from_raw(0),
+            pg_eval_buf: String::with_capacity(SQL_BUFFER_CAPACITY),
+            prepared_membership: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),
+            prepared_row_change: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),
+        })
+    }
+}
+
+/// Test-only deterministic fault injection (PGC-147). Compiled out entirely
+/// unless built with `--features fault-injection`; the writer-side CDC `40P01`
+/// is a timing race that cannot be provoked probabilistically, so the recovery
+/// path is exercised by forcing it here.
+#[cfg(feature = "fault-injection")]
+mod fault {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static CDC_DEADLOCK_ONCE: AtomicBool = AtomicBool::new(false);
+
+    /// Minimum batch size before the queue-empty flush trigger fires
+    /// (`PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES`), read once.
+    pub(super) fn hold_flush_frames() -> Option<usize> {
+        use std::sync::OnceLock;
+        static HOLD: OnceLock<Option<usize>> = OnceLock::new();
+        *HOLD.get_or_init(|| {
+            std::env::var("PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|n| *n > 0)
+        })
+    }
+
+    /// Arm the one-shot from the environment (read once at writer startup).
+    pub(super) fn init() {
+        if std::env::var_os("PGCACHE_FAULT_CDC_DEADLOCK_ONCE").is_some() {
+            CDC_DEADLOCK_ONCE.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// True exactly once if armed — consumes the one-shot.
+    pub(super) fn cdc_deadlock_take() -> bool {
+        CDC_DEADLOCK_ONCE.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// Whether to simulate a CDC-frame `40P01` for the current insert. Always
+/// `false` (and `core` untouched) unless built with `fault-injection`. The
+/// one-shot is consumed only once a query is cached, so fixture-load inserts
+/// (which precede any cached query) don't trip it — the injected deadlock
+/// lands on a frame that actually has a relation to recover.
+#[cfg(feature = "fault-injection")]
+fn fault_cdc_deadlock_should_inject(core: &WriterCore) -> bool {
+    core.cache.cached_queries.iter().next().is_some() && fault::cdc_deadlock_take()
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn fault_cdc_deadlock_should_inject(_core: &WriterCore) -> bool {
+    false
+}
+
+/// Test-only flush hold (PGC-242): with `PGCACHE_FAULT_CDC_HOLD_FLUSH_FRAMES=N`
+/// the queue-empty trigger is suppressed until N frames have accumulated, so
+/// tests can provoke deterministic multi-frame batches without real queue
+/// pressure. Size caps and `Recovering` still force a flush.
+#[cfg(feature = "fault-injection")]
+fn fault_cdc_hold_flush(batch_frames: usize) -> bool {
+    fault::hold_flush_frames().is_some_and(|n| batch_frames < n)
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn fault_cdc_hold_flush(_batch_frames: usize) -> bool {
+    false
 }

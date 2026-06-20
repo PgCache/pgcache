@@ -32,6 +32,14 @@ use super::super::query::{Action, ForwardReason, analyze};
 
 use super::*;
 
+/// Synth response for a Parse-only batch (no Describe): ParseComplete + RFQ('I').
+const PARSE_COMPLETE_RFQ_IDLE: &[u8] = &[b'1', 0, 0, 0, 4, b'Z', 0, 0, 0, 5, b'I'];
+
+/// Wire bytes of a bare `Sync` message (`'S'` + length 4). Synthesized to close
+/// origin's implicit transaction when a multi-execute cache batch falls back to
+/// forwarding (the client's own `Sync` isn't replayed per entry).
+const SYNC_MESSAGE: [u8; 5] = [b'S', 0, 0, 0, 4];
+
 /// A cacheable-query snapshot captured at Execute time. Taken eagerly (not at
 /// Sync) because a multi-execute batch typically reuses the unnamed portal /
 /// statement, so `self.portals` / `prepared_statements` reflect only the *last*
