@@ -1,9 +1,11 @@
-mod convert;
 mod convert_raw;
 #[cfg(test)]
-mod expr_parse;
+mod convert_raw_tests;
+mod fingerprint;
 pub(crate) mod raw;
 mod types;
+#[cfg(test)]
+mod where_clause_tests;
 
 use ecow::EcoString;
 use error_set::error_set;
@@ -99,8 +101,8 @@ impl Deparse for EcoString {
 }
 
 // Re-export everything public from submodules
-pub use convert::*;
 pub use convert_raw::query_expr_convert_raw;
 #[cfg(test)]
 pub(crate) use convert_raw::query_expr_parse;
+pub use fingerprint::*;
 pub use types::*;
