@@ -19,7 +19,8 @@ use crate::result::error_chain_format;
 use crate::settings::Settings;
 use crate::timing::duration_to_us_u64;
 
-use super::MIN_POOL_SIZE;
+/// Minimum number of connections in the cache serve pool.
+pub(super) const MIN_POOL_SIZE: usize = 4;
 
 /// Interval between serve-pool connection recycles while under memory pressure.
 /// One connection per tick → the whole pool refreshes over `pool_size × this`
