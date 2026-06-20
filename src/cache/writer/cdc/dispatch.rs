@@ -11,7 +11,8 @@ use crate::pg::protocol::ByteString;
 use super::super::super::messages::CdcCommand;
 use super::super::super::types::{UpdateEvalStrategy, UpdateQuery};
 use super::super::super::{CacheError, CacheResult, ReportExt};
-use super::super::core::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, WriterCore};
+use super::super::core::WriterCore;
+use super::super::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState};
 use super::super::staging::pk_body_render;
 
 use super::*;

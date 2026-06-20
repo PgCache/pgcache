@@ -21,7 +21,8 @@ use crate::query::transform::{
 
 use super::super::super::types::{UpdateEvalStrategy, UpdateQuery};
 use super::super::super::{CacheError, CacheResult, MapIntoReport};
-use super::super::core::{FrameRowEvent, WriterCore};
+use super::super::core::WriterCore;
+use super::super::frame::FrameRowEvent;
 use crate::result::error_chain_format;
 
 use super::*;

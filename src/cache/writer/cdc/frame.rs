@@ -7,10 +7,9 @@ use tracing::{error, info};
 
 use super::super::super::memo::SlotKey;
 use super::super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
-use super::super::core::{
-    FRAME_BUF_CAPACITY, FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, WriterCore,
-};
+use super::super::core::WriterCore;
 use super::super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
+use super::super::frame::{FRAME_BUF_CAPACITY, FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState};
 
 use super::*;
 

@@ -11,7 +11,8 @@ use tracing::{debug, error};
 use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 
-use super::super::core::{FrameRowEvent, ToastOverlayEntry, WriterCore};
+use super::super::core::WriterCore;
+use super::super::frame::{FrameRowEvent, ToastOverlayEntry};
 use super::super::staging::pk_body_render;
 
 use super::*;
