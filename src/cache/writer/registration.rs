@@ -39,10 +39,8 @@ use super::super::{
     messages::{AdmitAction, QueryCommand, SubsumptionResult},
     mv::{ShapeGate, resolved_has_join, shape_classify},
     query::CacheableQuery,
-    types::{
-        CachedQuery, QueryMetrics, SharedResolved, UpdateEvalStrategy, UpdateQueries, UpdateQuery,
-        UpdateQuerySource,
-    },
+    types::{CachedQuery, QueryMetrics, SharedResolved},
+    update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQuerySource},
 };
 use super::core::{MERGE_FLUSH_FORCE_AFTER, PendingMerge, WriterCore};
 use super::population::population_worker;

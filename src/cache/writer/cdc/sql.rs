@@ -13,7 +13,7 @@ use crate::query::ast::Deparse;
 use crate::query::resolved::ResolvedQueryExpr;
 use crate::query::transform::resolved_select_node_table_replace_with_values;
 
-use super::super::super::types::UpdateQuery;
+use super::super::super::update_query::UpdateQuery;
 use super::super::super::{CacheError, CacheResult};
 use super::super::core::WriterCore;
 use crate::result::error_chain_format;

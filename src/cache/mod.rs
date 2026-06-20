@@ -26,11 +26,13 @@ pub(crate) mod mv;
 pub(crate) mod query;
 mod query_cache;
 mod reg_bucket;
+mod reg_gate;
 mod reply;
 mod runtime;
 mod serve;
 pub(crate) mod status;
 mod types;
+mod update_query;
 mod write_queue;
 mod writer;
 
@@ -49,9 +51,9 @@ pub use runtime::{CacheGeneration, cache_generation_start, cache_supervise};
 pub use status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
 };
-pub use types::{
-    Cache, CachedQuery, CachedQueryState, CachedQueryView, PinnedQuery, SubqueryKind,
-    UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQuerySource,
+pub use types::{Cache, CachedQuery, CachedQueryState, CachedQueryView, PinnedQuery};
+pub use update_query::{
+    SubqueryKind, UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQuerySource,
 };
 
 error_set! {

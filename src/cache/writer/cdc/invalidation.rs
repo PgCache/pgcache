@@ -22,8 +22,9 @@ use crate::settings::CachePolicy;
 use crate::query::evaluate::where_expr_evaluate;
 
 use super::super::super::messages::QueryCommand;
-use super::super::super::types::{
-    CachedQueryState, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
+use super::super::super::types::CachedQueryState;
+use super::super::super::update_query::{
+    SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
 };
 use super::super::super::{CacheError, CacheResult, MapIntoReport};
 use super::super::core::WriterCore;

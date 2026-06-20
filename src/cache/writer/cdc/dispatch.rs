@@ -13,7 +13,7 @@ use crate::pg::protocol::ByteString;
 use crate::settings::Settings;
 
 use super::super::super::messages::CdcCommand;
-use super::super::super::types::{UpdateEvalStrategy, UpdateQuery};
+use super::super::super::update_query::{UpdateEvalStrategy, UpdateQuery};
 use super::super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::super::core::WriterCore;
 use super::super::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState};

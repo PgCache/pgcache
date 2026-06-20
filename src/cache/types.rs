@@ -1,8 +1,8 @@
 use crate::catalog::Oid;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -10,18 +10,19 @@ use dashmap::DashMap;
 use ecow::EcoString;
 use hdrhistogram::Histogram;
 
-use iddqd::{BiHashItem, BiHashMap, IdHashItem, IdHashMap, bi_upcast, id_upcast};
+use iddqd::{BiHashItem, BiHashMap, IdHashMap, bi_upcast};
 
 use crate::{
     cache::{memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::TableMetadata,
     query::{
-        Fingerprint, FingerprintDashMap, FingerprintMap, QueryShape, ast::QueryExpr,
-        constraint_index::ConstraintIndex, constraints::QueryConstraints,
-        resolved::ResolvedQueryExpr,
+        Fingerprint, FingerprintDashMap, QueryShape, ast::QueryExpr, resolved::ResolvedQueryExpr,
     },
     settings::{DynamicConfigHandle, Settings},
 };
+
+use super::reg_gate::RegGate;
+use super::update_query::UpdateQueries;
 
 /// Shared resolved query expression, wrapped in Arc to avoid deep cloning
 /// on every cache hit (the dispatch→serve path).
@@ -99,234 +100,6 @@ impl BiHashItem for CachedQuery {
 
 //     id_upcast!();
 // }
-
-/// The kind of subquery context a table was found in.
-/// Determines invalidation behavior based on whether the subquery's
-/// result set growing or shrinking affects the outer query.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SubqueryKind {
-    /// IN, EXISTS, FROM subquery, CTE.
-    /// Set growth → outer result grows → invalidate.
-    /// Set shrink → outer result shrinks → skip.
-    Inclusion,
-    /// NOT IN (<> ALL), NOT EXISTS.
-    /// Set growth → outer result shrinks → skip.
-    /// Set shrink → outer result grows → invalidate.
-    Exclusion,
-    /// Scalar subquery returning a single value.
-    /// Any change → invalidate.
-    Scalar,
-}
-
-/// Strategy for evaluating an update query's WHERE clause during CDC handling.
-///
-/// Determined once at registration time based on the shape of the resolved query.
-/// `LocalEval` rows skip per-query PG round-trips; `PgEval` rows fall through to
-/// the `INSERT ... WHERE EXISTS` dispatch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateEvalStrategy {
-    /// WHERE clause is fully representable by the Rust evaluator and can be
-    /// decided against a single CDC row without touching the cache DB.
-    LocalEval,
-    /// WHERE clause shape is not representable by the Rust evaluator (subqueries,
-    /// GROUP BY/HAVING, unsupported expressions, multi-table, or non-FromClause
-    /// source). CDC must use the per-query `INSERT ... WHERE EXISTS` path.
-    PgEval,
-}
-
-/// Whether an update query was derived from a direct table or a subquery table
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum UpdateQuerySource {
-    /// Table appears in the FROM clause (inner join or single table)
-    FromClause,
-    /// Table appears inside a subquery, CTE, or derived table
-    Subquery(SubqueryKind),
-    /// Table is on the terminal optional side of an outer join.
-    /// Its columns don't appear in WHERE or other join conditions, so
-    /// CDC INSERT/DELETE can be handled in place without invalidation.
-    /// The preserved side already has the row — changes here only affect
-    /// which values fill the NULL-padded columns.
-    OuterJoinTerminal,
-    /// Table is on the non-terminal optional side of an outer join
-    /// (its columns appear in WHERE or other join conditions).
-    /// CDC events trigger full query invalidation rather than row-level updates.
-    OuterJoinOptional,
-}
-
-/// Query used to update cached results when data changes
-#[derive(Debug, Clone)]
-pub struct UpdateQuery {
-    /// Fingerprint of cached query that generated this update query
-    pub fingerprint: Fingerprint,
-    /// Resolved AST query
-    pub resolved: ResolvedQueryExpr,
-    /// Whether this table was found directly in FROM or inside a subquery
-    pub source: UpdateQuerySource,
-    /// WHERE clause constraints for CDC invalidation filtering
-    pub constraints: QueryConstraints,
-    /// Whether the parent cached query has a LIMIT (max_limit.is_some()).
-    /// Used by CDC to determine if DELETE should trigger invalidation.
-    pub has_limit: bool,
-    /// Eval strategy for this query's WHERE clause during CDC row matching.
-    pub eval_strategy: UpdateEvalStrategy,
-    /// Columns from ORDER BY / WHERE / HAVING that define the LIMIT window.
-    /// Populated only when `has_limit`; consumed by row_cached_invalidation_check
-    /// to detect updates that may demote a cached row out of the window (PGC-94).
-    pub limit_window_columns: HashSet<EcoString>,
-    /// Whether a CDC UPDATE for this query can ever invalidate. When `false`,
-    /// `handle_update` skips the `query_row_changes` SELECT and the invalidation
-    /// check entirely (PGC-227). Set at registration from
-    /// `update_invalidation_possible` (the single source of truth — needs the
-    /// relation's table name).
-    pub change_dependent: bool,
-    /// Whether this query's PgEval membership can be evaluated for many CDC
-    /// rows in one multi-row VALUES statement (PGC-241). Requires per-row
-    /// independence: no GROUP BY / HAVING and no aggregates in the SELECT list
-    /// (those evaluate against the substituted rows *as a set*, so a multi-row
-    /// VALUES would change the per-row answer). Set at registration; only
-    /// meaningful for `eval_strategy == PgEval`.
-    pub pg_batchable: bool,
-    /// This relation's columns whose values CDC eval reads: WHERE, join
-    /// predicates, GROUP BY, HAVING — not the outer SELECT list. An
-    /// unchanged-toast UPDATE that elides one of these and can't be repaired
-    /// makes every eval verdict for this query untrustworthy, forcing
-    /// invalidation (PGC-264).
-    pub predicate_columns: HashSet<EcoString>,
-}
-
-impl UpdateQuery {
-    /// Whether a CDC UPDATE (`operation = Upsert`) for this query could ever
-    /// invalidate it: the static upper bound of `row_cached_invalidation_check`
-    /// ∪ `row_uncached_invalidation_check` over all possible row values. This is
-    /// the single source of truth for `change_dependent` (PGC-227); each clause
-    /// mirrors a check branch and the two must stay in lockstep — the
-    /// `debug_assert` in `update_queries_check_invalidate` enforces it at
-    /// runtime by failing if a check ever invalidates while this returns false.
-    pub fn update_invalidation_possible(&self, table_name: &str) -> bool {
-        // Cached path: Subquery / non-terminal outer join always invalidate.
-        matches!(
-            self.source,
-            UpdateQuerySource::Subquery(_) | UpdateQuerySource::OuterJoinOptional
-        )
-        // Cached path: a windowed FromClause query invalidates when a window
-        // column changes (PGC-94).
-        || (matches!(self.source, UpdateQuerySource::FromClause)
-            && self.has_limit
-            && !self.limit_window_columns.is_empty())
-        // Cached path: a join column on this table changing can invalidate.
-        || self.constraints.table_join_columns(table_name).next().is_some()
-        // Uncached path: any multi-table FromClause query invalidates on a row
-        // that newly satisfies the join — the partner side may not be cached,
-        // so in-place maintenance can't materialize it. Independent of whether
-        // the equivalence was recorded as `col = col`, so cross joins and
-        // expression/cast equi-joins land here rather than the join-column clause.
-        || (matches!(self.source, UpdateQuerySource::FromClause)
-            && !self.resolved.is_single_table())
-    }
-}
-
-/// Collection of update queries for a specific relation.
-///
-/// `queries` is keyed by fingerprint for O(1) lookup. `subsumption` is a typed
-/// index over the queries' WHERE-clause constraints used by
-/// `subsumption_check` for sub-linear candidate lookup (see PGC-119).
-#[derive(Debug)]
-pub struct UpdateQueries {
-    pub relation_oid: Oid,
-    pub queries: FingerprintMap<UpdateQuery>,
-    pub subsumption: ConstraintIndex<Fingerprint>,
-    /// Per-table constraint index over the *full* update-query population of
-    /// this relation — LocalEval and PgEval alike (PGC-292). Probed point-wise
-    /// (`candidates_point`) to narrow CDC per-row work: the upsert matcher
-    /// (`update_queries_execute_batch`, which filters to LocalEval after the
-    /// probe), the memo-eviction pass, and `mv_dirty_mark_removed_row`. Queries
-    /// with no/partial extractable constraints land in the unconstrained class
-    /// and are returned for every row, so narrowing never drops a true match
-    /// (no stale reads).
-    pub eval_index: ConstraintIndex<Fingerprint>,
-    /// Count of queries with `change_dependent == true`. Maintained on
-    /// insert/remove via `change_dependent_account` so `needs_change_eval` is
-    /// O(1) on the CDC hot path. Derivable from `queries`; `needs_change_eval`
-    /// debug-asserts it against a recompute so a missed account call can't
-    /// silently desync (a missed increment risks stale reads, a missed
-    /// decrement disables the PGC-227 skip).
-    change_dependent_count: usize,
-}
-
-impl UpdateQueries {
-    pub fn new(relation_oid: Oid) -> Self {
-        Self {
-            relation_oid,
-            queries: HashMap::default(),
-            subsumption: ConstraintIndex::new(),
-            eval_index: ConstraintIndex::new(),
-            change_dependent_count: 0,
-        }
-    }
-
-    /// Whether any query over this relation needs `query_row_changes` to decide
-    /// a CDC UPDATE's invalidation. When false, `handle_update` skips the
-    /// SELECT and the invalidation check entirely (PGC-227).
-    pub fn needs_change_eval(&self) -> bool {
-        debug_assert_eq!(
-            self.change_dependent_count,
-            self.queries.values().filter(|q| q.change_dependent).count(),
-            "change_dependent_count desynced from queries — insert/remove must go \
-             through query_insert/query_remove"
-        );
-        self.change_dependent_count > 0
-    }
-
-    /// Insert (or replace) an update query, keeping `change_dependent_count` in
-    /// sync with `queries`. Returns the replaced entry, if any. Replacement is
-    /// real: the same fingerprint can be registered more than once for a
-    /// relation (e.g. a self-correlated subquery decorrelates into multiple
-    /// update queries over the same table), and the map is keyed by fingerprint.
-    pub fn query_insert(&mut self, query: UpdateQuery) -> Option<UpdateQuery> {
-        let change_dependent = query.change_dependent;
-        let prev = self.queries.insert(query.fingerprint, query);
-        if let Some(prev) = &prev {
-            self.change_dependent_account(prev.change_dependent, false);
-        }
-        self.change_dependent_account(change_dependent, true);
-        prev
-    }
-
-    /// Remove an update query by fingerprint, keeping `change_dependent_count`
-    /// in sync with `queries`. Returns the removed entry, if any.
-    pub fn query_remove(&mut self, fingerprint: Fingerprint) -> Option<UpdateQuery> {
-        let removed = self.queries.remove(&fingerprint);
-        if let Some(removed) = &removed {
-            self.change_dependent_account(removed.change_dependent, false);
-        }
-        removed
-    }
-
-    /// Account for a query being added to / removed from the set. `added`
-    /// increments on insert, decrements on remove. Private: callers mutate
-    /// `queries` only via `query_insert`/`query_remove`, which keep the count
-    /// in lockstep.
-    fn change_dependent_account(&mut self, change_dependent: bool, added: bool) {
-        if !change_dependent {
-            return;
-        }
-        if added {
-            self.change_dependent_count += 1;
-        } else {
-            self.change_dependent_count = self.change_dependent_count.saturating_sub(1);
-        }
-    }
-}
-
-impl IdHashItem for UpdateQueries {
-    type Key<'a> = Oid;
-
-    fn key(&self) -> Self::Key<'_> {
-        self.relation_oid
-    }
-
-    id_upcast!();
-}
 
 /// Main cache data structure containing all cached state
 #[derive(Debug)]
@@ -442,121 +215,6 @@ impl QueryMetrics {
 /// Shared cache state for dispatch lookups and writer updates.
 /// Uses DashMap for per-shard locking — reads to one shard don't block
 /// writes to another, eliminating the global RwLock bottleneck.
-/// Shared state for the BBR-lite adaptive registration gate (PGC-277).
-///
-/// Model (à la TCP BBR): the writer's *drain rate* (registrations reaching Ready
-/// per second) is the bottleneck "bandwidth"; the writer *backlog depth* is the
-/// "queue". The controller max-filters the drain rate to estimate writer capacity
-/// and paces the admit rate (`reg_rate`) at it, using the min-filtered backlog as
-/// the standing-queue signal. There is deliberately no upper bound on `reg_rate`:
-/// when the writer keeps up it rises freely (effectively "no limit").
-///
-/// - Writer publishes: `completed` (monotonic Ready count) and the per-iteration
-///   backlog window via `queue_observe`.
-/// - Controller writes: `reg_rate`.
-/// - Dispatch token bucket reads: `reg_rate`.
-pub struct RegGate {
-    /// Admit rate (registrations/sec) the token bucket refills at — f64 in an
-    /// AtomicU64. `INFINITY` means "no gate yet" (admit all); the controller
-    /// replaces it with a finite paced rate once it has signal.
-    reg_rate_bits: AtomicU64,
-    /// Monotonic count of registrations that reached Ready. The controller's
-    /// drain-rate (capacity) estimate is `Δcompleted / Δt`.
-    completed: AtomicU64,
-    /// Writer backlog window min since the last controller reset. `~0` ⇒ the
-    /// writer drained (healthy); `> floor` ⇒ a standing queue (saturated).
-    queue_min: AtomicUsize,
-    /// Writer backlog window max since reset. `0` ⇒ no registration load this
-    /// window (the controller holds `reg_rate` rather than probing into a void).
-    queue_max: AtomicUsize,
-    /// Population in-flight: queries in `Loading` (admitted, populating, not yet
-    /// Ready). Published by the writer's gauge tick from the authoritative state
-    /// scan (so it never drifts). The second congestion signal — the writer's
-    /// command queue (`queue_min`) catches writer-stage congestion; this catches
-    /// population-stage congestion (`spawn_local` origin SELECTs), which on a
-    /// remote origin is the binding constraint the command queue is blind to.
-    loading: AtomicUsize,
-    /// Monotonic count of registrations the token bucket *denied* (shed to
-    /// origin). The controller probes the rate up only when this advanced — i.e.
-    /// demand is bumping against the rate — so a partly-warm cache (low miss/
-    /// registration load) can't drift the rate up into a low-demand void.
-    denied: AtomicU64,
-}
-
-impl RegGate {
-    pub fn new() -> Self {
-        Self {
-            reg_rate_bits: AtomicU64::new(f64::INFINITY.to_bits()),
-            completed: AtomicU64::new(0),
-            queue_min: AtomicUsize::new(usize::MAX),
-            queue_max: AtomicUsize::new(0),
-            loading: AtomicUsize::new(0),
-            denied: AtomicU64::new(0),
-        }
-    }
-
-    /// Current admit rate (registrations/sec). `INFINITY` ⇒ ungated.
-    pub fn rate(&self) -> f64 {
-        f64::from_bits(self.reg_rate_bits.load(Ordering::Relaxed))
-    }
-
-    /// Controller: set the paced admit rate.
-    pub fn rate_set(&self, rate: f64) {
-        self.reg_rate_bits.store(rate.to_bits(), Ordering::Relaxed);
-    }
-
-    /// Writer: a registration reached Ready (one unit of drained work).
-    pub fn completed_inc(&self) {
-        self.completed.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Controller: monotonic completed count, for the drain-rate delta.
-    pub fn completed_count(&self) -> u64 {
-        self.completed.load(Ordering::Relaxed)
-    }
-
-    /// Writer: fold the current backlog depth into this window's min/max.
-    pub fn queue_observe(&self, depth: usize) {
-        self.queue_min.fetch_min(depth, Ordering::Relaxed);
-        self.queue_max.fetch_max(depth, Ordering::Relaxed);
-    }
-
-    /// Controller: read and reset the backlog window. Returns `(min, max)`;
-    /// `min` is `0` when the window saw an empty backlog (or saw no samples).
-    pub fn window_take(&self) -> (usize, usize) {
-        let max = self.queue_max.swap(0, Ordering::Relaxed);
-        let min = self.queue_min.swap(usize::MAX, Ordering::Relaxed);
-        (if min == usize::MAX { 0 } else { min }, max)
-    }
-
-    /// Writer gauge tick: publish the authoritative `Loading` count (population
-    /// in-flight) from the state scan.
-    pub fn loading_set(&self, count: usize) {
-        self.loading.store(count, Ordering::Relaxed);
-    }
-
-    /// Controller: current population in-flight (queries still populating).
-    pub fn loading_get(&self) -> usize {
-        self.loading.load(Ordering::Relaxed)
-    }
-
-    /// Dispatch: the token bucket denied a registration (shed to origin).
-    pub fn denied_inc(&self) {
-        self.denied.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Controller: monotonic denied count, for the per-window shed delta.
-    pub fn denied_count(&self) -> u64 {
-        self.denied.load(Ordering::Relaxed)
-    }
-}
-
-impl Default for RegGate {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub struct CacheStateView {
     pub cached_queries: FingerprintDashMap<CachedQueryView>,
     pub metrics: FingerprintDashMap<QueryMetrics>,

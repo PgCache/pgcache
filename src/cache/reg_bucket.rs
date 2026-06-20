@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use tracing::info;
 
-use crate::cache::types::RegGate;
+use crate::cache::reg_gate::RegGate;
 
 /// Token bucket pacing new-query registration admission (PGC-277). The refill
 /// rate is the BBR-lite controller's `reg_gate.reg_rate` (registrations/sec),

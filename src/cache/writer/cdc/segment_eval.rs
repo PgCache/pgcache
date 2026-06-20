@@ -19,7 +19,7 @@ use crate::query::transform::{
     resolved_select_node_table_replace_with_values_batch,
 };
 
-use super::super::super::types::{UpdateEvalStrategy, UpdateQuery};
+use super::super::super::update_query::{UpdateEvalStrategy, UpdateQuery};
 use super::super::super::{CacheError, CacheResult, MapIntoReport};
 use super::super::core::WriterCore;
 use super::super::frame::FrameRowEvent;
