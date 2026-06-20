@@ -1,4 +1,5 @@
 use crate::pg::Lsn;
+use std::num::NonZeroU64;
 use std::sync::atomic::Ordering;
 
 use tokio::task::yield_now;
@@ -8,7 +9,7 @@ use crate::cache::status::{
 };
 use crate::query::ast::Deparse;
 
-use super::super::types::CachedQueryState;
+use super::super::types::{CachedQuery, CachedQueryState, QueryMetrics};
 
 use super::core::*;
 
@@ -130,116 +131,7 @@ impl WriterCore {
 
         let mut queries: Vec<QueryStatusData> = Vec::with_capacity(cache.cached_queries.len());
         for q in &cache.cached_queries {
-            let mut sql_preview = String::with_capacity(128);
-            Deparse::deparse(&*q.resolved, &mut sql_preview);
-            sql_preview.truncate(200);
-
-            let tables: Vec<String> = q
-                .relation_oids
-                .iter()
-                .filter_map(|oid| {
-                    cache
-                        .tables
-                        .get1(oid)
-                        .map(|t| format!("{}.{}", t.schema, t.name))
-                })
-                .collect();
-
-            let (state, mv_state) = self
-                .state_view
-                .cached_queries
-                .get(&q.fingerprint)
-                .map(|entry| {
-                    (
-                        format!("{:?}", entry.value().state),
-                        format!("{:?}", entry.value().mv.state),
-                    )
-                })
-                .unwrap_or_else(|| ("Unknown".to_owned(), "Unknown".to_owned()));
-
-            // Look up per-query metrics (shared read access)
-            let metrics = self.state_view.metrics.get(&q.fingerprint);
-            let now_ns =
-                u64::try_from(self.state_view.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            let (
-                hit_count,
-                miss_count,
-                idle_duration_ms,
-                registered_duration_ms,
-                cached_duration_ms,
-                invalidation_count,
-                readmission_count,
-                eviction_count,
-                subsumption_count,
-                population_count,
-                last_population_duration_ms,
-                total_bytes_served,
-                population_row_count,
-                cache_hit_latency,
-            ) = match &metrics {
-                Some(m) => {
-                    let latency_stats = if !m.cache_hit_latency.is_empty() {
-                        Some(LatencyStats {
-                            count: m.cache_hit_latency.len(),
-                            mean_us: m.cache_hit_latency.mean(),
-                            p50_us: m.cache_hit_latency.value_at_quantile(0.5),
-                            p95_us: m.cache_hit_latency.value_at_quantile(0.95),
-                            p99_us: m.cache_hit_latency.value_at_quantile(0.99),
-                            min_us: m.cache_hit_latency.min(),
-                            max_us: m.cache_hit_latency.max(),
-                        })
-                    } else {
-                        None
-                    };
-
-                    (
-                        m.hit_count,
-                        m.miss_count,
-                        m.last_hit_at_ns
-                            .map(|ns| now_ns.saturating_sub(ns.get()) / 1_000_000),
-                        m.registered_at_ns
-                            .map(|ns| now_ns.saturating_sub(ns.get()) / 1_000_000),
-                        m.cached_since_ns
-                            .map(|ns| now_ns.saturating_sub(ns.get()) / 1_000_000),
-                        m.invalidation_count,
-                        m.readmission_count,
-                        m.eviction_count,
-                        m.subsumption_count,
-                        m.population_count,
-                        m.last_population_duration_us.map(|us| us.get() / 1_000),
-                        m.total_bytes_served,
-                        m.population_row_count,
-                        latency_stats,
-                    )
-                }
-                None => (0, 0, None, None, None, 0, 0, 0, 0, 0, None, 0, 0, None),
-            };
-
-            queries.push(QueryStatusData {
-                fingerprint: q.fingerprint,
-                sql_preview,
-                tables,
-                state,
-                mv_state,
-                cached_bytes: q.cached_bytes,
-                max_limit: q.max_limit,
-                pinned: q.pinned,
-                hit_count,
-                miss_count,
-                idle_duration_ms,
-                registered_duration_ms,
-                cached_duration_ms,
-                invalidation_count,
-                readmission_count,
-                eviction_count,
-                subsumption_count,
-                population_count,
-                last_population_duration_ms,
-                total_bytes_served,
-                population_row_count,
-                cache_hit_latency,
-            });
-
+            queries.push(self.query_status_data(q));
             yield_now().await;
         }
 
@@ -251,5 +143,87 @@ impl WriterCore {
         };
 
         let _ = req.reply_tx.send(response);
+    }
+
+    /// Build one query's status row, mapping the shared per-query metrics into
+    /// named fields (zero / `None` when no metrics are recorded yet). Computing
+    /// `now_ns` per row matches the prior per-iteration behavior.
+    fn query_status_data(&self, q: &CachedQuery) -> QueryStatusData {
+        let cache = &self.cache;
+        let mut sql_preview = String::with_capacity(128);
+        Deparse::deparse(&*q.resolved, &mut sql_preview);
+        sql_preview.truncate(200);
+
+        let tables: Vec<String> = q
+            .relation_oids
+            .iter()
+            .filter_map(|oid| {
+                cache
+                    .tables
+                    .get1(oid)
+                    .map(|t| format!("{}.{}", t.schema, t.name))
+            })
+            .collect();
+
+        let (state, mv_state) = self
+            .state_view
+            .cached_queries
+            .get(&q.fingerprint)
+            .map(|entry| {
+                (
+                    format!("{:?}", entry.value().state),
+                    format!("{:?}", entry.value().mv.state),
+                )
+            })
+            .unwrap_or_else(|| ("Unknown".to_owned(), "Unknown".to_owned()));
+
+        let metrics = self.state_view.metrics.get(&q.fingerprint);
+        let m = metrics.as_deref();
+        let now_ns =
+            u64::try_from(self.state_view.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let since_ms = |ns: NonZeroU64| now_ns.saturating_sub(ns.get()) / 1_000_000;
+
+        QueryStatusData {
+            fingerprint: q.fingerprint,
+            sql_preview,
+            tables,
+            state,
+            mv_state,
+            cached_bytes: q.cached_bytes,
+            max_limit: q.max_limit,
+            pinned: q.pinned,
+            hit_count: m.map_or(0, |m| m.hit_count),
+            miss_count: m.map_or(0, |m| m.miss_count),
+            idle_duration_ms: m.and_then(|m| m.last_hit_at_ns).map(since_ms),
+            registered_duration_ms: m.and_then(|m| m.registered_at_ns).map(since_ms),
+            cached_duration_ms: m.and_then(|m| m.cached_since_ns).map(since_ms),
+            invalidation_count: m.map_or(0, |m| m.invalidation_count),
+            readmission_count: m.map_or(0, |m| m.readmission_count),
+            eviction_count: m.map_or(0, |m| m.eviction_count),
+            subsumption_count: m.map_or(0, |m| m.subsumption_count),
+            population_count: m.map_or(0, |m| m.population_count),
+            last_population_duration_ms: m
+                .and_then(|m| m.last_population_duration_us)
+                .map(|us| us.get() / 1_000),
+            total_bytes_served: m.map_or(0, |m| m.total_bytes_served),
+            population_row_count: m.map_or(0, |m| m.population_row_count),
+            cache_hit_latency: m.and_then(Self::latency_stats_build),
+        }
+    }
+
+    /// Summarize the cache-hit latency histogram, or `None` when empty.
+    fn latency_stats_build(m: &QueryMetrics) -> Option<LatencyStats> {
+        if m.cache_hit_latency.is_empty() {
+            return None;
+        }
+        Some(LatencyStats {
+            count: m.cache_hit_latency.len(),
+            mean_us: m.cache_hit_latency.mean(),
+            p50_us: m.cache_hit_latency.value_at_quantile(0.5),
+            p95_us: m.cache_hit_latency.value_at_quantile(0.95),
+            p99_us: m.cache_hit_latency.value_at_quantile(0.99),
+            min_us: m.cache_hit_latency.min(),
+            max_us: m.cache_hit_latency.max(),
+        })
     }
 }
