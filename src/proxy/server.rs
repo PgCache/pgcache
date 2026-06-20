@@ -10,7 +10,7 @@ use tokio::{net::TcpListener, runtime::Builder};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
 
-use crate::metrics::admin_server_spawn;
+use crate::admin::admin_server_spawn;
 
 use super::SharedProxyStatus;
 use crate::{

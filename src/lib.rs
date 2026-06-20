@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod cache;
 pub mod catalog;
 pub mod id_hash;
