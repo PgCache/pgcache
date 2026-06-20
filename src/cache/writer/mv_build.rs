@@ -25,10 +25,10 @@ use tokio_stream::StreamExt;
 use tracing::{error, trace};
 
 use crate::pg;
-use crate::query::ast::{Deparse, LiteralValue};
+use crate::query::ast::{Deparse, LiteralValue, SetOpType};
 use crate::query::resolved::{
     ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
-    ResolvedSelectColumns, ResolvedSelectNode,
+    ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode,
 };
 use crate::result::error_chain_format;
 use crate::settings::PgSettings;
@@ -337,25 +337,25 @@ async fn mv_gate_passes(client: &Client, ctx: &MvBuildContext) -> CacheResult<bo
     }
 }
 
-/// SQL for the Measure-gate denominator: a `count(*)` over the source query's
-/// *input* rows — the rows that feed the aggregate — NOT the whole table.
+/// Row source whose count is the Measure-gate denominator: the source query's
+/// *input* rows — the rows that feed the result — NOT the result itself.
 ///
-/// For a top-level aggregate SELECT, strips the projection/aggregation
-/// (GROUP BY/HAVING) and the outer ORDER BY/LIMIT, keeping FROM + WHERE + JOINs,
-/// so `count(*) FROM posts WHERE owneruserid=$1` counts the predicate-matching
-/// rows (index-scoped), not all of `posts`. Wrapping the *un-stripped* aggregate
-/// would count its single result row instead and defeat the gate.
-///
-/// For non-SELECT bodies (set-op / VALUES) it wraps the whole query directly —
-/// still predicate-scoped, never a whole-table scan. That's conservative for
-/// set-ops whose branches aggregate (counts the result, not the input, so the
-/// gate fails safe); PGC-329 tracks branch-aware handling.
-fn mv_source_count_sql(resolved: &ResolvedQueryExpr) -> String {
-    let inner = match &resolved.body {
+/// - **SELECT**: strip the projection/aggregation (GROUP BY/HAVING) and outer
+///   ORDER BY/LIMIT, keeping FROM + WHERE + JOINs, so the count is the
+///   predicate-scoped scanned rows (`SELECT 1 FROM posts WHERE owneruserid=$1`
+///   counts predicate-matching rows, not all of `posts`). Counting the
+///   un-stripped aggregate would yield its single result row and defeat the gate.
+/// - **Set-op**: recurse into both branches and `UNION ALL` their input sources,
+///   so the count is the *sum of branch inputs* — never the deduped/intersected
+///   result. This keeps the gate measuring reduction for UNION/INTERSECT/EXCEPT
+///   the way it does for an aggregate's pre-grouping rows (PGC-329).
+/// - **VALUES**: the literal rows themselves.
+fn mv_gate_input_query(resolved: &ResolvedQueryExpr) -> ResolvedQueryExpr {
+    let body = match &resolved.body {
         ResolvedQueryBody::Select(select) => {
             // Constant projection, no DISTINCT: counts scanned rows (including
             // join fan-out) — the work the query does.
-            let stripped = ResolvedSelectNode {
+            ResolvedQueryBody::Select(Box::new(ResolvedSelectNode {
                 distinct: false,
                 columns: ResolvedSelectColumns::Columns(vec![ResolvedSelectColumn {
                     expr: ResolvedScalarExpr::Literal(LiteralValue::Integer(1)),
@@ -365,21 +365,29 @@ fn mv_source_count_sql(resolved: &ResolvedQueryExpr) -> String {
                 where_clause: select.where_clause.clone(),
                 group_by: vec![],
                 having: None,
-            };
-            ResolvedQueryExpr {
-                body: ResolvedQueryBody::Select(Box::new(stripped)),
-                order_by: vec![],
-                limit: None,
-            }
+            }))
         }
-        // Set-op / VALUES: count the query's own rows (outer ORDER BY/LIMIT
-        // dropped to match the SELECT path's pre-LIMIT input count).
-        ResolvedQueryBody::Values(_) | ResolvedQueryBody::SetOp(_) => ResolvedQueryExpr {
-            body: resolved.body.clone(),
-            order_by: vec![],
-            limit: None,
-        },
+        // `UNION ALL` (not the original op) so no branch rows are deduped or
+        // dropped — the denominator is the total input the set-op scans.
+        ResolvedQueryBody::SetOp(setop) => ResolvedQueryBody::SetOp(ResolvedSetOpNode {
+            op: SetOpType::Union,
+            all: true,
+            left: Box::new(mv_gate_input_query(&setop.left)),
+            right: Box::new(mv_gate_input_query(&setop.right)),
+        }),
+        ResolvedQueryBody::Values(_) => resolved.body.clone(),
     };
+    ResolvedQueryExpr {
+        body,
+        order_by: vec![],
+        limit: None,
+    }
+}
+
+/// SQL for the Measure-gate denominator: `count(*)` over the source query's
+/// input rows (see `mv_gate_input_query`).
+fn mv_source_count_sql(resolved: &ResolvedQueryExpr) -> String {
+    let inner = mv_gate_input_query(resolved);
     let mut sql = String::with_capacity(256);
     sql.push_str("SELECT count(*) FROM (");
     inner.deparse(&mut sql);
@@ -530,7 +538,8 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, Oid, TableMetadata};
     use crate::query::ast::{
-        AstNode, ColumnNode, FunctionCall, QueryExpr, SelectNode, TableNode, query_expr_parse,
+        AstNode, ColumnNode, FunctionCall, QueryExpr, SelectNode, SetOpNode, SetOpType, TableNode,
+        query_expr_parse,
     };
     use crate::query::resolved::query_expr_resolve;
 
@@ -559,8 +568,16 @@ mod tests {
 
     fn test_tables() -> BiHashMap<TableMetadata> {
         let mut t = BiHashMap::new();
-        t.insert_overwrite(test_table("orders", Oid::from_raw(1), &["id", "status", "total"]));
-        t.insert_overwrite(test_table("users", Oid::from_raw(2), &["id", "name", "email"]));
+        t.insert_overwrite(test_table(
+            "orders",
+            Oid::from_raw(1),
+            &["id", "status", "total"],
+        ));
+        t.insert_overwrite(test_table(
+            "users",
+            Oid::from_raw(2),
+            &["id", "name", "email"],
+        ));
         t
     }
 
@@ -600,9 +617,8 @@ mod tests {
     /// GROUP BY is stripped so the count is over scanned input rows, not groups.
     #[test]
     fn test_denominator_strips_group_by() {
-        let ast = denom_ast(
-            "SELECT status, count(*) FROM orders WHERE status = 'open' GROUP BY status",
-        );
+        let ast =
+            denom_ast("SELECT status, count(*) FROM orders WHERE status = 'open' GROUP BY status");
         assert!(
             ast.nodes::<SelectNode>().all(|s| s.group_by.is_empty()),
             "no SELECT node may carry GROUP BY"
@@ -623,18 +639,79 @@ mod tests {
         );
     }
 
-    /// Non-SELECT bodies (set-op) take the conservative wrap-the-whole-query
-    /// form: both branches' source tables survive, only the wrapper `count(*)`,
-    /// and the outer LIMIT is dropped — never a whole-table scan.
+    /// Set-op denominator is branch-aware: each branch is stripped to its input
+    /// row source and the branches are `UNION ALL`'d, so the count is the sum of
+    /// branch inputs (not the deduped result). Outer LIMIT dropped.
     #[test]
-    fn test_denominator_wraps_non_select() {
+    fn test_denominator_sums_branch_inputs() {
         let ast = denom_ast("SELECT id FROM orders UNION SELECT id FROM users");
+        // Both branch source tables survive.
         assert!(ast.nodes::<TableNode>().any(|t| t.name == "orders"));
         assert!(ast.nodes::<TableNode>().any(|t| t.name == "users"));
+        // Each branch is stripped to a constant projection — no `id` column ref,
+        // so the count is over scanned rows, not the projected/deduped result.
+        assert!(
+            ast.nodes::<ColumnNode>().all(|c| c.column != "id"),
+            "branch projections must be stripped to a constant"
+        );
+        // Branches are combined with UNION ALL so the denominator is the *sum*
+        // of branch inputs, never the deduped UNION result.
+        assert!(
+            ast.nodes::<SetOpNode>()
+                .any(|s| s.op == SetOpType::Union && s.all),
+            "branches must be UNION ALL'd (sum of inputs, no dedup)"
+        );
         assert_eq!(count_aggs(&ast), 1, "only the wrapper count()");
         assert!(
             ast.nodes::<QueryExpr>().all(|q| q.limit.is_none()),
             "outer LIMIT dropped"
+        );
+    }
+
+    /// More than two branches: the binary set-op tree is recursed fully, so every
+    /// branch's table survives and each pairwise node becomes UNION ALL (a
+    /// 3-branch query has two such nodes). Confirms the recursion isn't limited to
+    /// two branches.
+    #[test]
+    fn test_denominator_three_branch_setop() {
+        let ast = denom_ast(
+            "SELECT id FROM orders UNION SELECT id FROM users UNION SELECT status FROM orders",
+        );
+        assert!(ast.nodes::<TableNode>().any(|t| t.name == "orders"));
+        assert!(ast.nodes::<TableNode>().any(|t| t.name == "users"));
+        assert_eq!(
+            ast.nodes::<SetOpNode>()
+                .filter(|s| s.op == SetOpType::Union && s.all)
+                .count(),
+            2,
+            "three branches → two UNION ALL nodes"
+        );
+        assert!(
+            ast.nodes::<ColumnNode>()
+                .all(|c| c.column != "id" && c.column != "status"),
+            "every branch projection stripped to a constant"
+        );
+        assert_eq!(count_aggs(&ast), 1, "only the wrapper count()");
+    }
+
+    /// PGC-329's example: a set-op whose branches aggregate. Each branch's
+    /// `count(*)` is stripped (the branch is reduced to its input row source), so
+    /// the denominator counts the rows feeding the aggregates — only the wrapper
+    /// `count()` survives, not the branch aggregates.
+    #[test]
+    fn test_denominator_setop_aggregate_branches() {
+        let ast = denom_ast("SELECT count(*) FROM orders UNION SELECT count(*) FROM users");
+        assert!(ast.nodes::<TableNode>().any(|t| t.name == "orders"));
+        assert!(ast.nodes::<TableNode>().any(|t| t.name == "users"));
+        assert!(
+            ast.nodes::<SetOpNode>()
+                .any(|s| s.op == SetOpType::Union && s.all),
+            "branches UNION ALL'd"
+        );
+        assert_eq!(
+            count_aggs(&ast),
+            1,
+            "branch count() aggregates stripped — only the wrapper count() remains"
         );
     }
 }
