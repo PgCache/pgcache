@@ -346,19 +346,19 @@ impl std::hash::Hash for ColumnMetadata {
 
 /// Metadata about a table index.
 ///
-/// Contains index definition information for recreating indexes
-/// on cached tables. Expression indexes and partial indexes are not supported.
-/// Primary key indexes are excluded since they are created by the PRIMARY KEY constraint.
+/// Holds the origin's canonical index definition (`pg_get_indexdef`) so the
+/// cache table can reproduce partial indexes, expression indexes, `DESC`,
+/// opclasses, and collations faithfully. Primary key indexes are excluded
+/// since they are created by the PRIMARY KEY constraint.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IndexMetadata {
     /// Index name (for reference/logging, not used in CREATE INDEX)
     pub name: EcoString,
     /// Whether this is a unique index
     pub is_unique: bool,
-    /// Index method (btree, hash, gist, gin, etc.)
-    pub method: EcoString,
-    /// Ordered list of column names in the index
-    pub columns: Vec<EcoString>,
+    /// Canonical `CREATE INDEX` statement from `pg_get_indexdef`, retargeted to
+    /// the cache table at creation time.
+    pub definition: EcoString,
 }
 
 /// PostgreSQL function volatility classification.

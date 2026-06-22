@@ -394,100 +394,127 @@ async fn test_cache_index_creation() -> Result<(), Error> {
 
     ctx.cache_settle().await?;
 
-    // Connect directly to the cache database to verify indexes
+    // Connect directly to the cache database and verify the replicated indexes
+    // via their canonical definitions. Cache indexes are created anonymously, so
+    // we assert on the definition shape (UNIQUE flag, access method, columns)
+    // rather than the origin index names.
     let cache_db = connect_cache_db(&ctx.dbs).await?;
-
-    // Query indexes using similar approach to query_table_indexes_get
     let rows = cache_db
         .query(
             r"
-            SELECT
-                i.relname AS index_name,
-                ix.indisunique AS is_unique,
-                am.amname AS method,
-                array_agg(a.attname ORDER BY array_position(ix.indkey::int[], a.attnum::int)) AS columns,
-                ix.indisprimary AS is_primary
+            SELECT pg_get_indexdef(ix.indexrelid) AS definition
             FROM pg_index ix
-            JOIN pg_class i ON i.oid = ix.indexrelid
             JOIN pg_class t ON t.oid = ix.indrelid
-            JOIN pg_am am ON am.oid = i.relam
-            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
-            WHERE t.relname = 'test_indexed'
-            GROUP BY i.relname, ix.indisunique, am.amname, ix.indisprimary, ix.indkey
-            ORDER BY i.relname
+            WHERE t.relname = 'test_indexed' AND NOT ix.indisprimary
             ",
             &[],
         )
         .await
         .map_err(Error::other)?;
 
-    // Build a list of (is_unique, method, columns, is_primary) for verification
-    let indexes: Vec<(bool, String, Vec<String>, bool)> = rows
-        .iter()
-        .map(|r| {
-            (
-                r.get("is_unique"),
-                r.get("method"),
-                r.get("columns"),
-                r.get("is_primary"),
-            )
-        })
-        .collect();
-
-    // Should have 5 indexes: 1 primary key + 4 non-pk indexes
+    let defs: Vec<String> = rows.iter().map(|r| r.get("definition")).collect();
     assert_eq!(
-        indexes.len(),
-        5,
-        "Expected 5 indexes, found {}",
-        indexes.len()
-    );
-
-    // Verify primary key index exists
-    let pk_indexes: Vec<_> = indexes.iter().filter(|i| i.3).collect();
-    assert_eq!(pk_indexes.len(), 1, "Expected exactly 1 primary key index");
-    assert_eq!(
-        pk_indexes[0].2,
-        vec!["id"],
-        "Primary key should be on 'id' column"
-    );
-
-    // Verify non-pk indexes
-    let non_pk_indexes: Vec<_> = indexes.iter().filter(|i| !i.3).collect();
-    assert_eq!(
-        non_pk_indexes.len(),
+        defs.len(),
         4,
-        "Expected 4 non-primary-key indexes"
+        "Expected 4 non-primary-key indexes, found: {defs:?}"
     );
 
-    // Check for unique btree index on (name)
-    let unique_name_idx = non_pk_indexes
-        .iter()
-        .find(|i| i.0 && i.1 == "btree" && i.2 == vec!["name"]);
+    let has = |needle: &str| defs.iter().any(|d| d.contains(needle));
+
     assert!(
-        unique_name_idx.is_some(),
-        "Missing unique btree index on (name)"
+        defs.iter()
+            .any(|d| d.contains("UNIQUE") && d.contains("USING btree (name)")),
+        "Missing unique btree index on (name): {defs:?}"
     );
-
-    // Check for btree index on (email)
-    let email_btree_idx = non_pk_indexes
-        .iter()
-        .find(|i| !i.0 && i.1 == "btree" && i.2 == vec!["email"]);
-    assert!(email_btree_idx.is_some(), "Missing btree index on (email)");
-
-    // Check for composite btree index on (email, created_at)
-    let composite_idx = non_pk_indexes
-        .iter()
-        .find(|i| i.1 == "btree" && i.2 == vec!["email", "created_at"]);
     assert!(
-        composite_idx.is_some(),
-        "Missing composite btree index on (email, created_at)"
+        has("USING btree (email)"),
+        "Missing btree index on (email): {defs:?}"
+    );
+    assert!(
+        has("USING btree (email, created_at)"),
+        "Missing composite btree index on (email, created_at): {defs:?}"
+    );
+    assert!(
+        has("USING hash (email)"),
+        "Missing hash index on (email): {defs:?}"
     );
 
-    // Check for hash index on (email)
-    let hash_idx = non_pk_indexes
+    Ok(())
+}
+
+/// Partial and `DESC` indexes must be replicated faithfully onto the cache
+/// table, not silently dropped (PGC-332).
+#[tokio::test]
+async fn test_cache_partial_index_creation() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE posts (
+            id INTEGER PRIMARY KEY,
+            owneruserid INTEGER,
+            lastactivitydate TIMESTAMP
+        )",
+        &[],
+    )
+    .await?;
+
+    // Partial index (the case that PGC-332 was dropping) and a DESC index.
+    ctx.query(
+        "CREATE INDEX posts_owneruserid_idx ON posts (owneruserid) WHERE owneruserid IS NOT NULL",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE INDEX posts_lastactivitydate_idx ON posts (lastactivitydate DESC)",
+        &[],
+    )
+    .await?;
+
+    ctx.query(
+        "INSERT INTO posts (id, owneruserid, lastactivitydate) VALUES
+         (1, 10, '2024-01-01'), (2, NULL, '2024-01-02')",
+        &[],
+    )
+    .await?;
+
+    // Trigger cache table creation.
+    let _ = ctx.simple_query("SELECT * FROM posts WHERE id = 1").await?;
+    ctx.cache_settle().await?;
+
+    let cache_db = connect_cache_db(&ctx.dbs).await?;
+    let rows = cache_db
+        .query(
+            r"
+            SELECT pg_get_indexdef(ix.indexrelid) AS definition
+            FROM pg_index ix
+            JOIN pg_class t ON t.oid = ix.indrelid
+            WHERE t.relname = 'posts' AND NOT ix.indisprimary
+            ",
+            &[],
+        )
+        .await
+        .map_err(Error::other)?;
+
+    let defs: Vec<String> = rows.iter().map(|r| r.get("definition")).collect();
+
+    let partial = defs
         .iter()
-        .find(|i| i.1 == "hash" && i.2 == vec!["email"]);
-    assert!(hash_idx.is_some(), "Missing hash index on (email)");
+        .find(|d| d.contains("(owneruserid)"))
+        .expect("partial index on owneruserid present in cache");
+    assert!(
+        partial.to_lowercase().contains("where")
+            && partial.to_lowercase().contains("owneruserid is not null"),
+        "partial index lost its predicate: {partial}"
+    );
+
+    let desc = defs
+        .iter()
+        .find(|d| d.contains("lastactivitydate"))
+        .expect("DESC index on lastactivitydate present in cache");
+    assert!(
+        desc.to_uppercase().contains("DESC"),
+        "DESC index lost its ordering: {desc}"
+    );
 
     Ok(())
 }

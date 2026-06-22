@@ -2,7 +2,7 @@ use crate::catalog::Oid;
 use ecow::EcoString;
 use tokio_postgres::Row;
 use tokio_postgres::types::Type;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
 use crate::catalog::{
     ColumnMetadata, ColumnStore, IndexMetadata, TableMetadata, cache_type_name_resolve,
@@ -215,18 +215,12 @@ impl WriterCore {
             SELECT
                 i.relname AS index_name,
                 ix.indisunique AS is_unique,
-                am.amname AS method,
-                array_agg(a.attname ORDER BY array_position(ix.indkey::int[], a.attnum::int)) AS columns
+                pg_get_indexdef(ix.indexrelid) AS definition
             FROM pg_index ix
             JOIN pg_class i ON i.oid = ix.indexrelid
             JOIN pg_class t ON t.oid = ix.indrelid
-            JOIN pg_am am ON am.oid = i.relam
-            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(ix.indkey)
             WHERE t.oid = $1
               AND NOT ix.indisprimary
-              AND ix.indexprs IS NULL
-              AND ix.indpred IS NULL
-            GROUP BY i.relname, ix.indisunique, am.amname, ix.indkey
             ORDER BY i.relname;
         ";
 
@@ -238,18 +232,10 @@ impl WriterCore {
 
         let indexes = rows
             .iter()
-            .map(|row| {
-                let columns: Vec<EcoString> = row
-                    .get::<_, Vec<String>>("columns")
-                    .into_iter()
-                    .map(Into::into)
-                    .collect();
-                IndexMetadata {
-                    name: row.get::<_, String>("index_name").into(),
-                    is_unique: row.get("is_unique"),
-                    method: row.get::<_, String>("method").into(),
-                    columns,
-                }
+            .map(|row| IndexMetadata {
+                name: row.get::<_, String>("index_name").into(),
+                is_unique: row.get("is_unique"),
+                definition: row.get::<_, String>("definition").into(),
             })
             .collect();
 
@@ -338,16 +324,31 @@ impl WriterCore {
             .map_into_report::<CacheError>()?;
 
         for index in &table_metadata.indexes {
-            let unique = if index.is_unique { "UNIQUE " } else { "" };
-            let method = &index.method;
-            let columns = index.columns.join(", ");
-            let index_sql = format!(
-                "CREATE {unique}INDEX ON \"{schema}\".\"{table}\" USING {method} ({columns})"
-            );
-            self.db_cache
+            let Some(index_sql) =
+                index_sql_retarget(&index.definition, index.is_unique, schema, table)
+            else {
+                warn!(
+                    "skipping index {} on \"{schema}\".\"{table}\": no USING clause in definition",
+                    index.name
+                );
+                continue;
+            };
+            // Index creation is best-effort: an index is a performance
+            // optimization, not a correctness requirement. An expression index
+            // may reference a function absent from the cache DB; let it fail
+            // without aborting table caching.
+            if let Err(e) = self
+                .db_cache
                 .execute(&index_sql, &[])
                 .await
-                .map_into_report::<CacheError>()?;
+                .map_into_report::<CacheError>()
+            {
+                warn!(
+                    "creating index {} on \"{schema}\".\"{table}\": {}",
+                    index.name,
+                    error_chain_format(e.current_context()),
+                );
+            }
         }
 
         // Enable generation tracking triggers on the table
@@ -391,5 +392,69 @@ impl WriterCore {
                 error_chain_format(e.current_context()),
             );
         }
+    }
+}
+
+/// Retarget a canonical `pg_get_indexdef` statement onto the cache table.
+///
+/// `pg_get_indexdef` emits `CREATE [UNIQUE] INDEX name ON schema.tbl USING ...`.
+/// Everything from `USING` onward references only column names — predicates and
+/// expressions never qualify the table — so we rebuild an anonymous index
+/// against the cache's own schema/table. This also retargets indexes read from
+/// a child partition, whose definition names the child rather than the parent
+/// cache table. Returns `None` if the definition has no `USING` clause.
+fn index_sql_retarget(
+    definition: &str,
+    is_unique: bool,
+    schema: &str,
+    table: &str,
+) -> Option<String> {
+    let (_, using) = definition.split_once(" USING ")?;
+    let unique = if is_unique { "UNIQUE " } else { "" };
+    Some(format!(
+        "CREATE {unique}INDEX ON \"{schema}\".\"{table}\" USING {using}"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_index_sql_retarget_partial() {
+        let def = "CREATE INDEX posts_owneruserid_idx ON public.posts USING btree (owneruserid) WHERE (owneruserid IS NOT NULL)";
+        let sql =
+            index_sql_retarget(def, false, "public", "posts").expect("retarget partial index");
+        assert_eq!(
+            sql,
+            "CREATE INDEX ON \"public\".\"posts\" USING btree (owneruserid) WHERE (owneruserid IS NOT NULL)"
+        );
+    }
+
+    #[test]
+    fn test_index_sql_retarget_unique_desc() {
+        let def = "CREATE UNIQUE INDEX foo_idx ON public.foo USING btree (created_at DESC, name)";
+        let sql = index_sql_retarget(def, true, "public", "foo").expect("retarget unique index");
+        assert_eq!(
+            sql,
+            "CREATE UNIQUE INDEX ON \"public\".\"foo\" USING btree (created_at DESC, name)"
+        );
+    }
+
+    #[test]
+    fn test_index_sql_retarget_partition_child_retargeted() {
+        // Definition read from a child partition names the child; output must
+        // target the parent cache table.
+        let def = "CREATE INDEX posts_2023_parentid_idx ON public.posts_2023 USING btree (parentid) WHERE (parentid IS NOT NULL)";
+        let sql = index_sql_retarget(def, false, "public", "posts").expect("retarget child index");
+        assert_eq!(
+            sql,
+            "CREATE INDEX ON \"public\".\"posts\" USING btree (parentid) WHERE (parentid IS NOT NULL)"
+        );
+    }
+
+    #[test]
+    fn test_index_sql_retarget_no_using_returns_none() {
+        assert!(index_sql_retarget("not an index def", false, "public", "posts").is_none());
     }
 }
