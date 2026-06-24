@@ -4,7 +4,7 @@
 //! First-pop and rebuild share a single state-machine — the `has_table` bit
 //! carried by `Pending` / `Scheduled` / `Building` tells the build which SQL
 //! variant to run (`CREATE UNLOGGED TABLE AS` for first-pop,
-//! `BEGIN; TRUNCATE; INSERT; COMMIT;` for rebuild) and whether a Measure gate
+//! `BEGIN; DELETE; INSERT; COMMIT;` for rebuild) and whether a Measure gate
 //! is still owed (only before the first successful build).
 //!
 //! Build SQL runs off-thread (`mv_build.rs`) so a backlog of builds never
@@ -379,7 +379,7 @@ impl WriterCore {
     /// the next hit rebuilds or eviction drops the table. Reclaiming them first
     /// means size pressure preferentially removes dead weight rather than
     /// evicting cache entries that might still be useful. The table persists
-    /// (empty) so the next rebuild's `BEGIN; TRUNCATE; INSERT; COMMIT` still
+    /// (empty) so the next rebuild's `BEGIN; DELETE; INSERT; COMMIT` still
     /// hits an existing table; state stays `Pending { has_table: true }` so
     /// dispatches keep falling through.
     ///

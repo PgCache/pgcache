@@ -51,7 +51,7 @@ const MV_BUILD_CONNECTIONS: usize = 2;
 pub(super) struct MvBuildContext {
     pub fingerprint: Fingerprint,
     /// Build path: `false` = `CREATE UNLOGGED TABLE AS` (first build, gate may
-    /// run), `true` = `BEGIN; TRUNCATE; INSERT; COMMIT` (rebuild).
+    /// run), `true` = `BEGIN; DELETE; INSERT; COMMIT` (rebuild).
     pub has_table: bool,
     pub shape_gate: ShapeGate,
     /// LIMIT cap for the MV body (joins only).
@@ -475,8 +475,16 @@ fn mv_body_append(buf: &mut String, ctx: &MvBuildContext) {
 
 /// Build the complete batch for an MV build. First-pop wraps `CREATE UNLOGGED
 /// TABLE AS <body>` with SET/RESET of the query generation. Rebuild uses a
-/// `BEGIN; TRUNCATE; INSERT; COMMIT;` transaction so concurrent reads are never
+/// `BEGIN; DELETE; INSERT; COMMIT;` transaction so concurrent reads are never
 /// exposed to an empty intermediate state.
+///
+/// Rebuild clears with `DELETE`, not `TRUNCATE`: TRUNCATE churns the relfilenode
+/// (the old one is unlinked at commit → a full shared-buffer scan in
+/// `DropRelationsAllBuffers` plus a relcache-invalidation broadcast every backend
+/// processes) and takes ACCESS EXCLUSIVE, which blocks readers for the whole
+/// rebuild — together collapsing the cache PG under an invalidation storm
+/// (PGC-335). DELETE reuses the relfilenode and takes only ROW EXCLUSIVE, so
+/// readers proceed on their MVCC snapshot; autovacuum reclaims the dead tuples.
 fn mv_build_batch(mv_table: &str, ctx: &MvBuildContext, has_table: bool, arity: usize) -> String {
     use std::fmt::Write;
     let mut sql = String::with_capacity(512);
@@ -486,7 +494,7 @@ fn mv_build_batch(mv_table: &str, ctx: &MvBuildContext, has_table: bool, arity: 
         let _ = write!(
             &mut sql,
             "BEGIN; SET mem.query_generation = {generation}; \
-             TRUNCATE {mv_table}; INSERT INTO {mv_table} {cols} "
+             DELETE FROM {mv_table}; INSERT INTO {mv_table} {cols} "
         );
         mv_body_append(&mut sql, ctx);
         sql.push_str("; COMMIT; SET mem.query_generation = 0;");
