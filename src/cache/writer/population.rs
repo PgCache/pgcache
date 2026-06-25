@@ -197,6 +197,7 @@ pub async fn population_worker(
                         cached_bytes,
                         row_count,
                         snapshot_lsn,
+                        enqueued_at: Instant::now(),
                     }))
                     .is_err()
                 {

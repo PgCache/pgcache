@@ -331,6 +331,9 @@ pub struct PopulationMerge {
     /// served by already-Ready bystander queries as a torn mix of two origin
     /// points in time.
     pub snapshot_lsn: Lsn,
+    /// When the staged population entered the merge pipeline (worker send time);
+    /// drives the merge-wait histogram at apply (PGC-335).
+    pub enqueued_at: std::time::Instant,
 }
 
 /// Controls what the writer does when a query is not subsumed.

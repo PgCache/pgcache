@@ -254,6 +254,16 @@ pub mod names {
     pub const CACHE_POPULATION_TASK_SECONDS: &str = "pgcache.cache.population.task_seconds";
     pub const CACHE_POPULATION_STREAM_SECONDS: &str = "pgcache.cache.population.stream_seconds";
     pub const CACHE_POPULATION_WAIT_SECONDS: &str = "pgcache.cache.population.wait_seconds";
+    /// Depth of the writer's pending-merges heap (staged populations awaiting the
+    /// Idle+watermark drain gate). A persistent backlog here localizes the stall
+    /// to the merge stage rather than fetch/queue (PGC-335).
+    pub const CACHE_MERGE_PENDING_DEPTH: &str = "pgcache.cache.merge.pending_depth";
+    /// Time a staged population waits from merge-enqueue to merge-apply (the merge
+    /// stage); complements population.wait (queue) + population.task (fetch+stage).
+    pub const CACHE_MERGE_WAIT_SECONDS: &str = "pgcache.cache.merge.wait_seconds";
+    /// Population merges applied (drain throughput) — compare against the
+    /// invalidation rate to see if the pipeline keeps up.
+    pub const CACHE_MERGES_APPLIED: &str = "pgcache.cache.merge.applied_total";
     /// Per-worker time waiting on rx.recv() between tasks. With \`task_seconds\`
     /// and wall clock, gives a clear utilization signal at a given pool size.
     pub const CACHE_POPULATION_WORKER_IDLE_SECONDS: &str =
@@ -482,6 +492,9 @@ pub struct RegHandles {
     pub population_task: Histogram,
     pub population_stream: Histogram,
     pub population_wait: Histogram,
+    pub merge_pending_depth: Gauge,
+    pub merge_wait: Histogram,
+    pub merges_applied: Counter,
 }
 
 pub struct StateHandles {
@@ -657,6 +670,9 @@ impl Handles {
                 population_task: metrics::histogram!(CACHE_POPULATION_TASK_SECONDS),
                 population_stream: metrics::histogram!(CACHE_POPULATION_STREAM_SECONDS),
                 population_wait: metrics::histogram!(CACHE_POPULATION_WAIT_SECONDS),
+                merge_pending_depth: metrics::gauge!(CACHE_MERGE_PENDING_DEPTH),
+                merge_wait: metrics::histogram!(CACHE_MERGE_WAIT_SECONDS),
+                merges_applied: metrics::counter!(CACHE_MERGES_APPLIED),
             },
             state: StateHandles {
                 queries_registered: metrics::gauge!(CACHE_QUERIES_REGISTERED),

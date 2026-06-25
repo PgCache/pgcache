@@ -1435,6 +1435,9 @@ impl WriterRegistration {
             match outcome {
                 Ok(MergeOutcome::Merged) => {
                     merged_any = true;
+                    let mh = crate::metrics::handles();
+                    mh.reg.merge_wait.record(merge.enqueued_at.elapsed().as_secs_f64());
+                    mh.reg.merges_applied.increment(1);
                     core.population_deleted_keys
                         .deactivate(fingerprint, generation);
                     self.query_ready_finalize(

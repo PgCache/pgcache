@@ -462,6 +462,11 @@ pub fn writer_run(
                                     writer_cdc.last_applied_lsn,
                                 );
                             }
+                            #[allow(clippy::cast_precision_loss)]
+                            crate::metrics::handles()
+                                .reg
+                                .merge_pending_depth
+                                .set(core.pending_merges.len() as f64);
                             core.disk_stats_refresh();
                             core.stale_entries_cleanup();
                             core.state_gauges_update();
