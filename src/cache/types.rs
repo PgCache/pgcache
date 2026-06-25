@@ -179,6 +179,10 @@ pub struct QueryMetrics {
     pub subsumption_count: u64,
     pub population_count: u64,
     pub last_population_duration_us: Option<NonZeroU64>,
+    /// EWMA of population fetch+stage time (ms), excluding queue wait. Sets the
+    /// re-population coalesce-forward deadline (PGC-335). `None` until the first
+    /// population completes, which also marks the query as no longer cold.
+    pub population_fetch_stage_ewma_ms: Option<f64>,
     pub total_bytes_served: u64,
     /// Physical rows inserted during last population (sum across all branch tables)
     pub population_row_count: u64,
@@ -201,6 +205,7 @@ impl QueryMetrics {
             subsumption_count: 0,
             population_count: 0,
             last_population_duration_us: None,
+            population_fetch_stage_ewma_ms: None,
             total_bytes_served: 0,
             population_row_count: 0,
             // Auto-resizing (starts at a few hundred bytes, grows on record)

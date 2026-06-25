@@ -165,6 +165,10 @@ pub mod names {
     // Request coalescing metrics
     pub const CACHE_COALESCE_WAITING: &str = "pgcache.cache.coalesce_waiting";
     pub const CACHE_COALESCE_SERVED: &str = "pgcache.cache.coalesce_served";
+    /// Coalesced waiters forwarded to origin because their population exceeded
+    /// the forward deadline (PGC-335).
+    pub const CACHE_COALESCE_DEADLINE_FORWARD: &str =
+        "pgcache.cache.coalesce_deadline_forward_total";
     /// Successful cache-subsystem restarts performed by the supervisor.
     pub const CACHE_RESTARTS_TOTAL: &str = "pgcache.cache.restarts_total";
     /// Cache-DB serve-pool connections reconnected after a poisoned discard.
@@ -381,6 +385,7 @@ pub struct CacheHandles {
     pub mv_fallthrough: Counter,
     pub coalesce_waiting: Gauge,
     pub coalesce_served: Counter,
+    pub coalesce_deadline_forward: Counter,
     /// In-process result memo (PGC-236).
     pub memo_hits: Counter,
     pub memo_captures: Counter,
@@ -572,6 +577,7 @@ impl Handles {
                 mv_fallthrough: metrics::counter!(CACHE_MV_FALLTHROUGH),
                 coalesce_waiting: metrics::gauge!(CACHE_COALESCE_WAITING),
                 coalesce_served: metrics::counter!(CACHE_COALESCE_SERVED),
+                coalesce_deadline_forward: metrics::counter!(CACHE_COALESCE_DEADLINE_FORWARD),
                 memo_hits: metrics::counter!(CACHE_MEMO_HITS),
                 memo_captures: metrics::counter!(CACHE_MEMO_CAPTURES),
                 memo_evictions: metrics::counter!(CACHE_MEMO_EVICTIONS),

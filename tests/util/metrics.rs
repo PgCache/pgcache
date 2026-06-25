@@ -24,6 +24,8 @@ pub struct MetricsSnapshot {
     pub cache_invalidations: u64,
     pub cache_readmissions: u64,
     pub cache_coalesce_served: u64,
+    /// Coalesced waiters forwarded to origin on the population deadline (PGC-335).
+    pub cache_coalesce_deadline_forward: u64,
     /// Gauge: waiters currently parked in the coalesce queue (point-in-time,
     /// not a delta).
     pub cache_coalesce_waiting: u64,
@@ -86,6 +88,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut cache_invalidations = 0u64;
     let mut cache_readmissions = 0u64;
     let mut cache_coalesce_served = 0u64;
+    let mut cache_coalesce_deadline_forward = 0u64;
     let mut cache_coalesce_waiting = 0u64;
     let mut cache_restarts_total = 0u64;
     let mut cache_pool_replenished = 0u64;
@@ -130,6 +133,9 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_cache_invalidations" => cache_invalidations = value,
                 "pgcache_cache_readmissions" => cache_readmissions = value,
                 "pgcache_cache_coalesce_served" => cache_coalesce_served = value,
+                "pgcache_cache_coalesce_deadline_forward_total" => {
+                    cache_coalesce_deadline_forward = value;
+                }
                 // Gauge: printed as "0", "1", or "1.0" — take the integer part.
                 "pgcache_cache_coalesce_waiting" => {
                     cache_coalesce_waiting = parts[1]
@@ -191,6 +197,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         cache_invalidations,
         cache_readmissions,
         cache_coalesce_served,
+        cache_coalesce_deadline_forward,
         cache_coalesce_waiting,
         cache_restarts_total,
         cache_pool_replenished,
@@ -231,6 +238,8 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         cache_invalidations: after.cache_invalidations - before.cache_invalidations,
         cache_readmissions: after.cache_readmissions - before.cache_readmissions,
         cache_coalesce_served: after.cache_coalesce_served - before.cache_coalesce_served,
+        cache_coalesce_deadline_forward: after.cache_coalesce_deadline_forward
+            - before.cache_coalesce_deadline_forward,
         // Gauge, not a counter: carry the current value rather than a delta.
         cache_coalesce_waiting: after.cache_coalesce_waiting,
         cache_restarts_total: after.cache_restarts_total - before.cache_restarts_total,

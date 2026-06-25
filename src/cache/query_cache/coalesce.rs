@@ -157,4 +157,37 @@ impl CacheDispatch {
             .coalesce_waiting
             .set(self.waiting_count() as f64);
     }
+
+    /// Forward to origin every coalesced waiter whose forward deadline has
+    /// passed. Decouples serve latency from population latency: a slow
+    /// population (large cold first-population, or a re-pop running past its
+    /// estimate) no longer holds its waiters hostage — they degrade to origin
+    /// while the population completes in the background (PGC-335).
+    pub fn waiting_drain_expired(&self) {
+        let expired = self.waiting.drain_expired(Instant::now());
+        if expired.is_empty() {
+            return;
+        }
+        let forwarded = expired.len() as u64;
+        let drain_started = Instant::now();
+        for mut msg in expired {
+            msg.timing.drain_started_at = Some(drain_started);
+            let _ = reply_forward(
+                msg.reply_tx,
+                msg.client_socket,
+                msg.pipeline,
+                msg.data,
+                msg.timing,
+            );
+        }
+        crate::metrics::handles()
+            .cache
+            .coalesce_deadline_forward
+            .increment(forwarded);
+        #[allow(clippy::cast_precision_loss)] // queue depth, never near 2^53
+        crate::metrics::handles()
+            .cache
+            .coalesce_waiting
+            .set(self.waiting_count() as f64);
+    }
 }

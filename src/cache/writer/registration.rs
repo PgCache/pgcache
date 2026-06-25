@@ -16,6 +16,7 @@ use tokio::task::spawn_local;
 use tokio_postgres::Client;
 use tracing::{debug, error, info, instrument, trace};
 
+use crate::cache::coalesce_queue::fetch_stage_ewma_update;
 use crate::cache::query::limit_rows_needed;
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::query::ast::{AstNode, Deparse, QueryBody, QueryExpr, TableNode};
@@ -1324,6 +1325,7 @@ impl WriterRegistration {
         fingerprint: Fingerprint,
         cached_bytes: usize,
         row_count: u64,
+        fetch_stage_ms: f64,
     ) {
         trace!("query_ready_mark {fingerprint}");
         let update_info = if let Some(mut query) = core.cache.cached_queries.get1_mut(&fingerprint)
@@ -1359,6 +1361,10 @@ impl WriterRegistration {
                 m.cached_since_ns =
                     NonZeroU64::new(duration_to_ns_u64(core.state_view.started_at.elapsed()));
                 m.last_population_duration_us = population_duration_us.and_then(NonZeroU64::new);
+                m.population_fetch_stage_ewma_ms = Some(fetch_stage_ewma_update(
+                    m.population_fetch_stage_ewma_ms,
+                    fetch_stage_ms,
+                ));
             }
 
             core.state_ready_transition(fingerprint, generation, resolved, deparsed_sql, max_limit);
@@ -1445,6 +1451,7 @@ impl WriterRegistration {
                         fingerprint,
                         merge.cached_bytes,
                         merge.row_count,
+                        merge.fetch_stage_ms,
                     )
                     .await?;
                 }
@@ -1511,8 +1518,9 @@ impl WriterRegistration {
         fingerprint: Fingerprint,
         cached_bytes: usize,
         row_count: u64,
+        fetch_stage_ms: f64,
     ) -> CacheResult<()> {
-        self.query_ready_mark(core, fingerprint, cached_bytes, row_count);
+        self.query_ready_mark(core, fingerprint, cached_bytes, row_count, fetch_stage_ms);
         core.mv_pinned_bootstrap(fingerprint);
         Ok(())
     }

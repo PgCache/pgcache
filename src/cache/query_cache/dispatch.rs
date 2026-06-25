@@ -17,7 +17,7 @@ use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, DynamicConfig, Settings};
 use crate::timing::{QueryTiming, duration_to_ns_u64};
 
-use crate::cache::coalesce_queue::{CoalesceKey, CoalesceQueue};
+use crate::cache::coalesce_queue::{CoalesceKey, CoalesceQueue, coalesce_deadline};
 use crate::cache::messages::{
     AdmitAction, CacheOutcome, CacheReply, PipelineContext, ProxyMessage, QueryCommand,
     SubsumptionResult, slices_concat,
@@ -295,7 +295,18 @@ impl CacheDispatch {
                     trace!("cache loading, coalesce {fingerprint}");
                     fault_coalesce_enqueue_delay().await;
                     let key = CoalesceKey::from_request(&msg);
-                    msg.timing.waiter_enqueued_at = Some(Instant::now());
+                    let now = Instant::now();
+                    msg.timing.waiter_enqueued_at = Some(now);
+                    // Forward to origin once this waiter has waited longer than
+                    // the population is expected to take (cold: fixed; re-pop:
+                    // scaled by the per-query fetch+stage estimate), so a slow
+                    // population can't stall serving (PGC-335).
+                    let estimate = self
+                        .state_view
+                        .metrics
+                        .get(&fingerprint)
+                        .and_then(|m| m.population_fetch_stage_ewma_ms);
+                    msg.timing.deadline_at = Some(now + coalesce_deadline(estimate));
                     // `enqueue_if_loading` re-checks state under the lock; on
                     // `Err` the state advanced and we re-dispatch the returned msg.
                     match self

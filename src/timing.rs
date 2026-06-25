@@ -128,6 +128,10 @@ pub struct QueryTiming {
     /// (in the Loading match arm of query_dispatch).
     pub waiter_enqueued_at: Option<Instant>,
 
+    /// Coalesce path only: the instant past which this waiter is forwarded to
+    /// origin rather than waiting for population (PGC-335 deadline sweep).
+    pub deadline_at: Option<Instant>,
+
     /// Coalesce path only: when `waiting_drain_ready` (or
     /// `waiting_drain_failed`) began processing this waiter's group.
     pub drain_started_at: Option<Instant>,
@@ -167,6 +171,7 @@ impl QueryTiming {
             dispatched_at: None,
             lookup_complete_at: None,
             waiter_enqueued_at: None,
+            deadline_at: None,
             drain_started_at: None,
             worker_received_at: None,
             conn_acquired_at: None,

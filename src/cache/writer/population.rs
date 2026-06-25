@@ -176,10 +176,11 @@ pub async fn population_worker(
             }
             break r;
         };
+        let fetch_stage = task_start.elapsed();
         crate::metrics::handles()
             .reg
             .population_task
-            .record(task_start.elapsed().as_secs_f64());
+            .record(fetch_stage.as_secs_f64());
 
         idle_start = Instant::now();
 
@@ -198,6 +199,7 @@ pub async fn population_worker(
                         row_count,
                         snapshot_lsn,
                         enqueued_at: Instant::now(),
+                        fetch_stage_ms: fetch_stage.as_secs_f64() * 1000.0,
                     }))
                     .is_err()
                 {

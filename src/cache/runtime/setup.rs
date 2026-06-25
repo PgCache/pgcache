@@ -223,11 +223,18 @@ async fn coalesce_drain(
     dispatch_publisher: CacheDispatchPublisher,
 ) {
     debug!("coalesce drain loop");
+    // Forward coalesced waiters whose population has exceeded the forward
+    // deadline (PGC-335). 50 ms granularity keeps the sweep cheap while
+    // bounding the slop on each waiter's deadline.
+    let mut deadline_sweep = tokio::time::interval(std::time::Duration::from_millis(50));
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 debug!("coalesce drain shutdown signal received");
                 break;
+            }
+            _ = deadline_sweep.tick() => {
+                dispatch.waiting_drain_expired();
             }
             notify = notify_rx.recv() => {
                 match notify {

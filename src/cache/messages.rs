@@ -334,6 +334,10 @@ pub struct PopulationMerge {
     /// When the staged population entered the merge pipeline (worker send time);
     /// drives the merge-wait histogram at apply (PGC-335).
     pub enqueued_at: std::time::Instant,
+    /// Fetch+stage wall time for this population (origin read + cache staging,
+    /// excluding queue wait). Feeds the per-query estimate that sets the
+    /// re-population coalesce-forward deadline (PGC-335).
+    pub fetch_stage_ms: f64,
 }
 
 /// Controls what the writer does when a query is not subsumed.
