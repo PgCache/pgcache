@@ -723,6 +723,13 @@ async fn test_limit_cdc_sort_update_spares_other_predicate() -> Result<(), Error
     assert_row_at(&res, 2, &[("id", "5"), ("score", "40")])?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
+    // owner 10's own page does match the changed row, so the predicate gate
+    // still invalidates it (the legitimate PGC-94 case); it re-serves the new
+    // top-2 with post 1 (score 100) leading.
+    let res = ctx.simple_query(query_a).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("score", "100")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("score", "40")])?;
+
     Ok(())
 }
 

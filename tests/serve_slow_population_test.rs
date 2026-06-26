@@ -49,9 +49,10 @@ async fn concurrent_reads(ctx: &TestContext, query: &str) -> Result<Duration, Er
 /// waiter is prematurely forwarded.
 #[tokio::test]
 async fn test_fast_population_serves_coalesced() -> Result<(), Error> {
-    // 100 ms population: a comfortable Loading window for followers to coalesce,
-    // well under the 200 ms cold forward deadline.
-    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "100")]).await?;
+    // 50 ms population: enough of a Loading window for followers to coalesce,
+    // with wide headroom under the 200 ms cold forward deadline so real
+    // fetch+stage overhead can't push a waiter past it and forward spuriously.
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "50")]).await?;
     ctx.query("CREATE TABLE fast_pop (id INT PRIMARY KEY, v TEXT)", &[])
         .await?;
     let vals: Vec<String> = (1..=100).map(|i| format!("({i}, 'v{i}')")).collect();
