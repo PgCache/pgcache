@@ -601,8 +601,23 @@ impl WriterCdc {
         // take its place is, by definition, not in the cache. Invalidate
         // to force repopulation. PGC-94.
         if update_query.has_limit && matches!(update_query.source, UpdateQuerySource::FromClause) {
-            for column in &update_query.limit_window_columns {
-                if *row_changes.get(column.as_str()).unwrap_or(&false) {
+            let window_changed = update_query
+                .limit_window_columns
+                .iter()
+                .any(|c| *row_changes.get(c.as_str()).unwrap_or(&false));
+            if window_changed {
+                // PGC-336: the row can only affect this query's window if it is
+                // (or was) inside the query's predicate region. If a predicate
+                // column changed we can't see the pre-image cheaply, so stay
+                // conservative; otherwise the predicate truth is stable and a
+                // row that fails it can neither be in nor enter the window.
+                let predicate_changed = update_query
+                    .predicate_columns
+                    .iter()
+                    .any(|c| *row_changes.get(c.as_str()).unwrap_or(&false));
+                if predicate_changed
+                    || row_constraints_match(&update_query.constraints, table_metadata, row_data)
+                {
                     return true;
                 }
             }

@@ -673,3 +673,100 @@ async fn test_limit_cdc_update_non_window_column_keeps_cache() -> Result<(), Err
 
     Ok(())
 }
+
+/// PGC-336 regression. Two cached `WHERE owner = K ORDER BY score DESC LIMIT`
+/// queries share the same table. A sort-key UPDATE on one owner's row must NOT
+/// invalidate the *other* owner's query — the changed row fails its predicate,
+/// so it can neither be in nor enter that window. Before the predicate-aware
+/// gate, the LIMIT-window branch invalidated every `ORDER BY score` query on
+/// the table regardless of owner (~500x over-invalidation on the demo).
+#[tokio::test]
+async fn test_limit_cdc_sort_update_spares_other_predicate() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, owner INTEGER, score INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO posts (id, owner, score) VALUES \
+         (1, 10, 50), (2, 10, 40), (3, 10, 30), \
+         (4, 20, 50), (5, 20, 40), (6, 20, 30)",
+        &[],
+    )
+    .await?;
+
+    let query_a = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC LIMIT 2";
+    let query_b = "SELECT id, score FROM posts WHERE owner = 20 ORDER BY score DESC LIMIT 2";
+
+    // Warm both owner pages into cache.
+    let m = ctx.metrics().await?;
+    ctx.simple_query(query_a).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.simple_query(query_b).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    ctx.simple_query(query_a).await?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+    ctx.simple_query(query_b).await?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Bump owner 10's top score. owner 20's page does not contain post 1.
+    ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // owner 20's query is untouched by an owner-10 row change → stays cached.
+    let res = ctx.simple_query(query_b).await?;
+    assert_row_at(&res, 1, &[("id", "4"), ("score", "50")])?;
+    assert_row_at(&res, 2, &[("id", "5"), ("score", "40")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// PGC-336 soundness guard. The predicate-aware gate must keep invalidating
+/// when the *predicate* column itself changes: a row leaving its owner's window
+/// has no cached replacement, so the window query must repopulate (the original
+/// PGC-94 hazard). This protects the `predicate_changed` escape hatch.
+#[tokio::test]
+async fn test_limit_cdc_predicate_column_change_still_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, owner INTEGER, score INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO posts (id, owner, score) VALUES \
+         (1, 10, 50), (2, 10, 40), (3, 10, 30), (4, 10, 20)",
+        &[],
+    )
+    .await?;
+
+    let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC LIMIT 2";
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("score", "50")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("score", "40")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    ctx.simple_query(query).await?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Move post 1 out of owner 10. It leaves the cached window; post 3 (score
+    // 30, outside the cached top-2) must take the second slot — and is not in
+    // cache, so the query must repopulate from origin to stay correct.
+    ctx.origin_query("UPDATE posts SET owner = 20 WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "2"), ("score", "40")])?;
+    assert_row_at(&res, 2, &[("id", "3"), ("score", "30")])?;
+
+    Ok(())
+}
