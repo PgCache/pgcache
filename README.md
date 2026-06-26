@@ -1,6 +1,6 @@
 # pgcache
 
-A transparent caching proxy for PostgreSQL that caches query results and maintains cache using PostgreSQL logical replication.
+A transparent caching proxy for PostgreSQL that caches query results and maintains cache using PostgreSQL logical replication. You can also think of it as a smart read replica that stores hot data, and leaves cold data on origin.
 
 ## Overview
 
