@@ -84,7 +84,8 @@ async fn test_fast_population_serves_coalesced() -> Result<(), Error> {
 #[tokio::test]
 async fn test_slow_cold_population_forwards_on_deadline() -> Result<(), Error> {
     // 3 s population vs 200 ms cold deadline: waiters forward ~14× sooner.
-    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "3000")]).await?;
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "3000")]).await?;
     ctx.query("CREATE TABLE slow_cold (id INT PRIMARY KEY, v TEXT)", &[])
         .await?;
     let vals: Vec<String> = (1..=100).map(|i| format!("({i}, 'v{i}')")).collect();
@@ -104,7 +105,8 @@ async fn test_slow_cold_population_forwards_on_deadline() -> Result<(), Error> {
         "reads blocked on the slow population ({elapsed:?}); serve is still coupled to populate"
     );
 
-    ctx.cache_settle_with_timeout(Duration::from_secs(10)).await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(10))
+        .await?;
     let delta = metrics_delta(&before, &ctx.metrics().await?);
 
     assert!(
@@ -124,12 +126,10 @@ async fn test_slow_cold_population_forwards_on_deadline() -> Result<(), Error> {
 /// contract is the same: waiters degrade to origin instead of blocking.
 #[tokio::test]
 async fn test_slow_repopulation_forwards_on_deadline() -> Result<(), Error> {
-    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "3000")]).await?;
-    ctx.query(
-        "CREATE TABLE authors (id INT PRIMARY KEY, name TEXT)",
-        &[],
-    )
-    .await?;
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "3000")]).await?;
+    ctx.query("CREATE TABLE authors (id INT PRIMARY KEY, name TEXT)", &[])
+        .await?;
     ctx.query(
         "CREATE TABLE books (id INT PRIMARY KEY, author_id INT, title TEXT)",
         &[],
@@ -137,7 +137,10 @@ async fn test_slow_repopulation_forwards_on_deadline() -> Result<(), Error> {
     .await?;
     let authors: Vec<String> = (1..=10).map(|i| format!("({i}, 'a{i}')")).collect();
     ctx.query(
-        &format!("INSERT INTO authors (id, name) VALUES {}", authors.join(", ")) as &str,
+        &format!(
+            "INSERT INTO authors (id, name) VALUES {}",
+            authors.join(", ")
+        ) as &str,
         &[],
     )
     .await?;
@@ -145,14 +148,16 @@ async fn test_slow_repopulation_forwards_on_deadline() -> Result<(), Error> {
         .map(|i| format!("({i}, {}, 't{i}')", (i % 10) + 1))
         .collect();
     ctx.query(
-        &format!("INSERT INTO books (id, author_id, title) VALUES {}", books.join(", ")) as &str,
+        &format!(
+            "INSERT INTO books (id, author_id, title) VALUES {}",
+            books.join(", ")
+        ) as &str,
         &[],
     )
     .await?;
     ctx.cdc_settle().await?;
 
-    let query =
-        "SELECT b.id, b.title, a.name FROM books b JOIN authors a ON b.author_id = a.id WHERE a.id <= 5";
+    let query = "SELECT b.id, b.title, a.name FROM books b JOIN authors a ON b.author_id = a.id WHERE a.id <= 5";
 
     // Warm the join to Ready (the cold population records the fetch+stage
     // estimate that will set the re-pop deadline).
@@ -160,7 +165,8 @@ async fn test_slow_repopulation_forwards_on_deadline() -> Result<(), Error> {
         let client = ctx.proxy_client_connect().await?;
         let _ = client.simple_query(query).await.map_err(Error::other)?;
     }
-    ctx.cache_settle_with_timeout(Duration::from_secs(10)).await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(10))
+        .await?;
 
     // Invalidate by inserting a book that grows the join result.
     ctx.query(
@@ -172,7 +178,8 @@ async fn test_slow_repopulation_forwards_on_deadline() -> Result<(), Error> {
 
     let before = ctx.metrics().await?;
     concurrent_reads(&ctx, query).await?;
-    ctx.cache_settle_with_timeout(Duration::from_secs(10)).await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(10))
+        .await?;
     let delta = metrics_delta(&before, &ctx.metrics().await?);
 
     assert!(
