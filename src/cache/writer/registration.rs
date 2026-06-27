@@ -786,6 +786,7 @@ impl WriterRegistration {
             // Walk `update_resolved`: it is the AST CDC eval actually runs.
             let predicate_columns =
                 predicate_columns_collect(&update_resolved, table_node.name.as_str());
+            let is_single_table = update_resolved.is_single_table();
             let update_query = UpdateQuery {
                 fingerprint,
                 resolved: update_resolved,
@@ -798,6 +799,7 @@ impl WriterRegistration {
                 change_dependent: false,
                 pg_batchable,
                 predicate_columns,
+                is_single_table,
             };
 
             self.update_query_register(core, relation_oid, table_node.name.as_str(), update_query);

@@ -101,6 +101,10 @@ pub struct UpdateQuery {
     /// makes every eval verdict for this query untrustworthy, forcing
     /// invalidation (PGC-264).
     pub predicate_columns: HashSet<EcoString>,
+    /// Precomputed `resolved.is_single_table()`. Cached because the CDC
+    /// invalidation checks consult it per row per query, and the underlying
+    /// `ResolvedQueryExpr::is_single_table` walks the AST.
+    pub is_single_table: bool,
 }
 
 impl UpdateQuery {
@@ -129,8 +133,7 @@ impl UpdateQuery {
         // so in-place maintenance can't materialize it. Independent of whether
         // the equivalence was recorded as `col = col`, so cross joins and
         // expression/cast equi-joins land here rather than the join-column clause.
-        || (matches!(self.source, UpdateQuerySource::FromClause)
-            && !self.resolved.is_single_table())
+        || (matches!(self.source, UpdateQuerySource::FromClause) && !self.is_single_table)
     }
 }
 

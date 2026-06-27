@@ -278,7 +278,7 @@ impl WriterCdc {
                 }
                 // Single-table: membership eval alone decides (the eval is
                 // trustworthy past the predicate_columns gate above).
-                if update_query.resolved.is_single_table() {
+                if update_query.is_single_table {
                     return false;
                 }
                 // Multi-table: a join-column change can create join matches
@@ -510,7 +510,7 @@ impl WriterCdc {
                 }
 
                 // Single-table queries don't need invalidation for uncached rows
-                if update_query.resolved.is_single_table() {
+                if update_query.is_single_table {
                     return false;
                 }
 
