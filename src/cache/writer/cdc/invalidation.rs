@@ -304,11 +304,17 @@ impl WriterCdc {
     /// Removes from generations BTreeSet and purges stale rows, but preserves
     /// cached_queries entry and update_queries for reuse on readmission.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    /// Returns `true` iff this call performed a real invalidation event — a
+    /// Ready→Invalidated transition, a FIFO eviction, or a pinned query's
+    /// deferred readmit. Returns `false` for no-ops — the query is already gone
+    /// or already invalidated — so the aggregate `cache_invalidations` metric
+    /// counts real events and is not inflated by re-flagging the standing
+    /// invalidated set every frame.
     pub(super) async fn cache_query_cdc_invalidate(
         &self,
         core: &mut WriterCore,
         fingerprint: Fingerprint,
-    ) -> CacheResult<()> {
+    ) -> CacheResult<bool> {
         // Pinned queries: defer readmission to the writer event loop. Still
         // drain parked waiters — the readmit's Ready can itself be superseded
         // under churn (waiting on it risks the same hang as the unpinned path).
@@ -321,22 +327,24 @@ impl WriterCdc {
             debug!("pinned query invalidated, deferring readmit {fingerprint}");
             let _ = core.query_tx.send(QueryCommand::Readmit { fingerprint });
             core.waiters_fail(fingerprint);
-            return Ok(());
+            // A pinned invalidation is a real event (it queues a readmit), so it
+            // counts — unlike the already-invalidated re-flag below.
+            return Ok(true);
         }
 
         let cfg = core.cache.dynamic.load();
 
         if cfg.cache_policy == CachePolicy::Fifo {
-            return core.cache_query_evict(fingerprint).await;
+            return core.cache_query_evict(fingerprint).await.map(|()| true);
         }
 
         let Some(query) = core.cache.cached_queries.get1(&fingerprint) else {
-            return Ok(());
+            return Ok(false);
         };
 
         // Already invalidated — nothing to do
         if query.invalidated {
-            return Ok(());
+            return Ok(false);
         }
 
         let generation = query.generation;
@@ -378,7 +386,7 @@ impl WriterCdc {
             core.generation_purge(new_threshold).await?;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// SELECT one row from the cache, projecting a boolean per non-PK column

@@ -91,11 +91,19 @@ impl WriterCdc {
         // Collected out: `cache_query_cdc_invalidate` needs `&mut core`, so we
         // can't hold a borrow of `core.frame_invalidations` across the loop.
         let fps: Vec<Fingerprint> = core.frame_invalidations.iter().copied().collect();
-        let count = fps.len() as u64;
+        // Count only fingerprints that actually transitioned (Ready→Invalidated
+        // or FIFO-evicted), not every enqueue: the same standing-invalidated
+        // query gets re-flagged each frame it keeps matching writes, and counting
+        // those no-ops inflated the metric ~8x over real transitions.
+        let mut count = 0u64;
         for fp in fps {
-            self.cache_query_cdc_invalidate(core, fp)
+            if self
+                .cache_query_cdc_invalidate(core, fp)
                 .await
-                .attach_loc("flushing deferred invalidation")?;
+                .attach_loc("flushing deferred invalidation")?
+            {
+                count += 1;
+            }
         }
         crate::metrics::handles().cdc.invalidations.increment(count);
         core.state_gauges_update();
