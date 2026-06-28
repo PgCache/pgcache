@@ -16,9 +16,9 @@
 
 use crate::catalog::Oid;
 use crate::pg::protocol::ByteString;
-use crate::query::Fingerprint;
 use crate::query::constraint_index::row_value_forms;
 use crate::query::constraints::ColumnRange;
+use crate::query::{Fingerprint, FingerprintSet};
 use std::sync::Arc;
 
 use tracing::{debug, error, trace};
@@ -330,34 +330,56 @@ impl WriterCore {
     /// values are gone), so only its PK is trustworthy. DELETE passes the genuine
     /// old image with `pk_only = false` — exact under REPLICA IDENTITY FULL,
     /// PK-only (via absent-column `Unknown`) under DEFAULT.
+    /// Candidate queries a *removed* row image could have belonged to: the
+    /// `eval_index` point probe on the old image. `pk_only` forces the `Unknown`
+    /// wildcard for non-PK columns (their old values are gone under REPLICA
+    /// IDENTITY DEFAULT), so the probe over-returns rather than under-returns.
+    /// Shared by MV dirty-marking and the narrowed memo-eviction pass (ADR-045).
+    pub(in crate::cache::writer) fn eval_candidates_removed(
+        &self,
+        relation_oid: Oid,
+        old_row: &[Option<ByteString>],
+        pk_only: bool,
+    ) -> FingerprintSet {
+        let Some(update_queries) = self.cache.update_queries.get(&relation_oid) else {
+            return FingerprintSet::default();
+        };
+        let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
+            return FingerprintSet::default();
+        };
+        update_queries.eval_index.candidates_point(|column| {
+            if pk_only
+                && !table_metadata
+                    .columns
+                    .get(column)
+                    .is_some_and(|m| m.is_primary_key)
+            {
+                vec![ColumnRange::Unknown]
+            } else {
+                row_value_forms(table_metadata, old_row, column)
+            }
+        })
+    }
+
     pub(super) fn mv_dirty_mark_removed_row(
         &self,
         relation_oid: Oid,
         old_row: &[Option<ByteString>],
         pk_only: bool,
     ) {
-        let candidates = {
-            let Some(update_queries) = self.cache.update_queries.get(&relation_oid) else {
-                return;
-            };
-            let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
-                return;
-            };
-            update_queries.eval_index.candidates_point(|column| {
-                if pk_only
-                    && !table_metadata
-                        .columns
-                        .get(column)
-                        .is_some_and(|m| m.is_primary_key)
-                {
-                    vec![ColumnRange::Unknown]
-                } else {
-                    row_value_forms(table_metadata, old_row, column)
-                }
-            })
-        };
+        self.mv_dirty_mark_candidates(&self.eval_candidates_removed(
+            relation_oid,
+            old_row,
+            pk_only,
+        ));
+    }
+
+    /// Dirty-mark a precomputed candidate set (self-gating per fingerprint).
+    /// Lets a caller that already ran the old-image probe for the memo pass
+    /// reuse it for MV instead of probing the `eval_index` twice (ADR-045).
+    pub(in crate::cache::writer) fn mv_dirty_mark_candidates(&self, candidates: &FingerprintSet) {
         for fingerprint in candidates {
-            self.mv_dirty_mark(fingerprint);
+            self.mv_dirty_mark(*fingerprint);
         }
     }
 

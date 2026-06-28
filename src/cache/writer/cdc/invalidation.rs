@@ -91,13 +91,6 @@ pub(super) fn row_constraints_match(
     true
 }
 
-/// CDC operation kind for memo eviction accumulation (rung 3b).
-pub(super) enum MemoOp {
-    Insert,
-    Update,
-    Delete,
-}
-
 /// Candidate fingerprints whose extracted constraints a CDC row could satisfy,
 /// probed once over the relation's full `eval_index` so the in-place matcher
 /// (`update_queries_execute_batch`, which filters to LocalEval) and the
@@ -119,77 +112,37 @@ pub(super) fn eval_candidates(
     }
 }
 
-/// Accumulate the memoized fingerprints whose in-process snapshot this CDC row
-/// change affects into `frame_memo_evictions` (rung 3b); the frame flush bumps
-/// `SlotKey::Memo(F)` for the set, so eviction is predicate-matched rather than
-/// relation-coarse.
+/// Accumulate the memoized fingerprints this CDC row change affects into
+/// `frame_memo_evictions` (rung 3b); the frame flush bumps `SlotKey::Memo(F)`
+/// for the set, so eviction is predicate-matched rather than relation-coarse.
 ///
-/// Correctness bar: never under-evict (a miss is a stale read). Conservative
-/// (evict every memo over the relation) for: DELETE (the old image is PK-only
-/// under REPLICA IDENTITY DEFAULT, so a non-PK WHERE can't be probed), PgEval
-/// memos (complex / multi-table membership), and UPDATE without `row_changes`
-/// (a membership flip-out is undetectable without the changed-column set). The
-/// precise path applies only to `LocalEval` memos, which are single-table by
-/// construction — so `update_query_matches_locally` fully decides membership.
+/// `memo_candidates` is the union of the new-row and old-image probes
+/// (`candidates(new) ∪ candidates(old)`; for a DELETE just the old image, for an
+/// INSERT just the new row — see the dispatch). A memo's result changes only if
+/// the row matched the query now or before, which makes the query satisfy its
+/// extracted constraints → it is in that union (the never-under-return guarantee
+/// of ADR-037 holds in both directions). So membership alone is complete — no
+/// per-memo predicate eval, and no PgEval special case (a non-candidate provably
+/// can't be in the result). Over-eviction (a candidate whose result didn't
+/// actually change) is harmless. Orphan memos (query no longer registered) are
+/// invalidated eagerly at eviction (`cache_query_evict`), not here.
 pub(super) fn memo_frame_accumulate(
     core: &mut WriterCore,
     relation_oid: Oid,
-    op: MemoOp,
-    new_row: &[Option<ByteString>],
-    row_changes: Option<&HashMap<EcoString, bool>>,
-    local_candidates: &FingerprintSet,
+    memo_candidates: &FingerprintSet,
 ) {
     if core.state_view.memo.is_empty() {
         return;
     }
-    let memo_over_r = core
-        .state_view
-        .memo
-        .fingerprints_for_relations([&relation_oid]);
-    if memo_over_r.is_empty() {
-        return;
+    for fingerprint in memo_candidates {
+        if core
+            .state_view
+            .memo
+            .relation_has_fingerprint(relation_oid, *fingerprint)
+        {
+            core.frame_memo_evictions.insert(*fingerprint);
+        }
     }
-    if matches!(op, MemoOp::Delete) {
-        core.frame_memo_evictions.extend(memo_over_r);
-        return;
-    }
-    let evict: Vec<Fingerprint> = {
-        let Some(uqs) = core.cache.update_queries.get(&relation_oid) else {
-            core.frame_memo_evictions.extend(memo_over_r);
-            return;
-        };
-        let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
-            core.frame_memo_evictions.extend(memo_over_r);
-            return;
-        };
-        memo_over_r
-            .iter()
-            .filter(|&f| {
-                let Some(uq) = uqs.queries.get(f) else {
-                    return true; // memoized but no update-query: conservative
-                };
-                if uq.eval_strategy != UpdateEvalStrategy::LocalEval {
-                    return true; // PgEval (complex / multi-table): conservative
-                }
-                let new_match = local_candidates.contains(f)
-                    && update_query_matches_locally(uq, table_metadata, new_row);
-                match (&op, row_changes) {
-                    (MemoOp::Insert, _) => new_match,
-                    (MemoOp::Update, Some(rc)) => {
-                        new_match
-                            || uq
-                                .predicate_columns
-                                .iter()
-                                .any(|c| rc.get(c.as_str()).copied().unwrap_or(false))
-                    }
-                    (MemoOp::Update, None) => true,
-                    (MemoOp::Delete, _) => true,
-                }
-            })
-            .copied()
-            .collect()
-    };
-    core.frame_memo_evictions.extend(evict);
 }
 
 /// Evaluate a LocalEval update query's WHERE against the CDC row.
@@ -659,6 +612,7 @@ impl WriterCdc {
     }
 
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    #[allow(clippy::too_many_arguments)] // cohesive per-row CDC inputs; candidates are shared from dispatch, not recomputed
     pub(super) fn update_queries_check_invalidate(
         &self,
         core: &WriterCore,
@@ -667,6 +621,7 @@ impl WriterCdc {
         row_data: &[Option<ByteString>],
         key_data: Option<&[Option<ByteString>]>,
         operation: CdcOperation,
+        candidates: &FingerprintSet,
     ) -> CacheResult<Vec<Fingerprint>> {
         // No cached query references this relation (never registered, or all
         // its queries were evicted) → nothing to invalidate. Not an error.
@@ -677,8 +632,30 @@ impl WriterCdc {
             return Ok(Vec::new());
         };
 
+        // ADR-045: examine only the narrowed set, not every query on the
+        // relation. `candidates` (the new-row probe) covers every "row now
+        // matches" branch; the carve-outs cover the branches that fire
+        // regardless of whether the post-image row matches — unconditional
+        // subquery / outer-join (`always_check`); a DELETE on any `has_limit`
+        // query; and an UPDATE of a limit predicate column that can push a row
+        // out of a window. Single-table non-limit FromClause queries provably
+        // never invalidate, so excluding them is the bulk of the saving.
+        let mut narrowed = candidates.clone();
+        narrowed.extend(update_queries.always_check.iter().copied());
+        let expand_limit = match (operation, row_changes) {
+            (CdcOperation::Delete, _) => true,
+            (CdcOperation::Upsert, Some(rc)) => update_queries.limit_predicate_changed(rc),
+            (CdcOperation::Upsert, None) => false,
+        };
+        if expand_limit {
+            narrowed.extend(update_queries.has_limit_from.iter().copied());
+        }
+
         let mut fp_list = Vec::new();
-        for update_query in update_queries.queries.values() {
+        for fingerprint in &narrowed {
+            let Some(update_query) = update_queries.queries.get(fingerprint) else {
+                continue;
+            };
             // `Some` → row is cached (UPDATE main path); `None` → row not cached
             // (INSERT, DELETE, or UPDATE of an uncached row).
             let invalidate = match row_changes {
@@ -710,7 +687,7 @@ impl WriterCdc {
                      path: update_invalidation_possible is out of sync with \
                      row_*_invalidation_check"
                 );
-                fp_list.push(update_query.fingerprint);
+                fp_list.push(*fingerprint);
             }
         }
 

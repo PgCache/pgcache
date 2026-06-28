@@ -1,7 +1,7 @@
 # ADR-045: Candidate-narrowed CDC invalidation and memo eviction
 
 ## Status
-Proposed
+Accepted
 
 ## Context
 Every CDC row event drives several per-query bookkeeping passes over the affected relation on the single writer thread. ADR-037 introduced a shared point-probe (`eval_candidates` over the per-relation constraint-containment index) and narrowed the in-place matcher and MV dirty-marking to that candidate set. Two consistency-critical passes were left scanning the **full** per-relation update-query set on every row:

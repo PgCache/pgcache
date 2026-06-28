@@ -9,6 +9,7 @@ use crate::query::ast::Deparse;
 use crate::result::error_chain_format;
 use crate::settings::CachePolicy;
 
+use super::super::memo::SlotKey;
 use super::super::{CacheError, CacheResult, MapIntoReport, types::CachedQueryState};
 
 use super::core::*;
@@ -482,17 +483,20 @@ impl WriterCore {
         // Remove from state view
         self.state_view.cached_queries.remove(&fingerprint);
 
-        // The memo is deliberately NOT swept here. An evicted query is removed
-        // from `cached_queries`, so it is no longer Ready and its orphan memo is
-        // never reached by the serve path (`memo_serve_plan` runs only on the
-        // Ready hit path). When the query re-registers and is served again, that
-        // serve re-captures and replaces the orphan under the same `MemoKey`. So
-        // eviction leaves a correctness-safe orphan: unreachable until replaced,
-        // and bounded by the memo byte budget (a full store rejects new captures,
-        // no leak). Coupling memo removal to query eviction would need a
-        // fingerprint→keys index, not just an O(n) scan per eviction — deferred
-        // until orphan accumulation under a write-light, high-cardinality
-        // workload is shown to matter (PGC-277).
+        // Eagerly invalidate this query's captured memo by bumping its
+        // per-fingerprint slot (ADR-045). The memo-eviction pass no longer scans
+        // every memo per CDC row, so it can't catch an evicted query's orphan
+        // memo once the query leaves `update_queries`/`eval_index`; without this
+        // bump a re-registration could serve a stale orphan (the first serve
+        // precedes re-capture). The bump (begin→end, +2) makes any stamped
+        // orphan version stale at once, so `memo.get` rejects it; the next
+        // capture re-stamps the new version.
+        self.state_view
+            .memo
+            .slot_dirty_begin(SlotKey::Memo(fingerprint));
+        self.state_view
+            .memo
+            .slot_dirty_end(SlotKey::Memo(fingerprint));
 
         // Drain coalesced waiters parked on the now-removed query (eviction can
         // remove a Loading query whose waiters would otherwise never be drained).

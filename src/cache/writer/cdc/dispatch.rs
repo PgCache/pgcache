@@ -448,6 +448,11 @@ impl WriterCdc {
             return Ok(());
         }
 
+        // Probe the eval index once; the invalidation check, the in-place
+        // matcher, and the memo eviction pass below all consume this candidate
+        // set (ADR-045).
+        let local_candidates = eval_candidates(core, relation_oid, row_data);
+
         let fp_list = self
             .update_queries_check_invalidate(
                 core,
@@ -456,6 +461,7 @@ impl WriterCdc {
                 row_data,
                 None,
                 CdcOperation::Upsert,
+                &local_candidates,
             )
             .attach_loc("checking for query invalidations")?;
 
@@ -464,22 +470,13 @@ impl WriterCdc {
         // it accompanies rather than visible mid-frame.
         core.frame_invalidations.extend(fp_list);
 
-        // Probe the LocalEval index once; both the in-place matcher and the memo
-        // eviction pass below consume the same candidate set.
-        let local_candidates = eval_candidates(core, relation_oid, row_data);
         let matched = self
             .update_queries_execute_batch(core, relation_oid, row_data, batch, &local_candidates)
             .await?;
 
-        // Rung 3b: evict memos this insert grows into (predicate-matched).
-        memo_frame_accumulate(
-            core,
-            relation_oid,
-            MemoOp::Insert,
-            row_data,
-            None,
-            &local_candidates,
-        );
+        // Rung 3b: evict memos this insert grows into. An INSERT only adds the
+        // row, so the new-row candidates are the full memo-eviction set (ADR-045).
+        memo_frame_accumulate(core, relation_oid, &local_candidates);
 
         // The inserted row is alive at origin: cancel any tracked deletion of
         // its key so population merges don't omit it (PGC-260). When the key
@@ -522,9 +519,26 @@ impl WriterCdc {
             return Ok(());
         }
 
-        // Probe the LocalEval index once; the memo eviction pass and the in-place
+        // Probe the eval index once; the invalidation check and the in-place
         // matcher (`update_queries_execute_batch` below) share this candidate set.
         let local_candidates = eval_candidates(core, relation_oid, new_row_data);
+
+        // Old-image candidates (PK-only; old non-PK values are gone), probed
+        // once and reused by both the symmetric memo eviction and the MV
+        // removed-row dirty-mark below (ADR-045 — avoids a second eval_index
+        // probe per UPDATE). Memo eviction is symmetric: a row leaving a query
+        // makes its memo stale, so memo needs new ∪ old candidates.
+        let old_candidates = core.eval_candidates_removed(
+            relation_oid,
+            if key_data.is_empty() {
+                new_row_data
+            } else {
+                key_data
+            },
+            true,
+        );
+        let mut memo_candidates = local_candidates.clone();
+        memo_candidates.extend(old_candidates.iter().copied());
 
         // PGC-227: when no cached query over this relation can have its UPDATE
         // invalidation depend on which columns changed or whether the row is
@@ -573,32 +587,17 @@ impl WriterCdc {
                 new_row_data,
                 Some(key_data),
                 CdcOperation::Upsert,
+                &local_candidates,
             )?;
             trace!("invalidation_count {}", fp_list.len());
             // Deferred to frame_invalidations_flush (see handle_insert).
             core.frame_invalidations.extend(fp_list);
-            // Rung 3b: predicate-matched memo eviction with the changed-column
-            // set available (precise grow / flip-out / projected-value change).
-            memo_frame_accumulate(
-                core,
-                relation_oid,
-                MemoOp::Update,
-                new_row_data,
-                row_changes,
-                &local_candidates,
-            );
-        } else {
-            // No `row_changes` computed (PGC-227 skip): a membership flip-out is
-            // undetectable, so memo eviction is conservative for this relation.
-            memo_frame_accumulate(
-                core,
-                relation_oid,
-                MemoOp::Update,
-                new_row_data,
-                None,
-                &local_candidates,
-            );
         }
+
+        // Rung 3b: memo eviction over the symmetric candidate set. Independent of
+        // the PGC-227 invalidation skip — an in-place value change leaves the
+        // query Ready but its memo stale, so memo must run regardless (ADR-045).
+        memo_frame_accumulate(core, relation_oid, &memo_candidates);
 
         let matched = self
             .update_queries_execute_batch(
@@ -640,19 +639,10 @@ impl WriterCdc {
         // matching query B (`matched` above), or a PK-change with other columns
         // changed, would otherwise leave A's MV serving the departed row forever
         // (PGC-254/PGC-265; the old image isn't available to detect departure
-        // precisely — PGC-255 tracks precision). Probe the eval index on the old
-        // PK (PK-only: the old non-PK values are gone, so any non-PK predicate
-        // matches conservatively via the `Unknown` wildcard) and dirty-mark the
-        // candidates; `mv_dirty_mark` self-gates (Fresh and Building only).
-        core.mv_dirty_mark_removed_row(
-            relation_oid,
-            if key_data.is_empty() {
-                new_row_data
-            } else {
-                key_data
-            },
-            true,
-        );
+        // precisely — PGC-255 tracks precision). Reuse the old-image candidates
+        // already probed above for the memo pass; `mv_dirty_mark` self-gates
+        // (Fresh and Building only).
+        core.mv_dirty_mark_candidates(&old_candidates);
 
         // A non-empty `key_data` means the PK changed; delete the old PK too.
         if !key_data.is_empty() {
@@ -820,29 +810,28 @@ impl WriterCdc {
         self.frame_cache_delete(core, relation_oid, row_data)
             .await?;
 
-        // Rung 3b: the delete's old image is PK-only, so a non-PK WHERE can't be
-        // probed — conservatively evict every memo over the relation.
-        // Delete eviction is conservative (no candidate probe needed).
-        memo_frame_accumulate(
-            core,
-            relation_oid,
-            MemoOp::Delete,
-            row_data,
-            None,
-            &FingerprintSet::default(),
-        );
+        // Rung 3b: evict memos the deleted row belonged to (ADR-045). The delete
+        // tuple is the old image — probe candidates on it (PK-only under REPLICA
+        // IDENTITY DEFAULT → `Unknown` wildcard over-returns), the symmetric
+        // counterpart of the new-row probe.
+        let del_candidates = eval_candidates(core, relation_oid, row_data);
+        memo_frame_accumulate(core, relation_oid, &del_candidates);
 
         // A deleted row leaves stale rows in any Fresh MV that materialized it;
         // CDC removals never went through the upsert path's dirty-mark, so the
-        // MV would serve the deleted row forever. Probe the eval index on the
-        // delete tuple (PGC-292): it's the genuine old image, so `pk_only=false`
-        // uses whatever columns it carries — exact under REPLICA IDENTITY FULL,
-        // PK-only (non-PK absent → `Unknown` wildcard) under DEFAULT (PGC-254).
-        core.mv_dirty_mark_removed_row(relation_oid, row_data, false);
+        // MV would serve the deleted row forever. The delete tuple's candidate
+        // set (the genuine old image; exact under REPLICA IDENTITY FULL, PK-only
+        // via `Unknown` wildcard under DEFAULT) is identical to `del_candidates`
+        // above — reuse it instead of re-probing (PGC-292/ADR-045).
+        core.mv_dirty_mark_candidates(&del_candidates);
 
         // Check for subquery invalidations — removing a row can expand the
         // final result set for Exclusion/Scalar subquery tables
         if core.cache.update_queries.contains_key(&relation_oid) {
+            // DELETE narrowing needs no candidate probe — its set is
+            // `has_limit_from ∪ always_check` (ADR-045): a delete invalidates
+            // all limit queries unconditionally, non-limit FromClause deletes
+            // never invalidate, and subquery/outer-join queries are always_check.
             let fp_list = self
                 .update_queries_check_invalidate(
                     core,
@@ -851,6 +840,7 @@ impl WriterCdc {
                     row_data,
                     None,
                     CdcOperation::Delete,
+                    &FingerprintSet::default(),
                 )
                 .attach_loc("checking delete invalidations")?;
 

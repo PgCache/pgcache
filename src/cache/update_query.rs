@@ -7,7 +7,7 @@ use crate::catalog::Oid;
 use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::QueryConstraints;
 use crate::query::resolved::ResolvedQueryExpr;
-use crate::query::{Fingerprint, FingerprintMap};
+use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 
 /// The kind of subquery context a table was found in.
 /// Determines invalidation behavior based on whether the subquery's
@@ -156,6 +156,19 @@ pub struct UpdateQueries {
     /// and are returned for every row, so narrowing never drops a true match
     /// (no stale reads).
     pub eval_index: ConstraintIndex<Fingerprint>,
+    /// ADR-045 invalidation carve-outs — queries that can invalidate even when
+    /// the changed row is not in the `eval_index` candidate set, so the narrowed
+    /// invalidation pass must always include them. `always_check`: Subquery /
+    /// OuterJoinOptional sources (invalidate unconditionally). `has_limit_from`:
+    /// `has_limit` FromClause queries (a DELETE invalidates all of them; an
+    /// UPDATE of a limit predicate column can push a row out of their window).
+    /// Both maintained on `query_insert`/`query_remove`.
+    pub always_check: FingerprintSet,
+    pub has_limit_from: FingerprintSet,
+    /// Refcounted union of `predicate_columns` over `has_limit_from`. Lets the
+    /// UPDATE narrowing decide in O(changed cols) whether a change could move a
+    /// row out of some limit window (then it expands to `has_limit_from`).
+    limit_predicate_columns: HashMap<EcoString, usize>,
     /// Count of queries with `change_dependent == true`. Maintained on
     /// insert/remove via `change_dependent_account` so `needs_change_eval` is
     /// O(1) on the CDC hot path. Derivable from `queries`; `needs_change_eval`
@@ -172,8 +185,70 @@ impl UpdateQueries {
             queries: HashMap::default(),
             subsumption: ConstraintIndex::new(),
             eval_index: ConstraintIndex::new(),
+            always_check: FingerprintSet::default(),
+            has_limit_from: FingerprintSet::default(),
+            limit_predicate_columns: HashMap::new(),
             change_dependent_count: 0,
         }
+    }
+
+    /// Carve-out membership for a query: `(always_check, has_limit_fromclause)`.
+    fn carveout_membership(q: &UpdateQuery) -> (bool, bool) {
+        let always = matches!(
+            q.source,
+            UpdateQuerySource::Subquery(_) | UpdateQuerySource::OuterJoinOptional
+        );
+        let limit_from = q.has_limit && matches!(q.source, UpdateQuerySource::FromClause);
+        (always, limit_from)
+    }
+
+    /// Add (`added`) or remove a query's carve-out memberships, keeping
+    /// `always_check` / `has_limit_from` / `limit_predicate_columns` in lockstep
+    /// with `queries`. Idempotent per fingerprint for the sets; refcounted for
+    /// the column union so replacement (same fingerprint, changed shape) and
+    /// multiple limit queries sharing a predicate column are handled correctly.
+    fn carveout_account(
+        &mut self,
+        fp: Fingerprint,
+        always: bool,
+        limit_from: bool,
+        predicate_columns: &HashSet<EcoString>,
+        added: bool,
+    ) {
+        if always {
+            if added {
+                self.always_check.insert(fp);
+            } else {
+                self.always_check.remove(&fp);
+            }
+        }
+        if limit_from {
+            if added {
+                self.has_limit_from.insert(fp);
+                for c in predicate_columns {
+                    *self.limit_predicate_columns.entry(c.clone()).or_insert(0) += 1;
+                }
+            } else {
+                self.has_limit_from.remove(&fp);
+                for c in predicate_columns {
+                    if let Some(n) = self.limit_predicate_columns.get_mut(c) {
+                        *n -= 1;
+                        if *n == 0 {
+                            self.limit_predicate_columns.remove(c);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether any column the UPDATE changed is a predicate column of some
+    /// `has_limit` FromClause query — i.e. the change could push a row out of a
+    /// limit window, so the invalidation pass must expand to `has_limit_from`.
+    pub fn limit_predicate_changed(&self, row_changes: &HashMap<EcoString, bool>) -> bool {
+        row_changes
+            .iter()
+            .any(|(c, &changed)| changed && self.limit_predicate_columns.contains_key(c))
     }
 
     /// Whether any query over this relation needs `query_row_changes` to decide
@@ -195,12 +270,18 @@ impl UpdateQueries {
     /// relation (e.g. a self-correlated subquery decorrelates into multiple
     /// update queries over the same table), and the map is keyed by fingerprint.
     pub fn query_insert(&mut self, query: UpdateQuery) -> Option<UpdateQuery> {
+        let fp = query.fingerprint;
         let change_dependent = query.change_dependent;
-        let prev = self.queries.insert(query.fingerprint, query);
+        let (new_always, new_limit_from) = Self::carveout_membership(&query);
+        let new_pcols = query.predicate_columns.clone();
+        let prev = self.queries.insert(fp, query);
         if let Some(prev) = &prev {
             self.change_dependent_account(prev.change_dependent, false);
+            let (pa, pl) = Self::carveout_membership(prev);
+            self.carveout_account(fp, pa, pl, &prev.predicate_columns, false);
         }
         self.change_dependent_account(change_dependent, true);
+        self.carveout_account(fp, new_always, new_limit_from, &new_pcols, true);
         prev
     }
 
@@ -210,6 +291,8 @@ impl UpdateQueries {
         let removed = self.queries.remove(&fingerprint);
         if let Some(removed) = &removed {
             self.change_dependent_account(removed.change_dependent, false);
+            let (a, l) = Self::carveout_membership(removed);
+            self.carveout_account(fingerprint, a, l, &removed.predicate_columns, false);
         }
         removed
     }

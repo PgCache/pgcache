@@ -372,6 +372,15 @@ impl ResultMemo {
         out
     }
 
+    /// Whether any memo entry over `relation` exists for `fingerprint`. O(1) —
+    /// the narrowed memo-eviction pass (ADR-045) probes this per candidate
+    /// instead of materializing the full per-relation fingerprint set per row.
+    pub fn relation_has_fingerprint(&self, relation: Oid, fingerprint: Fingerprint) -> bool {
+        self.relation_fingerprints
+            .get(&relation)
+            .is_some_and(|inner| inner.contains_key(&fingerprint))
+    }
+
     /// Remove an entry, returning its byte accounting to the budget.
     pub fn remove(&self, key: &MemoKey) {
         if let Some((_, entry)) = self.entries.remove(key) {

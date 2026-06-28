@@ -13,7 +13,7 @@ mod sql;
 mod toast_repair;
 
 pub(in crate::cache::writer::cdc) use invalidation::{
-    MemoOp, eval_candidates, memo_frame_accumulate, update_query_matches_locally,
+    eval_candidates, memo_frame_accumulate, update_query_matches_locally,
 };
 pub(in crate::cache::writer::cdc) use segment_eval::{
     BatchEvalView, PreparedEvalKey, SegmentMembership,
