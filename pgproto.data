@@ -1,9 +1,0 @@
-'P'	"S1"	"SELECT * FROM pgbench_accounts LIMIT 10"	0
-'B'	""	"S1"	0	0	0
-'E'	""	0
-'H'
-'y'
-'S'
-'Y'
-'X'
-
