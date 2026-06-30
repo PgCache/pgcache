@@ -182,13 +182,16 @@ fn join_membership_unchanged(
         return false;
     }
 
-    let join_columns: Vec<&str> = update_query
+    // Non-empty AND every join column is a PK column — decided on the iterator
+    // so this per-candidate check allocates nothing (PGC-342). `peek` proves
+    // non-empty; `all` then checks every column (including the peeked one).
+    let mut join_columns = update_query
         .constraints
         .table_join_columns(&table_metadata.name)
-        .collect();
+        .peekable();
 
-    !join_columns.is_empty()
-        && join_columns.iter().all(|col| {
+    join_columns.peek().is_some()
+        && join_columns.all(|col| {
             table_metadata
                 .primary_key_columns
                 .iter()
