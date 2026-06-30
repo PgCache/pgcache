@@ -127,18 +127,21 @@ pub(super) fn eval_candidates(
 pub(super) fn memo_frame_accumulate(
     core: &mut WriterCore,
     relation_oid: Oid,
-    memo_candidates: &FingerprintSet,
+    memo_candidates: impl IntoIterator<Item = Fingerprint>,
 ) {
     if core.state_view.memo.is_empty() {
         return;
     }
+    // Takes an iterator so callers can chain the new- and old-image candidate
+    // sets without materializing their union (PGC-340). `frame_memo_evictions`
+    // is a set, so a fingerprint present in both images inserts idempotently.
     for fingerprint in memo_candidates {
         if core
             .state_view
             .memo
-            .relation_has_fingerprint(relation_oid, *fingerprint)
+            .relation_has_fingerprint(relation_oid, fingerprint)
         {
-            core.frame_memo_evictions.insert(*fingerprint);
+            core.frame_memo_evictions.insert(fingerprint);
         }
     }
 }
@@ -638,20 +641,29 @@ impl WriterCdc {
         // query; and an UPDATE of a limit predicate column that can push a row
         // out of a window. Single-table non-limit FromClause queries provably
         // never invalidate, so excluding them is the bulk of the saving.
-        let mut narrowed = candidates.clone();
-        narrowed.extend(update_queries.always_check.iter().copied());
+        // Chain the carve-out sets onto the candidate probe instead of
+        // materializing their union (PGC-340). `fp_list` is deduped by the
+        // `frame_invalidations` set, so a fingerprint present in more than one
+        // set is harmless — re-checked, never double-invalidated.
         let expand_limit = match (operation, row_changes) {
             (CdcOperation::Delete, _) => true,
             (CdcOperation::Upsert, Some(rc)) => update_queries.limit_predicate_changed(rc),
             (CdcOperation::Upsert, None) => false,
         };
-        if expand_limit {
-            narrowed.extend(update_queries.has_limit_from.iter().copied());
-        }
+        let narrowed = candidates
+            .iter()
+            .copied()
+            .chain(update_queries.always_check.iter().copied())
+            .chain(
+                expand_limit
+                    .then(|| update_queries.has_limit_from.iter().copied())
+                    .into_iter()
+                    .flatten(),
+            );
 
         let mut fp_list = Vec::new();
-        for fingerprint in &narrowed {
-            let Some(update_query) = update_queries.queries.get(fingerprint) else {
+        for fingerprint in narrowed {
+            let Some(update_query) = update_queries.queries.get(&fingerprint) else {
                 continue;
             };
             // `Some` → row is cached (UPDATE main path); `None` → row not cached
@@ -685,7 +697,7 @@ impl WriterCdc {
                      path: update_invalidation_possible is out of sync with \
                      row_*_invalidation_check"
                 );
-                fp_list.push(*fingerprint);
+                fp_list.push(fingerprint);
             }
         }
 

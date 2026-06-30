@@ -476,7 +476,7 @@ impl WriterCdc {
 
         // Rung 3b: evict memos this insert grows into. An INSERT only adds the
         // row, so the new-row candidates are the full memo-eviction set (ADR-045).
-        memo_frame_accumulate(core, relation_oid, &local_candidates);
+        memo_frame_accumulate(core, relation_oid, local_candidates.iter().copied());
 
         // The inserted row is alive at origin: cancel any tracked deletion of
         // its key so population merges don't omit it (PGC-260). When the key
@@ -537,8 +537,6 @@ impl WriterCdc {
             },
             true,
         );
-        let mut memo_candidates = local_candidates.clone();
-        memo_candidates.extend(old_candidates.iter().copied());
 
         // PGC-227: when no cached query over this relation can have its UPDATE
         // invalidation depend on which columns changed or whether the row is
@@ -597,7 +595,15 @@ impl WriterCdc {
         // Rung 3b: memo eviction over the symmetric candidate set. Independent of
         // the PGC-227 invalidation skip — an in-place value change leaves the
         // query Ready but its memo stale, so memo must run regardless (ADR-045).
-        memo_frame_accumulate(core, relation_oid, &memo_candidates);
+        // Symmetric new ∪ old candidates, chained to avoid allocating the union.
+        memo_frame_accumulate(
+            core,
+            relation_oid,
+            local_candidates
+                .iter()
+                .copied()
+                .chain(old_candidates.iter().copied()),
+        );
 
         let matched = self
             .update_queries_execute_batch(
@@ -815,7 +821,7 @@ impl WriterCdc {
         // IDENTITY DEFAULT → `Unknown` wildcard over-returns), the symmetric
         // counterpart of the new-row probe.
         let del_candidates = eval_candidates(core, relation_oid, row_data);
-        memo_frame_accumulate(core, relation_oid, &del_candidates);
+        memo_frame_accumulate(core, relation_oid, del_candidates.iter().copied());
 
         // A deleted row leaves stale rows in any Fresh MV that materialized it;
         // CDC removals never went through the upsert path's dirty-mark, so the
