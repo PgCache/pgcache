@@ -34,6 +34,18 @@ type IdMap<K, V> = HashMap<K, V, BuildIdHasher<K>>;
 /// `HashSet` of an id type with the passthrough identity hasher.
 type IdSet<K> = HashSet<K, BuildIdHasher<K>>;
 
+/// Per-column candidate forms a CDC row value can take: the literal string plus
+/// optional float/bool reinterpretations. A fixed array (one slot per form) so
+/// the per-row point probe never heap-allocates on this axis (PGC-341), and so
+/// adding a fourth reinterpretation is a compile error (`[_; 3]` can't hold it)
+/// — forcing a deliberate decision about the capacity rather than a silent
+/// heap spill. Empty slots are `None`; iterate with `.iter().flatten()`.
+pub(crate) type ColumnForms = [Option<ColumnRange>; 3];
+
+/// Per-column `ValueKey`s extracted from a column's `Equal` forms — one slot per
+/// `ColumnForms` slot (a form is keyable or it isn't), same fixed-array rules.
+type ColumnKeys = [Option<ValueKey>; 3];
+
 /// Sorted, deduplicated set of column names — canonical key for a
 /// subsumption class. Two queries constraining the same columns hash to
 /// the same `ColumnSet` regardless of source order.
@@ -252,11 +264,11 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
     /// where a miss is a stale read, not just a lost optimization.
     pub(crate) fn candidates_point<F>(&self, col_forms_fn: F) -> IdSet<K>
     where
-        F: Fn(&str) -> Vec<ColumnRange>,
+        F: Fn(&str) -> ColumnForms,
     {
         let mut candidates = IdSet::default();
         for (column_set, class) in &self.classes {
-            let col_forms: Vec<Vec<ColumnRange>> = column_set
+            let col_forms: Vec<ColumnForms> = column_set
                 .columns()
                 .iter()
                 .map(|c| col_forms_fn(c.as_str()))
@@ -267,12 +279,11 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
             // for that position. All columns keyed → probe the small cartesian
             // product of joint tuples; any wildcard → scan the bucket, matching
             // non-wildcard positions against their key sets.
-            let key_sets: Vec<Vec<ValueKey>> = col_forms
+            let key_sets: Vec<ColumnKeys> = col_forms
                 .iter()
                 .map(|forms| {
-                    forms
-                        .iter()
-                        .filter_map(|r| match r {
+                    forms.each_ref().map(|slot| {
+                        slot.as_ref().and_then(|r| match r {
                             ColumnRange::Equal(v) => ValueKey::try_new(v),
                             ColumnRange::Unknown
                             | ColumnRange::Unconstrained
@@ -280,10 +291,10 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
                             | ColumnRange::InSet(_)
                             | ColumnRange::Range { .. } => None,
                         })
-                        .collect()
+                    })
                 })
                 .collect();
-            if key_sets.iter().all(|ks| !ks.is_empty()) {
+            if key_sets.iter().all(|ks| ks.iter().any(Option::is_some)) {
                 for tuple in value_key_product(&key_sets) {
                     if let Some(fps) = class.equality.get(&tuple) {
                         candidates.extend(fps);
@@ -291,10 +302,11 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
                 }
             } else {
                 for (tuple, fps) in &class.equality {
-                    let matches = key_sets
-                        .iter()
-                        .zip(tuple)
-                        .all(|(ks, t)| ks.is_empty() || ks.contains(t));
+                    let matches = key_sets.iter().zip(tuple).all(|(ks, t)| {
+                        // No keyable form for this column → wildcard; else the
+                        // tuple value must match one of the column's keys.
+                        ks.iter().all(Option::is_none) || ks.iter().flatten().any(|k| k == t)
+                    });
                     if matches {
                         candidates.extend(fps);
                     }
@@ -439,12 +451,13 @@ fn project_values(
 /// lookup. Empty input → one empty tuple (the unconstrained class). Each
 /// column carries ≤3 forms and classes have few columns, so the product stays
 /// tiny.
-fn value_key_product(key_sets: &[Vec<ValueKey>]) -> Vec<Vec<ValueKey>> {
+fn value_key_product(key_sets: &[ColumnKeys]) -> Vec<Vec<ValueKey>> {
     let mut result: Vec<Vec<ValueKey>> = vec![Vec::new()];
     for ks in key_sets {
-        let mut next = Vec::with_capacity(result.len() * ks.len());
+        let present = ks.iter().flatten().count();
+        let mut next = Vec::with_capacity(result.len() * present);
         for prefix in &result {
-            for k in ks {
+            for k in ks.iter().flatten() {
                 let mut tuple = prefix.clone();
                 tuple.push(k.clone());
                 next.push(tuple);
@@ -680,7 +693,7 @@ impl<K: IdHashable + Copy> ComplexIndex<K> {
     /// column's forms, then intersect across columns — mirrors `candidates`'
     /// smallest-first intersection. A `[Unknown]` column unions to every entry
     /// on that column (wildcard, no filtering).
-    fn candidates_point(&self, col_forms: &[Vec<ColumnRange>]) -> Vec<K> {
+    fn candidates_point(&self, col_forms: &[ColumnForms]) -> Vec<K> {
         if self.len == 0 {
             return Vec::new();
         }
@@ -690,9 +703,8 @@ impl<K: IdHashable + Copy> ComplexIndex<K> {
             // caller dedups into its own set.
             [column] => col_forms
                 .first()
-                .map(Vec::as_slice)
-                .unwrap_or(&[])
-                .iter()
+                .into_iter()
+                .flat_map(|forms| forms.iter().flatten())
                 .flat_map(|form| column.containing(form))
                 .collect(),
             columns => {
@@ -701,7 +713,7 @@ impl<K: IdHashable + Copy> ComplexIndex<K> {
                     .zip(col_forms)
                     .map(|(column, forms)| {
                         let mut set: IdSet<K> = IdSet::default();
-                        for form in forms {
+                        for form in forms.iter().flatten() {
                             set.extend(column.containing(form));
                         }
                         set.into_iter().collect::<Vec<K>>()
@@ -1030,23 +1042,27 @@ pub(crate) fn row_value_forms(
     table_metadata: &TableMetadata,
     row_data: &[Option<ByteString>],
     column: &str,
-) -> Vec<ColumnRange> {
+) -> ColumnForms {
     let Some(meta) = table_metadata.columns.get(column) else {
-        return vec![ColumnRange::Unknown];
+        return [Some(ColumnRange::Unknown), None, None];
     };
     let Some(Some(bytes)) = row_data.get(meta.index()) else {
-        return vec![ColumnRange::Unknown];
+        return [Some(ColumnRange::Unknown), None, None];
     };
     let text = bytes.as_str();
-    let mut forms = Vec::with_capacity(2);
-    forms.push(ColumnRange::Equal(LiteralValue::String(text.into())));
-    if let Some(n) = text.parse::<f64>().ok().and_then(|x| NotNan::new(x).ok()) {
-        forms.push(ColumnRange::Equal(LiteralValue::Float(n)));
-    }
-    if let Some(b) = pg_bool_parse(text) {
-        forms.push(ColumnRange::Equal(LiteralValue::Boolean(b)));
-    }
-    forms
+    // One slot per reinterpretation. A fourth would not fit `[_; 3]` — a
+    // deliberate compile-time gate on growing the inline capacity.
+    let float = text
+        .parse::<f64>()
+        .ok()
+        .and_then(|x| NotNan::new(x).ok())
+        .map(|n| ColumnRange::Equal(LiteralValue::Float(n)));
+    let boolean = pg_bool_parse(text).map(|b| ColumnRange::Equal(LiteralValue::Boolean(b)));
+    [
+        Some(ColumnRange::Equal(LiteralValue::String(text.into()))),
+        float,
+        boolean,
+    ]
 }
 
 #[cfg(test)]
@@ -1807,8 +1823,8 @@ mod tests {
         idx.insert(fp(3), &[]); // unconstrained — matches every row
 
         let got = idx.candidates_point(|c| match c {
-            "id" => vec![ColumnRange::Equal(int(200))],
-            _ => vec![ColumnRange::Unknown],
+            "id" => [Some(ColumnRange::Equal(int(200))), None, None],
+            _ => [Some(ColumnRange::Unknown), None, None],
         });
         assert!(got.contains(&fp(1)));
         assert!(got.contains(&fp(3)));
@@ -1826,7 +1842,7 @@ mod tests {
 
         // An `Unknown` column (NULL / unchanged-TOAST) must return every entry
         // constraining it — both buckets — never drop one.
-        let got = idx.candidates_point(|_| vec![ColumnRange::Unknown]);
+        let got = idx.candidates_point(|_| [Some(ColumnRange::Unknown), None, None]);
         assert!(
             got.contains(&fp(1)),
             "equality-pure entry must not be dropped under Unknown"
@@ -1846,29 +1862,30 @@ mod tests {
 
         // region pinned to 5, id unknown: both match on the pinned column.
         let got = idx.candidates_point(|c| match c {
-            "region" => vec![ColumnRange::Equal(int(5))],
-            _ => vec![ColumnRange::Unknown],
+            "region" => [Some(ColumnRange::Equal(int(5))), None, None],
+            _ => [Some(ColumnRange::Unknown), None, None],
         });
         assert!(got.contains(&fp(1)));
         assert!(got.contains(&fp(2)));
 
         // region pinned to a non-matching value excludes both.
         let none = idx.candidates_point(|c| match c {
-            "region" => vec![ColumnRange::Equal(int(9))],
-            _ => vec![ColumnRange::Unknown],
+            "region" => [Some(ColumnRange::Equal(int(9))), None, None],
+            _ => [Some(ColumnRange::Unknown), None, None],
         });
         assert!(none.is_empty());
     }
 
     // `row_value_forms`: every keyable interpretation of the wire text.
 
-    fn has_str_form(forms: &[ColumnRange], s: &str) -> bool {
+    fn has_str_form(forms: &ColumnForms, s: &str) -> bool {
         forms
             .iter()
+            .flatten()
             .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::String(v)) if v == s))
     }
-    fn has_num_form(forms: &[ColumnRange], x: f64) -> bool {
-        forms.iter().any(
+    fn has_num_form(forms: &ColumnForms, x: f64) -> bool {
+        forms.iter().flatten().any(
             |r| matches!(r, ColumnRange::Equal(LiteralValue::Float(n)) if *n == NotNan::new(x).unwrap()),
         )
     }
@@ -1890,6 +1907,7 @@ mod tests {
         assert!(
             !name
                 .iter()
+                .flatten()
                 .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_))))
         );
 
@@ -1899,18 +1917,19 @@ mod tests {
         assert!(
             active
                 .iter()
+                .flatten()
                 .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Boolean(true))))
         );
 
         // SQL NULL / absent column → [Unknown] (wildcard).
         let null_row = [None, bs("bob"), bs("f")];
         assert!(matches!(
-            row_value_forms(&t, &null_row, "id").as_slice(),
-            [ColumnRange::Unknown]
+            row_value_forms(&t, &null_row, "id"),
+            [Some(ColumnRange::Unknown), None, None]
         ));
         assert!(matches!(
-            row_value_forms(&t, &row, "nope").as_slice(),
-            [ColumnRange::Unknown]
+            row_value_forms(&t, &row, "nope"),
+            [Some(ColumnRange::Unknown), None, None]
         ));
 
         // numeric-looking-but-textual: a non-numeric text yields only String.
@@ -1919,6 +1938,7 @@ mod tests {
         assert!(has_str_form(&bad, "abc"));
         assert!(
             !bad.iter()
+                .flatten()
                 .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_))))
         );
     }

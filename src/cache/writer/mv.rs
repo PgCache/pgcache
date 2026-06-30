@@ -354,7 +354,7 @@ impl WriterCore {
                     .get(column)
                     .is_some_and(|m| m.is_primary_key)
             {
-                vec![ColumnRange::Unknown]
+                [Some(ColumnRange::Unknown), None, None]
             } else {
                 row_value_forms(table_metadata, old_row, column)
             }
