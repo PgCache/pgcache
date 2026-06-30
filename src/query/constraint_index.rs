@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ecow::EcoString;
 use ordered_float::NotNan;
+use smallvec::SmallVec;
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{ColumnRange, TableConstraint, column_range_build};
@@ -45,6 +46,16 @@ pub(crate) type ColumnForms = [Option<ColumnRange>; 3];
 /// Per-column `ValueKey`s extracted from a column's `Equal` forms — one slot per
 /// `ColumnForms` slot (a form is keyable or it isn't), same fixed-array rules.
 type ColumnKeys = [Option<ValueKey>; 3];
+
+/// Per-class collection: one `ColumnForms` per column in the class. Unlike the
+/// per-column forms (always ≤3), the column count is data-dependent and
+/// unbounded (wide composite predicates), so this is a `SmallVec` — inline for
+/// the common 1–2 column case, with a correct heap spill for wider classes,
+/// rather than a fixed array (PGC-341).
+type ClassForms = SmallVec<[ColumnForms; 2]>;
+
+/// Per-class collection of `ColumnKeys`, same shape and rationale as `ClassForms`.
+type ClassKeys = SmallVec<[ColumnKeys; 2]>;
 
 /// Sorted, deduplicated set of column names — canonical key for a
 /// subsumption class. Two queries constraining the same columns hash to
@@ -268,7 +279,7 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
     {
         let mut candidates = IdSet::default();
         for (column_set, class) in &self.classes {
-            let col_forms: Vec<ColumnForms> = column_set
+            let col_forms: ClassForms = column_set
                 .columns()
                 .iter()
                 .map(|c| col_forms_fn(c.as_str()))
@@ -279,7 +290,7 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
             // for that position. All columns keyed → probe the small cartesian
             // product of joint tuples; any wildcard → scan the bucket, matching
             // non-wildcard positions against their key sets.
-            let key_sets: Vec<ColumnKeys> = col_forms
+            let key_sets: ClassKeys = col_forms
                 .iter()
                 .map(|forms| {
                     forms.each_ref().map(|slot| {
