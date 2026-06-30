@@ -15,7 +15,9 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::settings::PgSettings;
 
 use super::protocol::PgMessage;
-use super::protocol::backend::{AUTHENTICATION_OK, PgBackendMessageCodec, PgBackendMessageType};
+use super::protocol::backend::{
+    AUTHENTICATION_OK, PgBackendMessageCodec, PgBackendMessageType, data_rows_first_columns,
+};
 
 /// Postgres `int8` (bigint) type OID, declared for the parameterized
 /// `LIMIT $1 OFFSET $2` placeholders so the planner doesn't have to infer it.
@@ -399,6 +401,125 @@ impl CacheConnection {
             .write_all(&self.write_buf)
             .await
             .map_into_report::<CacheError>()
+    }
+
+    /// Reset the session `mem.query_generation` GUC to 0 (simple query, drained
+    /// through `ReadyForQuery`). The serve path sets it with session scope
+    /// (`SETGEN_SQL`, `is_local=false`), so a pooled connection carries the last
+    /// serve's generation; without this reset an `EXPLAIN ANALYZE` would execute
+    /// the pgcache_pgrx custom scan at that generation and stamp the GC tracker
+    /// (PGC-345).
+    async fn generation_reset(&mut self) -> CacheResult<()> {
+        self.write_buf.clear();
+        frontend_msg_append(&mut self.write_buf, b'Q', |b| {
+            b.put_slice(b"SET mem.query_generation TO 0");
+            b.put_u8(0);
+            Ok(())
+        })?;
+        self.stream
+            .write_all(&self.write_buf)
+            .await
+            .map_into_report::<CacheError>()?;
+        loop {
+            if self.frame_next().await?.message_type == PgBackendMessageType::ReadyForQuery {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Run an already-`EXPLAIN`-wrapped statement via an unnamed extended-protocol
+    /// query, binding `literals` as `$1..$k`, and collect the `QUERY PLAN` rows
+    /// (PGC-345). Resets `mem.query_generation` to 0 first (see
+    /// [`generation_reset`](Self::generation_reset)) so an `EXPLAIN ANALYZE`
+    /// cannot stamp the pgcache_pgrx generation tracker. The response is read
+    /// through `ReadyForQuery`, leaving the connection protocol-clean for reuse;
+    /// a cache-DB `ErrorResponse` is captured rather than failing the connection.
+    /// Not a hot path — clarity over zero-copy.
+    pub async fn explain_collect(
+        &mut self,
+        explain_sql: &str,
+        literals: &[LiteralValue],
+    ) -> CacheResult<ExplainOutcome> {
+        self.generation_reset().await?;
+
+        self.write_buf.clear();
+        extended_query_build(
+            &mut self.write_buf,
+            b"",
+            explain_sql,
+            true,
+            literals,
+            &[],
+            &[],
+            true,  // Describe('P'): the plan's RowDescription is returned, then consumed here
+            false, // text results
+            true,  // standalone Sync
+        )?;
+        self.stream
+            .write_all(&self.write_buf)
+            .await
+            .map_into_report::<CacheError>()?;
+
+        let mut plan = Vec::new();
+        let mut cache_error: Option<String> = None;
+        loop {
+            let frame = self.frame_next().await?;
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match frame.message_type {
+                // The codec batches consecutive DataRow messages into one frame,
+                // so extract every row's plan line, not just the first.
+                PgBackendMessageType::DataRows => {
+                    data_rows_first_columns(&frame.data, &mut plan);
+                }
+                PgBackendMessageType::ErrorResponse => {
+                    cache_error = Some(error_response_display(&frame.data));
+                }
+                PgBackendMessageType::ReadyForQuery => break,
+                _ => {}
+            }
+        }
+
+        Ok(match cache_error {
+            Some(message) => ExplainOutcome::CacheError(message),
+            None => ExplainOutcome::Plan(plan),
+        })
+    }
+}
+
+/// Outcome of [`CacheConnection::explain_collect`].
+pub enum ExplainOutcome {
+    /// Plan text — one entry per `QUERY PLAN` row from the cache DB.
+    Plan(Vec<String>),
+    /// The cache DB rejected the statement (bad EXPLAIN options, or the cache
+    /// table was dropped during an eviction race). Carries a display message.
+    CacheError(String),
+}
+
+/// Render a backend `ErrorResponse` frame to `[<sqlstate>] <message>` for display.
+/// Fields are `code (1 byte) | value (null-terminated)`, list terminated by a 0
+/// code; only `C` (SQLSTATE) and `M` (message) are read.
+fn error_response_display(data: &[u8]) -> String {
+    let mut sqlstate: Option<&str> = None;
+    let mut message: Option<&str> = None;
+    let mut payload = data.get(5..).unwrap_or_default();
+    while let Some((&code, rest)) = payload.split_first() {
+        if code == 0 {
+            break;
+        }
+        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        let value = std::str::from_utf8(rest.get(..end).unwrap_or_default()).unwrap_or("");
+        match code {
+            b'C' => sqlstate = Some(value),
+            b'M' => message = Some(value),
+            _ => {}
+        }
+        payload = rest.get(end + 1..).unwrap_or_default();
+    }
+    match (sqlstate, message) {
+        (Some(code), Some(text)) => format!("[{code}] {text}"),
+        (None, Some(text)) => text.to_owned(),
+        (Some(code), None) => format!("[{code}]"),
+        (None, None) => "cache DB error".to_owned(),
     }
 }
 

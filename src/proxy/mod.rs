@@ -11,6 +11,7 @@ mod tls_stream;
 pub use cache_sender::{StatusSender, StatusSenderUpdater};
 
 pub use client_stream::{ClientSocket, OwnedClientReadHalf};
+pub use query::{ExplainSpec, ExplainTarget};
 
 use std::io;
 use std::sync::Arc;

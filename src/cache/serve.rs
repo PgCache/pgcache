@@ -334,15 +334,15 @@ async fn serve_failure_resolve<W: tokio::io::AsyncWrite + Unpin>(
 /// to avoid returning a connection with stale response data in its buffer; a
 /// replenish signal is sent so a fresh connection replaces it and the pool
 /// cannot permanently shrink (PGC-238).
-struct ConnectionGuard {
-    conn: Option<CacheConnection>,
+pub(crate) struct ConnectionGuard {
+    pub(crate) conn: Option<CacheConnection>,
     return_tx: Sender<CacheConnection>,
     replenish_tx: UnboundedSender<()>,
-    poisoned: bool,
+    pub(crate) poisoned: bool,
 }
 
 impl ConnectionGuard {
-    fn new(
+    pub(crate) fn new(
         conn: CacheConnection,
         return_tx: Sender<CacheConnection>,
         replenish_tx: UnboundedSender<()>,
@@ -356,7 +356,7 @@ impl ConnectionGuard {
     }
 
     /// Return the connection to the pool.
-    async fn release(mut self) -> CacheResult<()> {
+    pub(crate) async fn release(mut self) -> CacheResult<()> {
         if let Some(conn) = self.conn.take() {
             self.return_tx
                 .send(conn)

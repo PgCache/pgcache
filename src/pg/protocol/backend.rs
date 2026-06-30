@@ -303,3 +303,86 @@ pub fn data_row_first_column(data: &[u8]) -> Option<&str> {
     let col_data = payload.get(4..4 + col_len)?;
     std::str::from_utf8(col_data).ok()
 }
+
+/// Extract the first column of *every* DataRow in a (possibly batched) `DataRows`
+/// frame, appending each non-NULL value to `out`. [`decode`] coalesces
+/// consecutive DataRow messages into one frame, so a consumer that reads rows
+/// individually (rather than relaying the frame verbatim) must walk them all —
+/// reading only the first would silently drop the rest (e.g. all but the top
+/// line of a multi-row `EXPLAIN` plan).
+pub fn data_rows_first_columns(data: &[u8], out: &mut Vec<String>) {
+    let mut pos = 0;
+    while let Some(&tag) = data.get(pos) {
+        if tag != DATA_ROW_TAG {
+            break;
+        }
+        let Some(len_bytes) = data
+            .get(pos + 1..pos + 5)
+            .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        else {
+            break;
+        };
+        // The length field counts itself and the body, but not the tag byte.
+        let Ok(body_len) = usize::try_from(i32::from_be_bytes(len_bytes)) else {
+            break;
+        };
+        let msg_end = pos + 1 + body_len;
+        let Some(message) = data.get(pos..msg_end) else {
+            break;
+        };
+        if let Some(column) = data_row_first_column(message) {
+            out.push(column.to_owned());
+        }
+        pos = msg_end;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encode one `DataRow` ('D') with a single text column.
+    fn data_row(value: &str) -> Vec<u8> {
+        let mut frame = vec![DATA_ROW_TAG];
+        let body_len = 2 + 4 + value.len(); // column count + column length + value
+        frame.extend_from_slice(&i32::try_from(4 + body_len).unwrap().to_be_bytes());
+        frame.extend_from_slice(&1i16.to_be_bytes()); // one column
+        frame.extend_from_slice(&i32::try_from(value.len()).unwrap().to_be_bytes());
+        frame.extend_from_slice(value.as_bytes());
+        frame
+    }
+
+    #[test]
+    fn test_data_rows_first_columns_walks_every_batched_row() {
+        // The codec coalesces consecutive DataRow messages into one frame; the
+        // walker must return all of them, not just the first (PGC-345).
+        let mut blob = Vec::new();
+        for line in [
+            "Seq Scan on t",
+            "  Filter: (a = 1)",
+            "Planning Time: 0.1 ms",
+        ] {
+            blob.extend_from_slice(&data_row(line));
+        }
+        let mut out = Vec::new();
+        data_rows_first_columns(&blob, &mut out);
+        assert_eq!(
+            out,
+            vec![
+                "Seq Scan on t".to_owned(),
+                "  Filter: (a = 1)".to_owned(),
+                "Planning Time: 0.1 ms".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_data_rows_first_columns_stops_at_non_datarow() {
+        // A trailing non-'D' byte (e.g. the start of CommandComplete) ends the walk.
+        let mut blob = data_row("only line");
+        blob.push(b'C'); // start of a CommandComplete frame — not a DataRow
+        let mut out = Vec::new();
+        data_rows_first_columns(&blob, &mut out);
+        assert_eq!(out, vec!["only line".to_owned()]);
+    }
+}

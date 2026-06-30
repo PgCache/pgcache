@@ -13,6 +13,7 @@ use crate::settings::DynamicConfigHandle;
 use crate::timing::QueryTiming;
 
 use super::coalesce_queue::CoalesceQueue;
+use super::explain::ExplainJob;
 use super::messages::{CacheReply, MessageSlices, PipelineContext, PipelineDescribe, QueryCommand};
 use super::mv::MvServe;
 use super::query::CacheableQuery;
@@ -104,13 +105,35 @@ pub struct ServeRequest {
     pub coalesced: Vec<CoalescedClient>,
 }
 
+/// A unit of work for the serve pool: a normal cache serve, or a one-shot
+/// `pgcache_explain` (PGC-345). Both borrow a pooled cache connection from the
+/// same loop; the explain variant uses a dedicated handler.
+// `ServeRequest` is large and travels the serve hot path by value (as it did
+// before this enum existed); boxing it to shrink the variant gap would add a
+// per-serve allocation, so the size difference is accepted here.
+#[allow(clippy::large_enum_variant)]
+pub enum ServeJob {
+    Query(ServeRequest),
+    Explain(ExplainJob),
+}
+
+impl ServeJob {
+    /// The job's timing struct, for the serve loop's per-job stamps.
+    pub fn timing_mut(&mut self) -> &mut QueryTiming {
+        match self {
+            ServeJob::Query(request) => &mut request.timing,
+            ServeJob::Explain(job) => &mut job.timing,
+        }
+    }
+}
+
 /// Per-connection inline dispatch against the cache: routes queries and
 /// delegates writes to the writer thread. `Send + Clone`; each connection holds
 /// one (via the watch handle) and dispatches against it directly.
 #[derive(Clone)]
 pub struct CacheDispatch {
     query_tx: UnboundedSender<QueryCommand>,
-    serve_tx: UnboundedSender<ServeRequest>,
+    serve_tx: UnboundedSender<ServeJob>,
     state_view: Arc<CacheStateView>,
     dynamic: DynamicConfigHandle,
     waiting: Arc<CoalesceQueue>,

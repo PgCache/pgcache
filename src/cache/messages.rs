@@ -14,7 +14,7 @@ use super::{CacheError, Report, query::CacheableQuery, query_cache::QueryType};
 use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 use crate::pg::protocol::extended::ResultFormats;
-use crate::proxy::ClientSocket;
+use crate::proxy::{ClientSocket, ExplainSpec};
 use crate::query::transform::query_expr_parameters_replace;
 use crate::timing::QueryTiming;
 
@@ -169,6 +169,11 @@ pub enum CacheMessage {
         QueryParameters,
         ResultFormats,
     ),
+    /// `SELECT pgcache_explain(...)` — normally intercepted by the dispatch, but
+    /// the second field carries the original simple-query bytes so a fallback
+    /// path (cache unavailable) can still forward it to origin (which reports
+    /// the unknown function) rather than send an empty frame (PGC-345).
+    Explain(ExplainSpec, BytesMut),
 }
 
 impl CacheMessage {
@@ -176,6 +181,7 @@ impl CacheMessage {
     pub fn into_data(self) -> BytesMut {
         match self {
             CacheMessage::Query(data, _) | CacheMessage::QueryParameterized(data, _, _, _) => data,
+            CacheMessage::Explain(_, data) => data,
         }
     }
 
@@ -217,6 +223,9 @@ impl CacheMessage {
                     Err(e) => Err((e.context_transform(CacheError::from), data)),
                 }
             }
+            // Explain is routed by `dispatch_proxy` before `into_query_data`; if
+            // it ever reaches here, forward the original bytes to origin.
+            CacheMessage::Explain(_, data) => Err((CacheError::InvalidMessage.into(), data)),
         }
     }
 }

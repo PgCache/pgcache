@@ -95,3 +95,142 @@ pub fn bind_complete_encode(buf: &mut BytesMut) {
     buf.put_u8(BIND_COMPLETE_TAG);
     buf.put_i32(4);
 }
+
+/// `text` type OID — the column type for a synthesized single-column result.
+const TEXT_TYPE_OID: u32 = 25;
+
+/// Encode a `NoticeResponse` ('N') carrying a single message at NOTICE severity
+/// (SQLSTATE `00000`, successful_completion). Used to attach human-readable
+/// diagnostics to a synthesized response without polluting the result set.
+/// Fields: `S`=severity, `C`=SQLSTATE, `M`=message, each a null-terminated
+/// string, then a final field-list terminator.
+pub fn notice_response_encode(message: &str, buf: &mut BytesMut) {
+    let body_len = 1 + b"NOTICE".len() + 1   // 'S' + "NOTICE" + \0
+        + 1 + b"00000".len() + 1              // 'C' + "00000" + \0
+        + 1 + message.len() + 1               // 'M' + message + \0
+        + 1; // field-list terminator
+    let msg_len = i32::try_from(4 + body_len).expect("NoticeResponse fits in i32");
+
+    buf.put_u8(b'N');
+    buf.put_i32(msg_len);
+    buf.put_u8(b'S');
+    buf.put_slice(b"NOTICE");
+    buf.put_u8(0);
+    buf.put_u8(b'C');
+    buf.put_slice(b"00000");
+    buf.put_u8(0);
+    buf.put_u8(b'M');
+    buf.put_slice(message.as_bytes());
+    buf.put_u8(0);
+    buf.put_u8(0);
+}
+
+/// Encode a `RowDescription` for a single `text` column with the given name.
+/// Layout matches [`row_description_encode`] for one field; type is `text`
+/// (OID 25), variable width (size -1, modifier -1), text format.
+pub fn row_description_text_encode(column_name: &str, buf: &mut BytesMut) {
+    let msg_len =
+        i32::try_from(6 + 18 + column_name.len() + 1).expect("RowDescription fits in i32");
+    buf.put_u8(ROW_DESCRIPTION_TAG);
+    buf.put_i32(msg_len);
+    buf.put_i16(1); // one field
+    buf.put_slice(column_name.as_bytes());
+    buf.put_u8(0);
+    buf.put_i32(0); // table oid
+    buf.put_i16(0); // column num
+    buf.put_u32(TEXT_TYPE_OID);
+    buf.put_i16(-1); // text is variable width
+    buf.put_i32(-1); // no type modifier
+    buf.put_i16(0); // text format
+}
+
+/// Encode a `DataRow` for a single `text` column. `None` encodes a SQL NULL
+/// (length -1); `Some(value)` encodes its bytes.
+pub fn data_row_text_encode(value: Option<&str>, buf: &mut BytesMut) {
+    let value_len = value.map_or(0, str::len);
+    let msg_len = i32::try_from(6 + 4 + value_len).expect("DataRow fits in i32");
+    buf.put_u8(DATA_ROW_TAG);
+    buf.put_i32(msg_len);
+    buf.put_i16(1); // one column
+    match value {
+        Some(value) => {
+            buf.put_i32(i32::try_from(value.len()).expect("column value fits in i32"));
+            buf.put_slice(value.as_bytes());
+        }
+        None => buf.put_i32(-1),
+    }
+}
+
+/// Encode a `CommandComplete` carrying an arbitrary command tag (e.g. `EXPLAIN`),
+/// unlike [`command_complete_encode`] which always reports `SELECT <count>`.
+pub fn command_complete_tag_encode(tag: &str, buf: &mut BytesMut) {
+    let msg_len = i32::try_from(4 + tag.len() + 1).expect("CommandComplete fits in i32");
+    buf.put_u8(COMMAND_COMPLETE_TAG);
+    buf.put_i32(msg_len);
+    buf.put_slice(tag.as_bytes());
+    buf.put_u8(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A backend frame's declared length must equal the byte count after the
+    /// 1-byte tag (the length field counts itself plus the body, not the tag).
+    fn frame_length_field(buf: &[u8]) -> usize {
+        usize::try_from(i32::from_be_bytes(
+            buf[1..5].try_into().expect("length field present"),
+        ))
+        .expect("length field non-negative")
+    }
+
+    #[test]
+    fn test_notice_response_encode_layout() {
+        let mut buf = BytesMut::new();
+        notice_response_encode("hello", &mut buf);
+        assert_eq!(buf[0], b'N');
+        assert_eq!(frame_length_field(&buf) + 1, buf.len());
+        // Fields and terminator are present in order.
+        assert!(buf.windows(7).any(|w| w == b"SNOTICE"));
+        assert!(buf.windows(6).any(|w| w == b"C00000"));
+        assert!(buf.windows(6).any(|w| w == b"Mhello"));
+        assert_eq!(*buf.last().expect("non-empty"), 0);
+    }
+
+    #[test]
+    fn test_row_description_text_encode_layout() {
+        let mut buf = BytesMut::new();
+        row_description_text_encode("QUERY PLAN", &mut buf);
+        assert_eq!(buf[0], ROW_DESCRIPTION_TAG);
+        assert_eq!(frame_length_field(&buf) + 1, buf.len());
+        // One field.
+        assert_eq!(i16::from_be_bytes(buf[5..7].try_into().unwrap()), 1);
+        assert!(buf.windows(b"QUERY PLAN".len()).any(|w| w == b"QUERY PLAN"));
+    }
+
+    #[test]
+    fn test_data_row_text_encode_value_and_null() {
+        let mut buf = BytesMut::new();
+        data_row_text_encode(Some("abc"), &mut buf);
+        assert_eq!(buf[0], DATA_ROW_TAG);
+        assert_eq!(frame_length_field(&buf) + 1, buf.len());
+        assert_eq!(i16::from_be_bytes(buf[5..7].try_into().unwrap()), 1);
+        assert_eq!(i32::from_be_bytes(buf[7..11].try_into().unwrap()), 3);
+        assert_eq!(&buf[11..14], b"abc");
+
+        let mut null_buf = BytesMut::new();
+        data_row_text_encode(None, &mut null_buf);
+        // NULL column length is -1.
+        assert_eq!(i32::from_be_bytes(null_buf[7..11].try_into().unwrap()), -1);
+    }
+
+    #[test]
+    fn test_command_complete_tag_encode_layout() {
+        let mut buf = BytesMut::new();
+        command_complete_tag_encode("EXPLAIN", &mut buf);
+        assert_eq!(buf[0], COMMAND_COMPLETE_TAG);
+        assert_eq!(frame_length_field(&buf) + 1, buf.len());
+        assert_eq!(&buf[5..12], b"EXPLAIN");
+        assert_eq!(*buf.last().expect("non-empty"), 0);
+    }
+}

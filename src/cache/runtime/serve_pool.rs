@@ -8,8 +8,9 @@ use tokio::sync::mpsc::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
+use crate::cache::explain::handle_explain_request;
 use crate::cache::messages::{CacheOutcome, CacheReply, slices_concat};
-use crate::cache::query_cache::ServeRequest;
+use crate::cache::query_cache::{ServeJob, ServeRequest};
 use crate::cache::serve::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query};
 use crate::cache::types::CacheStateView;
 use crate::cache::{CacheError, CacheResult, ReportExt};
@@ -162,7 +163,7 @@ fn serve_metrics_record(
 /// serves spread across all runtime threads instead of one serve task.
 pub(super) async fn serve_loop(
     settings: Settings,
-    mut serve_rx: UnboundedReceiver<ServeRequest>,
+    mut serve_rx: UnboundedReceiver<ServeJob>,
     cancel: CancellationToken,
     state_view: Arc<CacheStateView>,
 ) {
@@ -224,7 +225,7 @@ pub(super) async fn serve_loop(
                 msg
             }
         };
-        msg.timing.worker_received_at = Some(Instant::now());
+        msg.timing_mut().worker_received_at = Some(Instant::now());
 
         // Wait for an available connection
         let conn = if let Ok(conn) = conn_rx.try_recv() {
@@ -237,7 +238,7 @@ pub(super) async fn serve_loop(
             };
             conn
         };
-        msg.timing.conn_acquired_at = Some(Instant::now());
+        msg.timing_mut().conn_acquired_at = Some(Instant::now());
 
         // Spawn the serve (request + connection) onto the shared runtime.
         let return_tx = conn_tx.clone();
@@ -256,7 +257,14 @@ pub(super) async fn serve_loop(
             .serves_in_flight
             .increment(1.0);
         tokio::spawn(async move {
-            handle_serve_request(conn, return_tx, replenish_tx, msg, state_view).await;
+            match msg {
+                ServeJob::Query(request) => {
+                    handle_serve_request(conn, return_tx, replenish_tx, request, state_view).await;
+                }
+                ServeJob::Explain(job) => {
+                    handle_explain_request(conn, return_tx, replenish_tx, job, &state_view).await;
+                }
+            }
             crate::metrics::handles()
                 .cache
                 .serves_in_flight

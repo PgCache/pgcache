@@ -60,6 +60,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 ## Observability & operations
 - [ADR-021](ADR-021-observability-admin-api.md) — Observability admin API (health/readiness/metrics/status HTTP endpoints)
 - [ADR-022](ADR-022-per-query-metrics.md) — Per-query metrics (hit/miss/invalidation/latency)
+- [ADR-046](ADR-046-cache-side-explain-pseudo-function.md) — Cache-side EXPLAIN via an intercepted `pgcache_explain(...)` pseudo-function (no stamping, no new unsafe)
 - [ADR-019](ADR-019-anonymous-telemetry.md) — Anonymous telemetry *(Proposed)*
 
 ## Cross-cutting notes

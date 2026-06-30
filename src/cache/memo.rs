@@ -381,6 +381,17 @@ impl ResultMemo {
             .is_some_and(|inner| inner.contains_key(&fingerprint))
     }
 
+    /// True if any *live* memo entry exists for `fingerprint` (across result
+    /// formats/shapes) — i.e. a matching request would currently serve from the
+    /// in-process memo without a cache-DB round trip. Read-only: unlike
+    /// [`get`](Self::get) it neither evicts stale entries nor records metrics
+    /// (used by `pgcache_explain` diagnostics).
+    pub fn fingerprint_memoized(&self, fingerprint: Fingerprint) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.key().fingerprint == fingerprint && self.slots_valid(&entry.stamped))
+    }
+
     /// Remove an entry, returning its byte accounting to the budget.
     pub fn remove(&self, key: &MemoKey) {
         if let Some((_, entry)) = self.entries.remove(key) {

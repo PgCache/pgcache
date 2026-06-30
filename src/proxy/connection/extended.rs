@@ -517,7 +517,10 @@ impl ConnectionState {
                 &self.func_volatility,
             ) {
                 Ok(Action::CacheCheck(ast)) => StatementType::Cacheable(ast),
-                Ok(Action::Forward(ForwardReason::UncacheableSelect)) => {
+                // `pgcache_explain(...)` is only intercepted on the simple-query
+                // path; over the extended protocol it forwards to origin (which
+                // has no such function), preserving pre-PGC-345 behavior.
+                Ok(Action::Forward(ForwardReason::UncacheableSelect) | Action::Explain(_)) => {
                     StatementType::UncacheableSelect
                 }
                 Ok(Action::Forward(

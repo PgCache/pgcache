@@ -10,19 +10,20 @@ use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, error, info, instrument, trace};
 
-use crate::proxy::ClientSocket;
+use crate::proxy::{ClientSocket, ExplainSpec, ExplainTarget};
 use crate::query::Fingerprint;
-use crate::query::ast::query_expr_fingerprint;
+use crate::query::ast::{query_expr_convert_raw, query_expr_fingerprint};
 use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, DynamicConfig, Settings};
 use crate::timing::{QueryTiming, duration_to_ns_u64};
 
 use crate::cache::coalesce_queue::{CoalesceKey, CoalesceQueue, coalesce_deadline};
+use crate::cache::explain::{ExplainJob, ExplainKind};
 use crate::cache::messages::{
-    AdmitAction, CacheOutcome, CacheReply, PipelineContext, ProxyMessage, QueryCommand,
-    SubsumptionResult, slices_concat,
+    AdmitAction, CacheMessage, CacheOutcome, CacheReply, PipelineContext, ProxyMessage,
+    QueryCommand, SubsumptionResult, slices_concat,
 };
-use crate::cache::mv::{MvMeta, ShapeGate};
+use crate::cache::mv::{MvMeta, MvServe, MvState, ShapeGate};
 use crate::cache::query::{CacheableQuery, limit_is_sufficient, limit_rows_needed};
 use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;
@@ -31,7 +32,7 @@ use crate::cache::types::{
 };
 use crate::cache::{CacheError, CacheResult, fast_path};
 
-use super::{CacheDispatch, QueryRequest, ServeRequest};
+use super::{CacheDispatch, QueryRequest, ServeJob};
 
 /// Minimum credit stamped on a Pending entry. Provides a survival floor during
 /// cold start (when `last_hits_per_gc` is zero) and for low-traffic workloads.
@@ -75,7 +76,7 @@ impl CacheDispatch {
     pub async fn new(
         settings: &Settings,
         query_tx: UnboundedSender<QueryCommand>,
-        serve_tx: UnboundedSender<ServeRequest>,
+        serve_tx: UnboundedSender<ServeJob>,
         state_view: Arc<CacheStateView>,
         cdc_connected: Arc<AtomicBool>,
     ) -> CacheResult<Self> {
@@ -111,31 +112,41 @@ impl CacheDispatch {
     /// to [`query_dispatch`](Self::query_dispatch). Replaces the former central
     /// dispatch hop: every connection calls this directly.
     pub async fn dispatch_proxy(&mut self, proxy_msg: ProxyMessage) {
-        if !self.cdc_connected.load(Ordering::Relaxed) {
-            // CDC down: forward to origin rather than serve possibly-stale data.
-            let data = proxy_msg.message.into_data();
-            let _ = reply_forward(
-                proxy_msg.reply_tx,
-                proxy_msg.client_socket,
-                proxy_msg.pipeline,
-                data,
-                proxy_msg.timing,
-            );
+        let ProxyMessage {
+            message,
+            client_socket,
+            reply_tx,
+            search_path,
+            timing,
+            pipeline,
+        } = proxy_msg;
+
+        // `pgcache_explain(...)` is a diagnostic that runs against cached state
+        // directly; route it before CDC-liveness gating and query conversion.
+        if let CacheMessage::Explain(spec, _) = message {
+            self.explain_dispatch(spec, client_socket, reply_tx, timing);
             return;
         }
 
-        match proxy_msg.message.into_query_data() {
+        if !self.cdc_connected.load(Ordering::Relaxed) {
+            // CDC down: forward to origin rather than serve possibly-stale data.
+            let data = message.into_data();
+            let _ = reply_forward(reply_tx, client_socket, pipeline, data, timing);
+            return;
+        }
+
+        match message.into_query_data() {
             Ok(query_data) => {
                 let request = QueryRequest {
                     query_type: query_data.query_type,
                     data: query_data.data,
                     cacheable_query: query_data.cacheable_query,
                     result_formats: query_data.result_formats,
-                    client_socket: proxy_msg.client_socket,
-                    reply_tx: proxy_msg.reply_tx,
-                    search_path: proxy_msg.search_path,
-                    timing: proxy_msg.timing,
-                    pipeline: proxy_msg.pipeline,
+                    client_socket,
+                    reply_tx,
+                    search_path,
+                    timing,
+                    pipeline,
                 };
                 if let Err(e) = self.query_dispatch(request).await {
                     error!(
@@ -146,14 +157,98 @@ impl CacheDispatch {
             }
             Err((e, data)) => {
                 debug!("forwarding to origin due to parameter conversion error: {e}");
-                let _ = reply_forward(
-                    proxy_msg.reply_tx,
-                    proxy_msg.client_socket,
-                    proxy_msg.pipeline,
-                    data,
-                    proxy_msg.timing,
-                );
+                let _ = reply_forward(reply_tx, client_socket, pipeline, data, timing);
             }
+        }
+    }
+
+    /// Route a `pgcache_explain(...)` request: resolve its target to a cached
+    /// query and hand an [`ExplainJob`] to the serve pool (PGC-345). The serve
+    /// pool borrows a connection and runs the actual EXPLAIN off this thread.
+    fn explain_dispatch(
+        &self,
+        spec: ExplainSpec,
+        client_socket: ClientSocket,
+        reply_tx: ReplySender<CacheReply>,
+        timing: QueryTiming,
+    ) {
+        let kind = self.explain_kind_build(spec);
+        let job = ExplainJob {
+            client_socket,
+            reply_tx,
+            timing,
+            kind,
+        };
+        if self.serve_tx.send(ServeJob::Explain(job)).is_err() {
+            // Serve channel closed (subsystem teardown): the leased socket drops
+            // with the job and the connection tears down.
+            debug!("serve channel closed; dropping explain request");
+        }
+    }
+
+    /// Resolve an [`ExplainSpec`] to the concrete work the serve pool should do:
+    /// a [`ExplainKind::Run`] for a Ready cached query, or
+    /// [`ExplainKind::Unavailable`] with a reason otherwise.
+    fn explain_kind_build(&self, spec: ExplainSpec) -> ExplainKind {
+        let fingerprint = match &spec.target {
+            ExplainTarget::Fingerprint(value) => Fingerprint::from_raw(*value),
+            ExplainTarget::Sql(sql) => match explain_sql_fingerprint(sql) {
+                Some(fingerprint) => fingerprint,
+                None => {
+                    return ExplainKind::Unavailable {
+                        message: "could not parse query for explain".into(),
+                    };
+                }
+            },
+        };
+
+        let Some(view) = self
+            .state_view
+            .cached_queries
+            .get(&fingerprint)
+            .map(|view| view.clone())
+        else {
+            return ExplainKind::Unavailable {
+                message: format!("query not cached (fingerprint {fingerprint})").into(),
+            };
+        };
+
+        let CachedQueryView {
+            state,
+            resolved,
+            serve_shape,
+            mv,
+            ..
+        } = view;
+        match state {
+            CachedQueryState::Ready => match resolved {
+                Some(resolved) => {
+                    // Read-only backend decision: reflect what would serve now
+                    // without the serve-path `mv_dispatch_decide` side effects (a
+                    // diagnostic must not schedule an MV build or move serve
+                    // metrics). A Fresh MV with captured columns serves from the
+                    // MV; everything else serves from source rows.
+                    let mv = match (mv.state, mv.output_columns) {
+                        (MvState::Fresh, Some(columns)) => MvServe::Mv(columns),
+                        _ => MvServe::SourceRow,
+                    };
+                    ExplainKind::Run {
+                        fingerprint,
+                        mv,
+                        serve_shape,
+                        resolved,
+                        options: spec.options,
+                    }
+                }
+                None => ExplainKind::Unavailable {
+                    message: "query cannot be served from cache (no resolved form)".into(),
+                },
+            },
+            state @ (CachedQueryState::Pending { .. }
+            | CachedQueryState::Loading
+            | CachedQueryState::Invalidated) => ExplainKind::Unavailable {
+                message: format!("query cannot be served from cache (state {state:?})").into(),
+            },
         }
     }
 
@@ -700,4 +795,14 @@ pub(super) fn reply_forward(
             outcome: CacheOutcome::Forward(buf, timing),
         })
         .map_err(|_| CacheError::Reply.into())
+}
+
+/// Fingerprint the inline SQL of a `pgcache_explain('<sql>')` request, the same
+/// way registration keys it (raw-tree convert → `query_expr_fingerprint`), so the
+/// lookup hits the cached entry. `None` if the argument doesn't parse as a SELECT.
+fn explain_sql_fingerprint(sql: &str) -> Option<Fingerprint> {
+    pg_query::parse_raw_scoped(sql, |tree| unsafe { query_expr_convert_raw(tree) })
+        .ok()
+        .and_then(Result::ok)
+        .map(|query| query_expr_fingerprint(&query))
 }

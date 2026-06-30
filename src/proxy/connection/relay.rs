@@ -214,12 +214,19 @@ async fn handle_connection(
                 };
 
                 // The cache query is in hand and its slot is serving. Resolve
-                // search_path; if unknown, forward to origin instead of caching.
-                let Some(resolved_search_path) = state.search_path_state.resolve() else {
-                    debug!("search_path unknown, forwarding to origin");
-                    crate::metrics::handles().query.uncacheable.increment(1);
-                    state.cache_slot_forward_to_origin(msg);
-                    continue;
+                // search_path; if unknown, forward to origin instead of caching —
+                // except `pgcache_explain`, which resolves against the cached
+                // query's stored form and doesn't use the client's search_path,
+                // so dispatch it even on the first (unresolved) statement (PGC-345).
+                let resolved_search_path = match state.search_path_state.resolve() {
+                    Some(search_path) => search_path,
+                    None if matches!(msg, CacheMessage::Explain(..)) => Arc::from([]),
+                    None => {
+                        debug!("search_path unknown, forwarding to origin");
+                        crate::metrics::handles().query.uncacheable.increment(1);
+                        state.cache_slot_forward_to_origin(msg);
+                        continue;
+                    }
                 };
 
                 crate::metrics::handles().query.cacheable.increment(1);
@@ -465,6 +472,19 @@ impl ConnectionState {
                             self.telemetry.cache_timing_start(fingerprint);
                             self.extended.dispatch_is_extended = false;
                             self.egress.cache_push(CacheMessage::Query(msg.data, ast));
+                            ProxyMode::OriginDrain
+                        }
+                        // `SELECT pgcache_explain(...)` — route to the cache to
+                        // explain a cached query's cache-side plan (PGC-345)
+                        // rather than forward to origin like a normal statement
+                        // the cache can't serve.
+                        Ok(Action::Explain(spec)) => {
+                            self.extended.dispatch_is_extended = false;
+                            // Carry the original bytes so a cache-unavailable
+                            // fallback can forward to origin instead of an empty
+                            // frame (PGC-345).
+                            self.egress
+                                .cache_push(CacheMessage::Explain(spec.as_ref().clone(), msg.data));
                             ProxyMode::OriginDrain
                         }
                         Err(e) => {

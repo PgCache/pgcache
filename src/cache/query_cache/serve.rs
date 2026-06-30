@@ -20,7 +20,7 @@ use crate::cache::write_queue::WriteQueue;
 use crate::cache::{CacheError, CacheResult};
 
 use super::dispatch::reply_forward;
-use super::{CacheDispatch, CoalescedClient, QueryRequest, QueryType, ServeRequest};
+use super::{CacheDispatch, CoalescedClient, QueryRequest, QueryType, ServeJob, ServeRequest};
 
 /// A pre-checked plan to serve a request from an in-process memo snapshot: the
 /// matched snapshot plus which envelope frames to regenerate around its core.
@@ -268,7 +268,7 @@ impl CacheDispatch {
             None => (false, false, false, PipelineDescribe::None, None, None),
         };
 
-        if let Err(SendError(req)) = self.serve_tx.send(ServeRequest {
+        if let Err(SendError(job)) = self.serve_tx.send(ServeJob::Query(ServeRequest {
             fingerprint,
             query_type: msg.query_type,
             data: msg.data,
@@ -289,11 +289,14 @@ impl CacheDispatch {
             parameter_description,
             forward_bytes,
             coalesced,
-        }) {
+        })) {
             // Worker channel closed (cache subsystem torn down or restarting):
             // degrade gracefully by forwarding the query — and any coalesced
             // waiters — to origin rather than surfacing a hard cache error.
             debug!("serve channel closed; forwarding query to origin");
+            let ServeJob::Query(req) = job else {
+                return Ok(());
+            };
             let buf = req
                 .forward_bytes
                 .map_or(req.data, |slices| slices_concat(&slices));
