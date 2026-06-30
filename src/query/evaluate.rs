@@ -373,6 +373,7 @@ mod tests {
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::{BinaryOp, LiteralValue, MultiOp, SubLinkType, UnaryOp};
+    use crate::query::predicate::CompiledPredicate;
     use crate::query::resolved::{
         ResolvedFunctionCall, ResolvedMultiExpr, ResolvedQueryBody, ResolvedQueryExpr,
         ResolvedSelectNode, ResolvedUnaryExpr,
@@ -2309,5 +2310,144 @@ mod tests {
 
         let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
+    }
+
+    // ------------------------------------------------------------------
+    // PGC-339: CompiledPredicate must evaluate identically to
+    // where_expr_evaluate (the oracle) for every shape, since it gates the
+    // CDC in-place-vs-invalidate decision.
+    // ------------------------------------------------------------------
+
+    /// A representative set of rows to exercise present/NULL/short-row cases.
+    fn diff_rows() -> Vec<Vec<Option<ByteString>>> {
+        vec![
+            vec![Some("1".into()), Some("john".into()), Some("true".into())],
+            vec![Some("42".into()), Some("jane".into()), Some("false".into())],
+            vec![Some("1".into()), None, Some("t".into())], // NULL name
+            vec![None, Some("john".into()), None],          // NULL id + active
+            vec![Some("7".into())],                         // short row (missing cols)
+            vec![],                                         // empty row
+        ]
+    }
+
+    /// Build the cross-table variant of a column (belongs to `other_table`).
+    fn cross_col(table: &TableMetadata, column: &str) -> ResolvedWhereExpr {
+        let mut c = resolved_column(table, column);
+        c.table = "other_table".into();
+        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(c))
+    }
+
+    fn assert_compiled_matches_oracle(expr: &ResolvedWhereExpr) {
+        let compiled = CompiledPredicate::compile(expr, TABLE);
+        for row in diff_rows() {
+            assert_eq!(
+                compiled.eval(&row),
+                where_expr_evaluate(expr, &row, TABLE),
+                "compiled vs oracle diverged for {expr:?} on row {row:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_predicate_matches_oracle_across_shapes() {
+        let table = test_table_metadata();
+        let exprs = vec![
+            // bare comparisons (both operand orders), every operator
+            binary_expr(
+                BinaryOp::Equal,
+                col_expr(&table, "name"),
+                val_expr(LiteralValue::String("john".into())),
+            ),
+            binary_expr(
+                BinaryOp::NotEqual,
+                col_expr(&table, "name"),
+                val_expr(LiteralValue::String("john".into())),
+            ),
+            binary_expr(
+                BinaryOp::GreaterThan,
+                col_expr(&table, "id"),
+                val_expr(LiteralValue::Integer(5)),
+            ),
+            binary_expr(
+                BinaryOp::LessThanOrEqual,
+                val_expr(LiteralValue::Integer(5)),
+                col_expr(&table, "id"), // literal-on-left → op_flip path
+            ),
+            binary_expr(
+                BinaryOp::Equal,
+                col_expr(&table, "name"),
+                val_expr(LiteralValue::Null), // col = NULL
+            ),
+            // AND / OR / NOT
+            binary_expr(
+                BinaryOp::And,
+                binary_expr(
+                    BinaryOp::Equal,
+                    col_expr(&table, "id"),
+                    val_expr(LiteralValue::Integer(1)),
+                ),
+                binary_expr(
+                    BinaryOp::Equal,
+                    col_expr(&table, "name"),
+                    val_expr(LiteralValue::String("john".into())),
+                ),
+            ),
+            binary_expr(
+                BinaryOp::Or,
+                binary_expr(
+                    BinaryOp::Equal,
+                    col_expr(&table, "id"),
+                    val_expr(LiteralValue::Integer(99)),
+                ),
+                binary_expr(
+                    BinaryOp::Equal,
+                    col_expr(&table, "active"),
+                    val_expr(LiteralValue::String("true".into())),
+                ),
+            ),
+            unary_expr(
+                UnaryOp::Not,
+                binary_expr(
+                    BinaryOp::Equal,
+                    col_expr(&table, "id"),
+                    val_expr(LiteralValue::Integer(1)),
+                ),
+            ),
+            // IS [NOT] NULL / TRUE / FALSE on a column and on a cross-table column
+            unary_expr(UnaryOp::IsNull, col_expr(&table, "name")),
+            unary_expr(UnaryOp::IsNotNull, col_expr(&table, "name")),
+            unary_expr(UnaryOp::IsTrue, col_expr(&table, "active")),
+            unary_expr(UnaryOp::IsNotFalse, col_expr(&table, "active")),
+            unary_expr(UnaryOp::IsNull, cross_col(&table, "id")),
+            // NOT over an unsupported inner (bare Like) → oracle returns
+            // !false = true; compiler must agree via Not(ConstFalse)
+            unary_expr(
+                UnaryOp::Not,
+                binary_expr(
+                    BinaryOp::Like,
+                    col_expr(&table, "name"),
+                    val_expr(LiteralValue::String("j%".into())),
+                ),
+            ),
+            // cast-coercion comparison: text col ::int4 = 42
+            binary_expr(
+                BinaryOp::Equal,
+                typecast(
+                    CastTarget::Int4,
+                    ResolvedScalarExpr::Column(resolved_column(&table, "name")),
+                ),
+                val_expr(LiteralValue::Integer(42)),
+            ),
+            // unsupported shapes the oracle decides false for
+            binary_expr(
+                BinaryOp::Like,
+                col_expr(&table, "name"),
+                val_expr(LiteralValue::String("j%".into())),
+            ),
+            col_expr(&table, "id"), // bare Scalar
+        ];
+        for expr in &exprs {
+            assert_compiled_matches_oracle(expr);
+        }
     }
 }

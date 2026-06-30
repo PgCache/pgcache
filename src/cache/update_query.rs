@@ -6,6 +6,7 @@ use iddqd::{IdHashItem, id_upcast};
 use crate::catalog::Oid;
 use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::QueryConstraints;
+use crate::query::predicate::CompiledPredicate;
 use crate::query::resolved::ResolvedQueryExpr;
 use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 
@@ -105,6 +106,12 @@ pub struct UpdateQuery {
     /// invalidation checks consult it per row per query, and the underlying
     /// `ResolvedQueryExpr::is_single_table` walks the AST.
     pub is_single_table: bool,
+    /// Pre-canonicalized WHERE clause for the LocalEval membership probe
+    /// (`update_query_matches_locally`), built once at registration so the per
+    /// row CDC path skips re-destructuring the resolved AST (PGC-339). `None`
+    /// means either no WHERE clause (unconditional match) or a non-LocalEval
+    /// query (never consulted — `eval_strategy != LocalEval`).
+    pub compiled_where: Option<CompiledPredicate>,
 }
 
 impl UpdateQuery {

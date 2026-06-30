@@ -12,3 +12,5 @@ debugfile
 
 # local YCSB test-harness configs (PGC-277/278 repro)
 config.ycsb*.toml
+
+config.harness.toml

@@ -25,6 +25,7 @@ use crate::query::constraints::{
 };
 use crate::query::decorrelate::query_expr_decorrelate;
 use crate::query::evaluate::resolved_where_expr_supported;
+use crate::query::predicate::CompiledPredicate;
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns,
     ResolvedSelectNode, ResolvedTableNode, query_expr_resolve,
@@ -787,6 +788,17 @@ impl WriterRegistration {
             let predicate_columns =
                 predicate_columns_collect(&update_resolved, table_node.name.as_str());
             let is_single_table = update_resolved.is_single_table();
+            // Compile the LocalEval WHERE once so the per-row CDC membership probe
+            // doesn't re-destructure the resolved AST (PGC-339). PgEval queries
+            // never consult this, so skip building it.
+            let compiled_where = if eval_strategy == UpdateEvalStrategy::LocalEval {
+                update_resolved
+                    .as_select()
+                    .and_then(|s| s.where_clause.as_ref())
+                    .map(|w| CompiledPredicate::compile(w, table_node.name.as_str()))
+            } else {
+                None
+            };
             let update_query = UpdateQuery {
                 fingerprint,
                 resolved: update_resolved,
@@ -800,6 +812,7 @@ impl WriterRegistration {
                 pg_batchable,
                 predicate_columns,
                 is_single_table,
+                compiled_where,
             };
 
             self.update_query_register(core, relation_oid, table_node.name.as_str(), update_query);

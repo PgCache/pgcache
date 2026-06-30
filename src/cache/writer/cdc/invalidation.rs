@@ -19,8 +19,6 @@ use crate::query::evaluate::{literal_compare, where_value_compare_string};
 
 use crate::settings::CachePolicy;
 
-use crate::query::evaluate::where_expr_evaluate;
-
 use super::super::super::messages::QueryCommand;
 use super::super::super::types::CachedQueryState;
 use super::super::super::update_query::{
@@ -153,15 +151,15 @@ pub(super) fn memo_frame_accumulate(
 /// the query loads every row, so the match is unconditional.
 pub(super) fn update_query_matches_locally(
     update_query: &UpdateQuery,
-    table_metadata: &TableMetadata,
+    _table_metadata: &TableMetadata,
     row_data: &[Option<ByteString>],
 ) -> bool {
-    let Some(select) = update_query.resolved.as_select() else {
-        return false;
-    };
-    match &select.where_clause {
+    // `compiled_where` is built from this query's WHERE at registration (PGC-339):
+    // `None` means no WHERE clause → unconditional match (the LocalEval contract,
+    // since this is only called for `eval_strategy == LocalEval`).
+    match &update_query.compiled_where {
         None => true,
-        Some(expr) => where_expr_evaluate(expr, row_data, table_metadata.name.as_str()),
+        Some(predicate) => predicate.eval(row_data),
     }
 }
 
