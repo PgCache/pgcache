@@ -1429,13 +1429,13 @@ impl WriterRegistration {
         applied_lsn: Lsn,
     ) -> CacheResult<()> {
         let mut merged_any = false;
-        loop {
-            let Some(Reverse(top)) = core.pending_merges.peek() else {
-                break;
-            };
-            let fingerprint = top.0.fingerprint;
-            let generation = top.0.generation;
-            let snapshot_lsn = top.0.snapshot_lsn;
+        // Copy the head's fields out in the condition so the `peek` borrow ends
+        // before the body re-borrows `core` mutably (pop / merge / staging).
+        while let Some((fingerprint, generation, snapshot_lsn)) = core
+            .pending_merges
+            .peek()
+            .map(|Reverse(top)| (top.0.fingerprint, top.0.generation, top.0.snapshot_lsn))
+        {
 
             // Tombstone check before the deadline check: a superseded /
             // invalidated / evicted entry is droppable regardless of the

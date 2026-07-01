@@ -36,14 +36,14 @@ fn table_alias_find(
                 frontier.push(&join.left);
                 frontier.push(&join.right);
             }
-            ResolvedTableSource::Table(table) => {
-                if table.relation_oid == table_metadata.relation_oid {
-                    return Ok(EcoString::from(
-                        table.alias.as_deref().unwrap_or(&table_metadata.name),
-                    ));
-                }
+            ResolvedTableSource::Table(table)
+                if table.relation_oid == table_metadata.relation_oid =>
+            {
+                return Ok(EcoString::from(
+                    table.alias.as_deref().unwrap_or(&table_metadata.name),
+                ));
             }
-            _ => (),
+            ResolvedTableSource::Table(_) | ResolvedTableSource::Subquery(_) => (),
         }
     }
     Err(Report::from(AstTransformError::MissingTable))
@@ -66,13 +66,11 @@ fn table_source_find_mut(
                 frontier.push(&mut join.left);
                 frontier.push(&mut join.right);
             }
-            ResolvedTableSource::Table(table) => {
-                if table.relation_oid == relation_oid {
-                    source_node = Some(cur);
-                    break;
-                }
+            ResolvedTableSource::Table(table) if table.relation_oid == relation_oid => {
+                source_node = Some(cur);
+                break;
             }
-            _ => (),
+            ResolvedTableSource::Table(_) | ResolvedTableSource::Subquery(_) => (),
         }
     }
     source_node.ok_or_else(|| Report::from(AstTransformError::MissingTable))
