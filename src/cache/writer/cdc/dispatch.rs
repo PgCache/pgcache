@@ -450,8 +450,9 @@ impl WriterCdc {
 
         // Probe the eval index once; the invalidation check, the in-place
         // matcher, and the memo eviction pass below all consume this candidate
-        // set (ADR-045).
-        let local_candidates = eval_candidates(core, relation_oid, row_data);
+        // set (ADR-045). Borrowed from the scratch pool and returned below.
+        let mut local_candidates = core.candidate_set_take();
+        eval_candidates_into(core, relation_oid, row_data, &mut local_candidates);
 
         let fp_list = self
             .update_queries_check_invalidate(
@@ -477,6 +478,7 @@ impl WriterCdc {
         // Rung 3b: evict memos this insert grows into. An INSERT only adds the
         // row, so the new-row candidates are the full memo-eviction set (ADR-045).
         memo_frame_accumulate(core, relation_oid, local_candidates.iter().copied());
+        core.candidate_set_return(local_candidates);
 
         // The inserted row is alive at origin: cancel any tracked deletion of
         // its key so population merges don't omit it (PGC-260). When the key
@@ -521,14 +523,18 @@ impl WriterCdc {
 
         // Probe the eval index once; the invalidation check and the in-place
         // matcher (`update_queries_execute_batch` below) share this candidate set.
-        let local_candidates = eval_candidates(core, relation_oid, new_row_data);
+        // Both candidate sets are borrowed from the scratch pool and returned
+        // below, so their backing allocations are reused across rows (PGC-341/344).
+        let mut local_candidates = core.candidate_set_take();
+        eval_candidates_into(core, relation_oid, new_row_data, &mut local_candidates);
 
         // Old-image candidates (PK-only; old non-PK values are gone), probed
         // once and reused by both the symmetric memo eviction and the MV
         // removed-row dirty-mark below (ADR-045 — avoids a second eval_index
         // probe per UPDATE). Memo eviction is symmetric: a row leaving a query
         // makes its memo stale, so memo needs new ∪ old candidates.
-        let old_candidates = core.eval_candidates_removed(
+        let mut old_candidates = core.candidate_set_take();
+        core.eval_candidates_removed_into(
             relation_oid,
             if key_data.is_empty() {
                 new_row_data
@@ -536,6 +542,7 @@ impl WriterCdc {
                 key_data
             },
             true,
+            &mut old_candidates,
         );
 
         // PGC-227: when no cached query over this relation can have its UPDATE
@@ -649,6 +656,9 @@ impl WriterCdc {
         // already probed above for the memo pass; `mv_dirty_mark` self-gates
         // (Fresh and Building only).
         core.mv_dirty_mark_candidates(&old_candidates);
+
+        core.candidate_set_return(local_candidates);
+        core.candidate_set_return(old_candidates);
 
         // A non-empty `key_data` means the PK changed; delete the old PK too.
         if !key_data.is_empty() {
@@ -820,7 +830,8 @@ impl WriterCdc {
         // tuple is the old image — probe candidates on it (PK-only under REPLICA
         // IDENTITY DEFAULT → `Unknown` wildcard over-returns), the symmetric
         // counterpart of the new-row probe.
-        let del_candidates = eval_candidates(core, relation_oid, row_data);
+        let mut del_candidates = core.candidate_set_take();
+        eval_candidates_into(core, relation_oid, row_data, &mut del_candidates);
         memo_frame_accumulate(core, relation_oid, del_candidates.iter().copied());
 
         // A deleted row leaves stale rows in any Fresh MV that materialized it;
@@ -830,6 +841,7 @@ impl WriterCdc {
         // via `Unknown` wildcard under DEFAULT) is identical to `del_candidates`
         // above — reuse it instead of re-probing (PGC-292/ADR-045).
         core.mv_dirty_mark_candidates(&del_candidates);
+        core.candidate_set_return(del_candidates);
 
         // Check for subquery invalidations — removing a row can expand the
         // final result set for Exclusion/Scalar subquery tables

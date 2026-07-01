@@ -341,24 +341,44 @@ impl WriterCore {
         old_row: &[Option<ByteString>],
         pk_only: bool,
     ) -> FingerprintSet {
-        let Some(update_queries) = self.cache.update_queries.get(&relation_oid) else {
-            return FingerprintSet::default();
+        let mut out = FingerprintSet::default();
+        self.eval_candidates_removed_into(relation_oid, old_row, pk_only, &mut out);
+        out
+    }
+
+    /// [`eval_candidates_removed`], filling a caller-provided scratch set
+    /// (cleared first). The old-image wildcard probe over-returns to a large
+    /// set; reusing the buffer keeps that big backing allocation instead of
+    /// re-allocating it per row (PGC-341/344).
+    pub(in crate::cache::writer) fn eval_candidates_removed_into(
+        &self,
+        relation_oid: Oid,
+        old_row: &[Option<ByteString>],
+        pk_only: bool,
+        out: &mut FingerprintSet,
+    ) {
+        let (Some(update_queries), Some(table_metadata)) = (
+            self.cache.update_queries.get(&relation_oid),
+            self.cache.tables.get1(&relation_oid),
+        ) else {
+            out.clear();
+            return;
         };
-        let Some(table_metadata) = self.cache.tables.get1(&relation_oid) else {
-            return FingerprintSet::default();
-        };
-        update_queries.eval_index.candidates_point(|column| {
-            if pk_only
-                && !table_metadata
-                    .columns
-                    .get(column)
-                    .is_some_and(|m| m.is_primary_key)
-            {
-                [Some(ColumnRange::Unknown), None, None]
-            } else {
-                row_value_forms(table_metadata, old_row, column)
-            }
-        })
+        update_queries.eval_index.candidates_point_into(
+            |column| {
+                if pk_only
+                    && !table_metadata
+                        .columns
+                        .get(column)
+                        .is_some_and(|m| m.is_primary_key)
+                {
+                    [Some(ColumnRange::Unknown), None, None]
+                } else {
+                    row_value_forms(table_metadata, old_row, column)
+                }
+            },
+            out,
+        );
     }
 
     pub(super) fn mv_dirty_mark_removed_row(

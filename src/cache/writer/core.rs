@@ -175,6 +175,13 @@ pub struct WriterCore {
     /// Set when a generation purge was skipped because a frame was open;
     /// flushed after the frame commits at `CommitMark`.
     pub(super) purge_pending: bool,
+    /// Reusable candidate `FingerprintSet`s for the per-row CDC probes
+    /// (`eval_candidates` / `eval_candidates_removed`). Taken out for the
+    /// duration of a handler and returned cleared, so the backing allocation —
+    /// large for the old-image wildcard probe — is reused across rows instead of
+    /// re-allocated per probe (PGC-341/344). Depth ≤ the sets alive at once
+    /// (2 in `handle_update`); balanced take/return keeps it there.
+    candidate_scratch: Vec<FingerprintSet>,
     /// Buffered SQL for the in-progress frame's cache-table writes (PGC-228).
     /// Statements are appended here instead of executed eagerly; the whole
     /// `BEGIN; …; COMMIT` is flushed in one round-trip at `CommitMark` (or
@@ -679,6 +686,7 @@ impl WriterCore {
             frame_state: FrameState::Idle,
             frame_invalidations: HashSet::default(),
             frame_memo_evictions: HashSet::default(),
+            candidate_scratch: Vec::new(),
             frame_relation_oids: HashSet::new(),
             purge_pending: false,
             frame_buf: String::with_capacity(FRAME_BUF_CAPACITY),
@@ -715,6 +723,21 @@ impl WriterCore {
 
     /// Whether the population identified by `(fingerprint, generation)` is still
     /// the live, non-invalidated cached query — i.e. a parked merge/ready entry
+    /// Borrow a cleared candidate `FingerprintSet` from the scratch pool
+    /// (PGC-341/344). Reuses a previously-returned set — retaining its backing
+    /// capacity — or allocates a fresh one when the pool is empty. Pair with
+    /// [`candidate_set_return`]; the set is owned by the caller in between, so it
+    /// can be read across `&mut self` calls without borrowing `self`.
+    pub(super) fn candidate_set_take(&mut self) -> FingerprintSet {
+        self.candidate_scratch.pop().unwrap_or_default()
+    }
+
+    /// Return a candidate set to the scratch pool, clearing it (capacity kept).
+    pub(super) fn candidate_set_return(&mut self, mut set: FingerprintSet) {
+        set.clear();
+        self.candidate_scratch.push(set);
+    }
+
     /// hasn't been superseded by a readmit (generation bump), invalidated, or
     /// evicted while it waited (PGC-250).
     pub(super) fn population_is_current(&self, fingerprint: Fingerprint, generation: u64) -> bool {

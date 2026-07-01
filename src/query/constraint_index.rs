@@ -273,11 +273,26 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
     /// is a wildcard that matches every entry constraining the column, so this
     /// **never under-returns** — load-bearing for the CDC/memo consumers,
     /// where a miss is a stale read, not just a lost optimization.
+    /// Returning convenience wrapper over [`candidates_point_into`] — production
+    /// CDC paths use the `_into` form to reuse a scratch set (PGC-341/344).
+    #[cfg(test)]
     pub(crate) fn candidates_point<F>(&self, col_forms_fn: F) -> IdSet<K>
     where
         F: Fn(&str) -> ColumnForms,
     {
         let mut candidates = IdSet::default();
+        self.candidates_point_into(col_forms_fn, &mut candidates);
+        candidates
+    }
+
+    /// Like [`candidates_point`], but fills a caller-provided set (cleared first)
+    /// instead of allocating a fresh one — lets the CDC hot path reuse a scratch
+    /// set, retaining its (possibly large) capacity across probes (PGC-341/344).
+    pub(crate) fn candidates_point_into<F>(&self, col_forms_fn: F, candidates: &mut IdSet<K>)
+    where
+        F: Fn(&str) -> ColumnForms,
+    {
+        candidates.clear();
         for (column_set, class) in &self.classes {
             let col_forms: ClassForms = column_set
                 .columns()
@@ -325,7 +340,6 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
             }
             candidates.extend(class.complex.candidates_point(&col_forms));
         }
-        candidates
     }
 
     /// Number of column-set classes across all entries. Useful for metrics

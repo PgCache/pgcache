@@ -90,23 +90,25 @@ pub(super) fn row_constraints_match(
 }
 
 /// Candidate fingerprints whose extracted constraints a CDC row could satisfy,
-/// probed once over the relation's full `eval_index` so the in-place matcher
-/// (`update_queries_execute_batch`, which filters to LocalEval) and the
-/// memo-eviction pass (`memo_frame_accumulate`) share one `candidates_point`
-/// probe. Empty when the relation has no cached queries.
-pub(super) fn eval_candidates(
+/// probed over the relation's full `eval_index` into a caller-provided scratch
+/// set (cleared first) so the CDC hot path reuses the allocation across rows
+/// (PGC-341/344). The in-place matcher (`update_queries_execute_batch`, filtered
+/// to LocalEval) and the memo-eviction pass (`memo_frame_accumulate`) share one
+/// probe. Leaves `out` empty when the relation has no cached queries.
+pub(super) fn eval_candidates_into(
     core: &WriterCore,
     relation_oid: Oid,
     row: &[Option<ByteString>],
-) -> FingerprintSet {
+    out: &mut FingerprintSet,
+) {
     match (
         core.cache.update_queries.get(&relation_oid),
         core.cache.tables.get1(&relation_oid),
     ) {
         (Some(uqs), Some(table_metadata)) => uqs
             .eval_index
-            .candidates_point(|c| row_value_forms(table_metadata, row, c)),
-        _ => FingerprintSet::default(),
+            .candidates_point_into(|c| row_value_forms(table_metadata, row, c), out),
+        _ => out.clear(),
     }
 }
 
