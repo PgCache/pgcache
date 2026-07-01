@@ -137,7 +137,10 @@ pub fn mv_state_initial(gate: ShapeGate) -> MvState {
 #[derive(Debug, Clone)]
 pub struct MvMeta {
     pub shape_gate: ShapeGate,
-    pub state: MvState,
+    /// Private so no raw `mv.state = …` write exists outside this module: writer
+    /// transitions go through `WriterCore::mv_state_write`, the dispatch side
+    /// through `state_set`.
+    state: MvState,
     /// PostgreSQL's output column names, captured at first build and
     /// reused across rebuilds. `None` until the MV has ever been built.
     pub output_columns: Option<Arc<[EcoString]>>,
@@ -156,6 +159,19 @@ impl MvMeta {
             output_columns: None,
             limit,
         }
+    }
+
+    /// Current MV state (`MvState` is `Copy`).
+    pub fn state(&self) -> MvState {
+        self.state
+    }
+
+    /// Raw state write. Prefer `WriterCore::mv_state_write`, which also keeps the
+    /// dirtiable-MV index consistent (PGC-338); call this directly only for the
+    /// non-dirtiable dispatch-side transition (`mv_schedule`), which the index
+    /// never tracks.
+    pub(in crate::cache) fn state_set(&mut self, state: MvState) {
+        self.state = state;
     }
 }
 

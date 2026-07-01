@@ -336,12 +336,13 @@ impl WriterCdc {
         // Update state view to Invalidated. Fold the MV dirty transition into
         // the same get_mut block so dispatches observe both transitions
         // atomically — a reader that sees state=Invalidated never sees the MV
-        // in a stale-Fresh state.
+        // in a stale-Fresh state. `state_set` is used directly here (not
+        // `mv_state_write`) to keep both writes under one guard.
         if let Some(mut entry) = core.state_view.cached_queries.get_mut(&fingerprint) {
             entry.state = CachedQueryState::Invalidated;
             entry.referenced = false;
-            if let Some(dirtied) = entry.mv.state.dirtied() {
-                entry.mv.state = dirtied;
+            if let Some(dirtied) = entry.mv.state().dirtied() {
+                entry.mv.state_set(dirtied);
             }
         }
 

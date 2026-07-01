@@ -172,7 +172,7 @@ impl WriterCore {
             .map(|entry| {
                 (
                     format!("{:?}", entry.value().state),
-                    format!("{:?}", entry.value().mv.state),
+                    format!("{:?}", entry.value().mv.state()),
                 )
             })
             .unwrap_or_else(|| ("Unknown".to_owned(), "Unknown".to_owned()));

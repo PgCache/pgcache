@@ -105,7 +105,7 @@ pub(crate) fn mv_serve_decide(
     let observed = state_view
         .cached_queries
         .get(&fingerprint)
-        .map(|e| (e.mv.state, e.mv.output_columns.clone(), e.mv.limit));
+        .map(|e| (e.mv.state(), e.mv.output_columns.clone(), e.mv.limit));
 
     match observed {
         None => MvDecision::Serve(MvServe::SourceRow),
@@ -154,9 +154,9 @@ pub(crate) fn mv_schedule(
     has_table: bool,
 ) -> Option<QueryCommand> {
     let mut entry = state_view.cached_queries.get_mut(&fingerprint)?;
-    if entry.mv.state != (MvState::Pending { has_table }) {
+    if entry.mv.state() != (MvState::Pending { has_table }) {
         return None;
     }
-    entry.mv.state = MvState::Scheduled { has_table };
+    entry.mv.state_set(MvState::Scheduled { has_table });
     Some(QueryCommand::MvBuild { fingerprint })
 }

@@ -70,7 +70,7 @@ fn memo_capture_begin(
     let mv_ineligible = state_view
         .cached_queries
         .get(&msg.fingerprint)
-        .is_some_and(|v| matches!(v.mv.state, MvState::Skipped | MvState::Ineligible));
+        .is_some_and(|v| matches!(v.mv.state(), MvState::Skipped | MvState::Ineligible));
     if !mv_ineligible {
         return None;
     }

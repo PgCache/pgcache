@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::id_hash::{BuildIdHasher, impl_id_hashable};
@@ -54,6 +54,8 @@ pub type FingerprintMap<V> = HashMap<Fingerprint, V, BuildIdHasher<Fingerprint>>
 pub type FingerprintSet = HashSet<Fingerprint, BuildIdHasher<Fingerprint>>;
 /// `DashMap` keyed by `Fingerprint` with the passthrough hasher.
 pub type FingerprintDashMap<V> = DashMap<Fingerprint, V, BuildIdHasher<Fingerprint>>;
+/// `DashSet` of `Fingerprint` with the passthrough hasher.
+pub type FingerprintDashSet = DashSet<Fingerprint, BuildIdHasher<Fingerprint>>;
 
 #[cfg(test)]
 mod tests {

@@ -26,11 +26,11 @@ use crate::query::constraints::{
 use crate::query::decorrelate::query_expr_decorrelate;
 use crate::query::evaluate::resolved_where_expr_supported;
 use crate::query::predicate::CompiledPredicate;
-use crate::query::transform::PgEvalTemplate;
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns,
     ResolvedSelectNode, ResolvedTableNode, query_expr_resolve,
 };
+use crate::query::transform::PgEvalTemplate;
 use crate::query::transform::predicate_pushdown_apply;
 use crate::query::update::query_table_update_queries;
 use crate::result::error_chain_format;
@@ -1436,7 +1436,6 @@ impl WriterRegistration {
             .peek()
             .map(|Reverse(top)| (top.0.fingerprint, top.0.generation, top.0.snapshot_lsn))
         {
-
             // Tombstone check before the deadline check: a superseded /
             // invalidated / evicted entry is droppable regardless of the
             // watermark — release its tracking and staging now rather than

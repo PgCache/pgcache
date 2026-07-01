@@ -228,7 +228,7 @@ impl CacheDispatch {
                     // diagnostic must not schedule an MV build or move serve
                     // metrics). A Fresh MV with captured columns serves from the
                     // MV; everything else serves from source rows.
-                    let mv = match (mv.state, mv.output_columns) {
+                    let mv = match (mv.state(), mv.output_columns) {
                         (MvState::Fresh, Some(columns)) => MvServe::Mv(columns),
                         _ => MvServe::SourceRow,
                     };

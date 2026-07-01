@@ -470,7 +470,7 @@ impl WriterCore {
             .state_view
             .cached_queries
             .get(&fingerprint)
-            .map(|v| v.mv.state);
+            .map(|v| v.mv.state());
         if let Some(mv_state) = mv_state
             && let Err(e) = self.mv_drop(fingerprint, mv_state).await
         {

@@ -51,10 +51,11 @@ impl WriterCore {
         let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) else {
             return;
         };
-        let MvState::Pending { has_table } = view.mv.state else {
+        let MvState::Pending { has_table } = view.mv.state() else {
             return;
         };
-        view.mv.state = MvState::Scheduled { has_table };
+        // Pending → Scheduled: neither state is dirtiable, so the index is untouched.
+        view.mv.state_set(MvState::Scheduled { has_table });
         drop(view);
         let _ = self.query_tx.send(QueryCommand::MvBuild { fingerprint });
     }
@@ -84,7 +85,7 @@ impl WriterCore {
             return;
         };
         self.mv_builds_inflight.insert(fingerprint);
-        self.mv_state_transition(
+        self.mv_state_write(
             fingerprint,
             MvState::Building {
                 has_table: ctx.has_table,
@@ -128,7 +129,7 @@ impl WriterCore {
             .state_view
             .cached_queries
             .get(&fingerprint)
-            .map(|v| v.mv.state);
+            .map(|v| v.mv.state());
 
         let Some(state) = state else {
             // Evicted during the build. Eviction skipped the MV drop (the
@@ -198,21 +199,23 @@ impl WriterCore {
                          dropping and resetting"
                     );
                     self.mv_table_drop(fingerprint).await;
-                    self.mv_state_transition(fingerprint, MvState::Pending { has_table: false });
+                    self.mv_state_write(fingerprint, MvState::Pending { has_table: false });
                     return;
                 }
 
                 if matches!(state, MvState::Building { .. }) {
                     if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
                         view.mv.output_columns = Some(output_columns);
-                        view.mv.state = MvState::Fresh;
                     }
+                    // →Fresh through the choke point: `Fresh` is dirtiable, so the
+                    // index insert must accompany the state write (PGC-338).
+                    self.mv_state_write(fingerprint, MvState::Fresh);
                     crate::metrics::handles().mv.rebuilds.increment(1);
                     trace!("mv build: fresh for {fingerprint}");
                 } else {
                     // BuildingDirty: a CDC change relevant to this query landed
                     // while the build was in flight; the table contents predate it.
-                    self.mv_state_transition(fingerprint, MvState::Pending { has_table: true });
+                    self.mv_state_write(fingerprint, MvState::Pending { has_table: true });
                     crate::metrics::handles().mv.skipped_rebuilds.increment(1);
                     trace!("mv build: discarded (dirtied in flight) for {fingerprint}");
                 }
@@ -220,11 +223,11 @@ impl WriterCore {
             MvBuildOutcome::Ineligible => {
                 // Gate verdict is sticky regardless of in-flight dirtying —
                 // no table was created (the gate runs before CREATE).
-                self.mv_state_transition(fingerprint, MvState::Ineligible);
+                self.mv_state_write(fingerprint, MvState::Ineligible);
                 trace!("mv build: size gate failed for {fingerprint}");
             }
             MvBuildOutcome::Failed { has_table } => {
-                self.mv_state_transition(fingerprint, MvState::Pending { has_table });
+                self.mv_state_write(fingerprint, MvState::Pending { has_table });
             }
         }
     }
@@ -253,7 +256,7 @@ impl WriterCore {
     /// isn't `Ready` (races resolved at the call site).
     fn mv_context_snapshot(&self, fingerprint: Fingerprint) -> Option<MvBuildContext> {
         let view = self.state_view.cached_queries.get(&fingerprint)?;
-        let MvState::Scheduled { has_table } = view.mv.state else {
+        let MvState::Scheduled { has_table } = view.mv.state() else {
             return None;
         };
         if view.state != CachedQueryState::Ready {
@@ -302,15 +305,14 @@ impl WriterCore {
 
     /// Apply the dirty transition (`MvState::dirtied`) for this fingerprint:
     /// `Fresh → Pending { has_table: true }`, `Building → BuildingDirty`.
-    /// No-op for any other state — dirty-marking has no meaningful effect.
-    ///
-    /// Takes `&self` (mutation is via DashMap interior mutability) so callers
-    /// holding `&self` in CDC paths don't need to become `&mut self`.
+    /// No-op for any other state — dirty-marking has no meaningful effect. Stays
+    /// `&self` (DashMap interior mutability) so the CDC invalidation loops, which
+    /// hold an immutable borrow of `core`, can call it inline.
     pub(super) fn mv_dirty_mark(&self, fingerprint: Fingerprint) {
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint)
-            && let Some(dirtied) = view.mv.state.dirtied()
+            && let Some(dirtied) = view.mv.state().dirtied()
         {
-            view.mv.state = dirtied;
+            view.mv.state_set(dirtied);
         }
     }
 
@@ -373,6 +375,8 @@ impl WriterCore {
     /// Dirty-mark a precomputed candidate set (self-gating per fingerprint).
     /// Lets a caller that already ran the old-image probe for the memo pass
     /// reuse it for MV instead of probing the `eval_index` twice (ADR-045).
+    /// O(candidates): `mv_dirty_mark` self-gates, so non-dirtiable entries are
+    /// cheap no-ops.
     pub(in crate::cache::writer) fn mv_dirty_mark_candidates(&self, candidates: &FingerprintSet) {
         for fingerprint in candidates {
             self.mv_dirty_mark(*fingerprint);
@@ -387,7 +391,7 @@ impl WriterCore {
         self.state_view
             .cached_queries
             .get(&fingerprint)
-            .is_some_and(|v| v.mv.state.dirtied().is_some())
+            .is_some_and(|view| view.mv.state().dirtied().is_some())
     }
 
     /// Eviction pre-sweep: truncate every MV in `Pending { has_table: true }`
@@ -411,7 +415,7 @@ impl WriterCore {
             .state_view
             .cached_queries
             .iter()
-            .filter(|entry| entry.mv.state == MvState::Pending { has_table: true })
+            .filter(|entry| entry.mv.state() == MvState::Pending { has_table: true })
             .map(|entry| *entry.key())
             .collect();
 
@@ -470,11 +474,16 @@ impl WriterCore {
         Ok(())
     }
 
-    /// Mutate `mv_state` on the state_view entry. No-op when the entry is gone
-    /// (evicted during the build).
-    fn mv_state_transition(&self, fingerprint: Fingerprint, new_state: MvState) {
+    /// The single choke point for writing an MV's state: `MvMeta.state` is
+    /// writer-module-private, so every writer transition routes here. No-op when
+    /// the entry is gone (evicted during a build).
+    pub(in crate::cache::writer) fn mv_state_write(
+        &self,
+        fingerprint: Fingerprint,
+        new_state: MvState,
+    ) {
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
-            view.mv.state = new_state;
+            view.mv.state_set(new_state);
         }
     }
 }
