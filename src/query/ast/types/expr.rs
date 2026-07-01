@@ -147,18 +147,41 @@ impl Deparse for LiteralValue {
     }
 }
 
-/// Emit a SQL string literal — `'...'` or `E'...'` if any byte needs
-/// escaping. `escape_literal` returns the leading-space `" E'..."` form
-/// for the latter case; we strip the space so the output stays
-/// concatenation-friendly.
-pub(crate) fn emit_escaped_string_literal(s: &str, buf: &mut String) {
-    let escaped = escape::escape_literal(s);
-    if let Some(stripped) = escaped.strip_prefix(" E'") {
-        buf.push_str("E'");
-        buf.push_str(stripped);
-    } else {
-        buf.push_str(&escaped);
+/// Forwards escaped output into a `String`, dropping the single leading space
+/// that `escape_literal_into` emits before `E'…'` (libpq's guard against
+/// interpolation right after an identifier). Our literals are always in value
+/// position, so the space is unwanted; stripping it in the sink keeps the output
+/// byte-identical to the old `escape_literal` + strip while avoiding the temp
+/// `String` (PGC-346).
+struct EscapedLiteralSink<'a> {
+    buf: &'a mut String,
+    at_start: bool,
+}
+
+impl std::fmt::Write for EscapedLiteralSink<'_> {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let s = if self.at_start {
+            self.at_start = false;
+            s.strip_prefix(' ').unwrap_or(s)
+        } else {
+            s
+        };
+        self.buf.push_str(s);
+        Ok(())
     }
+}
+
+/// Emit a SQL string literal — `'...'` or `E'...'` if any byte needs escaping —
+/// directly into `buf` with no intermediate allocation. Reuses the audited
+/// `escape_literal_into` for the escaping itself; only the leading-space guard
+/// is stripped (see [`EscapedLiteralSink`]).
+pub(crate) fn emit_escaped_string_literal(s: &str, buf: &mut String) {
+    let mut sink = EscapedLiteralSink {
+        buf,
+        at_start: true,
+    };
+    // Writing to a `String` sink is infallible.
+    let _ = escape::escape_literal_into(s, &mut sink);
 }
 
 fn array_element_text_render(elem: &LiteralValue, out: &mut String) {
@@ -1064,4 +1087,47 @@ pub enum SubLinkType {
     All,
     /// Scalar subquery returning single value
     Expr,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PGC-346: the zero-alloc `emit_escaped_string_literal` must be
+    /// byte-identical to the previous `escape_literal` + leading-space strip.
+    fn old_emit(s: &str) -> String {
+        let escaped = escape::escape_literal(s);
+        if let Some(stripped) = escaped.strip_prefix(" E'") {
+            format!("E'{stripped}")
+        } else {
+            escaped
+        }
+    }
+
+    #[test]
+    fn emit_escaped_string_literal_matches_prior_output() {
+        let cases = [
+            "",
+            "plain",
+            "o'brien",              // single quote → doubled
+            "a\\b",                 // backslash → E'…' with doubled backslash
+            "both ' and \\ here",   // quote + backslash
+            "''''",                 // only quotes
+            "\\\\\\",               // only backslashes
+            "café ☕ unicode",       // multibyte, no escaping
+            "tab\tnewline\n",       // control chars, no special escaping
+        ];
+        for case in cases {
+            let mut got = String::new();
+            emit_escaped_string_literal(case, &mut got);
+            assert_eq!(got, old_emit(case), "mismatch for input {case:?}");
+        }
+    }
+
+    #[test]
+    fn emit_escaped_string_literal_appends_without_clobbering() {
+        let mut buf = String::from("prefix ");
+        emit_escaped_string_literal("a\\b", &mut buf);
+        assert_eq!(buf, format!("prefix {}", old_emit("a\\b")));
+    }
 }
