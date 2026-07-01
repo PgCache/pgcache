@@ -410,8 +410,6 @@ fn insert_statement_build(
 fn row_to_tuple(
     row: &SimpleQueryRow,
     insert: &InsertStatement,
-    values_buf: &mut Vec<String>,
-    tuple_buf: &mut String,
 ) -> Option<(Vec<String>, String, usize)> {
     // Skip NULL-padded phantom rows from outer joins
     if insert
@@ -421,34 +419,54 @@ fn row_to_tuple(
     {
         return None;
     }
+    Some(escaped_tuple_build(insert.num_columns, &insert.pkey_positions, |idx| {
+        row.get(idx)
+    }))
+}
 
-    let mut row_bytes = 0;
-    values_buf.clear();
-    for idx in 0..insert.num_columns {
-        let value = row.get(idx);
-        row_bytes += value.map_or(0, |v| v.len());
-        values_buf.push(
-            value
-                .map(escape::escape_literal)
-                .unwrap_or_else(|| "NULL".to_owned()),
-        );
-    }
-
+/// Build the `(pk_key, tuple_string, row_byte_count)` for one row, escaping each
+/// value directly into the tuple buffer — no per-column `Vec<String>` and no
+/// `join` temporary (PGC-347). `get(idx)` returns the column value or `None` for
+/// SQL NULL. Split from [`row_to_tuple`] so it can be unit-tested without a live
+/// `SimpleQueryRow`.
+fn escaped_tuple_build<'a>(
+    num_columns: usize,
+    pkey_positions: &[usize],
+    get: impl Fn(usize) -> Option<&'a str>,
+) -> (Vec<String>, String, usize) {
     // Escaped PK values in conflict-column order. PK identity is snapshot-stable,
     // so this key is identical across workers even when non-PK columns drift
     // between MVCC snapshots; sorting on it (PGC-133) avoids the PK-index deadlock.
-    let pk_key: Vec<String> = insert
-        .pkey_positions
+    // PKs are non-NULL here (phantom rows already skipped by the caller).
+    let pk_key: Vec<String> = pkey_positions
         .iter()
-        .filter_map(|&pos| values_buf.get(pos).cloned())
+        .map(|&pos| {
+            let mut key = String::new();
+            if let Some(value) = get(pos) {
+                let _ = escape::escape_literal_into(value, &mut key);
+            }
+            key
+        })
         .collect();
 
-    tuple_buf.clear();
-    tuple_buf.push('(');
-    tuple_buf.push_str(&values_buf.join(","));
-    tuple_buf.push(')');
+    let row_bytes: usize = (0..num_columns).map(|idx| get(idx).map_or(0, str::len)).sum();
+    // Slack for escaping (doubled quotes/backslashes), separators, and parens.
+    let mut tuple = String::with_capacity(row_bytes + row_bytes / 4 + num_columns + 2);
+    tuple.push('(');
+    for idx in 0..num_columns {
+        if idx > 0 {
+            tuple.push(',');
+        }
+        match get(idx) {
+            Some(value) => {
+                let _ = escape::escape_literal_into(value, &mut tuple);
+            }
+            None => tuple.push_str("NULL"),
+        }
+    }
+    tuple.push(')');
 
-    Some((pk_key, tuple_buf.clone(), row_bytes))
+    (pk_key, tuple, row_bytes)
 }
 
 /// Fetch data from origin and stream it into the relation's staging table in
@@ -527,15 +545,11 @@ async fn population_stream(
     let mut row_count: u64 = 0;
     let mut value_tuples: Vec<(Vec<String>, String)> =
         Vec::with_capacity(POPULATION_INSERT_BATCH_SIZE);
-    let mut values_buf: Vec<String> = Vec::with_capacity(insert.num_columns);
-    let mut tuple_buf = String::new();
 
     loop {
         match stream.next().await {
             Some(Ok(SimpleQueryMessage::Row(row))) => {
-                if let Some((pk_key, tuple, bytes)) =
-                    row_to_tuple(&row, &insert, &mut values_buf, &mut tuple_buf)
-                {
+                if let Some((pk_key, tuple, bytes)) = row_to_tuple(&row, &insert) {
                     cached_bytes += bytes;
                     row_count += 1;
                     value_tuples.push((pk_key, tuple));
@@ -666,5 +680,49 @@ mod tests {
         ];
         let sql = batch_sql_build("", "", &mut rows);
         assert_eq!(sql, "('a','b'),('ab','')");
+    }
+
+    /// The prior implementation, reproduced as an oracle: escape every column
+    /// into a `Vec<String>`, then `(` + join(",") + `)`. PGC-347's zero-alloc
+    /// `escaped_tuple_build` must match it byte-for-byte.
+    fn oracle(values: &[Option<&str>], pkey_positions: &[usize]) -> (Vec<String>, String) {
+        let escaped: Vec<String> = values
+            .iter()
+            .map(|v| v.map(escape::escape_literal).unwrap_or_else(|| "NULL".to_owned()))
+            .collect();
+        let pk: Vec<String> = pkey_positions
+            .iter()
+            .filter_map(|&pos| escaped.get(pos).cloned())
+            .collect();
+        (pk, format!("({})", escaped.join(",")))
+    }
+
+    #[test]
+    fn escaped_tuple_build_matches_prior_output() {
+        let cases: &[&[Option<&str>]] = &[
+            &[Some("1"), Some("x")],
+            &[Some("42"), None, Some("o'brien")],          // NULL + quote-escaping
+            &[Some("a\\b"), Some("both ' and \\")],        // backslash → E'…'
+            &[Some(""), Some("''''")],                     // empty + only quotes
+            &[Some("café ☕"), None],                       // multibyte + NULL
+        ];
+        for &values in cases {
+            let pkey_positions = [0usize];
+            let (pk, tuple, row_bytes) =
+                escaped_tuple_build(values.len(), &pkey_positions, |idx| values[idx]);
+            let (want_pk, want_tuple) = oracle(values, &pkey_positions);
+            assert_eq!(tuple, want_tuple, "tuple mismatch for {values:?}");
+            assert_eq!(pk, want_pk, "pk_key mismatch for {values:?}");
+            let want_bytes: usize = values.iter().map(|v| v.map_or(0, str::len)).sum();
+            assert_eq!(row_bytes, want_bytes, "row_bytes mismatch for {values:?}");
+        }
+    }
+
+    #[test]
+    fn escaped_tuple_build_composite_pk() {
+        let values = [Some("ab"), Some("cd"), Some("ef")];
+        let (pk, tuple, _) = escaped_tuple_build(3, &[0, 2], |idx| values[idx]);
+        assert_eq!(tuple, "('ab','cd','ef')");
+        assert_eq!(pk, vec!["'ab'".to_owned(), "'ef'".to_owned()]);
     }
 }
