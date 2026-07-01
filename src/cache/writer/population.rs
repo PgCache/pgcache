@@ -449,6 +449,7 @@ fn escaped_tuple_build<'a>(
         })
         .collect();
 
+    // Pre-pass to size the tuple buffer exactly once (no growth reallocs).
     let row_bytes: usize = (0..num_columns).map(|idx| get(idx).map_or(0, str::len)).sum();
     // Slack for escaping (doubled quotes/backslashes), separators, and parens.
     let mut tuple = String::with_capacity(row_bytes + row_bytes / 4 + num_columns + 2);
@@ -457,11 +458,19 @@ fn escaped_tuple_build<'a>(
         if idx > 0 {
             tuple.push(',');
         }
-        match get(idx) {
-            Some(value) => {
-                let _ = escape::escape_literal_into(value, &mut tuple);
-            }
-            None => tuple.push_str("NULL"),
+        // Reuse the already-escaped PK value instead of escaping it a second time.
+        match pkey_positions
+            .iter()
+            .position(|&pos| pos == idx)
+            .and_then(|i| pk_key.get(i))
+        {
+            Some(escaped) => tuple.push_str(escaped),
+            None => match get(idx) {
+                Some(value) => {
+                    let _ = escape::escape_literal_into(value, &mut tuple);
+                }
+                None => tuple.push_str("NULL"),
+            },
         }
     }
     tuple.push(')');

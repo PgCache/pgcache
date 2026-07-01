@@ -163,7 +163,17 @@ pub(super) fn update_query_matches_locally(
     // `None` means no WHERE clause → unconditional match (the LocalEval contract,
     // since this is only called for `eval_strategy == LocalEval`).
     match &update_query.compiled_where {
-        None => true,
+        None => {
+            // `None` must mean "LocalEval SELECT with no WHERE", never a non-SELECT
+            // shape: the old code returned `false` for a non-SELECT, and the
+            // classifier only assigns LocalEval to SELECTs. Guard that invariant so
+            // a future classifier change can't silently make every row match here.
+            debug_assert!(
+                update_query.resolved.as_select().is_some(),
+                "LocalEval query must be a SELECT; classifier/compiled_where invariant broken"
+            );
+            true
+        }
         Some(predicate) => predicate.eval(row_data),
     }
 }

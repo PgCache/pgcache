@@ -104,6 +104,12 @@ pub(crate) mod fault {
 /// remainder is reclaimed on subsequent ticks.
 const EVICTION_TICK_BUDGET: usize = 512;
 
+/// Cap on retained candidate scratch sets. At most two are alive at once
+/// (`handle_update`), so this is generous headroom; it bounds the pool the way
+/// `ROW_VEC_POOL_MAX` / `TOAST_OVERLAY_POOL_MAX` bound their pools, in case a
+/// future caller ever returns more sets than it took.
+const CANDIDATE_SCRATCH_MAX: usize = 8;
+
 /// How long a population merge may stay gated on the apply watermark before the
 /// writer forces an origin WAL flush (`origin_flush_force`) to make its snapshot
 /// LSN reachable (PGC-290). Above the nudge→keepalive round-trip so a healthy
@@ -733,7 +739,11 @@ impl WriterCore {
     }
 
     /// Return a candidate set to the scratch pool, clearing it (capacity kept).
+    /// Dropped rather than pooled past `CANDIDATE_SCRATCH_MAX`.
     pub(super) fn candidate_set_return(&mut self, mut set: FingerprintSet) {
+        if self.candidate_scratch.len() >= CANDIDATE_SCRATCH_MAX {
+            return;
+        }
         set.clear();
         self.candidate_scratch.push(set);
     }

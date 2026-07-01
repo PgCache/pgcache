@@ -335,21 +335,10 @@ impl WriterCore {
     /// wildcard for non-PK columns (their old values are gone under REPLICA
     /// IDENTITY DEFAULT), so the probe over-returns rather than under-returns.
     /// Shared by MV dirty-marking and the narrowed memo-eviction pass (ADR-045).
-    pub(in crate::cache::writer) fn eval_candidates_removed(
-        &self,
-        relation_oid: Oid,
-        old_row: &[Option<ByteString>],
-        pk_only: bool,
-    ) -> FingerprintSet {
-        let mut out = FingerprintSet::default();
-        self.eval_candidates_removed_into(relation_oid, old_row, pk_only, &mut out);
-        out
-    }
-
-    /// [`eval_candidates_removed`], filling a caller-provided scratch set
-    /// (cleared first). The old-image wildcard probe over-returns to a large
-    /// set; reusing the buffer keeps that big backing allocation instead of
-    /// re-allocating it per row (PGC-341/344).
+    ///
+    /// Fills a caller-provided scratch set (cleared first). The old-image wildcard
+    /// probe over-returns to a large set; reusing the buffer keeps that big backing
+    /// allocation instead of re-allocating it per row (PGC-341/344).
     pub(in crate::cache::writer) fn eval_candidates_removed_into(
         &self,
         relation_oid: Oid,
@@ -379,19 +368,6 @@ impl WriterCore {
             },
             out,
         );
-    }
-
-    pub(super) fn mv_dirty_mark_removed_row(
-        &self,
-        relation_oid: Oid,
-        old_row: &[Option<ByteString>],
-        pk_only: bool,
-    ) {
-        self.mv_dirty_mark_candidates(&self.eval_candidates_removed(
-            relation_oid,
-            old_row,
-            pk_only,
-        ));
     }
 
     /// Dirty-mark a precomputed candidate set (self-gating per fingerprint).

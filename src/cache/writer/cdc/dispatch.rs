@@ -769,7 +769,9 @@ impl WriterCdc {
 
         // Same Fresh-MV rule as handle_update (PGC-254), narrowed via the
         // eval-index probe (PGC-292). Old non-PK values are gone, so PK-only.
-        core.mv_dirty_mark_removed_row(
+        // Use the scratch pool like the other CDC paths (PGC-341/344).
+        let mut removed_candidates = core.candidate_set_take();
+        core.eval_candidates_removed_into(
             relation_oid,
             if key_data.is_empty() {
                 new_row_data
@@ -777,7 +779,10 @@ impl WriterCdc {
                 key_data
             },
             true,
+            &mut removed_candidates,
         );
+        core.mv_dirty_mark_candidates(&removed_candidates);
+        core.candidate_set_return(removed_candidates);
 
         // The new-PK row is alive at origin: under recording its eviction must
         // not be recorded (see doc comment). The old PK after a PK change is
