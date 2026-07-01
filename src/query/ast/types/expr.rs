@@ -151,7 +151,7 @@ impl Deparse for LiteralValue {
 /// escaping. `escape_literal` returns the leading-space `" E'..."` form
 /// for the latter case; we strip the space so the output stays
 /// concatenation-friendly.
-fn emit_escaped_string_literal(s: &str, buf: &mut String) {
+pub(crate) fn emit_escaped_string_literal(s: &str, buf: &mut String) {
     let escaped = escape::escape_literal(s);
     if let Some(stripped) = escaped.strip_prefix(" E'") {
         buf.push_str("E'");

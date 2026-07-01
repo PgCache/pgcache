@@ -8,6 +8,7 @@ use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::QueryConstraints;
 use crate::query::predicate::CompiledPredicate;
 use crate::query::resolved::ResolvedQueryExpr;
+use crate::query::transform::PgEvalTemplate;
 use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 
 /// The kind of subquery context a table was found in.
@@ -112,6 +113,12 @@ pub struct UpdateQuery {
     /// means either no WHERE clause (unconditional match) or a non-LocalEval
     /// query (never consulted — `eval_strategy != LocalEval`).
     pub compiled_where: Option<CompiledPredicate>,
+    /// Precomputed membership-SELECT template for the PgEval path (PGC-343): the
+    /// query with its CDC'd table replaced by a `VALUES` subquery, deparsed once
+    /// so the per-row check renders only the row literals instead of cloning and
+    /// re-deparsing the whole AST. `None` for LocalEval queries or shapes the
+    /// template builder can't handle (the per-row clone-and-deparse still works).
+    pub pg_eval_template: Option<PgEvalTemplate>,
 }
 
 impl UpdateQuery {

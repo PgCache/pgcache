@@ -5,7 +5,9 @@ use rootcause::Report;
 use crate::cache::SubqueryKind;
 use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
-use crate::query::ast::{LiteralValue, TableAlias, ValuesClause};
+use crate::query::ast::{
+    Deparse, LiteralValue, TableAlias, ValuesClause, emit_escaped_string_literal,
+};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
     ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource,
@@ -153,6 +155,117 @@ pub fn resolved_select_node_table_replace_with_values(
     });
 
     Ok(resolved_new)
+}
+
+/// Marker literal injected into the template's `VALUES` row so the deparsed SQL
+/// can be split into the fixed prefix/suffix around the per-row literals. Chosen
+/// to be unique and escape-free, so it deparses to a plain `'…'` literal.
+const PG_EVAL_SENTINEL: &str = "__pgc_values_sentinel__";
+
+/// Precomputed deparse of a PgEval membership query with the CDC'd table already
+/// replaced by a `VALUES` subquery, split so only the per-row literals remain to
+/// render (PGC-343). Built once at registration; the hot path writes
+/// `prefix` + the row's literals + `suffix` into the reused eval buffer, skipping
+/// the per-row `resolved.clone()` + alias-walk + deparse.
+#[derive(Debug, Clone)]
+pub struct PgEvalTemplate {
+    prefix: EcoString,
+    suffix: EcoString,
+    /// `(row_data index, type_name)` per column, in the `VALUES` order the
+    /// template's alias expects — the full column set, so this only applies to
+    /// full CDC rows (`render_into` refuses short rows).
+    columns: Vec<(usize, EcoString)>,
+}
+
+impl PgEvalTemplate {
+    /// Build the template for one PgEval query over `table_metadata`, or `None`
+    /// if the query shape isn't a substitutable select or the sentinel split is
+    /// ambiguous — the caller then falls back to the per-row clone-and-deparse.
+    pub fn build(resolved: &ResolvedSelectNode, table_metadata: &TableMetadata) -> Option<Self> {
+        let mut template = resolved.clone();
+        let alias = table_alias_find(&template, table_metadata).ok()?;
+        resolved_select_node_column_alias_update(
+            &mut template,
+            &table_metadata.schema,
+            &table_metadata.name,
+            &alias,
+        );
+        let source_node = table_source_find_mut(&mut template, table_metadata.relation_oid).ok()?;
+
+        let column_names: Vec<EcoString> = table_metadata
+            .columns
+            .iter()
+            .map(|c| EcoString::from(c.name.as_str()))
+            .collect();
+        *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
+            query: Box::new(ResolvedQueryExpr {
+                body: ResolvedQueryBody::Values(ValuesClause {
+                    rows: vec![vec![LiteralValue::String(EcoString::from(PG_EVAL_SENTINEL))]],
+                }),
+                order_by: vec![],
+                limit: None,
+            }),
+            alias: TableAlias {
+                name: alias,
+                columns: column_names,
+            },
+            subquery_kind: SubqueryKind::Inclusion,
+        });
+
+        let mut sql = String::new();
+        Deparse::deparse(&template, &mut sql);
+
+        let mut needle = String::new();
+        emit_escaped_string_literal(PG_EVAL_SENTINEL, &mut needle);
+        if sql.matches(needle.as_str()).count() != 1 {
+            return None;
+        }
+        let (prefix, suffix) = sql.split_once(needle.as_str())?;
+
+        Some(Self {
+            prefix: EcoString::from(prefix),
+            suffix: EcoString::from(suffix),
+            columns: table_metadata
+                .columns
+                .iter()
+                .map(|c| (c.index(), EcoString::from(c.type_name.as_str())))
+                .collect(),
+        })
+    }
+
+    /// Render this query's membership SELECT for `row_data` into `buf`, matching
+    /// `resolved_select_node_table_replace_with_values` + deparse byte-for-byte.
+    /// Returns `false` without touching `buf` when `row_data` doesn't cover every
+    /// column (a short/partial CDC row), so the caller falls back.
+    pub fn render_into(&self, buf: &mut String, row_data: &[Option<ByteString>]) -> bool {
+        // Every column must be present before any write, so a short row falls
+        // back cleanly (no partial output left in `buf`).
+        if self.columns.iter().any(|(idx, _)| row_data.get(*idx).is_none()) {
+            return false;
+        }
+        buf.push_str(&self.prefix);
+        let mut sep = "";
+        for (idx, type_name) in &self.columns {
+            buf.push_str(sep);
+            // Mirror `values_row_build`'s `StringWithCast` / `NullWithCast`
+            // deparse. `Some(_)` is guaranteed by the guard above; a missing
+            // slot renders `NULL` rather than panicking.
+            match row_data.get(*idx).and_then(Option::as_ref) {
+                Some(value) => {
+                    emit_escaped_string_literal(value.as_str(), buf);
+                    buf.push_str("::");
+                    buf.push_str(type_name);
+                }
+                None => {
+                    buf.push_str("NULL::");
+                    buf.push_str(type_name);
+                }
+            }
+            sep = ", ";
+        }
+        buf.push_str(&self.suffix);
+        true
+    }
 }
 
 /// Multi-row variant of [`resolved_select_node_table_replace_with_values`]
@@ -1215,5 +1328,93 @@ mod tests {
         };
         assert_eq!(subquery.alias.name, "orders");
         assert_eq!(subquery.alias.columns, vec!["id", "total"]);
+    }
+
+    /// PGC-343: the precomputed `PgEvalTemplate` fast path must produce SQL
+    /// byte-identical to the clone-and-deparse oracle
+    /// (`resolved_select_node_table_replace_with_values` + `Deparse`), since it
+    /// feeds the PgEval membership check that gates invalidate-or-not.
+    fn assert_template_matches_oracle(
+        sql: &str,
+        table_metadata: &TableMetadata,
+        rows: &[Vec<Option<ByteString>>],
+    ) {
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(table_metadata.clone());
+        let qe = query_expr_parse(sql).expect("parse");
+        let QueryBody::Select(node) = qe.body else {
+            panic!("expected SELECT");
+        };
+        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
+        let template =
+            PgEvalTemplate::build(&resolved, table_metadata).expect("template builds for this shape");
+
+        for row in rows {
+            let oracle_select =
+                resolved_select_node_table_replace_with_values(&resolved, table_metadata, row)
+                    .expect("oracle replace");
+            let mut oracle = String::new();
+            Deparse::deparse(&oracle_select, &mut oracle);
+
+            let mut fast = String::new();
+            assert!(
+                template.render_into(&mut fast, row),
+                "full row should take the fast path: {row:?}"
+            );
+            assert_eq!(fast, oracle, "template SQL diverged from oracle for row {row:?}");
+        }
+    }
+
+    #[test]
+    fn pg_eval_template_matches_oracle_across_shapes() {
+        let onek = table_metadata(
+            "onek",
+            Oid::from_raw(7001),
+            &[("id", "int4"), ("ten", "int4"), ("name", "text")],
+        );
+        let rows = vec![
+            vec![Some("1".into()), Some("7".into()), Some("alice".into())],
+            // NULL in a text column (NullWithCast path) + a value needing escaping.
+            vec![Some("2".into()), None, Some("o'brien".into())],
+            vec![Some("3".into()), Some("0".into()), Some("".into())],
+        ];
+
+        // single-table WHERE, GROUP BY/HAVING, and a self-referential predicate —
+        // the shapes PgEval membership actually sees.
+        assert_template_matches_oracle("SELECT * FROM onek WHERE ten = 7", &onek, &rows);
+        assert_template_matches_oracle(
+            "SELECT id FROM onek WHERE name = 'x' AND ten > 3",
+            &onek,
+            &rows,
+        );
+        assert_template_matches_oracle(
+            "SELECT ten, count(*) AS c FROM onek GROUP BY ten HAVING count(*) > 0",
+            &onek,
+            &rows,
+        );
+    }
+
+    #[test]
+    fn pg_eval_template_declines_short_row() {
+        let onek = table_metadata(
+            "onek",
+            Oid::from_raw(7002),
+            &[("id", "int4"), ("ten", "int4"), ("name", "text")],
+        );
+        let qe = query_expr_parse("SELECT * FROM onek WHERE ten = 7").expect("parse");
+        let QueryBody::Select(node) = qe.body else {
+            panic!("expected SELECT");
+        };
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(onek.clone());
+        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
+        let template = PgEvalTemplate::build(&resolved, &onek).expect("template builds");
+
+        // Row missing the trailing column → decline, leaving buf untouched so the
+        // caller falls back to the clone-and-deparse path.
+        let short: Vec<Option<ByteString>> = vec![Some("1".into()), Some("7".into())];
+        let mut buf = String::from("PRE");
+        assert!(!template.render_into(&mut buf, &short));
+        assert_eq!(buf, "PRE", "declined render must not write into buf");
     }
 }

@@ -26,6 +26,7 @@ use crate::query::constraints::{
 use crate::query::decorrelate::query_expr_decorrelate;
 use crate::query::evaluate::resolved_where_expr_supported;
 use crate::query::predicate::CompiledPredicate;
+use crate::query::transform::PgEvalTemplate;
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns,
     ResolvedSelectNode, ResolvedTableNode, query_expr_resolve,
@@ -799,6 +800,19 @@ impl WriterRegistration {
             } else {
                 None
             };
+            // Precompute the PgEval membership template so the per-row check
+            // skips the resolved-AST clone + deparse (PGC-343). Only PgEval uses
+            // it; needs the relation's TableMetadata (registered before this loop).
+            let pg_eval_template = if eval_strategy == UpdateEvalStrategy::PgEval {
+                update_resolved.as_select().and_then(|select| {
+                    core.cache
+                        .tables
+                        .get1(&relation_oid)
+                        .and_then(|table_metadata| PgEvalTemplate::build(select, table_metadata))
+                })
+            } else {
+                None
+            };
             let update_query = UpdateQuery {
                 fingerprint,
                 resolved: update_resolved,
@@ -813,6 +827,7 @@ impl WriterRegistration {
                 predicate_columns,
                 is_single_table,
                 compiled_where,
+                pg_eval_template,
             };
 
             self.update_query_register(core, relation_oid, table_node.name.as_str(), update_query);

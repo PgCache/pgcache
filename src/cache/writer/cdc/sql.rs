@@ -10,7 +10,6 @@ use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 
 use crate::query::ast::Deparse;
-use crate::query::resolved::ResolvedQueryExpr;
 use crate::query::transform::resolved_select_node_table_replace_with_values;
 
 use super::super::super::update_query::UpdateQuery;
@@ -98,14 +97,14 @@ impl WriterCdc {
         for chunk in queries.chunks(PG_EVAL_CHUNK) {
             self.pg_eval_buf.clear();
             self.pg_eval_buf.push_str("SELECT ");
-            for (i, uq) in chunk.iter().enumerate() {
+            for (i, update_query) in chunk.iter().enumerate() {
                 if i > 0 {
                     self.pg_eval_buf.push_str(", ");
                 }
                 self.pg_eval_buf.push_str("EXISTS (");
                 Self::cache_predicate_into(
                     &mut self.pg_eval_buf,
-                    &uq.resolved,
+                    update_query,
                     table_metadata,
                     row_data,
                 )?;
@@ -117,13 +116,13 @@ impl WriterCdc {
                 continue;
             };
             // One boolean column per query; column `i` ↔ `chunk[i]`.
-            for (i, uq) in chunk.iter().enumerate() {
+            for (i, update_query) in chunk.iter().enumerate() {
                 if row.get(i) == Some("t") {
                     trace!(
                         "update_queries pg-eval matched fingerprint {}",
-                        uq.fingerprint
+                        update_query.fingerprint
                     );
-                    hits.push(uq.fingerprint);
+                    hits.push(update_query.fingerprint);
                 }
             }
         }
@@ -147,14 +146,14 @@ impl WriterCdc {
         for chunk in queries.chunks(PG_EVAL_CHUNK) {
             self.pg_eval_buf.clear();
             self.pg_eval_buf.push_str("SELECT ");
-            for (i, uq) in chunk.iter().enumerate() {
+            for (i, update_query) in chunk.iter().enumerate() {
                 if i > 0 {
                     self.pg_eval_buf.push_str(" OR ");
                 }
                 self.pg_eval_buf.push_str("EXISTS (");
                 Self::cache_predicate_into(
                     &mut self.pg_eval_buf,
-                    &uq.resolved,
+                    update_query,
                     table_metadata,
                     row_data,
                 )?;
@@ -199,11 +198,22 @@ impl WriterCdc {
     /// pre-transaction snapshot. Caller wraps it in `EXISTS (...)`.
     pub(super) fn cache_predicate_into(
         buf: &mut String,
-        resolved: &ResolvedQueryExpr,
+        update_query: &UpdateQuery,
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
-        let resolved_select = resolved.as_select().ok_or(CacheError::InvalidQuery)?;
+        // Fast path: render the row's literals into the precomputed template
+        // (PGC-343), skipping the per-row clone + deparse. `render_into` declines
+        // short/partial rows, falling through to the general path below.
+        if let Some(template) = &update_query.pg_eval_template
+            && template.render_into(buf, row_data)
+        {
+            return Ok(());
+        }
+        let resolved_select = update_query
+            .resolved
+            .as_select()
+            .ok_or(CacheError::InvalidQuery)?;
         let value_select = resolved_select_node_table_replace_with_values(
             resolved_select,
             table_metadata,
