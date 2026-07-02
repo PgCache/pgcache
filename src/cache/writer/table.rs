@@ -92,8 +92,10 @@ impl WriterCore {
         };
 
         let indexes = self.query_table_indexes_get(relation_oid).await?;
+        let replica_identity_full = self.query_replica_identity_full(relation_oid).await?;
 
         let table = TableMetadata {
+            replica_identity_full,
             name: table.into(),
             schema: schema.into(),
             relation_oid,
@@ -202,6 +204,21 @@ impl WriterCore {
     }
 
     #[instrument(skip_all)]
+    /// Whether the origin relation's REPLICA IDENTITY is FULL
+    /// (`pg_class.relreplident = 'f'`). Absent rows (dropped mid-registration)
+    /// default to false — the conservative old-image ladder then applies.
+    pub(super) async fn query_replica_identity_full(&self, relation_oid: Oid) -> CacheResult<bool> {
+        let rows = self
+            .db_origin
+            .query(
+                "SELECT relreplident = 'f' AS full FROM pg_class WHERE oid = $1",
+                &[&relation_oid],
+            )
+            .await
+            .map_into_report::<CacheError>()?;
+        Ok(rows.first().is_some_and(|row| row.get("full")))
+    }
+
     pub(super) async fn query_table_indexes_get(
         &self,
         relation_oid: Oid,

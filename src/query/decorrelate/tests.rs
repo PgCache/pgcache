@@ -28,6 +28,7 @@ fn test_table(name: &str, relation_oid: Oid, column_names: &[&str]) -> TableMeta
         }
     }));
     TableMetadata {
+        replica_identity_full: false,
         relation_oid,
         name: name.into(),
         schema: "public".into(),

@@ -256,3 +256,213 @@ async fn test_old_image_uncached_row_falls_back() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Reserved-word and mixed-case column names: the cache-table DDL quotes
+/// identifiers, so these columns exist in the cache DB — the row-change /
+/// old-image SQL must quote them too or every lookup on the relation fails
+/// (and the writer restart-loops). Covers both the boolean projections
+/// (change-eval relation via the LIMIT query) and the lookup-only path.
+#[tokio::test]
+async fn test_old_image_quoted_identifiers() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE items (id INT PRIMARY KEY, \"user\" INT, \"camelCase\" INT, val INT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO items (id, \"user\", \"camelCase\", val) VALUES \
+         (1, 10, 1, 5), (2, 20, 2, 7), (3, 30, 3, 9)",
+        &[],
+    )
+    .await?;
+    let q_val = "SELECT id FROM items WHERE val = 5";
+    let q_window = "SELECT id, val FROM items WHERE val > 0 ORDER BY val DESC LIMIT 2";
+    ctx.simple_query(q_val).await?;
+    ctx.simple_query(q_window).await?;
+    ctx.cache_settle().await?;
+
+    // UPDATE and DELETE both drive the batched lookup over the relation; any
+    // unquoted identifier would error the segment eval and kill the writer.
+    ctx.origin_query("UPDATE items SET val = 6 WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(q_val).await?;
+    assert_eq!(res.len(), 2, "val=5 result must be empty, got {res:?}");
+
+    ctx.origin_query("DELETE FROM items WHERE id = 3", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(q_window).await?;
+    assert_row_at(&res, 1, &[("id", "2"), ("val", "7")])?;
+    assert_row_at(&res, 2, &[("id", "1"), ("val", "6")])?;
+
+    Ok(())
+}
+
+/// Boolean old images: `bool::text` renders 'true'/'false' while the
+/// eval-index equality keys carry wire text ('t'/'f'). Without parse-time
+/// normalization the recovered old image misses the key and the memoized
+/// bool-constrained query serves stale rows after the flip.
+#[tokio::test]
+async fn test_old_image_bool_flip_evicts_memo() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE items (id INT PRIMARY KEY, active BOOL, val INT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO items (id, active, val) VALUES (1, true, 5), (2, false, 7)",
+        &[],
+    )
+    .await?;
+    let q_active = "SELECT val FROM items WHERE active = 't'";
+    let q_inactive = "SELECT val FROM items WHERE active = 'f'";
+    ctx.simple_query(q_active).await?;
+    ctx.simple_query(q_inactive).await?;
+    ctx.cache_settle().await?;
+    warm_until_memoized(&mut ctx, q_active).await?;
+
+    ctx.origin_query("UPDATE items SET active = false WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // The departed row's memo must die: a 'true'-vs-'t' probe miss would keep
+    // serving the stale [5].
+    let res = ctx.simple_query(q_active).await?;
+    assert_eq!(res.len(), 2, "active result must be empty, got {res:?}");
+
+    Ok(())
+}
+
+/// REPLICA IDENTITY FULL: a PK-change update must delete the vacated-PK row
+/// from the cache table. Under FULL the old tuple arrives as 'O' (not 'K'),
+/// so PK change is detected by comparing PK columns — presence alone would
+/// both miss this delete (phantom row) and wrongly fire on every update.
+#[tokio::test]
+async fn test_replica_identity_full_pk_change_removes_old_row() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE items (id INT PRIMARY KEY, owner INT, val INT)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query("ALTER TABLE items REPLICA IDENTITY FULL", &[])
+        .await?;
+    ctx.query("INSERT INTO items (id, owner, val) VALUES (1, 10, 5)", &[])
+        .await?;
+    let q10 = "SELECT id, val FROM items WHERE owner = 10 ORDER BY id";
+    ctx.simple_query(q10).await?;
+    ctx.cache_settle().await?;
+
+    // Unchanged-PK update: the full 'O' tuple must NOT be mistaken for a PK
+    // change (that would delete the freshly upserted row).
+    ctx.origin_query("UPDATE items SET val = 6 WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(q10).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("val", "6")])?;
+    assert_eq!(res.len(), 3, "expected exactly one row, got {res:?}");
+
+    // Genuine PK change: the vacated PK's row must be deleted, or the page
+    // serves a phantom.
+    ctx.origin_query("UPDATE items SET id = 3 WHERE id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(q10).await?;
+    assert_row_at(&res, 1, &[("id", "3"), ("val", "6")])?;
+    assert_eq!(
+        res.len(),
+        3,
+        "expected exactly one row (no phantom), got {res:?}"
+    );
+
+    Ok(())
+}
+
+/// REPLICA IDENTITY FULL rung 0: the 'O' tuple is the authoritative old
+/// image, so precision holds even for rows the cache table has never held —
+/// an update to an uncached, non-matching row must not evict the memo.
+#[tokio::test]
+async fn test_replica_identity_full_rung_zero_precision() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE items (id INT PRIMARY KEY, owner INT, val INT)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query("ALTER TABLE items REPLICA IDENTITY FULL", &[])
+        .await?;
+    ctx.query(
+        "INSERT INTO items (id, owner, val) VALUES (1, 10, 5), (2, 20, 7)",
+        &[],
+    )
+    .await?;
+    // Only owner 10's query is cached — row 2 is never in the cache table,
+    // so rung 2 could not have resolved it; only the 'O' tuple can.
+    let q10 = "SELECT val FROM items WHERE owner = 10";
+    ctx.simple_query(q10).await?;
+    ctx.cache_settle().await?;
+    warm_until_memoized(&mut ctx, q10).await?;
+
+    let evictions_before = ctx.metrics().await?.cache_memo_evictions;
+    ctx.origin_query("UPDATE items SET val = 8 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    assert_eq!(
+        ctx.metrics().await?.cache_memo_evictions,
+        evictions_before,
+        "uncached non-matching row update must not evict the memo (rung 0)"
+    );
+    let res = ctx.simple_query(q10).await?;
+    assert_row_at(&res, 1, &[("val", "5")])?;
+
+    Ok(())
+}
+
+/// Reserved-prefix column names (`__pgc_*`) collide with the batched lookup's
+/// projection-alias namespace, so such relations skip the batch entirely and
+/// their row-change booleans come from the per-row fallback — conservative
+/// window invalidation, wildcard old images, and above all: correct results
+/// and a live writer.
+#[tokio::test]
+async fn test_old_image_reserved_prefix_columns_stay_conservative() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE items (id INT PRIMARY KEY, score INT, __pgc_lt_score INT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO items (id, score, __pgc_lt_score) VALUES (1, 50, 0), (2, 40, 0), (3, 30, 0)",
+        &[],
+    )
+    .await?;
+    let q = "SELECT id, score FROM items WHERE score > 0 ORDER BY score DESC LIMIT 2";
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    // A demotion that also touches the colliding column: without the batch
+    // skip, the misfiled boolean could fabricate a promotion verdict and skip
+    // the invalidation — the window would keep serving [1, 2].
+    ctx.origin_query(
+        "UPDATE items SET score = 10, __pgc_lt_score = 1 WHERE id = 1",
+        &[],
+    )
+    .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "2"), ("score", "40")])?;
+    assert_row_at(&res, 2, &[("id", "3"), ("score", "30")])?;
+
+    // DELETE exercises the (skipped) old-image path for the relation.
+    ctx.origin_query("DELETE FROM items WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "3"), ("score", "30")])?;
+    assert_row_at(&res, 2, &[("id", "1"), ("score", "10")])?;
+
+    Ok(())
+}

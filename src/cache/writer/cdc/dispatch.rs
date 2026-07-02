@@ -516,9 +516,16 @@ impl WriterCdc {
         crate::metrics::handles().cdc.handle_updates.increment(1);
 
         // See handle_insert: an untracked relation's CDC is a benign skip.
-        if !core.cache.tables.contains_key1(&relation_oid) {
+        let Some((replica_identity_full, pk_changed)) =
+            core.cache.tables.get1(&relation_oid).map(|table_metadata| {
+                (
+                    table_metadata.replica_identity_full,
+                    update_pk_changed(table_metadata, key_data, new_row_data),
+                )
+            })
+        else {
             return Ok(());
-        }
+        };
 
         // Probe the eval index once; the invalidation check and the in-place
         // matcher (`update_queries_execute_batch` below) share this candidate set.
@@ -539,13 +546,15 @@ impl WriterCdc {
             Some(old_image) => {
                 eval_candidates_into(core, relation_oid, old_image, &mut old_candidates);
             }
+            // REPLICA IDENTITY FULL: the 'O' tuple IS the authoritative
+            // complete old image — probe it directly (rung 0; the overlay
+            // ladder is skipped for FULL relations in the segment pre-pass).
+            None if replica_identity_full && !key_data.is_empty() => {
+                eval_candidates_into(core, relation_oid, key_data, &mut old_candidates);
+            }
             None => core.eval_candidates_removed_into(
                 relation_oid,
-                if key_data.is_empty() {
-                    new_row_data
-                } else {
-                    key_data
-                },
+                if pk_changed { key_data } else { new_row_data },
                 true,
                 &mut old_candidates,
             ),
@@ -666,8 +675,10 @@ impl WriterCdc {
         core.candidate_set_return(local_candidates);
         core.candidate_set_return(old_candidates);
 
-        // A non-empty `key_data` means the PK changed; delete the old PK too.
-        if !key_data.is_empty() {
+        // Delete the vacated old PK on a genuine PK change (under REPLICA
+        // IDENTITY FULL `key_data` is present on every update, so presence
+        // alone is not the signal — `update_pk_changed` compares PK columns).
+        if pk_changed {
             self.frame_cache_delete(core, relation_oid, key_data)
                 .await?;
         }
@@ -708,9 +719,14 @@ impl WriterCdc {
         toasted_columns: &[EcoString],
     ) -> CacheResult<()> {
         // See handle_insert: an untracked relation's CDC is a benign skip.
-        if !core.cache.tables.contains_key1(&relation_oid) {
+        let Some(pk_changed) = core
+            .cache
+            .tables
+            .get1(&relation_oid)
+            .map(|table_metadata| update_pk_changed(table_metadata, key_data, new_row_data))
+        else {
             return Ok(());
-        }
+        };
 
         let recording = core.population_deleted_keys.is_recording(relation_oid);
         let mut fp_list: Vec<Fingerprint> = Vec::new();
@@ -779,11 +795,7 @@ impl WriterCdc {
         let mut removed_candidates = core.candidate_set_take();
         core.eval_candidates_removed_into(
             relation_oid,
-            if key_data.is_empty() {
-                new_row_data
-            } else {
-                key_data
-            },
+            if pk_changed { key_data } else { new_row_data },
             true,
             &mut removed_candidates,
         );
@@ -800,7 +812,7 @@ impl WriterCdc {
             self.frame_cache_delete(core, relation_oid, new_row_data)
                 .await?;
         }
-        if !key_data.is_empty() {
+        if pk_changed {
             self.frame_cache_delete(core, relation_oid, key_data)
                 .await?;
         }

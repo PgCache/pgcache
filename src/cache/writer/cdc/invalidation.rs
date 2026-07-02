@@ -15,7 +15,7 @@ use crate::query::ast::BinaryOp;
 use crate::query::cast::cast_target_coerce_text;
 use crate::query::constraint_index::row_value_forms;
 use crate::query::constraints::{QueryConstraints, TableConstraint};
-use crate::query::evaluate::{literal_compare, where_value_compare_string};
+use crate::query::evaluate::{literal_compare, pg_bool_parse, where_value_compare_string};
 
 use crate::settings::CachePolicy;
 
@@ -152,32 +152,66 @@ pub(super) fn memo_frame_accumulate(
 pub(super) const OLD_LESS_THAN_ALIAS_PREFIX: &str = "__pgc_lt_";
 pub(super) const OLD_IS_NULL_ALIAS_PREFIX: &str = "__pgc_nl_";
 
+/// Whether any of the relation's columns uses the reserved `__pgc_` prefix.
+/// Such a column's own result alias would collide with the projection-alias
+/// namespace and mis-route through the fold, so the ordering/old-image
+/// projections are suppressed for the relation and the fold routes every
+/// result column as plain (conservative: direction punts to invalidate, old
+/// images stay wildcard).
+pub(super) fn table_has_reserved_columns(table_metadata: &TableMetadata) -> bool {
+    table_metadata
+        .columns
+        .iter()
+        .any(|c| c.name.starts_with("__pgc_"))
+}
+
 /// Fold one row-change result column into the per-column map: plain names
 /// carry the `IS DISTINCT FROM` changed flag, prefixed aliases carry the
 /// ordering projections. `None` (SQL NULL) leaves ordering unknown and, for
 /// the changed flag, defensively counts as unchanged — matching the historic
-/// text parse.
-pub(super) fn row_change_column_fold(changes: &mut RowChanges, name: &str, value: Option<bool>) {
-    if let Some(col) = name.strip_prefix(OLD_LESS_THAN_ALIAS_PREFIX) {
+/// text parse. `strip_prefixes` is false when the builder suppressed every
+/// prefixed projection (`table_has_reserved_columns`): every result column is
+/// then a real column, including `__pgc_`-named ones.
+pub(super) fn row_change_column_fold(
+    changes: &mut RowChanges,
+    name: &str,
+    value: Option<bool>,
+    strip_prefixes: bool,
+) {
+    if strip_prefixes && let Some(col) = name.strip_prefix(OLD_LESS_THAN_ALIAS_PREFIX) {
         changes
             .entry(EcoString::from(col))
             .or_default()
             .old_less_than_new = value;
-    } else if let Some(col) = name.strip_prefix(OLD_IS_NULL_ALIAS_PREFIX) {
+    } else if strip_prefixes && let Some(col) = name.strip_prefix(OLD_IS_NULL_ALIAS_PREFIX) {
         changes.entry(EcoString::from(col)).or_default().old_is_null = value == Some(true);
     } else {
         changes.entry(EcoString::from(name)).or_default().changed = value == Some(true);
     }
 }
 
-/// PG boolean text ("t"/"f") to `Option<bool>`; anything else — including SQL
-/// NULL — is `None`.
-pub(super) fn pg_bool_text(value: Option<&str>) -> Option<bool> {
-    match value {
-        Some("t") => Some(true),
-        Some("f") => Some(false),
-        _ => None,
+/// Whether this UPDATE changed the row's primary key. Under REPLICA IDENTITY
+/// DEFAULT the presence of a key tuple IS the signal ('K' is sent only on PK
+/// change); under FULL every update carries the complete old row ('O'), so
+/// the PK columns are compared. A missing column defaults to changed — the
+/// conservative direction for every consumer (old-PK delete, ladder skip).
+pub(super) fn update_pk_changed(
+    table_metadata: &TableMetadata,
+    key_data: &[Option<ByteString>],
+    new_row_data: &[Option<ByteString>],
+) -> bool {
+    if key_data.is_empty() {
+        return false;
     }
+    if !table_metadata.replica_identity_full {
+        return true;
+    }
+    table_metadata.primary_key_columns.iter().any(|pk| {
+        let Some(meta) = table_metadata.columns.get(pk.as_str()) else {
+            return true;
+        };
+        key_data.get(meta.index()) != new_row_data.get(meta.index())
+    })
 }
 
 /// Whether this UPDATE moves the cached row strictly toward the front of the
@@ -481,12 +515,16 @@ impl WriterCdc {
         let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
         sql.push_str("SELECT ");
 
-        let order_columns: HashSet<&EcoString> = core
-            .cache
-            .update_queries
-            .get(&relation_oid)
-            .map(|uq| uq.limit_order_columns().collect())
-            .unwrap_or_default();
+        let reserved_columns = table_has_reserved_columns(table_metadata);
+        let order_columns: HashSet<&EcoString> = if reserved_columns {
+            HashSet::new()
+        } else {
+            core.cache
+                .update_queries
+                .get(&relation_oid)
+                .map(|uq| uq.limit_order_columns().collect())
+                .unwrap_or_default()
+        };
 
         let mut first_col = true;
         for column_meta in &table_metadata.columns {
@@ -498,17 +536,22 @@ impl WriterCdc {
                 if !first_col {
                     sql.push_str(", ");
                 }
-                let _ = write!(
-                    sql,
-                    "{} IS DISTINCT FROM {} AS {}",
-                    column_meta.name, value, column_meta.name
-                );
+                // Quoted throughout: the cache-table DDL quotes column names,
+                // so reserved-word / mixed-case columns exist here.
+                let name = escape::escape_identifier(&column_meta.name);
+                let _ = write!(sql, "{name} IS DISTINCT FROM {value} AS {name}");
                 if order_columns.contains(&column_meta.name) {
+                    let less_than_alias = escape::escape_identifier(&format!(
+                        "{OLD_LESS_THAN_ALIAS_PREFIX}{}",
+                        column_meta.name
+                    ));
+                    let is_null_alias = escape::escape_identifier(&format!(
+                        "{OLD_IS_NULL_ALIAS_PREFIX}{}",
+                        column_meta.name
+                    ));
                     let _ = write!(
                         sql,
-                        ", {c} < {v} AS {OLD_LESS_THAN_ALIAS_PREFIX}{c}, {c} IS NULL AS {OLD_IS_NULL_ALIAS_PREFIX}{c}",
-                        c = column_meta.name,
-                        v = value
+                        ", {name} < {value} AS {less_than_alias}, {name} IS NULL AS {is_null_alias}",
                     );
                 }
                 first_col = false;
@@ -518,7 +561,8 @@ impl WriterCdc {
         let _ = write!(
             sql,
             " FROM {}.{} WHERE ",
-            table_metadata.schema, table_metadata.name
+            escape::escape_identifier(&table_metadata.schema),
+            escape::escape_identifier(&table_metadata.name)
         );
 
         let mut has_pk = false;
@@ -532,7 +576,7 @@ impl WriterCdc {
                     if has_pk {
                         sql.push_str(" AND ");
                     }
-                    let _ = write!(sql, "{pk_column} = {value}");
+                    let _ = write!(sql, "{} = {value}", escape::escape_identifier(pk_column));
                     has_pk = true;
                 }
             }
@@ -552,7 +596,12 @@ impl WriterCdc {
             if let SimpleQueryMessage::Row(row) = msg {
                 let mut changes = RowChanges::with_capacity(row.len());
                 for (idx, col) in row.columns().iter().enumerate() {
-                    row_change_column_fold(&mut changes, col.name(), pg_bool_text(row.get(idx)));
+                    row_change_column_fold(
+                        &mut changes,
+                        col.name(),
+                        row.get(idx).and_then(pg_bool_parse),
+                        !reserved_columns,
+                    );
                 }
                 return Ok(Some(changes));
             }
@@ -1047,6 +1096,7 @@ mod tests {
             },
         ]);
         TableMetadata {
+            replica_identity_full: false,
             relation_oid: Oid::from_raw(1001),
             name: "users".into(),
             schema: "public".into(),

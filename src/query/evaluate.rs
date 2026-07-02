@@ -418,6 +418,7 @@ mod tests {
         ]);
 
         TableMetadata {
+            replica_identity_full: false,
             name: "test_table".into(),
             schema: "public".into(),
             relation_oid: Oid::from_raw(12345),
@@ -470,6 +471,7 @@ mod tests {
         ]);
 
         TableMetadata {
+            replica_identity_full: false,
             name: "ts_table".into(),
             schema: "public".into(),
             relation_oid: Oid::from_raw(23456),

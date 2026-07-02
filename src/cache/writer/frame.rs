@@ -120,6 +120,28 @@ pub(super) enum FrameState {
     Recovering,
 }
 
+/// Drop one relation's entries from an overlay map, harvesting `Values` Vecs
+/// into the shared pool.
+fn overlay_relation_drain(
+    map: &mut HashMap<(Oid, EcoString), OverlayEntry>,
+    pool: &mut Vec<Vec<(usize, Option<ByteString>)>>,
+    relation_oid: Oid,
+) {
+    map.retain(|(r, _), entry| {
+        if *r != relation_oid {
+            return true;
+        }
+        if let OverlayEntry::Values(values) = entry
+            && pool.len() < TOAST_OVERLAY_POOL_MAX
+        {
+            let mut harvested = std::mem::take(values);
+            harvested.clear();
+            pool.push(harvested);
+        }
+        false
+    });
+}
+
 /// Drain an overlay map, harvesting `Values` Vec allocations into the shared
 /// pool for reuse by the next batch's recording instead of dropping them.
 fn overlay_drain_into_pool(
@@ -147,6 +169,7 @@ impl WriterCore {
             &mut self.toast_overlay_pool,
         );
         self.batch_old_image_guard_oids.clear();
+        self.batch_old_image_epochs.clear();
     }
 
     /// Invalidate a relation as a repair/old-image source mid-batch (PGC-264,
@@ -160,28 +183,43 @@ impl WriterCore {
     /// dropping the stale entries (not just guarding) is what prevents a
     /// positional misuse.
     pub(super) fn toast_overlay_relation_invalidate(&mut self, relation_oid: Oid) {
-        let pool = &mut self.toast_overlay_pool;
-        let relation_drain =
-            |map: &mut HashMap<(Oid, EcoString), OverlayEntry>,
-             pool: &mut Vec<Vec<(usize, Option<ByteString>)>>| {
-                map.retain(|(r, _), entry| {
-                    if *r != relation_oid {
-                        return true;
-                    }
-                    if let OverlayEntry::Values(values) = entry
-                        && pool.len() < TOAST_OVERLAY_POOL_MAX
-                    {
-                        let mut harvested = std::mem::take(values);
-                        harvested.clear();
-                        pool.push(harvested);
-                    }
-                    false
-                });
-            };
-        relation_drain(&mut self.batch_toast_overlay, pool);
-        relation_drain(&mut self.batch_old_image_overlay, pool);
+        overlay_relation_drain(
+            &mut self.batch_toast_overlay,
+            &mut self.toast_overlay_pool,
+            relation_oid,
+        );
+        overlay_relation_drain(
+            &mut self.batch_old_image_overlay,
+            &mut self.toast_overlay_pool,
+            relation_oid,
+        );
         self.batch_toast_guard_oids.insert(relation_oid);
         self.batch_old_image_guard_oids.insert(relation_oid);
+    }
+
+    /// Reconcile a relation's old-image overlay with the current registration
+    /// epoch (code review, PGC-255): entries are batch-lifetime but recording
+    /// is gated on the current query set, so a mid-batch registration or
+    /// eviction changes what gets recorded — entries stamped under an older
+    /// epoch are untrustworthy. On mismatch, drop the relation's entries and
+    /// guard it for the batch remainder (rung 2 included: unrecorded
+    /// tombstones from the gap make the committed image unreliable too).
+    pub(super) fn old_image_overlay_epoch_reconcile(&mut self, relation_oid: Oid, epoch: u64) {
+        match self.batch_old_image_epochs.get(&relation_oid) {
+            Some(&stamped) if stamped == epoch => {}
+            Some(_) => {
+                overlay_relation_drain(
+                    &mut self.batch_old_image_overlay,
+                    &mut self.toast_overlay_pool,
+                    relation_oid,
+                );
+                self.batch_old_image_guard_oids.insert(relation_oid);
+                self.batch_old_image_epochs.insert(relation_oid, epoch);
+            }
+            None => {
+                self.batch_old_image_epochs.insert(relation_oid, epoch);
+            }
+        }
     }
 
     /// Recycle a `Values` Vec displaced from either overlay (a same-PK
@@ -213,16 +251,7 @@ impl WriterCore {
         let Some(key) = pk_body_render(table_metadata, row_data) else {
             return;
         };
-        let mut values = self.toast_overlay_pool.pop().unwrap_or_default();
-        values.extend(
-            index_positions
-                .iter()
-                .map(|&p| (p, row_data.get(p).cloned().flatten())),
-        );
-        let displaced = self
-            .batch_old_image_overlay
-            .insert((relation_oid, key), OverlayEntry::Values(values));
-        self.toast_overlay_recycle(displaced);
+        self.old_image_overlay_record_write_keyed(relation_oid, key, row_data, index_positions);
     }
 
     /// Tombstone a PK in the old-image overlay (PGC-255): the row was deleted
@@ -239,25 +268,55 @@ impl WriterCore {
         let Some(key) = pk_body_render(table_metadata, row_data) else {
             return;
         };
+        self.old_image_overlay_record_delete_keyed(relation_oid, key);
+    }
+
+    /// Rung-1 old-image lookup by pre-rendered PK key: `Some(Values)` =
+    /// resolved from an in-batch write, `Some(Deleted)` = tombstoned (fall
+    /// back to the wildcard probe), `None` = no in-batch state — consult the
+    /// batched pre-batch lookup unless the relation is guarded
+    /// (`batch_old_image_guard_oids`). Callers render the key once per event
+    /// (`pk_body_render`) and reuse it for the recording calls.
+    pub(super) fn old_image_overlay_get(
+        &self,
+        relation_oid: Oid,
+        key: &EcoString,
+    ) -> Option<&OverlayEntry> {
+        self.batch_old_image_overlay
+            .get(&(relation_oid, key.clone()))
+    }
+
+    /// Keyed variant of `old_image_overlay_record_write` — the caller already
+    /// rendered the row's PK.
+    pub(super) fn old_image_overlay_record_write_keyed(
+        &mut self,
+        relation_oid: Oid,
+        key: EcoString,
+        row_data: &[Option<ByteString>],
+        index_positions: &[usize],
+    ) {
+        let mut values = self.toast_overlay_pool.pop().unwrap_or_default();
+        values.extend(
+            index_positions
+                .iter()
+                .map(|&p| (p, row_data.get(p).cloned().flatten())),
+        );
+        let displaced = self
+            .batch_old_image_overlay
+            .insert((relation_oid, key), OverlayEntry::Values(values));
+        self.toast_overlay_recycle(displaced);
+    }
+
+    /// Keyed variant of `old_image_overlay_record_delete`.
+    pub(super) fn old_image_overlay_record_delete_keyed(
+        &mut self,
+        relation_oid: Oid,
+        key: EcoString,
+    ) {
         let displaced = self
             .batch_old_image_overlay
             .insert((relation_oid, key), OverlayEntry::Deleted);
         self.toast_overlay_recycle(displaced);
-    }
-
-    /// Rung-1 old-image lookup for the row's PK: `Some(Values)` = resolved
-    /// from an in-batch write, `Some(Deleted)` = tombstoned (fall back to the
-    /// wildcard probe), `None` = no in-batch state — consult the batched
-    /// pre-batch lookup unless the relation is guarded
-    /// (`batch_old_image_guard_oids`).
-    pub(super) fn old_image_overlay_get(
-        &self,
-        relation_oid: Oid,
-        pk_source_row: &[Option<ByteString>],
-    ) -> Option<&OverlayEntry> {
-        let table_metadata = self.cache.tables.get1(&relation_oid)?;
-        let key = pk_body_render(table_metadata, pk_source_row)?;
-        self.batch_old_image_overlay.get(&(relation_oid, key))
     }
 
     /// `cdc_values_convert` into a recycled row Vec from `row_vec_pool`.

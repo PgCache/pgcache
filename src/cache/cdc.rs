@@ -9,8 +9,8 @@ use postgres_replication::{
     LogicalReplicationStream,
     protocol::{
         BeginBody, CommitBody, DeleteBody, InsertBody, LogicalReplicationMessage, OriginBody,
-        PrimaryKeepAliveBody, RelationBody, ReplicationMessage, TruncateBody, TupleData, TypeBody,
-        UpdateBody, XLogDataBody,
+        PrimaryKeepAliveBody, RelationBody, ReplicaIdentity, ReplicationMessage, TruncateBody,
+        TupleData, TypeBody, UpdateBody, XLogDataBody,
     },
 };
 use postgres_types::PgLsn;
@@ -626,6 +626,10 @@ impl CdcProcessor {
         }
 
         TableMetadata {
+            replica_identity_full: matches!(
+                relation_body.replica_identity(),
+                ReplicaIdentity::Full
+            ),
             name: table_name,
             schema: schema_name,
             relation_oid,
@@ -646,10 +650,15 @@ impl CdcProcessor {
         &self,
         body: UpdateBody,
     ) -> Result<(Vec<CdcValue>, Vec<CdcValue>), Error> {
-        let (key_tuple, _old_tuple, new_tuple) = body.into_tuples();
+        let (key_tuple, old_tuple, new_tuple) = body.into_tuples();
         let new_row_data = tuple_data_parse(new_tuple.into_data());
 
+        // 'K' (REPLICA IDENTITY DEFAULT, sent only on PK change) or 'O'
+        // (REPLICA IDENTITY FULL, the complete old row on every update) —
+        // mutually exclusive per pgoutput. Downstream distinguishes them via
+        // `TableMetadata::replica_identity_full` / `update_pk_changed`.
         let key_data = key_tuple
+            .or(old_tuple)
             .map(|kt| tuple_data_parse(kt.into_data()))
             .unwrap_or_default();
 

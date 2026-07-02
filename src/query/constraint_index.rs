@@ -1193,6 +1193,7 @@ mod tests {
             },
         ]);
         TableMetadata {
+            replica_identity_full: false,
             name: "t".into(),
             schema: "public".into(),
             relation_oid: Oid::from_raw(1),

@@ -201,6 +201,7 @@ impl<'a> ResolutionScope<'a> {
         let columns = derived_table_columns_extract(resolved_query);
 
         let synthetic_metadata = TableMetadata {
+            replica_identity_full: false,
             relation_oid: Oid::from_raw(0),
             name: alias.into(),
             schema: "".into(),
@@ -1479,6 +1480,7 @@ mod tests {
         ]);
 
         TableMetadata {
+            replica_identity_full: false,
             relation_oid,
             name: name.into(),
             schema: "public".into(),
@@ -1510,6 +1512,7 @@ mod tests {
                     }),
             );
         TableMetadata {
+            replica_identity_full: false,
             relation_oid,
             name: name.into(),
             schema: "public".into(),

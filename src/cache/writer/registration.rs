@@ -1833,6 +1833,7 @@ mod classify_tests {
             }
         }));
         TableMetadata {
+            replica_identity_full: false,
             relation_oid: oid,
             name: name.into(),
             schema: "public".into(),

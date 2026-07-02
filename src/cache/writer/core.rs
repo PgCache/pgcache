@@ -308,6 +308,13 @@ pub struct WriterCore {
     /// images are untrustworthy as an old-image source; only overlay values
     /// written after the truncate resolve. Mirror of `batch_toast_guard_oids`.
     pub(super) batch_old_image_guard_oids: HashSet<Oid>,
+    /// Registration epoch (`UpdateQueries::epoch`) stamped at each relation's
+    /// first old-image activity in the batch. Overlay entries are
+    /// batch-lifetime but recording is gated on the *current* query set, so a
+    /// mid-batch registration/eviction changes what gets recorded — an epoch
+    /// mismatch drops the relation's entries and guards it for the batch
+    /// remainder (`old_image_overlay_epoch_reconcile`).
+    pub(super) batch_old_image_epochs: HashMap<Oid, u64>,
     /// Recycled row Vecs (`cdc_values_convert` output): replay-drained
     /// `FrameRowEvent`s return their row vecs here so conversion reuses them
     /// instead of allocating per event. Bounded by [`ROW_VEC_POOL_MAX`].
@@ -431,8 +438,11 @@ pub fn writer_run(
         // Create internal channel for population workers to send query commands back
         let (query_tx, mut internal_rx) = tokio::sync::mpsc::unbounded_channel();
 
+        // Boxed: the writer future's state machine has outgrown clippy's
+        // large-futures threshold; one heap allocation at startup keeps it
+        // off the spawning task's stack.
         LocalSet::new()
-            .run_until(async move {
+            .run_until(Box::pin(async move {
                 // Built inside the LocalSet so WriterRegistration can spawn_local
                 // its population workers.
                 let mut core = WriterCore::new(
@@ -645,7 +655,7 @@ pub fn writer_run(
                 }
 
                 Ok(())
-            })
+            }))
             .await
     })
 }
@@ -731,6 +741,7 @@ impl WriterCore {
             toast_overlay_pool: Vec::new(),
             batch_old_image_overlay: HashMap::new(),
             batch_old_image_guard_oids: HashSet::new(),
+            batch_old_image_epochs: HashMap::new(),
             row_vec_pool: Vec::new(),
             batch_toast_guard_oids: HashSet::new(),
             data_dir,

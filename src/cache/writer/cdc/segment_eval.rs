@@ -10,10 +10,11 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::{SimpleQueryMessage, Statement};
 use tracing::{error, warn};
 
-use crate::catalog::TableMetadata;
+use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::pg::protocol::ByteString;
 
 use crate::query::ast::Deparse;
+use crate::query::evaluate::pg_bool_parse;
 use crate::query::transform::{
     BATCH_IDX_COLUMN, resolved_select_node_table_replace_with_unnest,
     resolved_select_node_table_replace_with_values_batch,
@@ -25,8 +26,10 @@ use super::super::super::update_query::{
 use super::super::super::{CacheError, CacheResult, MapIntoReport};
 use super::super::core::WriterCore;
 use super::super::frame::{FrameRowEvent, OverlayEntry};
+use super::super::staging::pk_body_render;
 use super::invalidation::{
-    OLD_IS_NULL_ALIAS_PREFIX, OLD_LESS_THAN_ALIAS_PREFIX, pg_bool_text, row_change_column_fold,
+    OLD_IS_NULL_ALIAS_PREFIX, OLD_LESS_THAN_ALIAS_PREFIX, row_change_column_fold,
+    table_has_reserved_columns,
 };
 use crate::result::error_chain_format;
 
@@ -77,28 +80,48 @@ fn row_change_select_into(
     buf.push_str(BATCH_IDX_COLUMN);
     if spec.needs_changes {
         for column_meta in &table_metadata.columns {
-            let _ = write!(
-                buf,
-                ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
-                name = column_meta.name
-            );
-            if order_columns.contains(&column_meta.name) {
+            let order_projection = order_columns.contains(&column_meta.name);
+            // Identifiers are quoted throughout: cache-table DDL quotes column
+            // names, so reserved-word / mixed-case columns exist and unquoted
+            // references would error (or case-fold) against them. Quoting the
+            // aliases also makes result column names exact-case, keeping the
+            // fold and its consumers keyed by the real column names.
+            let name = escape::escape_identifier(&column_meta.name);
+            let _ = write!(buf, ", o.{name} IS DISTINCT FROM v.{name} AS {name}");
+            if order_projection {
+                let less_than_alias = escape::escape_identifier(&format!(
+                    "{OLD_LESS_THAN_ALIAS_PREFIX}{}",
+                    column_meta.name
+                ));
+                let is_null_alias = escape::escape_identifier(&format!(
+                    "{OLD_IS_NULL_ALIAS_PREFIX}{}",
+                    column_meta.name
+                ));
                 let _ = write!(
                     buf,
-                    ", o.{c} < v.{c} AS {OLD_LESS_THAN_ALIAS_PREFIX}{c}, o.{c} IS NULL AS {OLD_IS_NULL_ALIAS_PREFIX}{c}",
-                    c = column_meta.name
+                    ", o.{name} < v.{name} AS {less_than_alias}, o.{name} IS NULL AS {is_null_alias}",
                 );
             }
         }
     }
-    // Old-image values for the eval-index columns (PGC-255), cast to text so
-    // both the typed (prepared) and simple-query parses read them uniformly.
-    for column in &spec.index_columns {
-        let _ = write!(
-            buf,
-            ", o.{c}::text AS {OLD_VALUE_ALIAS_PREFIX}{c}",
-            c = column
-        );
+    // Old-image values for the wire-canonical eval-index columns (PGC-255),
+    // cast to text so both the typed (prepared) and simple-query parses read
+    // them uniformly.
+    for column in &spec.fetch_columns {
+        let name = escape::escape_identifier(column);
+        let alias = escape::escape_identifier(&format!("{OLD_VALUE_ALIAS_PREFIX}{column}"));
+        let wide = table_metadata
+            .columns
+            .get(column.as_str())
+            .is_some_and(|m| matches!(m.cache_type_name.as_str(), "text" | "varchar"));
+        if wide {
+            let _ = write!(
+                buf,
+                ", CASE WHEN pg_column_size(o.{name}) <= {OLD_VALUE_TEXT_FETCH_CAP}                  THEN o.{name}::text END AS {alias}"
+            );
+        } else {
+            let _ = write!(buf, ", o.{name}::text AS {alias}");
+        }
     }
 }
 
@@ -116,13 +139,15 @@ fn row_change_join_on_into(buf: &mut String, table_metadata: &TableMetadata) {
     let _ = write!(
         buf,
         " JOIN {}.{} o ON ",
-        table_metadata.schema, table_metadata.name
+        escape::escape_identifier(&table_metadata.schema),
+        escape::escape_identifier(&table_metadata.name)
     );
     for (i, pk_column) in table_metadata.primary_key_columns.iter().enumerate() {
         if i > 0 {
             buf.push_str(" AND ");
         }
-        let _ = write!(buf, "o.{pk_column} = v.{pk_column}");
+        let pk = escape::escape_identifier(pk_column);
+        let _ = write!(buf, "o.{pk} = v.{pk}");
     }
 }
 
@@ -158,15 +183,59 @@ type LookupRows<'a> = HashMap<Oid, Vec<LookupRow<'a>>>;
 /// lookup SELECT emits for eval-index columns (PGC-255).
 const OLD_VALUE_ALIAS_PREFIX: &str = "__pgc_ov_";
 
+/// Byte cap on fetched old-image values for unbounded text columns
+/// (`pg_column_size`, which reads the stored size without detoasting). An
+/// over-cap value ships NULL → `None` in the expanded image → the per-column
+/// `Unknown` wildcard — conservative, and it keeps `WHERE body = '…'`-style
+/// constraints from dragging whole documents through every lookup chunk.
+const OLD_VALUE_TEXT_FETCH_CAP: usize = 512;
+
 /// Per-relation lookup shape for one segment, computed once per relation:
 /// whether update events consume changed-column booleans, and the eval-index
-/// columns (names for the SQL projection, positions for overlay recording and
-/// old-image expansion).
+/// columns (positions for overlay recording and old-image expansion;
+/// `fetch_columns` for the rung-2 SQL projection). REPLICA IDENTITY FULL
+/// relations skip the ladder entirely — the 'O' tuple is authoritative
+/// (rung 0 in the dispatch handlers).
 struct RelationFetchSpec {
     needs_changes: bool,
-    index_columns: Vec<EcoString>,
+    replica_identity_full: bool,
+    /// `UpdateQueries::epoch` at spec build — stamped into the overlay via
+    /// `old_image_overlay_epoch_reconcile` before any overlay activity.
+    epoch: u64,
+    /// `__pgc_`-named real columns exist: their aliases would collide with
+    /// the projection-alias namespace (including the batch ordinal), so the
+    /// relation skips the batched lookup and the old-image ladder entirely —
+    /// booleans come from the per-row fallback, old images stay wildcard.
+    reserved_columns: bool,
+    /// Eval-index columns whose `::text` rendering is wire-canonical
+    /// (`old_image_text_stable`) — the only ones rung 2 may fetch. Excluded
+    /// columns stay `None` in the expanded image → `Unknown` wildcard.
+    fetch_columns: Vec<EcoString>,
     index_positions: Vec<usize>,
     full_width: usize,
+}
+
+/// Whether a column type's `::text` cast renders byte-identically to its
+/// pgoutput wire text under any GUC settings — the precondition for probing a
+/// rung-2-fetched value against the eval index, whose equality keys carry
+/// wire/query-literal spellings. `bool` qualifies via parse-time
+/// normalization ('true'/'false' → 't'/'f'); date/time types are DateStyle/
+/// TimeZone-sensitive and floats are extra_float_digits-sensitive, so they
+/// are excluded (their probe positions degrade to the wildcard).
+fn old_image_text_stable(cache_type_name: &str) -> bool {
+    matches!(
+        cache_type_name,
+        "int2"
+            | "int4"
+            | "int8"
+            | "oid"
+            | "numeric"
+            | "text"
+            | "varchar"
+            | "bpchar"
+            | "uuid"
+            | "bool"
+    )
 }
 
 /// The relation's fetch spec, computed on first use per segment. An untracked
@@ -177,38 +246,66 @@ fn relation_fetch_spec<'a>(
     relation_oid: Oid,
 ) -> &'a RelationFetchSpec {
     specs.entry(relation_oid).or_insert_with(|| {
-        let (needs_changes, index_columns) = core
+        let (needs_changes, epoch, index_columns) = core
             .cache
             .update_queries
             .get(&relation_oid)
             .map(|uq| {
                 (
                     uq.needs_change_eval(),
+                    uq.epoch(),
                     uq.eval_index.columns().cloned().collect::<Vec<_>>(),
                 )
             })
-            .unwrap_or((false, Vec::new()));
-        let (index_positions, full_width) = core
-            .cache
-            .tables
-            .get1(&relation_oid)
-            .map(|t| {
-                (
-                    index_columns
-                        .iter()
-                        .filter_map(|c| t.columns.get(c.as_str()).map(|m| m.index()))
-                        .collect::<Vec<_>>(),
-                    t.columns.len(),
-                )
-            })
-            .unwrap_or((Vec::new(), 0));
+            .unwrap_or((false, 0, Vec::new()));
+        let (replica_identity_full, reserved_columns, fetch_columns, index_positions, full_width) =
+            core.cache
+                .tables
+                .get1(&relation_oid)
+                .map(|t| {
+                    (
+                        t.replica_identity_full,
+                        table_has_reserved_columns(t),
+                        index_columns
+                            .iter()
+                            .filter(|c| {
+                                t.columns
+                                    .get(c.as_str())
+                                    .is_some_and(|m| old_image_text_stable(&m.cache_type_name))
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        index_columns
+                            .iter()
+                            .filter_map(|c| t.columns.get(c.as_str()).map(|m| m.index()))
+                            .collect::<Vec<_>>(),
+                        t.columns.len(),
+                    )
+                })
+                .unwrap_or((false, false, Vec::new(), Vec::new(), 0));
         RelationFetchSpec {
             needs_changes,
-            index_columns,
+            replica_identity_full,
+            epoch,
+            reserved_columns,
+            fetch_columns,
             index_positions,
             full_width,
         }
     })
+}
+
+/// `bool::text` renders 'true'/'false' but the eval-index keys carry wire
+/// text ('t'/'f') — normalize so the fetched value probes identically.
+fn old_image_bool_normalize<'a>(meta: &ColumnMetadata, value: &'a str) -> &'a str {
+    if meta.cache_type_name != "bool" {
+        return value;
+    }
+    match value {
+        "true" => "t",
+        "false" => "f",
+        _ => value,
+    }
 }
 
 /// Expand sparse eval-index `(position, value)` pairs to a full-width row.
@@ -706,7 +803,11 @@ impl WriterCdc {
                     row_data,
                 } => {
                     let spec = relation_fetch_spec(core, &mut specs, *relation_oid);
-                    if !spec.index_positions.is_empty() {
+                    if !spec.index_positions.is_empty()
+                        && !spec.replica_identity_full
+                        && !spec.reserved_columns
+                    {
+                        core.old_image_overlay_epoch_reconcile(*relation_oid, spec.epoch);
                         core.old_image_overlay_record_write(
                             *relation_oid,
                             row_data,
@@ -722,42 +823,72 @@ impl WriterCdc {
                     let spec = relation_fetch_spec(core, &mut specs, *relation_oid);
                     // PGC-227: booleans only for relations where some query's
                     // UPDATE invalidation depends on changed columns.
-                    let wants_changes = spec.needs_changes;
-                    let want_old = !spec.index_positions.is_empty();
+                    // Reserved-prefix relations never enter the batch (their
+                    // column aliases would collide with the projection
+                    // namespace) — the per-row fallback carries their booleans.
+                    let wants_changes = spec.needs_changes && !spec.reserved_columns;
+                    // REPLICA IDENTITY FULL bypasses the whole ladder: every
+                    // event carries its own authoritative 'O' old tuple, which
+                    // the dispatch handlers probe directly (rung 0). In the
+                    // remaining (DEFAULT) branch, a present key tuple IS the
+                    // PK-change signal.
+                    let want_old = !spec.replica_identity_full
+                        && !spec.reserved_columns
+                        && !spec.index_positions.is_empty();
                     let pk_changed = !key_data.is_empty();
                     let mut wants_old_image = false;
                     if want_old {
-                        // The old image lives under the pre-event PK.
+                        core.old_image_overlay_epoch_reconcile(*relation_oid, spec.epoch);
+                        // The old image lives under the pre-event PK; render
+                        // each key once per event and reuse it.
                         let source_row: &[Option<ByteString>] =
                             if pk_changed { key_data } else { new_row_data };
-                        match core.old_image_overlay_get(*relation_oid, source_row) {
-                            Some(OverlayEntry::Values(values)) => {
-                                let row = old_image_expand(spec.full_width, values);
-                                membership
-                                    .relations
-                                    .entry(*relation_oid)
-                                    .or_default()
-                                    .old_images
-                                    .insert(event_idx, row);
+                        let source_key = core
+                            .cache
+                            .tables
+                            .get1(relation_oid)
+                            .and_then(|t| pk_body_render(t, source_row));
+                        if let Some(source_key) = source_key {
+                            match core.old_image_overlay_get(*relation_oid, &source_key) {
+                                Some(OverlayEntry::Values(values)) => {
+                                    let row = old_image_expand(spec.full_width, values);
+                                    membership
+                                        .relations
+                                        .entry(*relation_oid)
+                                        .or_default()
+                                        .old_images
+                                        .insert(event_idx, row);
+                                }
+                                // Tombstoned: no valid old-image source → wildcard.
+                                Some(OverlayEntry::Deleted) => {}
+                                // PK-change events never take rung 2: the lookup
+                                // joins by the tuple's (new) PK, but the old image
+                                // lives under the old PK — wildcard instead.
+                                None => {
+                                    wants_old_image = !pk_changed
+                                        && !spec.fetch_columns.is_empty()
+                                        && !core.batch_old_image_guard_oids.contains(relation_oid);
+                                }
                             }
-                            // Tombstoned: no valid old-image source → wildcard.
-                            Some(OverlayEntry::Deleted) => {}
-                            // PK-change events never take rung 2: the lookup
-                            // joins by the tuple's (new) PK, but the old image
-                            // lives under the old PK — wildcard instead.
-                            None => {
-                                wants_old_image = !pk_changed
-                                    && !core.batch_old_image_guard_oids.contains(relation_oid);
+                            if pk_changed {
+                                core.old_image_overlay_record_delete_keyed(
+                                    *relation_oid,
+                                    source_key,
+                                );
+                                core.old_image_overlay_record_write(
+                                    *relation_oid,
+                                    new_row_data,
+                                    &spec.index_positions,
+                                );
+                            } else {
+                                core.old_image_overlay_record_write_keyed(
+                                    *relation_oid,
+                                    source_key,
+                                    new_row_data,
+                                    &spec.index_positions,
+                                );
                             }
                         }
-                        if pk_changed {
-                            core.old_image_overlay_record_delete(*relation_oid, key_data);
-                        }
-                        core.old_image_overlay_record_write(
-                            *relation_oid,
-                            new_row_data,
-                            &spec.index_positions,
-                        );
                     }
                     if wants_changes || wants_old_image {
                         rows_by_relation
@@ -776,25 +907,38 @@ impl WriterCdc {
                     row_data,
                 } => {
                     let spec = relation_fetch_spec(core, &mut specs, *relation_oid);
-                    if !spec.index_positions.is_empty() {
+                    // Under REPLICA IDENTITY FULL the delete tuple is the
+                    // complete old row — handle_delete probes it directly.
+                    if !spec.index_positions.is_empty()
+                        && !spec.replica_identity_full
+                        && !spec.reserved_columns
+                    {
+                        core.old_image_overlay_epoch_reconcile(*relation_oid, spec.epoch);
                         let mut wants_old_image = false;
-                        match core.old_image_overlay_get(*relation_oid, row_data) {
-                            Some(OverlayEntry::Values(values)) => {
-                                let row = old_image_expand(spec.full_width, values);
-                                membership
-                                    .relations
-                                    .entry(*relation_oid)
-                                    .or_default()
-                                    .old_images
-                                    .insert(event_idx, row);
+                        let key = core
+                            .cache
+                            .tables
+                            .get1(relation_oid)
+                            .and_then(|t| pk_body_render(t, row_data));
+                        if let Some(key) = key {
+                            match core.old_image_overlay_get(*relation_oid, &key) {
+                                Some(OverlayEntry::Values(values)) => {
+                                    let row = old_image_expand(spec.full_width, values);
+                                    membership
+                                        .relations
+                                        .entry(*relation_oid)
+                                        .or_default()
+                                        .old_images
+                                        .insert(event_idx, row);
+                                }
+                                Some(OverlayEntry::Deleted) => {}
+                                None => {
+                                    wants_old_image = !spec.fetch_columns.is_empty()
+                                        && !core.batch_old_image_guard_oids.contains(relation_oid);
+                                }
                             }
-                            Some(OverlayEntry::Deleted) => {}
-                            None => {
-                                wants_old_image =
-                                    !core.batch_old_image_guard_oids.contains(relation_oid);
-                            }
+                            core.old_image_overlay_record_delete_keyed(*relation_oid, key);
                         }
-                        core.old_image_overlay_record_delete(*relation_oid, row_data);
                         if wants_old_image {
                             rows_by_relation
                                 .entry(*relation_oid)
@@ -817,7 +961,11 @@ impl WriterCdc {
                     // The post-image is incomplete: neither PK is a
                     // trustworthy old-image source for later same-PK events.
                     let spec = relation_fetch_spec(core, &mut specs, *relation_oid);
-                    if !spec.index_positions.is_empty() {
+                    if !spec.index_positions.is_empty()
+                        && !spec.replica_identity_full
+                        && !spec.reserved_columns
+                    {
+                        core.old_image_overlay_epoch_reconcile(*relation_oid, spec.epoch);
                         if !key_data.is_empty() {
                             core.old_image_overlay_record_delete(*relation_oid, key_data);
                         }
@@ -920,7 +1068,7 @@ impl WriterCdc {
                     ", unnest(${}::text[])::{} AS {}",
                     i + 2,
                     column_meta.cache_type_name,
-                    column_meta.name
+                    escape::escape_identifier(&column_meta.name)
                 );
             }
             self.pg_eval_buf.push_str(") AS v");
@@ -967,13 +1115,18 @@ impl WriterCdc {
                         && let Some(meta) = table_metadata.columns.get(column)
                     {
                         let value: Option<&str> = row.try_get(col_idx).ok().flatten();
-                        old_values.push((meta.index(), value.map(ByteString::from)));
+                        old_values.push((
+                            meta.index(),
+                            value.map(|v| ByteString::from(old_image_bool_normalize(meta, v))),
+                        ));
                     }
                 } else {
                     row_change_column_fold(
                         &mut changes,
                         col.name(),
                         row.try_get::<_, Option<bool>>(col_idx).ok().flatten(),
+                        // Reserved-prefix relations never enter the batch.
+                        true,
                     );
                 }
             }
@@ -1031,7 +1184,11 @@ impl WriterCdc {
         }
         let _ = write!(self.pg_eval_buf, ") AS v({BATCH_IDX_COLUMN}");
         for column_meta in &table_metadata.columns {
-            let _ = write!(self.pg_eval_buf, ", {}", column_meta.name);
+            let _ = write!(
+                self.pg_eval_buf,
+                ", {}",
+                escape::escape_identifier(&column_meta.name)
+            );
         }
         self.pg_eval_buf.push(')');
         row_change_join_on_into(&mut self.pg_eval_buf, table_metadata);
@@ -1060,13 +1217,19 @@ impl WriterCdc {
                     if lookup_row.wants_old_image
                         && let Some(meta) = table_metadata.columns.get(column)
                     {
-                        old_values.push((meta.index(), row.get(col_idx).map(ByteString::from)));
+                        old_values.push((
+                            meta.index(),
+                            row.get(col_idx)
+                                .map(|v| ByteString::from(old_image_bool_normalize(meta, v))),
+                        ));
                     }
                 } else {
                     row_change_column_fold(
                         &mut changes,
                         col.name(),
-                        pg_bool_text(row.get(col_idx)),
+                        row.get(col_idx).and_then(pg_bool_parse),
+                        // Reserved-prefix relations never enter the batch.
+                        true,
                     );
                 }
             }

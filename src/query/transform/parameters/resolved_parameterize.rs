@@ -260,6 +260,7 @@ mod tests {
             },
         ]);
         TableMetadata {
+            replica_identity_full: false,
             relation_oid: Oid::from_raw(1001),
             name: "users".into(),
             schema: "public".into(),

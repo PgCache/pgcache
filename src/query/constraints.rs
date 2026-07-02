@@ -1161,6 +1161,7 @@ mod tests {
         ]);
 
         TableMetadata {
+            replica_identity_full: false,
             relation_oid,
             name: name.into(),
             schema: "public".into(),
@@ -1269,6 +1270,7 @@ mod tests {
         tables.insert_overwrite(test_table_metadata("b", Oid::from_raw(1002)));
 
         tables.insert_overwrite(TableMetadata {
+            replica_identity_full: false,
             relation_oid: Oid::from_raw(1003),
             name: "c".into(),
             schema: "public".into(),

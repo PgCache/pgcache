@@ -172,6 +172,11 @@ pub struct TableMetadata {
     pub columns: ColumnStore,
     /// Index metadata for non-primary-key indexes
     pub indexes: Vec<IndexMetadata>,
+    /// Whether the relation's REPLICA IDENTITY is FULL: pgoutput then carries
+    /// the complete old row on UPDATE/DELETE, so the CDC old-image ladder is
+    /// bypassed (the tuple itself is authoritative) and PK changes are
+    /// detected by comparing PK columns rather than key-tuple presence.
+    pub replica_identity_full: bool,
 }
 
 impl TableMetadata {

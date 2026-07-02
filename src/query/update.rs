@@ -102,6 +102,7 @@ mod tests {
             }
         }));
         TableMetadata {
+            replica_identity_full: false,
             relation_oid,
             name: name.into(),
             schema: "public".into(),

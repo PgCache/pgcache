@@ -166,7 +166,14 @@ impl WriterCdc {
                     new_row_data,
                 } => {
                     Self::toast_overlay_record_write(core, *relation_oid, new_row_data);
-                    if !key_data.is_empty() {
+                    // Under REPLICA IDENTITY FULL `key_data` is present on
+                    // every update; tombstone only a genuinely vacated PK.
+                    let pk_changed = core
+                        .cache
+                        .tables
+                        .get1(relation_oid)
+                        .is_some_and(|t| update_pk_changed(t, key_data, new_row_data));
+                    if pk_changed {
                         Self::toast_overlay_record_delete(core, *relation_oid, key_data);
                     }
                 }
@@ -256,7 +263,11 @@ impl WriterCdc {
                     }
                 }
 
-                let pk_changed = !key_data.is_empty();
+                let pk_changed = core
+                    .cache
+                    .tables
+                    .get1(&relation_oid)
+                    .is_some_and(|t| update_pk_changed(t, &key_data, &new_row_data));
                 *slot = if repaired {
                     metrics.toast_repairs.increment(1);
                     // Advance the chain to this event's post-image under the
@@ -335,9 +346,9 @@ impl WriterCdc {
         };
 
         // The cached copy the unchanged-toast marker refers to lives under
-        // the row's PRE-image key: when this UPDATE changed the PK
-        // (`key_data` non-empty), the source row is the old PK.
-        let pk_changed = !key_data.is_empty();
+        // the row's PRE-image key: when this UPDATE changed the PK, the
+        // source row is the old PK.
+        let pk_changed = update_pk_changed(table_metadata, &key_data, new_row_data);
         let source_row: &[Option<ByteString>] = if pk_changed { &key_data } else { new_row_data };
         let source_pk = pk_body_render(table_metadata, source_row);
 
