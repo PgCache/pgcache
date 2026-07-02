@@ -342,6 +342,19 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
         }
     }
 
+    /// Union of the columns any class consults — the columns a recovered old
+    /// image must carry for `candidates_point_into` to probe at full precision
+    /// (PGC-255). The unconstrained class contributes nothing; when this is
+    /// empty, every entry is value-independent and old-image recovery buys
+    /// nothing.
+    pub fn columns(&self) -> impl Iterator<Item = &EcoString> {
+        let mut seen: HashSet<&EcoString> = HashSet::new();
+        self.classes
+            .keys()
+            .flat_map(ColumnSet::columns)
+            .filter(move |c| seen.insert(c))
+    }
+
     /// Number of column-set classes across all entries. Useful for metrics
     /// and for sanity-checking the partitioning fan-out.
     pub fn classes_len(&self) -> usize {

@@ -24,7 +24,7 @@ use super::super::super::update_query::{
 };
 use super::super::super::{CacheError, CacheResult, MapIntoReport};
 use super::super::core::WriterCore;
-use super::super::frame::FrameRowEvent;
+use super::super::frame::{FrameRowEvent, OverlayEntry};
 use super::invalidation::{
     OLD_IS_NULL_ALIAS_PREFIX, OLD_LESS_THAN_ALIAS_PREFIX, pg_bool_text, row_change_column_fold,
 };
@@ -37,9 +37,10 @@ use super::*;
 /// `table_metadata.columns` order. The unnest transform's parameter numbering
 /// and the prepared row-change SQL builder both follow the same column order —
 /// this is the single place the binding contract is produced.
-fn chunk_arrays_build<'a>(
+fn chunk_arrays_build<'a, R>(
     table_metadata: &TableMetadata,
-    row_chunk: &[(usize, &'a [Option<ByteString>])],
+    row_chunk: &[R],
+    row_of: impl Fn(&R) -> &'a [Option<ByteString>],
 ) -> (Vec<i32>, Vec<Vec<Option<&'a str>>>) {
     // Chunk length is bounded by PG_EVAL_ROW_CHUNK (64): never wraps.
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -50,7 +51,11 @@ fn chunk_arrays_build<'a>(
         .map(|column_meta| {
             row_chunk
                 .iter()
-                .map(|(_, row)| row.get(column_meta.index()).and_then(|v| v.as_deref()))
+                .map(|r| {
+                    row_of(r)
+                        .get(column_meta.index())
+                        .and_then(|v| v.as_deref())
+                })
                 .collect()
         })
         .collect();
@@ -66,22 +71,34 @@ fn row_change_select_into(
     buf: &mut String,
     table_metadata: &TableMetadata,
     order_columns: &HashSet<&EcoString>,
+    spec: &RelationFetchSpec,
 ) {
     buf.push_str("SELECT v.");
     buf.push_str(BATCH_IDX_COLUMN);
-    for column_meta in &table_metadata.columns {
-        let _ = write!(
-            buf,
-            ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
-            name = column_meta.name
-        );
-        if order_columns.contains(&column_meta.name) {
+    if spec.needs_changes {
+        for column_meta in &table_metadata.columns {
             let _ = write!(
                 buf,
-                ", o.{c} < v.{c} AS {OLD_LESS_THAN_ALIAS_PREFIX}{c}, o.{c} IS NULL AS {OLD_IS_NULL_ALIAS_PREFIX}{c}",
-                c = column_meta.name
+                ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
+                name = column_meta.name
             );
+            if order_columns.contains(&column_meta.name) {
+                let _ = write!(
+                    buf,
+                    ", o.{c} < v.{c} AS {OLD_LESS_THAN_ALIAS_PREFIX}{c}, o.{c} IS NULL AS {OLD_IS_NULL_ALIAS_PREFIX}{c}",
+                    c = column_meta.name
+                );
+            }
         }
+    }
+    // Old-image values for the eval-index columns (PGC-255), cast to text so
+    // both the typed (prepared) and simple-query parses read them uniformly.
+    for column in &spec.index_columns {
+        let _ = write!(
+            buf,
+            ", o.{c}::text AS {OLD_VALUE_ALIAS_PREFIX}{c}",
+            c = column
+        );
     }
 }
 
@@ -121,6 +138,96 @@ pub(super) struct PreparedEvalKey {
 /// Per-relation membership-eval rows of one segment: `(event index, row)`.
 type SegmentRows<'a> = HashMap<Oid, Vec<(usize, &'a [Option<ByteString>])>>;
 
+/// One row of the per-relation row-change/old-image lookup batch. The join
+/// row is the new tuple for updates and the delete tuple for deletes;
+/// `wants_changes` marks update events on change-eval relations (their
+/// `IS DISTINCT FROM` booleans are consumed), `wants_old_image` marks events
+/// whose old image the rung-1 overlay didn't resolve and should be filled
+/// from the lookup's `o.<col>` values (PGC-255).
+struct LookupRow<'a> {
+    event_idx: usize,
+    row: &'a [Option<ByteString>],
+    wants_changes: bool,
+    wants_old_image: bool,
+}
+
+/// Per-relation lookup rows of one segment.
+type LookupRows<'a> = HashMap<Oid, Vec<LookupRow<'a>>>;
+
+/// Alias prefix for the old-image value projections (`o.<col>::text`) the
+/// lookup SELECT emits for eval-index columns (PGC-255).
+const OLD_VALUE_ALIAS_PREFIX: &str = "__pgc_ov_";
+
+/// Per-relation lookup shape for one segment, computed once per relation:
+/// whether update events consume changed-column booleans, and the eval-index
+/// columns (names for the SQL projection, positions for overlay recording and
+/// old-image expansion).
+struct RelationFetchSpec {
+    needs_changes: bool,
+    index_columns: Vec<EcoString>,
+    index_positions: Vec<usize>,
+    full_width: usize,
+}
+
+/// The relation's fetch spec, computed on first use per segment. An untracked
+/// relation yields an empty spec (no booleans, no old images).
+fn relation_fetch_spec<'a>(
+    core: &WriterCore,
+    specs: &'a mut HashMap<Oid, RelationFetchSpec>,
+    relation_oid: Oid,
+) -> &'a RelationFetchSpec {
+    specs.entry(relation_oid).or_insert_with(|| {
+        let (needs_changes, index_columns) = core
+            .cache
+            .update_queries
+            .get(&relation_oid)
+            .map(|uq| {
+                (
+                    uq.needs_change_eval(),
+                    uq.eval_index.columns().cloned().collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or((false, Vec::new()));
+        let (index_positions, full_width) = core
+            .cache
+            .tables
+            .get1(&relation_oid)
+            .map(|t| {
+                (
+                    index_columns
+                        .iter()
+                        .filter_map(|c| t.columns.get(c.as_str()).map(|m| m.index()))
+                        .collect::<Vec<_>>(),
+                    t.columns.len(),
+                )
+            })
+            .unwrap_or((Vec::new(), 0));
+        RelationFetchSpec {
+            needs_changes,
+            index_columns,
+            index_positions,
+            full_width,
+        }
+    })
+}
+
+/// Expand sparse eval-index `(position, value)` pairs to a full-width row.
+/// Unfetched positions stay `None`, which probes as the `Unknown` wildcard —
+/// vacuous, since the probe only consults index columns, all of which are
+/// fetched.
+fn old_image_expand(
+    full_width: usize,
+    values: &[(usize, Option<ByteString>)],
+) -> Vec<Option<ByteString>> {
+    let mut row = vec![None; full_width];
+    for (position, value) in values {
+        if let Some(slot) = row.get_mut(*position) {
+            *slot = value.clone();
+        }
+    }
+    row
+}
+
 /// Batched PgEval membership + row-change results for one segment of frame
 /// row events (PGC-241). Built by `segment_membership_eval` /
 /// `segment_row_changes_eval`, consumed per event by the decide pass.
@@ -157,6 +264,11 @@ struct RelationBatch {
     row_change_covered: HashSet<usize>,
     /// Per covered update event: column → changed (`IS DISTINCT FROM`).
     row_changes: HashMap<usize, RowChanges>,
+    /// Per update/delete event: the recovered old image as a full-width row
+    /// (eval-index columns carry values, the rest `None` → `Unknown` in the
+    /// probe). Resolved from the rung-1 overlay or the batched rung-2 lookup;
+    /// absent = wildcard fallback (PGC-255).
+    old_images: HashMap<usize, Vec<Option<ByteString>>>,
 }
 
 impl SegmentMembership {
@@ -176,7 +288,9 @@ impl SegmentMembership {
             .row_change_covered
             .contains(&event_idx)
             .then(|| batch.row_changes.get(&event_idx));
-        if fresh_fps.is_none() && rest_fps.is_none() && row_change.is_none() {
+        let old_image = batch.old_images.get(&event_idx).map(Vec::as_slice);
+        if fresh_fps.is_none() && rest_fps.is_none() && row_change.is_none() && old_image.is_none()
+        {
             return None;
         }
         Some(BatchEvalView {
@@ -185,6 +299,7 @@ impl SegmentMembership {
             hits: &batch.hits,
             event_idx,
             row_change,
+            old_image,
         })
     }
 }
@@ -198,6 +313,9 @@ pub(super) struct BatchEvalView<'a> {
     /// Outer `None` = row-change not batched for this event (fall back to the
     /// per-row SELECT); `Some(inner)` mirrors `query_row_changes`' return.
     pub(super) row_change: Option<Option<&'a RowChanges>>,
+    /// The event's recovered old image, when the recovery ladder resolved one
+    /// — `None` = use the wildcard probe (PGC-255).
+    pub(super) old_image: Option<&'a [Option<ByteString>]>,
 }
 
 impl BatchEvalView<'_> {
@@ -221,7 +339,7 @@ impl WriterCdc {
     /// detection, into one [`SegmentMembership`] matrix (PGC-241).
     pub(super) async fn segment_eval(
         &mut self,
-        core: &WriterCore,
+        core: &mut WriterCore,
         events: &[FrameRowEvent],
         base_idx: usize,
     ) -> CacheResult<SegmentMembership> {
@@ -407,7 +525,8 @@ impl WriterCdc {
         row_chunk: &[(usize, &[Option<ByteString>])],
         hits: &mut HashSet<(usize, Fingerprint)>,
     ) -> CacheResult<()> {
-        let (ordinals, column_arrays) = chunk_arrays_build(table_metadata, row_chunk);
+        let (ordinals, column_arrays) =
+            chunk_arrays_build(table_metadata, row_chunk, |&(_, row)| row);
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(1 + column_arrays.len());
         params.push(&ordinals);
         for array in &column_arrays {
@@ -569,37 +688,149 @@ impl WriterCdc {
     /// `cdc_write_conn`), so batching up front is snapshot-equivalent.
     async fn segment_row_changes_eval(
         &mut self,
-        core: &WriterCore,
+        core: &mut WriterCore,
         events: &[FrameRowEvent],
         base_idx: usize,
         membership: &mut SegmentMembership,
     ) -> CacheResult<()> {
-        let mut rows_by_relation: SegmentRows<'_> = HashMap::new();
+        let mut specs: HashMap<Oid, RelationFetchSpec> = HashMap::new();
+        let mut rows_by_relation: LookupRows<'_> = HashMap::new();
+
+        // Arrival-order pre-pass: maintain the rung-1 old-image overlay,
+        // resolve overlay hits, and queue the rest for the batched lookup.
         for (offset, event) in events.iter().enumerate() {
-            let FrameRowEvent::Update {
-                relation_oid,
-                new_row_data,
-                ..
-            } = event
-            else {
-                continue;
-            };
-            // PGC-227: skip relations where no query's UPDATE invalidation
-            // depends on changed columns — handle_update never reads changes.
-            if !core
-                .cache
-                .update_queries
-                .get(relation_oid)
-                .is_some_and(|q| q.needs_change_eval())
-            {
-                continue;
+            let event_idx = base_idx + offset;
+            match event {
+                FrameRowEvent::Insert {
+                    relation_oid,
+                    row_data,
+                } => {
+                    let spec = relation_fetch_spec(core, &mut specs, *relation_oid);
+                    if !spec.index_positions.is_empty() {
+                        core.old_image_overlay_record_write(
+                            *relation_oid,
+                            row_data,
+                            &spec.index_positions,
+                        );
+                    }
+                }
+                FrameRowEvent::Update {
+                    relation_oid,
+                    key_data,
+                    new_row_data,
+                } => {
+                    let spec = relation_fetch_spec(core, &mut specs, *relation_oid);
+                    // PGC-227: booleans only for relations where some query's
+                    // UPDATE invalidation depends on changed columns.
+                    let wants_changes = spec.needs_changes;
+                    let want_old = !spec.index_positions.is_empty();
+                    let pk_changed = !key_data.is_empty();
+                    let mut wants_old_image = false;
+                    if want_old {
+                        // The old image lives under the pre-event PK.
+                        let source_row: &[Option<ByteString>] =
+                            if pk_changed { key_data } else { new_row_data };
+                        match core.old_image_overlay_get(*relation_oid, source_row) {
+                            Some(OverlayEntry::Values(values)) => {
+                                let row = old_image_expand(spec.full_width, values);
+                                membership
+                                    .relations
+                                    .entry(*relation_oid)
+                                    .or_default()
+                                    .old_images
+                                    .insert(event_idx, row);
+                            }
+                            // Tombstoned: no valid old-image source → wildcard.
+                            Some(OverlayEntry::Deleted) => {}
+                            // PK-change events never take rung 2: the lookup
+                            // joins by the tuple's (new) PK, but the old image
+                            // lives under the old PK — wildcard instead.
+                            None => {
+                                wants_old_image = !pk_changed
+                                    && !core.batch_old_image_guard_oids.contains(relation_oid);
+                            }
+                        }
+                        if pk_changed {
+                            core.old_image_overlay_record_delete(*relation_oid, key_data);
+                        }
+                        core.old_image_overlay_record_write(
+                            *relation_oid,
+                            new_row_data,
+                            &spec.index_positions,
+                        );
+                    }
+                    if wants_changes || wants_old_image {
+                        rows_by_relation
+                            .entry(*relation_oid)
+                            .or_default()
+                            .push(LookupRow {
+                                event_idx,
+                                row: new_row_data,
+                                wants_changes,
+                                wants_old_image,
+                            });
+                    }
+                }
+                FrameRowEvent::Delete {
+                    relation_oid,
+                    row_data,
+                } => {
+                    let spec = relation_fetch_spec(core, &mut specs, *relation_oid);
+                    if !spec.index_positions.is_empty() {
+                        let mut wants_old_image = false;
+                        match core.old_image_overlay_get(*relation_oid, row_data) {
+                            Some(OverlayEntry::Values(values)) => {
+                                let row = old_image_expand(spec.full_width, values);
+                                membership
+                                    .relations
+                                    .entry(*relation_oid)
+                                    .or_default()
+                                    .old_images
+                                    .insert(event_idx, row);
+                            }
+                            Some(OverlayEntry::Deleted) => {}
+                            None => {
+                                wants_old_image =
+                                    !core.batch_old_image_guard_oids.contains(relation_oid);
+                            }
+                        }
+                        core.old_image_overlay_record_delete(*relation_oid, row_data);
+                        if wants_old_image {
+                            rows_by_relation
+                                .entry(*relation_oid)
+                                .or_default()
+                                .push(LookupRow {
+                                    event_idx,
+                                    row: row_data,
+                                    wants_changes: false,
+                                    wants_old_image: true,
+                                });
+                        }
+                    }
+                }
+                FrameRowEvent::UpdateToastFallback {
+                    relation_oid,
+                    key_data,
+                    new_row_data,
+                    ..
+                } => {
+                    // The post-image is incomplete: neither PK is a
+                    // trustworthy old-image source for later same-PK events.
+                    let spec = relation_fetch_spec(core, &mut specs, *relation_oid);
+                    if !spec.index_positions.is_empty() {
+                        if !key_data.is_empty() {
+                            core.old_image_overlay_record_delete(*relation_oid, key_data);
+                        }
+                        core.old_image_overlay_record_delete(*relation_oid, new_row_data);
+                    }
+                }
+                FrameRowEvent::UpdateToasted { .. }
+                | FrameRowEvent::Truncate { .. }
+                | FrameRowEvent::Boundary { .. } => {}
             }
-            rows_by_relation
-                .entry(*relation_oid)
-                .or_default()
-                .push((base_idx + offset, new_row_data));
         }
 
+        let core = &*core;
         for (relation_oid, rows) in rows_by_relation {
             let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
                 continue;
@@ -607,11 +838,14 @@ impl WriterCdc {
             if table_metadata.primary_key_columns.is_empty() {
                 continue;
             }
+            let Some(spec) = specs.get(&relation_oid) else {
+                continue;
+            };
             // Uniform VALUES arity, as in the membership batch.
             let full_width = table_metadata.columns.len();
-            let batch_rows: Vec<(usize, &[Option<ByteString>])> = rows
+            let batch_rows: Vec<LookupRow<'_>> = rows
                 .into_iter()
-                .filter(|(_, row)| row.len() == full_width)
+                .filter(|r| r.row.len() == full_width)
                 .collect();
 
             let batch = membership.relations.entry(relation_oid).or_default();
@@ -620,21 +854,24 @@ impl WriterCdc {
                 // on failure: drop the cached statement and run the inlined
                 // form for this chunk (re-prepare on next use).
                 if let Err(e) = self
-                    .row_change_chunk_prepared(core, table_metadata, row_chunk, batch)
+                    .row_change_chunk_prepared(core, table_metadata, spec, row_chunk, batch)
                     .await
                 {
                     warn!(
                         "prepared row-change eval failed; falling back to inline: {}",
                         error_chain_format(e.current_context()),
                     );
-                    self.row_change_chunk_inline(core, table_metadata, row_chunk, batch)
+                    self.row_change_chunk_inline(core, table_metadata, spec, row_chunk, batch)
                         .await?;
                 }
             }
 
-            batch
-                .row_change_covered
-                .extend(batch_rows.iter().map(|(event_idx, _)| *event_idx));
+            batch.row_change_covered.extend(
+                batch_rows
+                    .iter()
+                    .filter(|r| r.wants_changes)
+                    .map(|r| r.event_idx),
+            );
         }
 
         Ok(())
@@ -647,14 +884,15 @@ impl WriterCdc {
         &mut self,
         core: &WriterCore,
         table_metadata: &TableMetadata,
-        row_chunk: &[(usize, &[Option<ByteString>])],
+        spec: &RelationFetchSpec,
+        row_chunk: &[LookupRow<'_>],
         batch: &mut RelationBatch,
     ) -> CacheResult<()> {
         let relation_oid = table_metadata.relation_oid;
         let update_queries = core.cache.update_queries.get(&relation_oid);
         // The projection list depends on the relation's registered queries
-        // (their ORDER BY key columns) — a stale statement would silently drop
-        // the ordering projections, so the epoch is part of the cache hit.
+        // (ORDER BY key columns, eval-index columns) — a stale statement would
+        // silently drop projections, so the epoch is part of the cache hit.
         let epoch = update_queries.map_or(0, UpdateQueries::epoch);
         let cached = self
             .prepared_row_change
@@ -670,6 +908,7 @@ impl WriterCdc {
                 &mut self.pg_eval_buf,
                 table_metadata,
                 &relation_order_columns(update_queries),
+                spec,
             );
             let _ = write!(
                 self.pg_eval_buf,
@@ -696,7 +935,7 @@ impl WriterCdc {
             statement
         };
 
-        let (ordinals, column_arrays) = chunk_arrays_build(table_metadata, row_chunk);
+        let (ordinals, column_arrays) = chunk_arrays_build(table_metadata, row_chunk, |r| r.row);
         let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(1 + column_arrays.len());
         params.push(&ordinals);
         for array in &column_arrays {
@@ -717,18 +956,38 @@ impl WriterCdc {
                 continue;
             };
             #[allow(clippy::cast_sign_loss)] // ordinals are 0..chunk len
-            let Some(&(event_idx, _)) = row_chunk.get(local_idx as usize) else {
+            let Some(lookup_row) = row_chunk.get(local_idx as usize) else {
                 continue;
             };
             let mut changes = RowChanges::with_capacity(row.len().saturating_sub(1));
+            let mut old_values: Vec<(usize, Option<ByteString>)> = Vec::new();
             for (col_idx, col) in row.columns().iter().enumerate().skip(1) {
-                row_change_column_fold(
-                    &mut changes,
-                    col.name(),
-                    row.try_get::<_, Option<bool>>(col_idx).ok().flatten(),
-                );
+                if let Some(column) = col.name().strip_prefix(OLD_VALUE_ALIAS_PREFIX) {
+                    if lookup_row.wants_old_image
+                        && let Some(meta) = table_metadata.columns.get(column)
+                    {
+                        let value: Option<&str> = row.try_get(col_idx).ok().flatten();
+                        old_values.push((meta.index(), value.map(ByteString::from)));
+                    }
+                } else {
+                    row_change_column_fold(
+                        &mut changes,
+                        col.name(),
+                        row.try_get::<_, Option<bool>>(col_idx).ok().flatten(),
+                    );
+                }
             }
-            batch.row_changes.insert(event_idx, changes);
+            if lookup_row.wants_changes {
+                batch.row_changes.insert(lookup_row.event_idx, changes);
+            }
+            if lookup_row.wants_old_image {
+                // Overlay resolutions were never queued as wanting old images,
+                // so vacancy is the norm; keep them authoritative regardless.
+                batch
+                    .old_images
+                    .entry(lookup_row.event_idx)
+                    .or_insert_with(|| old_image_expand(table_metadata.columns.len(), &old_values));
+            }
         }
         Ok(())
     }
@@ -739,7 +998,8 @@ impl WriterCdc {
         &mut self,
         core: &WriterCore,
         table_metadata: &TableMetadata,
-        row_chunk: &[(usize, &[Option<ByteString>])],
+        spec: &RelationFetchSpec,
+        row_chunk: &[LookupRow<'_>],
         batch: &mut RelationBatch,
     ) -> CacheResult<()> {
         self.pg_eval_buf.clear();
@@ -747,15 +1007,17 @@ impl WriterCdc {
             &mut self.pg_eval_buf,
             table_metadata,
             &relation_order_columns(core.cache.update_queries.get(&table_metadata.relation_oid)),
+            spec,
         );
         self.pg_eval_buf.push_str(" FROM (VALUES ");
-        for (i, (_, row)) in row_chunk.iter().enumerate() {
+        for (i, lookup_row) in row_chunk.iter().enumerate() {
             if i > 0 {
                 self.pg_eval_buf.push_str(", ");
             }
             let _ = write!(self.pg_eval_buf, "({i}");
             for column_meta in &table_metadata.columns {
-                let value = row
+                let value = lookup_row
+                    .row
                     .get(column_meta.index())
                     .and_then(|v| v.as_deref())
                     .map_or_else(|| "NULL".to_owned(), escape::escape_literal);
@@ -788,14 +1050,35 @@ impl WriterCdc {
             let Some(local_idx) = row.get(0).and_then(|v| v.parse::<usize>().ok()) else {
                 continue;
             };
-            let Some(&(event_idx, _)) = row_chunk.get(local_idx) else {
+            let Some(lookup_row) = row_chunk.get(local_idx) else {
                 continue;
             };
             let mut changes = RowChanges::with_capacity(row.len().saturating_sub(1));
+            let mut old_values: Vec<(usize, Option<ByteString>)> = Vec::new();
             for (col_idx, col) in row.columns().iter().enumerate().skip(1) {
-                row_change_column_fold(&mut changes, col.name(), pg_bool_text(row.get(col_idx)));
+                if let Some(column) = col.name().strip_prefix(OLD_VALUE_ALIAS_PREFIX) {
+                    if lookup_row.wants_old_image
+                        && let Some(meta) = table_metadata.columns.get(column)
+                    {
+                        old_values.push((meta.index(), row.get(col_idx).map(ByteString::from)));
+                    }
+                } else {
+                    row_change_column_fold(
+                        &mut changes,
+                        col.name(),
+                        pg_bool_text(row.get(col_idx)),
+                    );
+                }
             }
-            batch.row_changes.insert(event_idx, changes);
+            if lookup_row.wants_changes {
+                batch.row_changes.insert(lookup_row.event_idx, changes);
+            }
+            if lookup_row.wants_old_image {
+                batch
+                    .old_images
+                    .entry(lookup_row.event_idx)
+                    .or_insert_with(|| old_image_expand(table_metadata.columns.len(), &old_values));
+            }
         }
         Ok(())
     }

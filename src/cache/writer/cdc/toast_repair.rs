@@ -12,7 +12,7 @@ use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 
 use super::super::core::WriterCore;
-use super::super::frame::{FrameRowEvent, ToastOverlayEntry};
+use super::super::frame::{FrameRowEvent, OverlayEntry};
 use super::super::staging::pk_body_render;
 
 use super::*;
@@ -83,12 +83,12 @@ impl WriterCdc {
         Self::toastable_values_extend(table_metadata, row_data, &mut values);
         let displaced = core
             .batch_toast_overlay
-            .insert((relation_oid, key), ToastOverlayEntry::Values(values));
+            .insert((relation_oid, key), OverlayEntry::Values(values));
         core.toast_overlay_recycle(displaced);
     }
 
     /// Collect a row image's toastable-column `(position, value)` pairs into
-    /// `values` — the payload of a [`ToastOverlayEntry::Values`].
+    /// `values` — the payload of a [`OverlayEntry::Values`].
     fn toastable_values_extend(
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
@@ -120,7 +120,7 @@ impl WriterCdc {
         if let Some(key) = pk_body_render(table_metadata, row_data) {
             let displaced = core
                 .batch_toast_overlay
-                .insert((relation_oid, key), ToastOverlayEntry::Deleted);
+                .insert((relation_oid, key), OverlayEntry::Deleted);
             core.toast_overlay_recycle(displaced);
         }
     }
@@ -218,7 +218,7 @@ impl WriterCdc {
         // from its post-image, not the pre-batch image.
         for (relation_oid, pendings) in pending {
             let lookup = Self::toast_lookup_batch(core, relation_oid, &pendings).await;
-            let mut chain: HashMap<EcoString, ToastOverlayEntry> = HashMap::new();
+            let mut chain: HashMap<EcoString, OverlayEntry> = HashMap::new();
             for p in pendings {
                 let Some(slot) = events.get_mut(p.event_idx) else {
                     continue;
@@ -238,8 +238,8 @@ impl WriterCdc {
                     continue;
                 };
                 let source_values = match chain.get(&p.overlay_key) {
-                    Some(ToastOverlayEntry::Values(values)) => Some(values),
-                    Some(ToastOverlayEntry::Deleted) => None,
+                    Some(OverlayEntry::Values(values)) => Some(values),
+                    Some(OverlayEntry::Deleted) => None,
                     None => lookup.as_ref().and_then(|rows| rows.get(&p.raw_pk)),
                 };
                 let mut repaired = source_values.is_some();
@@ -271,10 +271,10 @@ impl WriterCdc {
                             Some(p.overlay_key.clone())
                         };
                         if pk_changed {
-                            chain.insert(p.overlay_key.clone(), ToastOverlayEntry::Deleted);
+                            chain.insert(p.overlay_key.clone(), OverlayEntry::Deleted);
                         }
                         if let Some(key) = result_key {
-                            chain.insert(key, ToastOverlayEntry::Values(post));
+                            chain.insert(key, OverlayEntry::Values(post));
                         }
                     }
                     FrameRowEvent::Update {
@@ -286,12 +286,12 @@ impl WriterCdc {
                     // The fallback handler deletes the row: later queued
                     // events of either PK must not repair from the (stale)
                     // pre-batch image.
-                    chain.insert(p.overlay_key.clone(), ToastOverlayEntry::Deleted);
+                    chain.insert(p.overlay_key.clone(), OverlayEntry::Deleted);
                     if pk_changed
                         && let Some(table_metadata) = core.cache.tables.get1(&relation_oid)
                         && let Some(key) = pk_body_render(table_metadata, &new_row_data)
                     {
-                        chain.insert(key, ToastOverlayEntry::Deleted);
+                        chain.insert(key, OverlayEntry::Deleted);
                     }
                     Self::toast_fallback_build(core, relation_oid, key_data, new_row_data, &toasted)
                 };
@@ -302,7 +302,7 @@ impl WriterCdc {
             // already recorded eagerly (pass-1 Queue branch for vacated old
             // PKs, `toast_fallback_build` for fallen-back rows).
             for (key, entry) in chain {
-                if matches!(entry, ToastOverlayEntry::Values(_)) {
+                if matches!(entry, OverlayEntry::Values(_)) {
                     core.batch_toast_overlay
                         .entry((relation_oid, key))
                         .or_insert(entry);
@@ -344,7 +344,7 @@ impl WriterCdc {
         let resolution = match &source_pk {
             None => ToastResolution::Fallback,
             Some(key) => match core.batch_toast_overlay.get(&(relation_oid, key.clone())) {
-                Some(ToastOverlayEntry::Values(values)) => {
+                Some(OverlayEntry::Values(values)) => {
                     let mut complete = true;
                     let mut repaired: Vec<(usize, Option<ByteString>)> =
                         Vec::with_capacity(toasted.len());
@@ -360,7 +360,7 @@ impl WriterCdc {
                         ToastResolution::Fallback
                     }
                 }
-                Some(ToastOverlayEntry::Deleted) => ToastResolution::Fallback,
+                Some(OverlayEntry::Deleted) => ToastResolution::Fallback,
                 None if core.batch_toast_guard_oids.contains(&relation_oid) => {
                     ToastResolution::Fallback
                 }

@@ -289,12 +289,25 @@ pub struct WriterCore {
     /// `Deleted` tombstones block the stale lookup outright. Maintained in
     /// arrival order by the replay pre-pass; only relations with a toastable
     /// column pay for it. Same lifecycle as `batch_deleted_pks`.
-    pub(super) batch_toast_overlay: HashMap<(Oid, EcoString), ToastOverlayEntry>,
-    /// Recycled `ToastOverlayEntry::Values` allocations: batch reset harvests
+    pub(super) batch_toast_overlay: HashMap<(Oid, EcoString), OverlayEntry>,
+    /// Recycled `OverlayEntry::Values` allocations: batch reset harvests
     /// cleared Vecs here instead of dropping them, so steady-state overlay
     /// recording allocates no per-event Vec. Bounded by
-    /// [`TOAST_OVERLAY_POOL_MAX`].
+    /// [`TOAST_OVERLAY_POOL_MAX`]. Shared by both overlays.
     pub(super) toast_overlay_pool: Vec<Vec<(usize, Option<ByteString>)>>,
+    /// Last in-batch write per PK of the eval-index columns' values — the
+    /// rung-1 source for the precise old-image probe (PGC-255). The batched
+    /// old-image lookup reads the pre-batch committed state, which is stale
+    /// for any PK this batch has already written; the overlay supplies the
+    /// in-batch values instead, and `Deleted` tombstones block the stale
+    /// lookup. Maintained in arrival order by the segment pre-pass; only
+    /// relations with a non-empty eval-index column set pay for it. Same
+    /// lifecycle as `batch_toast_overlay`.
+    pub(super) batch_old_image_overlay: HashMap<(Oid, EcoString), OverlayEntry>,
+    /// Relations truncated in the current batch: their pre-batch committed
+    /// images are untrustworthy as an old-image source; only overlay values
+    /// written after the truncate resolve. Mirror of `batch_toast_guard_oids`.
+    pub(super) batch_old_image_guard_oids: HashSet<Oid>,
     /// Recycled row Vecs (`cdc_values_convert` output): replay-drained
     /// `FrameRowEvent`s return their row vecs here so conversion reuses them
     /// instead of allocating per event. Bounded by [`ROW_VEC_POOL_MAX`].
@@ -716,6 +729,8 @@ impl WriterCore {
             batch_deleted_pks: HashSet::new(),
             batch_toast_overlay: HashMap::new(),
             toast_overlay_pool: Vec::new(),
+            batch_old_image_overlay: HashMap::new(),
+            batch_old_image_guard_oids: HashSet::new(),
             row_vec_pool: Vec::new(),
             batch_toast_guard_oids: HashSet::new(),
             data_dir,

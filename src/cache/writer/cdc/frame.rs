@@ -309,7 +309,13 @@ impl WriterCdc {
                         relation_oid,
                         row_data,
                     } => (
-                        self.handle_delete(core, *relation_oid, row_data).await,
+                        self.handle_delete(
+                            core,
+                            *relation_oid,
+                            row_data,
+                            membership.view(*relation_oid, i),
+                        )
+                        .await,
                         "cdc replay delete",
                     ),
                     // Unreachable by construction (`split_last` separated the

@@ -334,9 +334,10 @@ impl WriterCore {
     /// PK-only (via absent-column `Unknown`) under DEFAULT.
     /// Candidate queries a *removed* row image could have belonged to: the
     /// `eval_index` point probe on the old image. `pk_only` forces the `Unknown`
-    /// wildcard for non-PK columns (their old values are gone under REPLICA
-    /// IDENTITY DEFAULT), so the probe over-returns rather than under-returns.
-    /// Shared by MV dirty-marking and the narrowed memo-eviction pass (ADR-045).
+    /// wildcard for non-PK columns, so the probe over-returns rather than
+    /// under-returns. Since PGC-255 this is the recovery ladder's *fallback* —
+    /// batch-covered events probe the recovered old image with real values
+    /// instead. Shared by MV dirty-marking and the memo-eviction pass (ADR-045).
     ///
     /// Fills a caller-provided scratch set (cleared first). The old-image wildcard
     /// probe over-returns to a large set; reusing the buffer keeps that big backing

@@ -527,22 +527,29 @@ impl WriterCdc {
         let mut local_candidates = core.candidate_set_take();
         eval_candidates_into(core, relation_oid, new_row_data, &mut local_candidates);
 
-        // Old-image candidates (PK-only; old non-PK values are gone), probed
-        // once and reused by both the symmetric memo eviction and the MV
-        // removed-row dirty-mark below (ADR-045 — avoids a second eval_index
-        // probe per UPDATE). Memo eviction is symmetric: a row leaving a query
-        // makes its memo stale, so memo needs new ∪ old candidates.
+        // Old-image candidates, probed once and reused by both the symmetric
+        // memo eviction and the MV removed-row dirty-mark below (ADR-045 —
+        // avoids a second eval_index probe per UPDATE). Memo eviction is
+        // symmetric: a row leaving a query makes its memo stale, so memo needs
+        // new ∪ old candidates. When the recovery ladder resolved the old
+        // image (PGC-255), probe it with real values — 6.5× fewer candidates
+        // than the PK-only wildcard fallback, same never-under-return.
         let mut old_candidates = core.candidate_set_take();
-        core.eval_candidates_removed_into(
-            relation_oid,
-            if key_data.is_empty() {
-                new_row_data
-            } else {
-                key_data
-            },
-            true,
-            &mut old_candidates,
-        );
+        match batch.as_ref().and_then(|view| view.old_image) {
+            Some(old_image) => {
+                eval_candidates_into(core, relation_oid, old_image, &mut old_candidates);
+            }
+            None => core.eval_candidates_removed_into(
+                relation_oid,
+                if key_data.is_empty() {
+                    new_row_data
+                } else {
+                    key_data
+                },
+                true,
+                &mut old_candidates,
+            ),
+        }
 
         // PGC-227: when no cached query over this relation can have its UPDATE
         // invalidation depend on which columns changed or whether the row is
@@ -808,11 +815,12 @@ impl WriterCdc {
     // Trace level: at info/debug the fmt layer allocates per-span extensions,
     // which would put a heap allocation on every CDC event.
     #[instrument(skip_all, level = "trace")]
-    pub async fn handle_delete(
+    pub(in crate::cache::writer::cdc) async fn handle_delete(
         &mut self,
         core: &mut WriterCore,
         relation_oid: Oid,
         row_data: &[Option<ByteString>],
+        batch: Option<BatchEvalView<'_>>,
     ) -> CacheResult<()> {
         let start = Instant::now();
         crate::metrics::handles().cdc.handle_deletes.increment(1);
@@ -830,12 +838,16 @@ impl WriterCdc {
         self.frame_cache_delete(core, relation_oid, row_data)
             .await?;
 
-        // Rung 3b: evict memos the deleted row belonged to (ADR-045). The delete
-        // tuple is the old image — probe candidates on it (PK-only under REPLICA
-        // IDENTITY DEFAULT → `Unknown` wildcard over-returns), the symmetric
-        // counterpart of the new-row probe.
+        // Rung 3b: evict memos the deleted row belonged to (ADR-045). The
+        // recovered old image (PGC-255) probes with real values; the fallback
+        // is the delete tuple itself — exact under REPLICA IDENTITY FULL,
+        // PK-only (`Unknown` wildcard over-return) under DEFAULT.
         let mut del_candidates = core.candidate_set_take();
-        eval_candidates_into(core, relation_oid, row_data, &mut del_candidates);
+        let old_image = batch
+            .as_ref()
+            .and_then(|view| view.old_image)
+            .unwrap_or(row_data);
+        eval_candidates_into(core, relation_oid, old_image, &mut del_candidates);
         memo_frame_accumulate(core, relation_oid, del_candidates.iter().copied());
 
         // A deleted row leaves stale rows in any Fresh MV that materialized it;
