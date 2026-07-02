@@ -106,7 +106,6 @@ impl WriterCdc {
             }
         }
         crate::metrics::handles().cdc.invalidations.increment(count);
-        core.state_gauges_update();
         Ok(())
     }
 

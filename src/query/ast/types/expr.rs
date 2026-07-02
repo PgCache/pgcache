@@ -1109,13 +1109,13 @@ mod tests {
         let cases = [
             "",
             "plain",
-            "o'brien",              // single quote → doubled
-            "a\\b",                 // backslash → E'…' with doubled backslash
-            "both ' and \\ here",   // quote + backslash
-            "''''",                 // only quotes
-            "\\\\\\",               // only backslashes
-            "café ☕ unicode",       // multibyte, no escaping
-            "tab\tnewline\n",       // control chars, no special escaping
+            "o'brien",            // single quote → doubled
+            "a\\b",               // backslash → E'…' with doubled backslash
+            "both ' and \\ here", // quote + backslash
+            "''''",               // only quotes
+            "\\\\\\",             // only backslashes
+            "café ☕ unicode",    // multibyte, no escaping
+            "tab\tnewline\n",     // control chars, no special escaping
         ];
         for case in cases {
             let mut got = String::new();

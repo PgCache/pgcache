@@ -419,9 +419,11 @@ fn row_to_tuple(
     {
         return None;
     }
-    Some(escaped_tuple_build(insert.num_columns, &insert.pkey_positions, |idx| {
-        row.get(idx)
-    }))
+    Some(escaped_tuple_build(
+        insert.num_columns,
+        &insert.pkey_positions,
+        |idx| row.get(idx),
+    ))
 }
 
 /// Build the `(pk_key, tuple_string, row_byte_count)` for one row, escaping each
@@ -450,7 +452,9 @@ fn escaped_tuple_build<'a>(
         .collect();
 
     // Pre-pass to size the tuple buffer exactly once (no growth reallocs).
-    let row_bytes: usize = (0..num_columns).map(|idx| get(idx).map_or(0, str::len)).sum();
+    let row_bytes: usize = (0..num_columns)
+        .map(|idx| get(idx).map_or(0, str::len))
+        .sum();
     // Slack for escaping (doubled quotes/backslashes), separators, and parens.
     let mut tuple = String::with_capacity(row_bytes + row_bytes / 4 + num_columns + 2);
     tuple.push('(');
@@ -697,7 +701,10 @@ mod tests {
     fn oracle(values: &[Option<&str>], pkey_positions: &[usize]) -> (Vec<String>, String) {
         let escaped: Vec<String> = values
             .iter()
-            .map(|v| v.map(escape::escape_literal).unwrap_or_else(|| "NULL".to_owned()))
+            .map(|v| {
+                v.map(escape::escape_literal)
+                    .unwrap_or_else(|| "NULL".to_owned())
+            })
             .collect();
         let pk: Vec<String> = pkey_positions
             .iter()
@@ -710,10 +717,10 @@ mod tests {
     fn escaped_tuple_build_matches_prior_output() {
         let cases: &[&[Option<&str>]] = &[
             &[Some("1"), Some("x")],
-            &[Some("42"), None, Some("o'brien")],          // NULL + quote-escaping
-            &[Some("a\\b"), Some("both ' and \\")],        // backslash → E'…'
-            &[Some(""), Some("''''")],                     // empty + only quotes
-            &[Some("café ☕"), None],                       // multibyte + NULL
+            &[Some("42"), None, Some("o'brien")], // NULL + quote-escaping
+            &[Some("a\\b"), Some("both ' and \\")], // backslash → E'…'
+            &[Some(""), Some("''''")],            // empty + only quotes
+            &[Some("café ☕"), None],             // multibyte + NULL
         ];
         for &values in cases {
             let pkey_positions = [0usize];

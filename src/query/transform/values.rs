@@ -198,7 +198,9 @@ impl PgEvalTemplate {
         *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
             query: Box::new(ResolvedQueryExpr {
                 body: ResolvedQueryBody::Values(ValuesClause {
-                    rows: vec![vec![LiteralValue::String(EcoString::from(PG_EVAL_SENTINEL))]],
+                    rows: vec![vec![LiteralValue::String(EcoString::from(
+                        PG_EVAL_SENTINEL,
+                    ))]],
                 }),
                 order_by: vec![],
                 limit: None,
@@ -238,7 +240,11 @@ impl PgEvalTemplate {
     pub fn render_into(&self, buf: &mut String, row_data: &[Option<ByteString>]) -> bool {
         // Every column must be present before any write, so a short row falls
         // back cleanly (no partial output left in `buf`).
-        if self.columns.iter().any(|(idx, _)| row_data.get(*idx).is_none()) {
+        if self
+            .columns
+            .iter()
+            .any(|(idx, _)| row_data.get(*idx).is_none())
+        {
             return false;
         }
         buf.push_str(&self.prefix);
@@ -1344,8 +1350,8 @@ mod tests {
             panic!("expected SELECT");
         };
         let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let template =
-            PgEvalTemplate::build(&resolved, table_metadata).expect("template builds for this shape");
+        let template = PgEvalTemplate::build(&resolved, table_metadata)
+            .expect("template builds for this shape");
 
         for row in rows {
             let oracle_select =
@@ -1359,7 +1365,10 @@ mod tests {
                 template.render_into(&mut fast, row),
                 "full row should take the fast path: {row:?}"
             );
-            assert_eq!(fast, oracle, "template SQL diverged from oracle for row {row:?}");
+            assert_eq!(
+                fast, oracle,
+                "template SQL diverged from oracle for row {row:?}"
+            );
         }
     }
 
