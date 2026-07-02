@@ -137,15 +137,11 @@ pub(super) fn memo_frame_accumulate(
     // Takes an iterator so callers can chain the new- and old-image candidate
     // sets without materializing their union (PGC-340). `frame_memo_evictions`
     // is a set, so a fingerprint present in both images inserts idempotently.
-    for fingerprint in memo_candidates {
-        if core
-            .state_view
-            .memo
-            .relation_has_fingerprint(relation_oid, fingerprint)
-        {
-            core.frame_memo_evictions.insert(fingerprint);
-        }
-    }
+    core.state_view.memo.candidates_memoized_into(
+        relation_oid,
+        memo_candidates,
+        &mut core.frame_memo_evictions,
+    );
 }
 
 /// Evaluate a LocalEval update query's WHERE against the CDC row.

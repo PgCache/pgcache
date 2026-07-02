@@ -372,13 +372,29 @@ impl ResultMemo {
         out
     }
 
-    /// Whether any memo entry over `relation` exists for `fingerprint`. O(1) —
-    /// the narrowed memo-eviction pass (ADR-045) probes this per candidate
-    /// instead of materializing the full per-relation fingerprint set per row.
-    pub fn relation_has_fingerprint(&self, relation: Oid, fingerprint: Fingerprint) -> bool {
-        self.relation_fingerprints
-            .get(&relation)
-            .is_some_and(|inner| inner.contains_key(&fingerprint))
+    /// Insert into `out` the `candidates` that have a live memo entry over
+    /// `relation` — the narrowed memo-eviction pass (ADR-045), filtered against
+    /// membership without materializing the full per-relation fingerprint set.
+    /// The relation is fixed across a CDC row's candidates, so the shard lock is
+    /// taken once for the whole batch rather than per candidate (PGC-348); a
+    /// relation with no memos skips the loop entirely. Like
+    /// [`fingerprints_for_relations`](Self::fingerprints_for_relations), may
+    /// transiently over-include a just-removed fingerprint (harmless extra
+    /// bump), never under-includes an entry present at the probe.
+    pub fn candidates_memoized_into(
+        &self,
+        relation: Oid,
+        candidates: impl IntoIterator<Item = Fingerprint>,
+        out: &mut FingerprintSet,
+    ) {
+        let Some(inner) = self.relation_fingerprints.get(&relation) else {
+            return;
+        };
+        for fingerprint in candidates {
+            if inner.contains_key(&fingerprint) {
+                out.insert(fingerprint);
+            }
+        }
     }
 
     /// True if any *live* memo entry exists for `fingerprint` (across result
@@ -620,6 +636,28 @@ mod tests {
         // Removal clears membership.
         m.remove(&k);
         assert!(m.fingerprints_for_relations(&[oid]).is_empty());
+    }
+
+    #[test]
+    fn test_candidates_memoized_into_filters_by_membership() {
+        let m = memo(1 << 20);
+        let oid = Oid::from_raw(10);
+        let fp = Fingerprint::from_raw;
+
+        let mut cap = MemoCapture::begin(&m, key(7), &[oid]).expect("capture begins");
+        cap.row_description_push(b"rd");
+        cap.command_complete_push(b"cc");
+        assert!(cap.finish(&m), "capture finishes");
+
+        // Only the memoized candidate lands in `out`, which extends rather
+        // than clears.
+        let mut out: FingerprintSet = [fp(99)].into_iter().collect();
+        m.candidates_memoized_into(oid, [fp(7), fp(8)], &mut out);
+        assert_eq!(out, [fp(7), fp(99)].into_iter().collect());
+
+        // A relation with no memos inserts nothing.
+        m.candidates_memoized_into(Oid::from_raw(11), [fp(7)], &mut out);
+        assert_eq!(out.len(), 2);
     }
 
     /// The create-memo vs. frame-update race: a frame that commits on a relation
