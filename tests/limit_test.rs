@@ -723,8 +723,8 @@ async fn test_limit_cdc_sort_update_spares_other_predicate() -> Result<(), Error
     assert_row_at(&res, 2, &[("id", "5"), ("score", "40")])?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
-    // owner 10's own page does match the changed row, so the predicate gate
-    // still invalidates it (the legitimate PGC-94 case); it re-serves the new
+    // owner 10's own page does match the changed row; the score rise is a
+    // promotion, so it is maintained in place (PGC-334) and serves the new
     // top-2 with post 1 (score 100) leading.
     let res = ctx.simple_query(query_a).await?;
     assert_row_at(&res, 1, &[("id", "1"), ("score", "100")])?;
@@ -774,6 +774,214 @@ async fn test_limit_cdc_predicate_column_change_still_invalidates() -> Result<()
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "2"), ("score", "40")])?;
     assert_row_at(&res, 2, &[("id", "3"), ("score", "30")])?;
+
+    Ok(())
+}
+
+/// Shared setup for the PGC-334 direction tests: three posts for owner 10.
+async fn setup_posts_table(ctx: &mut TestContext, rows: &str) -> Result<(), Error> {
+    ctx.query(
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, owner INTEGER, score INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        &format!("INSERT INTO posts (id, owner, score) VALUES {rows}"),
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Warm `query` into cache: miss → settle → hit. Returns the metrics baseline.
+async fn warm_query(
+    ctx: &mut TestContext,
+    query: &str,
+) -> Result<crate::util::MetricsSnapshot, Error> {
+    let m = ctx.metrics().await?;
+    ctx.simple_query(query).await?;
+    let m = assert_cache_miss(ctx, m).await?;
+    ctx.cache_settle().await?;
+    ctx.simple_query(query).await?;
+    assert_cache_hit(ctx, m).await
+}
+
+/// A sort-key rise under DESC is a promotion: the row can only push
+/// already-cached rows down, so the window is maintained in place — cache hit,
+/// re-sorted result, no invalidation (PGC-334).
+#[tokio::test]
+async fn test_limit_cdc_promotion_desc_keeps_cache() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_posts_table(&mut ctx, "(1, 10, 50), (2, 10, 40), (3, 10, 30)").await?;
+
+    let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC LIMIT 2";
+    let m = warm_query(&mut ctx, query).await?;
+
+    ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "2"), ("score", "100")])?;
+    assert_row_at(&res, 2, &[("id", "1"), ("score", "50")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// ASC mirror of the direction check: a sort-key *fall* is the promotion
+/// (maintained in place), a rise is the demotion (must invalidate — the row
+/// that takes the vacated slot may not be cached).
+#[tokio::test]
+async fn test_limit_cdc_direction_asc() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_posts_table(&mut ctx, "(1, 10, 10), (2, 10, 20), (3, 10, 30)").await?;
+
+    let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score ASC LIMIT 2";
+    let m = warm_query(&mut ctx, query).await?;
+
+    // Promotion (ASC: value falls): in place, cache hit, re-sorted.
+    ctx.origin_query("UPDATE posts SET score = 5 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "2"), ("score", "5")])?;
+    assert_row_at(&res, 2, &[("id", "1"), ("score", "10")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Demotion (ASC: value rises past the window): post 3 (score 30) enters
+    // the top-2 — it may not be cached, so the query must repopulate.
+    ctx.origin_query("UPDATE posts SET score = 35 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("score", "10")])?;
+    assert_row_at(&res, 2, &[("id", "3"), ("score", "30")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// NULL transitions under DESC NULLS LAST: leaving the NULL region is a
+/// promotion (in place); entering it is a demotion (invalidate, conservatively
+/// even when every row is cached).
+#[tokio::test]
+async fn test_limit_cdc_null_transitions_nulls_last() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_posts_table(&mut ctx, "(1, 10, 100), (2, 10, 40), (3, 10, NULL)").await?;
+
+    let query =
+        "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score DESC NULLS LAST LIMIT 3";
+    let m = warm_query(&mut ctx, query).await?;
+
+    // NULL → value with NULLS LAST: the row leaves the trailing NULL region —
+    // promotion, maintained in place.
+    ctx.origin_query("UPDATE posts SET score = 60 WHERE id = 3", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("score", "100")])?;
+    assert_row_at(&res, 2, &[("id", "3"), ("score", "60")])?;
+    assert_row_at(&res, 3, &[("id", "2"), ("score", "40")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // value → NULL with NULLS LAST: demotion — invalidates.
+    ctx.origin_query("UPDATE posts SET score = NULL WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("score", "100")])?;
+    assert_row_at(&res, 2, &[("id", "3"), ("score", "60")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// Multi-key ORDER BY: with the primary key unchanged, the tiebreak key
+/// decides direction lexicographically — a fall under ASC tiebreak is a
+/// promotion (in place), a rise is a demotion (invalidates).
+#[tokio::test]
+async fn test_limit_cdc_multi_key_tiebreak_direction() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "CREATE TABLE posts (id INTEGER PRIMARY KEY, owner INTEGER, score INTEGER, \
+         tiebreak INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO posts (id, owner, score, tiebreak) VALUES \
+         (1, 10, 50, 5), (2, 10, 50, 7), (3, 10, 50, 9)",
+        &[],
+    )
+    .await?;
+
+    let query = "SELECT id, tiebreak FROM posts WHERE owner = 10 \
+                 ORDER BY score DESC, tiebreak ASC LIMIT 2";
+    let m = warm_query(&mut ctx, query).await?;
+
+    // Tiebreak falls (ASC key): promotion — post 2 overtakes post 1 in place.
+    ctx.origin_query("UPDATE posts SET tiebreak = 4 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "2"), ("tiebreak", "4")])?;
+    assert_row_at(&res, 2, &[("id", "1"), ("tiebreak", "5")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Tiebreak rises: demotion — invalidates.
+    ctx.origin_query("UPDATE posts SET tiebreak = 8 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("tiebreak", "5")])?;
+    assert_row_at(&res, 2, &[("id", "2"), ("tiebreak", "8")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A SELECT-list alias in ORDER BY resolves through the alias chase; a rise
+/// under DESC is still recognized as a promotion.
+#[tokio::test]
+async fn test_limit_cdc_alias_sort_key_promotion() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_posts_table(&mut ctx, "(1, 10, 50), (2, 10, 40), (3, 10, 30)").await?;
+
+    let query = "SELECT id, score AS s FROM posts WHERE owner = 10 ORDER BY s DESC LIMIT 2";
+    let m = warm_query(&mut ctx, query).await?;
+
+    ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "2"), ("s", "100")])?;
+    assert_row_at(&res, 2, &[("id", "1"), ("s", "50")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// Soundness guard for the direction gate's punt: an expression sort key has
+/// no usable key spec (`order_by_keys == None`), so even a would-be promotion
+/// keeps the conservative invalidation.
+#[tokio::test]
+async fn test_limit_cdc_expression_sort_key_stays_conservative() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    setup_posts_table(&mut ctx, "(1, 10, 50), (2, 10, 40), (3, 10, 30)").await?;
+
+    let query = "SELECT id, score FROM posts WHERE owner = 10 ORDER BY score + 0 DESC LIMIT 2";
+    let m = warm_query(&mut ctx, query).await?;
+
+    ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_row_at(&res, 1, &[("id", "2"), ("score", "100")])?;
+    assert_row_at(&res, 2, &[("id", "1"), ("score", "50")])?;
+    let _m = assert_cache_miss(&mut ctx, m).await?;
 
     Ok(())
 }

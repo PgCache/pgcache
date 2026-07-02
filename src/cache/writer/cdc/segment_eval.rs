@@ -19,10 +19,15 @@ use crate::query::transform::{
     resolved_select_node_table_replace_with_values_batch,
 };
 
-use super::super::super::update_query::{UpdateEvalStrategy, UpdateQuery};
+use super::super::super::update_query::{
+    RowChanges, UpdateEvalStrategy, UpdateQueries, UpdateQuery,
+};
 use super::super::super::{CacheError, CacheResult, MapIntoReport};
 use super::super::core::WriterCore;
 use super::super::frame::FrameRowEvent;
+use super::invalidation::{
+    OLD_IS_NULL_ALIAS_PREFIX, OLD_LESS_THAN_ALIAS_PREFIX, pg_bool_text, row_change_column_fold,
+};
 use crate::result::error_chain_format;
 
 use super::*;
@@ -54,8 +59,14 @@ fn chunk_arrays_build<'a>(
 
 /// Append the row-change SELECT list — `SELECT v.<idx>, o.X IS DISTINCT FROM
 /// v.X AS X, …` — shared by the prepared and inline row-change builders so the
-/// changed-column contract can't drift between them.
-fn row_change_select_into(buf: &mut String, table_metadata: &TableMetadata) {
+/// changed-column contract can't drift between them. Limit-window ORDER BY key
+/// columns additionally project old-vs-new ordering (`o.X < v.X`,
+/// `o.X IS NULL`) for the window-direction check (PGC-334).
+fn row_change_select_into(
+    buf: &mut String,
+    table_metadata: &TableMetadata,
+    order_columns: &HashSet<&EcoString>,
+) {
     buf.push_str("SELECT v.");
     buf.push_str(BATCH_IDX_COLUMN);
     for column_meta in &table_metadata.columns {
@@ -64,7 +75,22 @@ fn row_change_select_into(buf: &mut String, table_metadata: &TableMetadata) {
             ", o.{name} IS DISTINCT FROM v.{name} AS {name}",
             name = column_meta.name
         );
+        if order_columns.contains(&column_meta.name) {
+            let _ = write!(
+                buf,
+                ", o.{c} < v.{c} AS {OLD_LESS_THAN_ALIAS_PREFIX}{c}, o.{c} IS NULL AS {OLD_IS_NULL_ALIAS_PREFIX}{c}",
+                c = column_meta.name
+            );
+        }
     }
+}
+
+/// The relation's limit-window ORDER BY key columns — the set
+/// `row_change_select_into` projects ordering for.
+fn relation_order_columns(update_queries: Option<&UpdateQueries>) -> HashSet<&EcoString> {
+    update_queries
+        .map(|uq| uq.limit_order_columns().collect())
+        .unwrap_or_default()
 }
 
 /// Append the row-change PK join — ` JOIN <schema>.<table> o ON o.pk = v.pk…`
@@ -130,7 +156,7 @@ struct RelationBatch {
     /// `None` case).
     row_change_covered: HashSet<usize>,
     /// Per covered update event: column → changed (`IS DISTINCT FROM`).
-    row_changes: HashMap<usize, HashMap<EcoString, bool>>,
+    row_changes: HashMap<usize, RowChanges>,
 }
 
 impl SegmentMembership {
@@ -171,7 +197,7 @@ pub(super) struct BatchEvalView<'a> {
     event_idx: usize,
     /// Outer `None` = row-change not batched for this event (fall back to the
     /// per-row SELECT); `Some(inner)` mirrors `query_row_changes`' return.
-    pub(super) row_change: Option<Option<&'a HashMap<EcoString, bool>>>,
+    pub(super) row_change: Option<Option<&'a RowChanges>>,
 }
 
 impl BatchEvalView<'_> {
@@ -625,13 +651,26 @@ impl WriterCdc {
         batch: &mut RelationBatch,
     ) -> CacheResult<()> {
         let relation_oid = table_metadata.relation_oid;
-        let statement = if let Some(statement) = self.prepared_row_change.get(&relation_oid) {
+        let update_queries = core.cache.update_queries.get(&relation_oid);
+        // The projection list depends on the relation's registered queries
+        // (their ORDER BY key columns) — a stale statement would silently drop
+        // the ordering projections, so the epoch is part of the cache hit.
+        let epoch = update_queries.map_or(0, UpdateQueries::epoch);
+        let cached = self
+            .prepared_row_change
+            .get(&relation_oid)
+            .filter(|(cached_epoch, _)| *cached_epoch == epoch);
+        let statement = if let Some((_, statement)) = cached {
             crate::metrics::handles().cdc.prepared_hits.increment(1);
             statement.clone()
         } else {
             crate::metrics::handles().cdc.prepared_misses.increment(1);
             self.pg_eval_buf.clear();
-            row_change_select_into(&mut self.pg_eval_buf, table_metadata);
+            row_change_select_into(
+                &mut self.pg_eval_buf,
+                table_metadata,
+                &relation_order_columns(update_queries),
+            );
             let _ = write!(
                 self.pg_eval_buf,
                 " FROM (SELECT unnest($1::int4[]) AS {BATCH_IDX_COLUMN}"
@@ -653,7 +692,7 @@ impl WriterCdc {
                 .await
                 .map_into_report::<CacheError>()?;
             self.prepared_row_change
-                .put(relation_oid, statement.clone());
+                .put(relation_oid, (epoch, statement.clone()));
             statement
         };
 
@@ -681,13 +720,12 @@ impl WriterCdc {
             let Some(&(event_idx, _)) = row_chunk.get(local_idx as usize) else {
                 continue;
             };
-            let mut changes = HashMap::with_capacity(row.len().saturating_sub(1));
+            let mut changes = RowChanges::with_capacity(row.len().saturating_sub(1));
             for (col_idx, col) in row.columns().iter().enumerate().skip(1) {
-                // NULL can't occur (IS DISTINCT FROM is total); default false
-                // defensively, matching the per-row parse.
-                changes.insert(
-                    EcoString::from(col.name()),
-                    row.try_get::<_, bool>(col_idx).unwrap_or(false),
+                row_change_column_fold(
+                    &mut changes,
+                    col.name(),
+                    row.try_get::<_, Option<bool>>(col_idx).ok().flatten(),
                 );
             }
             batch.row_changes.insert(event_idx, changes);
@@ -705,7 +743,11 @@ impl WriterCdc {
         batch: &mut RelationBatch,
     ) -> CacheResult<()> {
         self.pg_eval_buf.clear();
-        row_change_select_into(&mut self.pg_eval_buf, table_metadata);
+        row_change_select_into(
+            &mut self.pg_eval_buf,
+            table_metadata,
+            &relation_order_columns(core.cache.update_queries.get(&table_metadata.relation_oid)),
+        );
         self.pg_eval_buf.push_str(" FROM (VALUES ");
         for (i, (_, row)) in row_chunk.iter().enumerate() {
             if i > 0 {
@@ -749,11 +791,9 @@ impl WriterCdc {
             let Some(&(event_idx, _)) = row_chunk.get(local_idx) else {
                 continue;
             };
-            let mut changes = HashMap::with_capacity(row.len().saturating_sub(1));
+            let mut changes = RowChanges::with_capacity(row.len().saturating_sub(1));
             for (col_idx, col) in row.columns().iter().enumerate().skip(1) {
-                // PG boolean text: "t"/"f"; treat non-"t" as false,
-                // matching the per-row parse.
-                changes.insert(EcoString::from(col.name()), row.get(col_idx) == Some("t"));
+                row_change_column_fold(&mut changes, col.name(), pg_bool_text(row.get(col_idx)));
             }
             batch.row_changes.insert(event_idx, changes);
         }

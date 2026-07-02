@@ -1,6 +1,6 @@
 use crate::catalog::Oid;
 use crate::query::{Fingerprint, FingerprintSet};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Write;
 
 use ecow::EcoString;
@@ -22,7 +22,7 @@ use crate::settings::CachePolicy;
 use super::super::super::messages::QueryCommand;
 use super::super::super::types::CachedQueryState;
 use super::super::super::update_query::{
-    SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
+    RowChanges, SubqueryKind, UpdateEvalStrategy, UpdateQuery, UpdateQuerySource,
 };
 use super::super::super::{CacheError, CacheResult, MapIntoReport};
 use super::super::core::WriterCore;
@@ -142,6 +142,103 @@ pub(super) fn memo_frame_accumulate(
         memo_candidates,
         &mut core.frame_memo_evictions,
     );
+}
+
+/// Alias prefixes for the ordering projections the row-change SQL emits for
+/// limit-window ORDER BY columns (PGC-334), folded back into the base column's
+/// `ColumnChange` by `row_change_column_fold`. If a >54-byte column name makes
+/// PG truncate the alias, the fold misses and the ordering fields stay
+/// unknown — degrading to the conservative always-invalidate path.
+pub(super) const OLD_LESS_THAN_ALIAS_PREFIX: &str = "__pgc_lt_";
+pub(super) const OLD_IS_NULL_ALIAS_PREFIX: &str = "__pgc_nl_";
+
+/// Fold one row-change result column into the per-column map: plain names
+/// carry the `IS DISTINCT FROM` changed flag, prefixed aliases carry the
+/// ordering projections. `None` (SQL NULL) leaves ordering unknown and, for
+/// the changed flag, defensively counts as unchanged — matching the historic
+/// text parse.
+pub(super) fn row_change_column_fold(changes: &mut RowChanges, name: &str, value: Option<bool>) {
+    if let Some(col) = name.strip_prefix(OLD_LESS_THAN_ALIAS_PREFIX) {
+        changes
+            .entry(EcoString::from(col))
+            .or_default()
+            .old_less_than_new = value;
+    } else if let Some(col) = name.strip_prefix(OLD_IS_NULL_ALIAS_PREFIX) {
+        changes.entry(EcoString::from(col)).or_default().old_is_null = value == Some(true);
+    } else {
+        changes.entry(EcoString::from(name)).or_default().changed = value == Some(true);
+    }
+}
+
+/// PG boolean text ("t"/"f") to `Option<bool>`; anything else — including SQL
+/// NULL — is `None`.
+pub(super) fn pg_bool_text(value: Option<&str>) -> Option<bool> {
+    match value {
+        Some("t") => Some(true),
+        Some("f") => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether this UPDATE moves the cached row strictly toward the front of the
+/// query's ORDER BY output — a promotion, which can only push already-cached
+/// rows down and therefore never opens an uncached gap at the LIMIT-window
+/// boundary (PGC-334; holds under OFFSET too, since only boundary crossings
+/// change the cached prefix's membership). Compares the old and new sort
+/// tuples lexicographically: the first ORDER BY key whose value changed
+/// decides. Any ambiguity — no key spec, a changed window column that isn't a
+/// key, an incomparable pair, a missing value — returns `false`, which callers
+/// must treat as "invalidate".
+fn window_move_is_promotion(
+    update_query: &UpdateQuery,
+    table_metadata: &TableMetadata,
+    row_data: &[Option<ByteString>],
+    row_changes: &RowChanges,
+) -> bool {
+    let Some(keys) = &update_query.order_by_keys else {
+        return false;
+    };
+    // Every changed window column must be an ORDER BY key: predicate columns
+    // are already known unchanged here, but e.g. a HAVING reference isn't
+    // direction-analyzable.
+    for column in &update_query.limit_window_columns {
+        if row_changes.get(column).is_some_and(|cc| cc.changed)
+            && !keys.iter().any(|k| k.column == *column)
+        {
+            return false;
+        }
+    }
+    for key in keys.iter() {
+        let Some(change) = row_changes.get(&key.column) else {
+            return false;
+        };
+        if !change.changed {
+            continue;
+        }
+        let Some(new_value) = table_metadata
+            .columns
+            .get(key.column.as_str())
+            .and_then(|meta| row_data.get(meta.index()))
+        else {
+            return false;
+        };
+        return match (change.old_is_null, new_value.is_none()) {
+            // Contradicts `changed`; punt.
+            (true, true) => false,
+            // Left the NULL region: forward iff NULLs sort last.
+            (true, false) => !key.nulls_first,
+            // Entered the NULL region: forward iff NULLs sort first.
+            (false, true) => key.nulls_first,
+            (false, false) => match change.old_less_than_new {
+                // Value rose: forward iff larger sorts earlier.
+                Some(true) => key.descending,
+                Some(false) => !key.descending,
+                None => false,
+            },
+        };
+    }
+    // `window_changed` held but no key registered a change — punt.
+    false
 }
 
 /// Evaluate a LocalEval update query's WHERE against the CDC row.
@@ -358,15 +455,18 @@ impl WriterCdc {
     /// SELECT one row from the cache, projecting a boolean per non-PK column
     /// that's true iff the cached value differs from the incoming `row_data`
     /// value. Used by CDC UPDATE handling to decide whether a column change
-    /// actually shifts query membership. Returns `None` when the row isn't in
-    /// the cache (no PK match).
+    /// actually shifts query membership. For the relation's limit-window ORDER
+    /// BY key columns it additionally projects old-vs-new ordering
+    /// (`col < new`, `col IS NULL`) so the window check can tell promotions
+    /// from demotions (PGC-334). Returns `None` when the row isn't in the
+    /// cache (no PK match).
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) async fn query_row_changes(
         &self,
         core: &WriterCore,
         relation_oid: Oid,
         row_data: &[Option<ByteString>],
-    ) -> CacheResult<Option<HashMap<EcoString, bool>>> {
+    ) -> CacheResult<Option<RowChanges>> {
         let table_metadata =
             core.cache
                 .tables
@@ -380,6 +480,13 @@ impl WriterCdc {
         // Comparison columns go in the SELECT list, PK conditions in the WHERE clause.
         let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
         sql.push_str("SELECT ");
+
+        let order_columns: HashSet<&EcoString> = core
+            .cache
+            .update_queries
+            .get(&relation_oid)
+            .map(|uq| uq.limit_order_columns().collect())
+            .unwrap_or_default();
 
         let mut first_col = true;
         for column_meta in &table_metadata.columns {
@@ -396,6 +503,14 @@ impl WriterCdc {
                     "{} IS DISTINCT FROM {} AS {}",
                     column_meta.name, value, column_meta.name
                 );
+                if order_columns.contains(&column_meta.name) {
+                    let _ = write!(
+                        sql,
+                        ", {c} < {v} AS {OLD_LESS_THAN_ALIAS_PREFIX}{c}, {c} IS NULL AS {OLD_IS_NULL_ALIAS_PREFIX}{c}",
+                        c = column_meta.name,
+                        v = value
+                    );
+                }
                 first_col = false;
             }
         }
@@ -435,13 +550,9 @@ impl WriterCdc {
 
         for msg in msgs {
             if let SimpleQueryMessage::Row(row) = msg {
-                let mut changes = HashMap::with_capacity(row.len());
+                let mut changes = RowChanges::with_capacity(row.len());
                 for (idx, col) in row.columns().iter().enumerate() {
-                    // PG boolean text format: "t" = true, "f" = false. NULL
-                    // shouldn't occur (IS DISTINCT FROM always returns t/f),
-                    // but treat any non-"t" as false defensively.
-                    let changed = row.get(idx) == Some("t");
-                    changes.insert(EcoString::from(col.name()), changed);
+                    row_change_column_fold(&mut changes, col.name(), pg_bool_text(row.get(idx)));
                 }
                 return Ok(Some(changes));
             }
@@ -557,7 +668,7 @@ impl WriterCdc {
         update_query: &UpdateQuery,
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
-        row_changes: &HashMap<EcoString, bool>,
+        row_changes: &RowChanges,
     ) -> bool {
         // Subquery and non-terminal outer join tables: always invalidate on
         // UPDATE — column changes could shift set membership or cascade to
@@ -578,7 +689,7 @@ impl WriterCdc {
             let window_changed = update_query
                 .limit_window_columns
                 .iter()
-                .any(|c| *row_changes.get(c.as_str()).unwrap_or(&false));
+                .any(|c| row_changes.get(c.as_str()).is_some_and(|cc| cc.changed));
             if window_changed {
                 // PGC-336: the row can only affect this query's window if it is
                 // (or was) inside the query's predicate region. If a predicate
@@ -588,11 +699,24 @@ impl WriterCdc {
                 let predicate_changed = update_query
                     .predicate_columns
                     .iter()
-                    .any(|c| *row_changes.get(c.as_str()).unwrap_or(&false));
-                if predicate_changed
-                    || row_constraints_match(&update_query.constraints, table_metadata, row_data)
-                {
+                    .any(|c| row_changes.get(c.as_str()).is_some_and(|cc| cc.changed));
+                if predicate_changed {
                     return true;
+                }
+                if row_constraints_match(&update_query.constraints, table_metadata, row_data) {
+                    // PGC-334: a promotion can only push already-cached rows
+                    // down — the in-place upsert plus serve-time re-sort keeps
+                    // the window correct without invalidation. Only demotions
+                    // (and anything direction can't prove) can open an
+                    // uncached gap at the boundary.
+                    if !window_move_is_promotion(
+                        update_query,
+                        table_metadata,
+                        row_data,
+                        row_changes,
+                    ) {
+                        return true;
+                    }
                 }
             }
         }
@@ -602,12 +726,15 @@ impl WriterCdc {
             .table_join_columns(&table_metadata.name)
         {
             // Missing column would mean query constraints reference a column
-            // that wasn't projected — a builder invariant violation, not a
-            // runtime condition. Silent `false` would risk missed
-            // invalidations and stale reads, so panic instead.
-            let column_changed = *row_changes
-                .get(column)
-                .expect("column present in row_changes");
+            // that wasn't projected — a builder invariant violation. Default
+            // to changed (→ invalidate): the safe direction, since assuming
+            // unchanged could skip a required invalidation and serve stale
+            // data.
+            debug_assert!(
+                row_changes.contains_key(column),
+                "constraint column {column} missing from row_changes projection"
+            );
+            let column_changed = row_changes.get(column).is_none_or(|cc| cc.changed);
 
             if !column_changed {
                 continue;
@@ -630,7 +757,7 @@ impl WriterCdc {
         &self,
         core: &WriterCore,
         relation_oid: Oid,
-        row_changes: Option<&HashMap<EcoString, bool>>,
+        row_changes: Option<&RowChanges>,
         row_data: &[Option<ByteString>],
         key_data: Option<&[Option<ByteString>]>,
         operation: CdcOperation,

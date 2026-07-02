@@ -1,6 +1,5 @@
 use crate::catalog::Oid;
 use crate::query::{Fingerprint, FingerprintSet};
-use std::collections::HashMap;
 use std::time::Instant;
 
 use ecow::EcoString;
@@ -13,7 +12,7 @@ use crate::pg::protocol::ByteString;
 use crate::settings::Settings;
 
 use super::super::super::messages::CdcCommand;
-use super::super::super::update_query::{UpdateEvalStrategy, UpdateQuery};
+use super::super::super::update_query::{RowChanges, UpdateEvalStrategy, UpdateQuery};
 use super::super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::super::core::WriterCore;
 use super::super::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState};
@@ -570,7 +569,7 @@ impl WriterCdc {
             // Batched row-change result if the segment eval covered this event
             // (PGC-241 stage 3), else the per-row SELECT.
             let row_changes_fallback;
-            let row_changes: Option<&HashMap<EcoString, bool>> = if batch_deleted {
+            let row_changes: Option<&RowChanges> = if batch_deleted {
                 None
             } else {
                 match batch.as_ref().and_then(|view| view.row_change) {

@@ -19,7 +19,9 @@ use tracing::{debug, error, info, instrument, trace};
 use crate::cache::coalesce_queue::fetch_stage_ewma_update;
 use crate::cache::query::limit_rows_needed;
 use crate::catalog::{TableMetadata, aggregate_functions_load};
-use crate::query::ast::{AstNode, Deparse, QueryBody, QueryExpr, TableNode};
+use crate::query::ast::{
+    AstNode, Deparse, NullOrder, OrderDirection, QueryBody, QueryExpr, TableNode,
+};
 use crate::query::constraints::{
     TableConstraint, analyze_query_constraints, table_constraints_subsumed,
 };
@@ -43,7 +45,7 @@ use super::super::{
     mv::{ShapeGate, resolved_has_join, resolved_has_window, shape_classify},
     query::CacheableQuery,
     types::{CachedQuery, QueryMetrics, SharedResolved},
-    update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQuerySource},
+    update_query::{OrderByKey, UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQuerySource},
 };
 use super::core::{MERGE_FLUSH_FORCE_AFTER, PendingMerge, WriterCore};
 use super::population::population_worker;
@@ -208,6 +210,76 @@ fn limit_window_columns_collect(
     }
 
     cols
+}
+
+/// The ORDER BY key spec for direction-aware window invalidation (PGC-334):
+/// `Some` only when the parent query is a plain SELECT (no set-op, GROUP BY,
+/// HAVING, or DISTINCT — their windows aren't row-level) and every key
+/// resolves to exactly one plain column of `table_name`, directly or through
+/// a bare-column SELECT alias. Anything else returns `None` and the window
+/// check stays direction-blind (always invalidates). `Default` null ordering
+/// resolves per PG semantics — NULLs sort larger than every value, so
+/// ASC → last, DESC → first.
+fn limit_order_keys_collect(
+    resolved: &ResolvedQueryExpr,
+    table_name: &str,
+) -> Option<Box<[OrderByKey]>> {
+    let select = resolved.as_select()?;
+    if select.distinct || !select.group_by.is_empty() || select.having.is_some() {
+        return None;
+    }
+    if resolved.order_by.is_empty() {
+        return None;
+    }
+    let mut keys = Vec::with_capacity(resolved.order_by.len());
+    for clause in &resolved.order_by {
+        let column = match &clause.expr {
+            ResolvedScalarExpr::Column(col) => col,
+            // Aliased `ORDER BY value`: usable only when the aliased SELECT
+            // expression is itself a bare column.
+            ResolvedScalarExpr::Identifier(name) => {
+                let ResolvedSelectColumns::Columns(select_cols) = &select.columns else {
+                    return None;
+                };
+                let aliased = select_cols
+                    .iter()
+                    .find(|sc| sc.output_name() == Some(name))?;
+                match &aliased.expr {
+                    ResolvedScalarExpr::Column(col) => col,
+                    ResolvedScalarExpr::Identifier(_)
+                    | ResolvedScalarExpr::Function(_)
+                    | ResolvedScalarExpr::Literal(_)
+                    | ResolvedScalarExpr::Case(_)
+                    | ResolvedScalarExpr::Arithmetic(_)
+                    | ResolvedScalarExpr::Subquery(..)
+                    | ResolvedScalarExpr::Array(_)
+                    | ResolvedScalarExpr::TypeCast { .. } => return None,
+                }
+            }
+            ResolvedScalarExpr::Function(_)
+            | ResolvedScalarExpr::Literal(_)
+            | ResolvedScalarExpr::Case(_)
+            | ResolvedScalarExpr::Arithmetic(_)
+            | ResolvedScalarExpr::Subquery(..)
+            | ResolvedScalarExpr::Array(_)
+            | ResolvedScalarExpr::TypeCast { .. } => return None,
+        };
+        if column.table.as_str() != table_name {
+            return None;
+        }
+        let descending = matches!(clause.direction, OrderDirection::Desc);
+        let nulls_first = match clause.null_order {
+            NullOrder::NullsFirst => true,
+            NullOrder::NullsLast => false,
+            NullOrder::Default => descending,
+        };
+        keys.push(OrderByKey {
+            column: column.column.clone(),
+            descending,
+            nulls_first,
+        });
+    }
+    Some(keys.into())
 }
 
 /// Collect column names on `table_name` whose values CDC eval reads for this
@@ -789,6 +861,13 @@ impl WriterRegistration {
             let predicate_columns =
                 predicate_columns_collect(&update_resolved, table_node.name.as_str());
             let is_single_table = update_resolved.is_single_table();
+            // Direction-aware window spec (PGC-334) — the shapes the cached-path
+            // window check can reason about. Walks the parent `resolved` like
+            // `limit_window_columns` (ORDER BY is stripped from `update_resolved`).
+            let order_by_keys =
+                (has_limit && is_single_table && matches!(source, UpdateQuerySource::FromClause))
+                    .then(|| limit_order_keys_collect(resolved, table_node.name.as_str()))
+                    .flatten();
             // Compile the LocalEval WHERE once so the per-row CDC membership probe
             // doesn't re-destructure the resolved AST (PGC-339). PgEval queries
             // never consult this, so skip building it.
@@ -821,6 +900,7 @@ impl WriterRegistration {
                 has_limit,
                 eval_strategy,
                 limit_window_columns,
+                order_by_keys,
                 // Set authoritatively in update_query_register (needs table_name).
                 change_dependent: false,
                 pg_batchable,

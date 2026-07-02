@@ -45,6 +45,35 @@ pub enum UpdateEvalStrategy {
     PgEval,
 }
 
+/// One ORDER BY key of a LIMIT-windowed query, resolved to a plain local
+/// column with PG's sort semantics made explicit (`Default` null ordering is
+/// resolved at construction: NULLs sort as larger than every value, so
+/// ASC → last, DESC → first). Consumed by the direction-aware window
+/// invalidation check (PGC-334).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderByKey {
+    pub column: EcoString,
+    pub descending: bool,
+    pub nulls_first: bool,
+}
+
+/// Per-column result of the CDC row-change lookup. `changed` mirrors the
+/// original `IS DISTINCT FROM` projection; the ordering fields are populated
+/// only for columns in the relation's `limit_order_columns` union and feed the
+/// window-direction check (PGC-334). `old_less_than_new` is `None` when either side
+/// is NULL (or the projection wasn't emitted) — consumers treat that as
+/// unknown and stay conservative.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ColumnChange {
+    pub changed: bool,
+    pub old_less_than_new: Option<bool>,
+    pub old_is_null: bool,
+}
+
+/// Column → change info for one CDC UPDATE row, from `query_row_changes` or
+/// the batched segment eval.
+pub type RowChanges = HashMap<EcoString, ColumnChange>;
+
 /// Whether an update query was derived from a direct table or a subquery table
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UpdateQuerySource {
@@ -84,6 +113,13 @@ pub struct UpdateQuery {
     /// Populated only when `has_limit`; consumed by row_cached_invalidation_check
     /// to detect updates that may demote a cached row out of the window (PGC-94).
     pub limit_window_columns: HashSet<EcoString>,
+    /// The full ORDER BY key spec when every key is a plain local column and
+    /// the shape is a single-table FromClause SELECT without GROUP BY / HAVING
+    /// / DISTINCT. Lets the window check tell promotions (row can only rise —
+    /// provably safe in place) from demotions (may open an uncached gap at the
+    /// window boundary — must invalidate). `None` → always invalidate on a
+    /// window-column change, the pre-PGC-334 behavior.
+    pub order_by_keys: Option<Box<[OrderByKey]>>,
     /// Whether a CDC UPDATE for this query can ever invalidate. When `false`,
     /// `handle_update` skips the `query_row_changes` SELECT and the invalidation
     /// check entirely (PGC-227). Set at registration from
@@ -183,6 +219,16 @@ pub struct UpdateQueries {
     /// UPDATE narrowing decide in O(changed cols) whether a change could move a
     /// row out of some limit window (then it expands to `has_limit_from`).
     limit_predicate_columns: HashMap<EcoString, usize>,
+    /// Refcounted union of `order_by_keys` columns over `has_limit_from`. The
+    /// row-change SQL projects old-vs-new ordering for exactly these columns
+    /// (PGC-334); columns of queries with `order_by_keys == None` are excluded
+    /// (those queries never consult direction).
+    limit_order_columns: HashMap<EcoString, usize>,
+    /// Bumped on every `query_insert`/`query_remove`. Keys the batched
+    /// row-change prepared-statement cache so a registration that changes
+    /// `limit_order_columns` (or the column contract generally) can't keep
+    /// serving a stale prepared projection list.
+    epoch: u64,
     /// Count of queries with `change_dependent == true`. Maintained on
     /// insert/remove via `change_dependent_account` so `needs_change_eval` is
     /// O(1) on the CDC hot path. Derivable from `queries`; `needs_change_eval`
@@ -202,6 +248,8 @@ impl UpdateQueries {
             always_check: FingerprintSet::default(),
             has_limit_from: FingerprintSet::default(),
             limit_predicate_columns: HashMap::new(),
+            limit_order_columns: HashMap::new(),
+            epoch: 0,
             change_dependent_count: 0,
         }
     }
@@ -217,18 +265,13 @@ impl UpdateQueries {
     }
 
     /// Add (`added`) or remove a query's carve-out memberships, keeping
-    /// `always_check` / `has_limit_from` / `limit_predicate_columns` in lockstep
-    /// with `queries`. Idempotent per fingerprint for the sets; refcounted for
-    /// the column union so replacement (same fingerprint, changed shape) and
-    /// multiple limit queries sharing a predicate column are handled correctly.
-    fn carveout_account(
-        &mut self,
-        fp: Fingerprint,
-        always: bool,
-        limit_from: bool,
-        predicate_columns: &HashSet<EcoString>,
-        added: bool,
-    ) {
+    /// `always_check` / `has_limit_from` / `limit_predicate_columns` /
+    /// `limit_order_columns` in lockstep with `queries`. Idempotent per
+    /// fingerprint for the sets; refcounted for the column unions so
+    /// replacement (same fingerprint, changed shape) and multiple limit
+    /// queries sharing a column are handled correctly.
+    fn carveout_account(&mut self, fp: Fingerprint, q: &UpdateQuery, added: bool) {
+        let (always, limit_from) = Self::carveout_membership(q);
         if always {
             if added {
                 self.always_check.insert(fp);
@@ -239,30 +282,62 @@ impl UpdateQueries {
         if limit_from {
             if added {
                 self.has_limit_from.insert(fp);
-                for c in predicate_columns {
-                    *self.limit_predicate_columns.entry(c.clone()).or_insert(0) += 1;
-                }
             } else {
                 self.has_limit_from.remove(&fp);
-                for c in predicate_columns {
-                    if let Some(n) = self.limit_predicate_columns.get_mut(c) {
-                        *n -= 1;
-                        if *n == 0 {
-                            self.limit_predicate_columns.remove(c);
-                        }
-                    }
+            }
+            Self::column_refcounts_account(
+                &mut self.limit_predicate_columns,
+                q.predicate_columns.iter(),
+                added,
+            );
+            Self::column_refcounts_account(
+                &mut self.limit_order_columns,
+                q.order_by_keys.iter().flatten().map(|k| &k.column),
+                added,
+            );
+        }
+    }
+
+    /// Increment (`added`) or decrement a refcounted column union, dropping
+    /// zero-count entries.
+    fn column_refcounts_account<'a>(
+        counts: &mut HashMap<EcoString, usize>,
+        columns: impl Iterator<Item = &'a EcoString>,
+        added: bool,
+    ) {
+        for c in columns {
+            if added {
+                *counts.entry(c.clone()).or_insert(0) += 1;
+            } else if let Some(n) = counts.get_mut(c) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    counts.remove(c);
                 }
             }
         }
     }
 
+    /// Columns the row-change SQL must project old-vs-new ordering for: the
+    /// ORDER BY key columns of every `has_limit` FromClause query with a usable
+    /// key spec (PGC-334).
+    pub fn limit_order_columns(&self) -> impl Iterator<Item = &EcoString> {
+        self.limit_order_columns.keys()
+    }
+
+    /// Registration epoch — bumped on every insert/remove. Keys caches whose
+    /// contents depend on this relation's query population (e.g. the batched
+    /// row-change prepared statement).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Whether any column the UPDATE changed is a predicate column of some
     /// `has_limit` FromClause query — i.e. the change could push a row out of a
     /// limit window, so the invalidation pass must expand to `has_limit_from`.
-    pub fn limit_predicate_changed(&self, row_changes: &HashMap<EcoString, bool>) -> bool {
+    pub fn limit_predicate_changed(&self, row_changes: &RowChanges) -> bool {
         row_changes
             .iter()
-            .any(|(c, &changed)| changed && self.limit_predicate_columns.contains_key(c))
+            .any(|(c, cc)| cc.changed && self.limit_predicate_columns.contains_key(c))
     }
 
     /// Whether any query over this relation needs `query_row_changes` to decide
@@ -285,17 +360,18 @@ impl UpdateQueries {
     /// update queries over the same table), and the map is keyed by fingerprint.
     pub fn query_insert(&mut self, query: UpdateQuery) -> Option<UpdateQuery> {
         let fp = query.fingerprint;
-        let change_dependent = query.change_dependent;
-        let (new_always, new_limit_from) = Self::carveout_membership(&query);
-        let new_pcols = query.predicate_columns.clone();
-        let prev = self.queries.insert(fp, query);
+        self.epoch += 1;
+        // Un-account any replaced entry before accounting the new one: the
+        // carve-out sets are idempotent per fingerprint, so the reverse order
+        // would let the removal cancel the fresh insert.
+        let prev = self.queries.remove(&fp);
         if let Some(prev) = &prev {
             self.change_dependent_account(prev.change_dependent, false);
-            let (pa, pl) = Self::carveout_membership(prev);
-            self.carveout_account(fp, pa, pl, &prev.predicate_columns, false);
+            self.carveout_account(fp, prev, false);
         }
-        self.change_dependent_account(change_dependent, true);
-        self.carveout_account(fp, new_always, new_limit_from, &new_pcols, true);
+        self.change_dependent_account(query.change_dependent, true);
+        self.carveout_account(fp, &query, true);
+        self.queries.insert(fp, query);
         prev
     }
 
@@ -304,9 +380,9 @@ impl UpdateQueries {
     pub fn query_remove(&mut self, fingerprint: Fingerprint) -> Option<UpdateQuery> {
         let removed = self.queries.remove(&fingerprint);
         if let Some(removed) = &removed {
+            self.epoch += 1;
             self.change_dependent_account(removed.change_dependent, false);
-            let (a, l) = Self::carveout_membership(removed);
-            self.carveout_account(fingerprint, a, l, &removed.predicate_columns, false);
+            self.carveout_account(fingerprint, removed, false);
         }
         removed
     }

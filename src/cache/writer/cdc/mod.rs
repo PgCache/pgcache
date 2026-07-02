@@ -91,7 +91,10 @@ pub(super) struct WriterCdc {
     /// (schema change); an execution error drops the entry and the call falls
     /// back to the inlined-VALUES path (self-healing).
     prepared_membership: LruCache<PreparedEvalKey, Statement>,
-    /// Prepared row-change statements per relation (same lifecycle). These run
-    /// on `WriterCore.db_cache`, matching the per-row `query_row_changes`.
-    prepared_row_change: LruCache<Oid, Statement>,
+    /// Prepared row-change statements per relation (same lifecycle), tagged
+    /// with the relation's `UpdateQueries` epoch at build time: the projection
+    /// list depends on the registered queries' ORDER BY key columns (PGC-334),
+    /// so an epoch mismatch is a miss and re-prepares. These run on
+    /// `WriterCore.db_cache`, matching the per-row `query_row_changes`.
+    prepared_row_change: LruCache<Oid, (u64, Statement)>,
 }
