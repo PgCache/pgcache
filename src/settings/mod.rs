@@ -23,12 +23,36 @@ pub use toml_file::{config_file_dynamic_extract, config_file_dynamic_update};
 
 error_set! {
     ConfigError := {
-        ArgumentError(Box<dyn Error + Send + Sync + 'static>),
-        TomlError(Box<dyn Error + Send + Sync + 'static>),
+        ArgumentError(BoxedError),
+        TomlError(BoxedError),
 
         #[display("Missing argument: {name}")]
         ArgumentMissing{ name: &'static str},
         IoError(io::Error),
+    }
+}
+
+/// Concrete wrapper around an arbitrary boxed error so it satisfies the
+/// `std::error::Error` bound that `error_set` now requires on source variants
+/// (a bare `Box<dyn Error>` trait object is unsized and does not implement it).
+#[derive(Debug)]
+pub struct BoxedError(Box<dyn Error + Send + Sync + 'static>);
+
+impl BoxedError {
+    fn new(error: impl Into<Box<dyn Error + Send + Sync + 'static>>) -> Self {
+        Self(error.into())
+    }
+}
+
+impl fmt::Display for BoxedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Error for BoxedError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        self.0.source()
     }
 }
 
@@ -37,13 +61,13 @@ pub type ConfigResult<T> = Result<T, Report<ConfigError>>;
 
 impl From<lexopt::Error> for ConfigError {
     fn from(error: lexopt::Error) -> Self {
-        Self::ArgumentError(Box::new(error))
+        Self::ArgumentError(BoxedError::new(error))
     }
 }
 
 impl From<toml::de::Error> for ConfigError {
     fn from(error: toml::de::Error) -> Self {
-        Self::TomlError(Box::new(error))
+        Self::TomlError(BoxedError::new(error))
     }
 }
 

@@ -91,7 +91,7 @@ where
 {
     let s = arg_string(parser)?;
     s.parse()
-        .map_err(|e: T::Err| Report::from(ConfigError::ArgumentError(e.to_string().into())))
+        .map_err(|e: T::Err| Report::from(ConfigError::ArgumentError(BoxedError::new(e.to_string()))))
 }
 
 /// Require an `Option<T>` to be `Some`, or return `ArgumentMissing`.
@@ -252,7 +252,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
             }
             Short(_) | Long(_) | Value(_) => {
-                return Err(ConfigError::ArgumentError(Box::new(arg.unexpected())).into());
+                return Err(ConfigError::ArgumentError(BoxedError::new(arg.unexpected())).into());
             }
         }
     }

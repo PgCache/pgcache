@@ -37,7 +37,7 @@ pub fn config_file_dynamic_update(path: &Path, patch: &DynamicConfigPatch) -> Co
     let content = read_to_string(path).map_into_report::<ConfigError>()?;
     let mut doc: toml_edit::DocumentMut = content
         .parse()
-        .map_err(|e: toml_edit::TomlError| ConfigError::TomlError(Box::new(e)))
+        .map_err(|e: toml_edit::TomlError| ConfigError::TomlError(BoxedError::new(e)))
         .map_into_report::<ConfigError>()?;
 
     if let Some(v) = &patch.cache_size {
