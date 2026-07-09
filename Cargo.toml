@@ -3,7 +3,7 @@ members = [".", "conformance", "consistency"]
 
 [package]
 name = "pgcache"
-version = "0.6.2"
+version = "0.6.2-a3"
 edition = "2024"
 license = "Elastic-2.0"
 

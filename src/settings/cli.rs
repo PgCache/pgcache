@@ -194,16 +194,15 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
     let mut args = CliArgs::default();
     let mut config = None;
     let mut config_path = None;
+    let mut config_create = false;
     let mut parser = lexopt::Parser::from_env();
 
     while let Some(arg) = parser.next().map_into_report::<ConfigError>()? {
         match arg {
             Short('c') | Long("config") => {
-                let path = arg_string(&mut parser)?;
-                let file = read_to_string(&path).map_into_report::<ConfigError>()?;
-                config = Some(toml::from_str(&file).map_into_report::<ConfigError>()?);
-                config_path = Some(PathBuf::from(path));
+                config_path = Some(PathBuf::from(arg_string(&mut parser)?));
             }
+            Long("config_create") => config_create = true,
             Long("origin_host") => args.origin_host = Some(arg_string(&mut parser)?),
             Long("origin_port") => args.origin_port = Some(arg_parse(&mut parser)?),
             Long("origin_user") => args.origin_user = Some(arg_string(&mut parser)?),
@@ -254,6 +253,18 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Short(_) | Long(_) | Value(_) => {
                 return Err(ConfigError::ArgumentError(BoxedError::new(arg.unexpected())).into());
             }
+        }
+    }
+
+    // Read the config file after the loop so flag order is irrelevant. In create
+    // mode a missing file is expected — start from defaults and let the dynamic
+    // config write-back create it on the first `PUT /config`. Other IO errors
+    // (permissions, etc.) still fail even in create mode, since those aren't typos.
+    if let Some(path) = &config_path {
+        match read_to_string(path) {
+            Ok(file) => config = Some(toml::from_str(&file).map_into_report::<ConfigError>()?),
+            Err(e) if config_create && e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).map_into_report::<ConfigError>(),
         }
     }
 
@@ -555,6 +566,7 @@ impl Settings {
     fn print_usage_and_exit(name: &str) -> ! {
         println!(
             "Usage: {name} -c|--config TOML_FILE --origin_host HOST --origin_port PORT --origin_user USER --origin_database DB \n \
+            [--config_create] (create the config file if missing; persist dynamic /config changes to it) \n \
             [--origin_password PASSWORD] [--origin_ssl_mode disable|require|verify-full] \n \
             [--replication_host HOST] [--replication_port PORT] [--replication_user USER] [--replication_database DB] \n \
             [--replication_password PASSWORD] [--replication_ssl_mode disable|require|verify-full] \n \
