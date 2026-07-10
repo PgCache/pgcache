@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-// adapted from https://github.com/sunng87/pgwire
 use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
