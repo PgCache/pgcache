@@ -96,10 +96,10 @@ itoa = "1.0.18"
 # postgres-protocol = { path = "../rust-postgres/postgres-protocol" }
 # postgres-replication = { path = "../rust-postgres/postgres-replication", default-features = false }
 # postgres-types = { path = "../rust-postgres/postgres-types" }
-tokio-postgres = { git = "https://github.com/tempest98/rust-postgres", default-features = false, features = ["runtime"], branch = "compat" }
-postgres-protocol = {git = "https://github.com/tempest98/rust-postgres", branch = "compat" }
-postgres-replication = { git = "https://github.com/tempest98/rust-postgres", default-features = false, branch = "compat" }
-postgres-types = { git = "https://github.com/tempest98/rust-postgres", branch = "compat" }
+tokio-postgres = { git = "https://github.com/PgCache/rust-postgres", default-features = false, features = ["runtime"], branch = "compat" }
+postgres-protocol = {git = "https://github.com/PgCache/rust-postgres", branch = "compat" }
+postgres-replication = { git = "https://github.com/PgCache/rust-postgres", default-features = false, branch = "compat" }
+postgres-types = { git = "https://github.com/PgCache/rust-postgres", branch = "compat" }
 pg_query = "6.1.1"
 
 # TLS support for origin database connections

@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 pgcache-conformance = { path = "../conformance" }
 tokio = { version = "1.50.0", features = ["full"] }
-tokio-postgres = { git = "https://github.com/tempest98/rust-postgres", default-features = false, features = ["runtime"], branch = "compat" }
+tokio-postgres = { git = "https://github.com/PgCache/rust-postgres", default-features = false, features = ["runtime"], branch = "compat" }
 clap = { version = "4.6.1", features = ["derive"] }
 anyhow = "1.0.102"
 tracing = "0.1.44"
