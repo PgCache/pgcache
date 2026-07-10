@@ -32,38 +32,69 @@ No Redis, no schema migration, no manual invalidation logic.
 
 ## Quickstart
 
-Run pgcache in front of your database with Docker:
+pgcache needs three things: your **origin** database with logical replication enabled, a
+dedicated **cache** PostgreSQL that has the [`pgcache_pgrx`](#the-pgcache_pgrx-extension)
+extension, and a config file (or CLI flags) telling it how to reach both.
 
-```bash
-docker run -d -p 5432:5432 pgcache:latest \
-  --upstream postgres://user@your-db-host:5432/myapp
-```
-
-The origin database needs logical replication enabled and a publication for pgcache to
-subscribe to:
+**1.** Enable logical replication on the origin:
 
 ```ini
-# postgresql.conf
+# postgresql.conf (origin)
 wal_level = logical
 max_replication_slots = 10
 max_wal_senders = 10
 ```
 
-```sql
--- on the origin database
-CREATE PUBLICATION pgcache_pub FOR ALL TABLES;
+pgcache creates and manages the publication and replication slot itself (named in the
+config below) — you don't create them by hand.
+
+**2.** Tell pgcache how to reach both databases. The simplest way is a config file:
+
+```toml
+# pgcache.toml
+num_workers = 4
+
+[origin]
+host = "your-db-host"
+port = 5432
+user = "pgcache"
+database = "myapp"
+
+[cache]
+host = "localhost"
+port = 5432
+user = "postgres"
+database = "cache"
+
+[cdc]
+publication_name = "pgcache_pub"
+slot_name = "pgcache_slot"
+
+[listen]
+socket = "0.0.0.0:6432"
 ```
 
-Then point your application at pgcache by changing one connection string:
+```bash
+pgcache -c pgcache.toml
+```
+
+Every setting also has an equivalent CLI flag (`--origin_host`, `--cache_host`,
+`--cdc_publication_name`, `--listen_socket`, `--num_workers`, …) and environment variable;
+run `pgcache --help` for the full list.
+
+**3.** Point your application at pgcache by changing one connection string:
 
 ```diff
 - DATABASE_URL=postgres://user@your-db-host:5432/myapp
-+ DATABASE_URL=postgres://user@pgcache-host:5432/myapp
++ DATABASE_URL=postgres://user@pgcache-host:6432/myapp
 ```
 
 Writes still go to your primary; reads are served from cache when safe and forwarded to
-origin otherwise. Common options: `--listen` (default `0.0.0.0:5432`), `--workers`,
-`--publication` (default `pgcache_pub`).
+origin otherwise.
+
+> **Just want to try it?** The [Docker image](../pgcache-docker) bundles the cache
+> PostgreSQL (with `pgcache_pgrx` already preloaded) and wraps all of the above behind a
+> single `--upstream postgres://…` flag.
 
 ## How it works
 
@@ -90,6 +121,27 @@ applied to the cache directly or whether the affected query must be invalidated:
 At any moment a cached query is either up to date with every relevant committed change, or it
 is not served from cache at all — so applications never see data a committed write has
 superseded.
+
+## The pgcache_pgrx extension
+
+pgcache keeps its cached data in a dedicated PostgreSQL instance, and that instance **must**
+have the [`pgcache_pgrx`](../pgcache_pgrx) extension installed. pgcache runs `CREATE EXTENSION pgcache_pgrx` when it initializes the cache database on startup, and it will not run without it.
+
+`pgcache_pgrx` is a small extension (built with [pgrx](https://github.com/pgcentralfoundation/pgrx))
+that provides the generation-based tracking pgcache uses to garbage-collect the cache. The extension
+records which cached rows are still in use so unused rows can be reclaimed.
+
+Because it allocates shared memory, it must be preloaded, not just created:
+
+```ini
+# postgresql.conf of the cache database
+shared_preload_libraries = 'pgcache_pgrx'
+```
+
+You usually don't set this up by hand: the Docker image and the AWS Marketplace AMI bundle a
+PostgreSQL that already has `pgcache_pgrx` built, installed, and preloaded. You only need to
+install it yourself when running pgcache from source or against a PostgreSQL you manage — see
+[`pgcache_pgrx`](../pgcache_pgrx) for build and install steps.
 
 ## Status
 
