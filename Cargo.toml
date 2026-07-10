@@ -100,7 +100,7 @@ tokio-postgres = { git = "https://github.com/tempest98/rust-postgres", default-f
 postgres-protocol = {git = "https://github.com/tempest98/rust-postgres", branch = "compat" }
 postgres-replication = { git = "https://github.com/tempest98/rust-postgres", default-features = false, branch = "compat" }
 postgres-types = { git = "https://github.com/tempest98/rust-postgres", branch = "compat" }
-pg_query = "6.2.2"
+pg_query = "6.1.1"
 
 # TLS support for origin database connections
 rustls = { version = "0.23.37", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
@@ -157,4 +157,4 @@ name = "subsumption_index"
 harness = false
 
 [patch.crates-io]
-pg_query = { path = "../pg_query.rs" }
+pg_query = { git = "https://github.com/PgCache/pg_query.rs", branch = "pgcache" }
