@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::pg::Lsn;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 

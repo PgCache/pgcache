@@ -565,7 +565,8 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore, Oid, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::oid::Oid;
     use crate::query::ast::{
         AstNode, ColumnNode, FunctionCall, QueryExpr, SelectNode, SetOpNode, SetOpType, TableNode,
         query_expr_parse,

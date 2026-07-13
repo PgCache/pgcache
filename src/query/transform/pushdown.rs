@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 #[cfg(test)]
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use ecow::EcoString;
 
 use crate::query::ast::{AstNode, BinaryOp};

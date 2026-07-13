@@ -71,7 +71,8 @@ pub fn query_shape_derive(resolved: &ResolvedQueryExpr) -> QueryShape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore, Oid, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::oid::Oid;
     use crate::query::ast::query_expr_parse;
     use crate::query::resolve::query_expr_resolve;
     use iddqd::BiHashMap;

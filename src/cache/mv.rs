@@ -8,7 +8,7 @@
 //! See `docs/materialized-results.md` for the full design.
 
 #[cfg(test)]
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::query::Fingerprint;
 use std::collections::HashSet;
 use std::fmt::Write;

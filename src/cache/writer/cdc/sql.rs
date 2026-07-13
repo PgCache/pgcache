@@ -1,4 +1,4 @@
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::query::Fingerprint;
 use std::fmt::Write;
 

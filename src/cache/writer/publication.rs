@@ -1,4 +1,4 @@
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use std::collections::HashSet;
 use std::sync::Arc;
 

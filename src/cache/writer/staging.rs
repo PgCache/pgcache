@@ -13,7 +13,7 @@
 //! permanently. `PopulationDeletedKeys` records every key CDC removes while a
 //! population over that relation is in flight; the merge filters those keys out.
 
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::Fingerprint;
 use std::collections::HashMap;

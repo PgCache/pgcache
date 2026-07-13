@@ -1106,7 +1106,8 @@ pub(crate) fn row_value_forms(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore, Oid, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::oid::Oid;
     use crate::query::ast::{BinaryOp, LiteralValue};
     use crate::query::cast::CastTarget;
     use crate::query::{Fingerprint, FingerprintSet};

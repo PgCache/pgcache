@@ -1,4 +1,4 @@
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::query::{Fingerprint, FingerprintSet};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;

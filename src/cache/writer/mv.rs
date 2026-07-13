@@ -14,7 +14,7 @@
 //! discarded (the data a build reads is snapshot-consistent either way; the
 //! race is only about whether the table may claim to be current).
 
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
 use crate::query::constraint_index::row_value_forms;
 use crate::query::constraints::ColumnRange;

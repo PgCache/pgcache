@@ -50,7 +50,7 @@
 //! The writer is single-threaded and processes frames serially, so `begin`/`end`
 //! are balanced per relation per frame and the version never sticks odd.
 
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

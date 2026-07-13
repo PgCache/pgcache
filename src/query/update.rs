@@ -1,6 +1,6 @@
 use crate::cache::{UpdateQuerySource, query::outer_join_optional_tables};
 #[cfg(test)]
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::query::ast::LiteralValue;
 use crate::query::resolved::{
     ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,

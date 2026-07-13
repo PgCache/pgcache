@@ -1,4 +1,4 @@
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use ecow::EcoString;
 use rootcause::Report;
 

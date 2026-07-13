@@ -79,7 +79,7 @@ pub(crate) use impl_id_hashable;
 /// A sequential id does not — it is not `IdHashable`, so the map can't be built:
 /// ```compile_fail
 /// use pgcache_lib::id_hash::BuildIdHasher;
-/// use pgcache_lib::catalog::Oid;
+/// use pgcache_lib::oid::Oid;
 /// use std::collections::HashMap;
 /// let _: HashMap<Oid, u8, BuildIdHasher<Oid>> = HashMap::default();
 /// ```

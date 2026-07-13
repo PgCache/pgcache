@@ -1,4 +1,4 @@
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::Fingerprint;
 use std::sync::Arc;

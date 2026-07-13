@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 

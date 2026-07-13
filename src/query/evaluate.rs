@@ -1,7 +1,7 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
 #[cfg(test)]
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
 use crate::query::cast::{

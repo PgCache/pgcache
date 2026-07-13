@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod id_hash;
 pub mod memory;
 pub mod metrics;
+pub mod oid;
 pub mod pg;
 pub mod proxy;
 pub mod query;

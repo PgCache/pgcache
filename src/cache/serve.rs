@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::{Sender, UnboundedSender};

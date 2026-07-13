@@ -1,4 +1,4 @@
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use ecow::EcoString;
 use iddqd::{IdHashItem, id_upcast};
 
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::QueryConstraints;
 use crate::query::predicate::CompiledPredicate;

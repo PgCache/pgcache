@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use error_set::error_set;
 use rootcause::Report;
 use tokio_postgres::Error;

@@ -3,7 +3,8 @@
 use iddqd::BiHashMap;
 use tokio_postgres::types::Type;
 
-use crate::catalog::{ColumnMetadata, ColumnStore, Oid, TableMetadata};
+use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+use crate::oid::Oid;
 use crate::query::ast::{Deparse, JoinType, UnaryOp, query_expr_parse};
 use crate::query::resolved::{
     ResolvedJoinNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumns,

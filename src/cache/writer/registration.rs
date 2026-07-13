@@ -1,4 +1,4 @@
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::{Fingerprint, QueryShape, query_shape_derive};
 use std::cmp::Reverse;

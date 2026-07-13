@@ -1,5 +1,5 @@
 #[cfg(test)]
-use crate::catalog::Oid;
+use crate::oid::Oid;
 use crate::query::resolved::{ResolvedSelectColumns, ResolvedSelectNode};
 
 /// Replace SELECT columns in a ResolvedSelectNode for cache population fetches.
