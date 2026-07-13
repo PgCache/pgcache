@@ -52,57 +52,40 @@ pub trait TlsConnectionOps: Send + 'static {
     fn send_close_notify(&mut self);
 }
 
-impl TlsConnectionOps for rustls::ServerConnection {
-    fn reader_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        std::io::Read::read(&mut self.reader(), buf)
-    }
+/// Both rustls connection types deref to the same `ConnectionCommon`, so every
+/// method body is identical; only the impl header differs.
+macro_rules! tls_connection_ops_impl {
+    ($conn:ty) => {
+        impl TlsConnectionOps for $conn {
+            fn reader_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                std::io::Read::read(&mut self.reader(), buf)
+            }
 
-    fn writer_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        std::io::Write::write_all(&mut self.writer(), buf)
-    }
+            fn writer_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
+                std::io::Write::write_all(&mut self.writer(), buf)
+            }
 
-    fn read_tls<R: std::io::Read>(&mut self, rd: &mut R) -> io::Result<usize> {
-        self.deref_mut().read_tls(rd)
-    }
+            fn read_tls<R: std::io::Read>(&mut self, rd: &mut R) -> io::Result<usize> {
+                self.deref_mut().read_tls(rd)
+            }
 
-    fn write_tls<W: std::io::Write>(&mut self, wr: &mut W) -> io::Result<usize> {
-        self.deref_mut().write_tls(wr)
-    }
+            fn write_tls<W: std::io::Write>(&mut self, wr: &mut W) -> io::Result<usize> {
+                self.deref_mut().write_tls(wr)
+            }
 
-    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
-        self.deref_mut().process_new_packets()
-    }
+            fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
+                self.deref_mut().process_new_packets()
+            }
 
-    fn send_close_notify(&mut self) {
-        self.deref_mut().send_close_notify();
-    }
+            fn send_close_notify(&mut self) {
+                self.deref_mut().send_close_notify();
+            }
+        }
+    };
 }
 
-impl TlsConnectionOps for rustls::ClientConnection {
-    fn reader_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        std::io::Read::read(&mut self.reader(), buf)
-    }
-
-    fn writer_write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        std::io::Write::write_all(&mut self.writer(), buf)
-    }
-
-    fn read_tls<R: std::io::Read>(&mut self, rd: &mut R) -> io::Result<usize> {
-        self.deref_mut().read_tls(rd)
-    }
-
-    fn write_tls<W: std::io::Write>(&mut self, wr: &mut W) -> io::Result<usize> {
-        self.deref_mut().write_tls(wr)
-    }
-
-    fn process_new_packets(&mut self) -> Result<rustls::IoState, rustls::Error> {
-        self.deref_mut().process_new_packets()
-    }
-
-    fn send_close_notify(&mut self) {
-        self.deref_mut().send_close_notify();
-    }
-}
+tls_connection_ops_impl!(rustls::ServerConnection);
+tls_connection_ops_impl!(rustls::ClientConnection);
 
 // ============================================================================
 // TlsStream - generic stream supporting plain TCP or TLS

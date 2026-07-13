@@ -149,7 +149,7 @@ fn literal_pair_as_bool(left: &LiteralValue, right: &LiteralValue) -> Option<(bo
 fn literal_as_bool(v: &LiteralValue) -> Option<bool> {
     match v {
         LiteralValue::Boolean(b) => Some(*b),
-        LiteralValue::String(s) => crate::query::cast::parse_pg_bool(s),
+        LiteralValue::String(s) => crate::query::cast::bool_literal_parse(s),
         // Postgres implicitly coerces integer `1`/`0` in comparisons against
         // bool; anything else is a planner error at origin (so unreachable here).
         LiteralValue::Integer(1) => Some(true),
@@ -235,11 +235,16 @@ fn column_row_value_get<'a>(
     }
 }
 
-/// Parse a PostgreSQL boolean wire-text value to a `bool`: the canonical
-/// `t`/`f`, plus the spelled-out `true`/`false`. `None` for anything else. The
-/// single source of truth for boolean wire-text spellings, shared with the
+/// Parse a boolean as Postgres *emits* it — row values and CDC tuple text.
+/// Only the canonical `t`/`f` and the spelled-out `true`/`false` occur here.
+/// `None` for anything else.
+///
+/// Deliberately narrower than [`bool_literal_parse`](crate::query::cast::bool_literal_parse),
+/// which parses boolean text a *user* wrote (`yes`/`on`/`1`/…, per Postgres
+/// `boolin`). The two are separate domains, not duplicates: this one is the
+/// single source of truth for wire-text spellings, shared with the
 /// constraint-index row probe so the two can't drift.
-pub fn pg_bool_parse(text: &str) -> Option<bool> {
+pub fn bool_wire_text_parse(text: &str) -> Option<bool> {
     match text {
         "t" | "true" => Some(true),
         "f" | "false" => Some(false),
@@ -280,7 +285,7 @@ pub fn where_value_compare_string(
             }
         }
         LiteralValue::Boolean(filter_bool) => {
-            if let Some(row_bool) = pg_bool_parse(row_value_str) {
+            if let Some(row_bool) = bool_wire_text_parse(row_value_str) {
                 match op {
                     BinaryOp::Equal => row_bool == *filter_bool,
                     BinaryOp::NotEqual => row_bool != *filter_bool,

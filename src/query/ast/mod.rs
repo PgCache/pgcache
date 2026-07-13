@@ -66,16 +66,7 @@ pub trait Deparse {
 
 impl Deparse for String {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        match identifier_needs_quotes(self) {
-            true => {
-                buf.push('"');
-                buf.push_str(self);
-                buf.push('"');
-            }
-            false => buf.push_str(self),
-        };
-
-        buf
+        self.as_str().deparse(buf)
     }
 }
 

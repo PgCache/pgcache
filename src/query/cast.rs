@@ -119,7 +119,7 @@ pub fn cast_target_coerce_text(target: &CastTarget, row_text: &str) -> Option<Li
         CastTarget::Int4 | CastTarget::Int8 => {
             row_text.parse::<i64>().ok().map(LiteralValue::Integer)
         }
-        CastTarget::Bool => parse_pg_bool(row_text).map(LiteralValue::Boolean),
+        CastTarget::Bool => bool_literal_parse(row_text).map(LiteralValue::Boolean),
         CastTarget::Date => {
             timestamp_text_to_date(row_text).map(|s| LiteralValue::String(s.into()))
         }
@@ -174,11 +174,15 @@ pub fn is_canonical_date_literal(s: &str) -> bool {
     is_canonical_date_prefix(chunk)
 }
 
-/// Parse postgres-style boolean text. Accepts the common spellings
-/// (`true`/`false`/`t`/`f`/`yes`/`no`/`on`/`off`/`1`/`0`), case-insensitive,
-/// with leading/trailing whitespace trimmed. Returns `None` for anything
-/// else — postgres would raise; locally the row simply doesn't match.
-pub fn parse_pg_bool(s: &str) -> Option<bool> {
+/// Parse a boolean literal as a *user* may have written it, mirroring Postgres
+/// `boolin`: `true`/`false`/`t`/`f`/`yes`/`no`/`on`/`off`/`1`/`0`,
+/// case-insensitive, whitespace-trimmed. Returns `None` for anything else —
+/// postgres would raise; locally the row simply doesn't match.
+///
+/// Deliberately wider than [`bool_wire_text_parse`](crate::query::evaluate::bool_wire_text_parse),
+/// which parses boolean text Postgres *emits* (only `t`/`f`/`true`/`false`).
+/// The two are separate domains, not duplicates.
+pub fn bool_literal_parse(s: &str) -> Option<bool> {
     let trimmed = s.trim();
     for &spelling in &["t", "true", "y", "yes", "on", "1"] {
         if trimmed.eq_ignore_ascii_case(spelling) {
@@ -522,12 +526,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_pg_bool_true_spellings() {
+    fn test_bool_literal_parse_true_spellings() {
         for s in [
             "t", "T", "true", "True", "TRUE", "y", "yes", "YES", "on", "1",
         ] {
             assert_eq!(
-                parse_pg_bool(s),
+                bool_literal_parse(s),
                 Some(true),
                 "spelling {s:?} should be true"
             );
@@ -535,12 +539,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_pg_bool_false_spellings() {
+    fn test_bool_literal_parse_false_spellings() {
         for s in [
             "f", "F", "false", "False", "FALSE", "n", "no", "NO", "off", "0",
         ] {
             assert_eq!(
-                parse_pg_bool(s),
+                bool_literal_parse(s),
                 Some(false),
                 "spelling {s:?} should be false"
             );
@@ -548,17 +552,17 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_pg_bool_trims_whitespace() {
-        assert_eq!(parse_pg_bool("  true  "), Some(true));
-        assert_eq!(parse_pg_bool("\tno\n"), Some(false));
+    fn test_bool_literal_parse_trims_whitespace() {
+        assert_eq!(bool_literal_parse("  true  "), Some(true));
+        assert_eq!(bool_literal_parse("\tno\n"), Some(false));
     }
 
     #[test]
-    fn test_parse_pg_bool_rejects_nonsense() {
-        assert_eq!(parse_pg_bool(""), None);
-        assert_eq!(parse_pg_bool("   "), None);
-        assert_eq!(parse_pg_bool("maybe"), None);
-        assert_eq!(parse_pg_bool("2"), None);
+    fn test_bool_literal_parse_rejects_nonsense() {
+        assert_eq!(bool_literal_parse(""), None);
+        assert_eq!(bool_literal_parse("   "), None);
+        assert_eq!(bool_literal_parse("maybe"), None);
+        assert_eq!(bool_literal_parse("2"), None);
     }
 
     #[test]

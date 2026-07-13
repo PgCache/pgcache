@@ -14,7 +14,7 @@ use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::pg::protocol::ByteString;
 
 use crate::query::ast::Deparse;
-use crate::query::evaluate::pg_bool_parse;
+use crate::query::evaluate::bool_wire_text_parse;
 use crate::query::transform::{
     BATCH_IDX_COLUMN, resolved_select_node_table_replace_with_unnest,
     resolved_select_node_table_replace_with_values_batch,
@@ -1227,7 +1227,7 @@ impl WriterCdc {
                     row_change_column_fold(
                         &mut changes,
                         col.name(),
-                        row.get(col_idx).and_then(pg_bool_parse),
+                        row.get(col_idx).and_then(bool_wire_text_parse),
                         // Reserved-prefix relations never enter the batch.
                         true,
                     );

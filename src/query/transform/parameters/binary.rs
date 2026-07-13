@@ -27,6 +27,13 @@ const NUMERIC_NAN: u16 = 0xC000;
 const NUMERIC_PINF: u16 = 0xD000;
 const NUMERIC_NINF: u16 = 0xF000;
 
+/// Wrap a decode failure for `type_name`'s binary wire format.
+fn invalid_param(type_name: &str, e: impl std::fmt::Display) -> Report<AstTransformError> {
+    Report::from(AstTransformError::InvalidParameterValue {
+        message: format!("invalid binary {type_name}: {e}"),
+    })
+}
+
 pub(super) fn binary_parameter_to_literal(
     bytes: &[u8],
     oid: u32,
@@ -78,43 +85,23 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
 
     match pg_type {
         Some(PgType::BOOL) => {
-            let value = pg_types::bool_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary bool: {e}"),
-                })
-            })?;
+            let value = pg_types::bool_from_sql(bytes).map_err(|e| invalid_param("bool", e))?;
             Ok(LiteralValue::Boolean(value))
         }
         Some(PgType::INT2) => {
-            let value = pg_types::int2_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary int2: {e}"),
-                })
-            })?;
+            let value = pg_types::int2_from_sql(bytes).map_err(|e| invalid_param("int2", e))?;
             Ok(LiteralValue::Integer(value as i64))
         }
         Some(PgType::INT4) => {
-            let value = pg_types::int4_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary int4: {e}"),
-                })
-            })?;
+            let value = pg_types::int4_from_sql(bytes).map_err(|e| invalid_param("int4", e))?;
             Ok(LiteralValue::Integer(value as i64))
         }
         Some(PgType::INT8) => {
-            let value = pg_types::int8_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary int8: {e}"),
-                })
-            })?;
+            let value = pg_types::int8_from_sql(bytes).map_err(|e| invalid_param("int8", e))?;
             Ok(LiteralValue::Integer(value))
         }
         Some(PgType::FLOAT4) => {
-            let value = pg_types::float4_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary float4: {e}"),
-                })
-            })?;
+            let value = pg_types::float4_from_sql(bytes).map_err(|e| invalid_param("float4", e))?;
             let value = NotNan::new(value as f64).map_err(|_| {
                 Report::from(AstTransformError::InvalidParameterValue {
                     message: "NaN is not a valid float value".to_owned(),
@@ -123,11 +110,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
             Ok(LiteralValue::Float(value))
         }
         Some(PgType::FLOAT8) => {
-            let value = pg_types::float8_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary float8: {e}"),
-                })
-            })?;
+            let value = pg_types::float8_from_sql(bytes).map_err(|e| invalid_param("float8", e))?;
             let value = NotNan::new(value).map_err(|_| {
                 Report::from(AstTransformError::InvalidParameterValue {
                     message: "NaN is not a valid float value".to_owned(),
@@ -143,11 +126,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
             | PgType::CHAR
             | PgType::UNKNOWN,
         ) => {
-            let value = pg_types::text_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary text: {e}"),
-                })
-            })?;
+            let value = pg_types::text_from_sql(bytes).map_err(|e| invalid_param("text", e))?;
             Ok(LiteralValue::String(value.into()))
         }
         Some(PgType::UUID) => {
@@ -190,11 +169,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
             ))
         }
         Some(PgType::TIME) => {
-            let micros = pg_types::time_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary time: {e}"),
-                })
-            })?;
+            let micros = pg_types::time_from_sql(bytes).map_err(|e| invalid_param("time", e))?;
             Ok(LiteralValue::StringWithCast(
                 time_micros_to_text(micros).into(),
                 PgType::TIME.name().into(),
@@ -202,11 +177,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
         }
         Some(PgType::DATE) => {
             // ±i32 sentinels are PG14+ `infinity` / `-infinity`.
-            let days = pg_types::date_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary date: {e}"),
-                })
-            })?;
+            let days = pg_types::date_from_sql(bytes).map_err(|e| invalid_param("date", e))?;
             let text = match days {
                 i32::MAX => "infinity".to_owned(),
                 i32::MIN => "-infinity".to_owned(),
@@ -221,11 +192,8 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
             ))
         }
         Some(PgType::TIMESTAMP) => {
-            let micros = pg_types::timestamp_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary timestamp: {e}"),
-                })
-            })?;
+            let micros =
+                pg_types::timestamp_from_sql(bytes).map_err(|e| invalid_param("timestamp", e))?;
             let text = match micros {
                 i64::MAX => "infinity".to_owned(),
                 i64::MIN => "-infinity".to_owned(),
@@ -239,11 +207,8 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
         Some(PgType::TIMESTAMPTZ) => {
             // Emit explicit `+00` so PG re-parses with zone regardless of
             // session `TimeZone` setting. Wire format matches TIMESTAMP.
-            let micros = pg_types::timestamp_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary timestamptz: {e}"),
-                })
-            })?;
+            let micros =
+                pg_types::timestamp_from_sql(bytes).map_err(|e| invalid_param("timestamptz", e))?;
             let text = match micros {
                 i64::MAX => "infinity".to_owned(),
                 i64::MIN => "-infinity".to_owned(),
@@ -255,11 +220,8 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
             ))
         }
         Some(PgType::MACADDR) => {
-            let octets = pg_types::macaddr_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary macaddr: {e}"),
-                })
-            })?;
+            let octets =
+                pg_types::macaddr_from_sql(bytes).map_err(|e| invalid_param("macaddr", e))?;
             Ok(LiteralValue::StringWithCast(
                 macaddr_to_text(&octets).into(),
                 PgType::MACADDR.name().into(),
@@ -280,22 +242,14 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
             ))
         }
         Some(PgType::INET) => {
-            let inet = pg_types::inet_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary inet: {e}"),
-                })
-            })?;
+            let inet = pg_types::inet_from_sql(bytes).map_err(|e| invalid_param("inet", e))?;
             Ok(LiteralValue::StringWithCast(
                 inet_to_text(&inet, false).into(),
                 PgType::INET.name().into(),
             ))
         }
         Some(PgType::CIDR) => {
-            let inet = pg_types::inet_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary cidr: {e}"),
-                })
-            })?;
+            let inet = pg_types::inet_from_sql(bytes).map_err(|e| invalid_param("cidr", e))?;
             Ok(LiteralValue::StringWithCast(
                 inet_to_text(&inet, true).into(),
                 PgType::CIDR.name().into(),
@@ -354,11 +308,7 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
             // prefix or other framing — so it round-trips as a string
             // literal, just with an explicit `::json` cast to preserve
             // the column's expected type.
-            let value = pg_types::text_from_sql(bytes).map_err(|e| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid binary json: {e}"),
-                })
-            })?;
+            let value = pg_types::text_from_sql(bytes).map_err(|e| invalid_param("json", e))?;
             Ok(LiteralValue::StringWithCast(
                 value.into(),
                 PgType::JSON.name().into(),
@@ -659,11 +609,7 @@ fn interval_to_text(micros: i64, days: i32, months: i32) -> String {
 /// return `UnsupportedBinaryFormat` so the caller can fall through to
 /// origin uncached.
 fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
-    let array = pg_types::array_from_sql(bytes).map_err(|e| {
-        Report::from(AstTransformError::InvalidParameterValue {
-            message: format!("invalid binary array: {e}"),
-        })
-    })?;
+    let array = pg_types::array_from_sql(bytes).map_err(|e| invalid_param("array", e))?;
 
     // 1-D arrays only. Multi-dim falls through to origin uncached.
     let mut dims = array.dimensions();

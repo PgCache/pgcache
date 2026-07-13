@@ -28,7 +28,7 @@ use smallvec::SmallVec;
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{ColumnRange, TableConstraint, column_range_build};
-use crate::query::evaluate::pg_bool_parse;
+use crate::query::evaluate::bool_wire_text_parse;
 
 /// `HashMap` keyed by an id type with the passthrough identity hasher.
 type IdMap<K, V> = HashMap<K, V, BuildIdHasher<K>>;
@@ -1095,7 +1095,7 @@ pub(crate) fn row_value_forms(
         .ok()
         .and_then(|x| NotNan::new(x).ok())
         .map(|n| ColumnRange::Equal(LiteralValue::Float(n)));
-    let boolean = pg_bool_parse(text).map(|b| ColumnRange::Equal(LiteralValue::Boolean(b)));
+    let boolean = bool_wire_text_parse(text).map(|b| ColumnRange::Equal(LiteralValue::Boolean(b)));
     [
         Some(ColumnRange::Equal(LiteralValue::String(text.into()))),
         float,

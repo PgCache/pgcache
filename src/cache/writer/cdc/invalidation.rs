@@ -15,7 +15,7 @@ use crate::query::ast::BinaryOp;
 use crate::query::cast::cast_target_coerce_text;
 use crate::query::constraint_index::row_value_forms;
 use crate::query::constraints::{QueryConstraints, TableConstraint};
-use crate::query::evaluate::{literal_compare, pg_bool_parse, where_value_compare_string};
+use crate::query::evaluate::{bool_wire_text_parse, literal_compare, where_value_compare_string};
 
 use crate::settings::CachePolicy;
 
@@ -599,7 +599,7 @@ impl WriterCdc {
                     row_change_column_fold(
                         &mut changes,
                         col.name(),
-                        row.get(idx).and_then(pg_bool_parse),
+                        row.get(idx).and_then(bool_wire_text_parse),
                         !reserved_columns,
                     );
                 }
