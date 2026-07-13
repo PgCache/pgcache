@@ -9,23 +9,37 @@ use crate::query::ast::{
     Deparse, LiteralValue, TableAlias, ValuesClause, emit_escaped_string_literal,
 };
 use crate::query::resolved::{
-    ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
-    ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource,
-    ResolvedTableSubqueryNode, ResolvedWhereExpr,
+    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
+    ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource, ResolvedTableSubqueryNode,
 };
 
 use super::{AstTransformError, AstTransformResult};
+
+mod alias_rewrite;
+
+use alias_rewrite::resolved_select_node_alias_rewrite;
 
 /// Synthetic leading column carrying each batched row's ordinal through the
 /// membership query (PGC-241). Prefixed to avoid colliding with real columns.
 pub const BATCH_IDX_COLUMN: &str = "__pgc_idx";
 
-/// Find the first table source matching `relation_oid` in the FROM tree and
-/// return its effective alias (explicit alias, else the table name).
-fn table_alias_find(
+/// The FROM occurrence of the table being replaced by `VALUES`.
+pub(super) struct TableOccurrence {
+    /// `Some` iff the FROM entry carried an explicit alias. This is the
+    /// occurrence's *identity*: under a self-join the other occurrences share
+    /// `(schema, table)` and differ only here, so the rewrite keys on it to
+    /// avoid clobbering their references (PGC-256).
+    explicit_alias: Option<EcoString>,
+    /// Explicit alias, else the table name — what the `VALUES` subquery is
+    /// named, and what the rewritten references are qualified by.
+    effective_alias: EcoString,
+}
+
+/// Find the first table source matching `relation_oid` in the FROM tree.
+fn table_occurrence_find(
     resolved: &ResolvedSelectNode,
     table_metadata: &TableMetadata,
-) -> AstTransformResult<EcoString> {
+) -> AstTransformResult<TableOccurrence> {
     let Some(first_from) = resolved.from.first() else {
         return Err(AstTransformError::MissingTable.into());
     };
@@ -39,9 +53,14 @@ fn table_alias_find(
             ResolvedTableSource::Table(table)
                 if table.relation_oid == table_metadata.relation_oid =>
             {
-                return Ok(EcoString::from(
-                    table.alias.as_deref().unwrap_or(&table_metadata.name),
-                ));
+                let explicit_alias = table.alias.as_deref().map(EcoString::from);
+                let effective_alias = explicit_alias
+                    .clone()
+                    .unwrap_or_else(|| EcoString::from(table_metadata.name.as_str()));
+                return Ok(TableOccurrence {
+                    explicit_alias,
+                    effective_alias,
+                });
             }
             ResolvedTableSource::Table(_) | ResolvedTableSource::Subquery(_) => (),
         }
@@ -123,15 +142,15 @@ pub fn resolved_select_node_table_replace_with_values(
 ) -> AstTransformResult<ResolvedSelectNode> {
     let mut resolved_new = resolved.clone();
 
-    let alias = table_alias_find(&resolved_new, table_metadata)?;
+    let occurrence = table_occurrence_find(&resolved_new, table_metadata)?;
 
     // Update all column references for this table to use the alias
-    resolved_select_node_column_alias_update(
+    resolved_select_node_alias_rewrite(
         &mut resolved_new,
         &table_metadata.schema,
         &table_metadata.name,
-        &alias,
-    );
+        &occurrence,
+    )?;
 
     let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
 
@@ -146,7 +165,7 @@ pub fn resolved_select_node_table_replace_with_values(
             limit: None,
         }),
         alias: TableAlias {
-            name: alias,
+            name: occurrence.effective_alias.clone(),
             columns: column_names,
         },
         subquery_kind: SubqueryKind::Inclusion,
@@ -181,13 +200,14 @@ impl PgEvalTemplate {
     /// ambiguous — the caller then falls back to the per-row clone-and-deparse.
     pub fn build(resolved: &ResolvedSelectNode, table_metadata: &TableMetadata) -> Option<Self> {
         let mut template = resolved.clone();
-        let alias = table_alias_find(&template, table_metadata).ok()?;
-        resolved_select_node_column_alias_update(
+        let occurrence = table_occurrence_find(&template, table_metadata).ok()?;
+        resolved_select_node_alias_rewrite(
             &mut template,
             &table_metadata.schema,
             &table_metadata.name,
-            &alias,
-        );
+            &occurrence,
+        )
+        .ok()?;
         let source_node = table_source_find_mut(&mut template, table_metadata.relation_oid).ok()?;
 
         let column_names: Vec<EcoString> = table_metadata
@@ -206,7 +226,7 @@ impl PgEvalTemplate {
                 limit: None,
             }),
             alias: TableAlias {
-                name: alias,
+                name: occurrence.effective_alias.clone(),
                 columns: column_names,
             },
             subquery_kind: SubqueryKind::Inclusion,
@@ -290,14 +310,14 @@ pub fn resolved_select_node_table_replace_with_values_batch(
 ) -> AstTransformResult<ResolvedSelectNode> {
     let mut resolved_new = resolved.clone();
 
-    let alias = table_alias_find(&resolved_new, table_metadata)?;
+    let occurrence = table_occurrence_find(&resolved_new, table_metadata)?;
 
-    resolved_select_node_column_alias_update(
+    resolved_select_node_alias_rewrite(
         &mut resolved_new,
         &table_metadata.schema,
         &table_metadata.name,
-        &alias,
-    );
+        &occurrence,
+    )?;
 
     let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
 
@@ -327,7 +347,7 @@ pub fn resolved_select_node_table_replace_with_values_batch(
             limit: None,
         }),
         alias: TableAlias {
-            name: alias,
+            name: occurrence.effective_alias.clone(),
             columns: column_names,
         },
         subquery_kind: SubqueryKind::Inclusion,
@@ -377,14 +397,14 @@ pub fn resolved_select_node_table_replace_with_unnest(
 ) -> AstTransformResult<ResolvedSelectNode> {
     let mut resolved_new = resolved.clone();
 
-    let alias = table_alias_find(&resolved_new, table_metadata)?;
+    let occurrence = table_occurrence_find(&resolved_new, table_metadata)?;
 
-    resolved_select_node_column_alias_update(
+    resolved_select_node_alias_rewrite(
         &mut resolved_new,
         &table_metadata.schema,
         &table_metadata.name,
-        &alias,
-    );
+        &occurrence,
+    )?;
 
     let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
 
@@ -418,7 +438,7 @@ pub fn resolved_select_node_table_replace_with_unnest(
         // Column names flow from the inner select aliases; a bare table alias
         // keeps refs like `<alias>.<col>` resolving.
         alias: TableAlias {
-            name: alias,
+            name: occurrence.effective_alias.clone(),
             columns: vec![],
         },
         subquery_kind: SubqueryKind::Inclusion,
@@ -430,211 +450,6 @@ pub fn resolved_select_node_table_replace_with_unnest(
     }]);
 
     Ok(resolved_new)
-}
-
-/// Update all column references for a specific table to use an alias in a ResolvedSelectNode.
-fn resolved_select_node_column_alias_update(
-    resolved: &mut ResolvedSelectNode,
-    schema: &str,
-    table: &str,
-    alias: &str,
-) {
-    // Update WHERE clause columns
-    if let Some(where_clause) = &mut resolved.where_clause {
-        resolved_where_expr_alias_update(where_clause, schema, table, alias);
-    }
-    // Update SELECT columns
-    resolved_select_columns_alias_update(&mut resolved.columns, schema, table, alias);
-    // GROUP BY / HAVING — same dangling-ref hazard as the JOIN case
-    // below (PGC-145; same omission class as PGC-139).
-    for col in &mut resolved.group_by {
-        resolved_column_node_alias_update(col, schema, table, alias);
-    }
-    if let Some(having) = &mut resolved.having {
-        resolved_where_expr_alias_update(having, schema, table, alias);
-    }
-    // Update JOIN ON conditions: the replaced table becomes an aliased
-    // VALUES subquery, so refs to it in join conditions must use the
-    // alias too — otherwise a schema-qualified `schema.table.col`
-    // survives while the FROM entry is only `alias`, which Postgres
-    // rejects as "invalid reference to FROM-clause entry" (PGC-139).
-    for source in &mut resolved.from {
-        resolved_table_source_alias_update(source, schema, table, alias);
-    }
-}
-
-/// Rewrite a resolved column node referencing `schema.table` to use
-/// `alias` (the VALUES-subquery name), so it deparses as `alias.col`.
-fn resolved_column_node_alias_update(
-    col: &mut ResolvedColumnNode,
-    schema: &str,
-    table: &str,
-    alias: &str,
-) {
-    if col.schema == schema && col.table == table {
-        col.table_alias = Some(EcoString::from(alias));
-    }
-}
-
-/// Update column references for `table` to `alias` within a FROM source's
-/// JOIN conditions, recursing through nested joins. Subquery sources are
-/// left alone — a derived table is its own scope and cannot reference the
-/// outer table being replaced.
-fn resolved_table_source_alias_update(
-    source: &mut ResolvedTableSource,
-    schema: &str,
-    table: &str,
-    alias: &str,
-) {
-    match source {
-        ResolvedTableSource::Join(join) => {
-            resolved_table_source_alias_update(&mut join.left, schema, table, alias);
-            resolved_table_source_alias_update(&mut join.right, schema, table, alias);
-            if let Some(condition) = join.predicate_mut() {
-                resolved_where_expr_alias_update(condition, schema, table, alias);
-            }
-        }
-        ResolvedTableSource::Table(_) | ResolvedTableSource::Subquery(_) => {}
-    }
-}
-
-/// Update column aliases in a ResolvedQueryExpr
-fn resolved_query_expr_column_alias_update(
-    query: &mut ResolvedQueryExpr,
-    schema: &str,
-    table: &str,
-    alias: &str,
-) {
-    match &mut query.body {
-        ResolvedQueryBody::Select(select_node) => {
-            // Update WHERE clause columns
-            if let Some(where_clause) = &mut select_node.where_clause {
-                resolved_where_expr_alias_update(where_clause, schema, table, alias);
-            }
-            // Update SELECT columns
-            resolved_select_columns_alias_update(&mut select_node.columns, schema, table, alias);
-        }
-        ResolvedQueryBody::Values(_) => {
-            // VALUES clauses don't have column references to update
-        }
-        ResolvedQueryBody::SetOp(set_op) => {
-            resolved_query_expr_column_alias_update(&mut set_op.left, schema, table, alias);
-            resolved_query_expr_column_alias_update(&mut set_op.right, schema, table, alias);
-        }
-    }
-    // Update ORDER BY columns at query level
-    for order_by in &mut query.order_by {
-        resolved_scalar_expr_alias_update(&mut order_by.expr, schema, table, alias);
-    }
-}
-
-fn resolved_where_expr_alias_update(
-    expr: &mut ResolvedWhereExpr,
-    schema: &str,
-    table: &str,
-    alias: &str,
-) {
-    match expr {
-        ResolvedWhereExpr::Scalar(scalar) => {
-            resolved_scalar_expr_alias_update(scalar, schema, table, alias);
-        }
-        ResolvedWhereExpr::Unary(unary) => {
-            resolved_where_expr_alias_update(&mut unary.expr, schema, table, alias);
-        }
-        ResolvedWhereExpr::Binary(binary) => {
-            resolved_where_expr_alias_update(&mut binary.lexpr, schema, table, alias);
-            resolved_where_expr_alias_update(&mut binary.rexpr, schema, table, alias);
-        }
-        ResolvedWhereExpr::Multi(multi) => {
-            for e in &mut multi.exprs {
-                resolved_where_expr_alias_update(e, schema, table, alias);
-            }
-        }
-        ResolvedWhereExpr::Subquery {
-            query, test_expr, ..
-        } => {
-            resolved_query_expr_column_alias_update(query, schema, table, alias);
-            if let Some(test) = test_expr {
-                resolved_scalar_expr_alias_update(test, schema, table, alias);
-            }
-        }
-    }
-}
-
-fn resolved_select_columns_alias_update(
-    columns: &mut ResolvedSelectColumns,
-    schema: &str,
-    table: &str,
-    alias: &str,
-) {
-    match columns {
-        ResolvedSelectColumns::Columns(cols) => {
-            for col in cols {
-                resolved_scalar_expr_alias_update(&mut col.expr, schema, table, alias);
-            }
-        }
-        ResolvedSelectColumns::None => {}
-    }
-}
-
-fn resolved_scalar_expr_alias_update(
-    expr: &mut ResolvedScalarExpr,
-    schema: &str,
-    table: &str,
-    alias: &str,
-) {
-    match expr {
-        ResolvedScalarExpr::Column(col) => {
-            resolved_column_node_alias_update(col, schema, table, alias);
-        }
-        ResolvedScalarExpr::Function(func) => {
-            for arg in &mut func.args {
-                resolved_scalar_expr_alias_update(arg, schema, table, alias);
-            }
-            for clause in &mut func.agg_order {
-                resolved_scalar_expr_alias_update(&mut clause.expr, schema, table, alias);
-            }
-            if let Some(filter) = &mut func.agg_filter {
-                resolved_where_expr_alias_update(filter, schema, table, alias);
-            }
-            if let Some(window_spec) = &mut func.over {
-                for col in &mut window_spec.partition_by {
-                    resolved_scalar_expr_alias_update(col, schema, table, alias);
-                }
-                for clause in &mut window_spec.order_by {
-                    resolved_scalar_expr_alias_update(&mut clause.expr, schema, table, alias);
-                }
-            }
-        }
-        ResolvedScalarExpr::Case(case) => {
-            if let Some(arg) = &mut case.arg {
-                resolved_scalar_expr_alias_update(arg, schema, table, alias);
-            }
-            for when in &mut case.whens {
-                resolved_where_expr_alias_update(&mut when.condition, schema, table, alias);
-                resolved_scalar_expr_alias_update(&mut when.result, schema, table, alias);
-            }
-            if let Some(default) = &mut case.default {
-                resolved_scalar_expr_alias_update(default, schema, table, alias);
-            }
-        }
-        ResolvedScalarExpr::Arithmetic(arith) => {
-            resolved_scalar_expr_alias_update(&mut arith.left, schema, table, alias);
-            resolved_scalar_expr_alias_update(&mut arith.right, schema, table, alias);
-        }
-        ResolvedScalarExpr::Subquery(query, _) => {
-            resolved_query_expr_column_alias_update(query, schema, table, alias);
-        }
-        ResolvedScalarExpr::Array(elems) => {
-            for elem in elems {
-                resolved_scalar_expr_alias_update(elem, schema, table, alias);
-            }
-        }
-        ResolvedScalarExpr::TypeCast { expr, .. } => {
-            resolved_scalar_expr_alias_update(expr, schema, table, alias);
-        }
-        ResolvedScalarExpr::Identifier(_) | ResolvedScalarExpr::Literal(_) => {}
-    }
 }
 
 #[cfg(test)]
@@ -855,12 +670,12 @@ mod tests {
         );
     }
 
-    /// KNOWN GAP (PGC-322): a correlated reference to the CDC'd table inside a
-    /// nested subquery's HAVING is NOT rewritten — the nested-subquery handler
-    /// skips HAVING. The surviving `public.onek.ten` dangles against the
-    /// aliased FROM entry. The correct behavior would rewrite it to `onek.ten`.
+    /// A correlated reference to the CDC'd table inside a nested subquery's
+    /// HAVING is rewritten to the VALUES alias. The nested-subquery handler
+    /// used to skip HAVING, leaving `public.onek.ten` dangling against the
+    /// aliased FROM entry (PGC-317, same omission class as PGC-145).
     #[test]
-    fn test_nested_subquery_having_correlated_ref_not_rewritten() {
+    fn test_nested_subquery_having_correlated_ref_rewritten() {
         let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
         let dept_cols = &[("k", "int4"), ("v", "int4")];
         let mut tables = BiHashMap::new();
@@ -884,18 +699,16 @@ mod tests {
         Deparse::deparse(&replaced, &mut sql);
 
         assert!(
-            sql.contains("public.onek.ten"),
-            "expected the nested HAVING ref to remain un-aliased (current gap); got: {sql}"
+            !sql.contains("public.onek"),
+            "nested HAVING correlated ref must be aliased; got: {sql}"
         );
     }
 
-    /// KNOWN GAP (PGC-322): a correlated reference to the CDC'd table inside a
-    /// nested subquery's inner JOIN-ON is NOT rewritten — the nested-subquery
-    /// handler does not descend a subquery's FROM at all. This is the gap with
-    /// the highest shadowing risk to weigh in PGC-322, since a subquery's own
-    /// FROM is where a same-named inner instance would be introduced.
+    /// A correlated reference to the CDC'd table inside a nested subquery's
+    /// inner JOIN-ON is rewritten to the VALUES alias; the subquery's own
+    /// tables keep their schema qualification (PGC-317).
     #[test]
-    fn test_nested_subquery_join_on_correlated_ref_not_rewritten() {
+    fn test_nested_subquery_join_on_correlated_ref_rewritten() {
         let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
         let dept_cols = &[("k", "int4"), ("v", "int4")];
         let emp_cols = &[("k", "int4"), ("w", "int4")];
@@ -921,9 +734,77 @@ mod tests {
         Deparse::deparse(&replaced, &mut sql);
 
         assert!(
-            sql.contains("public.onek.ten"),
-            "expected the nested JOIN-ON ref to remain un-aliased (current gap); got: {sql}"
+            !sql.contains("public.onek"),
+            "nested JOIN-ON correlated ref must be aliased; got: {sql}"
         );
+        assert!(
+            sql.contains("public.dept") && sql.contains("public.emp"),
+            "the subquery's own tables must keep schema qualification; got: {sql}"
+        );
+    }
+
+    /// A subquery that re-opens the CDC'd table under its own alias is a
+    /// distinct occurrence: its references must survive untouched, while the
+    /// correlated reference to the outer occurrence is aliased. Matching on
+    /// bare `(schema, table)` clobbered both, collapsing the correlation into
+    /// the tautology `onek.ten = onek.ten` (PGC-256).
+    #[test]
+    fn test_inner_occurrence_under_own_alias_not_clobbered() {
+        let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols));
+        let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
+        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
+
+        let qe = query_expr_parse(
+            "SELECT unique1 FROM onek WHERE EXISTS \
+             (SELECT 1 FROM onek o2 WHERE o2.ten = onek.ten)",
+        )
+        .expect("convert");
+        let QueryBody::Select(node) = qe.body else {
+            panic!("expected SELECT");
+        };
+        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
+        let replaced = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
+            .expect("replace");
+        let mut sql = String::new();
+        Deparse::deparse(&replaced, &mut sql);
+
+        assert!(
+            sql.contains("o2.ten = onek.ten"),
+            "inner occurrence must keep its own alias, outer must be rewritten; got: {sql}"
+        );
+    }
+
+    /// When a subquery re-opens the CDC'd table under the *same* alias, its
+    /// references are indistinguishable from correlated references to the outer
+    /// occurrence. The rewrite refuses rather than emit a silently-wrong
+    /// membership predicate; CDC then invalidates instead of mis-applying
+    /// (PGC-256).
+    #[test]
+    fn test_same_alias_shadowing_refuses_rewrite() {
+        let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
+        let mut tables = BiHashMap::new();
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols));
+        let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
+        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
+
+        let qe = query_expr_parse(
+            "SELECT unique1 FROM onek WHERE EXISTS \
+             (SELECT 1 FROM onek WHERE onek.ten = 3)",
+        )
+        .expect("convert");
+        let QueryBody::Select(node) = qe.body else {
+            panic!("expected SELECT");
+        };
+        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
+
+        let err = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
+            .expect_err("refuse the rewrite under same-alias shadowing");
+        assert!(matches!(
+            err.current_context(),
+            AstTransformError::ShadowedTable { .. }
+        ));
     }
 
     /// USING/NATURAL deparse **verbatim** (so Postgres performs the

@@ -5,6 +5,7 @@ mod select_node;
 mod values;
 mod walk;
 
+use ecow::EcoString;
 use error_set::error_set;
 use rootcause::Report;
 
@@ -21,6 +22,8 @@ error_set! {
         InvalidParameterValue { message: String },
         #[display("Unsupported binary format for OID {oid}")]
         UnsupportedBinaryFormat { oid: u32 },
+        #[display("Table {table} is re-opened under the same alias in a subquery")]
+        ShadowedTable { table: EcoString },
     }
 }
 

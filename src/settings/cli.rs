@@ -90,8 +90,9 @@ where
     T::Err: fmt::Display,
 {
     let s = arg_string(parser)?;
-    s.parse()
-        .map_err(|e: T::Err| Report::from(ConfigError::ArgumentError(BoxedError::new(e.to_string()))))
+    s.parse().map_err(|e: T::Err| {
+        Report::from(ConfigError::ArgumentError(BoxedError::new(e.to_string())))
+    })
 }
 
 /// Require an `Option<T>` to be `Some`, or return `ArgumentMissing`.
