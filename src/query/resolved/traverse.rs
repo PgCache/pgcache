@@ -1,3 +1,15 @@
+//! [`AstNode`] for the resolved AST: a uniform pre-order walk over every
+//! descendant node.
+//!
+//! Uniform is the point, and also the limit. Several resolved analyses
+//! deliberately do *not* descend uniformly, and routing them through
+//! `nodes::<N>()` would silently change their answers — a FROM-clause derived
+//! table opens a new name scope ([`ResolvedSelectNode::direct_table_nodes`]),
+//! and an aggregate or window nested inside a scalar subquery does not make the
+//! *outer* expression aggregating or windowed ([`ResolvedScalarExpr::has_aggregate`],
+//! `cache::mv::shape_classify`). Each such site says so at its definition; treat
+//! that as load-bearing, not as duplication waiting to be collapsed.
+
 use std::any::Any;
 use std::ops::ControlFlow;
 

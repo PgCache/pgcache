@@ -70,33 +70,6 @@ impl ResolvedWhereExpr {
         }
     }
 
-    /// Recursively collect SELECT branches from subqueries in this WHERE expression.
-    fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
-        match self {
-            ResolvedWhereExpr::Scalar(scalar) => scalar.subquery_nodes_collect(branches),
-            ResolvedWhereExpr::Binary(binary) => {
-                binary.lexpr.subquery_nodes_collect(branches);
-                binary.rexpr.subquery_nodes_collect(branches);
-            }
-            ResolvedWhereExpr::Unary(unary) => {
-                unary.expr.subquery_nodes_collect(branches);
-            }
-            ResolvedWhereExpr::Multi(multi) => {
-                for expr in &multi.exprs {
-                    expr.subquery_nodes_collect(branches);
-                }
-            }
-            ResolvedWhereExpr::Subquery {
-                query, test_expr, ..
-            } => {
-                query.select_nodes_collect(branches);
-                if let Some(test) = test_expr {
-                    test.subquery_nodes_collect(branches);
-                }
-            }
-        }
-    }
-
     /// Like `subquery_nodes_collect_with_source` but force every collected
     /// subquery to `SubqueryKind::Scalar` regardless of `SubLinkType`. The
     /// truth value feeds an enclosing scalar (aggregate FILTER, CASE WHEN
@@ -175,61 +148,6 @@ impl ResolvedScalarExpr {
             }
         }
     }
-
-    /// Recursively collect SELECT branches from subqueries in this column expression.
-    fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
-        match self {
-            ResolvedScalarExpr::Column(_)
-            | ResolvedScalarExpr::Identifier(_)
-            | ResolvedScalarExpr::Literal(_) => {}
-            ResolvedScalarExpr::Function(func) => {
-                for arg in &func.args {
-                    arg.subquery_nodes_collect(branches);
-                }
-                for clause in &func.agg_order {
-                    clause.expr.subquery_nodes_collect(branches);
-                }
-                if let Some(filter) = &func.agg_filter {
-                    filter.subquery_nodes_collect(branches);
-                }
-                if let Some(over) = &func.over {
-                    for col in &over.partition_by {
-                        col.subquery_nodes_collect(branches);
-                    }
-                    for clause in &over.order_by {
-                        clause.expr.subquery_nodes_collect(branches);
-                    }
-                }
-            }
-            ResolvedScalarExpr::Case(case) => {
-                if let Some(arg) = &case.arg {
-                    arg.subquery_nodes_collect(branches);
-                }
-                for when in &case.whens {
-                    when.condition.subquery_nodes_collect(branches);
-                    when.result.subquery_nodes_collect(branches);
-                }
-                if let Some(default) = &case.default {
-                    default.subquery_nodes_collect(branches);
-                }
-            }
-            ResolvedScalarExpr::Arithmetic(arith) => {
-                arith.left.subquery_nodes_collect(branches);
-                arith.right.subquery_nodes_collect(branches);
-            }
-            ResolvedScalarExpr::Subquery(query, _) => {
-                query.select_nodes_collect(branches);
-            }
-            ResolvedScalarExpr::Array(elems) => {
-                for elem in elems {
-                    elem.subquery_nodes_collect(branches);
-                }
-            }
-            ResolvedScalarExpr::TypeCast { expr, .. } => {
-                expr.subquery_nodes_collect(branches);
-            }
-        }
-    }
 }
 
 impl ResolvedSelectColumns {
@@ -242,15 +160,6 @@ impl ResolvedSelectColumns {
         if let ResolvedSelectColumns::Columns(columns) = self {
             for col in columns {
                 col.expr.subquery_nodes_collect_with_source(branches);
-            }
-        }
-    }
-
-    /// Recursively collect SELECT branches from subqueries in the SELECT list.
-    fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
-        if let ResolvedSelectColumns::Columns(columns) = self {
-            for col in columns {
-                col.expr.subquery_nodes_collect(branches);
             }
         }
     }
@@ -286,23 +195,6 @@ impl ResolvedTableSource {
                     .subquery_nodes_collect_with_source(branches, negated);
                 if let Some(condition) = join.predicate() {
                     condition.subquery_nodes_collect_with_source(branches, negated);
-                }
-            }
-        }
-    }
-
-    /// Recursively collect SELECT branches from subqueries in this table source.
-    fn subquery_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
-        match self {
-            ResolvedTableSource::Table(_) => {}
-            ResolvedTableSource::Subquery(sub) => {
-                sub.query.select_nodes_collect(branches);
-            }
-            ResolvedTableSource::Join(join) => {
-                join.left.subquery_nodes_collect(branches);
-                join.right.subquery_nodes_collect(branches);
-                if let Some(condition) = join.predicate() {
-                    condition.subquery_nodes_collect(branches);
                 }
             }
         }
@@ -363,38 +255,9 @@ impl ResolvedQueryExpr {
     /// all SELECT branches from both sides.
     /// VALUES clauses are skipped (they don't reference tables).
     pub fn select_nodes(&self) -> Vec<&ResolvedSelectNode> {
-        let mut branches = Vec::new();
-        self.select_nodes_collect(&mut branches);
-        branches
-    }
-
-    /// Helper to recursively collect SELECT branches.
-    fn select_nodes_collect<'a>(&'a self, branches: &mut Vec<&'a ResolvedSelectNode>) {
-        match &self.body {
-            ResolvedQueryBody::Select(select) => {
-                branches.push(select);
-                // Descend into subqueries in FROM clause
-                for source in &select.from {
-                    source.subquery_nodes_collect(branches);
-                }
-                // Descend into subqueries in WHERE clause
-                if let Some(where_clause) = &select.where_clause {
-                    where_clause.subquery_nodes_collect(branches);
-                }
-                // Descend into subqueries in HAVING clause
-                if let Some(having) = &select.having {
-                    having.subquery_nodes_collect(branches);
-                }
-                // Descend into subqueries in SELECT list
-                select.columns.subquery_nodes_collect(branches);
-            }
-            ResolvedQueryBody::Values(_) => {
-                // VALUES clauses don't reference tables, skip
-            }
-            ResolvedQueryBody::SetOp(set_op) => {
-                set_op.left.select_nodes_collect(branches);
-                set_op.right.select_nodes_collect(branches);
-            }
-        }
+        self.select_nodes_with_source()
+            .into_iter()
+            .map(|(node, _)| node)
+            .collect()
     }
 }
