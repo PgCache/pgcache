@@ -121,6 +121,17 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
     let db = PgTempDBBuilder::new()
         .with_dbname("origin_test")
         .with_config_param("wal_level", "logical")
+        // Postgres inherits a *pipe* for stderr from pgtemp, and nothing drains
+        // it. Without the collector, backends log straight to that pipe; once
+        // its 16 KB buffer fills, a backend blocks inside `write()` in
+        // `EmitErrorReport` — mid-query, holding the client's response — until
+        // something frees space. The cache DB already runs a collector; origin
+        // did not, so any test that makes origin log heavily (e.g. an error per
+        // query) could stall a client for tens of seconds. Give origin its own
+        // syslogger so the pipe is always drained.
+        .with_config_param("log_destination", "stderr")
+        .with_config_param("logging_collector", "on")
+        .with_config_param("log_directory", "/tmp/")
         .start_async()
         .await;
 
