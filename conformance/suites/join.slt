@@ -24,9 +24,8 @@
 # forwards; cache coverage for joins comes from the keyed t1/t2/t3, x/y,
 # onek, and tenk1 fixtures.
 #
-# Four queries are kept correctly-red on PGC-283 (USING/NATURAL joins over
-# derived tables cache a wrong result). The x/y self-joins forward via
-# PGC-256 (self-join column-alias resolution) and are annotated passthrough.
+# The x/y self-joins forward via PGC-256 (self-join column-alias
+# resolution) and are annotated passthrough.
 
 #
 # CORRELATION NAMES — table/column aliases.
@@ -199,20 +198,18 @@ SELECT * FROM j1_tbl LEFT JOIN j2_tbl USING (i) WHERE (i = 1);
 # Multiway full join and join/subquery interactions (t1/t2/t3).
 #
 
-# USING/NATURAL over derived tables (subqueries) is cached but returns a
-# wrong result — PGC-283 (correctly red). The INNER/LEFT/NATURAL-INNER/
-# NATURAL-LEFT forms below cache-and-diverge; the FULL forms forward.
+# USING/NATURAL over derived tables (subqueries): `*` expansion covers
+# derived-table columns (PGC-359 fixed the dropped-column divergence).
+# The FULL forms forward.
 
 # pgcache: passthrough
 query TTTT
 SELECT * FROM t1 FULL JOIN t2 USING (name) FULL JOIN t3 USING (name);
 
-# PGC-283 (correctly red)
 # pgcache: cached
 query TTT
 SELECT * FROM (SELECT * FROM t2) AS s2 INNER JOIN (SELECT * FROM t3) s3 USING (name);
 
-# PGC-283 (correctly red)
 # pgcache: cached
 query TTT
 SELECT * FROM (SELECT * FROM t2) AS s2 LEFT JOIN (SELECT * FROM t3) s3 USING (name);
@@ -222,7 +219,6 @@ query TTT
 SELECT * FROM (SELECT * FROM t2) AS s2 FULL JOIN (SELECT * FROM t3) s3 USING (name);
 
 # NATURAL joins over subqueries with non-nullable constant columns.
-# PGC-283 (correctly red)
 # pgcache: cached
 query TTTTT
 SELECT * FROM
@@ -230,7 +226,6 @@ SELECT * FROM
   NATURAL INNER JOIN
   (SELECT name, n AS s3_n, 3 AS s3_2 FROM t3) s3;
 
-# PGC-283 (correctly red)
 # pgcache: cached
 query TTTTT
 SELECT * FROM

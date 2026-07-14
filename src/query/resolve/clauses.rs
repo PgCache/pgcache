@@ -45,17 +45,16 @@ pub(super) fn select_columns_resolve(
                                 });
                             }
                         }
-                        for (table_metadata, alias) in &scope.tables {
+                        for entry in &scope.entries {
                             let matches = match qualifier {
                                 None => true,
-                                Some(q) => {
-                                    alias.is_some_and(|a| a == q) || table_metadata.name == *q
-                                }
+                                Some(q) => entry.qualifier_matches(q),
                             };
                             if !matches {
                                 continue;
                             }
-                            let key = alias.unwrap_or(table_metadata.name.as_str());
+                            let table_metadata = entry.metadata();
+                            let key = entry.qualifier_key();
                             for column_metadata in table_metadata.columns.iter() {
                                 // Skip columns merged into a USING/NATURAL
                                 // join column (only for unqualified `*`).
@@ -70,7 +69,7 @@ pub(super) fn select_columns_resolve(
                                     expr: ResolvedScalarExpr::Column(ResolvedColumnNode {
                                         schema: table_metadata.schema.clone(),
                                         table: table_metadata.name.clone(),
-                                        table_alias: alias.map(EcoString::from),
+                                        table_alias: entry.alias().map(EcoString::from),
                                         column: column_metadata.name.clone(),
                                         column_metadata: column_metadata.clone(),
                                     }),

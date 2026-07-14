@@ -405,6 +405,205 @@ fn test_select_qualified_star_with_column() {
     assert_eq!(col.table, "orders");
 }
 
+/// The column node of a resolved select column, panicking otherwise.
+fn select_column_node(col: &ResolvedSelectColumn) -> &ResolvedColumnNode {
+    let ResolvedScalarExpr::Column(node) = &col.expr else {
+        panic!("expected column expression, got {:?}", col.expr);
+    };
+    node
+}
+
+/// Assert a star-expanded derived-table column: empty schema, synthetic
+/// table named after the alias, alias set — the same node shape an
+/// explicit `alias.column` reference resolves to.
+fn derived_column_assert(col: &ResolvedSelectColumn, alias: &str, column: &str) {
+    let node = select_column_node(col);
+    assert_eq!(node.schema, "");
+    assert_eq!(node.table, alias);
+    assert_eq!(node.table_alias.as_deref(), Some(alias));
+    assert_eq!(node.column, column);
+}
+
+/// PGC-359: `*` over a USING join of two derived tables expands to the
+/// merged join column plus each side's remaining columns.
+#[test]
+fn test_select_star_derived_using_inner() {
+    let mut tables = BiHashMap::new();
+    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
+
+    let resolved = resolve_sql(
+        "SELECT * FROM (SELECT id, name FROM users) a \
+         JOIN (SELECT id, name FROM orders) b USING (id)",
+        &tables,
+    );
+
+    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+        panic!("Expected Columns");
+    };
+    assert_eq!(cols.len(), 3); // merged id, a.name, b.name
+    assert_eq!(cols[0].alias.as_deref(), Some("id"));
+    derived_column_assert(&cols[0], "a", "id"); // inner merge = left column
+    derived_column_assert(&cols[1], "a", "name");
+    derived_column_assert(&cols[2], "b", "name");
+}
+
+/// PGC-359: `*` over a NATURAL LEFT JOIN of derived tables — merged
+/// column is COALESCE, remaining columns follow in FROM order.
+#[test]
+fn test_select_star_derived_natural_left() {
+    let mut tables = BiHashMap::new();
+    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
+
+    let resolved = resolve_sql(
+        "SELECT * FROM (SELECT name, id AS a_id FROM users) a \
+         NATURAL LEFT JOIN (SELECT name, id AS b_id FROM orders) b",
+        &tables,
+    );
+
+    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+        panic!("Expected Columns");
+    };
+    assert_eq!(cols.len(), 3); // merged name, a.a_id, b.b_id
+    assert_eq!(cols[0].alias.as_deref(), Some("name"));
+    let ResolvedScalarExpr::Function(f) = &cols[0].expr else {
+        panic!("expected COALESCE for outer-join merged column");
+    };
+    assert_eq!(f.name, "coalesce");
+    derived_column_assert(&cols[1], "a", "a_id");
+    derived_column_assert(&cols[2], "b", "b_id");
+}
+
+/// PGC-359: mixed base-then-derived USING join expands both sides.
+#[test]
+fn test_select_star_mixed_base_first() {
+    let mut tables = BiHashMap::new();
+    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    tables.insert_overwrite(test_table_metadata_with_columns(
+        "orders",
+        Oid::from_raw(1002),
+        &["id", "total"],
+    ));
+
+    let resolved = resolve_sql(
+        "SELECT * FROM users u JOIN (SELECT id, total FROM orders) o USING (id)",
+        &tables,
+    );
+
+    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+        panic!("Expected Columns");
+    };
+    assert_eq!(cols.len(), 3); // merged id, u.name, o.total
+    assert_eq!(cols[0].alias.as_deref(), Some("id"));
+    let base = select_column_node(&cols[1]);
+    assert_eq!(base.table, "users");
+    assert_eq!(base.column, "name");
+    derived_column_assert(&cols[2], "o", "total");
+}
+
+/// PGC-359: mixed derived-then-base USING join — `*` expands in FROM
+/// order (derived side's columns before the base table's).
+#[test]
+fn test_select_star_mixed_derived_first() {
+    let mut tables = BiHashMap::new();
+    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    tables.insert_overwrite(test_table_metadata_with_columns(
+        "orders",
+        Oid::from_raw(1002),
+        &["id", "total"],
+    ));
+
+    let resolved = resolve_sql(
+        "SELECT * FROM (SELECT id, total FROM orders) o JOIN users u USING (id)",
+        &tables,
+    );
+
+    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+        panic!("Expected Columns");
+    };
+    assert_eq!(cols.len(), 3); // merged id, o.total, u.name
+    assert_eq!(cols[0].alias.as_deref(), Some("id"));
+    derived_column_assert(&cols[1], "o", "total");
+    let base = select_column_node(&cols[2]);
+    assert_eq!(base.table, "users");
+    assert_eq!(base.column, "name");
+}
+
+/// PGC-359: qualified `derived.*` expands that side verbatim — join
+/// column included, no merged-column injection.
+#[test]
+fn test_select_qualified_star_derived() {
+    let mut tables = BiHashMap::new();
+    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    tables.insert_overwrite(test_table_metadata_with_columns(
+        "orders",
+        Oid::from_raw(1002),
+        &["id", "total"],
+    ));
+
+    let resolved = resolve_sql(
+        "SELECT o.* FROM (SELECT id, total FROM orders) o JOIN users u USING (id)",
+        &tables,
+    );
+
+    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+        panic!("Expected Columns");
+    };
+    assert_eq!(cols.len(), 2); // o.id, o.total
+    derived_column_assert(&cols[0], "o", "id");
+    derived_column_assert(&cols[1], "o", "total");
+}
+
+/// PGC-359 (latent case): `*` over a single derived table expands to
+/// the subquery's full output, not zero columns.
+#[test]
+fn test_select_star_single_derived() {
+    let mut tables = BiHashMap::new();
+    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+
+    let resolved = resolve_sql("SELECT * FROM (SELECT id, name FROM users) d", &tables);
+
+    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+        panic!("Expected Columns");
+    };
+    assert_eq!(cols.len(), 2);
+    derived_column_assert(&cols[0], "d", "id");
+    derived_column_assert(&cols[1], "d", "name");
+}
+
+/// PGC-359: multi-column USING over derived tables — each merged column
+/// emitted once in USING order, both sides' consumed columns suppressed.
+#[test]
+fn test_select_star_derived_using_multi_column() {
+    let mut tables = BiHashMap::new();
+    tables.insert_overwrite(test_table_metadata_with_columns(
+        "t1",
+        Oid::from_raw(1001),
+        &["id", "name", "x"],
+    ));
+    tables.insert_overwrite(test_table_metadata_with_columns(
+        "t2",
+        Oid::from_raw(1002),
+        &["id", "name", "y"],
+    ));
+
+    let resolved = resolve_sql(
+        "SELECT * FROM (SELECT id, name, x FROM t1) a \
+         JOIN (SELECT id, name, y FROM t2) b USING (id, name)",
+        &tables,
+    );
+
+    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+        panic!("Expected Columns");
+    };
+    assert_eq!(cols.len(), 4); // merged id, merged name, a.x, b.y
+    assert_eq!(cols[0].alias.as_deref(), Some("id"));
+    assert_eq!(cols[1].alias.as_deref(), Some("name"));
+    derived_column_assert(&cols[2], "a", "x");
+    derived_column_assert(&cols[3], "b", "y");
+}
+
 #[test]
 fn test_join_resolution() {
     let mut tables = BiHashMap::new();

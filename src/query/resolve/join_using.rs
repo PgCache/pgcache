@@ -37,26 +37,23 @@ pub(super) struct MergedJoinColumn {
 }
 
 /// Scope index ranges delimiting each side of a join, into
-/// `scope.tables` / `scope.derived_tables` (`d*`), used to attribute a
-/// `USING`/`NATURAL` column to the input that exposes it.
+/// `scope.entries`, used to attribute a `USING`/`NATURAL` column to the
+/// input that exposes it.
 #[derive(Clone, Copy)]
 pub(super) struct JoinScopeRanges {
     pub(super) left_lo: usize,
     pub(super) mid: usize,
     pub(super) hi: usize,
-    pub(super) dleft_lo: usize,
-    pub(super) dmid: usize,
-    pub(super) dhi: usize,
 }
 
 impl JoinScopeRanges {
-    /// `(tables, derived_tables)` index ranges for the left input.
-    pub(super) fn left(self) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
-        (self.left_lo..self.mid, self.dleft_lo..self.dmid)
+    /// `scope.entries` index range for the left input.
+    pub(super) fn left(self) -> std::ops::Range<usize> {
+        self.left_lo..self.mid
     }
-    /// `(tables, derived_tables)` index ranges for the right input.
-    pub(super) fn right(self) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
-        (self.mid..self.hi, self.dmid..self.dhi)
+    /// `scope.entries` index range for the right input.
+    pub(super) fn right(self) -> std::ops::Range<usize> {
+        self.mid..self.hi
     }
 }
 
@@ -68,32 +65,23 @@ pub(super) type JoinUsingResolved = (
     Vec<(EcoString, EcoString)>,
 );
 
-/// The qualifier (alias, else table name) of the single scope table in
-/// the given `tables`/`derived_tables` ranges exposing `column`. `None`
-/// if zero or more than one expose it — an ambiguous or absent
-/// `USING`/`NATURAL` column, which the caller turns into a resolve
-/// error so the query is forwarded rather than mis-cached.
+/// The qualifier (alias, else table name) of the single scope entry in
+/// the given `scope.entries` range exposing `column`. `None` if zero or
+/// more than one expose it — an ambiguous or absent `USING`/`NATURAL`
+/// column, which the caller turns into a resolve error so the query is
+/// forwarded rather than mis-cached.
 pub(super) fn join_side_qualifier(
     scope: &ResolutionScope<'_>,
-    t_range: std::ops::Range<usize>,
-    d_range: std::ops::Range<usize>,
+    range: std::ops::Range<usize>,
     column: &str,
 ) -> Option<EcoString> {
     let mut found: Option<EcoString> = None;
-    for (meta, alias) in scope.tables.get(t_range).unwrap_or(&[]) {
-        if meta.columns.get(column).is_some() {
+    for entry in scope.entries.get(range).unwrap_or(&[]) {
+        if entry.metadata().columns.get(column).is_some() {
             if found.is_some() {
                 return None;
             }
-            found = Some(EcoString::from(alias.unwrap_or(meta.name.as_str())));
-        }
-    }
-    for (meta, alias) in scope.derived_tables.get(d_range).unwrap_or(&[]) {
-        if meta.columns.get(column).is_some() {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(EcoString::from(alias.as_str()));
+            found = Some(EcoString::from(entry.qualifier_key()));
         }
     }
     found
@@ -105,21 +93,16 @@ pub(super) fn join_natural_common_columns(
     scope: &ResolutionScope<'_>,
     ranges: JoinScopeRanges,
 ) -> Vec<EcoString> {
-    let side_names = |t: std::ops::Range<usize>, d: std::ops::Range<usize>| {
+    let side_names = |range: std::ops::Range<usize>| {
         let mut names: Vec<&str> = Vec::new();
-        for (meta, _) in scope.tables.get(t).unwrap_or(&[]) {
-            names.extend(meta.columns.iter().map(|c| c.name.as_str()));
-        }
-        for (meta, _) in scope.derived_tables.get(d).unwrap_or(&[]) {
-            names.extend(meta.columns.iter().map(|c| c.name.as_str()));
+        for entry in scope.entries.get(range).unwrap_or(&[]) {
+            names.extend(entry.metadata().columns.iter().map(|c| c.name.as_str()));
         }
         names
     };
-    let (lt, ld) = ranges.left();
-    let (rt, rd) = ranges.right();
-    let right = side_names(rt, rd);
+    let right = side_names(ranges.right());
     let mut out: Vec<EcoString> = Vec::new();
-    for name in side_names(lt, ld) {
+    for name in side_names(ranges.left()) {
         if right.contains(&name) && !out.iter().any(|o| o == name) {
             out.push(EcoString::from(name));
         }
@@ -156,16 +139,14 @@ pub(super) fn join_using_resolve(
     join_type: JoinType,
 ) -> ResolveResult<JoinUsingResolved> {
     let outer = join_type != JoinType::Inner;
-    let (lt, ld) = ranges.left();
-    let (rt, rd) = ranges.right();
     let mut conjuncts: Vec<ResolvedWhereExpr> = Vec::with_capacity(cols.len());
     let mut merged: Vec<MergedJoinColumn> = Vec::with_capacity(cols.len());
     let mut consumed: Vec<(EcoString, EcoString)> = Vec::with_capacity(cols.len() * 2);
 
     for c in cols {
         let unsupported = || Report::from(ResolveError::UnsupportedJoinQualifier);
-        let lq = join_side_qualifier(scope, lt.clone(), ld.clone(), c).ok_or_else(unsupported)?;
-        let rq = join_side_qualifier(scope, rt.clone(), rd.clone(), c).ok_or_else(unsupported)?;
+        let lq = join_side_qualifier(scope, ranges.left(), c).ok_or_else(unsupported)?;
+        let rq = join_side_qualifier(scope, ranges.right(), c).ok_or_else(unsupported)?;
         let left_col = join_side_column_resolve(scope, &lq, c)?;
         let right_col = join_side_column_resolve(scope, &rq, c)?;
 

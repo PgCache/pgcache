@@ -79,20 +79,15 @@ pub(super) fn table_source_resolve<'a>(
         TableSource::Join(join_node) => {
             // Scope index ranges per side, to qualify USING/NATURAL
             // columns to the input that exposes them.
-            let left_lo = scope.tables.len();
-            let dleft_lo = scope.derived_tables.len();
+            let left_lo = scope.entries.len();
             let resolved_left = table_source_resolve(&join_node.left, tables, scope, search_path)?;
-            let mid = scope.tables.len();
-            let dmid = scope.derived_tables.len();
+            let mid = scope.entries.len();
             let resolved_right =
                 table_source_resolve(&join_node.right, tables, scope, search_path)?;
             let ranges = JoinScopeRanges {
                 left_lo,
                 mid,
-                hi: scope.tables.len(),
-                dleft_lo,
-                dmid,
-                dhi: scope.derived_tables.len(),
+                hi: scope.entries.len(),
             };
 
             // `USING`/`NATURAL` keep their qualifier (deparsed verbatim

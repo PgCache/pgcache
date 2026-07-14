@@ -17,14 +17,57 @@ use crate::query::resolved::{
 use super::entry::query_expr_resolve_scoped;
 use super::join_using::MergedJoinColumn;
 
+/// A FROM-clause entry visible in scope. Entries are kept in FROM order,
+/// which `*` expansion must follow (PostgreSQL expands `*` in FROM order).
+#[derive(Debug)]
+pub(super) enum ScopeEntry<'a> {
+    /// Catalog (base) table with optional alias.
+    Base {
+        metadata: &'a TableMetadata,
+        alias: Option<&'a str>,
+    },
+    /// Derived table (FROM subquery) with owned synthetic metadata whose
+    /// columns are determined by the subquery's output.
+    Derived {
+        metadata: TableMetadata,
+        alias: EcoString,
+    },
+}
+
+impl ScopeEntry<'_> {
+    pub(super) fn metadata(&self) -> &TableMetadata {
+        match self {
+            ScopeEntry::Base { metadata, .. } => metadata,
+            ScopeEntry::Derived { metadata, .. } => metadata,
+        }
+    }
+
+    pub(super) fn alias(&self) -> Option<&str> {
+        match self {
+            ScopeEntry::Base { alias, .. } => *alias,
+            ScopeEntry::Derived { alias, .. } => Some(alias.as_str()),
+        }
+    }
+
+    /// The scope key a column of this entry is qualified by: the alias,
+    /// else the table name. Matches the `merged_consumed` key convention.
+    pub(super) fn qualifier_key(&self) -> &str {
+        self.alias().unwrap_or(self.metadata().name.as_str())
+    }
+
+    /// Whether a query qualifier (e.g. the `t` of `t.*`) refers to this
+    /// entry: alias match, else table-name match. A derived table's
+    /// synthetic metadata is named after its alias, so both arms agree.
+    pub(super) fn qualifier_matches(&self, qualifier: &str) -> bool {
+        self.alias().is_some_and(|a| a == qualifier) || self.metadata().name == qualifier
+    }
+}
+
 /// Resolution scope tracking available tables and their aliases.
 #[derive(Debug)]
 pub(super) struct ResolutionScope<'a> {
-    /// Tables available in this scope, indexed by alias (or table name if no alias)
-    pub(super) tables: Vec<(&'a TableMetadata, Option<&'a str>)>, // (metadata, alias)
-    /// Derived tables (FROM subqueries) with owned synthetic metadata.
-    /// These are virtual tables whose columns are determined by the subquery's output.
-    pub(super) derived_tables: Vec<(TableMetadata, String)>, // (synthetic metadata, alias)
+    /// Base and derived tables visible in this scope, in FROM order.
+    pub(super) entries: Vec<ScopeEntry<'a>>,
     /// Catalog of all known tables (for subquery resolution)
     pub(super) catalog_tables: &'a BiHashMap<TableMetadata>,
     /// Search path for schema resolution
@@ -49,8 +92,7 @@ impl<'a> ResolutionScope<'a> {
         search_path: &[&'a str],
     ) -> Self {
         Self {
-            tables: Vec::new(),
-            derived_tables: Vec::new(),
+            entries: Vec::new(),
             catalog_tables,
             search_path: search_path.to_vec(),
             outer_tables: Vec::new(),
@@ -70,8 +112,7 @@ impl<'a> ResolutionScope<'a> {
         outer_tables: Vec<(TableMetadata, Option<String>)>,
     ) -> Self {
         Self {
-            tables: Vec::new(),
-            derived_tables: Vec::new(),
+            entries: Vec::new(),
             catalog_tables,
             search_path: search_path.to_vec(),
             outer_tables,
@@ -85,13 +126,10 @@ impl<'a> ResolutionScope<'a> {
     /// to a child subquery scope. The child needs access to all ancestor tables.
     pub(super) fn scope_tables_snapshot(&self) -> Vec<(TableMetadata, Option<String>)> {
         let mut snapshot: Vec<(TableMetadata, Option<String>)> = self
-            .tables
+            .entries
             .iter()
-            .map(|(meta, alias)| ((*meta).clone(), alias.map(str::to_owned)))
+            .map(|entry| (entry.metadata().clone(), entry.alias().map(str::to_owned)))
             .collect();
-        for (meta, alias) in &self.derived_tables {
-            snapshot.push((meta.clone(), Some(alias.clone())));
-        }
         // Include ancestors so nested correlation can reach any level
         snapshot.extend(self.outer_tables.iter().cloned());
         snapshot
@@ -116,7 +154,7 @@ impl<'a> ResolutionScope<'a> {
 
     /// Add a table to the scope
     pub(super) fn table_scope_add(&mut self, metadata: &'a TableMetadata, alias: Option<&'a str>) {
-        self.tables.push((metadata, alias));
+        self.entries.push(ScopeEntry::Base { metadata, alias });
     }
 
     /// A `USING`/`NATURAL` merged join column by (output) name.
@@ -127,22 +165,15 @@ impl<'a> ResolutionScope<'a> {
     /// Find table metadata by name or alias.
     /// Checks both catalog tables and derived tables (FROM subqueries).
     pub(super) fn table_scope_find(&self, name: &str) -> Option<(&TableMetadata, Option<&str>)> {
-        // Check catalog tables first
-        if let Some((meta, alias)) = self.tables.iter().find(|(meta, alias)| {
-            if let Some(alias_name) = alias {
-                *alias_name == name
-            } else {
-                meta.name == name
-            }
-        }) {
-            return Some((*meta, *alias));
-        }
-
-        // Check derived tables
-        self.derived_tables
+        self.entries
             .iter()
-            .find(|(_, alias)| alias == name)
-            .map(|(meta, alias)| (meta, Some(alias.as_str())))
+            .find(|entry| match entry {
+                ScopeEntry::Base { metadata, alias } => {
+                    alias.map_or(metadata.name == name, |a| a == name)
+                }
+                ScopeEntry::Derived { alias, .. } => alias == name,
+            })
+            .map(|entry| (entry.metadata(), entry.alias()))
     }
 
     /// Add a derived table (FROM subquery) to the scope.
@@ -167,8 +198,10 @@ impl<'a> ResolutionScope<'a> {
             indexes: Vec::new(),
         };
 
-        self.derived_tables
-            .push((synthetic_metadata, alias.to_owned()));
+        self.entries.push(ScopeEntry::Derived {
+            metadata: synthetic_metadata,
+            alias: alias.into(),
+        });
     }
 
     /// Find all tables in scope that contain a given column (for unqualified column resolution).
@@ -178,15 +211,9 @@ impl<'a> ResolutionScope<'a> {
     ) -> Vec<(&'b TableMetadata, Option<&'b str>, &'b ColumnMetadata)> {
         let mut matches = Vec::new();
 
-        for (table_metadata, alias) in &self.tables {
-            if let Some(col_meta) = table_metadata.columns.get(column) {
-                matches.push((*table_metadata, *alias, col_meta));
-            }
-        }
-
-        for (table_metadata, alias) in &self.derived_tables {
-            if let Some(col_meta) = table_metadata.columns.get(column) {
-                matches.push((table_metadata, Some(alias.as_str()), col_meta));
+        for entry in &self.entries {
+            if let Some(col_meta) = entry.metadata().columns.get(column) {
+                matches.push((entry.metadata(), entry.alias(), col_meta));
             }
         }
 
