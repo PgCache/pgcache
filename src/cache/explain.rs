@@ -16,7 +16,7 @@ use tracing::debug;
 use crate::cache::messages::{CacheOutcome, CacheReply};
 use crate::cache::mv::{MvServe, mv_table_name};
 use crate::cache::reply::ReplySender;
-use crate::cache::serve::ConnectionGuard;
+use crate::cache::runtime::serve_pool::ConnectionGuard;
 use crate::cache::types::{CacheStateView, SharedResolved};
 use crate::pg::cache_connection::{CacheConnection, ExplainOutcome};
 use crate::pg::protocol::encode::{

@@ -338,3 +338,61 @@ async fn pool_replenish(
 
     debug!("pool replenish task exiting");
 }
+
+/// Guard that ensures a connection is returned to the pool.
+///
+/// Returns the connection via async `release()` on success.
+/// On error (drop without release), the connection is discarded if poisoned
+/// to avoid returning a connection with stale response data in its buffer; a
+/// replenish signal is sent so a fresh connection replaces it and the pool
+/// cannot permanently shrink (PGC-238).
+pub(crate) struct ConnectionGuard {
+    pub(crate) conn: Option<CacheConnection>,
+    return_tx: Sender<CacheConnection>,
+    replenish_tx: UnboundedSender<()>,
+    pub(crate) poisoned: bool,
+}
+
+impl ConnectionGuard {
+    pub(crate) fn new(
+        conn: CacheConnection,
+        return_tx: Sender<CacheConnection>,
+        replenish_tx: UnboundedSender<()>,
+    ) -> Self {
+        Self {
+            conn: Some(conn),
+            return_tx,
+            replenish_tx,
+            poisoned: false,
+        }
+    }
+
+    /// Return the connection to the pool.
+    pub(crate) async fn release(mut self) -> CacheResult<()> {
+        if let Some(conn) = self.conn.take() {
+            self.return_tx
+                .send(conn)
+                .await
+                .map_err(|_| CacheError::NoConnection)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        if self.poisoned {
+            // Discard the connection — may have unread response data — and
+            // signal the replenish task to reconnect a replacement so the pool
+            // size stays constant (PGC-238).
+            self.conn.take();
+            let _ = self.replenish_tx.send(());
+            return;
+        }
+        if let Some(conn) = self.conn.take() {
+            // try_send won't block; channel always has capacity since
+            // pool size equals channel size
+            let _ = self.return_tx.try_send(conn);
+        }
+    }
+}

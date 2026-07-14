@@ -3,16 +3,18 @@ use std::time::{Duration, Instant};
 
 use crate::oid::Oid;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::sync::mpsc::{Sender, UnboundedSender};
-use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 use tokio_util::bytes::{Buf, Bytes};
 use tracing::{debug, error, instrument, trace, warn};
 
-use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe};
-use crate::pg::cache_connection::{CacheConnection, PrepareOutcome};
+use crate::cache::messages::PipelineDescribe;
+use tokio::net::TcpStream;
+use tokio_util::codec::FramedRead;
+
+use crate::pg::cache_connection::{CacheConnection, ParkedConnection, PrepareOutcome};
 use crate::pg::protocol::PgMessage;
+use crate::pg::protocol::backend::PgBackendMessageCodec;
 use crate::pg::protocol::backend::PgBackendMessageType;
 use crate::pg::protocol::encode::{
     BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG, SERVE_ERROR_MSG,
@@ -25,11 +27,23 @@ use super::{
     CacheError, CacheResult,
     memo::{MEMO_CAPTURE_MIN_HITS, MemoCapture, MemoKey, MemoShape},
     mv::{MvServe, MvState, mv_serve_sql_into},
-    query_cache::{CoalescedClient, QueryType, ServeRequest},
+    query_cache::{QueryType, ServeRequest},
     types::CacheStateView,
     write_queue::WriteQueue,
 };
 use crate::query::resolved::ResolvedTableNode;
+
+mod coalesce;
+mod sqlstate;
+
+pub use coalesce::CoalescedOutcome;
+use coalesce::{
+    BroadcastState, broadcast_error_reply, broadcast_join, broadcast_setup, push_and_broadcast,
+};
+pub(crate) use sqlstate::SQLSTATE_UNDEFINED_TABLE;
+use sqlstate::sqlstate_extract;
+
+use super::runtime::serve_pool::ConnectionGuard;
 
 /// Max gap between cache-DB frames while draining a response for a departed
 /// primary client before the connection is treated as stalled and discarded.
@@ -139,52 +153,6 @@ pub(crate) mod fault {
     }
 }
 
-/// Outcome of a coalesced client's write task.
-pub enum CoalescedOutcome {
-    /// All bytes were delivered successfully.
-    Complete(CoalescedClient),
-    /// Write failed or broadcast lagged — byte stream is corrupted.
-    Failed(CoalescedClient),
-}
-
-/// Broadcast state for coalesced request handling.
-struct BroadcastState {
-    tx: broadcast::Sender<Bytes>,
-    tasks: Vec<JoinHandle<Result<CoalescedClient, CoalescedClient>>>,
-}
-
-/// SQLSTATE `42P01` — `undefined_table`. The expected outcome when the cache
-/// table is dropped between dispatch and SELECT (eviction-window race).
-pub(crate) const SQLSTATE_UNDEFINED_TABLE: [u8; 5] = *b"42P01";
-
-/// Extract the 5-char SQLSTATE from a backend `ErrorResponse` frame.
-///
-/// Frame layout: `'E' (1 byte) | len (4 bytes BE) | field* | 0`, where each
-/// field is `code (1 byte) | value (null-terminated string)`. Field code `'C'`
-/// carries SQLSTATE — always exactly 5 ASCII bytes per the protocol.
-/// Returns `None` when the frame is malformed or the field is missing.
-fn sqlstate_extract(frame_data: &[u8]) -> Option<[u8; 5]> {
-    let payload = frame_data.get(5..)?;
-    let mut i = 0;
-    while i < payload.len() {
-        let code = *payload.get(i)?;
-        if code == 0 {
-            return None;
-        }
-        let value_start = i + 1;
-        let rest = payload.get(value_start..)?;
-        let value_len = rest.iter().position(|&b| b == 0)?;
-        if code == b'C' && value_len == 5 {
-            let value = rest.get(..5)?;
-            let mut out = [0u8; 5];
-            out.copy_from_slice(value);
-            return Some(out);
-        }
-        i = value_start + value_len + 1;
-    }
-    None
-}
-
 /// Handle an `ErrorResponse` from the cache DB on the hit path. Poisons the
 /// connection (the trailing ReadyForQuery would otherwise leak to the next
 /// user) and returns a typed error so `handle_serve_request` forwards to
@@ -216,86 +184,6 @@ async fn cache_error_response_handle(
     CacheError::CacheServerError { sqlstate }.into()
 }
 
-/// Push bytes to the primary WriteQueue and broadcast to coalesced clients.
-fn push_and_broadcast(
-    write_queue: &mut WriteQueue,
-    broadcast: &Option<BroadcastState>,
-    data: impl Into<Bytes>,
-) {
-    if let Some(bc) = broadcast {
-        let bytes: Bytes = data.into();
-        let _ = bc.tx.send(bytes.clone());
-        write_queue.push(bytes);
-    } else {
-        write_queue.push(data);
-    }
-}
-
-/// Create broadcast channel and spawn per-client write tasks.
-/// Returns None if there are no coalesced clients.
-fn broadcast_setup(msg: &mut ServeRequest) -> Option<BroadcastState> {
-    if msg.coalesced.is_empty() {
-        return None;
-    }
-
-    let (tx, _) = broadcast::channel::<Bytes>(64);
-
-    let tasks = msg
-        .coalesced
-        .drain(..)
-        .map(|mut client| {
-            let mut rx = tx.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(chunk) => {
-                            if client.client_socket.write_all(&chunk).await.is_err() {
-                                return Err(client);
-                            }
-                        }
-                        Err(RecvError::Closed) => return Ok(client),
-                        Err(RecvError::Lagged(_)) => return Err(client),
-                    }
-                }
-            })
-        })
-        .collect();
-
-    Some(BroadcastState { tx, tasks })
-}
-
-/// Drop the broadcast sender, join all tasks, and collect outcomes.
-async fn broadcast_join(bc: BroadcastState) -> Vec<CoalescedOutcome> {
-    drop(bc.tx);
-
-    let mut outcomes = Vec::with_capacity(bc.tasks.len());
-    for task in bc.tasks {
-        match task.await {
-            Ok(Ok(client)) => outcomes.push(CoalescedOutcome::Complete(client)),
-            Ok(Err(client)) => outcomes.push(CoalescedOutcome::Failed(client)),
-            Err(_) => {} // JoinError — task panicked
-        }
-    }
-    outcomes
-}
-
-/// Drop the broadcast sender, join all tasks, and send Error replies.
-/// Used when the primary path fails after broadcast was created.
-async fn broadcast_error_reply(bc: BroadcastState) {
-    drop(bc.tx);
-
-    for task in bc.tasks {
-        let client = match task.await {
-            Ok(Ok(c)) | Ok(Err(c)) => c,
-            Err(_) => continue,
-        };
-        let _ = client.reply_tx.send(CacheReply {
-            socket: client.client_socket,
-            outcome: CacheOutcome::Error(client.data),
-        });
-    }
-}
-
 /// PGC-291: resolve a serve failure under the A+C invariant. If any byte already
 /// reached the client (`client_bytes_sent`), the serve can no longer fall back to
 /// origin — origin would replay the already-sent prefix (e.g. a duplicate
@@ -325,64 +213,6 @@ async fn serve_failure_resolve<W: tokio::io::AsyncWrite + Unpin>(
     }
     let _ = client_socket.write_all_buf(write_queue).await;
     Ok((bytes_served, Vec::new()))
-}
-
-/// Guard that ensures a connection is returned to the pool.
-///
-/// Returns the connection via async `release()` on success.
-/// On error (drop without release), the connection is discarded if poisoned
-/// to avoid returning a connection with stale response data in its buffer; a
-/// replenish signal is sent so a fresh connection replaces it and the pool
-/// cannot permanently shrink (PGC-238).
-pub(crate) struct ConnectionGuard {
-    pub(crate) conn: Option<CacheConnection>,
-    return_tx: Sender<CacheConnection>,
-    replenish_tx: UnboundedSender<()>,
-    pub(crate) poisoned: bool,
-}
-
-impl ConnectionGuard {
-    pub(crate) fn new(
-        conn: CacheConnection,
-        return_tx: Sender<CacheConnection>,
-        replenish_tx: UnboundedSender<()>,
-    ) -> Self {
-        Self {
-            conn: Some(conn),
-            return_tx,
-            replenish_tx,
-            poisoned: false,
-        }
-    }
-
-    /// Return the connection to the pool.
-    pub(crate) async fn release(mut self) -> CacheResult<()> {
-        if let Some(conn) = self.conn.take() {
-            self.return_tx
-                .send(conn)
-                .await
-                .map_err(|_| CacheError::NoConnection)?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        if self.poisoned {
-            // Discard the connection — may have unread response data — and
-            // signal the replenish task to reconnect a replacement so the pool
-            // size stays constant (PGC-238).
-            self.conn.take();
-            let _ = self.replenish_tx.send(());
-            return;
-        }
-        if let Some(conn) = self.conn.take() {
-            // try_send won't block; channel always has capacity since
-            // pool size equals channel size
-            let _ = self.return_tx.try_send(conn);
-        }
-    }
 }
 
 /// Render a `LIMIT`/`OFFSET` clause field into text for its `$1`/`$2` bind. An
@@ -586,10 +416,7 @@ pub async fn handle_cached_query(
                     "cache serve exceeded stall deadline; poisoning connection; forwarding to origin if no bytes sent, else erroring the client (PGC-278/PGC-291)"
                 );
                 crate::metrics::handles().cache.serve_stall_total.increment(1);
-                guard.poisoned = true;
-                if let Some(bc) = relay.broadcast.take() {
-                    broadcast_error_reply(bc).await;
-                }
+                serve_poison(&mut guard, &mut relay).await;
                 return serve_failure_resolve(
                     client_bytes_sent, client_socket, &mut write_queue, emit_rfq,
                     relay.bytes_served, CacheError::Write.into(),
@@ -599,10 +426,7 @@ pub async fn handle_cached_query(
                 let frame = match frame {
                     Some(Ok(frame)) => frame,
                     Some(Err(_)) | None => {
-                        guard.poisoned = true;
-                        if let Some(bc) = relay.broadcast.take() {
-                            broadcast_error_reply(bc).await;
-                        }
+                        serve_poison(&mut guard, &mut relay).await;
                         return serve_failure_resolve(
                             client_bytes_sent, client_socket, &mut write_queue, emit_rfq,
                             relay.bytes_served, CacheError::InvalidMessage.into(),
@@ -651,10 +475,7 @@ pub async fn handle_cached_query(
             // (PGC-238 replenish heals the pool).
             _ = tokio::time::sleep(DRAIN_STALL_TIMEOUT), if client_gone => {
                 debug!("cache-DB stalled while draining for departed client; discarding connection");
-                guard.poisoned = true;
-                if let Some(bc) = relay.broadcast.take() {
-                    broadcast_error_reply(bc).await;
-                }
+                serve_poison(&mut guard, &mut relay).await;
                 return Err(CacheError::Write.into());
             }
         }
@@ -682,44 +503,68 @@ pub async fn handle_cached_query(
         }
     }
 
-    // PGC-278: the response is fully consumed at `Done` — the single trailing
-    // Sync means `ReadyForQuery` is the last frame, and no next response arrives
-    // until this connection serves again. Any bytes still buffered are therefore
-    // a response desync introduced by THIS serve (the state machine consumed the
-    // wrong number of frames for its pipeline shape). Discard the connection
-    // (poison ⇒ replenish) rather than hand the leftover frame to the next
-    // borrower, and record it at its source. The client's reply is unaffected —
-    // it already received a complete response.
-    let residual = framed.read_buffer().len();
-    if residual > 0 {
-        let lead = framed.read_buffer().first().copied().map(char::from);
-        warn!(
-            fingerprint = %msg.fingerprint,
-            residual_bytes = residual,
-            ?lead,
-            has_parse = msg.has_parse,
-            has_bind = msg.has_bind,
-            include_describe,
-            mv = matches!(msg.mv, MvServe::Mv(_)),
-            sent_setgen_parse = relay.prepare.sent_setgen_parse,
-            sent_parse = relay.prepare.sent_parse,
-            sent_close = relay.prepare.sent_close,
-            "serve left unconsumed cache-DB bytes after ReadyForQuery (response desync); discarding connection (PGC-278)"
-        );
-        crate::metrics::handles()
-            .cache
-            .serve_dirty_return_total
-            .increment(1);
-        guard.poisoned = true;
-        // Drop the dirty connection; the poisoned guard's `Drop` replenishes.
-        drop(framed);
-        drop(parked);
-    } else {
-        // Clean — return the connection to the pool immediately.
-        guard.conn = Some(CacheConnection::from_framed(framed, parked));
-    }
+    connection_return_or_discard(&mut guard, framed, parked, msg, &relay, include_describe);
 
     serve_response_finish(guard, &mut write_queue, relay, msg, client_gone, state_view).await
+}
+
+/// Poison the cache-DB connection and fail any coalesced waiters. The caller
+/// then resolves the primary client's fate (forward vs. terminate) separately —
+/// see [`serve_failure_resolve`].
+async fn serve_poison(guard: &mut ConnectionGuard, relay: &mut Relay) {
+    guard.poisoned = true;
+    if let Some(bc) = relay.broadcast.take() {
+        broadcast_error_reply(bc).await;
+    }
+}
+
+/// Return the cache-DB connection to the pool, or discard it if the serve left
+/// bytes unread.
+///
+/// PGC-278: the response is fully consumed at `Done` — the single trailing Sync
+/// means `ReadyForQuery` is the last frame, and no next response arrives until
+/// this connection serves again. Any bytes still buffered are therefore a
+/// response desync introduced by THIS serve (the state machine consumed the
+/// wrong number of frames for its pipeline shape). Discard the connection
+/// (poison ⇒ replenish) rather than hand the leftover frame to the next
+/// borrower, and record it at its source. The client's reply is unaffected — it
+/// already received a complete response.
+fn connection_return_or_discard(
+    guard: &mut ConnectionGuard,
+    framed: FramedRead<TcpStream, PgBackendMessageCodec>,
+    parked: ParkedConnection,
+    msg: &ServeRequest,
+    relay: &Relay,
+    include_describe: bool,
+) {
+    let residual = framed.read_buffer().len();
+    if residual == 0 {
+        guard.conn = Some(CacheConnection::from_framed(framed, parked));
+        return;
+    }
+
+    let lead = framed.read_buffer().first().copied().map(char::from);
+    warn!(
+        fingerprint = %msg.fingerprint,
+        residual_bytes = residual,
+        ?lead,
+        has_parse = msg.has_parse,
+        has_bind = msg.has_bind,
+        include_describe,
+        mv = matches!(msg.mv, MvServe::Mv(_)),
+        sent_setgen_parse = relay.prepare.sent_setgen_parse,
+        sent_parse = relay.prepare.sent_parse,
+        sent_close = relay.prepare.sent_close,
+        "serve left unconsumed cache-DB bytes after ReadyForQuery (response desync); discarding connection (PGC-278)"
+    );
+    crate::metrics::handles()
+        .cache
+        .serve_dirty_return_total
+        .increment(1);
+    guard.poisoned = true;
+    // Drop the dirty connection; the poisoned guard's `Drop` replenishes.
+    drop(framed);
+    drop(parked);
 }
 
 /// Mutable relay state plus read-only config for one serve's response stream.

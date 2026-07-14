@@ -8,7 +8,7 @@ mod cdc_driver;
 mod memory_monitor;
 mod reg_gate;
 mod reset;
-mod serve_pool;
+pub(crate) mod serve_pool;
 mod setup;
 mod supervise;
 
