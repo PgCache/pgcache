@@ -468,15 +468,37 @@ impl WriterRegistration {
         // rather than skip them (PGC-227). Derived from the single source of
         // truth so the flag can't drift from the actual checks.
         update_query.change_dependent = update_query.update_invalidation_possible(table_name);
+        // A relation appearing more than once (a self-join) has its constraints
+        // extracted per occurrence but keyed by table *name*, so they collapse
+        // into one set that only holds for one arm. `emp e JOIN emp m … WHERE
+        // e.dept = 'x'` yields `dept = 'x'` for `emp`, which is simply false of
+        // the `m` arm — the manager row would be filtered out of the candidate
+        // set and evicted as an update-out, even though the join still needs it
+        // (PGC-256). Index it as *unconstrained* instead: the broadest candidate
+        // class, so no true match is dropped, and let the per-occurrence
+        // membership predicate decide. Keep it out of `subsumption` though —
+        // there, "no constraints" means the opposite (the parent loaded every
+        // row, so it covers anything), which this query cannot claim.
+        let self_joined = update_query
+            .resolved
+            .nodes::<ResolvedTableNode>()
+            .filter(|t| t.relation_oid == relation_oid)
+            .count()
+            > 1;
+
         // Per-table constraints, shared by both indexes. Queries with empty
         // per-table constraints (full-table scans, OR/unhandled WHERE shapes)
         // are indexed with `&[]` — the broadest class, in the empty `ColumnSet`.
-        let table_constraints = update_query
-            .constraints
-            .table_constraints
-            .get(table_name)
-            .cloned()
-            .unwrap_or_default();
+        let table_constraints = if self_joined {
+            Vec::new()
+        } else {
+            update_query
+                .constraints
+                .table_constraints
+                .get(table_name)
+                .cloned()
+                .unwrap_or_default()
+        };
         // `eval_index` holds the *full* update-query population (PGC-292) — every
         // query regardless of eval strategy or `has_limit` — so a query with no
         // extractable constraints is a candidate for every row and narrowing
@@ -486,7 +508,8 @@ impl WriterRegistration {
         // - !where_analysis_complete: the WHERE couldn't be fully analyzed, so
         //   coverage isn't reasonable (PGC-106); the detailed check would reject
         //   these anyway, and skipping saves a per-lookup candidate visit.
-        let can_subsume = !has_limit && update_query.constraints.where_analysis_complete;
+        let can_subsume =
+            !self_joined && !has_limit && update_query.constraints.where_analysis_complete;
 
         let mut queries = core
             .cache

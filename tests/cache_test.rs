@@ -579,3 +579,140 @@ async fn test_client_tls() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// A CDC change to a self-joined relation must not corrupt the cached result.
+///
+/// `emp e JOIN emp m ON m.id = e.manager_id WHERE e.dept = 'x'` — a row can
+/// participate as the employee side, the manager side, or both. `payload` is
+/// projected but is not a join or WHERE column, so updating it can neither grow
+/// nor shrink the result: the cached rows must simply carry the new value.
+///
+/// Membership is decided by substituting the CDC row into the query. With a
+/// self-join it must hold for *any* occurrence — the manager row (`ceo`) fails
+/// the employee-side predicate `e.dept = 'x'` yet is still required as `m`.
+/// Testing a single occurrence evicts it and empties the result (PGC-256).
+#[tokio::test]
+async fn test_cache_self_join_noninvalidating_update() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table emp (id int primary key, name text, manager_id int, dept text, payload text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into emp values (1,'ceo',null,'exec','P1'), (2,'alice',1,'x','P2'), \
+         (3,'bob',1,'x','P3'), (4,'carol',2,'y','P4')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_settle().await?;
+
+    let query_str = "\
+        select e.id as e_id, e.payload as e_payload, m.id as m_id, m.payload as m_payload \
+        from emp e join emp m on m.id = e.manager_id \
+        where e.dept = 'x' order by e.id";
+
+    // Populate: alice and bob both report to ceo.
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query_str).await?;
+    assert_eq!(res.len(), 4); // 2 rows + RowDescription + CommandComplete
+    let _m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    // `ceo` appears only on the manager side — it never satisfies `e.dept = 'x'`.
+    ctx.query("update emp set payload = 'P1x' where id = 1", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    // `alice` appears only on the employee side (carol reports to her, but is
+    // filtered out by dept = 'y').
+    ctx.query("update emp set payload = 'P2x' where id = 2", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query_str).await?;
+    assert_row_at(
+        &res,
+        1,
+        &[
+            ("e_id", "2"),
+            ("e_payload", "P2x"),
+            ("m_id", "1"),
+            ("m_payload", "P1x"),
+        ],
+    )?;
+    assert_row_at(
+        &res,
+        2,
+        &[
+            ("e_id", "3"),
+            ("e_payload", "P3"),
+            ("m_id", "1"),
+            ("m_payload", "P1x"),
+        ],
+    )?;
+    assert_eq!(res.len(), 4, "both rows must survive the updates");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A self-joined cached query must not be treated as a subsumption parent.
+///
+/// `subsumption_check` only admits *single-table* parents — but it tests
+/// `relation_oids.len() == 1`, and a self-join has exactly one relation, so it
+/// sails through. Its extracted constraints then claim more than it caches:
+/// `emp e JOIN emp m … WHERE e.dept = 'x'` records `dept = 'x'` for `emp`, yet
+/// only caches emp rows the *join* reaches. `dave` is dept 'x' with no manager,
+/// so the join never sees him and he is never cached.
+///
+/// A later `WHERE dept = 'x'` query is therefore implied by the parent's claimed
+/// constraints, and would be marked Ready and served from the parent's rows —
+/// silently dropping `dave`. Self-joined queries must stay out of the
+/// subsumption index (PGC-256).
+#[tokio::test]
+async fn test_cache_self_join_is_not_a_subsumption_parent() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table emp (id int primary key, name text, manager_id int, dept text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into emp values (1,'ceo',null,'exec'), (2,'alice',1,'x'), \
+         (3,'bob',1,'x'), (5,'dave',null,'x')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_settle().await?;
+
+    // The join reaches ceo/alice/bob. `dave` has no manager, so he is not cached.
+    let self_join = "\
+        select e.id as e_id, m.id as m_id from emp e \
+        join emp m on m.id = e.manager_id where e.dept = 'x' order by e.id";
+    let res = ctx.simple_query(self_join).await?;
+    assert_eq!(res.len(), 4, "self-join returns alice and bob");
+    ctx.cache_settle().await?;
+
+    // Implied by the parent's *claimed* constraints (dept = 'x'), but not by what
+    // it actually caches. If subsumed, `dave` silently disappears.
+    let dept_x = "select id, name from emp where dept = 'x' order by id";
+    let res = ctx.simple_query(dept_x).await?;
+    assert_row_at(&res, 1, &[("id", "2"), ("name", "alice")])?;
+    assert_row_at(&res, 2, &[("id", "3"), ("name", "bob")])?;
+    assert_row_at(&res, 3, &[("id", "5"), ("name", "dave")])?;
+    assert_eq!(res.len(), 5, "dave must not be subsumed away");
+    ctx.cache_settle().await?;
+
+    // Still correct once served from its own cache entry.
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(dept_x).await?;
+    assert_row_at(&res, 3, &[("id", "5"), ("name", "dave")])?;
+    assert_eq!(res.len(), 5);
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}

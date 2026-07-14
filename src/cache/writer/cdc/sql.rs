@@ -10,7 +10,7 @@ use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 
 use crate::query::ast::Deparse;
-use crate::query::transform::resolved_select_node_table_replace_with_values;
+use crate::query::transform::resolved_select_node_table_replace_with_values_all;
 
 use super::super::super::update_query::UpdateQuery;
 use super::super::super::{CacheError, CacheResult};
@@ -101,7 +101,7 @@ impl WriterCdc {
                 if i > 0 {
                     self.pg_eval_buf.push_str(", ");
                 }
-                self.pg_eval_buf.push_str("EXISTS (");
+                self.pg_eval_buf.push('(');
                 Self::cache_predicate_into(
                     &mut self.pg_eval_buf,
                     update_query,
@@ -150,7 +150,7 @@ impl WriterCdc {
                 if i > 0 {
                     self.pg_eval_buf.push_str(" OR ");
                 }
-                self.pg_eval_buf.push_str("EXISTS (");
+                self.pg_eval_buf.push('(');
                 Self::cache_predicate_into(
                     &mut self.pg_eval_buf,
                     update_query,
@@ -192,10 +192,16 @@ impl WriterCdc {
         }))
     }
 
-    /// Append one cached query's membership predicate — the inner SELECT of a
-    /// `SELECT EXISTS (...)`, with the CDC row's values substituted for the
-    /// changed table — into `buf`. Read-only; evaluated against the
-    /// pre-transaction snapshot. Caller wraps it in `EXISTS (...)`.
+    /// Append one cached query's membership predicate into `buf` as a complete
+    /// boolean expression, with the CDC row's values substituted for the changed
+    /// table.
+    ///
+    /// The relation is substituted once per FROM occurrence and the results are
+    /// OR'd: `EXISTS (…)`, or `EXISTS (…) OR EXISTS (…)` for a self-join. A row
+    /// belongs to the result if it can stand in for **any** occurrence, so the
+    /// disjunction *is* the membership test — substituting a single arm
+    /// under-approximates it and evicts rows the other arm still needs
+    /// (PGC-256). Read-only; evaluated against the pre-transaction snapshot.
     pub(super) fn cache_predicate_into(
         buf: &mut String,
         update_query: &UpdateQuery,
@@ -203,24 +209,37 @@ impl WriterCdc {
         row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         // Fast path: render the row's literals into the precomputed template
-        // (PGC-343), skipping the per-row clone + deparse. `render_into` declines
-        // short/partial rows, falling through to the general path below.
-        if let Some(template) = &update_query.pg_eval_template
-            && template.render_into(buf, row_data)
-        {
-            return Ok(());
+        // (PGC-343), skipping the per-row clone + deparse. The template is only
+        // built for single-occurrence relations, so one `EXISTS` is the whole
+        // predicate. `render_into` declines short/partial rows, falling through
+        // to the general path below.
+        if let Some(template) = &update_query.pg_eval_template {
+            let mark = buf.len();
+            buf.push_str("EXISTS (");
+            if template.render_into(buf, row_data) {
+                buf.push(')');
+                return Ok(());
+            }
+            buf.truncate(mark);
         }
         let resolved_select = update_query
             .resolved
             .as_select()
             .ok_or(CacheError::InvalidQuery)?;
-        let value_select = resolved_select_node_table_replace_with_values(
+        let value_selects = resolved_select_node_table_replace_with_values_all(
             resolved_select,
             table_metadata,
             row_data,
         )
         .map_err(|e| e.context_transform(CacheError::from))?;
-        Deparse::deparse(&value_select, buf);
+        for (i, value_select) in value_selects.iter().enumerate() {
+            if i > 0 {
+                buf.push_str(" OR ");
+            }
+            buf.push_str("EXISTS (");
+            Deparse::deparse(value_select, buf);
+            buf.push(')');
+        }
         Ok(())
     }
 

@@ -24,7 +24,7 @@ use alias_rewrite::resolved_select_node_alias_rewrite;
 pub const BATCH_IDX_COLUMN: &str = "__pgc_idx";
 
 /// The FROM occurrence of the table being replaced by `VALUES`.
-pub(super) struct TableOccurrence {
+pub struct TableOccurrence {
     /// `Some` iff the FROM entry carried an explicit alias. This is the
     /// occurrence's *identity*: under a self-join the other occurrences share
     /// `(schema, table)` and differ only here, so the rewrite keys on it to
@@ -35,15 +35,14 @@ pub(super) struct TableOccurrence {
     effective_alias: EcoString,
 }
 
-/// Find the first table source matching `relation_oid` in the FROM tree.
-fn table_occurrence_find(
+/// Every FROM occurrence of `table_metadata`'s relation. A self-join yields one
+/// per arm; they are distinguished by their explicit alias (PGC-256).
+pub fn table_occurrences_find(
     resolved: &ResolvedSelectNode,
     table_metadata: &TableMetadata,
-) -> AstTransformResult<TableOccurrence> {
-    let Some(first_from) = resolved.from.first() else {
-        return Err(AstTransformError::MissingTable.into());
-    };
-    let mut frontier = vec![first_from];
+) -> AstTransformResult<Vec<TableOccurrence>> {
+    let mut occurrences = Vec::new();
+    let mut frontier: Vec<&ResolvedTableSource> = resolved.from.iter().collect();
     while let Some(cur) = frontier.pop() {
         match cur {
             ResolvedTableSource::Join(join) => {
@@ -57,7 +56,7 @@ fn table_occurrence_find(
                 let effective_alias = explicit_alias
                     .clone()
                     .unwrap_or_else(|| EcoString::from(table_metadata.name.as_str()));
-                return Ok(TableOccurrence {
+                occurrences.push(TableOccurrence {
                     explicit_alias,
                     effective_alias,
                 });
@@ -65,19 +64,39 @@ fn table_occurrence_find(
             ResolvedTableSource::Table(_) | ResolvedTableSource::Subquery(_) => (),
         }
     }
-    Err(Report::from(AstTransformError::MissingTable))
+    if occurrences.is_empty() {
+        return Err(Report::from(AstTransformError::MissingTable));
+    }
+    Ok(occurrences)
 }
 
-/// Find the first table source matching `relation_oid` in the FROM tree,
-/// mutably, for replacement.
-fn table_source_find_mut(
-    resolved: &mut ResolvedSelectNode,
+/// The relation's sole FROM occurrence. Errors when it appears more than once —
+/// the callers that use this (the batch/unnest transforms and the prepared
+/// `PgEvalTemplate`) all substitute a single occurrence, which is only a
+/// complete membership test when there *is* only one (PGC-256).
+fn table_occurrence_single(
+    resolved: &ResolvedSelectNode,
+    table_metadata: &TableMetadata,
+) -> AstTransformResult<TableOccurrence> {
+    let mut occurrences = table_occurrences_find(resolved, table_metadata)?;
+    if occurrences.len() > 1 {
+        return Err(AstTransformError::MultipleOccurrences {
+            table: EcoString::from(table_metadata.name.as_str()),
+        }
+        .into());
+    }
+    Ok(occurrences.remove(0))
+}
+
+/// Find the table source for `occurrence` in the FROM tree, mutably, for
+/// replacement. Matches on the occurrence's explicit alias, so a self-join
+/// replaces the intended arm rather than whichever one is found first.
+fn table_source_find_mut<'a>(
+    resolved: &'a mut ResolvedSelectNode,
     relation_oid: Oid,
-) -> AstTransformResult<&mut ResolvedTableSource> {
-    let Some(first_from) = resolved.from.first_mut() else {
-        return Err(AstTransformError::MissingTable.into());
-    };
-    let mut frontier = vec![first_from];
+    occurrence: &TableOccurrence,
+) -> AstTransformResult<&'a mut ResolvedTableSource> {
+    let mut frontier: Vec<&mut ResolvedTableSource> = resolved.from.iter_mut().collect();
     let mut source_node: Option<&mut ResolvedTableSource> = None;
     while let Some(cur) = frontier.pop() {
         match cur {
@@ -85,7 +104,10 @@ fn table_source_find_mut(
                 frontier.push(&mut join.left);
                 frontier.push(&mut join.right);
             }
-            ResolvedTableSource::Table(table) if table.relation_oid == relation_oid => {
+            ResolvedTableSource::Table(table)
+                if table.relation_oid == relation_oid
+                    && table.alias.as_deref() == occurrence.explicit_alias.as_deref() =>
+            {
                 source_node = Some(cur);
                 break;
             }
@@ -131,28 +153,53 @@ fn values_column_names(
         .collect()
 }
 
-/// Replace `table_metadata`'s table source with a single-row `VALUES`
-/// (the CDC row), aliased as the table, so the query can be evaluated
-/// as an `EXISTS(...)` membership test for that row. Column references
-/// to the table across every clause are rewritten to the alias.
+/// One membership-test query per FROM occurrence of `table_metadata`'s relation.
+///
+/// A row belongs to the query's result if it can stand in for **any** occurrence,
+/// so the caller must combine these disjunctively (`EXISTS(a) OR EXISTS(b)`).
+/// Testing a single arm of a self-join under-approximates membership and evicts
+/// rows the other arm still needs (PGC-256).
+pub fn resolved_select_node_table_replace_with_values_all(
+    resolved: &ResolvedSelectNode,
+    table_metadata: &TableMetadata,
+    row_data: &[Option<ByteString>],
+) -> AstTransformResult<Vec<ResolvedSelectNode>> {
+    table_occurrences_find(resolved, table_metadata)?
+        .iter()
+        .map(|occurrence| {
+            resolved_select_node_table_replace_with_values(
+                resolved,
+                table_metadata,
+                row_data,
+                occurrence,
+            )
+        })
+        .collect()
+}
+
+/// Replace one FROM occurrence of `table_metadata` with a single-row `VALUES`
+/// (the CDC row), aliased as that occurrence, so the query can be evaluated as
+/// an `EXISTS(...)` membership test for that row *standing in for that arm*.
+/// References belonging to the occurrence are rewritten to the alias; the other
+/// arms keep pointing at their real table entries.
 pub fn resolved_select_node_table_replace_with_values(
     resolved: &ResolvedSelectNode,
     table_metadata: &TableMetadata,
     row_data: &[Option<ByteString>],
+    occurrence: &TableOccurrence,
 ) -> AstTransformResult<ResolvedSelectNode> {
     let mut resolved_new = resolved.clone();
 
-    let occurrence = table_occurrence_find(&resolved_new, table_metadata)?;
-
-    // Update all column references for this table to use the alias
+    // Update all column references for this occurrence to use the alias
     resolved_select_node_alias_rewrite(
         &mut resolved_new,
         &table_metadata.schema,
         &table_metadata.name,
-        &occurrence,
+        occurrence,
     )?;
 
-    let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
+    let source_node =
+        table_source_find_mut(&mut resolved_new, table_metadata.relation_oid, occurrence)?;
 
     // Build VALUES clause from row_data and collect column names
     let column_names = values_column_names(table_metadata, row_data);
@@ -200,7 +247,7 @@ impl PgEvalTemplate {
     /// ambiguous — the caller then falls back to the per-row clone-and-deparse.
     pub fn build(resolved: &ResolvedSelectNode, table_metadata: &TableMetadata) -> Option<Self> {
         let mut template = resolved.clone();
-        let occurrence = table_occurrence_find(&template, table_metadata).ok()?;
+        let occurrence = table_occurrence_single(&template, table_metadata).ok()?;
         resolved_select_node_alias_rewrite(
             &mut template,
             &table_metadata.schema,
@@ -208,7 +255,8 @@ impl PgEvalTemplate {
             &occurrence,
         )
         .ok()?;
-        let source_node = table_source_find_mut(&mut template, table_metadata.relation_oid).ok()?;
+        let source_node =
+            table_source_find_mut(&mut template, table_metadata.relation_oid, &occurrence).ok()?;
 
         let column_names: Vec<EcoString> = table_metadata
             .columns
@@ -310,7 +358,7 @@ pub fn resolved_select_node_table_replace_with_values_batch(
 ) -> AstTransformResult<ResolvedSelectNode> {
     let mut resolved_new = resolved.clone();
 
-    let occurrence = table_occurrence_find(&resolved_new, table_metadata)?;
+    let occurrence = table_occurrence_single(&resolved_new, table_metadata)?;
 
     resolved_select_node_alias_rewrite(
         &mut resolved_new,
@@ -319,7 +367,8 @@ pub fn resolved_select_node_table_replace_with_values_batch(
         &occurrence,
     )?;
 
-    let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
+    let source_node =
+        table_source_find_mut(&mut resolved_new, table_metadata.relation_oid, &occurrence)?;
 
     // Batch rows are uniform full-width (the caller filters odd-arity rows
     // out), so the alias columns are the relation's full column list.
@@ -397,7 +446,7 @@ pub fn resolved_select_node_table_replace_with_unnest(
 ) -> AstTransformResult<ResolvedSelectNode> {
     let mut resolved_new = resolved.clone();
 
-    let occurrence = table_occurrence_find(&resolved_new, table_metadata)?;
+    let occurrence = table_occurrence_single(&resolved_new, table_metadata)?;
 
     resolved_select_node_alias_rewrite(
         &mut resolved_new,
@@ -406,7 +455,8 @@ pub fn resolved_select_node_table_replace_with_unnest(
         &occurrence,
     )?;
 
-    let source_node = table_source_find_mut(&mut resolved_new, table_metadata.relation_oid)?;
+    let source_node =
+        table_source_find_mut(&mut resolved_new, table_metadata.relation_oid, &occurrence)?;
 
     let mut unnest_columns = Vec::with_capacity(table_metadata.columns.len() + 1);
     unnest_columns.push(ResolvedSelectColumn {
@@ -454,6 +504,23 @@ pub fn resolved_select_node_table_replace_with_unnest(
 
 #[cfg(test)]
 mod tests {
+    /// Substitute the relation's sole FROM occurrence. Every test below uses a
+    /// query where the table appears once; self-join coverage lives in the
+    /// `cache_test` integration suite.
+    fn replace_single(
+        resolved: &ResolvedSelectNode,
+        table_metadata: &TableMetadata,
+        row_data: &[Option<ByteString>],
+    ) -> AstTransformResult<ResolvedSelectNode> {
+        let occurrence = table_occurrence_single(resolved, table_metadata)?;
+        resolved_select_node_table_replace_with_values(
+            resolved,
+            table_metadata,
+            row_data,
+            &occurrence,
+        )
+    }
+
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
@@ -573,8 +640,7 @@ mod tests {
             panic!("expected SELECT");
         };
         let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced =
-            resolved_select_node_table_replace_with_values(&resolved, &j1, &row).expect("replace");
+        let replaced = replace_single(&resolved, &j1, &row).expect("replace");
         let mut sql = String::new();
         Deparse::deparse(&replaced, &mut sql);
 
@@ -610,8 +676,7 @@ mod tests {
             panic!("expected SELECT");
         };
         let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
-            .expect("replace");
+        let replaced = replace_single(&resolved, &onek, &row).expect("replace");
         let mut sql = String::new();
         Deparse::deparse(&replaced, &mut sql);
 
@@ -659,8 +724,7 @@ mod tests {
             panic!("expected SELECT");
         };
         let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
-            .expect("replace");
+        let replaced = replace_single(&resolved, &onek, &row).expect("replace");
         let mut sql = String::new();
         Deparse::deparse(&replaced, &mut sql);
 
@@ -693,8 +757,7 @@ mod tests {
             panic!("expected SELECT");
         };
         let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
-            .expect("replace");
+        let replaced = replace_single(&resolved, &onek, &row).expect("replace");
         let mut sql = String::new();
         Deparse::deparse(&replaced, &mut sql);
 
@@ -728,8 +791,7 @@ mod tests {
             panic!("expected SELECT");
         };
         let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
-            .expect("replace");
+        let replaced = replace_single(&resolved, &onek, &row).expect("replace");
         let mut sql = String::new();
         Deparse::deparse(&replaced, &mut sql);
 
@@ -765,8 +827,7 @@ mod tests {
             panic!("expected SELECT");
         };
         let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
-            .expect("replace");
+        let replaced = replace_single(&resolved, &onek, &row).expect("replace");
         let mut sql = String::new();
         Deparse::deparse(&replaced, &mut sql);
 
@@ -799,7 +860,7 @@ mod tests {
         };
         let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
 
-        let err = resolved_select_node_table_replace_with_values(&resolved, &onek, &row)
+        let err = replace_single(&resolved, &onek, &row)
             .expect_err("refuse the rewrite under same-alias shadowing");
         assert!(matches!(
             err.current_context(),
@@ -898,8 +959,7 @@ mod tests {
         );
         let row = vec![Some("42".into()), Some("alice".into())];
 
-        let result =
-            resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
+        let result = replace_single(&node, &meta, &row).expect("replace");
 
         // The FROM source should now be a subquery with VALUES
         let from = result.from.first().expect("at least one FROM source");
@@ -941,8 +1001,7 @@ mod tests {
         );
         let row = vec![Some("1".into()), None];
 
-        let result =
-            resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
+        let result = replace_single(&node, &meta, &row).expect("replace");
 
         let mut buf = String::new();
         result.deparse(&mut buf);
@@ -1040,8 +1099,7 @@ mod tests {
         );
         let row = vec![Some("1".into())];
 
-        let result =
-            resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
+        let result = replace_single(&node, &meta, &row).expect("replace");
 
         let from = result.from.first().expect("at least one FROM source");
         let subquery = match from {
@@ -1061,7 +1119,7 @@ mod tests {
         let node = select_node(vec![], ResolvedSelectColumns::None, None);
         let row = vec![Some("1".into())];
 
-        let err = resolved_select_node_table_replace_with_values(&node, &meta, &row)
+        let err = replace_single(&node, &meta, &row)
             .map_err(|e| e.into_current_context())
             .expect_err("should fail");
 
@@ -1082,7 +1140,7 @@ mod tests {
         );
         let row = vec![Some("1".into())];
 
-        let err = resolved_select_node_table_replace_with_values(&node, &meta, &row)
+        let err = replace_single(&node, &meta, &row)
             .map_err(|e| e.into_current_context())
             .expect_err("should fail");
 
@@ -1119,8 +1177,7 @@ mod tests {
         );
         let row = vec![Some("42".into()), Some("alice".into())];
 
-        let result =
-            resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
+        let result = replace_single(&node, &meta, &row).expect("replace");
 
         // After replacement, column references to public.users should have table_alias set
         let mut buf = String::new();
@@ -1148,8 +1205,7 @@ mod tests {
         );
         let row = vec![Some("42".into())];
 
-        let result =
-            resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
+        let result = replace_single(&node, &meta, &row).expect("replace");
 
         let mut buf = String::new();
         result.deparse(&mut buf);
@@ -1184,8 +1240,7 @@ mod tests {
         let node = select_node(vec![join], ResolvedSelectColumns::None, None);
         let row = vec![Some("7".into()), Some("99.50".into())];
 
-        let result =
-            resolved_select_node_table_replace_with_values(&node, &meta, &row).expect("replace");
+        let result = replace_single(&node, &meta, &row).expect("replace");
 
         // The JOIN's right side should now be a subquery
         let from = result.from.first().expect("at least one FROM source");
@@ -1237,8 +1292,7 @@ mod tests {
 
         for row in rows {
             let oracle_select =
-                resolved_select_node_table_replace_with_values(&resolved, table_metadata, row)
-                    .expect("oracle replace");
+                replace_single(&resolved, table_metadata, row).expect("oracle replace");
             let mut oracle = String::new();
             Deparse::deparse(&oracle_select, &mut oracle);
 
