@@ -93,7 +93,21 @@ pub fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), Error> {
         std::io::stdout().write_all(&read_buf[0..cnt])?;
         buf.extend_from_slice(&read_buf[0..cnt]);
     }
-    pgcache.stdout = Some(stdout);
+    // Keep draining the child's stdout for the rest of the run. pgcache logs
+    // synchronously, so once the OS pipe buffer fills, the *async task* doing
+    // the logging blocks inside its `write` — wedging whatever it was doing
+    // (e.g. the coalesce drain loop, which then never forwards parked waiters
+    // and hangs every client on that fingerprint). Reading to EOF on a
+    // background thread keeps the pipe from ever filling.
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = stdout.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let _ = std::io::stdout().write_all(&buf[..n]);
+        }
+    });
 
     Ok(())
 }
