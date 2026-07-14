@@ -6,11 +6,9 @@
 
 #![allow(clippy::wildcard_enum_match_arm)]
 
-use std::collections::HashMap;
 use std::os::raw::c_void;
 
 use ecow::EcoString;
-use ordered_float::NotNan;
 use smallvec::SmallVec;
 
 use pg_query::pg_nodes as pg;
@@ -20,6 +18,17 @@ use crate::query::transform::query_expr_constant_fold;
 
 use super::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag, string_node_value};
 use super::*;
+
+mod where_clause;
+mod window;
+
+use where_clause::{
+    column_ref_extract, const_value_extract, param_ref_extract, where_expr_convert,
+};
+use window::{
+    select_columns_window_refs_resolve, window_clause_extract, window_def_convert,
+    window_order_by_convert, window_refs_assert_resolved,
+};
 
 /// Convert the root of a raw parse tree (`List *` of `RawStmt`, as an opaque
 /// pointer from `parse_raw_scoped`) into a [`QueryExpr`].
@@ -127,7 +136,7 @@ unsafe fn with_clause_extract(
     }
 }
 
-unsafe fn select_stmt_to_query_expr(
+pub(super) unsafe fn select_stmt_to_query_expr(
     select_stmt: *const pg::SelectStmt,
 ) -> Result<QueryExpr, AstError> {
     let ctx = ParseContext::empty();
@@ -485,7 +494,7 @@ unsafe fn table_subquery_node_convert(
     }
 }
 
-unsafe fn scalar_expr_convert(node: NodePtr) -> Result<ScalarExpr, AstError> {
+pub(super) unsafe fn scalar_expr_convert(node: NodePtr) -> Result<ScalarExpr, AstError> {
     unsafe {
         match node_tag(node) {
             pg::NodeTag_T_ColumnRef => {
@@ -679,303 +688,6 @@ unsafe fn func_call_convert(func_call: *const pg::FuncCall) -> Result<FunctionCa
     }
 }
 
-// Window `frameOptions` bitmask from PostgreSQL `parsenodes.h`. libpg_query
-// exposes these only as C `#define`s, which bindgen does not emit, so they are
-// mirrored here.
-const FRAMEOPTION_NONDEFAULT: i32 = 0x00001;
-const FRAMEOPTION_RANGE: i32 = 0x00002;
-const FRAMEOPTION_ROWS: i32 = 0x00004;
-const FRAMEOPTION_GROUPS: i32 = 0x00008;
-const FRAMEOPTION_START_UNBOUNDED_PRECEDING: i32 = 0x00020;
-const FRAMEOPTION_END_UNBOUNDED_FOLLOWING: i32 = 0x00100;
-const FRAMEOPTION_START_CURRENT_ROW: i32 = 0x00200;
-const FRAMEOPTION_END_CURRENT_ROW: i32 = 0x00400;
-const FRAMEOPTION_START_OFFSET_PRECEDING: i32 = 0x00800;
-const FRAMEOPTION_END_OFFSET_PRECEDING: i32 = 0x01000;
-const FRAMEOPTION_START_OFFSET_FOLLOWING: i32 = 0x02000;
-const FRAMEOPTION_END_OFFSET_FOLLOWING: i32 = 0x04000;
-const FRAMEOPTION_EXCLUDE_CURRENT_ROW: i32 = 0x08000;
-const FRAMEOPTION_EXCLUDE_GROUP: i32 = 0x10000;
-const FRAMEOPTION_EXCLUDE_TIES: i32 = 0x20000;
-
-/// Convert a function's `OVER` clause. A bare `OVER w` (`name` set, no inline
-/// clauses) becomes a deferred reference resolved later against the SELECT's
-/// `WINDOW` clause (PGC-280); an inline `OVER (...)` is converted directly.
-unsafe fn window_def_convert(win_def: *const pg::WindowDef) -> Result<WindowSpec, AstError> {
-    unsafe {
-        let name = cstr((*win_def).name);
-        if !name.is_empty() {
-            return Ok(WindowSpec {
-                partition_by: Vec::new(),
-                order_by: Vec::new(),
-                frame: None,
-                ref_name: Some(EcoString::from(name)),
-            });
-        }
-        window_spec_from_clauses(win_def)
-    }
-}
-
-/// Convert the inline PARTITION BY / ORDER BY / frame clauses of a `WindowDef`,
-/// ignoring its `name` (used both for `OVER (...)` and for the definitions in a
-/// `WINDOW` clause). `OVER (w ...)` frame inheritance (`refname`) is not
-/// supported and forwards.
-unsafe fn window_spec_from_clauses(win_def: *const pg::WindowDef) -> Result<WindowSpec, AstError> {
-    unsafe {
-        if !cstr((*win_def).refname).is_empty() {
-            return Err(AstError::UnsupportedFeature {
-                feature: "window definition inheriting another window".to_owned(),
-            });
-        }
-        let partition_by = list_nodes((*win_def).partitionClause)
-            .map(|n| scalar_expr_convert(n))
-            .collect::<Result<Vec<_>, _>>()?;
-        let order_by = window_order_by_convert((*win_def).orderClause)?.into_vec();
-        let frame = window_frame_convert(win_def)?;
-        Ok(WindowSpec {
-            partition_by,
-            order_by,
-            frame,
-            ref_name: None,
-        })
-    }
-}
-
-/// Build the `name → WindowSpec` map from a SELECT's `WINDOW` clause, so that
-/// `OVER w` references can be resolved to their definitions (PGC-280).
-unsafe fn window_clause_extract(
-    window_clause: *const pg::List,
-) -> Result<HashMap<EcoString, WindowSpec>, AstError> {
-    unsafe {
-        let mut defs = HashMap::new();
-        for node in list_nodes(window_clause) {
-            if node_tag(node) != pg::NodeTag_T_WindowDef {
-                return Err(AstError::UnsupportedFeature {
-                    feature: format!("WINDOW clause node type: {:?}", node_tag(node)),
-                });
-            }
-            let win_def = cast::<pg::WindowDef>(node);
-            let name = cstr((*win_def).name);
-            if name.is_empty() {
-                return Err(AstError::UnsupportedFeature {
-                    feature: "unnamed WINDOW clause entry".to_owned(),
-                });
-            }
-            defs.insert(EcoString::from(name), window_spec_from_clauses(win_def)?);
-        }
-        Ok(defs)
-    }
-}
-
-/// Replace `OVER w` references in the SELECT list with their definitions
-/// (PGC-280). An unresolved reference left behind is caught by
-/// `window_refs_assert_resolved` and forwards the whole query.
-fn select_columns_window_refs_resolve(
-    columns: &mut SelectColumns,
-    defs: &HashMap<EcoString, WindowSpec>,
-) -> Result<(), AstError> {
-    if let SelectColumns::Columns(cols) = columns {
-        for col in cols {
-            if let SelectColumn::Expr { expr, .. } = col {
-                scalar_expr_window_refs_resolve(expr, defs)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn scalar_expr_window_refs_resolve(
-    expr: &mut ScalarExpr,
-    defs: &HashMap<EcoString, WindowSpec>,
-) -> Result<(), AstError> {
-    match expr {
-        ScalarExpr::Function(func) => {
-            if let Some(over) = &mut func.over
-                && let Some(name) = over.ref_name.take()
-            {
-                *over = defs
-                    .get(&name)
-                    .cloned()
-                    .ok_or_else(|| AstError::UnsupportedFeature {
-                        feature: format!("reference to undefined window {name}"),
-                    })?;
-            }
-            for arg in &mut func.args {
-                scalar_expr_window_refs_resolve(arg, defs)?;
-            }
-        }
-        ScalarExpr::Arithmetic(arith) => {
-            scalar_expr_window_refs_resolve(&mut arith.left, defs)?;
-            scalar_expr_window_refs_resolve(&mut arith.right, defs)?;
-        }
-        ScalarExpr::Case(case) => {
-            if let Some(arg) = &mut case.arg {
-                scalar_expr_window_refs_resolve(arg, defs)?;
-            }
-            for when in &mut case.whens {
-                scalar_expr_window_refs_resolve(&mut when.result, defs)?;
-            }
-            if let Some(default) = &mut case.default {
-                scalar_expr_window_refs_resolve(default, defs)?;
-            }
-        }
-        ScalarExpr::Array(elems) => {
-            for e in elems {
-                scalar_expr_window_refs_resolve(e, defs)?;
-            }
-        }
-        ScalarExpr::TypeCast { expr, .. } => {
-            scalar_expr_window_refs_resolve(expr, defs)?;
-        }
-        ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Subquery(_) => {}
-    }
-    Ok(())
-}
-
-/// Fail loud on any window reference the SELECT-list resolution did not reach
-/// (e.g. `OVER w` in ORDER BY). Returning an error forwards the query, so an
-/// unresolved reference never silently deparses to `OVER ()` (PGC-280).
-fn window_refs_assert_resolved(query: &QueryExpr) -> Result<(), AstError> {
-    if query.nodes::<WindowSpec>().any(|w| w.ref_name.is_some()) {
-        return Err(AstError::UnsupportedFeature {
-            feature: "window reference outside the SELECT list".to_owned(),
-        });
-    }
-    Ok(())
-}
-
-/// Decode the frame clause from a `WindowDef`. Returns `None` for the SQL
-/// default frame (`NONDEFAULT` bit clear). Dropping a non-default frame is a
-/// silent wrong result (PGC-279), so every explicit frame must round-trip.
-unsafe fn window_frame_convert(
-    win_def: *const pg::WindowDef,
-) -> Result<Option<WindowFrame>, AstError> {
-    unsafe {
-        let opts = (*win_def).frameOptions;
-        if opts & FRAMEOPTION_NONDEFAULT == 0 {
-            return Ok(None);
-        }
-        let mode = if opts & FRAMEOPTION_RANGE != 0 {
-            FrameMode::Range
-        } else if opts & FRAMEOPTION_ROWS != 0 {
-            FrameMode::Rows
-        } else if opts & FRAMEOPTION_GROUPS != 0 {
-            FrameMode::Groups
-        } else {
-            return Err(AstError::UnsupportedFeature {
-                feature: format!("window frame mode (frameOptions={opts:#x})"),
-            });
-        };
-        let start = frame_bound_convert(
-            opts,
-            (*win_def).startOffset as NodePtr,
-            FRAMEOPTION_START_UNBOUNDED_PRECEDING,
-            FRAMEOPTION_START_CURRENT_ROW,
-            FRAMEOPTION_START_OFFSET_PRECEDING,
-            FRAMEOPTION_START_OFFSET_FOLLOWING,
-            // START_UNBOUNDED_FOLLOWING is disallowed by PostgreSQL as a start.
-            0,
-            "start",
-        )?;
-        let end = frame_bound_convert(
-            opts,
-            (*win_def).endOffset as NodePtr,
-            // END_UNBOUNDED_PRECEDING is disallowed by PostgreSQL as an end.
-            0,
-            FRAMEOPTION_END_CURRENT_ROW,
-            FRAMEOPTION_END_OFFSET_PRECEDING,
-            FRAMEOPTION_END_OFFSET_FOLLOWING,
-            FRAMEOPTION_END_UNBOUNDED_FOLLOWING,
-            "end",
-        )?;
-        let exclusion = if opts & FRAMEOPTION_EXCLUDE_CURRENT_ROW != 0 {
-            FrameExclusion::CurrentRow
-        } else if opts & FRAMEOPTION_EXCLUDE_GROUP != 0 {
-            FrameExclusion::Group
-        } else if opts & FRAMEOPTION_EXCLUDE_TIES != 0 {
-            FrameExclusion::Ties
-        } else {
-            FrameExclusion::NoOthers
-        };
-        Ok(Some(WindowFrame {
-            mode,
-            start,
-            end,
-            exclusion,
-        }))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn frame_bound_convert(
-    opts: i32,
-    offset: NodePtr,
-    unbounded_preceding: i32,
-    current_row: i32,
-    offset_preceding: i32,
-    offset_following: i32,
-    unbounded_following: i32,
-    which: &str,
-) -> Result<FrameBound, AstError> {
-    unsafe {
-        if unbounded_preceding != 0 && opts & unbounded_preceding != 0 {
-            Ok(FrameBound::UnboundedPreceding)
-        } else if unbounded_following != 0 && opts & unbounded_following != 0 {
-            Ok(FrameBound::UnboundedFollowing)
-        } else if opts & current_row != 0 {
-            Ok(FrameBound::CurrentRow)
-        } else if opts & offset_preceding != 0 {
-            Ok(FrameBound::OffsetPreceding(Box::new(scalar_expr_convert(
-                offset,
-            )?)))
-        } else if opts & offset_following != 0 {
-            Ok(FrameBound::OffsetFollowing(Box::new(scalar_expr_convert(
-                offset,
-            )?)))
-        } else {
-            Err(AstError::UnsupportedFeature {
-                feature: format!("window frame {which} bound (frameOptions={opts:#x})"),
-            })
-        }
-    }
-}
-
-unsafe fn window_order_by_convert(
-    order_clause: *const pg::List,
-) -> Result<SmallVec<[OrderByClause; 1]>, AstError> {
-    unsafe {
-        let mut order_by = SmallVec::new();
-        for sort_node in list_nodes(order_clause) {
-            if node_tag(sort_node) != pg::NodeTag_T_SortBy {
-                return Err(AstError::UnsupportedFeature {
-                    feature: format!("ORDER BY node type: {:?}", node_tag(sort_node)),
-                });
-            }
-            order_by.push(sort_by_to_order_clause(cast::<pg::SortBy>(sort_node))?);
-        }
-        Ok(order_by)
-    }
-}
-
-unsafe fn sort_by_to_order_clause(sort_by: *const pg::SortBy) -> Result<OrderByClause, AstError> {
-    unsafe {
-        let expr_node = (*sort_by).node as NodePtr;
-        if expr_node.is_null() {
-            return Err(AstError::UnsupportedFeature {
-                feature: "ORDER BY without expression".to_owned(),
-            });
-        }
-        let expr = scalar_expr_convert(expr_node)?;
-        let direction = order_dir_map((*sort_by).sortby_dir)?;
-        let null_order = null_order_map((*sort_by).sortby_nulls)?;
-        Ok(OrderByClause {
-            expr,
-            direction,
-            null_order,
-        })
-    }
-}
-
 unsafe fn coalesce_expr_convert(
     coalesce: *const pg::CoalesceExpr,
 ) -> Result<FunctionCall, AstError> {
@@ -1030,7 +742,9 @@ fn function_call_bare(name: EcoString, args: Vec<ScalarExpr>) -> FunctionCall {
     }
 }
 
-unsafe fn aexpr_arithmetic_convert(aexpr: *const pg::A_Expr) -> Result<ArithmeticExpr, AstError> {
+pub(super) unsafe fn aexpr_arithmetic_convert(
+    aexpr: *const pg::A_Expr,
+) -> Result<ArithmeticExpr, AstError> {
     unsafe {
         let op = arithmetic_op_extract((*aexpr).name)?;
         if (*aexpr).lexpr.is_null() {
@@ -1053,7 +767,7 @@ unsafe fn aexpr_arithmetic_convert(aexpr: *const pg::A_Expr) -> Result<Arithmeti
     }
 }
 
-fn arithmetic_op_from_str(op: &str) -> Option<ArithmeticOp> {
+pub(super) fn arithmetic_op_from_str(op: &str) -> Option<ArithmeticOp> {
     match op {
         "+" => Some(ArithmeticOp::Add),
         "-" => Some(ArithmeticOp::Subtract),
@@ -1066,7 +780,7 @@ fn arithmetic_op_from_str(op: &str) -> Option<ArithmeticOp> {
 
 /// The single operator name from a (possibly multi-part) operator `List`, with
 /// no intermediate allocation. `None` for multi-part or unparseable names.
-unsafe fn operator_name_single<'a>(name: *const pg::List) -> Option<&'a str> {
+pub(super) unsafe fn operator_name_single<'a>(name: *const pg::List) -> Option<&'a str> {
     unsafe {
         let mut it = list_nodes(name);
         match (it.next(), it.next()) {
@@ -1216,7 +930,7 @@ fn join_type_map(jt: pg::JoinType) -> Result<JoinType, AstError> {
     }
 }
 
-fn order_dir_map(dir: pg::SortByDir) -> Result<OrderDirection, AstError> {
+pub(super) fn order_dir_map(dir: pg::SortByDir) -> Result<OrderDirection, AstError> {
     match dir {
         pg::SortByDir_SORTBY_ASC | pg::SortByDir_SORTBY_DEFAULT => Ok(OrderDirection::Asc),
         pg::SortByDir_SORTBY_DESC => Ok(OrderDirection::Desc),
@@ -1226,7 +940,7 @@ fn order_dir_map(dir: pg::SortByDir) -> Result<OrderDirection, AstError> {
     }
 }
 
-fn null_order_map(n: pg::SortByNulls) -> Result<NullOrder, AstError> {
+pub(super) fn null_order_map(n: pg::SortByNulls) -> Result<NullOrder, AstError> {
     match n {
         pg::SortByNulls_SORTBY_NULLS_DEFAULT => Ok(NullOrder::Default),
         pg::SortByNulls_SORTBY_NULLS_FIRST => Ok(NullOrder::NullsFirst),
@@ -1237,7 +951,7 @@ fn null_order_map(n: pg::SortByNulls) -> Result<NullOrder, AstError> {
     }
 }
 
-fn sublink_type_map(t: pg::SubLinkType) -> Result<SubLinkType, AstError> {
+pub(super) fn sublink_type_map(t: pg::SubLinkType) -> Result<SubLinkType, AstError> {
     match t {
         pg::SubLinkType_EXISTS_SUBLINK => Ok(SubLinkType::Exists),
         pg::SubLinkType_ANY_SUBLINK => Ok(SubLinkType::Any),
@@ -1246,442 +960,6 @@ fn sublink_type_map(t: pg::SubLinkType) -> Result<SubLinkType, AstError> {
         other => Err(AstError::UnsupportedSubLinkType {
             sublink_type: format!("{other}"),
         }),
-    }
-}
-
-// ---------- Literal / column / param extraction ----------
-
-unsafe fn const_value_extract(c: *const pg::A_Const) -> Result<LiteralValue, WhereParseError> {
-    unsafe {
-        if (*c).isnull {
-            return Ok(LiteralValue::Null);
-        }
-        let val = &(*c).val;
-        match val.node.type_ {
-            pg::NodeTag_T_Integer => Ok(LiteralValue::Integer(val.ival.ival as i64)),
-            pg::NodeTag_T_Float => {
-                let s = cstr(val.fval.fval);
-                s.parse::<f64>()
-                    .ok()
-                    .and_then(|v| NotNan::new(v).ok())
-                    .map(LiteralValue::Float)
-                    .ok_or_else(|| WhereParseError::InvalidConstValue {
-                        value: s.to_owned(),
-                    })
-            }
-            pg::NodeTag_T_Boolean => Ok(LiteralValue::Boolean(val.boolval.boolval)),
-            pg::NodeTag_T_String => Ok(LiteralValue::String(cstr(val.sval.sval).into())),
-            pg::NodeTag_T_BitString => Ok(LiteralValue::String(cstr(val.bsval.bsval).into())),
-            _ => Ok(LiteralValue::Null),
-        }
-    }
-}
-
-unsafe fn column_ref_extract(col_ref: *const pg::ColumnRef) -> Result<ColumnNode, WhereParseError> {
-    unsafe {
-        if list_is_empty((*col_ref).fields) {
-            return Err(WhereParseError::InvalidColumnRef);
-        }
-
-        let mut table: Option<EcoString> = None;
-        let mut column: Option<EcoString> = None;
-
-        for field in list_nodes((*col_ref).fields) {
-            match string_node_value(field) {
-                Some(s) => {
-                    if column.is_none() {
-                        column = Some(EcoString::from(s));
-                    } else {
-                        table = column.clone();
-                        column = Some(EcoString::from(s));
-                    }
-                }
-                None => return Err(WhereParseError::InvalidColumnRef),
-            }
-        }
-
-        let column = column.ok_or(WhereParseError::InvalidColumnRef)?;
-        Ok(ColumnNode { table, column })
-    }
-}
-
-unsafe fn param_ref_extract(param_ref: *const pg::ParamRef) -> LiteralValue {
-    unsafe { LiteralValue::Parameter(format!("${}", (*param_ref).number).into()) }
-}
-
-// ---------- WHERE clause ----------
-
-unsafe fn where_expr_convert(node: NodePtr) -> Result<WhereExpr, WhereParseError> {
-    unsafe {
-        match node_tag(node) {
-            pg::NodeTag_T_A_Expr => a_expr_convert(cast::<pg::A_Expr>(node)),
-            pg::NodeTag_T_BoolExpr => bool_expr_convert(cast::<pg::BoolExpr>(node)),
-            pg::NodeTag_T_SubLink => sublink_convert(cast::<pg::SubLink>(node)),
-            pg::NodeTag_T_NullTest => null_test_convert(cast::<pg::NullTest>(node)),
-            pg::NodeTag_T_BooleanTest => boolean_test_convert(cast::<pg::BooleanTest>(node)),
-            pg::NodeTag_T_ColumnRef => Ok(WhereExpr::Scalar(ScalarExpr::Column(
-                column_ref_extract(cast::<pg::ColumnRef>(node))?,
-            ))),
-            pg::NodeTag_T_A_Const => Ok(WhereExpr::Scalar(ScalarExpr::Literal(
-                const_value_extract(cast::<pg::A_Const>(node))?,
-            ))),
-            pg::NodeTag_T_ParamRef => Ok(WhereExpr::Scalar(ScalarExpr::Literal(
-                param_ref_extract(cast::<pg::ParamRef>(node)),
-            ))),
-            pg::NodeTag_T_FuncCall | pg::NodeTag_T_TypeCast => {
-                Ok(WhereExpr::Scalar(scalar_expr_convert(node)?))
-            }
-            _ => Err(WhereParseError::UnsupportedPattern),
-        }
-    }
-}
-
-unsafe fn sublink_convert(sub_link: *const pg::SubLink) -> Result<WhereExpr, WhereParseError> {
-    unsafe {
-        let subselect = (*sub_link).subselect as NodePtr;
-        let query = if !subselect.is_null() && node_tag(subselect) == pg::NodeTag_T_SelectStmt {
-            select_stmt_to_query_expr(cast::<pg::SelectStmt>(subselect))?
-        } else {
-            return Err(WhereParseError::Other {
-                error: "SubLink missing or invalid subselect".to_owned(),
-            });
-        };
-
-        let test_expr = match ((*sub_link).testexpr as NodePtr).is_null() {
-            true => None,
-            false => Some(Box::new(scalar_expr_convert((*sub_link).testexpr)?)),
-        };
-
-        let sublink_type = sublink_type_map((*sub_link).subLinkType)?;
-
-        if sublink_type == SubLinkType::All {
-            sublink_all_operator_check((*sub_link).operName)?;
-        }
-
-        Ok(WhereExpr::Subquery {
-            query: Box::new(query),
-            sublink_type,
-            test_expr,
-        })
-    }
-}
-
-unsafe fn operator_name_string_extract<'a>(
-    oper_name: *const pg::List,
-    context: &str,
-) -> Result<&'a str, WhereParseError> {
-    unsafe {
-        let names: Vec<_> = list_nodes(oper_name).collect();
-        let [name_node] = names.as_slice() else {
-            return Err(WhereParseError::Other {
-                error: format!("{context}: expected single name node"),
-            });
-        };
-        string_node_value(*name_node).ok_or_else(|| WhereParseError::Other {
-            error: format!("{context}: expected string node"),
-        })
-    }
-}
-
-unsafe fn sublink_all_operator_check(oper_name: *const pg::List) -> Result<(), WhereParseError> {
-    unsafe {
-        let op = operator_name_string_extract(oper_name, "ALL operator")?;
-        if op == "<>" {
-            Ok(())
-        } else {
-            Err(WhereParseError::UnsupportedOperator {
-                operator: format!("ALL with operator '{op}'"),
-            })
-        }
-    }
-}
-
-unsafe fn null_test_convert(null_test: *const pg::NullTest) -> Result<WhereExpr, WhereParseError> {
-    unsafe {
-        let arg = (*null_test).arg as NodePtr;
-        if arg.is_null() {
-            return Err(WhereParseError::MissingExpression);
-        }
-        let op = match (*null_test).nulltesttype {
-            pg::NullTestType_IS_NULL => UnaryOp::IsNull,
-            pg::NullTestType_IS_NOT_NULL => UnaryOp::IsNotNull,
-            other => {
-                return Err(WhereParseError::UnsupportedAExpr {
-                    expr: format!("NullTest type {other}"),
-                });
-            }
-        };
-        Ok(WhereExpr::Unary(UnaryExpr {
-            op,
-            expr: Box::new(where_expr_convert(arg)?),
-        }))
-    }
-}
-
-unsafe fn boolean_test_convert(
-    bool_test: *const pg::BooleanTest,
-) -> Result<WhereExpr, WhereParseError> {
-    unsafe {
-        let arg = (*bool_test).arg as NodePtr;
-        if arg.is_null() {
-            return Err(WhereParseError::MissingExpression);
-        }
-        let op = match (*bool_test).booltesttype {
-            pg::BoolTestType_IS_TRUE => UnaryOp::IsTrue,
-            pg::BoolTestType_IS_NOT_TRUE => UnaryOp::IsNotTrue,
-            pg::BoolTestType_IS_FALSE => UnaryOp::IsFalse,
-            pg::BoolTestType_IS_NOT_FALSE => UnaryOp::IsNotFalse,
-            pg::BoolTestType_IS_UNKNOWN => UnaryOp::IsNull,
-            pg::BoolTestType_IS_NOT_UNKNOWN => UnaryOp::IsNotNull,
-            other => {
-                return Err(WhereParseError::UnsupportedAExpr {
-                    expr: format!("BooleanTest type {other}"),
-                });
-            }
-        };
-        Ok(WhereExpr::Unary(UnaryExpr {
-            op,
-            expr: Box::new(where_expr_convert(arg)?),
-        }))
-    }
-}
-
-unsafe fn a_expr_convert(expr: *const pg::A_Expr) -> Result<WhereExpr, WhereParseError> {
-    unsafe {
-        let kind = (*expr).kind;
-        let name = (*expr).name;
-        let lexpr = (*expr).lexpr as NodePtr;
-        let rexpr = (*expr).rexpr as NodePtr;
-
-        match kind {
-            pg::A_Expr_Kind_AEXPR_OP => {
-                // Extract the operator name once and classify it, rather than
-                // speculatively running (and discarding) the arithmetic path.
-                let op_name = operator_name_single(name).ok_or_else(|| WhereParseError::Other {
-                    error: "Multi-part operator names not supported".to_owned(),
-                })?;
-                if arithmetic_op_from_str(op_name).is_some() {
-                    let arith = aexpr_arithmetic_convert(expr)?;
-                    return Ok(WhereExpr::Scalar(ScalarExpr::Arithmetic(arith)));
-                }
-                let op = binary_op_from_str(op_name).ok_or_else(|| {
-                    WhereParseError::UnsupportedOperator {
-                        operator: op_name.to_owned(),
-                    }
-                })?;
-                if lexpr.is_null() || rexpr.is_null() {
-                    return Err(WhereParseError::MissingExpression);
-                }
-                Ok(WhereExpr::Binary(BinaryExpr {
-                    op,
-                    lexpr: Box::new(where_expr_convert(lexpr)?),
-                    rexpr: Box::new(where_expr_convert(rexpr)?),
-                }))
-            }
-            pg::A_Expr_Kind_AEXPR_IN => {
-                let op = in_operator_extract(name)?;
-                if lexpr.is_null() || rexpr.is_null() {
-                    return Err(WhereParseError::MissingExpression);
-                }
-                let left_expr = where_expr_convert(lexpr)?;
-                let values = in_list_extract(rexpr)?;
-                let mut exprs = vec![left_expr];
-                exprs.extend(values);
-                Ok(WhereExpr::Multi(MultiExpr { op, exprs }))
-            }
-            pg::A_Expr_Kind_AEXPR_BETWEEN
-            | pg::A_Expr_Kind_AEXPR_NOT_BETWEEN
-            | pg::A_Expr_Kind_AEXPR_BETWEEN_SYM
-            | pg::A_Expr_Kind_AEXPR_NOT_BETWEEN_SYM => {
-                let op = match kind {
-                    pg::A_Expr_Kind_AEXPR_BETWEEN => MultiOp::Between,
-                    pg::A_Expr_Kind_AEXPR_NOT_BETWEEN => MultiOp::NotBetween,
-                    pg::A_Expr_Kind_AEXPR_BETWEEN_SYM => MultiOp::BetweenSymmetric,
-                    _ => MultiOp::NotBetweenSymmetric,
-                };
-                if lexpr.is_null() || rexpr.is_null() {
-                    return Err(WhereParseError::MissingExpression);
-                }
-                let left_expr = where_expr_convert(lexpr)?;
-                let bounds = between_bounds_extract(rexpr)?;
-                Ok(WhereExpr::Multi(MultiExpr {
-                    op,
-                    exprs: vec![left_expr, bounds.0, bounds.1],
-                }))
-            }
-            pg::A_Expr_Kind_AEXPR_LIKE | pg::A_Expr_Kind_AEXPR_ILIKE => {
-                let op = like_operator_extract(name)?;
-                if lexpr.is_null() || rexpr.is_null() {
-                    return Err(WhereParseError::MissingExpression);
-                }
-                Ok(WhereExpr::Binary(BinaryExpr {
-                    op,
-                    lexpr: Box::new(where_expr_convert(lexpr)?),
-                    rexpr: Box::new(where_expr_convert(rexpr)?),
-                }))
-            }
-            pg::A_Expr_Kind_AEXPR_OP_ANY | pg::A_Expr_Kind_AEXPR_OP_ALL => {
-                let comparison = operator_extract(name)?;
-                let op = match kind {
-                    pg::A_Expr_Kind_AEXPR_OP_ANY => MultiOp::Any { comparison },
-                    _ => MultiOp::All { comparison },
-                };
-                if lexpr.is_null() || rexpr.is_null() {
-                    return Err(WhereParseError::MissingExpression);
-                }
-                let left_expr = where_expr_convert(lexpr)?;
-                let right_expr = any_all_rexpr_convert(rexpr)?;
-                Ok(WhereExpr::Multi(MultiExpr {
-                    op,
-                    exprs: vec![left_expr, right_expr],
-                }))
-            }
-            other => Err(WhereParseError::UnsupportedAExpr {
-                expr: format!("A_Expr_Kind {other}"),
-            }),
-        }
-    }
-}
-
-unsafe fn in_operator_extract(name: *const pg::List) -> Result<MultiOp, WhereParseError> {
-    unsafe {
-        match operator_name_string_extract(name, "IN operator")? {
-            "=" => Ok(MultiOp::In),
-            "<>" => Ok(MultiOp::NotIn),
-            other => Err(WhereParseError::UnsupportedOperator {
-                operator: format!("IN with operator '{other}'"),
-            }),
-        }
-    }
-}
-
-unsafe fn in_list_extract(node: NodePtr) -> Result<Vec<WhereExpr>, WhereParseError> {
-    unsafe {
-        if node_tag(node) != pg::NodeTag_T_List {
-            return Err(WhereParseError::Other {
-                error: "IN clause: expected List on right side".to_owned(),
-            });
-        }
-        list_nodes(node as *const pg::List)
-            .map(|n| where_expr_convert(n))
-            .collect()
-    }
-}
-
-unsafe fn between_bounds_extract(node: NodePtr) -> Result<(WhereExpr, WhereExpr), WhereParseError> {
-    unsafe {
-        if node_tag(node) != pg::NodeTag_T_List {
-            return Err(WhereParseError::Other {
-                error: "BETWEEN clause: expected List on right side".to_owned(),
-            });
-        }
-        let items: Vec<_> = list_nodes(node as *const pg::List).collect();
-        let [low, high] = items.as_slice() else {
-            return Err(WhereParseError::Other {
-                error: format!(
-                    "BETWEEN clause: expected exactly 2 bounds, got {}",
-                    items.len()
-                ),
-            });
-        };
-        Ok((where_expr_convert(*low)?, where_expr_convert(*high)?))
-    }
-}
-
-unsafe fn any_all_rexpr_convert(node: NodePtr) -> Result<WhereExpr, WhereParseError> {
-    unsafe {
-        if node_tag(node) == pg::NodeTag_T_A_ArrayExpr {
-            let elems = list_nodes((*cast::<pg::A_ArrayExpr>(node)).elements)
-                .map(|n| scalar_expr_convert(n))
-                .collect::<Result<Vec<_>, AstError>>()?;
-            Ok(WhereExpr::Scalar(ScalarExpr::Array(elems)))
-        } else {
-            where_expr_convert(node)
-        }
-    }
-}
-
-unsafe fn like_operator_extract(name: *const pg::List) -> Result<BinaryOp, WhereParseError> {
-    unsafe {
-        match operator_name_string_extract(name, "LIKE operator")? {
-            "~~" => Ok(BinaryOp::Like),
-            "!~~" => Ok(BinaryOp::NotLike),
-            "~~*" => Ok(BinaryOp::ILike),
-            "!~~*" => Ok(BinaryOp::NotILike),
-            other => Err(WhereParseError::UnsupportedOperator {
-                operator: format!("LIKE with operator '{other}'"),
-            }),
-        }
-    }
-}
-
-fn binary_op_from_str(op: &str) -> Option<BinaryOp> {
-    match op {
-        "=" => Some(BinaryOp::Equal),
-        "!=" | "<>" => Some(BinaryOp::NotEqual),
-        "<" => Some(BinaryOp::LessThan),
-        "<=" => Some(BinaryOp::LessThanOrEqual),
-        ">" => Some(BinaryOp::GreaterThan),
-        ">=" => Some(BinaryOp::GreaterThanOrEqual),
-        _ => None,
-    }
-}
-
-unsafe fn operator_extract(name: *const pg::List) -> Result<BinaryOp, WhereParseError> {
-    unsafe {
-        let op = operator_name_single(name).ok_or_else(|| WhereParseError::Other {
-            error: "Multi-part operator names not supported".to_owned(),
-        })?;
-        binary_op_from_str(op).ok_or_else(|| WhereParseError::UnsupportedOperator {
-            operator: op.to_owned(),
-        })
-    }
-}
-
-unsafe fn bool_expr_convert(expr: *const pg::BoolExpr) -> Result<WhereExpr, WhereParseError> {
-    unsafe {
-        let args: Vec<_> = list_nodes((*expr).args).collect();
-        match (*expr).boolop {
-            pg::BoolExprType_AND_EXPR | pg::BoolExprType_OR_EXPR => {
-                let op = if (*expr).boolop == pg::BoolExprType_AND_EXPR {
-                    BinaryOp::And
-                } else {
-                    BinaryOp::Or
-                };
-                let [first, second, rest @ ..] = args.as_slice() else {
-                    return Err(WhereParseError::Other {
-                        error: "boolean expression with < 2 arguments not supported".to_owned(),
-                    });
-                };
-                let mut result = WhereExpr::Binary(BinaryExpr {
-                    op,
-                    lexpr: Box::new(where_expr_convert(*first)?),
-                    rexpr: Box::new(where_expr_convert(*second)?),
-                });
-                for arg in rest {
-                    result = WhereExpr::Binary(BinaryExpr {
-                        op,
-                        lexpr: Box::new(result),
-                        rexpr: Box::new(where_expr_convert(*arg)?),
-                    });
-                }
-                Ok(result)
-            }
-            pg::BoolExprType_NOT_EXPR => {
-                let [arg] = args.as_slice() else {
-                    return Err(WhereParseError::Other {
-                        error: "NOT with != 1 argument not supported".to_owned(),
-                    });
-                };
-                Ok(WhereExpr::Unary(UnaryExpr {
-                    op: UnaryOp::Not,
-                    expr: Box::new(where_expr_convert(*arg)?),
-                }))
-            }
-            other => Err(WhereParseError::Other {
-                error: format!("boolean expression type {other}"),
-            }),
-        }
     }
 }
 
