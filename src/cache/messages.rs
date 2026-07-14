@@ -13,7 +13,7 @@ use super::reply::ReplySender;
 use super::{CacheError, Report, query::CacheableQuery, query_cache::QueryType};
 use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
-use crate::pg::protocol::extended::ResultFormats;
+use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::{ClientSocket, ExplainSpec};
 use crate::query::transform::query_expr_parameters_replace;
 use crate::timing::QueryTiming;

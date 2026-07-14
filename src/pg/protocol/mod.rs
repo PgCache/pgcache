@@ -14,6 +14,7 @@ pub(crate) mod backend;
 pub(crate) mod encode;
 pub(crate) mod extended;
 pub(crate) mod frontend;
+pub(crate) mod session;
 
 error_set! {
     ProtocolError := {

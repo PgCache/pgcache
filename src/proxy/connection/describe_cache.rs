@@ -5,7 +5,8 @@ use tokio_util::bytes::{BufMut, Bytes, BytesMut};
 use crate::pg::protocol::{
     ByteString,
     encode::{NO_DATA_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG},
-    extended::{StatementType, parse_parameter_description},
+    extended::parse_parameter_description,
+    session::StatementType,
 };
 
 use super::*;

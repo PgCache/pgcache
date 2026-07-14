@@ -35,11 +35,11 @@ use crate::{
             AUTHENTICATION_SASL, PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType,
             authentication_type, parameter_status_parse,
         },
-        extended::PreparedStatement,
         frontend::{
             PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType,
             simple_query_message_build, startup_message_parameter,
         },
+        session::PreparedStatement,
     },
     proxy::egress::EgressQueue,
     query::ast::query_expr_fingerprint,

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crate::pg::protocol::extended::ResultFormats;
+use crate::pg::protocol::session::ResultFormats;
 use crate::query::ast::LimitClause;
 use crate::query::{Fingerprint, FingerprintMap};
 

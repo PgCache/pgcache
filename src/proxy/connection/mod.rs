@@ -13,7 +13,7 @@ use tokio_util::bytes::BytesMut;
 
 use crate::{
     cache::CacheMessage,
-    pg::protocol::extended::{Portal, PreparedStatement},
+    pg::protocol::session::{Portal, PreparedStatement},
     proxy::egress::EgressQueue,
 };
 

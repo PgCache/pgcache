@@ -18,11 +18,12 @@ use crate::{
     pg::protocol::{
         encode::{CLOSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG},
         extended::{
-            ParsedBindMessage, ParsedParseMessage, Portal, PreparedStatement, ResultFormats,
-            StatementType, parse_bind_message, parse_close_message, parse_describe_message,
-            parse_execute_message, parse_parameter_description, parse_parse_message,
+            ParsedBindMessage, ParsedParseMessage, parse_bind_message, parse_close_message,
+            parse_describe_message, parse_execute_message, parse_parameter_description,
+            parse_parse_message,
         },
         frontend::PgFrontendMessage,
+        session::{Portal, PreparedStatement, ResultFormats, StatementType},
     },
     query::{Fingerprint, ast::query_expr_fingerprint},
 };

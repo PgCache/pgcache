@@ -5,7 +5,7 @@ use ecow::EcoString;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::bytes::{Bytes, BytesMut};
 
-use crate::pg::protocol::extended::ResultFormats;
+use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::ClientSocket;
 use crate::query::ast::LimitClause;
 use crate::query::{Fingerprint, QueryShape};
