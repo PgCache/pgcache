@@ -2,7 +2,7 @@ use crate::oid::Oid;
 use ecow::EcoString;
 use tokio_postgres::Row;
 use tokio_postgres::types::Type;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::catalog::{
     ColumnMetadata, ColumnStore, IndexMetadata, TableMetadata, cache_type_name_resolve,
@@ -431,6 +431,48 @@ fn index_sql_retarget(
     Some(format!(
         "CREATE {unique}INDEX ON \"{schema}\".\"{table}\" USING {using}"
     ))
+}
+
+impl WriterCore {
+    /// Register table metadata from CDC processing.
+    #[instrument(skip_all)]
+    pub(super) async fn cache_table_register(
+        &mut self,
+        mut table_metadata: TableMetadata,
+    ) -> CacheResult<()> {
+        let relation_oid = table_metadata.relation_oid;
+
+        let table_exists = self.cache.tables.contains_key1(&relation_oid);
+        if table_exists {
+            if let Some(current_table) = self.cache.tables.get1(&relation_oid)
+                && current_table.schema_eq(&table_metadata)
+            {
+                return Ok(());
+            }
+
+            info!(
+                "Table {} (OID: {}) recreating table, invalidating queries",
+                table_metadata.name, relation_oid
+            );
+
+            self.cache_table_invalidate(relation_oid).await?;
+            // The cache table is about to be recreated with a new shape; discard
+            // the relation's pooled staging tables so no population reuses an
+            // old-shape one (PGC-293 review).
+            self.staging_pool_relation_purge(relation_oid).await;
+        }
+
+        if table_metadata.indexes.is_empty() {
+            table_metadata.indexes = self.query_table_indexes_get(relation_oid).await?;
+        }
+
+        self.cache_table_create_from_metadata(&table_metadata)
+            .await?;
+
+        self.cache.tables.insert_overwrite(table_metadata);
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

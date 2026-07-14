@@ -10,7 +10,9 @@ mod publication;
 mod registration;
 mod staging;
 mod status;
+mod subsumption;
 mod table;
+mod update_classify;
 
 pub use self::core::writer_run;
 pub(super) use self::registration::PopulationWork;
