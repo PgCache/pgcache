@@ -303,6 +303,12 @@ pub mod names {
     /// signal lives here.
     pub const QUERY_STAGE_COALESCE_WAIT_SECONDS: &str = "pgcache.query.stage.coalesce_wait_seconds";
     pub const QUERY_STAGE_TOTAL_SECONDS: &str = "pgcache.query.stage.total_seconds";
+
+    /// Log lines dropped because the non-blocking appender's queue was full
+    /// (PGC-357). Only a stalled stdout reader backs the queue up, so any
+    /// non-zero value means log output is being lost *and* the consumer of fd 1
+    /// is not keeping up.
+    pub const LOG_DROPPED_LINES: &str = "pgcache.log.dropped_lines";
 }
 
 /// Cached metric handles, grouped by usage area.

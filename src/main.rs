@@ -5,6 +5,8 @@ use std::thread::sleep;
 use std::time::Duration;
 
 use pgcache_lib::metrics::metrics_recorder_install;
+#[cfg(not(feature = "console"))]
+use pgcache_lib::metrics::names::LOG_DROPPED_LINES;
 use pgcache_lib::proxy::SharedProxyStatus;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::Settings;
@@ -16,7 +18,16 @@ use pgcache_lib::tracing_utils::SimpeFormatter;
 use tokio::io;
 use tracing::info;
 #[cfg(not(feature = "console"))]
+use tracing_appender::non_blocking::NonBlockingBuilder;
+#[cfg(not(feature = "console"))]
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Depth of the log queue. A stalled stdout reader is the only thing that backs
+/// it up, and at that point dropping is the intended behaviour — so keep it deep
+/// enough to absorb a burst but shallow enough that a hard `abort` loses a
+/// readable tail rather than the appender default of 128k lines.
+#[cfg(not(feature = "console"))]
+const LOG_BUFFERED_LINES: usize = 4096;
 
 #[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
@@ -54,8 +65,22 @@ fn main() -> Result<(), Report> {
     #[cfg(feature = "console")]
     console_subscriber::init();
 
+    // Guard is held until `main` returns, which flushes the queue on the way out.
     #[cfg(not(feature = "console"))]
-    {
+    let (_log_guard, log_dropped_lines) = {
+        // `fmt::layer()` writes to stdout with a blocking `write`, inline on the
+        // tokio worker that emitted the event. If nothing drains fd 1 the pipe
+        // buffer fills and that worker wedges in the kernel — it cannot yield,
+        // because the block is a syscall and not an `.await` (PGC-357). Queue the
+        // lines instead and let a dedicated thread do the writing; if the reader
+        // stalls, the queue overflows and lines are dropped rather than taking a
+        // worker thread down with it.
+        let (log_writer, guard) = NonBlockingBuilder::default()
+            .buffered_lines_limit(LOG_BUFFERED_LINES)
+            .lossy(true)
+            .finish(std::io::stdout());
+        let dropped_lines = log_writer.error_counter();
+
         // Log level precedence: CLI arg > config file > RUST_LOG env var > default (info)
         let filter = settings
             .dynamic
@@ -69,7 +94,11 @@ fn main() -> Result<(), Report> {
         let (filter_layer, reload_handle) = tracing_subscriber::reload::Layer::new(filter);
         tracing_subscriber::registry()
             .with(filter_layer)
-            .with(tracing_subscriber::fmt::layer().event_format(SimpeFormatter))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .event_format(SimpeFormatter)
+                    .with_writer(log_writer),
+            )
             .init();
 
         let reload_handle_for_current = reload_handle.clone();
@@ -87,7 +116,9 @@ fn main() -> Result<(), Report> {
                         .ok()
                 }),
             });
-    }
+
+        (guard, dropped_lines)
+    };
 
     let sigint = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&sigint))?;
@@ -107,6 +138,8 @@ fn main() -> Result<(), Report> {
         // Wait for either SIGINT or proxy thread to finish
         while !sigint.load(Ordering::Relaxed) && !proxy_handle.is_finished() {
             sleep(sleep_duration);
+            #[cfg(not(feature = "console"))]
+            metrics::counter!(LOG_DROPPED_LINES).absolute(log_dropped_lines.dropped_lines() as u64);
         }
 
         // Signal all threads to shut down
