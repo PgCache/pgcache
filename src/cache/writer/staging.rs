@@ -404,13 +404,13 @@ impl MergePlan {
         let columns_csv = table
             .columns
             .iter()
-            .map(|c| format!("\"{}\"", c.name))
+            .map(|c| escape::escape_identifier(&c.name))
             .collect::<Vec<_>>()
             .join(",");
         let pk_quoted: Vec<String> = table
             .primary_key_columns
             .iter()
-            .map(|c| format!("\"{c}\""))
+            .map(|c| escape::escape_identifier(c))
             .collect();
         let pk_columns_paren = format!("({})", pk_quoted.join(","));
         let conflict_assign = pk_quoted

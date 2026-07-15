@@ -72,7 +72,9 @@ impl fmt::Display for Lsn {
 /// all-lowercase words can reach this check (anything else already fails
 /// the character-class test), so entries are lowercase. Sorted for
 /// binary search; sortedness and category membership are test-enforced
-/// against `pg_query::scan`.
+/// against `pg_query::scan`. The scanner cannot enumerate its keyword
+/// set, so completeness is manual: resync against libpg_query's
+/// kwlist_d.h whenever the `pg_query` dependency is bumped.
 static KEYWORDS_QUOTED: &[&str] = &[
     "all",
     "analyse",
@@ -278,6 +280,8 @@ pub fn identifier_quote_into(id: &str, buf: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    use pg_query::protobuf::KeywordKind;
+
     use super::*;
 
     #[test]
@@ -289,7 +293,6 @@ mod tests {
     /// category, per the parser's own scanner.
     #[test]
     fn test_keywords_quoted_match_pg_query_scan() {
-        use pg_query::protobuf::KeywordKind;
         for word in KEYWORDS_QUOTED {
             let scanned = pg_query::scan(word).expect("scan keyword");
             let token = scanned.tokens.first().expect("one token");

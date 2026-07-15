@@ -15,18 +15,20 @@ mod util;
 async fn test_mixed_case_identifiers_cdc_round_trip() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
+    // `we""ird` (SQL for the identifier we"ird) exercises embedded-quote
+    // doubling through DDL, population staging, and the CDC builders.
     ctx.query(
-        "CREATE TABLE \"Order\" (id integer primary key, \"user\" text, \"camelCase\" integer)",
+        "CREATE TABLE \"Order\" (id integer primary key, \"user\" text, \"camelCase\" integer, \"we\"\"ird\" text)",
         &[],
     )
     .await?;
     ctx.query(
-        "INSERT INTO \"Order\" (id, \"user\", \"camelCase\") VALUES (1, 'alice', 10), (2, 'bob', 20)",
+        "INSERT INTO \"Order\" (id, \"user\", \"camelCase\", \"we\"\"ird\") VALUES (1, 'alice', 10, 'x'), (2, 'bob', 20, 'y')",
         &[],
     )
     .await?;
 
-    let sql = "SELECT id, \"user\", \"camelCase\" FROM \"Order\" ORDER BY id";
+    let sql = "SELECT id, \"user\", \"camelCase\", \"we\"\"ird\" FROM \"Order\" ORDER BY id";
 
     // Cache miss — registration + population (staging LIKE, merge upsert).
     let m = ctx.metrics().await?;
@@ -44,7 +46,7 @@ async fn test_mixed_case_identifiers_cdc_round_trip() -> Result<(), Error> {
 
     // CDC INSERT — unconditional upsert builder.
     ctx.origin_query(
-        "INSERT INTO \"Order\" (id, \"user\", \"camelCase\") VALUES (3, 'carol', 30)",
+        "INSERT INTO \"Order\" (id, \"user\", \"camelCase\", \"we\"\"ird\") VALUES (3, 'carol', 30, 'z')",
         &[],
     )
     .await?;

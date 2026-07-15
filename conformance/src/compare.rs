@@ -106,16 +106,25 @@ pub fn results_match(
             rows_match(&o, &c, &origin.column_type_oids)
         }
         SortStrategy::Values => {
-            // Column identity is lost in a value-sorted multiset; apply
-            // the loosest tolerance among the result's float columns to
-            // any value that parses as a float.
-            let tol = origin
+            // Column identity is lost in a value-sorted multiset, so the
+            // float tolerance is only sound when every column is a float
+            // type — otherwise it would bleed onto numeric/text values
+            // that happen to parse as floats.
+            let per_column: Option<Vec<f64>> = origin
                 .column_type_oids
                 .iter()
-                .filter_map(|&oid| float_tolerance(oid))
-                .fold(None::<f64>, |acc, t| Some(acc.map_or(t, |a| a.max(t))));
+                .map(|&oid| float_tolerance(oid))
+                .collect();
+            let tol = per_column.and_then(|tols| tols.into_iter().reduce(f64::max));
             let mut o: Vec<String> = origin.rows.iter().flatten().cloned().collect();
             let mut c: Vec<String> = cache.rows.iter().flatten().cloned().collect();
+            if o.len() != c.len() {
+                return Err(format!(
+                    "value count differs: origin {}, pgcache {}",
+                    o.len(),
+                    c.len()
+                ));
+            }
             o.sort();
             c.sort();
             for (ov, cv) in o.iter().zip(c.iter()) {
@@ -269,9 +278,31 @@ mod tests {
     }
 
     #[test]
-    fn valuesort_applies_float_tolerance() {
-        let a = qr_typed(&[&["1", "431.7726"]], &[23, FLOAT4_OID]);
-        let b = qr_typed(&[&["1", "431.77258"]], &[23, FLOAT4_OID]);
+    fn valuesort_applies_float_tolerance_when_all_columns_float() {
+        let a = qr_typed(&[&["1.5", "431.7726"]], &[FLOAT4_OID, FLOAT4_OID]);
+        let b = qr_typed(&[&["1.5", "431.77258"]], &[FLOAT4_OID, FLOAT4_OID]);
         assert!(results_match(&a, &b, SortStrategy::Values).is_ok());
+    }
+
+    /// Value-sort loses column identity, so tolerance must not bleed onto
+    /// non-float columns that happen to parse as floats.
+    #[test]
+    fn valuesort_mixed_columns_stay_exact() {
+        let a = qr_typed(&[&["431.7726", "431.7726"]], &[1700, FLOAT4_OID]);
+        let b = qr_typed(&[&["431.77258", "431.7726"]], &[1700, FLOAT4_OID]);
+        assert!(results_match(&a, &b, SortStrategy::Values).is_err());
+    }
+
+    /// A dropped column shortens the flattened multiset; zip must not
+    /// silently truncate the comparison.
+    #[test]
+    fn valuesort_value_count_mismatch_is_reported() {
+        let a = qr_typed(&[&["1", "x"], &["2", "y"]], &[23, 25]);
+        let b = qr_typed(&[&["1"], &["2"]], &[23]);
+        assert!(
+            results_match(&a, &b, SortStrategy::Values)
+                .unwrap_err()
+                .contains("value count differs")
+        );
     }
 }

@@ -8,23 +8,9 @@
 
 use std::io::Error;
 
-use tokio_postgres::{SimpleQueryMessage, SimpleQueryRow};
-
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, rows_of};
 
 mod util;
-
-fn rows_of(messages: &[SimpleQueryMessage]) -> Vec<&SimpleQueryRow> {
-    messages
-        .iter()
-        .filter_map(|m| match m {
-            SimpleQueryMessage::Row(r) => Some(r),
-            SimpleQueryMessage::CommandComplete(_) | SimpleQueryMessage::RowDescription(_) | _ => {
-                None
-            }
-        })
-        .collect()
-}
 
 /// Equality query over an enum-columned table stays cached through CDC
 /// insert, update, and delete. Pre-fix, each origin write's Relation

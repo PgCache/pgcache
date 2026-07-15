@@ -246,11 +246,8 @@ impl ColumnMetadata {
                 Kind::Enum(_) => true,
                 Kind::Domain(base) => kind_is_enum(base),
                 Kind::Array(elem) => kind_is_enum(elem),
-                Kind::Simple
-                | Kind::Pseudo
-                | Kind::Range(_)
-                | Kind::Multirange(_)
-                | Kind::Composite(_) => false,
+                Kind::Range(sub) | Kind::Multirange(sub) => kind_is_enum(sub),
+                Kind::Simple | Kind::Pseudo | Kind::Composite(_) => false,
                 _ => false,
             }
         }

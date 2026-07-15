@@ -2,6 +2,18 @@ use std::io::Error;
 
 use tokio_postgres::SimpleQueryMessage;
 
+/// All data rows of a simple-query result, in order.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub fn rows_of(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Extract a row from SimpleQueryMessage results at the specified index.
 /// Returns an error with context if the message at that index is not a Row.
 pub fn extract_row(

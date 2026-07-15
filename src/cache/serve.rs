@@ -748,8 +748,9 @@ async fn relay_frame_apply(
         ) => {}
         // Any other frame is a protocol desync: poison immediately rather
         // than letting the stall deadline catch it 10s later (PGC-278).
-        // Covers NoData for zero-column statements too — previously a
-        // silent swallow that stalled the machine in DescribeRow.
+        // NoData is intentionally NOT special-cased: a row-returning
+        // portal Describe always yields RowDescription (zero-field for a
+        // column-less SELECT), so NoData here would itself be a desync.
         (state, message_type) => {
             warn!(
                 "unexpected cache backend frame {message_type:?} in serve state {state:?}; poisoning connection"

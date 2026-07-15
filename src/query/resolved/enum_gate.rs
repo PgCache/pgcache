@@ -19,7 +19,7 @@ use std::ops::ControlFlow;
 
 use rootcause::Report;
 
-use crate::query::ast::{AstNode, BinaryOp, MultiOp};
+use crate::query::ast::{AstNode, BinaryOp, LiteralValue, MultiOp};
 
 use super::{
     ResolveError, ResolveResult, ResolvedCaseExpr, ResolvedColumnNode, ResolvedFunctionCall,
@@ -72,8 +72,36 @@ fn order_by_check(
         {
             return Err(reject(c, position));
         }
+        // An ordinal (`ORDER BY 2`) resolves as an integer Literal but
+        // sorts by the referenced output column.
+        if let ResolvedScalarExpr::Literal(LiteralValue::Integer(ordinal)) = &clause.expr
+            && let Some(c) = output_ordinal_enum_column_find(body, *ordinal)
+        {
+            return Err(reject(c, position));
+        }
     }
     Ok(())
+}
+
+/// Resolve an ORDER BY ordinal (1-based) to the select list (leftmost
+/// SELECT of a set operation) and return its enum column, if any.
+fn output_ordinal_enum_column_find(
+    body: &ResolvedQueryBody,
+    ordinal: i64,
+) -> Option<&ResolvedColumnNode> {
+    match body {
+        ResolvedQueryBody::Select(select) => {
+            let ResolvedSelectColumns::Columns(cols) = &select.columns else {
+                return None;
+            };
+            let index = usize::try_from(ordinal.checked_sub(1)?).ok()?;
+            cols.get(index).and_then(|c| enum_column_find(&c.expr))
+        }
+        ResolvedQueryBody::SetOp(set_op) => {
+            output_ordinal_enum_column_find(&set_op.left.body, ordinal)
+        }
+        ResolvedQueryBody::Values(_) => None,
+    }
 }
 
 /// Resolve an ORDER BY output-name reference to the select list (leftmost
@@ -179,14 +207,10 @@ fn where_check(expr: &ResolvedWhereExpr) -> ResolveResult<()> {
                 }
                 MultiOp::In | MultiOp::NotIn => false,
             };
-            if order_dependent {
-                for e in &multi.exprs {
-                    if let Some(c) = enum_column_find(e) {
-                        return Err(reject(c, "range comparison"));
-                    }
-                }
-            }
             for e in &multi.exprs {
+                if order_dependent && let Some(c) = enum_column_find(e) {
+                    return Err(reject(c, "range comparison"));
+                }
                 where_check(e)?;
             }
             Ok(())
@@ -407,5 +431,13 @@ mod tests {
     #[test]
     fn test_group_by_enum_allowed() {
         assert_allowed("SELECT sev, count(*) FROM alerts GROUP BY sev");
+    }
+
+    #[test]
+    fn test_order_by_ordinal_enum_rejected() {
+        assert_rejected("SELECT id, sev FROM alerts ORDER BY 2");
+        assert_allowed("SELECT id, sev FROM alerts WHERE sev = 'low' ORDER BY 1");
+        // Out-of-range ordinal would error on origin; nothing to gate.
+        assert_allowed("SELECT id FROM alerts ORDER BY 5");
     }
 }

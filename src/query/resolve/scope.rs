@@ -165,6 +165,11 @@ impl<'a> ResolutionScope<'a> {
     /// Find table metadata by name or alias.
     /// Checks both catalog tables and derived tables (FROM subqueries).
     pub(super) fn table_scope_find(&self, name: &str) -> Option<(&TableMetadata, Option<&str>)> {
+        // Alias-EXCLUSIVE matching, unlike `qualifier_matches`: an aliased
+        // table is not referencable by its underlying name (and the VALUES
+        // transform relies on this — it aliases a replacement subquery with
+        // the original table name, which must not resolve to the base
+        // entry's still-aliased occurrence).
         self.entries
             .iter()
             .find(|entry| match entry {

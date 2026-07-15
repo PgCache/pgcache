@@ -1,5 +1,6 @@
 use crate::oid::Oid;
 use ecow::EcoString;
+use postgres_protocol::escape;
 use tokio_postgres::Row;
 use tokio_postgres::types::Type;
 use tracing::{debug, error, info, instrument, warn};
@@ -365,27 +366,33 @@ impl WriterCore {
         &self,
         table_metadata: &TableMetadata,
     ) -> CacheResult<()> {
-        let schema = &table_metadata.schema;
-        let table = &table_metadata.name;
+        let schema = escape::escape_identifier(&table_metadata.schema);
+        let table = escape::escape_identifier(&table_metadata.name);
 
         let column_defs: Vec<String> = table_metadata
             .columns
             .iter()
-            .map(|c| format!("    \"{}\" {}", c.name, c.cache_type_name))
+            .map(|c| {
+                format!(
+                    "    {} {}",
+                    escape::escape_identifier(&c.name),
+                    c.cache_type_name
+                )
+            })
             .collect();
         let column_defs = column_defs.join(",\n");
 
         let primary_key = table_metadata
             .primary_key_columns
             .iter()
-            .map(|c| format!("\"{c}\""))
+            .map(|c| escape::escape_identifier(c))
             .collect::<Vec<_>>()
             .join(", ");
 
-        let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS \"{schema}\"");
-        let drop_sql = format!("DROP TABLE IF EXISTS \"{schema}\".\"{table}\"");
+        let create_schema_sql = format!("CREATE SCHEMA IF NOT EXISTS {schema}");
+        let drop_sql = format!("DROP TABLE IF EXISTS {schema}.{table}");
         let create_sql = format!(
-            "CREATE UNLOGGED TABLE \"{schema}\".\"{table}\" (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)"
+            "CREATE UNLOGGED TABLE {schema}.{table} (\n{column_defs},\n\tPRIMARY KEY({primary_key})\n)"
         );
 
         self.db_cache
@@ -402,11 +409,14 @@ impl WriterCore {
             .map_into_report::<CacheError>()?;
 
         for index in &table_metadata.indexes {
-            let Some(index_sql) =
-                index_sql_retarget(&index.definition, index.is_unique, schema, table)
-            else {
+            let Some(index_sql) = index_sql_retarget(
+                &index.definition,
+                index.is_unique,
+                &table_metadata.schema,
+                &table_metadata.name,
+            ) else {
                 warn!(
-                    "skipping index {} on \"{schema}\".\"{table}\": no USING clause in definition",
+                    "skipping index {} on {schema}.{table}: no USING clause in definition",
                     index.name
                 );
                 continue;
@@ -422,7 +432,7 @@ impl WriterCore {
                 .map_into_report::<CacheError>()
             {
                 warn!(
-                    "creating index {} on \"{schema}\".\"{table}\": {}",
+                    "creating index {} on {schema}.{table}: {}",
                     index.name,
                     error_chain_format(e.current_context()),
                 );
@@ -430,8 +440,10 @@ impl WriterCore {
         }
 
         // Enable generation tracking triggers on the table
-        let enable_tracking_sql =
-            format!("SELECT pgcache_enable_tracking('\"{schema}\".\"{table}\"'::regclass::oid)");
+        let enable_tracking_sql = format!(
+            "SELECT pgcache_enable_tracking({}::regclass::oid)",
+            escape::escape_literal(&format!("{schema}.{table}"))
+        );
         self.db_cache
             .execute(&enable_tracking_sql, &[])
             .await
@@ -451,7 +463,11 @@ impl WriterCore {
         let mut quoted = Vec::with_capacity(relation_oids.len());
         for oid in relation_oids {
             if let Some(table) = self.cache.tables.remove1(oid) {
-                quoted.push(format!("\"{}\".\"{}\"", table.schema, table.name));
+                quoted.push(format!(
+                    "{}.{}",
+                    escape::escape_identifier(&table.schema),
+                    escape::escape_identifier(&table.name)
+                ));
             }
         }
         if quoted.is_empty() {
@@ -490,7 +506,9 @@ fn index_sql_retarget(
     let (_, using) = definition.split_once(" USING ")?;
     let unique = if is_unique { "UNIQUE " } else { "" };
     Some(format!(
-        "CREATE {unique}INDEX ON \"{schema}\".\"{table}\" USING {using}"
+        "CREATE {unique}INDEX ON {}.{} USING {using}",
+        escape::escape_identifier(schema),
+        escape::escape_identifier(table)
     ))
 }
 

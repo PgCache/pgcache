@@ -384,7 +384,7 @@ fn insert_statement_build(
 ) -> InsertStatement {
     let columns: Vec<String> = row_description
         .iter()
-        .map(|c| format!("\"{}\"", c.name()))
+        .map(|c| escape::escape_identifier(c.name()))
         .collect();
 
     let pkey_positions: Vec<usize> = table
