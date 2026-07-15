@@ -2937,6 +2937,47 @@ fn test_where_subquery_in_parsed() {
     }
 }
 
+/// PGC-361: only equality ANY sublinks are IN-equivalent; a quantified
+/// range comparison must be rejected (→ forwarded), not silently
+/// converted with its operator dropped.
+#[test]
+fn test_where_subquery_any_operator_check() {
+    // Explicit `= ANY (SELECT ...)` is IN — converts.
+    let select =
+        parse_select("SELECT * FROM users WHERE id = ANY (SELECT user_id FROM active_users)");
+    assert!(matches!(
+        select.where_clause.as_ref().expect("where"),
+        WhereExpr::Subquery {
+            sublink_type: SubLinkType::Any,
+            ..
+        }
+    ));
+
+    // Non-equality quantified comparisons are rejected.
+    for sql in [
+        "SELECT * FROM users WHERE id > ANY (SELECT user_id FROM active_users)",
+        "SELECT * FROM users WHERE id <= ANY (SELECT user_id FROM active_users)",
+        "SELECT * FROM users WHERE id <> ANY (SELECT user_id FROM active_users)",
+    ] {
+        assert!(query_expr_parse(sql).is_err(), "should be rejected: {sql}");
+    }
+
+    // ALL is unchanged: `<> ALL` (NOT IN) converts, `< ALL` rejects.
+    let select =
+        parse_select("SELECT * FROM users WHERE id <> ALL (SELECT user_id FROM active_users)");
+    assert!(matches!(
+        select.where_clause.as_ref().expect("where"),
+        WhereExpr::Subquery {
+            sublink_type: SubLinkType::All,
+            ..
+        }
+    ));
+    assert!(
+        query_expr_parse("SELECT * FROM users WHERE id < ALL (SELECT user_id FROM active_users)")
+            .is_err()
+    );
+}
+
 #[test]
 fn test_where_subquery_exists_parsed() {
     // Test that EXISTS subquery is properly parsed

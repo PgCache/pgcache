@@ -1119,3 +1119,61 @@ async fn test_subquery_where_in_constraint_filter() -> Result<(), Error> {
 // - SELECT ... WHERE col > (SELECT AVG(col) FROM t2 WHERE t2.ref = t1.ref)
 // - LATERAL (SELECT ... WHERE subquery.ref = table.ref)
 // - CASE WHEN EXISTS (SELECT 1 FROM t2 WHERE t2.ref = t1.ref) THEN ...
+
+// =============================================================================
+// Quantified comparison sublinks (PGC-361)
+// =============================================================================
+
+/// `x > ANY (SELECT ...)` must never cache: its comparison operator is not
+/// representable in the IN-equivalent sublink form, so admission would
+/// silently serve IN semantics (repro: origin {1,3}, cached {3}).
+/// A plain IN subquery on the same tables still caches.
+#[tokio::test]
+async fn test_quantified_any_comparison_forwards() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query("CREATE TABLE qa_t (id int PRIMARY KEY, x int)", &[])
+        .await?;
+    ctx.query("CREATE TABLE qa_u (id int PRIMARY KEY, y int)", &[])
+        .await?;
+    // x=5: `5 > ANY({3,7})` is TRUE (5>3) but `5 IN (3,7)` is FALSE — a
+    // cached IN-treatment would visibly drop id 1.
+    ctx.query("INSERT INTO qa_t VALUES (1, 5), (2, 2), (3, 7)", &[])
+        .await?;
+    ctx.query("INSERT INTO qa_u VALUES (1, 3), (2, 7)", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "SELECT id FROM qa_t WHERE x > ANY (SELECT y FROM qa_u) ORDER BY id";
+    for _ in 0..3 {
+        let m = ctx.metrics().await?;
+        let served = ctx.simple_query(q).await?;
+        assert_row_at(&served, 1, &[("id", "1")])?;
+        assert_row_at(&served, 2, &[("id", "3")])?;
+        // Rejected at AST conversion: counted uncacheable, never a hit
+        // (nor even a miss — it does not enter the cache pipeline).
+        let m2 = ctx.metrics().await?;
+        assert_eq!(
+            m2.queries_cache_hit, m.queries_cache_hit,
+            "must not serve from cache"
+        );
+        assert!(
+            m2.queries_uncacheable > m.queries_uncacheable,
+            "counted as uncacheable"
+        );
+        ctx.cache_settle().await?;
+    }
+
+    // Control: plain IN over the same tables still caches.
+    let in_q = "SELECT id FROM qa_t WHERE x IN (SELECT y FROM qa_u) ORDER BY id";
+    let m = ctx.metrics().await?;
+    let served = ctx.simple_query(in_q).await?;
+    assert_row_at(&served, 1, &[("id", "3")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let served = ctx.simple_query(in_q).await?;
+    assert_row_at(&served, 1, &[("id", "3")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}

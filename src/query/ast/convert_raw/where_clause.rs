@@ -130,8 +130,10 @@ pub(super) unsafe fn sublink_convert(
 
         let sublink_type = sublink_type_map((*sub_link).subLinkType)?;
 
-        if sublink_type == SubLinkType::All {
-            sublink_all_operator_check((*sub_link).operName)?;
+        match sublink_type {
+            SubLinkType::All => sublink_all_operator_check((*sub_link).operName)?,
+            SubLinkType::Any => sublink_any_operator_check((*sub_link).operName)?,
+            SubLinkType::Exists | SubLinkType::Expr => {}
         }
 
         Ok(WhereExpr::Subquery {
@@ -169,6 +171,29 @@ pub(super) unsafe fn sublink_all_operator_check(
         } else {
             Err(WhereParseError::UnsupportedOperator {
                 operator: format!("ALL with operator '{op}'"),
+            })
+        }
+    }
+}
+
+/// An ANY sublink is only IN-equivalent for `=`: plain `IN`/`NOT IN`
+/// parse with a NIL operName, explicit `= ANY (SELECT ...)` with `=`.
+/// Any other operator (`> ANY`, ...) is a quantified range comparison
+/// the downstream equality semi-join would silently mis-evaluate, so
+/// reject it — the query forwards to origin (PGC-361).
+pub(super) unsafe fn sublink_any_operator_check(
+    oper_name: *const pg::List,
+) -> Result<(), WhereParseError> {
+    unsafe {
+        if list_is_empty(oper_name) {
+            return Ok(());
+        }
+        let op = operator_name_string_extract(oper_name, "ANY operator")?;
+        if op == "=" {
+            Ok(())
+        } else {
+            Err(WhereParseError::UnsupportedOperator {
+                operator: format!("ANY with operator '{op}'"),
             })
         }
     }
