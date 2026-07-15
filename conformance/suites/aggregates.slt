@@ -31,12 +31,11 @@
 # EXPLAIN-only); it is the PGC-102 / PGC-136 regression coverage folded
 # in from the former aggregates_filter.slt.
 #
-# One query is kept correctly-red as a living regression on a bug this
-# port surfaced: PGC-282 (constant-argument aggregate MV build fails).
-# PGC-281 (float4 sum divergence) turned out to be inherent
-# accumulation-order sensitivity, not widening — the harness compares
-# float result columns with ulp-scale tolerance and asserts result
-# column types instead.
+# Two bugs this port surfaced are fixed: PGC-282 (constant-argument
+# aggregate MV build failed on the tracker's T_ResultState child) and
+# PGC-281 (float4 sum divergence — inherent accumulation-order
+# sensitivity, not widening; the harness compares float result columns
+# with ulp-scale tolerance and asserts result column types instead).
 
 #
 # Basic aggregates: avg / sum / max / min.
@@ -281,9 +280,9 @@ SELECT max(unique2) FROM tenk1 ORDER BY max(unique2);
 query II
 SELECT max(unique2), generate_series(1,3) AS g FROM tenk1 ORDER BY g DESC;
 
-# Constant aggregate argument — PGC-282 (correctly red): the MV build
-# fails (pgcache_pgrx tracker rejects the T_ResultState scan node), so
-# the query forwards and the swallowed-error scan flags it.
+# Constant aggregate argument: plans as a gating Result over the scan
+# (MinMaxAgg rewrite); the pgcache_pgrx tracker recurses through the
+# Result to stamp the scanned row (PGC-282).
 # pgcache: cached
 query I
 SELECT max(100) FROM tenk1;
