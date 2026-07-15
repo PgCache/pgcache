@@ -347,7 +347,7 @@ impl WriterCdc {
         {
             core.batch_deleted_pks.remove(&(relation_oid, key));
         }
-        self.cache_upsert_unconditional_into(&mut core.frame_buf, table_metadata, row_data);
+        Self::cache_upsert_unconditional_into(&mut core.frame_buf, table_metadata, row_data);
         self.frame_write_finish(core).await
     }
 
@@ -418,7 +418,7 @@ impl WriterCdc {
         {
             core.batch_deleted_pks.insert((relation_oid, key));
         }
-        self.cache_delete_into(&mut core.frame_buf, table_metadata, row_data)?;
+        Self::cache_delete_into(&mut core.frame_buf, table_metadata, row_data)?;
         if let Some(key) = deleted_key {
             core.frame_deleted_keys.push((relation_oid, key));
         }

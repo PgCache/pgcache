@@ -996,6 +996,33 @@ fn test_resolved_column_node_deparse_quoting() {
     assert_eq!(buf, "\"Public\".\"Users\".\"firstName\"");
 }
 
+/// PGC-262: lowercase reserved keywords are identifiers too — they must
+/// deparse quoted, and an embedded `"` must be doubled.
+#[test]
+fn test_resolved_column_node_deparse_keyword_quoting() {
+    let mut buf = String::new();
+    ResolvedColumnNode {
+        schema: "public".into(),
+        table: "order".into(),
+        table_alias: None,
+        column: "user".into(),
+        column_metadata: id_column_metadata(),
+    }
+    .deparse(&mut buf);
+    assert_eq!(buf, "public.\"order\".\"user\"");
+
+    buf.clear();
+    ResolvedColumnNode {
+        schema: "public".into(),
+        table: "users".into(),
+        table_alias: None,
+        column: "we\"ird".into(),
+        column_metadata: id_column_metadata(),
+    }
+    .deparse(&mut buf);
+    assert_eq!(buf, "public.users.\"we\"\"ird\"");
+}
+
 #[test]
 fn test_resolved_table_node_deparse_with_alias() {
     let mut buf = String::new();

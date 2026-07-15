@@ -2,6 +2,7 @@ use crate::oid::Oid;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use postgres_protocol::escape;
 use tracing::debug;
 
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
@@ -122,10 +123,13 @@ impl WriterCore {
     fn oids_to_table_list(&self, oids: &[Oid]) -> String {
         oids.iter()
             .filter_map(|oid| {
-                self.cache
-                    .tables
-                    .get1(oid)
-                    .map(|t| format!("{}.{}", t.schema, t.name))
+                self.cache.tables.get1(oid).map(|t| {
+                    format!(
+                        "{}.{}",
+                        escape::escape_identifier(&t.schema),
+                        escape::escape_identifier(&t.name)
+                    )
+                })
             })
             .collect::<Vec<_>>()
             .join(", ")

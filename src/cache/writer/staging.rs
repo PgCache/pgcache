@@ -447,8 +447,8 @@ impl MergePlan {
              INSERT INTO {schema}.{name} ({cols}) \
              SELECT DISTINCT ON {pk} {cols} FROM d{where_clause} {conflict}; \
              SET mem.query_generation = 0",
-            schema = self.schema,
-            name = self.name,
+            schema = escape::escape_identifier(&self.schema),
+            name = escape::escape_identifier(&self.name),
             cols = self.columns_csv,
             pk = self.pk_columns_paren,
             conflict = self.conflict,

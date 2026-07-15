@@ -512,7 +512,8 @@ async fn population_stream(
     if fresh && needs_create {
         let create = format!(
             "CREATE UNLOGGED TABLE IF NOT EXISTS pgcache_stage.{staging} (LIKE {}.{})",
-            table.schema, table.name
+            escape::escape_identifier(&table.schema),
+            escape::escape_identifier(&table.name)
         );
         db_cache
             .batch_execute(&create)

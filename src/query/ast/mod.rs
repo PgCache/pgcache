@@ -10,7 +10,7 @@ mod where_clause_tests;
 use ecow::EcoString;
 use error_set::error_set;
 
-use crate::pg::identifier_needs_quotes;
+use crate::pg::{identifier_needs_quotes, identifier_quote_into};
 
 error_set! {
     AstError := {
@@ -73,11 +73,7 @@ impl Deparse for String {
 impl Deparse for &str {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match identifier_needs_quotes(self) {
-            true => {
-                buf.push('"');
-                buf.push_str(self);
-                buf.push('"');
-            }
+            true => identifier_quote_into(self, buf),
             false => buf.push_str(self),
         };
 

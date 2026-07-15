@@ -1,12 +1,12 @@
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use std::fmt::Write;
 
 use postgres_protocol::escape;
 use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow};
 use tracing::{error, instrument, trace, warn};
 
 use crate::catalog::TableMetadata;
+use crate::pg::identifier_quote_into;
 use crate::pg::protocol::ByteString;
 
 use crate::query::ast::Deparse;
@@ -46,7 +46,9 @@ fn cdc_on_conflict_tail_append(
             sql.push_str(", ");
         }
         let col = column_meta.name.as_str();
-        let _ = write!(sql, "{col} = EXCLUDED.{col}");
+        identifier_quote_into(col, sql);
+        sql.push_str(" = EXCLUDED.");
+        identifier_quote_into(col, sql);
         first = false;
     }
     if first {
@@ -70,7 +72,9 @@ impl WriterCdc {
                 if !first {
                     sql.push_str(", ");
                 }
-                let _ = write!(sql, "{}.{}", table_metadata.schema, table_metadata.name);
+                identifier_quote_into(&table_metadata.schema, &mut sql);
+                sql.push('.');
+                identifier_quote_into(&table_metadata.name, &mut sql);
                 first = false;
             }
         }
@@ -251,7 +255,6 @@ impl WriterCdc {
     /// builders write into the reused frame buffer instead of allocating a
     /// per-statement `String`).
     pub(super) fn cache_upsert_unconditional_into(
-        &self,
         buf: &mut String,
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
@@ -259,10 +262,11 @@ impl WriterCdc {
         // Columns with a value in `row_data` are emitted in three passes
         // (names, values, conflict tail) over the position-sorted column
         // store, writing straight into `buf` — no per-event Vec or String.
-        let schema = &table_metadata.schema;
-        let table = &table_metadata.name;
-
-        let _ = write!(buf, "INSERT INTO {schema}.{table} (");
+        buf.push_str("INSERT INTO ");
+        identifier_quote_into(&table_metadata.schema, buf);
+        buf.push('.');
+        identifier_quote_into(&table_metadata.name, buf);
+        buf.push_str(" (");
         let mut first = true;
         for column_meta in &table_metadata.columns {
             if row_data.get(column_meta.index()).is_none() {
@@ -271,7 +275,7 @@ impl WriterCdc {
             if !first {
                 buf.push_str(", ");
             }
-            buf.push_str(column_meta.name.as_str());
+            identifier_quote_into(column_meta.name.as_str(), buf);
             first = false;
         }
         buf.push_str(") VALUES (");
@@ -296,7 +300,7 @@ impl WriterCdc {
             if i > 0 {
                 buf.push_str(", ");
             }
-            buf.push_str(pk);
+            identifier_quote_into(pk, buf);
         }
         buf.push(')');
         cdc_on_conflict_tail_append(buf, table_metadata, row_data);
@@ -308,16 +312,15 @@ impl WriterCdc {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     /// Append a PK-qualified delete for `row_data` into `buf` (PGC-228).
     pub(super) fn cache_delete_into(
-        &self,
         buf: &mut String,
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
-        let _ = write!(
-            buf,
-            "DELETE FROM {}.{} WHERE ",
-            table_metadata.schema, table_metadata.name
-        );
+        buf.push_str("DELETE FROM ");
+        identifier_quote_into(&table_metadata.schema, buf);
+        buf.push('.');
+        identifier_quote_into(&table_metadata.name, buf);
+        buf.push_str(" WHERE ");
 
         let mut has_pk = false;
         for pk_column in &table_metadata.primary_key_columns {
@@ -327,7 +330,8 @@ impl WriterCdc {
                     if has_pk {
                         buf.push_str(" AND ");
                     }
-                    let _ = write!(buf, "{pk_column} = ");
+                    identifier_quote_into(pk_column, buf);
+                    buf.push_str(" = ");
                     match row_value.as_deref() {
                         Some(value) => {
                             let _ = escape::escape_literal_into(value, buf);
@@ -345,5 +349,73 @@ impl WriterCdc {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use tokio_postgres::types::Type;
+
+    use crate::catalog::{ColumnMetadata, ColumnStore};
+
+    use super::*;
+
+    /// A table exercising every identifier hazard: mixed-case name,
+    /// reserved-word column (`user`), mixed-case column, embedded quote.
+    fn quoted_table_metadata() -> TableMetadata {
+        let column = |name: &str, position: i16, is_primary_key: bool| ColumnMetadata {
+            name: name.into(),
+            position,
+            type_oid: 25,
+            data_type: Type::TEXT,
+            type_name: "text".into(),
+            cache_type_name: "text".into(),
+            is_primary_key,
+        };
+        TableMetadata {
+            replica_identity_full: false,
+            relation_oid: Oid::from_raw(4242),
+            name: "Order".into(),
+            schema: "public".into(),
+            primary_key_columns: vec!["id".into()],
+            columns: ColumnStore::new([
+                column("id", 1, true),
+                column("user", 2, false),
+                column("camelCase", 3, false),
+                column("we\"ird", 4, false),
+            ]),
+            indexes: Vec::new(),
+        }
+    }
+
+    fn cell(value: &'static str) -> Option<ByteString> {
+        Some(ByteString::from_utf8(Bytes::from_static(value.as_bytes())).expect("utf8 cell"))
+    }
+
+    #[test]
+    fn test_upsert_quotes_identifiers() {
+        let table = quoted_table_metadata();
+        let row = vec![cell("1"), cell("alice"), cell("42"), None];
+        let mut buf = String::new();
+        WriterCdc::cache_upsert_unconditional_into(&mut buf, &table, &row);
+        assert_eq!(
+            buf,
+            "INSERT INTO \"public\".\"Order\" (\"id\", \"user\", \"camelCase\", \"we\"\"ird\") \
+             VALUES ('1', 'alice', '42', NULL) \
+             ON CONFLICT (\"id\") \
+             DO UPDATE SET \"user\" = EXCLUDED.\"user\", \
+             \"camelCase\" = EXCLUDED.\"camelCase\", \
+             \"we\"\"ird\" = EXCLUDED.\"we\"\"ird\""
+        );
+    }
+
+    #[test]
+    fn test_delete_quotes_identifiers() {
+        let table = quoted_table_metadata();
+        let row = vec![cell("1")];
+        let mut buf = String::new();
+        WriterCdc::cache_delete_into(&mut buf, &table, &row).expect("build delete");
+        assert_eq!(buf, "DELETE FROM \"public\".\"Order\" WHERE \"id\" = '1'");
     }
 }

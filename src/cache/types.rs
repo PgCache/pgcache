@@ -211,8 +211,7 @@ impl QueryMetrics {
             // Auto-resizing (starts at a few hundred bytes, grows on record)
             // rather than fixed-range — a fixed 1µs–60s bound pre-allocates
             // ~20 KB per query, the dominant cost under high query cardinality.
-            #[allow(clippy::unwrap_used)]
-            cache_hit_latency: Histogram::new(2).unwrap(),
+            cache_hit_latency: Histogram::new(2).expect("create auto-resizing histogram"),
         }
     }
 }
