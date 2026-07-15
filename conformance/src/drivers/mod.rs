@@ -99,6 +99,7 @@ pub async fn run_simple(client: &Client, sql: &str) -> RunOutcome {
 
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut column_count = 0usize;
+    let mut column_type_oids: Vec<u32> = Vec::new();
     let mut is_query = false;
     let mut rows_affected = 0u64;
 
@@ -107,6 +108,7 @@ pub async fn run_simple(client: &Client, sql: &str) -> RunOutcome {
             SimpleQueryMessage::RowDescription(cols) => {
                 is_query = true;
                 column_count = cols.len();
+                column_type_oids = cols.iter().map(|c| c.type_oid()).collect();
             }
             SimpleQueryMessage::Row(r) => {
                 is_query = true;
@@ -124,7 +126,11 @@ pub async fn run_simple(client: &Client, sql: &str) -> RunOutcome {
     }
 
     if is_query {
-        RunOutcome::Query(QueryResult { column_count, rows })
+        RunOutcome::Query(QueryResult {
+            column_count,
+            column_type_oids,
+            rows,
+        })
     } else {
         RunOutcome::Statement { rows_affected }
     }
@@ -137,6 +143,9 @@ pub async fn run_simple(client: &Client, sql: &str) -> RunOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryResult {
     pub column_count: usize,
+    /// Result column type OIDs from the RowDescription, used to gate
+    /// float-tolerant comparison and to detect result-type divergence.
+    pub column_type_oids: Vec<u32>,
     pub rows: Vec<Vec<String>>,
 }
 

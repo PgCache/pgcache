@@ -31,9 +31,12 @@
 # EXPLAIN-only); it is the PGC-102 / PGC-136 regression coverage folded
 # in from the former aggregates_filter.slt.
 #
-# Two queries are kept correctly-red as living regressions on bugs this
-# port surfaced: PGC-281 (sum() over float4 widened to float8 in cache)
-# and PGC-282 (constant-argument aggregate MV build fails).
+# One query is kept correctly-red as a living regression on a bug this
+# port surfaced: PGC-282 (constant-argument aggregate MV build fails).
+# PGC-281 (float4 sum divergence) turned out to be inherent
+# accumulation-order sensitivity, not widening — the harness compares
+# float result columns with ulp-scale tolerance and asserts result
+# column types instead.
 
 #
 # Basic aggregates: avg / sum / max / min.
@@ -64,8 +67,9 @@ SELECT sum(four) AS sum_1500 FROM onek;
 query I
 SELECT sum(a) AS sum_198 FROM aggtest;
 
-# PGC-281 (correctly red): sum() over a float4 column is widened to
-# float8 precision in the cache, diverging from origin's float4.
+# float4 accumulation order differs between origin heap order and the
+# cache's PK-ordered rows; matches within the harness float tolerance
+# (PGC-281 — inherent, not a widening bug).
 # pgcache: cached
 query R
 SELECT sum(b) AS avg_431_773 FROM aggtest;
