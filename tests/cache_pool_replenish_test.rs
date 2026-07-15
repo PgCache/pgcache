@@ -90,3 +90,126 @@ async fn test_serve_pool_replenishes_after_poison() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-278: a serve task that dies with the connection checked out of its
+/// guard (fault: abandon after `into_framed`, NOT poisoned) must still
+/// trigger a replenish — pre-fix the guard's non-poisoned `conn: None`
+/// branch was a no-op and each loss permanently shrank the pool (size 4
+/// here, so 3 losses would leave one connection and no self-healing).
+#[tokio::test]
+async fn test_lost_serve_replenishes() -> Result<(), Error> {
+    const LOSSES: u64 = 3;
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_LOSE_SERVES", &LOSSES.to_string())]).await?;
+
+    ctx.query(
+        "CREATE TABLE lost_t (id INTEGER PRIMARY KEY, data TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO lost_t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "SELECT id, data FROM lost_t WHERE id <= 3";
+    ctx.query(q, &[]).await?;
+    ctx.cache_settle().await?;
+
+    // Each faulted serve abandons its connection (forwarded to origin, rows
+    // stay correct) and must be replaced in the pool.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert_eq!(
+            ctx.query(q, &[]).await?.len(),
+            3,
+            "correct rows while serves are being lost"
+        );
+        let replenished = ctx.metrics().await?.cache_pool_replenished;
+        if replenished >= LOSSES {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "lost serve slots were not replenished (only {replenished}/{LOSSES})"
+        );
+    }
+
+    // Budget spent: serves hit from an intact pool, no further replenishment.
+    let before = ctx.metrics().await?;
+    for _ in 0..5 {
+        assert_eq!(ctx.query(q, &[]).await?.len(), 3);
+    }
+    let after = ctx.metrics().await?;
+    assert_eq!(
+        after.cache_pool_replenished, before.cache_pool_replenished,
+        "no further replenishment once the pool is whole"
+    );
+
+    Ok(())
+}
+
+/// PGC-278: an unexpected backend frame mid-serve poisons the connection at
+/// detection (counted in `serve_desync_total`) and the request forwards to
+/// origin — pre-fix it was silently swallowed and only the 10s stall
+/// deadline recovered the serve.
+#[tokio::test]
+async fn test_desync_poisons_and_replenishes() -> Result<(), Error> {
+    const DESYNCS: u64 = 2;
+    let mut ctx =
+        TestContext::setup_fault(&[("PGCACHE_FAULT_DESYNC_SERVES", &DESYNCS.to_string())]).await?;
+
+    ctx.query(
+        "CREATE TABLE desync_t (id INTEGER PRIMARY KEY, data TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO desync_t VALUES (1, 'a'), (2, 'b')", &[])
+        .await?;
+    ctx.cdc_settle().await?;
+
+    let q = "SELECT id, data FROM desync_t WHERE id <= 2";
+    ctx.query(q, &[]).await?;
+    ctx.cache_settle().await?;
+
+    // Every read stays correct; the desyncs are detected (not stalled) and
+    // each poisoned discard is replenished.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let start = Instant::now();
+        assert_eq!(
+            ctx.query(q, &[]).await?.len(),
+            2,
+            "correct rows through desync churn"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "desync must resolve at detection, not via the 10s stall deadline"
+        );
+        let m = ctx.metrics().await?;
+        if m.cache_serve_desync_total >= DESYNCS && m.cache_pool_replenished >= DESYNCS {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "desyncs not detected/replenished (desyncs {}, replenished {})",
+            m.cache_serve_desync_total,
+            m.cache_pool_replenished
+        );
+    }
+
+    // Healed: subsequent serves come from cache without new desyncs.
+    let before = ctx.metrics().await?;
+    for _ in 0..5 {
+        assert_eq!(ctx.query(q, &[]).await?.len(), 2);
+    }
+    let after = ctx.metrics().await?;
+    assert_eq!(
+        after.cache_serve_desync_total,
+        before.cache_serve_desync_total
+    );
+
+    Ok(())
+}

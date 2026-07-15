@@ -129,27 +129,48 @@ pub(crate) mod fault {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static POISON_SERVES: AtomicU64 = AtomicU64::new(0);
+    static LOSE_SERVES: AtomicU64 = AtomicU64::new(0);
+    static DESYNC_SERVES: AtomicU64 = AtomicU64::new(0);
     static INIT: Once = Once::new();
+
+    fn env_budget(var: &str, budget: &AtomicU64) {
+        if let Some(n) = std::env::var(var).ok().and_then(|s| s.parse::<u64>().ok()) {
+            budget.store(n, Ordering::Relaxed);
+        }
+    }
+
+    fn budget_consume(budget: &AtomicU64) -> bool {
+        budget
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+    }
 
     /// Arm from the environment (read once for the process).
     pub(crate) fn init() {
         INIT.call_once(|| {
-            if let Some(n) = std::env::var("PGCACHE_FAULT_POISON_SERVES")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-            {
-                POISON_SERVES.store(n, Ordering::Relaxed);
-            }
+            env_budget("PGCACHE_FAULT_POISON_SERVES", &POISON_SERVES);
+            env_budget("PGCACHE_FAULT_LOSE_SERVES", &LOSE_SERVES);
+            env_budget("PGCACHE_FAULT_DESYNC_SERVES", &DESYNC_SERVES);
         });
     }
 
     /// Returns true (consuming one) while serves remain to be poisoned.
     pub(crate) fn poison_serve() -> bool {
-        POISON_SERVES
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                (n > 0).then(|| n - 1)
-            })
-            .is_ok()
+        budget_consume(&POISON_SERVES)
+    }
+
+    /// Abandon the serve after the connection left the guard, without
+    /// poisoning — exercises the lost-slot replenish branch (PGC-278).
+    pub(crate) fn lose_serve() -> bool {
+        budget_consume(&LOSE_SERVES)
+    }
+
+    /// Corrupt the next backend frame's message type so the relay hits the
+    /// desync arm (PGC-278).
+    pub(crate) fn desync_serve() -> bool {
+        budget_consume(&DESYNC_SERVES)
     }
 }
 
@@ -331,6 +352,13 @@ pub async fn handle_cached_query(
     // Stream results to client: move the read half into a FramedRead and park
     // the rest of the connection to restore once the response is drained.
     let (mut framed, parked) = conn.into_framed();
+
+    // Fault (tests): drop the serve with the connection checked out and NOT
+    // poisoned — the guard must replenish the lost slot (PGC-278).
+    #[cfg(feature = "fault-injection")]
+    if fault::lose_serve() {
+        return Err(CacheError::InvalidMessage.into());
+    }
 
     let parameter_description = msg.parameter_description.take();
     let client_socket = &mut msg.client_socket;
@@ -598,6 +626,15 @@ async fn relay_frame_apply(
     guard: &mut ConnectionGuard,
     timing: &mut QueryTiming,
 ) -> CacheResult<()> {
+    // Fault (tests): corrupt the frame type so it lands in the desync arm.
+    #[cfg(feature = "fault-injection")]
+    let frame = {
+        let mut frame = frame;
+        if fault::desync_serve() {
+            frame.message_type = PgBackendMessageType::CopyData;
+        }
+        frame
+    };
     match (relay.state, frame.message_type) {
         (ServeResponseState::SetGenParse, PgBackendMessageType::ParseComplete) => {
             relay.state = ServeResponseState::SetGenBind;
@@ -701,7 +738,32 @@ async fn relay_frame_apply(
             )
             .await);
         }
-        _ => {}
+        // Async session messages can arrive at any point in the exchange
+        // and carry no sequencing meaning — pass over them.
+        (
+            _,
+            PgBackendMessageType::ParameterStatus
+            | PgBackendMessageType::NoticeResponse
+            | PgBackendMessageType::NotificationResponse,
+        ) => {}
+        // Any other frame is a protocol desync: poison immediately rather
+        // than letting the stall deadline catch it 10s later (PGC-278).
+        // Covers NoData for zero-column statements too — previously a
+        // silent swallow that stalled the machine in DescribeRow.
+        (state, message_type) => {
+            warn!(
+                "unexpected cache backend frame {message_type:?} in serve state {state:?}; poisoning connection"
+            );
+            crate::metrics::handles()
+                .cache
+                .serve_desync_total
+                .increment(1);
+            guard.poisoned = true;
+            if let Some(bc) = relay.broadcast.take() {
+                broadcast_error_reply(bc).await;
+            }
+            return Err(CacheError::InvalidMessage.into());
+        }
     }
     Ok(())
 }

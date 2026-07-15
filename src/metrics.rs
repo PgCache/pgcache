@@ -202,6 +202,9 @@ pub mod names {
     /// Serves that finished with unconsumed bytes still in the connection read
     /// buffer — a response desync caught at its source (PGC-278).
     pub const CACHE_SERVE_DIRTY_RETURN_TOTAL: &str = "pgcache.cache.serve_dirty_return_total";
+    /// Unexpected backend frames in the serve relay (poisoned + forwarded at
+    /// detection instead of waiting out the stall deadline) — PGC-278.
+    pub const CACHE_SERVE_DESYNC_TOTAL: &str = "pgcache.cache.serve_desync_total";
     /// BBR-lite adaptive registration gate (PGC-277): paced admit rate (reg/s),
     /// the windowed-max drain-rate capacity estimate (BtlBw), the backlog window
     /// min (standing-queue signal), and the latest drain-rate sample.
@@ -418,6 +421,7 @@ pub struct CacheHandles {
     pub pool_available: Gauge,
     pub serve_stall_total: Counter,
     pub serve_dirty_return_total: Counter,
+    pub serve_desync_total: Counter,
     /// Adaptive registration gate (PGC-277).
     pub reg_gate_rate: Gauge,
     pub reg_gate_btlbw: Gauge,
@@ -603,6 +607,7 @@ impl Handles {
                 pool_available: metrics::gauge!(CACHE_POOL_AVAILABLE),
                 serve_stall_total: metrics::counter!(CACHE_SERVE_STALL_TOTAL),
                 serve_dirty_return_total: metrics::counter!(CACHE_SERVE_DIRTY_RETURN_TOTAL),
+                serve_desync_total: metrics::counter!(CACHE_SERVE_DESYNC_TOTAL),
                 reg_gate_rate: metrics::gauge!(CACHE_REG_GATE_RATE),
                 reg_gate_btlbw: metrics::gauge!(CACHE_REG_GATE_BTLBW),
                 reg_gate_queue_min: metrics::gauge!(CACHE_REG_GATE_QUEUE_MIN),

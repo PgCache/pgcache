@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{
     Receiver, Sender, UnboundedReceiver, UnboundedSender, channel, unbounded_channel,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::cache::explain::handle_explain_request;
 use crate::cache::messages::{CacheOutcome, CacheReply, slices_concat};
@@ -257,6 +257,9 @@ pub(super) async fn serve_loop(
             .serves_in_flight
             .increment(1.0);
         tokio::spawn(async move {
+            // Decrement on drop, not fall-through, so a panicking or
+            // cancelled serve still balances the gauge (PGC-278).
+            let _in_flight = ServeInFlight;
             match msg {
                 ServeJob::Query(request) => {
                     handle_serve_request(conn, return_tx, replenish_tx, request, state_view).await;
@@ -265,10 +268,6 @@ pub(super) async fn serve_loop(
                     handle_explain_request(conn, return_tx, replenish_tx, job, &state_view).await;
                 }
             }
-            crate::metrics::handles()
-                .cache
-                .serves_in_flight
-                .decrement(1.0);
         });
 
         // Channel depth gauge; queue length never approaches 2^53.
@@ -339,6 +338,19 @@ async fn pool_replenish(
     debug!("pool replenish task exiting");
 }
 
+/// Balances the `serves_in_flight` gauge in `Drop` so panic and
+/// cancellation unwinds decrement it too.
+struct ServeInFlight;
+
+impl Drop for ServeInFlight {
+    fn drop(&mut self) {
+        crate::metrics::handles()
+            .cache
+            .serves_in_flight
+            .decrement(1.0);
+    }
+}
+
 /// Guard that ensures a connection is returned to the pool.
 ///
 /// Returns the connection via async `release()` on success.
@@ -351,6 +363,10 @@ pub(crate) struct ConnectionGuard {
     return_tx: Sender<CacheConnection>,
     replenish_tx: UnboundedSender<()>,
     pub(crate) poisoned: bool,
+    /// `release()` returned the connection to the pool. Distinguishes the
+    /// happy-path drop (`conn: None` after a clean return) from a serve
+    /// task that died with the connection checked out (PGC-278).
+    returned: bool,
 }
 
 impl ConnectionGuard {
@@ -364,6 +380,7 @@ impl ConnectionGuard {
             return_tx,
             replenish_tx,
             poisoned: false,
+            returned: false,
         }
     }
 
@@ -374,6 +391,7 @@ impl ConnectionGuard {
                 .send(conn)
                 .await
                 .map_err(|_| CacheError::NoConnection)?;
+            self.returned = true;
         }
         Ok(())
     }
@@ -389,10 +407,21 @@ impl Drop for ConnectionGuard {
             let _ = self.replenish_tx.send(());
             return;
         }
-        if let Some(conn) = self.conn.take() {
-            // try_send won't block; channel always has capacity since
-            // pool size equals channel size
-            let _ = self.return_tx.try_send(conn);
+        match self.conn.take() {
+            Some(conn) => {
+                // try_send won't block; channel always has capacity since
+                // pool size equals channel size
+                let _ = self.return_tx.try_send(conn);
+            }
+            // The serve task panicked or was cancelled while the connection
+            // was checked out of the guard (between `conn.take()` and
+            // reattach) — without a replenish the pool shrinks permanently
+            // (PGC-278).
+            None if !self.returned => {
+                warn!("serve task lost its cache connection mid-flight; replenishing the pool");
+                let _ = self.replenish_tx.send(());
+            }
+            None => {}
         }
     }
 }
