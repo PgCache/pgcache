@@ -12,7 +12,80 @@ use crate::result::error_chain_format;
 use super::super::{CacheError, CacheResult, MapIntoReport};
 use super::core::WriterCore;
 
+/// A column's resolved type triple — one resolution shared by both
+/// metadata-derivation paths (registration and CDC Relation re-resolve),
+/// so `schema_eq` compares like against like (PGC-266).
+pub(super) struct ColumnTypeInfo {
+    pub(super) data_type: Type,
+    pub(super) type_name: EcoString,
+    pub(super) cache_type_name: EcoString,
+}
+
 impl WriterCore {
+    /// Resolve a column type oid: builtin fast path via `Type::from_oid`,
+    /// else origin catalog lookup (memoized per connection), then the
+    /// cache-side type mapping.
+    pub(super) async fn column_type_resolve(&self, type_oid: u32) -> CacheResult<ColumnTypeInfo> {
+        let data_type = match Type::from_oid(type_oid) {
+            Some(t) => t,
+            None => self
+                .db_origin
+                .get_type(type_oid)
+                .await
+                .map_into_report::<CacheError>()?,
+        };
+        let type_name: EcoString = data_type.name().into();
+        let cache_type_name: EcoString = cache_type_name_resolve(&data_type)?.into();
+        Ok(ColumnTypeInfo {
+            data_type,
+            type_name,
+            cache_type_name,
+        })
+    }
+
+    /// Re-resolve origin-only column types (enums, domains, arrays of
+    /// such) in CDC-decoded Relation metadata. The decoder is sync with no
+    /// origin access and falls back to TEXT for non-builtin oids; without
+    /// this pass `schema_eq` sees a phantom schema change on every
+    /// Relation message and recreates the cache table (PGC-266).
+    ///
+    /// Never errors the CDC path: a failed lookup (type dropped
+    /// concurrently) or unsupported type keeps the decode-time TEXT
+    /// fallback, degrading to the recreate behavior for that table only.
+    pub(super) async fn table_metadata_types_resolve(&self, metadata: &mut TableMetadata) {
+        if metadata
+            .columns
+            .iter()
+            .all(|c| Type::from_oid(c.type_oid).is_some())
+        {
+            return;
+        }
+
+        let mut columns: Vec<ColumnMetadata> = metadata.columns.iter().cloned().collect();
+        for column in &mut columns {
+            if Type::from_oid(column.type_oid).is_some() {
+                continue;
+            }
+            match self.column_type_resolve(column.type_oid).await {
+                Ok(info) => {
+                    column.data_type = info.data_type;
+                    column.type_name = info.type_name;
+                    column.cache_type_name = info.cache_type_name;
+                }
+                Err(e) => {
+                    warn!(
+                        "type resolve failed for oid {} of {}.{}, keeping text fallback: {}",
+                        column.type_oid,
+                        metadata.schema,
+                        metadata.name,
+                        error_chain_format(e.current_context())
+                    );
+                }
+            }
+        }
+        metadata.columns = ColumnStore::new(columns);
+    }
+
     #[instrument(skip_all)]
     pub(super) async fn cache_table_create(
         &self,
@@ -47,28 +120,16 @@ impl WriterCore {
             }
 
             let type_oid: u32 = row.get("type_oid");
-
-            // Try built-in types first (fast path), then discover custom types from origin
-            let data_type = match Type::from_oid(type_oid) {
-                Some(t) => t,
-                None => self
-                    .db_origin
-                    .get_type(type_oid)
-                    .await
-                    .map_into_report::<CacheError>()?,
-            };
-
-            let type_name = data_type.name().to_owned();
-            let cache_type_name = cache_type_name_resolve(&data_type)?;
+            let type_info = self.column_type_resolve(type_oid).await?;
             let pg_position: i64 = row.get("position");
 
             let column = ColumnMetadata {
                 name: row.get::<_, String>("column_name").into(),
                 position: i16::try_from(pg_position).expect("column position fits in i16"),
                 type_oid,
-                data_type,
-                type_name: type_name.into(),
-                cache_type_name: cache_type_name.into(),
+                data_type: type_info.data_type,
+                type_name: type_info.type_name,
+                cache_type_name: type_info.cache_type_name,
                 is_primary_key: row.get("is_primary_key"),
             };
 

@@ -237,6 +237,26 @@ impl ColumnMetadata {
         usize::try_from(self.position - 1).expect("user column position is >= 1")
     }
 
+    /// Enum, domain over enum (recursive), or array of such — types whose
+    /// cache storage (text) does not preserve origin ordering, so
+    /// order-dependent uses must not be admitted to the cache.
+    pub fn is_enum_ordered(&self) -> bool {
+        fn kind_is_enum(t: &Type) -> bool {
+            match t.kind() {
+                Kind::Enum(_) => true,
+                Kind::Domain(base) => kind_is_enum(base),
+                Kind::Array(elem) => kind_is_enum(elem),
+                Kind::Simple
+                | Kind::Pseudo
+                | Kind::Range(_)
+                | Kind::Multirange(_)
+                | Kind::Composite(_) => false,
+                _ => false,
+            }
+        }
+        kind_is_enum(&self.data_type)
+    }
+
     /// Whether this column's type can carry a TOASTed value (PGC-264).
     /// Conservative by construction: only known fixed-width types are
     /// excluded, so an unrecognized type counts as toastable — a whitelist

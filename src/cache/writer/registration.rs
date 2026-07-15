@@ -24,7 +24,8 @@ use crate::query::constraints::analyze_query_constraints;
 use crate::query::decorrelate::query_expr_decorrelate;
 use crate::query::predicate::CompiledPredicate;
 use crate::query::resolved::{
-    ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, query_expr_resolve,
+    ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, enum_order_dependence_check,
+    query_expr_resolve,
 };
 use crate::query::transform::PgEvalTemplate;
 use crate::query::transform::predicate_pushdown_apply;
@@ -755,6 +756,10 @@ impl WriterRegistration {
                 .attach_loc("resolving query expression")
                 .map(predicate_pushdown_apply)?,
         );
+
+        enum_order_dependence_check(&resolved)
+            .map_err(|e| e.context_transform(CacheError::from))
+            .attach_loc("enum order-dependence gate")?;
 
         // Deparse once at registration. The output is a pure function of the
         // resolved AST, so every cache hit can splice it in instead of

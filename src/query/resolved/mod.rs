@@ -14,8 +14,11 @@ use crate::query::cast::CastTarget;
 
 mod analysis;
 mod deparse;
+mod enum_gate;
 mod subquery_collect;
 mod traverse;
+
+pub use enum_gate::enum_order_dependence_check;
 
 error_set! {
     ResolveError := {
@@ -39,6 +42,15 @@ error_set! {
 
         #[display("Unsupported join qualifier (USING/NATURAL not yet cacheable)")]
         UnsupportedJoinQualifier,
+
+        #[display(
+            "order-dependent use of enum column '{table}.{column}' in {position} — enums are cached as text"
+        )]
+        EnumOrderDependentUsage {
+            table: EcoString,
+            column: EcoString,
+            position: &'static str,
+        },
     }
 }
 

@@ -383,18 +383,18 @@ async fn test_typecast_timestamp_to_date_cacheable() -> Result<(), Error> {
     Ok(())
 }
 
-/// Canary: a table with an origin-only column type (domain) under a
+/// A table with an origin-only column type (domain) under a
 /// change-dependent (LIMIT) query must survive origin updates without a
-/// writer reset, serving correct data.
+/// writer reset — and, with the Relation re-resolve fix (PGC-266), stay
+/// cached through them.
 ///
-/// Today a Relation-vs-catalog metadata mismatch recreates the cache table
-/// and evicts the query on the first post-registration Relation message
-/// (tracked in the origin-only-types ticket), which masks the row-change
-/// path entirely — so this passes via eviction. Once that is fixed, the
-/// row-change batch runs against the domain column and this test guards the
+/// The row-change batch runs against the domain column, so this guards the
 /// `cache_type_name` casts in `row_change_chunk_prepared`/`_inline` (review
 /// finding B3): an origin-type cast would fail in the cache db and reset the
-/// writer, failing the settle below with a 503.
+/// writer, failing the settle below with a 503. The final hit assertion
+/// guards the re-resolve fix itself: pre-fix, the update's Relation message
+/// recreated the cache table and evicted the query, so the post-update read
+/// missed.
 #[tokio::test]
 async fn test_domain_column_update_with_change_dependent_query() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
@@ -417,15 +417,26 @@ async fn test_domain_column_update_with_change_dependent_query() -> Result<(), E
     ctx.simple_query(q).await?;
     ctx.cache_settle().await?;
 
-    // Pre-fix: this update's row-change batch casts the yr array to
-    // ::pgc_year, which doesn't exist in the cache db → writer reset loop and
-    // the settle below fails on /status 503.
+    // The update's row-change batch casts the yr array to the cache type
+    // (int4) — a ::pgc_year cast would fail in the cache db (no domain
+    // there) → writer reset loop and the settle below fails on /status 503.
     ctx.origin_query("update domain_rc set v = 11 where id = 1", &[])
         .await?;
     ctx.cdc_settle().await?;
 
+    // The update legitimately invalidates the LIMIT query (predicate column
+    // changed → conservative window invalidation), so this read forwards
+    // and triggers repopulation.
     let served = ctx.simple_query(q).await?;
     assert_row_at(&served, 1, &[("id", "1"), ("v", "11")])?;
+
+    // The query must still be registered and repopulate to a hit — pre-fix,
+    // the Relation-message recreate loop kept evicting it (PGC-266).
+    ctx.cache_settle().await?;
+    let m = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    assert_row_at(&served, 1, &[("id", "1"), ("v", "11")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }

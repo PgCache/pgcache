@@ -206,8 +206,12 @@ impl WriterCdc {
     pub(super) async fn table_register_handle(
         &mut self,
         core: &mut WriterCore,
-        table_metadata: TableMetadata,
+        mut table_metadata: TableMetadata,
     ) -> CacheResult<()> {
+        // Must precede the schema_eq below: the decoder's TEXT fallback for
+        // origin-only types would otherwise read as a schema change on
+        // every Relation message (PGC-266).
+        core.table_metadata_types_resolve(&mut table_metadata).await;
         core.frame_relation_oids.insert(table_metadata.relation_oid);
         let relation_oid = table_metadata.relation_oid;
         // A mid-frame Relation message whose metadata CHANGED (intra-txn
