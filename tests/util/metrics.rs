@@ -34,6 +34,7 @@ pub struct MetricsSnapshot {
     pub cache_serve_desync_total: u64,
     pub cache_mv_hits: u64,
     pub cache_mv_fallthrough: u64,
+    pub cache_mv_builds_suppressed: u64,
     pub cache_mv_rebuilds: u64,
     pub cache_mv_skipped_rebuilds: u64,
     pub cache_mv_dirty_truncates: u64,
@@ -96,6 +97,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut cache_serve_desync_total = 0u64;
     let mut cache_mv_hits = 0u64;
     let mut cache_mv_fallthrough = 0u64;
+    let mut cache_mv_builds_suppressed = 0u64;
     let mut cache_mv_rebuilds = 0u64;
     let mut cache_mv_skipped_rebuilds = 0u64;
     let mut cache_mv_dirty_truncates = 0u64;
@@ -151,6 +153,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_cache_serve_desync_total" => cache_serve_desync_total = value,
                 "pgcache_cache_mv_hits" => cache_mv_hits = value,
                 "pgcache_cache_mv_fallthrough" => cache_mv_fallthrough = value,
+                "pgcache_cache_mv_builds_suppressed" => cache_mv_builds_suppressed = value,
                 "pgcache_cache_mv_rebuilds" => cache_mv_rebuilds = value,
                 "pgcache_cache_mv_skipped_rebuilds" => cache_mv_skipped_rebuilds = value,
                 "pgcache_cache_mv_dirty_truncates" => cache_mv_dirty_truncates = value,
@@ -207,6 +210,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         cache_serve_desync_total,
         cache_mv_hits,
         cache_mv_fallthrough,
+        cache_mv_builds_suppressed,
         cache_mv_rebuilds,
         cache_mv_skipped_rebuilds,
         cache_mv_dirty_truncates,
@@ -251,6 +255,8 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         cache_serve_desync_total: after.cache_serve_desync_total - before.cache_serve_desync_total,
         cache_mv_hits: after.cache_mv_hits - before.cache_mv_hits,
         cache_mv_fallthrough: after.cache_mv_fallthrough - before.cache_mv_fallthrough,
+        cache_mv_builds_suppressed: after.cache_mv_builds_suppressed
+            - before.cache_mv_builds_suppressed,
         cache_mv_rebuilds: after.cache_mv_rebuilds - before.cache_mv_rebuilds,
         cache_mv_skipped_rebuilds: after.cache_mv_skipped_rebuilds
             - before.cache_mv_skipped_rebuilds,

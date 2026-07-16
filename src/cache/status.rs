@@ -62,6 +62,12 @@ pub struct QueryStatusData {
     /// builds run off the writer thread and aren't serialized with /status.
     #[serde(default)]
     pub mv_state: String,
+    /// Consecutive no-payoff MV builds (discard-backoff, PGC-364).
+    #[serde(default)]
+    pub mv_wasted_builds: u32,
+    /// Remaining MV rebuild cooldown, `None` when scheduling is permitted.
+    #[serde(default)]
+    pub mv_backoff_remaining_ms: Option<u64>,
     pub cached_bytes: usize,
     pub max_limit: Option<u64>,
     pub pinned: bool,

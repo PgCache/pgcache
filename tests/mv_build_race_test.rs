@@ -180,6 +180,11 @@ async fn test_mv_build_dirtied_in_flight_is_discarded() -> Result<(), Error> {
     // The discarded build must NOT serve: this read must fall through to
     // source rows and see both inserts. A broken discard (Fresh flip with
     // pre-insert contents) would serve 21 from the MV here.
+    //
+    // This scenario has also accumulated two consecutive wasted builds — the
+    // young Fresh dirtied by the first insert, then the in-flight discard —
+    // so discard-backoff (PGC-364) is now armed: this hit must be suppressed
+    // (serve source rows, schedule nothing).
     let m4 = ctx.metrics().await?;
     let row = ctx.query_one(q, &[]).await?;
     assert_eq!(
@@ -194,20 +199,35 @@ async fn test_mv_build_dirtied_in_flight_is_discarded() -> Result<(), Error> {
         "MV must not be Fresh right after a discarded build"
     );
     assert_eq!(d.cache_mv_fallthrough, 1);
+    assert_eq!(
+        d.cache_mv_builds_suppressed, 1,
+        "post-discard hit must be suppressed by the backoff cooldown"
+    );
     assert!(
         m4.cache_mv_skipped_rebuilds > m3.cache_mv_skipped_rebuilds,
         "expected the in-flight build to be counted as discarded"
     );
 
-    // The fallthrough hit above scheduled a clean rebuild (no concurrent
-    // writes this time): it must land Fresh and serve the full count.
-    ctx.cache_settle_with_timeout(SETTLE).await?;
+    // Wait out the first backoff interval (1s), then a hit schedules a clean
+    // rebuild (no concurrent writes this time): it must land Fresh and serve
+    // the full count.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     let m6 = ctx.metrics().await?;
     let row = ctx.query_one(q, &[]).await?;
     assert_eq!(row.get::<_, i64>(0), 22);
     let m7 = ctx.metrics().await?;
     assert_eq!(
-        metrics_delta(&m6, &m7).cache_mv_hits,
+        metrics_delta(&m6, &m7).cache_mv_builds_suppressed,
+        0,
+        "backoff must release after the cooldown"
+    );
+    ctx.cache_settle_with_timeout(SETTLE).await?;
+    let m8 = ctx.metrics().await?;
+    let row = ctx.query_one(q, &[]).await?;
+    assert_eq!(row.get::<_, i64>(0), 22);
+    let m9 = ctx.metrics().await?;
+    assert_eq!(
+        metrics_delta(&m8, &m9).cache_mv_hits,
         1,
         "expected MV hit after the clean rebuild"
     );

@@ -96,6 +96,9 @@ pub mod names {
     pub const CACHE_MV_HITS: &str = "pgcache.cache.mv_hits";
     /// Cache hits where mv_state != Fresh — fell through to source-row eval.
     pub const CACHE_MV_FALLTHROUGH: &str = "pgcache.cache.mv_fallthrough";
+    /// `Pending` hits whose rebuild scheduling was suppressed by the
+    /// discard-backoff cooldown (PGC-364); a subset of `mv_fallthrough`.
+    pub const CACHE_MV_BUILDS_SUPPRESSED: &str = "pgcache.cache.mv_builds_suppressed";
     /// Rebuilds committed by the writer (Dirty → Fresh transitions).
     pub const CACHE_MV_REBUILDS: &str = "pgcache.cache.mv_rebuilds";
     /// Builds dropped without producing a Fresh MV: dispatch preconditions not
@@ -392,6 +395,7 @@ pub struct CacheHandles {
     pub lookup_latency: Histogram,
     pub mv_hits: Counter,
     pub mv_fallthrough: Counter,
+    pub mv_builds_suppressed: Counter,
     pub coalesce_waiting: Gauge,
     pub coalesce_served: Counter,
     pub coalesce_deadline_forward: Counter,
@@ -585,6 +589,7 @@ impl Handles {
                 lookup_latency: metrics::histogram!(CACHE_LOOKUP_LATENCY_SECONDS),
                 mv_hits: metrics::counter!(CACHE_MV_HITS),
                 mv_fallthrough: metrics::counter!(CACHE_MV_FALLTHROUGH),
+                mv_builds_suppressed: metrics::counter!(CACHE_MV_BUILDS_SUPPRESSED),
                 coalesce_waiting: metrics::gauge!(CACHE_COALESCE_WAITING),
                 coalesce_served: metrics::counter!(CACHE_COALESCE_SERVED),
                 coalesce_deadline_forward: metrics::counter!(CACHE_COALESCE_DEADLINE_FORWARD),

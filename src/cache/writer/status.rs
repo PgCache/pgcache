@@ -1,6 +1,7 @@
 use crate::pg::Lsn;
 use std::num::NonZeroU64;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use tokio::task::yield_now;
 
@@ -165,17 +166,21 @@ impl WriterCore {
             })
             .collect();
 
-        let (state, mv_state) = self
+        let (state, mv_state, mv_wasted_builds, mv_backoff_remaining_ms) = self
             .state_view
             .cached_queries
             .get(&q.fingerprint)
             .map(|entry| {
+                let mv = &entry.value().mv;
                 (
                     format!("{:?}", entry.value().state),
-                    format!("{:?}", entry.value().mv.state()),
+                    format!("{:?}", mv.state()),
+                    mv.wasted_builds(),
+                    mv.backoff_remaining(Instant::now())
+                        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
                 )
             })
-            .unwrap_or_else(|| ("Unknown".to_owned(), "Unknown".to_owned()));
+            .unwrap_or_else(|| ("Unknown".to_owned(), "Unknown".to_owned(), 0, None));
 
         let metrics = self.state_view.metrics.get(&q.fingerprint);
         let m = metrics.as_deref();
@@ -189,6 +194,8 @@ impl WriterCore {
             tables,
             state,
             mv_state,
+            mv_wasted_builds,
+            mv_backoff_remaining_ms,
             cached_bytes: q.cached_bytes,
             max_limit: q.max_limit,
             pinned: q.pinned,

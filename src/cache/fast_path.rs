@@ -9,6 +9,7 @@ use crate::query::Fingerprint;
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use tracing::error;
 
@@ -102,24 +103,33 @@ pub(crate) fn mv_serve_decide(
     fingerprint: Fingerprint,
     rows_needed: Option<u64>,
 ) -> MvDecision {
-    let observed = state_view
-        .cached_queries
-        .get(&fingerprint)
-        .map(|e| (e.mv.state(), e.mv.output_columns.clone(), e.mv.limit));
+    let observed = state_view.cached_queries.get(&fingerprint).map(|e| {
+        let state = e.mv.state();
+        // Discard-backoff (PGC-364): only the `Pending` arm needs the check
+        // (and pays the `Instant::now()`); other states schedule nothing.
+        let build_permitted =
+            !matches!(state, MvState::Pending { .. }) || e.mv.build_permitted(Instant::now());
+        (
+            state,
+            e.mv.output_columns.clone(),
+            e.mv.limit,
+            build_permitted,
+        )
+    });
 
     match observed {
         None => MvDecision::Serve(MvServe::SourceRow),
-        Some((MvState::Fresh, Some(cols), mv_limit))
+        Some((MvState::Fresh, Some(cols), mv_limit, _))
             if limit_is_sufficient(mv_limit, rows_needed) =>
         {
             crate::metrics::handles().cache.mv_hits.increment(1);
             MvDecision::Serve(MvServe::Mv(cols))
         }
-        Some((MvState::Fresh, Some(_), _)) => {
+        Some((MvState::Fresh, Some(_), _, _)) => {
             crate::metrics::handles().cache.mv_fallthrough.increment(1);
             MvDecision::Serve(MvServe::SourceRow)
         }
-        Some((MvState::Fresh, None, _)) => {
+        Some((MvState::Fresh, None, _, _)) => {
             error!(
                 fingerprint = %fingerprint,
                 "MV is Fresh but output columns were never captured; serving from source rows"
@@ -127,19 +137,30 @@ pub(crate) fn mv_serve_decide(
             crate::metrics::handles().cache.mv_fallthrough.increment(1);
             MvDecision::Serve(MvServe::SourceRow)
         }
-        Some((MvState::Pending { has_table }, _, _)) => {
+        Some((MvState::Pending { has_table }, _, _, true)) => {
             crate::metrics::handles().cache.mv_fallthrough.increment(1);
             MvDecision::NeedsSchedule { has_table }
         }
+        Some((MvState::Pending { .. }, _, _, false)) => {
+            // Backed off after consecutive no-payoff builds: serve source rows
+            // without scheduling a rebuild (PGC-364).
+            crate::metrics::handles().cache.mv_fallthrough.increment(1);
+            crate::metrics::handles()
+                .cache
+                .mv_builds_suppressed
+                .increment(1);
+            MvDecision::Serve(MvServe::SourceRow)
+        }
         Some((
             MvState::Scheduled { .. } | MvState::Building { .. } | MvState::BuildingDirty { .. },
+            _,
             _,
             _,
         )) => {
             crate::metrics::handles().cache.mv_fallthrough.increment(1);
             MvDecision::Serve(MvServe::SourceRow)
         }
-        Some((MvState::Skipped | MvState::Ineligible, _, _)) => {
+        Some((MvState::Skipped | MvState::Ineligible, _, _, _)) => {
             MvDecision::Serve(MvServe::SourceRow)
         }
     }

@@ -41,6 +41,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-023](ADR-023-pinned-queries.md) — Pinned queries: pre-populate and protect from eviction
 - [ADR-026](ADR-026-request-coalescing.md) — Request coalescing for Loading-state queries
 - [ADR-031](ADR-031-materialized-query-results.md) — Materialized query results (MV tier) *(amended: off-thread builds)*
+- [ADR-047](ADR-047-mv-rebuild-discard-backoff.md) — MV rebuild discard-backoff (stop rebuilding thrashing MVs) *(extends ADR-031)*
 - [ADR-036](ADR-036-response-memoization.md) — In-process response memoization (third tier; serves client-ready wire bytes)
 - [ADR-040](ADR-040-shape-keyed-serving.md) — Shape-keyed prepared-statement serving (collapse per-literal plan churn)
 

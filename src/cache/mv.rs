@@ -13,6 +13,7 @@ use crate::query::Fingerprint;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ecow::EcoString;
 use postgres_protocol::escape::escape_identifier;
@@ -122,6 +123,28 @@ impl MvState {
     }
 }
 
+/// A `Fresh` MV dirtied before living this long counts as a wasted build:
+/// its build cost was never amortized (PGC-364 discard-backoff).
+pub const MV_PAYOFF_WINDOW: Duration = Duration::from_secs(5);
+/// First backoff interval, doubling per additional consecutive wasted build.
+pub const MV_BACKOFF_BASE: Duration = Duration::from_secs(1);
+/// Backoff ceiling — a permanently thrashing MV still probes this often, so
+/// the worst-case aggregate rebuild rate is N-thrashers / cap.
+pub const MV_BACKOFF_CAP: Duration = Duration::from_secs(300);
+
+/// Rebuild cooldown after `wasted` consecutive no-payoff builds: `None` below
+/// the engagement threshold (one wasted build is normal — any write to a
+/// cached table causes one), then exponential from [`MV_BACKOFF_BASE`] capped
+/// at [`MV_BACKOFF_CAP`].
+pub fn backoff_duration(wasted: u32) -> Option<Duration> {
+    if wasted < 2 {
+        return None;
+    }
+    // 2^9 s = 512 s already exceeds the cap; clamping the shift avoids overflow.
+    let doublings = (wasted - 2).min(9);
+    Some((MV_BACKOFF_BASE * (1 << doublings)).min(MV_BACKOFF_CAP))
+}
+
 /// Initial `MvState` derived from a `ShapeGate` at registration. No table
 /// exists yet in any case.
 pub fn mv_state_initial(gate: ShapeGate) -> MvState {
@@ -148,6 +171,16 @@ pub struct MvMeta {
     /// join), `None` otherwise. Dispatch falls through when an incoming
     /// variant needs more rows than the MV holds.
     pub limit: Option<u64>,
+    /// When the MV last flipped `Fresh` — measures whether a build's cost was
+    /// amortized before the next dirty (PGC-364).
+    fresh_at: Option<Instant>,
+    /// Consecutive builds with no payoff: discarded (`BuildingDirty`), failed,
+    /// or `Fresh` dirtied inside [`MV_PAYOFF_WINDOW`]. Reset when a `Fresh`
+    /// outlives the window.
+    wasted_builds: u32,
+    /// While in the future, `Pending` entries are not scheduled for rebuild —
+    /// hits serve from source rows instead (discard-backoff, PGC-364).
+    retry_after: Option<Instant>,
 }
 
 impl MvMeta {
@@ -158,12 +191,67 @@ impl MvMeta {
             state: mv_state_initial(shape_gate),
             output_columns: None,
             limit,
+            fresh_at: None,
+            wasted_builds: 0,
+            retry_after: None,
         }
     }
 
     /// Current MV state (`MvState` is `Copy`).
     pub fn state(&self) -> MvState {
         self.state
+    }
+
+    /// Consecutive no-payoff builds (for status/observability).
+    pub fn wasted_builds(&self) -> u32 {
+        self.wasted_builds
+    }
+
+    /// Remaining rebuild cooldown, `None` when scheduling is permitted.
+    pub fn backoff_remaining(&self, now: Instant) -> Option<Duration> {
+        let retry_after = self.retry_after?;
+        (retry_after > now).then(|| retry_after - now)
+    }
+
+    /// Whether a `Pending → Scheduled` build dispatch is currently permitted.
+    pub fn build_permitted(&self, now: Instant) -> bool {
+        self.retry_after.is_none_or(|t| now >= t)
+    }
+
+    /// Stamp the `→ Fresh` flip so the next dirty can judge the build's payoff.
+    pub(in crate::cache) fn fresh_mark(&mut self, now: Instant) {
+        self.fresh_at = Some(now);
+    }
+
+    /// Record a no-payoff build (discarded, failed, or short-lived `Fresh`) and
+    /// arm the rebuild cooldown once past the engagement threshold.
+    pub(in crate::cache) fn waste_record(&mut self, now: Instant) {
+        self.wasted_builds = self.wasted_builds.saturating_add(1);
+        self.retry_after = backoff_duration(self.wasted_builds).map(|d| now + d);
+    }
+
+    /// Apply the dirty transition (`MvState::dirtied`) with its backoff
+    /// bookkeeping: a `Fresh` that outlived [`MV_PAYOFF_WINDOW`] proves payoff
+    /// and resets the waste counter; a younger one counts as a wasted build
+    /// (an unstamped `Fresh` conservatively counts as waste too). The
+    /// `Building → BuildingDirty` flip records nothing here — that build's
+    /// waste is counted once, at completion discard. No-op for non-dirtiable
+    /// states.
+    pub(in crate::cache) fn dirty_apply(&mut self, now: Instant) {
+        let Some(next) = self.state.dirtied() else {
+            return;
+        };
+        if self.state == MvState::Fresh {
+            match self.fresh_at {
+                Some(t) if now.duration_since(t) >= MV_PAYOFF_WINDOW => {
+                    self.wasted_builds = 0;
+                    self.retry_after = None;
+                }
+                _ => self.waste_record(now),
+            }
+            self.fresh_at = None;
+        }
+        self.state = next;
     }
 
     /// Raw state write. Prefer `WriterCore::mv_state_write`, which also keeps the
@@ -559,6 +647,102 @@ mod tests {
         assert_eq!(MvState::Pending { has_table: true }.dirtied(), None);
         assert_eq!(MvState::Scheduled { has_table: true }.dirtied(), None);
         assert_eq!(MvState::BuildingDirty { has_table: true }.dirtied(), None);
+    }
+
+    // ==================== Discard-backoff tests (PGC-364) ====================
+
+    /// A gated `MvMeta` driven to `Fresh` with `fresh_at` stamped at `now`.
+    fn fresh_meta(now: Instant) -> MvMeta {
+        let mut meta = MvMeta::new(ShapeGate::Gated, None);
+        meta.state_set(MvState::Fresh);
+        meta.fresh_mark(now);
+        meta
+    }
+
+    #[test]
+    fn test_backoff_duration_engages_at_second_waste() {
+        assert_eq!(backoff_duration(0), None);
+        assert_eq!(backoff_duration(1), None);
+        assert_eq!(backoff_duration(2), Some(MV_BACKOFF_BASE));
+        assert_eq!(backoff_duration(3), Some(MV_BACKOFF_BASE * 2));
+        assert_eq!(backoff_duration(4), Some(MV_BACKOFF_BASE * 4));
+    }
+
+    #[test]
+    fn test_backoff_duration_caps() {
+        assert_eq!(backoff_duration(20), Some(MV_BACKOFF_CAP));
+        assert_eq!(backoff_duration(u32::MAX), Some(MV_BACKOFF_CAP));
+    }
+
+    #[test]
+    fn test_dirty_apply_young_fresh_counts_waste_first_free() {
+        let now = Instant::now();
+        let mut meta = fresh_meta(now);
+        meta.dirty_apply(now + MV_PAYOFF_WINDOW / 2);
+        assert_eq!(meta.state(), MvState::Pending { has_table: true });
+        assert_eq!(meta.wasted_builds(), 1);
+        // First waste is free: any write to a cached table causes one.
+        assert!(meta.build_permitted(now + MV_PAYOFF_WINDOW / 2));
+    }
+
+    #[test]
+    fn test_dirty_apply_second_waste_arms_cooldown() {
+        let now = Instant::now();
+        let mut meta = fresh_meta(now);
+        meta.dirty_apply(now); // waste 1
+        meta.state_set(MvState::Fresh);
+        meta.fresh_mark(now);
+        meta.dirty_apply(now); // waste 2 → cooldown armed
+        assert_eq!(meta.wasted_builds(), 2);
+        assert!(!meta.build_permitted(now));
+        assert_eq!(meta.backoff_remaining(now), Some(MV_BACKOFF_BASE));
+        // Permitted again once the cooldown elapses.
+        assert!(meta.build_permitted(now + MV_BACKOFF_BASE));
+        assert_eq!(meta.backoff_remaining(now + MV_BACKOFF_BASE), None);
+    }
+
+    #[test]
+    fn test_dirty_apply_long_lived_fresh_resets() {
+        let now = Instant::now();
+        let mut meta = fresh_meta(now);
+        meta.waste_record(now);
+        meta.waste_record(now);
+        assert!(!meta.build_permitted(now));
+        meta.dirty_apply(now + MV_PAYOFF_WINDOW);
+        assert_eq!(meta.state(), MvState::Pending { has_table: true });
+        assert_eq!(meta.wasted_builds(), 0);
+        assert!(meta.build_permitted(now + MV_PAYOFF_WINDOW));
+    }
+
+    #[test]
+    fn test_dirty_apply_unstamped_fresh_is_conservative_waste() {
+        let now = Instant::now();
+        let mut meta = MvMeta::new(ShapeGate::Gated, None);
+        meta.state_set(MvState::Fresh); // no fresh_mark
+        meta.dirty_apply(now);
+        assert_eq!(meta.wasted_builds(), 1);
+    }
+
+    #[test]
+    fn test_dirty_apply_building_records_nothing() {
+        // The in-flight dirty only flips the state; the build's waste is
+        // counted once, at completion discard.
+        let now = Instant::now();
+        let mut meta = MvMeta::new(ShapeGate::Gated, None);
+        meta.state_set(MvState::Building { has_table: false });
+        meta.dirty_apply(now);
+        assert_eq!(meta.state(), MvState::BuildingDirty { has_table: false });
+        assert_eq!(meta.wasted_builds(), 0);
+        assert!(meta.build_permitted(now));
+    }
+
+    #[test]
+    fn test_dirty_apply_noop_states_untouched() {
+        let now = Instant::now();
+        let mut meta = MvMeta::new(ShapeGate::Gated, None);
+        meta.dirty_apply(now);
+        assert_eq!(meta.state(), MvState::Pending { has_table: false });
+        assert_eq!(meta.wasted_builds(), 0);
     }
 
     // ==================== Classifier tests ====================

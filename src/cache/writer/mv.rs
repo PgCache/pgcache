@@ -20,6 +20,7 @@ use crate::query::constraint_index::row_value_forms;
 use crate::query::constraints::ColumnRange;
 use crate::query::{Fingerprint, FingerprintSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tracing::{debug, error, trace};
 
@@ -54,6 +55,11 @@ impl WriterCore {
         let MvState::Pending { has_table } = view.mv.state() else {
             return;
         };
+        // Discard-backoff (PGC-364): a suppressed pinned entry is scheduled by
+        // a later hit once the cooldown passes.
+        if !view.mv.build_permitted(Instant::now()) {
+            return;
+        }
         // Pending → Scheduled: neither state is dirtiable, so the index is untouched.
         view.mv.state_set(MvState::Scheduled { has_table });
         drop(view);
@@ -206,6 +212,7 @@ impl WriterCore {
                 if matches!(state, MvState::Building { .. }) {
                     if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
                         view.mv.output_columns = Some(output_columns);
+                        view.mv.fresh_mark(Instant::now());
                     }
                     // →Fresh through the choke point: `Fresh` is dirtiable, so the
                     // index insert must accompany the state write (PGC-338).
@@ -215,6 +222,7 @@ impl WriterCore {
                 } else {
                     // BuildingDirty: a CDC change relevant to this query landed
                     // while the build was in flight; the table contents predate it.
+                    self.mv_waste_record(fingerprint);
                     self.mv_state_write(fingerprint, MvState::Pending { has_table: true });
                     crate::metrics::handles().mv.skipped_rebuilds.increment(1);
                     trace!("mv build: discarded (dirtied in flight) for {fingerprint}");
@@ -227,6 +235,9 @@ impl WriterCore {
                 trace!("mv build: size gate failed for {fingerprint}");
             }
             MvBuildOutcome::Failed { has_table } => {
+                // A failed build is a no-payoff build: without this, a
+                // persistently failing build would be retried on every hit.
+                self.mv_waste_record(fingerprint);
                 self.mv_state_write(fingerprint, MvState::Pending { has_table });
             }
         }
@@ -304,15 +315,23 @@ impl WriterCore {
     }
 
     /// Apply the dirty transition (`MvState::dirtied`) for this fingerprint:
-    /// `Fresh → Pending { has_table: true }`, `Building → BuildingDirty`.
-    /// No-op for any other state — dirty-marking has no meaningful effect. Stays
-    /// `&self` (DashMap interior mutability) so the CDC invalidation loops, which
-    /// hold an immutable borrow of `core`, can call it inline.
+    /// `Fresh → Pending { has_table: true }`, `Building → BuildingDirty`,
+    /// with the discard-backoff bookkeeping folded in (`MvMeta::dirty_apply`,
+    /// PGC-364). No-op for any other state — dirty-marking has no meaningful
+    /// effect. Stays `&self` (DashMap interior mutability) so the CDC
+    /// invalidation loops, which hold an immutable borrow of `core`, can call
+    /// it inline.
     pub(super) fn mv_dirty_mark(&self, fingerprint: Fingerprint) {
-        if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint)
-            && let Some(dirtied) = view.mv.state().dirtied()
-        {
-            view.mv.state_set(dirtied);
+        if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
+            view.mv.dirty_apply(Instant::now());
+        }
+    }
+
+    /// Record a no-payoff build for this fingerprint (discard-backoff,
+    /// PGC-364). No-op when the entry is gone.
+    fn mv_waste_record(&self, fingerprint: Fingerprint) {
+        if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
+            view.mv.waste_record(Instant::now());
         }
     }
 
