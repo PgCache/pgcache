@@ -2,9 +2,11 @@
 //!
 //! Linux is the production/Docker target: RSS from `/proc/self/status`, the
 //! budget from `min(host MemTotal, cgroup memory limit)` so a constrained
-//! container budgets against its limit rather than host RAM. On non-Linux
-//! (dev/test) detection returns `None` and the caller leaves registration
-//! unthrottled.
+//! container budgets against its limit rather than host RAM. The cgroup limit
+//! is the tightest one on the process's ancestor chain, and cgroup usage is
+//! the working set (usage minus reclaimable page cache) — see
+//! [`cgroup`](super::cgroup) (PGC-354). On non-Linux (dev/test) detection
+//! returns `None` and the caller leaves registration unthrottled.
 //!
 //! The pure decision math that consumes these readings lives in the parent
 //! [`memory`](super) module.
@@ -22,11 +24,13 @@ pub fn total_budget_bytes() -> Option<u64> {
 }
 
 /// Total memory *currently used* on this machine, in bytes. In a memory-limited
-/// cgroup this is the cgroup's usage (`memory.current`); otherwise it is host
-/// `MemTotal - MemAvailable`. Either way it counts pgcache **and** the cache
-/// Postgres it manages — which share the same box/container — so the registration
-/// budget covers the whole footprint, not just pgcache's own RSS. `None` if
-/// undetectable (non-Linux).
+/// cgroup this is the cgroup's *working set* (usage minus reclaimable page
+/// cache — raw usage counts the cache PG's clean file pages and would latch the
+/// throttle, PGC-354); otherwise it is host `MemTotal - MemAvailable`, which
+/// already discounts reclaimable pages. Either way it counts pgcache **and**
+/// the cache Postgres it manages — which share the same box/container — so the
+/// registration budget covers the whole footprint, not just pgcache's own RSS.
+/// `None` if undetectable (non-Linux).
 pub fn system_used_bytes() -> Option<u64> {
     imp::system_used_bytes()
 }
@@ -79,19 +83,12 @@ fn budget_from(host: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
     }
 }
 
-/// cgroup v1 reports a near-`u64::MAX` sentinel when unlimited; treat any
-/// implausibly large limit (≥ 1 PiB) as "no limit".
-#[cfg(any(target_os = "linux", test))]
-fn sane_limit(v: u64) -> Option<u64> {
-    const MAX_SANE: u64 = 1 << 50; // 1 PiB
-    (v < MAX_SANE).then_some(v)
-}
-
 #[cfg(target_os = "linux")]
 mod imp {
     use std::fs;
 
-    use super::{budget_from, field_kb, sane_limit};
+    use super::super::cgroup::cgroup_memory_snapshot;
+    use super::{budget_from, field_kb};
 
     pub fn process_rss_bytes() -> Option<u64> {
         // VmRSS in /proc/self/status is the resident size in kB (what `top`
@@ -100,14 +97,15 @@ mod imp {
     }
 
     pub fn total_budget_bytes() -> Option<u64> {
-        budget_from(host_mem_total(), cgroup_mem_limit())
+        budget_from(host_mem_total(), cgroup_memory_snapshot().map(|c| c.limit))
     }
 
     pub fn system_used_bytes() -> Option<u64> {
-        // In a memory-limited cgroup, its own usage is the binding figure (and
-        // includes the co-located cache Postgres). Otherwise use host usage.
-        if let Some(used) = cgroup_used() {
-            return Some(used);
+        // In a memory-limited cgroup, the binding cgroup's working set is the
+        // figure the kernel would OOM against (and it includes the co-located
+        // cache Postgres). Otherwise use host usage.
+        if let Some(snapshot) = cgroup_memory_snapshot() {
+            return Some(snapshot.working_set());
         }
         let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
         let total = field_kb(&meminfo, "MemTotal:")?;
@@ -118,12 +116,8 @@ mod imp {
     pub fn system_private_bytes() -> Option<u64> {
         // cgroup: anonymous (private) memory from memory.stat; shared_buffers is
         // counted under `shmem`, not `anon`, so `anon` is already the private pool.
-        if cgroup_used().is_some()
-            && let Ok(stat) = fs::read_to_string("/sys/fs/cgroup/memory.stat")
-            && let Some(anon) = stat.lines().find_map(|l| l.strip_prefix("anon "))
-            && let Ok(v) = anon.trim().parse::<u64>()
-        {
-            return Some(v);
+        if let Some(anon) = cgroup_memory_snapshot().and_then(|c| c.anon) {
+            return Some(anon);
         }
         // host: used − Shmem (shared_buffers lives in Shmem).
         let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
@@ -135,46 +129,6 @@ mod imp {
 
     fn host_mem_total() -> Option<u64> {
         field_kb(&fs::read_to_string("/proc/meminfo").ok()?, "MemTotal:")
-    }
-
-    /// cgroup memory limit: v2 `memory.max`, then v1 `memory.limit_in_bytes`.
-    fn cgroup_mem_limit() -> Option<u64> {
-        if let Ok(s) = fs::read_to_string("/sys/fs/cgroup/memory.max") {
-            let s = s.trim();
-            if s == "max" {
-                return None;
-            }
-            return s.parse::<u64>().ok().and_then(sane_limit);
-        }
-        if let Ok(s) = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
-            return s.trim().parse::<u64>().ok().and_then(sane_limit);
-        }
-        None
-    }
-
-    /// Current cgroup memory usage, but only when memory is actually limited
-    /// (i.e. containerized). `None` on an unlimited/root cgroup so the caller
-    /// falls back to host-wide usage.
-    fn cgroup_used() -> Option<u64> {
-        // cgroup v2: usage is meaningful as a budget only when memory.max is set.
-        if let Ok(maxs) = fs::read_to_string("/sys/fs/cgroup/memory.max") {
-            if maxs.trim() == "max" {
-                return None;
-            }
-            return fs::read_to_string("/sys/fs/cgroup/memory.current")
-                .ok()?
-                .trim()
-                .parse()
-                .ok();
-        }
-        // cgroup v1: only if the limit is a real (sane) value.
-        let limit = fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?;
-        sane_limit(limit.trim().parse().ok()?)?;
-        fs::read_to_string("/sys/fs/cgroup/memory/memory.usage_in_bytes")
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
     }
 }
 
@@ -225,7 +179,7 @@ mod imp {
 
 #[cfg(test)]
 mod tests {
-    use super::{budget_from, field_kb, sane_limit};
+    use super::{budget_from, field_kb};
 
     #[test]
     fn test_field_kb_parses_proc_line() {
@@ -242,16 +196,6 @@ mod tests {
     #[test]
     fn test_field_kb_absent_key() {
         assert_eq!(field_kb("MemFree: 100 kB\n", "VmRSS:"), None);
-    }
-
-    #[test]
-    fn test_sane_limit_rejects_unlimited_sentinel() {
-        // cgroup v1 "unlimited" sentinel.
-        assert_eq!(sane_limit(0x7FFF_FFFF_FFFF_F000), None);
-        assert_eq!(
-            sane_limit(2 * 1024 * 1024 * 1024),
-            Some(2 * 1024 * 1024 * 1024)
-        );
     }
 
     #[test]

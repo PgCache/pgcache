@@ -18,8 +18,9 @@ const RECYCLE_PRESSURE_FRACTION: f64 = 0.8;
 /// Samples whole-system used memory against the registration budget and toggles
 /// `state_view.registration_throttled` (with hysteresis) so dispatch degrades to
 /// origin-forwarding before the box exhausts RAM. "Used" is system-wide
-/// (`MemTotal - MemAvailable`, or the cgroup's `memory.current`), so it counts
-/// pgcache *and* the cache Postgres it manages — not just pgcache's own RSS. The
+/// (`MemTotal - MemAvailable`, or the binding cgroup's working set — usage minus
+/// reclaimable page cache, PGC-354), so it counts pgcache *and* the cache
+/// Postgres it manages — not just pgcache's own RSS. The
 /// budget is 80% of detected RAM (cgroup-aware), optionally lowered by
 /// `memory_limit`, minus the memo's reserved budget. No-op where memory can't be
 /// detected (non-Linux): the flag stays clear and registration is unbounded.

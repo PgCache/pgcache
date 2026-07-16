@@ -4,6 +4,7 @@
 //! readings supplied by the platform layer in [`sys`], which this module
 //! re-exports so callers keep using `memory::process_rss_bytes()` etc.
 
+mod cgroup;
 mod sys;
 
 pub use sys::{
