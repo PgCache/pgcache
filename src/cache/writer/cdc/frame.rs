@@ -1,6 +1,7 @@
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::Fingerprint;
+use std::sync::atomic::Ordering;
 
 use ecow::EcoString;
 use tracing::{error, info};
@@ -453,6 +454,11 @@ impl WriterCdc {
         // watermark that keepalives also advance.
         if lsn > self.last_applied_lsn {
             self.last_applied_lsn = lsn;
+            // Publish for wait-free reads by proxy connections (PGC-124): the
+            // read-after-write gate must never clear a pending write before it
+            // is actually in the cache. `fetch_max` keeps the publication
+            // monotonic against the keepalive-time advance in `cmd_handle`.
+            self.settled_lsn.fetch_max(lsn.get(), Ordering::Relaxed);
         }
         core.last_applied_lsn = self.last_applied_lsn;
         // Per-frame deletes/truncates were stamped by Boundary events during

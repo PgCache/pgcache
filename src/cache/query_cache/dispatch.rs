@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, error, info, instrument, trace};
 
+use crate::pg::Lsn;
 use crate::proxy::{ClientSocket, ExplainSpec, ExplainTarget};
 use crate::query::Fingerprint;
 use crate::query::ast::{query_expr_convert_raw, query_expr_fingerprint};
@@ -82,6 +83,16 @@ impl CacheDispatch {
         self.state_view
             .registration_throttled
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The settled watermark for this generation — every origin
+    /// transaction committing at or below it is either applied to the cache or
+    /// produced no decodable output. Read by proxy connections to clear
+    /// per-connection read-after-write logs (PGC-124). Read through the current
+    /// dispatch (never a cached `Arc`) so a cache restart never surfaces a
+    /// stale-high value.
+    pub fn settled_lsn(&self) -> Lsn {
+        Lsn::from_raw(self.state_view.settled_lsn.load(Ordering::Relaxed))
     }
 
     pub async fn new(

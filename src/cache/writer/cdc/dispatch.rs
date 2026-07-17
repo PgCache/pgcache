@@ -1,5 +1,7 @@
 use crate::oid::Oid;
 use crate::query::{Fingerprint, FingerprintSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ecow::EcoString;
@@ -193,6 +195,15 @@ impl WriterCdc {
                     }
                     self.received_lsn_advance(lsn);
                     core.last_received_lsn = self.last_received_lsn;
+                    // The writer is drained (no open frame, batch flushed) and a
+                    // keepalive's LSN bounds the walsender's *sent* position —
+                    // every decodable commit at or below it was already emitted
+                    // in stream order, so everything it will ever deliver up to
+                    // `lsn` is applied. Publish it so read-after-write logs can
+                    // clear across non-decodable WAL (DDL, unpublished-table
+                    // commits, idle origin), where the commit-only
+                    // `last_applied_lsn` cannot advance (PGC-124).
+                    self.settled_lsn.fetch_max(lsn.get(), Ordering::Relaxed);
                 }
             }
         }
@@ -940,7 +951,7 @@ impl WriterCdc {
 }
 
 impl WriterCdc {
-    pub async fn new(settings: &Settings) -> CacheResult<Self> {
+    pub async fn new(settings: &Settings, settled_lsn: Arc<AtomicU64>) -> CacheResult<Self> {
         let cache_eval_conn = pg::connect(&settings.cache, "cache eval")
             .await
             .map_into_report::<CacheError>()?;
@@ -957,6 +968,7 @@ impl WriterCdc {
             cdc_write_conn,
             last_received_lsn: Lsn::from_raw(0),
             last_applied_lsn: Lsn::from_raw(0),
+            settled_lsn,
             pg_eval_buf: String::with_capacity(SQL_BUFFER_CAPACITY),
             prepared_membership: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),
             prepared_row_change: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),

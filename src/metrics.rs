@@ -49,6 +49,9 @@ pub mod names {
     /// Segment merges forced when CDC lag spans more LSN tiers than the cap —
     /// a signal that the apply watermark is falling behind the write rate.
     pub const RAW_SEGMENT_MERGES: &str = "pgcache.raw.segment_merges";
+    /// Commit-LSN probes injected on connections' origin sockets to bound
+    /// pending writes.
+    pub const RAW_PROBES: &str = "pgcache.raw.probes";
 
     // Histogram metrics (latency in seconds per Prometheus convention)
     /// End-to-end latency for cache hits: client message received → response written to client.
@@ -374,6 +377,7 @@ pub struct Handles {
 pub struct RawHandles {
     pub writes_recorded: Counter,
     pub segment_merges: Counter,
+    pub probes: Counter,
 }
 
 pub struct ConnHandles {
@@ -763,6 +767,7 @@ impl Handles {
             raw: RawHandles {
                 writes_recorded: metrics::counter!(RAW_WRITES_RECORDED),
                 segment_merges: metrics::counter!(RAW_SEGMENT_MERGES),
+                probes: metrics::counter!(RAW_PROBES),
             },
         }
     }

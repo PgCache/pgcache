@@ -21,11 +21,6 @@
 //! (an `InsertAggregate` inside [`TableAggregate`]) lands in PGC-369. For now a
 //! table with any pending write is opaque (any read of it intersects).
 
-// The stamp/roll/drain API and the gate accessors are built here but consumed
-// by PGC-367 (probe + watermark) and PGC-368 (gate); until those land they are
-// exercised only by unit tests. Remove when the consumers are wired.
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque};
 
 use crate::pg::Lsn;
@@ -156,6 +151,9 @@ impl WriteLog {
         self.segments.is_empty()
     }
 
+    /// Number of live LSN tiers — asserted in tests; a gate/metric consumer
+    /// arrives in PGC-368.
+    #[allow(dead_code)]
     pub(in crate::proxy::connection) fn segment_count(&self) -> usize {
         self.segments.len()
     }

@@ -1,6 +1,8 @@
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use lru::LruCache;
 use tokio_postgres::{Client, Statement};
@@ -88,6 +90,17 @@ pub(super) struct WriterCdc {
     /// through here are in the cache." (See `last_received_lsn` for the
     /// receive/liveness counterpart.)
     pub(super) last_applied_lsn: Lsn,
+    /// Settled watermark shared for wait-free reads by proxy
+    /// connections (per-connection read-after-write clearing, PGC-124): every
+    /// origin transaction committing at or below it is applied to the cache or
+    /// produced no decodable output. Advanced at the commit-only
+    /// `last_applied_lsn` advance in `batch_flush`, and to a keepalive's LSN
+    /// once the keepalive's batch flush leaves the writer drained — sound
+    /// because a logical walsender's keepalive carries its *sent* position
+    /// (`sentPtr`/`writePtr`), past which every decodable commit has already
+    /// been emitted in stream order. A clone of
+    /// `CacheStateView::settled_lsn`.
+    pub(super) settled_lsn: Arc<AtomicU64>,
     /// Reused scratch buffer for the combined predicate `SELECT` built per CDC
     /// row in `pg_eval_matches`/`pg_eval_any`. Lives for the writer's lifetime
     /// so steady-state membership evaluation allocates no SQL string.

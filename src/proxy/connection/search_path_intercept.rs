@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use ecow::EcoString;
+use postgres_types::PgLsn;
 
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, trace};
+
+use crate::pg::Lsn;
 
 use crate::pg::protocol::{
     backend::{PgBackendMessage, PgBackendMessageType, data_row_first_column},
@@ -41,6 +44,10 @@ pub(in crate::proxy::connection) enum OriginIntercept {
     /// Responses for the original statement are forwarded; the SHOW's response
     /// is stripped and parsed into `search_path_state`.
     TrailingShowSearchPath(TrailingShowState),
+    /// Read-after-write commit-LSN probe (PGC-124): an injected
+    /// `SELECT pg_current_wal_insert_lsn()` whose response is fully swallowed;
+    /// its LSN stamps the write-log segment holding writes up to `stamp_seq`.
+    WalLsnProbe { stamp_seq: u64 },
 }
 
 /// Sub-state for `OriginIntercept::TrailingShowSearchPath`.
@@ -179,6 +186,23 @@ impl ConnectionState {
 
             &OriginIntercept::TrailingShowSearchPath(state) => {
                 self.trailing_show_search_path_handle(state, msg)
+            }
+
+            &OriginIntercept::WalLsnProbe { stamp_seq } => {
+                match msg.message_type {
+                    PgBackendMessageType::DataRows => {
+                        if let Some(value) = data_row_first_column(&msg.data)
+                            && let Ok(lsn) = value.parse::<PgLsn>()
+                        {
+                            self.write_log.stamp(stamp_seq, Lsn::from(lsn));
+                        }
+                    }
+                    PgBackendMessageType::ReadyForQuery => {
+                        self.origin_intercept = OriginIntercept::None;
+                    }
+                    _ => {}
+                }
+                true
             }
         }
     }

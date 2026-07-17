@@ -404,7 +404,8 @@ pub fn writer_run(
                     Arc::clone(&core.state_view.registration_throttled),
                 )
                 .await?;
-                let mut writer_cdc = WriterCdc::new(settings).await?;
+                let mut writer_cdc =
+                    WriterCdc::new(settings, Arc::clone(&core.state_view.settled_lsn)).await?;
 
                 // Gauges (queries_loading/pending/invalidated, disk_used_bytes,
                 // generation, tables_tracked, update_queries_total/max) used to

@@ -68,6 +68,16 @@ impl<C> EgressQueue<C> {
         self.slots.is_empty()
     }
 
+    /// Whether every `Origin` slot is sealed — i.e. no origin response is
+    /// mid-flight. Used as a quiescence guard before injecting a probe query
+    /// whose response must be the next thing back from origin (PGC-124).
+    pub(super) fn origin_all_sealed(&self) -> bool {
+        !self
+            .slots
+            .iter()
+            .any(|s| matches!(s, EgressSlot::Origin { sealed: false, .. }))
+    }
+
     // --- Producers ---------------------------------------------------------
 
     /// Reserve a slot for a client-facing forward to origin. Call this when a

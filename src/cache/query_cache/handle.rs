@@ -1,6 +1,7 @@
 use tokio::sync::watch;
 
 use super::CacheDispatch;
+use crate::pg::Lsn;
 
 /// Connection-side handle to the current [`CacheDispatch`]. Hot-swaps across cache
 /// restarts via a `watch` channel; `None` before the cache is ready or while it
@@ -15,6 +16,15 @@ impl CacheDispatchHandle {
     /// `Arc`s) and gives the caller an owned `CacheDispatch` to dispatch against.
     pub fn current(&self) -> Option<CacheDispatch> {
         self.rx.borrow().clone()
+    }
+
+    /// The current generation's settled watermark, or `None` if the
+    /// cache is down/restarting. Reads through the watch without cloning the
+    /// dispatch, so a connection never caches an `Arc` to a dead generation's
+    /// (stale-high) watermark — the read always reflects the live generation
+    /// (PGC-124).
+    pub fn settled_lsn(&self) -> Option<Lsn> {
+        self.rx.borrow().as_ref().map(CacheDispatch::settled_lsn)
     }
 }
 

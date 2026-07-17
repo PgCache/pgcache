@@ -2,7 +2,7 @@ use crate::oid::Oid;
 use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use arc_swap::ArcSwap;
@@ -250,6 +250,15 @@ pub struct CacheStateView {
     /// BBR-lite adaptive registration gate (PGC-277): writer-published drain +
     /// backlog signals and the controller's paced admit rate.
     pub reg_gate: Arc<RegGate>,
+    /// Settled watermark (raw `Lsn`) published by the writer so
+    /// per-connection read-after-write logs can clear their pending writes once
+    /// it passes each write's commit-LSN bound (PGC-124): every origin
+    /// transaction committing at or below it has either been applied to the
+    /// cache or produced no decodable output. Decoded *and* applied — not the
+    /// decode-stage cursor, which runs ahead of apply under writer lag. Per-generation: a fresh
+    /// `CacheStateView` starts at 0, so a restart never reports a stale-high
+    /// watermark to a connection reading through the current dispatch.
+    pub settled_lsn: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for CacheStateView {
@@ -278,6 +287,7 @@ impl CacheStateView {
             recycle_wanted: Arc::new(AtomicBool::new(false)),
             recycle_count: Arc::new(AtomicUsize::new(0)),
             reg_gate: Arc::new(RegGate::new()),
+            settled_lsn: Arc::new(AtomicU64::new(0)),
             memo: ResultMemo::new(dynamic),
         }
     }

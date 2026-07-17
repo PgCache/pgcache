@@ -78,6 +78,11 @@ fn log_gate(last: &AtomicU64, window_secs: u64) -> bool {
 /// Window for the cache-down operator warnings, in seconds.
 const CACHE_DOWN_LOG_WINDOW_SECS: u64 = 5;
 
+/// Injected query that samples the origin's current WAL insert LSN — a safe
+/// upper bound on the commit LSN of every write forwarded before it, used to
+/// bound per-connection read-after-write log entries (PGC-124).
+const WAL_INSERT_LSN_PROBE: &str = "SELECT pg_current_wal_insert_lsn()";
+
 /// Gate state: cache died with a query in flight (client connection dropped).
 static CACHE_DEAD_INFLIGHT_LOG: AtomicU64 = AtomicU64::new(u64::MAX);
 
@@ -177,6 +182,7 @@ async fn handle_connection(
         origin_database,
         cacheability_store,
         read_your_writes,
+        dispatch_handle.clone(),
     );
 
     // Reused for every query's reply: allocated once here instead of a per-query
@@ -416,6 +422,7 @@ impl ConnectionState {
         origin_database: EcoString,
         cacheability_store: Arc<CacheabilityStore>,
         read_your_writes: bool,
+        dispatch_handle: CacheDispatchHandle,
     ) -> Self {
         Self {
             origin_write_buf: VecDeque::new(),
@@ -439,6 +446,7 @@ impl ConnectionState {
             cache_disabled: false,
             describe_cache: LruCache::new(DESCRIBE_CACHE_CAPACITY),
             write_log: WriteLog::new(read_your_writes),
+            dispatch_handle,
         }
     }
     /// Analyze a forwarded statement purely to record any write it performs into
@@ -782,6 +790,41 @@ impl ConnectionState {
             // ReadyForQuery ends this request's response: seal its slot so the
             // next slot (and any locally-produced response behind it) can flush.
             self.egress.origin_seal();
+            // The current request's slot is now sealed, so the quiescence check
+            // inside `write_log_maintain` sees only genuinely in-flight work.
+            self.write_log_maintain();
+        }
+    }
+
+    /// Maintain the read-after-write log at a ReadyForQuery boundary (PGC-124):
+    /// drop writes the CDC apply watermark has passed, then — when idle
+    /// (post-commit) and the origin socket is quiescent — inject a commit-LSN
+    /// probe to bound the still-unstamped writes.
+    fn write_log_maintain(&mut self) {
+        if self.write_log.is_empty() {
+            return;
+        }
+        // Clear applied writes. Read the watermark through the current dispatch
+        // so a cache restart never surfaces a stale-high value.
+        if let Some(watermark) = self.dispatch_handle.settled_lsn() {
+            self.write_log.purge(watermark);
+        }
+        // Sample a commit-LSN bound for the unstamped writes, but only when
+        // idle ('I' — the writes have committed) and no origin response is in
+        // flight, so the probe's LSN is the next thing back and bounds exactly
+        // the writes recorded through `stamp_seq`. A write racing in after the
+        // sample is caught by `WriteLog::stamp`'s seq guard.
+        if matches!(self.proxy_mode, ProxyMode::Read)
+            && !self.in_transaction
+            && matches!(self.origin_intercept, OriginIntercept::None)
+            && self.origin_write_buf.is_empty()
+            && self.egress.origin_all_sealed()
+            && let Some(stamp_seq) = self.write_log.stamp_seq()
+        {
+            self.origin_intercept = OriginIntercept::WalLsnProbe { stamp_seq };
+            self.origin_write_buf
+                .push_back(simple_query_message_build(WAL_INSERT_LSN_PROBE));
+            crate::metrics::handles().raw.probes.increment(1);
         }
     }
 

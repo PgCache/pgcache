@@ -12,7 +12,7 @@ use crate::catalog::FunctionVolatility;
 use tokio_util::bytes::BytesMut;
 
 use crate::{
-    cache::CacheMessage,
+    cache::{CacheDispatchHandle, CacheMessage},
     pg::protocol::session::{Portal, PreparedStatement},
     proxy::egress::EgressQueue,
 };
@@ -129,4 +129,9 @@ pub(super) struct ConnectionState {
     /// on this connection is forwarded rather than served stale while those
     /// writes are in the commit→CDC-apply window.
     pub(in crate::proxy::connection) write_log: WriteLog,
+
+    /// Handle to the current cache generation, used to read the CDC apply
+    /// watermark for draining `write_log`. Read through this (never a cached
+    /// `Arc`) so a cache restart never surfaces a stale-high watermark (PGC-124).
+    pub(in crate::proxy::connection) dispatch_handle: CacheDispatchHandle,
 }
