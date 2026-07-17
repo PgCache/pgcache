@@ -12,13 +12,14 @@ use tokio_util::bytes::BytesMut;
 use tracing::{debug, trace};
 
 use crate::{
-    cache::query::CacheableQuery,
+    cache::query::{CacheableQuery, query_has_volatile_function},
     catalog::FunctionVolatility,
     id_hash::{BuildIdHasher, impl_id_hashable},
     query::ast::{
-        AstError, LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns,
-        query_expr_convert_raw,
+        AstError, LiteralValue, QueryBody, QueryExpr, RawStatement, ScalarExpr, SelectColumn,
+        SelectColumns, statement_convert_raw,
     },
+    query::write::WriteClass,
 };
 
 use super::{ParseError, cacheability_store::CacheabilityStore};
@@ -120,9 +121,11 @@ fn explain_spec_extract(query: &QueryExpr) -> Option<ExplainSpec> {
 /// wrapper (which parses) is never on a hot path.
 #[cfg(test)]
 fn explain_intercept_parse(sql: &str) -> Option<ExplainSpec> {
-    let query = pg_query::parse_raw_scoped(sql, |tree| unsafe { query_expr_convert_raw(tree) })
-        .ok()?
-        .ok()?;
+    let query = pg_query::parse_raw_scoped(sql, |tree| unsafe {
+        crate::query::ast::query_expr_convert_raw(tree)
+    })
+    .ok()?
+    .ok()?;
     explain_spec_extract(&query)
 }
 
@@ -241,11 +244,36 @@ pub(super) enum ForwardReason {
     Invalid,
 }
 
+/// Map an AST conversion failure to its forward reason (metric bucket).
+fn ast_error_forward_reason(ast_error: &AstError) -> ForwardReason {
+    match ast_error {
+        AstError::UnsupportedStatement { .. } => {
+            // Not a SELECT statement (INSERT, UPDATE, DELETE, DDL, etc.)
+            ForwardReason::UnsupportedStatement
+        }
+        AstError::UnsupportedSelectFeature { .. }
+        | AstError::UnsupportedFeature { .. }
+        | AstError::UnsupportedJoinType
+        | AstError::UnsupportedSubLinkType { .. }
+        | AstError::WhereParseError(_) => {
+            debug!(%ast_error, "forwarding query: AST conversion failed");
+            ForwardReason::UncacheableSelect
+        }
+        AstError::MultipleStatements | AstError::MissingStatement | AstError::InvalidTableRef => {
+            debug!(%ast_error, "forwarding query: invalid");
+            ForwardReason::Invalid
+        }
+    }
+}
+
 /// Verdict from [`analyze`]. Cloned cheaply from the memo on a hit (`CacheCheck`
 /// and `Explain` are `Arc`s; `Forward` is `Copy`).
 #[derive(Clone)]
 pub(super) enum Action {
     Forward(ForwardReason),
+    /// A forwarded statement that may modify table data; carries the write
+    /// classification for the connection's read-after-write log (PGC-124).
+    ForwardWrite(ForwardReason, WriteClass),
     CacheCheck(Arc<CacheableQuery>),
     /// `SELECT pgcache_explain(...)` — route to the cache to explain a cached
     /// query's cache-side plan rather than forward to origin (PGC-345).
@@ -303,52 +331,84 @@ pub(super) fn analyze(
 
     // Build the QueryExpr straight off the raw parse tree, skipping the protobuf
     // serialize/decode round-trip (PGC-192). This is the only parse/convert; the
-    // explain interception and cacheability classification both read this AST.
+    // explain interception, cacheability classification, and write
+    // classification (PGC-124) all read this one pass.
     let convert_result =
-        pg_query::parse_raw_scoped(sql, |tree| unsafe { query_expr_convert_raw(tree) })?;
+        pg_query::parse_raw_scoped(sql, |tree| unsafe { statement_convert_raw(tree) })?;
 
     let action = match convert_result {
-        Ok(query) => {
+        Ok(RawStatement::Select {
+            converted: Ok(query),
+            ..
+        }) => {
             // `SELECT pgcache_explain(...)` is intercepted before cacheability
             // classification (it would otherwise be an uncacheable unknown
             // function) and routed to the cache to explain a cached plan.
             if let Some(spec) = explain_spec_extract(&query) {
                 Action::Explain(Arc::new(spec))
             } else {
-                match CacheableQuery::try_new(query, func_volatility) {
-                    Ok(cacheable_query) => Action::CacheCheck(Arc::new(cacheable_query)),
+                match CacheableQuery::cacheable(&query, func_volatility) {
+                    // `cacheable` just passed, so `try_new` (same validation)
+                    // cannot fail; forward conservatively if it ever disagrees.
+                    Ok(()) => match CacheableQuery::try_new(*query, func_volatility) {
+                        Ok(cacheable_query) => Action::CacheCheck(Arc::new(cacheable_query)),
+                        Err(_) => Action::Forward(ForwardReason::UncacheableSelect),
+                    },
                     Err(cacheability_error) => {
                         debug!(%cacheability_error, "uncacheable SELECT");
-                        Action::Forward(ForwardReason::UncacheableSelect)
+                        // A volatile (or unknown) function anywhere in the query
+                        // can modify the database, so an uncacheable SELECT
+                        // carrying one is a potential write (PGC-124). Scanned
+                        // only now that the query is known uncacheable — the
+                        // cacheable path never pays for it.
+                        if query_has_volatile_function(&query, func_volatility) {
+                            Action::ForwardWrite(
+                                ForwardReason::UncacheableSelect,
+                                WriteClass::Connection,
+                            )
+                        } else {
+                            Action::Forward(ForwardReason::UncacheableSelect)
+                        }
                     }
                 }
             }
         }
+        Ok(RawStatement::Select {
+            converted: Err(ast_error),
+            cte_write,
+        }) => {
+            let reason = ast_error_forward_reason(&ast_error);
+            match cte_write {
+                // A data-modifying CTE: the "select" writes.
+                Some(class) => Action::ForwardWrite(reason, class),
+                None => Action::Forward(reason),
+            }
+        }
+        Ok(RawStatement::Write(class)) => {
+            Action::ForwardWrite(ForwardReason::UnsupportedStatement, class)
+        }
+        Ok(RawStatement::ReadOnlyUtility { .. }) => {
+            Action::Forward(ForwardReason::UnsupportedStatement)
+        }
         Err(ast_error) => {
-            let reason = match &ast_error {
-                AstError::UnsupportedStatement { .. } => {
-                    // Not a SELECT statement (INSERT, UPDATE, DELETE, DDL, etc.)
-                    ForwardReason::UnsupportedStatement
-                }
-                AstError::UnsupportedSelectFeature { .. }
-                | AstError::UnsupportedFeature { .. }
-                | AstError::UnsupportedJoinType
-                | AstError::UnsupportedSubLinkType { .. }
-                | AstError::WhereParseError(_) => {
-                    debug!(%ast_error, "forwarding query: AST conversion failed");
-                    ForwardReason::UncacheableSelect
-                }
-                AstError::MultipleStatements
-                | AstError::MissingStatement
-                | AstError::InvalidTableRef => {
-                    debug!(%ast_error, "forwarding query: invalid");
-                    ForwardReason::Invalid
-                }
-            };
-            Action::Forward(reason)
+            let reason = ast_error_forward_reason(&ast_error);
+            // Any statement of a multi-statement batch can write.
+            if matches!(ast_error, AstError::MultipleStatements) {
+                Action::ForwardWrite(reason, WriteClass::Connection)
+            } else {
+                Action::Forward(reason)
+            }
         }
     };
 
+    // Don't memoize writes: DML text is almost always unique (fresh literals
+    // per statement), so a write entry would rarely be re-hit, and its class
+    // can carry a per-statement payload (INSERT rows). Interning them would
+    // grow the per-connection memo and the shared store with data they never
+    // serve. Reads intern as before.
+    if matches!(action, Action::ForwardWrite(..)) {
+        return Ok(action);
+    }
     let interned = cacheability_cache.store.intern(key, action);
     let verdict = (*interned).clone();
     cacheability_cache.remember(key, interned);
@@ -357,6 +417,8 @@ pub(super) fn analyze(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::wildcard_enum_match_arm)]
+
     use super::*;
 
     use std::sync::Arc;
@@ -536,5 +598,129 @@ mod tests {
         assert!(explain_intercept_parse("SELECT pgcache_explain('x', 'y', 'z')").is_none());
         assert!(explain_intercept_parse("INSERT INTO t VALUES (1)").is_none());
         assert!(explain_intercept_parse("not even sql").is_none());
+    }
+
+    fn analyze_fresh(sql: &str, fv: &HashMap<EcoString, FunctionVolatility>) -> Action {
+        let store = Arc::new(CacheabilityStore::new());
+        analyze(sql, &mut CacheabilityCache::new(store), fv).expect("analyze sql")
+    }
+
+    #[test]
+    fn test_analyze_dml_classifies_as_write() {
+        let fv = HashMap::new();
+        match analyze_fresh("INSERT INTO t (a) VALUES (1)", &fv) {
+            Action::ForwardWrite(
+                ForwardReason::UnsupportedStatement,
+                WriteClass::InsertRows(_),
+            ) => {}
+            other => panic!(
+                "expected InsertRows write, got {:?}",
+                discriminant_name(&other)
+            ),
+        }
+        match analyze_fresh("UPDATE t SET a = 1", &fv) {
+            Action::ForwardWrite(ForwardReason::UnsupportedStatement, WriteClass::Table(_)) => {}
+            other => panic!("expected Table write, got {:?}", discriminant_name(&other)),
+        }
+    }
+
+    #[test]
+    fn test_analyze_txn_control_is_plain_forward() {
+        let fv = HashMap::new();
+        for sql in ["BEGIN", "COMMIT", "SET search_path TO public"] {
+            assert!(
+                matches!(
+                    analyze_fresh(sql, &fv),
+                    Action::Forward(ForwardReason::UnsupportedStatement)
+                ),
+                "for {sql:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_analyze_volatile_where_function_is_a_write() {
+        // Unknown and volatile functions in WHERE can modify the database;
+        // stable ones cannot (PGC-124).
+        let mut fv = HashMap::new();
+        fv.insert(EcoString::from("f_volatile"), FunctionVolatility::Volatile);
+        fv.insert(EcoString::from("f_stable"), FunctionVolatility::Stable);
+
+        for sql in [
+            "SELECT * FROM t WHERE f_volatile(a) = 1",
+            "SELECT * FROM t WHERE f_unknown(a) = 1",
+        ] {
+            assert!(
+                matches!(
+                    analyze_fresh(sql, &fv),
+                    Action::ForwardWrite(ForwardReason::UncacheableSelect, WriteClass::Connection)
+                ),
+                "for {sql:?}"
+            );
+        }
+        assert!(matches!(
+            analyze_fresh("SELECT * FROM t WHERE f_stable(a) = 1", &fv),
+            Action::Forward(ForwardReason::UncacheableSelect)
+        ));
+    }
+
+    #[test]
+    fn test_analyze_volatile_nested_in_stable_is_a_write() {
+        // A volatile nested inside a stable function still executes and can
+        // modify the DB. The cacheability check short-circuits on the outer
+        // stable, so write detection must walk the whole tree independently.
+        let mut fv = HashMap::new();
+        fv.insert(EcoString::from("f_volatile"), FunctionVolatility::Volatile);
+        fv.insert(EcoString::from("f_stable"), FunctionVolatility::Stable);
+
+        assert!(
+            matches!(
+                analyze_fresh("SELECT * FROM t WHERE f_stable(f_volatile(a)) = 1", &fv),
+                Action::ForwardWrite(ForwardReason::UncacheableSelect, WriteClass::Connection)
+            ),
+            "stable wrapping volatile must be a write"
+        );
+        // Stable wrapping stable is still just a read.
+        assert!(matches!(
+            analyze_fresh("SELECT * FROM t WHERE f_stable(f_stable(a)) = 1", &fv),
+            Action::Forward(ForwardReason::UncacheableSelect)
+        ));
+    }
+
+    #[test]
+    fn test_analyze_multi_statement_is_a_write() {
+        assert!(matches!(
+            analyze_fresh("SELECT 1; SELECT 2", &HashMap::new()),
+            Action::ForwardWrite(ForwardReason::Invalid, WriteClass::Connection)
+        ));
+    }
+
+    #[test]
+    fn test_writes_are_not_memoized() {
+        let fv = HashMap::new();
+        let mut cache = CacheabilityCache::new(Arc::new(CacheabilityStore::new()));
+        // A write is classified but left out of the memo (DML text is ~unique
+        // and its class can carry a row payload).
+        assert!(matches!(
+            analyze("INSERT INTO t (a) VALUES (1)", &mut cache, &fv),
+            Ok(Action::ForwardWrite(..))
+        ));
+        assert!(cache.entries.is_empty(), "writes must not be memoized");
+
+        // A read verdict is memoized as before.
+        assert!(matches!(
+            analyze("SELECT * FROM t WHERE a = 1", &mut cache, &fv),
+            Ok(Action::CacheCheck(_))
+        ));
+        assert_eq!(cache.entries.len(), 1);
+    }
+
+    fn discriminant_name(action: &Action) -> &'static str {
+        match action {
+            Action::Forward(_) => "Forward",
+            Action::ForwardWrite(..) => "ForwardWrite",
+            Action::CacheCheck(_) => "CacheCheck",
+            Action::Explain(_) => "Explain",
+        }
     }
 }

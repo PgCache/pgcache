@@ -25,7 +25,7 @@ use crate::{
         frontend::PgFrontendMessage,
         session::{Portal, PreparedStatement, ResultFormats, StatementType},
     },
-    query::{Fingerprint, ast::query_expr_fingerprint},
+    query::{Fingerprint, ast::query_expr_fingerprint, write::WriteClass},
 };
 
 use super::super::ProxyMode;
@@ -512,6 +512,7 @@ impl ConnectionState {
             // used to fold in — isn't captured by that cache, so it's replayed
             // for the non-SELECT statements that can mutate it (no piggyback for
             // extended; a standalone SHOW is issued via the lazy path on RFQ).
+            let mut write_class = None;
             let sql_type = match analyze(
                 &parsed.sql,
                 &mut self.cacheability_cache,
@@ -530,11 +531,23 @@ impl ConnectionState {
                     self.search_path_parse_inspect(&parsed.sql);
                     StatementType::NonSelect
                 }
+                // Same StatementType mapping per reason as the read arms; the
+                // class additionally feeds the read-after-write log (PGC-366).
+                Ok(Action::ForwardWrite(reason, class)) => {
+                    write_class = Some(class);
+                    match reason {
+                        ForwardReason::UncacheableSelect => StatementType::UncacheableSelect,
+                        ForwardReason::UnsupportedStatement | ForwardReason::Invalid => {
+                            self.search_path_parse_inspect(&parsed.sql);
+                            StatementType::NonSelect
+                        }
+                    }
+                }
                 Err(_) => StatementType::ParseError,
             };
 
             let statement_name = parsed.statement_name.clone();
-            self.statement_store(parsed, sql_type, data.clone());
+            self.statement_store(parsed, sql_type, data.clone(), write_class);
 
             let seg = &mut self.extended.buffer_get_or_create().pending;
             if seg.has_parse {
@@ -1030,6 +1043,7 @@ impl ConnectionState {
         parsed: ParsedParseMessage,
         sql_type: StatementType,
         parse_bytes: Bytes,
+        write_class: Option<WriteClass>,
     ) {
         let client_parameter_oids = parsed.parameter_oids.clone();
         let stmt = PreparedStatement {
@@ -1043,6 +1057,7 @@ impl ConnectionState {
             describe_no_data: false,
             origin_prepared: false,
             parse_bytes: Some(parse_bytes),
+            write_class,
         };
         debug!("parsed statement insert {}", parsed.statement_name);
 

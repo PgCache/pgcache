@@ -11,9 +11,9 @@ use crate::{
     catalog::FunctionVolatility,
     query::{
         ast::{
-            AstNode, BinaryOp, CteRefNode, JoinNode, JoinQual, JoinType, LimitClause, LiteralValue,
-            MultiOp, QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode, SubLinkType,
-            TableNode, TableSource, TableSubqueryNode, WhereExpr,
+            AstNode, BinaryOp, CteRefNode, FunctionCall, JoinNode, JoinQual, JoinType, LimitClause,
+            LiteralValue, MultiOp, QueryBody, QueryExpr, ScalarExpr, SelectNode, SetOpNode,
+            SubLinkType, TableNode, TableSource, TableSubqueryNode, WhereExpr,
         },
         resolved::{
             ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectNode, ResolvedTableSource,
@@ -87,26 +87,58 @@ impl CacheableQuery {
 }
 
 impl CacheableQuery {
-    /// Check if a query is cacheable given the function volatility map.
+    /// Whether a query is cacheable, without consuming it. Lets a caller decide
+    /// cacheability before choosing whether to build the (owning) value or run
+    /// further analysis on the same borrow.
     ///
     /// Validates the query structure and ensures all functions in WHERE/FROM
     /// clauses are immutable. Functions in SELECT lists are always allowed.
-    pub fn try_new(
-        query: QueryExpr,
+    pub fn cacheable(
+        query: &QueryExpr,
         fv: &FunctionVolatilityMap,
-    ) -> Result<Self, CacheabilityError> {
+    ) -> Result<(), CacheabilityError> {
         // System catalogs (pg_catalog, pg_toast, unqualified pg_* relations) can't
         // be logically replicated, so registration against the cache db fails with
         // "unacceptable schema name". Reject up front and forward to origin —
         // e.g. psql's \d, which queries pg_class/pg_namespace.
-        references_system_catalog(&query)?;
+        references_system_catalog(query)?;
+        is_cacheable_body(&query.body, fv)
+    }
 
-        is_cacheable_body(&query.body, fv)?;
-
+    /// Build a cacheable query, validating it first. Fails with the same
+    /// verdict as [`Self::cacheable`].
+    pub fn try_new(
+        query: QueryExpr,
+        fv: &FunctionVolatilityMap,
+    ) -> Result<Self, CacheabilityError> {
+        Self::cacheable(&query, fv)?;
         // Take ownership of the (freshly built, ephemeral) query rather than
         // cloning the whole AST — the caller has no further use for it.
         Ok(CacheableQuery { query })
     }
+}
+
+/// Whether the query contains any function that can modify the database.
+///
+/// Only VOLATILE functions can write; IMMUTABLE and STABLE cannot. A function
+/// absent from the volatility map is unknown, so it is conservatively treated
+/// as volatile. Used to classify an uncacheable forwarded SELECT (e.g. a
+/// data-modifying-CTE-free `SELECT nextval(...)`) as a potential write for
+/// read-after-write tracking (PGC-124). The full-tree walk catches functions
+/// nested inside other functions and inside WHERE, which the cacheability
+/// check's short-circuit on the first non-immutable function would miss.
+pub fn query_has_volatile_function(query: &QueryExpr, fv: &FunctionVolatilityMap) -> bool {
+    query
+        .try_for_each_node::<FunctionCall, ()>(&mut |func| {
+            match fv.get(func.name.to_lowercase().as_str()) {
+                Some(FunctionVolatility::Immutable | FunctionVolatility::Stable) => {
+                    ControlFlow::Continue(())
+                }
+                // Volatile or unknown: assume it may write.
+                _ => ControlFlow::Break(()),
+            }
+        })
+        .is_break()
 }
 
 /// Reject queries that reference a PostgreSQL system catalog.

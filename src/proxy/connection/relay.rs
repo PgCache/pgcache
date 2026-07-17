@@ -468,7 +468,10 @@ impl ConnectionState {
                     )
                     .await
                     {
-                        Ok(Action::Forward(reason)) => {
+                        // The write class is recorded into the connection's
+                        // read-after-write log by PGC-366; until then a write
+                        // forwards exactly like any other forward.
+                        Ok(Action::Forward(reason) | Action::ForwardWrite(reason, _)) => {
                             match reason {
                                 ForwardReason::UnsupportedStatement => {
                                     m.query.unsupported.increment(1);
