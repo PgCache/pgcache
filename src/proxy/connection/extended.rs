@@ -41,6 +41,33 @@ const PARSE_COMPLETE_RFQ_IDLE: &[u8] = &[b'1', 0, 0, 0, 4, b'Z', 0, 0, 0, 5, b'I
 /// forwarding (the client's own `Sync` isn't replayed per entry).
 const SYNC_MESSAGE: [u8; 5] = [b'S', 0, 0, 0, 4];
 
+/// Classify each Execute in a forwarded buffer for the read-after-write log
+/// (PGC-124): resolve portal → statement → its captured write class. A
+/// read-only statement contributes nothing; an Execute whose portal or
+/// statement can't be resolved is recorded conservatively at connection scope
+/// so a genuine write is never missed.
+fn buffer_write_classes(
+    buffer: &ExtendedBuffer,
+    portals: &HashMap<EcoString, Portal>,
+    statements: &HashMap<EcoString, PreparedStatement>,
+) -> SmallVec<[WriteClass; 1]> {
+    let mut classes = SmallVec::new();
+    for entry in &buffer.entries {
+        let resolved = entry
+            .portal_name
+            .as_ref()
+            .and_then(|p| portals.get(p.as_str()))
+            .and_then(|portal| statements.get(&portal.statement_name))
+            .map(|stmt| stmt.write_class.clone());
+        match resolved {
+            Some(Some(class)) => classes.push(class),
+            Some(None) => {}
+            None => classes.push(WriteClass::Connection),
+        }
+    }
+    classes
+}
+
 /// A cacheable-query snapshot captured at Execute time. Taken eagerly (not at
 /// Sync) because a multi-execute batch typically reuses the unnamed portal /
 /// statement, so `self.portals` / `prepared_statements` reflect only the *last*
@@ -341,6 +368,11 @@ impl ExtendedPending {
         self.buffer.take()
     }
 
+    /// Borrow the active buffer, if any — for inspecting entries before a flush.
+    pub(in crate::proxy::connection) fn buffer_peek(&self) -> Option<&ExtendedBuffer> {
+        self.buffer.as_ref()
+    }
+
     /// Capture every forwarded Parse/Describe('S') statement name, in wire
     /// order, into the pending origin-response queues (shared by the flush and
     /// forward paths). Replaces any prior contents — this forwards a whole
@@ -452,6 +484,18 @@ impl ExtendedPending {
 impl ConnectionState {
     /// Flush any buffered extended protocol messages to origin.
     pub(in crate::proxy::connection) fn extended_buffer_flush_to_origin(&mut self) {
+        // A Flush forwards the whole buffer, including sealed Executes — record
+        // any writes among them before the buffer is consumed.
+        if self.write_log.is_enabled() {
+            let classes = self.extended.buffer_peek().map(|buffer| {
+                buffer_write_classes(buffer, &self.portals, &self.prepared_statements)
+            });
+            if let Some(classes) = classes {
+                for class in classes {
+                    self.write_log.record(&class);
+                }
+            }
+        }
         if let Some(bytes) = self.extended.buffer_flush() {
             self.origin_write_buf.push_back(bytes);
         }
@@ -494,6 +538,14 @@ impl ConnectionState {
                 &mut self.origin_write_buf,
                 &mut self.origin_intercept,
             );
+        }
+
+        // Record any writes among the forwarded Executes into the RaW log.
+        if self.write_log.is_enabled() {
+            let classes = buffer_write_classes(&buffer, &self.portals, &self.prepared_statements);
+            for class in classes {
+                self.write_log.record(&class);
+            }
         }
 
         let bytes = self.extended.buffer_forward(buffer, trailing_bytes);

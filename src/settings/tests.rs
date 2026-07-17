@@ -546,6 +546,7 @@ fn base_toml_config() -> SettingsToml {
         pinned_queries: None,
         pinned_tables: None,
         telemetry: None,
+        read_your_writes: None,
     }
 }
 

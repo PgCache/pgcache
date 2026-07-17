@@ -43,6 +43,13 @@ pub mod names {
     pub const QUERIES_CACHE_ERROR: &str = "pgcache.queries.cache_error";
     pub const QUERIES_ALLOWLIST_SKIPPED: &str = "pgcache.queries.allowlist_skipped";
 
+    // Read-after-write tracking (PGC-124)
+    /// Writes folded into a connection's read-after-write log.
+    pub const RAW_WRITES_RECORDED: &str = "pgcache.raw.writes_recorded";
+    /// Segment merges forced when CDC lag spans more LSN tiers than the cap —
+    /// a signal that the apply watermark is falling behind the write rate.
+    pub const RAW_SEGMENT_MERGES: &str = "pgcache.raw.segment_merges";
+
     // Histogram metrics (latency in seconds per Prometheus convention)
     /// End-to-end latency for cache hits: client message received → response written to client.
     pub const CACHE_QUERY_LATENCY_SECONDS: &str = "pgcache.query.cache_latency_seconds";
@@ -360,6 +367,13 @@ pub struct Handles {
     pub reg: RegHandles,
     /// Cache state, sizing, admission/eviction, and queue-depth gauges.
     pub state: StateHandles,
+    /// Per-connection read-after-write tracking (PGC-124).
+    pub raw: RawHandles,
+}
+
+pub struct RawHandles {
+    pub writes_recorded: Counter,
+    pub segment_merges: Counter,
 }
 
 pub struct ConnHandles {
@@ -745,6 +759,10 @@ impl Handles {
                 queue_writer_cdc: metrics::gauge!(CACHE_WRITER_CDC_QUEUE),
                 queue_writer_internal: metrics::gauge!(CACHE_WRITER_INTERNAL_QUEUE),
                 queue_worker: metrics::gauge!(CACHE_WORKER_QUEUE),
+            },
+            raw: RawHandles {
+                writes_recorded: metrics::counter!(RAW_WRITES_RECORDED),
+                segment_merges: metrics::counter!(RAW_SEGMENT_MERGES),
             },
         }
     }

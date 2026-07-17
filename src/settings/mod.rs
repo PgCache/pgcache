@@ -270,6 +270,10 @@ struct SettingsToml {
     /// Enable anonymous telemetry (default: true). Set to false to disable.
     #[serde(default)]
     telemetry: Option<bool>,
+    /// Per-connection read-after-write consistency (default: true). Set to false
+    /// to disable write tracking.
+    #[serde(default)]
+    read_your_writes: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -297,4 +301,10 @@ pub struct Settings {
     /// Enable anonymous telemetry (default: true).
     /// Disable via CLI --telemetry_off, TOML telemetry = false, or env PGCACHE_TELEMETRY=off.
     pub telemetry: bool,
+    /// Per-connection read-after-write consistency (default: true). A connection
+    /// forwards its own subsequent reads rather than serving them stale while its
+    /// writes are in the commit→CDC-apply window (PGC-124). Disable via CLI
+    /// --read_your_writes_off, TOML read_your_writes = false, or env
+    /// PGCACHE_READ_YOUR_WRITES=off.
+    pub read_your_writes: bool,
 }

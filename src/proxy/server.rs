@@ -259,6 +259,7 @@ pub fn proxy_run(
         let ssl_mode = settings.origin.ssl_mode;
         let server_name = EcoString::from(settings.origin.host.as_str());
         let origin_database = EcoString::from(settings.origin.database.as_str());
+        let read_your_writes = settings.read_your_writes;
 
         // Accept connections on a dedicated scoped thread so the proxy thread is
         // free to run the cache restart supervisor. Connections dispatch against
@@ -355,6 +356,7 @@ pub fn proxy_run(
                                     Arc::clone(&func_volatility),
                                     origin_database.clone(),
                                     Arc::clone(&cacheability_store),
+                                    read_your_writes,
                                 ));
                             }
                         }
@@ -435,6 +437,7 @@ mod tests {
             dynamic: DynamicConfigHandle::test_default(),
             pinned_queries,
             telemetry: false,
+            read_your_writes: true,
         }
     }
 

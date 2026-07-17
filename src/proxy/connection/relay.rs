@@ -54,6 +54,7 @@ use crate::{
 use super::super::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
 use super::super::query::{Action, CacheabilityCache, ForwardReason, handle_query};
 use super::super::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
+use crate::query::write::WriteClass;
 use crate::result::ReportExt;
 
 use super::*;
@@ -147,6 +148,7 @@ async fn handle_connection(
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
     cacheability_store: Arc<CacheabilityStore>,
+    read_your_writes: bool,
 ) -> ConnectionResult<()> {
     // Track active connections - guard ensures decrement on any exit path
     crate::metrics::handles().conn.active.increment(1.0);
@@ -170,7 +172,12 @@ async fn handle_connection(
     let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
 
     let mut cacheability_epoch = cacheability_store.epoch_subscribe();
-    let mut state = ConnectionState::new(func_volatility, origin_database, cacheability_store);
+    let mut state = ConnectionState::new(
+        func_volatility,
+        origin_database,
+        cacheability_store,
+        read_your_writes,
+    );
 
     // Reused for every query's reply: allocated once here instead of a per-query
     // oneshot, keeping the serve hot path allocation-free.
@@ -348,6 +355,7 @@ pub async fn connection_task(
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
     cacheability_store: Arc<CacheabilityStore>,
+    read_your_writes: bool,
 ) {
     debug!("task spawn");
 
@@ -380,6 +388,7 @@ pub async fn connection_task(
         func_volatility,
         origin_database,
         cacheability_store,
+        read_your_writes,
     )
     .await;
 
@@ -391,11 +400,22 @@ pub async fn connection_task(
     debug!("task done");
 }
 
+/// Increment the per-reason counter for a forwarded (non-cacheable) statement.
+fn forward_reason_metric(reason: ForwardReason) {
+    let m = crate::metrics::handles();
+    match reason {
+        ForwardReason::UnsupportedStatement => m.query.unsupported.increment(1),
+        ForwardReason::UncacheableSelect => m.query.uncacheable.increment(1),
+        ForwardReason::Invalid => m.query.invalid.increment(1),
+    }
+}
+
 impl ConnectionState {
     pub(in crate::proxy::connection) fn new(
         func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
         origin_database: EcoString,
         cacheability_store: Arc<CacheabilityStore>,
+        read_your_writes: bool,
     ) -> Self {
         Self {
             origin_write_buf: VecDeque::new(),
@@ -418,8 +438,24 @@ impl ConnectionState {
             origin_database,
             cache_disabled: false,
             describe_cache: LruCache::new(DESCRIBE_CACHE_CAPACITY),
+            write_log: WriteLog::new(read_your_writes),
         }
     }
+    /// Analyze a forwarded statement purely to record any write it performs into
+    /// the read-after-write log. Reads (and cache/explain verdicts) record
+    /// nothing; an unparseable statement records conservatively at connection
+    /// scope. Used on paths that forward without a cache decision (in-txn).
+    async fn write_log_record_forwarded(&mut self, data: &BytesMut) {
+        if !self.write_log.is_enabled() {
+            return;
+        }
+        match handle_query(data, &mut self.cacheability_cache, &self.func_volatility).await {
+            Ok(Action::ForwardWrite(_, class)) => self.write_log.record(&class),
+            Ok(_) => {}
+            Err(_) => self.write_log.record(&WriteClass::Connection),
+        }
+    }
+
     /// Push a Sync-terminated batch to origin, recording the forward in
     /// telemetry and reserving an ordered client-response slot so locally
     /// produced responses (synth, cache) can't jump ahead of this one.
@@ -468,21 +504,14 @@ impl ConnectionState {
                     )
                     .await
                     {
-                        // The write class is recorded into the connection's
-                        // read-after-write log by PGC-366; until then a write
-                        // forwards exactly like any other forward.
-                        Ok(Action::Forward(reason) | Action::ForwardWrite(reason, _)) => {
-                            match reason {
-                                ForwardReason::UnsupportedStatement => {
-                                    m.query.unsupported.increment(1);
-                                }
-                                ForwardReason::UncacheableSelect => {
-                                    m.query.uncacheable.increment(1);
-                                }
-                                ForwardReason::Invalid => {
-                                    m.query.invalid.increment(1);
-                                }
-                            }
+                        Ok(Action::Forward(reason)) => {
+                            forward_reason_metric(reason);
+                            self.origin_dispatch(msg.data, None);
+                            ProxyMode::Read
+                        }
+                        Ok(Action::ForwardWrite(reason, class)) => {
+                            forward_reason_metric(reason);
+                            self.write_log.record(&class);
                             self.origin_dispatch(msg.data, None);
                             ProxyMode::Read
                         }
@@ -510,12 +539,20 @@ impl ConnectionState {
                             m.query.uncacheable.increment(1);
                             m.query.invalid.increment(1);
                             error!("handle_query {}", e);
+                            // Unparseable: can't rule out a write — record
+                            // connection-scoped so no read is served stale.
+                            self.write_log.record(&WriteClass::Connection);
                             self.origin_dispatch(msg.data, None);
                             ProxyMode::Read
                         }
                     };
                 } else {
                     m.query.uncacheable.increment(1);
+                    // In-transaction statements are never cache-served, but a
+                    // write among them must still land in the log so post-commit
+                    // reads on this connection aren't served stale. Analyze here
+                    // (memoized) purely to classify; reads record nothing.
+                    self.write_log_record_forwarded(&msg.data).await;
                     self.origin_dispatch(msg.data, None);
                 }
             }
@@ -553,6 +590,9 @@ impl ConnectionState {
                         client_db, self.origin_database
                     );
                     self.cache_disabled = true;
+                    // The connection never serves from cache, so its write log
+                    // would only accrue dead weight.
+                    self.write_log.disable();
                 }
 
                 self.origin_write_buf.push_back(msg.data);
@@ -571,8 +611,17 @@ impl ConnectionState {
                 // use channel_binding=disable in their connection string.
                 self.origin_write_buf.push_back(msg.data);
             }
+            PgFrontendMessageType::FunctionCall => {
+                // Legacy fast-path function call: executes a function that may
+                // write, and it carries no SQL to classify — record
+                // conservatively so a subsequent read isn't served stale.
+                self.write_log.record(&WriteClass::Connection);
+                self.origin_write_buf.push_back(msg.data);
+            }
             _ => {
-                // All other message types - forward to origin
+                // All other message types (CopyData/CopyDone payload, etc.) —
+                // forward to origin. Not writes in their own right (the COPY
+                // statement itself was already classified when forwarded).
                 self.origin_write_buf.push_back(msg.data);
             }
         }

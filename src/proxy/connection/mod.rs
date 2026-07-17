@@ -25,6 +25,7 @@ mod extended;
 mod relay;
 mod search_path_intercept;
 mod telemetry;
+mod write_log;
 
 pub(in crate::proxy::connection) use super::origin_stream::{
     OriginReadHalf, OriginWriteHalf, origin_connect,
@@ -37,6 +38,7 @@ pub use relay::connection_task;
 pub(in crate::proxy::connection) use relay::forward_lazy_parse_install;
 pub(in crate::proxy::connection) use search_path_intercept::{OriginIntercept, SearchPathState};
 pub(in crate::proxy::connection) use telemetry::QueryTelemetry;
+pub(in crate::proxy::connection) use write_log::WriteLog;
 
 /// Manages state for a single client connection.
 /// Encapsulates transaction state, query fingerprint cache, and protocol state.
@@ -121,4 +123,10 @@ pub(super) struct ConnectionState {
     /// each forwarded Parse+Describe, consulted by the Parse-only synthesize
     /// path so repeat prepares skip the origin round-trip.
     pub(in crate::proxy::connection) describe_cache: LruCache<DescribeKey, DescribeCacheEntry>,
+
+    /// Per-connection read-after-write log (PGC-124): the writes this connection
+    /// forwarded to origin, aggregated per table, so a subsequent cacheable read
+    /// on this connection is forwarded rather than served stale while those
+    /// writes are in the commit→CDC-apply window.
+    pub(in crate::proxy::connection) write_log: WriteLog,
 }

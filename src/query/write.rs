@@ -28,7 +28,7 @@ pub enum TransactionBoundary {
 /// A table reference as written in a DML statement. Never schema-resolved —
 /// the proxy has no catalog knowledge, so consumers must treat an unqualified
 /// name conservatively (same-name ⇒ possibly the same table).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RelationRef {
     pub schema: Option<EcoString>,
     pub name: EcoString,
