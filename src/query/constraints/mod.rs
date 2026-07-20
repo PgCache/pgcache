@@ -28,7 +28,8 @@ mod tests;
 pub use extract::analyze_query_constraints;
 pub use subsume::table_constraints_subsumed;
 
-pub(crate) use range::{ColumnRange, column_range_build};
+pub(crate) use range::{ColumnRange, column_range_build, column_range_contains};
+pub(crate) use subsume::table_column_ranges;
 
 /// A column constraint extracted from WHERE/JOIN conditions
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

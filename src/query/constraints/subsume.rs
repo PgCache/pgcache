@@ -7,10 +7,32 @@
 
 use std::collections::HashMap;
 
+use ecow::EcoString;
+
 use crate::query::cast::CastTarget;
 
 use super::range::{ColumnRange, column_range_build, column_range_subsumes};
 use super::{QueryConstraints, TableConstraint};
+
+/// Reduce a query's constraints on `table` to a per-column [`ColumnRange`], for
+/// the read side of read-after-write disjointness (PGC-124). Only bare-column
+/// comparisons are kept — a cast comparison (`col::date = …`) constrains a
+/// derived value, not the raw column the inserted row supplies, so it can't
+/// prove disjointness against a raw inserted value. A column absent from the
+/// result is unconstrained by the read (and so can't exclude any insert).
+pub(crate) fn table_column_ranges(
+    constraints: &QueryConstraints,
+    table: &str,
+) -> HashMap<EcoString, ColumnRange> {
+    let Some(table_cs) = constraints.table_constraints.get(table) else {
+        return HashMap::new();
+    };
+    constraints_group_by_column(table_cs)
+        .into_iter()
+        .filter(|((_, cast), _)| cast.is_none())
+        .map(|((col, _), cs)| (EcoString::from(col), column_range_build(cs.as_slice())))
+        .collect()
+}
 
 // ============================================================================
 // ColumnRange: per-column constraint reduction for subsumption

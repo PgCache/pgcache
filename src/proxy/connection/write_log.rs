@@ -17,16 +17,22 @@
 //! gates an older, already-applied one: the waiting batch clears on its own
 //! LSN even while active holds newer writes.
 //!
-//! The gate that consults this log lands in PGC-368; row-level INSERT precision
-//! (an `InsertAggregate` inside [`TableAggregate`]) lands in PGC-369. For now a
-//! table with any pending write is opaque (any read of it intersects).
+//! The gate consulting this log ([`WriteLog::decide`]) forwards a read that
+//! could be superseded by a pending write. A non-row-enumerable write makes its
+//! table `opaque` (any read of it intersects); a row-enumerable INSERT keeps its
+//! rows ([`InsertAggregate`]) so a read provably disjoint from every inserted
+//! row can still be served (PGC-369).
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
+use std::sync::Arc;
+
+use ecow::EcoString;
 
 use crate::pg::Lsn;
-use crate::query::ast::{AstNode, QueryExpr, TableNode};
-use crate::query::write::{RelationRef, WriteClass};
+use crate::query::ast::{AstNode, LiteralValue, QueryExpr, TableNode};
+use crate::query::constraints::{ColumnRange, column_range_contains};
+use crate::query::write::{INSERT_MAX_ROWS, InsertStatement, RelationRef, WriteClass};
 
 /// Reason the read-after-write gate forwarded a cacheable read to origin
 /// instead of serving it from cache (PGC-124), for metrics.
@@ -37,6 +43,31 @@ pub(in crate::proxy::connection) enum RawForwardReason {
     /// A connection-scoped pending write (unknown target table): every read on
     /// the connection intersects until it clears.
     Connection,
+}
+
+/// The read-after-write gate's verdict for one cacheable read ([`WriteLog::decide`]).
+/// Side-effect-free so the caller records metrics exactly once per read; the three
+/// variants make the illegal "forwarding yet proven disjoint" state unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::proxy::connection) enum RawDecision {
+    /// Serve from cache — no pending write on this connection touches the read.
+    Serve,
+    /// Serve from cache — a pending INSERT on a referenced table was proven
+    /// row-level disjoint from the read (PGC-369); a precision win to record.
+    ServeDisjointInsert,
+    /// Forward to origin — a pending write the read can't rule out.
+    Forward(RawForwardReason),
+}
+
+/// What a single referenced table contributes to the gate decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TableWrite {
+    /// No pending write on this table.
+    None,
+    /// A pending write the read can't rule out → the read must forward.
+    Intersects,
+    /// Only pending INSERTs, all proven disjoint from the read → serveable.
+    DisjointInsert,
 }
 
 /// Max segments kept before the two oldest are merged. Two — one `active`
@@ -77,13 +108,68 @@ impl PendingLsn {
     }
 }
 
-/// Pending write state for one table within a segment. Opaque-only for now —
-/// PGC-369 adds row-level INSERT precision here.
+/// Pending write state for one table within a segment.
 #[derive(Debug, Default, Clone)]
 pub(in crate::proxy::connection) struct TableAggregate {
     /// A non-row-enumerable write (UPDATE/DELETE/MERGE/TRUNCATE, or a degraded
-    /// INSERT) is pending against this table → any read of it intersects.
+    /// INSERT) is pending against this table → any read of it intersects,
+    /// regardless of `inserts`.
     pub opaque: bool,
+    /// Row-enumerable INSERTs pending against this table (PGC-369). A read that
+    /// is provably disjoint from every inserted row may still be served. `None`
+    /// once `opaque` is set (an opaque write dominates).
+    pub inserts: Option<InsertAggregate>,
+}
+
+/// Row-enumerable INSERTs pending against one table: the actual inserted rows,
+/// bounded by [`INSERT_MAX_ROWS`] total. Beyond the cap the table degrades to
+/// `opaque` (table-level) — a bulk load broadly invalidates cached reads anyway.
+#[derive(Debug, Clone, Default)]
+pub(in crate::proxy::connection) struct InsertAggregate {
+    statements: Vec<Arc<InsertStatement>>,
+    rows: usize,
+}
+
+impl InsertAggregate {
+    /// Fold in another INSERT's rows. Returns `false` if the total would exceed
+    /// [`INSERT_MAX_ROWS`], signalling the caller to degrade the table to opaque.
+    fn fold(&mut self, insert: &Arc<InsertStatement>) -> bool {
+        let total = self.rows + insert.rows.len();
+        if total > INSERT_MAX_ROWS {
+            return false;
+        }
+        self.rows = total;
+        self.statements.push(Arc::clone(insert));
+        true
+    }
+
+    /// Whether every inserted row is provably excluded by the read's per-column
+    /// ranges — i.e. no inserted row can match the read, so it may be served. A
+    /// row is excluded when some predicate column with a known value in that row
+    /// falls outside the read's range for that column.
+    fn disjoint(&self, read_ranges: &HashMap<EcoString, ColumnRange>) -> bool {
+        self.statements.iter().all(|stmt| {
+            stmt.rows
+                .iter()
+                .all(|row| row_excluded(stmt, row, read_ranges))
+        })
+    }
+}
+
+/// Whether an inserted row cannot match a read with the given per-column ranges.
+fn row_excluded(
+    stmt: &InsertStatement,
+    row: &[Option<LiteralValue>],
+    read_ranges: &HashMap<EcoString, ColumnRange>,
+) -> bool {
+    stmt.columns.iter().zip(row).any(|(column, value)| {
+        value.as_ref().is_some_and(|v| {
+            read_ranges
+                .get(column)
+                .and_then(|range| column_range_contains(range, v))
+                == Some(false)
+        })
+    })
 }
 
 /// Connection-scoped pending writes whose target table is unknown (DDL, CALL,
@@ -120,11 +206,37 @@ impl WriteSegment {
     /// merged bound is the later-clearing of the two — so a never-clearing
     /// `Unstampable` (2PC) segment is never lost into a clearable one.
     fn absorb(&mut self, other: WriteSegment) {
-        for (relation, agg) in other.tables {
-            self.tables.entry(relation).or_default().opaque |= agg.opaque;
+        for (relation, other_agg) in other.tables {
+            self.tables.entry(relation).or_default().merge(other_agg);
         }
         self.connection.opaque |= other.connection.opaque;
         self.lsn = self.lsn.later_of(other.lsn);
+    }
+}
+
+impl TableAggregate {
+    /// Fold another aggregate for the same table into this one. `opaque`
+    /// dominates (and clears inserts); otherwise inserts combine, degrading to
+    /// opaque if the combined row count overflows.
+    fn merge(&mut self, other: TableAggregate) {
+        self.opaque |= other.opaque;
+        if self.opaque {
+            self.inserts = None;
+            return;
+        }
+        if let Some(other_inserts) = other.inserts {
+            let mut inserts = self.inserts.take().unwrap_or_default();
+            let overflow = other_inserts
+                .statements
+                .iter()
+                .any(|stmt| !inserts.fold(stmt));
+            if overflow {
+                self.opaque = true;
+                self.inserts = None;
+            } else {
+                self.inserts = Some(inserts);
+            }
+        }
     }
 }
 
@@ -164,6 +276,14 @@ impl WriteLog {
         self.segments.is_empty()
     }
 
+    /// Whether any pending write is a row-enumerable INSERT — the only case that
+    /// benefits from deriving the read's per-column ranges (PGC-369).
+    pub(in crate::proxy::connection) fn has_inserts(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|s| s.tables.values().any(|a| a.inserts.is_some()))
+    }
+
     /// Number of live LSN tiers — asserted in tests; a gate/metric consumer
     /// arrives in PGC-368.
     #[allow(dead_code)]
@@ -196,16 +316,25 @@ impl WriteLog {
         let seg = self.active();
         seg.latest_seq = seq;
         match class {
-            // Row-level precision arrives in PGC-369; for now an INSERT is an
-            // opaque write against its table like any other.
+            // Row-enumerable INSERT: keep the rows for row-level disjointness
+            // (PGC-369), unless the table is already opaque or the rows overflow
+            // the cap (then degrade to opaque).
             WriteClass::InsertRows(insert) => {
-                seg.tables
-                    .entry(insert.relation.clone())
-                    .or_default()
-                    .opaque = true;
+                let agg = seg.tables.entry(insert.relation.clone()).or_default();
+                if !agg.opaque {
+                    let mut inserts = agg.inserts.take().unwrap_or_default();
+                    if inserts.fold(insert) {
+                        agg.inserts = Some(inserts);
+                    } else {
+                        agg.opaque = true;
+                        agg.inserts = None;
+                    }
+                }
             }
             WriteClass::Table(relation) => {
-                seg.tables.entry(relation.clone()).or_default().opaque = true;
+                let agg = seg.tables.entry(relation.clone()).or_default();
+                agg.opaque = true;
+                agg.inserts = None;
             }
             WriteClass::Connection => {
                 seg.connection.opaque = true;
@@ -257,40 +386,87 @@ impl WriteLog {
         }
     }
 
-    /// Whether `query` could read data superseded by a still-pending write on
-    /// this connection — i.e. it must be forwarded to origin rather than served
-    /// from cache. `None` ⇒ provably disjoint (safe to serve). Conservative:
-    /// any uncertainty resolves to "intersects". Call [`Self::purge`] first so
-    /// applied writes don't force needless forwards.
-    pub(in crate::proxy::connection) fn intersects(
+    /// The gate's verdict for `query`: whether it could read data superseded by
+    /// a still-pending write on this connection and so must be forwarded rather
+    /// than served from cache. Conservative — any uncertainty forwards. Call
+    /// [`Self::purge`] first so applied writes don't force needless forwards.
+    ///
+    /// `read_ranges` are the read's per-column value ranges for its single table
+    /// (PGC-369), used for row-level INSERT disjointness; `None` (a multi-table
+    /// read, or one whose ranges couldn't be derived) makes any pending insert
+    /// forward conservatively.
+    pub(in crate::proxy::connection) fn decide(
         &self,
         query: &QueryExpr,
-    ) -> Option<RawForwardReason> {
+        read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+    ) -> RawDecision {
         // A connection-scoped pending write (unknown table) poisons every read.
         if self.segments.iter().any(|s| s.connection.opaque) {
-            return Some(RawForwardReason::Connection);
+            return RawDecision::Forward(RawForwardReason::Connection);
         }
-        // Otherwise a read intersects iff it references a table with a pending
-        // write. The walk covers joins, subqueries, and CTEs.
-        query
-            .try_for_each_node::<TableNode, ()>(&mut |table| {
-                if self.table_pending(table) {
-                    ControlFlow::Break(())
-                } else {
+        // Otherwise a read forwards iff it references a table with a pending
+        // write it can't rule out. The walk covers joins, subqueries, and CTEs.
+        let mut disjoint_proved = false;
+        let intersects = query
+            .try_for_each_node::<TableNode, ()>(&mut |table| match self
+                .table_write(table, read_ranges)
+            {
+                TableWrite::Intersects => ControlFlow::Break(()),
+                TableWrite::DisjointInsert => {
+                    disjoint_proved = true;
                     ControlFlow::Continue(())
                 }
+                TableWrite::None => ControlFlow::Continue(()),
             })
-            .is_break()
-            .then_some(RawForwardReason::Table)
+            .is_break();
+        if intersects {
+            RawDecision::Forward(RawForwardReason::Table)
+        } else if disjoint_proved {
+            RawDecision::ServeDisjointInsert
+        } else {
+            RawDecision::Serve
+        }
     }
 
-    /// Whether any segment holds a pending (opaque) write against a table
-    /// matching `table`.
-    fn table_pending(&self, table: &TableNode) -> bool {
-        self.segments.iter().any(|s| {
-            s.tables
+    /// What a referenced table contributes to the gate decision. An opaque write
+    /// always intersects; pending INSERTs intersect unless the read is provably
+    /// disjoint from every inserted row (in which case the table is serveable
+    /// but records that a row-level proof carried it).
+    fn table_write(
+        &self,
+        table: &TableNode,
+        read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+    ) -> TableWrite {
+        let mut outcome = TableWrite::None;
+        for segment in &self.segments {
+            for (relation, agg) in &segment.tables {
+                if !relation_matches(relation, table) {
+                    continue;
+                }
+                if agg.opaque {
+                    return TableWrite::Intersects;
+                }
+                if let Some(inserts) = &agg.inserts {
+                    if read_ranges.is_some_and(|ranges| inserts.disjoint(ranges)) {
+                        outcome = TableWrite::DisjointInsert;
+                    } else {
+                        return TableWrite::Intersects;
+                    }
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Whether a table the read references has a pending row-enumerable INSERT.
+    /// Cheap gate so the read-after-write gate skips the expensive per-column
+    /// range derivation for reads that no pending insert could affect (PGC-369).
+    pub(in crate::proxy::connection) fn table_has_inserts(&self, table: &TableNode) -> bool {
+        self.segments.iter().any(|segment| {
+            segment
+                .tables
                 .iter()
-                .any(|(relation, agg)| agg.opaque && relation_matches(relation, table))
+                .any(|(relation, agg)| agg.inserts.is_some() && relation_matches(relation, table))
         })
     }
 
@@ -326,6 +502,7 @@ fn relation_matches(relation: &RelationRef, table: &TableNode) -> bool {
 mod tests {
     use super::*;
     use crate::query::write::{InsertRow, InsertStatement, RelationRef};
+    use ordered_float::NotNan;
     use std::sync::Arc;
 
     fn table(name: &str) -> WriteClass {
@@ -346,16 +523,17 @@ mod tests {
         }))
     }
 
-    /// Whether `relation` is opaque in any segment (the PGC-368 gate will read
-    /// this; here it just inspects state).
+    /// Whether `relation` has any pending write (opaque or insert) in any segment.
     fn table_pending(log: &WriteLog, relation: &str) -> bool {
         let rel = RelationRef {
             schema: None,
             name: relation.into(),
         };
-        log.segments
-            .iter()
-            .any(|s| s.tables.get(&rel).is_some_and(|a| a.opaque))
+        log.segments.iter().any(|s| {
+            s.tables
+                .get(&rel)
+                .is_some_and(|a| a.opaque || a.inserts.is_some())
+        })
     }
 
     fn connection_pending(log: &WriteLog) -> bool {
@@ -371,12 +549,12 @@ mod tests {
         let mut log = WriteLog::new(true);
         log.record(&table("orders"));
         assert_eq!(
-            log.intersects(&query("SELECT * FROM orders WHERE id = 1")),
-            Some(RawForwardReason::Table)
+            log.decide(&query("SELECT * FROM orders WHERE id = 1"), None),
+            RawDecision::Forward(RawForwardReason::Table)
         );
         assert_eq!(
-            log.intersects(&query("SELECT * FROM items WHERE id = 1")),
-            None
+            log.decide(&query("SELECT * FROM items WHERE id = 1"), None),
+            RawDecision::Serve
         );
     }
 
@@ -385,8 +563,8 @@ mod tests {
         let mut log = WriteLog::new(true);
         log.record(&WriteClass::Connection);
         assert_eq!(
-            log.intersects(&query("SELECT * FROM whatever")),
-            Some(RawForwardReason::Connection)
+            log.decide(&query("SELECT * FROM whatever"), None),
+            RawDecision::Forward(RawForwardReason::Connection)
         );
     }
 
@@ -395,20 +573,25 @@ mod tests {
         let mut log = WriteLog::new(true);
         log.record(&table("orders"));
         assert_eq!(
-            log.intersects(&query(
-                "SELECT * FROM users u JOIN orders o ON u.id = o.uid"
-            )),
-            Some(RawForwardReason::Table)
+            log.decide(
+                &query("SELECT * FROM users u JOIN orders o ON u.id = o.uid"),
+                None
+            ),
+            RawDecision::Forward(RawForwardReason::Table)
         );
         assert_eq!(
-            log.intersects(&query(
-                "SELECT * FROM users WHERE id IN (SELECT uid FROM orders)"
-            )),
-            Some(RawForwardReason::Table)
+            log.decide(
+                &query("SELECT * FROM users WHERE id IN (SELECT uid FROM orders)"),
+                None
+            ),
+            RawDecision::Forward(RawForwardReason::Table)
         );
         assert_eq!(
-            log.intersects(&query("SELECT * FROM users u JOIN items i ON u.id = i.uid")),
-            None
+            log.decide(
+                &query("SELECT * FROM users u JOIN items i ON u.id = i.uid"),
+                None
+            ),
+            RawDecision::Serve
         );
     }
 
@@ -420,15 +603,160 @@ mod tests {
             name: "orders".into(),
         }));
         assert_eq!(
-            log.intersects(&query("SELECT * FROM sales.orders")),
-            Some(RawForwardReason::Table)
+            log.decide(&query("SELECT * FROM sales.orders"), None),
+            RawDecision::Forward(RawForwardReason::Table)
         );
         // Different schema, same name → not the same table.
-        assert_eq!(log.intersects(&query("SELECT * FROM other.orders")), None);
+        assert_eq!(
+            log.decide(&query("SELECT * FROM other.orders"), None),
+            RawDecision::Serve
+        );
         // Unqualified read conservatively matches (search_path unresolvable).
         assert_eq!(
-            log.intersects(&query("SELECT * FROM orders")),
-            Some(RawForwardReason::Table)
+            log.decide(&query("SELECT * FROM orders"), None),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    fn insert_int(table: &str, col: &str, values: &[i64]) -> WriteClass {
+        WriteClass::InsertRows(Arc::new(InsertStatement {
+            relation: RelationRef {
+                schema: None,
+                name: table.into(),
+            },
+            columns: vec![col.into()],
+            rows: values
+                .iter()
+                .map(|v| [Some(LiteralValue::Integer(*v))].into_iter().collect())
+                .collect(),
+        }))
+    }
+
+    fn ranges(col: &str, range: ColumnRange) -> HashMap<EcoString, ColumnRange> {
+        HashMap::from([(col.into(), range)])
+    }
+
+    #[test]
+    fn test_intersects_insert_row_level_disjointness() {
+        let mut log = WriteLog::new(true);
+        log.record(&insert_int("orders", "id", &[2]));
+        let q = query("SELECT * FROM orders WHERE id = 1");
+
+        // Read on id = 5 is disjoint from the inserted id = 2 → serve, and the
+        // row-level proof is recorded.
+        let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+        assert_eq!(log.decide(&q, Some(&r5)), RawDecision::ServeDisjointInsert);
+
+        // Read on id = 2 matches the inserted row → forward (no disjoint proof).
+        let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2)));
+        assert_eq!(
+            log.decide(&q, Some(&r2)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+
+        // Without the read's ranges (unregistered / multi-table) → conservative.
+        assert_eq!(
+            log.decide(&q, None),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_intersects_insert_multi_row() {
+        let mut log = WriteLog::new(true);
+        log.record(&insert_int("orders", "id", &[2, 3, 4]));
+        let q = query("SELECT * FROM orders");
+
+        // 5 is outside every inserted value → disjoint.
+        let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+        assert_eq!(log.decide(&q, Some(&r5)), RawDecision::ServeDisjointInsert);
+
+        // 3 matches one inserted row → intersects.
+        let r3 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(3)));
+        assert_eq!(
+            log.decide(&q, Some(&r3)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_intersects_insert_int_float_numeric() {
+        // A pending INSERT of a float value against an integer-literal read must
+        // compare by numeric value, not `LiteralValue` variant (PGC-124): `= 10`
+        // is disjoint from `10.0` only when the numbers differ.
+        let mut log = WriteLog::new(true);
+        log.record(&WriteClass::InsertRows(Arc::new(InsertStatement {
+            relation: RelationRef {
+                schema: None,
+                name: "orders".into(),
+            },
+            columns: vec!["id".into()],
+            rows: vec![
+                [Some(LiteralValue::Float(NotNan::new(20.0).unwrap()))]
+                    .into_iter()
+                    .collect(),
+            ],
+        })));
+        let q = query("SELECT * FROM orders WHERE id = 10");
+
+        // id = 10 vs inserted 20.0 → provably disjoint → serve.
+        let r10 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(10)));
+        assert_eq!(log.decide(&q, Some(&r10)), RawDecision::ServeDisjointInsert);
+
+        // id = 20 vs inserted 20.0 → numerically equal → intersects.
+        let r20 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(20)));
+        assert_eq!(
+            log.decide(&q, Some(&r20)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_intersects_insert_unknown_cell_forwards() {
+        // A row whose predicate-column value is unknown (DEFAULT/expr) can't be
+        // proven disjoint.
+        let mut log = WriteLog::new(true);
+        log.record(&WriteClass::InsertRows(Arc::new(InsertStatement {
+            relation: RelationRef {
+                schema: None,
+                name: "orders".into(),
+            },
+            columns: vec!["id".into()],
+            rows: vec![[None].into_iter().collect()],
+        })));
+        let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r5)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_insert_overflow_degrades_to_opaque() {
+        let mut log = WriteLog::new(true);
+        let first: Vec<i64> = (0..40).collect();
+        let second: Vec<i64> = (40..90).collect(); // 40 + 50 > cap
+        log.record(&insert_int("orders", "id", &first));
+        log.record(&insert_int("orders", "id", &second));
+        // Degraded to opaque: even a disjoint read forwards.
+        let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_non_insert_write_dominates_inserts() {
+        // An UPDATE (opaque) after an INSERT forces table-level regardless of the
+        // read's disjointness from the earlier inserted rows.
+        let mut log = WriteLog::new(true);
+        log.record(&insert_int("orders", "id", &[2]));
+        log.record(&table("orders"));
+        let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r5)),
+            RawDecision::Forward(RawForwardReason::Table)
         );
     }
 
@@ -439,7 +767,10 @@ mod tests {
         let seq = log.stamp_seq().expect("bound pending");
         log.stamp(seq, Lsn::from_raw(100));
         log.purge(Lsn::from_raw(100));
-        assert_eq!(log.intersects(&query("SELECT * FROM orders")), None);
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), None),
+            RawDecision::Serve
+        );
     }
 
     #[test]

@@ -107,6 +107,117 @@ fn value_satisfies_upper(value: &LiteralValue, bound: &RangeBound) -> Option<boo
     })
 }
 
+/// Exact three-way comparison between an integer and a float value, without the
+/// lossy rounding of `i as f64`. `floor(f)` is recovered exactly as an `i64`
+/// whenever `|f| < 2^63`, so the result never claims a false inequality — which
+/// for read-after-write exclusion (PGC-124) would drop a matching inserted row
+/// and serve stale data.
+#[allow(clippy::cast_possible_truncation)] // floor is integral and |f| < 2^63 → the cast is exact
+fn int_float_cmp(i: i64, f: f64) -> Ordering {
+    // Outside the i64 range `floor(f) as i64` would saturate; resolve by sign.
+    // 2^63 is exactly representable in f64.
+    let two_pow_63 = 2.0_f64.powi(63);
+    if f >= two_pow_63 {
+        return Ordering::Less; // i < f
+    }
+    if f < -two_pow_63 {
+        return Ordering::Greater; // i > f
+    }
+    let floor = f.floor();
+    let floor_int = floor as i64; // exact: integral and within i64 range
+    match i.cmp(&floor_int) {
+        Ordering::Greater => Ordering::Greater,
+        Ordering::Less => Ordering::Less,
+        // i == floor(f): equal only if f has no fractional part, else floor(f) < f.
+        Ordering::Equal if f == floor => Ordering::Equal,
+        Ordering::Equal => Ordering::Less,
+    }
+}
+
+/// Like [`literal_value_order`] but also orders `Integer`/`Float` spellings of
+/// the same value against each other (`10` vs `10.0`), exactly. Scoped to the
+/// read-after-write exclusion path so subsumption's stricter same-type ordering
+/// is unaffected (its precision extension is tracked separately).
+fn literal_value_order_numeric(a: &LiteralValue, b: &LiteralValue) -> Option<Ordering> {
+    match (a, b) {
+        (LiteralValue::Integer(i), LiteralValue::Float(f)) => {
+            Some(int_float_cmp(*i, (*f).into_inner()))
+        }
+        (LiteralValue::Float(f), LiteralValue::Integer(i)) => {
+            Some(int_float_cmp(*i, (*f).into_inner()).reverse())
+        }
+        _ => literal_value_order(a, b),
+    }
+}
+
+/// Whether a concrete `value` falls within a column's `range`.
+///
+/// `Some(true)` = in range, `Some(false)` = provably excluded, `None` =
+/// undecidable (an incomparable value, an `Unknown` range, or a bound that
+/// can't be ordered against the value). Used for read-after-write disjointness
+/// (PGC-124): a `Some(false)` on any predicate column proves an inserted row
+/// can't match the read, so the read may be served despite the pending insert.
+///
+/// Comparisons go through [`literal_value_order_numeric`], so an integer read
+/// literal and a float inserted value (or vice-versa) are compared by numeric
+/// value rather than by `LiteralValue` variant — a `= 10` read is neither
+/// wrongly excluded from nor wrongly forwarded past a pending `10.0`.
+pub(crate) fn column_range_contains(range: &ColumnRange, value: &LiteralValue) -> Option<bool> {
+    if literal_value_is_incomparable(value) {
+        return None;
+    }
+    match range {
+        ColumnRange::Unconstrained => Some(true),
+        ColumnRange::Empty => Some(false),
+        ColumnRange::Unknown => None,
+        ColumnRange::Equal(v) => {
+            literal_value_order_numeric(v, value).map(|o| o == Ordering::Equal)
+        }
+        ColumnRange::InSet(set) => {
+            // Excluded only if provably unequal to *every* element; an element
+            // incomparable to `value` leaves the membership undecidable.
+            let mut all_unequal = true;
+            for elem in set {
+                match literal_value_order_numeric(elem, value) {
+                    Some(Ordering::Equal) => return Some(true),
+                    Some(_) => {}
+                    None => all_unequal = false,
+                }
+            }
+            all_unequal.then_some(false)
+        }
+        ColumnRange::Range {
+            lower,
+            upper,
+            not_equal,
+        } => {
+            if not_equal
+                .iter()
+                .any(|nv| literal_value_order_numeric(nv, value) == Some(Ordering::Equal))
+            {
+                return Some(false);
+            }
+            let lower_ok = match lower {
+                Some(bound) => match literal_value_order_numeric(value, &bound.value)? {
+                    Ordering::Greater => true,
+                    Ordering::Equal => bound.inclusive,
+                    Ordering::Less => false,
+                },
+                None => true,
+            };
+            let upper_ok = match upper {
+                Some(bound) => match literal_value_order_numeric(value, &bound.value)? {
+                    Ordering::Less => true,
+                    Ordering::Equal => bound.inclusive,
+                    Ordering::Greater => false,
+                },
+                None => true,
+            };
+            Some(lower_ok && upper_ok)
+        }
+    }
+}
+
 /// Build a ColumnRange from all constraints on a single column.
 pub(crate) fn column_range_build(constraints: &[&TableConstraint]) -> ColumnRange {
     if constraints.is_empty() {
@@ -495,6 +606,8 @@ pub(super) fn literal_value_order(
 mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
+    use ordered_float::NotNan;
+
     use super::*;
 
     // ========== ColumnRange unit tests ==========
@@ -643,5 +756,123 @@ mod tests {
             }
             _ => panic!("expected Range with upper bound"),
         }
+    }
+
+    // ========== column_range_contains: numeric-aware exclusion (PGC-124) ==========
+
+    fn int(v: i64) -> LiteralValue {
+        LiteralValue::Integer(v)
+    }
+
+    fn float(v: f64) -> LiteralValue {
+        LiteralValue::Float(NotNan::new(v).expect("finite float"))
+    }
+
+    #[test]
+    fn test_contains_equal_same_type() {
+        let range = ColumnRange::Equal(int(10));
+        assert_eq!(column_range_contains(&range, &int(10)), Some(true));
+        assert_eq!(column_range_contains(&range, &int(20)), Some(false));
+    }
+
+    #[test]
+    fn test_contains_equal_int_float_match() {
+        // `WHERE id = 10` against a pending `10.0` must read as equal, so the
+        // row is NOT excluded (the read intersects and forwards).
+        assert_eq!(
+            column_range_contains(&ColumnRange::Equal(int(10)), &float(10.0)),
+            Some(true)
+        );
+        assert_eq!(
+            column_range_contains(&ColumnRange::Equal(float(10.0)), &int(10)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_contains_equal_int_float_disjoint() {
+        // Provably unequal across the type mismatch → excluded (read serves).
+        assert_eq!(
+            column_range_contains(&ColumnRange::Equal(int(10)), &float(20.0)),
+            Some(false)
+        );
+        assert_eq!(
+            column_range_contains(&ColumnRange::Equal(int(10)), &float(10.5)),
+            Some(false)
+        );
+        // A fractional value near the integer is still provably unequal, both
+        // directions (`10` vs `10.1` and `10.1` vs `10`).
+        assert_eq!(
+            column_range_contains(&ColumnRange::Equal(int(10)), &float(10.1)),
+            Some(false)
+        );
+        assert_eq!(
+            column_range_contains(&ColumnRange::Equal(float(10.1)), &int(10)),
+            Some(false)
+        );
+        assert_eq!(int_float_cmp(10, 10.1), Ordering::Less);
+        assert_eq!(int_float_cmp(10, 9.9), Ordering::Greater);
+    }
+
+    #[test]
+    fn test_contains_equal_cross_type_undecidable() {
+        // A text literal vs an integer value can't be proven equal or unequal.
+        assert_eq!(
+            column_range_contains(
+                &ColumnRange::Equal(LiteralValue::String("2".into())),
+                &int(2)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_contains_inset_int_float() {
+        let set = ColumnRange::InSet(HashSet::from([int(1), int(2), int(3)]));
+        assert_eq!(column_range_contains(&set, &float(2.0)), Some(true));
+        assert_eq!(column_range_contains(&set, &float(5.0)), Some(false));
+        assert_eq!(column_range_contains(&set, &int(3)), Some(true));
+    }
+
+    #[test]
+    fn test_contains_inset_incomparable_element_undecidable() {
+        // A mixed-type set with an element incomparable to the value leaves
+        // membership undecidable rather than falsely excluding.
+        let set = ColumnRange::InSet(HashSet::from([LiteralValue::String("x".into()), int(1)]));
+        assert_eq!(column_range_contains(&set, &float(9.0)), None);
+    }
+
+    #[test]
+    fn test_contains_range_int_float_bounds() {
+        // `WHERE price > 5`, integer bound, float inserted values.
+        let range = range_from_comparisons(&[(BinaryOp::GreaterThan, int(5))]);
+        assert_eq!(column_range_contains(&range, &float(4.5)), Some(false));
+        assert_eq!(column_range_contains(&range, &float(5.5)), Some(true));
+        assert_eq!(column_range_contains(&range, &float(5.0)), Some(false)); // exclusive
+    }
+
+    #[test]
+    fn test_contains_range_not_equal_int_float() {
+        let range = range_from_comparisons(&[
+            (BinaryOp::GreaterThanOrEqual, int(0)),
+            (BinaryOp::NotEqual, int(7)),
+        ]);
+        assert_eq!(column_range_contains(&range, &float(7.0)), Some(false));
+        assert_eq!(column_range_contains(&range, &float(8.0)), Some(true));
+    }
+
+    #[test]
+    fn test_int_float_cmp_exact_at_large_magnitude() {
+        // 2^53 + 1 is not representable as f64 (rounds to 2^53); the comparison
+        // must still report inequality rather than a false equal.
+        let big = (1i64 << 53) + 1;
+        assert_eq!(
+            int_float_cmp(big, 9_007_199_254_740_992.0),
+            Ordering::Greater
+        );
+        assert_eq!(int_float_cmp(0, 0.0), Ordering::Equal);
+        assert_eq!(int_float_cmp(3, 3.0), Ordering::Equal);
+        assert_eq!(int_float_cmp(3, 2.9), Ordering::Greater);
+        assert_eq!(int_float_cmp(3, 3.1), Ordering::Less);
     }
 }

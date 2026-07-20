@@ -174,3 +174,118 @@ async fn test_gate_does_not_over_forward_unrelated_tables() -> Result<(), Error>
 
     Ok(())
 }
+
+/// PGC-369: row-level INSERT precision. A cacheable read provably disjoint from
+/// a pending INSERT still serves from cache, while a read the insert could match
+/// forwards and sees the new row — both on the same connection, under CDC lag.
+#[tokio::test]
+async fn test_gate_row_level_insert_precision() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[RAW_ON, ("PGCACHE_FAULT_CDC_APPLY_LAG_MS", "1500")]).await?;
+    ctx.query("CREATE TABLE t (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO t VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    // Register two point reads: id = 1 (present) and id = 3 (absent for now).
+    for sql in [
+        "SELECT v FROM t WHERE id = 1",
+        "SELECT v FROM t WHERE id = 3",
+    ] {
+        let m0 = ctx.metrics().await?;
+        let _ = ctx.simple_query(sql).await?;
+        let _ = assert_cache_miss(&mut ctx, m0).await?;
+        ctx.cache_settle().await?;
+    }
+
+    // A write this connection just made, disjoint from `id = 1`. The explicit
+    // column list keeps it row-enumerable (an omitted list degrades to
+    // table-level for want of catalog column order).
+    ctx.simple_query("INSERT INTO t (id, v) VALUES (3, 30)")
+        .await?;
+
+    // `id = 1` is provably disjoint from the inserted id = 3 → still a cache hit,
+    // and the row-precision counter records the proof.
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query("SELECT v FROM t WHERE id = 1").await?;
+    assert_row_at(&res, 1, &[("v", "10")])?;
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&m, &after);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "disjoint read must serve from cache"
+    );
+    assert!(
+        delta.raw_insert_disjoint >= 1,
+        "row-level disjointness proof expected"
+    );
+
+    // `id = 3` is matched by the pending insert → forwarded, and sees v = 30
+    // (a stale cache hit would return no rows).
+    let res = ctx.simple_query("SELECT v FROM t WHERE id = 3").await?;
+    assert_row_at(&res, 1, &[("v", "30")])?;
+
+    Ok(())
+}
+
+/// PGC-124: the row-level disjointness proof compares by numeric value, not
+/// `LiteralValue` spelling. A read `WHERE k = 10` (integer literal) against a
+/// pending `INSERT ... (10.0)` (float literal) is numerically a match and must
+/// forward — before the numeric-aware fix the two spellings compared unequal,
+/// so the insert was wrongly proven disjoint and the read served a stale cache
+/// result that omitted the new row.
+#[tokio::test]
+async fn test_gate_int_float_numeric_precision() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[RAW_ON, ("PGCACHE_FAULT_CDC_APPLY_LAG_MS", "1500")]).await?;
+    ctx.query("CREATE TABLE nf (id int primary key, k int)", &[])
+        .await?;
+    ctx.query("INSERT INTO nf VALUES (1, 10)", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    // Register both reads up front (a read can only serve disjoint from a
+    // pending insert once it has a resolved cache entry): `k = 10` returns the
+    // seed row, `k = 99` returns none.
+    for sql in [
+        "SELECT id FROM nf WHERE k = 10",
+        "SELECT id FROM nf WHERE k = 99",
+    ] {
+        let m0 = ctx.metrics().await?;
+        let _ = ctx.simple_query(sql).await?;
+        let _ = assert_cache_miss(&mut ctx, m0).await?;
+        ctx.cache_settle().await?;
+    }
+
+    // Insert a second `k = 10` row spelled as a float (`10.0` → k = 10). Under
+    // CDC lag the cache still holds only the seed row.
+    ctx.simple_query("INSERT INTO nf (id, k) VALUES (2, 10.0)")
+        .await?;
+
+    // `k = 10` numerically matches the pending `10.0` → forward → sees both rows
+    // (a stale cache hit would return only the seed row).
+    let res = ctx.simple_query("SELECT id FROM nf WHERE k = 10").await?;
+    assert_eq!(
+        row_count(&res),
+        2,
+        "int/float numeric match must forward, not serve stale"
+    );
+
+    // `k = 99` is provably disjoint from the float insert → still a cache hit,
+    // recorded by the row-precision counter.
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query("SELECT id FROM nf WHERE k = 99").await?;
+    assert_eq!(row_count(&res), 0);
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&m, &after);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "disjoint read must serve from cache"
+    );
+    assert!(
+        delta.raw_insert_disjoint >= 1,
+        "row-level disjointness proof expected"
+    );
+
+    Ok(())
+}

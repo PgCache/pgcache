@@ -1,7 +1,9 @@
 use tokio::sync::watch;
 
 use super::CacheDispatch;
+use crate::cache::types::SharedResolved;
 use crate::pg::Lsn;
+use crate::query::Fingerprint;
 
 /// Connection-side handle to the current [`CacheDispatch`]. Hot-swaps across cache
 /// restarts via a `watch` channel; `None` before the cache is ready or while it
@@ -25,6 +27,16 @@ impl CacheDispatchHandle {
     /// (PGC-124).
     pub fn settled_lsn(&self) -> Option<Lsn> {
         self.rx.borrow().as_ref().map(CacheDispatch::settled_lsn)
+    }
+
+    /// The resolved form of a registered query in the current generation, for the
+    /// read-after-write gate's row-level INSERT check (PGC-124). Reads through the
+    /// watch without cloning the whole dispatch.
+    pub fn cached_query_resolved(&self, fingerprint: Fingerprint) -> Option<SharedResolved> {
+        self.rx
+            .borrow()
+            .as_ref()
+            .and_then(|d| d.cached_query_resolved(fingerprint))
     }
 }
 

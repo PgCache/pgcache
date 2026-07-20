@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     net::SocketAddr,
+    ops::ControlFlow,
     pin::Pin,
     sync::{
         Arc, LazyLock,
@@ -54,6 +55,8 @@ use crate::{
 use super::super::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
 use super::super::query::{Action, CacheabilityCache, ForwardReason, handle_query};
 use super::super::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
+use crate::query::ast::{AstNode, QueryExpr, TableNode};
+use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
 use crate::query::write::WriteClass;
 use crate::result::ReportExt;
 
@@ -257,17 +260,40 @@ async fn handle_connection(
                     if let Some(watermark) = state.dispatch_handle.settled_lsn() {
                         state.write_log.purge(watermark);
                     }
-                    let reason = msg
-                        .cacheable_query()
-                        .and_then(|query| state.write_log.intersects(query.query()));
-                    if let Some(reason) = reason {
+                    if let Some(cq) = msg.cacheable_query() {
+                        // Derive the read's per-column ranges only when a pending
+                        // INSERT could benefit from row-level disjointness
+                        // (PGC-369); an opaque/connection write ignores them, and
+                        // `read_column_ranges` self-limits to reads whose table
+                        // actually has a pending insert.
+                        let read_ranges = state
+                            .write_log
+                            .has_inserts()
+                            .then(|| {
+                                read_column_ranges(
+                                    cq.query(),
+                                    &state.dispatch_handle,
+                                    &state.write_log,
+                                )
+                            })
+                            .flatten();
                         let m = crate::metrics::handles();
-                        match reason {
-                            RawForwardReason::Table => m.raw.forwards_table.increment(1),
-                            RawForwardReason::Connection => m.raw.forwards_connection.increment(1),
+                        match state.write_log.decide(cq.query(), read_ranges.as_ref()) {
+                            RawDecision::Forward(reason) => {
+                                match reason {
+                                    RawForwardReason::Table => m.raw.forwards_table.increment(1),
+                                    RawForwardReason::Connection => {
+                                        m.raw.forwards_connection.increment(1)
+                                    }
+                                }
+                                state.cache_slot_forward_to_origin(msg);
+                                continue;
+                            }
+                            RawDecision::ServeDisjointInsert => {
+                                m.raw.insert_disjoint.increment(1);
+                            }
+                            RawDecision::Serve => {}
                         }
-                        state.cache_slot_forward_to_origin(msg);
-                        continue;
                     }
                 }
 
@@ -426,6 +452,45 @@ pub async fn connection_task(
     }
 
     debug!("task done");
+}
+
+/// The read's per-column value ranges for row-level INSERT disjointness
+/// (PGC-369), or `None` when row precision can't apply: a multi-table read (an
+/// insert into any joined table can grow the result), a read whose single table
+/// has no pending insert (nothing to prove disjoint from), an unregistered query
+/// (no resolved form to derive constraints from), or a WHERE the analyzer
+/// couldn't fully reduce. The pending-insert check comes first so unrelated
+/// reads skip the resolve + constraint analysis entirely.
+fn read_column_ranges(
+    query: &QueryExpr,
+    dispatch_handle: &CacheDispatchHandle,
+    write_log: &WriteLog,
+) -> Option<HashMap<EcoString, ColumnRange>> {
+    let table = single_table(query)?;
+    if !write_log.table_has_inserts(table) {
+        return None;
+    }
+    let fingerprint = query_expr_fingerprint(query);
+    let resolved = dispatch_handle.cached_query_resolved(fingerprint)?;
+    let select = resolved.as_select()?;
+    let constraints = analyze_query_constraints(select);
+    if !constraints.where_analysis_complete {
+        return None;
+    }
+    Some(table_column_ranges(&constraints, &table.name))
+}
+
+/// The single table a read references, or `None` if it references zero or more
+/// than one — a join, self-join, subquery, or CTE is conservative.
+fn single_table(query: &QueryExpr) -> Option<&TableNode> {
+    let mut count = 0usize;
+    let mut found = None;
+    let _ = query.try_for_each_node::<TableNode, ()>(&mut |table| {
+        count += 1;
+        found = Some(table);
+        ControlFlow::Continue(())
+    });
+    (count == 1).then_some(found).flatten()
 }
 
 /// Increment the per-reason counter for a forwarded (non-cacheable) statement.

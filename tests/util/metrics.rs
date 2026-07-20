@@ -53,6 +53,8 @@ pub struct MetricsSnapshot {
     pub raw_writes_recorded: u64,
     /// Commit-LSN probes injected to bound pending writes (PGC-124).
     pub raw_probes: u64,
+    /// Pending-INSERT aggregates the gate proved a read disjoint from (PGC-124).
+    pub raw_insert_disjoint: u64,
 }
 
 /// Fetch metrics via HTTP from the Prometheus endpoint.
@@ -87,6 +89,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut queries_unsupported = 0u64;
     let mut raw_writes_recorded = 0u64;
     let mut raw_probes = 0u64;
+    let mut raw_insert_disjoint = 0u64;
     let mut queries_invalid = 0u64;
     let mut queries_cache_hit = 0u64;
     let mut queries_cache_miss = 0u64;
@@ -136,6 +139,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_queries_unsupported" => queries_unsupported = value,
                 "pgcache_raw_writes_recorded" => raw_writes_recorded = value,
                 "pgcache_raw_probes" => raw_probes = value,
+                "pgcache_raw_insert_disjoint" => raw_insert_disjoint = value,
                 "pgcache_queries_invalid" => queries_invalid = value,
                 "pgcache_queries_cache_hit" => queries_cache_hit = value,
                 "pgcache_queries_cache_miss" => queries_cache_miss = value,
@@ -235,6 +239,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         cacheability_rate,
         raw_writes_recorded,
         raw_probes,
+        raw_insert_disjoint,
     })
 }
 
@@ -286,6 +291,7 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
         protocol_close_local: after.protocol_close_local - before.protocol_close_local,
         raw_writes_recorded: after.raw_writes_recorded - before.raw_writes_recorded,
         raw_probes: after.raw_probes - before.raw_probes,
+        raw_insert_disjoint: after.raw_insert_disjoint - before.raw_insert_disjoint,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

@@ -55,6 +55,9 @@ pub mod names {
     /// Cacheable reads forwarded to origin by the read-after-write gate because
     /// they intersected a pending write. Labeled `scope` = table | connection.
     pub const RAW_FORWARDS: &str = "pgcache.raw.forwards";
+    /// Pending-INSERT aggregates the gate proved a read disjoint from (row-level
+    /// precision, PGC-369) — a read served from cache despite a pending insert.
+    pub const RAW_INSERT_DISJOINT: &str = "pgcache.raw.insert_disjoint";
 
     // Histogram metrics (latency in seconds per Prometheus convention)
     /// End-to-end latency for cache hits: client message received → response written to client.
@@ -385,6 +388,8 @@ pub struct RawHandles {
     pub forwards_table: Counter,
     /// Reads forwarded because a connection-scoped pending write poisons all reads.
     pub forwards_connection: Counter,
+    /// Pending-INSERT aggregates proven disjoint from a read (row-level precision).
+    pub insert_disjoint: Counter,
 }
 
 pub struct ConnHandles {
@@ -777,6 +782,7 @@ impl Handles {
                 probes: metrics::counter!(RAW_PROBES),
                 forwards_table: metrics::counter!(RAW_FORWARDS, "scope" => "table"),
                 forwards_connection: metrics::counter!(RAW_FORWARDS, "scope" => "connection"),
+                insert_disjoint: metrics::counter!(RAW_INSERT_DISJOINT),
             },
         }
     }

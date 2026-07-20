@@ -30,7 +30,7 @@ use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;
 use crate::cache::serve_decision::{DecisionInput, EntrySnapshot, ServeDecision, serve_decide};
 use crate::cache::types::{
-    CacheStateView, CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics,
+    CacheStateView, CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics, SharedResolved,
 };
 use crate::cache::{CacheError, CacheResult, fast_path};
 
@@ -93,6 +93,18 @@ impl CacheDispatch {
     /// stale-high value.
     pub fn settled_lsn(&self) -> Lsn {
         Lsn::from_raw(self.state_view.settled_lsn.load(Ordering::Relaxed))
+    }
+
+    /// The resolved form of a registered (Ready) query, if present. Used by the
+    /// read-after-write gate for row-level INSERT disjointness (PGC-124) — the
+    /// proxy has no catalog to resolve the query itself, so it reads the resolved
+    /// node the writer produced at registration. `None` for unregistered or
+    /// still-loading queries (the gate then forwards conservatively).
+    pub fn cached_query_resolved(&self, fingerprint: Fingerprint) -> Option<SharedResolved> {
+        let view = self.state_view.cached_queries.get(&fingerprint)?;
+        matches!(view.state, CachedQueryState::Ready)
+            .then(|| view.resolved.clone())
+            .flatten()
     }
 
     pub async fn new(
