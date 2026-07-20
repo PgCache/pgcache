@@ -22,9 +22,22 @@
 //! table with any pending write is opaque (any read of it intersects).
 
 use std::collections::{HashMap, VecDeque};
+use std::ops::ControlFlow;
 
 use crate::pg::Lsn;
+use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::write::{RelationRef, WriteClass};
+
+/// Reason the read-after-write gate forwarded a cacheable read to origin
+/// instead of serving it from cache (PGC-124), for metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::proxy::connection) enum RawForwardReason {
+    /// A pending write against a table the read references.
+    Table,
+    /// A connection-scoped pending write (unknown target table): every read on
+    /// the connection intersects until it clears.
+    Connection,
+}
 
 /// Max segments kept before the two oldest are merged. Two — one `active`
 /// gathering writes, one `waiting` to clear — recovers LSN granularity without
@@ -244,6 +257,43 @@ impl WriteLog {
         }
     }
 
+    /// Whether `query` could read data superseded by a still-pending write on
+    /// this connection — i.e. it must be forwarded to origin rather than served
+    /// from cache. `None` ⇒ provably disjoint (safe to serve). Conservative:
+    /// any uncertainty resolves to "intersects". Call [`Self::purge`] first so
+    /// applied writes don't force needless forwards.
+    pub(in crate::proxy::connection) fn intersects(
+        &self,
+        query: &QueryExpr,
+    ) -> Option<RawForwardReason> {
+        // A connection-scoped pending write (unknown table) poisons every read.
+        if self.segments.iter().any(|s| s.connection.opaque) {
+            return Some(RawForwardReason::Connection);
+        }
+        // Otherwise a read intersects iff it references a table with a pending
+        // write. The walk covers joins, subqueries, and CTEs.
+        query
+            .try_for_each_node::<TableNode, ()>(&mut |table| {
+                if self.table_pending(table) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .is_break()
+            .then_some(RawForwardReason::Table)
+    }
+
+    /// Whether any segment holds a pending (opaque) write against a table
+    /// matching `table`.
+    fn table_pending(&self, table: &TableNode) -> bool {
+        self.segments.iter().any(|s| {
+            s.tables
+                .iter()
+                .any(|(relation, agg)| agg.opaque && relation_matches(relation, table))
+        })
+    }
+
     /// Merge the two oldest segments until at most [`MAX_SEGMENTS`] remain. The
     /// merged segment takes the higher (later) LSN and the union of aggregates —
     /// conservative (it clears no earlier than either input) and it never
@@ -258,6 +308,18 @@ impl WriteLog {
             next.absorb(older);
         }
     }
+}
+
+/// Whether a logged write's relation matches a table the read references.
+/// Names must be equal; schemas are compared only when *both* sides are
+/// schema-qualified — an unqualified name on either side conservatively matches,
+/// since the proxy can't resolve `search_path` to a concrete schema.
+fn relation_matches(relation: &RelationRef, table: &TableNode) -> bool {
+    relation.name == table.name
+        && match (&relation.schema, &table.schema) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
 }
 
 #[cfg(test)]
@@ -298,6 +360,86 @@ mod tests {
 
     fn connection_pending(log: &WriteLog) -> bool {
         log.segments.iter().any(|s| s.connection.opaque)
+    }
+
+    fn query(sql: &str) -> QueryExpr {
+        crate::query::ast::query_expr_parse(sql).expect("parse query")
+    }
+
+    #[test]
+    fn test_intersects_referenced_table_only() {
+        let mut log = WriteLog::new(true);
+        log.record(&table("orders"));
+        assert_eq!(
+            log.intersects(&query("SELECT * FROM orders WHERE id = 1")),
+            Some(RawForwardReason::Table)
+        );
+        assert_eq!(
+            log.intersects(&query("SELECT * FROM items WHERE id = 1")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_intersects_connection_scope_poisons_all_reads() {
+        let mut log = WriteLog::new(true);
+        log.record(&WriteClass::Connection);
+        assert_eq!(
+            log.intersects(&query("SELECT * FROM whatever")),
+            Some(RawForwardReason::Connection)
+        );
+    }
+
+    #[test]
+    fn test_intersects_covers_joins_and_subqueries() {
+        let mut log = WriteLog::new(true);
+        log.record(&table("orders"));
+        assert_eq!(
+            log.intersects(&query(
+                "SELECT * FROM users u JOIN orders o ON u.id = o.uid"
+            )),
+            Some(RawForwardReason::Table)
+        );
+        assert_eq!(
+            log.intersects(&query(
+                "SELECT * FROM users WHERE id IN (SELECT uid FROM orders)"
+            )),
+            Some(RawForwardReason::Table)
+        );
+        assert_eq!(
+            log.intersects(&query("SELECT * FROM users u JOIN items i ON u.id = i.uid")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_intersects_schema_matching() {
+        let mut log = WriteLog::new(true);
+        log.record(&WriteClass::Table(RelationRef {
+            schema: Some("sales".into()),
+            name: "orders".into(),
+        }));
+        assert_eq!(
+            log.intersects(&query("SELECT * FROM sales.orders")),
+            Some(RawForwardReason::Table)
+        );
+        // Different schema, same name → not the same table.
+        assert_eq!(log.intersects(&query("SELECT * FROM other.orders")), None);
+        // Unqualified read conservatively matches (search_path unresolvable).
+        assert_eq!(
+            log.intersects(&query("SELECT * FROM orders")),
+            Some(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_intersects_none_after_purge() {
+        let mut log = WriteLog::new(true);
+        log.record(&table("orders"));
+        let seq = log.stamp_seq().expect("bound pending");
+        log.stamp(seq, Lsn::from_raw(100));
+        log.purge(Lsn::from_raw(100));
+        assert_eq!(log.intersects(&query("SELECT * FROM orders")), None);
     }
 
     #[test]

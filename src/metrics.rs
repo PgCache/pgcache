@@ -52,6 +52,9 @@ pub mod names {
     /// Commit-LSN probes injected on connections' origin sockets to bound
     /// pending writes.
     pub const RAW_PROBES: &str = "pgcache.raw.probes";
+    /// Cacheable reads forwarded to origin by the read-after-write gate because
+    /// they intersected a pending write. Labeled `scope` = table | connection.
+    pub const RAW_FORWARDS: &str = "pgcache.raw.forwards";
 
     // Histogram metrics (latency in seconds per Prometheus convention)
     /// End-to-end latency for cache hits: client message received → response written to client.
@@ -378,6 +381,10 @@ pub struct RawHandles {
     pub writes_recorded: Counter,
     pub segment_merges: Counter,
     pub probes: Counter,
+    /// Reads forwarded because they intersect a table-scoped pending write.
+    pub forwards_table: Counter,
+    /// Reads forwarded because a connection-scoped pending write poisons all reads.
+    pub forwards_connection: Counter,
 }
 
 pub struct ConnHandles {
@@ -768,6 +775,8 @@ impl Handles {
                 writes_recorded: metrics::counter!(RAW_WRITES_RECORDED),
                 segment_merges: metrics::counter!(RAW_SEGMENT_MERGES),
                 probes: metrics::counter!(RAW_PROBES),
+                forwards_table: metrics::counter!(RAW_FORWARDS, "scope" => "table"),
+                forwards_connection: metrics::counter!(RAW_FORWARDS, "scope" => "connection"),
             },
         }
     }

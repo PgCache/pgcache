@@ -249,6 +249,28 @@ async fn handle_connection(
 
                 crate::metrics::handles().query.cacheable.increment(1);
 
+                // Read-after-write gate (PGC-124): if this cacheable read could
+                // be superseded by a still-pending write on this connection,
+                // forward it to origin rather than serve a value that predates
+                // the write. Skipped when the log is empty (the common case).
+                if !state.write_log.is_empty() {
+                    if let Some(watermark) = state.dispatch_handle.settled_lsn() {
+                        state.write_log.purge(watermark);
+                    }
+                    let reason = msg
+                        .cacheable_query()
+                        .and_then(|query| state.write_log.intersects(query.query()));
+                    if let Some(reason) = reason {
+                        let m = crate::metrics::handles();
+                        match reason {
+                            RawForwardReason::Table => m.raw.forwards_table.increment(1),
+                            RawForwardReason::Connection => m.raw.forwards_connection.increment(1),
+                        }
+                        state.cache_slot_forward_to_origin(msg);
+                        continue;
+                    }
+                }
+
                 let reply_tx = reply_slot.sender();
                 let timing = state.telemetry.cache_timing_dispatch();
 

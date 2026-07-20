@@ -242,6 +242,13 @@ fn pgcache_cmd(dbs: &TempDBs, listen_port: u16, metrics_port: u16, extra_args: &
     // serves spurious misses.
     cmd.env("PGCACHE_REG_RATE", "1000000");
 
+    // Disable per-connection read-after-write (PGC-124) by default: nearly every
+    // integration test loads its data and reads it back on the *same* connection,
+    // which the gate correctly forwards to origin until CDC catches up — turning
+    // deterministic cache hits into (timing-dependent) misses. Tests that
+    // exercise the feature itself override this (env set later wins).
+    cmd.env("PGCACHE_READ_YOUR_WRITES", "off");
+
     for arg in extra_args {
         cmd.arg(arg);
     }

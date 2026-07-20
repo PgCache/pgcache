@@ -114,6 +114,17 @@ impl CacheMessage {
             CacheMessage::Explain(_, data) => data,
         }
     }
+
+    /// The parsed cacheable query, for a `Query`/`QueryParameterized` message;
+    /// `None` for `Explain` (which isn't a real table read).
+    pub fn cacheable_query(&self) -> Option<&CacheableQuery> {
+        match self {
+            CacheMessage::Query(_, query) | CacheMessage::QueryParameterized(_, query, _, _) => {
+                Some(query)
+            }
+            CacheMessage::Explain(..) => None,
+        }
+    }
 }
 
 /// State of data stream processing
