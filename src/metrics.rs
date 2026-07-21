@@ -62,6 +62,13 @@ pub mod names {
     pub const RAW_SERVE_DISJOINT_INSERT: &str = "pgcache.raw.serve_disjoint_insert";
     pub const RAW_SERVE_DISJOINT_DELETE: &str = "pgcache.raw.serve_disjoint_delete";
     pub const RAW_SERVE_DISJOINT_UPDATE: &str = "pgcache.raw.serve_disjoint_update";
+    /// A table's pending row-predicates overflowed its per-table cap and degraded
+    /// to table-level opaque, losing row-precision until the segment clears. Split
+    /// by cap: inserted rows vs combined update/delete predicates. The signal for
+    /// whether the caps bite in practice (and thus whether raising/indexing them
+    /// is worthwhile).
+    pub const RAW_CAP_DEGRADED_INSERT: &str = "pgcache.raw.cap_degraded_insert";
+    pub const RAW_CAP_DEGRADED_UPDATE_DELETE: &str = "pgcache.raw.cap_degraded_update_delete";
 
     // Histogram metrics (latency in seconds per Prometheus convention)
     /// End-to-end latency for cache hits: client message received → response written to client.
@@ -397,6 +404,10 @@ pub struct RawHandles {
     pub serve_disjoint_insert: Counter,
     pub serve_disjoint_delete: Counter,
     pub serve_disjoint_update: Counter,
+    /// A per-table row-predicate cap overflowed and the table degraded to opaque,
+    /// split by which cap (inserted rows vs update/delete predicates).
+    pub cap_degraded_insert: Counter,
+    pub cap_degraded_update_delete: Counter,
 }
 
 pub struct ConnHandles {
@@ -792,6 +803,8 @@ impl Handles {
                 serve_disjoint_insert: metrics::counter!(RAW_SERVE_DISJOINT_INSERT),
                 serve_disjoint_delete: metrics::counter!(RAW_SERVE_DISJOINT_DELETE),
                 serve_disjoint_update: metrics::counter!(RAW_SERVE_DISJOINT_UPDATE),
+                cap_degraded_insert: metrics::counter!(RAW_CAP_DEGRADED_INSERT),
+                cap_degraded_update_delete: metrics::counter!(RAW_CAP_DEGRADED_UPDATE_DELETE),
             },
         }
     }

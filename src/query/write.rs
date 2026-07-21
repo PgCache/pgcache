@@ -10,8 +10,11 @@ use smallvec::SmallVec;
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 
-/// Row cap for [`WriteClass::InsertRows`]; larger INSERTs degrade to
-/// [`WriteClass::Table`].
+/// Cap on inserted rows tracked for row-level precision: at classification a
+/// larger `INSERT ... VALUES` degrades to [`WriteClass::Table`], and in the
+/// write log a table whose accumulated inserted rows exceed this degrades to
+/// opaque. Update/delete predicates are capped separately (they count
+/// statements, not rows) — see `UPDATE_DELETE_PREDICATE_CAP`.
 pub const INSERT_MAX_ROWS: usize = 64;
 
 /// Effect of a transaction-control statement on the session's

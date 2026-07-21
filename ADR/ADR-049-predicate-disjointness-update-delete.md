@@ -33,7 +33,7 @@ Extraction stays **resolution-free**: UPDATE/DELETE WHERE predicates and SET ass
 ### Negative
 - Precision is single-column equality/range, AND-only, literal values (bind parameters are substituted to literals before the gate, so parameterized statements are covered); multi-column predicates and `IN`/`BETWEEN` are follow-ups.
 - The UPDATE image approximates: a non-literal `SET` makes that column unconstrained, and check #1 forwards any read overlapping the WHERE even when the updated column is irrelevant to the read.
-- Predicate maps are capped per table (sharing the insert-row cap); overflow degrades the table to opaque.
+- Predicate maps are capped per table — inserted rows and update/delete predicates have separate caps (they count rows vs statements) — and overflow degrades the table to opaque. A metric records how often overflow occurs, so the cap can be tuned against real workloads.
 
 ## Implementation Notes
 `column_ranges_disjoint` lives in the constraint range algebra and reuses the numeric-aware comparison from ADR-048's stale-read fix. UPDATE/DELETE classify on the raw tree in the write classifier (reusing the SELECT WHERE converter); the write log stores per-table insert/delete/update predicates and the gate checks them through the shared primitive. This extends ADR-048; UPDATE/DELETE precision beyond single-column, and in-transaction serving, remain out of scope.

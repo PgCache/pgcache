@@ -39,6 +39,12 @@ use crate::query::write::{
     INSERT_MAX_ROWS, InsertStatement, RelationRef, UpdateStatement, WriteClass,
 };
 
+/// Cap on the combined update + delete predicate maps a single table may hold in
+/// one segment before it degrades to opaque. Unlike [`INSERT_MAX_ROWS`] this
+/// counts *statements* (each UPDATE/DELETE contributes one predicate), not rows,
+/// so it is tracked separately even though it currently shares the same value.
+const UPDATE_DELETE_PREDICATE_CAP: usize = 64;
+
 /// Reason the read-after-write gate forwarded a cacheable read to origin
 /// instead of serving it from cache (PGC-124), for metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,14 +271,22 @@ impl TableAggregate {
             let mut inserts = self.inserts.take().unwrap_or_default();
             if !inserts.merge(other_inserts) {
                 self.degrade_opaque();
+                crate::metrics::handles()
+                    .raw
+                    .cap_degraded_insert
+                    .increment(1);
                 return;
             }
             self.inserts = Some(inserts);
         }
         self.deletes.extend(other.deletes);
         self.updates.extend(other.updates);
-        if self.deletes.len() + self.updates.len() > INSERT_MAX_ROWS {
+        if self.deletes.len() + self.updates.len() > UPDATE_DELETE_PREDICATE_CAP {
             self.degrade_opaque();
+            crate::metrics::handles()
+                .raw
+                .cap_degraded_update_delete
+                .increment(1);
         }
     }
 
@@ -398,6 +412,10 @@ impl WriteLog {
                         agg.inserts = Some(inserts);
                     } else {
                         agg.degrade_opaque();
+                        crate::metrics::handles()
+                            .raw
+                            .cap_degraded_insert
+                            .increment(1);
                     }
                 }
             }
@@ -409,8 +427,12 @@ impl WriteLog {
                 if !agg.opaque {
                     agg.deletes
                         .push(column_ranges_from_comparisons(&delete.comparisons));
-                    if agg.deletes.len() + agg.updates.len() > INSERT_MAX_ROWS {
+                    if agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP {
                         agg.degrade_opaque();
+                        crate::metrics::handles()
+                            .raw
+                            .cap_degraded_update_delete
+                            .increment(1);
                     }
                 }
             }
@@ -421,8 +443,12 @@ impl WriteLog {
                 let agg = seg.tables.entry(update.relation.clone()).or_default();
                 if !agg.opaque {
                     agg.updates.push(update_predicate_build(update));
-                    if agg.deletes.len() + agg.updates.len() > INSERT_MAX_ROWS {
+                    if agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP {
                         agg.degrade_opaque();
+                        crate::metrics::handles()
+                            .raw
+                            .cap_degraded_update_delete
+                            .increment(1);
                     }
                 }
             }
@@ -950,7 +976,7 @@ mod tests {
     fn test_delete_overflow_degrades_to_opaque() {
         let mut log = WriteLog::new(true);
         // One past the predicate cap (values are irrelevant — the cap is on count).
-        for _ in 0..=INSERT_MAX_ROWS {
+        for _ in 0..=UPDATE_DELETE_PREDICATE_CAP {
             log.record(&delete_eq("orders", "id", 5));
         }
         // Past the predicate cap the table is opaque: even a disjoint read forwards.
