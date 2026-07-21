@@ -22,6 +22,23 @@ fn row_count(msgs: &[SimpleQueryMessage]) -> usize {
         .count()
 }
 
+/// Register a simple-protocol read into the cache and confirm it reaches a
+/// steady cache hit (miss → settle → hit), the baseline the shape tests write
+/// against.
+async fn register(ctx: &mut TestContext, sql: &str) -> Result<(), Error> {
+    let m = ctx.metrics().await?;
+    let _ = ctx.simple_query(sql).await?;
+    let m = assert_cache_miss(ctx, m).await?;
+    ctx.cache_settle().await?;
+    let _ = ctx.simple_query(sql).await?;
+    let _ = assert_cache_hit(ctx, m).await?;
+    Ok(())
+}
+
+/// Environment for the shape tests: read-after-write on, 1.5s CDC apply lag so a
+/// pending write stays visible across the forward/drain window.
+const RAW_LAG: [(&str, &str); 2] = [RAW_ON, ("PGCACHE_FAULT_CDC_APPLY_LAG_MS", "1500")];
+
 /// PGC-366: writes a connection forwards are recorded into its per-connection
 /// log (observed via the `pgcache.raw.writes_recorded` counter), while pure
 /// reads record nothing.
@@ -340,6 +357,194 @@ async fn test_gate_parameterized_insert_precision() -> Result<(), Error> {
     // id = 3 is matched by the pending parameterized insert → forward, sees v = 30.
     let res = ctx.simple_query("SELECT v FROM t WHERE id = 3").await?;
     assert_row_at(&res, 1, &[("v", "30")])?;
+
+    Ok(())
+}
+
+// ============================================================================
+// #5 — the gate is correct and behavior-neutral across common query shapes.
+// Each test: register a shaped read, write to a table it references, confirm the
+// read forwards fresh data during the lag window, then — once CDC drains — the
+// read cache-hits again.
+// ============================================================================
+
+/// A JOIN read: a write to a joined table grows the result, so the read must
+/// forward during lag; after CDC applies (and re-populates the grown join) it
+/// serves from cache again.
+#[tokio::test]
+async fn test_gate_join_shape() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE ja (id int primary key, bid int)", &[])
+        .await?;
+    ctx.query("CREATE TABLE jb (id int primary key, label text)", &[])
+        .await?;
+    ctx.query("INSERT INTO ja VALUES (1, 10)", &[]).await?;
+    ctx.query("INSERT INTO jb VALUES (10, 'x')", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT ja.id FROM ja JOIN jb ON ja.bid = jb.id";
+    register(&mut ctx, q).await?;
+
+    // A new ja row joining jb(10) grows the result to two rows.
+    ctx.simple_query("INSERT INTO ja VALUES (2, 10)").await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(
+        row_count(&res),
+        2,
+        "join read must forward the grown result"
+    );
+
+    // The growing insert invalidates the cached join; once CDC drains, the next
+    // request re-populates it, and the one after that cache-hits.
+    ctx.cdc_apply_settle().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 2);
+    ctx.cache_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 2);
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// An IN-subquery read: a write to the subquery's table changes membership, so
+/// the read (which references that table inside the subquery) forwards during
+/// lag, then serves from cache once CDC drains.
+#[tokio::test]
+async fn test_gate_subquery_shape() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE su (id int primary key, k int)", &[])
+        .await?;
+    ctx.query("CREATE TABLE sv (id int primary key)", &[])
+        .await?;
+    ctx.query("INSERT INTO su VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.query("INSERT INTO sv VALUES (10)", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT id FROM su WHERE k IN (SELECT id FROM sv) ORDER BY id";
+    register(&mut ctx, q).await?;
+
+    // Admitting sv=20 makes su(2) qualify → the result grows to two rows.
+    ctx.simple_query("INSERT INTO sv VALUES (20)").await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(
+        row_count(&res),
+        2,
+        "subquery read must forward the grown membership"
+    );
+
+    // The growing membership invalidates the cached query; re-populate after the
+    // drain, then confirm the following read cache-hits.
+    ctx.cdc_apply_settle().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 2);
+    ctx.cache_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 2);
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A LIMIT read: an in-place UPDATE to a row inside the limited window changes
+/// the served value, so the read forwards during lag; single-table CDC applies
+/// in place, so it cache-hits (with the new value) once drained.
+#[tokio::test]
+async fn test_gate_limit_shape() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE lt (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO lt VALUES (1, 10), (2, 20), (3, 30)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT id, v FROM lt ORDER BY id LIMIT 2";
+    register(&mut ctx, q).await?;
+
+    ctx.simple_query("UPDATE lt SET v = 99 WHERE id = 1")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("v", "99")])?;
+
+    ctx.cdc_apply_settle().await?;
+    ctx.cache_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("v", "99")])?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A read with a typecast comparison (`col::text = …`): the cast column is
+/// dropped from the read's ranges, so a pending write forwards conservatively;
+/// behavior is neutral once CDC drains.
+#[tokio::test]
+async fn test_gate_typecast_shape() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE tc (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO tc VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT id, v FROM tc WHERE id::text = '1'";
+    register(&mut ctx, q).await?;
+
+    ctx.simple_query("UPDATE tc SET v = 77 WHERE id = 1")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("v", "77")])?;
+
+    ctx.cdc_apply_settle().await?;
+    ctx.cache_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("v", "77")])?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// An extended-protocol parameterized read (`WHERE id = $1`): a pending write on
+/// its table forwards it during lag (the read side stays conservative); it
+/// cache-hits again with the new value once CDC drains.
+#[tokio::test]
+async fn test_gate_prepared_read_shape() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE pt (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO pt VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let read = "SELECT v FROM pt WHERE id = $1";
+    // Register the prepared read and confirm a baseline hit.
+    let m = ctx.metrics().await?;
+    let _ = ctx.query(read, &[&1i32]).await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let _ = ctx.query(read, &[&1i32]).await?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    // Write on the same connection, then read (prepared) during lag → forward,
+    // sees the new value.
+    ctx.simple_query("UPDATE pt SET v = 88 WHERE id = 1")
+        .await?;
+    let rows = ctx.query(read, &[&1i32]).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, i32>(0), 88, "prepared read must forward");
+
+    // Drain: single-table UPDATE applies in place, so the prepared read hits.
+    ctx.cdc_apply_settle().await?;
+    ctx.cache_settle().await?;
+    let m = ctx.metrics().await?;
+    let rows = ctx.query(read, &[&1i32]).await?;
+    assert_eq!(rows[0].get::<_, i32>(0), 88);
+    let _ = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())
 }
