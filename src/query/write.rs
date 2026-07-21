@@ -8,7 +8,7 @@ use std::sync::Arc;
 use ecow::EcoString;
 use smallvec::SmallVec;
 
-use crate::query::ast::LiteralValue;
+use crate::query::ast::{BinaryOp, LiteralValue};
 
 /// Row cap for [`WriteClass::InsertRows`]; larger INSERTs degrade to
 /// [`WriteClass::Table`].
@@ -41,8 +41,12 @@ pub struct RelationRef {
 pub enum WriteClass {
     /// `INSERT ... VALUES` with an explicit column list and extractable rows.
     InsertRows(Arc<InsertStatement>),
-    /// Target relation known, effect not row-enumerable (UPDATE, DELETE,
-    /// MERGE, degraded INSERT forms, COPY FROM, TRUNCATE).
+    /// `DELETE` from a single table with an extractable bare-column WHERE
+    /// predicate (PGC-381). A read whose predicate is provably disjoint from the
+    /// delete's can still be served — a delete only shrinks the result set.
+    DeleteRows(Arc<DeleteStatement>),
+    /// Target relation known, effect not row-enumerable (UPDATE, MERGE,
+    /// degraded INSERT/DELETE forms, COPY FROM, TRUNCATE).
     Table(RelationRef),
     /// Scope unknown: DDL, CALL, DO, EXECUTE, EXPLAIN, multi-statement, or
     /// anything unrecognized.
@@ -66,4 +70,17 @@ pub struct InsertStatement {
     /// Explicit target column names, in statement order.
     pub columns: Vec<EcoString>,
     pub rows: Vec<InsertRow>,
+}
+
+/// One bare-column comparison from a DELETE/UPDATE WHERE, normalized to
+/// `column op literal` (PGC-381).
+pub type WriteComparison = (EcoString, BinaryOp, LiteralValue);
+
+/// An extracted single-table `DELETE` with a bare-column WHERE predicate.
+/// `comparisons` are AND-ed conjuncts (single-column equality/range only);
+/// a predicate-less DELETE never produces this (it classifies as `Table`).
+#[derive(Debug)]
+pub struct DeleteStatement {
+    pub relation: RelationRef,
+    pub comparisons: Vec<WriteComparison>,
 }

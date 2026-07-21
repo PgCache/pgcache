@@ -9,10 +9,39 @@ use std::collections::HashMap;
 
 use ecow::EcoString;
 
+use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::CastTarget;
 
 use super::range::{ColumnRange, column_range_build, column_range_subsumes};
 use super::{QueryConstraints, TableConstraint};
+
+/// Reduce a set of bare-column `column op literal` comparisons (from a raw-tree
+/// DELETE/UPDATE WHERE, PGC-381) to a per-column [`ColumnRange`] map — the write
+/// side of read-after-write disjointness, mirroring [`table_column_ranges`] on
+/// the read side but sourced from comparisons the classifier extracted without
+/// resolution.
+pub(crate) fn column_ranges_from_comparisons(
+    comparisons: &[(EcoString, BinaryOp, LiteralValue)],
+) -> HashMap<EcoString, ColumnRange> {
+    let mut by_column: HashMap<EcoString, Vec<TableConstraint>> = HashMap::new();
+    for (column, op, value) in comparisons {
+        by_column
+            .entry(column.clone())
+            .or_default()
+            .push(TableConstraint::Comparison(
+                column.clone(),
+                *op,
+                value.clone(),
+            ));
+    }
+    by_column
+        .into_iter()
+        .map(|(column, cs)| {
+            let refs: Vec<&TableConstraint> = cs.iter().collect();
+            (column, column_range_build(&refs))
+        })
+        .collect()
+}
 
 /// Reduce a query's constraints on `table` to a per-column [`ColumnRange`], for
 /// the read side of read-after-write disjointness (PGC-124). Only bare-column

@@ -20,8 +20,9 @@
 //! The gate consulting this log ([`WriteLog::decide`]) forwards a read that
 //! could be superseded by a pending write. A non-row-enumerable write makes its
 //! table `opaque` (any read of it intersects); a row-enumerable INSERT keeps its
-//! rows ([`InsertAggregate`]) so a read provably disjoint from every inserted
-//! row can still be served (PGC-369).
+//! rows ([`InsertAggregate`]) and a row-enumerable DELETE keeps its WHERE
+//! predicate, so a read provably disjoint from every inserted row and every
+//! delete predicate can still be served (PGC-369 / PGC-381).
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
@@ -31,7 +32,9 @@ use ecow::EcoString;
 
 use crate::pg::Lsn;
 use crate::query::ast::{AstNode, LiteralValue, QueryExpr, TableNode};
-use crate::query::constraints::{ColumnRange, column_range_contains};
+use crate::query::constraints::{
+    ColumnRange, column_range_contains, column_ranges_disjoint, column_ranges_from_comparisons,
+};
 use crate::query::write::{INSERT_MAX_ROWS, InsertStatement, RelationRef, WriteClass};
 
 /// Reason the read-after-write gate forwarded a cacheable read to origin
@@ -111,14 +114,19 @@ impl PendingLsn {
 /// Pending write state for one table within a segment.
 #[derive(Debug, Default, Clone)]
 pub(in crate::proxy::connection) struct TableAggregate {
-    /// A non-row-enumerable write (UPDATE/DELETE/MERGE/TRUNCATE, or a degraded
-    /// INSERT) is pending against this table → any read of it intersects,
-    /// regardless of `inserts`.
+    /// A non-row-enumerable write (UPDATE/MERGE/TRUNCATE, or a degraded
+    /// INSERT/DELETE) is pending against this table → any read of it intersects,
+    /// regardless of `inserts`/`deletes`.
     pub opaque: bool,
     /// Row-enumerable INSERTs pending against this table (PGC-369). A read that
     /// is provably disjoint from every inserted row may still be served. `None`
     /// once `opaque` is set (an opaque write dominates).
     pub inserts: Option<InsertAggregate>,
+    /// Per-column predicate ranges of DELETEs pending against this table
+    /// (PGC-381), one entry per DELETE. A read whose predicate is provably
+    /// disjoint from every one may still be served — a delete only shrinks.
+    /// Cleared once `opaque` is set.
+    pub deletes: Vec<HashMap<EcoString, ColumnRange>>,
 }
 
 /// Row-enumerable INSERTs pending against one table: the actual inserted rows,
@@ -216,12 +224,12 @@ impl WriteSegment {
 
 impl TableAggregate {
     /// Fold another aggregate for the same table into this one. `opaque`
-    /// dominates (and clears inserts); otherwise inserts combine, degrading to
-    /// opaque if the combined row count overflows.
+    /// dominates (and clears inserts/deletes); otherwise inserts and delete
+    /// predicates combine, degrading to opaque if either overflows its cap.
     fn merge(&mut self, other: TableAggregate) {
         self.opaque |= other.opaque;
         if self.opaque {
-            self.inserts = None;
+            self.degrade_opaque();
             return;
         }
         if let Some(other_inserts) = other.inserts {
@@ -231,12 +239,22 @@ impl TableAggregate {
                 .iter()
                 .any(|stmt| !inserts.fold(stmt));
             if overflow {
-                self.opaque = true;
-                self.inserts = None;
-            } else {
-                self.inserts = Some(inserts);
+                self.degrade_opaque();
+                return;
             }
+            self.inserts = Some(inserts);
         }
+        self.deletes.extend(other.deletes);
+        if self.deletes.len() > INSERT_MAX_ROWS {
+            self.degrade_opaque();
+        }
+    }
+
+    /// Collapse to table-level opaque, discarding the finer insert/delete state.
+    fn degrade_opaque(&mut self) {
+        self.opaque = true;
+        self.inserts = None;
+        self.deletes.clear();
     }
 }
 
@@ -276,12 +294,15 @@ impl WriteLog {
         self.segments.is_empty()
     }
 
-    /// Whether any pending write is a row-enumerable INSERT — the only case that
-    /// benefits from deriving the read's per-column ranges (PGC-369).
-    pub(in crate::proxy::connection) fn has_inserts(&self) -> bool {
-        self.segments
-            .iter()
-            .any(|s| s.tables.values().any(|a| a.inserts.is_some()))
+    /// Whether any pending write is row-enumerable (an INSERT or DELETE) — the
+    /// cases that benefit from deriving the read's per-column ranges (PGC-369,
+    /// PGC-381). Opaque/connection writes ignore them.
+    pub(in crate::proxy::connection) fn has_row_predicates(&self) -> bool {
+        self.segments.iter().any(|s| {
+            s.tables
+                .values()
+                .any(|a| a.inserts.is_some() || !a.deletes.is_empty())
+        })
     }
 
     /// Number of live LSN tiers — asserted in tests; a gate/metric consumer
@@ -326,15 +347,28 @@ impl WriteLog {
                     if inserts.fold(insert) {
                         agg.inserts = Some(inserts);
                     } else {
-                        agg.opaque = true;
-                        agg.inserts = None;
+                        agg.degrade_opaque();
+                    }
+                }
+            }
+            // Row-enumerable DELETE: keep the predicate for row-level
+            // disjointness (PGC-381), unless the table is already opaque or the
+            // predicate count overflows the cap (then degrade to opaque).
+            WriteClass::DeleteRows(delete) => {
+                let agg = seg.tables.entry(delete.relation.clone()).or_default();
+                if !agg.opaque {
+                    agg.deletes
+                        .push(column_ranges_from_comparisons(&delete.comparisons));
+                    if agg.deletes.len() > INSERT_MAX_ROWS {
+                        agg.degrade_opaque();
                     }
                 }
             }
             WriteClass::Table(relation) => {
-                let agg = seg.tables.entry(relation.clone()).or_default();
-                agg.opaque = true;
-                agg.inserts = None;
+                seg.tables
+                    .entry(relation.clone())
+                    .or_default()
+                    .degrade_opaque();
             }
             WriteClass::Connection => {
                 seg.connection.opaque = true;
@@ -429,9 +463,10 @@ impl WriteLog {
     }
 
     /// What a referenced table contributes to the gate decision. An opaque write
-    /// always intersects; pending INSERTs intersect unless the read is provably
-    /// disjoint from every inserted row (in which case the table is serveable
-    /// but records that a row-level proof carried it).
+    /// always intersects; pending INSERTs/DELETEs intersect unless the read is
+    /// provably disjoint from every inserted row and every delete predicate (in
+    /// which case the table is serveable but records that a row-level proof
+    /// carried it).
     fn table_write(
         &self,
         table: &TableNode,
@@ -453,20 +488,28 @@ impl WriteLog {
                         return TableWrite::Intersects;
                     }
                 }
+                for delete in &agg.deletes {
+                    if read_ranges.is_some_and(|ranges| column_ranges_disjoint(ranges, delete)) {
+                        outcome = TableWrite::DisjointInsert;
+                    } else {
+                        return TableWrite::Intersects;
+                    }
+                }
             }
         }
         outcome
     }
 
-    /// Whether a table the read references has a pending row-enumerable INSERT.
-    /// Cheap gate so the read-after-write gate skips the expensive per-column
-    /// range derivation for reads that no pending insert could affect (PGC-369).
-    pub(in crate::proxy::connection) fn table_has_inserts(&self, table: &TableNode) -> bool {
+    /// Whether a table the read references has a pending row-enumerable write (an
+    /// INSERT or DELETE). Cheap gate so the read-after-write gate skips the
+    /// expensive per-column range derivation for reads no such write could affect
+    /// (PGC-369, PGC-381).
+    pub(in crate::proxy::connection) fn table_has_row_predicate(&self, table: &TableNode) -> bool {
         self.segments.iter().any(|segment| {
-            segment
-                .tables
-                .iter()
-                .any(|(relation, agg)| agg.inserts.is_some() && relation_matches(relation, table))
+            segment.tables.iter().any(|(relation, agg)| {
+                (agg.inserts.is_some() || !agg.deletes.is_empty())
+                    && relation_matches(relation, table)
+            })
         })
     }
 
@@ -501,7 +544,8 @@ fn relation_matches(relation: &RelationRef, table: &TableNode) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::write::{InsertRow, InsertStatement, RelationRef};
+    use crate::query::ast::BinaryOp;
+    use crate::query::write::{DeleteStatement, InsertRow, InsertStatement, RelationRef};
     use ordered_float::NotNan;
     use std::sync::Arc;
 
@@ -756,6 +800,80 @@ mod tests {
         let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
         assert_eq!(
             log.decide(&query("SELECT * FROM orders"), Some(&r5)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    fn delete_eq(table: &str, col: &str, value: i64) -> WriteClass {
+        WriteClass::DeleteRows(Arc::new(DeleteStatement {
+            relation: RelationRef {
+                schema: None,
+                name: table.into(),
+            },
+            comparisons: vec![(col.into(), BinaryOp::Equal, LiteralValue::Integer(value))],
+        }))
+    }
+
+    #[test]
+    fn test_decide_delete_predicate_disjointness() {
+        let mut log = WriteLog::new(true);
+        log.record(&delete_eq("orders", "id", 5));
+        let q = query("SELECT * FROM orders WHERE id = 1");
+
+        // Read on id = 1 is disjoint from the delete's id = 5 → serve.
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(log.decide(&q, Some(&r1)), RawDecision::ServeDisjointInsert);
+
+        // Read on id = 5 overlaps the delete predicate → forward.
+        let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+        assert_eq!(
+            log.decide(&q, Some(&r5)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+
+        // Without the read's ranges (multi-table / unregistered) → conservative.
+        assert_eq!(
+            log.decide(&q, None),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_decide_delete_only_forwards_referenced_table() {
+        let mut log = WriteLog::new(true);
+        log.record(&delete_eq("orders", "id", 5));
+        // A read of an unrelated table is unaffected.
+        assert_eq!(
+            log.decide(&query("SELECT * FROM items WHERE id = 5"), None),
+            RawDecision::Serve
+        );
+    }
+
+    #[test]
+    fn test_delete_overflow_degrades_to_opaque() {
+        let mut log = WriteLog::new(true);
+        // One past the predicate cap (values are irrelevant — the cap is on count).
+        for _ in 0..=INSERT_MAX_ROWS {
+            log.record(&delete_eq("orders", "id", 5));
+        }
+        // Past the predicate cap the table is opaque: even a disjoint read forwards.
+        let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_opaque_write_dominates_delete() {
+        // A later UPDATE (opaque) forces table-level regardless of the read's
+        // disjointness from an earlier delete predicate.
+        let mut log = WriteLog::new(true);
+        log.record(&delete_eq("orders", "id", 5));
+        log.record(&table("orders"));
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
             RawDecision::Forward(RawForwardReason::Table)
         );
     }

@@ -279,8 +279,6 @@ fn bound_below(upper: &Option<RangeBound>, lower: &Option<RangeBound>) -> bool {
 /// has disjoint ranges. A column present in only one map is unconstrained in the
 /// other, so it can't establish disjointness. Sound in one direction: only
 /// returns `true` when disjoint is provable.
-// Consumed by the UPDATE/DELETE gate in PGC-381 onward; unit-tested here now.
-#[allow(dead_code)]
 pub(crate) fn column_ranges_disjoint(
     a: &HashMap<EcoString, ColumnRange>,
     b: &HashMap<EcoString, ColumnRange>,

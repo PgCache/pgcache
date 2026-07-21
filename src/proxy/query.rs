@@ -622,6 +622,16 @@ mod tests {
             Action::ForwardWrite(ForwardReason::UnsupportedStatement, WriteClass::Table(_)) => {}
             other => panic!("expected Table write, got {:?}", discriminant_name(&other)),
         }
+        match analyze_fresh("DELETE FROM t WHERE id = 1", &fv) {
+            Action::ForwardWrite(
+                ForwardReason::UnsupportedStatement,
+                WriteClass::DeleteRows(_),
+            ) => {}
+            other => panic!(
+                "expected DeleteRows write, got {:?}",
+                discriminant_name(&other)
+            ),
+        }
     }
 
     #[test]

@@ -548,3 +548,64 @@ async fn test_gate_prepared_read_shape() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-381: row-level DELETE precision. A read provably disjoint from a pending
+/// DELETE's predicate still serves from cache, while a read the delete removes
+/// forwards and sees the deletion — both on the same connection, under CDC lag.
+#[tokio::test]
+async fn test_gate_delete_row_level_precision() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[RAW_ON, ("PGCACHE_FAULT_CDC_APPLY_LAG_MS", "1500")]).await?;
+    ctx.query("CREATE TABLE d (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO d VALUES (1, 10), (2, 20), (3, 30)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    for sql in [
+        "SELECT v FROM d WHERE id = 1",
+        "SELECT v FROM d WHERE id = 3",
+    ] {
+        let m0 = ctx.metrics().await?;
+        let _ = ctx.simple_query(sql).await?;
+        let _ = assert_cache_miss(&mut ctx, m0).await?;
+        ctx.cache_settle().await?;
+    }
+
+    // Delete id = 1 on this connection; id = 3 is disjoint from the delete.
+    ctx.simple_query("DELETE FROM d WHERE id = 1").await?;
+
+    // id = 3 is provably disjoint from the pending delete → still a cache hit,
+    // recorded by the row-precision counter.
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query("SELECT v FROM d WHERE id = 3").await?;
+    assert_row_at(&res, 1, &[("v", "30")])?;
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "disjoint read must serve from cache"
+    );
+    assert!(
+        delta.raw_insert_disjoint >= 1,
+        "row-level disjointness proof expected"
+    );
+
+    // id = 1 is removed by the pending delete → forwarded, sees zero rows (a
+    // stale cache hit would still return v = 10).
+    let res = ctx.simple_query("SELECT v FROM d WHERE id = 1").await?;
+    assert_eq!(
+        row_count(&res),
+        0,
+        "deleted row must not be served from cache"
+    );
+
+    // Once CDC applies the single-table delete in place, the read cache-hits
+    // again (now empty).
+    ctx.cdc_apply_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query("SELECT v FROM d WHERE id = 1").await?;
+    assert_eq!(row_count(&res), 0);
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}

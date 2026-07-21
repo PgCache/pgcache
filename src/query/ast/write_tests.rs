@@ -6,7 +6,8 @@ use ecow::EcoString;
 
 use crate::query::ast::*;
 use crate::query::write::{
-    INSERT_MAX_ROWS, InsertStatement, RelationRef, TransactionBoundary, WriteClass,
+    DeleteStatement, INSERT_MAX_ROWS, InsertStatement, RelationRef, TransactionBoundary,
+    WriteClass,
 };
 
 /// Classify one SQL statement through the public entry point.
@@ -190,14 +191,80 @@ fn test_insert_with_dml_cte_is_connection_scope() {
 // ---------- Other DML ----------
 
 #[test]
-fn test_update_delete_merge_are_table_scope() {
+fn test_update_merge_are_table_scope() {
     for sql in [
         "UPDATE t SET a = 1 WHERE b = 2",
-        "DELETE FROM t WHERE a = 1",
         "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN UPDATE SET b = s.b",
     ] {
         assert_eq!(table_name(&classify_write(sql)).name, "t", "for {sql:?}");
     }
+}
+
+// ---------- DELETE predicate extraction (PGC-381) ----------
+
+fn delete_rows(sql: &str) -> std::sync::Arc<DeleteStatement> {
+    match classify_write(sql) {
+        WriteClass::DeleteRows(delete) => delete,
+        other => panic!("expected DeleteRows for {sql:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_delete_extracts_bare_column_predicate() {
+    let del = delete_rows("DELETE FROM t WHERE id = 5 AND qty > 10");
+    assert_eq!(del.relation.name, "t");
+    assert_eq!(
+        del.comparisons,
+        vec![
+            (
+                EcoString::from("id"),
+                BinaryOp::Equal,
+                LiteralValue::Integer(5)
+            ),
+            (
+                EcoString::from("qty"),
+                BinaryOp::GreaterThan,
+                LiteralValue::Integer(10)
+            ),
+        ]
+    );
+}
+
+#[test]
+fn test_delete_flips_literal_op_column() {
+    // `5 = id` normalizes to `id = 5`.
+    let del = delete_rows("DELETE FROM t WHERE 5 = id");
+    assert_eq!(
+        del.comparisons,
+        vec![(
+            EcoString::from("id"),
+            BinaryOp::Equal,
+            LiteralValue::Integer(5)
+        )]
+    );
+}
+
+#[test]
+fn test_delete_non_extractable_predicate_is_table() {
+    // OR, whole-table (no WHERE), function, cross-column, subquery, USING join →
+    // table-level opaque, as before.
+    for sql in [
+        "DELETE FROM t WHERE a = 1 OR b = 2",
+        "DELETE FROM t",
+        "DELETE FROM t WHERE lower(a) = 'x'",
+        "DELETE FROM t WHERE a = b",
+        "DELETE FROM t WHERE id IN (SELECT id FROM s)",
+        "DELETE FROM t USING s WHERE t.a = s.a",
+        "DELETE FROM t WHERE id BETWEEN 1 AND 5",
+    ] {
+        assert_eq!(table_name(&classify_write(sql)).name, "t", "for {sql:?}");
+    }
+}
+
+#[test]
+fn test_delete_with_dml_cte_is_connection_scope() {
+    let sql = "WITH x AS (INSERT INTO other (a) VALUES (1) RETURNING a) DELETE FROM t WHERE a = 1";
+    assert!(matches!(classify_write(sql), WriteClass::Connection));
 }
 
 #[test]

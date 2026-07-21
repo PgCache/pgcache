@@ -11,12 +11,13 @@ use ecow::EcoString;
 use pg_query::pg_nodes as pg;
 
 use crate::query::write::{
-    INSERT_MAX_ROWS, InsertRow, InsertStatement, RelationRef, TransactionBoundary, WriteClass,
+    DeleteStatement, INSERT_MAX_ROWS, InsertRow, InsertStatement, RelationRef,
+    TransactionBoundary, WriteClass, WriteComparison,
 };
 
-use super::super::LiteralValue;
 use super::super::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
-use super::where_clause::{const_value_extract, param_ref_extract};
+use super::super::{BinaryExpr, BinaryOp, LiteralValue, ScalarExpr, WhereExpr};
+use super::where_clause::{const_value_extract, param_ref_extract, where_expr_convert};
 
 /// Classification of a non-SELECT root statement.
 pub(super) enum NonSelectClass {
@@ -37,10 +38,7 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                 let s = cast::<pg::UpdateStmt>(stmt);
                 Write(dml_table_classify((*s).relation, (*s).withClause))
             }
-            pg::NodeTag_T_DeleteStmt => {
-                let s = cast::<pg::DeleteStmt>(stmt);
-                Write(dml_table_classify((*s).relation, (*s).withClause))
-            }
+            pg::NodeTag_T_DeleteStmt => Write(delete_classify(cast::<pg::DeleteStmt>(stmt))),
             pg::NodeTag_T_MergeStmt => {
                 let s = cast::<pg::MergeStmt>(stmt);
                 Write(dml_table_classify((*s).relation, (*s).withClause))
@@ -270,6 +268,88 @@ unsafe fn insert_classify(insert: *const pg::InsertStmt) -> WriteClass {
             columns,
             rows,
         }))
+    }
+}
+
+/// Classify a `DELETE`. A single-table delete with a bare-column, AND-only
+/// WHERE predicate becomes row-enumerable [`WriteClass::DeleteRows`] so a read
+/// provably disjoint from the delete's predicate can still be served (PGC-381).
+/// A DML CTE, `USING` join, missing/whole-table WHERE, or any predicate the
+/// walker can't reduce degrades to table-level opaque.
+unsafe fn delete_classify(s: *const pg::DeleteStmt) -> WriteClass {
+    unsafe {
+        let relation = (*s).relation;
+        if relation.is_null() || with_clause_has_dml((*s).withClause) {
+            return WriteClass::Connection;
+        }
+        let table = table_class(relation);
+        let WriteClass::Table(relation_ref) = &table else {
+            return table;
+        };
+        // USING joins other tables into the predicate — not single-table.
+        if !list_is_empty((*s).usingClause) {
+            return table;
+        }
+        let where_node = (*s).whereClause as NodePtr;
+        if where_node.is_null() {
+            return table; // whole-table delete: any read of it intersects
+        }
+        let Ok(where_expr) = where_expr_convert(where_node) else {
+            return table; // unconvertible WHERE → opaque
+        };
+        match where_expr_comparisons(&where_expr) {
+            Some(comparisons) if !comparisons.is_empty() => {
+                WriteClass::DeleteRows(Arc::new(DeleteStatement {
+                    relation: relation_ref.clone(),
+                    comparisons,
+                }))
+            }
+            _ => table, // non-extractable predicate → opaque
+        }
+    }
+}
+
+/// Reduce a WHERE to its bare-column AND-conjunct comparisons, or `None` if any
+/// part isn't a single-column `col op literal` comparison (OR, NOT, IN/BETWEEN,
+/// subquery, function, cast, cross-column) — the whole predicate then degrades
+/// to opaque. Shared by DELETE (and UPDATE, PGC-382).
+fn where_expr_comparisons(where_expr: &WhereExpr) -> Option<Vec<WriteComparison>> {
+    let mut out = Vec::new();
+    where_expr_comparisons_collect(where_expr, &mut out).then_some(out)
+}
+
+fn where_expr_comparisons_collect(where_expr: &WhereExpr, out: &mut Vec<WriteComparison>) -> bool {
+    match where_expr {
+        WhereExpr::Binary(b) if b.op == BinaryOp::And => {
+            where_expr_comparisons_collect(&b.lexpr, out)
+                && where_expr_comparisons_collect(&b.rexpr, out)
+        }
+        WhereExpr::Binary(b) => match comparison_extract(b) {
+            Some(comparison) => {
+                out.push(comparison);
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Extract `column op literal` (or `literal op column`, flipped) from a binary
+/// comparison; `None` for logical/LIKE ops or non-bare-column operands.
+fn comparison_extract(b: &BinaryExpr) -> Option<WriteComparison> {
+    // `op_flip` returns `None` for non-comparison ops (AND/OR/LIKE/…).
+    b.op.op_flip()?;
+    match (b.lexpr.as_ref(), b.rexpr.as_ref()) {
+        (
+            WhereExpr::Scalar(ScalarExpr::Column(col)),
+            WhereExpr::Scalar(ScalarExpr::Literal(lit)),
+        ) => Some((col.column.clone(), b.op, lit.clone())),
+        (
+            WhereExpr::Scalar(ScalarExpr::Literal(lit)),
+            WhereExpr::Scalar(ScalarExpr::Column(col)),
+        ) => Some((col.column.clone(), b.op.op_flip()?, lit.clone())),
+        _ => None,
     }
 }
 

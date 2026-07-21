@@ -262,13 +262,13 @@ async fn handle_connection(
                     }
                     if let Some(cq) = msg.cacheable_query() {
                         // Derive the read's per-column ranges only when a pending
-                        // INSERT could benefit from row-level disjointness
-                        // (PGC-369); an opaque/connection write ignores them, and
-                        // `read_column_ranges` self-limits to reads whose table
-                        // actually has a pending insert.
+                        // INSERT/DELETE could benefit from row-level disjointness
+                        // (PGC-369/381); an opaque/connection write ignores them,
+                        // and `read_column_ranges` self-limits to reads whose
+                        // table actually has such a pending write.
                         let read_ranges = state
                             .write_log
-                            .has_inserts()
+                            .has_row_predicates()
                             .then(|| {
                                 read_column_ranges(
                                     cq.query(),
@@ -454,20 +454,20 @@ pub async fn connection_task(
     debug!("task done");
 }
 
-/// The read's per-column value ranges for row-level INSERT disjointness
-/// (PGC-369), or `None` when row precision can't apply: a multi-table read (an
-/// insert into any joined table can grow the result), a read whose single table
-/// has no pending insert (nothing to prove disjoint from), an unregistered query
-/// (no resolved form to derive constraints from), or a WHERE the analyzer
-/// couldn't fully reduce. The pending-insert check comes first so unrelated
-/// reads skip the resolve + constraint analysis entirely.
+/// The read's per-column value ranges for row-level INSERT/DELETE disjointness
+/// (PGC-369/381), or `None` when row precision can't apply: a multi-table read
+/// (a write to any referenced table can affect the result), a read whose single
+/// table has no pending row-enumerable write (nothing to prove disjoint from),
+/// an unregistered query (no resolved form to derive constraints from), or a
+/// WHERE the analyzer couldn't fully reduce. The pending-write check comes first
+/// so unrelated reads skip the resolve + constraint analysis entirely.
 fn read_column_ranges(
     query: &QueryExpr,
     dispatch_handle: &CacheDispatchHandle,
     write_log: &WriteLog,
 ) -> Option<HashMap<EcoString, ColumnRange>> {
     let table = single_table(query)?;
-    if !write_log.table_has_inserts(table) {
+    if !write_log.table_has_row_predicate(table) {
         return None;
     }
     let fingerprint = query_expr_fingerprint(query);
