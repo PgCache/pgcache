@@ -33,7 +33,7 @@ use ecow::EcoString;
 use crate::pg::Lsn;
 use crate::query::ast::{AstNode, LiteralValue, QueryExpr, TableNode};
 use crate::query::constraints::{
-    ColumnRange, column_range_contains, column_ranges_disjoint, column_ranges_from_comparisons,
+    ColumnRange, column_ranges_disjoint, column_ranges_from_comparisons,
 };
 use crate::query::write::{
     INSERT_MAX_ROWS, InsertStatement, RelationRef, UpdateStatement, WriteClass,
@@ -144,55 +144,64 @@ pub(in crate::proxy::connection) struct UpdatePredicate {
     image_ranges: HashMap<EcoString, ColumnRange>,
 }
 
-/// Row-enumerable INSERTs pending against one table: the actual inserted rows,
-/// bounded by [`INSERT_MAX_ROWS`] total. Beyond the cap the table degrades to
-/// `opaque` (table-level) — a bulk load broadly invalidates cached reads anyway.
+/// Row-enumerable INSERTs pending against one table, as one point-predicate
+/// range map per inserted row (PGC-383) — each row is a conjunction of
+/// `column = value` over its known cells. Bounded by [`INSERT_MAX_ROWS`] rows;
+/// beyond the cap the table degrades to `opaque`.
 #[derive(Debug, Clone, Default)]
 pub(in crate::proxy::connection) struct InsertAggregate {
-    statements: Vec<Arc<InsertStatement>>,
-    rows: usize,
+    rows: Vec<HashMap<EcoString, ColumnRange>>,
 }
 
 impl InsertAggregate {
     /// Fold in another INSERT's rows. Returns `false` if the total would exceed
     /// [`INSERT_MAX_ROWS`], signalling the caller to degrade the table to opaque.
     fn fold(&mut self, insert: &Arc<InsertStatement>) -> bool {
-        let total = self.rows + insert.rows.len();
-        if total > INSERT_MAX_ROWS {
+        if self.rows.len() + insert.rows.len() > INSERT_MAX_ROWS {
             return false;
         }
-        self.rows = total;
-        self.statements.push(Arc::clone(insert));
+        self.rows
+            .extend(insert.rows.iter().map(|row| insert_row_ranges(insert, row)));
         true
     }
 
-    /// Whether every inserted row is provably excluded by the read's per-column
-    /// ranges — i.e. no inserted row can match the read, so it may be served. A
-    /// row is excluded when some predicate column with a known value in that row
-    /// falls outside the read's range for that column.
+    /// Fold another aggregate's rows in. Returns `false` on cap overflow.
+    fn merge(&mut self, other: InsertAggregate) -> bool {
+        if self.rows.len() + other.rows.len() > INSERT_MAX_ROWS {
+            return false;
+        }
+        self.rows.extend(other.rows);
+        true
+    }
+
+    /// Whether the read is provably disjoint from every inserted row — i.e. no
+    /// inserted row can match the read, so it may be served. An insert row is a
+    /// point predicate, so this is the same [`column_ranges_disjoint`] test used
+    /// for DELETE/UPDATE predicates.
     fn disjoint(&self, read_ranges: &HashMap<EcoString, ColumnRange>) -> bool {
-        self.statements.iter().all(|stmt| {
-            stmt.rows
-                .iter()
-                .all(|row| row_excluded(stmt, row, read_ranges))
-        })
+        self.rows
+            .iter()
+            .all(|row| column_ranges_disjoint(read_ranges, row))
     }
 }
 
-/// Whether an inserted row cannot match a read with the given per-column ranges.
-fn row_excluded(
-    stmt: &InsertStatement,
+/// The point-predicate range map for one inserted row: `column = value` over its
+/// known cells (an unknown DEFAULT/expression cell leaves that column
+/// unconstrained, so it can never establish disjointness).
+fn insert_row_ranges(
+    insert: &InsertStatement,
     row: &[Option<LiteralValue>],
-    read_ranges: &HashMap<EcoString, ColumnRange>,
-) -> bool {
-    stmt.columns.iter().zip(row).any(|(column, value)| {
-        value.as_ref().is_some_and(|v| {
-            read_ranges
-                .get(column)
-                .and_then(|range| column_range_contains(range, v))
-                == Some(false)
+) -> HashMap<EcoString, ColumnRange> {
+    insert
+        .columns
+        .iter()
+        .zip(row)
+        .filter_map(|(column, value)| {
+            value
+                .as_ref()
+                .map(|v| (column.clone(), ColumnRange::Equal(v.clone())))
         })
-    })
+        .collect()
 }
 
 /// Connection-scoped pending writes whose target table is unknown (DDL, CALL,
@@ -249,11 +258,7 @@ impl TableAggregate {
         }
         if let Some(other_inserts) = other.inserts {
             let mut inserts = self.inserts.take().unwrap_or_default();
-            let overflow = other_inserts
-                .statements
-                .iter()
-                .any(|stmt| !inserts.fold(stmt));
-            if overflow {
+            if !inserts.merge(other_inserts) {
                 self.degrade_opaque();
                 return;
             }
