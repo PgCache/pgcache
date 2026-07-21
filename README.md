@@ -145,7 +145,7 @@ install it yourself when running pgcache from source or against a PostgreSQL you
 
 ## Status
 
-pgcache is under active development and not yet recommended for production use.
+pgcache is under active development, pre-1.0, and has not been battle-tested at scale.
 
 - **PostgreSQL:** 16, 17, and 18.
 - **Deployment:** AWS (Marketplace AMI), Docker, or bare metal.
