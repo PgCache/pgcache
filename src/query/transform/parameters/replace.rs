@@ -5,6 +5,7 @@ use rootcause::Report;
 
 use crate::cache::QueryParameters;
 use crate::query::ast::{LiteralValue, QueryExpr, ScalarExpr, SelectNode};
+use crate::query::write::{InsertRow, InsertStatement};
 
 use super::super::walk::{QueryWalkerMut, query_expr_walk_mut, select_node_walk_mut};
 use super::super::{AstTransformError, AstTransformResult};
@@ -31,6 +32,31 @@ pub fn select_node_parameters_replace(
 ) -> AstTransformResult<()> {
     let mut replacer = ParameterReplacer { parameters };
     select_node_walk_mut(select_node, &mut replacer)
+}
+
+/// Substitute Bind values for the `$N` cells of a parameterized `INSERT` write
+/// classification (PGC-370), so the read-after-write gate can prove an inserted
+/// row disjoint from a read instead of degrading to table-conservative. Concrete
+/// and unknown (`None`) cells are left untouched. Errors (out-of-bounds index,
+/// undecodable value) propagate so the caller degrades the whole write to
+/// table-level — a partially-substituted row must never be trusted.
+pub(crate) fn insert_statement_parameterize(
+    stmt: &InsertStatement,
+    parameters: &QueryParameters,
+) -> AstTransformResult<InsertStatement> {
+    let mut rows = Vec::with_capacity(stmt.rows.len());
+    for row in &stmt.rows {
+        let mut new_row: InsertRow = row.clone();
+        for cell in new_row.iter_mut().flatten() {
+            literal_value_parameters_replace(cell, parameters)?;
+        }
+        rows.push(new_row);
+    }
+    Ok(InsertStatement {
+        relation: stmt.relation.clone(),
+        columns: stmt.columns.clone(),
+        rows,
+    })
 }
 
 struct ParameterReplacer<'a> {
@@ -104,10 +130,14 @@ mod tests {
     use postgres_types::Type as PgType;
 
     use crate::cache::QueryParameters;
-    use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_parse};
+    use crate::query::ast::{Deparse, LiteralValue, QueryBody, SelectNode, query_expr_parse};
+    use crate::query::write::InsertStatement;
 
     use super::super::super::AstTransformError;
-    use super::{query_expr_parameters_replace, select_node_parameters_replace};
+    use super::{
+        insert_statement_parameterize, query_expr_parameters_replace,
+        select_node_parameters_replace,
+    };
 
     fn parse_select_node(sql: &str) -> SelectNode {
         let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
@@ -366,5 +396,59 @@ mod tests {
         );
         assert!(!buf.contains("$1"), "No unreplaced $1 should remain: {buf}");
         assert!(!buf.contains("$2"), "No unreplaced $2 should remain: {buf}");
+    }
+
+    fn insert_stmt(cells: Vec<Option<LiteralValue>>) -> InsertStatement {
+        InsertStatement {
+            relation: crate::query::write::RelationRef {
+                schema: None,
+                name: "t".into(),
+            },
+            columns: vec!["id".into(), "v".into()],
+            rows: vec![cells.into_iter().collect()],
+        }
+    }
+
+    fn param(n: u32) -> Option<LiteralValue> {
+        Some(LiteralValue::Parameter(format!("${n}").into()))
+    }
+
+    #[test]
+    fn test_insert_statement_parameterize_substitutes_cells() {
+        let stmt = insert_stmt(vec![param(1), param(2)]);
+        let params = typed_text_params(vec![
+            (Some(b"3"), PgType::INT4),
+            (Some(b"30"), PgType::INT4),
+        ]);
+        let out = insert_statement_parameterize(&stmt, &params).expect("substitute");
+        assert_eq!(
+            out.rows[0].as_slice(),
+            [
+                Some(LiteralValue::Integer(3)),
+                Some(LiteralValue::Integer(30))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_insert_statement_parameterize_preserves_concrete_and_unknown() {
+        // A concrete literal and an unknown (`None`, e.g. DEFAULT) cell survive
+        // untouched alongside a substituted parameter.
+        let stmt = insert_stmt(vec![Some(LiteralValue::Integer(9)), None]);
+        let params = typed_text_params(vec![(Some(b"3"), PgType::INT4)]);
+        let out = insert_statement_parameterize(&stmt, &params).expect("substitute");
+        assert_eq!(
+            out.rows[0].as_slice(),
+            [Some(LiteralValue::Integer(9)), None]
+        );
+    }
+
+    #[test]
+    fn test_insert_statement_parameterize_out_of_bounds_errors() {
+        // `$2` with only one bound value → error, so the caller degrades to
+        // table-conservative rather than trusting a partial row.
+        let stmt = insert_stmt(vec![param(1), param(2)]);
+        let params = typed_text_params(vec![(Some(b"3"), PgType::INT4)]);
+        assert!(insert_statement_parameterize(&stmt, &params).is_err());
     }
 }

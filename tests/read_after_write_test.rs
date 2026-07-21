@@ -289,3 +289,57 @@ async fn test_gate_int_float_numeric_precision() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-370: an extended-protocol *parameterized* INSERT (`VALUES ($1, $2)`) gets
+/// the same row-level precision as a literal one — its bind values are
+/// substituted at record time, so a disjoint read still serves from cache while
+/// a matching read forwards and sees the new row.
+#[tokio::test]
+async fn test_gate_parameterized_insert_precision() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[RAW_ON, ("PGCACHE_FAULT_CDC_APPLY_LAG_MS", "1500")]).await?;
+    ctx.query("CREATE TABLE t (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO t VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    // Register two literal point reads up front (isolates the write-side
+    // substitution): id = 1 (present) and id = 3 (absent for now).
+    for sql in [
+        "SELECT v FROM t WHERE id = 1",
+        "SELECT v FROM t WHERE id = 3",
+    ] {
+        let m0 = ctx.metrics().await?;
+        let _ = ctx.simple_query(sql).await?;
+        let _ = assert_cache_miss(&mut ctx, m0).await?;
+        ctx.cache_settle().await?;
+    }
+
+    // Parameterized INSERT over the extended protocol (tokio_postgres binds the
+    // int4 params in binary): disjoint from id = 1.
+    ctx.query("INSERT INTO t (id, v) VALUES ($1, $2)", &[&3i32, &30i32])
+        .await?;
+
+    // id = 1 is provably disjoint from the substituted inserted id = 3 → cache
+    // hit, and the row-precision counter records the proof (which only fires if
+    // the `$1`/`$2` cells were substituted to concrete values).
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query("SELECT v FROM t WHERE id = 1").await?;
+    assert_row_at(&res, 1, &[("v", "10")])?;
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "disjoint read must serve from cache"
+    );
+    assert!(
+        delta.raw_insert_disjoint >= 1,
+        "parameterized insert must be substituted for the row-level proof"
+    );
+
+    // id = 3 is matched by the pending parameterized insert → forward, sees v = 30.
+    let res = ctx.simple_query("SELECT v FROM t WHERE id = 3").await?;
+    assert_row_at(&res, 1, &[("v", "30")])?;
+
+    Ok(())
+}

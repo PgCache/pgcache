@@ -25,7 +25,10 @@ use crate::{
         frontend::PgFrontendMessage,
         session::{Portal, PreparedStatement, ResultFormats, StatementType},
     },
-    query::{Fingerprint, ast::query_expr_fingerprint, write::WriteClass},
+    query::{
+        Fingerprint, ast::query_expr_fingerprint, transform::insert_statement_parameterize,
+        write::WriteClass,
+    },
 };
 
 use super::super::ProxyMode;
@@ -57,15 +60,41 @@ fn buffer_write_classes(
             .portal_name
             .as_ref()
             .and_then(|p| portals.get(p.as_str()))
-            .and_then(|portal| statements.get(&portal.statement_name))
-            .map(|stmt| stmt.write_class.clone());
-        match resolved {
-            Some(Some(class)) => classes.push(class),
-            Some(None) => {}
-            None => classes.push(WriteClass::Connection),
+            .and_then(|portal| {
+                statements
+                    .get(&portal.statement_name)
+                    .map(|stmt| (portal, stmt))
+            });
+        let Some((portal, stmt)) = resolved else {
+            // Unresolvable portal/statement on an Execute → record conservatively.
+            classes.push(WriteClass::Connection);
+            continue;
+        };
+        match &stmt.write_class {
+            None => {}
+            Some(class) => classes.push(write_class_bind(class, portal, stmt)),
         }
     }
     classes
+}
+
+/// Resolve a parameterized INSERT's `$N` cells against a portal's bind values so
+/// it keeps row-level precision (PGC-370). Any other class passes through. On a
+/// substitution failure (out-of-bounds, undecodable, or missing OIDs) the INSERT
+/// degrades to table-conservative rather than trusting an unsubstituted cell.
+fn write_class_bind(class: &WriteClass, portal: &Portal, stmt: &PreparedStatement) -> WriteClass {
+    let WriteClass::InsertRows(insert) = class else {
+        return class.clone();
+    };
+    let parameters = QueryParameters {
+        values: portal.parameter_values.clone(),
+        formats: portal.parameter_formats.clone(),
+        oids: stmt.parameter_oids.clone(),
+    };
+    match insert_statement_parameterize(insert, &parameters) {
+        Ok(substituted) => WriteClass::InsertRows(Arc::new(substituted)),
+        Err(_) => WriteClass::Table(insert.relation.clone()),
+    }
 }
 
 /// A cacheable-query snapshot captured at Execute time. Taken eagerly (not at

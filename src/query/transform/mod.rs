@@ -33,6 +33,7 @@ error_set! {
 pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
 pub use constant_fold::query_expr_constant_fold;
+pub(crate) use parameters::insert_statement_parameterize;
 pub use parameters::{
     query_expr_parameters_replace, resolved_query_expr_parameterize, select_node_parameters_replace,
 };
