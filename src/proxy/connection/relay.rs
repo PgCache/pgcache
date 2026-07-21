@@ -57,6 +57,7 @@ use super::super::query::{Action, CacheabilityCache, ForwardReason, handle_query
 use super::super::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
+use crate::query::transform::query_expr_parameters_replace;
 use crate::query::write::WriteClass;
 use crate::result::ReportExt;
 
@@ -266,19 +267,25 @@ async fn handle_connection(
                         // disjointness (PGC-369/381/382); an opaque/connection
                         // write ignores them, and `read_column_ranges` self-limits
                         // to reads whose table actually has such a pending write.
-                        let read_ranges = state
-                            .write_log
-                            .has_row_predicates()
+                        let has_pred = state.write_log.has_row_predicates();
+                        // Under the extended protocol the read still carries `$n`
+                        // placeholders here; substitute the bind values so the
+                        // gate's ranges and fingerprint match the post-bind form
+                        // the cache is registered under. Only worthwhile when a
+                        // row predicate is pending.
+                        let bound = has_pred.then(|| read_query_bound(&msg)).flatten();
+                        let read_query = bound.as_ref().unwrap_or_else(|| cq.query());
+                        let read_ranges = has_pred
                             .then(|| {
                                 read_column_ranges(
-                                    cq.query(),
+                                    read_query,
                                     &state.dispatch_handle,
                                     &state.write_log,
                                 )
                             })
                             .flatten();
                         let m = crate::metrics::handles();
-                        match state.write_log.decide(cq.query(), read_ranges.as_ref()) {
+                        match state.write_log.decide(read_query, read_ranges.as_ref()) {
                             RawDecision::Forward(reason) => {
                                 match reason {
                                     RawForwardReason::Table => m.raw.forwards_table.increment(1),
@@ -470,6 +477,21 @@ pub async fn connection_task(
 /// an unregistered query (no resolved form to derive constraints from), or a
 /// WHERE the analyzer couldn't fully reduce. The pending-write check comes first
 /// so unrelated reads skip the resolve + constraint analysis entirely.
+/// The read query with bind values substituted, for an extended-protocol
+/// (`QueryParameterized`) read that still holds `$n` placeholders. `None` when
+/// there is nothing to substitute (simple protocol / no parameters) or the
+/// substitution fails — the caller then reasons about the placeholder form,
+/// which yields no ranges and forwards conservatively.
+fn read_query_bound(msg: &CacheMessage) -> Option<QueryExpr> {
+    let CacheMessage::QueryParameterized(_, cq, parameters, _) = msg else {
+        return None;
+    };
+    if parameters.is_empty() {
+        return None;
+    }
+    query_expr_parameters_replace(cq.query(), parameters).ok()
+}
+
 fn read_column_ranges(
     query: &QueryExpr,
     dispatch_handle: &CacheDispatchHandle,

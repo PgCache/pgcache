@@ -509,9 +509,51 @@ async fn test_gate_typecast_shape() -> Result<(), Error> {
     Ok(())
 }
 
-/// An extended-protocol parameterized read (`WHERE id = $1`): a pending write on
-/// its table forwards it during lag (the read side stays conservative); it
-/// cache-hits again with the new value once CDC drains.
+/// An extended-protocol parameterized read (`WHERE id = $1`) gets the same
+/// row-level precision as a literal one: its bind value is substituted before
+/// the gate derives the read's ranges, so a read disjoint from a pending
+/// (literal) UPDATE serves from cache instead of forwarding.
+#[tokio::test]
+async fn test_gate_prepared_read_disjoint_precision() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE pr (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO pr VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    // Register the prepared read for id = 2 (miss, then populate).
+    let read = "SELECT v FROM pr WHERE id = $1";
+    let m0 = ctx.metrics().await?;
+    let _ = ctx.query(read, &[&2i32]).await?;
+    let _ = assert_cache_miss(&mut ctx, m0).await?;
+    ctx.cache_settle().await?;
+
+    // Literal UPDATE of id = 1 on the same connection (concrete write predicate).
+    ctx.simple_query("UPDATE pr SET v = 88 WHERE id = 1").await?;
+
+    // The prepared read of id = 2 is disjoint from the pending update → cache
+    // hit, recorded by the update row-precision counter (which fires only if the
+    // read's `$1` was substituted to a concrete value before the gate).
+    let m = ctx.metrics().await?;
+    let rows = ctx.query(read, &[&2i32]).await?;
+    assert_eq!(rows[0].get::<_, i32>(0), 20);
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "disjoint prepared read must serve from cache"
+    );
+    assert!(
+        delta.raw_serve_disjoint_update >= 1,
+        "prepared read must be substituted for the row-level proof"
+    );
+
+    Ok(())
+}
+
+/// An extended-protocol parameterized read (`WHERE id = $1`) matching a pending
+/// write on the same connection: the read overlaps the write, so it forwards
+/// during lag and cache-hits again with the new value once CDC drains.
 #[tokio::test]
 async fn test_gate_prepared_read_shape() -> Result<(), Error> {
     let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
