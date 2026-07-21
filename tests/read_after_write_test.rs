@@ -530,7 +530,8 @@ async fn test_gate_prepared_read_disjoint_precision() -> Result<(), Error> {
     ctx.cache_settle().await?;
 
     // Literal UPDATE of id = 1 on the same connection (concrete write predicate).
-    ctx.simple_query("UPDATE pr SET v = 88 WHERE id = 1").await?;
+    ctx.simple_query("UPDATE pr SET v = 88 WHERE id = 1")
+        .await?;
 
     // The prepared read of id = 2 is disjoint from the pending update → cache
     // hit, recorded by the update row-precision counter (which fires only if the
@@ -587,6 +588,53 @@ async fn test_gate_prepared_read_shape() -> Result<(), Error> {
     let rows = ctx.query(read, &[&1i32]).await?;
     assert_eq!(rows[0].get::<_, i32>(0), 88);
     let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// PGC-386: an extended-protocol *parameterized* UPDATE (`... WHERE id = $1`)
+/// records a concrete predicate — its bind value is substituted at record time,
+/// so a disjoint parameterized read still serves from cache. Exercises both the
+/// write-side substitution and the read-side gate substitution together.
+#[tokio::test]
+async fn test_gate_parameterized_update_precision() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE pu (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO pu VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    // Register the prepared read for id = 2 (miss, then populate).
+    let read = "SELECT v FROM pu WHERE id = $1";
+    let m0 = ctx.metrics().await?;
+    let _ = ctx.query(read, &[&2i32]).await?;
+    let _ = assert_cache_miss(&mut ctx, m0).await?;
+    ctx.cache_settle().await?;
+
+    // Parameterized UPDATE of id = 1 over the extended protocol.
+    ctx.query("UPDATE pu SET v = 88 WHERE id = $1", &[&1i32])
+        .await?;
+
+    // The read of id = 2 is disjoint from the substituted update predicate (id =
+    // 1) → cache hit, recorded by the update row-precision counter (which fires
+    // only if both the write predicate and the read's `$1` were substituted).
+    let m = ctx.metrics().await?;
+    let rows = ctx.query(read, &[&2i32]).await?;
+    assert_eq!(rows[0].get::<_, i32>(0), 20);
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "disjoint read must serve from cache"
+    );
+    assert!(
+        delta.raw_serve_disjoint_update >= 1,
+        "parameterized update predicate must be substituted for the row-level proof"
+    );
+
+    // A read of id = 1 overlaps the substituted predicate → forward, sees v = 88.
+    let rows = ctx.query(read, &[&1i32]).await?;
+    assert_eq!(rows[0].get::<_, i32>(0), 88);
 
     Ok(())
 }

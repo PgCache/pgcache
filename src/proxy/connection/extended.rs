@@ -26,7 +26,12 @@ use crate::{
         session::{Portal, PreparedStatement, ResultFormats, StatementType},
     },
     query::{
-        Fingerprint, ast::query_expr_fingerprint, transform::insert_statement_parameterize,
+        Fingerprint,
+        ast::query_expr_fingerprint,
+        transform::{
+            delete_statement_parameterize, insert_statement_parameterize,
+            update_statement_parameterize,
+        },
         write::WriteClass,
     },
 };
@@ -83,17 +88,38 @@ fn buffer_write_classes(
 /// substitution failure (out-of-bounds, undecodable, or missing OIDs) the INSERT
 /// degrades to table-conservative rather than trusting an unsubstituted cell.
 fn write_class_bind(class: &WriteClass, portal: &Portal, stmt: &PreparedStatement) -> WriteClass {
-    let WriteClass::InsertRows(insert) = class else {
-        return class.clone();
-    };
-    let parameters = QueryParameters {
+    // Substitute `$n` bind values into row-enumerable write predicates so the
+    // read-after-write gate reasons about concrete values (PGC-370/386). A
+    // substitution error (out-of-range index, undecodable value) degrades the
+    // write to table-level: a partially-bound predicate must never be trusted.
+    // Non-row writes carry nothing to substitute, so params are built lazily.
+    let parameters = || QueryParameters {
         values: portal.parameter_values.clone(),
         formats: portal.parameter_formats.clone(),
         oids: stmt.parameter_oids.clone(),
     };
-    match insert_statement_parameterize(insert, &parameters) {
-        Ok(substituted) => WriteClass::InsertRows(Arc::new(substituted)),
-        Err(_) => WriteClass::Table(insert.relation.clone()),
+    match class {
+        WriteClass::InsertRows(insert) => {
+            match insert_statement_parameterize(insert, &parameters()) {
+                Ok(substituted) => WriteClass::InsertRows(Arc::new(substituted)),
+                Err(_) => WriteClass::Table(insert.relation.clone()),
+            }
+        }
+        WriteClass::DeleteRows(delete) => {
+            match delete_statement_parameterize(delete, &parameters()) {
+                Ok(substituted) => WriteClass::DeleteRows(Arc::new(substituted)),
+                Err(_) => WriteClass::Table(delete.relation.clone()),
+            }
+        }
+        WriteClass::UpdateRows(update) => {
+            match update_statement_parameterize(update, &parameters()) {
+                Ok(substituted) => WriteClass::UpdateRows(Arc::new(substituted)),
+                Err(_) => WriteClass::Table(update.relation.clone()),
+            }
+        }
+        WriteClass::Table(_) | WriteClass::Connection | WriteClass::ConnectionUnstampable => {
+            class.clone()
+        }
     }
 }
 
