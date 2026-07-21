@@ -402,8 +402,9 @@ fn where_expr_comparisons_collect(where_expr: &WhereExpr, out: &mut Vec<WriteCom
 /// Extract `column op literal` (or `literal op column`, flipped) from a binary
 /// comparison; `None` for logical/LIKE ops or non-bare-column operands.
 fn comparison_extract(b: &BinaryExpr) -> Option<WriteComparison> {
-    // `op_flip` returns `None` for non-comparison ops (AND/OR/LIKE/…).
-    b.op.op_flip()?;
+    // `op_flip` returns `None` for non-comparison ops (AND/OR/LIKE/…); the
+    // flipped op also normalizes `literal op column` to `column op literal`.
+    let flipped = b.op.op_flip()?;
     match (b.lexpr.as_ref(), b.rexpr.as_ref()) {
         (
             WhereExpr::Scalar(ScalarExpr::Column(col)),
@@ -412,7 +413,7 @@ fn comparison_extract(b: &BinaryExpr) -> Option<WriteComparison> {
         (
             WhereExpr::Scalar(ScalarExpr::Literal(lit)),
             WhereExpr::Scalar(ScalarExpr::Column(col)),
-        ) => Some((col.column.clone(), b.op.op_flip()?, lit.clone())),
+        ) => Some((col.column.clone(), flipped, lit.clone())),
         _ => None,
     }
 }

@@ -57,22 +57,27 @@ pub(in crate::proxy::connection) enum RawForwardReason {
 pub(in crate::proxy::connection) enum RawDecision {
     /// Serve from cache — no pending write on this connection touches the read.
     Serve,
-    /// Serve from cache — a pending INSERT on a referenced table was proven
-    /// row-level disjoint from the read (PGC-369); a precision win to record.
-    ServeDisjointInsert,
+    /// Serve from cache — a pending row-enumerable write on a referenced table
+    /// was proven row-level disjoint from the read (PGC-379); carries which write
+    /// kinds contributed, for per-kind metrics.
+    ServeDisjoint(DisjointKinds),
     /// Forward to origin — a pending write the read can't rule out.
     Forward(RawForwardReason),
 }
 
-/// What a single referenced table contributes to the gate decision.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TableWrite {
-    /// No pending write on this table.
-    None,
-    /// A pending write the read can't rule out → the read must forward.
-    Intersects,
-    /// Only pending INSERTs, all proven disjoint from the read → serveable.
-    DisjointInsert,
+/// Which pending write kinds a served read was proven disjoint from (PGC-384).
+/// A read can be disjoint from several kinds at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(in crate::proxy::connection) struct DisjointKinds {
+    pub insert: bool,
+    pub delete: bool,
+    pub update: bool,
+}
+
+impl DisjointKinds {
+    fn any(self) -> bool {
+        self.insert || self.delete || self.update
+    }
 }
 
 /// Max segments kept before the two oldest are merged. Two — one `active`
@@ -497,58 +502,55 @@ impl WriteLog {
         }
         // Otherwise a read forwards iff it references a table with a pending
         // write it can't rule out. The walk covers joins, subqueries, and CTEs.
-        let mut disjoint_proved = false;
+        let mut kinds = DisjointKinds::default();
         let intersects = query
-            .try_for_each_node::<TableNode, ()>(&mut |table| match self
-                .table_write(table, read_ranges)
-            {
-                TableWrite::Intersects => ControlFlow::Break(()),
-                TableWrite::DisjointInsert => {
-                    disjoint_proved = true;
+            .try_for_each_node::<TableNode, ()>(&mut |table| {
+                if self.table_intersects(table, read_ranges, &mut kinds) {
+                    ControlFlow::Break(())
+                } else {
                     ControlFlow::Continue(())
                 }
-                TableWrite::None => ControlFlow::Continue(()),
             })
             .is_break();
         if intersects {
             RawDecision::Forward(RawForwardReason::Table)
-        } else if disjoint_proved {
-            RawDecision::ServeDisjointInsert
+        } else if kinds.any() {
+            RawDecision::ServeDisjoint(kinds)
         } else {
             RawDecision::Serve
         }
     }
 
-    /// What a referenced table contributes to the gate decision. An opaque write
-    /// always intersects; pending INSERTs/DELETEs/UPDATEs intersect unless the
-    /// read is provably disjoint from every one (in which case the table is
-    /// serveable but records that a row-level proof carried it).
-    fn table_write(
+    /// Fold the read's disjointness from `table`'s pending writes into `kinds`;
+    /// returns `true` if the read intersects a pending write it can't rule out.
+    /// An opaque write always intersects; pending INSERTs/DELETEs/UPDATEs
+    /// intersect unless the read is provably disjoint from every one.
+    fn table_intersects(
         &self,
         table: &TableNode,
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
-    ) -> TableWrite {
-        let mut outcome = TableWrite::None;
+        kinds: &mut DisjointKinds,
+    ) -> bool {
         for segment in &self.segments {
             for (relation, agg) in &segment.tables {
                 if !relation_matches(relation, table) {
                     continue;
                 }
                 if agg.opaque {
-                    return TableWrite::Intersects;
+                    return true;
                 }
                 if let Some(inserts) = &agg.inserts {
                     if read_ranges.is_some_and(|ranges| inserts.disjoint(ranges)) {
-                        outcome = TableWrite::DisjointInsert;
+                        kinds.insert = true;
                     } else {
-                        return TableWrite::Intersects;
+                        return true;
                     }
                 }
                 for delete in &agg.deletes {
                     if read_ranges.is_some_and(|ranges| column_ranges_disjoint(ranges, delete)) {
-                        outcome = TableWrite::DisjointInsert;
+                        kinds.delete = true;
                     } else {
-                        return TableWrite::Intersects;
+                        return true;
                     }
                 }
                 for update in &agg.updates {
@@ -559,20 +561,20 @@ impl WriteLog {
                             && column_ranges_disjoint(ranges, &update.image_ranges)
                     });
                     if disjoint {
-                        outcome = TableWrite::DisjointInsert;
+                        kinds.update = true;
                     } else {
-                        return TableWrite::Intersects;
+                        return true;
                     }
                 }
             }
         }
-        outcome
+        false
     }
 
     /// Whether a table the read references has a pending row-enumerable write (an
-    /// INSERT or DELETE). Cheap gate so the read-after-write gate skips the
-    /// expensive per-column range derivation for reads no such write could affect
-    /// (PGC-369, PGC-381).
+    /// INSERT, DELETE, or UPDATE). Cheap gate so the read-after-write gate skips
+    /// the expensive per-column range derivation for reads no such write could
+    /// affect (PGC-369, PGC-381, PGC-382).
     pub(in crate::proxy::connection) fn table_has_row_predicate(&self, table: &TableNode) -> bool {
         self.segments.iter().any(|segment| {
             segment.tables.iter().any(|(relation, agg)| {
@@ -760,7 +762,13 @@ mod tests {
         // Read on id = 5 is disjoint from the inserted id = 2 → serve, and the
         // row-level proof is recorded.
         let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
-        assert_eq!(log.decide(&q, Some(&r5)), RawDecision::ServeDisjointInsert);
+        assert_eq!(
+            log.decide(&q, Some(&r5)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                insert: true,
+                ..Default::default()
+            })
+        );
 
         // Read on id = 2 matches the inserted row → forward (no disjoint proof).
         let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2)));
@@ -784,7 +792,13 @@ mod tests {
 
         // 5 is outside every inserted value → disjoint.
         let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
-        assert_eq!(log.decide(&q, Some(&r5)), RawDecision::ServeDisjointInsert);
+        assert_eq!(
+            log.decide(&q, Some(&r5)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                insert: true,
+                ..Default::default()
+            })
+        );
 
         // 3 matches one inserted row → intersects.
         let r3 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(3)));
@@ -816,7 +830,13 @@ mod tests {
 
         // id = 10 vs inserted 20.0 → provably disjoint → serve.
         let r10 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(10)));
-        assert_eq!(log.decide(&q, Some(&r10)), RawDecision::ServeDisjointInsert);
+        assert_eq!(
+            log.decide(&q, Some(&r10)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                insert: true,
+                ..Default::default()
+            })
+        );
 
         // id = 20 vs inserted 20.0 → numerically equal → intersects.
         let r20 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(20)));
@@ -893,7 +913,13 @@ mod tests {
 
         // Read on id = 1 is disjoint from the delete's id = 5 → serve.
         let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
-        assert_eq!(log.decide(&q, Some(&r1)), RawDecision::ServeDisjointInsert);
+        assert_eq!(
+            log.decide(&q, Some(&r1)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                delete: true,
+                ..Default::default()
+            })
+        );
 
         // Read on id = 5 overlaps the delete predicate → forward.
         let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
@@ -937,8 +963,8 @@ mod tests {
 
     #[test]
     fn test_opaque_write_dominates_delete() {
-        // A later UPDATE (opaque) forces table-level regardless of the read's
-        // disjointness from an earlier delete predicate.
+        // A later whole-table (opaque) write forces table-level regardless of the
+        // read's disjointness from an earlier delete predicate.
         let mut log = WriteLog::new(true);
         log.record(&delete_eq("orders", "id", 5));
         log.record(&table("orders"));
@@ -981,7 +1007,10 @@ mod tests {
         let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
         assert_eq!(
             log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
-            RawDecision::ServeDisjointInsert
+            RawDecision::ServeDisjoint(DisjointKinds {
+                update: true,
+                ..Default::default()
+            })
         );
         // A read on the matched rows (id = 5) overlaps the WHERE → forward.
         let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
@@ -1024,7 +1053,10 @@ mod tests {
         let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
         assert_eq!(
             log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
-            RawDecision::ServeDisjointInsert
+            RawDecision::ServeDisjoint(DisjointKinds {
+                update: true,
+                ..Default::default()
+            })
         );
     }
 

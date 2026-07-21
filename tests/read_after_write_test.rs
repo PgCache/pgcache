@@ -234,7 +234,7 @@ async fn test_gate_row_level_insert_precision() -> Result<(), Error> {
         "disjoint read must serve from cache"
     );
     assert!(
-        delta.raw_insert_disjoint >= 1,
+        delta.raw_serve_disjoint_insert >= 1,
         "row-level disjointness proof expected"
     );
 
@@ -300,7 +300,7 @@ async fn test_gate_int_float_numeric_precision() -> Result<(), Error> {
         "disjoint read must serve from cache"
     );
     assert!(
-        delta.raw_insert_disjoint >= 1,
+        delta.raw_serve_disjoint_insert >= 1,
         "row-level disjointness proof expected"
     );
 
@@ -350,7 +350,7 @@ async fn test_gate_parameterized_insert_precision() -> Result<(), Error> {
         "disjoint read must serve from cache"
     );
     assert!(
-        delta.raw_insert_disjoint >= 1,
+        delta.raw_serve_disjoint_insert >= 1,
         "parameterized insert must be substituted for the row-level proof"
     );
 
@@ -586,7 +586,7 @@ async fn test_gate_delete_row_level_precision() -> Result<(), Error> {
         "disjoint read must serve from cache"
     );
     assert!(
-        delta.raw_insert_disjoint >= 1,
+        delta.raw_serve_disjoint_delete >= 1,
         "row-level disjointness proof expected"
     );
 
@@ -648,7 +648,7 @@ async fn test_gate_update_row_level_precision() -> Result<(), Error> {
         "disjoint read must serve from cache"
     );
     assert!(
-        delta.raw_insert_disjoint >= 1,
+        delta.raw_serve_disjoint_update >= 1,
         "row-level disjointness proof expected"
     );
 
@@ -662,6 +662,82 @@ async fn test_gate_update_row_level_precision() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let res = ctx.simple_query("SELECT id FROM u WHERE v = 99").await?;
     assert_eq!(row_count(&res), 1);
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// PGC-384: DELETE across a JOIN shape. A delete to a joined table shrinks the
+/// result; the read forwards during lag and cache-hits once the (in-place)
+/// shrink is applied.
+#[tokio::test]
+async fn test_gate_delete_join_shape() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE dja (id int primary key, bid int)", &[])
+        .await?;
+    ctx.query("CREATE TABLE djb (id int primary key, label text)", &[])
+        .await?;
+    ctx.query("INSERT INTO dja VALUES (1, 10), (2, 10)", &[])
+        .await?;
+    ctx.query("INSERT INTO djb VALUES (10, 'x')", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT dja.id FROM dja JOIN djb ON dja.bid = djb.id ORDER BY dja.id";
+    register(&mut ctx, q).await?;
+
+    // Deleting dja(1) shrinks the join to a single row.
+    ctx.simple_query("DELETE FROM dja WHERE id = 1").await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(
+        row_count(&res),
+        1,
+        "join read must forward the shrunk result"
+    );
+
+    // A delete only shrinks, so CDC applies it in place — the read cache-hits.
+    ctx.cdc_apply_settle().await?;
+    ctx.cache_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 1);
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// PGC-384: UPDATE across an IN-subquery shape. Updating a row out of the
+/// subquery's match set shrinks membership; the read forwards during lag and
+/// cache-hits once applied.
+#[tokio::test]
+async fn test_gate_update_subquery_shape() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE usu (id int primary key, k int)", &[])
+        .await?;
+    ctx.query("CREATE TABLE usv (id int primary key)", &[])
+        .await?;
+    ctx.query("INSERT INTO usu VALUES (1, 10), (2, 20)", &[])
+        .await?;
+    ctx.query("INSERT INTO usv VALUES (10)", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT id FROM usu WHERE k IN (SELECT id FROM usv) ORDER BY id";
+    register(&mut ctx, q).await?;
+
+    // Move usu(1) out of the k = 10 match set → the result shrinks to empty.
+    ctx.simple_query("UPDATE usu SET k = 99 WHERE id = 1")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(
+        row_count(&res),
+        0,
+        "subquery read must forward the shrunk result"
+    );
+
+    ctx.cdc_apply_settle().await?;
+    ctx.cache_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 0);
     let _ = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())

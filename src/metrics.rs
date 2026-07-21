@@ -55,9 +55,13 @@ pub mod names {
     /// Cacheable reads forwarded to origin by the read-after-write gate because
     /// they intersected a pending write. Labeled `scope` = table | connection.
     pub const RAW_FORWARDS: &str = "pgcache.raw.forwards";
-    /// Pending-INSERT aggregates the gate proved a read disjoint from (row-level
-    /// precision, PGC-369) — a read served from cache despite a pending insert.
-    pub const RAW_INSERT_DISJOINT: &str = "pgcache.raw.insert_disjoint";
+    /// Cacheable reads served from cache despite a pending row-enumerable write,
+    /// because the gate proved the read disjoint from it (row-level precision,
+    /// PGC-379). One counter per write kind; a read disjoint from more than one
+    /// kind increments each, so the sum can exceed the number of reads served.
+    pub const RAW_SERVE_DISJOINT_INSERT: &str = "pgcache.raw.serve_disjoint_insert";
+    pub const RAW_SERVE_DISJOINT_DELETE: &str = "pgcache.raw.serve_disjoint_delete";
+    pub const RAW_SERVE_DISJOINT_UPDATE: &str = "pgcache.raw.serve_disjoint_update";
 
     // Histogram metrics (latency in seconds per Prometheus convention)
     /// End-to-end latency for cache hits: client message received → response written to client.
@@ -388,8 +392,11 @@ pub struct RawHandles {
     pub forwards_table: Counter,
     /// Reads forwarded because a connection-scoped pending write poisons all reads.
     pub forwards_connection: Counter,
-    /// Pending-INSERT aggregates proven disjoint from a read (row-level precision).
-    pub insert_disjoint: Counter,
+    /// Reads served despite a pending row-enumerable write proven disjoint,
+    /// per write kind (row-level precision, PGC-379).
+    pub serve_disjoint_insert: Counter,
+    pub serve_disjoint_delete: Counter,
+    pub serve_disjoint_update: Counter,
 }
 
 pub struct ConnHandles {
@@ -782,7 +789,9 @@ impl Handles {
                 probes: metrics::counter!(RAW_PROBES),
                 forwards_table: metrics::counter!(RAW_FORWARDS, "scope" => "table"),
                 forwards_connection: metrics::counter!(RAW_FORWARDS, "scope" => "connection"),
-                insert_disjoint: metrics::counter!(RAW_INSERT_DISJOINT),
+                serve_disjoint_insert: metrics::counter!(RAW_SERVE_DISJOINT_INSERT),
+                serve_disjoint_delete: metrics::counter!(RAW_SERVE_DISJOINT_DELETE),
+                serve_disjoint_update: metrics::counter!(RAW_SERVE_DISJOINT_UPDATE),
             },
         }
     }

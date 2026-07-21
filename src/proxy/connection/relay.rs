@@ -262,10 +262,10 @@ async fn handle_connection(
                     }
                     if let Some(cq) = msg.cacheable_query() {
                         // Derive the read's per-column ranges only when a pending
-                        // INSERT/DELETE could benefit from row-level disjointness
-                        // (PGC-369/381); an opaque/connection write ignores them,
-                        // and `read_column_ranges` self-limits to reads whose
-                        // table actually has such a pending write.
+                        // INSERT/DELETE/UPDATE could benefit from row-level
+                        // disjointness (PGC-369/381/382); an opaque/connection
+                        // write ignores them, and `read_column_ranges` self-limits
+                        // to reads whose table actually has such a pending write.
                         let read_ranges = state
                             .write_log
                             .has_row_predicates()
@@ -289,8 +289,16 @@ async fn handle_connection(
                                 state.cache_slot_forward_to_origin(msg);
                                 continue;
                             }
-                            RawDecision::ServeDisjointInsert => {
-                                m.raw.insert_disjoint.increment(1);
+                            RawDecision::ServeDisjoint(kinds) => {
+                                if kinds.insert {
+                                    m.raw.serve_disjoint_insert.increment(1);
+                                }
+                                if kinds.delete {
+                                    m.raw.serve_disjoint_delete.increment(1);
+                                }
+                                if kinds.update {
+                                    m.raw.serve_disjoint_update.increment(1);
+                                }
                             }
                             RawDecision::Serve => {}
                         }
@@ -454,10 +462,11 @@ pub async fn connection_task(
     debug!("task done");
 }
 
-/// The read's per-column value ranges for row-level INSERT/DELETE disjointness
-/// (PGC-369/381), or `None` when row precision can't apply: a multi-table read
-/// (a write to any referenced table can affect the result), a read whose single
-/// table has no pending row-enumerable write (nothing to prove disjoint from),
+/// The read's per-column value ranges for row-level INSERT/DELETE/UPDATE
+/// disjointness (PGC-369/381/382), or `None` when row precision can't apply: a
+/// multi-table read (a write to any referenced table can affect the result), a
+/// read whose single table has no pending row-enumerable write (nothing to prove
+/// disjoint from),
 /// an unregistered query (no resolved form to derive constraints from), or a
 /// WHERE the analyzer couldn't fully reduce. The pending-write check comes first
 /// so unrelated reads skip the resolve + constraint analysis entirely.
