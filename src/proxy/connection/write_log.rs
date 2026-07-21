@@ -20,9 +20,9 @@
 //! The gate consulting this log ([`WriteLog::decide`]) forwards a read that
 //! could be superseded by a pending write. A non-row-enumerable write makes its
 //! table `opaque` (any read of it intersects); a row-enumerable INSERT keeps its
-//! rows ([`InsertAggregate`]) and a row-enumerable DELETE keeps its WHERE
-//! predicate, so a read provably disjoint from every inserted row and every
-//! delete predicate can still be served (PGC-369 / PGC-381).
+//! rows ([`InsertAggregate`]), a DELETE keeps its WHERE predicate, and an UPDATE
+//! keeps its WHERE plus post-update image ([`UpdatePredicate`]) — so a read
+//! provably disjoint from every one can still be served (PGC-369/381/382).
 
 use std::collections::{HashMap, VecDeque};
 use std::ops::ControlFlow;
@@ -35,7 +35,9 @@ use crate::query::ast::{AstNode, LiteralValue, QueryExpr, TableNode};
 use crate::query::constraints::{
     ColumnRange, column_range_contains, column_ranges_disjoint, column_ranges_from_comparisons,
 };
-use crate::query::write::{INSERT_MAX_ROWS, InsertStatement, RelationRef, WriteClass};
+use crate::query::write::{
+    INSERT_MAX_ROWS, InsertStatement, RelationRef, UpdateStatement, WriteClass,
+};
 
 /// Reason the read-after-write gate forwarded a cacheable read to origin
 /// instead of serving it from cache (PGC-124), for metrics.
@@ -114,9 +116,9 @@ impl PendingLsn {
 /// Pending write state for one table within a segment.
 #[derive(Debug, Default, Clone)]
 pub(in crate::proxy::connection) struct TableAggregate {
-    /// A non-row-enumerable write (UPDATE/MERGE/TRUNCATE, or a degraded
-    /// INSERT/DELETE) is pending against this table → any read of it intersects,
-    /// regardless of `inserts`/`deletes`.
+    /// A non-row-enumerable write (MERGE/TRUNCATE, or a degraded
+    /// INSERT/DELETE/UPDATE) is pending against this table → any read of it
+    /// intersects, regardless of `inserts`/`deletes`/`updates`.
     pub opaque: bool,
     /// Row-enumerable INSERTs pending against this table (PGC-369). A read that
     /// is provably disjoint from every inserted row may still be served. `None`
@@ -127,6 +129,19 @@ pub(in crate::proxy::connection) struct TableAggregate {
     /// disjoint from every one may still be served — a delete only shrinks.
     /// Cleared once `opaque` is set.
     pub deletes: Vec<HashMap<EcoString, ColumnRange>>,
+    /// UPDATEs pending against this table (PGC-382), one entry each. A read is
+    /// unaffected only if disjoint from both the WHERE predicate and the
+    /// post-update image. Cleared once `opaque` is set.
+    pub updates: Vec<UpdatePredicate>,
+}
+
+/// An UPDATE's affected rows, as two per-column range maps (PGC-382): `where_`
+/// bounds the rows it touches (the shrink/value-change side); `image` bounds
+/// their post-update column values (the grow side — a row moving *into* a read).
+#[derive(Debug, Clone)]
+pub(in crate::proxy::connection) struct UpdatePredicate {
+    where_ranges: HashMap<EcoString, ColumnRange>,
+    image_ranges: HashMap<EcoString, ColumnRange>,
 }
 
 /// Row-enumerable INSERTs pending against one table: the actual inserted rows,
@@ -245,16 +260,41 @@ impl TableAggregate {
             self.inserts = Some(inserts);
         }
         self.deletes.extend(other.deletes);
-        if self.deletes.len() > INSERT_MAX_ROWS {
+        self.updates.extend(other.updates);
+        if self.deletes.len() + self.updates.len() > INSERT_MAX_ROWS {
             self.degrade_opaque();
         }
     }
 
-    /// Collapse to table-level opaque, discarding the finer insert/delete state.
+    /// Collapse to table-level opaque, discarding the finer row-predicate state.
     fn degrade_opaque(&mut self) {
         self.opaque = true;
         self.inserts = None;
         self.deletes.clear();
+        self.updates.clear();
+    }
+}
+
+/// Build an [`UpdatePredicate`] from a classified UPDATE (PGC-382): the WHERE
+/// ranges bound the affected rows; the image ranges are those with each SET
+/// column overridden by its new value (`Equal(literal)`), or made unconstrained
+/// (removed) when the new value is unknown — a non-literal SET RHS.
+fn update_predicate_build(update: &UpdateStatement) -> UpdatePredicate {
+    let where_ranges = column_ranges_from_comparisons(&update.where_comparisons);
+    let mut image_ranges = where_ranges.clone();
+    for (column, value) in &update.set {
+        match value {
+            Some(literal) => {
+                image_ranges.insert(column.clone(), ColumnRange::Equal(literal.clone()));
+            }
+            None => {
+                image_ranges.remove(column);
+            }
+        }
+    }
+    UpdatePredicate {
+        where_ranges,
+        image_ranges,
     }
 }
 
@@ -294,14 +334,14 @@ impl WriteLog {
         self.segments.is_empty()
     }
 
-    /// Whether any pending write is row-enumerable (an INSERT or DELETE) — the
-    /// cases that benefit from deriving the read's per-column ranges (PGC-369,
-    /// PGC-381). Opaque/connection writes ignore them.
+    /// Whether any pending write is row-enumerable (an INSERT, DELETE, or
+    /// UPDATE) — the cases that benefit from deriving the read's per-column
+    /// ranges (PGC-369/381/382). Opaque/connection writes ignore them.
     pub(in crate::proxy::connection) fn has_row_predicates(&self) -> bool {
         self.segments.iter().any(|s| {
             s.tables
                 .values()
-                .any(|a| a.inserts.is_some() || !a.deletes.is_empty())
+                .any(|a| a.inserts.is_some() || !a.deletes.is_empty() || !a.updates.is_empty())
         })
     }
 
@@ -359,7 +399,19 @@ impl WriteLog {
                 if !agg.opaque {
                     agg.deletes
                         .push(column_ranges_from_comparisons(&delete.comparisons));
-                    if agg.deletes.len() > INSERT_MAX_ROWS {
+                    if agg.deletes.len() + agg.updates.len() > INSERT_MAX_ROWS {
+                        agg.degrade_opaque();
+                    }
+                }
+            }
+            // Row-enumerable UPDATE: keep the WHERE predicate and the post-update
+            // image for the two-sided disjointness check (PGC-382), unless the
+            // table is opaque or the predicate count overflows the cap.
+            WriteClass::UpdateRows(update) => {
+                let agg = seg.tables.entry(update.relation.clone()).or_default();
+                if !agg.opaque {
+                    agg.updates.push(update_predicate_build(update));
+                    if agg.deletes.len() + agg.updates.len() > INSERT_MAX_ROWS {
                         agg.degrade_opaque();
                     }
                 }
@@ -463,10 +515,9 @@ impl WriteLog {
     }
 
     /// What a referenced table contributes to the gate decision. An opaque write
-    /// always intersects; pending INSERTs/DELETEs intersect unless the read is
-    /// provably disjoint from every inserted row and every delete predicate (in
-    /// which case the table is serveable but records that a row-level proof
-    /// carried it).
+    /// always intersects; pending INSERTs/DELETEs/UPDATEs intersect unless the
+    /// read is provably disjoint from every one (in which case the table is
+    /// serveable but records that a row-level proof carried it).
     fn table_write(
         &self,
         table: &TableNode,
@@ -495,6 +546,19 @@ impl WriteLog {
                         return TableWrite::Intersects;
                     }
                 }
+                for update in &agg.updates {
+                    // Serveable only if the read touches neither the updated rows
+                    // (WHERE) nor their post-update image (grow).
+                    let disjoint = read_ranges.is_some_and(|ranges| {
+                        column_ranges_disjoint(ranges, &update.where_ranges)
+                            && column_ranges_disjoint(ranges, &update.image_ranges)
+                    });
+                    if disjoint {
+                        outcome = TableWrite::DisjointInsert;
+                    } else {
+                        return TableWrite::Intersects;
+                    }
+                }
             }
         }
         outcome
@@ -507,7 +571,7 @@ impl WriteLog {
     pub(in crate::proxy::connection) fn table_has_row_predicate(&self, table: &TableNode) -> bool {
         self.segments.iter().any(|segment| {
             segment.tables.iter().any(|(relation, agg)| {
-                (agg.inserts.is_some() || !agg.deletes.is_empty())
+                (agg.inserts.is_some() || !agg.deletes.is_empty() || !agg.updates.is_empty())
                     && relation_matches(relation, table)
             })
         })
@@ -545,7 +609,9 @@ fn relation_matches(relation: &RelationRef, table: &TableNode) -> bool {
 mod tests {
     use super::*;
     use crate::query::ast::BinaryOp;
-    use crate::query::write::{DeleteStatement, InsertRow, InsertStatement, RelationRef};
+    use crate::query::write::{
+        DeleteStatement, InsertRow, InsertStatement, RelationRef, UpdateStatement,
+    };
     use ordered_float::NotNan;
     use std::sync::Arc;
 
@@ -875,6 +941,85 @@ mod tests {
         assert_eq!(
             log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
             RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    fn update_eq(
+        table: &str,
+        where_col: &str,
+        where_val: i64,
+        set: &[(&str, Option<i64>)],
+    ) -> WriteClass {
+        WriteClass::UpdateRows(Arc::new(UpdateStatement {
+            relation: RelationRef {
+                schema: None,
+                name: table.into(),
+            },
+            where_comparisons: vec![(
+                where_col.into(),
+                BinaryOp::Equal,
+                LiteralValue::Integer(where_val),
+            )],
+            set: set
+                .iter()
+                .map(|(c, v)| ((*c).into(), v.map(LiteralValue::Integer)))
+                .collect(),
+        }))
+    }
+
+    #[test]
+    fn test_decide_update_disjoint_serves() {
+        // UPDATE ... WHERE id = 5; a read on id = 1 is disjoint from both the
+        // matched rows and their image → serve.
+        let mut log = WriteLog::new(true);
+        log.record(&update_eq("orders", "id", 5, &[("v", Some(99))]));
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
+            RawDecision::ServeDisjointInsert
+        );
+        // A read on the matched rows (id = 5) overlaps the WHERE → forward.
+        let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_decide_update_grow_forwards() {
+        // UPDATE ... SET id = 1 WHERE id = 5 moves a row *into* `id = 1`: the
+        // WHERE is disjoint from the read, but the image is not → forward.
+        let mut log = WriteLog::new(true);
+        log.record(&update_eq("orders", "id", 5, &[("id", Some(1))]));
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_decide_update_value_change_forwards() {
+        // UPDATE ... SET v = 99 WHERE id = 1 changes a value in the read set.
+        let mut log = WriteLog::new(true);
+        log.record(&update_eq("orders", "id", 1, &[("v", Some(99))]));
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_decide_update_unknown_set_disjoint_serves() {
+        // A non-literal SET (unknown image) on id = 5 rows doesn't touch id = 1.
+        let mut log = WriteLog::new(true);
+        log.record(&update_eq("orders", "id", 5, &[("v", None)]));
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
+            RawDecision::ServeDisjointInsert
         );
     }
 

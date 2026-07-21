@@ -7,7 +7,7 @@ use ecow::EcoString;
 use crate::query::ast::*;
 use crate::query::write::{
     DeleteStatement, INSERT_MAX_ROWS, InsertStatement, RelationRef, TransactionBoundary,
-    WriteClass,
+    UpdateStatement, WriteClass,
 };
 
 /// Classify one SQL statement through the public entry point.
@@ -191,10 +191,61 @@ fn test_insert_with_dml_cte_is_connection_scope() {
 // ---------- Other DML ----------
 
 #[test]
-fn test_update_merge_are_table_scope() {
+fn test_merge_is_table_scope() {
+    let sql = "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN UPDATE SET b = s.b";
+    assert_eq!(table_name(&classify_write(sql)).name, "t");
+}
+
+// ---------- UPDATE predicate + SET extraction (PGC-382) ----------
+
+fn update_rows(sql: &str) -> std::sync::Arc<UpdateStatement> {
+    match classify_write(sql) {
+        WriteClass::UpdateRows(update) => update,
+        other => panic!("expected UpdateRows for {sql:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_update_extracts_where_and_set() {
+    let upd = update_rows("UPDATE t SET status = 'done', qty = 5 WHERE id = 5");
+    assert_eq!(upd.relation.name, "t");
+    assert_eq!(
+        upd.where_comparisons,
+        vec![(
+            EcoString::from("id"),
+            BinaryOp::Equal,
+            LiteralValue::Integer(5)
+        )]
+    );
+    assert_eq!(
+        upd.set,
+        vec![
+            (
+                EcoString::from("status"),
+                Some(LiteralValue::String("done".into()))
+            ),
+            (EcoString::from("qty"), Some(LiteralValue::Integer(5))),
+        ]
+    );
+}
+
+#[test]
+fn test_update_non_literal_set_is_unknown() {
+    // Expression / column / param RHS → `None` (unknown post-update value).
+    let upd = update_rows("UPDATE t SET v = v + 1, w = other WHERE id = 5");
+    assert_eq!(
+        upd.set,
+        vec![(EcoString::from("v"), None), (EcoString::from("w"), None),]
+    );
+}
+
+#[test]
+fn test_update_non_extractable_is_table() {
+    // No WHERE (whole table), FROM join, OR predicate → table-level opaque.
     for sql in [
-        "UPDATE t SET a = 1 WHERE b = 2",
-        "MERGE INTO t USING s ON t.a = s.a WHEN MATCHED THEN UPDATE SET b = s.b",
+        "UPDATE t SET a = 1",
+        "UPDATE t SET a = 1 FROM s WHERE t.x = s.y",
+        "UPDATE t SET a = 1 WHERE b = 1 OR c = 2",
     ] {
         assert_eq!(table_name(&classify_write(sql)).name, "t", "for {sql:?}");
     }

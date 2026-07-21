@@ -155,6 +155,7 @@ fn write_class_table(write_class: &WriteClass) -> String {
     let relation = match write_class {
         WriteClass::InsertRows(insert) => Some(&insert.relation),
         WriteClass::DeleteRows(delete) => Some(&delete.relation),
+        WriteClass::UpdateRows(update) => Some(&update.relation),
         WriteClass::Table(relation) => Some(relation),
         WriteClass::Connection | WriteClass::ConnectionUnstampable => None,
     };

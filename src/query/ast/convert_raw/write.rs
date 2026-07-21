@@ -11,8 +11,8 @@ use ecow::EcoString;
 use pg_query::pg_nodes as pg;
 
 use crate::query::write::{
-    DeleteStatement, INSERT_MAX_ROWS, InsertRow, InsertStatement, RelationRef,
-    TransactionBoundary, WriteClass, WriteComparison,
+    DeleteStatement, INSERT_MAX_ROWS, InsertRow, InsertStatement, RelationRef, SetAssignment,
+    TransactionBoundary, UpdateStatement, WriteClass, WriteComparison,
 };
 
 use super::super::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
@@ -34,10 +34,7 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
     unsafe {
         match node_tag(stmt) {
             pg::NodeTag_T_InsertStmt => Write(insert_classify(cast::<pg::InsertStmt>(stmt))),
-            pg::NodeTag_T_UpdateStmt => {
-                let s = cast::<pg::UpdateStmt>(stmt);
-                Write(dml_table_classify((*s).relation, (*s).withClause))
-            }
+            pg::NodeTag_T_UpdateStmt => Write(update_classify(cast::<pg::UpdateStmt>(stmt))),
             pg::NodeTag_T_DeleteStmt => Write(delete_classify(cast::<pg::DeleteStmt>(stmt))),
             pg::NodeTag_T_MergeStmt => {
                 let s = cast::<pg::MergeStmt>(stmt);
@@ -306,6 +303,73 @@ unsafe fn delete_classify(s: *const pg::DeleteStmt) -> WriteClass {
             }
             _ => table, // non-extractable predicate → opaque
         }
+    }
+}
+
+/// Classify an `UPDATE`. A single-table update with a bare-column AND-only WHERE
+/// and an extractable SET list becomes row-enumerable [`WriteClass::UpdateRows`]
+/// so a read disjoint from both the affected rows and their post-update image
+/// can still be served (PGC-382). A DML CTE, `FROM` join, missing/whole-table
+/// WHERE, or a SET target the walker can't reduce degrades to table-level opaque.
+unsafe fn update_classify(s: *const pg::UpdateStmt) -> WriteClass {
+    unsafe {
+        let relation = (*s).relation;
+        if relation.is_null() || with_clause_has_dml((*s).withClause) {
+            return WriteClass::Connection;
+        }
+        let table = table_class(relation);
+        let WriteClass::Table(relation_ref) = &table else {
+            return table;
+        };
+        // A FROM clause joins other tables into the predicate — not single-table.
+        if !list_is_empty((*s).fromClause) {
+            return table;
+        }
+        let Some(set) = update_set_extract((*s).targetList) else {
+            return table; // multi-assign / subscripted target → opaque
+        };
+        let where_node = (*s).whereClause as NodePtr;
+        if where_node.is_null() {
+            return table; // whole-table update: any read of it intersects
+        }
+        let Ok(where_expr) = where_expr_convert(where_node) else {
+            return table;
+        };
+        match where_expr_comparisons(&where_expr) {
+            Some(where_comparisons) if !where_comparisons.is_empty() => {
+                WriteClass::UpdateRows(Arc::new(UpdateStatement {
+                    relation: relation_ref.clone(),
+                    where_comparisons,
+                    set,
+                }))
+            }
+            _ => table,
+        }
+    }
+}
+
+/// Extract a SET list into `(column, Option<literal>)` assignments, or `None` if
+/// any target isn't a plain single-column assignment (multi-column `SET (a,b) =
+/// …`, subscripted `SET a[1] = …`). A non-literal RHS keeps the column with a
+/// `None` value — its post-update value is unknown (PGC-382).
+unsafe fn update_set_extract(target_list: *const pg::List) -> Option<Vec<SetAssignment>> {
+    unsafe {
+        let mut set = Vec::new();
+        for node in list_nodes(target_list) {
+            if node_tag(node) != pg::NodeTag_T_ResTarget {
+                return None;
+            }
+            let res = cast::<pg::ResTarget>(node);
+            let name = cstr((*res).name);
+            if name.is_empty() || !list_is_empty((*res).indirection) {
+                return None;
+            }
+            set.push((
+                EcoString::from(name),
+                insert_cell_extract((*res).val as NodePtr),
+            ));
+        }
+        (!set.is_empty()).then_some(set)
     }
 }
 

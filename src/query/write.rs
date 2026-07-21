@@ -45,8 +45,12 @@ pub enum WriteClass {
     /// predicate (PGC-381). A read whose predicate is provably disjoint from the
     /// delete's can still be served — a delete only shrinks the result set.
     DeleteRows(Arc<DeleteStatement>),
-    /// Target relation known, effect not row-enumerable (UPDATE, MERGE,
-    /// degraded INSERT/DELETE forms, COPY FROM, TRUNCATE).
+    /// `UPDATE` of a single table with an extractable bare-column WHERE and SET
+    /// list (PGC-382). Served only if the read is disjoint from both the WHERE
+    /// (no matched row) and the post-update image (no row grows into the read).
+    UpdateRows(Arc<UpdateStatement>),
+    /// Target relation known, effect not row-enumerable (MERGE, degraded
+    /// INSERT/DELETE/UPDATE forms, COPY FROM, TRUNCATE).
     Table(RelationRef),
     /// Scope unknown: DDL, CALL, DO, EXECUTE, EXPLAIN, multi-statement, or
     /// anything unrecognized.
@@ -83,4 +87,19 @@ pub type WriteComparison = (EcoString, BinaryOp, LiteralValue);
 pub struct DeleteStatement {
     pub relation: RelationRef,
     pub comparisons: Vec<WriteComparison>,
+}
+
+/// One `SET column = value` assignment. `None` = the new value isn't a literal
+/// (subquery, expression, column reference, DEFAULT, or parameter), so the
+/// post-update value of the column is unknown (PGC-382).
+pub type SetAssignment = (EcoString, Option<LiteralValue>);
+
+/// An extracted single-table `UPDATE` with a bare-column WHERE predicate and a
+/// SET list. Both are needed to bound the affected rows and their post-update
+/// image; a predicate-less UPDATE never produces this (it classifies as `Table`).
+#[derive(Debug)]
+pub struct UpdateStatement {
+    pub relation: RelationRef,
+    pub where_comparisons: Vec<WriteComparison>,
+    pub set: Vec<SetAssignment>,
 }

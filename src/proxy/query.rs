@@ -618,9 +618,20 @@ mod tests {
                 discriminant_name(&other)
             ),
         }
+        // No WHERE → whole-table opaque.
         match analyze_fresh("UPDATE t SET a = 1", &fv) {
             Action::ForwardWrite(ForwardReason::UnsupportedStatement, WriteClass::Table(_)) => {}
             other => panic!("expected Table write, got {:?}", discriminant_name(&other)),
+        }
+        match analyze_fresh("UPDATE t SET a = 1 WHERE id = 2", &fv) {
+            Action::ForwardWrite(
+                ForwardReason::UnsupportedStatement,
+                WriteClass::UpdateRows(_),
+            ) => {}
+            other => panic!(
+                "expected UpdateRows write, got {:?}",
+                discriminant_name(&other)
+            ),
         }
         match analyze_fresh("DELETE FROM t WHERE id = 1", &fv) {
             Action::ForwardWrite(

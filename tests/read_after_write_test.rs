@@ -609,3 +609,60 @@ async fn test_gate_delete_row_level_precision() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-382: row-level UPDATE precision. A read disjoint from both the update's
+/// WHERE and its post-update image still serves; a read a row grows *into* (via
+/// the SET image) forwards and sees the change — both under CDC lag.
+#[tokio::test]
+async fn test_gate_update_row_level_precision() -> Result<(), Error> {
+    let mut ctx =
+        TestContext::setup_fault(&[RAW_ON, ("PGCACHE_FAULT_CDC_APPLY_LAG_MS", "1500")]).await?;
+    ctx.query("CREATE TABLE u (id int primary key, v int)", &[])
+        .await?;
+    ctx.query("INSERT INTO u VALUES (1, 10), (2, 20), (3, 30)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    // id = 1 (present) and v = 99 (absent for now — the grow target).
+    for sql in [
+        "SELECT v FROM u WHERE id = 1",
+        "SELECT id FROM u WHERE v = 99",
+    ] {
+        let m0 = ctx.metrics().await?;
+        let _ = ctx.simple_query(sql).await?;
+        let _ = assert_cache_miss(&mut ctx, m0).await?;
+        ctx.cache_settle().await?;
+    }
+
+    // Update id = 2's v to 99 on this connection.
+    ctx.simple_query("UPDATE u SET v = 99 WHERE id = 2").await?;
+
+    // id = 1 is disjoint from the update (WHERE id = 2, image {id=2, v=99}) →
+    // cache hit, recorded by the row-precision counter.
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query("SELECT v FROM u WHERE id = 1").await?;
+    assert_row_at(&res, 1, &[("v", "10")])?;
+    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "disjoint read must serve from cache"
+    );
+    assert!(
+        delta.raw_insert_disjoint >= 1,
+        "row-level disjointness proof expected"
+    );
+
+    // `v = 99` grows to include the updated id = 2 → forwarded, sees the row
+    // (a stale cache hit would return no rows).
+    let res = ctx.simple_query("SELECT id FROM u WHERE v = 99").await?;
+    assert_row_at(&res, 1, &[("id", "2")])?;
+
+    // After CDC applies the single-table update in place, the read cache-hits.
+    ctx.cdc_apply_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query("SELECT id FROM u WHERE v = 99").await?;
+    assert_eq!(row_count(&res), 1);
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
