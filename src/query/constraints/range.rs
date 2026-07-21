@@ -6,7 +6,9 @@
 //! is also the range vocabulary consumed by `query::constraint_index`.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use ecow::EcoString;
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 
@@ -216,6 +218,80 @@ pub(crate) fn column_range_contains(range: &ColumnRange, value: &LiteralValue) -
             Some(lower_ok && upper_ok)
         }
     }
+}
+
+/// Whether two ranges over the same column are provably disjoint — no value can
+/// satisfy both. Sound in one direction only: returns `true` only when disjoint
+/// is certain; every uncertainty (an `Unknown` range, an incomparable bound)
+/// returns `false`. The building block for [`column_ranges_disjoint`], the
+/// UPDATE/DELETE read-after-write predicate check (PGC-379).
+fn column_range_disjoint(a: &ColumnRange, b: &ColumnRange) -> bool {
+    use ColumnRange::{Empty, Equal, InSet, Range, Unconstrained, Unknown};
+    match (a, b) {
+        // An unsatisfiable range shares no value with anything.
+        (Empty, _) | (_, Empty) => true,
+        // Can't reason about an opaque range.
+        (Unknown, _) | (_, Unknown) => false,
+        // A single point is disjoint iff the other range provably excludes it.
+        (Equal(x), other) | (other, Equal(x)) => column_range_contains(other, x) == Some(false),
+        // A set is disjoint iff every member is provably excluded by the other.
+        (InSet(set), other) | (other, InSet(set)) => set
+            .iter()
+            .all(|v| column_range_contains(other, v) == Some(false)),
+        // Any value satisfies an unconstrained range, so it overlaps every
+        // non-empty range (the `Empty` cases returned above).
+        (Unconstrained, _) | (_, Unconstrained) => false,
+        (
+            Range {
+                lower: la,
+                upper: ua,
+                ..
+            },
+            Range {
+                lower: lb,
+                upper: ub,
+                ..
+            },
+        ) => bound_below(ua, lb) || bound_below(ub, la),
+    }
+}
+
+/// Whether an interval whose upper bound is `upper` lies entirely below one
+/// whose lower bound is `lower` (`upper < lower`), so the two can't overlap.
+/// `None` bounds are ±infinity and can't separate. `not_equal` holes are
+/// ignored: treating a range as its bounds only ever reports *less*
+/// disjointness, never a false positive.
+fn bound_below(upper: &Option<RangeBound>, lower: &Option<RangeBound>) -> bool {
+    let (Some(u), Some(l)) = (upper, lower) else {
+        return false;
+    };
+    match literal_value_order_numeric(&u.value, &l.value) {
+        Some(Ordering::Less) => true,
+        // Touch at a single value: disjoint unless both sides include it.
+        Some(Ordering::Equal) => !(u.inclusive && l.inclusive),
+        Some(Ordering::Greater) | None => false,
+    }
+}
+
+/// Whether two per-column predicate range maps are provably disjoint — no row
+/// can satisfy both (PGC-379). `true` if either predicate is itself
+/// unsatisfiable (an `Empty` column range), or some column constrained by *both*
+/// has disjoint ranges. A column present in only one map is unconstrained in the
+/// other, so it can't establish disjointness. Sound in one direction: only
+/// returns `true` when disjoint is provable.
+// Consumed by the UPDATE/DELETE gate in PGC-381 onward; unit-tested here now.
+#[allow(dead_code)]
+pub(crate) fn column_ranges_disjoint(
+    a: &HashMap<EcoString, ColumnRange>,
+    b: &HashMap<EcoString, ColumnRange>,
+) -> bool {
+    if a.values().any(|r| matches!(r, ColumnRange::Empty))
+        || b.values().any(|r| matches!(r, ColumnRange::Empty))
+    {
+        return true;
+    }
+    a.iter()
+        .any(|(col, ra)| b.get(col).is_some_and(|rb| column_range_disjoint(ra, rb)))
 }
 
 /// Build a ColumnRange from all constraints on a single column.
@@ -874,5 +950,147 @@ mod tests {
         assert_eq!(int_float_cmp(3, 3.0), Ordering::Equal);
         assert_eq!(int_float_cmp(3, 2.9), Ordering::Greater);
         assert_eq!(int_float_cmp(3, 3.1), Ordering::Less);
+    }
+
+    // ========== column_range_disjoint / column_ranges_disjoint (PGC-379) ==========
+
+    fn gt(v: i64) -> ColumnRange {
+        range_from_comparisons(&[(BinaryOp::GreaterThan, int(v))])
+    }
+
+    fn lt(v: i64) -> ColumnRange {
+        range_from_comparisons(&[(BinaryOp::LessThan, int(v))])
+    }
+
+    fn inset(vals: &[i64]) -> ColumnRange {
+        ColumnRange::InSet(vals.iter().map(|v| int(*v)).collect())
+    }
+
+    #[test]
+    fn test_range_disjoint_equal() {
+        assert!(column_range_disjoint(
+            &ColumnRange::Equal(int(5)),
+            &ColumnRange::Equal(int(1))
+        ));
+        assert!(!column_range_disjoint(
+            &ColumnRange::Equal(int(5)),
+            &ColumnRange::Equal(int(5))
+        ));
+    }
+
+    #[test]
+    fn test_range_disjoint_equal_vs_range() {
+        // id = 5 vs id > 10 → disjoint; vs id < 10 → overlaps.
+        assert!(column_range_disjoint(&ColumnRange::Equal(int(5)), &gt(10)));
+        assert!(!column_range_disjoint(&ColumnRange::Equal(int(5)), &lt(10)));
+    }
+
+    #[test]
+    fn test_range_disjoint_range_vs_range() {
+        assert!(column_range_disjoint(&lt(5), &gt(10))); // (,5) and (10,) separated
+        assert!(!column_range_disjoint(&lt(5), &gt(3))); // overlap on (3,5)
+    }
+
+    #[test]
+    fn test_range_disjoint_touching_bounds() {
+        // (,5) exclusive upper vs [5,) inclusive lower → meet at 5 but neither
+        // both-inclusive: x < 5 and x >= 5 is unsatisfiable → disjoint.
+        let lt5 = lt(5);
+        let ge5 = range_from_comparisons(&[(BinaryOp::GreaterThanOrEqual, int(5))]);
+        assert!(column_range_disjoint(&lt5, &ge5));
+        // [5,) inclusive vs (,5] inclusive → both include 5 → overlap.
+        let le5 = range_from_comparisons(&[(BinaryOp::LessThanOrEqual, int(5))]);
+        assert!(!column_range_disjoint(&ge5, &le5));
+    }
+
+    #[test]
+    fn test_range_disjoint_inset() {
+        assert!(column_range_disjoint(&inset(&[1, 2, 3]), &inset(&[5, 6])));
+        assert!(!column_range_disjoint(&inset(&[1, 2, 3]), &inset(&[3, 4])));
+        // set vs point / range
+        assert!(column_range_disjoint(
+            &inset(&[1, 2, 3]),
+            &ColumnRange::Equal(int(9))
+        ));
+        assert!(column_range_disjoint(&inset(&[1, 2, 3]), &gt(10)));
+    }
+
+    #[test]
+    fn test_range_disjoint_int_float_numeric() {
+        // 5 vs 5.0 are numerically equal → NOT disjoint; 5 vs 6.0 → disjoint.
+        assert!(!column_range_disjoint(
+            &ColumnRange::Equal(int(5)),
+            &ColumnRange::Equal(float(5.0))
+        ));
+        assert!(column_range_disjoint(
+            &ColumnRange::Equal(int(5)),
+            &ColumnRange::Equal(float(6.0))
+        ));
+    }
+
+    #[test]
+    fn test_range_disjoint_unknown_empty_unconstrained() {
+        // Unknown can't be reasoned about → never disjoint.
+        assert!(!column_range_disjoint(
+            &ColumnRange::Unknown,
+            &ColumnRange::Equal(int(5))
+        ));
+        // Empty is unsatisfiable → disjoint from anything.
+        assert!(column_range_disjoint(
+            &ColumnRange::Empty,
+            &ColumnRange::Equal(int(5))
+        ));
+        // Unconstrained overlaps every non-empty range.
+        assert!(!column_range_disjoint(
+            &ColumnRange::Unconstrained,
+            &ColumnRange::Equal(int(5))
+        ));
+    }
+
+    fn ranges(pairs: &[(&str, ColumnRange)]) -> HashMap<EcoString, ColumnRange> {
+        pairs
+            .iter()
+            .map(|(c, r)| ((*c).into(), r.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn test_ranges_disjoint_map() {
+        // A column constrained by both, disjointly → whole predicates disjoint.
+        assert!(column_ranges_disjoint(
+            &ranges(&[("id", ColumnRange::Equal(int(5)))]),
+            &ranges(&[("id", ColumnRange::Equal(int(1)))]),
+        ));
+        // Same column, overlapping → not disjoint.
+        assert!(!column_ranges_disjoint(
+            &ranges(&[("id", ColumnRange::Equal(int(5)))]),
+            &ranges(&[("id", ColumnRange::Equal(int(5)))]),
+        ));
+        // No shared column → can't establish disjointness.
+        assert!(!column_ranges_disjoint(
+            &ranges(&[("id", ColumnRange::Equal(int(5)))]),
+            &ranges(&[("other", ColumnRange::Equal(int(1)))]),
+        ));
+        // One disjoint shared column is enough, even if another overlaps.
+        assert!(column_ranges_disjoint(
+            &ranges(&[
+                ("id", ColumnRange::Equal(int(5))),
+                ("x", ColumnRange::Equal(int(9)))
+            ]),
+            &ranges(&[
+                ("id", ColumnRange::Equal(int(1))),
+                ("x", ColumnRange::Equal(int(9)))
+            ]),
+        ));
+        // An empty map (no predicate) overlaps everything.
+        assert!(!column_ranges_disjoint(
+            &HashMap::new(),
+            &ranges(&[("id", ColumnRange::Equal(int(5)))]),
+        ));
+        // An unsatisfiable (Empty) column range → disjoint from anything.
+        assert!(column_ranges_disjoint(
+            &ranges(&[("id", ColumnRange::Empty)]),
+            &ranges(&[("other", ColumnRange::Equal(int(5)))]),
+        ));
     }
 }
