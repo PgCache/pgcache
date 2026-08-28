@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "conformance", "consistency"]
+members = [".", "conformance", "consistency", "fit"]
 
 [package]
 name = "pgcache"

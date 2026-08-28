@@ -24,7 +24,7 @@ mod fast_path;
 pub(crate) mod memo;
 pub(crate) mod messages;
 pub(crate) mod mv;
-pub(crate) mod query;
+pub mod query;
 mod query_cache;
 mod reg_bucket;
 mod reg_gate;
@@ -38,6 +38,8 @@ mod write_queue;
 mod writer;
 
 // Re-export public types
+pub use query::{CacheabilityError, CacheableQuery};
+
 pub use messages::{
     CacheMessage, CacheOutcome, CacheReply, DataStreamState, ProxyMessage, QueryParameter,
     QueryParameters,
