@@ -158,4 +158,6 @@ name = "subsumption_index"
 harness = false
 
 [patch.crates-io]
-pg_query = { git = "https://github.com/PgCache/pg_query.rs", branch = "pgcache" }
+# Local path while pg_query changes accumulate (bindgen allowlist); push the
+# fork and restore the git patch when the churn settles.
+pg_query = { path = "../pg_query.rs" }

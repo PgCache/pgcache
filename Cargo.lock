@@ -2042,7 +2042,6 @@ dependencies = [
 [[package]]
 name = "pg_query"
 version = "6.1.1"
-source = "git+https://github.com/PgCache/pg_query.rs?branch=pgcache#01b7a9be5b6509bce6b644d06d168a35f4a9d57b"
 dependencies = [
  "bindgen",
  "cc",

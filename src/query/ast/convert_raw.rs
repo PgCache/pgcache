@@ -15,12 +15,14 @@ use pg_query::pg_nodes as pg;
 
 use crate::query::cast::cast_target_from_canonical;
 use crate::query::transform::query_expr_constant_fold;
+use crate::query::write::WriteClass;
 
 use super::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag, string_node_value};
 use super::*;
 
 mod where_clause;
 mod window;
+mod write;
 
 use where_clause::{
     column_ref_extract, const_value_extract, param_ref_extract, where_expr_convert,
@@ -38,6 +40,71 @@ use window::{
 /// callback, valid for the duration of this call.
 pub unsafe fn query_expr_convert_raw(tree_root: *const c_void) -> Result<QueryExpr, AstError> {
     unsafe {
+        let stmt = root_statement(tree_root)?;
+        match node_tag(stmt) {
+            pg::NodeTag_T_SelectStmt => select_root_convert(cast::<pg::SelectStmt>(stmt)),
+            other => Err(AstError::UnsupportedStatement {
+                statement_type: format!("{other:?}"),
+            }),
+        }
+    }
+}
+
+/// Root-statement classification for the proxy's analyze path: the SELECT
+/// conversion result plus enough write classification to feed the
+/// per-connection read-after-write log (PGC-124).
+#[derive(Debug)]
+pub enum RawStatement {
+    /// Root was a `SelectStmt`. The converted expression is boxed to keep
+    /// the enum near the size of its unit variants.
+    Select {
+        converted: Result<Box<QueryExpr>, AstError>,
+        /// `Some` when conversion failed and the WITH clause contains a
+        /// data-modifying CTE — the "select" writes.
+        cte_write: Option<WriteClass>,
+    },
+    /// Root can modify table data (DML, DDL, EXECUTE, unknown, ...).
+    Write(WriteClass),
+    /// Root provably cannot modify table data (txn control, SET, SHOW, ...).
+    ReadOnlyUtility,
+}
+
+/// Classify the root of a raw parse tree, converting a `SelectStmt` root
+/// exactly as [`query_expr_convert_raw`] and classifying everything else for
+/// write tracking. Errs only on structural failures (multiple statements,
+/// empty statement).
+///
+/// # Safety
+/// `tree_root` must be the live `List *` handed to the `parse_raw_scoped`
+/// callback, valid for the duration of this call.
+pub unsafe fn statement_convert_raw(tree_root: *const c_void) -> Result<RawStatement, AstError> {
+    unsafe {
+        let stmt = root_statement(tree_root)?;
+        Ok(match node_tag(stmt) {
+            pg::NodeTag_T_SelectStmt => {
+                let select = cast::<pg::SelectStmt>(stmt);
+                let converted = select_root_convert(select).map(Box::new);
+                let cte_write = if converted.is_err() {
+                    write::select_cte_write_class(select)
+                } else {
+                    None
+                };
+                RawStatement::Select {
+                    converted,
+                    cte_write,
+                }
+            }
+            _ => match write::non_select_classify(stmt) {
+                write::NonSelectClass::Write(class) => RawStatement::Write(class),
+                write::NonSelectClass::ReadOnly => RawStatement::ReadOnlyUtility,
+            },
+        })
+    }
+}
+
+/// Unwrap the single root statement of a parse tree.
+unsafe fn root_statement(tree_root: *const c_void) -> Result<NodePtr, AstError> {
+    unsafe {
         let mut stmts = list_nodes(tree_root as *const pg::List);
         let (Some(raw_stmt), None) = (stmts.next(), stmts.next()) else {
             return Err(AstError::MultipleStatements);
@@ -47,16 +114,15 @@ pub unsafe fn query_expr_convert_raw(tree_root: *const c_void) -> Result<QueryEx
         if stmt.is_null() {
             return Err(AstError::MissingStatement);
         }
+        Ok(stmt)
+    }
+}
 
-        let mut query = match node_tag(stmt) {
-            pg::NodeTag_T_SelectStmt => select_stmt_to_query_expr(cast::<pg::SelectStmt>(stmt))?,
-            other => {
-                return Err(AstError::UnsupportedStatement {
-                    statement_type: format!("{other:?}"),
-                });
-            }
-        };
-
+/// Convert a root `SelectStmt` including the post-conversion passes shared by
+/// both entry points.
+unsafe fn select_root_convert(select: *const pg::SelectStmt) -> Result<QueryExpr, AstError> {
+    unsafe {
+        let mut query = select_stmt_to_query_expr(select)?;
         window_refs_assert_resolved(&query)?;
         query_expr_constant_fold(&mut query);
         Ok(query)

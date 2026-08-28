@@ -11,6 +11,7 @@ pub mod resolved;
 pub mod shape;
 pub mod transform;
 pub mod update;
+pub mod write;
 
 pub use fingerprint::{
     Fingerprint, FingerprintDashMap, FingerprintDashSet, FingerprintMap, FingerprintSet,
