@@ -48,7 +48,9 @@ impl SubsumerRegistry {
     /// candidates. Eligibility was decided by the shared admission analysis;
     /// the remaining gates run per lookup in `subsumption_covered`.
     pub fn subsumer_register(&mut self, analysis: &CacheableAnalysis) {
-        let single_relation = analysis.relations.len() == 1;
+        // The writer's gate counts relation_oids with duplicates (one per
+        // update query), so a same-table UNION parent is multi-relation.
+        let single_relation = analysis.admissions.len() == 1;
         for admission in &analysis.admissions {
             if !admission.subsumer_eligible {
                 continue;

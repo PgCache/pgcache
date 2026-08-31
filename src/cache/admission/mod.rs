@@ -16,7 +16,7 @@ mod analyze;
 mod subsume;
 mod update_classify;
 
-pub use analyze::query_admission_analyze;
+pub use analyze::{base_query_prepare, query_admission_analyze, shape_gate_classify};
 pub use subsume::subsumption_covered;
 
 /// Everything the writer stores (and pgcache-fit simulates) for one table of

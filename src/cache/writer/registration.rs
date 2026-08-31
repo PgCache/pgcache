@@ -16,9 +16,8 @@ use tokio_postgres::Client;
 use tracing::{debug, error, instrument, trace};
 
 use crate::cache::coalesce_queue::fetch_stage_ewma_update;
-use crate::cache::query::limit_rows_needed;
 use crate::catalog::{TableMetadata, aggregate_functions_load};
-use crate::query::ast::{AstNode, Deparse, QueryBody, QueryExpr, TableNode};
+use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode};
 use crate::query::decorrelate::query_expr_decorrelate;
 use crate::query::resolved::{
     ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, enum_order_dependence_check,
@@ -29,11 +28,11 @@ use crate::result::error_chain_format;
 use crate::settings::Settings;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
-use super::super::admission::query_admission_analyze;
+use super::super::admission::{base_query_prepare, query_admission_analyze, shape_gate_classify};
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{AdmitAction, QueryCommand, SubsumptionResult},
-    mv::{ShapeGate, resolved_has_join, resolved_has_window, shape_classify},
+    mv::{ShapeGate, resolved_has_join, resolved_has_window},
     query::CacheableQuery,
     types::{CachedQuery, QueryMetrics, SharedResolved},
     update_query::UpdateQueries,
@@ -89,20 +88,6 @@ pub(super) struct QueryResolution {
     /// windows all depend on the full input row set to produce correct
     /// result rows).
     pub(super) shape_gate: ShapeGate,
-}
-
-/// Clone the query, strip LIMIT, and compute max_limit for population.
-/// Set operations force max_limit = None since population runs per-branch.
-fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
-    let is_set_op = matches!(query.body, QueryBody::SetOp(_));
-    let max_limit = if is_set_op {
-        None
-    } else {
-        limit_rows_needed(&query.limit)
-    };
-    let mut base_query = query.clone();
-    base_query.limit = None;
-    (base_query, max_limit)
 }
 
 /// Test-only evict-mid-build (`PGCACHE_FAULT_MV_EVICT_ON_BUILD`): one-shot,
@@ -355,24 +340,6 @@ impl WriterRegistration {
         core.publication_dirty_drain().await?;
         cmd_handle.record(handle_start.elapsed().as_secs_f64());
         Ok(())
-    }
-
-    /// Classify a resolved query's shape for MV eligibility. Runs decorrelation
-    /// first so the classification matches what first-population / rebuild will
-    /// actually see (correlated subqueries get rewritten to JOIN + DISTINCT,
-    /// which affects classification). Falls back to the original resolved form
-    /// if decorrelation fails.
-    ///
-    /// NOTE: `population_work_build` and `update_queries_register` also decorrelate
-    /// the same resolved query. Factoring these three callers onto a single
-    /// decorrelation pass is a worthwhile follow-up but out of scope for v1.
-    fn shape_gate_classify(&self, resolved: &SharedResolved) -> ShapeGate {
-        let decorrelated = query_expr_decorrelate(resolved, &self.aggregate_functions).ok();
-        let query: &ResolvedQueryExpr = match &decorrelated {
-            Some(d) if d.transformed => &d.resolved,
-            _ => resolved,
-        };
-        shape_classify(query, &self.aggregate_functions)
     }
 
     /// Build population work for a query, handling decorrelation and branch extraction.
@@ -647,7 +614,7 @@ impl WriterRegistration {
         // Classify the shape once here; `query_register` and MV setup both reuse
         // the result via `QueryResolution.shape_gate` to avoid re-running
         // decorrelation + classification.
-        let shape_gate = self.shape_gate_classify(&resolved);
+        let shape_gate = shape_gate_classify(&resolved, &self.aggregate_functions);
 
         // Reducer shapes transform row cardinality — applying the user's
         // LIMIT to source-row population truncates the input and breaks

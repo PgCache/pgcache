@@ -310,4 +310,47 @@ mod target {
             assert!(!output.success, "pgss input refused for hitrate");
         }
     }
+
+    /// The writer pushes outer predicates into derived-table branches before
+    /// admission analysis (predicate_pushdown_apply), so the outer-WHERE form
+    /// of a derived table caches only id=5 rows too — it must not register as
+    /// a full-scan subsumer any more than the inner-WHERE form does.
+    #[test]
+    fn test_outer_where_derived_table_does_not_subsume_base_table() {
+        let report = hitrate_json(
+            "target_derived_outer.sql",
+            "SELECT * FROM (SELECT * FROM users) s WHERE s.id = 5;\n\
+             SELECT * FROM users WHERE id = 7;\n",
+        );
+        assert_eq!(count(&report, "subsumption_hits"), 0);
+        assert_eq!(count(&report, "cold_misses"), 2);
+    }
+
+    /// Reducer shapes (aggregates, DISTINCT, GROUP BY) force unbounded
+    /// population in the proxy (max_limit = None), so repeats with a
+    /// different LIMIT are plain hits, never limit bumps.
+    #[test]
+    fn test_reducer_limit_repeats_are_hits() {
+        let report = hitrate_json(
+            "target_reducer_limit.sql",
+            "SELECT count(*) FROM events LIMIT 3;\n\
+             SELECT count(*) FROM events LIMIT 5;\n",
+        );
+        assert_eq!(count(&report, "cold_misses"), 1);
+        assert_eq!(count(&report, "hits"), 1);
+    }
+
+    /// A same-table UNION parent registers one update query per branch, so
+    /// the writer's single-relation gate (duplicate-preserving relation_oids)
+    /// rejects it as a subsumer even though only one distinct table appears.
+    #[test]
+    fn test_same_table_union_parent_never_subsumes() {
+        let report = hitrate_json(
+            "target_union_parent.sql",
+            "SELECT * FROM users WHERE id = 1 UNION SELECT * FROM users WHERE name = 'a';\n\
+             SELECT * FROM users WHERE id = 1;\n",
+        );
+        assert_eq!(count(&report, "subsumption_hits"), 0);
+        assert_eq!(count(&report, "cold_misses"), 2);
+    }
 }

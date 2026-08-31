@@ -4,19 +4,20 @@
 
 use ecow::EcoString;
 use iddqd::BiHashMap;
-use pgcache_lib::cache::admission::query_admission_analyze;
-use pgcache_lib::cache::query::limit_rows_needed;
+use pgcache_lib::cache::admission::{
+    base_query_prepare, query_admission_analyze, shape_gate_classify,
+};
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::TableMetadata;
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::ast::{
-    QueryBody, QueryExpr, RawStatement, query_expr_fingerprint, statement_convert_raw,
+    QueryExpr, RawStatement, query_expr_fingerprint, statement_convert_raw,
 };
 use pgcache_lib::query::constraints::{
     QueryConstraints, TableConstraint, analyze_query_constraints,
 };
 use pgcache_lib::query::resolve::query_expr_resolve;
-use pgcache_lib::query::transform::query_expr_parameters_replace;
+use pgcache_lib::query::transform::{predicate_pushdown_apply, query_expr_parameters_replace};
 use pgcache_lib::query::write::WriteClass;
 use pgcache_lib::query::{Fingerprint, ShapeKey, query_shape_derive};
 
@@ -212,25 +213,27 @@ pub fn statement_classify(
         }
     };
 
-    // Stage B against the (synthesized) catalog, mirroring the writer's
-    // registration path: strip LIMIT before resolving (base_query_prepare)
-    // and derive has_limit from max_limit.
-    let is_set_op = matches!(cacheable.query.body, QueryBody::SetOp(_));
-    let max_limit = if is_set_op {
-        None
-    } else {
-        limit_rows_needed(&cacheable.query.limit)
-    };
-    let has_limit = max_limit.is_some();
-    let mut base_query = cacheable.query.clone();
-    base_query.limit = None;
+    // Stage B against the (synthesized) catalog — the writer's own query
+    // preparation: LIMIT stripped and max_limit derived (base_query_prepare),
+    // predicates pushed into derived-table branches, and reducer shapes
+    // forcing unbounded population, exactly as in query_resolve.
+    let (base_query, user_max_limit) = base_query_prepare(&cacheable.query);
 
-    let Ok(resolved) = query_expr_resolve(&base_query, catalog, &["public"]) else {
+    let Ok(resolved) =
+        query_expr_resolve(&base_query, catalog, &["public"]).map(predicate_pushdown_apply)
+    else {
         return Verdict::Passthrough {
             reason: PassthroughReason::ResolutionFailed,
             cte_write: None,
         };
     };
+    let shape_gate = shape_gate_classify(&resolved, &builtins.aggregates);
+    let max_limit = if shape_gate.is_reducer() {
+        None
+    } else {
+        user_max_limit
+    };
+    let has_limit = max_limit.is_some();
     let fingerprint = query_expr_fingerprint(&cacheable.query);
     let analysis = match query_admission_analyze(
         &resolved,

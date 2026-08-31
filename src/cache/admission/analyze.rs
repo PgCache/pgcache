@@ -8,7 +8,7 @@ use iddqd::BiHashMap;
 
 use crate::catalog::TableMetadata;
 use crate::query::Fingerprint;
-use crate::query::ast::AstNode;
+use crate::query::ast::{AstNode, QueryBody, QueryExpr};
 use crate::query::constraints::analyze_query_constraints;
 use crate::query::decorrelate::query_expr_decorrelate;
 use crate::query::predicate::CompiledPredicate;
@@ -17,6 +17,8 @@ use crate::query::transform::PgEvalTemplate;
 use crate::query::update::query_table_update_queries;
 use crate::result::ReportExt;
 
+use super::super::mv::{ShapeGate, shape_classify};
+use super::super::query::limit_rows_needed;
 use super::super::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
 use super::super::{CacheError, CacheResult};
 use super::update_classify::{
@@ -24,6 +26,41 @@ use super::update_classify::{
     predicate_columns_collect, update_eval_strategy_classify,
 };
 use super::{AdmissionAnalysis, TableAdmission};
+
+/// Clone the query, strip LIMIT, and compute max_limit for population.
+/// Set operations force max_limit = None since population runs per-branch.
+pub fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
+    let is_set_op = matches!(query.body, QueryBody::SetOp(_));
+    let max_limit = if is_set_op {
+        None
+    } else {
+        limit_rows_needed(&query.limit)
+    };
+    let mut base_query = query.clone();
+    base_query.limit = None;
+    (base_query, max_limit)
+}
+
+/// Classify a resolved query's shape for MV eligibility. Runs decorrelation
+/// first so the classification matches what first-population / rebuild will
+/// actually see (correlated subqueries get rewritten to JOIN + DISTINCT,
+/// which affects classification). Falls back to the original resolved form
+/// if decorrelation fails.
+///
+/// NOTE: `population_work_build` and `query_admission_analyze` also decorrelate
+/// the same resolved query. Factoring these callers onto a single
+/// decorrelation pass is a worthwhile follow-up but out of scope for v1.
+pub fn shape_gate_classify(
+    resolved: &ResolvedQueryExpr,
+    aggregate_functions: &HashSet<EcoString>,
+) -> ShapeGate {
+    let decorrelated = query_expr_decorrelate(resolved, aggregate_functions).ok();
+    let query: &ResolvedQueryExpr = match &decorrelated {
+        Some(d) if d.transformed => &d.resolved,
+        _ => resolved,
+    };
+    shape_classify(query, aggregate_functions)
+}
 
 /// Decorrelate the resolved query and derive one [`TableAdmission`] per
 /// update query: the built [`UpdateQuery`], its constraints, and the
