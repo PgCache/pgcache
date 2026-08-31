@@ -4,6 +4,7 @@
 use anyhow::Context;
 use bytes::Bytes;
 use clap::ValueEnum;
+use ecow::EcoString;
 use pgcache_lib::cache::QueryParameters;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -22,8 +23,8 @@ pub enum TraceFormat {
 /// (text form; `None` = NULL), and pg_stat_statements weights when present.
 #[derive(Debug, Clone)]
 pub struct TraceStatement {
-    pub sql: String,
-    pub parameters: Vec<Option<String>>,
+    pub sql: EcoString,
+    pub parameters: Vec<Option<EcoString>>,
     pub calls: u64,
     pub total_time_ms: Option<f64>,
     /// Backend identity from the log line prefix (pid); 0 when the source
@@ -32,7 +33,7 @@ pub struct TraceStatement {
 }
 
 impl TraceStatement {
-    fn from_sql(sql: impl Into<String>) -> Self {
+    fn from_sql(sql: impl Into<EcoString>) -> Self {
         TraceStatement {
             sql: sql.into(),
             parameters: Vec::new(),
@@ -161,7 +162,7 @@ fn csvlog_read(content: &str) -> anyhow::Result<TraceRead> {
             .and_then(|pid| pid.trim().parse::<u64>().ok())
             .unwrap_or(0);
         out.push(TraceStatement {
-            sql: sql.to_owned(),
+            sql: sql.into(),
             parameters,
             calls: 1,
             total_time_ms: duration_ms,
@@ -199,7 +200,7 @@ fn log_message_statement(message: &str) -> Option<(&str, Option<f64>)> {
 /// single-quoted with `''` escapes; parameter indexes are 1-based. A
 /// non-`Parameters:` detail yields no parameters; a malformed one also
 /// yields none but increments `dropped` so the report can disclose it.
-fn detail_parameters(detail: &str, dropped: &mut usize) -> Vec<Option<String>> {
+fn detail_parameters(detail: &str, dropped: &mut usize) -> Vec<Option<EcoString>> {
     let Some(list) = detail.trim_start().strip_prefix("Parameters: ") else {
         return Vec::new();
     };
@@ -212,8 +213,8 @@ fn detail_parameters(detail: &str, dropped: &mut usize) -> Vec<Option<String>> {
     }
 }
 
-fn parameter_list_parse(list: &str) -> Option<Vec<Option<String>>> {
-    let mut values: Vec<(usize, Option<String>)> = Vec::new();
+fn parameter_list_parse(list: &str) -> Option<Vec<Option<EcoString>>> {
+    let mut values: Vec<(usize, Option<EcoString>)> = Vec::new();
     let bytes = list.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
@@ -238,7 +239,7 @@ fn parameter_list_parse(list: &str) -> Option<Vec<Option<String>>> {
             i += 4;
         } else if after_eq.starts_with('\'') {
             let (value, consumed) = quoted_value_parse(after_eq)?;
-            values.push((index, Some(value)));
+            values.push((index, Some(value.into())));
             i += consumed;
         }
     }
@@ -306,7 +307,7 @@ fn stderr_log_read(content: &str) -> TraceRead {
             .map(|detail| detail_parameters(detail, dropped))
             .unwrap_or_default();
         out.push(TraceStatement {
-            sql: p.sql,
+            sql: p.sql.into(),
             parameters,
             calls: 1,
             total_time_ms: p.duration_ms,
@@ -410,8 +411,12 @@ fn log_line_split(line: &str) -> Option<(u64, &str, &str)> {
     let (position, severity) = SEVERITIES
         .iter()
         .filter_map(|s| {
-            let tag = format!("{s}:  ");
-            line.find(&tag).map(|p| (p, *s))
+            line.match_indices(s)
+                .find(|(i, _)| {
+                    line.get(i + s.len()..)
+                        .is_some_and(|rest| rest.starts_with(":  "))
+                })
+                .map(|(i, _)| (i, *s))
         })
         .min_by_key(|(p, _)| *p)?;
     let rest = line.get(position + severity.len() + 3..)?;
@@ -460,7 +465,7 @@ fn pgss_read(content: &str) -> anyhow::Result<TraceRead> {
             .and_then(|c| record.get(c))
             .and_then(|v| v.trim().parse::<f64>().ok());
         out.push(TraceStatement {
-            sql: sql.to_owned(),
+            sql: sql.into(),
             parameters: Vec::new(),
             calls,
             total_time_ms,
@@ -483,7 +488,7 @@ fn pgss_read(content: &str) -> anyhow::Result<TraceRead> {
 /// this, `execute` traffic would never fingerprint-match the same query
 /// written with inline literals. Returns the count of numeric inferences for
 /// the assumptions block.
-pub fn query_parameters_infer(values: &[Option<String>]) -> (QueryParameters, usize) {
+pub fn query_parameters_infer(values: &[Option<EcoString>]) -> (QueryParameters, usize) {
     const OID_INT8: u32 = 20;
     const OID_FLOAT8: u32 = 701;
 
@@ -544,7 +549,11 @@ mod tests {
         );
         assert_eq!(
             params,
-            vec![Some("42".to_owned()), None, Some("it's".to_owned())]
+            vec![
+                Some(EcoString::from("42")),
+                None,
+                Some(EcoString::from("it's"))
+            ]
         );
         assert_eq!(dropped, 0);
     }
@@ -591,9 +600,9 @@ mod tests {
 ";
         let statements = stderr_log_read(log).statements;
         assert_eq!(statements.len(), 3);
-        assert_eq!(statements[0].parameters, vec![Some("42".to_owned())]);
+        assert_eq!(statements[0].parameters, vec![Some(EcoString::from("42"))]);
         assert!(statements.iter().any(|s| s.sql == "SELECT 1"));
-        assert_eq!(statements[1].parameters, vec![Some("43".to_owned())]);
+        assert_eq!(statements[1].parameters, vec![Some(EcoString::from("43"))]);
     }
 
     #[test]
@@ -663,9 +672,9 @@ query,calls,total_exec_time
     #[test]
     fn test_parameter_inference_oids() {
         let (params, inferred) = query_parameters_infer(&[
-            Some("42".to_owned()),
-            Some("3.14".to_owned()),
-            Some("hello".to_owned()),
+            Some(EcoString::from("42")),
+            Some(EcoString::from("3.14")),
+            Some(EcoString::from("hello")),
             None,
         ]);
         assert_eq!(params.oids, vec![20, 701, 0, 0]);

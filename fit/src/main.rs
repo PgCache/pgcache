@@ -19,6 +19,7 @@ use std::rc::Rc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use ecow::EcoString;
 use pgcache_lib::query::ast::QueryExpr;
 
 use crate::catalog_synth::{SynthCatalog, catalog_synthesize};
@@ -94,7 +95,7 @@ fn trace_analyze(path: &PathBuf, format_override: Option<TraceFormat>) -> anyhow
     // once per distinct (sql, parameters) pair and share the results per
     // occurrence. `distinct` keeps first-seen order so catalog synthesis and
     // its heuristic counters stay deterministic.
-    let mut parse_memo: HashMap<(String, Vec<Option<String>>), Rc<ParsedStatement>> =
+    let mut parse_memo: HashMap<(EcoString, Vec<Option<EcoString>>), Rc<ParsedStatement>> =
         HashMap::new();
     let mut distinct: Vec<Rc<ParsedStatement>> = Vec::new();
     let occurrences: Vec<(TraceStatement, Rc<ParsedStatement>)> = statements
@@ -172,6 +173,7 @@ fn main() -> anyhow::Result<()> {
                 &analysis.catalog.stats,
                 analysis.format,
                 analysis.parameter_details_dropped,
+                json,
             );
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);

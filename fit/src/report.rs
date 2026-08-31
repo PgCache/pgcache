@@ -1,6 +1,7 @@
 //! Report assembly and rendering: doc-style text output and `--json`.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 
 use pgcache_lib::query::write::WriteClass;
 use pgcache_lib::query::{Fingerprint, ShapeKey};
@@ -11,7 +12,7 @@ use crate::hitrate::HitrateStats;
 use crate::input::TraceFormat;
 use crate::subsume::SubsumerRegistry;
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct BucketAggregate {
     pub statements: u64,
     pub calls: u64,
@@ -23,16 +24,6 @@ impl BucketAggregate {
         self.statements += 1;
         self.calls += calls;
         self.time_ms += time_ms.unwrap_or(0.0);
-    }
-}
-
-impl Default for BucketAggregate {
-    fn default() -> Self {
-        BucketAggregate {
-            statements: 0,
-            calls: 0,
-            time_ms: 0.0,
-        }
     }
 }
 
@@ -170,6 +161,7 @@ pub fn check_report_build(
     synth: &SynthesisStats,
     format: TraceFormat,
     parameter_details_dropped: usize,
+    include_verdicts: bool,
 ) -> CheckReport {
     let mut statements = 0u64;
     let mut calls = 0u64;
@@ -235,6 +227,9 @@ pub fn check_report_build(
                 ("utility", None)
             }
         };
+        if !include_verdicts {
+            continue;
+        }
         let detail = match &item.parsed.outcome {
             ParseOutcome::ParseError(error) | ParseOutcome::ParameterError(error) => {
                 Some(error.clone())
@@ -243,7 +238,7 @@ pub fn check_report_build(
             _ => None,
         };
         verdicts.push(StatementVerdict {
-            sql: item.trace.sql.clone(),
+            sql: item.trace.sql.to_string(),
             verdict: verdict_label,
             reason: reason_label,
             detail,
@@ -349,7 +344,6 @@ fn percent_time(part: f64, whole: f64) -> f64 {
 }
 
 pub fn check_report_render(report: &CheckReport) -> String {
-    use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -443,7 +437,6 @@ pub fn check_report_render(report: &CheckReport) -> String {
 }
 
 pub fn hitrate_report_render(report: &HitrateReport) -> String {
-    use std::fmt::Write;
     let stats = &report.stats;
     let mut out = String::new();
     let _ = writeln!(

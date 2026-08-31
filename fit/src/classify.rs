@@ -54,7 +54,7 @@ pub struct AnalyzedStatement {
     pub verdict: std::rc::Rc<Verdict>,
 }
 
-pub fn statement_parse(sql: &str, trace_parameters: &[Option<String>]) -> ParsedStatement {
+pub fn statement_parse(sql: &str, trace_parameters: &[Option<EcoString>]) -> ParsedStatement {
     let mut inferred_parameters = 0;
     let raw = pg_query::parse_raw_scoped(sql, |tree| unsafe { statement_convert_raw(tree) });
     let outcome = match raw {
@@ -316,8 +316,8 @@ mod tests {
     }
 
     fn classify_with_parameters(sql: &str, parameters: &[Option<&str>]) -> Verdict {
-        let parameters: Vec<Option<String>> =
-            parameters.iter().map(|p| p.map(str::to_owned)).collect();
+        let parameters: Vec<Option<EcoString>> =
+            parameters.iter().map(|p| p.map(EcoString::from)).collect();
         let parsed = statement_parse(sql, &parameters);
         let corpus: Vec<QueryExpr> = match &parsed.outcome {
             ParseOutcome::Select(expr) => vec![(**expr).clone()],

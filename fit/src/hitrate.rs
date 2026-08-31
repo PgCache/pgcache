@@ -154,7 +154,7 @@ mod tests {
                 let verdict = statement_classify(&p, &catalog.tables, &builtins);
                 AnalyzedStatement {
                     trace: TraceStatement {
-                        sql: (*sql).to_owned(),
+                        sql: (*sql).into(),
                         parameters: Vec::new(),
                         calls: 1,
                         total_time_ms: None,
@@ -219,7 +219,7 @@ mod tests {
         let verdict = statement_classify(&parsed, &catalog.tables, &builtins);
         let stats = hitrate_replay(&[AnalyzedStatement {
             trace: TraceStatement {
-                sql: sql.to_owned(),
+                sql: sql.into(),
                 parameters: Vec::new(),
                 calls: 100,
                 total_time_ms: None,

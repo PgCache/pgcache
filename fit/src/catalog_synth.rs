@@ -134,16 +134,16 @@ impl Synthesizer {
         if let SelectColumns::Columns(columns) = &select.columns {
             for column in columns {
                 if let SelectColumn::Expr { expr, .. } = column {
-                    self.expr_attribute(expr, scopes, None);
+                    self.expr_attribute(expr, scopes);
                 }
             }
         }
         for qual in join_quals {
-            self.expr_attribute(qual, scopes, None);
+            self.expr_attribute(qual, scopes);
             self.where_infer(qual, scopes);
         }
         if let Some(where_clause) = &select.where_clause {
-            self.expr_attribute(where_clause, scopes, None);
+            self.expr_attribute(where_clause, scopes);
             self.where_infer(where_clause, scopes);
         }
         for column in &select.group_by {
@@ -153,7 +153,7 @@ impl Synthesizer {
             self.column_attribute(column, scopes);
         }
         if let Some(having) = &select.having {
-            self.expr_attribute(having, scopes, None);
+            self.expr_attribute(having, scopes);
         }
         for order in order_by {
             match &order.expr {
@@ -162,7 +162,7 @@ impl Synthesizer {
                 ScalarExpr::Column(col)
                     if col.table.is_none() && output_aliases.contains(&col.column) => {}
                 ScalarExpr::Literal(_) => {}
-                expr => self.expr_attribute(expr, scopes, None),
+                expr => self.expr_attribute(expr, scopes),
             }
         }
 
@@ -245,13 +245,11 @@ impl Synthesizer {
     fn column_attribute(&mut self, column: &ColumnNode, scopes: &[Scope]) {
         match &column.table {
             Some(qualifier) => {
-                for scope in scopes.iter().rev() {
-                    if let Some(entry) = scope.entries.iter().find(|e| &e.alias == qualifier) {
-                        if let Some(key) = entry.key.clone() {
-                            self.column_add(key, column.column.clone());
-                        }
-                        return;
+                if let Some(entry) = scope_entry_find(scopes, qualifier) {
+                    if let Some(key) = entry.key.clone() {
+                        self.column_add(key, column.column.clone());
                     }
+                    return;
                 }
                 // Unknown qualifier: assume it names a table in public.
                 let key = (EcoString::from("public"), qualifier.clone());
@@ -285,10 +283,8 @@ impl Synthesizer {
     fn column_key_resolve(&self, column: &ColumnNode, scopes: &[Scope]) -> Option<TableKey> {
         match &column.table {
             Some(qualifier) => {
-                for scope in scopes.iter().rev() {
-                    if let Some(entry) = scope.entries.iter().find(|e| &e.alias == qualifier) {
-                        return entry.key.clone();
-                    }
+                if let Some(entry) = scope_entry_find(scopes, qualifier) {
+                    return entry.key.clone();
                 }
                 let key = (EcoString::from("public"), qualifier.clone());
                 self.tables.contains_key(&key).then_some(key)
@@ -312,12 +308,7 @@ impl Synthesizer {
     /// their own scopes. Direct columns are separated from subquery-internal
     /// ones by identity: everything under a nested `QueryExpr` is attributed
     /// by the recursive walk, not here.
-    fn expr_attribute<T: AstNode>(
-        &mut self,
-        expr: &T,
-        scopes: &mut Vec<Scope>,
-        output_aliases: Option<&HashSet<&EcoString>>,
-    ) {
+    fn expr_attribute<T: AstNode>(&mut self, expr: &T, scopes: &mut Vec<Scope>) {
         let subqueries: Vec<&QueryExpr> = expr.nodes::<QueryExpr>().collect();
         for subquery in subqueries
             .iter()
@@ -335,11 +326,6 @@ impl Synthesizer {
             .filter(|c| !nested_columns.contains(&std::ptr::from_ref(*c)))
             .collect();
         for column in direct {
-            if column.table.is_none()
-                && output_aliases.is_some_and(|aliases| aliases.contains(&column.column))
-            {
-                continue;
-            }
             self.column_attribute(column, scopes);
         }
     }
@@ -494,6 +480,14 @@ impl Synthesizer {
 
         SynthCatalog { tables, stats }
     }
+}
+
+/// Innermost scope entry whose alias matches a column qualifier.
+fn scope_entry_find<'a>(scopes: &'a [Scope], qualifier: &EcoString) -> Option<&'a ScopeEntry> {
+    scopes
+        .iter()
+        .rev()
+        .find_map(|scope| scope.entries.iter().find(|e| &e.alias == qualifier))
 }
 
 fn query_contains(outer: &QueryExpr, inner: &QueryExpr) -> bool {
