@@ -12,7 +12,10 @@ mod report;
 mod subsume;
 mod volatility;
 
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -20,9 +23,9 @@ use pgcache_lib::query::ast::QueryExpr;
 
 use crate::catalog_synth::{SynthCatalog, catalog_synthesize};
 use crate::classify::{
-    ParseOutcome, ParsedStatement, Verdict, statement_classify, statement_parse,
+    AnalyzedStatement, ParseOutcome, ParsedStatement, statement_classify, statement_parse,
 };
-use crate::input::{TraceFormat, statements_read, trace_format_detect};
+use crate::input::{TraceFormat, TraceStatement, statements_read, trace_format_detect};
 use crate::volatility::builtin_functions_load;
 
 const OUT_OF_SCOPE: &str = "\
@@ -68,7 +71,7 @@ enum Command {
 }
 
 struct Analysis {
-    items: Vec<(ParsedStatement, Verdict)>,
+    items: Vec<AnalyzedStatement>,
     catalog: SynthCatalog,
     format: TraceFormat,
     inferred_parameters: usize,
@@ -87,8 +90,31 @@ fn trace_analyze(path: &PathBuf, format_override: Option<TraceFormat>) -> anyhow
         path.display()
     );
 
-    let parsed: Vec<ParsedStatement> = statements.into_iter().map(statement_parse).collect();
-    let corpus: Vec<&QueryExpr> = parsed
+    // Raw traces are dominated by byte-identical repeats: parse and classify
+    // once per distinct (sql, parameters) pair and share the results per
+    // occurrence. `distinct` keeps first-seen order so catalog synthesis and
+    // its heuristic counters stay deterministic.
+    let mut parse_memo: HashMap<(String, Vec<Option<String>>), Rc<ParsedStatement>> =
+        HashMap::new();
+    let mut distinct: Vec<Rc<ParsedStatement>> = Vec::new();
+    let occurrences: Vec<(TraceStatement, Rc<ParsedStatement>)> = statements
+        .into_iter()
+        .map(|trace| {
+            let key = (trace.sql.clone(), trace.parameters.clone());
+            let parsed = match parse_memo.entry(key) {
+                Entry::Occupied(entry) => Rc::clone(entry.get()),
+                Entry::Vacant(entry) => {
+                    let parsed = Rc::new(statement_parse(&trace.sql, &trace.parameters));
+                    distinct.push(Rc::clone(&parsed));
+                    entry.insert(Rc::clone(&parsed));
+                    parsed
+                }
+            };
+            (trace, parsed)
+        })
+        .collect();
+
+    let corpus: Vec<&QueryExpr> = distinct
         .iter()
         .filter_map(|p| match &p.outcome {
             ParseOutcome::Select(expr) => Some(&**expr),
@@ -97,12 +123,30 @@ fn trace_analyze(path: &PathBuf, format_override: Option<TraceFormat>) -> anyhow
         .collect();
     let catalog = catalog_synthesize(corpus);
     let builtins = builtin_functions_load();
-    let inferred_parameters = parsed.iter().map(|p| p.inferred_parameters).sum();
-    let items = parsed
-        .into_iter()
+
+    let verdict_memo: HashMap<*const ParsedStatement, Rc<_>> = distinct
+        .iter()
         .map(|p| {
-            let verdict = statement_classify(&p, &catalog.tables, &builtins);
-            (p, verdict)
+            let verdict = Rc::new(statement_classify(p, &catalog.tables, &builtins));
+            (Rc::as_ptr(p), verdict)
+        })
+        .collect();
+
+    let mut inferred_parameters = 0;
+    let items: Vec<AnalyzedStatement> = occurrences
+        .into_iter()
+        .map(|(trace, parsed)| {
+            inferred_parameters += parsed.inferred_parameters;
+            let verdict = Rc::clone(
+                verdict_memo
+                    .get(&Rc::as_ptr(&parsed))
+                    .expect("verdict memoized for every distinct statement"),
+            );
+            AnalyzedStatement {
+                trace,
+                parsed,
+                verdict,
+            }
         })
         .collect();
     Ok(Analysis {

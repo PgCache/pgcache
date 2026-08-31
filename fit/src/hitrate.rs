@@ -8,7 +8,7 @@ use pgcache_lib::cache::query::limit_is_sufficient;
 use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::write::TransactionBoundary;
 
-use crate::classify::{ParsedStatement, Verdict};
+use crate::classify::{AnalyzedStatement, Verdict};
 use crate::subsume::SubsumerRegistry;
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -65,7 +65,7 @@ fn rate(hits: u64, total: u64) -> f64 {
 /// and the rest are hits. Two proxy serve gates are modeled: SELECTs inside
 /// an explicit transaction are forwarded, and a repeat needing more rows
 /// than the cached LIMIT window is a limit bump, not a hit.
-pub fn hitrate_replay(items: &[(ParsedStatement, Verdict)]) -> HitrateStats {
+pub fn hitrate_replay(items: &[AnalyzedStatement]) -> HitrateStats {
     let mut stats = HitrateStats::default();
     // Registered fingerprint → cached LIMIT window (`None` = unlimited).
     let mut seen: HashMap<Fingerprint, Option<u64>> = HashMap::new();
@@ -74,25 +74,23 @@ pub fn hitrate_replay(items: &[(ParsedStatement, Verdict)]) -> HitrateStats {
     // identity. Boundaries come from the parsed statement kind.
     let mut in_transaction: HashMap<u64, bool> = HashMap::new();
 
-    for (parsed, verdict) in items {
-        let calls = parsed.trace.calls.max(1);
+    for item in items {
+        let calls = item.trace.calls.max(1);
         stats.statements += 1;
         stats.calls += calls;
-        match verdict {
+        match &*item.verdict {
             Verdict::Write(_) => stats.write_calls += calls,
             Verdict::Utility(boundary) => {
                 stats.utility_calls += calls;
                 if let Some(boundary) = boundary {
-                    in_transaction.insert(
-                        parsed.trace.session,
-                        *boundary == TransactionBoundary::Begin,
-                    );
+                    in_transaction
+                        .insert(item.trace.session, *boundary == TransactionBoundary::Begin);
                 }
             }
             Verdict::Passthrough { .. } => stats.non_cacheable_calls += calls,
             Verdict::Cacheable(analysis) => {
                 if in_transaction
-                    .get(&parsed.trace.session)
+                    .get(&item.trace.session)
                     .copied()
                     .unwrap_or(false)
                 {
@@ -139,18 +137,7 @@ mod tests {
     use pgcache_lib::query::ast::QueryExpr;
 
     fn replay(sqls: &[&str]) -> HitrateStats {
-        let parsed: Vec<ParsedStatement> = sqls
-            .iter()
-            .map(|sql| {
-                statement_parse(TraceStatement {
-                    sql: (*sql).to_owned(),
-                    parameters: Vec::new(),
-                    calls: 1,
-                    total_time_ms: None,
-                    session: 0,
-                })
-            })
-            .collect();
+        let parsed: Vec<_> = sqls.iter().map(|sql| statement_parse(sql, &[])).collect();
         let corpus: Vec<QueryExpr> = parsed
             .iter()
             .filter_map(|p| match &p.outcome {
@@ -160,11 +147,22 @@ mod tests {
             .collect();
         let catalog = catalog_synthesize(corpus.iter());
         let builtins = builtin_functions_load();
-        let items: Vec<(ParsedStatement, Verdict)> = parsed
-            .into_iter()
-            .map(|p| {
+        let items: Vec<AnalyzedStatement> = sqls
+            .iter()
+            .zip(parsed)
+            .map(|(sql, p)| {
                 let verdict = statement_classify(&p, &catalog.tables, &builtins);
-                (p, verdict)
+                AnalyzedStatement {
+                    trace: TraceStatement {
+                        sql: (*sql).to_owned(),
+                        parameters: Vec::new(),
+                        calls: 1,
+                        total_time_ms: None,
+                        session: 0,
+                    },
+                    parsed: std::rc::Rc::new(p),
+                    verdict: std::rc::Rc::new(verdict),
+                }
             })
             .collect();
         hitrate_replay(&items)
@@ -210,14 +208,8 @@ mod tests {
 
     #[test]
     fn test_pgss_calls_weighting() {
-        let trace = TraceStatement {
-            sql: "SELECT * FROM users WHERE id = 7".to_owned(),
-            parameters: Vec::new(),
-            calls: 100,
-            total_time_ms: None,
-            session: 0,
-        };
-        let parsed = statement_parse(trace);
+        let sql = "SELECT * FROM users WHERE id = 7";
+        let parsed = statement_parse(sql, &[]);
         let corpus: Vec<QueryExpr> = match &parsed.outcome {
             ParseOutcome::Select(expr) => vec![(**expr).clone()],
             _ => vec![],
@@ -225,7 +217,17 @@ mod tests {
         let catalog = catalog_synthesize(corpus.iter());
         let builtins = builtin_functions_load();
         let verdict = statement_classify(&parsed, &catalog.tables, &builtins);
-        let stats = hitrate_replay(&[(parsed, verdict)]);
+        let stats = hitrate_replay(&[AnalyzedStatement {
+            trace: TraceStatement {
+                sql: sql.to_owned(),
+                parameters: Vec::new(),
+                calls: 100,
+                total_time_ms: None,
+                session: 0,
+            },
+            parsed: std::rc::Rc::new(parsed),
+            verdict: std::rc::Rc::new(verdict),
+        }]);
         assert_eq!(stats.cold_misses, 1);
         assert_eq!(stats.hits, 99);
         assert_eq!(stats.cacheable_calls, 100);

@@ -6,7 +6,7 @@ use pgcache_lib::query::write::WriteClass;
 use pgcache_lib::query::{Fingerprint, ShapeKey};
 
 use crate::catalog_synth::SynthesisStats;
-use crate::classify::{ParseOutcome, ParsedStatement, PassthroughReason, Verdict};
+use crate::classify::{AnalyzedStatement, ParseOutcome, PassthroughReason, Verdict};
 use crate::hitrate::HitrateStats;
 use crate::input::TraceFormat;
 use crate::subsume::SubsumerRegistry;
@@ -166,7 +166,7 @@ fn write_class_table(write_class: &WriteClass) -> String {
 }
 
 pub fn check_report_build(
-    items: &[(ParsedStatement, Verdict)],
+    items: &[AnalyzedStatement],
     synth: &SynthesisStats,
     format: TraceFormat,
     parameter_details_dropped: usize,
@@ -188,20 +188,20 @@ pub fn check_report_build(
     let mut registry = SubsumerRegistry::new();
     let mut subsumed_fingerprints = 0usize;
 
-    for (parsed, verdict) in items {
-        let statement_calls = parsed.trace.calls.max(1);
+    for item in items {
+        let statement_calls = item.trace.calls.max(1);
         statements += 1;
         calls += statement_calls;
-        if let Some(t) = parsed.trace.total_time_ms {
+        if let Some(t) = item.trace.total_time_ms {
             time_available = true;
             time_ms += t;
         }
-        inferred_parameters += parsed.inferred_parameters;
-        distinct_statements.insert(parsed.trace.sql.as_str());
+        inferred_parameters += item.parsed.inferred_parameters;
+        distinct_statements.insert(item.trace.sql.as_str());
 
-        let (verdict_label, reason_label) = match verdict {
+        let (verdict_label, reason_label) = match &*item.verdict {
             Verdict::Cacheable(analysis) => {
-                cacheable.add(statement_calls, parsed.trace.total_time_ms);
+                cacheable.add(statement_calls, item.trace.total_time_ms);
                 if fingerprints.insert(analysis.fingerprint) {
                     if registry.query_subsumed(analysis) {
                         subsumed_fingerprints += 1;
@@ -215,7 +215,7 @@ pub fn check_report_build(
                 passthrough_by_reason
                     .entry(*reason)
                     .or_default()
-                    .add(statement_calls, parsed.trace.total_time_ms);
+                    .add(statement_calls, item.trace.total_time_ms);
                 if let Some(write_class) = cte_write {
                     *writes_by_table
                         .entry(write_class_table(write_class))
@@ -224,18 +224,18 @@ pub fn check_report_build(
                 ("passthrough", Some(reason.label()))
             }
             Verdict::Write(write_class) => {
-                write.add(statement_calls, parsed.trace.total_time_ms);
+                write.add(statement_calls, item.trace.total_time_ms);
                 *writes_by_table
                     .entry(write_class_table(write_class))
                     .or_default() += statement_calls;
                 ("write", None)
             }
             Verdict::Utility(_) => {
-                utility.add(statement_calls, parsed.trace.total_time_ms);
+                utility.add(statement_calls, item.trace.total_time_ms);
                 ("utility", None)
             }
         };
-        let detail = match &parsed.outcome {
+        let detail = match &item.parsed.outcome {
             ParseOutcome::ParseError(error) | ParseOutcome::ParameterError(error) => {
                 Some(error.clone())
             }
@@ -243,7 +243,7 @@ pub fn check_report_build(
             _ => None,
         };
         verdicts.push(StatementVerdict {
-            sql: parsed.trace.sql.clone(),
+            sql: item.trace.sql.clone(),
             verdict: verdict_label,
             reason: reason_label,
             detail,

@@ -38,16 +38,25 @@ pub enum ParseOutcome {
     ParameterError(String),
 }
 
+/// Parse/conversion result for one distinct `(sql, parameters)` pair —
+/// trace-free so byte-identical repeats share one instance (raw statement
+/// logs are dominated by them).
 pub struct ParsedStatement {
-    pub trace: TraceStatement,
     pub outcome: ParseOutcome,
     /// Parameters whose type OID was inferred from the value text.
     pub inferred_parameters: usize,
 }
 
-pub fn statement_parse(trace: TraceStatement) -> ParsedStatement {
+/// One trace occurrence: its metadata plus the shared parse and verdict.
+pub struct AnalyzedStatement {
+    pub trace: TraceStatement,
+    pub parsed: std::rc::Rc<ParsedStatement>,
+    pub verdict: std::rc::Rc<Verdict>,
+}
+
+pub fn statement_parse(sql: &str, trace_parameters: &[Option<String>]) -> ParsedStatement {
     let mut inferred_parameters = 0;
-    let raw = pg_query::parse_raw_scoped(&trace.sql, |tree| unsafe { statement_convert_raw(tree) });
+    let raw = pg_query::parse_raw_scoped(sql, |tree| unsafe { statement_convert_raw(tree) });
     let outcome = match raw {
         Err(parse_error) => ParseOutcome::ParseError(parse_error.to_string()),
         // Structural failure (empty input, multiple statements in one payload).
@@ -61,10 +70,10 @@ pub fn statement_parse(trace: TraceStatement) -> ParsedStatement {
                 cte_write,
             },
             Ok(expr) => {
-                if trace.parameters.is_empty() {
+                if trace_parameters.is_empty() {
                     ParseOutcome::Select(expr)
                 } else {
-                    let (parameters, inferred) = query_parameters_infer(&trace.parameters);
+                    let (parameters, inferred) = query_parameters_infer(trace_parameters);
                     inferred_parameters = inferred;
                     match query_expr_parameters_replace(&expr, &parameters) {
                         Ok(substituted) => ParseOutcome::Select(Box::new(substituted)),
@@ -77,7 +86,6 @@ pub fn statement_parse(trace: TraceStatement) -> ParsedStatement {
         Ok(Ok(RawStatement::ReadOnlyUtility { transaction })) => ParseOutcome::Utility(transaction),
     };
     ParsedStatement {
-        trace,
         outcome,
         inferred_parameters,
     }
@@ -308,14 +316,9 @@ mod tests {
     }
 
     fn classify_with_parameters(sql: &str, parameters: &[Option<&str>]) -> Verdict {
-        let trace = TraceStatement {
-            sql: sql.to_owned(),
-            parameters: parameters.iter().map(|p| p.map(str::to_owned)).collect(),
-            calls: 1,
-            total_time_ms: None,
-            session: 0,
-        };
-        let parsed = statement_parse(trace);
+        let parameters: Vec<Option<String>> =
+            parameters.iter().map(|p| p.map(str::to_owned)).collect();
+        let parsed = statement_parse(sql, &parameters);
         let corpus: Vec<QueryExpr> = match &parsed.outcome {
             ParseOutcome::Select(expr) => vec![(**expr).clone()],
             _ => vec![],

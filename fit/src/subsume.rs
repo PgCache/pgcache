@@ -122,25 +122,13 @@ mod tests {
     use super::*;
     use crate::catalog_synth::catalog_synthesize;
     use crate::classify::{ParseOutcome, Verdict, statement_classify, statement_parse};
-    use crate::input::TraceStatement;
     use crate::volatility::builtin_functions_load;
     use pgcache_lib::query::ast::QueryExpr;
 
     /// Classify a corpus together (shared synthesized catalog), returning the
     /// cacheable analyses in corpus order.
     fn corpus_analyze(sqls: &[&str]) -> Vec<CacheableAnalysis> {
-        let parsed: Vec<_> = sqls
-            .iter()
-            .map(|sql| {
-                statement_parse(TraceStatement {
-                    sql: (*sql).to_owned(),
-                    parameters: Vec::new(),
-                    calls: 1,
-                    total_time_ms: None,
-                    session: 0,
-                })
-            })
-            .collect();
+        let parsed: Vec<_> = sqls.iter().map(|sql| statement_parse(sql, &[])).collect();
         let corpus: Vec<QueryExpr> = parsed
             .iter()
             .filter_map(|p| match &p.outcome {
