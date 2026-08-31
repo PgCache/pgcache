@@ -1,19 +1,42 @@
-//! Offline subsumption: which cacheable queries would be served from data an
-//! already-registered broader query holds. Mirrors the writer's
-//! `subsumption_check` gates: a subsumer must be a plain SELECT over exactly
-//! one relation (not self-joined), without LIMIT, with fully analyzed WHERE
-//! constraints; a set-operation query can never be subsumed.
+//! Offline subsumption registry. Admission gating and the coverage decision
+//! are the proxy's own (`pgcache_lib::cache::admission`); this module only
+//! stores admitted candidates per relation — indexed through the same
+//! `ConstraintIndex` the writer uses (ADR-037) — and answers lookups with
+//! `ready` always true (infinite cache, nothing ever invalidates).
 
 use std::collections::HashMap;
 
-use ecow::EcoString;
-use pgcache_lib::query::constraints::{QueryConstraints, table_constraints_subsumed};
+use pgcache_lib::cache::admission::{SubsumerCandidate, SubsumerSource, subsumption_covered};
+use pgcache_lib::oid::Oid;
+use pgcache_lib::query::Fingerprint;
+use pgcache_lib::query::constraint_index::ConstraintIndex;
+use pgcache_lib::query::constraints::{QueryConstraints, TableConstraint};
 
 use crate::classify::CacheableAnalysis;
 
 #[derive(Default)]
 pub struct SubsumerRegistry {
-    by_table: HashMap<EcoString, Vec<QueryConstraints>>,
+    by_relation: HashMap<Oid, RelationSubsumers>,
+}
+
+struct RelationSubsumers {
+    index: ConstraintIndex<Fingerprint>,
+    admitted: HashMap<Fingerprint, AdmittedSubsumer>,
+}
+
+struct AdmittedSubsumer {
+    constraints: QueryConstraints,
+    has_limit: bool,
+    single_relation: bool,
+}
+
+impl RelationSubsumers {
+    fn new() -> Self {
+        RelationSubsumers {
+            index: ConstraintIndex::new(),
+            admitted: HashMap::new(),
+        }
+    }
 }
 
 impl SubsumerRegistry {
@@ -21,43 +44,74 @@ impl SubsumerRegistry {
         SubsumerRegistry::default()
     }
 
-    /// Admit a registered query as a subsumption parent if it passes all
-    /// eligibility gates; otherwise a no-op.
+    /// Store the query's eligible per-table admissions as subsumption
+    /// candidates. Eligibility was decided by the shared admission analysis;
+    /// the remaining gates run per lookup in `subsumption_covered`.
     pub fn subsumer_register(&mut self, analysis: &CacheableAnalysis) {
-        if analysis.relations.len() != 1 || analysis.self_joined || analysis.has_limit {
-            return;
+        let single_relation = analysis.relations.len() == 1;
+        for admission in &analysis.admissions {
+            if !admission.subsumer_eligible {
+                continue;
+            }
+            let relation = self
+                .by_relation
+                .entry(admission.relation_oid)
+                .or_insert_with(RelationSubsumers::new);
+            relation
+                .index
+                .insert(analysis.fingerprint, &admission.index_constraints);
+            relation.admitted.insert(
+                analysis.fingerprint,
+                AdmittedSubsumer {
+                    constraints: admission.constraints.clone(),
+                    has_limit: analysis.has_limit,
+                    single_relation,
+                },
+            );
         }
-        let Some(constraints) = &analysis.constraints else {
-            return;
-        };
-        if !constraints.where_analysis_complete {
-            return;
-        }
-        let Some(table) = analysis.relations.first() else {
-            return;
-        };
-        self.by_table
-            .entry(table.clone())
-            .or_default()
-            .push(constraints.clone());
     }
 
     /// Whether every relation the query references is covered by some
-    /// registered subsumer whose constraints are implied by the query's.
+    /// registered subsumer — the writer's `subsumption_check`, offline.
     pub fn query_subsumed(&self, analysis: &CacheableAnalysis) -> bool {
-        if analysis.relations.is_empty() {
-            return false;
-        }
         let Some(new_constraints) = &analysis.constraints else {
             return false;
         };
-        analysis.relations.iter().all(|table| {
-            self.by_table.get(table).is_some_and(|candidates| {
-                candidates
-                    .iter()
-                    .any(|cached| table_constraints_subsumed(new_constraints, cached, table))
+        let relations: Vec<(Oid, &str)> = analysis
+            .relations
+            .iter()
+            .map(|(oid, name)| (*oid, name.as_str()))
+            .collect();
+        subsumption_covered(new_constraints, &relations, self)
+    }
+}
+
+impl SubsumerSource for SubsumerRegistry {
+    fn candidates(
+        &self,
+        relation_oid: Oid,
+        table_constraints: &[TableConstraint],
+    ) -> impl Iterator<Item = SubsumerCandidate<'_>> {
+        self.by_relation
+            .get(&relation_oid)
+            .into_iter()
+            .flat_map(move |relation| {
+                relation
+                    .index
+                    .candidates(table_constraints)
+                    .into_iter()
+                    .filter_map(move |fingerprint| {
+                        relation
+                            .admitted
+                            .get(&fingerprint)
+                            .map(|subsumer| SubsumerCandidate {
+                                constraints: &subsumer.constraints,
+                                has_limit: subsumer.has_limit,
+                                single_relation: subsumer.single_relation,
+                                ready: true,
+                            })
+                    })
             })
-        })
     }
 }
 
@@ -143,7 +197,9 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_table_parent_not_admitted() {
+    fn test_multi_table_parent_rejected_at_lookup() {
+        // Multi-table parents are indexed (like the writer) but rejected per
+        // lookup by the single_relation gate.
         let analyses = corpus_analyze(&[
             "SELECT * FROM users u JOIN orders o ON u.id = o.user_id",
             "SELECT * FROM users WHERE id = 5",
@@ -166,6 +222,18 @@ mod tests {
     }
 
     #[test]
+    fn test_self_join_parent_not_admitted() {
+        // PGC-256: self-joined update queries are never subsumers.
+        let analyses = corpus_analyze(&[
+            "SELECT * FROM emp e JOIN emp m ON e.manager_id = m.id",
+            "SELECT * FROM emp WHERE id = 1",
+        ]);
+        let mut registry = SubsumerRegistry::new();
+        registry.subsumer_register(&analyses[0]);
+        assert!(!registry.query_subsumed(&analyses[1]));
+    }
+
+    #[test]
     fn test_join_child_covered_by_two_single_table_parents() {
         let analyses = corpus_analyze(&[
             "SELECT * FROM users",
@@ -176,5 +244,29 @@ mod tests {
         registry.subsumer_register(&analyses[0]);
         registry.subsumer_register(&analyses[1]);
         assert!(registry.query_subsumed(&analyses[2]));
+    }
+
+    #[test]
+    fn test_derived_table_branch_constraints_prevent_false_subsumption() {
+        // The derived table caches only id=5 rows; its per-branch constraints
+        // (from the shared admission analysis) must not cover other literals.
+        let analyses = corpus_analyze(&[
+            "SELECT * FROM (SELECT * FROM users WHERE id = 5) s",
+            "SELECT * FROM users WHERE id = 7",
+        ]);
+        let mut registry = SubsumerRegistry::new();
+        registry.subsumer_register(&analyses[0]);
+        assert!(!registry.query_subsumed(&analyses[1]));
+    }
+
+    #[test]
+    fn test_cross_schema_same_name_not_subsumed() {
+        let analyses = corpus_analyze(&[
+            "SELECT * FROM tenant_a.users",
+            "SELECT * FROM tenant_b.users WHERE id = 5",
+        ]);
+        let mut registry = SubsumerRegistry::new();
+        registry.subsumer_register(&analyses[0]);
+        assert!(!registry.query_subsumed(&analyses[1]));
     }
 }

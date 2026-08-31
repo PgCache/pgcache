@@ -2,7 +2,6 @@ use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::{Fingerprint, QueryShape, query_shape_derive};
 use std::cmp::Reverse;
-use std::collections::HashSet;
 use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -20,35 +19,28 @@ use crate::cache::coalesce_queue::fetch_stage_ewma_update;
 use crate::cache::query::limit_rows_needed;
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::query::ast::{AstNode, Deparse, QueryBody, QueryExpr, TableNode};
-use crate::query::constraints::analyze_query_constraints;
 use crate::query::decorrelate::query_expr_decorrelate;
-use crate::query::predicate::CompiledPredicate;
 use crate::query::resolved::{
     ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, enum_order_dependence_check,
     query_expr_resolve,
 };
-use crate::query::transform::PgEvalTemplate;
 use crate::query::transform::predicate_pushdown_apply;
-use crate::query::update::query_table_update_queries;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
+use super::super::admission::query_admission_analyze;
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{AdmitAction, QueryCommand, SubsumptionResult},
     mv::{ShapeGate, resolved_has_join, resolved_has_window, shape_classify},
     query::CacheableQuery,
     types::{CachedQuery, QueryMetrics, SharedResolved},
-    update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery, UpdateQuerySource},
+    update_query::UpdateQueries,
 };
 use super::core::{MERGE_FLUSH_FORCE_AFTER, PendingMerge, WriterCore};
 use super::population::population_worker;
 use super::staging::MergeOutcome;
-use super::update_classify::{
-    limit_order_keys_collect, limit_window_columns_collect, pg_batchable_classify,
-    predicate_columns_collect, update_eval_strategy_classify,
-};
 use crate::pg;
 
 /// Minimum number of persistent population workers.
@@ -451,81 +443,6 @@ impl WriterRegistration {
         }
     }
 
-    /// Register an update query for a relation. Maintains complexity-sorted
-    /// fingerprint order for CDC iteration and indexes the constraints for
-    /// sub-linear subsumption candidate lookup.
-    fn update_query_register(
-        &self,
-        core: &mut WriterCore,
-        relation_oid: Oid,
-        table_name: &str,
-        mut update_query: UpdateQuery,
-    ) {
-        let fingerprint = update_query.fingerprint;
-        let has_limit = update_query.has_limit;
-
-        // Whether a CDC UPDATE for this query can ever invalidate — i.e. whether
-        // `handle_update` must run `query_row_changes` + the invalidation check
-        // rather than skip them (PGC-227). Derived from the single source of
-        // truth so the flag can't drift from the actual checks.
-        update_query.change_dependent = update_query.update_invalidation_possible(table_name);
-        // A relation appearing more than once (a self-join) has its constraints
-        // extracted per occurrence but keyed by table *name*, so they collapse
-        // into one set that only holds for one arm. `emp e JOIN emp m … WHERE
-        // e.dept = 'x'` yields `dept = 'x'` for `emp`, which is simply false of
-        // the `m` arm — the manager row would be filtered out of the candidate
-        // set and evicted as an update-out, even though the join still needs it
-        // (PGC-256). Index it as *unconstrained* instead: the broadest candidate
-        // class, so no true match is dropped, and let the per-occurrence
-        // membership predicate decide. Keep it out of `subsumption` though —
-        // there, "no constraints" means the opposite (the parent loaded every
-        // row, so it covers anything), which this query cannot claim.
-        let self_joined = update_query
-            .resolved
-            .nodes::<ResolvedTableNode>()
-            .filter(|t| t.relation_oid == relation_oid)
-            .count()
-            > 1;
-
-        // Per-table constraints, shared by both indexes. Queries with empty
-        // per-table constraints (full-table scans, OR/unhandled WHERE shapes)
-        // are indexed with `&[]` — the broadest class, in the empty `ColumnSet`.
-        let table_constraints = if self_joined {
-            Vec::new()
-        } else {
-            update_query
-                .constraints
-                .table_constraints
-                .get(table_name)
-                .cloned()
-                .unwrap_or_default()
-        };
-        // `eval_index` holds the *full* update-query population (PGC-292) — every
-        // query regardless of eval strategy or `has_limit` — so a query with no
-        // extractable constraints is a candidate for every row and narrowing
-        // never drops a true match (no stale reads). `subsumption` indexes the
-        // same constraints but only for eligible parents:
-        // - has_limit: limited queries are excluded by `subsumption_check`.
-        // - !where_analysis_complete: the WHERE couldn't be fully analyzed, so
-        //   coverage isn't reasonable (PGC-106); the detailed check would reject
-        //   these anyway, and skipping saves a per-lookup candidate visit.
-        let can_subsume =
-            !self_joined && !has_limit && update_query.constraints.where_analysis_complete;
-
-        let mut queries = core
-            .cache
-            .update_queries
-            .entry(relation_oid)
-            .or_insert_with(|| UpdateQueries::new(relation_oid));
-
-        queries.query_insert(update_query);
-
-        if can_subsume {
-            queries.subsumption.insert(fingerprint, &table_constraints);
-        }
-        queries.eval_index.insert(fingerprint, &table_constraints);
-    }
-
     /// Dispatch population work to next worker using round-robin scheduling.
     fn populate_work_dispatch(
         &mut self,
@@ -599,8 +516,10 @@ impl WriterRegistration {
         Ok(())
     }
 
-    /// Decorrelate the resolved AST and register update queries for each table.
-    /// Returns the relation OIDs that have update queries registered.
+    /// Run the pure admission analysis (decorrelation, per-table update
+    /// queries, subsumer eligibility) and store the results: the update-query
+    /// map plus the constraint indexes for sub-linear subsumption candidate
+    /// lookup. Returns the relation OIDs that have update queries registered.
     fn update_queries_register(
         &self,
         core: &mut WriterCore,
@@ -608,85 +527,33 @@ impl WriterRegistration {
         resolved: &SharedResolved,
         has_limit: bool,
     ) -> CacheResult<Vec<Oid>> {
-        let decorrelated = query_expr_decorrelate(resolved, &self.aggregate_functions)
-            .map_err(|e| e.context_transform(CacheError::from))
-            .attach_loc("decorrelating correlated subqueries")?;
-        let update_source = if decorrelated.transformed {
-            &decorrelated.resolved
-        } else {
-            resolved
-        };
+        let analysis = query_admission_analyze(
+            resolved,
+            fingerprint,
+            has_limit,
+            &self.aggregate_functions,
+            &core.cache.tables,
+        )?;
 
         let mut relation_oids = Vec::new();
-        for (table_node, update_resolved, source) in query_table_update_queries(update_source) {
-            let relation_oid = table_node.relation_oid;
-            let constraints = update_resolved
-                .as_select()
-                .map(analyze_query_constraints)
-                .unwrap_or_default();
-            let eval_strategy = update_eval_strategy_classify(&update_resolved, source);
-            let pg_batchable = eval_strategy == UpdateEvalStrategy::PgEval
-                && pg_batchable_classify(&update_resolved, relation_oid, &self.aggregate_functions);
-            // Walk the parent `resolved` — `update_resolved` has ORDER BY stripped.
-            let limit_window_columns = if has_limit {
-                limit_window_columns_collect(resolved, table_node.name.as_str())
-            } else {
-                HashSet::new()
-            };
-            // Walk `update_resolved`: it is the AST CDC eval actually runs.
-            let predicate_columns =
-                predicate_columns_collect(&update_resolved, table_node.name.as_str());
-            let is_single_table = update_resolved.is_single_table();
-            // Direction-aware window spec (PGC-334) — the shapes the cached-path
-            // window check can reason about. Walks the parent `resolved` like
-            // `limit_window_columns` (ORDER BY is stripped from `update_resolved`).
-            let order_by_keys =
-                (has_limit && is_single_table && matches!(source, UpdateQuerySource::FromClause))
-                    .then(|| limit_order_keys_collect(resolved, table_node.name.as_str()))
-                    .flatten();
-            // Compile the LocalEval WHERE once so the per-row CDC membership probe
-            // doesn't re-destructure the resolved AST (PGC-339). PgEval queries
-            // never consult this, so skip building it.
-            let compiled_where = if eval_strategy == UpdateEvalStrategy::LocalEval {
-                update_resolved
-                    .as_select()
-                    .and_then(|s| s.where_clause.as_ref())
-                    .map(|w| CompiledPredicate::compile(w, table_node.name.as_str()))
-            } else {
-                None
-            };
-            // Precompute the PgEval membership template so the per-row check
-            // skips the resolved-AST clone + deparse (PGC-343). Only PgEval uses
-            // it; needs the relation's TableMetadata (registered before this loop).
-            let pg_eval_template = if eval_strategy == UpdateEvalStrategy::PgEval {
-                update_resolved.as_select().and_then(|select| {
-                    core.cache
-                        .tables
-                        .get1(&relation_oid)
-                        .and_then(|table_metadata| PgEvalTemplate::build(select, table_metadata))
-                })
-            } else {
-                None
-            };
-            let update_query = UpdateQuery {
-                fingerprint,
-                resolved: update_resolved,
-                source,
-                constraints,
-                has_limit,
-                eval_strategy,
-                limit_window_columns,
-                order_by_keys,
-                // Set authoritatively in update_query_register (needs table_name).
-                change_dependent: false,
-                pg_batchable,
-                predicate_columns,
-                is_single_table,
-                compiled_where,
-                pg_eval_template,
-            };
+        for admission in analysis.tables {
+            let mut queries = core
+                .cache
+                .update_queries
+                .entry(admission.relation_oid)
+                .or_insert_with(|| UpdateQueries::new(admission.relation_oid));
 
-            self.update_query_register(core, relation_oid, table_node.name.as_str(), update_query);
+            let relation_oid = admission.relation_oid;
+            queries.query_insert(admission.update_query);
+
+            if admission.subsumer_eligible {
+                queries
+                    .subsumption
+                    .insert(fingerprint, &admission.index_constraints);
+            }
+            queries
+                .eval_index
+                .insert(fingerprint, &admission.index_constraints);
             relation_oids.push(relation_oid);
         }
         Ok(relation_oids)

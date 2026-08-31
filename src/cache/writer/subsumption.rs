@@ -9,17 +9,57 @@ use std::time::Instant;
 use ecow::EcoString;
 use tracing::{debug, error};
 
+use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::constraints::{
-    TableConstraint, analyze_query_constraints, table_constraints_subsumed,
-};
+use crate::query::constraints::{TableConstraint, analyze_query_constraints};
 use crate::result::error_chain_format;
 use crate::timing::duration_to_ns_u64;
 
-use super::super::types::SharedResolved;
+use super::super::admission::{SubsumerCandidate, SubsumerSource, subsumption_covered};
+use super::super::types::{Cache, SharedResolved};
 use super::super::{CacheError, CacheResult, MapIntoReport};
 use super::core::WriterCore;
 use super::registration::{QueryResolution, WriterRegistration};
+
+/// Candidate source over the writer's per-relation subsumption index plus
+/// parent readiness state.
+struct WriterSubsumerSource<'a> {
+    cache: &'a Cache,
+}
+
+impl SubsumerSource for WriterSubsumerSource<'_> {
+    fn candidates(
+        &self,
+        relation_oid: Oid,
+        table_constraints: &[TableConstraint],
+    ) -> impl Iterator<Item = SubsumerCandidate<'_>> {
+        self.cache
+            .update_queries
+            .get(&relation_oid)
+            .into_iter()
+            .flat_map(move |update_queries| {
+                // Sub-linear candidate lookup via the per-relation subsumption
+                // index; the fine-grained gates run per candidate in
+                // `subsumption_covered`.
+                update_queries
+                    .subsumption
+                    .candidates(table_constraints)
+                    .into_iter()
+                    .filter_map(move |fingerprint| {
+                        let update_query = update_queries.queries.get(&fingerprint)?;
+                        let parent = self.cache.cached_queries.get1(&fingerprint);
+                        Some(SubsumerCandidate {
+                            constraints: &update_query.constraints,
+                            has_limit: update_query.has_limit,
+                            ready: parent.is_some_and(|q| {
+                                !q.invalidated && q.registration_started_at.is_none()
+                            }),
+                            single_relation: parent.is_some_and(|q| q.relation_oids.len() == 1),
+                        })
+                    })
+            })
+    }
+}
 
 impl WriterRegistration {
     /// Check whether all tables in the new query are covered by existing cached queries.
@@ -42,61 +82,19 @@ impl WriterRegistration {
 
         let new_constraints = analyze_query_constraints(select);
 
+        let mut relations = Vec::with_capacity(resolution.relation_oids.len());
         for &oid in &resolution.relation_oids {
-            let Some(update_queries) = core.cache.update_queries.get(&oid) else {
-                return false;
-            };
-
             let Some(table_meta) = core.cache.tables.get1(&oid) else {
                 return false;
             };
-            let table_name = &table_meta.name;
-
-            // Sub-linear candidate lookup via the per-relation subsumption index.
-            // Returns parents whose constraint-column set is a subset of new's;
-            // we still need to apply parent_ready / single-table / fine-grained
-            // constraint checks per candidate, but the candidate set is
-            // typically far smaller than `queries.len()`.
-            let empty: Vec<TableConstraint> = Vec::new();
-            let new_table_constraints = new_constraints
-                .table_constraints
-                .get(table_name.as_str())
-                .unwrap_or(&empty);
-            let candidate_fps = update_queries.subsumption.candidates(new_table_constraints);
-
-            let table_covered = candidate_fps.into_iter().any(|fp| {
-                let Some(uq) = update_queries.queries.get(&fp) else {
-                    return false;
-                };
-                if uq.has_limit {
-                    return false;
-                }
-
-                let parent = core.cache.cached_queries.get1(&uq.fingerprint);
-
-                let parent_ready =
-                    parent.is_some_and(|q| !q.invalidated && q.registration_started_at.is_none());
-                if !parent_ready {
-                    return false;
-                }
-
-                // Only single-table cached queries are subsumption candidates.
-                // Multi-table queries have implicit join filtering that constraint
-                // analysis doesn't capture, so we can't safely reason about coverage.
-                let parent_single_table = parent.is_some_and(|q| q.relation_oids.len() == 1);
-                if !parent_single_table {
-                    return false;
-                }
-
-                table_constraints_subsumed(&new_constraints, &uq.constraints, table_name)
-            });
-
-            if !table_covered {
-                return false;
-            }
+            relations.push((oid, table_meta.name.as_str()));
         }
 
-        true
+        subsumption_covered(
+            &new_constraints,
+            &relations,
+            &WriterSubsumerSource { cache: &core.cache },
+        )
     }
 
     /// Handle a subsumed query: assign generation, stamp rows in cache DB, mark Ready.

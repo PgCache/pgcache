@@ -324,6 +324,25 @@ pub enum FunctionVolatility {
     Volatile,
 }
 
+/// SQL behind [`function_volatility_map_load`]. Public so pgcache-fit's
+/// embedded snapshot regenerates from the identical query and cannot drift
+/// from the loader.
+pub const FUNCTION_VOLATILITY_SQL: &str = "SELECT p.proname,
+        MAX(CASE p.provolatile
+            WHEN 'v' THEN 2
+            WHEN 's' THEN 1
+            ELSE 0
+        END) AS worst_volatility
+ FROM pg_proc p
+ JOIN pg_namespace n ON p.pronamespace = n.oid
+ WHERE p.prokind NOT IN ('a', 'w')
+ GROUP BY p.proname";
+
+/// SQL behind [`aggregate_functions_load`]; public for the same
+/// anti-drift reason as [`FUNCTION_VOLATILITY_SQL`].
+pub const AGGREGATE_FUNCTIONS_SQL: &str =
+    "SELECT DISTINCT lower(p.proname) FROM pg_proc p WHERE p.prokind = 'a'";
+
 /// Load function volatilities from pg_proc.
 ///
 /// Queries the origin database for all scalar functions and builds a map
@@ -335,21 +354,7 @@ pub enum FunctionVolatility {
 pub async fn function_volatility_map_load(
     client: &Client,
 ) -> Result<HashMap<EcoString, FunctionVolatility>, Error> {
-    let rows = client
-        .query(
-            "SELECT p.proname,
-                    MAX(CASE p.provolatile
-                        WHEN 'v' THEN 2
-                        WHEN 's' THEN 1
-                        ELSE 0
-                    END) AS worst_volatility
-             FROM pg_proc p
-             JOIN pg_namespace n ON p.pronamespace = n.oid
-             WHERE p.prokind NOT IN ('a', 'w')
-             GROUP BY p.proname",
-            &[],
-        )
-        .await?;
+    let rows = client.query(FUNCTION_VOLATILITY_SQL, &[]).await?;
 
     let mut map = HashMap::with_capacity(rows.len());
     for row in &rows {
@@ -373,12 +378,7 @@ pub async fn function_volatility_map_load(
 /// a scalar subquery's output expression contains an aggregate (which controls
 /// whether a GROUP BY is needed in the derived table).
 pub async fn aggregate_functions_load(client: &Client) -> Result<HashSet<EcoString>, Error> {
-    let rows = client
-        .query(
-            "SELECT DISTINCT lower(p.proname) FROM pg_proc p WHERE p.prokind = 'a'",
-            &[],
-        )
-        .await?;
+    let rows = client.query(AGGREGATE_FUNCTIONS_SQL, &[]).await?;
 
     let mut set = HashSet::with_capacity(rows.len());
     for row in &rows {

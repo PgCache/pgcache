@@ -17,6 +17,7 @@ pub type CacheResult<T> = Result<T, Report<CacheError>>;
 pub use crate::result::{MapIntoReport, ReportExt};
 
 // Module declarations
+pub mod admission;
 mod cdc;
 mod coalesce_queue;
 mod explain;

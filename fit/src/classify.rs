@@ -4,13 +4,17 @@
 
 use ecow::EcoString;
 use iddqd::BiHashMap;
+use pgcache_lib::cache::admission::query_admission_analyze;
+use pgcache_lib::cache::query::limit_rows_needed;
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::TableMetadata;
+use pgcache_lib::oid::Oid;
 use pgcache_lib::query::ast::{
-    AstNode, QueryExpr, RawStatement, TableNode, query_expr_fingerprint, statement_convert_raw,
+    QueryBody, QueryExpr, RawStatement, query_expr_fingerprint, statement_convert_raw,
 };
-use pgcache_lib::query::constraints::{QueryConstraints, analyze_query_constraints};
-use pgcache_lib::query::decorrelate::query_expr_decorrelate;
+use pgcache_lib::query::constraints::{
+    QueryConstraints, TableConstraint, analyze_query_constraints,
+};
 use pgcache_lib::query::resolve::query_expr_resolve;
 use pgcache_lib::query::transform::query_expr_parameters_replace;
 use pgcache_lib::query::write::WriteClass;
@@ -127,18 +131,33 @@ fn cacheability_reason(error: &CacheabilityError) -> PassthroughReason {
     }
 }
 
-/// Stage A + B analysis of a cacheable SELECT.
+/// Stage A + B analysis of a cacheable SELECT, carrying the pieces of the
+/// shared admission analysis the offline model needs.
 pub struct CacheableAnalysis {
     pub fingerprint: Fingerprint,
     pub shape_key: ShapeKey,
-    /// Distinct referenced table names.
-    pub relations: Vec<EcoString>,
-    /// Same table referenced more than once — excluded from subsumers,
-    /// mirroring the registration path (PGC-256).
-    pub self_joined: bool,
+    /// Distinct referenced relations, keyed like the writer: by oid.
+    pub relations: Vec<(Oid, EcoString)>,
     pub has_limit: bool,
-    /// `None` for set-operation queries (rejected by subsumption outright).
+    /// Rows needed to satisfy the query's LIMIT+OFFSET (`None` = unlimited),
+    /// mirroring the writer's `max_limit`; drives the replay's
+    /// limit-sufficiency gate.
+    pub max_limit: Option<u64>,
+    /// Whole-query constraints of the original (pre-decorrelation) resolved
+    /// form — the subsumed-side input; `None` for set-operation queries
+    /// (rejected by subsumption outright).
     pub constraints: Option<QueryConstraints>,
+    /// One entry per admitted update query (the subsumer side).
+    pub admissions: Vec<FitAdmission>,
+}
+
+/// The slice of a [`TableAdmission`] the offline registry keeps.
+pub struct FitAdmission {
+    pub relation_oid: Oid,
+    /// The update query's per-branch constraints — what subsumption compares.
+    pub constraints: QueryConstraints,
+    pub index_constraints: Vec<TableConstraint>,
+    pub subsumer_eligible: bool,
 }
 
 pub enum Verdict {
@@ -193,37 +212,70 @@ pub fn statement_classify(
         }
     };
 
-    // Stage B: resolve and decorrelate against the (synthesized) catalog.
-    let Ok(resolved) = query_expr_resolve(&cacheable.query, catalog, &["public"]) else {
+    // Stage B against the (synthesized) catalog, mirroring the writer's
+    // registration path: strip LIMIT before resolving (base_query_prepare)
+    // and derive has_limit from max_limit.
+    let is_set_op = matches!(cacheable.query.body, QueryBody::SetOp(_));
+    let max_limit = if is_set_op {
+        None
+    } else {
+        limit_rows_needed(&cacheable.query.limit)
+    };
+    let has_limit = max_limit.is_some();
+    let mut base_query = cacheable.query.clone();
+    base_query.limit = None;
+
+    let Ok(resolved) = query_expr_resolve(&base_query, catalog, &["public"]) else {
         return Verdict::Passthrough {
             reason: PassthroughReason::ResolutionFailed,
             cte_write: None,
         };
     };
-    if query_expr_decorrelate(&resolved, &builtins.aggregates).is_err() {
-        return Verdict::Passthrough {
-            reason: PassthroughReason::DecorrelationFailed,
-            cte_write: None,
-        };
-    }
+    let fingerprint = query_expr_fingerprint(&cacheable.query);
+    let analysis = match query_admission_analyze(
+        &resolved,
+        fingerprint,
+        has_limit,
+        &builtins.aggregates,
+        catalog,
+    ) {
+        Ok(analysis) => analysis,
+        Err(_) => {
+            return Verdict::Passthrough {
+                reason: PassthroughReason::DecorrelationFailed,
+                cte_write: None,
+            };
+        }
+    };
 
-    let table_references: Vec<&TableNode> = cacheable.query.nodes::<TableNode>().collect();
-    let mut relations: Vec<EcoString> = Vec::new();
-    for table in &table_references {
-        if !relations.contains(&table.name) {
-            relations.push(table.name.clone());
+    let mut relations: Vec<(Oid, EcoString)> = Vec::new();
+    for table in &analysis.tables {
+        if !relations.iter().any(|(oid, _)| *oid == table.relation_oid) {
+            relations.push((table.relation_oid, table.table_name.clone()));
         }
     }
-    let self_joined = table_references.len() > relations.len();
+    let admissions = analysis
+        .tables
+        .into_iter()
+        .map(|table| FitAdmission {
+            relation_oid: table.relation_oid,
+            constraints: table.update_query.constraints,
+            index_constraints: table.index_constraints,
+            subsumer_eligible: table.subsumer_eligible,
+        })
+        .collect();
+    // The subsumed side analyzes the original (pre-decorrelation) resolved
+    // form, like the writer's subsumption_check.
     let constraints = resolved.as_select().map(analyze_query_constraints);
 
     Verdict::Cacheable(Box::new(CacheableAnalysis {
-        fingerprint: query_expr_fingerprint(&cacheable.query),
+        fingerprint,
         shape_key: query_shape_derive(&resolved).key,
         relations,
-        self_joined,
-        has_limit: cacheable.query.limit.is_some(),
+        has_limit,
+        max_limit,
         constraints,
+        admissions,
     }))
 }
 
@@ -365,14 +417,15 @@ mod tests {
     }
 
     #[test]
-    fn test_self_join_flagged() {
+    fn test_self_join_excluded_from_subsumers() {
         let Verdict::Cacheable(analysis) =
             classify("SELECT * FROM emp e JOIN emp m ON e.manager_id = m.id WHERE e.id = 1")
         else {
             panic!("expected cacheable");
         };
-        assert!(analysis.self_joined);
         assert_eq!(analysis.relations.len(), 1);
+        assert!(!analysis.admissions.is_empty());
+        assert!(analysis.admissions.iter().all(|a| !a.subsumer_eligible));
     }
 
     /// Spike (a), locked in as a regression test: a logged text parameter
