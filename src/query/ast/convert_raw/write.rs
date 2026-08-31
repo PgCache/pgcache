@@ -10,7 +10,9 @@ use ecow::EcoString;
 
 use pg_query::pg_nodes as pg;
 
-use crate::query::write::{INSERT_MAX_ROWS, InsertRow, InsertStatement, RelationRef, WriteClass};
+use crate::query::write::{
+    INSERT_MAX_ROWS, InsertRow, InsertStatement, RelationRef, TransactionBoundary, WriteClass,
+};
 
 use super::super::LiteralValue;
 use super::super::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
@@ -21,7 +23,8 @@ pub(super) enum NonSelectClass {
     Write(WriteClass),
     /// Provably cannot modify table data (transaction control, SET, SHOW,
     /// FETCH, ...). Kept to an explicit whitelist; everything else is a write.
-    ReadOnly,
+    /// Carries the transaction boundary for transaction-control statements.
+    ReadOnly(Option<TransactionBoundary>),
 }
 
 /// Classify a non-`SelectStmt` root statement.
@@ -50,7 +53,7 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                     // COPY (WITH x AS (INSERT ...) ...) TO — the query writes.
                     Write(WriteClass::Connection)
                 } else {
-                    ReadOnly
+                    ReadOnly(None)
                 }
             }
             pg::NodeTag_T_TruncateStmt => {
@@ -64,14 +67,24 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                 }
             }
             pg::NodeTag_T_TransactionStmt => {
-                match (*cast::<pg::TransactionStmt>(stmt)).kind {
+                let s = cast::<pg::TransactionStmt>(stmt);
+                match (*s).kind {
                     pg::TransactionStmtKind_TRANS_STMT_BEGIN
-                    | pg::TransactionStmtKind_TRANS_STMT_START
-                    | pg::TransactionStmtKind_TRANS_STMT_COMMIT
-                    | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK
-                    | pg::TransactionStmtKind_TRANS_STMT_SAVEPOINT
+                    | pg::TransactionStmtKind_TRANS_STMT_START => {
+                        ReadOnly(Some(TransactionBoundary::Begin))
+                    }
+                    // AND CHAIN immediately re-enters a transaction.
+                    pg::TransactionStmtKind_TRANS_STMT_COMMIT
+                    | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK => {
+                        ReadOnly(Some(if (*s).chain {
+                            TransactionBoundary::Begin
+                        } else {
+                            TransactionBoundary::End
+                        }))
+                    }
+                    pg::TransactionStmtKind_TRANS_STMT_SAVEPOINT
                     | pg::TransactionStmtKind_TRANS_STMT_RELEASE
-                    | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO => ReadOnly,
+                    | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO => ReadOnly(None),
                     // PREPARE TRANSACTION commits later, possibly from another
                     // session — the entry must never be LSN-stamped.
                     pg::TransactionStmtKind_TRANS_STMT_PREPARE => {
@@ -89,7 +102,7 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
             | pg::NodeTag_T_PrepareStmt
             | pg::NodeTag_T_ListenStmt
             | pg::NodeTag_T_UnlistenStmt
-            | pg::NodeTag_T_NotifyStmt => ReadOnly,
+            | pg::NodeTag_T_NotifyStmt => ReadOnly(None),
             // ExecuteStmt runs a SQL-level prepared statement whose body may be
             // DML; ExplainStmt with ANALYZE executes its argument. Everything
             // else (DDL, CALL, DO, unknown) is a potential write.

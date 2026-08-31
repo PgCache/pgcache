@@ -14,6 +14,17 @@ use crate::query::ast::LiteralValue;
 /// [`WriteClass::Table`].
 pub const INSERT_MAX_ROWS: usize = 64;
 
+/// Effect of a transaction-control statement on the session's
+/// explicit-transaction state. `Begin` also covers `COMMIT AND CHAIN` /
+/// `ROLLBACK AND CHAIN` (the session re-enters a transaction); savepoint
+/// operations (SAVEPOINT, RELEASE, ROLLBACK TO) leave the state unchanged
+/// and carry no boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionBoundary {
+    Begin,
+    End,
+}
+
 /// A table reference as written in a DML statement. Never schema-resolved —
 /// the proxy has no catalog knowledge, so consumers must treat an unqualified
 /// name conservatively (same-name ⇒ possibly the same table).

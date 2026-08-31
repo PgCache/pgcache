@@ -5,7 +5,9 @@
 use ecow::EcoString;
 
 use crate::query::ast::*;
-use crate::query::write::{INSERT_MAX_ROWS, InsertStatement, RelationRef, WriteClass};
+use crate::query::write::{
+    INSERT_MAX_ROWS, InsertStatement, RelationRef, TransactionBoundary, WriteClass,
+};
 
 /// Classify one SQL statement through the public entry point.
 fn classify(sql: &str) -> Result<RawStatement, AstError> {
@@ -36,9 +38,43 @@ fn table_name(class: &WriteClass) -> &RelationRef {
 
 fn assert_read_only(sql: &str) {
     assert!(
-        matches!(classify(sql), Ok(RawStatement::ReadOnlyUtility)),
+        matches!(classify(sql), Ok(RawStatement::ReadOnlyUtility { .. })),
         "expected ReadOnlyUtility for {sql:?}"
     );
+}
+
+fn transaction_of(sql: &str) -> Option<TransactionBoundary> {
+    match classify(sql) {
+        Ok(RawStatement::ReadOnlyUtility { transaction }) => transaction,
+        other => panic!("expected ReadOnlyUtility for {sql:?}, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_transaction_boundaries_classified() {
+    assert_eq!(transaction_of("BEGIN"), Some(TransactionBoundary::Begin));
+    assert_eq!(
+        transaction_of("START TRANSACTION"),
+        Some(TransactionBoundary::Begin)
+    );
+    assert_eq!(transaction_of("COMMIT"), Some(TransactionBoundary::End));
+    assert_eq!(transaction_of("END"), Some(TransactionBoundary::End));
+    assert_eq!(transaction_of("ROLLBACK"), Some(TransactionBoundary::End));
+    assert_eq!(transaction_of("ABORT"), Some(TransactionBoundary::End));
+    assert_eq!(
+        transaction_of("COMMIT AND CHAIN"),
+        Some(TransactionBoundary::Begin)
+    );
+    assert_eq!(
+        transaction_of("ROLLBACK AND CHAIN"),
+        Some(TransactionBoundary::Begin)
+    );
+    // Savepoint operations leave the transaction state unchanged.
+    assert_eq!(transaction_of("SAVEPOINT s"), None);
+    assert_eq!(transaction_of("RELEASE SAVEPOINT s"), None);
+    assert_eq!(transaction_of("ROLLBACK TO SAVEPOINT s"), None);
+    // Non-transaction utilities carry no boundary.
+    assert_eq!(transaction_of("SHOW search_path"), None);
 }
 
 // ---------- INSERT row extraction ----------

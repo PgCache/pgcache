@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use pgcache_lib::cache::query::limit_is_sufficient;
 use pgcache_lib::query::Fingerprint;
+use pgcache_lib::query::write::TransactionBoundary;
 
 use crate::classify::{ParsedStatement, Verdict};
 use crate::subsume::SubsumerRegistry;
@@ -58,23 +59,6 @@ fn rate(hits: u64, total: u64) -> f64 {
     }
 }
 
-/// A utility statement that opens or closes an explicit transaction.
-/// `Some(true)` = opens, `Some(false)` = closes.
-fn transaction_boundary(sql: &str) -> Option<bool> {
-    let first_word = sql.split_whitespace().next()?;
-    if first_word.eq_ignore_ascii_case("BEGIN") || first_word.eq_ignore_ascii_case("START") {
-        Some(true)
-    } else if first_word.eq_ignore_ascii_case("COMMIT")
-        || first_word.eq_ignore_ascii_case("END")
-        || first_word.eq_ignore_ascii_case("ROLLBACK")
-        || first_word.eq_ignore_ascii_case("ABORT")
-    {
-        Some(false)
-    } else {
-        None
-    }
-}
-
 /// Replay classified statements against an infinite cache. Admission
 /// threshold is 1 (pgcache's default): a cacheable query registers on first
 /// sight, so of its `calls`, the first is a cold miss (or subsumption hit)
@@ -86,7 +70,9 @@ pub fn hitrate_replay(items: &[(ParsedStatement, Verdict)]) -> HitrateStats {
     // Registered fingerprint → cached LIMIT window (`None` = unlimited).
     let mut seen: HashMap<Fingerprint, Option<u64>> = HashMap::new();
     let mut registry = SubsumerRegistry::new();
-    let mut in_transaction = false;
+    // Per-session explicit-transaction state, keyed by the trace's backend
+    // identity. Boundaries come from the parsed statement kind.
+    let mut in_transaction: HashMap<u64, bool> = HashMap::new();
 
     for (parsed, verdict) in items {
         let calls = parsed.trace.calls.max(1);
@@ -94,15 +80,22 @@ pub fn hitrate_replay(items: &[(ParsedStatement, Verdict)]) -> HitrateStats {
         stats.calls += calls;
         match verdict {
             Verdict::Write(_) => stats.write_calls += calls,
-            Verdict::Utility => {
+            Verdict::Utility(boundary) => {
                 stats.utility_calls += calls;
-                if let Some(opens) = transaction_boundary(&parsed.trace.sql) {
-                    in_transaction = opens;
+                if let Some(boundary) = boundary {
+                    in_transaction.insert(
+                        parsed.trace.session,
+                        *boundary == TransactionBoundary::Begin,
+                    );
                 }
             }
             Verdict::Passthrough { .. } => stats.non_cacheable_calls += calls,
             Verdict::Cacheable(analysis) => {
-                if in_transaction {
+                if in_transaction
+                    .get(&parsed.trace.session)
+                    .copied()
+                    .unwrap_or(false)
+                {
                     stats.in_transaction_calls += calls;
                     continue;
                 }
@@ -154,6 +147,7 @@ mod tests {
                     parameters: Vec::new(),
                     calls: 1,
                     total_time_ms: None,
+                    session: 0,
                 })
             })
             .collect();
@@ -221,6 +215,7 @@ mod tests {
             parameters: Vec::new(),
             calls: 100,
             total_time_ms: None,
+            session: 0,
         };
         let parsed = statement_parse(trace);
         let corpus: Vec<QueryExpr> = match &parsed.outcome {

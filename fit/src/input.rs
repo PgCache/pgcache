@@ -26,6 +26,9 @@ pub struct TraceStatement {
     pub parameters: Vec<Option<String>>,
     pub calls: u64,
     pub total_time_ms: Option<f64>,
+    /// Backend identity from the log line prefix (pid); 0 when the source
+    /// carries none (SQL files, pgss). Scopes the replay's transaction gate.
+    pub session: u64,
 }
 
 impl TraceStatement {
@@ -35,6 +38,7 @@ impl TraceStatement {
             parameters: Vec::new(),
             calls: 1,
             total_time_ms: None,
+            session: 0,
         }
     }
 }
@@ -99,6 +103,7 @@ fn sql_read(content: &str) -> anyhow::Result<Vec<TraceStatement>> {
 
 /// csvlog fixed field positions (stable across supported versions; later
 /// versions only append columns).
+const CSVLOG_PID: usize = 3;
 const CSVLOG_SEVERITY: usize = 11;
 const CSVLOG_MESSAGE: usize = 13;
 const CSVLOG_DETAIL: usize = 14;
@@ -124,11 +129,16 @@ fn csvlog_read(content: &str) -> anyhow::Result<Vec<TraceStatement>> {
             .get(CSVLOG_DETAIL)
             .and_then(detail_parameters)
             .unwrap_or_default();
+        let session = record
+            .get(CSVLOG_PID)
+            .and_then(|pid| pid.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         out.push(TraceStatement {
             sql: sql.to_owned(),
             parameters,
             calls: 1,
             total_time_ms: duration_ms,
+            session,
         });
     }
     Ok(out)
@@ -232,6 +242,7 @@ fn stderr_log_read(content: &str) -> Vec<TraceStatement> {
         sql: String,
         duration_ms: Option<f64>,
         detail: Option<String>,
+        session: u64,
     }
 
     enum LastMessage {
@@ -250,6 +261,7 @@ fn stderr_log_read(content: &str) -> Vec<TraceStatement> {
             parameters: parameters.unwrap_or_default(),
             calls: 1,
             total_time_ms: p.duration_ms,
+            session: p.session,
         });
     };
 
@@ -290,6 +302,7 @@ fn stderr_log_read(content: &str) -> Vec<TraceStatement> {
                             sql: sql.to_owned(),
                             duration_ms,
                             detail: None,
+                            session: pid,
                         },
                     );
                     last_message = Some(LastMessage::Statement(pid));
@@ -399,6 +412,7 @@ fn pgss_read(content: &str) -> anyhow::Result<Vec<TraceStatement>> {
             parameters: Vec::new(),
             calls,
             total_time_ms,
+            session: 0,
         });
     }
     Ok(out)

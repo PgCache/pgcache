@@ -137,6 +137,7 @@ mod tests {
                     parameters: Vec::new(),
                     calls: 1,
                     total_time_ms: None,
+                    session: 0,
                 })
             })
             .collect();

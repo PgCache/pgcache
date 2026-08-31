@@ -18,7 +18,7 @@ use pgcache_lib::query::constraints::{
 };
 use pgcache_lib::query::resolve::query_expr_resolve;
 use pgcache_lib::query::transform::{predicate_pushdown_apply, query_expr_parameters_replace};
-use pgcache_lib::query::write::WriteClass;
+use pgcache_lib::query::write::{TransactionBoundary, WriteClass};
 use pgcache_lib::query::{Fingerprint, ShapeKey, query_shape_derive};
 
 use crate::input::{TraceStatement, query_parameters_infer};
@@ -33,7 +33,7 @@ pub enum ParseOutcome {
         cte_write: Option<WriteClass>,
     },
     Write(WriteClass),
-    Utility,
+    Utility(Option<TransactionBoundary>),
     ParseError(String),
     ParameterError(String),
 }
@@ -74,7 +74,7 @@ pub fn statement_parse(trace: TraceStatement) -> ParsedStatement {
             }
         },
         Ok(Ok(RawStatement::Write(write_class))) => ParseOutcome::Write(write_class),
-        Ok(Ok(RawStatement::ReadOnlyUtility)) => ParseOutcome::Utility,
+        Ok(Ok(RawStatement::ReadOnlyUtility { transaction })) => ParseOutcome::Utility(transaction),
     };
     ParsedStatement {
         trace,
@@ -170,7 +170,7 @@ pub enum Verdict {
         cte_write: Option<WriteClass>,
     },
     Write(WriteClass),
-    Utility,
+    Utility(Option<TransactionBoundary>),
 }
 
 pub fn statement_classify(
@@ -198,7 +198,7 @@ pub fn statement_classify(
             };
         }
         ParseOutcome::Write(write_class) => return Verdict::Write(write_class.clone()),
-        ParseOutcome::Utility => return Verdict::Utility,
+        ParseOutcome::Utility(transaction) => return Verdict::Utility(*transaction),
         ParseOutcome::Select(expr) => expr,
     };
 
@@ -311,6 +311,7 @@ mod tests {
             parameters: parameters.iter().map(|p| p.map(str::to_owned)).collect(),
             calls: 1,
             total_time_ms: None,
+            session: 0,
         };
         let parsed = statement_parse(trace);
         let corpus: Vec<QueryExpr> = match &parsed.outcome {
@@ -406,8 +407,9 @@ mod tests {
 
     #[test]
     fn test_txn_control_is_utility() {
-        assert!(matches!(classify("BEGIN"), Verdict::Utility));
-        assert!(matches!(classify("COMMIT"), Verdict::Utility));
+        use pgcache_lib::query::write::TransactionBoundary::{Begin, End};
+        assert!(matches!(classify("BEGIN"), Verdict::Utility(Some(Begin))));
+        assert!(matches!(classify("COMMIT"), Verdict::Utility(Some(End))));
     }
 
     #[test]

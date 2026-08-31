@@ -340,6 +340,43 @@ mod target {
         assert_eq!(count(&report, "hits"), 1);
     }
 
+    /// ROLLBACK TO SAVEPOINT does not end the transaction: SELECTs after it
+    /// are still inside the explicit transaction and never served. The
+    /// boundary comes from the parsed statement kind, not the first token.
+    #[test]
+    fn test_rollback_to_savepoint_keeps_transaction_open() {
+        let report = hitrate_json(
+            "target_savepoint.sql",
+            "BEGIN;\n\
+             SAVEPOINT s;\n\
+             SELECT * FROM users WHERE id = 1;\n\
+             ROLLBACK TO SAVEPOINT s;\n\
+             SELECT * FROM users WHERE id = 1;\n\
+             COMMIT;\n",
+        );
+        assert_eq!(
+            count(&report, "hits") + count(&report, "subsumption_hits"),
+            0
+        );
+        assert_eq!(count(&report, "in_transaction_calls"), 2);
+    }
+
+    /// The transaction gate is per backend session: one session's open
+    /// transaction must not deny hits to autocommit traffic from another.
+    #[test]
+    fn test_transaction_gate_is_per_session() {
+        let report = hitrate_json(
+            "target_txn_sessions.log",
+            "2026-08-28 10:00:00.000 PDT [100] LOG:  statement: BEGIN\n\
+             2026-08-28 10:00:00.001 PDT [200] LOG:  statement: SELECT * FROM users WHERE id = 1\n\
+             2026-08-28 10:00:00.002 PDT [200] LOG:  statement: SELECT * FROM users WHERE id = 1\n\
+             2026-08-28 10:00:00.003 PDT [100] LOG:  statement: COMMIT\n",
+        );
+        assert_eq!(count(&report, "cold_misses"), 1);
+        assert_eq!(count(&report, "hits"), 1);
+        assert_eq!(count(&report, "in_transaction_calls"), 0);
+    }
+
     /// A same-table UNION parent registers one update query per branch, so
     /// the writer's single-relation gate (duplicate-preserving relation_oids)
     /// rejects it as a subsumer even though only one distinct table appears.

@@ -15,7 +15,7 @@ use pg_query::pg_nodes as pg;
 
 use crate::query::cast::cast_target_from_canonical;
 use crate::query::transform::query_expr_constant_fold;
-use crate::query::write::WriteClass;
+use crate::query::write::{TransactionBoundary, WriteClass};
 
 use super::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag, string_node_value};
 use super::*;
@@ -66,7 +66,10 @@ pub enum RawStatement {
     /// Root can modify table data (DML, DDL, EXECUTE, unknown, ...).
     Write(WriteClass),
     /// Root provably cannot modify table data (txn control, SET, SHOW, ...).
-    ReadOnlyUtility,
+    ReadOnlyUtility {
+        /// Set for transaction-control statements.
+        transaction: Option<TransactionBoundary>,
+    },
 }
 
 /// Classify the root of a raw parse tree, converting a `SelectStmt` root
@@ -96,7 +99,9 @@ pub unsafe fn statement_convert_raw(tree_root: *const c_void) -> Result<RawState
             }
             _ => match write::non_select_classify(stmt) {
                 write::NonSelectClass::Write(class) => RawStatement::Write(class),
-                write::NonSelectClass::ReadOnly => RawStatement::ReadOnlyUtility,
+                write::NonSelectClass::ReadOnly(transaction) => {
+                    RawStatement::ReadOnlyUtility { transaction }
+                }
             },
         })
     }

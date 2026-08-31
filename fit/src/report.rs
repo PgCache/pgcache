@@ -219,7 +219,7 @@ pub fn check_report_build(
                     .or_default() += statement_calls;
                 ("write", None)
             }
-            Verdict::Utility => {
+            Verdict::Utility(_) => {
                 utility.add(statement_calls, parsed.trace.total_time_ms);
                 ("utility", None)
             }
