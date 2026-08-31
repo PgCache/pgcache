@@ -137,6 +137,13 @@ fn main() -> anyhow::Result<()> {
             format,
         } => {
             let analysis = trace_analyze(&input, format)?;
+            // pgss rows are pre-normalized ($N), one row per shape; replaying
+            // them would count calls-1 of every shape as per-literal hits.
+            anyhow::ensure!(
+                analysis.format != TraceFormat::PgssCsv,
+                "pg_stat_statements input is pre-normalized ($N): per-literal hit rates \
+                 cannot be derived from it — use `check` for shape-level analysis"
+            );
             let stats = hitrate::hitrate_replay(&analysis.items);
             let report = report::hitrate_report_build(
                 stats,

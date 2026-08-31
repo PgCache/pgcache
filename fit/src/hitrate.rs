@@ -2,8 +2,9 @@
 //! plus subsumption. Write-driven invalidation is not simulated (future mode);
 //! writes are counted so that extension has its inputs.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
+use pgcache_lib::cache::query::limit_is_sufficient;
 use pgcache_lib::query::Fingerprint;
 
 use crate::classify::{ParsedStatement, Verdict};
@@ -16,13 +17,20 @@ pub struct HitrateStats {
     pub write_calls: u64,
     pub utility_calls: u64,
     pub non_cacheable_calls: u64,
+    /// Cacheable SELECTs issued inside an explicit transaction — the proxy
+    /// forwards these (transaction gate), so they can never be hits.
+    pub in_transaction_calls: u64,
     pub cacheable_calls: u64,
-    /// Calls answered by an already-registered fingerprint.
+    /// Calls answered by an already-registered fingerprint with a sufficient
+    /// cached LIMIT window.
     pub hits: u64,
     /// First-seen fingerprints answered from a subsuming registered query.
     pub subsumption_hits: u64,
     /// First-seen fingerprints that had to populate from origin.
     pub cold_misses: u64,
+    /// Repeats asking for more rows than the cached window: a miss plus
+    /// repopulation with the larger window, mirroring the proxy's limit bump.
+    pub limit_bumps: u64,
 }
 
 impl HitrateStats {
@@ -33,7 +41,7 @@ impl HitrateStats {
     pub fn rate_over_selects(&self) -> f64 {
         rate(
             self.hits + self.subsumption_hits,
-            self.cacheable_calls + self.non_cacheable_calls,
+            self.cacheable_calls + self.non_cacheable_calls + self.in_transaction_calls,
         )
     }
 
@@ -50,14 +58,35 @@ fn rate(hits: u64, total: u64) -> f64 {
     }
 }
 
+/// A utility statement that opens or closes an explicit transaction.
+/// `Some(true)` = opens, `Some(false)` = closes.
+fn transaction_boundary(sql: &str) -> Option<bool> {
+    let first_word = sql.split_whitespace().next()?;
+    if first_word.eq_ignore_ascii_case("BEGIN") || first_word.eq_ignore_ascii_case("START") {
+        Some(true)
+    } else if first_word.eq_ignore_ascii_case("COMMIT")
+        || first_word.eq_ignore_ascii_case("END")
+        || first_word.eq_ignore_ascii_case("ROLLBACK")
+        || first_word.eq_ignore_ascii_case("ABORT")
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Replay classified statements against an infinite cache. Admission
 /// threshold is 1 (pgcache's default): a cacheable query registers on first
 /// sight, so of its `calls`, the first is a cold miss (or subsumption hit)
-/// and the rest are hits.
+/// and the rest are hits. Two proxy serve gates are modeled: SELECTs inside
+/// an explicit transaction are forwarded, and a repeat needing more rows
+/// than the cached LIMIT window is a limit bump, not a hit.
 pub fn hitrate_replay(items: &[(ParsedStatement, Verdict)]) -> HitrateStats {
     let mut stats = HitrateStats::default();
-    let mut seen: HashSet<Fingerprint> = HashSet::new();
+    // Registered fingerprint → cached LIMIT window (`None` = unlimited).
+    let mut seen: HashMap<Fingerprint, Option<u64>> = HashMap::new();
     let mut registry = SubsumerRegistry::new();
+    let mut in_transaction = false;
 
     for (parsed, verdict) in items {
         let calls = parsed.trace.calls.max(1);
@@ -65,23 +94,41 @@ pub fn hitrate_replay(items: &[(ParsedStatement, Verdict)]) -> HitrateStats {
         stats.calls += calls;
         match verdict {
             Verdict::Write(_) => stats.write_calls += calls,
-            Verdict::Utility => stats.utility_calls += calls,
+            Verdict::Utility => {
+                stats.utility_calls += calls;
+                if let Some(opens) = transaction_boundary(&parsed.trace.sql) {
+                    in_transaction = opens;
+                }
+            }
             Verdict::Passthrough { .. } => stats.non_cacheable_calls += calls,
             Verdict::Cacheable(analysis) => {
+                if in_transaction {
+                    stats.in_transaction_calls += calls;
+                    continue;
+                }
                 stats.cacheable_calls += calls;
-                if seen.contains(&analysis.fingerprint) {
-                    stats.hits += calls;
-                } else {
-                    seen.insert(analysis.fingerprint);
-                    if registry.query_subsumed(analysis) {
-                        // Served from a broader registered query's rows;
-                        // no population round-trip.
-                        stats.subsumption_hits += calls;
-                    } else {
-                        stats.cold_misses += 1;
-                        stats.hits += calls - 1;
+                match seen.get_mut(&analysis.fingerprint) {
+                    Some(cached_max) => {
+                        if limit_is_sufficient(*cached_max, analysis.max_limit) {
+                            stats.hits += calls;
+                        } else {
+                            stats.limit_bumps += 1;
+                            stats.hits += calls - 1;
+                            *cached_max = analysis.max_limit;
+                        }
                     }
-                    registry.subsumer_register(analysis);
+                    None => {
+                        seen.insert(analysis.fingerprint, analysis.max_limit);
+                        if registry.query_subsumed(analysis) {
+                            // Served from a broader registered query's rows;
+                            // no population round-trip.
+                            stats.subsumption_hits += calls;
+                        } else {
+                            stats.cold_misses += 1;
+                            stats.hits += calls - 1;
+                        }
+                        registry.subsumer_register(analysis);
+                    }
                 }
             }
         }

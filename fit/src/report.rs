@@ -282,11 +282,26 @@ pub fn hitrate_report_build(
     inferred_parameters: usize,
     format: TraceFormat,
 ) -> HitrateReport {
+    let mut assumptions = assumptions_build(synth, inferred_parameters, format);
+    if stats.in_transaction_calls > 0 {
+        assumptions.push(format!(
+            "SELECTs inside explicit transactions are forwarded, never served \
+             (proxy transaction gate): {} calls",
+            stats.in_transaction_calls
+        ));
+    }
+    if stats.limit_bumps > 0 {
+        assumptions.push(format!(
+            "repeats needing more rows than the cached LIMIT window repopulate \
+             (limit bump), not hit: {}",
+            stats.limit_bumps
+        ));
+    }
     HitrateReport {
         hit_rate_cacheable: stats.rate_over_cacheable(),
         hit_rate_selects: stats.rate_over_selects(),
         hit_rate_all: stats.rate_over_all(),
-        assumptions: assumptions_build(synth, inferred_parameters, format),
+        assumptions,
         stats,
     }
 }
@@ -422,10 +437,20 @@ pub fn hitrate_report_render(report: &HitrateReport) -> String {
     );
     let _ = writeln!(out, "Utility:       {} calls", stats.utility_calls);
     let _ = writeln!(out, "Non-cacheable: {} calls", stats.non_cacheable_calls);
+    if stats.in_transaction_calls > 0 {
+        let _ = writeln!(
+            out,
+            "In-transaction:{} calls (forwarded — proxy transaction gate)",
+            stats.in_transaction_calls
+        );
+    }
     let _ = writeln!(out, "Cacheable:     {} calls", stats.cacheable_calls);
     let _ = writeln!(out, "  hits              {}", stats.hits);
     let _ = writeln!(out, "  subsumption hits  {}", stats.subsumption_hits);
     let _ = writeln!(out, "  cold misses       {}", stats.cold_misses);
+    if stats.limit_bumps > 0 {
+        let _ = writeln!(out, "  limit bumps       {}", stats.limit_bumps);
+    }
     let _ = writeln!(out);
     let _ = writeln!(
         out,
