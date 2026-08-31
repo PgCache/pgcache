@@ -25,7 +25,7 @@ struct RelationSubsumers {
 }
 
 struct AdmittedSubsumer {
-    constraints: QueryConstraints,
+    constraints: std::rc::Rc<QueryConstraints>,
     has_limit: bool,
     single_relation: bool,
 }
@@ -65,7 +65,7 @@ impl SubsumerRegistry {
             relation.admitted.insert(
                 analysis.fingerprint,
                 AdmittedSubsumer {
-                    constraints: admission.constraints.clone(),
+                    constraints: std::rc::Rc::clone(&admission.constraints),
                     has_limit: analysis.has_limit,
                     single_relation,
                 },

@@ -5,7 +5,7 @@
 use ecow::EcoString;
 use iddqd::BiHashMap;
 use pgcache_lib::cache::admission::{
-    base_query_prepare, query_admission_analyze, shape_gate_classify,
+    AdmissionDepth, base_query_prepare, query_admission_analyze, shape_gate_classify,
 };
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::TableMetadata;
@@ -156,7 +156,8 @@ pub struct CacheableAnalysis {
 pub struct FitAdmission {
     pub relation_oid: Oid,
     /// The update query's per-branch constraints — what subsumption compares.
-    pub constraints: QueryConstraints,
+    /// Shared, not cloned: the registry keeps a reference per registration.
+    pub constraints: std::rc::Rc<QueryConstraints>,
     pub index_constraints: Vec<TableConstraint>,
     pub subsumer_eligible: bool,
 }
@@ -241,6 +242,7 @@ pub fn statement_classify(
         has_limit,
         &builtins.aggregates,
         catalog,
+        AdmissionDepth::DecisionOnly,
     ) {
         Ok(analysis) => analysis,
         Err(_) => {
@@ -262,7 +264,7 @@ pub fn statement_classify(
         .into_iter()
         .map(|table| FitAdmission {
             relation_oid: table.relation_oid,
-            constraints: table.update_query.constraints,
+            constraints: std::rc::Rc::new(table.update_query.constraints),
             index_constraints: table.index_constraints,
             subsumer_eligible: table.subsumer_eligible,
         })

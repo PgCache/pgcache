@@ -27,6 +27,16 @@ use super::update_classify::{
 };
 use super::{AdmissionAnalysis, TableAdmission};
 
+/// How much of each [`TableAdmission`] to build. The writer needs the full
+/// [`UpdateQuery`] including its CDC-eval caches; offline analysis
+/// (pgcache-fit) keeps only the decision fields, so the caches — a per-table
+/// AST clone + deparse among them — are skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionDepth {
+    Full,
+    DecisionOnly,
+}
+
 /// Clone the query, strip LIMIT, and compute max_limit for population.
 /// Set operations force max_limit = None since population runs per-branch.
 pub fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
@@ -72,6 +82,7 @@ pub fn query_admission_analyze(
     has_limit: bool,
     aggregate_functions: &HashSet<EcoString>,
     tables: &BiHashMap<TableMetadata>,
+    depth: AdmissionDepth,
 ) -> CacheResult<AdmissionAnalysis> {
     let decorrelated = query_expr_decorrelate(resolved, aggregate_functions)
         .map_err(|e| e.context_transform(CacheError::from))
@@ -90,7 +101,8 @@ pub fn query_admission_analyze(
             .map(analyze_query_constraints)
             .unwrap_or_default();
         let eval_strategy = update_eval_strategy_classify(&update_resolved, source);
-        let pg_batchable = eval_strategy == UpdateEvalStrategy::PgEval
+        let pg_batchable = depth == AdmissionDepth::Full
+            && eval_strategy == UpdateEvalStrategy::PgEval
             && pg_batchable_classify(&update_resolved, relation_oid, aggregate_functions);
         // Walk the parent `resolved` — `update_resolved` has ORDER BY stripped.
         let limit_window_columns = if has_limit {
@@ -112,26 +124,28 @@ pub fn query_admission_analyze(
         // Compile the LocalEval WHERE once so the per-row CDC membership probe
         // doesn't re-destructure the resolved AST (PGC-339). PgEval queries
         // never consult this, so skip building it.
-        let compiled_where = if eval_strategy == UpdateEvalStrategy::LocalEval {
-            update_resolved
-                .as_select()
-                .and_then(|s| s.where_clause.as_ref())
-                .map(|w| CompiledPredicate::compile(w, table_node.name.as_str()))
-        } else {
-            None
-        };
+        let compiled_where =
+            if depth == AdmissionDepth::Full && eval_strategy == UpdateEvalStrategy::LocalEval {
+                update_resolved
+                    .as_select()
+                    .and_then(|s| s.where_clause.as_ref())
+                    .map(|w| CompiledPredicate::compile(w, table_node.name.as_str()))
+            } else {
+                None
+            };
         // Precompute the PgEval membership template so the per-row check
         // skips the resolved-AST clone + deparse (PGC-343). Only PgEval uses
         // it; needs the relation's TableMetadata.
-        let pg_eval_template = if eval_strategy == UpdateEvalStrategy::PgEval {
-            update_resolved.as_select().and_then(|select| {
-                tables
-                    .get1(&relation_oid)
-                    .and_then(|table_metadata| PgEvalTemplate::build(select, table_metadata))
-            })
-        } else {
-            None
-        };
+        let pg_eval_template =
+            if depth == AdmissionDepth::Full && eval_strategy == UpdateEvalStrategy::PgEval {
+                update_resolved.as_select().and_then(|select| {
+                    tables
+                        .get1(&relation_oid)
+                        .and_then(|table_metadata| PgEvalTemplate::build(select, table_metadata))
+                })
+            } else {
+                None
+            };
 
         let table_name = table_node.name.clone();
         let mut update_query = UpdateQuery {
@@ -154,7 +168,9 @@ pub fn query_admission_analyze(
         // whether `handle_update` must run `query_row_changes` + the
         // invalidation check rather than skip them (PGC-227). Derived from
         // the single source of truth so the flag can't drift.
-        update_query.change_dependent = update_query.update_invalidation_possible(&table_name);
+        if depth == AdmissionDepth::Full {
+            update_query.change_dependent = update_query.update_invalidation_possible(&table_name);
+        }
 
         // A relation appearing more than once (a self-join) has its
         // constraints extracted per occurrence but keyed by table *name*, so
@@ -188,7 +204,6 @@ pub fn query_admission_analyze(
             relation_oid,
             table_name,
             update_query,
-            self_joined,
             subsumer_eligible,
             index_constraints,
         });

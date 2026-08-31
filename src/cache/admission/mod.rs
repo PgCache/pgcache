@@ -16,7 +16,9 @@ mod analyze;
 mod subsume;
 mod update_classify;
 
-pub use analyze::{base_query_prepare, query_admission_analyze, shape_gate_classify};
+pub use analyze::{
+    AdmissionDepth, base_query_prepare, query_admission_analyze, shape_gate_classify,
+};
 pub use subsume::subsumption_covered;
 
 /// Everything the writer stores (and pgcache-fit simulates) for one table of
@@ -24,12 +26,10 @@ pub use subsume::subsumption_covered;
 pub struct TableAdmission {
     pub relation_oid: Oid,
     pub table_name: EcoString,
-    /// Fully built update query, `change_dependent` included.
+    /// The built update query. With [`AdmissionDepth::DecisionOnly`] the
+    /// CDC-eval caches (`compiled_where`, `pg_eval_template`,
+    /// `pg_batchable`, `change_dependent`) are left unset.
     pub update_query: UpdateQuery,
-    /// The relation appears more than once in this update query (a
-    /// self-join): its name-collapsed constraints only hold for one arm
-    /// (PGC-256), so it is indexed unconstrained and never subsumes.
-    pub self_joined: bool,
     /// Mirrors the writer's `can_subsume`: eligible for the subsumption
     /// index. The remaining gates (parent readiness, parent single-relation)
     /// are checked per lookup in [`subsumption_covered`].

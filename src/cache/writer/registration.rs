@@ -28,7 +28,9 @@ use crate::result::error_chain_format;
 use crate::settings::Settings;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
-use super::super::admission::{base_query_prepare, query_admission_analyze, shape_gate_classify};
+use super::super::admission::{
+    AdmissionDepth, base_query_prepare, query_admission_analyze, shape_gate_classify,
+};
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{AdmitAction, QueryCommand, SubsumptionResult},
@@ -500,6 +502,7 @@ impl WriterRegistration {
             has_limit,
             &self.aggregate_functions,
             &core.cache.tables,
+            AdmissionDepth::Full,
         )?;
 
         let mut relation_oids = Vec::new();
