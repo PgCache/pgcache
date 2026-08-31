@@ -52,6 +52,10 @@ type TableKey = (EcoString, EcoString);
 enum TypeEvidence {
     Integer,
     Float,
+    /// Only string/boolean literals observed — the text default is right,
+    /// and there is nothing conflicting to report.
+    Text,
+    /// Mixed numeric and text evidence; left as text and disclosed.
     Conflicted,
 }
 
@@ -396,7 +400,7 @@ impl Synthesizer {
             LiteralValue::Float(_) => Some(TypeEvidence::Float),
             LiteralValue::String(_)
             | LiteralValue::StringWithCast(..)
-            | LiteralValue::Boolean(_) => Some(TypeEvidence::Conflicted),
+            | LiteralValue::Boolean(_) => Some(TypeEvidence::Text),
             _ => None,
         };
         let Some(observed) = observed else { return };
@@ -415,6 +419,7 @@ impl Synthesizer {
                     (TypeEvidence::Integer, TypeEvidence::Float)
                     | (TypeEvidence::Float, TypeEvidence::Integer)
                     | (TypeEvidence::Float, TypeEvidence::Float) => TypeEvidence::Float,
+                    (TypeEvidence::Text, TypeEvidence::Text) => TypeEvidence::Text,
                     _ => TypeEvidence::Conflicted,
                 };
             })
@@ -457,6 +462,7 @@ impl Synthesizer {
                         stats.inferred_columns += 1;
                         (701, Type::FLOAT8, "float8")
                     }
+                    Some(TypeEvidence::Text) => (25, Type::TEXT, "text"),
                     Some(TypeEvidence::Conflicted) => {
                         stats.conflicted_columns += 1;
                         (25, Type::TEXT, "text")
@@ -573,6 +579,24 @@ mod tests {
         assert_eq!(column("weight").type_name, "float8");
         assert_eq!(column("status").type_name, "text");
         assert_eq!(catalog.stats.inferred_columns, 2);
+        // Uniform text evidence is not a conflict.
+        assert_eq!(catalog.stats.conflicted_columns, 0);
+    }
+
+    #[test]
+    fn test_mixed_numeric_and_text_evidence_is_conflicted() {
+        let catalog = synthesize(&[
+            "SELECT * FROM orders WHERE code = 5",
+            "SELECT * FROM orders WHERE code = 'x'",
+        ]);
+        let orders = table(&catalog, "orders");
+        let code = orders
+            .columns
+            .iter()
+            .find(|c| c.name == "code")
+            .expect("column attributed");
+        assert_eq!(code.type_name, "text");
+        assert_eq!(catalog.stats.conflicted_columns, 1);
     }
 
     #[test]

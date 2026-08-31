@@ -52,7 +52,7 @@ pub fn trace_format_detect(path: &std::path::Path, content: &str) -> TraceFormat
     if pgss_header_is(first_line) {
         return TraceFormat::PgssCsv;
     }
-    if csvlog_line_is(first_line) {
+    if csvlog_content_is(content) {
         return TraceFormat::CsvLog;
     }
     if content.contains("LOG:") {
@@ -70,15 +70,37 @@ fn pgss_header_is(line: &str) -> bool {
     has("query") && (has("calls") || has("total_exec_time") || has("total_time"))
 }
 
-fn csvlog_line_is(line: &str) -> bool {
-    let dated = line.len() > 10
-        && line.as_bytes().first().is_some_and(u8::is_ascii_digit)
-        && line.as_bytes().get(4) == Some(&b'-')
-        && line.as_bytes().get(7) == Some(&b'-');
-    dated && line.matches(',').count() >= 15
+/// Detect csvlog by its first *record* (the csv reader handles quoted
+/// multi-line message fields, which a physical-line comma count does not):
+/// enough fields to carry a message, and a timestamp-shaped first field.
+fn csvlog_content_is(content: &str) -> bool {
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(content.as_bytes());
+    let mut record = csv::StringRecord::new();
+    if !matches!(reader.read_record(&mut record), Ok(true)) {
+        return false;
+    }
+    record.len() > CSVLOG_MESSAGE
+        && record.get(0).is_some_and(|timestamp| {
+            timestamp.len() > 10
+                && timestamp.as_bytes().first().is_some_and(u8::is_ascii_digit)
+                && timestamp.as_bytes().get(4) == Some(&b'-')
+                && timestamp.as_bytes().get(7) == Some(&b'-')
+        })
 }
 
-pub fn statements_read(content: &str, format: TraceFormat) -> anyhow::Result<Vec<TraceStatement>> {
+/// Statements plus reader-level data-quality counters for the report's
+/// assumptions block.
+pub struct TraceRead {
+    pub statements: Vec<TraceStatement>,
+    /// `Parameters:` details that could not be parsed; their statements are
+    /// analyzed as unparameterized.
+    pub parameter_details_dropped: usize,
+}
+
+pub fn statements_read(content: &str, format: TraceFormat) -> anyhow::Result<TraceRead> {
     match format {
         TraceFormat::Sql => sql_read(content),
         TraceFormat::CsvLog => csvlog_read(content),
@@ -87,14 +109,18 @@ pub fn statements_read(content: &str, format: TraceFormat) -> anyhow::Result<Vec
     }
 }
 
-fn sql_read(content: &str) -> anyhow::Result<Vec<TraceStatement>> {
-    let statements = pg_query::split_with_scanner(content).context("splitting SQL input")?;
-    Ok(statements
-        .into_iter()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(TraceStatement::from_sql)
-        .collect())
+fn sql_read(content: &str) -> anyhow::Result<TraceRead> {
+    let statements = pg_query::split_with_scanner(content)
+        .context("splitting SQL input (if this is a log or CSV trace, pass --format)")?;
+    Ok(TraceRead {
+        statements: statements
+            .into_iter()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(TraceStatement::from_sql)
+            .collect(),
+        parameter_details_dropped: 0,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -108,12 +134,13 @@ const CSVLOG_SEVERITY: usize = 11;
 const CSVLOG_MESSAGE: usize = 13;
 const CSVLOG_DETAIL: usize = 14;
 
-fn csvlog_read(content: &str) -> anyhow::Result<Vec<TraceStatement>> {
+fn csvlog_read(content: &str) -> anyhow::Result<TraceRead> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .flexible(true)
         .from_reader(content.as_bytes());
     let mut out = Vec::new();
+    let mut parameter_details_dropped = 0;
     for record in reader.records() {
         let record = record.context("reading csvlog record")?;
         if record.get(CSVLOG_SEVERITY) != Some("LOG") {
@@ -127,7 +154,7 @@ fn csvlog_read(content: &str) -> anyhow::Result<Vec<TraceStatement>> {
         };
         let parameters = record
             .get(CSVLOG_DETAIL)
-            .and_then(detail_parameters)
+            .map(|detail| detail_parameters(detail, &mut parameter_details_dropped))
             .unwrap_or_default();
         let session = record
             .get(CSVLOG_PID)
@@ -141,7 +168,10 @@ fn csvlog_read(content: &str) -> anyhow::Result<Vec<TraceStatement>> {
             session,
         });
     }
-    Ok(out)
+    Ok(TraceRead {
+        statements: out,
+        parameter_details_dropped,
+    })
 }
 
 /// Extract the SQL payload (and duration, when the message came from
@@ -166,9 +196,23 @@ fn log_message_statement(message: &str) -> Option<(&str, Option<f64>)> {
 }
 
 /// Parse a `Parameters: $1 = 'x', $2 = NULL` detail payload. Values are
-/// single-quoted with `''` escapes; parameter indexes are 1-based.
-fn detail_parameters(detail: &str) -> Option<Vec<Option<String>>> {
-    let list = detail.trim_start().strip_prefix("Parameters: ")?;
+/// single-quoted with `''` escapes; parameter indexes are 1-based. A
+/// non-`Parameters:` detail yields no parameters; a malformed one also
+/// yields none but increments `dropped` so the report can disclose it.
+fn detail_parameters(detail: &str, dropped: &mut usize) -> Vec<Option<String>> {
+    let Some(list) = detail.trim_start().strip_prefix("Parameters: ") else {
+        return Vec::new();
+    };
+    match parameter_list_parse(list) {
+        Some(values) => values,
+        None => {
+            *dropped += 1;
+            Vec::new()
+        }
+    }
+}
+
+fn parameter_list_parse(list: &str) -> Option<Vec<Option<String>>> {
     let mut values: Vec<(usize, Option<String>)> = Vec::new();
     let bytes = list.as_bytes();
     let mut i = 0;
@@ -236,7 +280,7 @@ fn quoted_value_parse(s: &str) -> Option<(String, usize)> {
 /// lines with optional `DETAIL:  Parameters:` lines, grouped by the `[pid]`
 /// from the line prefix when present. Continuation lines (leading tab) attach
 /// to the most recently started message.
-fn stderr_log_read(content: &str) -> Vec<TraceStatement> {
+fn stderr_log_read(content: &str) -> TraceRead {
     #[derive(Default)]
     struct Pending {
         sql: String,
@@ -252,13 +296,18 @@ fn stderr_log_read(content: &str) -> Vec<TraceStatement> {
 
     let mut pending: std::collections::HashMap<u64, Pending> = std::collections::HashMap::new();
     let mut out = Vec::new();
+    let mut parameter_details_dropped = 0;
     let mut last_message: Option<LastMessage> = None;
 
-    let flush = |p: Pending, out: &mut Vec<TraceStatement>| {
-        let parameters = p.detail.as_deref().and_then(detail_parameters);
+    let flush = |p: Pending, out: &mut Vec<TraceStatement>, dropped: &mut usize| {
+        let parameters = p
+            .detail
+            .as_deref()
+            .map(|detail| detail_parameters(detail, dropped))
+            .unwrap_or_default();
         out.push(TraceStatement {
             sql: p.sql,
-            parameters: parameters.unwrap_or_default(),
+            parameters,
             calls: 1,
             total_time_ms: p.duration_ms,
             session: p.session,
@@ -294,7 +343,7 @@ fn stderr_log_read(content: &str) -> Vec<TraceStatement> {
             "LOG" => {
                 if let Some((sql, duration_ms)) = log_message_statement(rest) {
                     if let Some(previous) = pending.remove(&pid) {
-                        flush(previous, &mut out);
+                        flush(previous, &mut out, &mut parameter_details_dropped);
                     }
                     pending.insert(
                         pid,
@@ -309,7 +358,7 @@ fn stderr_log_read(content: &str) -> Vec<TraceStatement> {
                 } else {
                     // Any other LOG message for this backend ends the statement.
                     if let Some(previous) = pending.remove(&pid) {
-                        flush(previous, &mut out);
+                        flush(previous, &mut out, &mut parameter_details_dropped);
                     }
                     last_message = None;
                 }
@@ -324,7 +373,7 @@ fn stderr_log_read(content: &str) -> Vec<TraceStatement> {
             }
             _ => {
                 if let Some(previous) = pending.remove(&pid) {
-                    flush(previous, &mut out);
+                    flush(previous, &mut out, &mut parameter_details_dropped);
                 }
                 last_message = None;
             }
@@ -334,9 +383,12 @@ fn stderr_log_read(content: &str) -> Vec<TraceStatement> {
     let mut rest: Vec<(u64, Pending)> = pending.into_iter().collect();
     rest.sort_by_key(|(pid, _)| *pid);
     for (_, p) in rest {
-        flush(p, &mut out);
+        flush(p, &mut out, &mut parameter_details_dropped);
     }
-    out
+    TraceRead {
+        statements: out,
+        parameter_details_dropped,
+    }
 }
 
 const SEVERITIES: &[&str] = &[
@@ -379,7 +431,7 @@ fn log_line_split(line: &str) -> Option<(u64, &str, &str)> {
 // pg_stat_statements
 // ---------------------------------------------------------------------------
 
-fn pgss_read(content: &str) -> anyhow::Result<Vec<TraceStatement>> {
+fn pgss_read(content: &str) -> anyhow::Result<TraceRead> {
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
         .flexible(true)
@@ -415,7 +467,10 @@ fn pgss_read(content: &str) -> anyhow::Result<Vec<TraceStatement>> {
             session: 0,
         });
     }
-    Ok(out)
+    Ok(TraceRead {
+        statements: out,
+        parameter_details_dropped: 0,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -473,20 +528,38 @@ mod tests {
 
     #[test]
     fn test_sql_file_split() {
-        let statements =
-            sql_read("SELECT 1;\nSELECT * FROM users WHERE id = 2;\n").expect("split sql");
+        let statements = sql_read("SELECT 1;\nSELECT * FROM users WHERE id = 2;\n")
+            .expect("split sql")
+            .statements;
         assert_eq!(statements.len(), 2);
         assert_eq!(statements[0].sql, "SELECT 1");
     }
 
     #[test]
     fn test_detail_parameters_basic() {
-        let params =
-            detail_parameters("Parameters: $1 = '42', $2 = NULL, $3 = 'it''s'").expect("parse");
+        let mut dropped = 0;
+        let params = detail_parameters(
+            "Parameters: $1 = '42', $2 = NULL, $3 = 'it''s'",
+            &mut dropped,
+        );
         assert_eq!(
             params,
             vec![Some("42".to_owned()), None, Some("it's".to_owned())]
         );
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn test_detail_parameters_malformed_counted() {
+        let mut dropped = 0;
+        // Unterminated quote: the whole list is dropped, and counted.
+        let params = detail_parameters("Parameters: $1 = 'unterminated", &mut dropped);
+        assert!(params.is_empty());
+        assert_eq!(dropped, 1);
+        // A non-Parameters detail is not a drop.
+        let params = detail_parameters("Failed row contains (1, x).", &mut dropped);
+        assert!(params.is_empty());
+        assert_eq!(dropped, 1);
     }
 
     #[test]
@@ -516,7 +589,7 @@ mod tests {
 2026-08-28 10:00:00.003 PDT [123] LOG:  execute stmt_1: SELECT * FROM users WHERE id = $1
 2026-08-28 10:00:00.004 PDT [123] DETAIL:  Parameters: $1 = '43'
 ";
-        let statements = stderr_log_read(log);
+        let statements = stderr_log_read(log).statements;
         assert_eq!(statements.len(), 3);
         assert_eq!(statements[0].parameters, vec![Some("42".to_owned())]);
         assert!(statements.iter().any(|s| s.sql == "SELECT 1"));
@@ -531,7 +604,7 @@ mod tests {
 \tWHERE id = 1
 2026-08-28 10:00:00.001 PDT [123] LOG:  disconnection: session time
 ";
-        let statements = stderr_log_read(log);
+        let statements = stderr_log_read(log).statements;
         assert_eq!(statements.len(), 1);
         assert_eq!(statements[0].sql, "SELECT *\nFROM users\nWHERE id = 1");
     }
@@ -543,7 +616,7 @@ query,calls,total_exec_time
 \"SELECT * FROM users WHERE id = $1\",100,12.5
 \"UPDATE users SET name = $1 WHERE id = $2\",7,3.25
 ";
-        let statements = pgss_read(csv).expect("parse pgss csv");
+        let statements = pgss_read(csv).expect("parse pgss csv").statements;
         assert_eq!(statements.len(), 2);
         assert_eq!(statements[0].calls, 100);
         assert_eq!(statements[0].total_time_ms, Some(12.5));
@@ -569,6 +642,22 @@ query,calls,total_exec_time
             ),
             TraceFormat::StderrLog
         );
+    }
+
+    #[test]
+    fn test_csvlog_detected_with_multiline_first_record() {
+        // First record's message field is a quoted multi-line statement, so
+        // the first physical line carries too few commas for a line-based
+        // probe — the record-based one must still detect csvlog.
+        let log = "2026-08-28 10:00:00.000 PDT,\"u\",\"db\",123,\"[local]\",\"s1\",1,\"SELECT\",2026-08-28 10:00:00 PDT,\"1/2\",0,\"LOG\",\"00000\",\"statement: SELECT *\n  FROM users\n  WHERE id = 1\",,,,,,,,,\"app\"\n";
+        assert_eq!(
+            trace_format_detect(std::path::Path::new("trace.csv"), log),
+            TraceFormat::CsvLog
+        );
+        let statements = csvlog_read(log).expect("parse csvlog").statements;
+        assert_eq!(statements.len(), 1);
+        assert!(statements[0].sql.contains("FROM users"));
+        assert_eq!(statements[0].session, 123);
     }
 
     #[test]

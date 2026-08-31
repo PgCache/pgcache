@@ -95,13 +95,23 @@ pub fn assumptions_build(
     synth: &SynthesisStats,
     inferred_parameters: usize,
     format: TraceFormat,
+    parameter_details_dropped: usize,
 ) -> Vec<String> {
     let mut out = vec![
         "all tables assumed to have a primary key".to_owned(),
         "all relations assumed to be tables (views not detectable without schema)".to_owned(),
         "all unqualified names assumed in schema public".to_owned(),
         "enum/composite types not detectable".to_owned(),
+        "function volatility from a builtin PostgreSQL snapshot; unknown \
+         (extension/user-defined) functions treated as non-immutable"
+            .to_owned(),
     ];
+    if parameter_details_dropped > 0 {
+        out.push(format!(
+            "unparseable 'Parameters:' details (statements analyzed as \
+             unparameterized): {parameter_details_dropped}"
+        ));
+    }
     if synth.heuristic_attributions > 0 {
         out.push(format!(
             "columns attributed heuristically to the first FROM-order table: {}",
@@ -159,6 +169,7 @@ pub fn check_report_build(
     items: &[(ParsedStatement, Verdict)],
     synth: &SynthesisStats,
     format: TraceFormat,
+    parameter_details_dropped: usize,
 ) -> CheckReport {
     let mut statements = 0u64;
     let mut calls = 0u64;
@@ -271,7 +282,12 @@ pub fn check_report_build(
         distinct_shapes: shapes.len(),
         post_subsumption_estimate: distinct_fingerprints - subsumed_fingerprints,
         shape_level_fingerprints: format == TraceFormat::PgssCsv,
-        assumptions: assumptions_build(synth, inferred_parameters, format),
+        assumptions: assumptions_build(
+            synth,
+            inferred_parameters,
+            format,
+            parameter_details_dropped,
+        ),
         verdicts,
     }
 }
@@ -281,8 +297,14 @@ pub fn hitrate_report_build(
     synth: &SynthesisStats,
     inferred_parameters: usize,
     format: TraceFormat,
+    parameter_details_dropped: usize,
 ) -> HitrateReport {
-    let mut assumptions = assumptions_build(synth, inferred_parameters, format);
+    let mut assumptions = assumptions_build(
+        synth,
+        inferred_parameters,
+        format,
+        parameter_details_dropped,
+    );
     if stats.in_transaction_calls > 0 {
         assumptions.push(format!(
             "SELECTs inside explicit transactions are forwarded, never served \

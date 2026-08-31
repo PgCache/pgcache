@@ -72,13 +72,15 @@ struct Analysis {
     catalog: SynthCatalog,
     format: TraceFormat,
     inferred_parameters: usize,
+    parameter_details_dropped: usize,
 }
 
 fn trace_analyze(path: &PathBuf, format_override: Option<TraceFormat>) -> anyhow::Result<Analysis> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let format = format_override.unwrap_or_else(|| trace_format_detect(path, &content));
-    let statements = statements_read(&content, format)?;
+    let trace = statements_read(&content, format)?;
+    let statements = trace.statements;
     anyhow::ensure!(
         !statements.is_empty(),
         "no statements found in {} (detected format: {format:?}; override with --format)",
@@ -108,6 +110,7 @@ fn trace_analyze(path: &PathBuf, format_override: Option<TraceFormat>) -> anyhow
         catalog,
         format,
         inferred_parameters,
+        parameter_details_dropped: trace.parameter_details_dropped,
     })
 }
 
@@ -124,6 +127,7 @@ fn main() -> anyhow::Result<()> {
                 &analysis.items,
                 &analysis.catalog.stats,
                 analysis.format,
+                analysis.parameter_details_dropped,
             );
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -150,6 +154,7 @@ fn main() -> anyhow::Result<()> {
                 &analysis.catalog.stats,
                 analysis.inferred_parameters,
                 analysis.format,
+                analysis.parameter_details_dropped,
             );
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
