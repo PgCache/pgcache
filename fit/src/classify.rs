@@ -7,6 +7,7 @@ use iddqd::BiHashMap;
 use pgcache_lib::cache::admission::{
     AdmissionDepth, base_query_prepare, query_admission_analyze, shape_gate_classify,
 };
+use pgcache_lib::cache::query::limit_rows_needed;
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::TableMetadata;
 use pgcache_lib::oid::Oid;
@@ -148,9 +149,11 @@ pub struct CacheableAnalysis {
     /// Distinct referenced relations, keyed like the writer: by oid.
     pub relations: Vec<(Oid, EcoString)>,
     pub has_limit: bool,
-    /// Rows needed to satisfy the query's LIMIT+OFFSET (`None` = unlimited),
-    /// mirroring the writer's `max_limit`; drives the replay's
-    /// limit-sufficiency gate.
+    /// Rows the request asks for (LIMIT+OFFSET, `None` = all): the dispatch
+    /// side of the limit-sufficiency gate.
+    pub rows_needed: Option<u64>,
+    /// Rows the writer would cache for this query (`None` = all) — the
+    /// request's window unless the shape forces unbounded population.
     pub max_limit: Option<u64>,
     /// Whole-query constraints of the original (pre-decorrelation) resolved
     /// form — the subsumed-side input; `None` for set-operation queries
@@ -286,6 +289,7 @@ pub fn statement_classify(
         shape_key: query_shape_derive(&resolved).key,
         relations,
         has_limit,
+        rows_needed: limit_rows_needed(&cacheable.query().limit),
         max_limit,
         constraints,
         admissions,

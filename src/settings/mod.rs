@@ -17,7 +17,8 @@ mod toml_file;
 mod tests;
 
 pub use dynamic::{
-    DynamicConfig, DynamicConfigHandle, DynamicConfigPatch, LogReloadHandle, StaticConfigSnapshot,
+    DEFAULT_ADMISSION_THRESHOLD, DynamicConfig, DynamicConfigHandle, DynamicConfigPatch,
+    LogReloadHandle, StaticConfigSnapshot,
 };
 pub use toml_file::{config_file_dynamic_extract, config_file_dynamic_update};
 

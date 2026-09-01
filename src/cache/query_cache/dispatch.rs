@@ -14,7 +14,7 @@ use crate::proxy::{ClientSocket, ExplainSpec, ExplainTarget};
 use crate::query::Fingerprint;
 use crate::query::ast::{query_expr_convert_raw, query_expr_fingerprint};
 use crate::result::error_chain_format;
-use crate::settings::{CachePolicy, DynamicConfig, Settings};
+use crate::settings::{CachePolicy, Settings};
 use crate::timing::{QueryTiming, duration_to_ns_u64};
 
 use crate::cache::coalesce_queue::{CoalesceKey, CoalesceQueue, coalesce_deadline};
@@ -24,9 +24,10 @@ use crate::cache::messages::{
     QueryCommand, SubsumptionResult, slices_concat,
 };
 use crate::cache::mv::{MvMeta, MvServe, MvState, ShapeGate};
-use crate::cache::query::{CacheableQuery, limit_is_sufficient, limit_rows_needed};
+use crate::cache::query::{CacheableQuery, limit_rows_needed};
 use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;
+use crate::cache::serve_decision::{DecisionInput, EntrySnapshot, ServeDecision, serve_decide};
 use crate::cache::types::{
     CacheStateView, CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics,
 };
@@ -278,7 +279,13 @@ impl CacheDispatch {
         let fingerprint = query_expr_fingerprint(msg.cacheable_query.query());
         trace!("{fingerprint}");
 
-        let rows_needed = limit_rows_needed(&msg.cacheable_query.query().limit);
+        let input = DecisionInput {
+            rows_needed: limit_rows_needed(&msg.cacheable_query.query().limit),
+            admission_threshold: cfg.admission_threshold,
+            cache_policy: cfg.cache_policy,
+            throttled: self.state_view.throttled(),
+            pending_credit: self.pending_initial_credit(),
+        };
 
         let lookup_start = Instant::now();
         let mut cache_entry = self
@@ -296,21 +303,35 @@ impl CacheDispatch {
         // (forward_decision / coalesce_intake / coalesce_wait).
         msg.timing.lookup_complete_at = Some(Instant::now());
 
-        // Retry loop: the `Loading` arm may observe (under the waiting lock) that
-        // the state has advanced since the snapshot above and fall through to
-        // re-dispatch against the fresh state. All other arms are terminal.
+        // Retry loop: decisions that write state re-decide under the write
+        // guard (`transition_apply`), and the coalesce arm re-checks under the
+        // waiting lock. Losing either race falls through to re-read the entry
+        // and re-dispatch against the fresh state.
         loop {
-            match &cache_entry {
-                // Cache hit: Ready with sufficient rows — serve from cache
-                Some(CachedQueryView {
-                    state: CachedQueryState::Ready,
-                    generation,
-                    resolved: Some(resolved),
-                    deparsed_sql: Some(deparsed_sql),
-                    serve_shape,
-                    max_limit,
-                    ..
-                }) if limit_is_sufficient(*max_limit, rows_needed) => {
+            let snapshot = cache_entry.as_ref().map(EntrySnapshot::from);
+            let decision = serve_decide(snapshot.as_ref(), &input, || self.reg_bucket.try_take());
+            match decision {
+                ServeDecision::Hit => {
+                    let Some(CachedQueryView {
+                        generation,
+                        resolved: Some(resolved),
+                        deparsed_sql: Some(deparsed_sql),
+                        serve_shape,
+                        ..
+                    }) = &cache_entry
+                    else {
+                        // The writer publishes the resolved form together with
+                        // Ready; serve from origin rather than guess if not.
+                        debug_assert!(false, "Ready entry without resolved form {fingerprint}");
+                        debug!("ready entry without resolved form, forwarding {fingerprint}");
+                        return reply_forward(
+                            msg.reply_tx,
+                            msg.client_socket,
+                            msg.pipeline,
+                            msg.data,
+                            msg.timing,
+                        );
+                    };
                     self.metrics_hit_record(fingerprint);
                     self.clock_reference_set(cfg.cache_policy, &fingerprint);
                     return self
@@ -321,29 +342,24 @@ impl CacheDispatch {
                             deparsed_sql.clone(),
                             serve_shape.clone(),
                             *generation,
-                            rows_needed,
+                            input.rows_needed,
                         )
                         .await;
                 }
 
-                // Cache hit: Ready but insufficient rows — forward and request limit bump
-                Some(CachedQueryView {
-                    state: CachedQueryState::Ready,
-                    max_limit,
-                    ..
-                }) => {
-                    trace!("limit bump {fingerprint} cached={max_limit:?} needed={rows_needed:?}");
-                    // CAS Ready(insufficient)→Loading: a single dispatch claims the
-                    // bump. If we lose (another bumper won, or a completed bump made
-                    // the entry sufficient), re-dispatch against the fresh state.
-                    if self.transition_if(
-                        fingerprint,
-                        |v| {
-                            matches!(v.state, CachedQueryState::Ready)
-                                && !limit_is_sufficient(v.max_limit, rows_needed)
-                        },
-                        CachedQueryState::Loading,
-                    ) {
+                // Ready but insufficient rows — forward and request a limit bump.
+                // A single dispatch claims the bump; if another bumper won (or a
+                // completed bump made the entry sufficient), re-dispatch.
+                ServeDecision::LimitBump { .. } => {
+                    trace!(
+                        "limit bump {fingerprint} cached={:?} needed={:?}",
+                        snapshot.and_then(|s| s.max_limit),
+                        input.rows_needed
+                    );
+                    if self
+                        .transition_apply(fingerprint, decision, &input)
+                        .is_some()
+                    {
                         self.metrics_miss_record(fingerprint);
                         reply_forward(
                             msg.reply_tx,
@@ -355,12 +371,11 @@ impl CacheDispatch {
                         self.query_tx
                             .send(QueryCommand::LimitBump {
                                 fingerprint,
-                                max_limit: rows_needed,
+                                max_limit: input.rows_needed,
                             })
                             .map_err(|_| CacheError::WriterSend)?;
                         return Ok(());
                     }
-                    // Lost the race; fall through to re-read and re-dispatch.
                 }
 
                 // Loading — coalesce: queue request for later dispatch from cache.
@@ -369,26 +384,7 @@ impl CacheDispatch {
                 // notify that drains this queue, so if we still observe `Loading`
                 // while holding the lock, the drain has not yet removed our group
                 // (or will see us); otherwise we fall through and re-dispatch.
-                Some(CachedQueryView {
-                    state: CachedQueryState::Loading,
-                    ..
-                }) => {
-                    // Under memory pressure this query's population is being
-                    // skipped (it won't become Ready), so forward to origin
-                    // rather than coalesce-wait on a load that won't complete.
-                    if self.state_view.throttled() {
-                        crate::metrics::handles()
-                            .cache
-                            .registration_throttled_total
-                            .increment(1);
-                        return reply_forward(
-                            msg.reply_tx,
-                            msg.client_socket,
-                            msg.pipeline,
-                            msg.data,
-                            msg.timing,
-                        );
-                    }
+                ServeDecision::Coalesce => {
                     trace!("cache loading, coalesce {fingerprint}");
                     fault_coalesce_enqueue_delay().await;
                     let key = CoalesceKey::from_request(&msg);
@@ -422,98 +418,45 @@ impl CacheDispatch {
                         }
                         Err(returned) => {
                             msg = returned;
-                            // State advanced; fall through to re-read and re-dispatch.
                         }
                     }
                 }
 
-                // Pending — increment hit count under the guard and admit if the
-                // threshold is reached. The read-modify-write happens atomically in
-                // `pending_admit`; if the entry is no longer Pending we re-dispatch.
-                Some(CachedQueryView {
-                    state: CachedQueryState::Pending { .. },
-                    ..
-                }) => {
-                    trace!("pending {fingerprint}");
-                    let credit = self.pending_initial_credit();
-                    match self.pending_admit(fingerprint, cfg.admission_threshold, credit) {
-                        Some(action) => {
-                            return self.subsumption_await(msg, fingerprint, action).await;
-                        }
-                        None => {
-                            // No longer Pending; fall through to re-read and re-dispatch.
-                        }
+                // Pending (count a hit, admit at threshold), Invalidated (fast
+                // readmit) or cold (claim the slot): the writer runs the
+                // subsumption check and, on `Admit`, registers and populates.
+                ServeDecision::Register { .. } => {
+                    trace!(
+                        "register {fingerprint} from {:?}",
+                        snapshot.map(|s| s.state)
+                    );
+                    if let Some(ServeDecision::Register { action, .. }) =
+                        self.transition_apply(fingerprint, decision, &input)
+                    {
+                        return self.subsumption_await(msg, fingerprint, action).await;
                     }
                 }
 
-                // Invalidated — fast-readmit (skip admission gate). CAS the
-                // Invalidated→Loading transition so only one dispatch readmits.
-                Some(CachedQueryView {
-                    state: CachedQueryState::Invalidated,
-                    ..
-                }) => {
-                    trace!("invalidated readmit {fingerprint}");
-                    if self.transition_if(
-                        fingerprint,
-                        |v| matches!(v.state, CachedQueryState::Invalidated),
-                        CachedQueryState::Loading,
-                    ) {
-                        return self
-                            .subsumption_await(msg, fingerprint, AdmitAction::Admit)
-                            .await;
-                    }
-                    // Lost the race; fall through to re-read and re-dispatch.
-                }
-
-                // Cache miss — claim the entry atomically; only the winner
-                // registers, losers re-dispatch against the now-present entry.
-                None => {
-                    trace!("cache miss {fingerprint}");
-                    // Under memory pressure, don't register a brand-new query
-                    // (each registration costs in-process memory). Forward it to
-                    // origin instead; already-tracked queries are unaffected.
-                    if self.state_view.throttled() {
-                        crate::metrics::handles()
-                            .cache
-                            .registration_throttled_total
-                            .increment(1);
-                        return reply_forward(
-                            msg.reply_tx,
-                            msg.client_socket,
-                            msg.pipeline,
-                            msg.data,
-                            msg.timing,
-                        );
-                    }
-                    // PGC-277 prototype: cap the new-registration rate so the
-                    // population storm can't saturate the box. No token -> forward
-                    // to origin without registering (origin is the source of truth).
-                    if !self.reg_bucket.try_take() {
-                        crate::metrics::handles()
-                            .cache
-                            .registration_throttled_total
-                            .increment(1);
-                        return reply_forward(
-                            msg.reply_tx,
-                            msg.client_socket,
-                            msg.pipeline,
-                            msg.data,
-                            msg.timing,
-                        );
-                    }
-                    match self.first_miss_claim(fingerprint, &cfg) {
-                        Some(action) => {
-                            return self.subsumption_await(msg, fingerprint, action).await;
-                        }
-                        None => {
-                            // Another dispatch inserted it first; fall through to retry.
-                        }
-                    }
+                // Memory pressure or the new-registration rate cap (PGC-277):
+                // forward to origin without touching cache state.
+                ServeDecision::Forward(reason) => {
+                    trace!("forward {fingerprint}: {reason:?}");
+                    crate::metrics::handles()
+                        .cache
+                        .registration_throttled_total
+                        .increment(1);
+                    return reply_forward(
+                        msg.reply_tx,
+                        msg.client_socket,
+                        msg.pipeline,
+                        msg.data,
+                        msg.timing,
+                    );
                 }
             }
 
-            // Reached only when the Loading arm fell through: re-read the entry
-            // and re-dispatch against the now-current state.
+            // Lost a race: re-read the entry and re-dispatch against the
+            // now-current state.
             cache_entry = self
                 .state_view
                 .cached_queries
@@ -551,99 +494,56 @@ impl CacheDispatch {
         fast_path::clock_reference_set(&self.state_view, cache_policy, fingerprint);
     }
 
-    /// Atomically transition `fingerprint` to `new` iff the entry still satisfies
-    /// `pred` *under the write guard*. Returns `true` if this caller performed the
-    /// transition, `false` if the entry advanced (the caller re-dispatches). This
-    /// is the compare-and-set that makes the cold dispatch arms race-safe under
-    /// the multi-thread runtime (cf. `fast_path::mv_schedule`).
-    fn transition_if(
+    /// Apply a decision's state write under the write guard. For an existing
+    /// entry the decision is re-made from the guarded state rather than
+    /// trusting the caller's snapshot — the compare-and-set that makes the cold
+    /// arms race-safe under the multi-thread runtime (cf.
+    /// `fast_path::mv_schedule`); a cold claim inserts iff the slot is still
+    /// vacant. Returns the decision actually applied (same kind as `decision`,
+    /// possibly with a different admit action), or `None` when the entry
+    /// advanced and the caller must re-dispatch.
+    fn transition_apply(
         &self,
         fingerprint: Fingerprint,
-        pred: impl Fn(&CachedQueryView) -> bool,
-        new: CachedQueryState,
-    ) -> bool {
-        if let Some(mut entry) = self.state_view.cached_queries.get_mut(&fingerprint)
-            && pred(&entry)
-        {
-            entry.state = new;
-            return true;
-        }
-        false
-    }
-
-    /// Under the write guard: if still `Pending`, increment the hit count and
-    /// either admit (→ `Loading`, returning `Admit`) or bump the credit
-    /// (returning `CheckOnly`). Returns `None` if the entry is no longer
-    /// `Pending` (the caller re-dispatches). Race-safe read-modify-write.
-    fn pending_admit(
-        &self,
-        fingerprint: Fingerprint,
-        threshold: u32,
-        credit: u32,
-    ) -> Option<AdmitAction> {
-        let mut entry = self.state_view.cached_queries.get_mut(&fingerprint)?;
-        let CachedQueryState::Pending { hit_count, .. } = entry.state else {
-            return None;
-        };
-        let new_count = hit_count + 1;
-        if new_count >= threshold {
-            entry.state = CachedQueryState::Loading;
-            Some(AdmitAction::Admit)
-        } else {
-            entry.state = CachedQueryState::Pending {
-                hit_count: new_count,
-                credit,
-            };
-            Some(AdmitAction::CheckOnly)
-        }
-    }
-
-    /// Claim a cold fingerprint atomically: insert the initial cache view iff the
-    /// entry is vacant. Returns the `AdmitAction` to register with when this
-    /// caller won the insert; `None` if another dispatch already inserted it (the
-    /// caller re-dispatches against the now-present entry). Prevents concurrent
-    /// first-misses from double-registering.
-    fn first_miss_claim(
-        &self,
-        fingerprint: Fingerprint,
-        cfg: &DynamicConfig,
-    ) -> Option<AdmitAction> {
-        let immediate_admit = cfg.cache_policy == CachePolicy::Fifo || cfg.admission_threshold <= 1;
-        let (initial_state, action) = if immediate_admit {
-            (CachedQueryState::Loading, AdmitAction::Admit)
-        } else {
-            (
-                CachedQueryState::Pending {
-                    hit_count: 1,
-                    credit: self.pending_initial_credit(),
-                },
-                AdmitAction::CheckOnly,
-            )
-        };
-
-        match self.state_view.cached_queries.entry(fingerprint) {
-            Entry::Occupied(_) => return None, // lost the race; re-dispatch
-            Entry::Vacant(slot) => {
-                slot.insert(CachedQueryView {
-                    state: initial_state,
-                    generation: 0,
-                    resolved: None,
-                    deparsed_sql: None,
-                    serve_shape: None,
-                    max_limit: None,
-                    referenced: false,
-                    // Writer fills this in after resolution/classification.
-                    mv: MvMeta::new(ShapeGate::Skip, None),
-                });
+        decision: ServeDecision,
+        input: &DecisionInput,
+    ) -> Option<ServeDecision> {
+        let transition = decision.transition()?;
+        if transition.expected.is_none() {
+            // Cold claim: the caller's decision already consumed the
+            // registration budget, so insert exactly what it decided.
+            match self.state_view.cached_queries.entry(fingerprint) {
+                Entry::Occupied(_) => return None,
+                Entry::Vacant(slot) => {
+                    slot.insert(CachedQueryView {
+                        state: transition.new,
+                        generation: 0,
+                        resolved: None,
+                        deparsed_sql: None,
+                        serve_shape: None,
+                        max_limit: None,
+                        referenced: false,
+                        // Writer fills this in after resolution/classification.
+                        mv: MvMeta::new(ShapeGate::Skip, None),
+                    });
+                }
             }
+            let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
+            self.state_view
+                .metrics
+                .entry(fingerprint)
+                .or_insert_with(|| QueryMetrics::new(now));
+            return Some(decision);
         }
 
-        let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
-        self.state_view
-            .metrics
-            .entry(fingerprint)
-            .or_insert_with(|| QueryMetrics::new(now));
-        Some(action)
+        let mut entry = self.state_view.cached_queries.get_mut(&fingerprint)?;
+        // An existing entry never consults the registration budget.
+        let guarded = serve_decide(Some(&EntrySnapshot::from(&*entry)), input, || false);
+        if std::mem::discriminant(&guarded) != std::mem::discriminant(&decision) {
+            return None;
+        }
+        entry.state = guarded.transition()?.new;
+        Some(guarded)
     }
 
     /// Register pinned queries at startup by sending Register commands with `pinned: true`.
