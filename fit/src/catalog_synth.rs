@@ -255,26 +255,18 @@ impl Synthesizer {
                 let key = (EcoString::from("public"), qualifier.clone());
                 self.column_add(key, column.column.clone());
             }
-            None => {
-                for scope in scopes.iter().rev() {
-                    if scope.entries.is_empty() {
-                        continue;
+            None => match scope_unqualified_resolve(scopes) {
+                UnqualifiedResolution::Table { entry, ambiguous } => {
+                    if ambiguous {
+                        self.heuristic_attributions += 1;
                     }
-                    if scope.has_derived {
-                        self.skipped_unqualified += 1;
-                        return;
+                    if let Some(key) = entry.key.clone() {
+                        self.column_add(key, column.column.clone());
                     }
-                    if let Some(entry) = scope.entries.first() {
-                        if scope.entries.len() > 1 {
-                            self.heuristic_attributions += 1;
-                        }
-                        if let Some(key) = entry.key.clone() {
-                            self.column_add(key, column.column.clone());
-                        }
-                    }
-                    return;
                 }
-            }
+                UnqualifiedResolution::Derived => self.skipped_unqualified += 1,
+                UnqualifiedResolution::NoScope => {}
+            },
         }
     }
 
@@ -289,18 +281,10 @@ impl Synthesizer {
                 let key = (EcoString::from("public"), qualifier.clone());
                 self.tables.contains_key(&key).then_some(key)
             }
-            None => {
-                for scope in scopes.iter().rev() {
-                    if scope.entries.is_empty() {
-                        continue;
-                    }
-                    if scope.has_derived {
-                        return None;
-                    }
-                    return scope.entries.first().and_then(|e| e.key.clone());
-                }
-                None
-            }
+            None => match scope_unqualified_resolve(scopes) {
+                UnqualifiedResolution::Table { entry, .. } => entry.key.clone(),
+                UnqualifiedResolution::Derived | UnqualifiedResolution::NoScope => None,
+            },
         }
     }
 
@@ -480,6 +464,38 @@ impl Synthesizer {
 
         SynthCatalog { tables, stats }
     }
+}
+
+/// Resolution of an unqualified column against the innermost scope that has
+/// any entries — the single source for both attribution and type-evidence
+/// lookup, so the two can never disagree.
+enum UnqualifiedResolution<'a> {
+    /// First FROM-order table of the innermost scope; `ambiguous` when more
+    /// than one table was in that scope.
+    Table {
+        entry: &'a ScopeEntry,
+        ambiguous: bool,
+    },
+    /// A derived source (subquery/CTE) is in scope: table membership cannot
+    /// be assumed.
+    Derived,
+    NoScope,
+}
+
+fn scope_unqualified_resolve(scopes: &[Scope]) -> UnqualifiedResolution<'_> {
+    for scope in scopes.iter().rev() {
+        let Some(entry) = scope.entries.first() else {
+            continue;
+        };
+        if scope.has_derived {
+            return UnqualifiedResolution::Derived;
+        }
+        return UnqualifiedResolution::Table {
+            entry,
+            ambiguous: scope.entries.len() > 1,
+        };
+    }
+    UnqualifiedResolution::NoScope
 }
 
 /// Innermost scope entry whose alias matches a column qualifier.

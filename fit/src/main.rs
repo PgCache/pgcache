@@ -168,12 +168,13 @@ fn main() -> anyhow::Result<()> {
             format,
         } => {
             let analysis = trace_analyze(&input, format)?;
+            let include_verdicts = json;
             let report = report::check_report_build(
                 &analysis.items,
                 &analysis.catalog.stats,
                 analysis.format,
                 analysis.parameter_details_dropped,
-                json,
+                include_verdicts,
             );
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);

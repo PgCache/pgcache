@@ -43,7 +43,7 @@ pub struct TableWrites {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StatementVerdict {
-    pub sql: String,
+    pub sql: ecow::EcoString,
     pub verdict: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
@@ -176,7 +176,11 @@ pub fn check_report_build(
     let mut fingerprints: HashSet<Fingerprint> = HashSet::new();
     let mut shapes: HashSet<ShapeKey> = HashSet::new();
     let mut inferred_parameters = 0usize;
-    let mut verdicts = Vec::with_capacity(items.len());
+    let mut verdicts = if include_verdicts {
+        Vec::with_capacity(items.len())
+    } else {
+        Vec::new()
+    };
     let mut registry = SubsumerRegistry::new();
     let mut subsumed_fingerprints = 0usize;
 
@@ -227,22 +231,21 @@ pub fn check_report_build(
                 ("utility", None)
             }
         };
-        if !include_verdicts {
-            continue;
+        if include_verdicts {
+            let detail = match &item.parsed.outcome {
+                ParseOutcome::ParseError(error) | ParseOutcome::ParameterError(error) => {
+                    Some(error.clone())
+                }
+                ParseOutcome::SelectUnconvertible { error, .. } => Some(error.clone()),
+                _ => None,
+            };
+            verdicts.push(StatementVerdict {
+                sql: item.trace.sql.clone(),
+                verdict: verdict_label,
+                reason: reason_label,
+                detail,
+            });
         }
-        let detail = match &item.parsed.outcome {
-            ParseOutcome::ParseError(error) | ParseOutcome::ParameterError(error) => {
-                Some(error.clone())
-            }
-            ParseOutcome::SelectUnconvertible { error, .. } => Some(error.clone()),
-            _ => None,
-        };
-        verdicts.push(StatementVerdict {
-            sql: item.trace.sql.to_string(),
-            verdict: verdict_label,
-            reason: reason_label,
-            detail,
-        });
     }
 
     let mut passthrough: Vec<ReasonAggregate> = passthrough_by_reason

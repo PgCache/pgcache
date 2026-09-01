@@ -239,7 +239,7 @@ fn parameter_list_parse(list: &str) -> Option<Vec<Option<EcoString>>> {
             i += 4;
         } else if after_eq.starts_with('\'') {
             let (value, consumed) = quoted_value_parse(after_eq)?;
-            values.push((index, Some(value.into())));
+            values.push((index, Some(value)));
             i += consumed;
         }
     }
@@ -255,9 +255,9 @@ fn parameter_list_parse(list: &str) -> Option<Vec<Option<EcoString>>> {
 
 /// Parse a leading `'...'` value with `''` escapes; returns the unescaped
 /// value and the byte length consumed including quotes.
-fn quoted_value_parse(s: &str) -> Option<(String, usize)> {
+fn quoted_value_parse(s: &str) -> Option<(EcoString, usize)> {
     let inner = s.strip_prefix('\'')?;
-    let mut value = String::new();
+    let mut value = EcoString::new();
     let mut i = 0;
     let bytes = inner.as_bytes();
     while i < bytes.len() {
@@ -284,7 +284,7 @@ fn quoted_value_parse(s: &str) -> Option<(String, usize)> {
 fn stderr_log_read(content: &str) -> TraceRead {
     #[derive(Default)]
     struct Pending {
-        sql: String,
+        sql: EcoString,
         duration_ms: Option<f64>,
         detail: Option<String>,
         session: u64,
@@ -307,7 +307,7 @@ fn stderr_log_read(content: &str) -> TraceRead {
             .map(|detail| detail_parameters(detail, dropped))
             .unwrap_or_default();
         out.push(TraceStatement {
-            sql: p.sql.into(),
+            sql: p.sql,
             parameters,
             calls: 1,
             total_time_ms: p.duration_ms,
@@ -349,7 +349,7 @@ fn stderr_log_read(content: &str) -> TraceRead {
                     pending.insert(
                         pid,
                         Pending {
-                            sql: sql.to_owned(),
+                            sql: sql.into(),
                             duration_ms,
                             detail: None,
                             session: pid,
@@ -392,34 +392,27 @@ fn stderr_log_read(content: &str) -> TraceRead {
     }
 }
 
-const SEVERITIES: &[&str] = &[
-    "LOG",
-    "DETAIL",
-    "STATEMENT",
-    "ERROR",
-    "FATAL",
-    "PANIC",
-    "WARNING",
-    "NOTICE",
-    "HINT",
-    "INFO",
+const SEVERITIES: &[(&str, &str)] = &[
+    ("LOG:  ", "LOG"),
+    ("DETAIL:  ", "DETAIL"),
+    ("STATEMENT:  ", "STATEMENT"),
+    ("ERROR:  ", "ERROR"),
+    ("FATAL:  ", "FATAL"),
+    ("PANIC:  ", "PANIC"),
+    ("WARNING:  ", "WARNING"),
+    ("NOTICE:  ", "NOTICE"),
+    ("HINT:  ", "HINT"),
+    ("INFO:  ", "INFO"),
 ];
 
 /// Split a stderr log line into `([pid], SEVERITY, payload)`. The pid comes
 /// from the last `[digits]` group before the severity tag; 0 when absent.
 fn log_line_split(line: &str) -> Option<(u64, &str, &str)> {
-    let (position, severity) = SEVERITIES
+    let (position, tag, severity) = SEVERITIES
         .iter()
-        .filter_map(|s| {
-            line.match_indices(s)
-                .find(|(i, _)| {
-                    line.get(i + s.len()..)
-                        .is_some_and(|rest| rest.starts_with(":  "))
-                })
-                .map(|(i, _)| (i, *s))
-        })
-        .min_by_key(|(p, _)| *p)?;
-    let rest = line.get(position + severity.len() + 3..)?;
+        .filter_map(|(tag, name)| line.find(tag).map(|p| (p, *tag, *name)))
+        .min_by_key(|(p, _, _)| *p)?;
+    let rest = line.get(position + tag.len()..)?;
     let prefix = line.get(..position)?;
     let pid = prefix
         .rfind('[')
