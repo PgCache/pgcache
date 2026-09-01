@@ -283,7 +283,7 @@ impl DispatchContext {
         candidate: CacheCandidate,
         is_last: bool,
     ) -> Self {
-        let fingerprint = query_expr_fingerprint(&candidate.cacheable_query.query);
+        let fingerprint = query_expr_fingerprint(candidate.cacheable_query.query());
         let lazy_parse = (!entry.has_parse && candidate.lazy_parse_needed())
             .then(|| candidate.statement_name.clone());
         let pipeline = PipelineContext {

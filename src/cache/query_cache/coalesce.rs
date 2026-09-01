@@ -56,7 +56,7 @@ impl CacheDispatch {
             let primary = waiters.remove(0);
 
             // Check whether the cached rows cover this group's LIMIT
-            let primary_needed = limit_rows_needed(&primary.cacheable_query.query.limit);
+            let primary_needed = limit_rows_needed(&primary.cacheable_query.query().limit);
             if !limit_is_sufficient(max_limit, primary_needed) {
                 let _ = reply_forward(
                     primary.reply_tx,

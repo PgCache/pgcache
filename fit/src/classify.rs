@@ -226,7 +226,7 @@ pub fn statement_classify(
     // preparation: LIMIT stripped and max_limit derived (base_query_prepare),
     // predicates pushed into derived-table branches, and reducer shapes
     // forcing unbounded population, exactly as in query_resolve.
-    let (base_query, user_max_limit) = base_query_prepare(&cacheable.query);
+    let (base_query, user_max_limit) = base_query_prepare(cacheable.query());
 
     let Ok(resolved) =
         query_expr_resolve(&base_query, catalog, &["public"]).map(predicate_pushdown_apply)
@@ -243,7 +243,7 @@ pub fn statement_classify(
         user_max_limit
     };
     let has_limit = max_limit.is_some();
-    let fingerprint = query_expr_fingerprint(&cacheable.query);
+    let fingerprint = query_expr_fingerprint(cacheable.query());
     let analysis = match query_admission_analyze(
         &resolved,
         fingerprint,

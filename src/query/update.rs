@@ -211,7 +211,8 @@ mod tests {
     fn update_queries(sql: &str) -> Vec<(String, ResolvedQueryExpr, UpdateQuerySource)> {
         let tables = test_tables();
         let cacheable = parse_cacheable(sql);
-        let resolved = query_expr_resolve(&cacheable.query, &tables, &["public"]).expect("resolve");
+        let resolved =
+            query_expr_resolve(cacheable.query(), &tables, &["public"]).expect("resolve");
         query_table_update_queries(&resolved)
             .into_iter()
             .map(|(t, q, s)| (t.name.to_string(), q, s))

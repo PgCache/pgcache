@@ -11,7 +11,6 @@ use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::pg::protocol::session::ResultFormats;
 use crate::query::Fingerprint;
-use crate::query::transform::query_expr_parameters_replace;
 
 use super::super::types::SharedResolved;
 use super::super::{
@@ -66,13 +65,11 @@ impl CacheMessage {
                         result_formats,
                     });
                 }
-                // Replace parameters in AST, producing a new QueryExpr
-                match query_expr_parameters_replace(&cacheable_query.query, &parameters) {
-                    Ok(replaced_query) => Ok(QueryData {
+                // Replace parameters in AST, producing the per-literal form.
+                match cacheable_query.parameters_replace(&parameters) {
+                    Ok(replaced) => Ok(QueryData {
                         data,
-                        cacheable_query: Arc::new(CacheableQuery {
-                            query: replaced_query,
-                        }),
+                        cacheable_query: Arc::new(replaced),
                         query_type: QueryType::Extended,
                         result_formats,
                     }),

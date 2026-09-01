@@ -468,7 +468,7 @@ impl ConnectionState {
                             ProxyMode::Read
                         }
                         Ok(Action::CacheCheck(ast)) => {
-                            let fingerprint = query_expr_fingerprint(&ast.query);
+                            let fingerprint = query_expr_fingerprint(ast.query());
                             self.telemetry.cache_timing_start(fingerprint);
                             self.extended.dispatch_is_extended = false;
                             self.egress.cache_push(CacheMessage::Query(msg.data, ast));

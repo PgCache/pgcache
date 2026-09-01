@@ -5,6 +5,8 @@ use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
+use crate::cache::messages::QueryParameters;
+use crate::query::transform::{AstTransformResult, query_expr_parameters_replace};
 use crate::{
     catalog::FunctionVolatility,
     query::{
@@ -38,18 +40,35 @@ error_set! {
 /// Type alias for the function volatility map passed through cacheability checks.
 type FunctionVolatilityMap = HashMap<EcoString, FunctionVolatility>;
 
+/// A query that passed the cacheability check. The field is private so
+/// `try_new` (and the invariant-preserving `parameters_replace`) are the only
+/// ways to construct one — a `CacheableQuery` in hand is proof of validation.
 #[derive(Debug, Clone)]
 pub struct CacheableQuery {
-    pub query: QueryExpr,
+    query: QueryExpr,
 }
 
 impl CacheableQuery {
+    pub fn query(&self) -> &QueryExpr {
+        &self.query
+    }
+
     /// Get the SELECT body of this query, if it is a simple SELECT.
     ///
     /// Returns `Some` if the query body is a SELECT statement, `None` if it's
     /// a set operation (UNION/INTERSECT/EXCEPT) or VALUES clause.
     pub fn as_select(&self) -> Option<&SelectNode> {
         self.query.as_select()
+    }
+
+    /// Substitute bind parameters, producing the per-literal form of this
+    /// query. Substitution only replaces `Parameter` literals and
+    /// constant-folds, so the result inherits this query's validation.
+    pub fn parameters_replace(
+        &self,
+        parameters: &QueryParameters,
+    ) -> AstTransformResult<CacheableQuery> {
+        query_expr_parameters_replace(&self.query, parameters).map(|query| CacheableQuery { query })
     }
 }
 

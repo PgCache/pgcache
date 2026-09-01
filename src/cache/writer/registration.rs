@@ -582,7 +582,7 @@ impl WriterRegistration {
         cacheable_query: &CacheableQuery,
         search_path: &[&str],
     ) -> CacheResult<QueryResolution> {
-        let (base_query, user_max_limit) = base_query_prepare(&cacheable_query.query);
+        let (base_query, user_max_limit) = base_query_prepare(cacheable_query.query());
 
         self.cache_tables_ensure(core, &base_query, search_path)
             .await?;

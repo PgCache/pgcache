@@ -258,8 +258,10 @@ impl CacheDispatch {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, mut msg: QueryRequest) -> CacheResult<()> {
         let cfg = self.dynamic.load();
-        if !fast_path::query_allowlist_check(&cfg.allowed_tables_parsed, &msg.cacheable_query.query)
-        {
+        if !fast_path::query_allowlist_check(
+            &cfg.allowed_tables_parsed,
+            msg.cacheable_query.query(),
+        ) {
             crate::metrics::handles()
                 .query
                 .allowlist_skipped
@@ -273,10 +275,10 @@ impl CacheDispatch {
             );
         }
 
-        let fingerprint = query_expr_fingerprint(&msg.cacheable_query.query);
+        let fingerprint = query_expr_fingerprint(msg.cacheable_query.query());
         trace!("{fingerprint}");
 
-        let rows_needed = limit_rows_needed(&msg.cacheable_query.query.limit);
+        let rows_needed = limit_rows_needed(&msg.cacheable_query.query().limit);
 
         let lookup_start = Instant::now();
         let mut cache_entry = self
@@ -750,7 +752,7 @@ impl CacheDispatch {
                 // Subsumed queries have mv_state = MeasurePending (see Future Work:
                 // "MV first-pop for subsumed queries"); mv_dispatch_decide returns
                 // false and the serve goes through the fallthrough path.
-                let rows_needed = limit_rows_needed(&msg.cacheable_query.query.limit);
+                let rows_needed = limit_rows_needed(&msg.cacheable_query.query().limit);
                 let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
                 self.pool_serve(
                     fingerprint,
