@@ -43,11 +43,26 @@ pub struct CacheStatusData {
 /// natural home, and avoids cross-thread plumbing for read-only display.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CdcStatusData {
-    /// Highest LSN whose effects (cache mutations and invalidations) have
-    /// been fully applied by the writer. Advances on transaction commit
-    /// markers and keep-alive markers delivered through the CDC command
-    /// channel — guaranteed transaction-aligned.
+    /// Highest LSN the writer has consumed from the replication stream.
+    /// Advances on transaction commit markers AND keep-alive markers delivered
+    /// through the CDC command channel — the keepalive path advances it during
+    /// idle (for gated-query liveness) and can run ahead of delivered data, so
+    /// this is the receive/liveness watermark, NOT an apply barrier.
+    pub last_received_lsn: Lsn,
+    /// Highest commit LSN actually applied to the cache. Advances only on a
+    /// real cache commit (never on keepalives), so — unlike `last_received_lsn`
+    /// — it never leads delivered data. Use this to confirm that all committed
+    /// changes up to a given LSN are visible in the cache.
     pub last_applied_lsn: Lsn,
+    /// Whether the apply pipeline has no frame in flight — no open source
+    /// transaction and no frames accumulated for a batch — at the instant this
+    /// status was produced. A momentary snapshot, not a barrier: it does not
+    /// account for commands still queued to the writer or transactions still
+    /// buffered server-side, so a lone reading can be `true` with work inbound.
+    /// Sampled stably over a window it distinguishes a `last_applied_lsn`
+    /// that has stalled on non-applyable WAL (background records, or changes to
+    /// unpublished tables) from one still awaiting a pending cache mutation.
+    pub apply_idle: bool,
 }
 
 /// Per-query status for a cached query.

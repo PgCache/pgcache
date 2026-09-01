@@ -92,7 +92,7 @@ pub enum CdcCommand {
     /// Keep-alive marker. Emitted when the CDC processor receives a
     /// PrimaryKeepAlive whose `wal_end` advances past the previously
     /// observed position. Carries `wal_end`. Allows the writer's
-    /// `last_applied_lsn` watermark to advance during idle periods
+    /// `last_received_lsn` watermark to advance during idle periods
     /// (no published-table transactions) so the gauge remains current.
     KeepAliveMark { lsn: Lsn },
 }

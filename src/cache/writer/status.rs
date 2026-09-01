@@ -105,7 +105,7 @@ impl WriterCore {
     }
 
     /// Build and send a status response for an admin `/status` request.
-    pub(super) async fn status_respond(&self, req: StatusRequest, last_applied_lsn: Lsn) {
+    pub(super) async fn status_respond(&self, req: StatusRequest, last_received_lsn: Lsn) {
         let cache = &self.cache;
 
         let (mut total_hits, mut total_misses) = (0u64, 0u64);
@@ -138,7 +138,11 @@ impl WriterCore {
 
         let response = StatusResponse {
             cache: cache_status,
-            cdc: CdcStatusData { last_applied_lsn },
+            cdc: CdcStatusData {
+                last_received_lsn,
+                last_applied_lsn: self.last_applied_lsn,
+                apply_idle: self.batch_frames == 0 && !self.frame_open,
+            },
             queries,
             fault_injection: cfg!(feature = "fault-injection"),
         };

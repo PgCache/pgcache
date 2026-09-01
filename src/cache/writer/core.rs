@@ -230,7 +230,7 @@ pub struct WriterCore {
     /// queries can never serve a torn mix of two origin points in time.
     pub(super) pending_merges: BinaryHeap<Reverse<PendingMerge>>,
     /// Signals the CDC thread to request an immediate keepalive (reply-requested
-    /// standby status update), advancing `last_applied_lsn` so a gated query's
+    /// standby status update), advancing `last_received_lsn` so a gated query's
     /// snapshot LSN is reached within a round-trip instead of waiting for the
     /// next periodic keepalive.
     pub(super) watermark_nudge: Arc<Notify>,
@@ -243,9 +243,12 @@ pub struct WriterCore {
     /// needs no further marker — this gates re-emits to roughly one per stuck
     /// wave rather than one per gated merge (PGC-290).
     pub(super) last_flush_marker_lsn: Lsn,
-    /// Mirror of `WriterCdc.last_applied_lsn`, updated as the CDC path advances
+    /// Mirror of `WriterCdc.last_received_lsn`, updated as the CDC path advances
     /// the watermark. Read at population dispatch to seed the deleted-key
     /// anchor floor (a lower bound on the population's snapshot LSN).
+    pub(super) last_received_lsn: Lsn,
+    /// Mirror of `WriterCdc.last_applied_lsn` — the commit-only apply
+    /// watermark, advanced only on an actual cache commit.
     pub(super) last_applied_lsn: Lsn,
     /// PK tuple bodies removed by the in-progress CDC frame, drained at
     /// `CommitMark` and recorded into `population_deleted_keys` stamped with the
@@ -495,7 +498,7 @@ pub fn writer_run(
                                     core.frame_open,
                                     core.pending_merges.len(),
                                     min_snap,
-                                    writer_cdc.last_applied_lsn,
+                                    writer_cdc.last_received_lsn,
                                 );
                             }
                             #[allow(clippy::cast_precision_loss)]
@@ -605,7 +608,7 @@ pub fn writer_run(
                         // Handle status requests from admin HTTP server
                         msg = status_rx.recv() => {
                             if let Some(req) = msg {
-                                core.status_respond(req, writer_cdc.last_applied_lsn).await;
+                                core.status_respond(req, writer_cdc.last_received_lsn).await;
                             }
                         }
                     }
@@ -620,7 +623,7 @@ pub fn writer_run(
                     if core.frame_state == FrameState::Idle
                         && !core.pending_merges.is_empty()
                         && let Err(e) = registration
-                            .pending_merges_drain(&mut core, writer_cdc.last_applied_lsn)
+                            .pending_merges_drain(&mut core, writer_cdc.last_received_lsn)
                             .await
                     {
                         error!(
@@ -728,6 +731,7 @@ impl WriterCore {
             watermark_nudge,
             merge_stall_since: None,
             last_flush_marker_lsn: Lsn::from_raw(0),
+            last_received_lsn: Lsn::from_raw(0),
             last_applied_lsn: Lsn::from_raw(0),
             frame_deleted_keys: Vec::new(),
             frame_truncated_relations: Vec::new(),

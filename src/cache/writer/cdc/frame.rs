@@ -443,7 +443,16 @@ impl WriterCdc {
         core.batch_deleted_pks.clear();
         core.toast_overlay_reset();
         core.batch_toast_guard_oids.clear();
-        self.applied_lsn_advance(lsn);
+        self.received_lsn_advance(lsn);
+        core.last_received_lsn = self.last_received_lsn;
+        // The commit-only watermark advances *only here*, on an actual cache
+        // commit — never on the keepalive path (which can run ahead of
+        // delivered data). This is the honest "everything through here is in
+        // the cache" position; `last_received_lsn` is the receive/liveness
+        // watermark that keepalives also advance.
+        if lsn > self.last_applied_lsn {
+            self.last_applied_lsn = lsn;
+        }
         core.last_applied_lsn = self.last_applied_lsn;
         // Per-frame deletes/truncates were stamped by Boundary events during
         // replay; these drains catch what replay didn't reach — pending
@@ -528,11 +537,11 @@ impl WriterCdc {
         Ok(())
     }
 
-    /// Advance `last_applied_lsn` forward to `lsn`, updating the Prometheus
+    /// Advance `last_received_lsn` forward to `lsn`, updating the Prometheus
     /// gauge. No-op if `lsn` does not advance the watermark.
-    pub(super) fn applied_lsn_advance(&mut self, lsn: Lsn) {
-        if lsn > self.last_applied_lsn {
-            self.last_applied_lsn = lsn;
+    pub(super) fn received_lsn_advance(&mut self, lsn: Lsn) {
+        if lsn > self.last_received_lsn {
+            self.last_received_lsn = lsn;
             // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
             #[allow(clippy::cast_precision_loss)]
             crate::metrics::handles()

@@ -426,7 +426,7 @@ impl WriterRegistration {
         let relation_oids: Vec<Oid> = work.table_metadata.iter().map(|t| t.relation_oid).collect();
         // Anchor floor: a lower bound on this population's snapshot LSN, used to
         // prune deleted keys it can no longer need (PGC-250).
-        let anchor_floor = core.last_applied_lsn;
+        let anchor_floor = core.last_received_lsn;
         core.population_deleted_keys.activate(
             fingerprint,
             generation,

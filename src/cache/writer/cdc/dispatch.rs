@@ -191,8 +191,8 @@ impl WriterCdc {
                         let up_to = core.batch_last_lsn;
                         self.batch_flush(core, up_to).await?;
                     }
-                    self.applied_lsn_advance(lsn);
-                    core.last_applied_lsn = self.last_applied_lsn;
+                    self.received_lsn_advance(lsn);
+                    core.last_received_lsn = self.last_received_lsn;
                 }
             }
         }
@@ -955,6 +955,7 @@ impl WriterCdc {
         Ok(Self {
             cache_eval_conn,
             cdc_write_conn,
+            last_received_lsn: Lsn::from_raw(0),
             last_applied_lsn: Lsn::from_raw(0),
             pg_eval_buf: String::with_capacity(SQL_BUFFER_CAPACITY),
             prepared_membership: LruCache::new(PREPARED_EVAL_CACHE_CAPACITY),

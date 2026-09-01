@@ -75,9 +75,18 @@ pub(super) struct WriterCdc {
     /// transaction atomically. Distinct from `cache_eval_conn` and from
     /// `WriterCore.db_cache`.
     pub(super) cdc_write_conn: Client,
-    /// Highest LSN whose effects (cache mutations and invalidations) have been
-    /// applied by this writer. Advances on `CommitMark` and `KeepAliveMark`,
-    /// guaranteed transaction-aligned by mpsc ordering.
+    /// Highest LSN this writer has consumed from the replication stream.
+    /// Advances on `CommitMark` and `KeepAliveMark`, guaranteed
+    /// transaction-aligned by mpsc ordering. Used for gated-query liveness
+    /// (PGC-250), so it must keep moving during idle via keepalives — which
+    /// means it can run ahead of the last cache commit, i.e. ahead of the
+    /// actually-applied position.
+    pub(super) last_received_lsn: Lsn,
+    /// Highest commit LSN actually applied (committed to the cache). Advances
+    /// *only* in `batch_flush`, never on keepalives, so it never leads
+    /// delivered data. This is the watermark that means "all committed changes
+    /// through here are in the cache." (See `last_received_lsn` for the
+    /// receive/liveness counterpart.)
     pub(super) last_applied_lsn: Lsn,
     /// Reused scratch buffer for the combined predicate `SELECT` built per CDC
     /// row in `pg_eval_matches`/`pg_eval_any`. Lives for the writer's lifetime
