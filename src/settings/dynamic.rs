@@ -46,7 +46,7 @@ pub struct DynamicConfig {
     pub disk_limit: Option<usize>,
 }
 
-const DEFAULT_ADMISSION_THRESHOLD: u32 = 1;
+pub const DEFAULT_ADMISSION_THRESHOLD: u32 = 1;
 
 pub(super) const DEFAULT_MV_SIZE_RATIO: u32 = 10;
 

@@ -32,6 +32,7 @@ mod reg_gate;
 mod reply;
 mod runtime;
 mod serve;
+pub mod serve_decision;
 pub(crate) mod status;
 mod types;
 mod update_query;

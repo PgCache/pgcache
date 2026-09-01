@@ -21,11 +21,13 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use ecow::EcoString;
 use pgcache_lib::query::ast::QueryExpr;
+use pgcache_lib::settings::DEFAULT_ADMISSION_THRESHOLD;
 
 use crate::catalog_synth::{SynthCatalog, catalog_synthesize};
 use crate::classify::{
     AnalyzedStatement, ParseOutcome, ParsedStatement, statement_classify, statement_parse,
 };
+use crate::hitrate::ReplayConfig;
 use crate::input::{TraceFormat, TraceStatement, statements_read, trace_format_detect};
 use crate::volatility::builtin_functions_load;
 
@@ -68,6 +70,10 @@ enum Command {
         /// Override input format auto-detection
         #[arg(long, value_enum)]
         format: Option<TraceFormat>,
+        /// pgcache's admission_threshold: a query registers on its Nth
+        /// sighting and is forwarded before that
+        #[arg(long, default_value_t = DEFAULT_ADMISSION_THRESHOLD)]
+        admission_threshold: u32,
     },
 }
 
@@ -186,6 +192,7 @@ fn main() -> anyhow::Result<()> {
             input,
             json,
             format,
+            admission_threshold,
         } => {
             let analysis = trace_analyze(&input, format)?;
             // pgss rows are pre-normalized ($N), one row per shape; replaying
@@ -195,9 +202,13 @@ fn main() -> anyhow::Result<()> {
                 "pg_stat_statements input is pre-normalized ($N): per-literal hit rates \
                  cannot be derived from it — use `check` for shape-level analysis"
             );
-            let stats = hitrate::hitrate_replay(&analysis.items);
+            let config = ReplayConfig {
+                admission_threshold,
+            };
+            let stats = hitrate::hitrate_replay(&analysis.items, config);
             let report = report::hitrate_report_build(
                 stats,
+                config,
                 &analysis.catalog.stats,
                 analysis.inferred_parameters,
                 analysis.format,

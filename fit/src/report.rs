@@ -8,7 +8,7 @@ use pgcache_lib::query::{Fingerprint, ShapeKey};
 
 use crate::catalog_synth::SynthesisStats;
 use crate::classify::{AnalyzedStatement, ParseOutcome, PassthroughReason, Verdict};
-use crate::hitrate::HitrateStats;
+use crate::hitrate::{HitrateStats, ReplayConfig};
 use crate::input::TraceFormat;
 use crate::subsume::SubsumerRegistry;
 
@@ -76,6 +76,7 @@ pub struct CheckReport {
 pub struct HitrateReport {
     #[serde(flatten)]
     pub stats: HitrateStats,
+    pub admission_threshold: u32,
     pub hit_rate_cacheable: f64,
     pub hit_rate_selects: f64,
     pub hit_rate_all: f64,
@@ -292,6 +293,7 @@ pub fn check_report_build(
 
 pub fn hitrate_report_build(
     stats: HitrateStats,
+    config: ReplayConfig,
     synth: &SynthesisStats,
     inferred_parameters: usize,
     format: TraceFormat,
@@ -317,7 +319,15 @@ pub fn hitrate_report_build(
             stats.limit_bumps
         ));
     }
+    if config.admission_threshold > 1 {
+        assumptions.push(format!(
+            "admission threshold {}: a query is forwarded until its {}th sighting \
+             (proxy Pending gate): {} calls",
+            config.admission_threshold, config.admission_threshold, stats.pending_forwards
+        ));
+    }
     HitrateReport {
+        admission_threshold: config.admission_threshold,
         hit_rate_cacheable: stats.rate_over_cacheable(),
         hit_rate_selects: stats.rate_over_selects(),
         hit_rate_all: stats.rate_over_all(),
@@ -468,6 +478,9 @@ pub fn hitrate_report_render(report: &HitrateReport) -> String {
     let _ = writeln!(out, "  cold misses       {}", stats.cold_misses);
     if stats.limit_bumps > 0 {
         let _ = writeln!(out, "  limit bumps       {}", stats.limit_bumps);
+    }
+    if stats.pending_forwards > 0 {
+        let _ = writeln!(out, "  pending forwards  {}", stats.pending_forwards);
     }
     let _ = writeln!(out);
     let _ = writeln!(

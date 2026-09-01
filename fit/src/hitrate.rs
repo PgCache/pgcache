@@ -1,15 +1,34 @@
 //! Infinite-cache replay: the theoretical maximum hit rate from repetition
-//! plus subsumption. Write-driven invalidation is not simulated (future mode);
-//! writes are counted so that extension has its inputs.
+//! plus subsumption, driven by the proxy's own serve decision
+//! (`cache::serve_decision`). Write-driven invalidation is not simulated
+//! (future mode); writes are counted so that extension has its inputs.
 
 use std::collections::HashMap;
 
-use pgcache_lib::cache::query::limit_is_sufficient;
+use pgcache_lib::cache::serve_decision::{
+    AdmitAction, DecisionInput, EntrySnapshot, ServeDecision, serve_decide,
+};
 use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::write::TransactionBoundary;
+use pgcache_lib::settings::{CachePolicy, DEFAULT_ADMISSION_THRESHOLD};
 
 use crate::classify::{AnalyzedStatement, Verdict};
 use crate::subsume::SubsumerRegistry;
+
+/// Proxy configuration the replay mirrors.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplayConfig {
+    /// A query registers on its Nth sighting; earlier sightings are forwarded.
+    pub admission_threshold: u32,
+}
+
+impl Default for ReplayConfig {
+    fn default() -> Self {
+        ReplayConfig {
+            admission_threshold: DEFAULT_ADMISSION_THRESHOLD,
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct HitrateStats {
@@ -25,13 +44,24 @@ pub struct HitrateStats {
     /// Calls answered by an already-registered fingerprint with a sufficient
     /// cached LIMIT window.
     pub hits: u64,
-    /// First-seen fingerprints answered from a subsuming registered query.
+    /// Fingerprints answered from a subsuming registered query on the sighting
+    /// that would otherwise have registered or stayed pending.
     pub subsumption_hits: u64,
-    /// First-seen fingerprints that had to populate from origin.
+    /// Admitted fingerprints that had to populate from origin.
     pub cold_misses: u64,
     /// Repeats asking for more rows than the cached window: a miss plus
     /// repopulation with the larger window, mirroring the proxy's limit bump.
     pub limit_bumps: u64,
+    /// Sightings below the admission threshold: forwarded without registering.
+    pub pending_forwards: u64,
+    /// Forwards the proxy takes only under memory pressure or the registration
+    /// rate cap — inputs offline replay never sets, so always zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub pressure_forwards: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl HitrateStats {
@@ -59,16 +89,15 @@ fn rate(hits: u64, total: u64) -> f64 {
     }
 }
 
-/// Replay classified statements against an infinite cache. Admission
-/// threshold is 1 (pgcache's default): a cacheable query registers on first
-/// sight, so of its `calls`, the first is a cold miss (or subsumption hit)
-/// and the rest are hits. Two proxy serve gates are modeled: SELECTs inside
-/// an explicit transaction are forwarded, and a repeat needing more rows
-/// than the cached LIMIT window is a limit bump, not a hit.
-pub fn hitrate_replay(items: &[AnalyzedStatement]) -> HitrateStats {
+/// Replay classified statements against an infinite cache, one call at a
+/// time through the proxy's serve decision. Populations complete instantly
+/// (no time axis), so `Loading` is never observed and a coalesced waiter —
+/// which the proxy serves from cache once the population lands — cannot
+/// arise. One proxy gate sits in front of the decision: SELECTs inside an
+/// explicit transaction are forwarded (fit-local until PGC-406).
+pub fn hitrate_replay(items: &[AnalyzedStatement], config: ReplayConfig) -> HitrateStats {
     let mut stats = HitrateStats::default();
-    // Registered fingerprint → cached LIMIT window (`None` = unlimited).
-    let mut seen: HashMap<Fingerprint, Option<u64>> = HashMap::new();
+    let mut entries: HashMap<Fingerprint, EntrySnapshot> = HashMap::new();
     let mut registry = SubsumerRegistry::new();
     // Per-session explicit-transaction state, keyed by the trace's backend
     // identity. Boundaries come from the parsed statement kind.
@@ -78,49 +107,84 @@ pub fn hitrate_replay(items: &[AnalyzedStatement]) -> HitrateStats {
         let calls = item.trace.calls.max(1);
         stats.statements += 1;
         stats.calls += calls;
-        match &*item.verdict {
-            Verdict::Write(_) => stats.write_calls += calls,
+        let analysis = match &*item.verdict {
+            Verdict::Write(_) => {
+                stats.write_calls += calls;
+                continue;
+            }
             Verdict::Utility(boundary) => {
                 stats.utility_calls += calls;
                 if let Some(boundary) = boundary {
                     in_transaction
                         .insert(item.trace.session, *boundary == TransactionBoundary::Begin);
                 }
+                continue;
             }
-            Verdict::Passthrough { .. } => stats.non_cacheable_calls += calls,
-            Verdict::Cacheable(analysis) => {
-                if in_transaction
-                    .get(&item.trace.session)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    stats.in_transaction_calls += calls;
-                    continue;
-                }
-                stats.cacheable_calls += calls;
-                match seen.get_mut(&analysis.fingerprint) {
-                    Some(cached_max) => {
-                        if limit_is_sufficient(*cached_max, analysis.max_limit) {
-                            stats.hits += calls;
-                        } else {
-                            stats.limit_bumps += 1;
-                            stats.hits += calls - 1;
-                            *cached_max = analysis.max_limit;
-                        }
+            Verdict::Passthrough { .. } => {
+                stats.non_cacheable_calls += calls;
+                continue;
+            }
+            Verdict::Cacheable(analysis) => analysis,
+        };
+        if in_transaction
+            .get(&item.trace.session)
+            .copied()
+            .unwrap_or(false)
+        {
+            stats.in_transaction_calls += calls;
+            continue;
+        }
+        stats.cacheable_calls += calls;
+
+        let fingerprint = analysis.fingerprint;
+        let input = DecisionInput {
+            rows_needed: analysis.rows_needed,
+            admission_threshold: config.admission_threshold,
+            cache_policy: CachePolicy::default(),
+            throttled: false,
+            pending_credit: 0,
+        };
+        for _ in 0..calls {
+            let entry = entries.get(&fingerprint).copied();
+            match serve_decide(entry.as_ref(), &input, || true) {
+                ServeDecision::Hit | ServeDecision::Coalesce => stats.hits += 1,
+                ServeDecision::LimitBump { .. } => {
+                    stats.limit_bumps += 1;
+                    if let Some(entry) = entry {
+                        entries.insert(fingerprint, entry.population_complete(input.rows_needed));
                     }
-                    None => {
-                        seen.insert(analysis.fingerprint, analysis.max_limit);
-                        if registry.query_subsumed(analysis) {
-                            // Served from a broader registered query's rows;
-                            // no population round-trip.
-                            stats.subsumption_hits += calls;
-                        } else {
-                            stats.cold_misses += 1;
-                            stats.hits += calls - 1;
-                        }
+                }
+                ServeDecision::Register { transition, action } => {
+                    let claimed = EntrySnapshot {
+                        state: transition.new,
+                        max_limit: None,
+                    };
+                    // The writer checks subsumption for both actions and serves
+                    // a subsumed query from the parent's rows; only a query that
+                    // ends up Ready becomes a subsumer itself.
+                    if registry.query_subsumed(analysis) {
+                        stats.subsumption_hits += 1;
+                        entries
+                            .insert(fingerprint, claimed.population_complete(analysis.max_limit));
                         registry.subsumer_register(analysis);
+                    } else {
+                        match action {
+                            AdmitAction::Admit => {
+                                stats.cold_misses += 1;
+                                entries.insert(
+                                    fingerprint,
+                                    claimed.population_complete(analysis.max_limit),
+                                );
+                                registry.subsumer_register(analysis);
+                            }
+                            AdmitAction::CheckOnly => {
+                                stats.pending_forwards += 1;
+                                entries.insert(fingerprint, claimed);
+                            }
+                        }
                     }
                 }
+                ServeDecision::Forward(_) => stats.pressure_forwards += 1,
             }
         }
     }
@@ -137,6 +201,10 @@ mod tests {
     use pgcache_lib::query::ast::QueryExpr;
 
     fn replay(sqls: &[&str]) -> HitrateStats {
+        replay_with(sqls, ReplayConfig::default())
+    }
+
+    fn replay_with(sqls: &[&str], config: ReplayConfig) -> HitrateStats {
         let parsed: Vec<_> = sqls.iter().map(|sql| statement_parse(sql, &[])).collect();
         let corpus: Vec<QueryExpr> = parsed
             .iter()
@@ -165,7 +233,7 @@ mod tests {
                 }
             })
             .collect();
-        hitrate_replay(&items)
+        hitrate_replay(&items, config)
     }
 
     #[test]
@@ -217,19 +285,71 @@ mod tests {
         let catalog = catalog_synthesize(corpus.iter());
         let builtins = builtin_functions_load();
         let verdict = statement_classify(&parsed, &catalog.tables, &builtins);
-        let stats = hitrate_replay(&[AnalyzedStatement {
-            trace: TraceStatement {
-                sql: sql.into(),
-                parameters: Vec::new(),
-                calls: 100,
-                total_time_ms: None,
-                session: 0,
-            },
-            parsed: std::rc::Rc::new(parsed),
-            verdict: std::rc::Rc::new(verdict),
-        }]);
+        let stats = hitrate_replay(
+            &[AnalyzedStatement {
+                trace: TraceStatement {
+                    sql: sql.into(),
+                    parameters: Vec::new(),
+                    calls: 100,
+                    total_time_ms: None,
+                    session: 0,
+                },
+                parsed: std::rc::Rc::new(parsed),
+                verdict: std::rc::Rc::new(verdict),
+            }],
+            ReplayConfig::default(),
+        );
         assert_eq!(stats.cold_misses, 1);
         assert_eq!(stats.hits, 99);
         assert_eq!(stats.cacheable_calls, 100);
+    }
+
+    #[test]
+    fn test_admission_threshold_forwards_until_reached() {
+        let config = ReplayConfig {
+            admission_threshold: 2,
+        };
+        let stats = replay_with(
+            &[
+                "SELECT * FROM users WHERE id = 1",
+                "SELECT * FROM users WHERE id = 1",
+                "SELECT * FROM users WHERE id = 1",
+            ],
+            config,
+        );
+        assert_eq!(stats.pending_forwards, 1);
+        assert_eq!(stats.cold_misses, 1);
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.cacheable_calls, 3);
+    }
+
+    #[test]
+    fn test_pending_query_still_served_by_subsumer() {
+        let config = ReplayConfig {
+            admission_threshold: 2,
+        };
+        let stats = replay_with(
+            &[
+                "SELECT * FROM users",
+                "SELECT * FROM users",
+                "SELECT * FROM users WHERE id = 1",
+            ],
+            config,
+        );
+        assert_eq!(stats.pending_forwards, 1);
+        assert_eq!(stats.cold_misses, 1);
+        assert_eq!(stats.subsumption_hits, 1);
+    }
+
+    #[test]
+    fn test_limit_bump_then_hit() {
+        let stats = replay(&[
+            "SELECT * FROM users ORDER BY id LIMIT 10",
+            "SELECT * FROM users ORDER BY id LIMIT 20",
+            "SELECT * FROM users ORDER BY id LIMIT 15",
+        ]);
+        assert_eq!(stats.cold_misses, 1);
+        assert_eq!(stats.limit_bumps, 1);
+        assert_eq!(stats.hits, 1);
     }
 }

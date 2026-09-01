@@ -31,8 +31,13 @@ struct FitOutput {
 }
 
 fn fit_run(mode: &str, fixture: &PathBuf) -> FitOutput {
+    fit_run_with(mode, fixture, &[])
+}
+
+fn fit_run_with(mode: &str, fixture: &PathBuf, extra: &[&str]) -> FitOutput {
     let output = Command::new(env!("CARGO_BIN_EXE_pgcache-fit"))
         .args([mode, "--json"])
+        .args(extra)
         .arg(fixture)
         .output()
         .expect("run pgcache-fit");
@@ -389,5 +394,26 @@ mod target {
         );
         assert_eq!(count(&report, "subsumption_hits"), 0);
         assert_eq!(count(&report, "cold_misses"), 2);
+    }
+
+    /// The replay runs the proxy's own serve decision (PGC-392), so its
+    /// admission gate is available offline: with `--admission-threshold 2`
+    /// the first sighting is forwarded without registering, the second
+    /// registers (cold miss), the third hits.
+    #[test]
+    fn test_admission_threshold_replayed() {
+        let fixture = fixture_write(
+            "admission_threshold.sql",
+            "SELECT * FROM users WHERE id = 1;\n\
+             SELECT * FROM users WHERE id = 1;\n\
+             SELECT * FROM users WHERE id = 1;\n",
+        );
+        let output = fit_run_with("hitrate", &fixture, &["--admission-threshold", "2"]);
+        assert!(output.success, "hitrate run succeeds");
+        let report = output.json.expect("hitrate JSON present");
+        assert_eq!(count(&report, "admission_threshold"), 2);
+        assert_eq!(count(&report, "pending_forwards"), 1);
+        assert_eq!(count(&report, "cold_misses"), 1);
+        assert_eq!(count(&report, "hits"), 1);
     }
 }
