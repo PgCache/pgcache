@@ -276,7 +276,7 @@ async fn test_extended_protocol_parameterized_cache_hit() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query again — cache was updated via CDC INSERT, still a cache hit
     let rows = ctx.query(&stmt, &[&"foo"]).await?;

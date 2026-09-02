@@ -60,7 +60,7 @@ async fn test_delete_during_population_no_ghost_row() -> Result<(), Error> {
         .await?;
     ctx.simple_query("insert into ghost_del (id, v) values (1, 'a')")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Cache miss: served from origin pass-through, triggers the background
     // population which blocks (fault delay) after reading its snapshot.
@@ -78,12 +78,12 @@ async fn test_delete_during_population_no_ghost_row() -> Result<(), Error> {
     tokio::time::sleep(SNAPSHOT_SETTLE).await;
     ctx.origin_query("delete from ghost_del where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Let the delayed population finish (it inserts its snapshot row), then
     // drain any trailing CDC.
     ctx.cache_settle().await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let origin = ctx
         .origin_query("select id, v from ghost_del where id = 1", &[])
@@ -116,7 +116,7 @@ async fn test_update_out_of_predicate_during_population_no_ghost_row() -> Result
         .await?;
     ctx.simple_query("insert into ghost_upd (id, v, status) values (1, 'x', 'active')")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let initial = ctx
         .simple_query("select id, v from ghost_upd where status = 'active'")
@@ -131,10 +131,10 @@ async fn test_update_out_of_predicate_during_population_no_ghost_row() -> Result
     tokio::time::sleep(SNAPSHOT_SETTLE).await;
     ctx.origin_query("update ghost_upd set status = 'inactive' where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     ctx.cache_settle().await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let origin = ctx
         .origin_query("select id, v from ghost_upd where status = 'active'", &[])
@@ -174,7 +174,7 @@ async fn test_truncate_during_population_no_resurrected_rows() -> Result<(), Err
         .await?;
     ctx.simple_query("insert into trunc_t (id, v) values (1, 'a'), (2, 'b'), (3, 'c')")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Miss: population reads the 3 rows, then blocks (population delay).
     let initial = ctx.simple_query("select id, v from trunc_t").await?;
@@ -187,13 +187,13 @@ async fn test_truncate_during_population_no_resurrected_rows() -> Result<(), Err
     // Truncate during the population window: origin is now empty.
     tokio::time::sleep(Duration::from_millis(400)).await;
     ctx.origin_query("truncate trunc_t", &[]).await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Let the delayed population finish (its merge must abort, not orphan the 3
     // pre-truncate rows into the shared cache table).
     ctx.cache_settle_with_timeout(Duration::from_secs(15))
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Repopulate and read a cache hit — a forward would mask orphan rows.
     let _ = ctx.simple_query("select id, v from trunc_t").await?;
@@ -245,7 +245,7 @@ async fn test_invalidation_drains_coalesced_waiters() -> Result<(), Error> {
         .await?;
     ctx.simple_query("insert into coal_i (id, gid) values (1, 1), (2, 1)")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Miss: registers the join query; population reads its snapshot, then blocks
     // for 5s (fault delay) — the query sits in Loading the whole time.
@@ -332,7 +332,7 @@ async fn test_deferred_ready_gate_serves_caught_up_value() -> Result<(), Error> 
     ctx.simple_query("insert into gate_t (id, v) values (1, 10)")
         .await?;
     // No cached query yet, so the CDC delivery delay is inactive here.
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Miss: population reads v=10, then blocks (population delay). Registering
     // the query tracks the relation, which activates the CDC delivery delay.
@@ -381,7 +381,7 @@ async fn test_reinsert_during_population_included() -> Result<(), Error> {
         .await?;
     ctx.simple_query("insert into reins (id, flag, v) values (1, 'guard', 1), (2, 'target', 10)")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Guard query: its (one-shot-delayed) population keeps deleted-key
     // tracking active for the relation across the whole scenario.
@@ -394,13 +394,13 @@ async fn test_reinsert_during_population_included() -> Result<(), Error> {
     // cancel + force-upsert the reinsert writes nothing.
     ctx.origin_query("delete from reins where id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.origin_query(
         "insert into reins (id, flag, v) values (2, 'target', 20)",
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Now register the query that matches the reinserted row. Its population
     // runs undelayed, merging while the guard is still in flight (the tracked
@@ -440,7 +440,7 @@ async fn test_reinsert_same_frame_during_population_included() -> Result<(), Err
     .await?;
     ctx.simple_query("insert into reins_f (id, flag, v) values (1, 'guard', 1), (2, 'target', 10)")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     ctx.simple_query("select id, v from reins_f where flag = 'guard'")
         .await?;
@@ -455,7 +455,7 @@ async fn test_reinsert_same_frame_during_population_included() -> Result<(), Err
         )
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let q = "select id, v from reins_f where flag = 'target'";
     ctx.simple_query(q).await?;
@@ -489,7 +489,7 @@ async fn test_insert_delete_same_frame_during_population_no_ghost_row() -> Resul
         .await?;
     ctx.simple_query("insert into ghost_idd (id, v) values (1, 'a')")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Cache miss: population reads its snapshot (id=1 present) then blocks on the
     // fault delay before its insert.
@@ -516,12 +516,12 @@ async fn test_insert_delete_same_frame_during_population_no_ghost_row() -> Resul
         )
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Let the delayed population finish (it inserts its snapshot row), then drain
     // trailing CDC.
     ctx.cache_settle().await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let origin = ctx
         .origin_query("select id, v from ghost_idd where id = 1", &[])
@@ -560,7 +560,7 @@ async fn test_update_out_during_tracking_included_for_later_population() -> Resu
         "insert into upd_out (id, status, v) values (1, 'guard', 1), (2, 'active', 10)",
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Guard query: its (one-shot-delayed) population keeps deleted-key
     // tracking active for the relation across the whole scenario.
@@ -577,7 +577,7 @@ async fn test_update_out_during_tracking_included_for_later_population() -> Resu
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // A later query matching the new version populates while the guard is
     // still in flight; its merge must include id=2.

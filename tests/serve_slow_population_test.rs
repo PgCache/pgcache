@@ -61,7 +61,7 @@ async fn test_fast_population_serves_coalesced() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let before = ctx.metrics().await?;
     concurrent_reads(&ctx, "SELECT id, v FROM fast_pop WHERE id <= 50").await?;
@@ -95,7 +95,7 @@ async fn test_slow_cold_population_forwards_on_deadline() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let before = ctx.metrics().await?;
     let elapsed = concurrent_reads(&ctx, "SELECT id, v FROM slow_cold WHERE id <= 50").await?;
@@ -156,7 +156,7 @@ async fn test_slow_repopulation_forwards_on_deadline() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query = "SELECT b.id, b.title, a.name FROM books b JOIN authors a ON b.author_id = a.id WHERE a.id <= 5";
 
@@ -175,7 +175,7 @@ async fn test_slow_repopulation_forwards_on_deadline() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let before = ctx.metrics().await?;
     concurrent_reads(&ctx, query).await?;

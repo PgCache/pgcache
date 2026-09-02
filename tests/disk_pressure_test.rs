@@ -49,7 +49,7 @@ async fn test_disk_pressure_throttles_and_drops_fewest_queries_table() -> Result
         ))
         .await?;
     }
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q_small = "select data from dp_small where id = 1";
     let q_big1 = "select data from dp_big where id = 1";

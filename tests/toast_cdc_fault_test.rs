@@ -48,7 +48,7 @@ async fn test_unchanged_toast_update_out_during_tracking_preserved() -> Result<(
         "insert into toast_uo (id, big, status) values (1, '', 'guard'), (2, '{big}', 'active')"
     ))
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Guard query: its (one-shot-delayed) population keeps deleted-key
     // tracking active for the relation across the whole scenario.
@@ -73,14 +73,14 @@ async fn test_unchanged_toast_update_out_during_tracking_preserved() -> Result<(
         }
     }
     assert!(qa_cached, "active-row query never cached within 3s");
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Update-out with `big` unchanged → elided. Tracking is active, so the
     // PGC-261 branch upserts the new version — it must carry the repaired
     // TOAST value into the shared table.
     ctx.origin_query("update toast_uo set status = 'archived' where id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // A later query over the new version populates while the guard is still
     // in flight; its merge never overwrites the upserted row, so a NULL hole

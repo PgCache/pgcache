@@ -112,7 +112,7 @@ async fn test_typecast_text_column_uses_local_eval_on_cdc() -> Result<(), Error>
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let m_after = ctx.metrics().await?;
 
     let delta = metrics_delta(&m_before, &m_after);
@@ -164,7 +164,7 @@ async fn test_typecast_int_column_uses_local_eval_on_cdc() -> Result<(), Error> 
     let m_before = ctx.metrics().await?;
     ctx.query("insert into tc_int_col (id, val) values (3, 42)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let m_after = ctx.metrics().await?;
 
     let delta = metrics_delta(&m_before, &m_after);
@@ -215,7 +215,7 @@ async fn test_typecast_text_to_int4_uses_local_eval_on_cdc() -> Result<(), Error
     let m_before = ctx.metrics().await?;
     ctx.query("insert into tc_text_int (id, code) values (3, '42')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let m_after = ctx.metrics().await?;
 
     let delta = metrics_delta(&m_before, &m_after);
@@ -266,7 +266,7 @@ async fn test_typecast_text_to_bool_uses_local_eval_on_cdc() -> Result<(), Error
     let m_before = ctx.metrics().await?;
     ctx.query("insert into tc_text_bool (id, flag) values (3, 't')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let m_after = ctx.metrics().await?;
 
     let delta = metrics_delta(&m_before, &m_after);
@@ -322,7 +322,7 @@ async fn test_typecast_timestamp_to_date_uses_local_eval_on_cdc() -> Result<(), 
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let m_after = ctx.metrics().await?;
 
     let delta = metrics_delta(&m_before, &m_after);
@@ -409,7 +409,7 @@ async fn test_domain_column_update_with_change_dependent_query() -> Result<(), E
         "insert into domain_rc (id, yr, v) values (1, 1999, 10), (2, 2005, 20), (3, 2020, 30)",
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // LIMIT makes the query change-dependent (limit-window invalidation needs
     // row_changes), forcing updates through the batched row-change eval.
@@ -422,7 +422,7 @@ async fn test_domain_column_update_with_change_dependent_query() -> Result<(), E
     // there) → writer reset loop and the settle below fails on /status 503.
     ctx.origin_query("update domain_rc set v = 11 where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // The update legitimately invalidates the LIMIT query (predicate column
     // changed → conservative window invalidation), so this read forwards

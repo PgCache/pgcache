@@ -104,7 +104,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
     // --- CDC INSERT: MV becomes Dirty. Next hit falls through + schedules rebuild.
     ctx.origin_query("INSERT INTO mv_count VALUES (100, 'new')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let m3 = ctx.metrics().await?;
     let row = ctx.query_one("SELECT count(*) FROM mv_count", &[]).await?;
@@ -890,7 +890,7 @@ async fn test_cdc_short_circuit_preserves_fresh_and_upsert() -> Result<(), Error
     // CDC INSERT a grp=1 row — matches the Fresh agg AND the rows query.
     ctx.origin_query("INSERT INTO pgc138 VALUES (16, 1)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.cache_settle().await?;
     assert_eq!(
         ctx.query_one(agg, &[]).await?.get::<_, i64>(0),
@@ -906,7 +906,7 @@ async fn test_cdc_short_circuit_preserves_fresh_and_upsert() -> Result<(), Error
     // CDC INSERT a grp=2 row — matches neither WHERE grp=1 query.
     ctx.origin_query("INSERT INTO pgc138 VALUES (17, 2)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.cache_settle().await?;
     assert_eq!(
         ctx.query_one(agg, &[]).await?.get::<_, i64>(0),
@@ -940,7 +940,7 @@ async fn test_subsumed_query_still_materializes() -> Result<(), Error> {
         ctx.query("INSERT INTO sub_mv VALUES ($1, 8)", &[&id])
             .await?;
     }
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Broad single-table query caches all of sub_mv (Ready, non-limited) — this
     // makes the narrower aggregate below a subsumption candidate.

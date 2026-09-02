@@ -60,7 +60,8 @@ enum Command {
         #[arg(long, value_enum)]
         format: Option<TraceFormat>,
     },
-    /// Replay a trace and estimate the max hit rate under an infinite cache
+    /// [experimental] Replay a trace and estimate the ceiling on hit rate
+    /// under an infinite cache (write-driven invalidation not yet simulated)
     Hitrate {
         /// Statement trace: postgres log (csvlog/stderr) or .sql file
         input: PathBuf,

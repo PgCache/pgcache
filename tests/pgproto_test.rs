@@ -136,7 +136,7 @@ async fn test_pgproto_extended_protocol() -> Result<(), Error> {
 
     // Wait for CDC to invalidate the cached SELECT * FROM proto_test
     // so the verification query isn't served from stale cache via subsumption
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Verify the INSERT actually executed on origin
     let rows = ctx

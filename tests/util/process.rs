@@ -121,6 +121,7 @@ pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
     let db = PgTempDBBuilder::new()
         .with_dbname("origin_test")
         .with_config_param("wal_level", "logical")
+        .with_config_param("synchronous_commit", "on")
         // Postgres inherits a *pipe* for stderr from pgtemp, and nothing drains
         // it. Without the collector, backends log straight to that pipe; once
         // its 16 KB buffer fills, a backend blocks inside `write()` in

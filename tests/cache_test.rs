@@ -52,7 +52,7 @@ async fn test_cache_simple() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Third query — cache hit (Direct + INSERT, row added in place)
     let res = ctx
@@ -102,7 +102,7 @@ async fn test_cache_join() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query_str = "select t.id, t.data as test_data, tm.test_id, tm.data as map_data \
         from test_join t join test_map_join tm on tm.test_id = t.id where t.id = 1 \
@@ -158,7 +158,7 @@ async fn test_cache_join() -> Result<(), Error> {
     ctx.origin_query("update test_join set id = 1 where id = 10", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query after CDC — cache miss (UPDATE invalidates)
     let res = ctx.simple_query(query_str).await?;
@@ -229,7 +229,7 @@ async fn test_cache_self_join() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Self-join: test_self appears as both t0 and t1, joined on data.
     // t0 is filtered via test_map_self, t1 fans out on matching data.
@@ -327,7 +327,7 @@ async fn test_cache_self_join() -> Result<(), Error> {
     ctx.origin_query("insert into test_self (id, data) values (4, 'bar')", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query after CDC — cache miss, now t1 has an additional match for data='bar'
     let res = ctx.simple_query(query_str).await?;
@@ -606,7 +606,7 @@ async fn test_cache_self_join_noninvalidating_update() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query_str = "\
         select e.id as e_id, e.payload as e_payload, m.id as m_id, m.payload as m_payload \
@@ -623,13 +623,13 @@ async fn test_cache_self_join_noninvalidating_update() -> Result<(), Error> {
     // `ceo` appears only on the manager side — it never satisfies `e.dept = 'x'`.
     ctx.query("update emp set payload = 'P1x' where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // `alice` appears only on the employee side (carol reports to her, but is
     // filtered out by dept = 'y').
     ctx.query("update emp set payload = 'P2x' where id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(query_str).await?;
@@ -687,7 +687,7 @@ async fn test_cache_self_join_is_not_a_subsumption_parent() -> Result<(), Error>
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // The join reaches ceo/alice/bob. `dave` has no manager, so he is not cached.
     let self_join = "\

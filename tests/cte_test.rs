@@ -46,7 +46,7 @@ async fn test_cte_simple() -> Result<(), Error> {
 
     // Wait for setup CDC events to be processed before caching —
     // INSERT events on subquery/CTE tables would trigger invalidation
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query = "WITH active_emp AS (SELECT id, name, department FROM employees WHERE active = true) \
                  SELECT name, department FROM active_emp ORDER BY name";
@@ -81,7 +81,7 @@ async fn test_cte_simple() -> Result<(), Error> {
     ctx.origin_query("UPDATE employees SET active = true WHERE id = 2", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // CDC UPDATE on CTE table invalidates → cache miss
     // Query should now include Bob
@@ -97,7 +97,7 @@ async fn test_cte_simple() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM employees WHERE id = 4", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // CDC DELETE on CTE table (Inclusion) does NOT invalidate → cache hit
     // Row removed from cache table, query re-evaluates correctly
@@ -146,7 +146,7 @@ async fn test_cte_with_join() -> Result<(), Error> {
     .await?;
 
     // Wait for setup CDC events to be processed before caching
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // CTE selects active employees, then join with projects
     let query = "WITH active_emp AS (SELECT id, name FROM employees WHERE active = true) \
@@ -211,7 +211,7 @@ async fn test_cte_multiple_tables() -> Result<(), Error> {
     .await?;
 
     // Wait for setup CDC events
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Two CTEs: active employees and their sales
     let query = "WITH active_emp AS (SELECT id, name FROM employees WHERE active = true), \
@@ -267,7 +267,7 @@ async fn test_cte_materialized() -> Result<(), Error> {
     .await?;
 
     // Wait for setup CDC events
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query = "WITH eng AS MATERIALIZED (SELECT id, name FROM employees WHERE department = 'eng') \
                  SELECT name FROM eng ORDER BY name";

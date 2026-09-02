@@ -454,7 +454,7 @@ pub fn hitrate_report_render(report: &HitrateReport) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "pgcache-fit hitrate — {} statements, {} calls",
+        "pgcache-fit hitrate [experimental] — {} statements, {} calls",
         stats.statements, stats.calls
     );
     let _ = writeln!(out);

@@ -81,7 +81,7 @@ async fn test_narrowing_subquery_update_shrinks_amid_single_table() -> Result<()
     // candidate; only the unconditional subquery invalidation catches it.
     ctx.origin_query("UPDATE orders SET amount = 50 WHERE id = 10", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Subquery query must be invalidated and re-serve the shrunk result [bob].
     let m = ctx.metrics().await?;
@@ -135,7 +135,7 @@ async fn test_narrowing_predicate_change_leaves_limit_window() -> Result<(), Err
     // top-2 → must repopulate.
     ctx.origin_query("UPDATE posts SET owner = 999 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(&page(10)).await?;
@@ -183,7 +183,7 @@ async fn test_narrowing_delete_invalidates_limit_query() -> Result<(), Error> {
     // (score 30), outside the cached top-2.
     ctx.origin_query("DELETE FROM posts WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(&page(10)).await?;
@@ -240,7 +240,7 @@ async fn test_narrowing_join_insert_grows_result() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let m = ctx.metrics().await?;
     let res = ctx.simple_query(&tag_page("rust")).await?;
@@ -283,7 +283,7 @@ async fn test_narrowing_unrelated_single_table_update_stays_cached() -> Result<(
     // In-place label update on owner 10's row (non-predicate, non-window).
     ctx.origin_query("UPDATE items SET label = 'X2' WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Owner 10 reflects the new label (applied in place) and stays a cache hit.
     let m = ctx.metrics().await?;
@@ -324,7 +324,7 @@ async fn test_narrowing_memo_evicted_on_predicate_leave_shrink() -> Result<(), E
     // result). owner 10's query is not a candidate for the new owner (20).
     ctx.origin_query("UPDATE items SET owner = 20 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Must serve the fresh shrunk result [2], not the stale memo [1, 2].
     let res = ctx.simple_query(q).await?;

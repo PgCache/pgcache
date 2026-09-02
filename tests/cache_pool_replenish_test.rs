@@ -43,7 +43,7 @@ async fn test_serve_pool_replenishes_after_poison() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "SELECT id, data FROM pool_t WHERE id <= 5";
 
@@ -112,7 +112,7 @@ async fn test_lost_serve_replenishes() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "SELECT id, data FROM lost_t WHERE id <= 3";
     ctx.query(q, &[]).await?;
@@ -168,7 +168,7 @@ async fn test_desync_poisons_and_replenishes() -> Result<(), Error> {
     .await?;
     ctx.query("INSERT INTO desync_t VALUES (1, 'a'), (2, 'b')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "SELECT id, data FROM desync_t WHERE id <= 2";
     ctx.query(q, &[]).await?;

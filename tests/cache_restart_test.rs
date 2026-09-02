@@ -41,7 +41,7 @@ async fn test_cache_restart_recovers_after_writer_death() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // The query range excludes the sentinel row (id 999), so its result is
     // identical before and after the restart.
@@ -132,7 +132,7 @@ async fn test_connection_survives_query_during_restart_window() -> Result<(), Er
         .await?;
     ctx.simple_query("insert into restart_w values (1, 'a'), (2, 'b')")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select id, data from restart_w where id <= 2";
     ctx.simple_query(q).await?;

@@ -92,7 +92,7 @@ async fn test_unchanged_toast_preserved_on_update() -> Result<(), Error> {
         "insert into toast_t (id, big, n, status) values (1, '{big}', 1, 'active')"
     ))
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select big, n from toast_t where id = 1";
     ctx.simple_query(q).await?;
@@ -101,7 +101,7 @@ async fn test_unchanged_toast_preserved_on_update() -> Result<(), Error> {
     // The toast column is unchanged → elided from the CDC new-row image.
     ctx.origin_query("update toast_t set n = 2 where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // No cache_settle between the update and the read: an invalidation would
     // surface as a miss here, so the hit assertion also proves the repair
@@ -132,7 +132,7 @@ async fn test_unchanged_toast_uncached_row_entering_predicate() -> Result<(), Er
         "insert into toast_e (id, big, n, status) values (1, '{big}', 1, 'inactive')"
     ))
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Caches zero rows: id=1 is 'inactive', so it is absent from the cache table.
     let q = "select big from toast_e where status = 'active'";
@@ -143,7 +143,7 @@ async fn test_unchanged_toast_uncached_row_entering_predicate() -> Result<(), Er
     // Row enters the predicate; `big` is unchanged → elided → unrepairable.
     ctx.origin_query("update toast_e set status = 'active' where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Forward-or-hit, either must carry the real value.
     let served = ctx.simple_query(q).await?;
@@ -176,7 +176,7 @@ async fn test_unchanged_toast_predicate_on_toast_column() -> Result<(), Error> {
         "insert into toast_p (id, big, n, status) values (1, '{big}', 1, 'inactive')"
     ))
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select id from toast_p where big like 'x%' and status = 'active'";
     let initial = ctx.simple_query(q).await?;
@@ -185,7 +185,7 @@ async fn test_unchanged_toast_predicate_on_toast_column() -> Result<(), Error> {
 
     ctx.origin_query("update toast_p set status = 'active' where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let served = ctx.simple_query(q).await?;
     assert_eq!(
@@ -217,7 +217,7 @@ async fn test_unchanged_toast_same_transaction_rewrite() -> Result<(), Error> {
         "insert into toast_b (id, big, n, status) values (1, '{old}', 1, 'active')"
     ))
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select big from toast_b where id = 1";
     ctx.simple_query(q).await?;
@@ -232,7 +232,7 @@ async fn test_unchanged_toast_same_transaction_rewrite() -> Result<(), Error> {
         ))
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let served = ctx.simple_query(q).await?;
     assert_eq!(
@@ -263,7 +263,7 @@ async fn test_unchanged_toast_truncate_insert_update_same_transaction() -> Resul
         "insert into toast_tr (id, big, n, status) values (1, '{old}', 1, 'active')"
     ))
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select big from toast_tr where id = 1";
     ctx.simple_query(q).await?;
@@ -279,7 +279,7 @@ async fn test_unchanged_toast_truncate_insert_update_same_transaction() -> Resul
         ))
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let served = ctx.simple_query(q).await?;
     assert_eq!(
@@ -308,7 +308,7 @@ async fn test_unchanged_toast_two_toasted_updates_same_transaction() -> Result<(
         "insert into toast_q (id, a, b, n) values (1, '{a_old}', '{b}', 1)"
     ))
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select a, b from toast_q where id = 1";
     ctx.simple_query(q).await?;
@@ -324,7 +324,7 @@ async fn test_unchanged_toast_two_toasted_updates_same_transaction() -> Result<(
         ))
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let read_before = ctx.metrics().await?;
     let served = ctx.simple_query(q).await?;
@@ -367,7 +367,7 @@ async fn test_unchanged_toast_repair_across_replay_chunks() -> Result<(), Error>
         "insert into toast_x (id, a, b, n) values (1, '{a_old}', '{b}', 1)"
     ))
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select a, b from toast_x where id = 1";
     ctx.simple_query(q).await?;
@@ -387,7 +387,8 @@ async fn test_unchanged_toast_repair_across_replay_chunks() -> Result<(), Error>
         ))
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle_with_timeout(Duration::from_secs(30)).await?;
+    ctx.cdc_apply_settle_with_timeout(Duration::from_secs(30))
+        .await?;
 
     let read_before = ctx.metrics().await?;
     let served = ctx.simple_query(q).await?;
@@ -421,7 +422,7 @@ async fn test_unchanged_toast_pk_change_then_toasted_update() -> Result<(), Erro
         "insert into toast_pc (id, big, n, status) values (1, '{big}', 1, 'active')"
     ))
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select big from toast_pc where status = 'active'";
     ctx.simple_query(q).await?;
@@ -437,7 +438,7 @@ async fn test_unchanged_toast_pk_change_then_toasted_update() -> Result<(), Erro
         )
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let read_before = ctx.metrics().await?;
     let served = ctx.simple_query(q).await?;

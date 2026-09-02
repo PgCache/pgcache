@@ -26,6 +26,16 @@ pub struct TestContext {
     pub dbs: TempDBs,
 }
 
+/// The CDC watermarks read from `/status`.
+struct CdcStatusSnapshot {
+    /// `last_received_lsn`: the receive/liveness watermark (keepalive-advanced).
+    received: u64,
+    /// `last_applied_lsn`: the commit-only apply watermark.
+    applied: u64,
+    /// Whether the CDC apply pipeline has no work in flight.
+    apply_idle: bool,
+}
+
 impl TestContext {
     pub async fn setup() -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
@@ -248,59 +258,153 @@ impl TestContext {
             .map_err(Error::other)
     }
 
-    /// Wait for pgcache to apply all CDC events committed up to the current
-    /// origin WAL position. Captures `pg_current_wal_lsn()` from origin and
-    /// polls `/status` until `cdc.last_applied_lsn` reaches that LSN.
+    /// Wait until CDC has *consumed the replication stream* up to the origin's
+    /// current WAL position — the decode stage. Polls until `last_received_lsn`
+    /// (the decode/liveness watermark, advanced by keepalives as well as
+    /// commits) reaches the captured position.
     ///
-    /// Use this after a write to origin (directly or via the cache proxy)
-    /// before reading data that should reflect the write.
+    /// Use this as a drain barrier where there may be nothing to apply — e.g.
+    /// after setup writes to tables no cached query references yet — since the
+    /// decode watermark advances via keepalives regardless of application.
+    /// When a test then asserts that a committed change is *reflected in the
+    /// cache*, use [`cdc_apply_settle`](Self::cdc_apply_settle) instead: this
+    /// one can return while a delivered commit's effects are still pending.
     ///
-    /// Times out after 5 seconds. The error includes both LSNs to make
-    /// stalls diagnosable.
-    pub async fn cdc_settle(&self) -> Result<(), Error> {
-        self.cdc_settle_with_timeout(Duration::from_secs(5)).await
+    /// Times out after 5 seconds.
+    pub async fn cdc_decode_settle(&self) -> Result<(), Error> {
+        self.cdc_decode_settle_with_timeout(Duration::from_secs(5))
+            .await
     }
 
-    /// Same as `cdc_settle` with an explicit timeout. Useful for tests that
-    /// stress slow paths or need a tighter bound.
-    pub async fn cdc_settle_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
-        // Use `pg_current_wal_insert_lsn()` (not `pg_current_wal_lsn()`):
-        // the latter returns the WAL *write* position, which can lag behind
-        // the just-committed record under synchronous_commit=off (the
-        // walwriter flushes asynchronously). The insert position always
-        // includes the committed record. CDC will eventually catch up to
-        // it via flush + decode, advancing `last_applied_lsn`.
-        let captured_lsn_str: String = self
-            .origin
-            .query_one("SELECT pg_current_wal_insert_lsn()::text", &[])
-            .await
-            .map_err(Error::other)?
-            .get(0);
+    /// Same as [`cdc_decode_settle`](Self::cdc_decode_settle) with an explicit
+    /// timeout.
+    pub async fn cdc_decode_settle_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
+        let captured_lsn_str = self.flush_lsn_capture().await?;
         let captured_lsn = lsn_parse(&captured_lsn_str)?;
-
         let deadline = Instant::now() + timeout;
         loop {
-            let (status, body) = http_get(self.metrics_port, "/status").await?;
-            if status != 200 {
-                return Err(Error::other(format!("/status returned {status}: {body}")));
-            }
-            let json: serde_json::Value = serde_json::from_str(&body)
-                .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
-            let applied = json
-                .get("cdc")
-                .and_then(|c| c.get("last_applied_lsn"))
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| Error::other("cdc.last_applied_lsn missing or not a u64"))?;
-            if applied >= captured_lsn {
+            let cdc = self.cdc_status().await?;
+            if cdc.received >= captured_lsn {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(Error::other(format!(
-                    "cdc_settle timed out: applied={applied} captured={captured_lsn} ({captured_lsn_str})"
+                    "cdc decode settle timed out: received={} captured={captured_lsn} ({captured_lsn_str})",
+                    cdc.received
                 )));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// Wait until pgcache has *applied to the cache* every committed change up
+    /// to the origin's current WAL position — the apply stage.
+    ///
+    /// Use this after a write to a table a cached query references, before
+    /// reading data that must reflect the write. Unlike
+    /// [`cdc_decode_settle`](Self::cdc_decode_settle) it never returns early on
+    /// the keepalive cursor, so an invalidation or in-place update is visible
+    /// once it returns.
+    ///
+    /// Times out after 5 seconds.
+    pub async fn cdc_apply_settle(&self) -> Result<(), Error> {
+        self.cdc_apply_settle_with_timeout(Duration::from_secs(5))
+            .await
+    }
+
+    /// Same as [`cdc_apply_settle`](Self::cdc_apply_settle) with an explicit
+    /// timeout.
+    ///
+    /// Settles when the commit-only watermark reaches the flush target. The
+    /// target can occasionally land past the last real commit — on a *flushed*
+    /// background record (e.g. a running-xacts snapshot) that produces no cache
+    /// mutation, so the commit watermark can never reach it. The fallback path
+    /// handles that: if the decode cursor has passed the target and the writer
+    /// reports no in-flight apply work (`apply_idle`) continuously for a fixed
+    /// window, the residual gap is non-applyable WAL and we settle. Under
+    /// `synchronous_commit=on` (the harness default) a real committed write is
+    /// flushed and delivered promptly, so `apply_idle` cannot stay set across
+    /// the window while a genuine change is still pending — the fallback only
+    /// fires for a true background-record gap.
+    pub async fn cdc_apply_settle_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
+        // Fallback window: the target can land past the last real commit on a
+        // *flushed* background record (e.g. a running-xacts snapshot emitted by
+        // concurrent activity) that produces no cache mutation, so the commit
+        // watermark can never reach it. When the decode cursor has passed the
+        // target and the writer reports no in-flight apply work (`apply_idle`)
+        // continuously for this long, the residual gap is non-applyable WAL and
+        // we settle. Must exceed the worst-case decode->deliver->apply latency
+        // so a not-yet-delivered frame (transient `apply_idle`) never settles us
+        // early, and held frames (an `apply_idle == false` batch) never do.
+        const APPLY_IDLE_STABLE: Duration = Duration::from_millis(500);
+        let captured_lsn_str = self.flush_lsn_capture().await?;
+        let captured_lsn = lsn_parse(&captured_lsn_str)?;
+        let deadline = Instant::now() + timeout;
+        let mut apply_idle_since: Option<Instant> = None;
+        loop {
+            let cdc = self.cdc_status().await?;
+            if cdc.applied >= captured_lsn {
+                return Ok(());
+            }
+            if cdc.received >= captured_lsn && cdc.apply_idle {
+                let since = *apply_idle_since.get_or_insert_with(Instant::now);
+                if since.elapsed() >= APPLY_IDLE_STABLE {
+                    return Ok(());
+                }
+            } else {
+                apply_idle_since = None;
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::other(format!(
+                    "cdc apply settle timed out: applied={} received={} apply_idle={} captured={captured_lsn} ({captured_lsn_str})",
+                    cdc.applied, cdc.received, cdc.apply_idle
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The origin's current flush position, as the `0/HEX` text form.
+    ///
+    /// The target is `pg_current_wal_flush_lsn()`, not the *insert* position:
+    /// the insert position can include a background record (e.g. a
+    /// running-xacts snapshot) left unflushed in the WAL buffer, which the
+    /// logical walsender never decodes or sends. The flush position is the
+    /// ceiling CDC can reach, and under `synchronous_commit=on` (the harness
+    /// default) it already includes every committed write.
+    async fn flush_lsn_capture(&self) -> Result<String, Error> {
+        Ok(self
+            .origin
+            .query_one("SELECT pg_current_wal_flush_lsn()::text", &[])
+            .await
+            .map_err(Error::other)?
+            .get(0))
+    }
+
+    /// Read the CDC watermarks from `/status`.
+    async fn cdc_status(&self) -> Result<CdcStatusSnapshot, Error> {
+        let (status, body) = http_get(self.metrics_port, "/status").await?;
+        if status != 200 {
+            return Err(Error::other(format!("/status returned {status}: {body}")));
+        }
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
+        let cdc = json
+            .get("cdc")
+            .ok_or_else(|| Error::other("status body missing cdc block"))?;
+        let lsn = |field: &str| {
+            cdc.get(field)
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| Error::other(format!("cdc.{field} missing or not a u64")))
+        };
+        Ok(CdcStatusSnapshot {
+            received: lsn("last_received_lsn")?,
+            applied: lsn("last_applied_lsn")?,
+            apply_idle: cdc
+                .get("apply_idle")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+        })
     }
 
     /// Wait for all currently-registered queries to reach a terminal state

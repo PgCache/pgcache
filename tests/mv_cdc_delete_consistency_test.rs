@@ -47,7 +47,7 @@ async fn test_cdc_delete_during_fresh_mv_leaves_no_ghost() -> Result<(), Error> 
     )
     .await?;
     // The two items of group 1 get ids 1002 and 1003.
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // The `row_number()` window function makes the join an unconditional
     // materialization candidate (`ShapeGate::Materialize`), bypassing the size
@@ -98,7 +98,7 @@ async fn test_cdc_delete_during_fresh_mv_leaves_no_ghost() -> Result<(), Error> 
     // DELETE one item at origin; CDC removes it from the source cache table.
     ctx.origin_query("delete from mvg_items where id = 1002", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Source cache table reflects the delete (sanity: the delete path works).
     let src_count: i64 = cache_db
@@ -149,7 +149,7 @@ async fn test_cdc_version_bump_after_delete_heals_mv() -> Result<(), Error> {
          from generate_series(1, 50) g, generate_series(0, 1) r",
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Window function → `ShapeGate::Materialize`, so the join MV is built
     // unconditionally (see the delete test for the rationale).
@@ -193,13 +193,13 @@ async fn test_cdc_version_bump_after_delete_heals_mv() -> Result<(), Error> {
     // rebuilds it against the (now clean) source — the ghost heals.
     ctx.origin_query("delete from mvh_items where id = 1002", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.origin_query(
         "update mvh_groups set version = version + 1 where group_id = 1",
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let mut served_ids: Vec<i32> = Vec::new();
     for _ in 0..10 {
@@ -255,7 +255,7 @@ async fn test_cdc_pk_change_during_fresh_mv_leaves_no_ghost() -> Result<(), Erro
          from generate_series(1, 50) g, generate_series(0, 1) r",
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Window function → `ShapeGate::Materialize`, so the join MV is built
     // unconditionally (see the delete test for the rationale).
@@ -320,7 +320,7 @@ async fn test_cdc_pk_change_during_fresh_mv_leaves_no_ghost() -> Result<(), Erro
     // Change item 1002's PK to 9999 at origin.
     ctx.origin_query("update mvp_items set id = 9999 where id = 1002", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // The MV table may have been dropped/rebuilt; read it if it still exists.
     let mv_ids: Vec<i32> = cache_db
@@ -385,7 +385,7 @@ async fn test_cdc_update_departure_during_fresh_mv_no_ghost() -> Result<(), Erro
     )
     .await?;
     // Group 1's items are ids 1002 and 1003 (data 100 and 101).
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Per-group join queries with a non-join data predicate (so the departure
     // update below changes no join column → no invalidation path fires). The
@@ -434,7 +434,7 @@ async fn test_cdc_update_departure_during_fresh_mv_no_ghost() -> Result<(), Erro
     // still matches (matched=true); no join column changed (no invalidation).
     ctx.origin_query("update mvd_items set data = 200000 where id = 1002", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // The served result must drop the departed row: the update must have
     // dirty-marked the MV (else it stays Fresh and serves id=1002 forever).

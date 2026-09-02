@@ -71,7 +71,7 @@ async fn test_old_image_memo_survives_unrelated_row_update() -> Result<(), Error
     let hits_before = ctx.metrics().await?.cache_memo_hits;
     ctx.origin_query("UPDATE items SET val = 8 WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let m = ctx.metrics().await?;
     assert_eq!(
@@ -90,7 +90,7 @@ async fn test_old_image_memo_survives_unrelated_row_update() -> Result<(), Error
     // fresh value must serve (an under-returning probe would serve stale 5).
     ctx.origin_query("UPDATE items SET val = 6 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q10).await?;
     assert_row_at(&res, 1, &[("val", "6")])?;
     assert!(
@@ -112,7 +112,7 @@ async fn test_old_image_delete_precision() -> Result<(), Error> {
     let evictions_before = ctx.metrics().await?.cache_memo_evictions;
     ctx.origin_query("DELETE FROM items WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
     assert_eq!(
         ctx.metrics().await?.cache_memo_evictions,
         evictions_before,
@@ -123,7 +123,7 @@ async fn test_old_image_delete_precision() -> Result<(), Error> {
 
     ctx.origin_query("DELETE FROM items WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     // RowDescription + CommandComplete only — serving stale [5] here means the
     // delete's old image under-returned.
     let res = ctx.simple_query(q10).await?;
@@ -164,7 +164,7 @@ async fn test_old_image_chained_same_pk_updates_one_txn() -> Result<(), Error> {
         )
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Owner 10 lost the row: stale [5] here means the first event's old image
     // under-returned.
@@ -202,7 +202,7 @@ async fn test_old_image_pk_change_conservative() -> Result<(), Error> {
 
     ctx.origin_query("UPDATE items SET id = 3 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(q10).await?;
     assert_row_at(&res, 1, &[("id", "3"), ("val", "5")])?;
@@ -236,20 +236,20 @@ async fn test_old_image_uncached_row_falls_back() -> Result<(), Error> {
     // Update-out: owner 10 → 99 (no cached query matches owner 99).
     ctx.origin_query("UPDATE items SET owner = 99 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
     let res = ctx.simple_query(q10).await?;
     assert_eq!(res.len(), 2, "owner-10 result must be empty, got {res:?}");
 
     // The row is now uncached; this update's old image resolves on no rung.
     ctx.origin_query("UPDATE items SET val = 9 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Coming back into the predicate region must serve the fresh value.
     let m = ctx.metrics().await?;
     ctx.origin_query("UPDATE items SET owner = 10 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q10).await?;
     assert_row_at(&res, 1, &[("val", "9")])?;
     let _ = m;
@@ -286,13 +286,13 @@ async fn test_old_image_quoted_identifiers() -> Result<(), Error> {
     // unquoted identifier would error the segment eval and kill the writer.
     ctx.origin_query("UPDATE items SET val = 6 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q_val).await?;
     assert_eq!(res.len(), 2, "val=5 result must be empty, got {res:?}");
 
     ctx.origin_query("DELETE FROM items WHERE id = 3", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q_window).await?;
     assert_row_at(&res, 1, &[("id", "2"), ("val", "7")])?;
     assert_row_at(&res, 2, &[("id", "1"), ("val", "6")])?;
@@ -326,7 +326,7 @@ async fn test_old_image_bool_flip_evicts_memo() -> Result<(), Error> {
 
     ctx.origin_query("UPDATE items SET active = false WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // The departed row's memo must die: a 'true'-vs-'t' probe miss would keep
     // serving the stale [5].
@@ -360,7 +360,7 @@ async fn test_replica_identity_full_pk_change_removes_old_row() -> Result<(), Er
     // change (that would delete the freshly upserted row).
     ctx.origin_query("UPDATE items SET val = 6 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q10).await?;
     assert_row_at(&res, 1, &[("id", "1"), ("val", "6")])?;
     assert_eq!(res.len(), 3, "expected exactly one row, got {res:?}");
@@ -369,7 +369,7 @@ async fn test_replica_identity_full_pk_change_removes_old_row() -> Result<(), Er
     // serves a phantom.
     ctx.origin_query("UPDATE items SET id = 3 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q10).await?;
     assert_row_at(&res, 1, &[("id", "3"), ("val", "6")])?;
     assert_eq!(
@@ -409,7 +409,7 @@ async fn test_replica_identity_full_rung_zero_precision() -> Result<(), Error> {
     let evictions_before = ctx.metrics().await?.cache_memo_evictions;
     ctx.origin_query("UPDATE items SET val = 8 WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     assert_eq!(
         ctx.metrics().await?.cache_memo_evictions,
         evictions_before,
@@ -451,7 +451,7 @@ async fn test_old_image_reserved_prefix_columns_stay_conservative() -> Result<()
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q).await?;
     assert_row_at(&res, 1, &[("id", "2"), ("score", "40")])?;
     assert_row_at(&res, 2, &[("id", "3"), ("score", "30")])?;
@@ -459,7 +459,7 @@ async fn test_old_image_reserved_prefix_columns_stay_conservative() -> Result<()
     // DELETE exercises the (skipped) old-image path for the relation.
     ctx.origin_query("DELETE FROM items WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q).await?;
     assert_row_at(&res, 1, &[("id", "3"), ("score", "30")])?;
     assert_row_at(&res, 2, &[("id", "1"), ("score", "10")])?;
