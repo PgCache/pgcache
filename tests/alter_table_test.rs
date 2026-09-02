@@ -48,14 +48,14 @@ async fn test_alter_table_add_column_repopulates() -> Result<(), Error> {
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
     // Change the relation's shape, then write to it again so logical replication
-    // resends the relation with its new shape; `cdc_settle` then waits for
+    // resends the relation with its new shape; `cdc_apply_settle` then waits for
     // pgcache to apply that relation message (schema change → invalidate +
     // recreate cache table + staging-pool purge) before the next read.
     ctx.query("alter table alter_t add column extra text", &[])
         .await?;
     ctx.query("update alter_t set extra = 'e1' where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // The query was invalidated by the schema change → miss, then repopulates
     // against the new shape via a freshly minted staging table. Without the pool

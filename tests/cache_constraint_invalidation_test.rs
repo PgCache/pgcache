@@ -55,7 +55,7 @@ async fn test_insert_matching_constraint() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query should show all 3 rows with test_id = 1
     let res = ctx
@@ -121,7 +121,7 @@ async fn test_insert_non_matching_constraint() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query should still return only the original 2 rows (cache not invalidated, new row doesn't match)
     let res = ctx
@@ -187,7 +187,7 @@ async fn test_update_entering_result_set() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query should now show 3 rows including gamma
     let res = ctx
@@ -254,7 +254,7 @@ async fn test_update_leaving_result_set() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query should now return 1 row (only beta)
     let res = ctx
@@ -319,7 +319,7 @@ async fn test_update_non_join_column() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query should show updated data
     let res = ctx
@@ -379,7 +379,7 @@ async fn test_update_where_column_entering_result_set() -> Result<(), Error> {
 
     // Drain setup INSERT CDC events before priming so they don't race the
     // query registration that follows.
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Prime the cache with join query filtering by users.status = 'active'
     // Should only return orders for user 1 (amounts 100, 200)
@@ -415,7 +415,7 @@ async fn test_update_where_column_entering_result_set() -> Result<(), Error> {
     ctx.origin_query("update users_where set status = 'active' where id = 2", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query should now return 4 orders (both users are active)
     let res = ctx
@@ -490,7 +490,7 @@ async fn test_update_where_column_leaving_result_set() -> Result<(), Error> {
 
     // Wait for setup CDC events to be processed before caching —
     // INSERT events on cached tables would trigger invalidation
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query_str = "select o.id, o.user_id, o.amount, u.status \
             from orders_leave o join users_leave u on o.user_id = u.id \
@@ -542,7 +542,7 @@ async fn test_update_where_column_leaving_result_set() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query should now return only 2 orders (only user 2 is active)
     let res = ctx.simple_query(query_str).await?;
@@ -607,7 +607,7 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
     .await?;
 
     // Wait for initial data to settle
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query_str = "select fa.film_id, a.actor_id, a.first_name, a.last_name from film_actor_opt fa join actor_opt a on fa.actor_id = a.actor_id where fa.film_id = 19 order by a.actor_id";
 
@@ -650,7 +650,7 @@ async fn test_update_non_pk_column_unconstrained_table_not_in_cache() -> Result<
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query again - should still be a cache hit (not invalidated)
     let res = ctx.simple_query(query_str).await?;
@@ -724,7 +724,7 @@ async fn test_update_inclusive_subquery_non_pk_column_unconstrained_table_not_in
     .await?;
 
     // Wait for initial data to settle
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query_str = "select film_id, title from film where film_id in ( \
                 select fa.film_id \
@@ -759,7 +759,7 @@ async fn test_update_inclusive_subquery_non_pk_column_unconstrained_table_not_in
     ctx.origin_query("update actor set last_name = 'Updated' where id = 2", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query again - should still be a cache hit (not invalidated)
     let res = ctx.simple_query(query_str).await?;
@@ -818,7 +818,7 @@ async fn test_expression_join_uncached_update_invalidates() -> Result<(), Error>
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query_str = "select a.label, b.note \
         from exprjoin_a a join exprjoin_b b on a.id = b.parent_id + 1 \
@@ -845,7 +845,7 @@ async fn test_expression_join_uncached_update_invalidates() -> Result<(), Error>
     ctx.origin_query("update exprjoin_b set parent_id = 7 where id = 200", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Correct result is now both pairs: (a5, b100) and (a8, b200).
     let res = ctx.simple_query(query_str).await?;
@@ -889,7 +889,7 @@ async fn test_cross_join_uncached_update_invalidates() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query_str = "select a.label, c.note \
         from crossj_a a cross join crossj_c c where c.val = 7 \
@@ -911,7 +911,7 @@ async fn test_cross_join_uncached_update_invalidates() -> Result<(), Error> {
     ctx.origin_query("update crossj_c set val = 7 where id = 10", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query_str).await?;
     assert_eq!(res.len(), 4, "expected 2 data rows after the update");

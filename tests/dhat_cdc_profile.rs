@@ -77,7 +77,9 @@ async fn dhat_cdc_apply_workload() -> Result<(), Error> {
     // Let the writer drain the replication stream so every event's apply cost
     // lands in the heap profile. Non-fatal: a settle timeout must not skip the
     // SIGINT-triggered dhat flush.
-    let _ = ctx.cdc_settle_with_timeout(Duration::from_secs(240)).await;
+    let _ = ctx
+        .cdc_apply_settle_with_timeout(Duration::from_secs(240))
+        .await;
 
     // Sanity-check the workload: raw CDC counters from the metrics endpoint,
     // so per-event allocation counts in the profile have a trusted denominator.

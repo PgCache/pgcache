@@ -160,7 +160,7 @@ async fn test_range_subsumption_cdc_insert() -> Result<(), Error> {
     // INSERT a matching row via origin → CDC in-place update (single-table, never invalidated)
     ctx.origin_query("INSERT INTO test_rsub_cdc VALUES (3, 300)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Should see all 3 rows — served from cache with in-place update
     let res = ctx
@@ -361,7 +361,7 @@ async fn test_in_set_cdc_insert_matching() -> Result<(), Error> {
     // INSERT matching row via origin → CDC in-place update (single-table, never invalidated)
     ctx.origin_query("INSERT INTO test_in_cdc VALUES (4, 'active')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Cache hit with in-place update — should see new row
     let res = ctx
@@ -405,7 +405,7 @@ async fn test_in_set_cdc_insert_non_matching() -> Result<(), Error> {
     // INSERT non-matching row via origin
     ctx.origin_query("INSERT INTO test_in_cdc_no VALUES (3, 'inactive')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Should still be a cache hit — 'inactive' not in the IN-set
     ctx.simple_query("SELECT * FROM test_in_cdc_no WHERE status IN ('active', 'pending')")

@@ -20,7 +20,7 @@ async fn test_generation_tracking_basic() -> Result<(), Error> {
     .await?;
 
     // Wait for CDC to process the inserts before caching
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // First cached query - should get generation 1
     let _res = ctx
@@ -80,7 +80,7 @@ async fn test_generation_tracking_multiple_queries() -> Result<(), Error> {
     .await?;
 
     // Wait for CDC to process the inserts before caching
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // First cached query - generation 1
     let _res = ctx
@@ -164,7 +164,7 @@ async fn test_generation_purge() -> Result<(), Error> {
     .await?;
 
     // Wait for CDC to process the inserts before caching
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Create two cached queries
     let _res = ctx
@@ -294,7 +294,7 @@ async fn test_generation_zero_promote() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Cache a query so the table exists in the cache DB (generation 1)
     let _res = ctx
@@ -451,7 +451,7 @@ async fn test_generation_zero_promote_noop() -> Result<(), Error> {
     ctx.query("insert into test (id, data) values (1, 'foo')", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Cache and hit a query to create gen-1 entries
     let _res = ctx
@@ -520,7 +520,7 @@ async fn test_generation_tracking_join() -> Result<(), Error> {
     .await?;
 
     // Wait for CDC to process the inserts before caching
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Cached JOIN query
     let _res = ctx

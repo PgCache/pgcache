@@ -50,7 +50,7 @@ async fn test_mixed_case_identifiers_cdc_round_trip() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
     let rows = ctx.query(sql, &[]).await?;
     assert_eq!(rows.len(), 3, "CDC INSERT landed in cache");
     let m = assert_cache_hit(&mut ctx, m).await?;
@@ -61,7 +61,7 @@ async fn test_mixed_case_identifiers_cdc_round_trip() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let rows = ctx.query(sql, &[]).await?;
     assert_eq!(rows[2].get::<_, String>("user"), "carla");
     assert_eq!(rows[2].get::<_, i32>("camelCase"), 33);
@@ -70,14 +70,14 @@ async fn test_mixed_case_identifiers_cdc_round_trip() -> Result<(), Error> {
     // CDC DELETE — PK-qualified delete builder.
     ctx.origin_query("DELETE FROM \"Order\" WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let rows = ctx.query(sql, &[]).await?;
     assert_eq!(rows.len(), 2, "CDC DELETE removed the row");
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
     // CDC TRUNCATE — truncate_sql_build.
     ctx.origin_query("TRUNCATE \"Order\"", &[]).await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let rows = ctx.query(sql, &[]).await?;
     assert_eq!(rows.len(), 0, "CDC TRUNCATE emptied the cached result");
 
@@ -117,7 +117,7 @@ async fn test_reserved_keyword_identifiers_round_trip() -> Result<(), Error> {
     // CDC UPDATE with a reserved-word column in the SET list.
     ctx.origin_query("UPDATE \"order\" SET \"select\" = 'y' WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let rows = ctx.query(sql, &[]).await?;
     assert_eq!(rows[0].get::<_, String>("select"), "y");
     let _m = assert_cache_hit(&mut ctx, m).await?;

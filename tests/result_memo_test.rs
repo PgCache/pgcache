@@ -118,7 +118,7 @@ async fn test_memo_no_stale_on_inplace_update() -> Result<(), Error> {
     // relation seqlock, which must invalidate the 'old' snapshot.
     ctx.origin_query("update memo_stale set val = 'new' where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // The next read must NOT serve the stale 'old' snapshot.
     let res = ctx
@@ -150,7 +150,7 @@ async fn test_memo_evicted_on_grow_insert() -> Result<(), Error> {
 
     ctx.origin_query("insert into memo_grow values (2, 'x')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // The memoized single-row snapshot must be evicted; the fresh read sees both.
     let res = ctx
@@ -211,7 +211,7 @@ async fn test_memo_prepared_no_stale_on_update() -> Result<(), Error> {
 
     ctx.origin_query("update memo_prep_stale set val = 'new' where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let rows = ctx
         .query("select val from memo_prep_stale where id = $1", &[&1i32])
@@ -249,7 +249,7 @@ async fn test_memo_no_stale_across_runtime_disable() -> Result<(), Error> {
     // A write commits while disabled — the seqlock must still bump.
     ctx.origin_query("update memo_toggle set val = 'new' where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Re-enable memoization.
     let (status, body) = http_put(
@@ -326,7 +326,7 @@ async fn test_memo_survives_unrelated_insert() -> Result<(), Error> {
     // An insert that does not match `val = 42` — the memo must survive.
     ctx.origin_query("insert into memo_unrel values (2, 7)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let before = ctx.metrics().await?;
     let res = ctx
@@ -363,7 +363,7 @@ async fn test_memo_evicted_on_matching_insert() -> Result<(), Error> {
 
     ctx.origin_query("insert into memo_match values (3, 42)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Fresh result (both rows) proves the matching insert busted the one-row
     // snapshot — a surviving stale memo would return only id=1.
@@ -397,7 +397,7 @@ async fn test_memo_evicted_on_inplace_matching_insert() -> Result<(), Error> {
 
     ctx.origin_query("insert into memo_ins values (3, 42)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Same query (same MemoKey): a stale memo would still return only id=1.
     let res = ctx.simple_query(sql).await?;
@@ -433,7 +433,7 @@ async fn test_memo_evicted_on_delete() -> Result<(), Error> {
 
     ctx.origin_query("delete from memo_del where id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Fresh result (deleted row gone) proves the delete busted the snapshot — a
     // surviving stale memo would still return id=2.
@@ -476,7 +476,7 @@ async fn test_memo_busted_by_deadlock_recovery() -> Result<(), Error> {
     // writer enters Recovering and `frame_recover` truncates + busts memos.
     ctx.origin_query("insert into memo_recover values (2, 7)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let before = ctx.metrics().await?;
     let res = ctx

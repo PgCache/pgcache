@@ -9,7 +9,7 @@
 //! queries, and the frame-deferred maintenance paths (publication drain /
 //! eviction / generation purge) no longer deadlock against the open frame.
 //!
-//! `cdc_settle()` polls `/status` until `last_applied_lsn` reaches the origin
+//! `cdc_apply_settle()` polls `/status` until `last_applied_lsn` reaches the origin
 //! WAL position. Because the watermark only advances at `CommitMark` (after
 //! `frame_commit`), a broken or stalled frame surfaces here as a settle
 //! timeout, not just a wrong result.
@@ -65,7 +65,7 @@ async fn test_multi_statement_source_txn_atomic() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select id, data from sf_multi where data = 'foo' order by id";
 
@@ -88,7 +88,7 @@ async fn test_multi_statement_source_txn_atomic() -> Result<(), Error> {
         )
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(q).await?;
     assert_eq!(res.len(), 4, "final data='foo' set should be ids 2 and 3");
@@ -115,7 +115,7 @@ async fn test_same_row_delete_then_reinsert_in_txn() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select id, data from sf_reinsert order by id";
     ctx.simple_query(q).await?;
@@ -130,7 +130,7 @@ async fn test_same_row_delete_then_reinsert_in_txn() -> Result<(), Error> {
         )
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(q).await?;
     assert_eq!(res.len(), 4, "expected ids 1 and 2");
@@ -155,7 +155,7 @@ async fn test_truncate_single_table_in_frame() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select id, data from sf_trunc order by id";
     ctx.simple_query(q).await?;
@@ -167,7 +167,7 @@ async fn test_truncate_single_table_in_frame() -> Result<(), Error> {
         .batch_execute("truncate sf_trunc")
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(q).await?;
     assert_eq!(res.len(), 2, "0 rows + desc + complete after truncate");
@@ -191,7 +191,7 @@ async fn test_truncate_then_insert_same_txn() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select id, data from sf_trunc_ins order by id";
     ctx.simple_query(q).await?;
@@ -206,7 +206,7 @@ async fn test_truncate_then_insert_same_txn() -> Result<(), Error> {
         )
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(q).await?;
     assert_eq!(res.len(), 4, "only the two post-truncate rows");
@@ -243,7 +243,7 @@ async fn test_truncate_invalidates_join_query() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select p.id, p.name, c.val from sf_j_parent p \
              join sf_j_child c on c.parent_id = p.id where p.id = 1 order by c.id";
@@ -260,7 +260,7 @@ async fn test_truncate_invalidates_join_query() -> Result<(), Error> {
         .batch_execute("truncate sf_j_child")
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // The join query referenced sf_j_child → invalidated → repopulated from
     // the now-empty child table.
@@ -273,7 +273,7 @@ async fn test_truncate_invalidates_join_query() -> Result<(), Error> {
 /// transaction whose changes invalidate it while the frame is open, so the
 /// invalidation's physical cleanup (generation purge) would run on `db_cache`
 /// against the frame's locks. Before the frame-deferred-maintenance fix this
-/// deadlocked the writer and `cdc_settle` timed out; the cleanup must now defer
+/// deadlocked the writer and `cdc_apply_settle` timed out; the cleanup must now defer
 /// to `CommitMark`, so this settles and returns correct data.
 #[tokio::test]
 async fn test_txn_invalidation_under_small_cache_no_deadlock() -> Result<(), Error> {
@@ -300,7 +300,7 @@ async fn test_txn_invalidation_under_small_cache_no_deadlock() -> Result<(), Err
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select p.id, p.name, c.val from sf_dl_parent p \
              join sf_dl_child c on c.parent_id = p.id where p.id = 1 order by c.id";
@@ -325,7 +325,7 @@ async fn test_txn_invalidation_under_small_cache_no_deadlock() -> Result<(), Err
 
     // The assertion that matters most: this returns (no settle timeout =
     // no deadlock).
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(q).await?;
     // id=1 now joins child rows a, b, e (d was on parent 3; f on parent 2).
@@ -338,7 +338,7 @@ async fn test_txn_invalidation_under_small_cache_no_deadlock() -> Result<(), Err
 
 /// PGC-147: under population↔CDC-frame contention on one table's shared
 /// source cache table, the cache stays consistent with origin and never
-/// resets — `cdc_settle` always succeeds (a writer reset surfaces as 503 /
+/// resets — `cdc_apply_settle` always succeeds (a writer reset surfaces as 503 /
 /// timeout). One-directional: red iff the bug regresses, never flaky.
 /// Doesn't deterministically provoke the writer `40P01` (unreproducible
 /// probabilistically — see `test_cdc_frame_deadlock_recovery`); guards the
@@ -357,7 +357,7 @@ async fn test_cdc_frame_population_contention_consistent() -> Result<(), Error> 
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Equality-correlated subqueries (decorrelatable per ADR-014/016/015):
     // each materializes a *different* subset of dl_t into dl_t's shared
@@ -396,7 +396,7 @@ async fn test_cdc_frame_population_contention_consistent() -> Result<(), Error> 
             .map_err(Error::other)?;
 
         // Invariant: the frame committed or recovered — never reset.
-        ctx.cdc_settle().await?;
+        ctx.cdc_apply_settle().await?;
 
         for q in &queries {
             let via_cache = ctx.simple_query(q).await?;
@@ -416,7 +416,7 @@ async fn test_cdc_frame_population_contention_consistent() -> Result<(), Error> 
 /// `--test-threads=1`). The writer `40P01`-victim path is unreproducible
 /// probabilistically, so it's forced via the env one-shot
 /// `PGCACHE_FAULT_CDC_DEADLOCK_ONCE`. Asserts the full recovery contract: no
-/// cache reset (`cdc_settle` succeeds), the dependent query is invalidated
+/// cache reset (`cdc_apply_settle` succeeds), the dependent query is invalidated
 /// then repopulates cleanly (cache table was truncated, not left stale),
 /// results correct throughout.
 #[cfg(feature = "fault-injection")]
@@ -439,7 +439,7 @@ async fn test_cdc_frame_deadlock_recovery() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "SELECT count(*) FROM rec_t WHERE k = 0";
 
@@ -462,7 +462,7 @@ async fn test_cdc_frame_deadlock_recovery() -> Result<(), Error> {
         .map_err(Error::other)?;
 
     // Primary invariant: recovery did not reset the cache.
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Invalidated by recovery → next request is a miss, forwarded to origin,
     // returning the correct incremented count.
@@ -512,7 +512,7 @@ async fn test_fat_frame_batched_membership_maintains_joins() -> Result<(), Error
          select i, (i % 3) + 1, i from generate_series(1, 72) i",
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let group_query = |g: i32| {
         format!(
@@ -541,7 +541,7 @@ async fn test_fat_frame_batched_membership_maintains_joins() -> Result<(), Error
     txn.push_str("update bm_items set gid = 2 where id = 10; ");
     txn.push_str("COMMIT;");
     ctx.origin.batch_execute(&txn).await.map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.cache_settle().await?;
 
     // Every per-group join result must match origin exactly.
@@ -602,7 +602,7 @@ async fn test_local_match_short_circuits_batched_pg_eval() -> Result<(), Error> 
     .await?;
     ctx.simple_query("insert into sc_other (id, ref) values (1, 1), (2, 2)")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // LocalEval over sc_main (single table, simple predicate)…
     ctx.simple_query("select id, data from sc_main where grp = 1")
@@ -620,7 +620,7 @@ async fn test_local_match_short_circuits_batched_pg_eval() -> Result<(), Error> 
     let before = ctx.metrics().await?;
     ctx.origin_query("update sc_main set data = data + 1 where id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let after = ctx.metrics().await?;
     assert_eq!(
         after.cache_cdc_pg_eval_hits - before.cache_cdc_pg_eval_hits,
@@ -633,7 +633,7 @@ async fn test_local_match_short_circuits_batched_pg_eval() -> Result<(), Error> 
     let before = ctx.metrics().await?;
     ctx.origin_query("update sc_main set data = data + 1 where id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let after = ctx.metrics().await?;
     assert!(
         after.cache_cdc_pg_eval_hits > before.cache_cdc_pg_eval_hits,
@@ -666,7 +666,7 @@ async fn test_intra_txn_ddl_does_not_misalign_buffered_events() -> Result<(), Er
     .await?;
     ctx.simple_query("insert into sf_ddl (id, a, b, c) values (1, 10, 20, 30), (2, 11, 21, 31)")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select id, a, c from sf_ddl order by id";
     ctx.simple_query(q).await?;
@@ -685,7 +685,7 @@ async fn test_intra_txn_ddl_does_not_misalign_buffered_events() -> Result<(), Er
         )
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     // The schema change invalidates and repopulates the query.
     ctx.cache_settle().await?;
 
@@ -720,7 +720,7 @@ async fn test_intra_txn_ddl_after_partial_replay_recovers_in_band() -> Result<()
     // forcing a partial replay before the DDL arrives.
     ctx.simple_query("insert into sf_ddlp_filler select g, 0 from generate_series(1, 4200) g")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select id, keep from sf_ddlp where id = 1";
     ctx.simple_query(q).await?;
@@ -745,7 +745,8 @@ async fn test_intra_txn_ddl_after_partial_replay_recovers_in_band() -> Result<()
         )
         .await
         .map_err(Error::other)?;
-    ctx.cdc_settle_with_timeout(Duration::from_secs(30)).await?;
+    ctx.cdc_apply_settle_with_timeout(Duration::from_secs(30))
+        .await?;
     ctx.cache_settle().await?;
 
     // In-band recovery: no writer death / cache reset.
@@ -780,7 +781,7 @@ async fn test_batch_holds_watermark_until_flush() -> Result<(), Error> {
         .await?;
     ctx.simple_query("insert into bt_w (id, v) values (1, 10)")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select id, v from bt_w order by id";
     ctx.simple_query(q).await?;
@@ -793,7 +794,7 @@ async fn test_batch_holds_watermark_until_flush() -> Result<(), Error> {
     ctx.origin_query("insert into bt_w (id, v) values (2, 20)", &[])
         .await?;
     assert!(
-        ctx.cdc_settle_with_timeout(Duration::from_secs(2))
+        ctx.cdc_apply_settle_with_timeout(Duration::from_secs(2))
             .await
             .is_err(),
         "watermark advanced past unflushed batched frames"
@@ -808,7 +809,7 @@ async fn test_batch_holds_watermark_until_flush() -> Result<(), Error> {
     // atomically and the watermark advances.
     ctx.origin_query("insert into bt_w (id, v) values (3, 30)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let before = ctx.metrics().await?;
     let served = ctx.simple_query(q).await?;
     assert_cache_hit(&mut ctx, before).await?;
@@ -834,7 +835,7 @@ async fn test_batch_cross_frame_same_pk_sequences() -> Result<(), Error> {
         .await?;
     ctx.simple_query("insert into bt_pk (id, v) values (1, 'keep'), (2, 'old')")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "select id, v from bt_pk order by id";
     ctx.simple_query(q).await?;
@@ -850,7 +851,7 @@ async fn test_batch_cross_frame_same_pk_sequences() -> Result<(), Error> {
         .await?;
     ctx.origin_query("insert into bt_pk (id, v) values (2, 'new')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.cache_settle().await?;
 
     let served = ctx.simple_query(q).await?;
@@ -878,7 +879,7 @@ async fn test_batch_keepalive_forces_flush() -> Result<(), Error> {
         .await?;
     ctx.simple_query("insert into bt_ka (id, v) values (1, 10)")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Open a batch the hold will never release on its own.
     ctx.origin_query("update bt_ka set v = 11 where id = 1", &[])
@@ -915,7 +916,7 @@ async fn test_batch_value_revert_across_frames() -> Result<(), Error> {
         .await?;
     ctx.simple_query("insert into bt_rev (id, v) values (1, 5), (2, 7)")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // A LIMIT query makes v a window column (change-dependent invalidation).
     let q = "select id, v from bt_rev where v > 0 order by v, id limit 10";
@@ -928,7 +929,7 @@ async fn test_batch_value_revert_across_frames() -> Result<(), Error> {
         .await?;
     ctx.origin_query("insert into bt_rev (id, v) values (3, 8)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.cache_settle().await?;
 
     let served = ctx.simple_query(q).await?;
@@ -958,7 +959,7 @@ async fn test_batch_deadlock_recovery_covers_all_frames() -> Result<(), Error> {
         .await?;
     ctx.simple_query("insert into bt_rec_b (id, v) values (1, 100)")
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let qa = "select id, v from bt_rec_a order by id";
     let qb = "select id, v from bt_rec_b order by id";
@@ -973,7 +974,7 @@ async fn test_batch_deadlock_recovery_covers_all_frames() -> Result<(), Error> {
         .await?;
     ctx.origin_query("insert into bt_rec_b (id, v) values (2, 200)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     // Recovery evicted the queries; repopulation restores correct state.
     ctx.cache_settle().await?;
 

@@ -182,7 +182,7 @@ async fn test_immutable_function_cdc_insert() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query should now include the new row
     let res = ctx.simple_query(query_str).await?;
@@ -236,7 +236,7 @@ async fn test_immutable_function_join_cdc() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Equality constraint on child (parent_id = 1) gives CDC something to extract.
     // The immutable function on the parent is an additional filter.
@@ -279,7 +279,7 @@ async fn test_immutable_function_join_cdc() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Should still be a cache hit — row doesn't match child constraint
     let res = ctx.simple_query(query_str).await?;

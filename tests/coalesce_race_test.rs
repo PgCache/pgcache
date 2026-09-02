@@ -39,7 +39,7 @@ async fn test_coalesce_enqueue_drain_race() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Each round uses a distinct literal → a distinct (cold) fingerprint, so
     // every round exercises a fresh Loading → coalesce → drain cycle.

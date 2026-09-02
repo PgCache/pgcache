@@ -28,7 +28,7 @@ async fn test_enum_table_stays_cached_through_cdc() -> Result<(), Error> {
          (1, 'ok', 'a'), (2, 'happy', 'b'), (3, 'ok', 'c'), (4, 'sad', 'd')",
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let q = "SELECT id, note FROM moods WHERE m = 'ok' ORDER BY id";
 
@@ -49,7 +49,7 @@ async fn test_enum_table_stays_cached_through_cdc() -> Result<(), Error> {
     // message preceding it must not invalidate the query.
     ctx.origin_query("INSERT INTO moods (id, m, note) VALUES (5, 'ok', 'e')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q).await?;
     let rows = rows_of(&res);
     assert_eq!(rows.len(), 3, "CDC INSERT landed in cache");
@@ -60,7 +60,7 @@ async fn test_enum_table_stays_cached_through_cdc() -> Result<(), Error> {
         .await?;
     ctx.origin_query("UPDATE moods SET m = 'ok' WHERE id = 4", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q).await?;
     let rows = rows_of(&res);
     assert_eq!(rows.len(), 3);
@@ -72,7 +72,7 @@ async fn test_enum_table_stays_cached_through_cdc() -> Result<(), Error> {
     // CDC DELETE.
     ctx.origin_query("DELETE FROM moods WHERE id = 3", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(q).await?;
     let rows = rows_of(&res);
     assert_eq!(rows.len(), 2, "CDC DELETE removed the row");
@@ -101,7 +101,7 @@ async fn test_enum_order_dependent_queries_forward() -> Result<(), Error> {
         "INSERT INTO alerts (id, sev) VALUES (1, 'low'), (2, 'medium'), (3, 'high'), (4, 'critical')",
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Order-dependent shapes: repeatedly executed past any admission
     // threshold, with settles between — they must never serve from cache.

@@ -302,7 +302,7 @@ async fn test_status_applied_lsn_advances_after_write() -> Result<(), Error> {
     )
     .await?;
     // `pg_current_wal_insert_lsn` (not `pg_current_wal_lsn`) — see the
-    // doc comment on `TestContext::cdc_settle_with_timeout`.
+    // doc comment on `TestContext::cdc_apply_settle_with_timeout`.
     let captured_lsn_str: String = ctx
         .origin
         .query_one("SELECT pg_current_wal_insert_lsn()::text", &[])

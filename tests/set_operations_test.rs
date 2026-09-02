@@ -72,7 +72,7 @@ async fn test_set_op_union() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // CDC updates cache in place → cache hit, Dave now included
     let res = ctx.simple_query(query).await?;
@@ -91,7 +91,7 @@ async fn test_set_op_union() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // CDC updates cache in place → cache hit, Admin3 now included
     let res = ctx.simple_query(query).await?;
@@ -104,7 +104,7 @@ async fn test_set_op_union() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM users WHERE id = 4", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // CDC DELETE updates cache in place → cache hit, Dave gone
     let res = ctx.simple_query(query).await?;
@@ -174,7 +174,7 @@ async fn test_set_op_intersect() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // CDC updates cache in place → cache hit, SKU-004 now in intersection
     let res = ctx.simple_query(query).await?;
@@ -244,7 +244,7 @@ async fn test_set_op_except() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // CDC updates cache in place → cache hit, Cherry removed
     let res = ctx.simple_query(query).await?;
@@ -405,7 +405,7 @@ async fn test_set_op_union_join_constraint_filter() -> Result<(), Error> {
     .await?;
 
     // Wait for setup CDC events to settle
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // UNION with JOINs in each branch, both filtered by region = 'east'
     //
@@ -444,7 +444,7 @@ async fn test_set_op_union_join_constraint_filter() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Cache hit — non-matching INSERT on constrained table was filtered
     let res = ctx.simple_query(query).await?;
@@ -460,7 +460,7 @@ async fn test_set_op_union_join_constraint_filter() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Cache miss — matching INSERT triggered invalidation
     // Result unchanged (Stark has no orders) but invalidation occurred

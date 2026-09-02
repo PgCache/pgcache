@@ -246,7 +246,7 @@ async fn test_search_path_cache_invalidation() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Query should return updated value (cache invalidated by CDC)
     let res = ctx
@@ -489,7 +489,7 @@ async fn test_search_path_join() -> Result<(), Error> {
     ctx.query("SET search_path TO store_join, public", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Join query with unqualified table names
     let m = ctx.metrics().await?;

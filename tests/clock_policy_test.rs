@@ -118,7 +118,7 @@ async fn test_clock_fast_readmission() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query_str = "SELECT t.id, t.data, tm.data AS map_data \
         FROM test_readmit t JOIN test_readmit_map tm ON tm.test_id = t.id \
@@ -148,7 +148,7 @@ async fn test_clock_fast_readmission() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // gamma (test_id=2) is not in the cached result — update it to enter
     ctx.origin_query(
@@ -157,7 +157,7 @@ async fn test_clock_fast_readmission() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Next query — cache miss, but triggers fast readmission (skips admission gate)
     let res = ctx.simple_query(query_str).await?;

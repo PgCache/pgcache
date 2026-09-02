@@ -31,7 +31,7 @@ async fn test_request_coalescing() -> Result<(), Error> {
     );
     ctx.query(&insert_sql as &str, &[]).await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Open multiple proxy connections before firing queries
     let num_clients = 10;

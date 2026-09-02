@@ -99,7 +99,7 @@ async fn test_filter_aggregate_two_predicates() -> Result<(), Error> {
         &[],
     )
     .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.cache_settle().await?;
 
     let row = ctx.query_one(sql, &[]).await?;
@@ -146,7 +146,7 @@ async fn test_filter_subquery_cdc_invalidation() -> Result<(), Error> {
     // EXISTS predicate flips false → true and forces invalidation.
 
     // Let CDC register both tables with the writer before the first SELECT.
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Touch each table once so the writer's catalog learns about them.
     let _ = ctx.simple_query("SELECT count(*) FROM posts").await?;
@@ -196,7 +196,7 @@ async fn test_filter_subquery_cdc_invalidation() -> Result<(), Error> {
     // insert — serving stale data.
     ctx.origin_query("INSERT INTO allowed_types VALUES (1)", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.cache_settle().await?;
 
     let row = ctx.query_one(sql, &[]).await?;
@@ -245,7 +245,7 @@ async fn test_filter_subquery_cdc_invalidation_delete() -> Result<(), Error> {
     ctx.query("INSERT INTO allowed_types VALUES (1)", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let _ = ctx.simple_query("SELECT count(*) FROM posts").await?;
     let _ = ctx
@@ -286,7 +286,7 @@ async fn test_filter_subquery_cdc_invalidation_delete() -> Result<(), Error> {
     // pgcache must invalidate the MV; otherwise it serves stale 100.
     ctx.origin_query("DELETE FROM allowed_types WHERE type_id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.cache_settle().await?;
 
     let row = ctx.query_one(sql, &[]).await?;
@@ -326,7 +326,7 @@ async fn test_case_when_subquery_cdc_invalidation_delete() -> Result<(), Error> 
     ctx.query("INSERT INTO allowed_types VALUES (1)", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let _ = ctx.simple_query("SELECT count(*) FROM posts").await?;
     let _ = ctx
@@ -369,7 +369,7 @@ async fn test_case_when_subquery_cdc_invalidation_delete() -> Result<(), Error> 
 
     ctx.origin_query("DELETE FROM allowed_types WHERE type_id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.cache_settle().await?;
 
     let row = ctx.query_one(sql, &[]).await?;

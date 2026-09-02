@@ -60,7 +60,7 @@ async fn test_population_merge_does_not_expose_future_rows() -> Result<(), Error
     ctx.simple_query("insert into merge_race (id, grp, v) values (1, 1, 1)")
         .await?;
     // The delivery delay is inactive until a cached query tracks the relation.
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Q1: cached and Ready. Registering it arms the CDC delivery delay.
     let q1 = "select id, v from merge_race where grp = 1 order by id";

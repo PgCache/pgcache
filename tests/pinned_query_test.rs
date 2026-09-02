@@ -110,7 +110,7 @@ async fn test_pinned_query_auto_readmit_after_cdc() -> Result<(), Error> {
     .await?;
 
     // Wait for CDC invalidation + auto-readmit + re-population
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     ctx.cache_settle().await?;
 
     // Verify invalidation and readmission happened

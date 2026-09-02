@@ -157,7 +157,7 @@ async fn test_mv_build_dirtied_in_flight_is_discarded() -> Result<(), Error> {
     // Dirty the MV (insert matches the aggregate unconditionally).
     ctx.origin_query("INSERT INTO mv_race VALUES (100, 'first')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Trigger the rebuild: fallthrough serve + `Pending → Scheduled` +
     // dispatch. The build task is now held in `Building` for ~1s.
@@ -170,7 +170,7 @@ async fn test_mv_build_dirtied_in_flight_is_discarded() -> Result<(), Error> {
     // well inside the hold window.
     ctx.origin_query("INSERT INTO mv_race VALUES (101, 'mid-build')", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Wait for the held build to complete and the writer to process the
     // completion (discard).

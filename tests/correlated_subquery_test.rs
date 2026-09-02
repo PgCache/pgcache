@@ -73,7 +73,7 @@ async fn test_correlated_exists_basic() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees who have at least one order
     let query = "SELECT e.name FROM employees e \
@@ -103,7 +103,7 @@ async fn test_correlated_exists_basic() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // Alice, Bob, Charlie
@@ -120,7 +120,7 @@ async fn test_correlated_exists_basic() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM orders WHERE id = 101", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // Alice, Bob
@@ -177,7 +177,7 @@ async fn test_correlated_not_exists_basic() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Departments with no employees
     let query = "SELECT d.name FROM departments d \
@@ -206,7 +206,7 @@ async fn test_correlated_not_exists_basic() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 2); // no departments without employees + RowDesc + CommandComplete
@@ -219,7 +219,7 @@ async fn test_correlated_not_exists_basic() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM employees WHERE id = 11", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3); // Sales + RowDesc + CommandComplete
@@ -271,7 +271,7 @@ async fn test_correlated_exists_residual_constraint_filter() -> Result<(), Error
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees with at least one shipped order
     let query = "SELECT e.name FROM employees e \
@@ -299,7 +299,7 @@ async fn test_correlated_exists_residual_constraint_filter() -> Result<(), Error
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Cache hit — 'pending' doesn't match the 'shipped' constraint
     let res = ctx.simple_query(query).await?;
@@ -313,7 +313,7 @@ async fn test_correlated_exists_residual_constraint_filter() -> Result<(), Error
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Cache miss — matching INSERT triggered invalidation
     let res = ctx.simple_query(query).await?;
@@ -367,7 +367,7 @@ async fn test_correlated_not_exists_residual_predicates() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Departments with no ACTIVE employees
     let query = "SELECT d.name FROM departments d \
@@ -400,7 +400,7 @@ async fn test_correlated_not_exists_residual_predicates() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3); // only Marketing
@@ -454,7 +454,7 @@ async fn test_correlated_exists_with_group_by() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees with more than 1 order
     let query = "SELECT e.name FROM employees e \
@@ -490,7 +490,7 @@ async fn test_correlated_exists_with_group_by() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // Alice, Bob
@@ -540,7 +540,7 @@ async fn test_correlated_exists_outer_table_cdc() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Active employees who have orders
     let query = "SELECT e.name FROM employees e \
@@ -566,7 +566,7 @@ async fn test_correlated_exists_outer_table_cdc() -> Result<(), Error> {
     ctx.origin_query("UPDATE employees SET active = 0 WHERE id = 2", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3); // only Alice
@@ -628,7 +628,7 @@ async fn test_correlated_exists_inner_join() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees who have orders from gold-tier customers
     let query = "SELECT e.name FROM employees e \
@@ -655,7 +655,7 @@ async fn test_correlated_exists_inner_join() -> Result<(), Error> {
     ctx.origin_query("UPDATE customers SET tier = 'gold' WHERE id = 11", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Bob should now appear (his customer is now gold)
     let res = ctx.simple_query(query).await?;
@@ -716,7 +716,7 @@ async fn test_correlated_in_basic() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees who have orders in their own department
     // Correlation: o.dept_id = e.dept_id, IN predicate: e.id = o.emp_id
@@ -749,7 +749,7 @@ async fn test_correlated_in_basic() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // Alice, Bob, Charlie
@@ -766,7 +766,7 @@ async fn test_correlated_in_basic() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM orders WHERE id = 101", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // Alice, Bob
@@ -822,7 +822,7 @@ async fn test_correlated_in_with_correlation() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees whose dept_id matches a department in the same location
     let query = "SELECT e.name FROM employees e \
@@ -853,7 +853,7 @@ async fn test_correlated_in_with_correlation() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // Alice, Bob, Charlie
@@ -908,7 +908,7 @@ async fn test_correlated_in_residual_constraint_filter() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees in active departments
     let query = "SELECT e.name FROM employees e \
@@ -939,7 +939,7 @@ async fn test_correlated_in_residual_constraint_filter() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Cache hit — 'inactive' doesn't match the 'active' constraint
     let res = ctx.simple_query(query).await?;
@@ -953,7 +953,7 @@ async fn test_correlated_in_residual_constraint_filter() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // Alice, Charlie
@@ -1013,7 +1013,7 @@ async fn test_correlated_not_in_basic() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Departments whose id does NOT appear among employee dept_ids
     // Correlation: e.dept_id = d.id, NOT IN predicate: d.id = e.dept_id
@@ -1045,7 +1045,7 @@ async fn test_correlated_not_in_basic() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 2); // no departments without employees + RowDesc + CommandComplete
@@ -1058,7 +1058,7 @@ async fn test_correlated_not_in_basic() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM employees WHERE id = 11", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3); // Sales + RowDesc + CommandComplete
@@ -1112,7 +1112,7 @@ async fn test_correlated_not_in_with_correlation() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees whose id does NOT appear among orders with a matching status
     let query = "SELECT e.name FROM employees e \
@@ -1145,7 +1145,7 @@ async fn test_correlated_not_in_with_correlation() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     // All three now have matching orders → no results
@@ -1158,7 +1158,7 @@ async fn test_correlated_not_in_with_correlation() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM orders WHERE id = 100", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3); // Alice + RowDesc + CommandComplete
@@ -1208,7 +1208,7 @@ async fn test_correlated_not_in_residual_constraint_filter() -> Result<(), Error
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees not in critically blocked departments
     let query = "SELECT e.name FROM employees e \
@@ -1241,7 +1241,7 @@ async fn test_correlated_not_in_residual_constraint_filter() -> Result<(), Error
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Cache hit — 'minor' doesn't match the 'critical' constraint
     let res = ctx.simple_query(query).await?;
@@ -1255,7 +1255,7 @@ async fn test_correlated_not_in_residual_constraint_filter() -> Result<(), Error
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 3); // only Bob
@@ -1326,7 +1326,7 @@ async fn test_correlated_in_not_in_exists_combined() -> Result<(), Error> {
     ctx.query("INSERT INTO suspensions (id, emp_id) VALUES (200, 2)", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees who:
     // 1. Are in an active department (correlated IN: d.id = e.dept_id is both correlation and IN predicate)
@@ -1361,7 +1361,7 @@ async fn test_correlated_in_not_in_exists_combined() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM suspensions WHERE id = 200", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     // Bob's dept 20 has no projects, so he's still excluded
@@ -1374,7 +1374,7 @@ async fn test_correlated_in_not_in_exists_combined() -> Result<(), Error> {
     ctx.origin_query("INSERT INTO projects (id, dept_id) VALUES (101, 20)", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // Alice, Bob, Charlie
@@ -1437,7 +1437,7 @@ async fn test_correlated_scalar_select_count() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query = "SELECT e.name, \
                      (SELECT count(*) FROM orders o WHERE o.emp_id = e.id) AS order_count \
@@ -1470,7 +1470,7 @@ async fn test_correlated_scalar_select_count() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5);
@@ -1485,7 +1485,7 @@ async fn test_correlated_scalar_select_count() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM orders WHERE id = 100", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5);
@@ -1536,7 +1536,7 @@ async fn test_correlated_scalar_select_lookup() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query = "SELECT e.name, \
                      (SELECT d.name FROM departments d WHERE d.id = e.dept_id) AS dept_name \
@@ -1562,7 +1562,7 @@ async fn test_correlated_scalar_select_lookup() -> Result<(), Error> {
     ctx.origin_query("UPDATE departments SET name = 'Eng' WHERE id = 1", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
@@ -1604,7 +1604,7 @@ async fn test_correlated_scalar_where_aggregate() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Departments with budget above their location's average
     // NYC avg = 80: Engineering (100) above, Marketing (60) below
@@ -1633,7 +1633,7 @@ async fn test_correlated_scalar_where_aggregate() -> Result<(), Error> {
     ctx.origin_query("UPDATE departments SET budget = 120 WHERE id = 2", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     // Now only Marketing (120 > 110) and Sales (90 > 70)
@@ -1686,7 +1686,7 @@ async fn test_correlated_scalar_where_lookup() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     let query = "SELECT e.name FROM employees e \
                  WHERE e.name = (SELECT d.name FROM departments d WHERE d.id = e.dept_id) \
@@ -1710,7 +1710,7 @@ async fn test_correlated_scalar_where_lookup() -> Result<(), Error> {
     ctx.origin_query("UPDATE departments SET name = 'Bob' WHERE id = 2", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4); // Alice, Bob
@@ -1769,7 +1769,7 @@ async fn test_correlated_scalar_and_exists_combined() -> Result<(), Error> {
     ctx.query("INSERT INTO projects (id, dept_id) VALUES (200, 10)", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
 
     // Employees in departments that have projects, with their order count
     let query = "SELECT e.name, \
@@ -1798,7 +1798,7 @@ async fn test_correlated_scalar_and_exists_combined() -> Result<(), Error> {
     ctx.origin_query("INSERT INTO projects (id, dept_id) VALUES (201, 20)", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 5); // Alice, Bob, Charlie

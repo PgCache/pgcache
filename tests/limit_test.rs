@@ -253,7 +253,7 @@ async fn test_limit_cdc_delete_invalidates() -> Result<(), Error> {
     ctx.origin_query("DELETE FROM items WHERE id = 7", &[])
         .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Should be cache miss — DELETE on a limited query invalidates
     let res = ctx.simple_query(query).await?;
@@ -304,7 +304,7 @@ async fn test_limit_cdc_insert_no_invalidation() -> Result<(), Error> {
     )
     .await?;
 
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // Should still be cache hit — INSERT doesn't invalidate limited queries
     let res = ctx.simple_query(query).await?;
@@ -519,7 +519,7 @@ async fn test_limit_cdc_update_promotes_untracked_row_single_table() -> Result<(
 
     ctx.origin_query("UPDATE rankings SET value = 100 WHERE id = 5", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
@@ -573,7 +573,7 @@ async fn test_limit_cdc_update_promotes_untracked_row_via_join() -> Result<(), E
 
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 5", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
@@ -619,7 +619,7 @@ async fn test_limit_cdc_update_demotes_cached_row_leaves_gap() -> Result<(), Err
 
     ctx.origin_query("UPDATE rankings SET value = 5 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
@@ -663,7 +663,7 @@ async fn test_limit_cdc_update_non_window_column_keeps_cache() -> Result<(), Err
 
     ctx.origin_query("UPDATE rankings SET name = 'AAA' WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_eq!(res.len(), 4);
@@ -715,7 +715,7 @@ async fn test_limit_cdc_sort_update_spares_other_predicate() -> Result<(), Error
     // Bump owner 10's top score. owner 20's page does not contain post 1.
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     // owner 20's query is untouched by an owner-10 row change → stays cached.
     let res = ctx.simple_query(query_b).await?;
@@ -769,7 +769,7 @@ async fn test_limit_cdc_predicate_column_change_still_invalidates() -> Result<()
     // cache, so the query must repopulate from origin to stay correct.
     ctx.origin_query("UPDATE posts SET owner = 20 WHERE id = 1", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "2"), ("score", "40")])?;
@@ -819,7 +819,7 @@ async fn test_limit_cdc_promotion_desc_keeps_cache() -> Result<(), Error> {
 
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "2"), ("score", "100")])?;
@@ -843,7 +843,7 @@ async fn test_limit_cdc_direction_asc() -> Result<(), Error> {
     // Promotion (ASC: value falls): in place, cache hit, re-sorted.
     ctx.origin_query("UPDATE posts SET score = 5 WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "2"), ("score", "5")])?;
     assert_row_at(&res, 2, &[("id", "1"), ("score", "10")])?;
@@ -853,7 +853,7 @@ async fn test_limit_cdc_direction_asc() -> Result<(), Error> {
     // the top-2 — it may not be cached, so the query must repopulate.
     ctx.origin_query("UPDATE posts SET score = 35 WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "1"), ("score", "10")])?;
     assert_row_at(&res, 2, &[("id", "3"), ("score", "30")])?;
@@ -878,7 +878,7 @@ async fn test_limit_cdc_null_transitions_nulls_last() -> Result<(), Error> {
     // promotion, maintained in place.
     ctx.origin_query("UPDATE posts SET score = 60 WHERE id = 3", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "1"), ("score", "100")])?;
     assert_row_at(&res, 2, &[("id", "3"), ("score", "60")])?;
@@ -888,7 +888,7 @@ async fn test_limit_cdc_null_transitions_nulls_last() -> Result<(), Error> {
     // value → NULL with NULLS LAST: demotion — invalidates.
     ctx.origin_query("UPDATE posts SET score = NULL WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "1"), ("score", "100")])?;
     assert_row_at(&res, 2, &[("id", "3"), ("score", "60")])?;
@@ -923,7 +923,7 @@ async fn test_limit_cdc_multi_key_tiebreak_direction() -> Result<(), Error> {
     // Tiebreak falls (ASC key): promotion — post 2 overtakes post 1 in place.
     ctx.origin_query("UPDATE posts SET tiebreak = 4 WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_decode_settle().await?;
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "2"), ("tiebreak", "4")])?;
     assert_row_at(&res, 2, &[("id", "1"), ("tiebreak", "5")])?;
@@ -932,7 +932,7 @@ async fn test_limit_cdc_multi_key_tiebreak_direction() -> Result<(), Error> {
     // Tiebreak rises: demotion — invalidates.
     ctx.origin_query("UPDATE posts SET tiebreak = 8 WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "1"), ("tiebreak", "5")])?;
     assert_row_at(&res, 2, &[("id", "2"), ("tiebreak", "8")])?;
@@ -953,7 +953,7 @@ async fn test_limit_cdc_alias_sort_key_promotion() -> Result<(), Error> {
 
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "2"), ("s", "100")])?;
@@ -976,7 +976,7 @@ async fn test_limit_cdc_expression_sort_key_stays_conservative() -> Result<(), E
 
     ctx.origin_query("UPDATE posts SET score = 100 WHERE id = 2", &[])
         .await?;
-    ctx.cdc_settle().await?;
+    ctx.cdc_apply_settle().await?;
 
     let res = ctx.simple_query(query).await?;
     assert_row_at(&res, 1, &[("id", "2"), ("score", "100")])?;
