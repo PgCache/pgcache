@@ -1,0 +1,112 @@
+name: fit-release
+
+# Manual-only: builds pgcache-fit for each target and publishes a GitHub
+# Release. Nothing runs until you press "Run workflow".
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 0.1.0 (tag becomes fit-v<version>)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+    steps:
+      # The pg_query patch (../pg_query.rs) needs the two repos as siblings:
+      #   <workspace>/pgcache        (this repo)
+      #   <workspace>/pg_query.rs    (with its libpg_query submodule)
+      - name: Checkout pgcache
+        uses: actions/checkout@v4
+        with:
+          path: pgcache
+      - name: Checkout pg_query.rs
+        uses: actions/checkout@v4
+        with:
+          repository: PgCache/pg_query.rs
+          path: pg_query.rs
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang cmake musl-tools
+
+      - name: Install macOS build deps
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Build
+        working-directory: pgcache
+        # musl C deps (libpg_query via bindgen, aws-lc-sys) compile with
+        # musl-gcc; bindgen/libclang run as glibc host tools, so no dlopen fight.
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release -p pgcache-fit --target ${{ matrix.target }}
+
+      - name: Package
+        working-directory: pgcache
+        run: |
+          bin="target/${{ matrix.target }}/release/pgcache-fit"
+          strip "$bin"
+          out="pgcache-fit-${{ inputs.version }}-${{ matrix.target }}"
+          cp "$bin" "$out"
+          echo "ASSET=pgcache/$out" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgcache-fit-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum pgcache-fit-* > SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: fit-v${{ inputs.version }}
+          name: pgcache-fit v${{ inputs.version }}
+          files: |
+            dist/pgcache-fit-*
+            dist/SHA256SUMS
+          body: |
+            Pre-built `pgcache-fit` binaries.
+
+            macOS binaries are unsigned; on first run clear the quarantine flag:
+            `xattr -d com.apple.quarantine ./pgcache-fit-*`
