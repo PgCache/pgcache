@@ -39,6 +39,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: PgCache/pg_query.rs
+          # The fork's pgcache-specific API (pg_nodes, parse_raw_scoped) lives
+          # on the pgcache branch, not the upstream-tracking default branch.
+          ref: pgcache
           path: pg_query.rs
           submodules: recursive
 
