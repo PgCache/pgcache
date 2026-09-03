@@ -109,7 +109,9 @@ jobs:
             dist/pgcache-fit-*
             dist/SHA256SUMS
           body: |
-            Pre-built `pgcache-fit` binaries.
+            Pre-built `pgcache-fit` binaries. Make one executable with
+            `chmod +x pgcache-fit-*`, then run it.
 
-            macOS binaries are unsigned; on first run clear the quarantine flag:
-            `xattr -d com.apple.quarantine ./pgcache-fit-*`
+            macOS binaries are unsigned. Running from the terminal usually
+            works after `chmod`. Only if macOS refuses ("cannot be verified"),
+            clear the quarantine flag: `xattr -d com.apple.quarantine ./pgcache-fit-*`

@@ -10,7 +10,44 @@ constraint analysis, admission) against your queries, so a verdict here is the
 verdict the proxy would reach. It does not connect to anything or send your
 queries anywhere.
 
-## Build
+## Install
+
+Pre-built binaries are attached to the repo's
+[Releases](https://github.com/PgCache/pgcache/releases). Pick the asset for
+your platform:
+
+| Platform | Asset |
+|---|---|
+| macOS (Apple Silicon) | `pgcache-fit-0.0.1-aarch64-apple-darwin` |
+| Linux x86_64 | `pgcache-fit-0.0.1-x86_64-unknown-linux-musl` |
+| Linux arm64 | `pgcache-fit-0.0.1-aarch64-unknown-linux-musl` |
+
+Download it, make it executable, and run:
+
+```sh
+# with the gh CLI (macOS arm64 shown)
+gh release download fit-v0.0.1 --repo PgCache/pgcache \
+  --pattern 'pgcache-fit-0.0.1-aarch64-apple-darwin'
+
+# or with curl
+curl -LO https://github.com/PgCache/pgcache/releases/download/fit-v0.0.1/pgcache-fit-0.0.1-aarch64-apple-darwin
+
+chmod +x pgcache-fit-0.0.1-*
+./pgcache-fit-0.0.1-aarch64-apple-darwin check queries.sql
+```
+
+The Linux binaries are static (musl) and run on any distro with no
+dependencies. macOS binaries are unsigned; running from the terminal after
+`chmod` normally works — only if macOS refuses with "cannot be verified",
+clear the quarantine flag: `xattr -d com.apple.quarantine ./pgcache-fit-*`.
+
+Verify a download against the release's `SHA256SUMS`:
+
+```sh
+sha256sum -c SHA256SUMS   # Linux; on macOS: shasum -a 256 -c SHA256SUMS
+```
+
+## Build from source
 
 pgcache-fit is a member of the pgcache workspace:
 
