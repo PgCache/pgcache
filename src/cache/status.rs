@@ -54,15 +54,12 @@ pub struct CdcStatusData {
     /// — it never leads delivered data. Use this to confirm that all committed
     /// changes up to a given LSN are visible in the cache.
     pub last_applied_lsn: Lsn,
-    /// Whether the apply pipeline has no frame in flight — no open source
-    /// transaction and no frames accumulated for a batch — at the instant this
-    /// status was produced. A momentary snapshot, not a barrier: it does not
-    /// account for commands still queued to the writer or transactions still
-    /// buffered server-side, so a lone reading can be `true` with work inbound.
-    /// Sampled stably over a window it distinguishes a `last_applied_lsn`
-    /// that has stalled on non-applyable WAL (background records, or changes to
-    /// unpublished tables) from one still awaiting a pending cache mutation.
-    pub apply_idle: bool,
+    /// Settled watermark: every origin transaction committing at or below it is
+    /// either applied to the cache or produced no decodable output. Unlike
+    /// `last_applied_lsn` it also advances across non-decodable WAL (via
+    /// keepalives at drained points), so it is the field that answers "has
+    /// pgcache applied every effect up to this origin LSN".
+    pub settled_lsn: Lsn,
 }
 
 /// Per-query status for a cached query.

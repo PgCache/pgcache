@@ -23,6 +23,7 @@ const STATE_PENDING_PREFIX: &str = "Pending";
 #[derive(Debug, Clone, Default)]
 pub struct StatusSnapshot {
     pub last_applied_lsn: u64,
+    pub settled_lsn: u64,
     /// Per-fingerprint counters, keyed by `QueryStatusData.fingerprint`.
     pub queries: HashMap<u64, QueryCounters>,
 }
@@ -109,6 +110,7 @@ impl StatusClient {
 
         Ok(StatusSnapshot {
             last_applied_lsn: resp.cdc.last_applied_lsn.get(),
+            settled_lsn: resp.cdc.settled_lsn.get(),
             queries,
         })
     }
@@ -148,7 +150,7 @@ impl StatusClient {
 }
 
 impl LsnSource for StatusClient {
-    async fn last_applied_lsn(&self) -> Result<u64> {
-        Ok(self.snapshot().await?.last_applied_lsn)
+    async fn settled_lsn(&self) -> Result<u64> {
+        Ok(self.snapshot().await?.settled_lsn)
     }
 }

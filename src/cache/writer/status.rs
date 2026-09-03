@@ -141,7 +141,7 @@ impl WriterCore {
             cdc: CdcStatusData {
                 last_received_lsn,
                 last_applied_lsn: self.last_applied_lsn,
-                apply_idle: self.batch_frames == 0 && !self.frame_open,
+                settled_lsn: Lsn::from_raw(self.state_view.settled_lsn.load(Ordering::Relaxed)),
             },
             queries,
             fault_injection: cfg!(feature = "fault-injection"),

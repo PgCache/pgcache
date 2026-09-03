@@ -33,8 +33,9 @@ struct CdcStatusSnapshot {
     received: u64,
     /// `last_applied_lsn`: the commit-only apply watermark.
     applied: u64,
-    /// Whether the CDC apply pipeline has no work in flight.
-    apply_idle: bool,
+    /// `settled_lsn`: every origin transaction committing at or below it is
+    /// either applied to the cache or produced no decodable output.
+    settled: u64,
 }
 
 impl TestContext {
@@ -327,9 +328,10 @@ impl TestContext {
     ///
     /// Use this after a write to a table a cached query references, before
     /// reading data that must reflect the write. Unlike
-    /// [`cdc_decode_settle`](Self::cdc_decode_settle) it never returns early on
-    /// the keepalive cursor, so an invalidation or in-place update is visible
-    /// once it returns.
+    /// [`cdc_decode_settle`](Self::cdc_decode_settle)'s cursor (which advances
+    /// on decode regardless of application), the settled watermark polled here
+    /// advances past an LSN only once everything decodable below it is applied
+    /// — so an invalidation or in-place update is visible once it returns.
     ///
     /// Times out after 5 seconds.
     pub async fn cdc_apply_settle(&self) -> Result<(), Error> {
@@ -340,49 +342,25 @@ impl TestContext {
     /// Same as [`cdc_apply_settle`](Self::cdc_apply_settle) with an explicit
     /// timeout.
     ///
-    /// Settles when the commit-only watermark reaches the flush target. The
-    /// target can occasionally land past the last real commit — on a *flushed*
-    /// background record (e.g. a running-xacts snapshot) that produces no cache
-    /// mutation, so the commit watermark can never reach it. The fallback path
-    /// handles that: if the decode cursor has passed the target and the writer
-    /// reports no in-flight apply work (`apply_idle`) continuously for a fixed
-    /// window, the residual gap is non-applyable WAL and we settle. Under
-    /// `synchronous_commit=on` (the harness default) a real committed write is
-    /// flushed and delivered promptly, so `apply_idle` cannot stay set across
-    /// the window while a genuine change is still pending — the fallback only
-    /// fires for a true background-record gap.
+    /// Settles when the settled watermark reaches the flush target. The target
+    /// can land past the last real commit — on a *flushed* background record
+    /// (e.g. a running-xacts snapshot) that produces no cache mutation — which
+    /// the settled watermark covers via keepalives processed at drained
+    /// points, so no idle-window fallback is needed: the watermark itself
+    /// asserts that everything decodable at or below it is applied.
     pub async fn cdc_apply_settle_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
-        // Fallback window: the target can land past the last real commit on a
-        // *flushed* background record (e.g. a running-xacts snapshot emitted by
-        // concurrent activity) that produces no cache mutation, so the commit
-        // watermark can never reach it. When the decode cursor has passed the
-        // target and the writer reports no in-flight apply work (`apply_idle`)
-        // continuously for this long, the residual gap is non-applyable WAL and
-        // we settle. Must exceed the worst-case decode->deliver->apply latency
-        // so a not-yet-delivered frame (transient `apply_idle`) never settles us
-        // early, and held frames (an `apply_idle == false` batch) never do.
-        const APPLY_IDLE_STABLE: Duration = Duration::from_millis(500);
         let captured_lsn_str = self.flush_lsn_capture().await?;
         let captured_lsn = lsn_parse(&captured_lsn_str)?;
         let deadline = Instant::now() + timeout;
-        let mut apply_idle_since: Option<Instant> = None;
         loop {
             let cdc = self.cdc_status().await?;
-            if cdc.applied >= captured_lsn {
+            if cdc.settled >= captured_lsn {
                 return Ok(());
-            }
-            if cdc.received >= captured_lsn && cdc.apply_idle {
-                let since = *apply_idle_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= APPLY_IDLE_STABLE {
-                    return Ok(());
-                }
-            } else {
-                apply_idle_since = None;
             }
             if Instant::now() >= deadline {
                 return Err(Error::other(format!(
-                    "cdc apply settle timed out: applied={} received={} apply_idle={} captured={captured_lsn} ({captured_lsn_str})",
-                    cdc.applied, cdc.received, cdc.apply_idle
+                    "cdc apply settle timed out: settled={} applied={} received={} captured={captured_lsn} ({captured_lsn_str})",
+                    cdc.settled, cdc.applied, cdc.received
                 )));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -425,10 +403,7 @@ impl TestContext {
         Ok(CdcStatusSnapshot {
             received: lsn("last_received_lsn")?,
             applied: lsn("last_applied_lsn")?,
-            apply_idle: cdc
-                .get("apply_idle")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false),
+            settled: lsn("settled_lsn")?,
         })
     }
 

@@ -3,10 +3,11 @@
 //!
 //! Between any DML and the next SELECT, the runner captures
 //! `pg_current_wal_lsn()` on origin and polls pgcache
-//! `/status::cdc.last_applied_lsn` until it reaches that point.
-//! `last_applied_lsn` is the only transaction-aligned watermark; the
-//! wire-side `received`/`flushed` gauges do not imply effects are
-//! visible in the cache.
+//! `/status::cdc.settled_lsn` until it reaches that point. The settled
+//! watermark advances across non-decodable WAL (seed writes before any
+//! table is registered, background records), which the commit-only
+//! `last_applied_lsn` never covers; the wire-side `received`/`flushed`
+//! gauges do not imply effects are visible in the cache.
 
 use std::ops::ControlFlow;
 use std::time::Duration;
@@ -14,10 +15,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use tokio_postgres::types::PgLsn;
 
-/// A source of pgcache's current `last_applied_lsn` (the `/status`
-/// client implements this).
+/// A source of pgcache's current `settled_lsn` (the `/status` client
+/// implements this).
 pub trait LsnSource {
-    fn last_applied_lsn(&self) -> impl Future<Output = Result<u64>> + Send;
+    fn settled_lsn(&self) -> impl Future<Output = Result<u64>> + Send;
 }
 
 /// Parse a PostgreSQL LSN (`"0/3A1B2C00"`) into a `u64`, via the
@@ -29,7 +30,7 @@ pub fn lsn_parse(s: &str) -> Result<u64> {
         .map_err(|_| anyhow!("invalid PostgreSQL LSN: {s:?}"))
 }
 
-/// Poll `source` until its `last_applied_lsn` reaches `target`, tolerating
+/// Poll `source` until its `settled_lsn` reaches `target`, tolerating
 /// arbitrarily long drains as long as the watermark keeps advancing: the
 /// deadline is a STALL bound, reset on every observed advance. Detects a
 /// wedged writer without bounding healthy drain time — deep backlogs are
@@ -44,9 +45,9 @@ pub async fn settle_while_progressing(
     let mut stall_start = std::time::Instant::now();
     loop {
         let applied = source
-            .last_applied_lsn()
+            .settled_lsn()
             .await
-            .context("polling /status::cdc.last_applied_lsn")?;
+            .context("polling /status::cdc.settled_lsn")?;
         if applied >= target {
             return Ok(());
         }
@@ -55,26 +56,26 @@ pub async fn settle_while_progressing(
             stall_start = std::time::Instant::now();
         } else if stall_start.elapsed() >= stall_timeout {
             return Err(anyhow!(
-                "CDC apply stalled for {stall_timeout:?}: applied LSN {applied}                  has not reached target {target}"
+                "CDC apply stalled for {stall_timeout:?}: settled LSN {applied}                  has not reached target {target}"
             ));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-/// Poll `source` until its `last_applied_lsn` reaches `target`, or fail
+/// Poll `source` until its `settled_lsn` reaches `target`, or fail
 /// once `timeout` elapses.
 pub async fn settle(source: &impl LsnSource, target: u64, timeout: Duration) -> Result<()> {
     crate::poll::poll_until(timeout, Duration::from_millis(25), || async {
         let applied = source
-            .last_applied_lsn()
+            .settled_lsn()
             .await
-            .context("polling /status::cdc.last_applied_lsn")?;
+            .context("polling /status::cdc.settled_lsn")?;
         if applied >= target {
             Ok(ControlFlow::Break(()))
         } else {
             Ok(ControlFlow::Continue(format!(
-                "CDC settling timed out after {timeout:?}: applied LSN {applied} \
+                "CDC settling timed out after {timeout:?}: settled LSN {applied} \
                  has not reached target {target}"
             )))
         }
@@ -106,7 +107,7 @@ mod tests {
 
     struct FixedSource(u64);
     impl LsnSource for FixedSource {
-        async fn last_applied_lsn(&self) -> Result<u64> {
+        async fn settled_lsn(&self) -> Result<u64> {
             Ok(self.0)
         }
     }
@@ -117,7 +118,7 @@ mod tests {
         cap: u64,
     }
     impl LsnSource for SteppingSource {
-        async fn last_applied_lsn(&self) -> Result<u64> {
+        async fn settled_lsn(&self) -> Result<u64> {
             use std::sync::atomic::Ordering;
             let v = self.v.load(Ordering::Relaxed);
             if v < self.cap {
