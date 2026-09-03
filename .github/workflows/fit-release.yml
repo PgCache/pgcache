@@ -50,15 +50,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # macOS runners already carry clang + cmake, so no dep step is needed
+      # there. protoc is deliberately absent: the pg_query build regenerates
+      # src/protobuf.rs only when protoc is present, and we want the committed
+      # generated file for a reproducible build.
       - name: Install Linux build deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler clang cmake musl-tools
-
-      - name: Install macOS build deps
-        if: runner.os == 'macOS'
-        run: brew install protobuf
+          sudo apt-get install -y clang cmake musl-tools
 
       - name: Build
         working-directory: pgcache
