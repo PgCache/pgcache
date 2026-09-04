@@ -198,7 +198,7 @@ mod stable {
     }
 
     #[test]
-    fn test_check_shape_funnel_with_subsumption_estimate() {
+    fn test_check_shape_funnel() {
         let report = check_json(
             "stable_funnel.sql",
             "SELECT * FROM users;\n\
@@ -206,8 +206,12 @@ mod stable {
              SELECT * FROM users WHERE id = 2;\n",
         );
         assert_eq!(count(&report, "distinct_fingerprints"), 3);
-        // The two per-literal fingerprints are subsumed by the full scan.
-        assert_eq!(count(&report, "post_subsumption_estimate"), 1);
+        // Per-literal fingerprints collapse to one shape per predicate form.
+        assert_eq!(count(&report, "distinct_shapes"), 2);
+        assert!(
+            report.get("post_subsumption_estimate").is_none(),
+            "subsumption is order-dependent and belongs to hitrate only"
+        );
     }
 }
 

@@ -10,7 +10,6 @@ use crate::catalog_synth::SynthesisStats;
 use crate::classify::{AnalyzedStatement, ParseOutcome, PassthroughReason, Verdict};
 use crate::hitrate::{HitrateStats, ReplayConfig};
 use crate::input::TraceFormat;
-use crate::subsume::SubsumerRegistry;
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct BucketAggregate {
@@ -66,7 +65,6 @@ pub struct CheckReport {
     pub distinct_statements: usize,
     pub distinct_fingerprints: usize,
     pub distinct_shapes: usize,
-    pub post_subsumption_estimate: usize,
     pub shape_level_fingerprints: bool,
     pub assumptions: Vec<String>,
     pub verdicts: Vec<StatementVerdict>,
@@ -182,8 +180,6 @@ pub fn check_report_build(
     } else {
         Vec::new()
     };
-    let mut registry = SubsumerRegistry::new();
-    let mut subsumed_fingerprints = 0usize;
 
     for item in items {
         let statement_calls = item.trace.calls.max(1);
@@ -199,12 +195,7 @@ pub fn check_report_build(
         let (verdict_label, reason_label) = match &*item.verdict {
             Verdict::Cacheable(analysis) => {
                 cacheable.add(statement_calls, item.trace.total_time_ms);
-                if fingerprints.insert(analysis.fingerprint) {
-                    if registry.query_subsumed(analysis) {
-                        subsumed_fingerprints += 1;
-                    }
-                    registry.subsumer_register(analysis);
-                }
+                fingerprints.insert(analysis.fingerprint);
                 shapes.insert(analysis.shape_key);
                 ("cacheable", None)
             }
@@ -265,7 +256,6 @@ pub fn check_report_build(
         .collect();
     writes_sorted.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.table.cmp(&b.table)));
 
-    let distinct_fingerprints = fingerprints.len();
     CheckReport {
         statements,
         calls,
@@ -277,9 +267,8 @@ pub fn check_report_build(
         utility,
         writes_by_table: writes_sorted,
         distinct_statements: distinct_statements.len(),
-        distinct_fingerprints,
+        distinct_fingerprints: fingerprints.len(),
         distinct_shapes: shapes.len(),
-        post_subsumption_estimate: distinct_fingerprints - subsumed_fingerprints,
         shape_level_fingerprints: format == TraceFormat::PgssCsv,
         assumptions: assumptions_build(
             synth,
@@ -433,12 +422,11 @@ pub fn check_report_render(report: &CheckReport) -> String {
     };
     let _ = writeln!(
         out,
-        "Shapes: {} distinct statements → {} {} → {} shapes → {} after subsumption",
+        "Shapes: {} distinct statements → {} {} → {} shapes",
         report.distinct_statements,
         report.distinct_fingerprints,
         fingerprint_kind,
-        report.distinct_shapes,
-        report.post_subsumption_estimate
+        report.distinct_shapes
     );
 
     let _ = writeln!(out);

@@ -81,7 +81,7 @@ Writes:       16.7% of calls (1 statements)
 Write mix by table:
   users                           1 calls
 
-Shapes: 6 distinct statements → 3 fingerprints → 3 shapes → 3 after subsumption
+Shapes: 6 distinct statements → 3 fingerprints → 3 shapes
 
 Assumptions (schema-less mode):
   ...
@@ -93,9 +93,10 @@ Assumptions (schema-less mode):
   reference, and so on).
 - **Writes** — INSERT/UPDATE/DELETE, with a per-table breakdown. In the proxy
   these drive cache invalidation; here they're only counted.
-- **Shapes** — how the distinct statements collapse into fingerprints, query
-  shapes, and finally shapes after subsumption (one cached query serving
-  several). Fewer shapes means better cache density.
+- **Shapes** — how the distinct statements collapse into fingerprints (the
+  cache key, per literal) and query shapes. Fewer shapes means better cache
+  density. Subsumption (one cached query serving several) depends on arrival
+  order, so it is reported by `hitrate`, not here.
 
 `--json` additionally emits a per-statement verdict list (each statement, its
 verdict, and the passthrough reason).
