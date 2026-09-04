@@ -58,6 +58,18 @@ fn hitrate_json(name: &str, trace: &str) -> serde_json::Value {
     output.json.expect("hitrate JSON present")
 }
 
+fn check_text(name: &str, trace: &str, extra: &[&str]) -> String {
+    let fixture = fixture_write(name, trace);
+    let output = Command::new(env!("CARGO_BIN_EXE_pgcache-fit"))
+        .arg("check")
+        .args(extra)
+        .arg(fixture)
+        .output()
+        .expect("run pgcache-fit");
+    assert!(output.status.success(), "check run succeeds");
+    String::from_utf8(output.stdout).expect("utf-8 report")
+}
+
 fn check_json(name: &str, trace: &str) -> serde_json::Value {
     let fixture = fixture_write(name, trace);
     let output = fit_run("check", &fixture);
@@ -195,6 +207,57 @@ mod stable {
         assert_eq!(reason(3), "non-immutable function");
         assert_eq!(verdict(4), "passthrough");
         assert_eq!(reason(4), "system catalog reference");
+    }
+
+    #[test]
+    fn test_check_verdicts_aggregate_repeated_statements() {
+        let report = check_json(
+            "stable_verdict_repeats.sql",
+            "SELECT * FROM pg_class;\n\
+             SELECT * FROM pg_class;\n\
+             SELECT * FROM pg_class;\n\
+             SELECT * FROM users WHERE id = 1;\n",
+        );
+        let verdicts = report["verdicts"].as_array().expect("verdicts array");
+        assert_eq!(verdicts.len(), 2);
+        assert_eq!(verdicts[0]["occurrences"], 3);
+        assert_eq!(verdicts[0]["verdict"], "passthrough");
+        assert_eq!(verdicts[1]["occurrences"], 1);
+        assert_eq!(count(&report, "statements"), 4);
+    }
+
+    #[test]
+    fn test_check_text_lists_statements_only_on_request() {
+        let trace: String = (1..=7)
+            .map(|i| format!("SELECT * FROM pg_class WHERE oid = {i};\n"))
+            .chain(std::iter::once(
+                "SELECT * FROM t TABLESAMPLE SYSTEM (10);\n".to_owned(),
+            ))
+            .collect();
+        let text = check_text("stable_text_default.sql", &trace, &[]);
+        assert!(!text.contains("statements:\n"));
+        assert!(!text.contains("SELECT * FROM pg_class WHERE oid"));
+
+        let all = check_text("stable_text_all.sql", &trace, &["--statements"]);
+        assert!(all.contains("Passthrough statements:"));
+        assert!(all.contains("system catalog reference: 7 statements"));
+        assert_eq!(all.matches("SELECT * FROM pg_class WHERE oid").count(), 7);
+        // Conversion failures carry the converter's detail line.
+        assert!(all.contains("  SELECT * FROM t TABLESAMPLE SYSTEM (10)\n    Unsupported"));
+    }
+
+    #[test]
+    fn test_check_text_statements_flag_groups_every_verdict() {
+        let text = check_text(
+            "stable_text_groups.sql",
+            "SELECT * FROM users WHERE id = 1;\n\
+             INSERT INTO users (id) VALUES (2);\n\
+             BEGIN;\n",
+            &["--statements"],
+        );
+        assert!(text.contains("Cacheable statements:\n  SELECT * FROM users WHERE id = 1"));
+        assert!(text.contains("Write statements:\n\nusers: 1 statement"));
+        assert!(text.contains("Utility statements:\n  BEGIN"));
     }
 
     #[test]

@@ -106,8 +106,29 @@ Cacheable:   3 statements (50.0%)   calls  71.9%  time  31.5%
   density. Subsumption (one cached query serving several) depends on arrival
   order, so it is reported by `hitrate`, not here.
 
-`--json` additionally emits a per-statement verdict list (each statement, its
-verdict, and the passthrough reason).
+`--statements` appends every statement, grouped by verdict: cacheable,
+passthrough by reason, writes by table, and utility. Conversion failures carry
+the converter's detail line:
+
+```
+Passthrough statements:
+
+non-immutable function: 1 statement (16.7%)   calls   3.0%  time  61.6%
+  [50 calls, 900.0 ms] SELECT * FROM events WHERE created_at > now()
+
+unsupported construct (conversion): 2 statements (33.3%)
+  SELECT a, b FROM t GROUP BY GROUPING SETS ((a), (b))
+    Unsupported feature: GROUP BY expression
+  SELECT * FROM t TABLESAMPLE SYSTEM (10)
+    Unsupported SELECT feature: FROM clause type
+```
+
+Within a group, statements are ordered by time when the input has it, else by
+calls, else by how often they occur (`[3×]`).
+
+`--json` emits the same per-statement list under `verdicts`: one entry per
+distinct statement with its verdict, reason, detail, write target, and
+aggregate `occurrences`, `calls`, and `time_ms`.
 
 ### `hitrate` (experimental)
 

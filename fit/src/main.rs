@@ -56,6 +56,10 @@ enum Command {
         /// Emit the report (and per-statement verdicts) as JSON
         #[arg(long)]
         json: bool,
+        /// List every statement grouped by verdict (cacheable, passthrough
+        /// by reason, writes by table, utility)
+        #[arg(long)]
+        statements: bool,
         /// Override input format auto-detection
         #[arg(long, value_enum)]
         format: Option<TraceFormat>,
@@ -172,21 +176,20 @@ fn main() -> anyhow::Result<()> {
         Command::Check {
             input,
             json,
+            statements,
             format,
         } => {
             let analysis = trace_analyze(&input, format)?;
-            let include_verdicts = json;
             let report = report::check_report_build(
                 &analysis.items,
                 &analysis.catalog.stats,
                 analysis.format,
                 analysis.parameter_details_dropped,
-                include_verdicts,
             );
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
-                print!("{}", report::check_report_render(&report));
+                print!("{}", report::check_report_render(&report, statements));
             }
         }
         Command::Hitrate {

@@ -41,15 +41,23 @@ pub struct TableWrites {
     pub calls: u64,
 }
 
+/// One distinct statement (by text, verdict, and reason) with its aggregate
+/// weight across the trace.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct StatementVerdict {
     pub sql: ecow::EcoString,
     pub verdict: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// Target table of a write (or of a data-modifying CTE).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
     /// Underlying parse/conversion error message, when there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    pub occurrences: u64,
+    pub calls: u64,
+    pub time_ms: f64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -163,7 +171,6 @@ pub fn check_report_build(
     synth: &SynthesisStats,
     format: TraceFormat,
     parameter_details_dropped: usize,
-    include_verdicts: bool,
 ) -> CheckReport {
     let mut statements = 0u64;
     let mut calls = 0u64;
@@ -179,11 +186,9 @@ pub fn check_report_build(
     let mut fingerprints: HashSet<Fingerprint> = HashSet::new();
     let mut shapes: HashSet<ShapeKey> = HashSet::new();
     let mut inferred_parameters = 0usize;
-    let mut verdicts = if include_verdicts {
-        Vec::with_capacity(items.len())
-    } else {
-        Vec::new()
-    };
+    let mut verdicts: Vec<StatementVerdict> = Vec::new();
+    let mut verdict_index: HashMap<(&str, &'static str, Option<&'static str>), usize> =
+        HashMap::new();
 
     for item in items {
         let statement_calls = item.trace.calls;
@@ -199,56 +204,65 @@ pub fn check_report_build(
         inferred_parameters += item.parsed.inferred_parameters;
         distinct_statements.insert(item.trace.sql.as_str());
 
-        let (verdict_label, reason_label) = match &*item.verdict {
+        let (verdict_label, reason_label, table) = match &*item.verdict {
             Verdict::Cacheable(analysis) => {
                 cacheable.add(statement_calls, item.trace.total_time_ms);
                 fingerprints.insert(analysis.fingerprint);
                 shapes.insert(analysis.shape_key);
-                ("cacheable", None)
+                ("cacheable", None, None)
             }
             Verdict::Passthrough { reason, cte_write } => {
                 passthrough_by_reason
                     .entry(*reason)
                     .or_default()
                     .add(statement_calls, item.trace.total_time_ms);
-                if let Some(write_class) = cte_write {
-                    let entry = writes_by_table
-                        .entry(write_class_table(write_class))
-                        .or_default();
+                let table = cte_write.as_ref().map(write_class_table);
+                if let Some(table) = &table {
+                    let entry = writes_by_table.entry(table.clone()).or_default();
                     entry.0 += 1;
                     entry.1 += statement_calls.unwrap_or(0);
                 }
-                ("passthrough", Some(reason.label()))
+                ("passthrough", Some(reason.label()), table)
             }
             Verdict::Write(write_class) => {
                 write.add(statement_calls, item.trace.total_time_ms);
-                let entry = writes_by_table
-                    .entry(write_class_table(write_class))
-                    .or_default();
+                let table = write_class_table(write_class);
+                let entry = writes_by_table.entry(table.clone()).or_default();
                 entry.0 += 1;
                 entry.1 += statement_calls.unwrap_or(0);
-                ("write", None)
+                ("write", None, Some(table))
             }
             Verdict::Utility(_) => {
                 utility.add(statement_calls, item.trace.total_time_ms);
-                ("utility", None)
+                ("utility", None, None)
             }
         };
-        if include_verdicts {
-            let detail = match &item.parsed.outcome {
-                ParseOutcome::ParseError(error) | ParseOutcome::ParameterError(error) => {
-                    Some(error.clone())
-                }
-                ParseOutcome::SelectUnconvertible { error, .. } => Some(error.clone()),
-                _ => None,
-            };
-            verdicts.push(StatementVerdict {
-                sql: item.trace.sql.clone(),
-                verdict: verdict_label,
-                reason: reason_label,
-                detail,
+        let index = *verdict_index
+            .entry((item.trace.sql.as_str(), verdict_label, reason_label))
+            .or_insert_with(|| {
+                let detail = match &item.parsed.outcome {
+                    ParseOutcome::ParseError(error) | ParseOutcome::ParameterError(error) => {
+                        Some(error.clone())
+                    }
+                    ParseOutcome::SelectUnconvertible { error, .. } => Some(error.clone()),
+                    _ => None,
+                };
+                verdicts.push(StatementVerdict {
+                    sql: item.trace.sql.clone(),
+                    verdict: verdict_label,
+                    reason: reason_label,
+                    table,
+                    detail,
+                    occurrences: 0,
+                    calls: 0,
+                    time_ms: 0.0,
+                });
+                verdicts.len() - 1
             });
-        }
+        let entry = &mut verdicts[index];
+        entry.occurrences += 1;
+        entry.calls += statement_calls.unwrap_or(0);
+        entry.time_ms += item.trace.total_time_ms.unwrap_or(0.0);
     }
 
     let mut passthrough: Vec<ReasonAggregate> = passthrough_by_reason
@@ -376,7 +390,165 @@ fn percent_time(part: f64, whole: f64) -> f64 {
     }
 }
 
-pub fn check_report_render(report: &CheckReport) -> String {
+/// Call/time weighting appended after the statement view, only when the
+/// source carries it.
+fn weight_suffix(report: &CheckReport, bucket: &BucketAggregate) -> String {
+    let mut suffix = String::new();
+    if report.calls_available {
+        let _ = write!(
+            suffix,
+            "   calls {:>5.1}%",
+            percent(bucket.calls, report.calls)
+        );
+    }
+    if report.time_available {
+        let _ = write!(
+            suffix,
+            "  time {:>5.1}%",
+            percent_time(bucket.time_ms, report.time_ms)
+        );
+    }
+    suffix
+}
+
+fn bucket_of(entries: &[&StatementVerdict]) -> BucketAggregate {
+    entries.iter().fold(BucketAggregate::default(), |mut b, e| {
+        b.statements += e.occurrences;
+        b.calls += e.calls;
+        b.time_ms += e.time_ms;
+        b
+    })
+}
+
+fn sql_one_line(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Heaviest first by the best weight the source offers; stable, so ties keep
+/// first-seen order.
+fn entries_sort(report: &CheckReport, entries: &mut [&StatementVerdict]) {
+    if report.time_available {
+        entries.sort_by(|a, b| b.time_ms.total_cmp(&a.time_ms));
+    } else if report.calls_available {
+        entries.sort_by_key(|e| std::cmp::Reverse(e.calls));
+    } else {
+        entries.sort_by_key(|e| std::cmp::Reverse(e.occurrences));
+    }
+}
+
+fn entry_prefix(report: &CheckReport, entry: &StatementVerdict) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if entry.occurrences > 1 {
+        parts.push(format!("{}×", entry.occurrences));
+    }
+    if report.calls_available {
+        parts.push(format!("{} calls", entry.calls));
+    }
+    if report.time_available {
+        parts.push(format!("{:.1} ms", entry.time_ms));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", parts.join(", "))
+    }
+}
+
+/// One group of statements under an optional label line.
+fn group_render(
+    out: &mut String,
+    report: &CheckReport,
+    label: Option<&str>,
+    mut entries: Vec<&StatementVerdict>,
+) {
+    if let Some(label) = label {
+        let bucket = bucket_of(&entries);
+        let noun = if bucket.statements == 1 {
+            "statement"
+        } else {
+            "statements"
+        };
+        let _ = writeln!(
+            out,
+            "{label}: {} {noun} ({:.1}%){}",
+            bucket.statements,
+            percent(bucket.statements, report.statements),
+            weight_suffix(report, &bucket)
+        );
+    }
+    entries_sort(report, &mut entries);
+    for entry in &entries {
+        let _ = writeln!(
+            out,
+            "  {}{}",
+            entry_prefix(report, entry),
+            sql_one_line(&entry.sql)
+        );
+        if let Some(detail) = &entry.detail {
+            let _ = writeln!(out, "    {detail}");
+        }
+    }
+}
+
+/// Every statement grouped by verdict: cacheable, passthrough by reason,
+/// writes by table, utility.
+fn statements_render(out: &mut String, report: &CheckReport) {
+    let by_verdict = |verdict: &str| -> Vec<&StatementVerdict> {
+        report
+            .verdicts
+            .iter()
+            .filter(|e| e.verdict == verdict)
+            .collect()
+    };
+    let cacheable = by_verdict("cacheable");
+    if !cacheable.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Cacheable statements:");
+        group_render(out, report, None, cacheable);
+    }
+
+    let passthrough = by_verdict("passthrough");
+    if !passthrough.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Passthrough statements:");
+        // Reason order follows the summary (heaviest reason first).
+        for reason in &report.passthrough {
+            let entries: Vec<&StatementVerdict> = passthrough
+                .iter()
+                .copied()
+                .filter(|e| e.reason == Some(reason.label))
+                .collect();
+            let _ = writeln!(out);
+            group_render(out, report, Some(reason.label), entries);
+        }
+    }
+
+    let writes = by_verdict("write");
+    if !writes.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Write statements:");
+        for table_writes in &report.writes_by_table {
+            let entries: Vec<&StatementVerdict> = writes
+                .iter()
+                .copied()
+                .filter(|e| e.table.as_deref() == Some(table_writes.table.as_str()))
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out);
+            group_render(out, report, Some(&table_writes.table), entries);
+        }
+    }
+    let utility = by_verdict("utility");
+    if !utility.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Utility statements:");
+        group_render(out, report, None, utility);
+    }
+}
+
+pub fn check_report_render(report: &CheckReport, list_statements: bool) -> String {
     let mut out = String::new();
     let mut header = format!("pgcache-fit check — {} statements", report.statements);
     if report.calls_available {
@@ -389,34 +561,13 @@ pub fn check_report_render(report: &CheckReport) -> String {
     let _ = writeln!(out, "{header}");
     let _ = writeln!(out);
 
-    // Call/time weighting is appended after the statement view, only when
-    // the source carries it.
-    let weighted = |bucket: &BucketAggregate| -> String {
-        let mut suffix = String::new();
-        if report.calls_available {
-            let _ = write!(
-                suffix,
-                "   calls {:>5.1}%",
-                percent(bucket.calls, report.calls)
-            );
-        }
-        if report.time_available {
-            let _ = write!(
-                suffix,
-                "  time {:>5.1}%",
-                percent_time(bucket.time_ms, report.time_ms)
-            );
-        }
-        suffix
-    };
-
     let bucket_line = |out: &mut String, name: &str, bucket: &BucketAggregate| {
         let _ = writeln!(
             out,
             "{name:<13}{} statements ({:.1}%){}",
             bucket.statements,
             percent(bucket.statements, report.statements),
-            weighted(bucket)
+            weight_suffix(report, bucket)
         );
     };
 
@@ -441,7 +592,7 @@ pub fn check_report_render(report: &CheckReport) -> String {
                 reason.label,
                 reason.bucket.statements,
                 percent(reason.bucket.statements, report.statements),
-                weighted(&reason.bucket)
+                weight_suffix(report, &reason.bucket)
             );
         }
     }
@@ -488,6 +639,10 @@ pub fn check_report_render(report: &CheckReport) -> String {
         fingerprint_kind,
         report.distinct_shapes
     );
+
+    if list_statements {
+        statements_render(&mut out, report);
+    }
 
     let _ = writeln!(out);
     let _ = writeln!(out, "Assumptions (schema-less mode):");
