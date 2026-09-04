@@ -19,9 +19,9 @@ pub struct BucketAggregate {
 }
 
 impl BucketAggregate {
-    fn add(&mut self, calls: u64, time_ms: Option<f64>) {
+    fn add(&mut self, calls: Option<u64>, time_ms: Option<f64>) {
         self.statements += 1;
-        self.calls += calls;
+        self.calls += calls.unwrap_or(0);
         self.time_ms += time_ms.unwrap_or(0.0);
     }
 }
@@ -37,6 +37,7 @@ pub struct ReasonAggregate {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TableWrites {
     pub table: String,
+    pub statements: u64,
     pub calls: u64,
 }
 
@@ -54,6 +55,8 @@ pub struct StatementVerdict {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CheckReport {
     pub statements: u64,
+    /// Call counts exist only when the source carries them (pg_stat_statements).
+    pub calls_available: bool,
     pub calls: u64,
     pub time_available: bool,
     pub time_ms: f64,
@@ -164,13 +167,14 @@ pub fn check_report_build(
 ) -> CheckReport {
     let mut statements = 0u64;
     let mut calls = 0u64;
+    let mut calls_available = false;
     let mut time_ms = 0.0f64;
     let mut time_available = false;
     let mut cacheable = BucketAggregate::default();
     let mut write = BucketAggregate::default();
     let mut utility = BucketAggregate::default();
     let mut passthrough_by_reason: HashMap<PassthroughReason, BucketAggregate> = HashMap::new();
-    let mut writes_by_table: HashMap<String, u64> = HashMap::new();
+    let mut writes_by_table: HashMap<String, (u64, u64)> = HashMap::new();
     let mut distinct_statements: HashSet<&str> = HashSet::new();
     let mut fingerprints: HashSet<Fingerprint> = HashSet::new();
     let mut shapes: HashSet<ShapeKey> = HashSet::new();
@@ -182,9 +186,12 @@ pub fn check_report_build(
     };
 
     for item in items {
-        let statement_calls = item.trace.calls.max(1);
+        let statement_calls = item.trace.calls;
         statements += 1;
-        calls += statement_calls;
+        if let Some(c) = statement_calls {
+            calls_available = true;
+            calls += c;
+        }
         if let Some(t) = item.trace.total_time_ms {
             time_available = true;
             time_ms += t;
@@ -205,17 +212,21 @@ pub fn check_report_build(
                     .or_default()
                     .add(statement_calls, item.trace.total_time_ms);
                 if let Some(write_class) = cte_write {
-                    *writes_by_table
+                    let entry = writes_by_table
                         .entry(write_class_table(write_class))
-                        .or_default() += statement_calls;
+                        .or_default();
+                    entry.0 += 1;
+                    entry.1 += statement_calls.unwrap_or(0);
                 }
                 ("passthrough", Some(reason.label()))
             }
             Verdict::Write(write_class) => {
                 write.add(statement_calls, item.trace.total_time_ms);
-                *writes_by_table
+                let entry = writes_by_table
                     .entry(write_class_table(write_class))
-                    .or_default() += statement_calls;
+                    .or_default();
+                entry.0 += 1;
+                entry.1 += statement_calls.unwrap_or(0);
                 ("write", None)
             }
             Verdict::Utility(_) => {
@@ -248,16 +259,26 @@ pub fn check_report_build(
             bucket,
         })
         .collect();
-    passthrough.sort_by_key(|reason| std::cmp::Reverse(reason.bucket.calls));
+    passthrough
+        .sort_by_key(|reason| std::cmp::Reverse((reason.bucket.statements, reason.bucket.calls)));
 
     let mut writes_sorted: Vec<TableWrites> = writes_by_table
         .into_iter()
-        .map(|(table, calls)| TableWrites { table, calls })
+        .map(|(table, (statements, calls))| TableWrites {
+            table,
+            statements,
+            calls,
+        })
         .collect();
-    writes_sorted.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.table.cmp(&b.table)));
+    writes_sorted.sort_by(|a, b| {
+        (b.statements, b.calls)
+            .cmp(&(a.statements, a.calls))
+            .then(a.table.cmp(&b.table))
+    });
 
     CheckReport {
         statements,
+        calls_available,
         calls,
         time_available,
         time_ms,
@@ -337,6 +358,16 @@ fn percent(part: u64, whole: u64) -> f64 {
     }
 }
 
+/// Width of a left-aligned label column: the longest label plus a gap, never
+/// narrower than the default so short reports keep a stable layout.
+fn label_column_width<'a>(labels: impl Iterator<Item = &'a str>) -> usize {
+    labels
+        .map(|label| label.chars().count() + 2)
+        .max()
+        .unwrap_or(0)
+        .max(32)
+}
+
 fn percent_time(part: f64, whole: f64) -> f64 {
     if whole <= 0.0 {
         0.0
@@ -347,70 +378,99 @@ fn percent_time(part: f64, whole: f64) -> f64 {
 
 pub fn check_report_render(report: &CheckReport) -> String {
     let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "pgcache-fit check — {} statements, {} calls",
-        report.statements, report.calls
-    );
+    let mut header = format!("pgcache-fit check — {} statements", report.statements);
+    if report.calls_available {
+        let _ = write!(header, " ({} calls", report.calls);
+        if report.time_available {
+            let _ = write!(header, ", {:.1} ms", report.time_ms);
+        }
+        header.push(')');
+    }
+    let _ = writeln!(out, "{header}");
     let _ = writeln!(out);
 
-    let bucket_line = |out: &mut String, name: &str, bucket: &BucketAggregate| {
-        let mut line = format!(
-            "{name:<13}{:>5.1}% of calls ({} statements)",
-            percent(bucket.calls, report.calls),
-            bucket.statements
-        );
+    // Call/time weighting is appended after the statement view, only when
+    // the source carries it.
+    let weighted = |bucket: &BucketAggregate| -> String {
+        let mut suffix = String::new();
+        if report.calls_available {
+            let _ = write!(
+                suffix,
+                "   calls {:>5.1}%",
+                percent(bucket.calls, report.calls)
+            );
+        }
         if report.time_available {
             let _ = write!(
-                line,
-                " / {:.1}% of time",
+                suffix,
+                "  time {:>5.1}%",
                 percent_time(bucket.time_ms, report.time_ms)
             );
         }
-        let _ = writeln!(out, "{line}");
+        suffix
+    };
+
+    let bucket_line = |out: &mut String, name: &str, bucket: &BucketAggregate| {
+        let _ = writeln!(
+            out,
+            "{name:<13}{} statements ({:.1}%){}",
+            bucket.statements,
+            percent(bucket.statements, report.statements),
+            weighted(bucket)
+        );
     };
 
     bucket_line(&mut out, "Cacheable:", &report.cacheable);
-    let passthrough_total: u64 = report.passthrough.iter().map(|r| r.bucket.calls).sum();
-    if passthrough_total > 0 {
-        let _ = writeln!(
-            out,
-            "Passthrough: {:>5.1}% of calls",
-            percent(passthrough_total, report.calls)
-        );
+    if !report.passthrough.is_empty() {
+        let passthrough_total =
+            report
+                .passthrough
+                .iter()
+                .fold(BucketAggregate::default(), |mut total, reason| {
+                    total.statements += reason.bucket.statements;
+                    total.calls += reason.bucket.calls;
+                    total.time_ms += reason.bucket.time_ms;
+                    total
+                });
+        bucket_line(&mut out, "Passthrough:", &passthrough_total);
+        let label_width = label_column_width(report.passthrough.iter().map(|r| r.label));
         for reason in &report.passthrough {
-            let mut line = format!(
-                "  {:<32}{:>5.1}% of calls ({})",
+            let _ = writeln!(
+                out,
+                "  {:<label_width$}{} ({:.1}%){}",
                 reason.label,
-                percent(reason.bucket.calls, report.calls),
-                reason.bucket.statements
+                reason.bucket.statements,
+                percent(reason.bucket.statements, report.statements),
+                weighted(&reason.bucket)
             );
-            if report.time_available {
-                let _ = write!(
-                    line,
-                    " / {:.1}% of time",
-                    percent_time(reason.bucket.time_ms, report.time_ms)
-                );
-            }
-            let _ = writeln!(out, "{line}");
         }
     }
-    if report.write.calls > 0 {
+    if report.write.statements > 0 {
         bucket_line(&mut out, "Writes:", &report.write);
     }
-    if report.utility.calls > 0 {
+    if report.utility.statements > 0 {
         bucket_line(&mut out, "Utility:", &report.utility);
     }
 
     if !report.writes_by_table.is_empty() {
         let _ = writeln!(out);
         let _ = writeln!(out, "Write mix by table:");
+        let label_width =
+            label_column_width(report.writes_by_table.iter().map(|t| t.table.as_str()));
         for table_writes in &report.writes_by_table {
-            let _ = writeln!(
-                out,
-                "  {:<32}{} calls",
-                table_writes.table, table_writes.calls
+            let noun = if table_writes.statements == 1 {
+                "statement"
+            } else {
+                "statements"
+            };
+            let mut line = format!(
+                "  {:<label_width$}{} {noun}",
+                table_writes.table, table_writes.statements
             );
+            if report.calls_available {
+                let _ = write!(line, " ({} calls)", table_writes.calls);
+            }
+            let _ = writeln!(out, "{line}");
         }
     }
 

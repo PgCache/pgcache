@@ -70,21 +70,29 @@ override input auto-detection.
 
 ```
 $ pgcache-fit check queries.sql
-pgcache-fit check — 6 statements, 6 calls
+pgcache-fit check — 6 statements
 
-Cacheable:    50.0% of calls (3 statements)
-Passthrough:  33.3% of calls
-  unsupported FROM clause          16.7% of calls (1)
-  non-immutable function           16.7% of calls (1)
-Writes:       16.7% of calls (1 statements)
+Cacheable:   3 statements (50.0%)
+Passthrough: 2 statements (33.3%)
+  unsupported FROM clause         1 (16.7%)
+  non-immutable function          1 (16.7%)
+Writes:      1 statements (16.7%)
 
 Write mix by table:
-  users                           1 calls
+  users                           1 statement
 
 Shapes: 6 distinct statements → 3 fingerprints → 3 shapes
 
 Assumptions (schema-less mode):
   ...
+```
+
+Percentages are of statements. When the input carries call counts
+(pg_stat_statements), each line also shows the share of calls, and of
+execution time when that column is present:
+
+```
+Cacheable:   3 statements (50.0%)   calls  71.9%  time  31.5%
 ```
 
 - **Cacheable** — pgcache would cache this SELECT.

@@ -104,7 +104,7 @@ pub fn hitrate_replay(items: &[AnalyzedStatement], config: ReplayConfig) -> Hitr
     let mut in_transaction: HashMap<u64, bool> = HashMap::new();
 
     for item in items {
-        let calls = item.trace.calls.max(1);
+        let calls = item.trace.calls.unwrap_or(1);
         stats.statements += 1;
         stats.calls += calls;
         let analysis = match &*item.verdict {
@@ -224,7 +224,7 @@ mod tests {
                     trace: TraceStatement {
                         sql: (*sql).into(),
                         parameters: Vec::new(),
-                        calls: 1,
+                        calls: None,
                         total_time_ms: None,
                         session: 0,
                     },
@@ -290,7 +290,7 @@ mod tests {
                 trace: TraceStatement {
                     sql: sql.into(),
                     parameters: Vec::new(),
-                    calls: 100,
+                    calls: Some(100),
                     total_time_ms: None,
                     session: 0,
                 },

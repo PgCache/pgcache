@@ -25,7 +25,9 @@ pub enum TraceFormat {
 pub struct TraceStatement {
     pub sql: EcoString,
     pub parameters: Vec<Option<EcoString>>,
-    pub calls: u64,
+    /// Call count from the source (pg_stat_statements); `None` when the
+    /// source is one occurrence per line.
+    pub calls: Option<u64>,
     pub total_time_ms: Option<f64>,
     /// Backend identity from the log line prefix (pid); 0 when the source
     /// carries none (SQL files, pgss). Scopes the replay's transaction gate.
@@ -37,7 +39,7 @@ impl TraceStatement {
         TraceStatement {
             sql: sql.into(),
             parameters: Vec::new(),
-            calls: 1,
+            calls: None,
             total_time_ms: None,
             session: 0,
         }
@@ -164,7 +166,7 @@ fn csvlog_read(content: &str) -> anyhow::Result<TraceRead> {
         out.push(TraceStatement {
             sql: sql.into(),
             parameters,
-            calls: 1,
+            calls: None,
             total_time_ms: duration_ms,
             session,
         });
@@ -309,7 +311,7 @@ fn stderr_log_read(content: &str) -> TraceRead {
         out.push(TraceStatement {
             sql: p.sql,
             parameters,
-            calls: 1,
+            calls: None,
             total_time_ms: p.duration_ms,
             session: p.session,
         });
@@ -453,7 +455,7 @@ fn pgss_read(content: &str) -> anyhow::Result<TraceRead> {
         let calls = calls_column
             .and_then(|c| record.get(c))
             .and_then(|v| v.trim().parse::<f64>().ok())
-            .map_or(1, |v| v.max(1.0) as u64);
+            .map(|v| v.max(1.0) as u64);
         let total_time_ms = time_column
             .and_then(|c| record.get(c))
             .and_then(|v| v.trim().parse::<f64>().ok());
@@ -620,7 +622,7 @@ query,calls,total_exec_time
 ";
         let statements = pgss_read(csv).expect("parse pgss csv").statements;
         assert_eq!(statements.len(), 2);
-        assert_eq!(statements[0].calls, 100);
+        assert_eq!(statements[0].calls, Some(100));
         assert_eq!(statements[0].total_time_ms, Some(12.5));
     }
 
