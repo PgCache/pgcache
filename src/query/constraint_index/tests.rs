@@ -340,35 +340,59 @@ fn test_remove_unconstrained_drops_empty_class() {
     assert!(idx.candidates(&[]).is_empty());
 }
 
-// Documented limitation: parents in non-empty equality classes are only
-// probed when new is *fully* equality-pure on at least one matching
-// subset. When new is overall Complex (any non-equality constraint), the
-// equality probe is skipped for non-empty subsets — even if new has
-// matching equality on the subset's columns. This is a lossy-safe
-// false negative: we populate from origin rather than stamping, never
-// a wrong subsumption claim.
-//
-// The fingerprint can still be found via the complex bucket of the
-// matching subset class, so the only true miss is when the parent is in
-// an equality bucket of a non-empty class AND new is overall complex.
+// PGC-412: the equality probe is decided per subset class, from the new
+// query's per-column ranges on that subset — not from whether the new query
+// is equality-pure overall. A parent in a non-empty equality bucket is found
+// whenever new reduces to its value tuple on the class columns, whatever new
+// does on other columns.
+
 #[test]
-fn test_known_limitation_equality_parent_missed_by_complex_new() {
+fn test_equality_parent_found_by_complex_new_range() {
     let mut idx = ConstraintIndex::<Fingerprint>::new();
     // Parent: WHERE a = 5 — lives in class {a}.equality[(5,)]
     idx.insert(fp(1), &[eq("a", int(5))]);
 
     // New: WHERE a = 5 AND b > 10 — Complex overall, columns {a, b}
     let new = vec![eq("a", int(5)), gt("b", int(10))];
-    let candidates = idx.candidates(&new);
+    assert_eq!(idx.candidates(&new), fps([1]));
+}
 
-    // The parent COULD subsume (parent's a=5 ⊇ new's a=5∧b>10 on column
-    // a; parent has no constraint on b → covers all b). But the index
-    // currently misses this — see comment above. Update this test if the
-    // limitation is removed (per-column equality detection in candidates).
-    assert!(
-        !candidates.contains(&fp(1)),
-        "limitation: equality parent in non-empty class not probed when new is Complex"
-    );
+#[test]
+fn test_equality_parent_found_by_complex_new_inset() {
+    let mut idx = ConstraintIndex::<Fingerprint>::new();
+    idx.insert(fp(1), &[eq("a", int(5))]);
+
+    let new = vec![eq("a", int(5)), any_of("b", vec![int(1), int(2)])];
+    assert_eq!(idx.candidates(&new), fps([1]));
+}
+
+#[test]
+fn test_equality_parent_found_by_complex_new_cast() {
+    let mut idx = ConstraintIndex::<Fingerprint>::new();
+    idx.insert(fp(1), &[eq("a", int(5))]);
+
+    let new = vec![eq("a", int(5)), cast_eq("b", CastTarget::Text, text("x"))];
+    assert_eq!(idx.candidates(&new), fps([1]));
+}
+
+#[test]
+fn test_multi_column_equality_parent_found_via_subset_of_complex_new() {
+    let mut idx = ConstraintIndex::<Fingerprint>::new();
+    // Parent: WHERE a = 5 AND b = 6 — class {a, b}.equality[(5, 6)]
+    idx.insert(fp(1), &[eq("a", int(5)), eq("b", int(6))]);
+
+    // New: WHERE a = 5 AND b = 6 AND c > 1 — found via the {a, b} subset.
+    let new = vec![eq("a", int(5)), eq("b", int(6)), gt("c", int(1))];
+    assert_eq!(idx.candidates(&new), fps([1]));
+}
+
+#[test]
+fn test_equality_parent_excluded_by_complex_new_with_different_value() {
+    let mut idx = ConstraintIndex::<Fingerprint>::new();
+    idx.insert(fp(1), &[eq("a", int(5))]);
+
+    let new = vec![eq("a", int(6)), gt("b", int(1))];
+    assert!(idx.candidates(&new).is_empty());
 }
 
 /// Mirrors `docs/walkthroughs/subsumption-index.md`: two parents on `orders`,
@@ -390,16 +414,17 @@ fn test_walkthrough_two_parents_four_queries() {
     let q1 = idx.candidates(&[eq("tenant_id", int(7)), eq("status", text("open"))]);
     assert_eq!(q1, fps([1]));
 
-    // Query 2: complex. B is found via the {created_at, tenant_id} class. A
-    // is missed because the equality probe is skipped for a complex new
-    // query (PGC-412; expect {1, 2} once fixed).
+    // Query 2: complex. A is found via the {tenant_id} class's equality
+    // bucket (new reduces to Equal(7) on that subset); B via the
+    // {created_at, tenant_id} class's complex index.
     let q2 = idx.candidates(&[eq("tenant_id", int(7)), gt("created_at", int(150))]);
-    assert_eq!(q2, fps([2]));
+    assert_eq!(q2, fps([1, 2]));
 
     // Query 3: B's lower bound 100 is above 50, so the created_at column
-    // returns nothing and the per-column intersection is empty.
+    // returns nothing and the per-column intersection is empty. A is still
+    // found via {tenant_id}.
     let q3 = idx.candidates(&[eq("tenant_id", int(7)), gt("created_at", int(50))]);
-    assert!(q3.is_empty());
+    assert_eq!(q3, fps([1]));
 
     // Query 4: only B registered. The new query's classes {} and {tenant_id}
     // don't exist, so B (narrower) is never a candidate.

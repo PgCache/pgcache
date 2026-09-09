@@ -22,6 +22,16 @@ pub(super) enum Classification {
     },
 }
 
+impl Classification {
+    pub(super) fn into_columns(self) -> ColumnSet {
+        match self {
+            Classification::EqualityPure { columns, .. } | Classification::Complex { columns } => {
+                columns
+            }
+        }
+    }
+}
+
 /// Classify a query's table constraints. Equality-pure iff every constraint
 /// is `Comparison(_, Equal, _)` and every constrained column has exactly one
 /// such constraint with a consistent value.
@@ -94,27 +104,6 @@ pub(super) fn column_set_powerset(set: &ColumnSet) -> Vec<ColumnSet> {
         subsets.push(ColumnSet(subset));
     }
     subsets
-}
-
-/// Project a value tuple onto a subset of the original column set. Both
-/// `full_columns` and `subset` are sorted; we walk in lockstep.
-pub(super) fn project_values(
-    full_columns: &ColumnSet,
-    full_values: &[ValueKey],
-    subset: &ColumnSet,
-) -> Option<Vec<ValueKey>> {
-    let mut result = Vec::with_capacity(subset.len());
-    let mut full_iter = full_columns.columns().iter().zip(full_values);
-    for sub_col in subset.columns() {
-        loop {
-            let (col, val) = full_iter.next()?;
-            if col == sub_col {
-                result.push(val.clone());
-                break;
-            }
-        }
-    }
-    Some(result)
 }
 
 /// Cartesian product of per-column key sets, for the point-probe equality

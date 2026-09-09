@@ -41,7 +41,7 @@ classes:
 
 1. Classify: `EqualityPure`, columns `{status, tenant_id}`, values `[Str("open"), Num(7)]`.
 2. Powerset: `{}`, `{status}`, `{tenant_id}`, `{status, tenant_id}`. Only `{tenant_id}` exists as a class.
-3. Probe `{tenant_id}`: project the value tuple onto the subset, giving `[Num(7)]`. Equality hash hit: A. The class's complex index is empty.
+3. Probe `{tenant_id}`: `column_ranges` on the subset gives `[Equal(7)]`, all equality, so the key is `[Num(7)]`. Equality hash hit: A. The class's complex index is empty.
 4. Candidates: `{A}`.
 5. Precise check: A constrains only `tenant_id`; cached `Equal(7)` against new `Equal(7)` passes. Gates (no LIMIT, Ready, single relation) pass.
 
@@ -51,23 +51,24 @@ B was never consulted, correctly: its class constrains `created_at`, which Query
 
 ## Query 2: `WHERE tenant_id = 7 AND created_at > 150`
 
-1. Classify: `Complex`, columns `{created_at, tenant_id}`. No joint value tuple.
+1. Classify: `Complex`, columns `{created_at, tenant_id}`. Only the column set is used from here; the equality probe is decided per subset below.
 2. Powerset: `{}`, `{created_at}`, `{tenant_id}`, `{created_at, tenant_id}`. Two classes exist.
-3. Probe `{tenant_id}`: the equality probe is skipped because the new query is not equality-pure overall. The complex probe builds `[Equal(7)]` and asks the class's complex index, which is empty. Nothing. **A is missed.**
-4. Probe `{created_at, tenant_id}`: ranges `[Range { lower: 150 }, Equal(7)]`.
+3. Probe `{tenant_id}`: `column_ranges` on the subset gives `[Equal(7)]`, so the equality key is `[Num(7)]`. Hash hit: A. The class's complex index is empty.
+4. Probe `{created_at, tenant_id}`: ranges `[Range { lower: 150 }, Equal(7)]`. Not all equality, so no equality key; the complex probe runs.
    - `created_at` column: `range_lower.range(..=150)` finds key 100, giving `[B]`.
    - `tenant_id` column: `eq[Num(7)]` gives `[B]`.
    - Intersect smallest-first: `{B}`.
-5. Candidates: `{B}`.
-6. Precise check on B: `created_at` cached `Range { lower: 100 }` against new `Range { lower: 150 }`; the new bound is at least as tight, pass. `tenant_id` equal, pass.
+5. Candidates: `{A, B}`.
+6. Precise check on A: A constrains only `tenant_id`; cached `Equal(7)` against new `Equal(7)` passes. A covers every `created_at`, so the new range is inside it.
+7. Precise check on B: `created_at` cached `Range { lower: 100 }` against new `Range { lower: 150 }`; the new bound is at least as tight, pass. `tenant_id` equal, pass.
 
-**Subsumed by B.** The outcome is right, but step 3 is a known gap: an equality-pure parent in a non-empty class is only reachable when the new query is itself equality-pure on that subset. If B did not exist, Query 2 would populate from origin even though A covers it. Tracked as PGC-412; when it lands, step 3 finds A and the candidate set becomes `{A, B}`.
+**Subsumed** (by A or B; the first passing candidate wins). The equality probe at step 3 keys on the new query's ranges over the subset's columns, not on whether the new query is equality-pure overall, so a broad equality parent is reachable from any narrower query that keeps the same equality (PGC-412).
 
 ## Query 3: `WHERE tenant_id = 7 AND created_at > 50`
 
-Same walk as Query 2 until the `created_at` column probe. `range_lower.range(..=50)` finds nothing, because B's bound of 100 is above 50. That column's match set is empty, so the intersection is empty. A is missed for the same reason as in Query 2.
+Same walk as Query 2 until the `created_at` column probe. `range_lower.range(..=50)` finds nothing, because B's bound of 100 is above 50. That column's match set is empty, so the intersection is empty. A is still found via `{tenant_id}`.
 
-**No candidates, not subsumed, populate from origin.** Correct for B: rows with `created_at` between 50 and 100 are not in the cache.
+**Candidates `{A}`, subsumed by A.** Correct: B could not cover it, since rows with `created_at` between 50 and 100 may be absent from B's load, and the index excluded B on the column alone. A loaded every row for tenant 7, so it does cover the query.
 
 ## Query 4: `WHERE tenant_id = 7` with only B registered
 

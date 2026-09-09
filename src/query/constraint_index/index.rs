@@ -9,7 +9,7 @@ use crate::id_hash::IdHashable;
 use crate::query::constraints::TableConstraint;
 
 use super::classify::{
-    Classification, classify, column_ranges, column_set_powerset, project_values, value_key_product,
+    Classification, classify, column_ranges, column_set_powerset, value_key_product,
 };
 use super::column_index::ComplexIndex;
 use super::value_key::ValueKey;
@@ -139,35 +139,38 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
     /// under-returns a true subsumer.
     pub fn candidates(&self, new_constraints: &[TableConstraint]) -> IdSet<K> {
         let mut candidates = IdSet::default();
-        let new_class = classify(new_constraints);
-        let (new_columns, new_values_opt) = match &new_class {
-            Classification::EqualityPure { columns, values } => (columns, Some(values)),
-            Classification::Complex { columns } => (columns, None),
-        };
+        let new_columns = classify(new_constraints).into_columns();
 
-        for subset in column_set_powerset(new_columns) {
+        for subset in column_set_powerset(&new_columns) {
             let Some(bucket) = self.classes.get(&subset) else {
                 continue;
             };
-            // Equality probe: when new is equality-pure on `subset`, parents
-            // with exactly-matching values are candidates. Independently, the
-            // empty subset always probes the empty-tuple key — that bucket
-            // holds truly unconstrained parents, which subsume any new query
-            // regardless of new's shape.
-            let probe_values = if subset.columns().is_empty() {
-                Some(Vec::new())
-            } else {
-                new_values_opt.and_then(|nv| project_values(new_columns, nv, &subset))
-            };
-            if let Some(values) = probe_values
-                && let Some(fps) = bucket.equality.get(&values)
+            // `new` constrains every column of `subset` (subset is a subset
+            // of new's columns), so the ranges are fully populated.
+            let ranges = column_ranges(new_constraints, &subset);
+            // Equality probe: when new reduces to a keyable `Equal(v)` on
+            // every column of `subset`, parents with exactly that value tuple
+            // are candidates — regardless of what new does on columns outside
+            // the subset (PGC-412). The empty subset reduces to the empty
+            // tuple, which holds truly unconstrained parents.
+            let equality_key: Option<Vec<ValueKey>> = ranges
+                .iter()
+                .map(|r| match r {
+                    ColumnRange::Equal(v) => ValueKey::try_new(v),
+                    ColumnRange::Unknown
+                    | ColumnRange::Unconstrained
+                    | ColumnRange::Empty
+                    | ColumnRange::InSet(_)
+                    | ColumnRange::Range { .. } => None,
+                })
+                .collect();
+            if let Some(key) = equality_key
+                && let Some(fps) = bucket.equality.get(&key)
             {
                 candidates.extend(fps);
             }
             // Complex probe: per-column containment lookup over the subset's
-            // columns. `new` constrains every column of `subset` (subset is a
-            // subset of new's columns), so the ranges are fully populated.
-            let ranges = column_ranges(new_constraints, &subset);
+            // columns.
             candidates.extend(bucket.complex.candidates(&ranges));
         }
         candidates
