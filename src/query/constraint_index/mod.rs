@@ -88,6 +88,15 @@ impl ColumnSet {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// Whether every column of `self` is in `other`. Both sides are sorted
+    /// and deduplicated by construction, so this is a single merge walk.
+    pub fn is_subset_of(&self, other: &ColumnSet) -> bool {
+        let mut other_iter = other.0.iter();
+        self.0
+            .iter()
+            .all(|col| other_iter.by_ref().any(|other_col| other_col == col))
+    }
 }
 
 /// Sub-linear per-relation constraint-containment index.

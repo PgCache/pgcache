@@ -137,43 +137,70 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
     /// via hash lookup; complex-bucket parents are filtered per-column via
     /// `ComplexIndex` (PGC-129/189). Lossy-safe: may over-return, never
     /// under-returns a true subsumer.
+    ///
+    /// Covering classes are found from whichever side is smaller (PGC-410):
+    /// hash-probe each subset of new's columns when 2^n is no larger than
+    /// the class count, else walk the classes and keep those whose column
+    /// set is a subset of new's. Cost is `min(2^n, |classes| × n)`, so a
+    /// wide generated WHERE stays cheap against the handful of shapes
+    /// actually registered.
     pub fn candidates(&self, new_constraints: &[TableConstraint]) -> IdSet<K> {
         let mut candidates = IdSet::default();
         let new_columns = classify(new_constraints).into_columns();
+        let n = new_columns.len();
 
-        for subset in column_set_powerset(&new_columns) {
-            let Some(bucket) = self.classes.get(&subset) else {
-                continue;
-            };
-            // `new` constrains every column of `subset` (subset is a subset
-            // of new's columns), so the ranges are fully populated.
-            let ranges = column_ranges(new_constraints, &subset);
-            // Equality probe: when new reduces to a keyable `Equal(v)` on
-            // every column of `subset`, parents with exactly that value tuple
-            // are candidates — regardless of what new does on columns outside
-            // the subset (PGC-412). The empty subset reduces to the empty
-            // tuple, which holds truly unconstrained parents.
-            let equality_key: Option<Vec<ValueKey>> = ranges
-                .iter()
-                .map(|r| match r {
-                    ColumnRange::Equal(v) => ValueKey::try_new(v),
-                    ColumnRange::Unknown
-                    | ColumnRange::Unconstrained
-                    | ColumnRange::Empty
-                    | ColumnRange::InSet(_)
-                    | ColumnRange::Range { .. } => None,
-                })
-                .collect();
-            if let Some(key) = equality_key
-                && let Some(fps) = bucket.equality.get(&key)
-            {
-                candidates.extend(fps);
+        let powerset_is_smaller = n < u32::BITS as usize && (1usize << n) <= self.classes.len();
+        if powerset_is_smaller {
+            for subset in column_set_powerset(&new_columns) {
+                if let Some(bucket) = self.classes.get(&subset) {
+                    self.subset_probe(new_constraints, &subset, bucket, &mut candidates);
+                }
             }
-            // Complex probe: per-column containment lookup over the subset's
-            // columns.
-            candidates.extend(bucket.complex.candidates(&ranges));
+        } else {
+            for (subset, bucket) in &self.classes {
+                if subset.is_subset_of(&new_columns) {
+                    self.subset_probe(new_constraints, subset, bucket, &mut candidates);
+                }
+            }
         }
         candidates
+    }
+
+    /// Probe one covering class for [`candidates`](Self::candidates).
+    /// `subset` is a subset of new's constrained columns, so `new`
+    /// constrains every column of it and the ranges are fully populated.
+    fn subset_probe(
+        &self,
+        new_constraints: &[TableConstraint],
+        subset: &ColumnSet,
+        bucket: &SubsumptionClass<K>,
+        candidates: &mut IdSet<K>,
+    ) {
+        let ranges = column_ranges(new_constraints, subset);
+        // Equality probe: when new reduces to a keyable `Equal(v)` on
+        // every column of `subset`, parents with exactly that value tuple
+        // are candidates — regardless of what new does on columns outside
+        // the subset (PGC-412). The empty subset reduces to the empty
+        // tuple, which holds truly unconstrained parents.
+        let equality_key: Option<Vec<ValueKey>> = ranges
+            .iter()
+            .map(|r| match r {
+                ColumnRange::Equal(v) => ValueKey::try_new(v),
+                ColumnRange::Unknown
+                | ColumnRange::Unconstrained
+                | ColumnRange::Empty
+                | ColumnRange::InSet(_)
+                | ColumnRange::Range { .. } => None,
+            })
+            .collect();
+        if let Some(key) = equality_key
+            && let Some(fps) = bucket.equality.get(&key)
+        {
+            candidates.extend(fps);
+        }
+        // Complex probe: per-column containment lookup over the subset's
+        // columns.
+        candidates.extend(bucket.complex.candidates(&ranges));
     }
 
     /// Candidate entries whose constraints a single row satisfies. Unlike

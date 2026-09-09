@@ -82,6 +82,11 @@ per class column, with `candidates()` intersecting their per-column matches.
   `table_constraints_subsumed` are two halves of one subsumption mechanism.
 
 ## Implementation Notes
+Covering classes for a lookup are enumerated from whichever side is smaller:
+the powerset of the new query's columns when `2^n` is at most the class
+count, else the class map filtered by a sorted subset test, for
+`min(2^n, |classes| × n)` (PGC-410).
+
 Two-sided-range support (a real 2-D containment structure) and set-trie
 indexing for `InSet` are left to a future V2, triggered when
 `complex_fallback_total` grows relative to `complex_total`.

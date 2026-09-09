@@ -88,12 +88,17 @@ pub(super) fn classify(constraints: &[TableConstraint]) -> Classification {
 }
 
 /// Enumerate all subsets of a column set, each as a sorted `ColumnSet`.
-/// Bounded by 2^|set| — typical |constraint_columns| ≤ 4 keeps this small.
-pub(super) fn column_set_powerset(set: &ColumnSet) -> Vec<ColumnSet> {
+/// 2^|set| subsets, yielded lazily. Callers only take this branch when
+/// 2^|set| is no larger than the class count (PGC-410), which keeps the
+/// `u32` mask in range.
+pub(super) fn column_set_powerset(set: &ColumnSet) -> impl Iterator<Item = ColumnSet> + '_ {
     let cols = set.columns();
     let n = cols.len();
-    let mut subsets = Vec::with_capacity(1usize << n);
-    for mask in 0u32..(1u32 << n) {
+    debug_assert!(
+        n < u32::BITS as usize,
+        "powerset branch taken for {n} columns"
+    );
+    (0u32..(1u32 << n)).map(move |mask| {
         let mut subset = Vec::with_capacity(mask.count_ones() as usize);
         for (i, col) in cols.iter().enumerate() {
             if mask & (1 << i) != 0 {
@@ -101,9 +106,8 @@ pub(super) fn column_set_powerset(set: &ColumnSet) -> Vec<ColumnSet> {
             }
         }
         // `cols` is sorted, so the subset stays sorted by construction.
-        subsets.push(ColumnSet(subset));
-    }
-    subsets
+        ColumnSet(subset)
+    })
 }
 
 /// Cartesian product of per-column key sets, for the point-probe equality

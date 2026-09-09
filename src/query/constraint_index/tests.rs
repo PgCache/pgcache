@@ -241,7 +241,59 @@ fn test_powerset_bounded_by_column_count() {
     // 4 columns → 16 subsets. Just confirm we don't explode for a
     // realistic max.
     let cols = ColumnSet::new(vec![col("a"), col("b"), col("c"), col("d")]);
-    assert_eq!(column_set_powerset(&cols).len(), 16);
+    assert_eq!(column_set_powerset(&cols).count(), 16);
+}
+
+// PGC-410: covering classes come from whichever side is smaller — the
+// powerset of new's columns, or the class map filtered by subset.
+
+#[test]
+fn test_column_set_is_subset_of() {
+    let empty = ColumnSet::new(vec![]);
+    let ab = ColumnSet::new(vec![col("a"), col("b")]);
+    let abd = ColumnSet::new(vec![col("a"), col("b"), col("d")]);
+    let ad = ColumnSet::new(vec![col("a"), col("d")]);
+    let bc = ColumnSet::new(vec![col("b"), col("c")]);
+
+    assert!(empty.is_subset_of(&empty));
+    assert!(empty.is_subset_of(&ab));
+    assert!(!ab.is_subset_of(&empty));
+    assert!(ab.is_subset_of(&ab));
+    assert!(ab.is_subset_of(&abd));
+    assert!(!abd.is_subset_of(&ab));
+    // The walk must skip `b` in the superset to find `d`.
+    assert!(ad.is_subset_of(&abd));
+    // Shares `b` but `c` is absent.
+    assert!(!bc.is_subset_of(&abd));
+}
+
+#[test]
+fn test_wide_new_query_finds_parents_via_class_walk() {
+    let mut idx = ConstraintIndex::<Fingerprint>::new();
+    idx.insert(fp(1), &[eq("c00", int(5))]);
+    idx.insert(fp(2), &[eq("c00", int(5)), gt("c01", int(0))]);
+    idx.insert(fp(3), &[eq("c00", int(6))]);
+    idx.insert(fp(4), &[]);
+
+    // 40 constrained columns: 2^40 subsets would be unenumerable (and the
+    // u32 mask would overflow); the class walk costs 4 × 40 comparisons.
+    let mut new = vec![eq("c00", int(5))];
+    new.extend((1..40).map(|i| gt(&format!("c{i:02}"), int(1))));
+    assert_eq!(idx.candidates(&new), fps([1, 2, 4]));
+}
+
+#[test]
+fn test_narrow_new_query_against_many_classes_uses_powerset() {
+    let mut idx = ConstraintIndex::<Fingerprint>::new();
+    // 20 single-column classes: 2^2 = 4 subsets is the smaller side.
+    for i in 0..20u64 {
+        idx.insert(fp(i), &[eq(&format!("c{i:02}"), int(1))]);
+    }
+    let new = vec![eq("c03", int(1)), eq("c17", int(1))];
+    assert_eq!(idx.candidates(&new), fps([3, 17]));
+    // Same shape, one value off: only the matching class hits.
+    let new = vec![eq("c03", int(1)), eq("c17", int(2))];
+    assert_eq!(idx.candidates(&new), fps([3]));
 }
 
 // Regression: unconstrained parents must be findable by *complex* new

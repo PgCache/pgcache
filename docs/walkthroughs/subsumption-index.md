@@ -9,7 +9,7 @@ Decisions behind the structure: ADR-024 (subsumption rule), ADR-029 (per-column 
 - **Parent**: an already-cached query whose data might cover a new one.
 - **Subsumed**: the new query's result set is guaranteed to lie inside a parent's loaded rows. The parent's predicate region contains the new query's region, so the new query is at least as restrictive.
 - **Class**: entries in the index are partitioned per table by `ColumnSet`, the sorted set of columns their constraints mention. Within a class, equality-pure entries sit in a joint-value-tuple hash; everything else goes to a `ComplexIndex` with one `ColumnIndex` per class column.
-- **Region probe**: `ConstraintIndex::candidates`. Enumerates the powerset of the new query's constrained columns and probes each existing class. Lossy-safe: it may over-return, never wrongly claims coverage, and a missed candidate only costs an origin populate.
+- **Region probe**: `ConstraintIndex::candidates`. Finds the classes whose column set is a subset of the new query's constrained columns, from whichever side is smaller: hash-probing each subset of the new columns, or walking the class map with a sorted subset test (PGC-410). Lossy-safe: it may over-return, never wrongly claims coverage, and a missed candidate only costs an origin populate.
 - **Precise check**: `table_constraints_subsumed` in `src/query/constraints/subsume.rs`. Reduces each side to per-column `ColumnRange`s and requires every column the parent constrains to contain the new query's range on that column.
 
 ## Setup
@@ -40,7 +40,7 @@ classes:
 ## Query 1: `WHERE tenant_id = 7 AND status = 'open'`
 
 1. Classify: `EqualityPure`, columns `{status, tenant_id}`, values `[Str("open"), Num(7)]`.
-2. Powerset: `{}`, `{status}`, `{tenant_id}`, `{status, tenant_id}`. Only `{tenant_id}` exists as a class.
+2. Covering classes: of `{}`, `{status}`, `{tenant_id}`, `{status, tenant_id}`, only `{tenant_id}` exists as a class.
 3. Probe `{tenant_id}`: `column_ranges` on the subset gives `[Equal(7)]`, all equality, so the key is `[Num(7)]`. Equality hash hit: A. The class's complex index is empty.
 4. Candidates: `{A}`.
 5. Precise check: A constrains only `tenant_id`; cached `Equal(7)` against new `Equal(7)` passes. Gates (no LIMIT, Ready, single relation) pass.
@@ -52,7 +52,7 @@ B was never consulted, correctly: its class constrains `created_at`, which Query
 ## Query 2: `WHERE tenant_id = 7 AND created_at > 150`
 
 1. Classify: `Complex`, columns `{created_at, tenant_id}`. Only the column set is used from here; the equality probe is decided per subset below.
-2. Powerset: `{}`, `{created_at}`, `{tenant_id}`, `{created_at, tenant_id}`. Two classes exist.
+2. Covering classes: of `{}`, `{created_at}`, `{tenant_id}`, `{created_at, tenant_id}`, two exist.
 3. Probe `{tenant_id}`: `column_ranges` on the subset gives `[Equal(7)]`, so the equality key is `[Num(7)]`. Hash hit: A. The class's complex index is empty.
 4. Probe `{created_at, tenant_id}`: ranges `[Range { lower: 150 }, Equal(7)]`. Not all equality, so no equality key; the complex probe runs.
    - `created_at` column: `range_lower.range(..=150)` finds key 100, giving `[B]`.
@@ -72,7 +72,7 @@ Same walk as Query 2 until the `created_at` column probe. `range_lower.range(..=
 
 ## Query 4: `WHERE tenant_id = 7` with only B registered
 
-Powerset: `{}` and `{tenant_id}`. Neither exists as a class, since B lives in `{created_at, tenant_id}`. No candidates.
+Covering classes: `{}` and `{tenant_id}` are the only possible ones, and neither exists, since B lives in `{created_at, tenant_id}`. No candidates.
 
 **Not subsumed.** Correct: B is narrower than the new query. The subset-class rule rejects it purely on column sets, before any value is compared.
 
