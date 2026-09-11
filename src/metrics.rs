@@ -66,6 +66,9 @@ pub mod names {
     pub const CDC_DELETES: &str = "pgcache.cdc.deletes";
     pub const CDC_LAG_BYTES: &str = "pgcache.cdc.lag_bytes";
     pub const CDC_LAG_SECONDS: &str = "pgcache.cdc.lag_seconds";
+    /// Keepalive marks absorbed into the run they arrived in (PGC-420): a run of
+    /// consecutive marks is handled as one, at its highest LSN.
+    pub const CDC_KEEPALIVE_MARKS_COALESCED: &str = "pgcache.cdc.keepalive_marks_coalesced";
     pub const CDC_FLUSH_STALENESS_SECONDS: &str = "pgcache.cdc.flush_staleness_seconds";
     /// Last LSN received from origin via XLogData. Set in the CDC processor
     /// thread on every replication message.
@@ -479,6 +482,7 @@ pub struct CdcHandles {
     pub cmd_truncate: Histogram,
     pub cmd_commit_mark: Histogram,
     pub cmd_keepalive_mark: Histogram,
+    pub keepalive_marks_coalesced: Counter,
 }
 
 pub struct MvHandles {
@@ -659,6 +663,7 @@ impl Handles {
                 cmd_truncate: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_truncate"),
                 cmd_commit_mark: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_commit_mark"),
                 cmd_keepalive_mark: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_keepalive_mark"),
+                keepalive_marks_coalesced: metrics::counter!(CDC_KEEPALIVE_MARKS_COALESCED),
             },
             mv: MvHandles {
                 rebuilds: metrics::counter!(CACHE_MV_REBUILDS),

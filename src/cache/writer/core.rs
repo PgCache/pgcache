@@ -565,30 +565,38 @@ pub fn writer_run(
                         msg = cdc_rx.recv() => {
                             match msg {
                                 Some(cmd) => {
-                                    #[cfg(feature = "fault-injection")]
-                                    if let CdcCommand::Insert { row_data, .. } = &cmd
-                                        && fault::writer_die_check(row_data)
-                                    {
-                                        error!("fault injection: writer exiting on sentinel CDC insert to exercise restart");
-                                        return Err(CacheError::CdcFailure.into());
-                                    }
-                                    // Queue depth after this command drives the
-                                    // batch flush decision (PGC-242): an empty
-                                    // queue flushes immediately; a backlog
-                                    // accumulates frames.
-                                    let queued = cdc_rx.len();
-                                    if let Err(e) = writer_cdc
-                                        .cdc_command_handle(&mut core, cmd, queued)
-                                        .await
-                                    {
-                                        // Propagate: tears down the cache
-                                        // subsystem so the supervisor restart
-                                        // rebuilds it from a clean reset.
-                                        error!(
-                                            "writer cdc command failed, resetting cache: {}",
-                                            error_chain_format(e.current_context()),
-                                        );
-                                        return Err(e);
+                                    // A run of consecutive keepalive marks is
+                                    // handled as one at its highest LSN, plus
+                                    // the command that ended the run (PGC-420):
+                                    // a keepalive burst then costs this one
+                                    // iteration instead of one each.
+                                    let (cmd, trailing) = cdc_keepalive_run_coalesce(cmd, &mut cdc_rx);
+                                    for cmd in std::iter::once(cmd).chain(trailing) {
+                                        #[cfg(feature = "fault-injection")]
+                                        if let CdcCommand::Insert { row_data, .. } = &cmd
+                                            && fault::writer_die_check(row_data)
+                                        {
+                                            error!("fault injection: writer exiting on sentinel CDC insert to exercise restart");
+                                            return Err(CacheError::CdcFailure.into());
+                                        }
+                                        // Queue depth after this command drives the
+                                        // batch flush decision (PGC-242): an empty
+                                        // queue flushes immediately; a backlog
+                                        // accumulates frames.
+                                        let queued = cdc_rx.len();
+                                        if let Err(e) = writer_cdc
+                                            .cdc_command_handle(&mut core, cmd, queued)
+                                            .await
+                                        {
+                                            // Propagate: tears down the cache
+                                            // subsystem so the supervisor restart
+                                            // rebuilds it from a clean reset.
+                                            error!(
+                                                "writer cdc command failed, resetting cache: {}",
+                                                error_chain_format(e.current_context()),
+                                            );
+                                            return Err(e);
+                                        }
                                     }
                                 }
                                 None => {
@@ -966,9 +974,91 @@ impl WriterCore {
     }
 }
 
+/// Collapse the run of consecutive `KeepAliveMark`s starting at `first` into
+/// one mark at the run's highest LSN (PGC-420). Marks are monotonic and the
+/// handler's watermark advance is a max, so one flush + one advance yields the
+/// same state as handling each in turn — and no frame command can sit inside
+/// the run, because it stops at the first non-keepalive. That command is
+/// already off the queue, so it is returned for handling in the same
+/// iteration. A non-keepalive `first` is returned untouched.
+fn cdc_keepalive_run_coalesce(
+    first: CdcCommand,
+    cdc_rx: &mut UnboundedReceiver<CdcCommand>,
+) -> (CdcCommand, Option<CdcCommand>) {
+    let CdcCommand::KeepAliveMark { mut lsn } = first else {
+        return (first, None);
+    };
+    let mut absorbed = 0u64;
+    let trailing = loop {
+        match cdc_rx.try_recv() {
+            Ok(CdcCommand::KeepAliveMark { lsn: next }) => {
+                lsn = lsn.max(next);
+                absorbed += 1;
+            }
+            Ok(other) => break Some(other),
+            Err(_) => break None,
+        }
+    };
+    if absorbed > 0 {
+        crate::metrics::handles()
+            .cdc
+            .keepalive_marks_coalesced
+            .increment(absorbed);
+    }
+    (CdcCommand::KeepAliveMark { lsn }, trailing)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::population_finalize_allowed;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use super::{CdcCommand, Lsn, cdc_keepalive_run_coalesce, population_finalize_allowed};
+
+    fn mark(lsn: u64) -> CdcCommand {
+        CdcCommand::KeepAliveMark {
+            lsn: Lsn::from_raw(lsn),
+        }
+    }
+
+    #[test]
+    fn test_keepalive_run_collapses_to_max_and_returns_the_command_that_ended_it() {
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(mark(7)).expect("queue mark");
+        tx.send(mark(5)).expect("queue mark");
+        tx.send(CdcCommand::Begin { xid: 42 }).expect("queue begin");
+        tx.send(mark(9)).expect("queue mark after begin");
+
+        let (first, trailing) = cdc_keepalive_run_coalesce(mark(3), &mut rx);
+        assert!(matches!(first, CdcCommand::KeepAliveMark { lsn } if lsn == Lsn::from_raw(7)));
+        assert!(matches!(trailing, Some(CdcCommand::Begin { xid: 42 })));
+        // The mark after the run is left for the next iteration, in order.
+        assert!(
+            matches!(rx.try_recv(), Ok(CdcCommand::KeepAliveMark { lsn }) if lsn == Lsn::from_raw(9))
+        );
+    }
+
+    #[test]
+    fn test_keepalive_run_drains_to_empty_without_trailing_command() {
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(mark(2)).expect("queue mark");
+        let (first, trailing) = cdc_keepalive_run_coalesce(mark(1), &mut rx);
+        assert!(matches!(first, CdcCommand::KeepAliveMark { lsn } if lsn == Lsn::from_raw(2)));
+        assert!(trailing.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_non_keepalive_first_command_is_passed_through_untouched() {
+        let (tx, mut rx) = unbounded_channel();
+        tx.send(mark(2)).expect("queue mark");
+        let (first, trailing) = cdc_keepalive_run_coalesce(CdcCommand::Begin { xid: 1 }, &mut rx);
+        assert!(matches!(first, CdcCommand::Begin { xid: 1 }));
+        assert!(trailing.is_none());
+        assert!(
+            rx.try_recv().is_ok(),
+            "queued mark is left for the next iteration"
+        );
+    }
 
     /// Live query at the parked generation, not invalidated → finalize.
     #[test]
