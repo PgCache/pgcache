@@ -8,10 +8,10 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
-use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use crate::cache::StatusRequest;
+use crate::listener::listener_bind;
 use crate::proxy::{SharedProxyStatus, StatusSender};
 use crate::settings::{
     DynamicConfig, DynamicConfigHandle, DynamicConfigPatch, config_file_dynamic_extract,
@@ -59,7 +59,7 @@ async fn admin_server_run(
     status_tx: StatusSender,
     dynamic: DynamicConfigHandle,
 ) {
-    let listener = match TcpListener::bind(addr).await {
+    let listener = match listener_bind(addr).await {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("admin server bind failed on {addr}: {e}");

@@ -6,11 +6,12 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use rootcause::Report;
 
 use crate::result::{MapIntoReport, ReportExt};
-use tokio::{net::TcpListener, runtime::Builder};
+use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
 
 use crate::admin::admin_server_spawn;
+use crate::listener::listener_bind;
 
 use super::SharedProxyStatus;
 use crate::{
@@ -274,14 +275,12 @@ pub fn proxy_run(
                     .attach_loc("resolving origin host")?
                     .collect();
 
-                    let listener =
-                        TcpListener::bind(&settings.listen.socket)
-                            .await
-                            .map_err(|e| {
-                                Report::from(ConnectionError::IoError(std::io::Error::other(
-                                    format!("bind error [{}] {e}", settings.listen.socket),
-                                )))
-                            })?;
+                    let listener = listener_bind(settings.listen.socket).await.map_err(|e| {
+                        Report::from(ConnectionError::IoError(std::io::Error::other(format!(
+                            "bind error [{}] {e}",
+                            settings.listen.socket
+                        ))))
+                    })?;
                     // Listener is bound — only now is the proxy ready to accept
                     // connections, so flip `/readyz` to ready (it reports
                     // not-ready through the preceding cache setup).

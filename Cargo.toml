@@ -98,6 +98,7 @@ proxy = [
     "dep:metrics-util",
     "dep:metrics-exporter-prometheus",
     "dep:hyper",
+    "dep:socket2",
     "dep:hyper-util",
     "dep:http",
     "dep:http-body-util",
@@ -181,6 +182,7 @@ hyper = { version = "1", features = ["http1", "server"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "http1"], optional = true }
 http = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
+socket2 = { version = "0.6.4", optional = true }
 bytes = "1"
 fallible-iterator = "0.2.0"
 smallvec = "1.15.1"

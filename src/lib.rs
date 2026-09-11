@@ -11,6 +11,8 @@ pub mod settings;
 #[cfg(feature = "proxy")]
 pub mod admin;
 #[cfg(feature = "proxy")]
+pub mod listener;
+#[cfg(feature = "proxy")]
 pub mod memory;
 #[cfg(feature = "proxy")]
 pub mod metrics;
