@@ -35,7 +35,7 @@ use super::super::{
 use super::cdc::WriterCdc;
 use super::mv_build::MvBuildPool;
 use super::registration::WriterRegistration;
-use super::staging::{PopulationDeletedKeys, StagingPool};
+use super::staging::{MergeInProgress, PopulationDeletedKeys, StagingPool};
 
 use super::frame::*;
 
@@ -229,6 +229,17 @@ pub struct WriterCore {
     /// until CDC has applied past the snapshot, so already-Ready bystander
     /// queries can never serve a torn mix of two origin points in time.
     pub(super) pending_merges: BinaryHeap<Reverse<PendingMerge>>,
+    /// The merge being applied chunk by chunk (PGC-418), popped from
+    /// `pending_merges` once its gate released. The writer loop runs one chunk
+    /// per iteration while a CDC frame is not open, so apply interleaves with
+    /// the merge instead of waiting behind one statement over the whole
+    /// staging table.
+    pub(super) merge_in_progress: Option<MergeInProgress>,
+    /// A CDC batch flush has returned the frame to Idle since the last merge
+    /// chunk ran. Under a sustained CDC backlog the queue is never empty, so
+    /// this is what lets a merge progress: one chunk per completed batch,
+    /// proportional to CDC throughput rather than a clock (PGC-418).
+    pub(super) batch_flushed_since_chunk: bool,
     /// Signals the CDC thread to request an immediate keepalive (reply-requested
     /// standby status update), advancing `last_received_lsn` so a gated query's
     /// snapshot LSN is reached within a round-trip instead of waiting for the
@@ -611,6 +622,24 @@ pub fn writer_run(
                                 core.status_respond(req, writer_cdc.last_received_lsn).await;
                             }
                         }
+                        // Advance the in-progress population merge by one chunk
+                        // (PGC-418). Runs when the CDC queue is drained — never
+                        // ahead of queued real work — or, under a sustained
+                        // backlog, once per completed batch flush so the merge
+                        // cannot starve. Only while no frame is open — a chunk
+                        // on db_cache mid-frame would join the frame's
+                        // transaction.
+                        () = std::future::ready(()),
+                            if core.frame_state == FrameState::Idle
+                                && core.merge_in_progress.is_some()
+                                && (cdc_rx.is_empty() || core.batch_flushed_since_chunk) => {
+                            if let Err(e) = registration.merge_in_progress_step(&mut core).await {
+                                error!(
+                                    "population merge step failed: {}",
+                                    error_chain_format(e.current_context()),
+                                );
+                            }
+                        }
                     }
 
                     // Drain population merges while the writer is quiescent
@@ -621,6 +650,7 @@ pub fn writer_run(
                     // snapshot LSN (PGC-272); the watermark advances on the
                     // CDC path, so re-check on every quiescent iteration.
                     if core.frame_state == FrameState::Idle
+                        && core.merge_in_progress.is_none()
                         && !core.pending_merges.is_empty()
                         && let Err(e) = registration
                             .pending_merges_drain(&mut core, writer_cdc.last_received_lsn)
@@ -728,6 +758,8 @@ impl WriterCore {
             population_deleted_keys: PopulationDeletedKeys::default(),
             staging_pool: StagingPool::default(),
             pending_merges: BinaryHeap::new(),
+            merge_in_progress: None,
+            batch_flushed_since_chunk: false,
             watermark_nudge,
             merge_stall_since: None,
             last_flush_marker_lsn: Lsn::from_raw(0),

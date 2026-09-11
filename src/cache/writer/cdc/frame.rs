@@ -431,6 +431,7 @@ impl WriterCdc {
         finalize?;
 
         core.frame_state = FrameState::Idle;
+        core.batch_flushed_since_chunk = true;
         core.frame_invalidations.clear();
         core.frame_memo_evictions.clear();
         core.frame_relation_oids.clear();

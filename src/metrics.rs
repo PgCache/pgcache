@@ -274,6 +274,12 @@ pub mod names {
     /// Population merges applied (drain throughput) — compare against the
     /// invalidation rate to see if the pipeline keeps up.
     pub const CACHE_MERGES_APPLIED: &str = "pgcache.cache.merge.applied_total";
+    /// Merge chunks applied. A merge drains its staging tables in bounded
+    /// chunks so CDC apply interleaves between them (PGC-418).
+    pub const CACHE_MERGE_CHUNKS: &str = "pgcache.cache.merge.chunks_total";
+    /// Wall time of one merge chunk statement — the longest a CDC frame waits
+    /// behind an in-progress merge.
+    pub const CACHE_MERGE_CHUNK_SECONDS: &str = "pgcache.cache.merge.chunk_seconds";
     /// Per-worker time waiting on rx.recv() between tasks. With \`task_seconds\`
     /// and wall clock, gives a clear utilization signal at a given pool size.
     pub const CACHE_POPULATION_WORKER_IDLE_SECONDS: &str =
@@ -514,6 +520,8 @@ pub struct RegHandles {
     pub merge_pending_depth: Gauge,
     pub merge_wait: Histogram,
     pub merges_applied: Counter,
+    pub merge_chunks: Counter,
+    pub merge_chunk: Histogram,
 }
 
 pub struct StateHandles {
@@ -695,6 +703,8 @@ impl Handles {
                 merge_pending_depth: metrics::gauge!(CACHE_MERGE_PENDING_DEPTH),
                 merge_wait: metrics::histogram!(CACHE_MERGE_WAIT_SECONDS),
                 merges_applied: metrics::counter!(CACHE_MERGES_APPLIED),
+                merge_chunks: metrics::counter!(CACHE_MERGE_CHUNKS),
+                merge_chunk: metrics::histogram!(CACHE_MERGE_CHUNK_SECONDS),
             },
             state: StateHandles {
                 queries_registered: metrics::gauge!(CACHE_QUERIES_REGISTERED),
