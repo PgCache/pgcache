@@ -71,6 +71,20 @@ pub(super) enum MergeStep {
     Aborted,
 }
 
+/// Why the pending-heap walk stopped, which decides whether the head needs
+/// the watermark nudge and flush-force tail: only a gated head is stalled on
+/// the watermark. A head waiting for the merge slot is not, and arming the
+/// stall clock for it would fire the origin flush without its grace window
+/// on the first walk after the active drain finishes.
+pub(super) enum HeapStop {
+    /// Nothing pending.
+    Exhausted,
+    /// The head's snapshot is past the apply watermark.
+    HeadGated(Lsn),
+    /// The head is releasable but a drain is already active.
+    SlotBusy,
+}
+
 /// What a drain does with each staging window.
 pub(super) enum DrainTarget {
     /// Upsert into the cache table: the population merge, carrying the

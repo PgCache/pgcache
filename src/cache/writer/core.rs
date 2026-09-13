@@ -592,11 +592,13 @@ pub fn writer_run(
                     // the shared cache table (PGC-250). Each merge is
                     // additionally gated on the apply watermark reaching its
                     // snapshot LSN (PGC-272); the watermark advances on the
-                    // CDC path, so re-check on every quiescent iteration.
+                    // CDC path, so re-check on every quiescent iteration —
+                    // also while a drain is active, so a gated head behind it
+                    // keeps being nudged (only starting the next drain waits).
                     if core.frame_state == FrameState::Idle
-                        && core.merges.active.is_none()
                         && (!core.merges.pending.is_empty() || !core.merges.discards.is_empty())
                     {
+                        let slot_was_free = core.merges.active.is_none();
                         if let Err(e) = registration
                             .pending_merges_drain(&mut core, writer_cdc.last_received_lsn)
                             .await
@@ -606,7 +608,9 @@ pub fn writer_run(
                                 error_chain_format(e.current_context()),
                             );
                         }
-                        core.merges.chunk_boundary_mark(query_rx.len());
+                        if slot_was_free && core.merges.active.is_some() {
+                            core.merges.chunk_boundary_mark(query_rx.len());
+                        }
                     }
 
                     // Fold the writer backlog into the adaptive-gate window every
