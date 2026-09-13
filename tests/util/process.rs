@@ -453,6 +453,28 @@ pub async fn connect_pgcache_pinned_small_cache(
     Ok((pgcache, listen_port, metrics_port, client))
 }
 
+/// Connect to pgcache with pinned queries and fault-injection environment
+/// variables set on the child process (requires the binary built with
+/// `--features fault-injection`).
+pub async fn connect_pgcache_pinned_fault(
+    dbs: &TempDBs,
+    pinned_queries: &str,
+    env: &[(&str, &str)],
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+    let listen_port = find_available_port()?;
+    let metrics_port = find_available_port()?;
+    let mut pgcache = pgcache_spawn_env(
+        dbs,
+        listen_port,
+        metrics_port,
+        &["--cache_policy", "fifo", "--pinned_queries", pinned_queries],
+        env,
+    );
+    proxy_wait_for_ready(&mut pgcache).map_err(Error::other)?;
+    let client = pgcache_client_connect(listen_port).await?;
+    Ok((pgcache, listen_port, metrics_port, client))
+}
+
 /// Connect to pgcache with TLS enabled on the proxy.
 pub async fn connect_pgcache_tls(
     dbs: &TempDBs,

@@ -80,7 +80,6 @@ impl WriterCore {
         /// Bounds re-stamping work and prevents pathological case where all queries are referenced.
         const MAX_BUMPS: usize = 5;
         let mut bumps = 0;
-        let mut pinned_skips = 0;
         let mut evicted = 0usize;
 
         let cfg = self.cache.dynamic.load();
@@ -96,36 +95,52 @@ impl WriterCore {
             "eviction_run entry"
         );
 
-        loop {
+        // Walk candidates in generation order over a snapshot. A candidate
+        // that is skipped (not Ready, see below) keeps its generation, so
+        // re-reading the minimum would spin on it; the snapshot lets the round
+        // move past it to the next candidate instead.
+        let candidates: Vec<u64> = self.cache.generations.iter().copied().collect();
+        for candidate_gen in candidates {
             if self.cache.cached_queries.len() <= count_cap {
                 break;
             }
-            let Some(&min_gen) = self.cache.generations.first() else {
-                break;
-            };
-            let Some(query) = self.cache.cached_queries.get2(&min_gen) else {
-                break;
+            let Some(query) = self.cache.cached_queries.get2(&candidate_gen) else {
+                continue;
             };
             let fingerprint = query.fingerprint;
             let query_pinned = query.pinned;
 
-            // Pinned queries are never evicted — always bump to move past them.
+            // A generation bump re-keys the query; a population or merge in
+            // flight is keyed by the old generation and would be abandoned
+            // with nothing to finalize or readmit it, leaving the query
+            // Loading forever (PGC-418 review). Only a Ready query is bumped;
+            // anything else at the head of the order is skipped this round
+            // and revisited once it settles.
+            let ready = self
+                .state_view
+                .cached_queries
+                .get(&fingerprint)
+                .is_some_and(|e| e.state == CachedQueryState::Ready);
+
+            // Pinned queries are never evicted — bump to move past them.
             // Unlike CLOCK bumps, pinned bumps are not bounded by MAX_BUMPS.
             if query_pinned {
-                trace!("pinned bump {fingerprint}");
-                crate::metrics::handles()
-                    .state
-                    .evictions_pinned_bump
-                    .increment(1);
-                self.cache_query_generation_bump(fingerprint).await?;
-                pinned_skips += 1;
-                if pinned_skips >= self.cache.cached_queries.len() {
-                    break; // all remaining candidates are pinned
+                if ready {
+                    trace!("pinned bump {fingerprint}");
+                    crate::metrics::handles()
+                        .state
+                        .evictions_pinned_bump
+                        .increment(1);
+                    self.cache_query_generation_bump(fingerprint).await?;
+                } else {
+                    trace!("pinned not Ready, skipped this round {fingerprint}");
                 }
                 continue;
             }
 
-            // CLOCK second-chance: referenced queries get bumped (bounded by MAX_BUMPS)
+            // CLOCK second-chance: referenced queries get bumped (bounded by
+            // MAX_BUMPS). A referenced query that is not Ready keeps its
+            // chance without the bump.
             if cfg.cache_policy == CachePolicy::Clock && bumps < MAX_BUMPS {
                 let referenced = self
                     .state_view
@@ -135,10 +150,14 @@ impl WriterCore {
                     .unwrap_or(false);
 
                 if referenced {
-                    trace!("clock bump {fingerprint}");
-                    crate::metrics::handles().state.evictions_bump.increment(1);
-                    self.cache_query_generation_bump(fingerprint).await?;
-                    bumps += 1;
+                    if ready {
+                        trace!("clock bump {fingerprint}");
+                        crate::metrics::handles().state.evictions_bump.increment(1);
+                        self.cache_query_generation_bump(fingerprint).await?;
+                        bumps += 1;
+                    } else {
+                        trace!("clock referenced but not Ready, skipped this round {fingerprint}");
+                    }
                     continue;
                 }
             }
@@ -151,7 +170,6 @@ impl WriterCore {
             // tick's statvfs read, not measured here (PGC-276).
             self.publication_dirty_drain().await?;
             bumps = 0;
-            pinned_skips = 0;
             evicted += 1;
             if max_evictions.is_some_and(|m| evicted >= m) {
                 break;

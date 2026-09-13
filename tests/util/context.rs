@@ -10,7 +10,8 @@ use super::metrics::MetricsSnapshot;
 use super::process::{
     PgCacheProcess, TempDBs, connect_pgcache, connect_pgcache_allowlist, connect_pgcache_args,
     connect_pgcache_clock, connect_pgcache_fault, connect_pgcache_pinned,
-    connect_pgcache_pinned_small_cache, connect_pgcache_small_cache, start_databases,
+    connect_pgcache_pinned_fault, connect_pgcache_pinned_small_cache, connect_pgcache_small_cache,
+    start_databases,
 };
 
 /// Test context combining all resources needed for integration tests.
@@ -155,6 +156,30 @@ impl TestContext {
     /// Set up a test context with pinned queries that force-evicts down to
     /// `max_cached_queries` via the fault-injection count cap (requires
     /// `--features fault-injection`).
+    /// Pinned queries plus fault-injection environment on the child process.
+    pub async fn setup_pinned_fault<F, Fut>(
+        pinned_queries: &str,
+        env: &[(&str, &str)],
+        before_start: F,
+    ) -> Result<Self, Error>
+    where
+        F: FnOnce(Client) -> Fut,
+        Fut: std::future::Future<Output = Result<Client, Error>>,
+    {
+        let (dbs, origin) = start_databases().await?;
+        let origin = before_start(origin).await?;
+        let (pgcache, cache_port, metrics_port, cache) =
+            connect_pgcache_pinned_fault(&dbs, pinned_queries, env).await?;
+        Ok(Self {
+            cache,
+            origin,
+            cache_port,
+            metrics_port,
+            pgcache,
+            dbs,
+        })
+    }
+
     pub async fn setup_pinned_small_cache<F, Fut>(
         pinned_queries: &str,
         max_cached_queries: usize,
