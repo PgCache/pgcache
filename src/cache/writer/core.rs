@@ -239,11 +239,12 @@ pub struct WriterCore {
     /// (`MergeMode::Discard`), started when the merge slot is free and no
     /// releasable merge is waiting.
     pub(super) pending_discards: VecDeque<StagingDiscard>,
-    /// A CDC batch flush has returned the frame to Idle since the last merge
-    /// chunk ran. Under a sustained CDC backlog the queue is never empty, so
-    /// this is what lets a merge progress: one chunk per completed batch,
+    /// Count of CDC batch flushes (each returns the frame to Idle). The
+    /// in-progress drain remembers the value at its last chunk: under a
+    /// sustained CDC backlog the queue is never empty, and a changed count is
+    /// what lets the drain take its next chunk — one per completed batch,
     /// proportional to CDC throughput rather than a clock (PGC-418).
-    pub(super) batch_flushed_since_chunk: bool,
+    pub(super) batch_flush_seq: u64,
     /// Signals the CDC thread to request an immediate keepalive (reply-requested
     /// standby status update), advancing `last_received_lsn` so a gated query's
     /// snapshot LSN is reached within a round-trip instead of waiting for the
@@ -643,8 +644,10 @@ pub fn writer_run(
                         // transaction.
                         () = std::future::ready(()),
                             if core.frame_state == FrameState::Idle
-                                && core.merge_in_progress.is_some()
-                                && (cdc_rx.is_empty() || core.batch_flushed_since_chunk) => {
+                                && core
+                                    .merge_in_progress
+                                    .as_ref()
+                                    .is_some_and(|m| m.chunk_due(cdc_rx.is_empty(), core.batch_flush_seq)) => {
                             if let Err(e) = registration.merge_in_progress_step(&mut core).await {
                                 error!(
                                     "population merge step failed: {}",
@@ -772,7 +775,7 @@ impl WriterCore {
             pending_merges: BinaryHeap::new(),
             merge_in_progress: None,
             pending_discards: VecDeque::new(),
-            batch_flushed_since_chunk: false,
+            batch_flush_seq: 0,
             watermark_nudge,
             merge_stall_since: None,
             last_flush_marker_lsn: Lsn::from_raw(0),

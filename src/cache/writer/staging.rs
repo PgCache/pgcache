@@ -54,22 +54,10 @@ const MERGE_CHUNK_BLOCKS_INITIAL: u32 = 64;
 const MERGE_CHUNK_BLOCKS_MIN: u32 = 4;
 const MERGE_CHUNK_BLOCKS_MAX: u32 = 8_192;
 /// Wall-time target per merge chunk. The writer runs one chunk per loop
-/// iteration while a merge is in progress and the CDC queue is drained (or a
-/// batch has flushed since the last chunk — `WriterCore::batch_flushed_since_chunk`),
-/// so this bounds how long a CDC frame waits behind the merge (PGC-418).
+/// iteration while a drain is in progress and a chunk is due
+/// (`MergeInProgress::chunk_due`), so this bounds how long a CDC frame waits
+/// behind the merge (PGC-418).
 const MERGE_CHUNK_TARGET: Duration = Duration::from_millis(100);
-
-/// What the in-progress merge does with each staging window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum MergeMode {
-    /// Drain into the cache table (the population merge).
-    Apply,
-    /// Drain and discard: the population was abandoned, aborted, failed, or
-    /// superseded before its merge, and its staging must be emptied for pool
-    /// reuse — in the same bounded chunks, so the check-in's one-statement
-    /// `DELETE` over up to millions of rows does not stall CDC apply (PGC-418).
-    Discard,
-}
 
 /// Outcome of one merge chunk.
 pub(super) enum MergeStep {
@@ -85,6 +73,54 @@ pub(super) enum MergeStep {
     Aborted,
 }
 
+/// What a drain does with each staging window.
+pub(super) enum DrainTarget {
+    /// Upsert into the cache table: the population merge, carrying the
+    /// population for Ready finalization.
+    Apply(PopulationMerge),
+    /// Delete only: the population was superseded, invalidated, evicted,
+    /// aborted, or failed, and its staging must be emptied for pool reuse —
+    /// in the same bounded chunks, so the check-in's one-statement `DELETE`
+    /// over up to millions of rows does not stall CDC apply (PGC-418).
+    Discard,
+}
+
+/// Where a drain is within its staged relations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrainCursor {
+    /// About to start `staged[index]`; its size is read on the next step.
+    RelationStart { index: usize },
+    /// Inside `staged[index]`: the next window starts at `next_block` and the
+    /// table has `blocks` heap blocks — from `pg_relation_size` at relation
+    /// start, the file size rather than `pg_class.relpages`, since pooled
+    /// tables carry dead space from earlier populations and the stats can lag
+    /// by half the file.
+    InRelation {
+        index: usize,
+        next_block: u32,
+        blocks: u32,
+    },
+    /// Every staged relation is drained.
+    Done,
+}
+
+impl DrainCursor {
+    /// The cursor at the start of `staged[0]`, or `Done` for an empty set.
+    fn first(staged_len: usize) -> Self {
+        Self::after_relation(0, staged_len)
+    }
+
+    /// The cursor once `staged[index - 1]` (or nothing, for `index == 0`) is
+    /// drained: the start of `staged[index]`, or `Done` past the end.
+    fn after_relation(index: usize, staged_len: usize) -> Self {
+        if index < staged_len {
+            Self::RelationStart { index }
+        } else {
+            Self::Done
+        }
+    }
+}
+
 /// A population's staging tables awaiting a chunked discard.
 pub(super) struct StagingDiscard {
     pub(super) fingerprint: Fingerprint,
@@ -92,28 +128,23 @@ pub(super) struct StagingDiscard {
     pub(super) staged: Vec<(Oid, EcoString)>,
 }
 
-/// A population merge being applied one chunk at a time (PGC-418). At most one
-/// is in progress; the writer loop advances it by one chunk per iteration while
-/// no CDC frame is open, so CDC apply interleaves with the merge instead of
-/// waiting behind a single statement over the whole staging table.
+/// A staging drain in progress — a population merge, or a discard — advanced
+/// one chunk at a time (PGC-418). At most one is in progress; the writer loop
+/// advances it by one chunk per iteration while no CDC frame is open, so CDC
+/// apply interleaves with it instead of waiting behind a single statement
+/// over the whole staging table.
 pub(super) struct MergeInProgress {
     pub(super) fingerprint: Fingerprint,
     pub(super) generation: u64,
     /// `(relation_oid, staging table name in pgcache_stage)` per relation.
     staged: Vec<(Oid, EcoString)>,
-    /// The population being applied; `None` once the merge is discarding.
-    pub(super) apply: Option<PopulationMerge>,
-    /// Index into `merge.staged` of the relation being drained.
-    relation_index: usize,
-    /// First heap block of the next window in the current relation's staging
-    /// table.
-    next_block: u32,
-    /// Heap blocks in the current relation's staging table, read from
-    /// `pg_relation_size` when the relation starts (`None` until then). The
-    /// file size, not `pg_class.relpages`: pooled tables carry dead space from
-    /// earlier populations and the stats can lag by half the file.
-    relation_blocks: Option<u32>,
+    pub(super) target: DrainTarget,
+    cursor: DrainCursor,
     chunk_blocks: u32,
+    /// `WriterCore::batch_flush_seq` when the last chunk ran (or the drain
+    /// started): under a CDC backlog the next chunk is due only once a batch
+    /// has flushed since.
+    flush_seq_at_last_chunk: u64,
     /// Rows drained from staging so far (before the deleted-key filter).
     pub(super) drained_rows: u64,
     pub(super) chunks: u64,
@@ -121,51 +152,38 @@ pub(super) struct MergeInProgress {
 }
 
 impl MergeInProgress {
-    fn new_apply(merge: PopulationMerge) -> Self {
-        Self::new(
-            merge.fingerprint,
-            merge.generation,
-            merge.staged.clone(),
-            Some(merge),
-        )
-    }
-
-    fn new_discard(discard: StagingDiscard) -> Self {
-        Self::new(
-            discard.fingerprint,
-            discard.generation,
-            discard.staged,
-            None,
-        )
-    }
-
-    pub(super) fn mode(&self) -> MergeMode {
-        if self.apply.is_some() {
-            MergeMode::Apply
-        } else {
-            MergeMode::Discard
-        }
-    }
-
     fn new(
         fingerprint: Fingerprint,
         generation: u64,
         staged: Vec<(Oid, EcoString)>,
-        apply: Option<PopulationMerge>,
+        target: DrainTarget,
+        batch_flush_seq: u64,
     ) -> Self {
+        let cursor = DrainCursor::first(staged.len());
         Self {
             fingerprint,
             generation,
             staged,
-            apply,
-            relation_index: 0,
-            next_block: 0,
-            relation_blocks: None,
+            target,
+            cursor,
             chunk_blocks: fault_merge_chunk_blocks().unwrap_or(MERGE_CHUNK_BLOCKS_INITIAL),
+            flush_seq_at_last_chunk: batch_flush_seq,
             drained_rows: 0,
             chunks: 0,
             started_at: Instant::now(),
         }
+    }
+
+    pub(super) fn is_applying(&self) -> bool {
+        matches!(self.target, DrainTarget::Apply(_))
+    }
+
+    /// Whether the next chunk may run now: immediately when no CDC command is
+    /// queued — never ahead of queued real work — or, under a backlog, once a
+    /// batch has flushed since the last chunk, so the drain progresses in
+    /// proportion to CDC throughput instead of starving.
+    pub(super) fn chunk_due(&self, cdc_queue_empty: bool, batch_flush_seq: u64) -> bool {
+        cdc_queue_empty || batch_flush_seq != self.flush_seq_at_last_chunk
     }
 
     /// Scale the next chunk toward `MERGE_CHUNK_TARGET` from the last chunk's
@@ -736,7 +754,14 @@ impl WriterCore {
             self.merge_in_progress.is_none(),
             "population merge started while another is in progress"
         );
-        self.merge_in_progress = Some(MergeInProgress::new_apply(merge));
+        let staged = merge.staged.clone();
+        self.merge_in_progress = Some(MergeInProgress::new(
+            merge.fingerprint,
+            merge.generation,
+            staged,
+            DrainTarget::Apply(merge),
+            self.batch_flush_seq,
+        ));
     }
 
     /// Begin emptying a superseded population's staging tables in chunks (it
@@ -746,7 +771,13 @@ impl WriterCore {
             self.merge_in_progress.is_none(),
             "population discard started while a merge is in progress"
         );
-        self.merge_in_progress = Some(MergeInProgress::new_discard(discard));
+        self.merge_in_progress = Some(MergeInProgress::new(
+            discard.fingerprint,
+            discard.generation,
+            discard.staged,
+            DrainTarget::Discard,
+            self.batch_flush_seq,
+        ));
     }
 
     /// Queue a population's staging for a chunked discard once the merge slot
@@ -775,113 +806,129 @@ impl WriterCore {
     /// reclaimed by generation once nothing references them.
     pub(super) fn population_merge_discard_remaining(&mut self) {
         if let Some(in_progress) = self.merge_in_progress.as_mut()
-            && in_progress.apply.take().is_some()
+            && in_progress.is_applying()
         {
             debug!(
                 "population merge stopped after {} chunks / {} rows, discarding the rest {}",
                 in_progress.chunks, in_progress.drained_rows, in_progress.fingerprint
             );
+            in_progress.target = DrainTarget::Discard;
         }
     }
 
-    /// Run one chunk of the in-progress merge (PGC-418), filtering keys CDC
-    /// removed during the population (PGC-250). The deleted-key filter is
-    /// rebuilt per chunk so a removal that lands between chunks is honored.
-    /// Returns `Continue` while staging rows remain; on `Done` / `Aborted` the
-    /// caller takes `merge_in_progress` and finalizes.
+    /// Run one chunk of the in-progress drain (PGC-418): size the relation the
+    /// cursor is about to enter, or drain one window of the relation it is in.
+    /// A merge filters keys CDC removed during the population (PGC-250); the
+    /// filter is rebuilt per chunk so a removal that lands between chunks is
+    /// honored. Returns `Continue` while staging rows remain; on `Done` /
+    /// `Aborted` the caller takes `merge_in_progress` and finalizes.
     pub(super) async fn population_merge_step(&mut self) -> CacheResult<MergeStep> {
-        loop {
-            let Some(in_progress) = self.merge_in_progress.as_ref() else {
-                return Ok(MergeStep::Done);
-            };
-            let Some((relation_oid, staging)) =
-                in_progress.staged.get(in_progress.relation_index).cloned()
-            else {
-                return Ok(MergeStep::Done);
-            };
-            let mode = in_progress.mode();
-            // Abort if any relation lost keys (overflow) or was bulk-invalidated
-            // (TRUNCATE / recovery) at an LSN past this population's snapshot —
-            // a later chunk could resurrect removed rows. Checked per chunk:
-            // either can happen in a CDC frame applied between chunks.
-            if let Some(apply) = &in_progress.apply
-                && in_progress.staged.iter().any(|(oid, _)| {
-                    self.population_deleted_keys
-                        .should_abort(*oid, apply.snapshot_lsn)
-                })
-            {
-                return Ok(MergeStep::Aborted);
-            }
-            let generation = in_progress.generation;
-            let lo_block = in_progress.next_block;
-            let chunk_blocks = in_progress.chunk_blocks;
-
-            let relation_blocks = match in_progress.relation_blocks {
-                Some(blocks) => blocks,
-                None => {
-                    let blocks = self.staging_blocks(&staging).await?;
-                    if let Some(in_progress) = self.merge_in_progress.as_mut() {
-                        in_progress.relation_blocks = Some(blocks);
+        let Some(in_progress) = self.merge_in_progress.as_ref() else {
+            return Ok(MergeStep::Done);
+        };
+        let staged_len = in_progress.staged.len();
+        let (index, lo_block, blocks) = match in_progress.cursor {
+            DrainCursor::Done => return Ok(MergeStep::Done),
+            DrainCursor::RelationStart { index } => {
+                let Some((_, staging)) = in_progress.staged.get(index) else {
+                    return Ok(MergeStep::Done);
+                };
+                let blocks = self.staging_blocks(staging).await?;
+                let cursor = if blocks == 0 {
+                    DrainCursor::after_relation(index + 1, staged_len)
+                } else {
+                    DrainCursor::InRelation {
+                        index,
+                        next_block: 0,
+                        blocks,
                     }
-                    blocks
+                };
+                if let Some(in_progress) = self.merge_in_progress.as_mut() {
+                    in_progress.cursor = cursor;
                 }
-            };
-            if lo_block >= relation_blocks {
-                if self.merge_relation_advance() {
-                    continue;
-                }
-                return Ok(MergeStep::Done);
+                return Ok(MergeStep::Continue);
             }
-            let hi_block = lo_block.saturating_add(chunk_blocks).min(relation_blocks);
-
-            // A relation evicted mid-population has no cache table to merge
-            // into; its staging rows are discarded in chunks like the rest.
-            let plan = match mode {
-                MergeMode::Apply => self.cache.tables.get1(&relation_oid).map(MergePlan::build),
-                MergeMode::Discard => None,
-            };
-            let sql = match &plan {
-                Some(plan) => {
-                    let filter = self
-                        .population_deleted_keys
-                        .filter_predicate(relation_oid, &plan.pk_columns_paren);
-                    plan.chunk_sql(&staging, generation, lo_block, hi_block, filter.as_deref())
-                }
-                None => discard_sql(&staging, lo_block, hi_block),
-            };
-
-            let started = Instant::now();
-            let messages = self
-                .db_cache
-                .simple_query(&sql)
-                .await
-                .map_into_report::<CacheError>()
-                .attach_loc("population merge chunk")?;
-            let elapsed = started.elapsed();
-            let count = match &plan {
-                Some(_) => chunk_result_parse(&messages)?,
-                None => discard_result_parse(&messages),
-            };
-            fault_merge_chunk_delay().await;
-
-            let mh = crate::metrics::handles();
-            match &plan {
-                Some(_) => mh.reg.merge_chunks.increment(1),
-                None => mh.reg.merge_discard_chunks.increment(1),
-            }
-            mh.reg.merge_chunk.record(elapsed.as_secs_f64());
-            // The next chunk under a CDC backlog waits for the next batch flush.
-            self.batch_flushed_since_chunk = false;
-
-            let Some(in_progress) = self.merge_in_progress.as_mut() else {
-                return Ok(MergeStep::Done);
-            };
-            in_progress.chunks += 1;
-            in_progress.drained_rows += count;
-            in_progress.next_block = hi_block;
-            in_progress.chunk_blocks_adapt(elapsed);
-            return Ok(MergeStep::Continue);
+            DrainCursor::InRelation {
+                index,
+                next_block,
+                blocks,
+            } => (index, next_block, blocks),
+        };
+        let Some((relation_oid, staging)) = in_progress.staged.get(index).cloned() else {
+            return Ok(MergeStep::Done);
+        };
+        // Abort if any relation lost keys (overflow) or was bulk-invalidated
+        // (TRUNCATE / recovery) at an LSN past this population's snapshot —
+        // a later chunk could resurrect removed rows. Checked per chunk:
+        // either can happen in a CDC frame applied between chunks.
+        if let DrainTarget::Apply(merge) = &in_progress.target
+            && in_progress.staged.iter().any(|(oid, _)| {
+                self.population_deleted_keys
+                    .should_abort(*oid, merge.snapshot_lsn)
+            })
+        {
+            return Ok(MergeStep::Aborted);
         }
+        let generation = in_progress.generation;
+        let hi_block = lo_block
+            .saturating_add(in_progress.chunk_blocks)
+            .min(blocks);
+
+        // A relation evicted mid-population has no cache table to merge into;
+        // its staging rows are discarded in chunks like the rest.
+        let plan = match &in_progress.target {
+            DrainTarget::Apply(_) => self.cache.tables.get1(&relation_oid).map(MergePlan::build),
+            DrainTarget::Discard => None,
+        };
+        let sql = match &plan {
+            Some(plan) => {
+                let filter = self
+                    .population_deleted_keys
+                    .filter_predicate(relation_oid, &plan.pk_columns_paren);
+                plan.chunk_sql(&staging, generation, lo_block, hi_block, filter.as_deref())
+            }
+            None => discard_sql(&staging, lo_block, hi_block),
+        };
+
+        let started = Instant::now();
+        let messages = self
+            .db_cache
+            .simple_query(&sql)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("population merge chunk")?;
+        let elapsed = started.elapsed();
+        let count = match &plan {
+            Some(_) => chunk_result_parse(&messages)?,
+            None => discard_result_parse(&messages),
+        };
+        fault_merge_chunk_delay().await;
+
+        let mh = crate::metrics::handles();
+        match &plan {
+            Some(_) => mh.reg.merge_chunks.increment(1),
+            None => mh.reg.merge_discard_chunks.increment(1),
+        }
+        mh.reg.merge_chunk.record(elapsed.as_secs_f64());
+
+        let batch_flush_seq = self.batch_flush_seq;
+        let Some(in_progress) = self.merge_in_progress.as_mut() else {
+            return Ok(MergeStep::Done);
+        };
+        in_progress.chunks += 1;
+        in_progress.drained_rows += count;
+        in_progress.flush_seq_at_last_chunk = batch_flush_seq;
+        in_progress.chunk_blocks_adapt(elapsed);
+        in_progress.cursor = if hi_block >= blocks {
+            DrainCursor::after_relation(index + 1, staged_len)
+        } else {
+            DrainCursor::InRelation {
+                index,
+                next_block: hi_block,
+                blocks,
+            }
+        };
+        Ok(MergeStep::Continue)
     }
 
     /// Heap blocks in a staging table's main fork, from the file size.
@@ -902,18 +949,6 @@ impl WriterCore {
         u32::try_from(blocks)
             .map_err(|_| Report::from(CacheError::Other))
             .attach_loc("staging table block count out of range")
-    }
-
-    /// Move the in-progress merge to its next staged relation. Returns whether
-    /// one remains.
-    fn merge_relation_advance(&mut self) -> bool {
-        let Some(in_progress) = self.merge_in_progress.as_mut() else {
-            return false;
-        };
-        in_progress.relation_index += 1;
-        in_progress.next_block = 0;
-        in_progress.relation_blocks = None;
-        in_progress.relation_index < in_progress.staged.len()
     }
 
     /// Return a population's staging tables to the pool (PGC-293): empty each
@@ -1202,6 +1237,37 @@ mod tests {
     }
 
     #[test]
+    fn test_drain_cursor_walks_relations_then_finishes() {
+        assert_eq!(DrainCursor::first(0), DrainCursor::Done);
+        assert_eq!(
+            DrainCursor::first(2),
+            DrainCursor::RelationStart { index: 0 }
+        );
+        assert_eq!(
+            DrainCursor::after_relation(1, 2),
+            DrainCursor::RelationStart { index: 1 }
+        );
+        assert_eq!(DrainCursor::after_relation(2, 2), DrainCursor::Done);
+    }
+
+    #[test]
+    fn test_chunk_due_on_empty_queue_or_after_a_batch_flush() {
+        let m = MergeInProgress::new(Fingerprint::from_raw(1), 1, vec![], DrainTarget::Discard, 7);
+        assert!(
+            m.chunk_due(true, 7),
+            "empty queue: due regardless of flushes"
+        );
+        assert!(
+            !m.chunk_due(false, 7),
+            "backlog and no flush since: not due"
+        );
+        assert!(
+            m.chunk_due(false, 8),
+            "backlog but a batch flushed since: due"
+        );
+    }
+
+    #[test]
     fn test_discard_sql_is_the_same_page_window_without_the_insert() {
         let sql = discard_sql("stage_1_0", 3, 67);
         assert_eq!(
@@ -1236,7 +1302,13 @@ mod tests {
             enqueued_at: Instant::now(),
             fetch_stage_ms: 0.0,
         };
-        let mut m = MergeInProgress::new_apply(merge);
+        let mut m = MergeInProgress::new(
+            merge.fingerprint,
+            merge.generation,
+            merge.staged.clone(),
+            DrainTarget::Apply(merge),
+            0,
+        );
         assert_eq!(m.chunk_blocks, MERGE_CHUNK_BLOCKS_INITIAL);
         m.chunk_blocks_adapt(MERGE_CHUNK_TARGET / 2);
         assert_eq!(m.chunk_blocks, MERGE_CHUNK_BLOCKS_INITIAL * 2);
