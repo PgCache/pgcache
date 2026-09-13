@@ -11,7 +11,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::cache::StatusRequest;
-use crate::listener::listener_bind;
+use crate::listener::admin_listener_bind;
 use crate::proxy::{SharedProxyStatus, StatusSender};
 use crate::settings::{
     DynamicConfig, DynamicConfigHandle, DynamicConfigPatch, config_file_dynamic_extract,
@@ -59,13 +59,17 @@ async fn admin_server_run(
     status_tx: StatusSender,
     dynamic: DynamicConfigHandle,
 ) {
-    let listener = match listener_bind(addr).await {
+    let listener = match admin_listener_bind(addr).await {
         Ok(l) => l,
         Err(e) => {
             tracing::error!("admin server bind failed on {addr}: {e}");
             return;
         }
     };
+    match listener.local_addr() {
+        Ok(bound) => tracing::info!("admin server listening on {bound}"),
+        Err(e) => tracing::info!("admin server listening on {addr} (local addr unavailable: {e})"),
+    }
 
     loop {
         let stream = tokio::select! {

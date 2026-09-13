@@ -1,13 +1,20 @@
+//! Admin listener bind. The wire listener binds its configured address as
+//! given (`TcpListener::bind`); only the admin HTTP server is widened, since
+//! that is where an in-container healthcheck against `localhost` lands and a
+//! wider proxy bind would change what the proxy exposes on hosts whose
+//! firewall rules cover IPv4 only.
+
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 
-/// Bind `addr`, widening an IPv4 wildcard (`0.0.0.0:port`) to a dual-stack
-/// `[::]:port` socket so clients that resolve `localhost` to `::1` first
-/// (Alpine's /etc/hosts with BusyBox wget) can connect. Falls back to the
-/// plain IPv4 bind when the host has no IPv6.
-pub async fn listener_bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
+/// Bind the admin listener at `addr`, widening an IPv4 wildcard
+/// (`0.0.0.0:port`) to a dual-stack `[::]:port` socket so clients that resolve
+/// `localhost` to `::1` first (Alpine's /etc/hosts with BusyBox wget) can
+/// reach the healthcheck. Falls back to the plain IPv4 bind when the host has
+/// no IPv6.
+pub async fn admin_listener_bind(addr: SocketAddr) -> std::io::Result<TcpListener> {
     if addr.ip() != Ipv4Addr::UNSPECIFIED {
         return TcpListener::bind(addr).await;
     }
@@ -44,7 +51,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ipv4_wildcard_accepts_both_loopback_families() {
-        let listener = listener_bind("0.0.0.0:0".parse().expect("valid socket addr"))
+        let listener = admin_listener_bind("0.0.0.0:0".parse().expect("valid socket addr"))
             .await
             .expect("bind wildcard");
         let port = listener.local_addr().expect("local addr").port();
@@ -62,7 +69,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_explicit_ipv4_address_stays_ipv4() {
-        let listener = listener_bind("127.0.0.1:0".parse().expect("valid socket addr"))
+        let listener = admin_listener_bind("127.0.0.1:0".parse().expect("valid socket addr"))
             .await
             .expect("bind loopback");
         let local = listener.local_addr().expect("local addr");
