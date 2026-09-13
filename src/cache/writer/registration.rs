@@ -39,9 +39,9 @@ use super::super::{
     types::{CachedQuery, QueryMetrics, SharedResolved},
     update_query::UpdateQueries,
 };
-use super::core::{MERGE_FLUSH_FORCE_AFTER, PendingMerge, WriterCore};
+use super::core::WriterCore;
+use super::merge_queue::{DrainTarget, MERGE_FLUSH_FORCE_AFTER, MergeStep, PendingMerge};
 use super::population::population_worker;
-use super::staging::{DrainTarget, MergeStep};
 use crate::pg;
 
 /// Minimum number of persistent population workers.
@@ -270,7 +270,7 @@ impl WriterRegistration {
                 // is open (PGC-250) AND the apply watermark has reached its
                 // snapshot LSN (PGC-272). Running it here could be mid-frame,
                 // racing the CDC writer's frame txn on the shared cache table.
-                core.pending_merges.push(Reverse(PendingMerge(merge)));
+                core.merges.pending.push(Reverse(PendingMerge(merge)));
             }
             QueryCommand::Failed {
                 fingerprint,
@@ -959,7 +959,8 @@ impl WriterRegistration {
         // Copy the head's fields out in the condition so the `peek` borrow ends
         // before the body re-borrows `core` mutably (pop / merge / staging).
         while let Some((fingerprint, generation, snapshot_lsn)) = core
-            .pending_merges
+            .merges
+            .pending
             .peek()
             .map(|Reverse(top)| (top.0.fingerprint, top.0.generation, top.0.snapshot_lsn))
         {
@@ -970,7 +971,7 @@ impl WriterRegistration {
             // entries buried below a live top are reaped lazily when they
             // surface.) The successor population has its own entry.
             if !core.population_is_current(fingerprint, generation) {
-                let Some(Reverse(PendingMerge(_))) = core.pending_merges.pop() else {
+                let Some(Reverse(PendingMerge(_))) = core.merges.pending.pop() else {
                     break;
                 };
                 core.population_deleted_keys
@@ -990,10 +991,10 @@ impl WriterRegistration {
             // One merge at a time: the released head starts now and is
             // advanced chunk by chunk from the writer loop (PGC-418); the next
             // releasable entry starts once it finishes.
-            if core.merge_in_progress.is_some() {
+            if core.merges.active.is_some() {
                 break;
             }
-            let Some(Reverse(PendingMerge(merge))) = core.pending_merges.pop() else {
+            let Some(Reverse(PendingMerge(merge))) = core.merges.pending.pop() else {
                 break;
             };
             started_any = true;
@@ -1005,8 +1006,8 @@ impl WriterRegistration {
         }
         // Real merges take the slot first; a queued discard runs when none is
         // releasable, so pool tables come back without ever stalling apply.
-        if core.merge_in_progress.is_none()
-            && let Some(discard) = core.pending_discards.pop_front()
+        if core.merges.active.is_none()
+            && let Some(discard) = core.merges.discards.pop_front()
         {
             core.population_discard_start(discard);
         }
@@ -1014,12 +1015,13 @@ impl WriterRegistration {
         // A released merge means the watermark is advancing on its own; restart
         // the stall clock so the grace window times the *current* gated head.
         if started_any {
-            core.merge_stall_since = None;
+            core.merges.stall_since = None;
         }
 
         // Peek the gated head and drop the borrow before mutating `core`.
         let gated_snapshot_lsn = core
-            .pending_merges
+            .merges
+            .pending
             .peek()
             .map(|Reverse(top)| top.0.snapshot_lsn);
         match gated_snapshot_lsn {
@@ -1029,15 +1031,15 @@ impl WriterRegistration {
             // reachable (PGC-290). `last_flush_marker_lsn` suppresses re-emits
             // once a marker already covers the gated backlog.
             Some(snapshot_lsn) => {
-                core.watermark_nudge.notify_one();
-                let stalled_since = *core.merge_stall_since.get_or_insert_with(Instant::now);
+                core.merges.watermark_nudge.notify_one();
+                let stalled_since = *core.merges.stall_since.get_or_insert_with(Instant::now);
                 if stalled_since.elapsed() >= MERGE_FLUSH_FORCE_AFTER
-                    && snapshot_lsn > core.last_flush_marker_lsn
+                    && snapshot_lsn > core.merges.flush_marker_lsn
                 {
-                    core.last_flush_marker_lsn = core.origin_flush_force().await?;
+                    core.merges.flush_marker_lsn = core.origin_flush_force().await?;
                 }
             }
-            None => core.merge_stall_since = None,
+            None => core.merges.stall_since = None,
         }
         Ok(())
     }
@@ -1051,7 +1053,8 @@ impl WriterRegistration {
     /// (`DrainTarget::Discard`), never with one DELETE over the remainder.
     pub(super) async fn merge_in_progress_step(&self, core: &mut WriterCore) -> CacheResult<()> {
         let Some((fingerprint, generation, applying)) = core
-            .merge_in_progress
+            .merges
+            .active
             .as_ref()
             .map(|m| (m.fingerprint, m.generation, m.is_applying()))
         else {
@@ -1066,7 +1069,7 @@ impl WriterRegistration {
         match core.population_merge_step().await {
             Ok(MergeStep::Continue) => {}
             Ok(MergeStep::Done) => {
-                let Some(finished) = core.merge_in_progress.take() else {
+                let Some(finished) = core.merges.active.take() else {
                     return Ok(());
                 };
                 // Staging is drained; check-in returns the tables to the pool
@@ -1121,7 +1124,7 @@ impl WriterRegistration {
                 } else {
                     // The discard itself failed: fall back to the one-statement
                     // check-in rather than retry forever.
-                    core.merge_in_progress = None;
+                    core.merges.active = None;
                     core.staging_checkin(fingerprint, generation).await;
                 }
             }

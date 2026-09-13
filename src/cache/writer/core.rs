@@ -2,7 +2,7 @@ use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::{Fingerprint, FingerprintSet};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,16 +26,17 @@ use crate::settings::Settings;
 
 use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::{CdcCommand, PopulationMerge, QueryCommand, WriterNotify},
+    messages::{CdcCommand, QueryCommand, WriterNotify},
     mv::{MvMeta, ShapeGate},
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
     },
 };
 use super::cdc::WriterCdc;
+use super::merge_queue::MergeQueue;
 use super::mv_build::MvBuildPool;
 use super::registration::WriterRegistration;
-use super::staging::{MergeInProgress, PopulationDeletedKeys, StagingDiscard, StagingPool};
+use super::staging::{PopulationDeletedKeys, StagingPool};
 
 use super::frame::*;
 
@@ -109,14 +110,6 @@ const EVICTION_TICK_BUDGET: usize = 512;
 /// `ROW_VEC_POOL_MAX` / `TOAST_OVERLAY_POOL_MAX` bound their pools, in case a
 /// future caller ever returns more sets than it took.
 const CANDIDATE_SCRATCH_MAX: usize = 8;
-
-/// How long a population merge may stay gated on the apply watermark before the
-/// writer forces an origin WAL flush (`origin_flush_force`) to make its snapshot
-/// LSN reachable (PGC-290). Above the nudge→keepalive round-trip so a healthy
-/// active origin, where the flush pointer catches up on its own, never triggers
-/// a marker; the cost is at most this much extra ready-latency on a stalled
-/// (idle / async-commit) origin.
-pub(super) const MERGE_FLUSH_FORCE_AFTER: Duration = Duration::from_millis(100);
 
 /// Shared writer state for the CDC apply and registration/population paths.
 /// `WriterCdc` and `WriterRegistration` borrow `&mut WriterCore` per command;
@@ -221,44 +214,9 @@ pub struct WriterCore {
     /// checked out at dispatch, returned (emptied + vacuumed) at merge, so a
     /// population emits no DDL.
     pub(super) staging_pool: StagingPool,
-    /// Population merges awaiting both a quiescent (frame-Idle) writer and the
-    /// CDC apply watermark reaching their snapshot LSN (PGC-272): a min-heap
-    /// on `(snapshot_lsn, generation)`, drained in deadline order by
-    /// `pending_merges_drain` as the watermark advances. Gating the merge —
-    /// not just Ready — keeps snapshot-state rows out of the shared table
-    /// until CDC has applied past the snapshot, so already-Ready bystander
-    /// queries can never serve a torn mix of two origin points in time.
-    pub(super) pending_merges: BinaryHeap<Reverse<PendingMerge>>,
-    /// The merge being applied chunk by chunk (PGC-418), popped from
-    /// `pending_merges` once its gate released. The writer loop runs one chunk
-    /// per iteration while a CDC frame is not open, so apply interleaves with
-    /// the merge instead of waiting behind one statement over the whole
-    /// staging table.
-    pub(super) merge_in_progress: Option<MergeInProgress>,
-    /// Superseded populations whose staging awaits a chunked discard
-    /// (`MergeMode::Discard`), started when the merge slot is free and no
-    /// releasable merge is waiting.
-    pub(super) pending_discards: VecDeque<StagingDiscard>,
-    /// Count of CDC batch flushes (each returns the frame to Idle). The
-    /// in-progress drain remembers the value at its last chunk: under a
-    /// sustained CDC backlog the queue is never empty, and a changed count is
-    /// what lets the drain take its next chunk — one per completed batch,
-    /// proportional to CDC throughput rather than a clock (PGC-418).
-    pub(super) batch_flush_seq: u64,
-    /// Signals the CDC thread to request an immediate keepalive (reply-requested
-    /// standby status update), advancing `last_received_lsn` so a gated query's
-    /// snapshot LSN is reached within a round-trip instead of waiting for the
-    /// next periodic keepalive.
-    pub(super) watermark_nudge: Arc<Notify>,
-    /// When the earliest gated population merge first became gated, or `None`
-    /// when nothing is gated. Times the grace window before `origin_flush_force`
-    /// is used to make a stuck snapshot LSN reachable (PGC-290).
-    pub(super) merge_stall_since: Option<std::time::Instant>,
-    /// LSN of the last `origin_flush_force` marker. A merge whose snapshot LSN is
-    /// at or below this has already had the flush pointer forced past it, so it
-    /// needs no further marker — this gates re-emits to roughly one per stuck
-    /// wave rather than one per gated merge (PGC-290).
-    pub(super) last_flush_marker_lsn: Lsn,
+    /// Population merges and staging discards: the gated queue, the one drain
+    /// in progress, and the gate's bookkeeping (PGC-272 / PGC-418).
+    pub(super) merges: MergeQueue,
     /// Mirror of `WriterCdc.last_received_lsn`, updated as the CDC path advances
     /// the watermark. Read at population dispatch to seed the deleted-key
     /// anchor floor (a lower bound on the population's snapshot LSN).
@@ -367,41 +325,6 @@ pub struct WriterCore {
     pub(super) disk_drop_backoff: bool,
 }
 
-/// A queued population merge, ordered by its watermark deadline (PGC-272).
-/// The ordering key is `(snapshot_lsn, generation)`: `generation` comes from
-/// the single global monotonic counter, so the tuple is a total order even
-/// when two populations capture identical snapshot LSNs. Deliberately NOT
-/// `fingerprint` — two populations of one fingerprint at different
-/// generations can be in flight simultaneously and must not tie. The payload
-/// is excluded from the ordering.
-pub(super) struct PendingMerge(pub(super) PopulationMerge);
-
-impl PendingMerge {
-    fn key(&self) -> (Lsn, u64) {
-        (self.0.snapshot_lsn, self.0.generation)
-    }
-}
-
-impl Ord for PendingMerge {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.key().cmp(&other.key())
-    }
-}
-
-impl PartialOrd for PendingMerge {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for PendingMerge {
-    fn eq(&self, other: &Self) -> bool {
-        self.key() == other.key()
-    }
-}
-
-impl Eq for PendingMerge {}
-
 /// Whether a parked population (a queued merge or a gated ready entry) at
 /// `parked_generation` may still finalize. `live` is the current cached query's
 /// `(generation, invalidated)`, or `None` if it was evicted. Finalize only when
@@ -505,14 +428,14 @@ pub fn writer_run(
                             // Diagnose merge-gate stalls (PGC-290): if merges are
                             // parked, report why the drain gate (frame_state ==
                             // Idle && watermark >= min snapshot_lsn) is not firing.
-                            if !core.pending_merges.is_empty() {
+                            if !core.merges.pending.is_empty() {
                                 let min_snap =
-                                    core.pending_merges.peek().map(|Reverse(m)| m.0.snapshot_lsn);
+                                    core.merges.pending.peek().map(|Reverse(m)| m.0.snapshot_lsn);
                                 debug!(
                                     "merge-gate: frame_state={:?} frame_open={} pending={} min_snapshot_lsn={:?} watermark={:?}",
                                     core.frame_state,
                                     core.frame_open,
-                                    core.pending_merges.len(),
+                                    core.merges.pending.len(),
                                     min_snap,
                                     writer_cdc.last_received_lsn,
                                 );
@@ -521,7 +444,7 @@ pub fn writer_run(
                             crate::metrics::handles()
                                 .reg
                                 .merge_pending_depth
-                                .set(core.pending_merges.len() as f64);
+                                .set(core.merges.pending.len() as f64);
                             core.disk_stats_refresh();
                             core.stale_entries_cleanup();
                             core.state_gauges_update();
@@ -645,9 +568,9 @@ pub fn writer_run(
                         () = std::future::ready(()),
                             if core.frame_state == FrameState::Idle
                                 && core
-                                    .merge_in_progress
+                                    .merges.active
                                     .as_ref()
-                                    .is_some_and(|m| m.chunk_due(cdc_rx.is_empty(), core.batch_flush_seq)) => {
+                                    .is_some_and(|m| m.chunk_due(cdc_rx.is_empty(), core.merges.batch_flush_seq)) => {
                             if let Err(e) = registration.merge_in_progress_step(&mut core).await {
                                 error!(
                                     "population merge step failed: {}",
@@ -665,8 +588,8 @@ pub fn writer_run(
                     // snapshot LSN (PGC-272); the watermark advances on the
                     // CDC path, so re-check on every quiescent iteration.
                     if core.frame_state == FrameState::Idle
-                        && core.merge_in_progress.is_none()
-                        && (!core.pending_merges.is_empty() || !core.pending_discards.is_empty())
+                        && core.merges.active.is_none()
+                        && (!core.merges.pending.is_empty() || !core.merges.discards.is_empty())
                         && let Err(e) = registration
                             .pending_merges_drain(&mut core, writer_cdc.last_received_lsn)
                             .await
@@ -772,13 +695,7 @@ impl WriterCore {
             frame_buf_relations: HashSet::new(),
             population_deleted_keys: PopulationDeletedKeys::default(),
             staging_pool: StagingPool::default(),
-            pending_merges: BinaryHeap::new(),
-            merge_in_progress: None,
-            pending_discards: VecDeque::new(),
-            batch_flush_seq: 0,
-            watermark_nudge,
-            merge_stall_since: None,
-            last_flush_marker_lsn: Lsn::from_raw(0),
+            merges: MergeQueue::new(watermark_nudge),
             last_received_lsn: Lsn::from_raw(0),
             last_applied_lsn: Lsn::from_raw(0),
             frame_deleted_keys: Vec::new(),

@@ -3,6 +3,7 @@ mod core;
 mod deadlock;
 mod eviction;
 mod frame;
+mod merge_queue;
 mod mv;
 mod mv_build;
 mod population;
