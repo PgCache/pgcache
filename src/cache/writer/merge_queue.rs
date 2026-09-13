@@ -31,6 +31,7 @@ use crate::query::Fingerprint;
 use super::super::messages::PopulationMerge;
 use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use super::core::WriterCore;
+use super::staging::PopulationDeletedKeys;
 
 /// How long a population merge may stay gated on the apply watermark before the
 /// writer forces an origin WAL flush (`origin_flush_force`) to make its snapshot
@@ -125,6 +126,16 @@ pub(super) struct StagingDiscard {
     pub(super) staged: Vec<(Oid, EcoString)>,
 }
 
+/// The deleted-key filter rendered for one relation of a drain, reused across
+/// chunks while the relation's key set stays at `version`. Up to
+/// `POPULATION_DELETED_KEY_CAP` tuples, so re-rendering per chunk would cost
+/// every chunk a fixed price the size controller would then chase.
+struct FilterCache {
+    relation_oid: Oid,
+    version: u64,
+    predicate: String,
+}
+
 /// A staging drain in progress — a population merge, or a discard — advanced
 /// one chunk at a time (PGC-418). At most one is in progress; the writer loop
 /// advances it by one chunk per iteration while no CDC frame is open, so CDC
@@ -142,6 +153,7 @@ pub(super) struct MergeInProgress {
     /// started): under a CDC backlog the next chunk is due only once a batch
     /// has flushed since.
     flush_seq_at_last_chunk: u64,
+    filter: Option<FilterCache>,
     /// Rows drained from staging so far (before the deleted-key filter).
     pub(super) drained_rows: u64,
     pub(super) chunks: u64,
@@ -165,6 +177,7 @@ impl MergeInProgress {
             cursor,
             chunk_blocks: fault_merge_chunk_blocks().unwrap_or(MERGE_CHUNK_BLOCKS_INITIAL),
             flush_seq_at_last_chunk: batch_flush_seq,
+            filter: None,
             drained_rows: 0,
             chunks: 0,
             started_at: Instant::now(),
@@ -173,6 +186,32 @@ impl MergeInProgress {
 
     pub(super) fn is_applying(&self) -> bool {
         matches!(self.target, DrainTarget::Apply(_))
+    }
+
+    /// The deleted-key filter for the chunk about to run, rendered from `keys`
+    /// only when the relation's key set changed since the last rendering, so a
+    /// removal landing between chunks is honored without paying the rendering
+    /// on every chunk.
+    fn filter_predicate(
+        &mut self,
+        keys: &PopulationDeletedKeys,
+        relation_oid: Oid,
+        pk_columns_paren: &str,
+    ) -> Option<&str> {
+        let version = keys.filter_version(relation_oid)?;
+        let current = self
+            .filter
+            .as_ref()
+            .is_some_and(|c| c.relation_oid == relation_oid && c.version == version);
+        if !current {
+            let predicate = keys.filter_predicate(relation_oid, pk_columns_paren)?;
+            self.filter = Some(FilterCache {
+                relation_oid,
+                version,
+                predicate,
+            });
+        }
+        self.filter.as_ref().map(|c| c.predicate.as_str())
     }
 
     /// Whether the next chunk may run now: immediately when no CDC command is
@@ -522,9 +561,10 @@ impl WriterCore {
     /// Run one chunk of the in-progress drain (PGC-418): size the relation the
     /// cursor is about to enter, or drain one window of the relation it is in.
     /// A merge filters keys CDC removed during the population (PGC-250); the
-    /// filter is rebuilt per chunk so a removal that lands between chunks is
-    /// honored. Returns `Continue` while staging rows remain; on `Done` /
-    /// `Aborted` the caller takes `merge_in_progress` and finalizes.
+    /// filter is re-rendered whenever the key set changed since the last chunk
+    /// so a removal that lands between chunks is honored. Returns `Continue`
+    /// while staging rows remain; on `Done` / `Aborted` the caller takes the
+    /// active drain and finalizes.
     pub(super) async fn population_merge_step(&mut self) -> CacheResult<MergeStep> {
         let Some(in_progress) = self.merges.active.as_ref() else {
             return Ok(MergeStep::Done);
@@ -585,10 +625,14 @@ impl WriterCore {
         };
         let sql = match &plan {
             Some(plan) => {
-                let filter = self
-                    .population_deleted_keys
-                    .filter_predicate(relation_oid, &plan.pk_columns_paren);
-                plan.chunk_sql(&staging, generation, lo_block, hi_block, filter.as_deref())
+                let filter = self.merges.active.as_mut().and_then(|in_progress| {
+                    in_progress.filter_predicate(
+                        &self.population_deleted_keys,
+                        relation_oid,
+                        &plan.pk_columns_paren,
+                    )
+                });
+                plan.chunk_sql(&staging, generation, lo_block, hi_block, filter)
             }
             None => discard_sql(&staging, lo_block, hi_block),
         };
@@ -658,6 +702,62 @@ impl WriterCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REL: Oid = Oid::from_raw(10);
+
+    fn drain() -> MergeInProgress {
+        MergeInProgress::new(
+            Fingerprint::from_raw(1),
+            1,
+            vec![(REL, EcoString::from("stage_10_0"))],
+            DrainTarget::Discard,
+            0,
+        )
+    }
+
+    fn keys_recording() -> PopulationDeletedKeys {
+        let mut keys = PopulationDeletedKeys::default();
+        keys.activate(Fingerprint::from_raw(1), 1, &[REL], Lsn::from_raw(1));
+        keys
+    }
+
+    /// The rendered filter is reused across chunks while the key set holds and
+    /// re-rendered as soon as a key lands or is cancelled between chunks.
+    #[test]
+    fn test_filter_cache_follows_key_set_changes() {
+        let mut keys = keys_recording();
+        let mut drain = drain();
+        assert!(drain.filter_predicate(&keys, REL, "(id)").is_none());
+
+        keys.record(REL, EcoString::from("4"), Lsn::from_raw(10));
+        let first = drain
+            .filter_predicate(&keys, REL, "(id)")
+            .expect("filter present")
+            .as_ptr();
+        let again = drain
+            .filter_predicate(&keys, REL, "(id)")
+            .expect("filter present")
+            .as_ptr();
+        assert_eq!(first, again, "unchanged key set reuses the rendering");
+
+        keys.record(REL, EcoString::from("7"), Lsn::from_raw(11));
+        let grown = drain
+            .filter_predicate(&keys, REL, "(id)")
+            .expect("filter present");
+        assert!(grown.contains("(4)") && grown.contains("(7)"), "{grown}");
+
+        assert!(keys.cancel(REL, "4"));
+        let shrunk = drain
+            .filter_predicate(&keys, REL, "(id)")
+            .expect("filter present");
+        assert!(
+            !shrunk.contains("(4)") && shrunk.contains("(7)"),
+            "{shrunk}"
+        );
+
+        assert!(keys.cancel(REL, "7"));
+        assert!(drain.filter_predicate(&keys, REL, "(id)").is_none());
+    }
 
     fn plan() -> MergePlan {
         MergePlan {

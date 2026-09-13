@@ -68,6 +68,9 @@ struct DeletedKeyEntry {
     floors: HashMap<PopulationKey, Lsn>,
     /// Rendered PK tuple body (e.g. `42` or `'a','b'`) → commit LSN of the delete.
     keys: HashMap<EcoString, Lsn>,
+    /// Bumped whenever the key *set* changes (not an LSN restamp), so a merge
+    /// can reuse its rendered filter across chunks until the set moves.
+    version: u64,
     /// Set once `keys` exceeds the cap; keys are dropped and *every* merge over
     /// the relation aborts (keys genuinely lost) until the last population leaves.
     overflowed: bool,
@@ -86,7 +89,30 @@ impl DeletedKeyEntry {
         let Some(min_floor) = self.floors.values().copied().min() else {
             return;
         };
-        self.keys.retain(|_, lsn| *lsn > min_floor);
+        self.keys_retain(|lsn| lsn > min_floor);
+    }
+
+    fn key_insert(&mut self, key: EcoString, lsn: Lsn) {
+        if self.keys.insert(key, lsn).is_none() {
+            self.version += 1;
+        }
+    }
+
+    /// Drop a key; returns whether it was tracked.
+    fn key_remove(&mut self, key: &str) -> bool {
+        let removed = self.keys.remove(key).is_some();
+        if removed {
+            self.version += 1;
+        }
+        removed
+    }
+
+    fn keys_retain(&mut self, keep: impl Fn(Lsn) -> bool) {
+        let before = self.keys.len();
+        self.keys.retain(|_, lsn| keep(*lsn));
+        if self.keys.len() != before {
+            self.version += 1;
+        }
     }
 
     /// Cap overflow: keys are lost, so every merge over this relation must abort
@@ -95,6 +121,7 @@ impl DeletedKeyEntry {
         self.keys.clear();
         self.keys.shrink_to_fit();
         self.overflowed = true;
+        self.version += 1;
     }
 
     /// A bulk invalidation committed at `lsn` emptied/dropped rows; raise the
@@ -102,13 +129,18 @@ impl DeletedKeyEntry {
     /// truncate and irrelevant to surviving post-event snapshots).
     fn abort_below(&mut self, lsn: Lsn) {
         self.aborted_below = self.aborted_below.max(lsn);
-        self.keys.retain(|_, key_lsn| *key_lsn > lsn);
+        self.keys_retain(|key_lsn| key_lsn > lsn);
     }
 
     /// Whether a merge whose snapshot is `snapshot_lsn` must abort: keys were
     /// lost (overflow), or the snapshot predates a bulk invalidation.
     fn should_abort(&self, snapshot_lsn: Lsn) -> bool {
         self.overflowed || snapshot_lsn < self.aborted_below
+    }
+
+    /// Whether a merge filter would render: keys are held and not lost.
+    fn filters(&self) -> bool {
+        !self.overflowed && !self.keys.is_empty()
     }
 }
 
@@ -169,7 +201,7 @@ impl PopulationDeletedKeys {
         if entry.overflowed {
             return;
         }
-        entry.keys.insert(key, lsn);
+        entry.key_insert(key, lsn);
         if entry.keys.len() > POPULATION_DELETED_KEY_CAP {
             entry.disable();
             error!(
@@ -194,7 +226,7 @@ impl PopulationDeletedKeys {
     pub(super) fn cancel(&mut self, relation_oid: Oid, key: &str) -> bool {
         self.relations
             .get_mut(&relation_oid)
-            .is_some_and(|entry| entry.keys.remove(key).is_some())
+            .is_some_and(|entry| entry.key_remove(key))
     }
 
     /// Raise the abort watermark for `relation_oid` to `lsn` — a bulk
@@ -217,6 +249,16 @@ impl PopulationDeletedKeys {
             .is_some_and(|e| e.should_abort(snapshot_lsn))
     }
 
+    /// Version of the filter `filter_predicate` would render for
+    /// `relation_oid`, or `None` when it would render nothing. Changes exactly
+    /// when the rendered filter would, so a merge can key a cached rendering on
+    /// it across chunks. Valid only while the relation's entry lives; a
+    /// draining population's own floor keeps it alive for the whole drain.
+    pub(super) fn filter_version(&self, relation_oid: Oid) -> Option<u64> {
+        let entry = self.relations.get(&relation_oid)?;
+        entry.filters().then_some(entry.version)
+    }
+
     /// Build the `(<pk cols>) NOT IN (...)` predicate excluding recorded deletes,
     /// or `None` when there's nothing to exclude.
     pub(super) fn filter_predicate(
@@ -225,7 +267,7 @@ impl PopulationDeletedKeys {
         pk_columns_paren: &str,
     ) -> Option<String> {
         let entry = self.relations.get(&relation_oid)?;
-        if entry.overflowed || entry.keys.is_empty() {
+        if !entry.filters() {
             return None;
         }
         let mut tuples = String::new();
@@ -490,6 +532,54 @@ mod tests {
 
     fn record(keys: &mut PopulationDeletedKeys, body: &str, lsn: Lsn) {
         keys.record(REL, EcoString::from(body), lsn);
+    }
+
+    /// The filter version moves exactly when the rendered filter would: on a
+    /// new key, a cancel, a prune, a bulk-invalidation drop, and overflow — not
+    /// on a re-record of a key already held.
+    #[test]
+    fn test_filter_version_tracks_key_set_changes() {
+        let mut keys = PopulationDeletedKeys::default();
+        assert!(keys.filter_version(REL).is_none(), "no entry");
+        keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(100));
+        keys.activate(Fingerprint::from_raw(2), GEN, &[REL], Lsn::from_raw(200));
+        assert!(keys.filter_version(REL).is_none(), "no keys");
+
+        record(&mut keys, "5", Lsn::from_raw(150));
+        let v1 = keys.filter_version(REL).expect("filter present");
+        record(&mut keys, "5", Lsn::from_raw(160));
+        assert_eq!(keys.filter_version(REL), Some(v1), "restamp keeps the set");
+        record(&mut keys, "25", Lsn::from_raw(250));
+        let v2 = keys.filter_version(REL).expect("filter present");
+        assert_ne!(v1, v2, "new key");
+
+        assert!(keys.cancel(REL, "25"));
+        let v3 = keys.filter_version(REL).expect("filter present");
+        assert_ne!(v2, v3, "cancel");
+        assert!(!keys.cancel(REL, "25"));
+        assert_eq!(
+            keys.filter_version(REL),
+            Some(v3),
+            "cancel of untracked key"
+        );
+
+        // fp1 leaves: min floor 200 prunes the delete at 160.
+        keys.deactivate(Fingerprint::from_raw(1), GEN);
+        assert!(keys.filter_version(REL).is_none(), "pruned to empty");
+
+        record(&mut keys, "30", Lsn::from_raw(300));
+        let v4 = keys.filter_version(REL).expect("filter present");
+        keys.abort_below(REL, Lsn::from_raw(250));
+        assert_eq!(
+            keys.filter_version(REL),
+            Some(v4),
+            "key above the truncate survives"
+        );
+        keys.abort_below(REL, Lsn::from_raw(350));
+        assert!(
+            keys.filter_version(REL).is_none(),
+            "dropped below the truncate"
+        );
     }
 
     /// Deactivating a population raises the relation's min floor, pruning deletes
