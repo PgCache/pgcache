@@ -136,6 +136,29 @@ struct FilterCache {
     predicate: String,
 }
 
+/// What the writer's input queues held when the active drain last took a
+/// chunk (or started). Under a backlog the next chunk is due only once each
+/// queue has yielded its unit of foreground work since: a CDC batch flush,
+/// or the query commands that were queued at the boundary. That owed set is
+/// the arrivals during one chunk, so the interleave balances by the
+/// commands' actual cost — a cheap burst drains in a blink and the merge
+/// resumes, an expensive one is still bounded to a chunk's worth of arrivals
+/// — with no clock and no count knob.
+#[derive(Clone, Copy, Default)]
+struct ChunkBoundary {
+    batch_flush_seq: u64,
+    commands_handled: u64,
+    commands_owed: u64,
+}
+
+/// Emptiness of the writer's input queues at a chunk decision.
+#[derive(Clone, Copy)]
+pub(super) struct InputQueues {
+    pub(super) cdc_empty: bool,
+    pub(super) query_empty: bool,
+    pub(super) internal_empty: bool,
+}
+
 /// A staging drain in progress — a population merge, or a discard — advanced
 /// one chunk at a time (PGC-418). At most one is in progress; the writer loop
 /// advances it by one chunk per iteration while no CDC frame is open, so CDC
@@ -149,10 +172,7 @@ pub(super) struct MergeInProgress {
     pub(super) target: DrainTarget,
     cursor: DrainCursor,
     chunk_blocks: u32,
-    /// `WriterCore::batch_flush_seq` when the last chunk ran (or the drain
-    /// started): under a CDC backlog the next chunk is due only once a batch
-    /// has flushed since.
-    flush_seq_at_last_chunk: u64,
+    boundary: ChunkBoundary,
     filter: Option<FilterCache>,
     /// Rows drained from staging so far (before the deleted-key filter).
     pub(super) drained_rows: u64,
@@ -166,7 +186,7 @@ impl MergeInProgress {
         generation: u64,
         staged: Vec<(Oid, EcoString)>,
         target: DrainTarget,
-        batch_flush_seq: u64,
+        boundary: ChunkBoundary,
     ) -> Self {
         let cursor = DrainCursor::first(staged.len());
         Self {
@@ -176,7 +196,7 @@ impl MergeInProgress {
             target,
             cursor,
             chunk_blocks: fault_merge_chunk_blocks().unwrap_or(MERGE_CHUNK_BLOCKS_INITIAL),
-            flush_seq_at_last_chunk: batch_flush_seq,
+            boundary,
             filter: None,
             drained_rows: 0,
             chunks: 0,
@@ -212,14 +232,6 @@ impl MergeInProgress {
             });
         }
         self.filter.as_ref().map(|c| c.predicate.as_str())
-    }
-
-    /// Whether the next chunk may run now: immediately when no CDC command is
-    /// queued — never ahead of queued real work — or, under a backlog, once a
-    /// batch has flushed since the last chunk, so the drain progresses in
-    /// proportion to CDC throughput instead of starving.
-    pub(super) fn chunk_due(&self, cdc_queue_empty: bool, batch_flush_seq: u64) -> bool {
-        cdc_queue_empty || batch_flush_seq != self.flush_seq_at_last_chunk
     }
 
     /// Scale the next chunk toward `MERGE_CHUNK_TARGET` from the last chunk's
@@ -322,12 +334,14 @@ pub(super) struct MergeQueue {
     /// The drain being advanced chunk by chunk, popped from `pending` once its
     /// gate released, or started from `discards`.
     pub(super) active: Option<MergeInProgress>,
-    /// Count of CDC batch flushes (each returns the frame to Idle). The active
-    /// drain remembers the value at its last chunk: under a sustained CDC
-    /// backlog the queue is never empty, and a changed count is what lets it
-    /// take its next chunk — one per completed batch, proportional to CDC
-    /// throughput rather than a clock (PGC-418).
-    pub(super) batch_flush_seq: u64,
+    /// Count of CDC batch flushes (each returns the frame to Idle); see
+    /// `ChunkBoundary`.
+    batch_flush_seq: u64,
+    /// Count of handled query commands (registrations and the like — not
+    /// population-task completions, which are trivial and bounded by the
+    /// workers in flight, so a chunk simply waits for them); see
+    /// `ChunkBoundary`.
+    commands_handled: u64,
     /// Signals the CDC thread to request an immediate keepalive (reply-requested
     /// standby status update), advancing `last_received_lsn` so a gated query's
     /// snapshot LSN is reached within a round-trip instead of waiting for the
@@ -351,10 +365,55 @@ impl MergeQueue {
             discards: VecDeque::new(),
             active: None,
             batch_flush_seq: 0,
+            commands_handled: 0,
             watermark_nudge,
             stall_since: None,
             flush_marker_lsn: Lsn::from_raw(0),
         }
+    }
+
+    pub(super) fn batch_flushed(&mut self) {
+        self.batch_flush_seq = self.batch_flush_seq.wrapping_add(1);
+    }
+
+    pub(super) fn command_handled(&mut self) {
+        self.commands_handled = self.commands_handled.wrapping_add(1);
+    }
+
+    fn boundary(&self, commands_owed: u64) -> ChunkBoundary {
+        ChunkBoundary {
+            batch_flush_seq: self.batch_flush_seq,
+            commands_handled: self.commands_handled,
+            commands_owed,
+        }
+    }
+
+    /// Mark a chunk boundary for the active drain — a chunk just ran, or the
+    /// drain just started — owing the `query_queued` commands waiting now.
+    pub(super) fn chunk_boundary_mark(&mut self, query_queued: usize) {
+        let boundary = self.boundary(query_queued as u64);
+        if let Some(active) = self.active.as_mut() {
+            active.boundary = boundary;
+        }
+    }
+
+    /// Whether the active drain may take its next chunk now: every input
+    /// queue is drained — never ahead of queued real work — or has yielded
+    /// its unit since the last boundary (`ChunkBoundary`). Population-task
+    /// completions are always drained first.
+    pub(super) fn chunk_due(&self, queues: InputQueues) -> bool {
+        let Some(active) = &self.active else {
+            return false;
+        };
+        let boundary = active.boundary;
+        let flushed_since = self.batch_flush_seq != boundary.batch_flush_seq;
+        let owed_handled = self
+            .commands_handled
+            .wrapping_sub(boundary.commands_handled)
+            >= boundary.commands_owed;
+        (queues.cdc_empty || flushed_since)
+            && (queues.query_empty || owed_handled)
+            && queues.internal_empty
     }
 }
 
@@ -502,7 +561,7 @@ impl WriterCore {
             merge.generation,
             staged,
             DrainTarget::Apply(merge),
-            self.merges.batch_flush_seq,
+            self.merges.boundary(0),
         ));
     }
 
@@ -518,7 +577,7 @@ impl WriterCore {
             discard.generation,
             discard.staged,
             DrainTarget::Discard,
-            self.merges.batch_flush_seq,
+            self.merges.boundary(0),
         ));
     }
 
@@ -658,13 +717,11 @@ impl WriterCore {
         }
         mh.reg.merge_chunk.record(elapsed.as_secs_f64());
 
-        let batch_flush_seq = self.merges.batch_flush_seq;
         let Some(in_progress) = self.merges.active.as_mut() else {
             return Ok(MergeStep::Done);
         };
         in_progress.chunks += 1;
         in_progress.drained_rows += count;
-        in_progress.flush_seq_at_last_chunk = batch_flush_seq;
         in_progress.chunk_blocks_adapt(elapsed);
         in_progress.cursor = if hi_block >= blocks {
             DrainCursor::after_relation(index + 1, staged_len)
@@ -711,7 +768,7 @@ mod tests {
             1,
             vec![(REL, EcoString::from("stage_10_0"))],
             DrainTarget::Discard,
-            0,
+            ChunkBoundary::default(),
         )
     }
 
@@ -811,21 +868,90 @@ mod tests {
         assert_eq!(DrainCursor::after_relation(2, 2), DrainCursor::Done);
     }
 
+    fn merges_with_active_drain() -> MergeQueue {
+        let mut merges = MergeQueue::new(Arc::new(Notify::new()));
+        merges.active = Some(MergeInProgress::new(
+            Fingerprint::from_raw(1),
+            1,
+            vec![],
+            DrainTarget::Discard,
+            merges.boundary(0),
+        ));
+        merges
+    }
+
+    const ALL_EMPTY: InputQueues = InputQueues {
+        cdc_empty: true,
+        query_empty: true,
+        internal_empty: true,
+    };
+
     #[test]
-    fn test_chunk_due_on_empty_queue_or_after_a_batch_flush() {
-        let m = MergeInProgress::new(Fingerprint::from_raw(1), 1, vec![], DrainTarget::Discard, 7);
+    fn test_chunk_due_only_with_an_active_drain() {
+        let merges = MergeQueue::new(Arc::new(Notify::new()));
+        assert!(!merges.chunk_due(ALL_EMPTY));
+        assert!(merges_with_active_drain().chunk_due(ALL_EMPTY));
+    }
+
+    #[test]
+    fn test_chunk_waits_for_a_batch_flush_under_a_cdc_backlog() {
+        let mut merges = merges_with_active_drain();
+        let cdc_backlog = InputQueues {
+            cdc_empty: false,
+            ..ALL_EMPTY
+        };
         assert!(
-            m.chunk_due(true, 7),
-            "empty queue: due regardless of flushes"
+            !merges.chunk_due(cdc_backlog),
+            "no flush since the boundary"
         );
+        merges.batch_flushed();
+        assert!(merges.chunk_due(cdc_backlog), "a batch flushed since");
+        merges.chunk_boundary_mark(0);
         assert!(
-            !m.chunk_due(false, 7),
-            "backlog and no flush since: not due"
+            !merges.chunk_due(cdc_backlog),
+            "boundary consumed the flush"
         );
+    }
+
+    #[test]
+    fn test_chunk_waits_for_the_commands_owed_at_the_boundary() {
+        let mut merges = merges_with_active_drain();
+        let query_backlog = InputQueues {
+            query_empty: false,
+            ..ALL_EMPTY
+        };
+        merges.chunk_boundary_mark(3);
+        merges.command_handled();
+        merges.command_handled();
         assert!(
-            m.chunk_due(false, 8),
-            "backlog but a batch flushed since: due"
+            !merges.chunk_due(query_backlog),
+            "one of three owed still queued"
         );
+        merges.command_handled();
+        assert!(merges.chunk_due(query_backlog), "owed set drained");
+        merges.command_handled();
+        assert!(
+            merges.chunk_due(query_backlog),
+            "arrivals beyond the owed set do not re-gate this chunk"
+        );
+        merges.chunk_boundary_mark(0);
+        assert!(
+            merges.chunk_due(query_backlog),
+            "nothing owed: arrivals after the boundary compete"
+        );
+    }
+
+    #[test]
+    fn test_chunk_always_waits_for_population_completions() {
+        let mut merges = merges_with_active_drain();
+        let internal_backlog = InputQueues {
+            internal_empty: false,
+            ..ALL_EMPTY
+        };
+        assert!(!merges.chunk_due(internal_backlog));
+        merges.batch_flushed();
+        merges.command_handled();
+        assert!(!merges.chunk_due(internal_backlog), "no unit satisfies it");
     }
 
     #[test]
@@ -868,7 +994,7 @@ mod tests {
             merge.generation,
             merge.staged.clone(),
             DrainTarget::Apply(merge),
-            0,
+            ChunkBoundary::default(),
         );
         assert_eq!(m.chunk_blocks, MERGE_CHUNK_BLOCKS_INITIAL);
         m.chunk_blocks_adapt(MERGE_CHUNK_TARGET / 2);

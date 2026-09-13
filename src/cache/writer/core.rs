@@ -33,7 +33,7 @@ use super::super::{
     },
 };
 use super::cdc::WriterCdc;
-use super::merge_queue::MergeQueue;
+use super::merge_queue::{InputQueues, MergeQueue};
 use super::mv_build::MvBuildPool;
 use super::registration::WriterRegistration;
 use super::staging::{PopulationDeletedKeys, StagingPool};
@@ -482,6 +482,7 @@ pub fn writer_run(
                                             error_chain_format(e.current_context()),
                                         );
                                     }
+                                    core.merges.command_handled();
                                 }
                                 None => {
                                     debug!("writer query channel closed, shutting down");
@@ -559,24 +560,29 @@ pub fn writer_run(
                             }
                         }
                         // Advance the in-progress population merge by one chunk
-                        // (PGC-418). Runs when the CDC queue is drained — never
-                        // ahead of queued real work — or, under a sustained
-                        // backlog, once per completed batch flush so the merge
-                        // cannot starve. Only while no frame is open — a chunk
-                        // on db_cache mid-frame would join the frame's
-                        // transaction.
+                        // (PGC-418). Runs when every input queue is drained —
+                        // never ahead of queued real work, and the select is
+                        // unbiased so a ready chunk would otherwise win random
+                        // picks against queued commands — or, under a backlog,
+                        // once each queue has yielded its unit since the last
+                        // chunk (a batch flush; the commands queued at that
+                        // chunk) so the merge cannot starve. Only while no
+                        // frame is open — a chunk on db_cache mid-frame would
+                        // join the frame's transaction.
                         () = std::future::ready(()),
                             if core.frame_state == FrameState::Idle
-                                && core
-                                    .merges.active
-                                    .as_ref()
-                                    .is_some_and(|m| m.chunk_due(cdc_rx.is_empty(), core.merges.batch_flush_seq)) => {
+                                && core.merges.chunk_due(InputQueues {
+                                    cdc_empty: cdc_rx.is_empty(),
+                                    query_empty: query_rx.is_empty(),
+                                    internal_empty: internal_rx.is_empty(),
+                                }) => {
                             if let Err(e) = registration.merge_in_progress_step(&mut core).await {
                                 error!(
                                     "population merge step failed: {}",
                                     error_chain_format(e.current_context()),
                                 );
                             }
+                            core.merges.chunk_boundary_mark(query_rx.len());
                         }
                     }
 
@@ -590,14 +596,17 @@ pub fn writer_run(
                     if core.frame_state == FrameState::Idle
                         && core.merges.active.is_none()
                         && (!core.merges.pending.is_empty() || !core.merges.discards.is_empty())
-                        && let Err(e) = registration
+                    {
+                        if let Err(e) = registration
                             .pending_merges_drain(&mut core, writer_cdc.last_received_lsn)
                             .await
-                    {
-                        error!(
-                            "population merge drain failed: {}",
-                            error_chain_format(e.current_context()),
-                        );
+                        {
+                            error!(
+                                "population merge drain failed: {}",
+                                error_chain_format(e.current_context()),
+                            );
+                        }
+                        core.merges.chunk_boundary_mark(query_rx.len());
                     }
 
                     // Fold the writer backlog into the adaptive-gate window every
