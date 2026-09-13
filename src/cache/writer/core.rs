@@ -2,7 +2,7 @@ use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::{Fingerprint, FingerprintSet};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ use super::super::{
 use super::cdc::WriterCdc;
 use super::mv_build::MvBuildPool;
 use super::registration::WriterRegistration;
-use super::staging::{MergeInProgress, PopulationDeletedKeys, StagingPool};
+use super::staging::{MergeInProgress, PopulationDeletedKeys, StagingDiscard, StagingPool};
 
 use super::frame::*;
 
@@ -235,6 +235,10 @@ pub struct WriterCore {
     /// the merge instead of waiting behind one statement over the whole
     /// staging table.
     pub(super) merge_in_progress: Option<MergeInProgress>,
+    /// Superseded populations whose staging awaits a chunked discard
+    /// (`MergeMode::Discard`), started when the merge slot is free and no
+    /// releasable merge is waiting.
+    pub(super) pending_discards: VecDeque<StagingDiscard>,
     /// A CDC batch flush has returned the frame to Idle since the last merge
     /// chunk ran. Under a sustained CDC backlog the queue is never empty, so
     /// this is what lets a merge progress: one chunk per completed batch,
@@ -659,7 +663,7 @@ pub fn writer_run(
                     // CDC path, so re-check on every quiescent iteration.
                     if core.frame_state == FrameState::Idle
                         && core.merge_in_progress.is_none()
-                        && !core.pending_merges.is_empty()
+                        && (!core.pending_merges.is_empty() || !core.pending_discards.is_empty())
                         && let Err(e) = registration
                             .pending_merges_drain(&mut core, writer_cdc.last_received_lsn)
                             .await
@@ -767,6 +771,7 @@ impl WriterCore {
             staging_pool: StagingPool::default(),
             pending_merges: BinaryHeap::new(),
             merge_in_progress: None,
+            pending_discards: VecDeque::new(),
             batch_flushed_since_chunk: false,
             watermark_nudge,
             merge_stall_since: None,

@@ -283,6 +283,9 @@ pub mod names {
     /// Wall time of one merge chunk statement — the longest a CDC frame waits
     /// behind an in-progress merge.
     pub const CACHE_MERGE_CHUNK_SECONDS: &str = "pgcache.cache.merge.chunk_seconds";
+    /// Discard chunks applied: staging of an abandoned, aborted, or superseded
+    /// population is emptied in the same bounded chunks rather than one DELETE.
+    pub const CACHE_MERGE_DISCARD_CHUNKS: &str = "pgcache.cache.merge.discard_chunks_total";
     /// Per-worker time waiting on rx.recv() between tasks. With \`task_seconds\`
     /// and wall clock, gives a clear utilization signal at a given pool size.
     pub const CACHE_POPULATION_WORKER_IDLE_SECONDS: &str =
@@ -526,6 +529,7 @@ pub struct RegHandles {
     pub merges_applied: Counter,
     pub merge_chunks: Counter,
     pub merge_chunk: Histogram,
+    pub merge_discard_chunks: Counter,
 }
 
 pub struct StateHandles {
@@ -710,6 +714,7 @@ impl Handles {
                 merges_applied: metrics::counter!(CACHE_MERGES_APPLIED),
                 merge_chunks: metrics::counter!(CACHE_MERGE_CHUNKS),
                 merge_chunk: metrics::histogram!(CACHE_MERGE_CHUNK_SECONDS),
+                merge_discard_chunks: metrics::counter!(CACHE_MERGE_DISCARD_CHUNKS),
             },
             state: StateHandles {
                 queries_registered: metrics::gauge!(CACHE_QUERIES_REGISTERED),

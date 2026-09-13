@@ -41,7 +41,7 @@ use super::super::{
 };
 use super::core::{MERGE_FLUSH_FORCE_AFTER, PendingMerge, WriterCore};
 use super::population::population_worker;
-use super::staging::MergeStep;
+use super::staging::{MergeMode, MergeStep};
 use crate::pg;
 
 /// Minimum number of persistent population workers.
@@ -278,9 +278,10 @@ impl WriterRegistration {
             } => {
                 core.population_deleted_keys
                     .deactivate(fingerprint, generation);
-                // Return the population's staging tables to the pool (PGC-293):
-                // the worker no longer drops them on failure.
-                core.staging_checkin(fingerprint, generation).await;
+                // Whatever the worker staged before failing is emptied in
+                // chunks, not with one DELETE on the writer (PGC-293 keeps the
+                // tables checked out until that check-in).
+                core.population_discard_enqueue(fingerprint, generation);
                 self.query_failed_cleanup(core, fingerprint);
             }
             QueryCommand::LimitBump {
@@ -974,7 +975,9 @@ impl WriterRegistration {
                 };
                 core.population_deleted_keys
                     .deactivate(fingerprint, generation);
-                core.staging_checkin(fingerprint, generation).await;
+                // Its staging (a complete population) is emptied in chunks,
+                // not with one DELETE on the writer.
+                core.population_discard_enqueue(fingerprint, generation);
                 continue;
             }
 
@@ -1000,6 +1003,14 @@ impl WriterRegistration {
                 .record(merge.enqueued_at.elapsed().as_secs_f64());
             core.population_merge_start(merge);
         }
+        // Real merges take the slot first; a queued discard runs when none is
+        // releasable, so pool tables come back without ever stalling apply.
+        if core.merge_in_progress.is_none()
+            && let Some(discard) = core.pending_discards.pop_front()
+        {
+            core.population_discard_start(discard);
+        }
+
         // A released merge means the watermark is advancing on its own; restart
         // the stall clock so the grace window times the *current* gated head.
         if started_any {
@@ -1031,72 +1042,91 @@ impl WriterRegistration {
         Ok(())
     }
 
-    /// Run one chunk of the in-progress population merge and finalize on a
-    /// terminal outcome (PGC-418). Mirrors the one-shot merge's terminal
-    /// handling: `Done` marks the query Ready, `Aborted` / error fail it.
-    /// A merge whose query was superseded, invalidated, or evicted since the
-    /// last chunk is abandoned — its remaining staging is checked back in and
-    /// nothing is finalized (the successor population has its own entry).
+    /// Run one chunk of the in-progress population merge or discard and
+    /// finalize on a terminal outcome (PGC-418). Query-side finalization
+    /// happens the moment applying stops — `Done` marks the query Ready,
+    /// `Aborted` / error fail it, a superseded / invalidated / evicted query
+    /// is left to its successor — but the staging tables are only checked
+    /// back in once their rows have been drained in chunks
+    /// (`MergeMode::Discard`), never with one DELETE over the remainder.
     pub(super) async fn merge_in_progress_step(&self, core: &mut WriterCore) -> CacheResult<()> {
-        let Some((fingerprint, generation)) = core
+        let Some((fingerprint, generation, mode)) = core
             .merge_in_progress
             .as_ref()
-            .map(|m| (m.merge.fingerprint, m.merge.generation))
+            .map(|m| (m.fingerprint, m.generation, m.mode()))
         else {
             return Ok(());
         };
-        if !core.population_is_current(fingerprint, generation) {
-            core.population_merge_abandon();
+        if mode == MergeMode::Apply && !core.population_is_current(fingerprint, generation) {
             core.population_deleted_keys
                 .deactivate(fingerprint, generation);
-            core.staging_checkin(fingerprint, generation).await;
+            core.population_merge_discard_remaining();
             return Ok(());
         }
-        let step = core.population_merge_step().await;
-        if matches!(step, Ok(MergeStep::Continue)) {
-            return Ok(());
-        }
-        let Some(finished) = core.merge_in_progress.take() else {
-            return Ok(());
-        };
-        // Return the population's staging tables to the pool (PGC-293)
-        // regardless of outcome, before any `?` below could short-circuit
-        // and leak them.
-        core.staging_checkin(fingerprint, generation).await;
-        core.population_deleted_keys
-            .deactivate(fingerprint, generation);
-        match step {
-            Ok(MergeStep::Continue) => unreachable!("handled above"),
+        match core.population_merge_step().await {
+            Ok(MergeStep::Continue) => {}
             Ok(MergeStep::Done) => {
-                debug!(
-                    "population merge applied in {} chunks / {} rows over {:?} {fingerprint}",
-                    finished.chunks,
-                    finished.drained_rows,
-                    finished.started_at.elapsed()
-                );
-                crate::metrics::handles().reg.merges_applied.increment(1);
-                self.query_ready_finalize(
-                    core,
-                    fingerprint,
-                    finished.merge.cached_bytes,
-                    finished.merge.row_count,
-                    finished.merge.fetch_stage_ms,
-                )
-                .await?;
+                let Some(finished) = core.merge_in_progress.take() else {
+                    return Ok(());
+                };
+                // Staging is drained; check-in returns the tables to the pool
+                // (PGC-293) before any `?` below could short-circuit and leak
+                // them.
+                core.staging_checkin(fingerprint, generation).await;
+                match finished.apply {
+                    Some(applied) => {
+                        debug!(
+                            "population merge applied in {} chunks / {} rows over {:?} {fingerprint}",
+                            finished.chunks,
+                            finished.drained_rows,
+                            finished.started_at.elapsed()
+                        );
+                        core.population_deleted_keys
+                            .deactivate(fingerprint, generation);
+                        crate::metrics::handles().reg.merges_applied.increment(1);
+                        self.query_ready_finalize(
+                            core,
+                            fingerprint,
+                            applied.cached_bytes,
+                            applied.row_count,
+                            applied.fetch_stage_ms,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        debug!(
+                            "population staging discarded in {} chunks / {} rows {fingerprint}",
+                            finished.chunks, finished.drained_rows
+                        );
+                    }
+                }
             }
             Ok(MergeStep::Aborted) => {
-                debug!(
-                    "population merge aborted (overflow / truncate) after {} chunks {fingerprint}",
-                    finished.chunks
-                );
+                debug!("population merge aborted (overflow / truncate) {fingerprint}");
+                core.population_deleted_keys
+                    .deactivate(fingerprint, generation);
                 self.query_failed_cleanup(core, fingerprint);
+                core.population_merge_discard_remaining();
             }
             Err(e) => {
                 error!(
-                    "population merge failed for {fingerprint}: {}",
+                    "population merge chunk failed for {fingerprint}: {}",
                     error_chain_format(e.current_context()),
                 );
-                self.query_failed_cleanup(core, fingerprint);
+                match mode {
+                    MergeMode::Apply => {
+                        core.population_deleted_keys
+                            .deactivate(fingerprint, generation);
+                        self.query_failed_cleanup(core, fingerprint);
+                        core.population_merge_discard_remaining();
+                    }
+                    // The discard itself failed: fall back to the one-statement
+                    // check-in rather than retry forever.
+                    MergeMode::Discard => {
+                        core.merge_in_progress = None;
+                        core.staging_checkin(fingerprint, generation).await;
+                    }
+                }
             }
         }
         Ok(())

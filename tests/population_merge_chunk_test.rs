@@ -21,6 +21,19 @@ use tokio_postgres::SimpleQueryMessage;
 
 use crate::util::{TestContext, http_get};
 
+/// Discard chunks applied (staging of an abandoned/superseded population).
+async fn discard_chunks_total(metrics_port: u16) -> Result<f64, Error> {
+    let (status, body) = http_get(metrics_port, "/metrics").await?;
+    if status != 200 {
+        return Err(Error::other(format!("/metrics returned {status}")));
+    }
+    Ok(body
+        .lines()
+        .find_map(|l| l.strip_prefix("pgcache_cache_merge_discard_chunks_total "))
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.0))
+}
+
 mod util;
 
 /// Heap blocks per chunk under test. The 12-byte rows below pack ~200 per
@@ -201,5 +214,114 @@ async fn test_delete_between_chunks_is_not_resurrected() -> Result<(), Error> {
         "a row deleted mid-merge was resurrected by a later chunk"
     );
     assert_eq!(after.queries_cache_hit - before.queries_cache_hit, 1);
+    Ok(())
+}
+
+/// A merge abandoned part-way (here: its query evicted under a count cap)
+/// must empty its remaining staging in chunks, not with one DELETE on the
+/// writer — a Ready bystander keeps seeing CDC while the discard runs.
+#[tokio::test]
+async fn test_abandoned_merge_discards_staging_in_chunks() -> Result<(), Error> {
+    // The bystander is pinned so the count-cap eviction takes the populating
+    // query (the oldest unpinned generation) and not the observer.
+    let q1 = "select id, v from chunked where grp = 1 order by id";
+    let mut ctx = TestContext::setup_pinned_fault(
+        q1,
+        &[
+            ("PGCACHE_FAULT_MERGE_CHUNK_BLOCKS", CHUNK_BLOCKS),
+            ("PGCACHE_FAULT_MERGE_CHUNK_DELAY_MS", CHUNK_DELAY_MS),
+            ("PGCACHE_FAULT_EVICTION_COUNT_CAP", "1"),
+        ],
+        |origin| async move {
+            origin
+                .batch_execute(&format!(
+                    "create table chunked (id int primary key, grp int not null, v int not null); \
+                     insert into chunked (id, grp, v) values (1, 1, 1); \
+                     insert into chunked (id, grp, v) select i, 2, i from generate_series(1000, {}) i; \
+                     create table trigger_t (id int primary key); insert into trigger_t values (1);",
+                    999 + POPULATED_ROWS
+                ))
+                .await
+                .map_err(Error::other)?;
+            Ok(origin)
+        },
+    )
+    .await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(15))
+        .await?;
+    let baseline = merge_chunks_total(ctx.metrics_port).await?;
+
+    // Populating query: its merge spans several seconds.
+    let q2 = "select count(*) from chunked where grp = 2";
+    ctx.simple_query(q2).await?;
+    merge_in_progress_wait(&ctx, baseline).await?;
+
+    // A third registration puts the count over the cap of one; the eviction
+    // tick evicts q2 mid-merge, which abandons the merge and discards its
+    // remaining staging in chunks.
+    ctx.simple_query("select id from trigger_t where id = 1")
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if discard_chunks_total(ctx.metrics_port).await? >= 1.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the abandoned merge never started discarding"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // An origin write to the bystander's group while the discard is in
+    // progress must reach it long before the discard ends.
+    let written_at = Instant::now();
+    ctx.origin
+        .batch_execute("insert into chunked (id, grp, v) values (2, 1, 2)")
+        .await
+        .map_err(Error::other)?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let before = ctx.metrics().await?;
+        let served = ctx.simple_query(q1).await?;
+        let after = ctx.metrics().await?;
+        let ids: Vec<String> = served
+            .iter()
+            .filter_map(|m| match m {
+                SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+                SimpleQueryMessage::CommandComplete(_)
+                | SimpleQueryMessage::RowDescription(_)
+                | _ => None,
+            })
+            .collect();
+        if ids.iter().any(|id| id == "2") {
+            let seen_after = written_at.elapsed();
+            assert_eq!(after.queries_cache_hit - before.queries_cache_hit, 1);
+            assert!(
+                seen_after < Duration::from_millis(2_000),
+                "insert took {seen_after:?} to reach the bystander: CDC apply waited on the discard"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "insert never reached the bystander during the discard"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // The discard drains the whole remainder in chunks (many, given the pinned
+    // chunk size), never as one statement.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if discard_chunks_total(ctx.metrics_port).await? >= 5.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "discard did not proceed in chunks"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     Ok(())
 }
