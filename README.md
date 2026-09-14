@@ -92,7 +92,7 @@ run `pgcache --help` for the full list.
 Writes still go to your primary; reads are served from cache when safe and forwarded to
 origin otherwise.
 
-> **Just want to try it?** The [Docker image](../pgcache-docker) bundles the cache
+> **Just want to try it?** The [Docker image](https://hub.docker.com/r/pgcache/pgcache) bundles the cache
 > PostgreSQL (with `pgcache_pgrx` already preloaded) and wraps all of the above behind a
 > single `--upstream postgres://…` flag.
 
@@ -125,7 +125,7 @@ superseded.
 ## The pgcache_pgrx extension
 
 pgcache keeps its cached data in a dedicated PostgreSQL instance, and that instance **must**
-have the [`pgcache_pgrx`](../pgcache_pgrx) extension installed. pgcache runs `CREATE EXTENSION pgcache_pgrx` when it initializes the cache database on startup, and it will not run without it.
+have the [`pgcache_pgrx`](https://github.com/PgCache/pgcache_pgrx) extension installed. pgcache runs `CREATE EXTENSION pgcache_pgrx` when it initializes the cache database on startup, and it will not run without it.
 
 `pgcache_pgrx` is a small extension (built with [pgrx](https://github.com/pgcentralfoundation/pgrx))
 that provides the generation-based tracking pgcache uses to garbage-collect the cache. The extension
@@ -141,7 +141,7 @@ shared_preload_libraries = 'pgcache_pgrx'
 You usually don't set this up by hand: the Docker image and the AWS Marketplace AMI bundle a
 PostgreSQL that already has `pgcache_pgrx` built, installed, and preloaded. You only need to
 install it yourself when running pgcache from source or against a PostgreSQL you manage — see
-[`pgcache_pgrx`](../pgcache_pgrx) for build and install steps.
+[`pgcache_pgrx`](https://github.com/PgCache/pgcache_pgrx) for build and install steps.
 
 ## Status
 
