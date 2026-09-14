@@ -30,18 +30,30 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use ecow::EcoString;
+use smallvec::SmallVec;
 
 use crate::pg::Lsn;
-use crate::query::ast::{AstNode, LiteralValue, QueryExpr, TableNode};
+use crate::query::ast::{AstNode, BinaryOp, LiteralValue, QueryExpr, TableNode};
 use crate::query::constraints::{
     ColumnRange, column_range_contains, column_ranges_disjoint, column_ranges_from_comparisons,
 };
-use crate::query::write::{InsertRow, InsertStatement, RelationRef, UpdateStatement, WriteClass};
+use crate::query::write::{
+    InsertRow, InsertStatement, RelationRef, UpdateStatement, WriteClass, WriteComparison,
+};
 
 /// Cap on the combined update + delete predicate maps a single table may hold in
 /// one tier before it degrades to opaque. Counts *statements* (each
-/// UPDATE/DELETE contributes one predicate).
+/// UPDATE/DELETE contributes one predicate map) — only the non-mergeable
+/// shapes land here; all-equality predicates go to the far larger merged
+/// tuple store ([`MERGED_PREDICATE_CAP`]).
 const UPDATE_DELETE_PREDICATE_CAP: usize = 64;
+
+/// Cap on merged all-equality DELETE/UPDATE tuples one table's tier may hold
+/// before it degrades to opaque. A tuple is one literal per predicate column,
+/// so this sits far above the per-statement map cap: a row-at-a-time workload
+/// (`DELETE ... WHERE id = $1` repeated) stays row-precise for this many
+/// statements.
+const MERGED_PREDICATE_CAP: usize = 1024;
 
 /// Cap on inserted rows one table's tier may accumulate before it degrades to
 /// opaque. Column-major storage keeps a row to one cell per column, so this
@@ -102,10 +114,18 @@ pub(in crate::proxy::connection) struct TableAggregate {
     /// is provably disjoint from every inserted row may still be served. `None`
     /// once `opaque` is set (an opaque write dominates).
     pub inserts: Option<InsertAggregate>,
-    /// Per-column predicate ranges of DELETEs pending against this table
-    /// (PGC-381), one entry per DELETE. A read whose predicate is provably
-    /// disjoint from every one may still be served — a delete only shrinks.
-    /// Cleared once `opaque` is set.
+    /// All-equality DELETE predicates pending against this table (PGC-381),
+    /// shape-grouped: one literal tuple per statement, keyed by the sorted
+    /// predicate column list. Semantically each tuple is the same per-column
+    /// `Equal` map a legacy entry would hold — stored flat so the common
+    /// row-at-a-time shape costs one tuple, not one map. Cleared once `opaque`
+    /// is set.
+    pub merged_deletes: MergedTuples,
+    /// Per-column predicate ranges of DELETEs with a non-mergeable shape (a
+    /// range comparison, or a duplicated column), one entry per DELETE
+    /// (PGC-381). A read whose predicate is provably disjoint from every one
+    /// may still be served — a delete only shrinks. Cleared once `opaque` is
+    /// set.
     pub deletes: Vec<HashMap<EcoString, ColumnRange>>,
     /// UPDATEs pending against this table (PGC-382), one entry each. A read is
     /// unaffected only if disjoint from both the WHERE predicate and the
@@ -237,6 +257,70 @@ impl InsertAggregate {
     }
 }
 
+/// One all-equality predicate as its literal values, aligned with its shape's
+/// sorted column list.
+type EqualityTuple = SmallVec<[LiteralValue; 2]>;
+
+/// Merged all-equality predicates, grouped by shape (the sorted column list).
+type MergedTuples = HashMap<Box<[EcoString]>, Vec<EqualityTuple>>;
+
+/// The sorted, distinct-column equality tuple of a WHERE predicate, or `None`
+/// when the shape doesn't merge: a non-equality comparison, or a column
+/// constrained twice (the legacy range-map path handles both, including the
+/// contradictory `c = 1 AND c = 2` case it folds to `Empty`).
+fn equality_tuple(comparisons: &[WriteComparison]) -> Option<(Box<[EcoString]>, EqualityTuple)> {
+    if comparisons.iter().any(|(_, op, _)| *op != BinaryOp::Equal) {
+        return None;
+    }
+    let mut pairs: SmallVec<[(&EcoString, &LiteralValue); 2]> = comparisons
+        .iter()
+        .map(|(column, _, value)| (column, value))
+        .collect();
+    pairs.sort_by(|a, b| a.0.cmp(b.0));
+    if pairs.windows(2).any(|w| matches!(w, [a, b] if a.0 == b.0)) {
+        return None;
+    }
+    let columns = pairs.iter().map(|(column, _)| (*column).clone()).collect();
+    let values = pairs.iter().map(|(_, value)| (*value).clone()).collect();
+    Some((columns, values))
+}
+
+/// Whether the read is provably disjoint from every merged tuple — the exact
+/// check [`column_ranges_disjoint`] applies to a per-column `Equal` map, minus
+/// the maps: a tuple is excluded when some column the read constrains carries
+/// a value the read's range provably excludes.
+fn merged_tuples_disjoint(
+    merged: &MergedTuples,
+    read_ranges: &HashMap<EcoString, ColumnRange>,
+) -> bool {
+    // An unsatisfiable read matches no row at all.
+    if read_ranges
+        .values()
+        .any(|range| matches!(range, ColumnRange::Empty))
+    {
+        return true;
+    }
+    merged.iter().all(|(columns, tuples)| {
+        // Resolve the shape's columns against the read once.
+        let constrained: SmallVec<[(usize, &ColumnRange); 2]> = columns
+            .iter()
+            .enumerate()
+            .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
+            .collect();
+        if constrained.is_empty() {
+            return tuples.is_empty();
+        }
+        tuples.iter().all(|tuple| {
+            constrained.iter().any(|(position, range)| {
+                matches!(
+                    tuple.get(*position),
+                    Some(value) if column_range_contains(range, value) == Some(false)
+                )
+            })
+        })
+    })
+}
+
 impl TableAggregate {
     /// Fold another aggregate for the same table into this one. `opaque`
     /// dominates (and clears inserts/deletes); otherwise inserts and delete
@@ -259,9 +343,17 @@ impl TableAggregate {
             }
             self.inserts = Some(inserts);
         }
+        for (columns, tuples) in other.merged_deletes {
+            self.merged_deletes
+                .entry(columns)
+                .or_default()
+                .extend(tuples);
+        }
         self.deletes.extend(other.deletes);
         self.updates.extend(other.updates);
-        if self.deletes.len() + self.updates.len() > UPDATE_DELETE_PREDICATE_CAP {
+        if self.deletes.len() + self.updates.len() > UPDATE_DELETE_PREDICATE_CAP
+            || self.merged_count() > MERGED_PREDICATE_CAP
+        {
             self.degrade_opaque();
             crate::metrics::handles()
                 .raw
@@ -270,16 +362,26 @@ impl TableAggregate {
         }
     }
 
+    /// Merged all-equality tuples held, across shapes — the count
+    /// [`MERGED_PREDICATE_CAP`] bounds.
+    fn merged_count(&self) -> usize {
+        self.merged_deletes.values().map(Vec::len).sum()
+    }
+
     /// Collapse to table-level opaque, discarding the finer row-predicate state.
     fn degrade_opaque(&mut self) {
         self.opaque = true;
         self.inserts = None;
+        self.merged_deletes.clear();
         self.deletes.clear();
         self.updates.clear();
     }
 
     fn has_row_predicates(&self) -> bool {
-        self.inserts.is_some() || !self.deletes.is_empty() || !self.updates.is_empty()
+        self.inserts.is_some()
+            || !self.merged_deletes.is_empty()
+            || !self.deletes.is_empty()
+            || !self.updates.is_empty()
     }
 }
 
@@ -487,9 +589,18 @@ impl WriteLog {
             WriteClass::DeleteRows(delete) => {
                 let agg = self.table_active(&delete.relation, seq);
                 if !agg.opaque {
-                    agg.deletes
-                        .push(column_ranges_from_comparisons(&delete.comparisons));
-                    if agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP {
+                    let overflow = match equality_tuple(&delete.comparisons) {
+                        Some((columns, values)) => {
+                            agg.merged_deletes.entry(columns).or_default().push(values);
+                            agg.merged_count() > MERGED_PREDICATE_CAP
+                        }
+                        None => {
+                            agg.deletes
+                                .push(column_ranges_from_comparisons(&delete.comparisons));
+                            agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP
+                        }
+                    };
+                    if overflow {
                         agg.degrade_opaque();
                         crate::metrics::handles()
                             .raw
@@ -656,6 +767,15 @@ impl WriteLog {
                 if let Some(inserts) = &agg.inserts {
                     if read_ranges.is_some_and(|ranges| inserts.disjoint(ranges)) {
                         kinds.insert = true;
+                    } else {
+                        return true;
+                    }
+                }
+                if !agg.merged_deletes.is_empty() {
+                    if read_ranges
+                        .is_some_and(|ranges| merged_tuples_disjoint(&agg.merged_deletes, ranges))
+                    {
+                        kinds.delete = true;
                     } else {
                         return true;
                     }
@@ -1112,18 +1232,173 @@ mod tests {
         );
     }
 
+    /// A DELETE with a range comparison — the non-mergeable shape that lands in
+    /// the legacy per-statement predicate list.
+    fn delete_range(table: &str, col: &str, below: i64) -> WriteClass {
+        WriteClass::DeleteRows(Arc::new(DeleteStatement {
+            relation: RelationRef {
+                schema: None,
+                name: table.into(),
+            },
+            comparisons: vec![(col.into(), BinaryOp::LessThan, LiteralValue::Integer(below))],
+        }))
+    }
+
     #[test]
-    fn test_delete_overflow_degrades_to_opaque() {
+    fn test_delete_row_at_a_time_stays_precise() {
+        // The motivating workload: hundreds of single-row equality DELETEs must
+        // keep row-level precision (the old per-statement cap degraded at 64).
         let mut log = WriteLog::new(true);
-        // One past the predicate cap (values are irrelevant — the cap is on count).
-        for _ in 0..=UPDATE_DELETE_PREDICATE_CAP {
-            log.record(&delete_eq("orders", "id", 5));
+        for i in 0..500 {
+            log.record(&delete_eq("orders", "id", i));
         }
-        // Past the predicate cap the table is opaque: even a disjoint read forwards.
-        let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
+        let q = query("SELECT * FROM orders WHERE id = 9999");
+        let disjoint = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
+        assert_eq!(
+            log.decide(&q, Some(&disjoint)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                delete: true,
+                ..Default::default()
+            })
+        );
+        let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250)));
+        assert_eq!(
+            log.decide(&q, Some(&hit)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_delete_merged_overflow_degrades_to_opaque() {
+        let mut log = WriteLog::new(true);
+        for i in 0..=MERGED_PREDICATE_CAP {
+            log.record(&delete_eq("orders", "id", i64::try_from(i).expect("cap fits i64")));
+        }
+        // Past the merged cap the table is opaque: even a disjoint read forwards.
+        let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
         assert_eq!(
             log.decide(&query("SELECT * FROM orders"), Some(&r)),
             RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_delete_legacy_overflow_degrades_to_opaque() {
+        let mut log = WriteLog::new(true);
+        // Range deletes don't merge; one past the per-statement cap degrades.
+        for i in 0..=UPDATE_DELETE_PREDICATE_CAP {
+            log.record(&delete_range("orders", "id", i64::try_from(i).expect("cap fits i64")));
+        }
+        let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_delete_mixed_merged_and_legacy_shapes() {
+        // Equality deletes (merged) and a range delete (legacy) on one table:
+        // the read must be disjoint from both stores to serve.
+        let mut log = WriteLog::new(true);
+        log.record(&delete_eq("orders", "id", 5));
+        log.record(&delete_range("orders", "id", 3)); // id < 3
+        let q = query("SELECT * FROM orders WHERE id = 10");
+        // id = 10 clears both the id = 5 tuple and the id < 3 range.
+        let r10 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(10)));
+        assert_eq!(
+            log.decide(&q, Some(&r10)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                delete: true,
+                ..Default::default()
+            })
+        );
+        // id = 2 clears the tuple but overlaps the range → forward.
+        let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2)));
+        assert_eq!(
+            log.decide(&q, Some(&r2)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_delete_multi_column_equality_tuples() {
+        // WHERE a = .. AND b = ..: tuples exclude per-statement, possibly via
+        // different columns per tuple — a per-column value union would be
+        // unsound, the tuple check is not.
+        fn delete_ab(a: i64, b: i64) -> WriteClass {
+            WriteClass::DeleteRows(Arc::new(DeleteStatement {
+                relation: RelationRef {
+                    schema: None,
+                    name: "orders".into(),
+                },
+                comparisons: vec![
+                    ("a".into(), BinaryOp::Equal, LiteralValue::Integer(a)),
+                    ("b".into(), BinaryOp::Equal, LiteralValue::Integer(b)),
+                ],
+            }))
+        }
+        let mut log = WriteLog::new(true);
+        log.record(&delete_ab(1, 10));
+        log.record(&delete_ab(2, 20));
+        let q = query("SELECT * FROM orders WHERE a = 2 AND b = 10");
+        // a = 2 excludes the first tuple, b = 10 excludes the second.
+        let r = HashMap::from([
+            (
+                EcoString::from("a"),
+                ColumnRange::Equal(LiteralValue::Integer(2)),
+            ),
+            (
+                EcoString::from("b"),
+                ColumnRange::Equal(LiteralValue::Integer(10)),
+            ),
+        ]);
+        assert_eq!(
+            log.decide(&q, Some(&r)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                delete: true,
+                ..Default::default()
+            })
+        );
+        // a = 2, b = 20 matches the second tuple exactly → forward.
+        let r_hit = HashMap::from([
+            (
+                EcoString::from("a"),
+                ColumnRange::Equal(LiteralValue::Integer(2)),
+            ),
+            (
+                EcoString::from("b"),
+                ColumnRange::Equal(LiteralValue::Integer(20)),
+            ),
+        ]);
+        assert_eq!(
+            log.decide(&q, Some(&r_hit)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_delete_duplicate_column_routes_legacy() {
+        // `id = 1 AND id = 2` is contradictory — the legacy range path folds it
+        // to `Empty` (matches nothing), so any read is disjoint from it.
+        let mut log = WriteLog::new(true);
+        log.record(&WriteClass::DeleteRows(Arc::new(DeleteStatement {
+            relation: RelationRef {
+                schema: None,
+                name: "orders".into(),
+            },
+            comparisons: vec![
+                ("id".into(), BinaryOp::Equal, LiteralValue::Integer(1)),
+                ("id".into(), BinaryOp::Equal, LiteralValue::Integer(2)),
+            ],
+        })));
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                delete: true,
+                ..Default::default()
+            })
         );
     }
 
