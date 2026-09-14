@@ -34,17 +34,21 @@ use ecow::EcoString;
 use crate::pg::Lsn;
 use crate::query::ast::{AstNode, LiteralValue, QueryExpr, TableNode};
 use crate::query::constraints::{
-    ColumnRange, column_ranges_disjoint, column_ranges_from_comparisons,
+    ColumnRange, column_range_contains, column_ranges_disjoint, column_ranges_from_comparisons,
 };
-use crate::query::write::{
-    INSERT_MAX_ROWS, InsertStatement, RelationRef, UpdateStatement, WriteClass,
-};
+use crate::query::write::{InsertRow, InsertStatement, RelationRef, UpdateStatement, WriteClass};
 
 /// Cap on the combined update + delete predicate maps a single table may hold in
-/// one tier before it degrades to opaque. Unlike [`INSERT_MAX_ROWS`] this
-/// counts *statements* (each UPDATE/DELETE contributes one predicate), not rows,
-/// so it is tracked separately even though it currently shares the same value.
+/// one tier before it degrades to opaque. Counts *statements* (each
+/// UPDATE/DELETE contributes one predicate).
 const UPDATE_DELETE_PREDICATE_CAP: usize = 64;
+
+/// Cap on inserted rows one table's tier may accumulate before it degrades to
+/// opaque. Column-major storage keeps a row to one cell per column, so this
+/// sits far above the classification-time extraction cap
+/// ([`crate::query::write::INSERT_MAX_ROWS`]): a row-at-a-time bulk insert
+/// stays row-precise for this many rows.
+const INSERT_MERGED_ROWS_CAP: usize = 1024;
 
 /// Reason the read-after-write gate forwarded a cacheable read to origin
 /// instead of serving it from cache (PGC-124), for metrics.
@@ -118,64 +122,119 @@ pub(in crate::proxy::connection) struct UpdatePredicate {
     image_ranges: HashMap<EcoString, ColumnRange>,
 }
 
-/// Row-enumerable INSERTs pending against one table, as one point-predicate
-/// range map per inserted row (PGC-383) — each row is a conjunction of
-/// `column = value` over its known cells. Bounded by [`INSERT_MAX_ROWS`] rows;
-/// beyond the cap the table degrades to `opaque`.
+/// Row-enumerable INSERTs pending against one table, stored column-major
+/// (PGC-383): one shared column list, one literal tuple per inserted row —
+/// each row is the point predicate `column = value` over its known cells.
+/// Bounded by [`INSERT_MERGED_ROWS_CAP`] rows; beyond the cap the table
+/// degrades to `opaque`.
 #[derive(Debug, Clone, Default)]
 pub(in crate::proxy::connection) struct InsertAggregate {
-    rows: Vec<HashMap<EcoString, ColumnRange>>,
+    /// Union of the folded statements' column lists, in first-seen order.
+    columns: Vec<EcoString>,
+    /// Positionally aligned with `columns`. `None` = cell value unknown
+    /// (DEFAULT/expression, or a column this row's statement didn't mention).
+    /// A row folded before later statements widened `columns` stays short —
+    /// a missing trailing cell reads as `None`.
+    rows: Vec<InsertRow>,
 }
 
 impl InsertAggregate {
     /// Fold in another INSERT's rows. Returns `false` if the total would exceed
-    /// [`INSERT_MAX_ROWS`], signalling the caller to degrade the table to opaque.
+    /// [`INSERT_MERGED_ROWS_CAP`], signalling the caller to degrade the table
+    /// to opaque.
     fn fold(&mut self, insert: &Arc<InsertStatement>) -> bool {
-        if self.rows.len() + insert.rows.len() > INSERT_MAX_ROWS {
+        if self.rows.len() + insert.rows.len() > INSERT_MERGED_ROWS_CAP {
             return false;
         }
-        self.rows
-            .extend(insert.rows.iter().map(|row| insert_row_ranges(insert, row)));
+        let positions = self.column_positions(&insert.columns);
+        for row in &insert.rows {
+            self.row_push(&positions, row.iter().cloned());
+        }
         true
     }
 
     /// Fold another aggregate's rows in. Returns `false` on cap overflow.
     fn merge(&mut self, other: InsertAggregate) -> bool {
-        if self.rows.len() + other.rows.len() > INSERT_MAX_ROWS {
+        if self.rows.len() + other.rows.len() > INSERT_MERGED_ROWS_CAP {
             return false;
         }
-        self.rows.extend(other.rows);
+        if self.rows.is_empty() {
+            *self = other;
+            return true;
+        }
+        let positions = self.column_positions(&other.columns);
+        for row in other.rows {
+            self.row_push(&positions, row.into_iter());
+        }
         true
     }
 
-    /// Whether the read is provably disjoint from every inserted row — i.e. no
-    /// inserted row can match the read, so it may be served. An insert row is a
-    /// point predicate, so this is the same [`column_ranges_disjoint`] test used
-    /// for DELETE/UPDATE predicates.
-    fn disjoint(&self, read_ranges: &HashMap<EcoString, ColumnRange>) -> bool {
-        self.rows
+    /// Map a statement's column list onto `self.columns`, extending it with
+    /// names not seen before.
+    fn column_positions(&mut self, statement_columns: &[EcoString]) -> Vec<usize> {
+        statement_columns
             .iter()
-            .all(|row| column_ranges_disjoint(read_ranges, row))
+            .map(|column| {
+                self.columns
+                    .iter()
+                    .position(|existing| existing == column)
+                    .unwrap_or_else(|| {
+                        self.columns.push(column.clone());
+                        self.columns.len() - 1
+                    })
+            })
+            .collect()
     }
-}
 
-/// The point-predicate range map for one inserted row: `column = value` over its
-/// known cells (an unknown DEFAULT/expression cell leaves that column
-/// unconstrained, so it can never establish disjointness).
-fn insert_row_ranges(
-    insert: &InsertStatement,
-    row: &[Option<LiteralValue>],
-) -> HashMap<EcoString, ColumnRange> {
-    insert
-        .columns
-        .iter()
-        .zip(row)
-        .filter_map(|(column, value)| {
-            value
-                .as_ref()
-                .map(|v| (column.clone(), ColumnRange::Equal(v.clone())))
+    /// Append one row, scattering its cells to their aggregate positions.
+    fn row_push(
+        &mut self,
+        positions: &[usize],
+        values: impl Iterator<Item = Option<LiteralValue>>,
+    ) {
+        let mut cells = InsertRow::new();
+        cells.resize(self.columns.len(), None);
+        for (value, &position) in values.zip(positions) {
+            if let Some(cell) = cells.get_mut(position) {
+                *cell = value;
+            }
+        }
+        self.rows.push(cells);
+    }
+
+    /// Whether the read is provably disjoint from every inserted row — i.e. no
+    /// inserted row can match the read, so it may be served. A row is excluded
+    /// when some column the read constrains has a known cell value the read's
+    /// range provably excludes ([`column_range_contains`] `== Some(false)`) —
+    /// the same per-column test the map-based [`column_ranges_disjoint`] check
+    /// applies, minus the per-row maps.
+    fn disjoint(&self, read_ranges: &HashMap<EcoString, ColumnRange>) -> bool {
+        // An unsatisfiable read matches no row at all.
+        if read_ranges
+            .values()
+            .any(|range| matches!(range, ColumnRange::Empty))
+        {
+            return true;
+        }
+        // Resolve the read's constrained columns to positions once.
+        let constrained: Vec<(usize, &ColumnRange)> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
+            .collect();
+        if constrained.is_empty() {
+            return self.rows.is_empty();
+        }
+        self.rows.iter().all(|row| {
+            constrained.iter().any(|(position, range)| {
+                matches!(
+                    row.get(*position),
+                    Some(Some(value)) if column_range_contains(range, value) == Some(false)
+                )
+            })
         })
-        .collect()
+    }
 }
 
 impl TableAggregate {
@@ -915,8 +974,8 @@ mod tests {
     #[test]
     fn test_insert_overflow_degrades_to_opaque() {
         let mut log = WriteLog::new(true);
-        let first: Vec<i64> = (0..40).collect();
-        let second: Vec<i64> = (40..90).collect(); // 40 + 50 > cap
+        let first: Vec<i64> = (0..600).collect();
+        let second: Vec<i64> = (600..1200).collect(); // 600 + 600 > cap
         log.record(&insert_int("orders", "id", &first));
         log.record(&insert_int("orders", "id", &second));
         // Degraded to opaque: even a disjoint read forwards.
@@ -924,6 +983,67 @@ mod tests {
         assert_eq!(
             log.decide(&query("SELECT * FROM orders"), Some(&r)),
             RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_insert_row_at_a_time_stays_precise() {
+        // The motivating workload: an ORM inserting rows one statement at a
+        // time. Hundreds of single-row INSERTs must keep row-level precision
+        // (the old per-statement cap degraded to opaque at 64).
+        let mut log = WriteLog::new(true);
+        for i in 0..500 {
+            log.record(&insert_int("orders", "id", &[i]));
+        }
+        let q = query("SELECT * FROM orders WHERE id = 9999");
+        let disjoint = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
+        assert_eq!(
+            log.decide(&q, Some(&disjoint)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                insert: true,
+                ..Default::default()
+            })
+        );
+        let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250)));
+        assert_eq!(
+            log.decide(&q, Some(&hit)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_insert_diverging_column_lists() {
+        // Statements with different column lists fold into one aggregate; a
+        // column a row's statement didn't mention is unknown for that row and
+        // can never prove disjointness.
+        let mut log = WriteLog::new(true);
+        log.record(&insert_int("orders", "a", &[1]));
+        log.record(&insert_int("orders", "b", &[2]));
+        let q = query("SELECT * FROM orders WHERE a = 5");
+        // Read on a = 5: the a-row is excluded (1 ≠ 5) but the b-row's `a` cell
+        // is unknown → forward.
+        let ra = ranges("a", ColumnRange::Equal(LiteralValue::Integer(5)));
+        assert_eq!(
+            log.decide(&q, Some(&ra)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+        // Read constraining both columns: each row excluded via its own column.
+        let rab = HashMap::from([
+            (
+                EcoString::from("a"),
+                ColumnRange::Equal(LiteralValue::Integer(5)),
+            ),
+            (
+                EcoString::from("b"),
+                ColumnRange::Equal(LiteralValue::Integer(5)),
+            ),
+        ]);
+        assert_eq!(
+            log.decide(&q, Some(&rab)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                insert: true,
+                ..Default::default()
+            })
         );
     }
 

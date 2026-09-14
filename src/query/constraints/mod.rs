@@ -28,7 +28,9 @@ mod tests;
 pub use extract::analyze_query_constraints;
 pub use subsume::table_constraints_subsumed;
 
-pub(crate) use range::{ColumnRange, column_range_build, column_ranges_disjoint};
+pub(crate) use range::{
+    ColumnRange, column_range_build, column_range_contains, column_ranges_disjoint,
+};
 pub(crate) use subsume::{column_ranges_from_comparisons, table_column_ranges};
 
 /// A column constraint extracted from WHERE/JOIN conditions
