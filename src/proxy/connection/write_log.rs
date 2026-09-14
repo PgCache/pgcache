@@ -328,9 +328,15 @@ impl ConnectionTiers {
     }
 }
 
+/// The schema variants of one table name with pending writes. Keyed by bare
+/// name so the gate's fuzzy schema matching (an unqualified side matches any
+/// schema) is one hash probe plus a scan of this — almost always singleton —
+/// bucket, instead of a scan of every logged relation.
+type SchemaBucket = HashMap<Option<EcoString>, TableTiers>;
+
 /// Per-connection write log. See the module docs for the model.
 pub(in crate::proxy::connection) struct WriteLog {
-    tables: HashMap<RelationRef, TableTiers>,
+    tables: HashMap<EcoString, SchemaBucket>,
     connection: ConnectionTiers,
     next_seq: u64,
     /// Earliest stamped bound across all waiting tiers — lets [`Self::purge`]
@@ -374,9 +380,12 @@ impl WriteLog {
     /// UPDATE) — the cases that benefit from deriving the read's per-column
     /// ranges (PGC-369/381/382). Opaque/connection writes ignore them.
     pub(in crate::proxy::connection) fn has_row_predicates(&self) -> bool {
-        self.tables
-            .values()
+        self.tiers()
             .any(|tiers| tiers.aggregates().any(TableAggregate::has_row_predicates))
+    }
+
+    fn tiers(&self) -> impl Iterator<Item = &TableTiers> {
+        self.tables.values().flat_map(HashMap::values)
     }
 
     /// Record a forwarded write into its table's (or the connection's) active
@@ -399,7 +408,7 @@ impl WriteLog {
             // (PGC-369), unless the table is already opaque or the rows overflow
             // the cap (then degrade to opaque).
             WriteClass::InsertRows(insert) => {
-                let agg = self.table_active(insert.relation.clone(), seq);
+                let agg = self.table_active(&insert.relation, seq);
                 if !agg.opaque {
                     let mut inserts = agg.inserts.take().unwrap_or_default();
                     if inserts.fold(insert) {
@@ -417,7 +426,7 @@ impl WriteLog {
             // disjointness (PGC-381), unless the table is already opaque or the
             // predicate count overflows the cap (then degrade to opaque).
             WriteClass::DeleteRows(delete) => {
-                let agg = self.table_active(delete.relation.clone(), seq);
+                let agg = self.table_active(&delete.relation, seq);
                 if !agg.opaque {
                     agg.deletes
                         .push(column_ranges_from_comparisons(&delete.comparisons));
@@ -434,7 +443,7 @@ impl WriteLog {
             // image for the two-sided disjointness check (PGC-382), unless the
             // table is opaque or the predicate count overflows the cap.
             WriteClass::UpdateRows(update) => {
-                let agg = self.table_active(update.relation.clone(), seq);
+                let agg = self.table_active(&update.relation, seq);
                 if !agg.opaque {
                     agg.updates.push(update_predicate_build(update));
                     if agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP {
@@ -447,7 +456,7 @@ impl WriteLog {
                 }
             }
             WriteClass::Table(relation) => {
-                self.table_active(relation.clone(), seq).degrade_opaque();
+                self.table_active(relation, seq).degrade_opaque();
             }
             WriteClass::Connection => {
                 self.connection.active = Some(seq);
@@ -463,8 +472,14 @@ impl WriteLog {
         }
     }
 
-    fn table_active(&mut self, relation: RelationRef, seq: u64) -> &mut TableAggregate {
-        self.tables.entry(relation).or_default().active_mut(seq)
+    fn table_active(&mut self, relation: &RelationRef, seq: u64) -> &mut TableAggregate {
+        // Recording routes by exact identity; fuzzy matching is read-side only.
+        self.tables
+            .entry(relation.name.clone())
+            .or_default()
+            .entry(relation.schema.clone())
+            .or_default()
+            .active_mut(seq)
     }
 
     /// The sequence to hand the probe at injection: writes recorded up to and
@@ -472,8 +487,7 @@ impl WriteLog {
     /// nothing to stamp (no active tier awaiting a bound).
     pub(in crate::proxy::connection) fn stamp_seq(&self) -> Option<u64> {
         let tables = self
-            .tables
-            .values()
+            .tiers()
             .filter_map(|tiers| tiers.active.as_ref().map(|(seq, _)| *seq));
         tables.chain(self.connection.active).max()
     }
@@ -484,7 +498,7 @@ impl WriteLog {
     /// may predate that write's commit) and a subsequent probe retries it;
     /// every other table still stamps.
     pub(in crate::proxy::connection) fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
-        for tiers in self.tables.values_mut() {
+        for tiers in self.tables.values_mut().flat_map(HashMap::values_mut) {
             tiers.stamp(stamp_seq, lsn);
         }
         self.connection.stamp(stamp_seq, lsn);
@@ -498,11 +512,14 @@ impl WriteLog {
         if self.min_stamped_lsn.is_none_or(|min| watermark < min) {
             return;
         }
-        self.tables.retain(|_, tiers| {
-            if matches!(&tiers.waiting, Some((lsn, _)) if *lsn <= watermark) {
-                tiers.waiting = None;
-            }
-            !tiers.is_empty()
+        self.tables.retain(|_, bucket| {
+            bucket.retain(|_, tiers| {
+                if matches!(&tiers.waiting, Some((lsn, _)) if *lsn <= watermark) {
+                    tiers.waiting = None;
+                }
+                !tiers.is_empty()
+            });
+            !bucket.is_empty()
         });
         if matches!(self.connection.waiting, Some(lsn) if lsn <= watermark) {
             self.connection.waiting = None;
@@ -512,8 +529,7 @@ impl WriteLog {
 
     fn min_stamped_lsn_recompute(&mut self) {
         let tables = self
-            .tables
-            .values()
+            .tiers()
             .filter_map(|tiers| tiers.waiting.as_ref().map(|(lsn, _)| *lsn));
         self.min_stamped_lsn = tables.chain(self.connection.waiting).min();
     }
@@ -567,8 +583,11 @@ impl WriteLog {
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
         kinds: &mut DisjointKinds,
     ) -> bool {
-        for (relation, tiers) in &self.tables {
-            if !relation_matches(relation, table) {
+        let Some(bucket) = self.tables.get(&table.name) else {
+            return false;
+        };
+        for (schema, tiers) in bucket {
+            if !schema_matches(schema, &table.schema) {
                 continue;
             }
             for agg in tiers.aggregates() {
@@ -612,9 +631,11 @@ impl WriteLog {
     /// the expensive per-column range derivation for reads no such write could
     /// affect (PGC-369, PGC-381, PGC-382).
     pub(in crate::proxy::connection) fn table_has_row_predicate(&self, table: &TableNode) -> bool {
-        self.tables.iter().any(|(relation, tiers)| {
-            relation_matches(relation, table)
-                && tiers.aggregates().any(TableAggregate::has_row_predicates)
+        self.tables.get(&table.name).is_some_and(|bucket| {
+            bucket.iter().any(|(schema, tiers)| {
+                schema_matches(schema, &table.schema)
+                    && tiers.aggregates().any(TableAggregate::has_row_predicates)
+            })
         })
     }
 }
@@ -629,16 +650,15 @@ impl TableTiers {
     }
 }
 
-/// Whether a logged write's relation matches a table the read references.
-/// Names must be equal; schemas are compared only when *both* sides are
-/// schema-qualified — an unqualified name on either side conservatively matches,
-/// since the proxy can't resolve `search_path` to a concrete schema.
-fn relation_matches(relation: &RelationRef, table: &TableNode) -> bool {
-    relation.name == table.name
-        && match (&relation.schema, &table.schema) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        }
+/// Whether a logged write's schema matches a read table's, given equal names
+/// (the bucket key). Compared only when *both* sides are schema-qualified — an
+/// unqualified name on either side conservatively matches, since the proxy
+/// can't resolve `search_path` to a concrete schema.
+fn schema_matches(relation: &Option<EcoString>, table: &Option<EcoString>) -> bool {
+    match (relation, table) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -671,13 +691,12 @@ mod tests {
 
     /// Whether `relation` has any pending write (opaque or insert) in any tier.
     fn table_pending(log: &WriteLog, relation: &str) -> bool {
-        let rel = RelationRef {
-            schema: None,
-            name: relation.into(),
-        };
-        log.tables
-            .get(&rel)
-            .is_some_and(|tiers| tiers.aggregates().any(|a| a.opaque || a.inserts.is_some()))
+        log.tables.get(relation).is_some_and(|bucket| {
+            bucket
+                .values()
+                .flat_map(TableTiers::aggregates)
+                .any(|a| a.opaque || a.inserts.is_some())
+        })
     }
 
     fn connection_pending(log: &WriteLog) -> bool {
