@@ -127,9 +127,15 @@ pub(in crate::proxy::connection) struct TableAggregate {
     /// may still be served — a delete only shrinks. Cleared once `opaque` is
     /// set.
     pub deletes: Vec<HashMap<EcoString, ColumnRange>>,
-    /// UPDATEs pending against this table (PGC-382), one entry each. A read is
-    /// unaffected only if disjoint from both the WHERE predicate and the
-    /// post-update image. Cleared once `opaque` is set.
+    /// All-equality-WHERE UPDATE predicates pending against this table
+    /// (PGC-382), shape-grouped like `merged_deletes`, each entry carrying its
+    /// WHERE tuple and SET values so the two-sided (WHERE + post-update image)
+    /// check runs over flat tuples. Cleared once `opaque` is set.
+    pub merged_updates: MergedUpdates,
+    /// UPDATEs with a non-mergeable shape (a range WHERE comparison, a
+    /// duplicated column), one entry each (PGC-382). A read is unaffected only
+    /// if disjoint from both the WHERE predicate and the post-update image.
+    /// Cleared once `opaque` is set.
     pub updates: Vec<UpdatePredicate>,
 }
 
@@ -321,6 +327,106 @@ fn merged_tuples_disjoint(
     })
 }
 
+/// One merged UPDATE's SET values, aligned with its shape's SET column list.
+/// `None` = non-literal RHS, post-update value unknown.
+type SetTuple = SmallVec<[Option<LiteralValue>; 4]>;
+
+/// A merged UPDATE's shape: the sorted WHERE column list and the SET column
+/// list (statement order).
+type UpdateShape = (Box<[EcoString]>, Box<[EcoString]>);
+
+/// Merged all-equality-WHERE UPDATEs, grouped by [`UpdateShape`].
+type MergedUpdates = HashMap<UpdateShape, Vec<(EqualityTuple, SetTuple)>>;
+
+/// The shape key and tuples of a mergeable UPDATE, or `None` when it doesn't
+/// merge: a non-equality/duplicated-column WHERE (see [`equality_tuple`]), or a
+/// duplicated SET column (whose last-assignment-wins semantics only the legacy
+/// map path preserves).
+fn update_tuple(update: &UpdateStatement) -> Option<(UpdateShape, (EqualityTuple, SetTuple))> {
+    let (where_columns, where_values) = equality_tuple(&update.where_comparisons)?;
+    let duplicate_set = update.set.iter().enumerate().any(|(i, (column, _))| {
+        update
+            .set
+            .iter()
+            .skip(i + 1)
+            .any(|(other, _)| other == column)
+    });
+    if duplicate_set {
+        return None;
+    }
+    let set_columns = update
+        .set
+        .iter()
+        .map(|(column, _)| column.clone())
+        .collect();
+    let set_values = update.set.iter().map(|(_, value)| value.clone()).collect();
+    Some(((where_columns, set_columns), (where_values, set_values)))
+}
+
+/// Whether the read is provably disjoint from every merged UPDATE — from both
+/// the WHERE tuple (the rows it touches) and the post-update image (the WHERE
+/// values with SET overrides applied; an unknown SET value constrains
+/// nothing). The tuple-level equivalent of checking [`UpdatePredicate`]'s two
+/// range maps.
+fn merged_updates_disjoint(
+    merged: &MergedUpdates,
+    read_ranges: &HashMap<EcoString, ColumnRange>,
+) -> bool {
+    // An unsatisfiable read matches no row at all.
+    if read_ranges
+        .values()
+        .any(|range| matches!(range, ColumnRange::Empty))
+    {
+        return true;
+    }
+    merged.iter().all(|((where_columns, set_columns), tuples)| {
+        // Resolve the shape's columns against the read once.
+        let where_constrained: SmallVec<[(usize, &ColumnRange); 2]> = where_columns
+            .iter()
+            .enumerate()
+            .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
+            .collect();
+        // Image side: WHERE columns keep their value unless a SET overrides
+        // them; SET columns carry their new value.
+        let where_in_image: SmallVec<[(usize, &ColumnRange); 2]> = where_constrained
+            .iter()
+            .filter(|(position, _)| {
+                where_columns
+                    .get(*position)
+                    .is_some_and(|column| !set_columns.contains(column))
+            })
+            .copied()
+            .collect();
+        let set_constrained: SmallVec<[(usize, &ColumnRange); 4]> = set_columns
+            .iter()
+            .enumerate()
+            .filter_map(|(position, column)| read_ranges.get(column).map(|range| (position, range)))
+            .collect();
+        tuples.iter().all(|(where_values, set_values)| {
+            let where_excluded = where_constrained.iter().any(|(position, range)| {
+                matches!(
+                    where_values.get(*position),
+                    Some(value) if column_range_contains(range, value) == Some(false)
+                )
+            });
+            if !where_excluded {
+                return false;
+            }
+            where_in_image.iter().any(|(position, range)| {
+                matches!(
+                    where_values.get(*position),
+                    Some(value) if column_range_contains(range, value) == Some(false)
+                )
+            }) || set_constrained.iter().any(|(position, range)| {
+                matches!(
+                    set_values.get(*position),
+                    Some(Some(value)) if column_range_contains(range, value) == Some(false)
+                )
+            })
+        })
+    })
+}
+
 impl TableAggregate {
     /// Fold another aggregate for the same table into this one. `opaque`
     /// dominates (and clears inserts/deletes); otherwise inserts and delete
@@ -349,6 +455,9 @@ impl TableAggregate {
                 .or_default()
                 .extend(tuples);
         }
+        for (shape, tuples) in other.merged_updates {
+            self.merged_updates.entry(shape).or_default().extend(tuples);
+        }
         self.deletes.extend(other.deletes);
         self.updates.extend(other.updates);
         if self.deletes.len() + self.updates.len() > UPDATE_DELETE_PREDICATE_CAP
@@ -365,7 +474,8 @@ impl TableAggregate {
     /// Merged all-equality tuples held, across shapes — the count
     /// [`MERGED_PREDICATE_CAP`] bounds.
     fn merged_count(&self) -> usize {
-        self.merged_deletes.values().map(Vec::len).sum()
+        self.merged_deletes.values().map(Vec::len).sum::<usize>()
+            + self.merged_updates.values().map(Vec::len).sum::<usize>()
     }
 
     /// Collapse to table-level opaque, discarding the finer row-predicate state.
@@ -374,6 +484,7 @@ impl TableAggregate {
         self.inserts = None;
         self.merged_deletes.clear();
         self.deletes.clear();
+        self.merged_updates.clear();
         self.updates.clear();
     }
 
@@ -381,6 +492,7 @@ impl TableAggregate {
         self.inserts.is_some()
             || !self.merged_deletes.is_empty()
             || !self.deletes.is_empty()
+            || !self.merged_updates.is_empty()
             || !self.updates.is_empty()
     }
 }
@@ -615,8 +727,17 @@ impl WriteLog {
             WriteClass::UpdateRows(update) => {
                 let agg = self.table_active(&update.relation, seq);
                 if !agg.opaque {
-                    agg.updates.push(update_predicate_build(update));
-                    if agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP {
+                    let overflow = match update_tuple(update) {
+                        Some((shape, tuple)) => {
+                            agg.merged_updates.entry(shape).or_default().push(tuple);
+                            agg.merged_count() > MERGED_PREDICATE_CAP
+                        }
+                        None => {
+                            agg.updates.push(update_predicate_build(update));
+                            agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP
+                        }
+                    };
+                    if overflow {
                         agg.degrade_opaque();
                         crate::metrics::handles()
                             .raw
@@ -783,6 +904,15 @@ impl WriteLog {
                 for delete in &agg.deletes {
                     if read_ranges.is_some_and(|ranges| column_ranges_disjoint(ranges, delete)) {
                         kinds.delete = true;
+                    } else {
+                        return true;
+                    }
+                }
+                if !agg.merged_updates.is_empty() {
+                    if read_ranges
+                        .is_some_and(|ranges| merged_updates_disjoint(&agg.merged_updates, ranges))
+                    {
+                        kinds.update = true;
                     } else {
                         return true;
                     }
@@ -1272,7 +1402,11 @@ mod tests {
     fn test_delete_merged_overflow_degrades_to_opaque() {
         let mut log = WriteLog::new(true);
         for i in 0..=MERGED_PREDICATE_CAP {
-            log.record(&delete_eq("orders", "id", i64::try_from(i).expect("cap fits i64")));
+            log.record(&delete_eq(
+                "orders",
+                "id",
+                i64::try_from(i).expect("cap fits i64"),
+            ));
         }
         // Past the merged cap the table is opaque: even a disjoint read forwards.
         let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
@@ -1287,7 +1421,11 @@ mod tests {
         let mut log = WriteLog::new(true);
         // Range deletes don't merge; one past the per-statement cap degrades.
         for i in 0..=UPDATE_DELETE_PREDICATE_CAP {
-            log.record(&delete_range("orders", "id", i64::try_from(i).expect("cap fits i64")));
+            log.record(&delete_range(
+                "orders",
+                "id",
+                i64::try_from(i).expect("cap fits i64"),
+            ));
         }
         let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
         assert_eq!(
@@ -1491,6 +1629,136 @@ mod tests {
         // A non-literal SET (unknown image) on id = 5 rows doesn't touch id = 1.
         let mut log = WriteLog::new(true);
         log.record(&update_eq("orders", "id", 5, &[("v", None)]));
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                update: true,
+                ..Default::default()
+            })
+        );
+    }
+
+    #[test]
+    fn test_update_merged_survives_tier_collision() {
+        // A second stamp before the first clears merges the waiting aggregate
+        // into the new one; the prior tier's merged UPDATE tuples must survive
+        // — losing them serves stale reads of the still-pending rows.
+        let mut log = WriteLog::new(true);
+        log.record(&update_eq("orders", "id", 5, &[("v", Some(7))]));
+        let seq = log.stamp_seq().expect("bound pending");
+        log.stamp(seq, Lsn::from_raw(100));
+        log.record(&update_eq("orders", "id", 6, &[("v", Some(8))]));
+        let seq = log.stamp_seq().expect("bound pending");
+        log.stamp(seq, Lsn::from_raw(200));
+        let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
+            RawDecision::Forward(RawForwardReason::Table),
+            "the id = 5 UPDATE is still pending and must forward"
+        );
+        // And both clear once the watermark passes the merged bound.
+        log.purge(Lsn::from_raw(200));
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn test_delete_merged_survives_tier_collision() {
+        let mut log = WriteLog::new(true);
+        log.record(&delete_eq("orders", "id", 5));
+        let seq = log.stamp_seq().expect("bound pending");
+        log.stamp(seq, Lsn::from_raw(100));
+        log.record(&delete_eq("orders", "id", 6));
+        let seq = log.stamp_seq().expect("bound pending");
+        log.stamp(seq, Lsn::from_raw(200));
+        let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
+            RawDecision::Forward(RawForwardReason::Table),
+            "the id = 5 DELETE is still pending and must forward"
+        );
+    }
+
+    #[test]
+    fn test_update_row_at_a_time_stays_precise() {
+        // Hundreds of single-row `UPDATE ... SET v = ? WHERE id = ?` statements
+        // must keep row-level precision (the old per-statement cap degraded at
+        // 64).
+        let mut log = WriteLog::new(true);
+        for i in 0..500 {
+            log.record(&update_eq("orders", "id", i, &[("v", Some(i))]));
+        }
+        let q = query("SELECT * FROM orders WHERE id = 9999");
+        let disjoint = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
+        assert_eq!(
+            log.decide(&q, Some(&disjoint)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                update: true,
+                ..Default::default()
+            })
+        );
+        let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250)));
+        assert_eq!(
+            log.decide(&q, Some(&hit)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_update_merged_grow_forwards() {
+        // The grow case must survive the merged path: with many merged updates
+        // pending, one whose SET moves a row *into* the read still forwards.
+        let mut log = WriteLog::new(true);
+        for i in 100..200 {
+            log.record(&update_eq("orders", "id", i, &[("v", Some(0))]));
+        }
+        log.record(&update_eq("orders", "id", 500, &[("id", Some(1))]));
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_update_delete_share_merged_cap() {
+        // Merged deletes and updates draw on one combined budget.
+        let mut log = WriteLog::new(true);
+        for i in 0..600 {
+            log.record(&delete_eq("orders", "id", i));
+        }
+        for i in 0..425 {
+            log.record(&update_eq("orders", "id", i, &[("v", Some(0))]));
+        }
+        // 600 + 425 = 1025 > cap → opaque: even a disjoint read forwards.
+        let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_update_duplicate_set_column_routes_legacy() {
+        // `SET v = 1, v = 2` (last wins) can't merge; the legacy map path keeps
+        // the override semantics: the final image v = 2 is what the read must
+        // be disjoint from.
+        let mut log = WriteLog::new(true);
+        log.record(&update_eq(
+            "orders",
+            "id",
+            5,
+            &[("v", Some(1)), ("v", Some(2))],
+        ));
+        // Read on v = 1 (the overwritten value) is disjoint from the image
+        // v = 2 and the WHERE id = 5 leaves v unconstrained... the read must
+        // still check id: unconstrained on id → WHERE not excluded → forward.
+        let rv1 = ranges("v", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE v = 1"), Some(&rv1)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+        // Disjoint via id on both sides → serve.
         let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
         assert_eq!(
             log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
