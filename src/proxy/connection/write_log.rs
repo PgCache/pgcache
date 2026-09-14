@@ -10,12 +10,13 @@
 //!
 //! Writes aggregate per table, not per statement: thousands of writes to one
 //! table collapse to O(1) state, so a bulk load never bloats memory or the
-//! per-read gate. On top of that sits a bounded **active/waiting** pair of
-//! segments giving LSN granularity — `active` gathers new (unstamped) writes;
-//! at most one stamped `waiting` segment drains as the CDC apply watermark
-//! passes its commit-LSN bound. Separating the two means a fresh write never
-//! gates an older, already-applied one: the waiting batch clears on its own
-//! LSN even while active holds newer writes.
+//! per-read gate. Each table carries its own bounded **active/waiting** pair of
+//! tiers giving per-table LSN granularity — `active` gathers new (unstamped)
+//! writes; the stamped `waiting` tier drains as the CDC apply watermark passes
+//! its commit-LSN bound. Bounds are per table, so one table's clearance is
+//! never held back by another's later bound, and a fresh write never gates an
+//! older, already-applied one: the waiting tier clears on its own LSN even
+//! while active holds newer writes.
 //!
 //! The gate consulting this log ([`WriteLog::decide`]) forwards a read that
 //! could be superseded by a pending write. A non-row-enumerable write makes its
@@ -24,7 +25,7 @@
 //! keeps its WHERE plus post-update image ([`UpdatePredicate`]) — so a read
 //! provably disjoint from every one can still be served (PGC-369/381/382).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -40,7 +41,7 @@ use crate::query::write::{
 };
 
 /// Cap on the combined update + delete predicate maps a single table may hold in
-/// one segment before it degrades to opaque. Unlike [`INSERT_MAX_ROWS`] this
+/// one tier before it degrades to opaque. Unlike [`INSERT_MAX_ROWS`] this
 /// counts *statements* (each UPDATE/DELETE contributes one predicate), not rows,
 /// so it is tracked separately even though it currently shares the same value.
 const UPDATE_DELETE_PREDICATE_CAP: usize = 64;
@@ -86,45 +87,7 @@ impl DisjointKinds {
     }
 }
 
-/// Max segments kept before the two oldest are merged. Two — one `active`
-/// gathering writes, one `waiting` to clear — recovers LSN granularity without
-/// per-statement state; when CDC keeps up the waiting batch clears before each
-/// probe, so no merge happens and precision is per-batch. Raising this to keep
-/// more LSN tiers under sustained lag is a one-line change.
-const MAX_SEGMENTS: usize = 2;
-
-/// The commit-LSN bound on a segment's writes — the point past which the CDC
-/// apply watermark guarantees every write in the segment is applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::proxy::connection) enum PendingLsn {
-    /// No bound sampled yet (the probe hasn't stamped this segment). Never
-    /// clears until stamped.
-    Unstamped,
-    /// The apply watermark clears this segment once it reaches `lsn`.
-    Stamped(Lsn),
-    /// `PREPARE TRANSACTION`: the commit happens later, possibly from another
-    /// session, so no probe LSN can bound it. Never cleared by the watermark;
-    /// dropped only at connection close.
-    Unstampable,
-}
-
-impl PendingLsn {
-    /// The later-clearing of two bounds, for merging segments. A bound that
-    /// never clears via the watermark (`Unstampable`, or an `Unstamped` segment
-    /// that — once merged — is no longer the active one a probe could stamp)
-    /// dominates a `Stamped` one; two `Stamped` bounds take the max. Keeping the
-    /// *more* conservative bound guarantees a merged segment never clears before
-    /// either input would have.
-    fn later_of(self, other: PendingLsn) -> PendingLsn {
-        match (self, other) {
-            (PendingLsn::Unstampable, _) | (_, PendingLsn::Unstampable) => PendingLsn::Unstampable,
-            (PendingLsn::Unstamped, _) | (_, PendingLsn::Unstamped) => PendingLsn::Unstamped,
-            (PendingLsn::Stamped(a), PendingLsn::Stamped(b)) => PendingLsn::Stamped(a.max(b)),
-        }
-    }
-}
-
-/// Pending write state for one table within a segment.
+/// Pending write state for one table within a tier.
 #[derive(Debug, Default, Clone)]
 pub(in crate::proxy::connection) struct TableAggregate {
     /// A non-row-enumerable write (MERGE/TRUNCATE, or a degraded
@@ -215,48 +178,6 @@ fn insert_row_ranges(
         .collect()
 }
 
-/// Connection-scoped pending writes whose target table is unknown (DDL, CALL,
-/// EXECUTE, multi-statement, unparseable forwards). While set, *every* read
-/// intersects until the segment clears.
-#[derive(Debug, Default, Clone)]
-pub(in crate::proxy::connection) struct ConnAggregate {
-    pub opaque: bool,
-}
-
-/// One LSN tier of aggregated writes.
-#[derive(Debug, Clone)]
-pub(in crate::proxy::connection) struct WriteSegment {
-    lsn: PendingLsn,
-    /// Sequence of the newest write folded in — the probe stamps a segment only
-    /// when no write arrived after the probe sampled its bound.
-    latest_seq: u64,
-    tables: HashMap<RelationRef, TableAggregate>,
-    connection: ConnAggregate,
-}
-
-impl WriteSegment {
-    fn new(seq: u64) -> Self {
-        Self {
-            lsn: PendingLsn::Unstamped,
-            latest_seq: seq,
-            tables: HashMap::new(),
-            connection: ConnAggregate::default(),
-        }
-    }
-
-    /// Fold the other segment's aggregates into this one (used when merging the
-    /// two oldest segments on overflow). Opaque flags OR together, and the
-    /// merged bound is the later-clearing of the two — so a never-clearing
-    /// `Unstampable` (2PC) segment is never lost into a clearable one.
-    fn absorb(&mut self, other: WriteSegment) {
-        for (relation, other_agg) in other.tables {
-            self.tables.entry(relation).or_default().merge(other_agg);
-        }
-        self.connection.opaque |= other.connection.opaque;
-        self.lsn = self.lsn.later_of(other.lsn);
-    }
-}
-
 impl TableAggregate {
     /// Fold another aggregate for the same table into this one. `opaque`
     /// dominates (and clears inserts/deletes); otherwise inserts and delete
@@ -297,6 +218,10 @@ impl TableAggregate {
         self.deletes.clear();
         self.updates.clear();
     }
+
+    fn has_row_predicates(&self) -> bool {
+        self.inserts.is_some() || !self.deletes.is_empty() || !self.updates.is_empty()
+    }
 }
 
 /// Build an [`UpdatePredicate`] from a classified UPDATE (PGC-382): the WHERE
@@ -322,13 +247,96 @@ fn update_predicate_build(update: &UpdateStatement) -> UpdatePredicate {
     }
 }
 
+/// One table's pending writes, as an active/waiting tier pair with per-table
+/// LSN bounds.
+#[derive(Debug, Default)]
+struct TableTiers {
+    /// Stamped with its commit-LSN bound; drains once the CDC apply watermark
+    /// passes it.
+    waiting: Option<(Lsn, TableAggregate)>,
+    /// Gathering unstamped writes. The sequence is that of the newest write
+    /// folded in — the probe stamps a tier only when no write arrived after the
+    /// probe sampled its bound.
+    active: Option<(u64, TableAggregate)>,
+}
+
+impl TableTiers {
+    fn is_empty(&self) -> bool {
+        self.waiting.is_none() && self.active.is_none()
+    }
+
+    /// Fold a write into the active tier, marking it with `seq`.
+    fn active_mut(&mut self, seq: u64) -> &mut TableAggregate {
+        let (latest_seq, agg) = self
+            .active
+            .get_or_insert_with(|| (seq, TableAggregate::default()));
+        *latest_seq = seq;
+        agg
+    }
+
+    /// Promote the active tier to waiting under the probe's bound, if no write
+    /// arrived after the probe sampled it. On a waiting-tier collision (the
+    /// previous stamp hasn't cleared yet) the old aggregate merges into the new
+    /// one under the later bound — conservative, and scoped to this table only.
+    fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
+        if !matches!(&self.active, Some((latest_seq, _)) if *latest_seq <= stamp_seq) {
+            return;
+        }
+        let Some((_, mut agg)) = self.active.take() else {
+            return;
+        };
+        if let Some((prior_lsn, prior_agg)) = self.waiting.take() {
+            crate::metrics::handles().raw.tier_merges.increment(1);
+            agg.merge(prior_agg);
+            // A stamp's LSN is sampled after the prior one, so the new bound is
+            // the later; keep it (max is belt-and-braces for the invariant).
+            self.waiting = Some((lsn.max(prior_lsn), agg));
+        } else {
+            self.waiting = Some((lsn, agg));
+        }
+    }
+}
+
+/// Connection-scoped pending writes whose target table is unknown (DDL, CALL,
+/// EXECUTE, multi-statement, unparseable forwards). While pending, *every* read
+/// on the connection intersects.
+#[derive(Debug, Default)]
+struct ConnectionTiers {
+    /// Stamped: clears once the watermark passes the bound.
+    waiting: Option<Lsn>,
+    /// Unstamped: the newest connection-scoped write's sequence.
+    active: Option<u64>,
+    /// `PREPARE TRANSACTION`: the commit happens later, possibly from another
+    /// session, so no probe LSN can bound it. Never cleared by the watermark;
+    /// dropped only at connection close.
+    unstampable: bool,
+}
+
+impl ConnectionTiers {
+    fn is_empty(&self) -> bool {
+        self.waiting.is_none() && self.active.is_none() && !self.unstampable
+    }
+
+    fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
+        let stampable = matches!(self.active, Some(latest_seq) if latest_seq <= stamp_seq);
+        if !stampable {
+            return;
+        }
+        self.active = None;
+        // Later bound wins on collision, as for tables.
+        self.waiting = Some(self.waiting.map_or(lsn, |prior| lsn.max(prior)));
+    }
+}
+
 /// Per-connection write log. See the module docs for the model.
 pub(in crate::proxy::connection) struct WriteLog {
-    /// Newest-last. The back segment is `active` (unstamped, gathering) whenever
-    /// one exists; every segment ahead of it is stamped. Bounded to
-    /// [`MAX_SEGMENTS`] after each stamp by merging the two oldest.
-    segments: VecDeque<WriteSegment>,
+    tables: HashMap<RelationRef, TableTiers>,
+    connection: ConnectionTiers,
     next_seq: u64,
+    /// Earliest stamped bound across all waiting tiers — lets [`Self::purge`]
+    /// skip its scan (it runs per gated read) until the watermark can clear
+    /// something. `None` = nothing stamped.
+    min_stamped_lsn: Option<Lsn>,
     /// Recording is off entirely when the feature is disabled or the connection
     /// can't serve from cache (`cache_disabled`).
     enabled: bool,
@@ -337,8 +345,10 @@ pub(in crate::proxy::connection) struct WriteLog {
 impl WriteLog {
     pub(in crate::proxy::connection) fn new(enabled: bool) -> Self {
         Self {
-            segments: VecDeque::new(),
+            tables: HashMap::new(),
+            connection: ConnectionTiers::default(),
             next_seq: 0,
+            min_stamped_lsn: None,
             enabled,
         }
     }
@@ -347,7 +357,9 @@ impl WriteLog {
     /// cache is off for its lifetime).
     pub(in crate::proxy::connection) fn disable(&mut self) {
         self.enabled = false;
-        self.segments.clear();
+        self.tables.clear();
+        self.connection = ConnectionTiers::default();
+        self.min_stamped_lsn = None;
     }
 
     pub(in crate::proxy::connection) fn is_enabled(&self) -> bool {
@@ -355,42 +367,20 @@ impl WriteLog {
     }
 
     pub(in crate::proxy::connection) fn is_empty(&self) -> bool {
-        self.segments.is_empty()
+        self.tables.is_empty() && self.connection.is_empty()
     }
 
     /// Whether any pending write is row-enumerable (an INSERT, DELETE, or
     /// UPDATE) — the cases that benefit from deriving the read's per-column
     /// ranges (PGC-369/381/382). Opaque/connection writes ignore them.
     pub(in crate::proxy::connection) fn has_row_predicates(&self) -> bool {
-        self.segments.iter().any(|s| {
-            s.tables
-                .values()
-                .any(|a| a.inserts.is_some() || !a.deletes.is_empty() || !a.updates.is_empty())
-        })
+        self.tables
+            .values()
+            .any(|tiers| tiers.aggregates().any(TableAggregate::has_row_predicates))
     }
 
-    /// Number of live LSN tiers — asserted in tests; a gate/metric consumer
-    /// arrives in PGC-368.
-    #[allow(dead_code)]
-    pub(in crate::proxy::connection) fn segment_count(&self) -> usize {
-        self.segments.len()
-    }
-
-    /// The `active` (back, unstamped) segment, creating one if the log is empty
-    /// or its back segment has already been stamped.
-    fn active(&mut self) -> &mut WriteSegment {
-        let need_new = match self.segments.back() {
-            None => true,
-            Some(back) => !matches!(back.lsn, PendingLsn::Unstamped),
-        };
-        if need_new {
-            let seq = self.next_seq;
-            self.segments.push_back(WriteSegment::new(seq));
-        }
-        self.segments.back_mut().expect("active segment present")
-    }
-
-    /// Record a forwarded write into the active segment. No-op when disabled.
+    /// Record a forwarded write into its table's (or the connection's) active
+    /// tier. No-op when disabled.
     pub(in crate::proxy::connection) fn record(&mut self, class: &WriteClass) {
         if !self.enabled {
             return;
@@ -398,14 +388,18 @@ impl WriteLog {
         crate::metrics::handles().raw.writes_recorded.increment(1);
         let seq = self.next_seq;
         self.next_seq += 1;
-        let seg = self.active();
-        seg.latest_seq = seq;
+        // An unstampable connection-scoped write forwards every read until
+        // connection close, so any finer per-table state is unreachable — skip
+        // recording it (and drop what exists, freeing the memory early).
+        if self.connection.unstampable {
+            return;
+        }
         match class {
             // Row-enumerable INSERT: keep the rows for row-level disjointness
             // (PGC-369), unless the table is already opaque or the rows overflow
             // the cap (then degrade to opaque).
             WriteClass::InsertRows(insert) => {
-                let agg = seg.tables.entry(insert.relation.clone()).or_default();
+                let agg = self.table_active(insert.relation.clone(), seq);
                 if !agg.opaque {
                     let mut inserts = agg.inserts.take().unwrap_or_default();
                     if inserts.fold(insert) {
@@ -423,7 +417,7 @@ impl WriteLog {
             // disjointness (PGC-381), unless the table is already opaque or the
             // predicate count overflows the cap (then degrade to opaque).
             WriteClass::DeleteRows(delete) => {
-                let agg = seg.tables.entry(delete.relation.clone()).or_default();
+                let agg = self.table_active(delete.relation.clone(), seq);
                 if !agg.opaque {
                     agg.deletes
                         .push(column_ranges_from_comparisons(&delete.comparisons));
@@ -440,7 +434,7 @@ impl WriteLog {
             // image for the two-sided disjointness check (PGC-382), unless the
             // table is opaque or the predicate count overflows the cap.
             WriteClass::UpdateRows(update) => {
-                let agg = seg.tables.entry(update.relation.clone()).or_default();
+                let agg = self.table_active(update.relation.clone(), seq);
                 if !agg.opaque {
                     agg.updates.push(update_predicate_build(update));
                     if agg.deletes.len() + agg.updates.len() > UPDATE_DELETE_PREDICATE_CAP {
@@ -453,59 +447,75 @@ impl WriteLog {
                 }
             }
             WriteClass::Table(relation) => {
-                seg.tables
-                    .entry(relation.clone())
-                    .or_default()
-                    .degrade_opaque();
+                self.table_active(relation.clone(), seq).degrade_opaque();
             }
             WriteClass::Connection => {
-                seg.connection.opaque = true;
+                self.connection.active = Some(seq);
             }
             WriteClass::ConnectionUnstampable => {
-                seg.connection.opaque = true;
-                seg.lsn = PendingLsn::Unstampable;
+                self.connection.unstampable = true;
+                self.connection.active = None;
+                self.connection.waiting = None;
+                // Every read forwards until close; per-table state is moot.
+                self.tables.clear();
+                self.min_stamped_lsn = None;
             }
         }
+    }
+
+    fn table_active(&mut self, relation: RelationRef, seq: u64) -> &mut TableAggregate {
+        self.tables.entry(relation).or_default().active_mut(seq)
     }
 
     /// The sequence to hand the probe at injection: writes recorded up to and
     /// including this may be stamped with the probe's LSN. `None` when there is
-    /// nothing to stamp (no active segment awaiting a bound).
+    /// nothing to stamp (no active tier awaiting a bound).
     pub(in crate::proxy::connection) fn stamp_seq(&self) -> Option<u64> {
-        self.segments
-            .back()
-            .filter(|s| matches!(s.lsn, PendingLsn::Unstamped))
-            .map(|s| s.latest_seq)
+        let tables = self
+            .tables
+            .values()
+            .filter_map(|tiers| tiers.active.as_ref().map(|(seq, _)| *seq));
+        tables.chain(self.connection.active).max()
     }
 
-    /// Stamp the active segment with the probe's LSN bound, but only if no write
-    /// arrived after the probe sampled it (`active.latest_seq <= stamp_seq`).
-    /// Otherwise the sample may predate a later write's commit, so skip and let
-    /// a subsequent probe retry. Rolls the stamped segment to `waiting` and
-    /// enforces the segment bound.
+    /// Stamp each active tier with the probe's LSN bound — per table, and only
+    /// where no write arrived after the probe sampled it (`latest_seq <=
+    /// stamp_seq`). A table with a later write is skipped on its own (the sample
+    /// may predate that write's commit) and a subsequent probe retries it;
+    /// every other table still stamps.
     pub(in crate::proxy::connection) fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
-        let Some(active) = self.segments.back_mut() else {
-            return;
-        };
-        // An Unstampable (2PC) segment must never take an LSN bound.
-        if !matches!(active.lsn, PendingLsn::Unstamped) || active.latest_seq > stamp_seq {
-            return;
+        for tiers in self.tables.values_mut() {
+            tiers.stamp(stamp_seq, lsn);
         }
-        active.lsn = PendingLsn::Stamped(lsn);
-        self.segments_bound();
+        self.connection.stamp(stamp_seq, lsn);
+        self.min_stamped_lsn_recompute();
     }
 
-    /// Drop every leading segment the watermark has passed. `Unstamped` and
-    /// `Unstampable` segments never clear here.
+    /// Drop every waiting tier the watermark has passed. Active (unstamped)
+    /// tiers and an unstampable connection entry never clear here.
     pub(in crate::proxy::connection) fn purge(&mut self, watermark: Lsn) {
-        while let Some(front) = self.segments.front() {
-            match front.lsn {
-                PendingLsn::Stamped(lsn) if lsn <= watermark => {
-                    self.segments.pop_front();
-                }
-                PendingLsn::Stamped(_) | PendingLsn::Unstamped | PendingLsn::Unstampable => break,
-            }
+        // Runs per gated read: skip the scan while nothing can clear.
+        if self.min_stamped_lsn.is_none_or(|min| watermark < min) {
+            return;
         }
+        self.tables.retain(|_, tiers| {
+            if matches!(&tiers.waiting, Some((lsn, _)) if *lsn <= watermark) {
+                tiers.waiting = None;
+            }
+            !tiers.is_empty()
+        });
+        if matches!(self.connection.waiting, Some(lsn) if lsn <= watermark) {
+            self.connection.waiting = None;
+        }
+        self.min_stamped_lsn_recompute();
+    }
+
+    fn min_stamped_lsn_recompute(&mut self) {
+        let tables = self
+            .tables
+            .values()
+            .filter_map(|tiers| tiers.waiting.as_ref().map(|(lsn, _)| *lsn));
+        self.min_stamped_lsn = tables.chain(self.connection.waiting).min();
     }
 
     /// The gate's verdict for `query`: whether it could read data superseded by
@@ -523,7 +533,7 @@ impl WriteLog {
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
     ) -> RawDecision {
         // A connection-scoped pending write (unknown table) poisons every read.
-        if self.segments.iter().any(|s| s.connection.opaque) {
+        if !self.connection.is_empty() {
             return RawDecision::Forward(RawForwardReason::Connection);
         }
         // Otherwise a read forwards iff it references a table with a pending
@@ -557,11 +567,11 @@ impl WriteLog {
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
         kinds: &mut DisjointKinds,
     ) -> bool {
-        for segment in &self.segments {
-            for (relation, agg) in &segment.tables {
-                if !relation_matches(relation, table) {
-                    continue;
-                }
+        for (relation, tiers) in &self.tables {
+            if !relation_matches(relation, table) {
+                continue;
+            }
+            for agg in tiers.aggregates() {
                 if agg.opaque {
                     return true;
                 }
@@ -602,27 +612,20 @@ impl WriteLog {
     /// the expensive per-column range derivation for reads no such write could
     /// affect (PGC-369, PGC-381, PGC-382).
     pub(in crate::proxy::connection) fn table_has_row_predicate(&self, table: &TableNode) -> bool {
-        self.segments.iter().any(|segment| {
-            segment.tables.iter().any(|(relation, agg)| {
-                (agg.inserts.is_some() || !agg.deletes.is_empty() || !agg.updates.is_empty())
-                    && relation_matches(relation, table)
-            })
+        self.tables.iter().any(|(relation, tiers)| {
+            relation_matches(relation, table)
+                && tiers.aggregates().any(TableAggregate::has_row_predicates)
         })
     }
+}
 
-    /// Merge the two oldest segments until at most [`MAX_SEGMENTS`] remain. The
-    /// merged segment takes the higher (later) LSN and the union of aggregates —
-    /// conservative (it clears no earlier than either input) and it never
-    /// touches the active (back) segment.
-    fn segments_bound(&mut self) {
-        while self.segments.len() > MAX_SEGMENTS {
-            crate::metrics::handles().raw.segment_merges.increment(1);
-            let older = self.segments.pop_front().expect("two segments to merge");
-            let next = self.segments.front_mut().expect("merge target present");
-            // `absorb` unions the aggregates and takes the later-clearing bound,
-            // so merging never lets an Unstampable (2PC) segment clear early.
-            next.absorb(older);
-        }
+impl TableTiers {
+    /// Both tiers' aggregates, waiting first.
+    fn aggregates(&self) -> impl Iterator<Item = &TableAggregate> {
+        self.waiting
+            .iter()
+            .map(|(_, agg)| agg)
+            .chain(self.active.iter().map(|(_, agg)| agg))
     }
 }
 
@@ -666,21 +669,19 @@ mod tests {
         }))
     }
 
-    /// Whether `relation` has any pending write (opaque or insert) in any segment.
+    /// Whether `relation` has any pending write (opaque or insert) in any tier.
     fn table_pending(log: &WriteLog, relation: &str) -> bool {
         let rel = RelationRef {
             schema: None,
             name: relation.into(),
         };
-        log.segments.iter().any(|s| {
-            s.tables
-                .get(&rel)
-                .is_some_and(|a| a.opaque || a.inserts.is_some())
-        })
+        log.tables
+            .get(&rel)
+            .is_some_and(|tiers| tiers.aggregates().any(|a| a.opaque || a.inserts.is_some()))
     }
 
     fn connection_pending(log: &WriteLog) -> bool {
-        log.segments.iter().any(|s| s.connection.opaque)
+        !log.connection.is_empty()
     }
 
     fn query(sql: &str) -> QueryExpr {
@@ -1100,13 +1101,12 @@ mod tests {
     }
 
     #[test]
-    fn test_record_aggregates_into_active_segment() {
+    fn test_record_aggregates_per_table() {
         let mut log = WriteLog::new(true);
         log.record(&table("orders"));
         log.record(&table("orders"));
         log.record(&insert("users"));
-        // Thousands would collapse the same way: one segment, per-table opaque.
-        assert_eq!(log.segment_count(), 1);
+        // Thousands would collapse the same way: one active tier per table.
         assert!(table_pending(&log, "orders"));
         assert!(table_pending(&log, "users"));
         assert!(!table_pending(&log, "items"));
@@ -1127,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn test_stamp_then_purge_clears_segment() {
+    fn test_stamp_then_purge_clears_table() {
         let mut log = WriteLog::new(true);
         log.record(&table("orders"));
         let seq = log.stamp_seq().expect("active awaiting a bound");
@@ -1141,18 +1141,36 @@ mod tests {
     }
 
     #[test]
-    fn test_stamp_skipped_when_write_arrived_after_injection() {
+    fn test_stamp_partial_on_race() {
         let mut log = WriteLog::new(true);
         log.record(&table("orders"));
         let seq = log.stamp_seq().expect("bound pending");
         // A write races in after the probe sampled its bound.
         log.record(&table("items"));
         log.stamp(seq, Lsn::from_raw(100));
-        // The sample may predate `items`' commit, so nothing is stamped; the
-        // whole active segment stays unstamped and never clears on this LSN.
+        // Per-table stamping: `orders` (recorded before the sample) is bounded
+        // and clears; `items` (after) stays unstamped for the next probe.
+        log.purge(Lsn::from_raw(1_000));
+        assert!(!table_pending(&log, "orders"));
+        assert!(table_pending(&log, "items"));
+        // The next probe bounds `items`.
+        let seq = log.stamp_seq().expect("items awaiting a bound");
+        log.stamp(seq, Lsn::from_raw(2_000));
+        log.purge(Lsn::from_raw(2_000));
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn test_stamp_same_table_race_holds_earlier_writes() {
+        // A racing write to the SAME table keeps that table's earlier writes
+        // pending too: one active tier per table, guarded by its latest seq.
+        let mut log = WriteLog::new(true);
+        log.record(&table("orders"));
+        let seq = log.stamp_seq().expect("bound pending");
+        log.record(&table("orders"));
+        log.stamp(seq, Lsn::from_raw(100));
         log.purge(Lsn::from_raw(1_000));
         assert!(table_pending(&log, "orders"));
-        assert!(table_pending(&log, "items"));
     }
 
     #[test]
@@ -1161,37 +1179,53 @@ mod tests {
         let mut log = WriteLog::new(true);
         log.record(&table("orders"));
         let seq = log.stamp_seq().expect("bound pending");
-        log.stamp(seq, Lsn::from_raw(100)); // waiting: orders @ 100
-        log.record(&table("items")); // active: items, unstamped
-        assert_eq!(log.segment_count(), 2);
-        // Watermark passes the waiting batch but not the active writes.
+        log.stamp(seq, Lsn::from_raw(100)); // orders waiting @ 100
+        log.record(&table("items")); // items active, unstamped
+        // Watermark passes the waiting tier but not the active writes.
         log.purge(Lsn::from_raw(100));
         assert!(!table_pending(&log, "orders")); // cleared independently
         assert!(table_pending(&log, "items")); // active still pending
     }
 
     #[test]
-    fn test_overflow_merges_oldest_two() {
+    fn test_tables_clear_on_own_bounds() {
+        // Per-table bounds: a table stamped low clears without waiting for a
+        // table stamped high (the cross-table coupling the segmented log had).
         let mut log = WriteLog::new(true);
-        // Three stamped batches at rising LSNs, none cleared.
         for (i, tbl) in ["a", "b", "c"].iter().enumerate() {
             log.record(&table(tbl));
             let seq = log.stamp_seq().expect("bound pending");
             log.stamp(seq, Lsn::from_raw((i as u64 + 1) * 100));
         }
-        // Bounded to MAX_SEGMENTS; the two oldest merged, all tables retained.
-        assert_eq!(log.segment_count(), MAX_SEGMENTS);
-        assert!(table_pending(&log, "a"));
+        log.purge(Lsn::from_raw(100));
+        assert!(!table_pending(&log, "a"));
         assert!(table_pending(&log, "b"));
         assert!(table_pending(&log, "c"));
-        // The merged (oldest) segment took the later bound (200), so `a` and `b`
-        // clear together only once the watermark reaches it.
+        log.purge(Lsn::from_raw(300));
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn test_waiting_collision_merges_under_later_bound() {
+        // Two stamps on the same table before the first clears: the aggregates
+        // merge and the later bound governs (conservative, scoped to the table).
+        let mut log = WriteLog::new(true);
+        log.record(&insert_int("orders", "id", &[1]));
+        let seq = log.stamp_seq().expect("bound pending");
+        log.stamp(seq, Lsn::from_raw(100));
+        log.record(&insert_int("orders", "id", &[2]));
+        let seq = log.stamp_seq().expect("bound pending");
+        log.stamp(seq, Lsn::from_raw(200));
+        // Both inserts pending under the 200 bound.
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r1)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
         log.purge(Lsn::from_raw(100));
-        assert!(table_pending(&log, "a"));
+        assert!(table_pending(&log, "orders"));
         log.purge(Lsn::from_raw(200));
-        assert!(!table_pending(&log, "a"));
-        assert!(!table_pending(&log, "b"));
-        assert!(table_pending(&log, "c"));
+        assert!(log.is_empty());
     }
 
     #[test]
@@ -1205,23 +1239,22 @@ mod tests {
     }
 
     #[test]
-    fn test_unstampable_survives_merge() {
-        // A 2PC prepare's pending state must not clear when overflow merges its
-        // (never-clearing) segment into a stamped one.
+    fn test_unstampable_drops_and_blocks_table_state() {
+        // Once the connection is unstampable (2PC prepare), every read forwards
+        // until close, so per-table state is unreachable — dropped, and later
+        // writes aren't recorded.
         let mut log = WriteLog::new(true);
-        log.record(&WriteClass::ConnectionUnstampable); // oldest: never clears
-        for (i, tbl) in ["x", "y"].iter().enumerate() {
-            log.record(&table(tbl));
-            let seq = log.stamp_seq().expect("bound pending");
-            log.stamp(seq, Lsn::from_raw((i as u64 + 1) * 100));
-        }
-        // Overflow merged the Unstampable segment into a stamped one; the merged
-        // bound must stay never-clearing.
-        assert_eq!(log.segment_count(), MAX_SEGMENTS);
+        log.record(&table("orders"));
+        log.record(&WriteClass::ConnectionUnstampable);
+        assert!(!table_pending(&log, "orders"));
+        log.record(&table("items"));
+        assert!(!table_pending(&log, "items"));
+        assert_eq!(log.stamp_seq(), None);
         log.purge(Lsn::from_raw(u64::MAX));
-        assert!(
-            connection_pending(&log),
-            "2PC pending state must survive a segment merge"
+        assert!(connection_pending(&log));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM anything"), None),
+            RawDecision::Forward(RawForwardReason::Connection)
         );
     }
 

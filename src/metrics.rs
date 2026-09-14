@@ -46,9 +46,10 @@ pub mod names {
     // Read-after-write tracking (PGC-124)
     /// Writes folded into a connection's read-after-write log.
     pub const RAW_WRITES_RECORDED: &str = "pgcache.raw.writes_recorded";
-    /// Segment merges forced when CDC lag spans more LSN tiers than the cap —
-    /// a signal that the apply watermark is falling behind the write rate.
-    pub const RAW_SEGMENT_MERGES: &str = "pgcache.raw.segment_merges";
+    /// Waiting-tier merges: a table was stamped again before its previous bound
+    /// cleared, coarsening that table's clearance to the later LSN — a signal
+    /// that the apply watermark is falling behind the write rate.
+    pub const RAW_TIER_MERGES: &str = "pgcache.raw.tier_merges";
     /// Commit-LSN probes injected on connections' origin sockets to bound
     /// pending writes.
     pub const RAW_PROBES: &str = "pgcache.raw.probes";
@@ -393,7 +394,7 @@ pub struct Handles {
 
 pub struct RawHandles {
     pub writes_recorded: Counter,
-    pub segment_merges: Counter,
+    pub tier_merges: Counter,
     pub probes: Counter,
     /// Reads forwarded because they intersect a table-scoped pending write.
     pub forwards_table: Counter,
@@ -796,7 +797,7 @@ impl Handles {
             },
             raw: RawHandles {
                 writes_recorded: metrics::counter!(RAW_WRITES_RECORDED),
-                segment_merges: metrics::counter!(RAW_SEGMENT_MERGES),
+                tier_merges: metrics::counter!(RAW_TIER_MERGES),
                 probes: metrics::counter!(RAW_PROBES),
                 forwards_table: metrics::counter!(RAW_FORWARDS, "scope" => "table"),
                 forwards_connection: metrics::counter!(RAW_FORWARDS, "scope" => "connection"),
