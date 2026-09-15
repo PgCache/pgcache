@@ -46,7 +46,8 @@ pub(in crate::proxy::connection) enum OriginIntercept {
     TrailingShowSearchPath(TrailingShowState),
     /// Read-after-write commit-LSN probe (PGC-124): an injected
     /// `SELECT pg_current_wal_insert_lsn()` whose response is fully swallowed;
-    /// its LSN stamps the write-log segment holding writes up to `stamp_seq`.
+    /// its LSN bounds each table's active tier holding writes up to
+    /// `stamp_seq` (a table with a later write is skipped and re-probed).
     WalLsnProbe { stamp_seq: u64 },
 }
 

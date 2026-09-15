@@ -182,7 +182,7 @@ impl InsertAggregate {
         if self.caps_exceeded(&insert.columns, insert.rows.len()) {
             return false;
         }
-        let positions = self.column_positions(&insert.columns);
+        let positions = self.column_positions_resolve(&insert.columns);
         for row in &insert.rows {
             self.row_push(&positions, row.iter().cloned());
         }
@@ -198,7 +198,7 @@ impl InsertAggregate {
             *self = other;
             return true;
         }
-        let positions = self.column_positions(&other.columns);
+        let positions = self.column_positions_resolve(&other.columns);
         for row in other.rows {
             self.row_push(&positions, row.into_iter());
         }
@@ -221,7 +221,7 @@ impl InsertAggregate {
 
     /// Map a statement's column list onto `self.columns`, extending it with
     /// names not seen before.
-    fn column_positions(&mut self, statement_columns: &[EcoString]) -> Vec<usize> {
+    fn column_positions_resolve(&mut self, statement_columns: &[EcoString]) -> Vec<usize> {
         statement_columns
             .iter()
             .map(|column| {
@@ -298,7 +298,9 @@ type MergedTuples = HashMap<Box<[EcoString]>, Vec<EqualityTuple>>;
 /// when the shape doesn't merge: a non-equality comparison, or a column
 /// constrained twice (the legacy range-map path handles both, including the
 /// contradictory `c = 1 AND c = 2` case it folds to `Empty`).
-fn equality_tuple(comparisons: &[WriteComparison]) -> Option<(Box<[EcoString]>, EqualityTuple)> {
+fn equality_tuple_build(
+    comparisons: &[WriteComparison],
+) -> Option<(Box<[EcoString]>, EqualityTuple)> {
     if comparisons.iter().any(|(_, op, _)| *op != BinaryOp::Equal) {
         return None;
     }
@@ -363,11 +365,13 @@ type UpdateShape = (Box<[EcoString]>, Box<[EcoString]>);
 type MergedUpdates = HashMap<UpdateShape, Vec<(EqualityTuple, SetTuple)>>;
 
 /// The shape key and tuples of a mergeable UPDATE, or `None` when it doesn't
-/// merge: a non-equality/duplicated-column WHERE (see [`equality_tuple`]), or a
+/// merge: a non-equality/duplicated-column WHERE (see [`equality_tuple_build`]), or a
 /// duplicated SET column (whose last-assignment-wins semantics only the legacy
 /// map path preserves).
-fn update_tuple(update: &UpdateStatement) -> Option<(UpdateShape, (EqualityTuple, SetTuple))> {
-    let (where_columns, where_values) = equality_tuple(&update.where_comparisons)?;
+fn update_tuple_build(
+    update: &UpdateStatement,
+) -> Option<(UpdateShape, (EqualityTuple, SetTuple))> {
+    let (where_columns, where_values) = equality_tuple_build(&update.where_comparisons)?;
     let duplicate_set = update.set.iter().enumerate().any(|(i, (column, _))| {
         update
             .set
@@ -733,7 +737,7 @@ impl WriteLog {
             WriteClass::DeleteRows(delete) => {
                 let agg = self.table_active(&delete.relation, seq);
                 if !agg.opaque {
-                    let overflow = match equality_tuple(&delete.comparisons) {
+                    let overflow = match equality_tuple_build(&delete.comparisons) {
                         Some((columns, values)) => {
                             agg.merged_deletes.entry(columns).or_default().push(values);
                             agg.merged_predicates += 1;
@@ -760,7 +764,7 @@ impl WriteLog {
             WriteClass::UpdateRows(update) => {
                 let agg = self.table_active(&update.relation, seq);
                 if !agg.opaque {
-                    let overflow = match update_tuple(update) {
+                    let overflow = match update_tuple_build(update) {
                         Some((shape, tuple)) => {
                             agg.merged_updates.entry(shape).or_default().push(tuple);
                             agg.merged_predicates += 1;
