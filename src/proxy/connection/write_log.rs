@@ -10,13 +10,14 @@
 //!
 //! Writes aggregate per table, not per statement: thousands of writes to one
 //! table collapse to O(1) state, so a bulk load never bloats memory or the
-//! per-read gate. Each table carries its own bounded **active/waiting** pair of
-//! tiers giving per-table LSN granularity — `active` gathers new (unstamped)
-//! writes; the stamped `waiting` tier drains as the CDC apply watermark passes
-//! its commit-LSN bound. Bounds are per table, so one table's clearance is
-//! never held back by another's later bound, and a fresh write never gates an
-//! older, already-applied one: the waiting tier clears on its own LSN even
-//! while active holds newer writes.
+//! per-read gate. Each table carries its own **active** tier gathering new
+//! (unstamped) writes plus a bounded queue of **stamped** tiers, each draining
+//! as the CDC apply watermark passes its own commit-LSN bound. Bounds are per
+//! table and per batch, so one table's clearance is never held back by
+//! another's later bound, and a fresh write never gates an older,
+//! already-applied one; only when the queue saturates (CDC lag spanning more
+//! probe windows than [`WAITING_TIERS`]) do the oldest batches merge under the
+//! later bound.
 //!
 //! The gate consulting this log ([`WriteLog::decide`]) forwards a read that
 //! could be superseded by a pending write. A non-row-enumerable write makes its
@@ -553,13 +554,21 @@ fn update_predicate_build(update: &UpdateStatement) -> UpdatePredicate {
     }
 }
 
-/// One table's pending writes, as an active/waiting tier pair with per-table
-/// LSN bounds.
+/// Stamped tiers a table holds before a further stamp merges the two oldest.
+/// Two keeps the common CDC-lag regime (lag under two probe windows) merge-free
+/// — each batch drains on its own bound — without unbounded tier growth;
+/// `tier_merges` counts saturation of both slots.
+const WAITING_TIERS: usize = 2;
+
+/// One table's pending writes: an active tier gathering unstamped writes, plus
+/// a bounded queue of stamped tiers each draining on its own per-table bound.
 #[derive(Debug, Default)]
 struct TableTiers {
-    /// Stamped with its commit-LSN bound; drains once the CDC apply watermark
-    /// passes it.
-    waiting: Option<(Lsn, TableAggregate)>,
+    /// Stamped tiers, oldest first (bounds are monotonic); each drains once
+    /// the CDC apply watermark passes its commit-LSN bound. Bounded to
+    /// [`WAITING_TIERS`]; a stamp past that merges the two oldest under the
+    /// later bound.
+    waiting: SmallVec<[(Lsn, TableAggregate); WAITING_TIERS]>,
     /// Gathering unstamped writes. The sequence is that of the newest write
     /// folded in — the probe stamps a tier only when no write arrived after the
     /// probe sampled its bound.
@@ -568,7 +577,7 @@ struct TableTiers {
 
 impl TableTiers {
     fn is_empty(&self) -> bool {
-        self.waiting.is_none() && self.active.is_none()
+        self.waiting.is_empty() && self.active.is_none()
     }
 
     /// Fold a write into the active tier, marking it with `seq`.
@@ -580,26 +589,28 @@ impl TableTiers {
         agg
     }
 
-    /// Promote the active tier to waiting under the probe's bound, if no write
-    /// arrived after the probe sampled it. On a waiting-tier collision (the
-    /// previous stamp hasn't cleared yet) the old aggregate merges into the new
-    /// one under the later bound — conservative, and scoped to this table only.
+    /// Promote the active tier to a waiting slot under the probe's bound, if no
+    /// write arrived after the probe sampled it. When the queue is full (the
+    /// oldest bounds haven't cleared), the two oldest tiers merge under the
+    /// later of their bounds — conservative, and scoped to this table only.
     fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
         if !matches!(&self.active, Some((latest_seq, _)) if *latest_seq <= stamp_seq) {
             return;
         }
-        let Some((_, mut agg)) = self.active.take() else {
+        let Some((_, agg)) = self.active.take() else {
             return;
         };
-        if let Some((prior_lsn, prior_agg)) = self.waiting.take() {
+        if self.waiting.len() >= WAITING_TIERS {
             crate::metrics::handles().raw.tier_merges.increment(1);
-            agg.merge(prior_agg);
-            // A stamp's LSN is sampled after the prior one, so the new bound is
-            // the later; keep it (max is belt-and-braces for the invariant).
-            self.waiting = Some((lsn.max(prior_lsn), agg));
-        } else {
-            self.waiting = Some((lsn, agg));
+            let (oldest_lsn, oldest_agg) = self.waiting.remove(0);
+            if let Some((next_lsn, next_agg)) = self.waiting.first_mut() {
+                next_agg.merge(oldest_agg);
+                // Bounds are monotonic in stamp order, so the later of the two
+                // is the surviving slot's own (max is belt-and-braces).
+                *next_lsn = (*next_lsn).max(oldest_lsn);
+            }
         }
+        self.waiting.push((lsn, agg));
     }
 }
 
@@ -839,9 +850,7 @@ impl WriteLog {
     pub(in crate::proxy::connection) fn purge(&mut self, watermark: Lsn) {
         self.tables.retain(|_, bucket| {
             bucket.retain(|_, tiers| {
-                if matches!(&tiers.waiting, Some((lsn, _)) if *lsn <= watermark) {
-                    tiers.waiting = None;
-                }
+                tiers.waiting.retain(|(lsn, _)| *lsn > watermark);
                 !tiers.is_empty()
             });
             !bucket.is_empty()
@@ -1713,36 +1722,34 @@ mod tests {
 
     #[test]
     fn test_update_merged_survives_tier_collision() {
-        // A second stamp before the first clears merges the waiting aggregate
-        // into the new one; the prior tier's merged UPDATE tuples must survive
-        // — losing them serves stale reads of the still-pending rows.
+        // Saturating the waiting queue merges the two oldest aggregates; the
+        // older tier's merged UPDATE tuples must survive the merge — losing
+        // them serves stale reads of the still-pending rows.
         let mut log = WriteLog::new(true);
-        log.record(&update_eq("orders", "id", 5, &[("v", Some(7))]));
-        let seq = log.stamp_seq().expect("bound pending");
-        log.stamp(seq, Lsn::from_raw(100));
-        log.record(&update_eq("orders", "id", 6, &[("v", Some(8))]));
-        let seq = log.stamp_seq().expect("bound pending");
-        log.stamp(seq, Lsn::from_raw(200));
+        for (i, id) in [5i64, 6, 7].iter().enumerate() {
+            log.record(&update_eq("orders", "id", *id, &[("v", Some(0))]));
+            let seq = log.stamp_seq().expect("bound pending");
+            log.stamp(seq, Lsn::from_raw((i as u64 + 1) * 100));
+        }
         let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
         assert_eq!(
             log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
             RawDecision::Forward(RawForwardReason::Table),
             "the id = 5 UPDATE is still pending and must forward"
         );
-        // And both clear once the watermark passes the merged bound.
-        log.purge(Lsn::from_raw(200));
+        // And everything clears once the watermark passes every bound.
+        log.purge(Lsn::from_raw(300));
         assert!(log.is_empty());
     }
 
     #[test]
     fn test_delete_merged_survives_tier_collision() {
         let mut log = WriteLog::new(true);
-        log.record(&delete_eq("orders", "id", 5));
-        let seq = log.stamp_seq().expect("bound pending");
-        log.stamp(seq, Lsn::from_raw(100));
-        log.record(&delete_eq("orders", "id", 6));
-        let seq = log.stamp_seq().expect("bound pending");
-        log.stamp(seq, Lsn::from_raw(200));
+        for (i, id) in [5i64, 6, 7].iter().enumerate() {
+            log.record(&delete_eq("orders", "id", *id));
+            let seq = log.stamp_seq().expect("bound pending");
+            log.stamp(seq, Lsn::from_raw((i as u64 + 1) * 100));
+        }
         let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
         assert_eq!(
             log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
@@ -1994,9 +2001,9 @@ mod tests {
     }
 
     #[test]
-    fn test_waiting_collision_merges_under_later_bound() {
-        // Two stamps on the same table before the first clears: the aggregates
-        // merge and the later bound governs (conservative, scoped to the table).
+    fn test_waiting_tiers_drain_independently() {
+        // Two stamps before anything clears occupy both waiting slots; the
+        // older batch drains on its own lower bound, not the newer one's.
         let mut log = WriteLog::new(true);
         log.record(&insert_int("orders", "id", &[1]));
         let seq = log.stamp_seq().expect("bound pending");
@@ -2004,15 +2011,63 @@ mod tests {
         log.record(&insert_int("orders", "id", &[2]));
         let seq = log.stamp_seq().expect("bound pending");
         log.stamp(seq, Lsn::from_raw(200));
-        // Both inserts pending under the 200 bound.
+        // Both inserts pending; a read of id = 1 forwards.
         let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
         assert_eq!(
             log.decide(&query("SELECT * FROM orders"), Some(&r1)),
             RawDecision::Forward(RawForwardReason::Table)
         );
+        // The 100-bound batch clears alone: id = 1 now serves disjoint-free,
+        // id = 2 still forwards.
         log.purge(Lsn::from_raw(100));
-        assert!(table_pending(&log, "orders"));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r1)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                insert: true,
+                ..Default::default()
+            })
+        );
+        let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r2)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
         log.purge(Lsn::from_raw(200));
+        assert!(log.is_empty());
+    }
+
+    #[test]
+    fn test_waiting_saturation_merges_oldest_two() {
+        // A third stamp with both slots full merges the two oldest batches
+        // under the later of their bounds (conservative, scoped to the table).
+        let mut log = WriteLog::new(true);
+        for (i, id) in [1i64, 2, 3].iter().enumerate() {
+            log.record(&insert_int("orders", "id", &[*id]));
+            let seq = log.stamp_seq().expect("bound pending");
+            log.stamp(seq, Lsn::from_raw((i as u64 + 1) * 100));
+        }
+        // The 100-batch merged into the 200 bound: purging 100 clears nothing.
+        let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+        log.purge(Lsn::from_raw(100));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r1)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+        // At 200 the merged pair clears; the 300 batch remains.
+        log.purge(Lsn::from_raw(200));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r1)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                insert: true,
+                ..Default::default()
+            })
+        );
+        let r3 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(3)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders"), Some(&r3)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+        log.purge(Lsn::from_raw(300));
         assert!(log.is_empty());
     }
 
