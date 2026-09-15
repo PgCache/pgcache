@@ -62,6 +62,12 @@ const MERGED_PREDICATE_CAP: usize = 1024;
 /// stays row-precise for this many rows.
 const INSERT_MERGED_ROWS_CAP: usize = 1024;
 
+/// Cap on total cells (rows × union column width) one table's tier may hold.
+/// Rows are stored dense to the union of the folded statements' column lists,
+/// so wide or heterogeneous column lists hit this budget before the row cap —
+/// it bounds the aggregate's memory, which the row count alone does not.
+const INSERT_MERGED_CELLS_CAP: usize = 8192;
+
 /// Reason the read-after-write gate forwarded a cacheable read to origin
 /// instead of serving it from cache (PGC-124), for metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,10 +176,10 @@ pub(in crate::proxy::connection) struct InsertAggregate {
 
 impl InsertAggregate {
     /// Fold in another INSERT's rows. Returns `false` if the total would exceed
-    /// [`INSERT_MERGED_ROWS_CAP`], signalling the caller to degrade the table
-    /// to opaque.
+    /// [`INSERT_MERGED_ROWS_CAP`] or [`INSERT_MERGED_CELLS_CAP`], signalling
+    /// the caller to degrade the table to opaque. Checked before any mutation.
     fn fold(&mut self, insert: &Arc<InsertStatement>) -> bool {
-        if self.rows.len() + insert.rows.len() > INSERT_MERGED_ROWS_CAP {
+        if self.caps_exceeded(&insert.columns, insert.rows.len()) {
             return false;
         }
         let positions = self.column_positions(&insert.columns);
@@ -185,7 +191,7 @@ impl InsertAggregate {
 
     /// Fold another aggregate's rows in. Returns `false` on cap overflow.
     fn merge(&mut self, other: InsertAggregate) -> bool {
-        if self.rows.len() + other.rows.len() > INSERT_MERGED_ROWS_CAP {
+        if self.caps_exceeded(&other.columns, other.rows.len()) {
             return false;
         }
         if self.rows.is_empty() {
@@ -197,6 +203,20 @@ impl InsertAggregate {
             self.row_push(&positions, row.into_iter());
         }
         true
+    }
+
+    /// Whether folding `incoming_rows` rows with `incoming_columns` would
+    /// overflow the row or cell budget. The cell budget uses the prospective
+    /// union width — a conservative bound, since rows folded before a widening
+    /// stay short.
+    fn caps_exceeded(&self, incoming_columns: &[EcoString], incoming_rows: usize) -> bool {
+        let new_columns = incoming_columns
+            .iter()
+            .filter(|column| !self.columns.contains(column))
+            .count();
+        let rows_total = self.rows.len() + incoming_rows;
+        rows_total > INSERT_MERGED_ROWS_CAP
+            || rows_total * (self.columns.len() + new_columns) > INSERT_MERGED_CELLS_CAP
     }
 
     /// Map a statement's column list onto `self.columns`, extending it with
@@ -1234,6 +1254,52 @@ mod tests {
         let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
         assert_eq!(
             log.decide(&query("SELECT * FROM orders"), Some(&r)),
+            RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_insert_wide_rows_hit_cells_cap() {
+        // 20-column rows exhaust the cell budget (8192 / 20 ≈ 409 rows) long
+        // before the 1024-row cap — the memory bound, not the row count, must
+        // govern wide inserts.
+        fn wide_insert(row_count: usize) -> WriteClass {
+            let columns: Vec<EcoString> =
+                (0..20).map(|c| EcoString::from(format!("c{c}"))).collect();
+            let rows = (0..row_count)
+                .map(|r| {
+                    (0..20)
+                        .map(|c| {
+                            let cell = i64::try_from(r * 20 + c).expect("cell id fits i64");
+                            Some(LiteralValue::Integer(cell))
+                        })
+                        .collect()
+                })
+                .collect();
+            WriteClass::InsertRows(Arc::new(InsertStatement {
+                relation: RelationRef {
+                    schema: None,
+                    name: "orders".into(),
+                },
+                columns,
+                rows,
+            }))
+        }
+        let mut log = WriteLog::new(true);
+        log.record(&wide_insert(300));
+        // Still precise below the budget.
+        let r = ranges("c0", ColumnRange::Equal(LiteralValue::Integer(-1)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE c0 = -1"), Some(&r)),
+            RawDecision::ServeDisjoint(DisjointKinds {
+                insert: true,
+                ..Default::default()
+            })
+        );
+        // 300 + 200 = 500 rows × 20 columns = 10000 cells > 8192 → opaque.
+        log.record(&wide_insert(200));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE c0 = -1"), Some(&r)),
             RawDecision::Forward(RawForwardReason::Table)
         );
     }

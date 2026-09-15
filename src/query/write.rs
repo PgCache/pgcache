@@ -11,11 +11,12 @@ use smallvec::SmallVec;
 use crate::query::ast::{BinaryOp, LiteralValue};
 
 /// Classification-time cap on extracted `INSERT ... VALUES` rows: a larger
-/// statement degrades to [`WriteClass::Table`] rather than pay per-row
-/// extraction. Accumulation across statements is capped separately (and much
-/// higher) in the write log's column-major aggregate — see
-/// `INSERT_MERGED_ROWS_CAP`.
-pub const INSERT_MAX_ROWS: usize = 256;
+/// statement degrades to [`WriteClass::Table`] rather than pay per-cell
+/// extraction — which runs during query analysis for every deployment, read-
+/// after-write enabled or not, and again per Bind on the extended path.
+/// Accumulation across statements is capped separately (and much higher) in
+/// the write log's column-major aggregate — see `INSERT_MERGED_ROWS_CAP`.
+pub const INSERT_MAX_ROWS: usize = 64;
 
 /// Effect of a transaction-control statement on the session's
 /// explicit-transaction state. `Begin` also covers `COMMIT AND CHAIN` /
