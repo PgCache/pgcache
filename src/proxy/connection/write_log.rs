@@ -621,10 +621,6 @@ pub(in crate::proxy::connection) struct WriteLog {
     tables: HashMap<EcoString, SchemaBucket>,
     connection: ConnectionTiers,
     next_seq: u64,
-    /// Earliest stamped bound across all waiting tiers — lets [`Self::purge`]
-    /// skip its scan (it runs per gated read) until the watermark can clear
-    /// something. `None` = nothing stamped.
-    min_stamped_lsn: Option<Lsn>,
     /// Recording is off entirely when the feature is disabled or the connection
     /// can't serve from cache (`cache_disabled`).
     enabled: bool,
@@ -636,7 +632,6 @@ impl WriteLog {
             tables: HashMap::new(),
             connection: ConnectionTiers::default(),
             next_seq: 0,
-            min_stamped_lsn: None,
             enabled,
         }
     }
@@ -647,7 +642,6 @@ impl WriteLog {
         self.enabled = false;
         self.tables.clear();
         self.connection = ConnectionTiers::default();
-        self.min_stamped_lsn = None;
     }
 
     pub(in crate::proxy::connection) fn is_enabled(&self) -> bool {
@@ -767,7 +761,6 @@ impl WriteLog {
                 self.connection.waiting = None;
                 // Every read forwards until close; per-table state is moot.
                 self.tables.clear();
-                self.min_stamped_lsn = None;
             }
         }
     }
@@ -802,16 +795,13 @@ impl WriteLog {
             tiers.stamp(stamp_seq, lsn);
         }
         self.connection.stamp(stamp_seq, lsn);
-        self.min_stamped_lsn_recompute();
     }
 
     /// Drop every waiting tier the watermark has passed. Active (unstamped)
-    /// tiers and an unstampable connection entry never clear here.
+    /// tiers and an unstampable connection entry never clear here. Runs per
+    /// gated read, but the scan is over the handful of tables with pending
+    /// writes — no derived fast-path state to keep consistent.
     pub(in crate::proxy::connection) fn purge(&mut self, watermark: Lsn) {
-        // Runs per gated read: skip the scan while nothing can clear.
-        if self.min_stamped_lsn.is_none_or(|min| watermark < min) {
-            return;
-        }
         self.tables.retain(|_, bucket| {
             bucket.retain(|_, tiers| {
                 if matches!(&tiers.waiting, Some((lsn, _)) if *lsn <= watermark) {
@@ -824,14 +814,6 @@ impl WriteLog {
         if matches!(self.connection.waiting, Some(lsn) if lsn <= watermark) {
             self.connection.waiting = None;
         }
-        self.min_stamped_lsn_recompute();
-    }
-
-    fn min_stamped_lsn_recompute(&mut self) {
-        let tables = self
-            .tiers()
-            .filter_map(|tiers| tiers.waiting.as_ref().map(|(lsn, _)| *lsn));
-        self.min_stamped_lsn = tables.chain(self.connection.waiting).min();
     }
 
     /// The gate's verdict for `query`: whether it could read data superseded by
