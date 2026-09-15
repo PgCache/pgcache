@@ -29,7 +29,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 #[cfg(not(feature = "console"))]
 const LOG_BUFFERED_LINES: usize = 4096;
 
-#[cfg(not(feature = "dhat-heap"))]
+#[cfg(not(any(feature = "dhat-heap", feature = "system-allocator")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

@@ -114,6 +114,9 @@ fault-injection = []
 # Heap allocation profiling: swaps the global allocator to dhat::Alloc and writes
 # dhat-heap.json on clean exit. Off by default; profiling/dev only.
 dhat-heap = ["dep:dhat"]
+# Allocator A/B for memory investigations: drop the mimalloc global allocator and
+# use the platform malloc. Off by default.
+system-allocator = []
 # Tokio task-dump on SIGUSR2 (deadlock debugging): logs every task's suspended
 # await backtrace. Build with `RUSTFLAGS="--cfg tokio_unstable" cargo build
 # --features taskdump` (the `tokio/taskdump` feature enables the dump API; the

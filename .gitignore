@@ -14,3 +14,7 @@ debugfile
 config.ycsb*.toml
 
 config.harness.toml
+
+# local issue test configs
+config.issue*.toml
+
