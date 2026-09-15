@@ -132,6 +132,10 @@ pub(in crate::proxy::connection) struct TableAggregate {
     /// WHERE tuple and SET values so the two-sided (WHERE + post-update image)
     /// check runs over flat tuples. Cleared once `opaque` is set.
     pub merged_updates: MergedUpdates,
+    /// Total tuples across `merged_deletes` and `merged_updates` — the count
+    /// [`MERGED_PREDICATE_CAP`] bounds, maintained incrementally so recording
+    /// never rescans the shape maps.
+    pub merged_predicates: usize,
     /// UPDATEs with a non-mergeable shape (a range WHERE comparison, a
     /// duplicated column), one entry each (PGC-382). A read is unaffected only
     /// if disjoint from both the WHERE predicate and the post-update image.
@@ -354,12 +358,22 @@ fn update_tuple(update: &UpdateStatement) -> Option<(UpdateShape, (EqualityTuple
     if duplicate_set {
         return None;
     }
-    let set_columns = update
+    // Sort SET pairs by column so `SET a = ?, b = ?` and `SET b = ?, a = ?`
+    // share one shape instead of fragmenting the store.
+    let mut set_pairs: SmallVec<[(&EcoString, &Option<LiteralValue>); 4]> = update
         .set
         .iter()
-        .map(|(column, _)| column.clone())
+        .map(|(column, value)| (column, value))
         .collect();
-    let set_values = update.set.iter().map(|(_, value)| value.clone()).collect();
+    set_pairs.sort_by(|a, b| a.0.cmp(b.0));
+    let set_columns = set_pairs
+        .iter()
+        .map(|(column, _)| (*column).clone())
+        .collect();
+    let set_values = set_pairs
+        .iter()
+        .map(|(_, value)| (*value).clone())
+        .collect();
     Some(((where_columns, set_columns), (where_values, set_values)))
 }
 
@@ -458,10 +472,11 @@ impl TableAggregate {
         for (shape, tuples) in other.merged_updates {
             self.merged_updates.entry(shape).or_default().extend(tuples);
         }
+        self.merged_predicates += other.merged_predicates;
         self.deletes.extend(other.deletes);
         self.updates.extend(other.updates);
         if self.deletes.len() + self.updates.len() > UPDATE_DELETE_PREDICATE_CAP
-            || self.merged_count() > MERGED_PREDICATE_CAP
+            || self.merged_predicates > MERGED_PREDICATE_CAP
         {
             self.degrade_opaque();
             crate::metrics::handles()
@@ -469,13 +484,6 @@ impl TableAggregate {
                 .cap_degraded_update_delete
                 .increment(1);
         }
-    }
-
-    /// Merged all-equality tuples held, across shapes — the count
-    /// [`MERGED_PREDICATE_CAP`] bounds.
-    fn merged_count(&self) -> usize {
-        self.merged_deletes.values().map(Vec::len).sum::<usize>()
-            + self.merged_updates.values().map(Vec::len).sum::<usize>()
     }
 
     /// Collapse to table-level opaque, discarding the finer row-predicate state.
@@ -486,6 +494,7 @@ impl TableAggregate {
         self.deletes.clear();
         self.merged_updates.clear();
         self.updates.clear();
+        self.merged_predicates = 0;
     }
 
     fn has_row_predicates(&self) -> bool {
@@ -707,7 +716,8 @@ impl WriteLog {
                     let overflow = match equality_tuple(&delete.comparisons) {
                         Some((columns, values)) => {
                             agg.merged_deletes.entry(columns).or_default().push(values);
-                            agg.merged_count() > MERGED_PREDICATE_CAP
+                            agg.merged_predicates += 1;
+                            agg.merged_predicates > MERGED_PREDICATE_CAP
                         }
                         None => {
                             agg.deletes
@@ -733,7 +743,8 @@ impl WriteLog {
                     let overflow = match update_tuple(update) {
                         Some((shape, tuple)) => {
                             agg.merged_updates.entry(shape).or_default().push(tuple);
-                            agg.merged_count() > MERGED_PREDICATE_CAP
+                            agg.merged_predicates += 1;
+                            agg.merged_predicates > MERGED_PREDICATE_CAP
                         }
                         None => {
                             agg.updates.push(update_predicate_build(update));
@@ -1708,6 +1719,40 @@ mod tests {
         assert_eq!(
             log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
             RawDecision::Forward(RawForwardReason::Table)
+        );
+    }
+
+    #[test]
+    fn test_update_set_order_shares_one_shape() {
+        // `SET a = ?, b = ?` and `SET b = ?, a = ?` are the same shape; an ORM
+        // iterating a hash-ordered dirty set must not fragment the store.
+        let mut log = WriteLog::new(true);
+        log.record(&update_eq(
+            "orders",
+            "id",
+            1,
+            &[("a", Some(1)), ("b", Some(2))],
+        ));
+        log.record(&update_eq(
+            "orders",
+            "id",
+            2,
+            &[("b", Some(3)), ("a", Some(4))],
+        ));
+        let shapes: usize = log
+            .tables
+            .values()
+            .flat_map(HashMap::values)
+            .flat_map(TableTiers::aggregates)
+            .map(|agg| agg.merged_updates.len())
+            .sum();
+        assert_eq!(shapes, 1, "reordered SET lists must share one shape");
+        // The image check still tracks each tuple's own values.
+        let ra = ranges("a", ColumnRange::Equal(LiteralValue::Integer(4)));
+        assert_eq!(
+            log.decide(&query("SELECT * FROM orders WHERE a = 4"), Some(&ra)),
+            RawDecision::Forward(RawForwardReason::Table),
+            "a row updated into a = 4 must forward"
         );
     }
 
