@@ -591,12 +591,21 @@ impl ConnectionTiers {
     }
 
     fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
+        // A 2PC prepare must never take an LSN bound: its commit happens
+        // later, possibly from another session. `record` refuses writes while
+        // unstampable, but this state must hold even if that ever changes.
+        if self.unstampable {
+            return;
+        }
         let stampable = matches!(self.active, Some(latest_seq) if latest_seq <= stamp_seq);
         if !stampable {
             return;
         }
         self.active = None;
         // Later bound wins on collision, as for tables.
+        if self.waiting.is_some() {
+            crate::metrics::handles().raw.tier_merges.increment(1);
+        }
         self.waiting = Some(self.waiting.map_or(lsn, |prior| lsn.max(prior)));
     }
 }
@@ -1918,6 +1927,19 @@ mod tests {
         assert_eq!(log.stamp_seq(), None);
         log.purge(Lsn::from_raw(u64::MAX));
         assert!(connection_pending(&log));
+    }
+
+    #[test]
+    fn test_unstampable_connection_never_takes_a_bound() {
+        // Defense in depth for the deleted PendingLsn::Unstampable type guard:
+        // even if a future change records a connection-scoped write while
+        // unstampable (today `record` refuses), a probe must not bound it.
+        let mut log = WriteLog::new(true);
+        log.record(&WriteClass::ConnectionUnstampable);
+        log.connection.active = Some(log.next_seq);
+        log.stamp(log.next_seq, Lsn::from_raw(100));
+        log.purge(Lsn::from_raw(u64::MAX));
+        assert!(connection_pending(&log), "2PC state must survive any probe");
     }
 
     #[test]
