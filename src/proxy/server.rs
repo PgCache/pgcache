@@ -179,6 +179,7 @@ pub fn proxy_run(
         let (status_updater, status_sender) = StatusSenderUpdater::new_pending();
 
         let telemetry_metrics = metrics_handle.clone();
+        let upkeep_metrics = metrics_handle.clone();
         if let Some(ref m) = settings.metrics {
             admin_server_spawn(
                 m.socket,
@@ -221,13 +222,23 @@ pub fn proxy_run(
         // distinct text instead of each retaining its own AST.
         let cacheability_store = Arc::new(CacheabilityStore::new());
 
-        // Publish the store's size on a 1s tick rather than on every membership
-        // change: `DashMap::len` read-locks every shard, so doing it per
-        // intern/release would put an all-shards operation on the churn path
-        // (the trap `state_gauges_update` hit on the writer). 1s is well below
-        // typical Prometheus scrape intervals.
+        // Periodic metrics maintenance, on a 1s tick.
+        //
+        // Publishing the store's size here rather than on every membership change
+        // keeps an all-shards operation off the churn path: `DashMap::len`
+        // read-locks every shard (the trap `state_gauges_update` hit on the
+        // writer). 1s is well below typical Prometheus scrape intervals.
+        //
+        // The upkeep call is what bounds histogram memory. `Histogram::record`
+        // appends raw (value, instant) pairs to an unbounded list and a
+        // `/metrics` render is the only other drain, so without this a process
+        // that is never scraped retains every sample it has ever recorded —
+        // ~180 bytes per query, which is unbounded growth under load. Draining
+        // every second also keeps each drain small and improves the time
+        // attribution of samples into the exporter's rolling windows.
         {
             let store = Arc::clone(&cacheability_store);
+            let upkeep = upkeep_metrics;
             let cancel = cancel.child_token();
             rt_handle.spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -235,7 +246,10 @@ pub fn proxy_run(
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => break,
-                        _ = tick.tick() => store.gauge_publish(),
+                        _ = tick.tick() => {
+                            store.gauge_publish();
+                            upkeep.run_upkeep();
+                        }
                     }
                 }
             });
