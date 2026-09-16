@@ -1,4 +1,5 @@
 mod cache_sender;
+mod cacheability_store;
 mod client_stream;
 mod connection;
 mod egress;
@@ -9,6 +10,7 @@ mod server;
 mod tls_stream;
 
 pub use cache_sender::{StatusSender, StatusSenderUpdater};
+pub use cacheability_store::CacheabilityStore;
 
 pub use client_stream::{ClientSocket, OwnedClientReadHalf};
 pub use query::{ExplainSpec, ExplainTarget};

@@ -23,7 +23,9 @@ use crate::{
     telemetry, tls,
 };
 
-use super::{ConnectionError, ConnectionResult, StatusSenderUpdater, connection_task};
+use super::{
+    CacheabilityStore, ConnectionError, ConnectionResult, StatusSenderUpdater, connection_task,
+};
 
 fn tls_config_load(settings: &Settings) -> ConnectionResult<Option<Arc<tls::TlsAcceptor>>> {
     match (&settings.tls_cert, &settings.tls_key) {
@@ -214,6 +216,31 @@ pub fn proxy_run(
         })
         .attach_loc("setting up cache")?;
 
+        // One interned cacheability store for the whole process: analysis is a
+        // pure function of the SQL text, so connections share one payload per
+        // distinct text instead of each retaining its own AST.
+        let cacheability_store = Arc::new(CacheabilityStore::new());
+
+        // Publish the store's size on a 1s tick rather than on every membership
+        // change: `DashMap::len` read-locks every shard, so doing it per
+        // intern/release would put an all-shards operation on the churn path
+        // (the trap `state_gauges_update` hit on the writer). 1s is well below
+        // typical Prometheus scrape intervals.
+        {
+            let store = Arc::clone(&cacheability_store);
+            let cancel = cancel.child_token();
+            rt_handle.spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => break,
+                        _ = tick.tick() => store.gauge_publish(),
+                    }
+                }
+            });
+        }
+
         // Origin connection params, resolved once and cloned into each task.
         let ssl_mode = settings.origin.ssl_mode;
         let server_name = EcoString::from(settings.origin.host.as_str());
@@ -313,6 +340,7 @@ pub fn proxy_run(
                                     tls_acceptor.clone(),
                                     Arc::clone(&func_volatility),
                                     origin_database.clone(),
+                                    Arc::clone(&cacheability_store),
                                 ));
                             }
                         }

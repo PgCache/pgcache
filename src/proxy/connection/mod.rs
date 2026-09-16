@@ -56,7 +56,8 @@ pub(super) struct ConnectionState {
     /// sending its next message, so the next client message seals the slot.
     pub(in crate::proxy::connection) flush_describe_pending: bool,
 
-    /// Cache of query fingerprints to cacheability decisions
+    /// Per-connection cacheability memo: bounded handles into the shared
+    /// interning store.
     pub(in crate::proxy::connection) cacheability_cache: CacheabilityCache,
 
     /// Whether the connection is currently in a transaction

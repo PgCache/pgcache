@@ -1,8 +1,11 @@
 use std::{
     collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
+    num::NonZeroUsize,
     sync::Arc,
 };
+
+use lru::LruCache;
 
 use ecow::EcoString;
 use tokio_util::bytes::BytesMut;
@@ -18,7 +21,7 @@ use crate::{
     },
 };
 
-use super::ParseError;
+use super::{ParseError, cacheability_store::CacheabilityStore};
 
 /// Name of the pseudo-function the proxy intercepts to explain a cached query
 /// against the cache database (PGC-345). It is never executed as a real
@@ -155,15 +158,81 @@ impl SqlTextHash {
     }
 }
 
-/// `HashMap` keyed by `SqlTextHash` with the passthrough hasher (key is already
-/// a hash) — parallels the `FingerprintMap` aliases so the identity hasher and
-/// its key type travel together.
-pub(super) type SqlTextHashMap<V> = HashMap<SqlTextHash, V, BuildIdHasher<SqlTextHash>>;
+/// Bounded per connection so a dynamic-SQL workload can't grow it unbounded,
+/// matching the describe cache. A miss here is not a re-analysis — it falls
+/// back to the shared store, which is a sharded-map lookup and an `Arc` clone
+/// — so erring small costs little.
+const CACHEABILITY_MEMO_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
 /// The proxy's per-connection cacheability memo: SQL text hash → the analyzed
 /// verdict (cacheable AST, forward reason, or an explain interception), so the
 /// parse/convert/classify work is done once per distinct query text.
-pub(super) type CacheabilityCache = SqlTextHashMap<Action>;
+///
+/// Entries are cheap handles into [`CacheabilityStore`]; the payload itself is
+/// interned there once for the whole process. Dropping a handle — by LRU
+/// eviction, epoch drain, or the connection closing — releases the key back to
+/// the store, which reclaims it if nothing else holds it.
+pub(super) struct CacheabilityCache {
+    entries: LruCache<SqlTextHash, Arc<Action>, BuildIdHasher<SqlTextHash>>,
+    store: Arc<CacheabilityStore>,
+    /// Drain epoch this memo was last reconciled against.
+    epoch: u64,
+}
+
+impl CacheabilityCache {
+    pub(super) fn new(store: Arc<CacheabilityStore>) -> Self {
+        Self {
+            entries: LruCache::with_hasher(CACHEABILITY_MEMO_CAPACITY, BuildIdHasher::default()),
+            epoch: store.epoch(),
+            store,
+        }
+    }
+
+    /// Feed a memory-pressure sample through to the shared store. Called where
+    /// the connection already holds a `CacheDispatch`, which carries the flag
+    /// for the current cache generation.
+    pub(in crate::proxy) fn pressure_observe(&self, pressured: bool) {
+        self.store.pressure_observed(pressured);
+    }
+
+    /// Drop every handle and release the keys, so the store can reclaim any
+    /// entry this memo was the last to hold.
+    fn drain(&mut self) {
+        let keys: Vec<SqlTextHash> = self.entries.iter().map(|(key, _)| *key).collect();
+        self.entries.clear();
+        for key in keys {
+            self.store.release(key);
+        }
+    }
+
+    /// Reconcile against a wholesale drop: clearing the store alone frees
+    /// nothing while connections still hold `Arc`s, so each connection drains
+    /// when it notices the epoch move.
+    pub(in crate::proxy) fn epoch_reconcile(&mut self) {
+        let current = self.store.epoch();
+        if current != self.epoch {
+            self.drain();
+            self.epoch = current;
+        }
+    }
+
+    /// Record a handle, releasing whatever the LRU evicted to make room.
+    fn remember(&mut self, key: SqlTextHash, action: Arc<Action>) {
+        if let Some((evicted_key, evicted)) = self.entries.push(key, action) {
+            // Drop before releasing: the scrutinee temporary outlives the body,
+            // so a handle still held here keeps the store's count above 1 and
+            // the release silently does nothing.
+            drop(evicted);
+            self.store.release(evicted_key);
+        }
+    }
+}
+
+impl Drop for CacheabilityCache {
+    fn drop(&mut self) {
+        self.drain();
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ForwardReason {
@@ -202,20 +271,34 @@ pub(super) fn query_sql_extract(data: &BytesMut) -> Option<&str> {
     data.get(5..msg_len).and_then(|b| str::from_utf8(b).ok())
 }
 
-/// Cacheability analysis for a SQL string, memoized in `cacheability_cache` keyed on a
-/// hash of the text. On a hit the parse/convert/classify work is skipped
-/// entirely; on a miss the result (cacheable AST or forward reason) is cached.
-/// Shared by the simple-query and extended (Parse) paths.
+/// Cacheability analysis for a SQL string, memoized on a hash of the text. On a
+/// hit the parse/convert/classify work is skipped entirely. Shared by the
+/// simple-query and extended (Parse) paths.
+///
+/// Two tiers. The per-connection LRU is the hot path and needs no
+/// synchronization. On a miss the shared [`CacheabilityStore`] is consulted,
+/// which costs a sharded-map lookup and an `Arc` clone rather than a
+/// re-analysis; only a miss in both tiers parses. The verdict is interned there
+/// so every connection shares one payload.
 pub(super) fn analyze(
     sql: &str,
     cacheability_cache: &mut CacheabilityCache,
     func_volatility: &HashMap<EcoString, FunctionVolatility>,
 ) -> Result<Action, ParseError> {
+    cacheability_cache.epoch_reconcile();
+
     let key = SqlTextHash::of(sql);
 
-    if let Some(action) = cacheability_cache.get(&key) {
+    if let Some(action) = cacheability_cache.entries.get(&key) {
         trace!("cacheability memo hit");
-        return Ok(action.clone());
+        return Ok((**action).clone());
+    }
+
+    if let Some(action) = cacheability_cache.store.get(key) {
+        trace!("cacheability store hit");
+        let verdict = (*action).clone();
+        cacheability_cache.remember(key, action);
+        return Ok(verdict);
     }
 
     // Build the QueryExpr straight off the raw parse tree, skipping the protobuf
@@ -266,13 +349,132 @@ pub(super) fn analyze(
         }
     };
 
-    cacheability_cache.insert(key, action.clone());
-    Ok(action)
+    let interned = cacheability_cache.store.intern(key, action);
+    let verdict = (*interned).clone();
+    cacheability_cache.remember(key, interned);
+    Ok(verdict)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::Arc;
+
+    use crate::proxy::cacheability_store::CacheabilityStore;
+
+    fn empty_volatility() -> HashMap<EcoString, FunctionVolatility> {
+        HashMap::new()
+    }
+
+    /// Two connections analyzing the same text must share one interned payload.
+    /// This is the defect behind GitHub issue #4: previously each connection
+    /// called `Arc::new` on its own analysis, so N connections retained N ASTs.
+    #[test]
+    fn test_repeat_text_across_connections_interns_once() {
+        let store = Arc::new(CacheabilityStore::new());
+        let fv = empty_volatility();
+        let sql = "SELECT a FROM t WHERE id = 1";
+
+        let mut first = CacheabilityCache::new(Arc::clone(&store));
+        let mut second = CacheabilityCache::new(Arc::clone(&store));
+
+        let a = analyze(sql, &mut first, &fv).expect("analyze on the first connection");
+        let b = analyze(sql, &mut second, &fv).expect("analyze on the second connection");
+
+        let (Action::CacheCheck(a), Action::CacheCheck(b)) = (a, b) else {
+            panic!("expected a cacheable verdict for a plain SELECT");
+        };
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "both connections must share one interned payload"
+        );
+    }
+
+    /// Distinct texts must not accumulate past the per-connection bound, and
+    /// what falls out must be released so the store can reclaim it. Without a
+    /// bound a pooled connection accumulates every text it ever sees.
+    #[test]
+    fn test_memo_is_bounded_and_releases_on_eviction() {
+        let store = Arc::new(CacheabilityStore::new());
+        let fv = empty_volatility();
+        let mut memo = CacheabilityCache::new(Arc::clone(&store));
+
+        let overshoot = CACHEABILITY_MEMO_CAPACITY.get() * 2;
+        for i in 0..overshoot {
+            let sql = format!("SELECT a FROM t WHERE id = {i}");
+            analyze(&sql, &mut memo, &fv).expect("analyze a distinct literal");
+        }
+
+        assert_eq!(
+            memo.entries.len(),
+            CACHEABILITY_MEMO_CAPACITY.get(),
+            "per-connection memo must stay at its cap"
+        );
+        assert_eq!(
+            store.len(),
+            CACHEABILITY_MEMO_CAPACITY.get(),
+            "evicted texts must be released, not retained by the store"
+        );
+    }
+
+    /// Closing a connection releases everything it held, so nothing survives a
+    /// connection's lifetime unless another connection still wants it.
+    #[test]
+    fn test_connection_close_reclaims_its_entries() {
+        let store = Arc::new(CacheabilityStore::new());
+        let fv = empty_volatility();
+
+        let mut memo = CacheabilityCache::new(Arc::clone(&store));
+        analyze("SELECT a FROM t WHERE id = 1", &mut memo, &fv).expect("analyze");
+        analyze("SELECT a FROM t WHERE id = 2", &mut memo, &fv).expect("analyze");
+        assert_eq!(store.len(), 2);
+
+        drop(memo);
+        assert_eq!(
+            store.len(),
+            0,
+            "closing the connection reclaims its entries"
+        );
+    }
+
+    /// A text two connections share survives one of them closing.
+    #[test]
+    fn test_shared_entry_survives_one_connection_closing() {
+        let store = Arc::new(CacheabilityStore::new());
+        let fv = empty_volatility();
+        let sql = "SELECT a FROM t WHERE id = 1";
+
+        let mut first = CacheabilityCache::new(Arc::clone(&store));
+        let mut second = CacheabilityCache::new(Arc::clone(&store));
+        analyze(sql, &mut first, &fv).expect("analyze");
+        analyze(sql, &mut second, &fv).expect("analyze");
+
+        drop(first);
+        assert_eq!(store.len(), 1, "the other connection still references it");
+        drop(second);
+        assert_eq!(store.len(), 0);
+    }
+
+    /// A pressure drop must actually free: clearing the store alone frees
+    /// nothing while connections still hold handles, so connections drain on
+    /// the epoch move.
+    #[test]
+    fn test_pressure_drop_drains_connection_memos() {
+        let store = Arc::new(CacheabilityStore::new());
+        let fv = empty_volatility();
+        let mut memo = CacheabilityCache::new(Arc::clone(&store));
+        analyze("SELECT a FROM t WHERE id = 1", &mut memo, &fv).expect("analyze");
+
+        store.pressure_observed(true);
+        assert_eq!(store.len(), 0, "store cleared");
+        assert_eq!(memo.entries.len(), 1, "connection has not noticed yet");
+
+        // Next query on that connection reconciles the epoch and drains.
+        analyze("SELECT a FROM t WHERE id = 2", &mut memo, &fv).expect("analyze");
+        assert_eq!(memo.entries.len(), 1, "drained, then re-populated with one");
+        assert_eq!(store.len(), 1);
+    }
 
     #[test]
     fn test_explain_intercept_parse_sql_argument() {

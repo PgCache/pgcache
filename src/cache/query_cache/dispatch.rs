@@ -74,6 +74,16 @@ async fn fault_coalesce_enqueue_delay() {
 async fn fault_coalesce_enqueue_delay() {}
 
 impl CacheDispatch {
+    /// Whether the cache is under memory pressure. Read by the proxy to drop
+    /// its interned cacheability verdicts as a last resort; the flag is
+    /// per-cache-generation and this dispatch is republished on restart, so
+    /// callers always observe the live one rather than a stale capture.
+    pub fn memory_pressure(&self) -> bool {
+        self.state_view
+            .registration_throttled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub async fn new(
         settings: &Settings,
         query_tx: UnboundedSender<QueryCommand>,

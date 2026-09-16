@@ -15,6 +15,8 @@ use lru::LruCache;
 use ecow::EcoString;
 
 use crate::catalog::FunctionVolatility;
+use crate::proxy::CacheabilityStore;
+use tokio::sync::watch;
 
 use tokio::{io::AsyncWriteExt, net::TcpStream, select};
 use tokio_stream::StreamExt;
@@ -144,6 +146,7 @@ async fn handle_connection(
     dispatch_handle: CacheDispatchHandle,
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
+    cacheability_store: Arc<CacheabilityStore>,
 ) -> ConnectionResult<()> {
     // Track active connections - guard ensures decrement on any exit path
     crate::metrics::handles().conn.active.increment(1.0);
@@ -166,7 +169,8 @@ async fn handle_connection(
     let (client_read, mut socket) = client_stream.into_split();
     let client_framed_read = FramedRead::new(client_read, PgFrontendMessageCodec::default());
 
-    let mut state = ConnectionState::new(func_volatility, origin_database);
+    let mut cacheability_epoch = cacheability_store.epoch_subscribe();
+    let mut state = ConnectionState::new(func_volatility, origin_database, cacheability_store);
 
     // Reused for every query's reply: allocated once here instead of a per-query
     // oneshot, keeping the serve hot path allocation-free.
@@ -185,6 +189,7 @@ async fn handle_connection(
                         &mut client_framed_read,
                         &mut origin_write,
                         &mut socket,
+                        &mut cacheability_epoch,
                     )
                     .await
                 {
@@ -250,6 +255,14 @@ async fn handle_connection(
                 // reply (and the leased write half) comes back via `reply_rx`.
                 match dispatch_handle.current() {
                     Some(mut dispatch) => {
+                        // Last resort: under memory pressure drop the interned
+                        // verdicts wholesale and let them rebuild. Sampled here
+                        // because the dispatch carries the flag for the current
+                        // cache generation — the restart supervisor publishes a
+                        // new one per generation.
+                        state
+                            .cacheability_cache
+                            .pressure_observe(dispatch.memory_pressure());
                         // The write half is now leased into the dispatch. Await the
                         // reply, which returns it; origin messages buffer in egress
                         // meanwhile and flush once we are back in `Read`.
@@ -334,6 +347,7 @@ pub async fn connection_task(
     tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
+    cacheability_store: Arc<CacheabilityStore>,
 ) {
     debug!("task spawn");
 
@@ -365,6 +379,7 @@ pub async fn connection_task(
         dispatch_handle,
         func_volatility,
         origin_database,
+        cacheability_store,
     )
     .await;
 
@@ -380,12 +395,13 @@ impl ConnectionState {
     pub(in crate::proxy::connection) fn new(
         func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
         origin_database: EcoString,
+        cacheability_store: Arc<CacheabilityStore>,
     ) -> Self {
         Self {
             origin_write_buf: VecDeque::new(),
             egress: EgressQueue::new(),
             flush_describe_pending: false,
-            cacheability_cache: CacheabilityCache::default(),
+            cacheability_cache: CacheabilityCache::new(cacheability_store),
             in_transaction: false,
             proxy_mode: ProxyMode::Read,
             proxy_status: ProxyStatus::Normal,
@@ -875,6 +891,7 @@ impl ConnectionState {
         client_read: &mut Pin<&mut FramedRead<OwnedClientReadHalf, PgFrontendMessageCodec>>,
         origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
         client_write: &mut ClientSocket,
+        cacheability_epoch: &mut watch::Receiver<u64>,
     ) -> ConnectionResult<()> {
         select! {
             res = client_read.next() => {
@@ -903,6 +920,17 @@ impl ConnectionState {
             }
             _ = client_write.writable(), if self.egress.has_writable() => {
                 self.client_egress_flush(client_write).await?;
+            }
+            res = cacheability_epoch.changed() => {
+                // A memory-pressure drop moved the epoch. Draining is otherwise
+                // lazy (on the next `analyze`), so an idle connection would pin
+                // its handles indefinitely and the drop would reclaim far less
+                // than it appears to. The sender lives in the store this
+                // connection holds, so an error here means shutdown.
+                res.map_err(|_| ConnectionError::IoError(io::Error::other(
+                    "cacheability store dropped",
+                )))?;
+                self.cacheability_cache.epoch_reconcile();
             }
         };
 

@@ -58,6 +58,10 @@ pub mod names {
     pub const CONNECTIONS_TOTAL: &str = "pgcache.connections.total";
     pub const CONNECTIONS_ACTIVE: &str = "pgcache.connections.active";
     pub const CONNECTIONS_ERRORS: &str = "pgcache.connections.errors";
+    /// Interned cacheability verdicts shared across connections. Bounded by
+    /// distinct SQL texts referenced by live connections, not by connection
+    /// count.
+    pub const CACHEABILITY_ENTRIES: &str = "pgcache.connections.cacheability_entries";
 
     // CDC/Replication metrics
     pub const CDC_EVENTS_PROCESSED: &str = "pgcache.cdc.events_processed";
@@ -362,6 +366,7 @@ pub struct ConnHandles {
     pub total: Counter,
     pub active: Gauge,
     pub errors: Counter,
+    pub cacheability_entries: Gauge,
     pub simple_queries: Counter,
     pub extended_queries: Counter,
     pub prepared_statements: Gauge,
@@ -563,6 +568,7 @@ impl Handles {
                 total: metrics::counter!(CONNECTIONS_TOTAL),
                 active: metrics::gauge!(CONNECTIONS_ACTIVE),
                 errors: metrics::counter!(CONNECTIONS_ERRORS),
+                cacheability_entries: metrics::gauge!(CACHEABILITY_ENTRIES),
                 simple_queries: metrics::counter!(PROTOCOL_SIMPLE_QUERIES),
                 extended_queries: metrics::counter!(PROTOCOL_EXTENDED_QUERIES),
                 prepared_statements: metrics::gauge!(PROTOCOL_PREPARED_STATEMENTS),
