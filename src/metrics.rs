@@ -182,6 +182,12 @@ pub mod names {
     pub const CACHE_POPULATION_QUEUE: &str = "pgcache.cache.population_queue";
     /// Live population worker count (elastic pool, PGC-437).
     pub const CACHE_POPULATION_WORKERS: &str = "pgcache.cache.population_workers";
+    /// Elastic-pool scale events (PGC-437).
+    pub const CACHE_POPULATION_SCALE_UP: &str = "pgcache.cache.population_scale_up";
+    pub const CACHE_POPULATION_SCALE_DOWN: &str = "pgcache.cache.population_scale_down";
+    /// Uncongested population service-time baseline (windowed min, seconds).
+    pub const CACHE_POPULATION_TASK_FLOOR_SECONDS: &str =
+        "pgcache.cache.population_task_floor_seconds";
     pub const CACHE_HANDLE_INSERTS: &str = "pgcache.cache.handle_inserts";
     pub const CACHE_HANDLE_UPDATES: &str = "pgcache.cache.handle_updates";
     pub const CACHE_HANDLE_DELETES: &str = "pgcache.cache.handle_deletes";
@@ -584,6 +590,9 @@ pub struct RegHandles {
     pub population_stream: Histogram,
     pub population_wait: Histogram,
     pub population_workers: Gauge,
+    pub population_scale_up: Counter,
+    pub population_scale_down: Counter,
+    pub population_task_floor: Gauge,
     pub merge_pending_depth: Gauge,
     pub merge_wait: Histogram,
     pub merges_applied: Counter,
@@ -771,6 +780,9 @@ impl Handles {
                 population_stream: metrics::histogram!(CACHE_POPULATION_STREAM_SECONDS),
                 population_wait: metrics::histogram!(CACHE_POPULATION_WAIT_SECONDS),
                 population_workers: metrics::gauge!(CACHE_POPULATION_WORKERS),
+                population_scale_up: metrics::counter!(CACHE_POPULATION_SCALE_UP),
+                population_scale_down: metrics::counter!(CACHE_POPULATION_SCALE_DOWN),
+                population_task_floor: metrics::gauge!(CACHE_POPULATION_TASK_FLOOR_SECONDS),
                 merge_pending_depth: metrics::gauge!(CACHE_MERGE_PENDING_DEPTH),
                 merge_wait: metrics::histogram!(CACHE_MERGE_WAIT_SECONDS),
                 merges_applied: metrics::counter!(CACHE_MERGES_APPLIED),

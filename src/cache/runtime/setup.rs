@@ -22,6 +22,7 @@ use crate::settings::Settings;
 
 use super::cdc_driver::cdc_run;
 use super::memory_monitor::{memory_monitor, shared_buffers_bytes_query};
+use super::population_pool::population_pool_controller;
 use super::reg_gate::reg_gate_controller;
 use super::reset::cache_database_reset;
 use super::serve_pool::{MIN_POOL_SIZE, serve_loop};
@@ -199,6 +200,12 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     ));
     handle.spawn(reg_gate_controller(
         Arc::clone(&state_view),
+        cache_cancel.clone(),
+    ));
+    handle.spawn(population_pool_controller(
+        Arc::clone(&state_view),
+        settings.population_workers_min,
+        settings.population_workers_max,
         cache_cancel.clone(),
     ));
     handle.spawn(coalesce_drain(
