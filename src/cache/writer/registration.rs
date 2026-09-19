@@ -41,7 +41,7 @@ use super::super::{
 };
 use super::core::WriterCore;
 use super::merge_queue::{DrainTarget, HeapStop, MERGE_FLUSH_FORCE_AFTER, MergeStep, PendingMerge};
-use super::population::population_worker;
+use super::population::{population_dispatcher, population_worker};
 use crate::pg;
 
 /// Minimum number of persistent population workers.
@@ -117,10 +117,9 @@ fn fault_mv_evict_on_build(_core: &WriterCore, _fingerprint: Fingerprint) -> boo
 /// transitions against the shared `WriterCore`. Holds the population worker
 /// channels and aggregate-function catalog (used for decorrelation).
 pub(super) struct WriterRegistration {
-    /// Channels to persistent population workers (round-robin dispatch).
-    populate_txs: Vec<UnboundedSender<PopulationWork>>,
-    /// Index for round-robin dispatch to population workers.
-    populate_next: usize,
+    /// Shared population work queue; a dispatcher task pairs each item with
+    /// the next idle worker.
+    populate_tx: UnboundedSender<PopulationWork>,
     /// Aggregate function names from pg_proc, used for scalar subquery decorrelation.
     aggregate_functions: std::collections::HashSet<EcoString>,
 }
@@ -137,9 +136,14 @@ impl WriterRegistration {
             .map_into_report::<CacheError>()
             .attach_loc("loading aggregate functions")?;
 
+        // Shared work queue and idle-slot channel; the dispatcher pairs each
+        // work item with the next idle worker.
+        let (populate_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_local(population_dispatcher(work_rx, idle_rx, query_tx.clone()));
+
         // Spawn persistent population workers (each with its own cache connection)
         let populate_pool_size = settings.num_workers.max(MIN_POPULATE_POOL_SIZE);
-        let mut populate_txs = Vec::with_capacity(populate_pool_size);
 
         for i in 0..populate_pool_size {
             let cache_conn = pg::connect(&settings.cache, &format!("population worker {i}"))
@@ -161,9 +165,7 @@ impl WriterRegistration {
                 .await
                 .map_into_report::<CacheError>()?;
 
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            populate_txs.push(tx);
-
+            let worker_idle_tx = idle_tx.clone();
             let worker_origin_settings = settings.origin.clone();
             let worker_query_tx = query_tx.clone();
             let worker_throttled = Arc::clone(&registration_throttled);
@@ -171,7 +173,7 @@ impl WriterRegistration {
             spawn_local(async move {
                 population_worker(
                     i,
-                    rx,
+                    worker_idle_tx,
                     origin_conn,
                     worker_origin_settings,
                     cache_conn,
@@ -183,8 +185,7 @@ impl WriterRegistration {
         }
 
         Ok(Self {
-            populate_txs,
-            populate_next: 0,
+            populate_tx,
             aggregate_functions,
         })
     }
@@ -413,7 +414,8 @@ impl WriterRegistration {
         }
     }
 
-    /// Dispatch population work to next worker using round-robin scheduling.
+    /// Enqueue population work on the shared queue; the dispatcher hands it to
+    /// the next idle worker.
     fn populate_work_dispatch(
         &mut self,
         core: &mut WriterCore,
@@ -440,18 +442,8 @@ impl WriterRegistration {
             .staging_pool
             .checkout(fingerprint, generation, &relation_oids);
 
-        let idx = self.populate_next;
-        self.populate_next = (self.populate_next + 1) % self.populate_txs.len();
-
-        let Some(tx) = self.populate_txs.get(idx) else {
-            core.population_deleted_keys
-                .deactivate(fingerprint, generation);
-            core.staging_pool.forget(fingerprint, generation);
-            return Err(CacheError::Other.into());
-        };
-
-        if tx.send(work).is_err() {
-            error!("population worker {idx} channel closed");
+        if self.populate_tx.send(work).is_err() {
+            error!("population dispatcher channel closed");
             core.population_deleted_keys
                 .deactivate(fingerprint, generation);
             core.staging_pool.forget(fingerprint, generation);

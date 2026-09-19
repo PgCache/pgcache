@@ -13,6 +13,7 @@ use postgres_types::PgLsn;
 use rootcause::prelude::ResultExt;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio_postgres::{Client, SimpleColumn, SimpleQueryMessage, SimpleQueryRow};
 use tokio_stream::StreamExt;
@@ -78,11 +79,52 @@ async fn fault_population_delay() {
 #[cfg(not(feature = "fault-injection"))]
 async fn fault_population_delay() {}
 
-/// Persistent population worker that processes work items from a channel.
-/// Each worker owns its own cache database connection.
+/// Dispatcher between the shared population work queue and the idle workers.
+/// Owns the single work receiver; each idle worker registers a one-shot slot
+/// and the dispatcher pairs the next work item with the next idle slot, so no
+/// item is ever bound to a busy worker (no head-of-line blocking) and worker
+/// count can change without re-routing.
+pub async fn population_dispatcher(
+    mut work_rx: UnboundedReceiver<PopulationWork>,
+    mut idle_rx: UnboundedReceiver<oneshot::Sender<PopulationWork>>,
+    query_tx: UnboundedSender<QueryCommand>,
+) {
+    let queue_handle = crate::metrics::population_queue_handle();
+    while let Some(mut work) = work_rx.recv().await {
+        // Queue length never approaches 2^53.
+        #[allow(clippy::cast_precision_loss)]
+        queue_handle.set(work_rx.len() as f64);
+        loop {
+            let Some(slot) = idle_rx.recv().await else {
+                // Every worker has exited (connection loss at spawn, shutdown
+                // race): fail the work so the writer's `Failed` handler
+                // releases its staging tables and deleted-key tracking.
+                error!(
+                    "population dispatcher: no workers; failing query {}",
+                    work.fingerprint
+                );
+                let _ = query_tx.send(QueryCommand::Failed {
+                    fingerprint: work.fingerprint,
+                    generation: work.generation,
+                });
+                return;
+            };
+            // A slot whose worker died hands the work back; try the next one.
+            match slot.send(work) {
+                Ok(()) => break,
+                Err(returned) => work = returned,
+            }
+        }
+    }
+    debug!("population dispatcher shutting down");
+}
+
+/// Persistent population worker. Registers an idle slot with the dispatcher,
+/// executes the work item it is handed, repeat. Each worker owns its own
+/// origin and cache database connections.
 pub async fn population_worker(
     id: usize,
-    mut rx: UnboundedReceiver<PopulationWork>,
+    idle_tx: UnboundedSender<oneshot::Sender<PopulationWork>>,
     mut db_origin: Client,
     origin_settings: PgSettings,
     db_cache: Client,
@@ -91,9 +133,16 @@ pub async fn population_worker(
 ) {
     debug!("population worker {id} started");
 
-    let (idle_handle, queue_handle) = crate::metrics::population_worker_handles(id);
+    let idle_handle = crate::metrics::population_worker_idle_handle(id);
     let mut idle_start = Instant::now();
-    while let Some(work) = rx.recv().await {
+    loop {
+        let (slot_tx, slot_rx) = oneshot::channel();
+        if idle_tx.send(slot_tx).is_err() {
+            break; // dispatcher gone: shutdown
+        }
+        let Ok(work) = slot_rx.await else {
+            break; // dispatcher dropped the unused slot: shutdown
+        };
         // Under memory pressure, skip populating the in-flight backlog: building
         // these cache tables/rows is what overshoots the budget after dispatch
         // stops admitting new queries. Fail them so `query_failed_cleanup`
@@ -114,10 +163,6 @@ pub async fn population_worker(
         // quantiles surface variance. Pairs with task_seconds and wall clock
         // to compute per-worker utilization.
         idle_handle.record(idle_start.elapsed().as_secs_f64());
-
-        // Channel depth gauge; queue length never approaches 2^53.
-        #[allow(clippy::cast_precision_loss)]
-        queue_handle.set(rx.len() as f64);
 
         crate::metrics::handles()
             .reg

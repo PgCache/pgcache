@@ -176,7 +176,10 @@ pub mod names {
     pub const CACHE_WRITER_CDC_QUEUE: &str = "pgcache.cache.writer_cdc_queue";
     pub const CACHE_WRITER_INTERNAL_QUEUE: &str = "pgcache.cache.writer_internal_queue";
     pub const CACHE_WORKER_QUEUE: &str = "pgcache.cache.worker_queue";
-    pub const CACHE_POPULATION_WORKER_QUEUE: &str = "pgcache.cache.population_worker_queue";
+    /// Depth of the shared population work queue (undispatched items). The
+    /// queue is shared across all workers, so this is a single gauge rather
+    /// than per-worker.
+    pub const CACHE_POPULATION_QUEUE: &str = "pgcache.cache.population_queue";
     pub const CACHE_HANDLE_INSERTS: &str = "pgcache.cache.handle_inserts";
     pub const CACHE_HANDLE_UPDATES: &str = "pgcache.cache.handle_updates";
     pub const CACHE_HANDLE_DELETES: &str = "pgcache.cache.handle_deletes";
@@ -821,15 +824,16 @@ pub fn handles() -> &'static Handles {
     HANDLES.get_or_init(Handles::build)
 }
 
-/// Per-worker population handles (idle-time histogram, queue-depth gauge),
-/// labeled `worker={id}`. The label value is dynamic, so these can't live in the
-/// global [`Handles`]; resolve once per worker and reuse across the worker loop.
-pub fn population_worker_handles(id: usize) -> (Histogram, Gauge) {
-    let worker = id.to_string();
-    (
-        metrics::histogram!(names::CACHE_POPULATION_WORKER_IDLE_SECONDS, "worker" => worker.clone()),
-        metrics::gauge!(names::CACHE_POPULATION_WORKER_QUEUE, "worker" => worker),
-    )
+/// Per-worker population idle-time histogram, labeled `worker={id}`. The label
+/// value is dynamic, so it can't live in the global [`Handles`]; resolve once
+/// per worker and reuse across the worker loop.
+pub fn population_worker_idle_handle(id: usize) -> Histogram {
+    metrics::histogram!(names::CACHE_POPULATION_WORKER_IDLE_SECONDS, "worker" => id.to_string())
+}
+
+/// Shared population work-queue depth gauge (one queue feeds all workers).
+pub fn population_queue_handle() -> Gauge {
+    metrics::gauge!(names::CACHE_POPULATION_QUEUE)
 }
 
 /// Install the global Prometheus metrics recorder.
