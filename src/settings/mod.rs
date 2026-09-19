@@ -274,6 +274,14 @@ struct SettingsToml {
     /// to disable write tracking.
     #[serde(default)]
     read_your_writes: Option<bool>,
+    /// Minimum (and initial) population worker count. Defaults to
+    /// `max(num_workers, 2)`.
+    #[serde(default)]
+    population_workers_min: Option<usize>,
+    /// Ceiling for the elastic population worker pool. Defaults to
+    /// `num_workers * 8`; never below `population_workers_min`.
+    #[serde(default)]
+    population_workers_max: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,4 +315,16 @@ pub struct Settings {
     /// --read_your_writes_off, TOML read_your_writes = false, or env
     /// PGCACHE_READ_YOUR_WRITES=off.
     pub read_your_writes: bool,
+    /// Minimum (and initial) population worker count. Population tasks are
+    /// origin-I/O-bound, so this floor is deliberately decoupled from
+    /// `num_workers` (CPU sizing). Set via CLI --population_workers_min, TOML
+    /// population_workers_min, or env PGCACHE_POPULATION_WORKERS_MIN; defaults
+    /// to `max(num_workers, 2)`.
+    pub population_workers_min: usize,
+    /// Ceiling for the elastic population worker pool — the origin-protection
+    /// bound on concurrent population SELECTs. Set via CLI
+    /// --population_workers_max, TOML population_workers_max, or env
+    /// PGCACHE_POPULATION_WORKERS_MAX; defaults to `num_workers * 8`, and is
+    /// clamped to at least `population_workers_min`.
+    pub population_workers_max: usize,
 }

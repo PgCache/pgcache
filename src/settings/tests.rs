@@ -505,6 +505,8 @@ fn replication_resolve_cli_port_only_with_toml_host() {
 
 fn base_toml_config() -> SettingsToml {
     SettingsToml {
+        population_workers_min: None,
+        population_workers_max: None,
         origin: PgSettings {
             host: "origin.example.com".to_owned(),
             port: 5432,
@@ -1161,4 +1163,27 @@ socket = "127.0.0.1:6432"
     assert!(!updated.contains("log_level")); // removed
 
     let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn test_population_workers_bounds_defaults_derive_from_num_workers() {
+    use super::cli::population_workers_bounds;
+
+    // Small box: floor of 2 applies, ceiling scales with num_workers.
+    assert_eq!(population_workers_bounds(2, None, None), (2, 16));
+    // Larger box: min follows num_workers.
+    assert_eq!(population_workers_bounds(16, None, None), (16, 128));
+    // num_workers = 1 still gets the floor of 2.
+    assert_eq!(population_workers_bounds(1, None, None), (2, 8));
+}
+
+#[test]
+fn test_population_workers_bounds_explicit_values_and_clamps() {
+    use super::cli::population_workers_bounds;
+
+    assert_eq!(population_workers_bounds(2, Some(4), Some(32)), (4, 32));
+    // max is never below min.
+    assert_eq!(population_workers_bounds(2, Some(6), Some(3)), (6, 6));
+    // min of 0 is raised to 1.
+    assert_eq!(population_workers_bounds(2, Some(0), None), (1, 16));
 }

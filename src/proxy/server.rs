@@ -431,6 +431,8 @@ mod tests {
                 socket: "127.0.0.1:5432".parse().expect("valid socket"),
             },
             num_workers: 1,
+            population_workers_min: 2,
+            population_workers_max: 16,
             tls_cert: None,
             tls_key: None,
             metrics: None,

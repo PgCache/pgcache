@@ -44,9 +44,6 @@ use super::merge_queue::{DrainTarget, HeapStop, MERGE_FLUSH_FORCE_AFTER, MergeSt
 use super::population::{population_dispatcher, population_worker};
 use crate::pg;
 
-/// Minimum number of persistent population workers.
-const MIN_POPULATE_POOL_SIZE: usize = 2;
-
 /// Work item for population worker pool.
 pub struct PopulationWork {
     pub fingerprint: Fingerprint,
@@ -143,7 +140,7 @@ impl WriterRegistration {
         spawn_local(population_dispatcher(work_rx, idle_rx, query_tx.clone()));
 
         // Spawn persistent population workers (each with its own cache connection)
-        let populate_pool_size = settings.num_workers.max(MIN_POPULATE_POOL_SIZE);
+        let populate_pool_size = settings.population_workers_min;
 
         for i in 0..populate_pool_size {
             let cache_conn = pg::connect(&settings.cache, &format!("population worker {i}"))

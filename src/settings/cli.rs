@@ -173,6 +173,8 @@ pub(super) struct CliArgs {
     pub(super) cdc_slot_name: Option<String>,
     pub(super) listen_socket: Option<SocketAddr>,
     pub(super) num_workers: Option<usize>,
+    pub(super) population_workers_min: Option<usize>,
+    pub(super) population_workers_max: Option<usize>,
     pub(super) cache_size: Option<usize>,
     pub(super) tls_cert: Option<PathBuf>,
     pub(super) tls_key: Option<PathBuf>,
@@ -233,6 +235,12 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("cdc_slot_name") => args.cdc_slot_name = Some(arg_string(&mut parser)?),
             Long("listen_socket") => args.listen_socket = Some(arg_parse(&mut parser)?),
             Long("num_workers") => args.num_workers = Some(arg_parse(&mut parser)?),
+            Long("population_workers_min") => {
+                args.population_workers_min = Some(arg_parse(&mut parser)?);
+            }
+            Long("population_workers_max") => {
+                args.population_workers_max = Some(arg_parse(&mut parser)?);
+            }
             Long("cache_size") => args.cache_size = Some(arg_parse(&mut parser)?),
             Long("tls_cert") => args.tls_cert = Some(PathBuf::from(arg_string(&mut parser)?)),
             Long("tls_key") => args.tls_key = Some(PathBuf::from(arg_string(&mut parser)?)),
@@ -388,6 +396,39 @@ fn disk_limit_resolve(cli: Option<usize>, toml_value: Option<usize>) -> Option<u
     None
 }
 
+/// Resolve one population worker bound from CLI > TOML > env var. Returns None
+/// to fall through to the num_workers-derived default.
+fn population_workers_resolve(
+    cli: Option<usize>,
+    toml_value: Option<usize>,
+    env_var: &str,
+) -> Option<usize> {
+    if let Some(v) = cli {
+        return Some(v);
+    }
+    if let Some(v) = toml_value {
+        return Some(v);
+    }
+    if let Ok(v) = std::env::var(env_var)
+        && let Ok(parsed) = v.parse::<usize>()
+    {
+        return Some(parsed);
+    }
+    None
+}
+
+/// Effective (min, max) population worker bounds: apply the num_workers-derived
+/// defaults and force `max >= min >= 1`.
+pub(super) fn population_workers_bounds(
+    num_workers: usize,
+    min: Option<usize>,
+    max: Option<usize>,
+) -> (usize, usize) {
+    let min = min.unwrap_or(num_workers.max(2)).max(1);
+    let max = max.unwrap_or(num_workers * 8).max(min);
+    (min, max)
+}
+
 fn cache_size_deprecation_warn(set: bool) {
     if set {
         tracing::warn!(
@@ -457,6 +498,21 @@ pub(super) fn settings_build_with_config(
     };
     let cache = cache_overrides.merge_with(&config.cache);
 
+    let num_workers = args.num_workers.unwrap_or(config.num_workers);
+    let (population_workers_min, population_workers_max) = population_workers_bounds(
+        num_workers,
+        population_workers_resolve(
+            args.population_workers_min,
+            config.population_workers_min,
+            "PGCACHE_POPULATION_WORKERS_MIN",
+        ),
+        population_workers_resolve(
+            args.population_workers_max,
+            config.population_workers_max,
+            "PGCACHE_POPULATION_WORKERS_MAX",
+        ),
+    );
+
     cache_size_deprecation_warn(args.cache_size.or(config.cache_size).is_some());
     let dynamic = DynamicConfig::new(
         args.cache_size.or(config.cache_size),
@@ -486,7 +542,9 @@ pub(super) fn settings_build_with_config(
         listen: ListenSettings {
             socket: args.listen_socket.unwrap_or(config.listen.socket),
         },
-        num_workers: args.num_workers.unwrap_or(config.num_workers),
+        num_workers,
+        population_workers_min,
+        population_workers_max,
         tls_cert: args.tls_cert.or_else(|| config.tls_cert.clone()),
         tls_key: args.tls_key.or_else(|| config.tls_key.clone()),
         metrics: args
@@ -532,6 +590,20 @@ pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
     );
 
     cache_size_deprecation_warn(args.cache_size.is_some());
+    let num_workers = require(args.num_workers, "num_workers")?;
+    let (population_workers_min, population_workers_max) = population_workers_bounds(
+        num_workers,
+        population_workers_resolve(
+            args.population_workers_min,
+            None,
+            "PGCACHE_POPULATION_WORKERS_MIN",
+        ),
+        population_workers_resolve(
+            args.population_workers_max,
+            None,
+            "PGCACHE_POPULATION_WORKERS_MAX",
+        ),
+    );
     Ok(Settings {
         origin,
         replication,
@@ -550,7 +622,9 @@ pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
         listen: ListenSettings {
             socket: require(args.listen_socket, "listen_socket")?,
         },
-        num_workers: require(args.num_workers, "num_workers")?,
+        num_workers,
+        population_workers_min,
+        population_workers_max,
         tls_cert: args.tls_cert,
         tls_key: args.tls_key,
         metrics: args.metrics_socket.map(|socket| MetricsSettings { socket }),
@@ -596,6 +670,8 @@ impl Settings {
             --cdc_publication_name NAME --cdc_slot_name SLOT_NAME \n \
             --listen_socket IP_AND_PORT \n \
             --num_workers NUMBER \n \
+            [--population_workers_min NUMBER] (population worker floor; default max(num_workers, 2)) \n \
+            [--population_workers_max NUMBER] (population worker ceiling; default num_workers * 8) \n \
             [--cache_size BYTES] (deprecated and ignored; use --disk_limit) \n \
             [--cache_policy fifo|clock] (default: clock) \n \
             [--admission_threshold N] (default: 1, clock policy only) \n \
