@@ -402,6 +402,7 @@ pub fn writer_run(
                     &core.db_origin,
                     query_tx,
                     Arc::clone(&core.state_view.registration_throttled),
+                    Arc::clone(&core.state_view.population_pool),
                 )
                 .await?;
                 let mut writer_cdc =
@@ -450,6 +451,7 @@ pub fn writer_run(
                             core.stale_entries_cleanup();
                             core.state_gauges_update();
                             core.writer_scale_gauges_update();
+                            registration.population_pool_reconcile();
                             core.state_view.memo.gc();
                             core.state_view.memo.metrics_publish();
                             // Eviction runs only here now (not per Ready, PGC-276).

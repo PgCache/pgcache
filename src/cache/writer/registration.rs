@@ -35,14 +35,17 @@ use super::super::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{AdmitAction, QueryCommand, SubsumptionResult},
     mv::{ShapeGate, resolved_has_join, resolved_has_window},
+    population_pool::PopulationPool,
     query::CacheableQuery,
     types::{CachedQuery, QueryMetrics, SharedResolved},
     update_query::UpdateQueries,
 };
 use super::core::WriterCore;
 use super::merge_queue::{DrainTarget, HeapStop, MERGE_FLUSH_FORCE_AFTER, MergeStep, PendingMerge};
-use super::population::{population_dispatcher, population_worker};
-use crate::pg;
+use super::population::{
+    POPULATION_SPAWN_COOLDOWN, PopulationSpawnContext, population_dispatcher,
+    population_worker_connect, population_worker_run,
+};
 
 /// Work item for population worker pool.
 pub struct PopulationWork {
@@ -117,6 +120,10 @@ pub(super) struct WriterRegistration {
     /// Shared population work queue; a dispatcher task pairs each item with
     /// the next idle worker.
     populate_tx: UnboundedSender<PopulationWork>,
+    /// Spawn ingredients for elastic worker scale-up (PGC-437).
+    spawn_ctx: PopulationSpawnContext,
+    /// No spawn attempts before this instant (set after a connect failure).
+    spawn_cooldown_until: std::cell::Cell<Option<Instant>>,
     /// Aggregate function names from pg_proc, used for scalar subquery decorrelation.
     aggregate_functions: std::collections::HashSet<EcoString>,
 }
@@ -127,6 +134,7 @@ impl WriterRegistration {
         db_origin: &Rc<Client>,
         query_tx: UnboundedSender<QueryCommand>,
         registration_throttled: Arc<AtomicBool>,
+        pool: Arc<PopulationPool>,
     ) -> CacheResult<Self> {
         let aggregate_functions = aggregate_functions_load(db_origin)
             .await
@@ -139,52 +147,79 @@ impl WriterRegistration {
         let (idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel();
         spawn_local(population_dispatcher(work_rx, idle_rx, query_tx.clone()));
 
-        // Spawn persistent population workers (each with its own cache connection)
-        let populate_pool_size = settings.population_workers_min;
+        pool.desired_workers_set(settings.population_workers_min);
+        let spawn_ctx = PopulationSpawnContext {
+            idle_tx,
+            cache_settings: settings.cache.clone(),
+            origin_settings: settings.origin.clone(),
+            query_tx,
+            throttled: registration_throttled,
+            pool,
+        };
 
-        for i in 0..populate_pool_size {
-            let cache_conn = pg::connect(&settings.cache, &format!("population worker {i}"))
-                .await
-                .map_into_report::<CacheError>()?;
-            // Staging setup runs `DROP TABLE IF EXISTS` defensively before every
-            // CREATE; the table almost never exists (names embed the
-            // generation), so PG would emit a "does not exist, skipping" NOTICE
-            // per population — pure log noise. Suppress notices on this session.
-            cache_conn
-                .batch_execute("SET client_min_messages = warning")
-                .await
-                .map_into_report::<CacheError>()?;
-
-            // Each worker reads from origin on its own connection so the origin
-            // executes population SELECTs concurrently rather than serializing
-            // them on one shared backend.
-            let origin_conn = pg::connect(&settings.origin, &format!("population origin {i}"))
-                .await
-                .map_into_report::<CacheError>()?;
-
-            let worker_idle_tx = idle_tx.clone();
-            let worker_origin_settings = settings.origin.clone();
-            let worker_query_tx = query_tx.clone();
-            let worker_throttled = Arc::clone(&registration_throttled);
-
-            spawn_local(async move {
-                population_worker(
-                    i,
-                    worker_idle_tx,
-                    origin_conn,
-                    worker_origin_settings,
-                    cache_conn,
-                    worker_query_tx,
-                    worker_throttled,
-                )
-                .await;
-            });
+        // Spawn the initial worker set, failing writer startup if any
+        // connection can't open (matching pre-elastic behavior); later
+        // scale-up spawns are best-effort (see population_pool_reconcile).
+        for _ in 0..settings.population_workers_min {
+            let id = spawn_ctx.pool.worker_reserve();
+            let (origin_conn, cache_conn) = population_worker_connect(&spawn_ctx, id).await?;
+            spawn_local(population_worker_run(
+                spawn_ctx.clone(),
+                id,
+                origin_conn,
+                cache_conn,
+            ));
         }
 
         Ok(Self {
             populate_tx,
+            spawn_ctx,
+            spawn_cooldown_until: std::cell::Cell::new(None),
             aggregate_functions,
         })
+    }
+
+    /// Reconcile the live population worker set toward the controller's
+    /// target (PGC-437). Called from the writer's 1s gauge tick; scale-down is
+    /// claimed by surplus workers themselves between work items, so only
+    /// scale-up needs action here.
+    pub fn population_pool_reconcile(&self) {
+        let pool = &self.spawn_ctx.pool;
+        if pool.spawn_failure_take() {
+            self.spawn_cooldown_until
+                .set(Some(Instant::now() + POPULATION_SPAWN_COOLDOWN));
+        }
+        if let Some(until) = self.spawn_cooldown_until.get() {
+            if Instant::now() < until {
+                return;
+            }
+            self.spawn_cooldown_until.set(None);
+        }
+        while pool.live_workers() < pool.desired_workers() {
+            let id = pool.worker_reserve();
+            let ctx = self.spawn_ctx.clone();
+            spawn_local(async move {
+                match population_worker_connect(&ctx, id).await {
+                    Ok((origin_conn, cache_conn)) => {
+                        population_worker_run(ctx, id, origin_conn, cache_conn).await;
+                    }
+                    Err(e) => {
+                        error!(
+                            "population worker {id} scale-up connect failed: {}",
+                            error_chain_format(e.current_context()),
+                        );
+                        ctx.pool.spawn_failure_mark();
+                        ctx.pool.worker_exit(id);
+                    }
+                }
+            });
+        }
+        // Live-worker gauge; counts never approach 2^53.
+        #[allow(clippy::cast_precision_loss)]
+        crate::metrics::handles()
+            .reg
+            .population_workers
+            .set(pool.live_workers() as f64);
     }
 
     /// Handle a query command, dispatching to the appropriate method.
@@ -439,6 +474,7 @@ impl WriterRegistration {
             .staging_pool
             .checkout(fingerprint, generation, &relation_oids);
 
+        self.spawn_ctx.pool.enqueued_mark();
         if self.populate_tx.send(work).is_err() {
             error!("population dispatcher channel closed");
             core.population_deleted_keys

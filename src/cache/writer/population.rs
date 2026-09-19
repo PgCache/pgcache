@@ -20,6 +20,7 @@ use tokio_stream::StreamExt;
 use tracing::{debug, error, trace};
 
 use crate::catalog::TableMetadata;
+use crate::pg;
 use crate::query::ast::Deparse;
 use crate::query::resolved::{ResolvedSelectNode, ResolvedTableNode};
 use crate::query::transform::resolved_select_node_replace;
@@ -27,6 +28,7 @@ use crate::query::transform::resolved_select_node_replace;
 use super::super::{
     CacheError, CacheResult, MapIntoReport,
     messages::{PopulationMerge, QueryCommand},
+    population_pool::PopulationPool,
 };
 use super::PopulationWork;
 use super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
@@ -79,6 +81,58 @@ async fn fault_population_delay() {
 #[cfg(not(feature = "fault-injection"))]
 async fn fault_population_delay() {}
 
+/// How long to hold off spawn attempts after a population worker's
+/// connections failed to open, so a down origin isn't hammered with connect
+/// attempts every reconcile tick.
+pub(super) const POPULATION_SPAWN_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Everything needed to spawn one population worker outside `new()` (elastic
+/// scale-up, PGC-437).
+#[derive(Clone)]
+pub(super) struct PopulationSpawnContext {
+    pub(super) idle_tx: UnboundedSender<oneshot::Sender<PopulationWork>>,
+    pub(super) cache_settings: PgSettings,
+    pub(super) origin_settings: PgSettings,
+    pub(super) query_tx: UnboundedSender<QueryCommand>,
+    pub(super) throttled: Arc<AtomicBool>,
+    pub(super) pool: Arc<PopulationPool>,
+}
+
+/// Open one population worker's connection pair (origin + cache).
+pub(super) async fn population_worker_connect(
+    ctx: &PopulationSpawnContext,
+    id: usize,
+) -> CacheResult<(Client, Client)> {
+    let cache_conn = pg::connect(&ctx.cache_settings, &format!("population worker {id}"))
+        .await
+        .map_into_report::<CacheError>()?;
+    // Staging setup runs `DROP TABLE IF EXISTS` defensively before every
+    // CREATE; the table almost never exists (names embed the
+    // generation), so PG would emit a "does not exist, skipping" NOTICE
+    // per population — pure log noise. Suppress notices on this session.
+    cache_conn
+        .batch_execute("SET client_min_messages = warning")
+        .await
+        .map_into_report::<CacheError>()?;
+    // Each worker reads from origin on its own connection so the origin
+    // executes population SELECTs concurrently rather than serializing
+    // them on one shared backend.
+    let origin_conn = pg::connect(&ctx.origin_settings, &format!("population origin {id}"))
+        .await
+        .map_into_report::<CacheError>()?;
+    Ok((origin_conn, cache_conn))
+}
+
+/// Run one population worker to completion from its spawn context.
+pub(super) async fn population_worker_run(
+    ctx: PopulationSpawnContext,
+    id: usize,
+    origin_conn: Client,
+    cache_conn: Client,
+) {
+    population_worker(id, ctx, origin_conn, cache_conn).await;
+}
+
 /// Dispatcher between the shared population work queue and the idle workers.
 /// Owns the single work receiver; each idle worker registers a one-shot slot
 /// and the dispatcher pairs the next work item with the next idle slot, so no
@@ -96,11 +150,14 @@ pub async fn population_dispatcher(
         queue_handle.set(work_rx.len() as f64);
         loop {
             let Some(slot) = idle_rx.recv().await else {
-                // Every worker has exited (connection loss at spawn, shutdown
-                // race): fail the work so the writer's `Failed` handler
-                // releases its staging tables and deleted-key tracking.
-                error!(
-                    "population dispatcher: no workers; failing query {}",
+                // The idle channel closes only when the registration (which
+                // holds a sender in its spawn context) is dropped — shutdown.
+                // With zero live workers this recv simply blocks until the
+                // reconcile tick respawns one. Best-effort fail the in-hand
+                // work so the writer's `Failed` handler releases its staging
+                // tables and deleted-key tracking.
+                debug!(
+                    "population dispatcher shutting down with query {} in hand",
                     work.fingerprint
                 );
                 let _ = query_tx.send(QueryCommand::Failed {
@@ -121,21 +178,32 @@ pub async fn population_dispatcher(
 
 /// Persistent population worker. Registers an idle slot with the dispatcher,
 /// executes the work item it is handed, repeat. Each worker owns its own
-/// origin and cache database connections.
+/// origin and cache database connections. A worker that finds the pool above
+/// its target retires itself between work items (PGC-437).
 pub async fn population_worker(
     id: usize,
-    idle_tx: UnboundedSender<oneshot::Sender<PopulationWork>>,
+    ctx: PopulationSpawnContext,
     mut db_origin: Client,
-    origin_settings: PgSettings,
     db_cache: Client,
-    query_tx: UnboundedSender<QueryCommand>,
-    throttled: Arc<AtomicBool>,
 ) {
+    let PopulationSpawnContext {
+        idle_tx,
+        origin_settings,
+        query_tx,
+        throttled,
+        pool,
+        ..
+    } = ctx;
     debug!("population worker {id} started");
 
     let idle_handle = crate::metrics::population_worker_idle_handle(id);
     let mut idle_start = Instant::now();
     loop {
+        if pool.retire_claim() {
+            pool.retired_id_return(id);
+            debug!("population worker {id} retired (pool shrink)");
+            return;
+        }
         let (slot_tx, slot_rx) = oneshot::channel();
         if idle_tx.send(slot_tx).is_err() {
             break; // dispatcher gone: shutdown
@@ -164,10 +232,12 @@ pub async fn population_worker(
         // to compute per-worker utilization.
         idle_handle.record(idle_start.elapsed().as_secs_f64());
 
+        let wait = work.enqueued_at.elapsed();
         crate::metrics::handles()
             .reg
             .population_wait
-            .record(work.enqueued_at.elapsed().as_secs_f64());
+            .record(wait.as_secs_f64());
+        pool.wait_observe(crate::timing::duration_to_us_u64(wait));
 
         // A dropped origin connection only surfaces on the next work item (a
         // mid-population drop fails that population, which forwards to origin).
@@ -226,6 +296,7 @@ pub async fn population_worker(
             .reg
             .population_task
             .record(fetch_stage.as_secs_f64());
+        pool.task_observe(crate::timing::duration_to_us_u64(fetch_stage));
 
         idle_start = Instant::now();
 
@@ -277,6 +348,7 @@ pub async fn population_worker(
         }
     }
 
+    pool.worker_exit(id);
     debug!("population worker {id} shutting down");
 }
 

@@ -180,6 +180,8 @@ pub mod names {
     /// queue is shared across all workers, so this is a single gauge rather
     /// than per-worker.
     pub const CACHE_POPULATION_QUEUE: &str = "pgcache.cache.population_queue";
+    /// Live population worker count (elastic pool, PGC-437).
+    pub const CACHE_POPULATION_WORKERS: &str = "pgcache.cache.population_workers";
     pub const CACHE_HANDLE_INSERTS: &str = "pgcache.cache.handle_inserts";
     pub const CACHE_HANDLE_UPDATES: &str = "pgcache.cache.handle_updates";
     pub const CACHE_HANDLE_DELETES: &str = "pgcache.cache.handle_deletes";
@@ -581,6 +583,7 @@ pub struct RegHandles {
     pub population_task: Histogram,
     pub population_stream: Histogram,
     pub population_wait: Histogram,
+    pub population_workers: Gauge,
     pub merge_pending_depth: Gauge,
     pub merge_wait: Histogram,
     pub merges_applied: Counter,
@@ -767,6 +770,7 @@ impl Handles {
                 population_task: metrics::histogram!(CACHE_POPULATION_TASK_SECONDS),
                 population_stream: metrics::histogram!(CACHE_POPULATION_STREAM_SECONDS),
                 population_wait: metrics::histogram!(CACHE_POPULATION_WAIT_SECONDS),
+                population_workers: metrics::gauge!(CACHE_POPULATION_WORKERS),
                 merge_pending_depth: metrics::gauge!(CACHE_MERGE_PENDING_DEPTH),
                 merge_wait: metrics::histogram!(CACHE_MERGE_WAIT_SECONDS),
                 merges_applied: metrics::counter!(CACHE_MERGES_APPLIED),

@@ -34,12 +34,13 @@ pub(crate) mod messages;
 // MV build/backoff paths are writer-only; the analysis-only build sees them as dead.
 #[cfg_attr(not(feature = "proxy"), allow(dead_code))]
 pub(crate) mod mv;
+#[cfg(feature = "proxy")]
+mod population_pool;
 pub mod query;
 #[cfg(feature = "proxy")]
 mod query_cache;
 #[cfg(feature = "proxy")]
 mod reg_bucket;
-#[cfg(feature = "proxy")]
 mod reg_gate;
 #[cfg(feature = "proxy")]
 mod reply;

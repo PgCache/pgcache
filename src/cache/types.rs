@@ -21,6 +21,7 @@ use crate::{
     settings::{DynamicConfigHandle, Settings},
 };
 
+use super::population_pool::PopulationPool;
 use super::reg_gate::RegGate;
 use super::update_query::UpdateQueries;
 
@@ -250,6 +251,9 @@ pub struct CacheStateView {
     /// BBR-lite adaptive registration gate (PGC-277): writer-published drain +
     /// backlog signals and the controller's paced admit rate.
     pub reg_gate: Arc<RegGate>,
+    /// Elastic population worker pool (PGC-437): worker-published demand and
+    /// service-time counters, and the controller's worker-count target.
+    pub population_pool: Arc<PopulationPool>,
     /// Settled watermark (raw `Lsn`) published by the writer so
     /// per-connection read-after-write logs can clear their pending writes once
     /// it passes each write's commit-LSN bound (PGC-124): every origin
@@ -287,6 +291,7 @@ impl CacheStateView {
             recycle_wanted: Arc::new(AtomicBool::new(false)),
             recycle_count: Arc::new(AtomicUsize::new(0)),
             reg_gate: Arc::new(RegGate::new()),
+            population_pool: Arc::new(PopulationPool::new(0)),
             settled_lsn: Arc::new(AtomicU64::new(0)),
             memo: ResultMemo::new(dynamic),
         }
