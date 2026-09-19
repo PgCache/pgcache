@@ -38,7 +38,8 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-037](ADR-037-constraint-containment-index.md) — Generalized constraint-containment index *(generalizes ADR-024/029/030; shared with the CDC matcher)*
 
 ## Caching tiers & serving
-- [ADR-010](ADR-010-population-worker-pool.md) — Persistent population worker pool
+- [ADR-010](ADR-010-population-worker-pool.md) — Persistent population worker pool *(amended by ADR-050)*
+- [ADR-050](ADR-050-elastic-population-pool.md) — Elastic population pool: shared queue + Little's-law BBR-lite sizing *(amends ADR-010)*
 - [ADR-020](ADR-020-table-allowlist.md) — Optional table allowlist restricting what is cached
 - [ADR-023](ADR-023-pinned-queries.md) — Pinned queries: pre-populate and protect from eviction
 - [ADR-026](ADR-026-request-coalescing.md) — Request coalescing for Loading-state queries
