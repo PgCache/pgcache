@@ -20,6 +20,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-042](ADR-042-hot-path-allocation-elimination.md) — Hot-path allocation elimination across serve encoding + CDC apply *(extends ADR-025)*
 - [ADR-048](ADR-048-per-connection-read-after-write.md) — Per-connection read-after-write: forwarded-write log + post-commit LSN probe, forward-not-wait
 - [ADR-049](ADR-049-predicate-disjointness-update-delete.md) — Predicate-disjointness for UPDATE/DELETE read-after-write (one `ranges_disjoint` primitive across all write kinds) *(extends ADR-048)*
+- [ADR-051](ADR-051-raw-tier-merge-newest.md) — RaW tier saturation folds into the newest tier; depth cap 8 *(amends ADR-048's tier queues)*
 
 ## Query parsing, analysis & transformation
 - [ADR-002](ADR-002-resolved-ast.md) — Resolved AST: fully schema-qualified query form for analysis

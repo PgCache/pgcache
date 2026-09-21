@@ -16,8 +16,8 @@
 //! table and per batch, so one table's clearance is never held back by
 //! another's later bound, and a fresh write never gates an older,
 //! already-applied one; only when the queue saturates (CDC lag spanning more
-//! probe windows than [`WAITING_TIERS`]) do the oldest batches merge under the
-//! later bound.
+//! probe windows than [`WAITING_TIERS_MAX`]) does a new batch fold into the
+//! newest tier under the later bound — old bounds stay anchored (ADR-051).
 //!
 //! The gate consulting this log ([`WriteLog::decide`]) forwards a read that
 //! could be superseded by a pending write. A non-row-enumerable write makes its

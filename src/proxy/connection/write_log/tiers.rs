@@ -8,11 +8,15 @@ use crate::pg::Lsn;
 use super::RawBlocker;
 use super::aggregate::TableAggregate;
 
-/// Stamped tiers a table holds before a further stamp merges the two oldest.
-/// Two keeps the common CDC-lag regime (lag under two probe windows) merge-free
-/// — each batch drains on its own bound — without unbounded tier growth;
-/// `tier_merges` counts saturation of both slots.
-pub(super) const WAITING_TIERS: usize = 2;
+/// Stamped tiers a table holds before a further stamp coarsens the newest.
+/// Merges stay absent while settle lag is under `WAITING_TIERS_MAX` stamp
+/// intervals — each batch drains on its own bound; `tier_merges` counts
+/// saturation (ADR-051).
+pub(super) const WAITING_TIERS_MAX: usize = 8;
+
+/// SmallVec inline slots. Depth beyond this exists only while settle lags, so
+/// the common calm-state allocation stays small and deep tiers heap-spill.
+const WAITING_TIERS_INLINE: usize = 2;
 
 /// One table's pending writes: an active tier gathering unstamped writes, plus
 /// a bounded queue of stamped tiers each draining on its own per-table bound.
@@ -20,9 +24,9 @@ pub(super) const WAITING_TIERS: usize = 2;
 pub(super) struct TableTiers {
     /// Stamped tiers, oldest first (bounds are monotonic); each drains once
     /// the CDC apply watermark passes its commit-LSN bound. Bounded to
-    /// [`WAITING_TIERS`]; a stamp past that merges the two oldest under the
-    /// later bound.
-    pub(super) waiting: SmallVec<[(Lsn, TableAggregate); WAITING_TIERS]>,
+    /// [`WAITING_TIERS_MAX`]; a stamp past that folds into the newest tier
+    /// under the later bound, so old bounds stay anchored (ADR-051).
+    pub(super) waiting: SmallVec<[(Lsn, TableAggregate); WAITING_TIERS_INLINE]>,
     /// Gathering unstamped writes. The sequence is that of the newest write
     /// folded in — the probe stamps a tier only when no write arrived after the
     /// probe sampled its bound.
@@ -45,8 +49,12 @@ impl TableTiers {
 
     /// Promote the active tier to a waiting slot under the probe's bound, if no
     /// write arrived after the probe sampled it. When the queue is full (the
-    /// oldest bounds haven't cleared), the two oldest tiers merge under the
-    /// later of their bounds — conservative, and scoped to this table only.
+    /// oldest bounds haven't cleared), the incoming batch folds into the
+    /// *newest* waiting tier under the later bound: coarsening lands on the
+    /// writes whose clearance is farthest away anyway, while the oldest tiers
+    /// keep their anchored bounds and drain on schedule — merging the oldest
+    /// instead would re-push their bound on every stamp and starve the
+    /// longest-waiting readers under sustained churn (ADR-051).
     pub(super) fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
         if !matches!(&self.active, Some((latest_seq, _)) if *latest_seq <= stamp_seq) {
             return;
@@ -54,15 +62,15 @@ impl TableTiers {
         let Some((_, agg)) = self.active.take() else {
             return;
         };
-        if self.waiting.len() >= WAITING_TIERS {
+        if self.waiting.len() >= WAITING_TIERS_MAX
+            && let Some((newest_lsn, newest_agg)) = self.waiting.last_mut()
+        {
             crate::metrics::handles().raw.tier_merges.increment(1);
-            let (oldest_lsn, oldest_agg) = self.waiting.remove(0);
-            if let Some((next_lsn, next_agg)) = self.waiting.first_mut() {
-                next_agg.merge(oldest_agg);
-                // Bounds are monotonic in stamp order, so the later of the two
-                // is the surviving slot's own (max is belt-and-braces).
-                *next_lsn = (*next_lsn).max(oldest_lsn);
-            }
+            newest_agg.merge(agg);
+            // Bounds are monotonic in stamp order, so the incoming bound is
+            // the later one (max is belt-and-braces).
+            *newest_lsn = (*newest_lsn).max(lsn);
+            return;
         }
         self.waiting.push((lsn, agg));
     }

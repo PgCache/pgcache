@@ -719,45 +719,64 @@ fn test_decide_update_unknown_set_disjoint_serves() {
 
 #[test]
 fn test_update_merged_survives_tier_collision() {
-    // Saturating the waiting queue merges the two oldest aggregates; the
-    // older tier's merged UPDATE tuples must survive the merge — losing
-    // them serves stale reads of the still-pending rows.
+    // Saturating the waiting queue folds the incoming batch into the newest
+    // tier; its merged UPDATE tuples must survive the fold — losing them
+    // serves stale reads of the still-pending rows.
     let mut log = WriteLog::new(true);
-    for (i, id) in [5i64, 6, 7].iter().enumerate() {
-        log.record(&update_eq("orders", "id", *id, &[("v", Some(0))]));
+    for id in 1i64..=9 {
+        log.record(&update_eq("orders", "id", id, &[("v", Some(0))]));
         let seq = log.stamp_seq().expect("bound pending");
-        log.stamp(seq, Lsn::from_raw((i as u64 + 1) * 100));
+        log.stamp(seq, Lsn::from_raw(id.unsigned_abs() * 100));
     }
-    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+    // The 9th stamp folded {9} into the 800-tier under bound 900.
+    let r9 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9)));
     assert_eq!(
-        log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
+        log.decide(&query("SELECT * FROM orders WHERE id = 9"), Some(&r9)),
         RawDecision::Forward(
             RawForwardReason::Table,
-            RawBlocker::Stamped(Lsn::from_raw(200))
+            RawBlocker::Stamped(Lsn::from_raw(900))
         ),
-        "the id = 5 UPDATE is still pending (merged under the later bound) and must forward"
+        "the id = 9 UPDATE is still pending (folded under the later bound) and must forward"
+    );
+    let r8 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(8)));
+    assert_eq!(
+        log.decide(&query("SELECT * FROM orders WHERE id = 8"), Some(&r8)),
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(900))
+        ),
+        "the id = 8 UPDATE absorbed the fold and must survive it"
     );
     // And everything clears once the watermark passes every bound.
-    log.purge(Lsn::from_raw(300));
+    log.purge(Lsn::from_raw(900));
     assert!(log.is_empty());
 }
 
 #[test]
 fn test_delete_merged_survives_tier_collision() {
     let mut log = WriteLog::new(true);
-    for (i, id) in [5i64, 6, 7].iter().enumerate() {
-        log.record(&delete_eq("orders", "id", *id));
+    for id in 1i64..=9 {
+        log.record(&delete_eq("orders", "id", id));
         let seq = log.stamp_seq().expect("bound pending");
-        log.stamp(seq, Lsn::from_raw((i as u64 + 1) * 100));
+        log.stamp(seq, Lsn::from_raw(id.unsigned_abs() * 100));
     }
-    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+    let r9 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9)));
     assert_eq!(
-        log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
+        log.decide(&query("SELECT * FROM orders WHERE id = 9"), Some(&r9)),
         RawDecision::Forward(
             RawForwardReason::Table,
-            RawBlocker::Stamped(Lsn::from_raw(200))
+            RawBlocker::Stamped(Lsn::from_raw(900))
         ),
-        "the id = 5 DELETE is still pending (merged under the later bound) and must forward"
+        "the id = 9 DELETE is still pending (folded under the later bound) and must forward"
+    );
+    let r8 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(8)));
+    assert_eq!(
+        log.decide(&query("SELECT * FROM orders WHERE id = 8"), Some(&r8)),
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(900))
+        ),
+        "the id = 8 DELETE absorbed the fold and must survive it"
     );
 }
 
@@ -1047,28 +1066,70 @@ fn test_waiting_tiers_drain_independently() {
 }
 
 #[test]
-fn test_waiting_saturation_merges_oldest_two() {
-    // A third stamp with both slots full merges the two oldest batches
-    // under the later of their bounds (conservative, scoped to the table).
+fn test_waiting_saturation_folds_into_newest() {
+    // A stamp past the cap folds into the *newest* tier under the later
+    // bound: coarsening lands on the freshest writes, while every older
+    // tier keeps its anchored bound and drains on schedule (ADR-051).
     let mut log = WriteLog::new(true);
-    for (i, id) in [1i64, 2, 3].iter().enumerate() {
-        log.record(&insert_int("orders", "id", &[*id]));
+    for id in 1i64..=9 {
+        log.record(&insert_int("orders", "id", &[id]));
         let seq = log.stamp_seq().expect("bound pending");
-        log.stamp(seq, Lsn::from_raw((i as u64 + 1) * 100));
+        log.stamp(seq, Lsn::from_raw(id.unsigned_abs() * 100));
     }
-    // The 100-batch merged into the 200 bound: purging 100 clears nothing,
-    // and the read now waits on the merged (later) bound.
+    // The oldest batch still clears at its own bound.
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     log.purge(Lsn::from_raw(100));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r1)),
+        RawDecision::ServeDisjoint(DisjointKinds {
+            insert: true,
+            ..Default::default()
+        }),
+        "the oldest bound must stay anchored through saturation"
+    );
+    // The folded pair ({8, 9} under 900) waits on the later bound.
+    let r8 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(8)));
+    assert_eq!(
+        log.decide(&query("SELECT * FROM orders"), Some(&r8)),
         RawDecision::Forward(
             RawForwardReason::Table,
-            RawBlocker::Stamped(Lsn::from_raw(200))
+            RawBlocker::Stamped(Lsn::from_raw(900))
         )
     );
-    // At 200 the merged pair clears; the 300 batch remains.
-    log.purge(Lsn::from_raw(200));
+    log.purge(Lsn::from_raw(800));
+    assert_eq!(
+        log.decide(&query("SELECT * FROM orders"), Some(&r8)),
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(900))
+        )
+    );
+    log.purge(Lsn::from_raw(900));
+    assert!(log.is_empty());
+}
+
+#[test]
+fn test_saturation_keeps_oldest_anchored_under_sustained_stamping() {
+    // The merge-oldest pathology this replaces: under continuous stamping
+    // past the cap, the oldest tier's bound must never move — a reader
+    // blocked on the oldest write clears as soon as settle passes *its*
+    // bound, no matter how many later stamps arrive.
+    let mut log = WriteLog::new(true);
+    for id in 1i64..=20 {
+        log.record(&insert_int("orders", "id", &[id]));
+        let seq = log.stamp_seq().expect("bound pending");
+        log.stamp(seq, Lsn::from_raw(id.unsigned_abs() * 100));
+    }
+    let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
+    assert_eq!(
+        log.decide(&query("SELECT * FROM orders"), Some(&r1)),
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(100))
+        ),
+        "twelve stamps past saturation must not push the oldest bound"
+    );
+    log.purge(Lsn::from_raw(100));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r1)),
         RawDecision::ServeDisjoint(DisjointKinds {
@@ -1076,16 +1137,6 @@ fn test_waiting_saturation_merges_oldest_two() {
             ..Default::default()
         })
     );
-    let r3 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(3)));
-    assert_eq!(
-        log.decide(&query("SELECT * FROM orders"), Some(&r3)),
-        RawDecision::Forward(
-            RawForwardReason::Table,
-            RawBlocker::Stamped(Lsn::from_raw(300))
-        )
-    );
-    log.purge(Lsn::from_raw(300));
-    assert!(log.is_empty());
 }
 
 #[test]
