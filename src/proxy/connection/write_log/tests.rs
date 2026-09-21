@@ -1,7 +1,7 @@
 use super::aggregate::{MERGED_PREDICATE_CAP, UPDATE_DELETE_PREDICATE_CAP};
 use super::log::WriteLog;
 use super::tiers::TableTiers;
-use super::{DisjointKinds, RawDecision, RawForwardReason};
+use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
 use crate::pg::Lsn;
 use crate::query::ast::{BinaryOp, LiteralValue, QueryExpr};
 use crate::query::constraints::ColumnRange;
@@ -55,7 +55,7 @@ fn test_intersects_referenced_table_only() {
     log.record(&table("orders"));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), None),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
     assert_eq!(
         log.decide(&query("SELECT * FROM items WHERE id = 1"), None),
@@ -69,7 +69,7 @@ fn test_intersects_connection_scope_poisons_all_reads() {
     log.record(&WriteClass::Connection);
     assert_eq!(
         log.decide(&query("SELECT * FROM whatever"), None),
-        RawDecision::Forward(RawForwardReason::Connection)
+        RawDecision::Forward(RawForwardReason::Connection, RawBlocker::Unstamped)
     );
 }
 
@@ -82,14 +82,14 @@ fn test_intersects_covers_joins_and_subqueries() {
             &query("SELECT * FROM users u JOIN orders o ON u.id = o.uid"),
             None
         ),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
     assert_eq!(
         log.decide(
             &query("SELECT * FROM users WHERE id IN (SELECT uid FROM orders)"),
             None
         ),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
     assert_eq!(
         log.decide(
@@ -109,7 +109,7 @@ fn test_intersects_schema_matching() {
     }));
     assert_eq!(
         log.decide(&query("SELECT * FROM sales.orders"), None),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
     // Different schema, same name → not the same table.
     assert_eq!(
@@ -119,7 +119,7 @@ fn test_intersects_schema_matching() {
     // Unqualified read conservatively matches (search_path unresolvable).
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), None),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -162,13 +162,13 @@ fn test_intersects_insert_row_level_disjointness() {
     let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2)));
     assert_eq!(
         log.decide(&q, Some(&r2)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 
     // Without the read's ranges (unregistered / multi-table) → conservative.
     assert_eq!(
         log.decide(&q, None),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -192,7 +192,7 @@ fn test_intersects_insert_multi_row() {
     let r3 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(3)));
     assert_eq!(
         log.decide(&q, Some(&r3)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -230,7 +230,7 @@ fn test_intersects_insert_int_float_numeric() {
     let r20 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(20)));
     assert_eq!(
         log.decide(&q, Some(&r20)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -250,7 +250,7 @@ fn test_intersects_insert_unknown_cell_forwards() {
     let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r5)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -265,7 +265,7 @@ fn test_insert_overflow_degrades_to_opaque() {
     let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(9999)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -310,7 +310,7 @@ fn test_insert_wide_rows_hit_cells_cap() {
     log.record(&wide_insert(200));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE c0 = -1"), Some(&r)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -335,7 +335,7 @@ fn test_insert_row_at_a_time_stays_precise() {
     let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250)));
     assert_eq!(
         log.decide(&q, Some(&hit)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -353,7 +353,7 @@ fn test_insert_diverging_column_lists() {
     let ra = ranges("a", ColumnRange::Equal(LiteralValue::Integer(5)));
     assert_eq!(
         log.decide(&q, Some(&ra)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
     // Read constraining both columns: each row excluded via its own column.
     let rab = HashMap::from([
@@ -385,7 +385,7 @@ fn test_non_insert_write_dominates_inserts() {
     let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r5)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -419,13 +419,13 @@ fn test_decide_delete_predicate_disjointness() {
     let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
     assert_eq!(
         log.decide(&q, Some(&r5)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 
     // Without the read's ranges (multi-table / unregistered) → conservative.
     assert_eq!(
         log.decide(&q, None),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -472,7 +472,7 @@ fn test_delete_row_at_a_time_stays_precise() {
     let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250)));
     assert_eq!(
         log.decide(&q, Some(&hit)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -490,7 +490,7 @@ fn test_delete_merged_overflow_degrades_to_opaque() {
     let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -508,7 +508,7 @@ fn test_delete_legacy_overflow_degrades_to_opaque() {
     let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -533,7 +533,7 @@ fn test_delete_mixed_merged_and_legacy_shapes() {
     let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2)));
     assert_eq!(
         log.decide(&q, Some(&r2)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -589,7 +589,7 @@ fn test_delete_multi_column_equality_tuples() {
     ]);
     assert_eq!(
         log.decide(&q, Some(&r_hit)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -628,7 +628,7 @@ fn test_opaque_write_dominates_delete() {
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -673,7 +673,7 @@ fn test_decide_update_disjoint_serves() {
     let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -686,7 +686,7 @@ fn test_decide_update_grow_forwards() {
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -698,7 +698,7 @@ fn test_decide_update_value_change_forwards() {
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -731,8 +731,11 @@ fn test_update_merged_survives_tier_collision() {
     let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
-        RawDecision::Forward(RawForwardReason::Table),
-        "the id = 5 UPDATE is still pending and must forward"
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(200))
+        ),
+        "the id = 5 UPDATE is still pending (merged under the later bound) and must forward"
     );
     // And everything clears once the watermark passes every bound.
     log.purge(Lsn::from_raw(300));
@@ -750,8 +753,11 @@ fn test_delete_merged_survives_tier_collision() {
     let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
-        RawDecision::Forward(RawForwardReason::Table),
-        "the id = 5 DELETE is still pending and must forward"
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(200))
+        ),
+        "the id = 5 DELETE is still pending (merged under the later bound) and must forward"
     );
 }
 
@@ -776,7 +782,7 @@ fn test_update_row_at_a_time_stays_precise() {
     let hit = ranges("id", ColumnRange::Equal(LiteralValue::Integer(250)));
     assert_eq!(
         log.decide(&q, Some(&hit)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -792,7 +798,7 @@ fn test_update_merged_grow_forwards() {
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), Some(&r1)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -825,7 +831,7 @@ fn test_update_set_order_shares_one_shape() {
     let ra = ranges("a", ColumnRange::Equal(LiteralValue::Integer(4)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE a = 4"), Some(&ra)),
-        RawDecision::Forward(RawForwardReason::Table),
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped),
         "a row updated into a = 4 must forward"
     );
 }
@@ -844,7 +850,7 @@ fn test_update_delete_share_merged_cap() {
     let r = ranges("id", ColumnRange::Equal(LiteralValue::Integer(999_999)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
 }
 
@@ -866,7 +872,7 @@ fn test_update_duplicate_set_column_routes_legacy() {
     let rv1 = ranges("v", ColumnRange::Equal(LiteralValue::Integer(1)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE v = 1"), Some(&rv1)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
     );
     // Disjoint via id on both sides → serve.
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
@@ -1008,11 +1014,15 @@ fn test_waiting_tiers_drain_independently() {
     log.record(&insert_int("orders", "id", &[2]));
     let seq = log.stamp_seq().expect("bound pending");
     log.stamp(seq, Lsn::from_raw(200));
-    // Both inserts pending; a read of id = 1 forwards.
+    // Both inserts pending; a read of id = 1 forwards, bound by the tier it
+    // intersects (the disjoint 200-tier does not raise it).
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r1)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(100))
+        )
     );
     // The 100-bound batch clears alone: id = 1 now serves disjoint-free,
     // id = 2 still forwards.
@@ -1027,7 +1037,10 @@ fn test_waiting_tiers_drain_independently() {
     let r2 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(2)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r2)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(200))
+        )
     );
     log.purge(Lsn::from_raw(200));
     assert!(log.is_empty());
@@ -1043,12 +1056,16 @@ fn test_waiting_saturation_merges_oldest_two() {
         let seq = log.stamp_seq().expect("bound pending");
         log.stamp(seq, Lsn::from_raw((i as u64 + 1) * 100));
     }
-    // The 100-batch merged into the 200 bound: purging 100 clears nothing.
+    // The 100-batch merged into the 200 bound: purging 100 clears nothing,
+    // and the read now waits on the merged (later) bound.
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     log.purge(Lsn::from_raw(100));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r1)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(200))
+        )
     );
     // At 200 the merged pair clears; the 300 batch remains.
     log.purge(Lsn::from_raw(200));
@@ -1062,7 +1079,10 @@ fn test_waiting_saturation_merges_oldest_two() {
     let r3 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(3)));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders"), Some(&r3)),
-        RawDecision::Forward(RawForwardReason::Table)
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(300))
+        )
     );
     log.purge(Lsn::from_raw(300));
     assert!(log.is_empty());
@@ -1107,7 +1127,7 @@ fn test_unstampable_drops_and_blocks_table_state() {
     assert!(connection_pending(&log));
     assert_eq!(
         log.decide(&query("SELECT * FROM anything"), None),
-        RawDecision::Forward(RawForwardReason::Connection)
+        RawDecision::Forward(RawForwardReason::Connection, RawBlocker::Unstamped)
     );
 }
 
@@ -1120,4 +1140,97 @@ fn test_disable_clears_existing() {
     assert!(!log.is_enabled());
     log.record(&table("orders"));
     assert!(log.is_empty());
+}
+
+#[test]
+fn test_blocker_stamped_tier_carries_its_bound() {
+    let mut log = WriteLog::new(true);
+    log.record(&table("orders"));
+    let seq = log.stamp_seq().expect("active awaiting a bound");
+    log.stamp(seq, Lsn::from_raw(100));
+    assert_eq!(
+        log.decide(&query("SELECT * FROM orders"), None),
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(100))
+        )
+    );
+}
+
+#[test]
+fn test_blocker_unstamped_dominates_stamped() {
+    // A stamped tier and a fresh unstamped write both block: no watermark
+    // advance can clear the unstamped one, so it must win the attribution.
+    let mut log = WriteLog::new(true);
+    log.record(&table("orders"));
+    let seq = log.stamp_seq().expect("active awaiting a bound");
+    log.stamp(seq, Lsn::from_raw(100));
+    log.record(&table("orders"));
+    assert_eq!(
+        log.decide(&query("SELECT * FROM orders"), None),
+        RawDecision::Forward(RawForwardReason::Table, RawBlocker::Unstamped)
+    );
+}
+
+#[test]
+fn test_blocker_disjoint_tier_does_not_bind() {
+    // Only the tiers the read actually intersects contribute to the blocker:
+    // a later stamped tier whose rows are disjoint must not raise the bound.
+    let mut log = WriteLog::new(true);
+    log.record(&delete_eq("orders", "id", 5));
+    let seq = log.stamp_seq().expect("active awaiting a bound");
+    log.stamp(seq, Lsn::from_raw(100));
+    log.record(&delete_eq("orders", "id", 7));
+    let seq = log.stamp_seq().expect("active awaiting a bound");
+    log.stamp(seq, Lsn::from_raw(200));
+    let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
+    assert_eq!(
+        log.decide(&query("SELECT * FROM orders WHERE id = 5"), Some(&r5)),
+        RawDecision::Forward(
+            RawForwardReason::Table,
+            RawBlocker::Stamped(Lsn::from_raw(100))
+        )
+    );
+}
+
+#[test]
+fn test_blocker_connection_stamped_carries_its_bound() {
+    let mut log = WriteLog::new(true);
+    log.record(&WriteClass::Connection);
+    let seq = log.stamp_seq().expect("active awaiting a bound");
+    log.stamp(seq, Lsn::from_raw(100));
+    assert_eq!(
+        log.decide(&query("SELECT * FROM whatever"), None),
+        RawDecision::Forward(
+            RawForwardReason::Connection,
+            RawBlocker::Stamped(Lsn::from_raw(100))
+        )
+    );
+}
+
+#[test]
+fn test_forward_cause_classification() {
+    use super::{RawForwardCause, forward_cause};
+    let bound = RawBlocker::Stamped(Lsn::from_raw(100));
+    // Unstamped is unstamped regardless of cursors.
+    assert_eq!(
+        forward_cause(RawBlocker::Unstamped, Some(Lsn::from_raw(u64::MAX))),
+        RawForwardCause::Unstamped
+    );
+    // Bound at or below the receive cursor: the WAL is here, apply is behind.
+    assert_eq!(
+        forward_cause(bound, Some(Lsn::from_raw(100))),
+        RawForwardCause::ApplyLag
+    );
+    assert_eq!(
+        forward_cause(bound, Some(Lsn::from_raw(150))),
+        RawForwardCause::ApplyLag
+    );
+    // Bound past the receive cursor: origin hasn't delivered it.
+    assert_eq!(
+        forward_cause(bound, Some(Lsn::from_raw(99))),
+        RawForwardCause::DeliveryLag
+    );
+    // Cache down/restarting: nothing delivered this generation.
+    assert_eq!(forward_cause(bound, None), RawForwardCause::DeliveryLag);
 }

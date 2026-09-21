@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::runtime::Builder;
@@ -95,6 +95,7 @@ pub(super) fn cdc_run(
     cancel: CancellationToken,
     cdc_connected: Arc<AtomicBool>,
     watermark_nudge: Arc<tokio::sync::Notify>,
+    received_lsn: Arc<AtomicU64>,
 ) -> CacheResult<()> {
     let rt = Builder::new_current_thread()
         .enable_all()
@@ -111,6 +112,7 @@ pub(super) fn cdc_run(
             cdc_tx.clone(),
             Arc::clone(&active_relations),
             Arc::clone(&watermark_nudge),
+            Arc::clone(&received_lsn),
         )
         .await
         .attach_loc("initializing CDC processor")?;
@@ -200,6 +202,7 @@ pub(super) fn cdc_run(
                         cdc_tx.clone(),
                         Arc::clone(&active_relations),
                         Arc::clone(&watermark_nudge),
+                        Arc::clone(&received_lsn),
                     ) => r,
                 };
                 match reconnect {

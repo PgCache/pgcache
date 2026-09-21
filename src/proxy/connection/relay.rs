@@ -286,11 +286,23 @@ async fn handle_connection(
                             .flatten();
                         let m = crate::metrics::handles();
                         match state.write_log.decide(read_query, read_ranges.as_ref()) {
-                            RawDecision::Forward(reason) => {
+                            RawDecision::Forward(reason, blocker) => {
                                 match reason {
                                     RawForwardReason::Table => m.raw.forwards_table.increment(1),
                                     RawForwardReason::Connection => {
                                         m.raw.forwards_connection.increment(1)
+                                    }
+                                }
+                                let received = state.dispatch_handle.received_lsn();
+                                match forward_cause(blocker, received) {
+                                    RawForwardCause::Unstamped => {
+                                        m.raw.forward_blocked_unstamped.increment(1);
+                                    }
+                                    RawForwardCause::DeliveryLag => {
+                                        m.raw.forward_blocked_delivery_lag.increment(1);
+                                    }
+                                    RawForwardCause::ApplyLag => {
+                                        m.raw.forward_blocked_apply_lag.increment(1);
                                     }
                                 }
                                 state.cache_slot_forward_to_origin(msg);

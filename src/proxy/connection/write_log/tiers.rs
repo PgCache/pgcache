@@ -5,6 +5,7 @@ use smallvec::SmallVec;
 
 use crate::pg::Lsn;
 
+use super::RawBlocker;
 use super::aggregate::TableAggregate;
 
 /// Stamped tiers a table holds before a further stamp merges the two oldest.
@@ -87,6 +88,18 @@ impl ConnectionTiers {
         self.waiting.is_none() && self.active.is_none() && !self.unstampable
     }
 
+    /// The clearance constraint of a non-empty connection scope: unstamped
+    /// (active or 2PC-unstampable) dominates the stamped bound, since every
+    /// pending entry must clear before any read serves (PGC-440).
+    pub(super) fn blocker(&self) -> RawBlocker {
+        if self.active.is_some() || self.unstampable {
+            RawBlocker::Unstamped
+        } else {
+            self.waiting
+                .map_or(RawBlocker::Unstamped, RawBlocker::Stamped)
+        }
+    }
+
     pub(super) fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
         // A 2PC prepare must never take an LSN bound: its commit happens
         // later, possibly from another session. `record` refuses writes while
@@ -110,9 +123,18 @@ impl ConnectionTiers {
 impl TableTiers {
     /// Both tiers' aggregates, waiting first.
     pub(super) fn aggregates(&self) -> impl Iterator<Item = &TableAggregate> {
+        self.aggregates_bounded().map(|(_, agg)| agg)
+    }
+
+    /// All aggregates with their clearance bound: `Some(lsn)` for stamped
+    /// waiting tiers, `None` for the active (unstamped) tier. For the gate's
+    /// forward attribution (PGC-440).
+    pub(super) fn aggregates_bounded(
+        &self,
+    ) -> impl Iterator<Item = (Option<Lsn>, &TableAggregate)> {
         self.waiting
             .iter()
-            .map(|(_, agg)| agg)
-            .chain(self.active.iter().map(|(_, agg)| agg))
+            .map(|(lsn, agg)| (Some(*lsn), agg))
+            .chain(self.active.iter().map(|(_, agg)| (None, agg)))
     }
 }

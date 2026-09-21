@@ -29,6 +29,13 @@ impl CacheDispatchHandle {
         self.rx.borrow().as_ref().map(CacheDispatch::settled_lsn)
     }
 
+    /// The current generation's decode-stage receive cursor, or `None` if the
+    /// cache is down/restarting. For the read-after-write gate's forward
+    /// attribution (PGC-440).
+    pub fn received_lsn(&self) -> Option<Lsn> {
+        self.rx.borrow().as_ref().map(CacheDispatch::received_lsn)
+    }
+
     /// The resolved form of a registered query in the current generation, for the
     /// read-after-write gate's row-level INSERT check (PGC-124). Reads through the
     /// watch without cloning the whole dispatch.

@@ -56,6 +56,13 @@ pub mod names {
     /// Cacheable reads forwarded to origin by the read-after-write gate because
     /// they intersected a pending write. Labeled `scope` = table | connection.
     pub const RAW_FORWARDS: &str = "pgcache.raw.forwards";
+    /// Forward attribution (PGC-440): which pipeline stage the blocking write
+    /// was stuck at. Labeled `cause` = unstamped (commit-LSN probe not yet
+    /// returned) | delivery_lag (bound past the decode-stage receive cursor —
+    /// origin hasn't shipped the WAL) | apply_lag (WAL received but decode/
+    /// apply/settle behind). Sums to `pgcache.raw.forwards`; the delivery vs
+    /// apply split sizes what walsender solicitation vs faster settle recovers.
+    pub const RAW_FORWARD_BLOCKED: &str = "pgcache.raw.forward_blocked";
     /// Cacheable reads served from cache despite a pending row-enumerable write,
     /// because the gate proved the read disjoint from it (row-level precision,
     /// PGC-379). One counter per write kind; a read disjoint from more than one
@@ -411,6 +418,11 @@ pub struct RawHandles {
     pub forwards_table: Counter,
     /// Reads forwarded because a connection-scoped pending write poisons all reads.
     pub forwards_connection: Counter,
+    /// Forward attribution by blocking stage (PGC-440); the three sum to the
+    /// forwards total.
+    pub forward_blocked_unstamped: Counter,
+    pub forward_blocked_delivery_lag: Counter,
+    pub forward_blocked_apply_lag: Counter,
     /// Reads served despite a pending row-enumerable write proven disjoint,
     /// per write kind (row-level precision, PGC-379).
     pub serve_disjoint_insert: Counter,
@@ -820,6 +832,9 @@ impl Handles {
                 probes: metrics::counter!(RAW_PROBES),
                 forwards_table: metrics::counter!(RAW_FORWARDS, "scope" => "table"),
                 forwards_connection: metrics::counter!(RAW_FORWARDS, "scope" => "connection"),
+                forward_blocked_unstamped: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "unstamped"),
+                forward_blocked_delivery_lag: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "delivery_lag"),
+                forward_blocked_apply_lag: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "apply_lag"),
                 serve_disjoint_insert: metrics::counter!(RAW_SERVE_DISJOINT_INSERT),
                 serve_disjoint_delete: metrics::counter!(RAW_SERVE_DISJOINT_DELETE),
                 serve_disjoint_update: metrics::counter!(RAW_SERVE_DISJOINT_UPDATE),

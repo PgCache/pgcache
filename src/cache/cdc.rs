@@ -24,6 +24,7 @@ use tokio_util::bytes::Bytes;
 use tokio_util::sync::CancellationToken;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
@@ -93,6 +94,9 @@ pub struct CdcProcessor {
     /// the server returns its current `wal_end`, advancing the watermark within
     /// a round-trip (PGC-250 Slice B).
     watermark_nudge: Arc<Notify>,
+    /// Shared publication of `last_received_lsn` for the read-after-write
+    /// gate's forward attribution (PGC-440); see `CacheStateView::received_lsn`.
+    received_lsn_shared: Arc<AtomicU64>,
 }
 
 impl CdcProcessor {
@@ -102,6 +106,7 @@ impl CdcProcessor {
         cdc_tx: UnboundedSender<CdcCommand>,
         active_relations: ActiveRelations,
         watermark_nudge: Arc<Notify>,
+        received_lsn_shared: Arc<AtomicU64>,
     ) -> CacheResult<Self> {
         let origin_cdc_client = connect_replication(&settings.replication, "CDC replication")
             .await
@@ -125,6 +130,7 @@ impl CdcProcessor {
             last_flush_sent: None,
             keep_alive_sent_count: 0,
             watermark_nudge,
+            received_lsn_shared,
         })
     }
 
@@ -230,6 +236,7 @@ impl CdcProcessor {
     async fn update_lsn(&mut self, xlog_data: &XLogDataBody<LogicalReplicationMessage>) {
         let lsn = Lsn::from_raw(xlog_data.wal_start());
         self.last_received_lsn = lsn;
+        self.received_lsn_shared.store(lsn.get(), Ordering::Relaxed);
         // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
         #[allow(clippy::cast_precision_loss)]
         crate::metrics::handles()
@@ -370,6 +377,8 @@ impl CdcProcessor {
         if wal_end > self.last_decoded_lsn {
             self.last_received_lsn = wal_end;
             self.last_decoded_lsn = wal_end;
+            self.received_lsn_shared
+                .store(wal_end.get(), Ordering::Relaxed);
             #[allow(clippy::cast_precision_loss)]
             crate::metrics::handles()
                 .cdc

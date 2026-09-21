@@ -38,7 +38,9 @@ pub use relay::connection_task;
 pub(in crate::proxy::connection) use relay::forward_lazy_parse_install;
 pub(in crate::proxy::connection) use search_path_intercept::{OriginIntercept, SearchPathState};
 pub(in crate::proxy::connection) use telemetry::QueryTelemetry;
-pub(in crate::proxy::connection) use write_log::{RawDecision, RawForwardReason, WriteLog};
+pub(in crate::proxy::connection) use write_log::{
+    RawDecision, RawForwardCause, RawForwardReason, WriteLog, forward_cause,
+};
 
 /// Manages state for a single client connection.
 /// Encapsulates transaction state, query fingerprint cache, and protocol state.

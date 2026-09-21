@@ -263,6 +263,12 @@ pub struct CacheStateView {
     /// `CacheStateView` starts at 0, so a restart never reports a stale-high
     /// watermark to a connection reading through the current dispatch.
     pub settled_lsn: Arc<AtomicU64>,
+    /// Decode-stage receive cursor (raw `Lsn`) published by the CDC processor:
+    /// the highest WAL position origin has delivered to pgcache. Runs ahead of
+    /// `settled_lsn` under decode/apply lag. Used by the read-after-write
+    /// gate's forward attribution (PGC-440): a forward whose blocking bound is
+    /// at or below it is waiting on apply/settle, above it on origin delivery.
+    pub received_lsn: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for CacheStateView {
@@ -293,6 +299,7 @@ impl CacheStateView {
             reg_gate: Arc::new(RegGate::new()),
             population_pool: Arc::new(PopulationPool::new(0)),
             settled_lsn: Arc::new(AtomicU64::new(0)),
+            received_lsn: Arc::new(AtomicU64::new(0)),
             memo: ResultMemo::new(dynamic),
         }
     }

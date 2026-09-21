@@ -18,7 +18,7 @@ use super::aggregate::{
     merged_tuples_disjoint, merged_updates_disjoint, update_predicate_build, update_tuple_build,
 };
 use super::tiers::{ConnectionTiers, TableTiers};
-use super::{DisjointKinds, RawDecision, RawForwardReason};
+use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
 
 /// The schema variants of one table name with pending writes. Keyed by bare
 /// name so the gate's fuzzy schema matching (an unqualified side matches any
@@ -242,22 +242,22 @@ impl WriteLog {
     ) -> RawDecision {
         // A connection-scoped pending write (unknown table) poisons every read.
         if !self.connection.is_empty() {
-            return RawDecision::Forward(RawForwardReason::Connection);
+            return RawDecision::Forward(RawForwardReason::Connection, self.connection.blocker());
         }
         // Otherwise a read forwards iff it references a table with a pending
         // write it can't rule out. The walk covers joins, subqueries, and CTEs.
+        // The break payload is the first blocking table's clearance constraint;
+        // a later table could in principle carry a still-later bound, but one
+        // blocking table suffices for attribution (PGC-440).
         let mut kinds = DisjointKinds::default();
-        let intersects = query
-            .try_for_each_node::<TableNode, ()>(&mut |table| {
-                if self.table_intersects(table, read_ranges, &mut kinds) {
-                    ControlFlow::Break(())
-                } else {
-                    ControlFlow::Continue(())
-                }
-            })
-            .is_break();
-        if intersects {
-            RawDecision::Forward(RawForwardReason::Table)
+        let blocked = query.try_for_each_node::<TableNode, RawBlocker>(&mut |table| match self
+            .table_intersects(table, read_ranges, &mut kinds)
+        {
+            Some(blocker) => ControlFlow::Break(blocker),
+            None => ControlFlow::Continue(()),
+        });
+        if let ControlFlow::Break(blocker) = blocked {
+            RawDecision::Forward(RawForwardReason::Table, blocker)
         } else if kinds.any() {
             RawDecision::ServeDisjoint(kinds)
         } else {
@@ -266,71 +266,86 @@ impl WriteLog {
     }
 
     /// Fold the read's disjointness from `table`'s pending writes into `kinds`;
-    /// returns `true` if the read intersects a pending write it can't rule out.
-    /// An opaque write always intersects; pending INSERTs/DELETEs/UPDATEs
-    /// intersect unless the read is provably disjoint from every one.
+    /// returns the table's clearance constraint if the read intersects a pending
+    /// write it can't rule out (`None` = no intersection). All of the table's
+    /// tiers are checked — not just the first blocking one — so the returned
+    /// blocker is the slowest-to-clear constraint (PGC-440 attribution).
     fn table_intersects(
         &self,
         table: &TableNode,
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
         kinds: &mut DisjointKinds,
-    ) -> bool {
-        let Some(bucket) = self.tables.get(&table.name) else {
-            return false;
-        };
+    ) -> Option<RawBlocker> {
+        let bucket = self.tables.get(&table.name)?;
+        let mut blocker: Option<RawBlocker> = None;
         for (schema, tiers) in bucket {
             if !schema_matches(schema, &table.schema) {
                 continue;
             }
-            for agg in tiers.aggregates() {
-                if agg.opaque {
-                    return true;
+            for (bound, agg) in tiers.aggregates_bounded() {
+                if Self::aggregate_intersects(agg, read_ranges, kinds) {
+                    let tier = bound.map_or(RawBlocker::Unstamped, RawBlocker::Stamped);
+                    blocker = Some(blocker.map_or(tier, |prior| prior.merge(tier)));
                 }
-                if let Some(inserts) = &agg.inserts {
-                    if read_ranges.is_some_and(|ranges| inserts.disjoint(ranges)) {
-                        kinds.insert = true;
-                    } else {
-                        return true;
-                    }
-                }
-                if !agg.merged_deletes.is_empty() {
-                    if read_ranges
-                        .is_some_and(|ranges| merged_tuples_disjoint(&agg.merged_deletes, ranges))
-                    {
-                        kinds.delete = true;
-                    } else {
-                        return true;
-                    }
-                }
-                for delete in &agg.deletes {
-                    if read_ranges.is_some_and(|ranges| column_ranges_disjoint(ranges, delete)) {
-                        kinds.delete = true;
-                    } else {
-                        return true;
-                    }
-                }
-                if !agg.merged_updates.is_empty() {
-                    if read_ranges
-                        .is_some_and(|ranges| merged_updates_disjoint(&agg.merged_updates, ranges))
-                    {
-                        kinds.update = true;
-                    } else {
-                        return true;
-                    }
-                }
-                for update in &agg.updates {
-                    // Serveable only if the read touches neither the updated rows
-                    // (WHERE) nor their post-update image (grow).
-                    let disjoint = read_ranges.is_some_and(|ranges| {
-                        column_ranges_disjoint(ranges, &update.where_ranges)
-                            && column_ranges_disjoint(ranges, &update.image_ranges)
-                    });
-                    if disjoint {
-                        kinds.update = true;
-                    } else {
-                        return true;
-                    }
-                }
+            }
+        }
+        blocker
+    }
+
+    /// Whether the read intersects one tier aggregate's pending writes. An
+    /// opaque write always intersects; pending INSERTs/DELETEs/UPDATEs
+    /// intersect unless the read is provably disjoint from every one (the
+    /// proven-disjoint kinds fold into `kinds`).
+    fn aggregate_intersects(
+        agg: &TableAggregate,
+        read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+        kinds: &mut DisjointKinds,
+    ) -> bool {
+        if agg.opaque {
+            return true;
+        }
+        if let Some(inserts) = &agg.inserts {
+            if read_ranges.is_some_and(|ranges| inserts.disjoint(ranges)) {
+                kinds.insert = true;
+            } else {
+                return true;
+            }
+        }
+        if !agg.merged_deletes.is_empty() {
+            if read_ranges.is_some_and(|ranges| merged_tuples_disjoint(&agg.merged_deletes, ranges))
+            {
+                kinds.delete = true;
+            } else {
+                return true;
+            }
+        }
+        for delete in &agg.deletes {
+            if read_ranges.is_some_and(|ranges| column_ranges_disjoint(ranges, delete)) {
+                kinds.delete = true;
+            } else {
+                return true;
+            }
+        }
+        if !agg.merged_updates.is_empty() {
+            if read_ranges
+                .is_some_and(|ranges| merged_updates_disjoint(&agg.merged_updates, ranges))
+            {
+                kinds.update = true;
+            } else {
+                return true;
+            }
+        }
+        for update in &agg.updates {
+            // Serveable only if the read touches neither the updated rows
+            // (WHERE) nor their post-update image (grow).
+            let disjoint = read_ranges.is_some_and(|ranges| {
+                column_ranges_disjoint(ranges, &update.where_ranges)
+                    && column_ranges_disjoint(ranges, &update.image_ranges)
+            });
+            if disjoint {
+                kinds.update = true;
+            } else {
+                return true;
             }
         }
         false

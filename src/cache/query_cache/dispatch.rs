@@ -95,6 +95,13 @@ impl CacheDispatch {
         Lsn::from_raw(self.state_view.settled_lsn.load(Ordering::Relaxed))
     }
 
+    /// The decode-stage receive cursor for this generation — the highest WAL
+    /// position origin has delivered. Read by the read-after-write gate's
+    /// forward attribution (PGC-440) to split apply lag from delivery lag.
+    pub fn received_lsn(&self) -> Lsn {
+        Lsn::from_raw(self.state_view.received_lsn.load(Ordering::Relaxed))
+    }
+
     /// The resolved form of a registered (Ready) query, if present. Used by the
     /// read-after-write gate for row-level INSERT disjointness (PGC-124) — the
     /// proxy has no catalog to resolve the query itself, so it reads the resolved

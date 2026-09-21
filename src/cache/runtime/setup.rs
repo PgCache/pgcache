@@ -122,6 +122,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     let cancel_cdc = cache_cancel.clone();
     let cdc_connected_cdc = Arc::clone(&cdc_connected);
     let watermark_nudge_cdc = Arc::clone(&watermark_nudge);
+    let received_lsn_cdc = Arc::clone(&state_view.received_lsn);
     let cdc_handle = match thread::Builder::new()
         .name("cdc worker".to_owned())
         .spawn_scoped(scope, move || {
@@ -132,6 +133,7 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
                 cancel_cdc,
                 cdc_connected_cdc,
                 watermark_nudge_cdc,
+                received_lsn_cdc,
             );
             if let Err(ref e) = result {
                 error!(
