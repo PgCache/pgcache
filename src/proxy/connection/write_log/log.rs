@@ -214,9 +214,16 @@ impl WriteLog {
     /// gated read, but the scan is over the handful of tables with pending
     /// writes — no derived fast-path state to keep consistent.
     pub(in crate::proxy::connection) fn purge(&mut self, watermark: Lsn) {
+        let clearance = &crate::metrics::handles().raw.clearance;
         self.tables.retain(|_, bucket| {
             bucket.retain(|_, tiers| {
-                tiers.waiting.retain(|(lsn, _)| *lsn > watermark);
+                tiers.waiting.retain(|tier| {
+                    if tier.bound > watermark {
+                        return true;
+                    }
+                    clearance.record(tier.stamped_at.elapsed());
+                    false
+                });
                 !tiers.is_empty()
             });
             !bucket.is_empty()

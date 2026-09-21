@@ -63,6 +63,11 @@ pub mod names {
     /// apply/settle behind). Sums to `pgcache.raw.forwards`; the delivery vs
     /// apply split sizes what walsender solicitation vs faster settle recovers.
     pub const RAW_FORWARD_BLOCKED: &str = "pgcache.raw.forward_blocked";
+    /// Realized clearance latency of a stamped tier: stamp → settled-watermark
+    /// purge. A folded tier keeps its earliest stamp time, so this reports
+    /// worst-case content age at clearance (PGC-440); tiers dropped at
+    /// connection close or disable are not observed.
+    pub const RAW_CLEARANCE_SECONDS: &str = "pgcache.raw.clearance_seconds";
     /// Cacheable reads served from cache despite a pending row-enumerable write,
     /// because the gate proved the read disjoint from it (row-level precision,
     /// PGC-379). One counter per write kind; a read disjoint from more than one
@@ -423,6 +428,8 @@ pub struct RawHandles {
     pub forward_blocked_unstamped: Counter,
     pub forward_blocked_delivery_lag: Counter,
     pub forward_blocked_apply_lag: Counter,
+    /// Stamp → watermark-purge latency per waiting tier (PGC-440).
+    pub clearance: Histogram,
     /// Reads served despite a pending row-enumerable write proven disjoint,
     /// per write kind (row-level precision, PGC-379).
     pub serve_disjoint_insert: Counter,
@@ -835,6 +842,7 @@ impl Handles {
                 forward_blocked_unstamped: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "unstamped"),
                 forward_blocked_delivery_lag: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "delivery_lag"),
                 forward_blocked_apply_lag: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "apply_lag"),
+                clearance: metrics::histogram!(RAW_CLEARANCE_SECONDS),
                 serve_disjoint_insert: metrics::counter!(RAW_SERVE_DISJOINT_INSERT),
                 serve_disjoint_delete: metrics::counter!(RAW_SERVE_DISJOINT_DELETE),
                 serve_disjoint_update: metrics::counter!(RAW_SERVE_DISJOINT_UPDATE),

@@ -1,6 +1,8 @@
 //! LSN tier queues: per-table active/stamped tiers and the connection-scoped
 //! entry, each draining as the settled watermark passes its bound.
 
+use std::time::Instant;
+
 use smallvec::SmallVec;
 
 use crate::pg::Lsn;
@@ -18,6 +20,16 @@ pub(super) const WAITING_TIERS_MAX: usize = 8;
 /// the common calm-state allocation stays small and deep tiers heap-spill.
 const WAITING_TIERS_INLINE: usize = 2;
 
+/// One stamped batch of pending writes awaiting its clearance bound.
+#[derive(Debug)]
+pub(super) struct WaitingTier {
+    pub(super) bound: Lsn,
+    /// When the batch was stamped; a fold keeps the earliest, so the
+    /// clearance histogram reports worst-case content age (PGC-440).
+    pub(super) stamped_at: Instant,
+    pub(super) aggregate: TableAggregate,
+}
+
 /// One table's pending writes: an active tier gathering unstamped writes, plus
 /// a bounded queue of stamped tiers each draining on its own per-table bound.
 #[derive(Debug, Default)]
@@ -26,7 +38,7 @@ pub(super) struct TableTiers {
     /// the CDC apply watermark passes its commit-LSN bound. Bounded to
     /// [`WAITING_TIERS_MAX`]; a stamp past that folds into the newest tier
     /// under the later bound, so old bounds stay anchored (ADR-051).
-    pub(super) waiting: SmallVec<[(Lsn, TableAggregate); WAITING_TIERS_INLINE]>,
+    pub(super) waiting: SmallVec<[WaitingTier; WAITING_TIERS_INLINE]>,
     /// Gathering unstamped writes. The sequence is that of the newest write
     /// folded in — the probe stamps a tier only when no write arrived after the
     /// probe sampled its bound.
@@ -63,16 +75,21 @@ impl TableTiers {
             return;
         };
         if self.waiting.len() >= WAITING_TIERS_MAX
-            && let Some((newest_lsn, newest_agg)) = self.waiting.last_mut()
+            && let Some(newest) = self.waiting.last_mut()
         {
             crate::metrics::handles().raw.tier_merges.increment(1);
-            newest_agg.merge(agg);
+            newest.aggregate.merge(agg);
             // Bounds are monotonic in stamp order, so the incoming bound is
-            // the later one (max is belt-and-braces).
-            *newest_lsn = (*newest_lsn).max(lsn);
+            // the later one (max is belt-and-braces). `stamped_at` keeps the
+            // tier's earlier value: the histogram tracks worst-case age.
+            newest.bound = newest.bound.max(lsn);
             return;
         }
-        self.waiting.push((lsn, agg));
+        self.waiting.push(WaitingTier {
+            bound: lsn,
+            stamped_at: Instant::now(),
+            aggregate: agg,
+        });
     }
 }
 
@@ -142,7 +159,7 @@ impl TableTiers {
     ) -> impl Iterator<Item = (Option<Lsn>, &TableAggregate)> {
         self.waiting
             .iter()
-            .map(|(lsn, agg)| (Some(*lsn), agg))
+            .map(|tier| (Some(tier.bound), &tier.aggregate))
             .chain(self.active.iter().map(|(_, agg)| (None, agg)))
     }
 }
