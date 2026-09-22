@@ -25,8 +25,11 @@ conclusion that produced ADR-052 for the population pool.
    bench evidence).
 2. **Bounds are hardcoded**: min `num_workers × 2` (the old floor of 4 was a
    sizing guess; sizing is now dynamic), max `num_workers × 8` — the
-   cache-PG protection bound, and what the memory monitor budgets backend
-   RSS against (conservative; revisit toward live-size budgeting).
+   cache-PG protection bound. The memory monitor receives the max as its
+   PGC-251 full-pool-recycled threshold (its only use of pool size — a
+   re-measurement trigger, not an RSS reservation); the sole consequence is
+   a slower count-cap re-probe under sustained memory pressure, and max is
+   the conservative-correct value for that trigger's semantics.
 3. **The replenish task becomes a reconciler** maintaining `live == desired`:
    each existing loss signal (poison discard PGC-238, mid-flight loss
    PGC-278, memory-pressure recycle PGC-251) decrements `live` and the same
@@ -60,8 +63,9 @@ conclusion that produced ADR-052 for the population pool.
 
 ### Negative
 
-- Memory-monitor RSS budgeting uses the elastic maximum, over-reserving
-  while the pool runs small (flagged for revisit).
+- The memory monitor's full-pool-recycled re-measurement trigger fires
+  slower (it counts to the elastic max), delaying count-cap re-learning
+  under sustained memory pressure.
 - Serve latency now depends on a feedback loop; a mis-tuned wait target
   moves where queueing sits rather than eliminating it (the underlying
   wr0.2 capacity problem is the box CPU — PGC-441 attacks the demand side).
@@ -75,5 +79,10 @@ conclusion that produced ADR-052 for the population pool.
 - Metrics: `serve_pool_size`, `serve_pool_scale_up/down`,
   `serve_pool_backstop_grows`, alongside the existing pool
   liveness/replenish/recycle series.
+- One surplus connection parks (with expiry, and released immediately under
+  memory pressure) instead of dropping, so the controller's probe cycle at a
+  capacity ceiling reuses a backend rather than recreating one; paired with
+  the escalating refute hold (ADR-052 amendment) steady state at a stable
+  ceiling is an occasional unpark/repark with zero connection churn.
 - Amends ADR-052 (controller shared, config-parameterized). Bench validation
   under PGC-442.

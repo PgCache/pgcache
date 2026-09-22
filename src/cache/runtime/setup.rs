@@ -192,8 +192,9 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         Arc::clone(&state_view),
     ));
     let shared_buffers = handle.block_on(shared_buffers_bytes_query(settings));
-    // Budget backend RSS against the elastic maximum — conservative until the
-    // monitor learns to track the live size (ADR-053).
+    // The monitor uses pool size only as its full-pool-recycled threshold
+    // (PGC-251 re-measurement trigger); the elastic max is the conservative-
+    // correct value for that semantics (ADR-053).
     let (_, serve_pool_max) = serve_pool_bounds(settings.num_workers);
     handle.spawn(memory_monitor(
         Arc::clone(&state_view),

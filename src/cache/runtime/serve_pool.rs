@@ -60,6 +60,25 @@ const POOL_REPLENISH_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 /// Maximum backoff between serve-pool reconnection attempts.
 const POOL_REPLENISH_MAX_BACKOFF: Duration = Duration::from_secs(10);
 
+/// How long a parked connection may sit before it is dropped for real: long
+/// enough to absorb the controller's probe cycles at the hold-ladder cap,
+/// short enough that a backend the workload stopped needing is released.
+const PARK_EXPIRY: Duration = Duration::from_secs(300);
+
+/// One surplus connection kept aside instead of dropped (ADR-053): the
+/// controller's probe cycle at a capacity ceiling then reuses it instead of
+/// tearing down and re-establishing a backend every cycle. Guarded by a sync
+/// mutex; never held across an await.
+type ParkedSlot = Arc<std::sync::Mutex<Option<(CacheConnection, Instant)>>>;
+
+fn parked_lock(
+    parked: &ParkedSlot,
+) -> std::sync::MutexGuard<'_, Option<(CacheConnection, Instant)>> {
+    parked
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Handles a serve request by executing the query and sending the reply.
 /// Sends replies for both the primary client and any coalesced clients.
 async fn handle_serve_request(
@@ -220,12 +239,14 @@ pub(super) async fn serve_loop(
     // controller's desired size (ADR-053; replenish semantics from PGC-238).
     // Unbounded — signals are unit-sized and bounded by pool size.
     let (replenish_tx, replenish_rx) = unbounded_channel::<()>();
+    let parked: ParkedSlot = Arc::new(std::sync::Mutex::new(None));
     tokio::spawn(pool_reconcile(
         settings.clone(),
         conn_tx.clone(),
         replenish_rx,
         cancel.clone(),
         Arc::clone(&serve_pool),
+        Arc::clone(&parked),
     ));
 
     // Recycle one idle connection per tick while the monitor flags memory pressure
@@ -252,7 +273,8 @@ pub(super) async fn serve_loop(
                     state_view.recycle_count.fetch_add(1, Ordering::Relaxed);
                     crate::metrics::handles().cache.pool_recycled.increment(1);
                 }
-                pool_shrink_apply(&serve_pool, &mut conn_rx);
+                parked_maintain(&parked, state_view.recycle_wanted.load(Ordering::Relaxed));
+                pool_shrink_apply(&serve_pool, &mut conn_rx, &parked);
                 continue;
             }
             msg = serve_rx.recv() => {
@@ -264,7 +286,7 @@ pub(super) async fn serve_loop(
 
         // Retire surplus idle connections the controller no longer wants
         // before taking one for this serve.
-        pool_shrink_apply(&serve_pool, &mut conn_rx);
+        pool_shrink_apply(&serve_pool, &mut conn_rx, &parked);
 
         // Wait for an available connection
         let conn = if let Ok(conn) = conn_rx.try_recv() {
@@ -334,17 +356,39 @@ pub(super) async fn serve_loop(
 /// Drop idle connections beyond the controller's desired size. Only idle
 /// connections are retired (`try_recv`), so an in-flight serve is never
 /// interrupted; a checked-out surplus connection is caught on a later pass.
-fn pool_shrink_apply(serve_pool: &ServePool, conn_rx: &mut Receiver<CacheConnection>) {
+fn pool_shrink_apply(
+    serve_pool: &ServePool,
+    conn_rx: &mut Receiver<CacheConnection>,
+    parked: &ParkedSlot,
+) {
     while serve_pool.live() > serve_pool.desired() {
         let Ok(conn) = conn_rx.try_recv() else {
             return;
         };
-        drop(conn);
         serve_pool.live_sub(1);
         crate::metrics::handles()
             .cache
             .serve_pool_scale_down
             .increment(1);
+        // The first surplus connection parks so the next probe cycle reuses
+        // it (ADR-053); further surplus is a genuinely oversized pool and
+        // releases its backends.
+        let mut slot = parked_lock(parked);
+        if slot.is_none() {
+            *slot = Some((conn, Instant::now()));
+        }
+    }
+}
+
+/// Drop the parked connection when it has outlived its usefulness: expired,
+/// or the memory monitor wants backends released (a held-back backend is
+/// exactly what recycling exists to reclaim).
+fn parked_maintain(parked: &ParkedSlot, recycle_wanted: bool) {
+    let mut slot = parked_lock(parked);
+    if let Some((_, since)) = slot.as_ref()
+        && (recycle_wanted || since.elapsed() > PARK_EXPIRY)
+    {
+        *slot = None;
     }
 }
 
@@ -361,6 +405,7 @@ async fn pool_reconcile(
     mut replenish_rx: UnboundedReceiver<()>,
     cancel: CancellationToken,
     serve_pool: Arc<ServePool>,
+    parked: ParkedSlot,
 ) {
     debug!("pool reconcile task");
     let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -378,6 +423,18 @@ async fn pool_reconcile(
         }
 
         while serve_pool.live() < serve_pool.desired() {
+            // A parked connection is reused before dialing: the probe cycle
+            // at a capacity ceiling then costs no reconnect (ADR-053). A
+            // stale parked backend that died meanwhile poisons on first use
+            // and replenishes through the normal path.
+            let unparked = parked_lock(&parked).take();
+            if let Some((conn, _)) = unparked {
+                if conn_tx.send(conn).await.is_err() {
+                    break 'outer;
+                }
+                serve_pool.live_add(1);
+                continue;
+            }
             // Reconnect with capped backoff; abandon on subsystem teardown.
             let mut backoff = POOL_REPLENISH_INITIAL_BACKOFF;
             let conn = loop {
