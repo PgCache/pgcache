@@ -23,6 +23,7 @@ use crate::{
 
 use super::population_pool::PopulationPool;
 use super::reg_gate::RegGate;
+use super::serve_pool_state::ServePool;
 use super::update_query::UpdateQueries;
 
 /// Shared resolved query expression, wrapped in Arc to avoid deep cloning
@@ -254,6 +255,9 @@ pub struct CacheStateView {
     /// Elastic population worker pool (PGC-437): worker-published demand and
     /// service-time counters, and the controller's worker-count target.
     pub population_pool: Arc<PopulationPool>,
+    /// Elastic cache serve pool (ADR-053): serve-loop-published demand and
+    /// service-time counters, and the controller's connection-count target.
+    pub serve_pool: Arc<ServePool>,
     /// Settled watermark (raw `Lsn`) published by the writer so
     /// per-connection read-after-write logs can clear their pending writes once
     /// it passes each write's commit-LSN bound (PGC-124): every origin
@@ -298,6 +302,7 @@ impl CacheStateView {
             recycle_count: Arc::new(AtomicUsize::new(0)),
             reg_gate: Arc::new(RegGate::new()),
             population_pool: Arc::new(PopulationPool::new(0)),
+            serve_pool: Arc::new(ServePool::default()),
             settled_lsn: Arc::new(AtomicU64::new(0)),
             received_lsn: Arc::new(AtomicU64::new(0)),
             memo: ResultMemo::new(dynamic),

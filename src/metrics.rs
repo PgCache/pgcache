@@ -259,6 +259,13 @@ pub mod names {
     /// Idle (available) cache-DB serve-pool connections. A sustained 0 with serves
     /// in flight is pool exhaustion (PGC-278).
     pub const CACHE_POOL_AVAILABLE: &str = "pgcache.cache.pool_available";
+    /// Live serve-pool connection count (elastic pool, ADR-053).
+    pub const CACHE_SERVE_POOL_SIZE: &str = "pgcache.cache.serve_pool_size";
+    /// Elastic serve-pool scale events (ADR-053); backstop grows are steps
+    /// taken while the verify signal was indeterminate.
+    pub const CACHE_SERVE_POOL_SCALE_UP: &str = "pgcache.cache.serve_pool_scale_up";
+    pub const CACHE_SERVE_POOL_SCALE_DOWN: &str = "pgcache.cache.serve_pool_scale_down";
+    pub const CACHE_SERVE_POOL_BACKSTOP_GROWS: &str = "pgcache.cache.serve_pool_backstop_grows";
     /// Serves that exceeded the stall deadline (poisoned + forwarded to origin) —
     /// a stuck cache-DB read or a response desync (PGC-278).
     pub const CACHE_SERVE_STALL_TOTAL: &str = "pgcache.cache.serve_stall_total";
@@ -521,6 +528,10 @@ pub struct CacheHandles {
     /// Serve-pool liveness observability (PGC-278).
     pub serves_in_flight: Gauge,
     pub pool_available: Gauge,
+    pub serve_pool_size: Gauge,
+    pub serve_pool_scale_up: Counter,
+    pub serve_pool_scale_down: Counter,
+    pub serve_pool_backstop_grows: Counter,
     pub serve_stall_total: Counter,
     pub serve_dirty_return_total: Counter,
     pub serve_desync_total: Counter,
@@ -717,6 +728,10 @@ impl Handles {
                 registration_throttled_total: metrics::counter!(CACHE_REGISTRATION_THROTTLED_TOTAL),
                 serves_in_flight: metrics::gauge!(CACHE_SERVES_IN_FLIGHT),
                 pool_available: metrics::gauge!(CACHE_POOL_AVAILABLE),
+                serve_pool_size: metrics::gauge!(CACHE_SERVE_POOL_SIZE),
+                serve_pool_scale_up: metrics::counter!(CACHE_SERVE_POOL_SCALE_UP),
+                serve_pool_scale_down: metrics::counter!(CACHE_SERVE_POOL_SCALE_DOWN),
+                serve_pool_backstop_grows: metrics::counter!(CACHE_SERVE_POOL_BACKSTOP_GROWS),
                 serve_stall_total: metrics::counter!(CACHE_SERVE_STALL_TOTAL),
                 serve_dirty_return_total: metrics::counter!(CACHE_SERVE_DIRTY_RETURN_TOTAL),
                 serve_desync_total: metrics::counter!(CACHE_SERVE_DESYNC_TOTAL),

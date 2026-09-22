@@ -12,6 +12,7 @@ use crate::cache::explain::handle_explain_request;
 use crate::cache::messages::{CacheOutcome, CacheReply, slices_concat};
 use crate::cache::query_cache::{ServeJob, ServeRequest};
 use crate::cache::serve::{CoalescedOutcome, SQLSTATE_UNDEFINED_TABLE, handle_cached_query};
+use crate::cache::serve_pool_state::ServePool;
 use crate::cache::types::CacheStateView;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::pg::cache_connection::CacheConnection;
@@ -20,8 +21,33 @@ use crate::result::error_chain_format;
 use crate::settings::Settings;
 use crate::timing::duration_to_us_u64;
 
-/// Minimum number of connections in the cache serve pool.
-pub(super) const MIN_POOL_SIZE: usize = 4;
+use super::pool_controller::{PoolController, PoolControllerConfig, StepKind, TickSample};
+
+/// Elastic serve-pool bounds (ADR-053): the floor keeps light traffic served
+/// without ramp-up latency; the ceiling is the cache-PG protection bound and
+/// what the memory monitor budgets backend RSS against. The operating size
+/// between them is found by the probe-and-verify controller, not configured.
+pub(super) fn serve_pool_bounds(num_workers: usize) -> (usize, usize) {
+    (num_workers * 2, num_workers * 8)
+}
+
+/// Serve-pool controller thresholds (ADR-053). Serves are millisecond-scale
+/// cache-PG queries, so tens of milliseconds of queue wait is already the
+/// harm signal (populations use 250ms; see ADR-052). Initial value — revisit
+/// against bench evidence.
+const CONTROLLER_CONFIG: PoolControllerConfig = PoolControllerConfig {
+    wait_target: Duration::from_millis(25),
+    verify_beta: 0.5,
+    verify_min_completions: 5,
+    probe_hold_ticks: 5,
+    backstop_ticks: 5,
+    spawn_wait_ticks: 5,
+    rho_shrink: 0.6,
+    down_ticks: 30,
+};
+
+/// Controller tick.
+const CONTROLLER_TICK: Duration = Duration::from_secs(1);
 
 /// Interval between serve-pool connection recycles while under memory pressure.
 /// One connection per tick → the whole pool refreshes over `pool_size × this`
@@ -117,19 +143,21 @@ async fn handle_serve_request(
     debug!("cache serve task done");
 }
 
-/// Creates cache database connections and returns them as a channel pair.
-/// Connections are immediately available in the receiver.
+/// Creates the pool channel with capacity for the elastic maximum and fills
+/// it to the starting size. Connections are immediately available in the
+/// receiver; the reconciler grows and shrinks the live set between the bounds.
 async fn connection_pool_create(
     settings: &Settings,
-    size: usize,
+    initial: usize,
+    capacity: usize,
 ) -> CacheResult<(Sender<CacheConnection>, Receiver<CacheConnection>)> {
-    let (tx, rx) = channel(size);
+    let (tx, rx) = channel(capacity);
 
-    for i in 0..size {
+    for i in 0..initial {
         debug!(
             "Creating connection {}/{} to cache db at {}:{}",
             i + 1,
-            size,
+            initial,
             settings.cache.host,
             settings.cache.port
         );
@@ -141,7 +169,7 @@ async fn connection_pool_create(
         tx.send(conn).await.map_err(|_| CacheError::NoConnection)?;
     }
 
-    debug!("Created {} connections", size);
+    debug!("Created {} connections", initial);
     Ok((tx, rx))
 }
 
@@ -170,8 +198,9 @@ pub(super) async fn serve_loop(
     debug!("cache serve loop");
     #[cfg(feature = "fault-injection")]
     crate::cache::serve::fault::init();
-    let pool_size = (settings.num_workers * 2).max(MIN_POOL_SIZE);
-    let (conn_tx, mut conn_rx) = match connection_pool_create(&settings, pool_size).await {
+    let (pool_min, pool_max) = serve_pool_bounds(settings.num_workers);
+    let serve_pool = Arc::clone(&state_view.serve_pool);
+    let (conn_tx, mut conn_rx) = match connection_pool_create(&settings, pool_min, pool_max).await {
         Ok(pool) => pool,
         Err(e) => {
             error!(
@@ -182,16 +211,20 @@ pub(super) async fn serve_loop(
             return;
         }
     };
+    serve_pool.desired_set(pool_min);
+    serve_pool.live_add(pool_min);
 
-    // Replenish channel: a poisoned-connection discard signals here, and
-    // `pool_replenish` reconnects a replacement so the pool stays at capacity
-    // (PGC-238). Unbounded — signals are unit-sized and bounded by pool_size.
+    // Reconcile channel: a lost connection (poison discard, mid-flight loss,
+    // recycle) signals here, and `pool_reconcile` keeps the live set at the
+    // controller's desired size (ADR-053; replenish semantics from PGC-238).
+    // Unbounded — signals are unit-sized and bounded by pool size.
     let (replenish_tx, replenish_rx) = unbounded_channel::<()>();
-    tokio::spawn(pool_replenish(
+    tokio::spawn(pool_reconcile(
         settings.clone(),
         conn_tx.clone(),
         replenish_rx,
         cancel.clone(),
+        Arc::clone(&serve_pool),
     ));
 
     // Recycle one idle connection per tick while the monitor flags memory pressure
@@ -218,6 +251,7 @@ pub(super) async fn serve_loop(
                     state_view.recycle_count.fetch_add(1, Ordering::Relaxed);
                     crate::metrics::handles().cache.pool_recycled.increment(1);
                 }
+                pool_shrink_apply(&serve_pool, &mut conn_rx);
                 continue;
             }
             msg = serve_rx.recv() => {
@@ -226,6 +260,10 @@ pub(super) async fn serve_loop(
             }
         };
         msg.timing_mut().worker_received_at = Some(Instant::now());
+
+        // Retire surplus idle connections the controller no longer wants
+        // before taking one for this serve.
+        pool_shrink_apply(&serve_pool, &mut conn_rx);
 
         // Wait for an available connection
         let conn = if let Ok(conn) = conn_rx.try_recv() {
@@ -238,7 +276,15 @@ pub(super) async fn serve_loop(
             };
             conn
         };
-        msg.timing_mut().conn_acquired_at = Some(Instant::now());
+        let acquired_at = Instant::now();
+        msg.timing_mut().conn_acquired_at = Some(acquired_at);
+        // Queue-pressure signal for the pool controller: dispatch → connection
+        // acquired covers both the serve-queue and the pool wait.
+        if let Some(dispatched) = msg.timing_mut().dispatched_at {
+            serve_pool.wait_observe(duration_to_us_u64(
+                acquired_at.saturating_duration_since(dispatched),
+            ));
+        }
 
         // Spawn the serve (request + connection) onto the shared runtime.
         let return_tx = conn_tx.clone();
@@ -256,6 +302,7 @@ pub(super) async fn serve_loop(
             .cache
             .serves_in_flight
             .increment(1.0);
+        let serve_pool_task = Arc::clone(&serve_pool);
         tokio::spawn(async move {
             // Decrement on drop, not fall-through, so a panicking or
             // cancelled serve still balances the gauge (PGC-278).
@@ -268,6 +315,8 @@ pub(super) async fn serve_loop(
                     handle_explain_request(conn, return_tx, replenish_tx, job, &state_view).await;
                 }
             }
+            // Service-time signal for the pool controller (both job kinds).
+            serve_pool_task.task_observe(duration_to_us_u64(acquired_at.elapsed()));
         });
 
         // Channel depth gauge; queue length never approaches 2^53.
@@ -281,61 +330,142 @@ pub(super) async fn serve_loop(
     debug!("cache serve loop exiting");
 }
 
-/// Replenishes the cache-DB serve pool: each signal from a poisoned-connection
-/// discard triggers one reconnection, keeping the pool at `pool_size` so it can
-/// never permanently shrink (PGC-238). The bounded pool channel always has room
-/// for the replacement because the discard vacated a slot. Lives for the
+/// Drop idle connections beyond the controller's desired size. Only idle
+/// connections are retired (`try_recv`), so an in-flight serve is never
+/// interrupted; a checked-out surplus connection is caught on a later pass.
+fn pool_shrink_apply(serve_pool: &ServePool, conn_rx: &mut Receiver<CacheConnection>) {
+    while serve_pool.live() > serve_pool.desired() {
+        let Ok(conn) = conn_rx.try_recv() else {
+            return;
+        };
+        drop(conn);
+        serve_pool.live_sub(1);
+        crate::metrics::handles()
+            .cache
+            .serve_pool_scale_down
+            .increment(1);
+    }
+}
+
+/// Maintains the serve pool at the controller's desired size (ADR-053).
+/// Each signal reports one permanently lost connection (poisoned discard,
+/// mid-flight loss, or recycle drop — PGC-238/278/251); a periodic tick picks
+/// up controller growth. Reconnects with capped backoff; the pool channel has
+/// capacity for the elastic maximum, so sends cannot block. Lives for the
 /// generation — cancelled on subsystem teardown, or exits when the last
 /// `replenish_tx` (serve loop + in-flight serves) drops.
-async fn pool_replenish(
+async fn pool_reconcile(
     settings: Settings,
     conn_tx: Sender<CacheConnection>,
     mut replenish_rx: UnboundedReceiver<()>,
     cancel: CancellationToken,
+    serve_pool: Arc<ServePool>,
 ) {
-    debug!("pool replenish task");
-    loop {
+    debug!("pool reconcile task");
+    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    'outer: loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             signal = replenish_rx.recv() => {
                 if signal.is_none() {
                     break;
                 }
+                serve_pool.live_sub(1);
             }
+            _ = tick.tick() => {}
         }
 
-        // Reconnect with capped backoff; abandon on subsystem teardown.
-        let mut backoff = POOL_REPLENISH_INITIAL_BACKOFF;
-        let conn = loop {
-            match CacheConnection::connect(&settings.cache).await {
-                Ok(conn) => break Some(conn),
-                Err(e) => {
-                    error!(
-                        "serve-pool reconnect failed, retrying: {}",
-                        error_chain_format(e.current_context())
-                    );
-                    tokio::select! {
-                        _ = cancel.cancelled() => break None,
-                        _ = tokio::time::sleep(backoff) => {}
+        while serve_pool.live() < serve_pool.desired() {
+            // Reconnect with capped backoff; abandon on subsystem teardown.
+            let mut backoff = POOL_REPLENISH_INITIAL_BACKOFF;
+            let conn = loop {
+                match CacheConnection::connect(&settings.cache).await {
+                    Ok(conn) => break conn,
+                    Err(e) => {
+                        error!(
+                            "serve-pool reconnect failed, retrying: {}",
+                            error_chain_format(e.current_context())
+                        );
+                        tokio::select! {
+                            _ = cancel.cancelled() => break 'outer,
+                            _ = tokio::time::sleep(backoff) => {}
+                        }
+                        backoff = (backoff * 2).min(POOL_REPLENISH_MAX_BACKOFF);
                     }
-                    backoff = (backoff * 2).min(POOL_REPLENISH_MAX_BACKOFF);
                 }
-            }
-        };
-        let Some(conn) = conn else { break };
+            };
 
-        // The discard freed a slot, so this send cannot block on a full pool;
-        // an error means the pool channel closed (teardown).
-        if conn_tx.send(conn).await.is_err() {
-            break;
+            // An error means the pool channel closed (teardown).
+            if conn_tx.send(conn).await.is_err() {
+                break 'outer;
+            }
+            serve_pool.live_add(1);
+            crate::metrics::handles()
+                .cache
+                .pool_replenished
+                .increment(1);
         }
-        crate::metrics::handles()
-            .cache
-            .pool_replenished
-            .increment(1);
     }
 
-    debug!("pool replenish task exiting");
+    debug!("pool reconcile task exiting");
+}
+
+/// Elastic serve pool controller (ADR-053): probes the connection count
+/// upward while serve queue wait is breached — verifying each step against
+/// measured serve throughput — and shrinks on sustained low utilization,
+/// bounded by [`serve_pool_bounds`]. The serve loop's reconcile task applies
+/// the target.
+pub(super) async fn serve_pool_controller(
+    state_view: Arc<CacheStateView>,
+    num_workers: usize,
+    cancel: CancellationToken,
+) {
+    let (pool_min, pool_max) = serve_pool_bounds(num_workers);
+    let pool = &state_view.serve_pool;
+    let mut controller = PoolController::new(pool_min, pool_max, CONTROLLER_CONFIG);
+    let mut prev = pool.counters();
+    let mut interval = tokio::time::interval(CONTROLLER_TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let handles = &crate::metrics::handles().cache;
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        let now = pool.counters();
+        let sample = TickSample {
+            task_us: now.0 - prev.0,
+            task_count: now.1 - prev.1,
+            wait_us: now.2 - prev.2,
+            wait_count: now.3 - prev.3,
+            live: pool.live(),
+            tick_seconds: CONTROLLER_TICK.as_secs_f64(),
+        };
+        prev = now;
+
+        let desired = pool.desired();
+        let (next, kind) = controller.step(sample, desired);
+        if next != desired {
+            pool.desired_set(next);
+            match kind {
+                StepKind::Grow => handles.serve_pool_scale_up.increment(1),
+                StepKind::GrowBackstop => {
+                    handles.serve_pool_scale_up.increment(1);
+                    handles.serve_pool_backstop_grows.increment(1);
+                }
+                // Applied lazily by `pool_shrink_apply`; counted there.
+                StepKind::Shrink | StepKind::Hold => {}
+            }
+            tracing::debug!(
+                "serve pool target {desired} -> {next} ({kind:?}, serves/tick={})",
+                sample.task_count,
+            );
+        }
+        // Live count as a gauge; pool sizes never approach 2^53.
+        #[allow(clippy::cast_precision_loss)]
+        handles.serve_pool_size.set(pool.live() as f64);
+    }
 }
 
 /// Balances the `serves_in_flight` gauge in `Drop` so panic and
@@ -423,5 +553,17 @@ impl Drop for ConnectionGuard {
             }
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serve_pool_bounds_scale_with_workers() {
+        assert_eq!(serve_pool_bounds(1), (2, 8));
+        assert_eq!(serve_pool_bounds(2), (4, 16));
+        assert_eq!(serve_pool_bounds(8), (16, 64));
     }
 }

@@ -25,7 +25,7 @@ use super::memory_monitor::{memory_monitor, shared_buffers_bytes_query};
 use super::population_pool::population_pool_controller;
 use super::reg_gate::reg_gate_controller;
 use super::reset::cache_database_reset;
-use super::serve_pool::{MIN_POOL_SIZE, serve_loop};
+use super::serve_pool::{serve_loop, serve_pool_bounds, serve_pool_controller};
 
 /// Build one generation of the cache subsystem.
 ///
@@ -192,12 +192,19 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         Arc::clone(&state_view),
     ));
     let shared_buffers = handle.block_on(shared_buffers_bytes_query(settings));
-    let serve_pool_size = (settings.num_workers * 2).max(MIN_POOL_SIZE);
+    // Budget backend RSS against the elastic maximum — conservative until the
+    // monitor learns to track the live size (ADR-053).
+    let (_, serve_pool_max) = serve_pool_bounds(settings.num_workers);
     handle.spawn(memory_monitor(
         Arc::clone(&state_view),
         settings.dynamic.clone(),
         shared_buffers,
-        serve_pool_size,
+        serve_pool_max,
+        cache_cancel.clone(),
+    ));
+    handle.spawn(serve_pool_controller(
+        Arc::clone(&state_view),
+        settings.num_workers,
         cache_cancel.clone(),
     ));
     handle.spawn(reg_gate_controller(

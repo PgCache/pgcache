@@ -49,6 +49,7 @@ mod runtime;
 #[cfg(feature = "proxy")]
 mod serve;
 pub mod serve_decision;
+mod serve_pool_state;
 #[cfg(feature = "proxy")]
 pub(crate) mod status;
 #[cfg(feature = "proxy")]
