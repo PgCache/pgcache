@@ -6,6 +6,7 @@ use crate::cache::CacheResult;
 
 mod cdc_driver;
 mod memory_monitor;
+mod pool_controller;
 mod population_pool;
 mod reg_gate;
 mod reset;
