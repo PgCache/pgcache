@@ -1,5 +1,15 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
+
+use tokio::sync::Notify;
+
+/// How long a parked worker holds its connection pair before exiting for
+/// real: long enough to absorb the controller's probe cycles at the
+/// hold-ladder cap, short enough that an origin connection the workload
+/// stopped needing is released (ADR-050's no-idle-connections intent —
+/// bounded to exactly one pair, briefly).
+pub const POPULATION_PARK_EXPIRY: Duration = Duration::from_secs(300);
 
 /// Shared state for the elastic population worker pool (PGC-437).
 ///
@@ -38,6 +48,15 @@ pub struct PopulationPool {
     /// Set by a spawn task whose connections failed; consumed by the writer's
     /// reconcile, which backs off further spawn attempts for a cooldown.
     spawn_failed: AtomicBool,
+    /// At most one retired worker parks with its connection pair instead of
+    /// exiting, so a probe cycle at a capacity ceiling reuses it rather than
+    /// tearing down and re-dialing origin (ADR-052/053 damping).
+    parked: AtomicUsize,
+    /// Unpark grant from the reconcile, consumed by the parked worker; also
+    /// the reconcile's pending-live count so a grant in flight isn't
+    /// double-filled by a spawn.
+    unpark_credits: AtomicUsize,
+    unpark_notify: Notify,
 }
 
 impl PopulationPool {
@@ -53,6 +72,9 @@ impl PopulationPool {
             free_ids: Mutex::new(Vec::new()),
             next_id: AtomicUsize::new(0),
             spawn_failed: AtomicBool::new(false),
+            parked: AtomicUsize::new(0),
+            unpark_credits: AtomicUsize::new(0),
+            unpark_notify: Notify::new(),
         }
     }
 
@@ -149,6 +171,66 @@ impl PopulationPool {
         }
     }
 
+    /// A retiring worker claims the single park slot (keeping its id and
+    /// connections). Returns false when the slot is taken — the worker then
+    /// exits for real.
+    pub fn park_claim(&self) -> bool {
+        self.parked
+            .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// A parked worker leaves the slot without resuming (expiry). Any grant
+    /// that raced in is swept by the caller via
+    /// [`unpark_credit_take`](Self::unpark_credit_take) *after* this, so no
+    /// stranded credit under-counts the reconcile's pending-live forever.
+    pub fn park_release(&self) {
+        self.parked.store(0, Ordering::Relaxed);
+    }
+
+    /// Reconcile-side: grant an unpark to a parked worker. Returns true only
+    /// when a *fresh* grant was issued this call — a grant already in flight
+    /// returns false so the reconcile falls through to spawning for the rest
+    /// of the deficit instead of spinning (the in-flight grant is counted via
+    /// [`unpark_pending`](Self::unpark_pending)).
+    pub fn unpark_request(&self) -> bool {
+        if self.parked.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        let granted = self
+            .unpark_credits
+            .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok();
+        if granted {
+            self.unpark_notify.notify_one();
+        }
+        granted
+    }
+
+    /// Unpark grants outstanding — the reconcile counts these as pending
+    /// live workers.
+    pub fn unpark_pending(&self) -> usize {
+        self.unpark_credits.load(Ordering::Relaxed)
+    }
+
+    /// Parked-worker side: consume the grant, if any.
+    pub fn unpark_credit_take(&self) -> bool {
+        self.unpark_credits
+            .compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// A parked worker resumes: leaves the park slot and rejoins the live set.
+    pub fn unpark_complete(&self) {
+        self.parked.store(0, Ordering::Relaxed);
+        self.live_workers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Wait for an unpark grant (parked-worker side).
+    pub async fn unpark_notified(&self) {
+        self.unpark_notify.notified().await;
+    }
+
     /// Return a retiring worker's id after a successful
     /// [`retire_claim`](Self::retire_claim) (the live count is already
     /// decremented, so plain `worker_exit` would double-count).
@@ -188,6 +270,52 @@ mod tests {
         pool.retired_id_return(a);
         assert_eq!(pool.live_workers(), 2);
         assert!(!pool.retire_claim());
+    }
+
+    #[test]
+    fn test_park_slot_is_single() {
+        let pool = PopulationPool::new(2);
+        assert!(pool.park_claim());
+        assert!(!pool.park_claim());
+        pool.park_release();
+        assert!(pool.park_claim());
+    }
+
+    #[test]
+    fn test_unpark_grant_flow_restores_live() {
+        let pool = PopulationPool::new(2);
+        let _a = pool.worker_reserve();
+        let _b = pool.worker_reserve();
+        let _c = pool.worker_reserve();
+        // Surplus worker retires into the park slot: live drops to desired.
+        assert!(pool.retire_claim());
+        assert!(pool.park_claim());
+        assert_eq!(pool.live_workers(), 2);
+        // Grant covers one deficit unit until consumed...
+        assert!(pool.unpark_request());
+        assert_eq!(pool.unpark_pending(), 1);
+        // ...and a second request is not a fresh grant (the reconcile falls
+        // through to spawning) while pending still counts the first.
+        assert!(!pool.unpark_request());
+        assert_eq!(pool.unpark_pending(), 1);
+        // The parked worker consumes it and rejoins.
+        assert!(pool.unpark_credit_take());
+        pool.unpark_complete();
+        assert_eq!(pool.live_workers(), 3);
+        assert_eq!(pool.unpark_pending(), 0);
+        assert!(!pool.unpark_request(), "no parked worker left to grant to");
+    }
+
+    #[test]
+    fn test_expiry_sweeps_stranded_credit() {
+        let pool = PopulationPool::new(2);
+        assert!(pool.park_claim());
+        assert!(pool.unpark_request());
+        // Worker expires just as the grant lands: release, then sweep.
+        pool.park_release();
+        assert!(pool.unpark_credit_take());
+        assert_eq!(pool.unpark_pending(), 0);
+        assert!(!pool.unpark_request());
     }
 
     #[test]

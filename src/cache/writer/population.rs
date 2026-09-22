@@ -1,3 +1,4 @@
+use crate::cache::population_pool::POPULATION_PARK_EXPIRY;
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::Fingerprint;
@@ -200,9 +201,13 @@ pub async fn population_worker(
     let mut idle_start = Instant::now();
     loop {
         if pool.retire_claim() {
-            pool.retired_id_return(id);
-            debug!("population worker {id} retired (pool shrink)");
-            return;
+            if population_worker_park(&pool).await {
+                debug!("population worker {id} unparked (probe reuse)");
+            } else {
+                pool.retired_id_return(id);
+                debug!("population worker {id} retired (pool shrink)");
+                return;
+            }
         }
         let (slot_tx, slot_rx) = oneshot::channel();
         if idle_tx.send(slot_tx).is_err() {
@@ -755,6 +760,38 @@ fn batch_sql_build(
     }
     sql.push_str(insert_suffix);
     sql
+}
+
+/// Park a retired worker instead of exiting: hold the connection pair until
+/// the reconcile grants an unpark (resume: true) or the park expires
+/// (exit: false). The credit CAS arbitrates the expiry/grant race, and a
+/// grant that lands after expiry is swept post-release so the reconcile's
+/// pending count can't stay stuck (ADR-052/053 damping).
+async fn population_worker_park(pool: &PopulationPool) -> bool {
+    if !pool.park_claim() {
+        return false;
+    }
+    let expiry = tokio::time::Instant::now() + POPULATION_PARK_EXPIRY;
+    loop {
+        if pool.unpark_credit_take() {
+            pool.unpark_complete();
+            return true;
+        }
+        if tokio::time::timeout_at(expiry, pool.unpark_notified())
+            .await
+            .is_err()
+        {
+            // Expired: final grant check, then leave the slot and sweep any
+            // grant that raced in after that check.
+            if pool.unpark_credit_take() {
+                pool.unpark_complete();
+                return true;
+            }
+            pool.park_release();
+            let _ = pool.unpark_credit_take();
+            return false;
+        }
+    }
 }
 
 #[cfg(test)]

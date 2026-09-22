@@ -195,7 +195,11 @@ impl WriterRegistration {
             }
             self.spawn_cooldown_until.set(None);
         }
-        while pool.live_workers() < pool.desired_workers() {
+        while pool.live_workers() + pool.unpark_pending() < pool.desired_workers() {
+            // A parked worker covers one deficit unit without a reconnect.
+            if pool.unpark_request() {
+                continue;
+            }
             let id = pool.worker_reserve();
             let ctx = self.spawn_ctx.clone();
             spawn_local(async move {
