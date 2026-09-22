@@ -78,10 +78,14 @@ Replace the model with two feedback loops; no service-time baseline at all.
 
 ## Implementation Notes
 
-- `cache/runtime/population_pool.rs` — `PoolController::step` remains a pure
-  function (`ProbeState`: Idle / AwaitVerify / Hold); thresholds are internal
-  constants, not settings (per ADR-050's stance). The writer-side reconcile,
-  worker self-retire, and spawn-failure cooldown (ADR-050) are unchanged.
+- `PoolController::step` remains a pure function (`ProbeState`: Idle /
+  AwaitVerify / Hold); thresholds are internal constants, not settings (per
+  ADR-050's stance). The writer-side reconcile, worker self-retire, and
+  spawn-failure cooldown (ADR-050) are unchanged.
+- The controller was extracted to `cache/runtime/pool_controller.rs` behind
+  `PoolControllerConfig` and is shared with the elastic serve pool
+  (ADR-053); the population thresholds live in
+  `cache/runtime/population_pool.rs`.
 - `population_task_floor_seconds` was removed with its only consumer;
   `population_backstop_grows` added.
 - Amends ADR-050 (controller core only; pool mechanics stand).

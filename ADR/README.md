@@ -41,7 +41,8 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 ## Caching tiers & serving
 - [ADR-010](ADR-010-population-worker-pool.md) — Persistent population worker pool *(amended by ADR-050)*
 - [ADR-050](ADR-050-elastic-population-pool.md) — Elastic population pool: shared queue + Little's-law BBR-lite sizing *(amends ADR-010; controller superseded by ADR-052)*
-- [ADR-052](ADR-052-probe-and-verify-population-controller.md) — Probe-and-verify population controller: measured growth, utilization shrink *(amends ADR-050)*
+- [ADR-052](ADR-052-probe-and-verify-population-controller.md) — Probe-and-verify population controller: measured growth, utilization shrink *(amends ADR-050; controller shared with ADR-053)*
+- [ADR-053](ADR-053-elastic-serve-pool.md) — Elastic cache serve pool: shared probe-and-verify controller sizes the cache-PG connections *(amends ADR-052)*
 - [ADR-020](ADR-020-table-allowlist.md) — Optional table allowlist restricting what is cached
 - [ADR-023](ADR-023-pinned-queries.md) — Pinned queries: pre-populate and protect from eviction
 - [ADR-026](ADR-026-request-coalescing.md) — Request coalescing for Loading-state queries
