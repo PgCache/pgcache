@@ -86,6 +86,10 @@ Replace the model with two feedback loops; no service-time baseline at all.
   `PoolControllerConfig` and is shared with the elastic serve pool
   (ADR-053); the population thresholds live in
   `cache/runtime/population_pool.rs`.
+- The refute hold escalates (doubling per consecutive refute, capped) so a
+  stable capacity ceiling is probed at a decaying cadence instead of a fixed
+  churn cycle; the ladder resets on a confirmed grow or a sustained healthy
+  streak — never on a single sub-target tick at a hovering ceiling.
 - `population_task_floor_seconds` was removed with its only consumer;
   `population_backstop_grows` added.
 - Amends ADR-050 (controller core only; pool mechanics stand).

@@ -18,6 +18,7 @@ const CONFIG: PoolControllerConfig = PoolControllerConfig {
     verify_beta: 0.5,
     verify_min_completions: 5,
     probe_hold_ticks: 5,
+    probe_hold_max_ticks: 60,
     backstop_ticks: 5,
     spawn_wait_ticks: 5,
     rho_shrink: 0.6,

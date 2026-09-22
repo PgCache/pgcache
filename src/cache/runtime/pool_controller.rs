@@ -18,8 +18,13 @@ pub(super) struct PoolControllerConfig {
     /// Completions a verify tick needs before its throughput delta is judged
     /// at all; below this the verdict is indeterminate (the backstop path).
     pub verify_min_completions: u64,
-    /// Ticks a refuted probe holds before probing again while the breach lasts.
+    /// Ticks a refuted probe holds before probing again while the breach
+    /// lasts. Doubles per consecutive refute up to [`Self::probe_hold_max_ticks`]:
+    /// a stable ceiling is probed at a decaying cadence instead of a fixed
+    /// churn cycle.
     pub probe_hold_ticks: u32,
+    /// Cap on the escalating refute hold.
+    pub probe_hold_max_ticks: u32,
     /// Cadence of backstop growth while verify is indeterminate and the wait
     /// breach persists: slow enough to bound congestion amplification, fast
     /// enough that a signal-starved storm still reaches the max in tens of
@@ -78,6 +83,11 @@ enum ProbeState {
     },
 }
 
+/// Consecutive healthy (sub-target wait) ticks before the probe state and the
+/// refute-hold ladder reset. At a hovering ceiling, single noisy healthy
+/// ticks must not restart eager probing.
+const HEALTHY_RESET_TICKS: u32 = 5;
+
 /// Pure state machine so the policy is unit-testable without a runtime.
 pub(super) struct PoolController {
     min: usize,
@@ -86,6 +96,10 @@ pub(super) struct PoolController {
     probe: ProbeState,
     backstop_ticks: u32,
     shrink_streak: u32,
+    /// Refutes since the last confirmed grow or sustained-healthy reset;
+    /// drives the escalating hold.
+    consecutive_refutes: u32,
+    healthy_streak: u32,
 }
 
 impl PoolController {
@@ -97,6 +111,8 @@ impl PoolController {
             probe: ProbeState::Idle,
             backstop_ticks: 0,
             shrink_streak: 0,
+            consecutive_refutes: 0,
+            healthy_streak: 0,
         }
     }
 
@@ -113,10 +129,16 @@ impl PoolController {
             .map_or(Duration::ZERO, Duration::from_micros);
 
         if wait_now <= self.config.wait_target {
-            // Healthy queue: re-arm the probe and consider shrinking on
-            // sustained low utilization of the live members.
-            self.probe = ProbeState::Idle;
-            self.backstop_ticks = 0;
+            // Healthy queue: after a sustained streak (not one noisy tick at
+            // a hovering ceiling), re-arm the probe and the hold ladder; and
+            // consider shrinking on sustained low utilization of the live
+            // members.
+            self.healthy_streak += 1;
+            if self.healthy_streak >= HEALTHY_RESET_TICKS {
+                self.probe = ProbeState::Idle;
+                self.backstop_ticks = 0;
+                self.consecutive_refutes = 0;
+            }
             let busy = sample.task_us as f64 / 1e6;
             let capacity = sample.live as f64 * sample.tick_seconds;
             if sample.live > 0 && desired > self.min && busy < self.config.rho_shrink * capacity {
@@ -133,6 +155,7 @@ impl PoolController {
 
         // Wait breached: probe upward.
         self.shrink_streak = 0;
+        self.healthy_streak = 0;
         match self.probe {
             ProbeState::Hold { ticks_left } => {
                 self.probe = if ticks_left > 1 {
@@ -191,15 +214,22 @@ impl PoolController {
                 let s_now = sample.task_us as f64 / sample.task_count as f64 / 1e6;
                 let expected = self.config.verify_beta / s_now.max(1e-6);
                 if x_now - baseline_x >= expected {
-                    // Confirmed: the added member delivered; keep stepping.
+                    // Confirmed: the added member delivered; keep stepping,
+                    // and reset the hold ladder — the ceiling moved.
+                    self.consecutive_refutes = 0;
                     self.probe_step(x_now, desired, StepKind::Grow)
                 } else {
                     // Refuted with a valid measurement: adding a member did
                     // not raise throughput — the backend is the bottleneck.
-                    // Back off and hold.
-                    self.probe = ProbeState::Hold {
-                        ticks_left: self.config.probe_hold_ticks,
-                    };
+                    // Back off and hold, doubling the hold per consecutive
+                    // refute so a stable ceiling converges to a slow cadence.
+                    let hold = self
+                        .config
+                        .probe_hold_ticks
+                        .saturating_mul(1 << self.consecutive_refutes.min(6))
+                        .min(self.config.probe_hold_max_ticks);
+                    self.consecutive_refutes = self.consecutive_refutes.saturating_add(1);
+                    self.probe = ProbeState::Hold { ticks_left: hold };
                     (clamp(desired.saturating_sub(1)), StepKind::Shrink)
                 }
             }
@@ -226,11 +256,12 @@ mod tests {
     use super::*;
 
     /// The population pool's thresholds (also the test reference config).
-    const CFG: PoolControllerConfig = PoolControllerConfig {
+    pub(super) const CFG: PoolControllerConfig = PoolControllerConfig {
         wait_target: Duration::from_millis(250),
         verify_beta: 0.5,
         verify_min_completions: 5,
         probe_hold_ticks: 5,
+        probe_hold_max_ticks: 60,
         backstop_ticks: 5,
         spawn_wait_ticks: 5,
         rho_shrink: 0.6,
@@ -239,7 +270,7 @@ mod tests {
 
     /// A breached-wait tick where `live` members each complete `per_member`
     /// tasks of `task_ms`.
-    fn storm(live: usize, per_member: u64, task_ms: u64) -> TickSample {
+    pub(super) fn storm(live: usize, per_member: u64, task_ms: u64) -> TickSample {
         let count = live as u64 * per_member;
         TickSample {
             task_us: task_ms * 1000 * count,
@@ -251,7 +282,7 @@ mod tests {
         }
     }
 
-    fn calm(live: usize, count: u64, task_ms: u64, wait_ms: u64) -> TickSample {
+    pub(super) fn calm(live: usize, count: u64, task_ms: u64, wait_ms: u64) -> TickSample {
         TickSample {
             task_us: task_ms * 1000 * count,
             task_count: count,
@@ -264,7 +295,7 @@ mod tests {
 
     /// A breached tick where total completions stay fixed no matter how many
     /// members are live — the congestion signature.
-    fn congested(live: usize, count: u64, task_ms: u64) -> TickSample {
+    pub(super) fn congested(live: usize, count: u64, task_ms: u64) -> TickSample {
         TickSample {
             task_us: task_ms * 1000 * count,
             task_count: count,
@@ -431,5 +462,150 @@ mod tests {
         let mut c = PoolController::new(2, 16, CFG);
         let (next, kind) = c.step(calm(2, 0, 0, 0), 2);
         assert_eq!((next, kind), (2, StepKind::Hold));
+    }
+}
+
+#[cfg(test)]
+mod ladder_tests {
+    #![allow(clippy::wildcard_enum_match_arm)]
+
+    use super::tests::congested;
+    use super::tests::{CFG, calm, storm};
+    use super::*;
+
+    /// Run refute cycles at a fixed ceiling and return the hold length (ticks
+    /// between a refute and the next probe) of each cycle.
+    fn hold_gaps(cycles: usize) -> Vec<u32> {
+        let mut c = PoolController::new(2, 16, CFG);
+        let mut desired = 4;
+        let mut gaps = Vec::new();
+        let mut hold_run: u32 = 0;
+        let mut seen_refute = false;
+        while gaps.len() < cycles {
+            let (next, kind) = c.step(congested(desired, 40, 90), desired);
+            match kind {
+                StepKind::Shrink => {
+                    seen_refute = true;
+                    hold_run = 0;
+                }
+                StepKind::Hold if seen_refute => hold_run += 1,
+                StepKind::Grow if seen_refute => {
+                    gaps.push(hold_run);
+                    hold_run = 0;
+                }
+                _ => {}
+            }
+            desired = next;
+        }
+        gaps
+    }
+
+    #[test]
+    fn test_refute_hold_escalates_and_caps() {
+        assert_eq!(hold_gaps(6), vec![5, 10, 20, 40, 60, 60]);
+    }
+
+    #[test]
+    fn test_confirmed_grow_resets_ladder() {
+        let mut c = PoolController::new(2, 16, CFG);
+        let mut desired = 4;
+        // Two refuted cycles escalate the ladder (next hold would be 20).
+        for _ in 0..40 {
+            let (next, _) = c.step(congested(desired, 40, 90), desired);
+            desired = next;
+        }
+        // The ceiling lifts: the first Grow is only the probe step — the
+        // ladder resets when the *next* tick confirms it (the second Grow).
+        let mut grows = 0;
+        while grows < 2 {
+            let (next, kind) = c.step(storm(desired, 12, 80), desired);
+            desired = next;
+            if kind == StepKind::Grow {
+                grows += 1;
+            }
+        }
+        // ...so after the next refute, the hold is back to the base length.
+        let mut hold_run = 0;
+        let mut refuted = false;
+        loop {
+            let (next, kind) = c.step(congested(desired, 40, 90), desired);
+            desired = next;
+            match kind {
+                StepKind::Shrink => {
+                    refuted = true;
+                    hold_run = 0;
+                }
+                StepKind::Hold if refuted => hold_run += 1,
+                StepKind::Grow if refuted => break,
+                _ => {}
+            }
+        }
+        assert_eq!(hold_run, 5, "confirm must reset the hold ladder");
+    }
+
+    #[test]
+    fn test_sustained_healthy_resets_ladder() {
+        let mut c = PoolController::new(2, 16, CFG);
+        let mut desired = 4;
+        for _ in 0..40 {
+            let (next, _) = c.step(congested(desired, 40, 90), desired);
+            desired = next;
+        }
+        // Breach resolves for a sustained streak: ladder re-arms.
+        for _ in 0..HEALTHY_RESET_TICKS {
+            let (next, _) = c.step(calm(desired, 40, 10, 1), desired);
+            desired = next;
+        }
+        let mut hold_run = 0;
+        let mut refuted = false;
+        loop {
+            let (next, kind) = c.step(congested(desired, 40, 90), desired);
+            desired = next;
+            match kind {
+                StepKind::Shrink => {
+                    refuted = true;
+                    hold_run = 0;
+                }
+                StepKind::Hold if refuted => hold_run += 1,
+                StepKind::Grow if refuted => break,
+                _ => {}
+            }
+        }
+        assert_eq!(hold_run, 5, "sustained healthy must reset the hold ladder");
+    }
+
+    #[test]
+    fn test_single_healthy_tick_does_not_reset_ladder() {
+        let mut c = PoolController::new(2, 16, CFG);
+        let mut desired = 4;
+        // Two full refuted cycles: ladder is at 20 for the next refute.
+        let mut refutes = 0;
+        while refutes < 2 {
+            let (next, kind) = c.step(congested(desired, 40, 90), desired);
+            if kind == StepKind::Shrink {
+                refutes += 1;
+            }
+            desired = next;
+        }
+        // One noisy healthy tick mid-hold...
+        let (next, _) = c.step(calm(desired, 40, 10, 1), desired);
+        desired = next;
+        // ...must not reset: the third refuted cycle still holds for 20.
+        let mut hold_run = 0;
+        let mut refuted = false;
+        loop {
+            let (next, kind) = c.step(congested(desired, 40, 90), desired);
+            desired = next;
+            match kind {
+                StepKind::Shrink => {
+                    refuted = true;
+                    hold_run = 0;
+                }
+                StepKind::Hold if refuted => hold_run += 1,
+                StepKind::Grow if refuted => break,
+                _ => {}
+            }
+        }
+        assert_eq!(hold_run, 20, "one healthy tick must not reset the ladder");
     }
 }
