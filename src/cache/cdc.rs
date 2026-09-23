@@ -236,7 +236,13 @@ impl CdcProcessor {
     async fn update_lsn(&mut self, xlog_data: &XLogDataBody<LogicalReplicationMessage>) {
         let lsn = Lsn::from_raw(xlog_data.wal_start());
         self.last_received_lsn = lsn;
-        self.received_lsn_shared.store(lsn.get(), Ordering::Relaxed);
+        // fetch_max: the keepalive path advances the shared cursor to the
+        // decoder's read position, which runs ahead of ReorderBuffer-buffered
+        // transactions — their wal_start arriving later must not regress the
+        // cursor (attribution would misread delivered writes as delivery lag,
+        // PGC-454). Same guard after a reconnect replays lower positions.
+        self.received_lsn_shared
+            .fetch_max(lsn.get(), Ordering::Relaxed);
         // LSNs past 2^53 lose precision in f64 (~9 PB of WAL — irrelevant).
         #[allow(clippy::cast_precision_loss)]
         crate::metrics::handles()
@@ -378,7 +384,7 @@ impl CdcProcessor {
             self.last_received_lsn = wal_end;
             self.last_decoded_lsn = wal_end;
             self.received_lsn_shared
-                .store(wal_end.get(), Ordering::Relaxed);
+                .fetch_max(wal_end.get(), Ordering::Relaxed);
             #[allow(clippy::cast_precision_loss)]
             crate::metrics::handles()
                 .cdc
