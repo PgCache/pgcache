@@ -316,11 +316,15 @@ pub(super) async fn serve_loop(
         };
         let acquired_at = Instant::now();
         msg.timing_mut().conn_acquired_at = Some(acquired_at);
-        // Queue-pressure signal for the pool controller: dispatch → connection
-        // acquired covers both the serve-queue and the pool wait.
-        if let Some(dispatched) = msg.timing_mut().dispatched_at {
+        // Queue-pressure signal for the pool controller: serve-queue plus
+        // pool wait. A coalesce-drained waiter keeps its original
+        // dispatched_at through the park, so its wait is measured from
+        // drain start instead — otherwise a multi-second population would
+        // read as pool pressure and drive spurious probes (PGC-453).
+        let timing = msg.timing_mut();
+        if let Some(origin) = timing.drain_started_at.or(timing.dispatched_at) {
             serve_pool.wait_observe(duration_to_us_u64(
-                acquired_at.saturating_duration_since(dispatched),
+                acquired_at.saturating_duration_since(origin),
             ));
         }
 
