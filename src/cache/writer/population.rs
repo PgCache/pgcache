@@ -87,6 +87,13 @@ async fn fault_population_delay() {}
 /// attempts every reconcile tick.
 pub(super) const POPULATION_SPAWN_COOLDOWN: Duration = Duration::from_secs(5);
 
+/// How long an idle worker waits for work before looping to re-evaluate
+/// retirement. The only retire/park check is at the loop top, which a worker
+/// suspended in the idle rendezvous never reaches — without a bounded wait a
+/// quiet pool never drains to its floor (PGC-455). Matches the controller's
+/// shrink cadence, so the pool releases about one worker per shrink step.
+const IDLE_RETIRE_RECHECK: Duration = Duration::from_secs(30);
+
 /// Everything needed to spawn one population worker outside `new()` (elastic
 /// scale-up, PGC-437).
 #[derive(Clone)]
@@ -221,8 +228,13 @@ pub async fn population_worker(
         if idle_tx.send(slot_tx).is_err() {
             break; // dispatcher gone: shutdown
         }
-        let Ok(work) = slot_rx.await else {
-            break; // dispatcher dropped the unused slot: shutdown
+        // Bounded wait (PGC-455): on timeout the abandoned slot reads as dead
+        // to the dispatcher — which already skips dead slots — and the loop
+        // top re-checks retirement before registering a fresh one.
+        let work = match tokio::time::timeout(IDLE_RETIRE_RECHECK, slot_rx).await {
+            Ok(Ok(work)) => work,
+            Ok(Err(_)) => break, // dispatcher dropped the unused slot: shutdown
+            Err(_) => continue,  // idle recheck
         };
         // Under memory pressure, skip populating the in-flight backlog: building
         // these cache tables/rows is what overshoots the budget after dispatch
