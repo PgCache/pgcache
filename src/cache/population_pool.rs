@@ -57,6 +57,9 @@ pub struct PopulationPool {
     /// double-filled by a spawn.
     unpark_credits: AtomicUsize,
     unpark_notify: Notify,
+    /// Work-queue depth hint, maintained by the dispatcher; the controller's
+    /// saturated-vs-idle discriminator for zero-observation ticks (PGC-452).
+    queue_depth: AtomicUsize,
 }
 
 impl PopulationPool {
@@ -75,6 +78,7 @@ impl PopulationPool {
             parked: AtomicUsize::new(0),
             unpark_credits: AtomicUsize::new(0),
             unpark_notify: Notify::new(),
+            queue_depth: AtomicUsize::new(0),
         }
     }
 
@@ -102,6 +106,14 @@ impl PopulationPool {
             self.wait_us.load(Ordering::Relaxed),
             self.wait_count.load(Ordering::Relaxed),
         )
+    }
+
+    pub fn queue_depth_set(&self, n: usize) {
+        self.queue_depth.store(n, Ordering::Relaxed);
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.queue_depth.load(Ordering::Relaxed)
     }
 
     pub fn desired_workers(&self) -> usize {

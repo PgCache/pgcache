@@ -361,7 +361,9 @@ pub(super) async fn serve_loop(
             serve_pool_task.task_observe(duration_to_us_u64(acquired_at.elapsed()));
         });
 
-        // Channel depth gauge; queue length never approaches 2^53.
+        // Channel depth gauge + controller backlog hint; queue length never
+        // approaches 2^53.
+        serve_pool.queue_depth_set(serve_rx.len());
         #[allow(clippy::cast_precision_loss)]
         crate::metrics::handles()
             .state
@@ -517,6 +519,7 @@ pub(super) async fn serve_pool_controller(
             wait_us: now.2 - prev.2,
             wait_count: now.3 - prev.3,
             live: pool.live(),
+            backlog: pool.queue_depth(),
             tick_seconds: CONTROLLER_TICK.as_secs_f64(),
         };
         prev = now;

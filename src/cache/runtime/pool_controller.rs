@@ -52,6 +52,12 @@ pub(super) struct TickSample {
     pub wait_us: u64,
     pub wait_count: u64,
     pub live: usize,
+    /// Queued work beyond what members hold in hand, sampled from the pool's
+    /// queue-depth hint. Distinguishes a saturated pool (members mid-task
+    /// longer than a tick: zero observations, backlog pending) from an idle
+    /// one — without it a saturated tick reads as healthy and shrinks
+    /// (PGC-452).
+    pub backlog: usize,
     pub tick_seconds: f64,
 }
 
@@ -122,6 +128,14 @@ impl PoolController {
     #[allow(clippy::cast_precision_loss)]
     pub(super) fn step(&mut self, sample: TickSample, desired: usize) -> (usize, StepKind) {
         let clamp = |n: usize| n.clamp(self.min, self.max);
+        // A tick with nothing observed but work pending is a saturated pool,
+        // not an idle one: every member is mid-task longer than the tick.
+        // No signal — freeze all streaks and holds rather than shrink the
+        // pool at the moment capacity is most needed (PGC-452).
+        if sample.task_count == 0 && sample.wait_count == 0 && sample.backlog > 0 && sample.live > 0
+        {
+            return (clamp(desired), StepKind::Hold);
+        }
         let x_now = sample.task_count as f64 / sample.tick_seconds;
         let wait_now = sample
             .wait_us
@@ -278,6 +292,7 @@ mod tests {
             wait_us: 2_000_000 * count.max(1),
             wait_count: count.max(1),
             live,
+            backlog: 0,
             tick_seconds: 1.0,
         }
     }
@@ -289,6 +304,7 @@ mod tests {
             wait_us: wait_ms * 1000 * count.max(1),
             wait_count: count.max(1),
             live,
+            backlog: 0,
             tick_seconds: 1.0,
         }
     }
@@ -302,6 +318,7 @@ mod tests {
             wait_us: 2_000_000 * count.max(1),
             wait_count: count.max(1),
             live,
+            backlog: 0,
             tick_seconds: 1.0,
         }
     }
@@ -455,6 +472,57 @@ mod tests {
         assert_eq!(next, 3);
         let (next, kind) = c.step(storm(3, 40, 20), 3);
         assert_eq!((next, kind), (3, StepKind::Hold));
+    }
+
+    /// PGC-452: a tick with zero observations but pending backlog is a
+    /// saturated pool (members mid-task longer than the tick) — it must not
+    /// advance the shrink streak, reset the ladder, or change desired.
+    #[test]
+    fn test_saturated_zero_observation_ticks_freeze() {
+        let mut c = PoolController::new(2, 16, CFG);
+        let mut desired = 6;
+        let frozen = TickSample {
+            task_us: 0,
+            task_count: 0,
+            wait_us: 0,
+            wait_count: 0,
+            live: 6,
+            backlog: 40,
+            tick_seconds: 1.0,
+        };
+        for _ in 0..(CFG.down_ticks * 3) {
+            let (next, kind) = c.step(frozen, desired);
+            assert_eq!((next, kind), (6, StepKind::Hold));
+            desired = next;
+        }
+        // Completions resume with a breach: probing starts immediately (the
+        // freeze preserved the Idle probe state).
+        let (next, kind) = c.step(storm(6, 12, 80), desired);
+        assert_eq!((next, kind), (7, StepKind::Grow));
+    }
+
+    /// Zero observations with NO backlog is a genuinely idle pool: the
+    /// utilization shrink must still work.
+    #[test]
+    fn test_idle_zero_observation_ticks_still_shrink() {
+        let mut c = PoolController::new(2, 16, CFG);
+        let mut desired = 6;
+        let idle = TickSample {
+            task_us: 0,
+            task_count: 0,
+            wait_us: 0,
+            wait_count: 0,
+            live: 6,
+            backlog: 0,
+            tick_seconds: 1.0,
+        };
+        for _ in 0..CFG.down_ticks - 1 {
+            let (next, _) = c.step(idle, desired);
+            assert_eq!(next, 6);
+            desired = next;
+        }
+        let (next, kind) = c.step(idle, desired);
+        assert_eq!((next, kind), (5, StepKind::Shrink));
     }
 
     #[test]

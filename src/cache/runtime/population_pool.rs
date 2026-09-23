@@ -54,6 +54,7 @@ pub(super) async fn population_pool_controller(
             wait_us: now.3 - prev.3,
             wait_count: now.4 - prev.4,
             live: pool.live_workers(),
+            backlog: pool.queue_depth(),
             tick_seconds: TICK.as_secs_f64(),
         };
         prev = now;

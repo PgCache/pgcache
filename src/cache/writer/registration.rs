@@ -145,7 +145,12 @@ impl WriterRegistration {
         // work item with the next idle worker.
         let (populate_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
         let (idle_tx, idle_rx) = tokio::sync::mpsc::unbounded_channel();
-        spawn_local(population_dispatcher(work_rx, idle_rx, query_tx.clone()));
+        spawn_local(population_dispatcher(
+            work_rx,
+            idle_rx,
+            query_tx.clone(),
+            Arc::clone(&pool),
+        ));
 
         pool.desired_workers_set(settings.population_workers_min);
         let spawn_ctx = PopulationSpawnContext {

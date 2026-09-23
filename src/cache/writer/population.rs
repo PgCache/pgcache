@@ -147,10 +147,13 @@ pub async fn population_dispatcher(
     mut work_rx: UnboundedReceiver<PopulationWork>,
     mut idle_rx: UnboundedReceiver<oneshot::Sender<PopulationWork>>,
     query_tx: UnboundedSender<QueryCommand>,
+    pool: Arc<PopulationPool>,
 ) {
     let queue_handle = crate::metrics::population_queue_handle();
     while let Some(mut work) = work_rx.recv().await {
-        // Queue length never approaches 2^53.
+        // Queue gauge + controller backlog hint (PGC-452); length never
+        // approaches 2^53.
+        pool.queue_depth_set(work_rx.len());
         #[allow(clippy::cast_precision_loss)]
         queue_handle.set(work_rx.len() as f64);
         loop {

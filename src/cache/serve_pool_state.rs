@@ -23,6 +23,9 @@ pub struct ServePool {
     desired: AtomicUsize,
     /// Connections currently in the pool or checked out.
     live: AtomicUsize,
+    /// Serve-queue depth hint, maintained by the serve loop; the controller's
+    /// saturated-vs-idle discriminator for zero-observation ticks (PGC-452).
+    queue_depth: AtomicUsize,
 }
 
 impl ServePool {
@@ -60,6 +63,14 @@ impl ServePool {
 
     pub fn live_add(&self, n: usize) {
         self.live.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn queue_depth_set(&self, n: usize) {
+        self.queue_depth.store(n, Ordering::Relaxed);
+    }
+
+    pub fn queue_depth(&self) -> usize {
+        self.queue_depth.load(Ordering::Relaxed)
     }
 
     pub fn live_sub(&self, n: usize) {
