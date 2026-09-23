@@ -80,7 +80,6 @@ impl WriteLog {
         if !self.enabled {
             return;
         }
-        crate::metrics::handles().raw.writes_recorded.increment(1);
         let seq = self.next_seq;
         self.next_seq += 1;
         // An unstampable connection-scoped write forwards every read until
@@ -89,6 +88,7 @@ impl WriteLog {
         if self.connection.unstampable {
             return;
         }
+        crate::metrics::handles().raw.writes_recorded.increment(1);
         match class {
             // Row-enumerable INSERT: keep the rows for row-level disjointness
             // (PGC-369), unless the table is already opaque or the rows overflow
