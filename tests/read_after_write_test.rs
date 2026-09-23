@@ -853,10 +853,8 @@ async fn test_gate_batch_portal_rebind_logs_each_execute() -> Result<(), Error> 
     // single Sync batch, then the read of id = 1 while the writes are
     // unsettled (1.5s injected apply lag). The read must see the row.
     let m = ctx.metrics().await?;
-    let output = crate::util::pgproto_run(
-        ctx.cache_port,
-        "tests/data/pgproto/raw_batch_rebind.data",
-    );
+    let output =
+        crate::util::pgproto_run(ctx.cache_port, "tests/data/pgproto/raw_batch_rebind.data");
     let rows = output.matches("<= BE DataRow").count();
     assert_eq!(
         rows, 1,
@@ -872,6 +870,41 @@ async fn test_gate_batch_portal_rebind_logs_each_execute() -> Result<(), Error> 
     assert_eq!(
         after.queries_cache_hit, 0,
         "the gated read must forward, not serve from cache"
+    );
+    Ok(())
+}
+
+/// PGC-446: a pending text write must never be proven disjoint from a read by
+/// byte *ordering* — byte order disagrees with collation order ('a' > 'B' in
+/// bytes, 'a' < 'B' under en_US). A pending `DELETE ... WHERE name < 'B'`
+/// must gate an equality read of 'a': byte order would "prove" 'a' outside
+/// the deleted range and serve the cached (pre-delete) row.
+#[tokio::test]
+async fn test_gate_string_ordering_never_proves_disjoint() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE raw_text (id int primary key, name text)", &[])
+        .await?;
+    ctx.query("INSERT INTO raw_text VALUES (1, 'a')", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT id, name FROM raw_text WHERE name = 'a'";
+    register(&mut ctx, q).await?;
+
+    // Pending range delete on the same connection removes 'a' at origin.
+    let m = ctx.metrics().await?;
+    ctx.simple_query("DELETE FROM raw_text WHERE name < 'B'")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(
+        row_count(&res),
+        0,
+        "the read must forward and observe its own pending delete"
+    );
+    let after = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        after.queries_cache_hit, 0,
+        "text ordering must not prove disjointness"
     );
     Ok(())
 }

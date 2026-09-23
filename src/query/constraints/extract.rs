@@ -17,7 +17,9 @@ use crate::query::resolved::{
     ResolvedScalarExpr, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
 };
 
-use super::range::{literal_value_is_incomparable, literal_value_order};
+use super::range::{
+    literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
+};
 use super::{ColumnConstraint, ColumnEquivalence, QueryConstraints, TableConstraint};
 
 /// Extract constraint information from any resolved WHERE expression.
@@ -192,8 +194,9 @@ fn in_constraints_extract(
         literal_values.push(v.clone());
     }
 
-    // Sort for deterministic Hash on ColumnConstraint::InSet
-    literal_values.sort_by(|a, b| literal_value_order(a, b).unwrap_or(Ordering::Equal));
+    // Sort for deterministic Hash on ColumnConstraint::InSet (canonical byte
+    // order — never a PG-semantic claim, PGC-446).
+    literal_values.sort_by(literal_value_canonical_order);
     literal_values.dedup();
 
     constraints.insert(ColumnConstraint::InSet {
@@ -259,8 +262,8 @@ fn any_eq_array_constraints_extract(
     }
 
     // Sort for deterministic Hash on ColumnConstraint::InSet (matching
-    // `in_constraints_extract`).
-    literal_values.sort_by(|a, b| literal_value_order(a, b).unwrap_or(Ordering::Equal));
+    // `in_constraints_extract`; canonical byte order, PGC-446).
+    literal_values.sort_by(literal_value_canonical_order);
     literal_values.dedup();
 
     constraints.insert(ColumnConstraint::InSet {

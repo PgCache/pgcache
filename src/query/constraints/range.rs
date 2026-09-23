@@ -172,17 +172,15 @@ pub(crate) fn column_range_contains(range: &ColumnRange, value: &LiteralValue) -
         ColumnRange::Unconstrained => Some(true),
         ColumnRange::Empty => Some(false),
         ColumnRange::Unknown => None,
-        ColumnRange::Equal(v) => {
-            literal_value_order_numeric(v, value).map(|o| o == Ordering::Equal)
-        }
+        ColumnRange::Equal(v) => literal_value_eq(v, value),
         ColumnRange::InSet(set) => {
             // Excluded only if provably unequal to *every* element; an element
             // incomparable to `value` leaves the membership undecidable.
             let mut all_unequal = true;
             for elem in set {
-                match literal_value_order_numeric(elem, value) {
-                    Some(Ordering::Equal) => return Some(true),
-                    Some(_) => {}
+                match literal_value_eq(elem, value) {
+                    Some(true) => return Some(true),
+                    Some(false) => {}
                     None => all_unequal = false,
                 }
             }
@@ -195,7 +193,7 @@ pub(crate) fn column_range_contains(range: &ColumnRange, value: &LiteralValue) -
         } => {
             if not_equal
                 .iter()
-                .any(|nv| literal_value_order_numeric(nv, value) == Some(Ordering::Equal))
+                .any(|nv| literal_value_eq(nv, value) == Some(true))
             {
                 return Some(false);
             }
@@ -661,8 +659,12 @@ pub(super) fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> 
     }
 }
 
-/// Compare two literal values for ordering. Returns None if the values
-/// are not comparable (different types, Parameters, Nulls).
+/// Compare two literal values for ordering. Returns None if the values are
+/// not comparable (different types, Parameters, Nulls) — and always for
+/// strings: byte order does not mirror PostgreSQL collation order (`'a' >
+/// 'B'` in bytes but `'a' < 'B'` under en_US), so an ordering claim over text
+/// could prove a false exclusion and serve stale data (PGC-446). String
+/// *equality* is decided by [`literal_value_eq`] instead.
 pub(super) fn literal_value_order(
     a: &LiteralValue,
     b: &LiteralValue,
@@ -670,9 +672,40 @@ pub(super) fn literal_value_order(
     match (a, b) {
         (LiteralValue::Integer(a), LiteralValue::Integer(b)) => Some(a.cmp(b)),
         (LiteralValue::Float(a), LiteralValue::Float(b)) => Some(a.cmp(b)),
-        (LiteralValue::String(a), LiteralValue::String(b)) => Some(a.cmp(b)),
-        (LiteralValue::StringWithCast(a, _), LiteralValue::StringWithCast(b, _)) => Some(a.cmp(b)),
         _ => None,
+    }
+}
+
+/// Whether two literal values are provably equal (`Some(true)`), provably
+/// unequal (`Some(false)`), or undecidable (`None`). Strings compare by
+/// bytes: PostgreSQL guarantees byte equality ⇔ collation equality for
+/// deterministic collations; explicitly-created nondeterministic collations
+/// (which PG itself heavily restricts) are a documented exclusion (PGC-446).
+pub(super) fn literal_value_eq(a: &LiteralValue, b: &LiteralValue) -> Option<bool> {
+    match (a, b) {
+        (LiteralValue::Integer(a), LiteralValue::Integer(b)) => Some(a == b),
+        (LiteralValue::Float(a), LiteralValue::Float(b)) => Some(a == b),
+        (LiteralValue::Integer(i), LiteralValue::Float(f))
+        | (LiteralValue::Float(f), LiteralValue::Integer(i)) => {
+            Some(int_float_cmp(*i, (*f).into_inner()) == Ordering::Equal)
+        }
+        (LiteralValue::String(a), LiteralValue::String(b)) => Some(a == b),
+        (LiteralValue::StringWithCast(a, _), LiteralValue::StringWithCast(b, _)) => Some(a == b),
+        _ => None,
+    }
+}
+
+/// Total order for canonicalization only (deterministic `InSet` hashing and
+/// dedup) — never a PostgreSQL-semantic claim, so byte order on strings is
+/// fine here. Incomparable pairs order as equal, matching the previous
+/// `unwrap_or(Equal)` at the sort sites.
+pub(super) fn literal_value_canonical_order(a: &LiteralValue, b: &LiteralValue) -> Ordering {
+    match (a, b) {
+        (LiteralValue::Integer(a), LiteralValue::Integer(b)) => a.cmp(b),
+        (LiteralValue::Float(a), LiteralValue::Float(b)) => a.cmp(b),
+        (LiteralValue::String(a), LiteralValue::String(b)) => a.cmp(b),
+        (LiteralValue::StringWithCast(a, _), LiteralValue::StringWithCast(b, _)) => a.cmp(b),
+        _ => Ordering::Equal,
     }
 }
 
@@ -1090,5 +1123,55 @@ mod tests {
             &ranges(&[("id", ColumnRange::Empty)]),
             &ranges(&[("other", ColumnRange::Equal(int(5)))]),
         ));
+    }
+    /// PGC-446: byte order is not collation order, so ordering claims over
+    /// strings must be undecidable — a false exclusion would serve stale data.
+    #[test]
+    fn test_string_ordering_is_undecidable() {
+        let a = LiteralValue::String("a".into());
+        let b = LiteralValue::String("B".into());
+        assert_eq!(literal_value_order(&a, &b), None);
+        // A text range bound cannot exclude a pending value ('a' < 'B' under
+        // en_US even though 'a' > 'B' in bytes).
+        let range = ColumnRange::Range {
+            lower: None,
+            upper: Some(RangeBound {
+                value: b,
+                inclusive: false,
+            }),
+            not_equal: vec![],
+        };
+        assert_eq!(column_range_contains(&range, &a), None);
+    }
+
+    /// String equality stays decidable by bytes (sound for deterministic
+    /// collations), so text-PK point disjointness is preserved.
+    #[test]
+    fn test_string_equality_still_decides() {
+        let a = LiteralValue::String("a".into());
+        let a2 = LiteralValue::String("a".into());
+        let b = LiteralValue::String("b".into());
+        assert_eq!(literal_value_eq(&a, &a2), Some(true));
+        assert_eq!(literal_value_eq(&a, &b), Some(false));
+        assert_eq!(
+            column_range_contains(&ColumnRange::Equal(a.clone()), &a2),
+            Some(true)
+        );
+        assert_eq!(
+            column_range_contains(&ColumnRange::Equal(a), &b),
+            Some(false)
+        );
+    }
+
+    /// The canonicalization comparator keeps a total byte order for strings —
+    /// hash determinism only, never a PG-semantic claim.
+    #[test]
+    fn test_canonical_order_sorts_strings() {
+        let mut values = [
+            LiteralValue::String("b".into()),
+            LiteralValue::String("a".into()),
+        ];
+        values.sort_by(literal_value_canonical_order);
+        assert_eq!(values[0], LiteralValue::String("a".into()));
     }
 }

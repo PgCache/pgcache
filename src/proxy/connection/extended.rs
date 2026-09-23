@@ -528,9 +528,7 @@ impl ConnectionState {
         // A Flush forwards the whole buffer, including sealed Executes — record
         // any writes among them before the buffer is consumed.
         if self.write_log.is_enabled() {
-            let classes = self.extended.buffer_peek().map(|buffer| {
-                buffer_write_classes(buffer)
-            });
+            let classes = self.extended.buffer_peek().map(buffer_write_classes);
             if let Some(classes) = classes {
                 for class in classes {
                     self.write_log.record(&class);
