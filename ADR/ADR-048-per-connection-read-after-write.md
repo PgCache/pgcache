@@ -41,6 +41,14 @@ Each connection maintains a per-connection **write log** of the writes it forwar
 - Row-level precision covers single-table INSERT reads only; joins, `UPDATE`/`DELETE`, and in-transaction serving stay table/connection-conservative (later stages).
 - Clearance liveness floor: when the WAL tail is non-decodable, entries clear only at the next keepalive, so the forward window can extend to the keepalive cadence (extra forwards, not a wedge).
 - The commit-LSN probe adds one origin round-trip per write-then-idle boundary.
+- **Known exclusion (PGC-447)**: the gate matches pending writes to reads by
+  relation *name*, so a write routed through an auto-updatable view, or
+  directly into a partition child while the parent is cached, is not matched
+  to reads of the underlying/parent table — such writes sit outside the
+  per-connection read-your-writes guarantee (CDC still corrects the cache;
+  the exposure is the same-connection commit→settle window). A point-in-time
+  name mapping goes stale on view creation / partition attach, so the fix is
+  deferred to origin schema-change observation (PGC-458).
 
 ## Implementation Notes
 The settled watermark is published as an atomic on the per-generation `CacheStateView` and read through the live dispatch, never a cached handle from a dead generation (which would read frozen-high). The gate lives in the `OriginDrain` arm of the connection loop; write classification runs at cacheability-analysis time. This is Stage 1 scope; UPDATE/DELETE predicate intersection and in-transaction serving are follow-ups.
