@@ -33,8 +33,9 @@ No Redis, no schema migration, no manual invalidation logic.
 ## Will it fit your workload?
 
 Find out before you install anything. The [Fit Analyzer](https://www.pgcache.com/fit)
-takes your real queries and shows how much of your workload pgcache can cache. It runs in
-your browser as WebAssembly: your queries are analyzed locally and never uploaded.
+takes your real queries and shows how much of your workload pgcache can cache. It runs the
+same query analysis as the proxy, compiled to WebAssembly and executed in your browser, so
+your queries are never uploaded.
 
 The quickest input is a `pg_stat_statements` export, which weights each query shape by
 calls and execution time:
