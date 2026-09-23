@@ -100,21 +100,25 @@ pub(super) struct PopulationSpawnContext {
 }
 
 /// Open one population worker's connection pair (origin + cache).
-pub(super) async fn population_worker_connect(
-    ctx: &PopulationSpawnContext,
-    id: usize,
-) -> CacheResult<(Client, Client)> {
-    let cache_conn = pg::connect(&ctx.cache_settings, &format!("population worker {id}"))
+/// Connect a worker's cache-side session, with staging NOTICE noise
+/// suppressed: setup runs `DROP TABLE IF EXISTS` defensively before every
+/// CREATE and the table almost never exists (names embed the generation).
+async fn population_cache_connect(settings: &PgSettings, id: usize) -> CacheResult<Client> {
+    let cache_conn = pg::connect(settings, &format!("population worker {id}"))
         .await
         .map_into_report::<CacheError>()?;
-    // Staging setup runs `DROP TABLE IF EXISTS` defensively before every
-    // CREATE; the table almost never exists (names embed the
-    // generation), so PG would emit a "does not exist, skipping" NOTICE
-    // per population — pure log noise. Suppress notices on this session.
     cache_conn
         .batch_execute("SET client_min_messages = warning")
         .await
         .map_into_report::<CacheError>()?;
+    Ok(cache_conn)
+}
+
+pub(super) async fn population_worker_connect(
+    ctx: &PopulationSpawnContext,
+    id: usize,
+) -> CacheResult<(Client, Client)> {
+    let cache_conn = population_cache_connect(&ctx.cache_settings, id).await?;
     // Each worker reads from origin on its own connection so the origin
     // executes population SELECTs concurrently rather than serializing
     // them on one shared backend.
@@ -185,11 +189,12 @@ pub async fn population_worker(
     id: usize,
     ctx: PopulationSpawnContext,
     mut db_origin: Client,
-    db_cache: Client,
+    mut db_cache: Client,
 ) {
     let PopulationSpawnContext {
         idle_tx,
         origin_settings,
+        cache_settings,
         query_tx,
         throttled,
         pool,
@@ -253,6 +258,25 @@ pub async fn population_worker(
                 Ok(c) => db_origin = c,
                 Err(e) => {
                     error!("population worker {id}: origin reconnect failed: {e}");
+                    let _ = query_tx.send(QueryCommand::Failed {
+                        fingerprint: work.fingerprint,
+                        generation: work.generation,
+                    });
+                    continue;
+                }
+            }
+        }
+        // The cache side dies the same ways (backend kill, reset) and every
+        // staging write needs it — without this check a dead cache connection
+        // made the worker a permanent population-failure sink (PGC-451).
+        if db_cache.is_closed() {
+            match population_cache_connect(&cache_settings, id).await {
+                Ok(c) => db_cache = c,
+                Err(e) => {
+                    error!(
+                        "population worker {id}: cache reconnect failed: {}",
+                        crate::result::error_chain_format(e.current_context())
+                    );
                     let _ = query_tx.send(QueryCommand::Failed {
                         fingerprint: work.fingerprint,
                         generation: work.generation,
