@@ -634,7 +634,14 @@ impl ConnectionState {
                         }
                     }
                 }
-                Err(_) => StatementType::ParseError,
+                // pg_query failed but origin may still parse it (parser
+                // version skew): any Execute of this statement could be a
+                // write, so record conservatively at connection scope — the
+                // same failure direction as the simple path (PGC-448).
+                Err(_) => {
+                    write_class = Some(WriteClass::Connection);
+                    StatementType::ParseError
+                }
             };
 
             let statement_name = parsed.statement_name.clone();

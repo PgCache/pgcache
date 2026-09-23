@@ -908,3 +908,23 @@ async fn test_gate_string_ordering_never_proves_disjoint() -> Result<(), Error> 
     );
     Ok(())
 }
+
+/// PGC-448: an Execute of a statement pg_query cannot parse must record
+/// conservatively at connection scope (parser version skew could make it a
+/// genuine write at origin), mirroring the simple path's failure direction.
+#[tokio::test]
+async fn test_gate_parse_error_execute_records_connection_scope() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[RAW_ON]).await?;
+    let m = ctx.metrics().await?;
+    let _ = crate::util::pgproto_run(
+        ctx.cache_port,
+        "tests/data/pgproto/parse_error_execute.data",
+    );
+    let after = metrics_delta(&m, &ctx.metrics().await?);
+    assert!(
+        after.raw_writes_recorded >= 1,
+        "parse-error execute must be recorded, delta: {}",
+        after.raw_writes_recorded
+    );
+    Ok(())
+}

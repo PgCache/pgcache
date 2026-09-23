@@ -1,0 +1,9 @@
+# PGC-448: a statement pg_query cannot parse still records conservatively at
+# connection scope when executed (origin may parse it under version skew).
+# Origin errors on this one, but the write log must not depend on that.
+'P'	"S1"	"FROBNICATE THE WIDGETS"	0
+'B'	""	"S1"	0	0	0
+'E'	""	0
+'S'
+'Y'
+'X'
