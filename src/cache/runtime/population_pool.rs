@@ -56,10 +56,10 @@ pub(super) async fn population_pool_controller(
         let elapsed = last_tick.elapsed().as_secs_f64().max(0.1);
         last_tick = std::time::Instant::now();
         let sample = TickSample {
-            task_us: now.1 - prev.1,
-            task_count: now.2 - prev.2,
-            wait_us: now.3 - prev.3,
-            wait_count: now.4 - prev.4,
+            task_us: now.0 - prev.0,
+            task_count: now.1 - prev.1,
+            wait_us: now.2 - prev.2,
+            wait_count: now.3 - prev.3,
             // Exclude in-flight connects: a probe's verify must wait for
             // the worker to materialize, not judge one that never ran
             // (PGC-456).

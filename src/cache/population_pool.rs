@@ -20,9 +20,6 @@ pub const POPULATION_PARK_EXPIRY: Duration = Duration::from_secs(300);
 /// are origin-I/O-bound, so the right worker count follows Little's law
 /// (arrival rate × service time), not the CPU-derived `num_workers`.
 pub struct PopulationPool {
-    /// Monotonic count of work items enqueued to the shared population queue.
-    /// The controller's demand estimate (λ) is `Δenqueued / Δt`.
-    enqueued: AtomicU64,
     /// Monotonic sum of population task time, in microseconds, and its count.
     /// The controller's service-time estimate (S) is `Δsum / Δcount`; its
     /// windowed minimum is the uncongested baseline (à la BBR min_rtt), and
@@ -71,7 +68,6 @@ pub struct PopulationPool {
 impl PopulationPool {
     pub fn new(initial_workers: usize) -> Self {
         Self {
-            enqueued: AtomicU64::new(0),
             task_us: AtomicU64::new(0),
             task_count: AtomicU64::new(0),
             wait_us: AtomicU64::new(0),
@@ -89,10 +85,6 @@ impl PopulationPool {
         }
     }
 
-    pub fn enqueued_mark(&self) {
-        self.enqueued.fetch_add(1, Ordering::Relaxed);
-    }
-
     pub fn task_observe(&self, micros: u64) {
         self.task_us.fetch_add(micros, Ordering::Relaxed);
         self.task_count.fetch_add(1, Ordering::Relaxed);
@@ -104,10 +96,9 @@ impl PopulationPool {
     }
 
     /// Controller-side snapshot of the monotonic counters:
-    /// `(enqueued, task_us, task_count, wait_us, wait_count)`.
-    pub fn counters(&self) -> (u64, u64, u64, u64, u64) {
+    /// `(task_us, task_count, wait_us, wait_count)`.
+    pub fn counters(&self) -> (u64, u64, u64, u64) {
         (
-            self.enqueued.load(Ordering::Relaxed),
             self.task_us.load(Ordering::Relaxed),
             self.task_count.load(Ordering::Relaxed),
             self.wait_us.load(Ordering::Relaxed),
@@ -375,10 +366,8 @@ mod tests {
     #[test]
     fn test_counters_accumulate() {
         let pool = PopulationPool::new(2);
-        pool.enqueued_mark();
-        pool.enqueued_mark();
         pool.task_observe(1_000);
         pool.wait_observe(250);
-        assert_eq!(pool.counters(), (2, 1_000, 1, 250, 1));
+        assert_eq!(pool.counters(), (1_000, 1, 250, 1));
     }
 }

@@ -484,7 +484,6 @@ impl WriterRegistration {
             .staging_pool
             .checkout(fingerprint, generation, &relation_oids);
 
-        self.spawn_ctx.pool.enqueued_mark();
         if self.populate_tx.send(work).is_err() {
             error!("population dispatcher channel closed");
             core.population_deleted_keys
