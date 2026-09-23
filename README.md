@@ -30,6 +30,24 @@ so applications connect to it exactly as they would to Postgres. For each query 
 
 No Redis, no schema migration, no manual invalidation logic.
 
+## Will it fit your workload?
+
+Find out before you install anything. The [Fit Analyzer](https://www.pgcache.com/fit)
+takes your real queries and shows how much of your workload pgcache can cache. It runs in
+your browser as WebAssembly: your queries are analyzed locally and never uploaded.
+
+The quickest input is a `pg_stat_statements` export, which weights each query shape by
+calls and execution time:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;  -- once, then let it accumulate
+\copy (SELECT query, calls, total_exec_time FROM pg_stat_statements ORDER BY calls DESC LIMIT 1000) TO 'workload.csv' WITH CSV HEADER
+```
+
+To also get a hit-rate estimate, use a PostgreSQL csvlog, which preserves arrival order.
+Pasted SQL and stderr logs (best-effort) work too. Setup for each is under
+*How to capture a trace* on the [Fit Analyzer page](https://www.pgcache.com/fit).
+
 ## Quickstart
 
 pgcache needs three things: your **origin** database with logical replication enabled, a
