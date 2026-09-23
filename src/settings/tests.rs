@@ -1182,8 +1182,12 @@ fn test_population_workers_bounds_explicit_values_and_clamps() {
     use super::cli::population_workers_bounds;
 
     assert_eq!(population_workers_bounds(2, Some(4), Some(32)), (4, 32));
-    // max is never below min.
+    // An explicit max below an *explicit* min: the floor wins (liveness).
     assert_eq!(population_workers_bounds(2, Some(6), Some(3)), (6, 6));
     // min of 0 is raised to 1.
     assert_eq!(population_workers_bounds(2, Some(0), None), (1, 16));
+    // An explicit max below the *derived* floor lowers the floor instead of
+    // silently discarding the user's ceiling (PGC-457).
+    assert_eq!(population_workers_bounds(16, None, Some(4)), (4, 4));
+    assert_eq!(population_workers_bounds(2, None, Some(1)), (1, 1));
 }

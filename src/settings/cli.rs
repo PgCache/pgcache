@@ -424,7 +424,14 @@ pub(super) fn population_workers_bounds(
     min: Option<usize>,
     max: Option<usize>,
 ) -> (usize, usize) {
-    let min = min.unwrap_or(num_workers.max(2)).max(1);
+    // A *derived* floor defers to an explicitly configured lower ceiling —
+    // raising the user's max to a default they never chose discards their
+    // setting (PGC-457). An explicit min still wins over an explicit max
+    // (tested-intentional: the floor is the liveness guarantee).
+    let derived_min = num_workers.max(2);
+    let min = min
+        .unwrap_or_else(|| max.map_or(derived_min, |m| derived_min.min(m)))
+        .max(1);
     let max = max.unwrap_or(num_workers * 8).max(min);
     (min, max)
 }
