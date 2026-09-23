@@ -288,16 +288,31 @@ pub(super) async fn serve_loop(
         // before taking one for this serve.
         pool_shrink_apply(&serve_pool, &mut conn_rx, &parked);
 
-        // Wait for an available connection
+        // Wait for an available connection, raced against teardown: on total
+        // pool loss at generation cancel (every conn poisoned, reconcile
+        // exited) nothing will ever refill the channel — and `recv()` cannot
+        // return `None` because this loop holds a `conn_tx` clone — so an
+        // unraced wait would wedge the loop holding a client's reply slot
+        // (PGC-450). Dropping the request drops its reply_tx; the proxy's
+        // reply slot observes Dropped and closes that client cleanly instead
+        // of hanging forever.
         let conn = if let Ok(conn) = conn_rx.try_recv() {
             conn
         } else {
-            let Some(conn) = conn_rx.recv().await else {
-                error!("cache connection pool closed");
-                cancel.cancel();
-                return;
-            };
-            conn
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    debug!("cache serve shutdown while awaiting a pool connection");
+                    break;
+                }
+                conn = conn_rx.recv() => {
+                    let Some(conn) = conn else {
+                        error!("cache connection pool closed");
+                        cancel.cancel();
+                        return;
+                    };
+                    conn
+                }
+            }
         };
         let acquired_at = Instant::now();
         msg.timing_mut().conn_acquired_at = Some(acquired_at);
