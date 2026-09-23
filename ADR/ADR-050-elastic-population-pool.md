@@ -82,6 +82,10 @@ and must back off on evidence of origin congestion.
 - `cache/writer/population.rs` — dispatcher + worker rendezvous, worker
   self-retire; `cache/writer/registration.rs` — spawn context, reconcile on
   the writer's gauge tick, 5s connect-failure cooldown.
+- Idle workers re-evaluate retirement on a bounded (30s) wait for work, so a
+  quiet pool drains to its floor instead of holding surplus connection pairs
+  indefinitely (PGC-455); the controller's live sample excludes in-flight
+  connects (PGC-456).
 - Metrics: `population_queue`, `population_workers`,
   `population_scale_up/down`, `population_task_floor_seconds`, alongside the
   existing `population.wait_seconds` / `population.task_seconds`.

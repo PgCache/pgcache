@@ -60,6 +60,12 @@ pub struct PopulationPool {
     /// Work-queue depth hint, maintained by the dispatcher; the controller's
     /// saturated-vs-idle discriminator for zero-observation ticks (PGC-452).
     queue_depth: AtomicUsize,
+    /// Reserved worker slots whose connections are still being opened.
+    /// `live_workers` includes them (the reconcile must not double-spawn), but
+    /// the controller's live sample excludes them so a probe's verify waits
+    /// for the worker to actually materialize instead of judging one that
+    /// never ran (PGC-456).
+    pending_connects: AtomicUsize,
 }
 
 impl PopulationPool {
@@ -79,6 +85,7 @@ impl PopulationPool {
             unpark_credits: AtomicUsize::new(0),
             unpark_notify: Notify::new(),
             queue_depth: AtomicUsize::new(0),
+            pending_connects: AtomicUsize::new(0),
         }
     }
 
@@ -133,6 +140,7 @@ impl PopulationPool {
     /// running worker does when it stops.
     pub fn worker_reserve(&self) -> usize {
         self.live_workers.fetch_add(1, Ordering::Relaxed);
+        self.pending_connects.fetch_add(1, Ordering::Relaxed);
         let reused = {
             let mut free = self
                 .free_ids
@@ -141,6 +149,20 @@ impl PopulationPool {
             free.pop()
         };
         reused.unwrap_or_else(|| self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// A reserved worker's connect resolved (successfully into a running
+    /// worker, or into a failed spawn) — either way it is no longer pending.
+    pub fn pending_connect_done(&self) {
+        let _ = self
+            .pending_connects
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
+
+    pub fn pending_connects(&self) -> usize {
+        self.pending_connects.load(Ordering::Relaxed)
     }
 
     pub fn spawn_failure_mark(&self) {
@@ -328,6 +350,26 @@ mod tests {
         assert!(pool.unpark_credit_take());
         assert_eq!(pool.unpark_pending(), 0);
         assert!(!pool.unpark_request());
+    }
+
+    /// PGC-456: a reserved worker is pending until its connect resolves —
+    /// the controller's live sample excludes it, the reconcile's includes it.
+    #[test]
+    fn test_pending_connects_track_reserve_to_resolution() {
+        let pool = PopulationPool::new(2);
+        let a = pool.worker_reserve();
+        assert_eq!((pool.live_workers(), pool.pending_connects()), (1, 1));
+        // Connect succeeded: the worker's run entry consumes the pending.
+        pool.pending_connect_done();
+        assert_eq!((pool.live_workers(), pool.pending_connects()), (1, 0));
+        // Connect failure consumes pending and releases the slot.
+        let _b = pool.worker_reserve();
+        pool.pending_connect_done();
+        pool.worker_exit(a);
+        assert_eq!((pool.live_workers(), pool.pending_connects()), (1, 0));
+        // Saturating: a stray extra done never wraps.
+        pool.pending_connect_done();
+        assert_eq!(pool.pending_connects(), 0);
     }
 
     #[test]

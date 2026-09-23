@@ -210,6 +210,7 @@ pub async fn population_worker(
         pool,
         ..
     } = ctx;
+    pool.pending_connect_done();
     debug!("population worker {id} started");
 
     let idle_handle = crate::metrics::population_worker_idle_handle(id);

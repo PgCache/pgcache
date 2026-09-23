@@ -218,6 +218,7 @@ impl WriterRegistration {
                             error_chain_format(e.current_context()),
                         );
                         ctx.pool.spawn_failure_mark();
+                        ctx.pool.pending_connect_done();
                         ctx.pool.worker_exit(id);
                     }
                 }
