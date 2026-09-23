@@ -928,3 +928,36 @@ async fn test_gate_parse_error_execute_records_connection_scope() -> Result<(), 
     );
     Ok(())
 }
+
+/// PGC-449: a SELECT whose AST conversion fails has no tree to scan for
+/// volatile (writing) functions, so it must record conservatively at
+/// connection scope — the same failure direction as a parse failure.
+#[tokio::test]
+async fn test_gate_conversion_failed_select_records_connection_scope() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE raw_conv (id int primary key)", &[])
+        .await?;
+    ctx.query("INSERT INTO raw_conv VALUES (1)", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    let q = "SELECT id FROM raw_conv WHERE id = 1";
+    register(&mut ctx, q).await?;
+
+    // WITH RECURSIVE fails conversion; it could hide a volatile writing
+    // function, so it must poison the connection scope.
+    let m = ctx.metrics().await?;
+    let _ = ctx
+        .simple_query("WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(row_count(&res), 1);
+    let after = metrics_delta(&m, &ctx.metrics().await?);
+    assert!(
+        after.raw_writes_recorded >= 1,
+        "conversion-failed select must be recorded"
+    );
+    assert_eq!(
+        after.queries_cache_hit, 0,
+        "reads after an unconvertible select must forward until settle"
+    );
+    Ok(())
+}

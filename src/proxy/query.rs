@@ -381,7 +381,13 @@ pub(super) fn analyze(
             match cte_write {
                 // A data-modifying CTE: the "select" writes.
                 Some(class) => Action::ForwardWrite(reason, class),
-                None => Action::Forward(reason),
+                // No converted tree to scan for volatile (writing) functions,
+                // and a partial raw-tree scan would be unsound in exactly the
+                // way it is meant to prevent — so the failure direction is
+                // "assume it wrote", the same policy as a parse failure
+                // (PGC-449). Conversion failures are rare, exotic SELECTs;
+                // the converted-but-uncacheable arm keeps the precise scan.
+                None => Action::ForwardWrite(reason, WriteClass::Connection),
             }
         }
         Ok(RawStatement::Write(class)) => {
