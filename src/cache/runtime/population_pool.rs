@@ -39,6 +39,7 @@ pub(super) async fn population_pool_controller(
     let pool = &state_view.population_pool;
     let mut controller = PoolController::new(min_workers, max_workers, CONFIG);
     let mut prev = pool.counters();
+    let mut last_tick = std::time::Instant::now();
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let handles = &crate::metrics::handles().reg;
@@ -48,6 +49,12 @@ pub(super) async fn population_pool_controller(
             _ = interval.tick() => {}
         }
         let now = pool.counters();
+        // Measure the real elapsed interval: with MissedTickBehavior::Skip a
+        // stalled tick covers several seconds of counter deltas, and dividing
+        // by the nominal period would inflate the throughput sample into a
+        // spurious verify confirm (PGC-457).
+        let elapsed = last_tick.elapsed().as_secs_f64().max(0.1);
+        last_tick = std::time::Instant::now();
         let sample = TickSample {
             task_us: now.1 - prev.1,
             task_count: now.2 - prev.2,
@@ -58,7 +65,7 @@ pub(super) async fn population_pool_controller(
             // (PGC-456).
             live: pool.live_workers().saturating_sub(pool.pending_connects()),
             backlog: pool.queue_depth(),
-            tick_seconds: TICK.as_secs_f64(),
+            tick_seconds: elapsed,
         };
         prev = now;
 
