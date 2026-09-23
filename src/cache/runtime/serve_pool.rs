@@ -273,7 +273,11 @@ pub(super) async fn serve_loop(
                     state_view.recycle_count.fetch_add(1, Ordering::Relaxed);
                     crate::metrics::handles().cache.pool_recycled.increment(1);
                 }
-                parked_maintain(&parked, state_view.recycle_wanted.load(Ordering::Relaxed));
+                parked_maintain(
+                    &parked,
+                    state_view.recycle_wanted.load(Ordering::Relaxed),
+                    &state_view,
+                );
                 pool_shrink_apply(&serve_pool, &mut conn_rx, &parked);
                 continue;
             }
@@ -403,13 +407,19 @@ fn pool_shrink_apply(
 
 /// Drop the parked connection when it has outlived its usefulness: expired,
 /// or the memory monitor wants backends released (a held-back backend is
-/// exactly what recycling exists to reclaim).
-fn parked_maintain(parked: &ParkedSlot, recycle_wanted: bool) {
+/// exactly what recycling exists to reclaim). A pressure drop counts toward
+/// the recycle counters so the PGC-251 full-pool-recycled re-measurement
+/// trigger sees it (PGC-457).
+fn parked_maintain(parked: &ParkedSlot, recycle_wanted: bool, state_view: &CacheStateView) {
     let mut slot = parked_lock(parked);
     if let Some((_, since)) = slot.as_ref()
         && (recycle_wanted || since.elapsed() > PARK_EXPIRY)
     {
         *slot = None;
+        if recycle_wanted {
+            state_view.recycle_count.fetch_add(1, Ordering::Relaxed);
+            crate::metrics::handles().cache.pool_recycled.increment(1);
+        }
     }
 }
 
