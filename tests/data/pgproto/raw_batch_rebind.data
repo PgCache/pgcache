@@ -1,0 +1,25 @@
+# PGC-445: a multi-execute batch rebinding the unnamed portal must log each
+# execute's own bind values into the read-after-write log. The follow-up
+# same-connection read of the FIRST inserted row must forward (1 DataRow),
+# not be served from a cache that predates the batch (0 DataRows).
+# Batch 1: Parse + Describe(S) so origin's ParameterDescription backfills
+# the statement's parameter OIDs (pgproto cannot declare Parse OIDs on
+# macOS), keeping the INSERT row-enumerable for the gate.
+'P'	"S1"	"INSERT INTO raw_batch (id, v) VALUES ($1, 0)"	0
+'D'	'S'	"S1"
+'S'
+'Y'
+# Batch 2: two executes rebinding the unnamed portal with different values.
+'B'	""	"S1"	1	0	1	1	"1"	0
+'E'	""	0
+'B'	""	"S1"	1	0	1	1	"2"	0
+'E'	""	0
+'S'
+'Y'
+# Batch 3: read the FIRST execute's row while the writes are unsettled.
+'P'	"S2"	"SELECT id, v FROM raw_batch WHERE id = 1"	0
+'B'	""	"S2"	0	0	0
+'E'	""	0
+'S'
+'Y'
+'X'

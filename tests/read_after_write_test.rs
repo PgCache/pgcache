@@ -832,3 +832,46 @@ async fn test_gate_update_subquery_shape() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-445: a multi-execute batch that rebinds the unnamed portal must record
+/// each execute's own bind values — resolving portals at Sync time would alias
+/// every entry to the last Bind, and a read matching an earlier execute's row
+/// would be wrongly proven disjoint and served from a cache that predates the
+/// batch's own committed writes.
+#[tokio::test]
+async fn test_gate_batch_portal_rebind_logs_each_execute() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query("CREATE TABLE raw_batch (id int primary key, v int)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    // Register the read so a stale serve is possible at all.
+    let q = "SELECT id, v FROM raw_batch WHERE id = 1";
+    register(&mut ctx, q).await?;
+
+    // One pgproto connection: INSERT $1 bound to 1 then rebound to 2 in a
+    // single Sync batch, then the read of id = 1 while the writes are
+    // unsettled (1.5s injected apply lag). The read must see the row.
+    let m = ctx.metrics().await?;
+    let output = crate::util::pgproto_run(
+        ctx.cache_port,
+        "tests/data/pgproto/raw_batch_rebind.data",
+    );
+    let rows = output.matches("<= BE DataRow").count();
+    assert_eq!(
+        rows, 1,
+        "read of the first execute's row must forward, not serve stale:\n{output}"
+    );
+    // Both executes must be logged, and the gated read must have forwarded —
+    // a stale serve would have counted a cache hit instead.
+    let after = metrics_delta(&m, &ctx.metrics().await?);
+    assert_eq!(
+        after.raw_writes_recorded, 2,
+        "each execute must record its own write"
+    );
+    assert_eq!(
+        after.queries_cache_hit, 0,
+        "the gated read must forward, not serve from cache"
+    );
+    Ok(())
+}

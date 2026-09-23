@@ -49,38 +49,17 @@ const PARSE_COMPLETE_RFQ_IDLE: &[u8] = &[b'1', 0, 0, 0, 4, b'Z', 0, 0, 0, 5, b'I
 /// forwarding (the client's own `Sync` isn't replayed per entry).
 const SYNC_MESSAGE: [u8; 5] = [b'S', 0, 0, 0, 4];
 
-/// Classify each Execute in a forwarded buffer for the read-after-write log
-/// (PGC-124): resolve portal → statement → its captured write class. A
-/// read-only statement contributes nothing; an Execute whose portal or
-/// statement can't be resolved is recorded conservatively at connection scope
-/// so a genuine write is never missed.
-fn buffer_write_classes(
-    buffer: &ExtendedBuffer,
-    portals: &HashMap<EcoString, Portal>,
-    statements: &HashMap<EcoString, PreparedStatement>,
-) -> SmallVec<[WriteClass; 1]> {
-    let mut classes = SmallVec::new();
-    for entry in &buffer.entries {
-        let resolved = entry
-            .portal_name
-            .as_ref()
-            .and_then(|p| portals.get(p.as_str()))
-            .and_then(|portal| {
-                statements
-                    .get(&portal.statement_name)
-                    .map(|stmt| (portal, stmt))
-            });
-        let Some((portal, stmt)) = resolved else {
-            // Unresolvable portal/statement on an Execute → record conservatively.
-            classes.push(WriteClass::Connection);
-            continue;
-        };
-        match &stmt.write_class {
-            None => {}
-            Some(class) => classes.push(write_class_bind(class, portal, stmt)),
-        }
-    }
-    classes
+/// Collect each Execute's write-class snapshot for the read-after-write log
+/// (PGC-124). The class is captured at Execute time (`execute_write_class`),
+/// not resolved here: by Sync/Flush a later execute in the batch has usually
+/// rebound the same — typically unnamed — portal, so the live portal map
+/// reflects only the *last* Bind's values (PGC-445).
+fn buffer_write_classes(buffer: &ExtendedBuffer) -> SmallVec<[WriteClass; 1]> {
+    buffer
+        .entries
+        .iter()
+        .filter_map(|entry| entry.write_class.clone())
+        .collect()
 }
 
 /// Resolve a parameterized INSERT's `$N` cells against a portal's bind values so
@@ -198,6 +177,11 @@ pub(in crate::proxy::connection) struct ExecuteEntry {
     /// Cacheable-query snapshot captured at Execute time, if this execute is a
     /// cacheable SELECT with a resolvable portal. `None` ⇒ not cacheable.
     pub(in crate::proxy::connection) candidate: Option<CacheCandidate>,
+    /// Write class for the read-after-write log, captured at Execute time with
+    /// this execute's own bind values — the same rebind hazard `candidate`
+    /// documents (PGC-445). `None` ⇒ provably read-only; an unresolvable
+    /// portal/statement snapshots conservative connection scope.
+    pub(in crate::proxy::connection) write_class: Option<WriteClass>,
 }
 
 impl ExecuteEntry {
@@ -229,6 +213,7 @@ impl ExtendedBuffer {
         execute_bytes: Bytes,
         portal_name: Option<EcoString>,
         candidate: Option<CacheCandidate>,
+        write_class: Option<WriteClass>,
     ) {
         let mut seg = std::mem::take(&mut self.pending);
         seg.bytes.push(execute_bytes);
@@ -242,6 +227,7 @@ impl ExtendedBuffer {
             describe_statement_names: seg.describe_statement_names,
             dirty: seg.dirty,
             candidate,
+            write_class,
         });
     }
 
@@ -543,7 +529,7 @@ impl ConnectionState {
         // any writes among them before the buffer is consumed.
         if self.write_log.is_enabled() {
             let classes = self.extended.buffer_peek().map(|buffer| {
-                buffer_write_classes(buffer, &self.portals, &self.prepared_statements)
+                buffer_write_classes(buffer)
             });
             if let Some(classes) = classes {
                 for class in classes {
@@ -597,7 +583,7 @@ impl ConnectionState {
 
         // Record any writes among the forwarded Executes into the RaW log.
         if self.write_log.is_enabled() {
-            let classes = buffer_write_classes(&buffer, &self.portals, &self.prepared_statements);
+            let classes = buffer_write_classes(&buffer);
             for class in classes {
                 self.write_log.record(&class);
             }
@@ -711,13 +697,38 @@ impl ConnectionState {
             .as_ref()
             .map_or(PipelineDescribe::None, |b| b.pending.describe);
         let candidate = self.execute_cache_candidate(portal_name.as_deref(), describe);
+        let write_class = self.execute_write_class(portal_name.as_deref());
 
         self.extended.buffer_get_or_create().pending_seal(
             msg.data.freeze(),
             portal_name,
             candidate,
+            write_class,
         );
         trace!("net: Execute buffered");
+    }
+
+    /// Snapshot the write class for the portal an Execute targets, with this
+    /// execute's own bind values substituted — captured now for the same
+    /// reason as `execute_cache_candidate`: a later execute in the batch may
+    /// rebind the portal, and the write log must never alias one execute's
+    /// values onto another (PGC-445). Unresolvable portal/statement (or an
+    /// unparseable Execute) snapshots conservative connection scope so a
+    /// genuine write is never missed.
+    fn execute_write_class(&self, portal_name: Option<&str>) -> Option<WriteClass> {
+        let resolved = portal_name
+            .and_then(|p| self.portals.get(p))
+            .and_then(|portal| {
+                self.prepared_statements
+                    .get(&portal.statement_name)
+                    .map(|stmt| (portal, stmt))
+            });
+        let Some((portal, stmt)) = resolved else {
+            return Some(WriteClass::Connection);
+        };
+        stmt.write_class
+            .as_ref()
+            .map(|class| write_class_bind(class, portal, stmt))
     }
 
     /// Snapshot a cacheable-query candidate for the portal an Execute targets.
