@@ -7,9 +7,10 @@ use std::time::Duration;
 use pgcache_lib::metrics::metrics_recorder_install;
 #[cfg(not(feature = "console"))]
 use pgcache_lib::metrics::names::LOG_DROPPED_LINES;
+use pgcache_lib::preflight::{preflight_run, report_render};
 use pgcache_lib::proxy::SharedProxyStatus;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
-use pgcache_lib::settings::Settings;
+use pgcache_lib::settings::{PreflightSettings, RunMode};
 use rootcause::Report;
 use tokio_util::sync::CancellationToken;
 
@@ -52,7 +53,10 @@ fn main() -> Result<(), Report> {
         .format(hotpath::Format::Table)
         .build();
 
-    let settings = Settings::from_args()?;
+    let settings = match RunMode::from_args()? {
+        RunMode::Check(preflight) => return preflight_main(&preflight),
+        RunMode::Serve(settings) => *settings,
+    };
     let cancel = CancellationToken::new();
     let shared_proxy_status = SharedProxyStatus::new();
 
@@ -162,4 +166,16 @@ fn main() -> Result<(), Report> {
 
         res
     })
+}
+
+/// `--check`: run the origin readiness checks, print the report and exit.
+/// Exit status is 1 when any check failed; warnings alone exit 0.
+fn preflight_main(settings: &PreflightSettings) -> Result<(), Report> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let report = runtime.block_on(preflight_run(settings));
+    print!("{}", report_render(&report));
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::process::exit(if report.failed() { 1 } else { 0 });
 }

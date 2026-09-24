@@ -18,6 +18,8 @@ pub mod memory;
 pub mod metrics;
 pub mod pg;
 #[cfg(feature = "proxy")]
+pub mod preflight;
+#[cfg(feature = "proxy")]
 pub mod proxy;
 #[cfg(feature = "proxy")]
 pub mod stream_utils;

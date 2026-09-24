@@ -192,6 +192,7 @@ pub(super) struct CliArgs {
     pub(super) pinned_tables: Option<String>,
     pub(super) telemetry_off: bool,
     pub(super) read_your_writes_off: bool,
+    pub(super) check: bool,
 }
 
 fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathBuf>)> {
@@ -257,6 +258,7 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("pinned_queries") => args.pinned_queries = Some(arg_string(&mut parser)?),
             Long("pinned_tables") => args.pinned_tables = Some(arg_string(&mut parser)?),
             Long("telemetry_off") => args.telemetry_off = true,
+            Long("check") => args.check = true,
             Long("read_your_writes_off") => args.read_your_writes_off = true,
             Long("help") => {
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
@@ -444,6 +446,99 @@ fn cache_size_deprecation_warn(set: bool) {
     }
 }
 
+fn origin_overrides_take(args: &mut CliArgs) -> PgSettingsPartial {
+    PgSettingsPartial {
+        host: args.origin_host.take(),
+        port: args.origin_port.take(),
+        user: args.origin_user.take(),
+        password: args.origin_password.take(),
+        database: args.origin_database.take(),
+        ssl_mode: args.origin_ssl_mode.take(),
+    }
+}
+
+fn replication_overrides_take(args: &mut CliArgs) -> PgSettingsPartial {
+    PgSettingsPartial {
+        host: args.replication_host.take(),
+        port: args.replication_port.take(),
+        user: args.replication_user.take(),
+        password: args.replication_password.take(),
+        database: args.replication_database.take(),
+        ssl_mode: args.replication_ssl_mode.take(),
+    }
+}
+
+/// Origin settings from CLI args alone; host, port, user and database are required.
+fn origin_require(args: &mut CliArgs) -> ConfigResult<PgSettings> {
+    Ok(PgSettings {
+        host: require(args.origin_host.take(), "origin_host")?,
+        port: require(args.origin_port.take(), "origin_port")?,
+        user: require(args.origin_user.take(), "origin_user")?,
+        password: args.origin_password.take(),
+        database: require(args.origin_database.take(), "origin_database")?,
+        ssl_mode: args.origin_ssl_mode.take().unwrap_or_default(),
+    })
+}
+
+/// Settings for `--check`: origin, replication and CDC names only. CDC names
+/// fall back to the defaults so a bare `--check --origin_*` invocation works.
+fn preflight_settings_build(
+    mut args: CliArgs,
+    config: Option<SettingsToml>,
+) -> ConfigResult<PreflightSettings> {
+    let (origin, replication, mut cdc, allowed_tables) = match config {
+        Some(mut config) => {
+            let origin = origin_overrides_take(&mut args).merge_with(&config.origin);
+            let replication = replication_settings_resolve(
+                &origin,
+                config.replication.take(),
+                replication_overrides_take(&mut args),
+            );
+            let cdc = CdcSettings {
+                publication_name: args
+                    .cdc_publication_name
+                    .take()
+                    .unwrap_or_else(|| config.cdc.publication_name.clone()),
+                slot_name: args
+                    .cdc_slot_name
+                    .take()
+                    .unwrap_or_else(|| config.cdc.slot_name.clone()),
+            };
+            let allowed = csv_parse(args.allowed_tables.take()).or(config.allowed_tables.take());
+            (origin, replication, cdc, allowed)
+        }
+        None => {
+            let origin = origin_require(&mut args)?;
+            let replication =
+                replication_settings_resolve(&origin, None, replication_overrides_take(&mut args));
+            let cdc = CdcSettings {
+                publication_name: args
+                    .cdc_publication_name
+                    .take()
+                    .unwrap_or_else(|| DEFAULT_PUBLICATION_NAME.to_owned()),
+                slot_name: args
+                    .cdc_slot_name
+                    .take()
+                    .unwrap_or_else(|| DEFAULT_SLOT_NAME.to_owned()),
+            };
+            (
+                origin,
+                replication,
+                cdc,
+                csv_parse(args.allowed_tables.take()),
+            )
+        }
+    };
+    cdc.publication_name = cdc.publication_name.to_ascii_lowercase();
+    cdc.slot_name = cdc.slot_name.to_ascii_lowercase();
+    Ok(PreflightSettings {
+        origin,
+        replication,
+        cdc,
+        allowed_tables: allowlist_parse(&allowed_tables),
+    })
+}
+
 pub(super) fn settings_build(
     args: CliArgs,
     config: Option<SettingsToml>,
@@ -468,31 +563,16 @@ pub(super) fn settings_build(
 
 /// Build settings by merging CLI args over a TOML config file.
 pub(super) fn settings_build_with_config(
-    args: CliArgs,
+    mut args: CliArgs,
     config: &mut SettingsToml,
     config_path: Option<PathBuf>,
 ) -> ConfigResult<Settings> {
-    let origin_overrides = PgSettingsPartial {
-        host: args.origin_host,
-        port: args.origin_port,
-        user: args.origin_user,
-        password: args.origin_password,
-        database: args.origin_database,
-        ssl_mode: args.origin_ssl_mode,
-    };
-    let origin = origin_overrides.merge_with(&config.origin);
+    let origin = origin_overrides_take(&mut args).merge_with(&config.origin);
 
     let replication = replication_settings_resolve(
         &origin,
         config.replication.take(),
-        PgSettingsPartial {
-            host: args.replication_host,
-            port: args.replication_port,
-            user: args.replication_user,
-            password: args.replication_password,
-            database: args.replication_database,
-            ssl_mode: args.replication_ssl_mode,
-        },
+        replication_overrides_take(&mut args),
     );
 
     let cache_overrides = PgSettingsPartial {
@@ -572,29 +652,12 @@ pub(super) fn settings_build_with_config(
 }
 
 /// Build settings from CLI args alone (no config file). Required fields must be present.
-pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
-    let origin = PgSettings {
-        host: require(args.origin_host, "origin_host")?,
-        port: require(args.origin_port, "origin_port")?,
-        user: require(args.origin_user, "origin_user")?,
-        password: args.origin_password,
-        database: require(args.origin_database, "origin_database")?,
-        ssl_mode: args.origin_ssl_mode.unwrap_or_default(),
-    };
+pub(super) fn settings_build_cli_only(mut args: CliArgs) -> ConfigResult<Settings> {
+    let origin = origin_require(&mut args)?;
 
     // CLI-only mode: replication defaults to origin, with CLI overrides
-    let replication = replication_settings_resolve(
-        &origin,
-        None,
-        PgSettingsPartial {
-            host: args.replication_host,
-            port: args.replication_port,
-            user: args.replication_user,
-            password: args.replication_password,
-            database: args.replication_database,
-            ssl_mode: args.replication_ssl_mode,
-        },
-    );
+    let replication =
+        replication_settings_resolve(&origin, None, replication_overrides_take(&mut args));
 
     cache_size_deprecation_warn(args.cache_size.is_some());
     let num_workers = require(args.num_workers, "num_workers")?;
@@ -660,12 +723,23 @@ pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
     })
 }
 
-impl Settings {
-    pub fn from_args() -> ConfigResult<Settings> {
+impl RunMode {
+    pub fn from_args() -> ConfigResult<RunMode> {
         let (args, config, config_path) = cli_args_parse()?;
-        settings_build(args, config, config_path)
+        if args.check {
+            return Ok(RunMode::Check(Box::new(preflight_settings_build(
+                args, config,
+            )?)));
+        }
+        Ok(RunMode::Serve(Box::new(settings_build(
+            args,
+            config,
+            config_path,
+        )?)))
     }
+}
 
+impl Settings {
     fn print_usage_and_exit(name: &str) -> ! {
         println!(
             "Usage: {name} -c|--config TOML_FILE --origin_host HOST --origin_port PORT --origin_user USER --origin_database DB \n \
@@ -694,7 +768,8 @@ impl Settings {
             [--pinned_tables TABLE1,TABLE2,...] (pin SELECT * FROM table for each table) \n \
             [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug) \n \
             [--telemetry_off] (disable anonymous telemetry) \n \
-            [--read_your_writes_off] (disable per-connection read-after-write consistency)"
+            [--read_your_writes_off] (disable per-connection read-after-write consistency) \n \
+            [--check] (check the origin is ready for pgcache, print a report and exit; cache settings not needed)"
         );
         std::process::exit(1);
     }

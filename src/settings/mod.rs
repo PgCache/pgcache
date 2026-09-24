@@ -153,6 +153,9 @@ pub type AllowlistEntry = (Option<String>, String);
 /// Parsed and ready-to-match allowlist. None = all tables cacheable.
 pub type Allowlist = Option<Vec<AllowlistEntry>>;
 
+pub const DEFAULT_PUBLICATION_NAME: &str = "pgcache_pub";
+pub const DEFAULT_SLOT_NAME: &str = "pgcache_slot";
+
 impl FromStr for SslMode {
     type Err = ParseSslModeError;
 
@@ -282,6 +285,22 @@ struct SettingsToml {
     /// `num_workers * 8`; never below `population_workers_min`.
     #[serde(default)]
     population_workers_max: Option<usize>,
+}
+
+/// The origin-side subset of [`Settings`] that `--check` needs. Cache-side
+/// settings are not required, so a check runs without an embedded cache.
+#[derive(Debug, Clone)]
+pub struct PreflightSettings {
+    pub origin: PgSettings,
+    pub replication: PgSettings,
+    pub cdc: CdcSettings,
+    pub allowed_tables: Allowlist,
+}
+
+/// What the binary was asked to do, decided by the CLI.
+pub enum RunMode {
+    Serve(Box<Settings>),
+    Check(Box<PreflightSettings>),
 }
 
 #[derive(Debug, Clone)]
