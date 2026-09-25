@@ -92,69 +92,74 @@ async fn handle_serve_request(
 
     msg.timing.worker_start_at = Some(Instant::now());
 
-    let reply =
-        match handle_cached_query(conn, return_tx, replenish_tx, &mut msg, &state_view).await {
-            Ok((bytes_served, coalesced_outcomes)) => {
-                let latency_us = msg
-                    .timing
-                    .worker_start_at
-                    .map(|s| duration_to_us_u64(s.elapsed()))
-                    .unwrap_or(0);
-                // Record directly in the shared view (no extra hop).
-                serve_metrics_record(
-                    &state_view,
-                    msg.fingerprint,
-                    latency_us,
-                    bytes_served as u64,
-                );
+    let reply = match handle_cached_query(conn, return_tx, replenish_tx, &mut msg, &state_view)
+        .await
+    {
+        Ok((bytes_served, coalesced_outcomes)) => {
+            let latency_us = msg
+                .timing
+                .worker_start_at
+                .map(|s| duration_to_us_u64(s.elapsed()))
+                .unwrap_or(0);
+            // Record directly in the shared view (no extra hop).
+            serve_metrics_record(
+                &state_view,
+                msg.fingerprint,
+                latency_us,
+                bytes_served as u64,
+            );
 
-                // Send replies to coalesced clients, returning each leased socket.
-                for outcome in coalesced_outcomes {
-                    match outcome {
-                        CoalescedOutcome::Complete(client) => {
-                            let _ = client.reply_tx.send(CacheReply {
-                                socket: client.client_socket,
-                                outcome: CacheOutcome::Complete(Some(client.timing)),
-                            });
-                        }
-                        CoalescedOutcome::Failed(client) => {
-                            let _ = client.reply_tx.send(CacheReply {
-                                socket: client.client_socket,
-                                outcome: CacheOutcome::Error(client.data),
-                            });
-                        }
+            // Send replies to coalesced clients, returning each leased socket.
+            for outcome in coalesced_outcomes {
+                match outcome {
+                    CoalescedOutcome::Complete(client) => {
+                        let _ = client.reply_tx.send(CacheReply {
+                            socket: client.client_socket,
+                            outcome: CacheOutcome::Complete(Some(client.timing)),
+                        });
+                    }
+                    CoalescedOutcome::Failed(client) => {
+                        let _ = client.reply_tx.send(CacheReply {
+                            socket: client.client_socket,
+                            outcome: CacheOutcome::Error(client.data),
+                        });
                     }
                 }
+            }
 
-                CacheReply {
-                    socket: msg.client_socket,
-                    outcome: CacheOutcome::Complete(Some(msg.timing)),
-                }
+            CacheReply {
+                socket: msg.client_socket,
+                outcome: CacheOutcome::Complete(Some(msg.timing)),
             }
-            Err(e) => {
-                // 42P01 is the expected eviction-window race; other SQLSTATEs are bugs.
-                let ctx = e.current_context();
-                let undefined_table = matches!(
-                    ctx,
-                    CacheError::CacheServerError { sqlstate: Some(s) }
-                        if *s == SQLSTATE_UNDEFINED_TABLE
-                );
-                if undefined_table {
-                    debug!("cache hit fell through to origin (table dropped during eviction)");
-                } else {
-                    error!("handle_cached_query failed: {}", error_chain_format(ctx));
-                }
-                // Coalesced clients already received Error replies inside the serve path
-                let error_buf = msg
-                    .forward_bytes
-                    .take()
-                    .map_or_else(|| msg.data.split_off(0), |slices| slices_concat(&slices));
-                CacheReply {
-                    socket: msg.client_socket,
-                    outcome: CacheOutcome::Error(error_buf),
-                }
+        }
+        Err(e) if matches!(e.current_context(), CacheError::ServeAbandonedInBlock) => CacheReply {
+            socket: msg.client_socket,
+            outcome: CacheOutcome::Abandon,
+        },
+        Err(e) => {
+            // 42P01 is the expected eviction-window race; other SQLSTATEs are bugs.
+            let ctx = e.current_context();
+            let undefined_table = matches!(
+                ctx,
+                CacheError::CacheServerError { sqlstate: Some(s) }
+                    if *s == SQLSTATE_UNDEFINED_TABLE
+            );
+            if undefined_table {
+                debug!("cache hit fell through to origin (table dropped during eviction)");
+            } else {
+                error!("handle_cached_query failed: {}", error_chain_format(ctx));
             }
-        };
+            // Coalesced clients already received Error replies inside the serve path
+            let error_buf = msg
+                .forward_bytes
+                .take()
+                .map_or_else(|| msg.data.split_off(0), |slices| slices_concat(&slices));
+            CacheReply {
+                socket: msg.client_socket,
+                outcome: CacheOutcome::Error(error_buf),
+            }
+        }
+    };
 
     if msg.reply_tx.send(reply).is_err() {
         error!("failed to send reply: no receiver");

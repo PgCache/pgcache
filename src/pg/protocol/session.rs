@@ -12,7 +12,7 @@ use tokio_util::bytes::Bytes;
 
 use super::ByteString;
 use crate::cache::query::CacheableQuery;
-use crate::query::write::WriteClass;
+use crate::query::write::StatementEffects;
 
 /// Classification of a prepared statement based on SQL analysis
 #[derive(Debug, Clone)]
@@ -62,10 +62,9 @@ pub struct PreparedStatement {
     /// or transaction paths work correctly. `Bytes` (refcounted, frozen from the
     /// codec split) so storing it doesn't deep-copy the Parse message.
     pub parse_bytes: Option<Bytes>,
-    /// Write classification when the statement may modify table data,
-    /// captured at Parse time for the connection's read-after-write log
-    /// (PGC-124). `None` = provably read-only.
-    pub write_class: Option<WriteClass>,
+    /// What executing the statement does to the connection's tracked state
+    /// (write log, isolation, block boundary), captured at Parse time.
+    pub effects: StatementEffects,
 }
 
 /// Result-column format codes from a Bind message, collapsed to intent.

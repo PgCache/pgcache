@@ -7,6 +7,7 @@ mod http;
 mod metrics;
 mod pgproto;
 mod process;
+mod wire;
 
 use std::io::Error;
 
@@ -29,6 +30,7 @@ pub use process::{
     connect_pgcache_pinned_small_cache, connect_pgcache_small_cache, connect_pgcache_tls,
     pgcache_client_connect, proxy_wait_for_ready, start_databases,
 };
+pub use wire::{WireClient, WireMessage, WireResponse};
 
 // --- Standalone helpers that don't belong to a specific submodule ---
 

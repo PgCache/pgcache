@@ -16,7 +16,7 @@ use crate::{
         query::CacheableQuery,
     },
     pg::protocol::{
-        encode::{CLOSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG},
+        encode::CLOSE_COMPLETE_MSG,
         extended::{
             ParsedBindMessage, ParsedParseMessage, parse_bind_message, parse_close_message,
             parse_describe_message, parse_execute_message, parse_parameter_description,
@@ -32,7 +32,7 @@ use crate::{
             delete_statement_parameterize, insert_statement_parameterize,
             update_statement_parameterize,
         },
-        write::WriteClass,
+        write::{StatementEffects, WriteClass},
     },
 };
 
@@ -49,16 +49,16 @@ const PARSE_COMPLETE_RFQ_IDLE: &[u8] = &[b'1', 0, 0, 0, 4, b'Z', 0, 0, 0, 5, b'I
 /// forwarding (the client's own `Sync` isn't replayed per entry).
 const SYNC_MESSAGE: [u8; 5] = [b'S', 0, 0, 0, 4];
 
-/// Collect each Execute's write-class snapshot for the read-after-write log
-/// (PGC-124). The class is captured at Execute time (`execute_write_class`),
-/// not resolved here: by Sync/Flush a later execute in the batch has usually
-/// rebound the same — typically unnamed — portal, so the live portal map
-/// reflects only the *last* Bind's values (PGC-445).
-fn buffer_write_classes(buffer: &ExtendedBuffer) -> SmallVec<[WriteClass; 1]> {
+/// Each Execute's effects snapshot, in batch order, for a forwarded buffer.
+/// Captured at Execute time (`execute_effects`), not resolved here: by
+/// Sync/Flush a later execute in the batch has usually rebound the same —
+/// typically unnamed — portal, so the live portal map reflects only the
+/// *last* Bind's values (PGC-445).
+fn buffer_effects(buffer: &ExtendedBuffer) -> SmallVec<[StatementEffects; 1]> {
     buffer
         .entries
         .iter()
-        .filter_map(|entry| entry.write_class.clone())
+        .map(|entry| entry.effects.clone())
         .collect()
 }
 
@@ -177,11 +177,11 @@ pub(in crate::proxy::connection) struct ExecuteEntry {
     /// Cacheable-query snapshot captured at Execute time, if this execute is a
     /// cacheable SELECT with a resolvable portal. `None` ⇒ not cacheable.
     pub(in crate::proxy::connection) candidate: Option<CacheCandidate>,
-    /// Write class for the read-after-write log, captured at Execute time with
-    /// this execute's own bind values — the same rebind hazard `candidate`
-    /// documents (PGC-445). `None` ⇒ provably read-only; an unresolvable
-    /// portal/statement snapshots conservative connection scope.
-    pub(in crate::proxy::connection) write_class: Option<WriteClass>,
+    /// What forwarding this execute does to the connection's tracked state,
+    /// captured at Execute time with this execute's own bind values — the same
+    /// rebind hazard `candidate` documents (PGC-445). An unresolvable
+    /// portal/statement snapshots the conservative unknown effects.
+    pub(in crate::proxy::connection) effects: StatementEffects,
 }
 
 impl ExecuteEntry {
@@ -213,7 +213,7 @@ impl ExtendedBuffer {
         execute_bytes: Bytes,
         portal_name: Option<EcoString>,
         candidate: Option<CacheCandidate>,
-        write_class: Option<WriteClass>,
+        effects: StatementEffects,
     ) {
         let mut seg = std::mem::take(&mut self.pending);
         seg.bytes.push(execute_bytes);
@@ -227,7 +227,7 @@ impl ExtendedBuffer {
             describe_statement_names: seg.describe_statement_names,
             dirty: seg.dirty,
             candidate,
-            write_class,
+            effects,
         });
     }
 
@@ -525,14 +525,11 @@ impl ExtendedPending {
 impl ConnectionState {
     /// Flush any buffered extended protocol messages to origin.
     pub(in crate::proxy::connection) fn extended_buffer_flush_to_origin(&mut self) {
-        // A Flush forwards the whole buffer, including sealed Executes — record
-        // any writes among them before the buffer is consumed.
-        if self.write_log.is_enabled() {
-            let classes = self.extended.buffer_peek().map(buffer_write_classes);
-            if let Some(classes) = classes {
-                for class in classes {
-                    self.write_log.record(&class);
-                }
+        // A Flush forwards the whole buffer, including sealed Executes — apply
+        // their effects before the buffer is consumed.
+        if let Some(effects) = self.extended.buffer_peek().map(buffer_effects) {
+            for entry_effects in effects {
+                self.forwarded_effects_apply(&entry_effects);
             }
         }
         if let Some(bytes) = self.extended.buffer_flush() {
@@ -549,7 +546,13 @@ impl ConnectionState {
     ) {
         let mut lazy_parse_stmt: Option<EcoString> = None;
         if let Some(first) = buffer.entries.first() {
-            crate::metrics::handles().query.uncacheable.increment(1);
+            let m = crate::metrics::handles();
+            m.query.uncacheable.increment(1);
+            // A cacheable read in a failed block forwards so origin reports the
+            // aborted-transaction error.
+            if first.candidate.is_some() && self.transaction_status == TransactionStatus::Failed {
+                m.txn.forward_failed.increment(1);
+            }
 
             if let Some(portal_name) = &first.portal_name
                 && let Some(portal) = self.portals.get(portal_name.as_str())
@@ -579,12 +582,8 @@ impl ConnectionState {
             );
         }
 
-        // Record any writes among the forwarded Executes into the RaW log.
-        if self.write_log.is_enabled() {
-            let classes = buffer_write_classes(&buffer);
-            for class in classes {
-                self.write_log.record(&class);
-            }
+        for entry_effects in buffer_effects(&buffer) {
+            self.forwarded_effects_apply(&entry_effects);
         }
 
         let bytes = self.extended.buffer_forward(buffer, trailing_bytes);
@@ -603,7 +602,7 @@ impl ConnectionState {
             // used to fold in — isn't captured by that cache, so it's replayed
             // for the non-SELECT statements that can mutate it (no piggyback for
             // extended; a standalone SHOW is issued via the lazy path on RFQ).
-            let mut write_class = None;
+            let mut effects = StatementEffects::default();
             let sql_type = match analyze(
                 &parsed.sql,
                 &mut self.cacheability_cache,
@@ -613,39 +612,31 @@ impl ConnectionState {
                 // `pgcache_explain(...)` is only intercepted on the simple-query
                 // path; over the extended protocol it forwards to origin (which
                 // has no such function), preserving pre-PGC-345 behavior.
-                Ok(Action::Forward(ForwardReason::UncacheableSelect) | Action::Explain(_)) => {
+                Ok(Action::Explain(_)) => StatementType::UncacheableSelect,
+                Ok(Action::Forward(ForwardReason::UncacheableSelect, statement_effects)) => {
+                    effects = statement_effects;
                     StatementType::UncacheableSelect
                 }
                 Ok(Action::Forward(
                     ForwardReason::UnsupportedStatement | ForwardReason::Invalid,
+                    statement_effects,
                 )) => {
+                    effects = statement_effects;
                     self.search_path_parse_inspect(&parsed.sql);
                     StatementType::NonSelect
-                }
-                // Same StatementType mapping per reason as the read arms; the
-                // class additionally feeds the read-after-write log (PGC-366).
-                Ok(Action::ForwardWrite(reason, class)) => {
-                    write_class = Some(class);
-                    match reason {
-                        ForwardReason::UncacheableSelect => StatementType::UncacheableSelect,
-                        ForwardReason::UnsupportedStatement | ForwardReason::Invalid => {
-                            self.search_path_parse_inspect(&parsed.sql);
-                            StatementType::NonSelect
-                        }
-                    }
                 }
                 // pg_query failed but origin may still parse it (parser
                 // version skew): any Execute of this statement could be a
                 // write, so record conservatively at connection scope — the
                 // same failure direction as the simple path (PGC-448).
                 Err(_) => {
-                    write_class = Some(WriteClass::Connection);
+                    effects = StatementEffects::unknown();
                     StatementType::ParseError
                 }
             };
 
             let statement_name = parsed.statement_name.clone();
-            self.statement_store(parsed, sql_type, data.clone(), write_class);
+            self.statement_store(parsed, sql_type, data.clone(), effects);
 
             let seg = &mut self.extended.buffer_get_or_create().pending;
             if seg.has_parse {
@@ -702,25 +693,25 @@ impl ConnectionState {
             .as_ref()
             .map_or(PipelineDescribe::None, |b| b.pending.describe);
         let candidate = self.execute_cache_candidate(portal_name.as_deref(), describe);
-        let write_class = self.execute_write_class(portal_name.as_deref());
+        let effects = self.execute_effects(portal_name.as_deref());
 
         self.extended.buffer_get_or_create().pending_seal(
             msg.data.freeze(),
             portal_name,
             candidate,
-            write_class,
+            effects,
         );
         trace!("net: Execute buffered");
     }
 
-    /// Snapshot the write class for the portal an Execute targets, with this
-    /// execute's own bind values substituted — captured now for the same
-    /// reason as `execute_cache_candidate`: a later execute in the batch may
-    /// rebind the portal, and the write log must never alias one execute's
-    /// values onto another (PGC-445). Unresolvable portal/statement (or an
-    /// unparseable Execute) snapshots conservative connection scope so a
-    /// genuine write is never missed.
-    fn execute_write_class(&self, portal_name: Option<&str>) -> Option<WriteClass> {
+    /// Snapshot the effects of the statement an Execute targets, with this
+    /// execute's own bind values substituted into a row-enumerable write —
+    /// captured now for the same reason as `execute_cache_candidate`: a later
+    /// execute in the batch may rebind the portal, and the write log must never
+    /// alias one execute's values onto another (PGC-445). An unresolvable
+    /// portal/statement (or an unparseable Execute) could be anything, so it
+    /// snapshots the conservative unknown effects.
+    fn execute_effects(&self, portal_name: Option<&str>) -> StatementEffects {
         let resolved = portal_name
             .and_then(|p| self.portals.get(p))
             .and_then(|portal| {
@@ -729,11 +720,17 @@ impl ConnectionState {
                     .map(|stmt| (portal, stmt))
             });
         let Some((portal, stmt)) = resolved else {
-            return Some(WriteClass::Connection);
+            return StatementEffects::unknown();
         };
-        stmt.write_class
-            .as_ref()
-            .map(|class| write_class_bind(class, portal, stmt))
+        StatementEffects {
+            write: stmt
+                .effects
+                .write
+                .as_ref()
+                .map(|class| write_class_bind(class, portal, stmt)),
+            isolation: stmt.effects.isolation,
+            transaction: stmt.effects.transaction,
+        }
     }
 
     /// Snapshot a cacheable-query candidate for the portal an Execute targets.
@@ -888,8 +885,9 @@ impl ConnectionState {
             // synthesize the ReadyForQuery instead of a useless round-trip.
             if local_closes > 0 && !group_origin_forwarded {
                 trace!("net: bare Sync → synth ReadyForQuery (local closes only)");
-                self.egress
-                    .synth_push(Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+                self.egress.synth_push(Bytes::from_static(
+                    self.transaction_status.ready_for_query_message(),
+                ));
             } else {
                 trace!("net: proxy→origin Sync (no buffer)");
                 self.egress.origin_open();
@@ -921,7 +919,8 @@ impl ConnectionState {
     ) -> bool {
         !buffer.entries.is_empty()
             && buffer.pending.bytes.is_empty()
-            && self.cache_globally_enabled()
+            && self.cache_dispatch_possible()
+            && self.proxy_status == ProxyStatus::Normal
             && buffer
                 .entries
                 .iter()
@@ -1061,7 +1060,7 @@ impl ConnectionState {
         if seg.describe == PipelineDescribe::Portal {
             return None;
         }
-        if self.in_transaction {
+        if self.in_transaction() {
             return None;
         }
         let stmt_name = seg.parse_statement_names.first().map(EcoString::as_str)?;
@@ -1166,7 +1165,7 @@ impl ConnectionState {
         parsed: ParsedParseMessage,
         sql_type: StatementType,
         parse_bytes: Bytes,
-        write_class: Option<WriteClass>,
+        effects: StatementEffects,
     ) {
         let client_parameter_oids = parsed.parameter_oids.clone();
         let stmt = PreparedStatement {
@@ -1180,7 +1179,7 @@ impl ConnectionState {
             describe_no_data: false,
             origin_prepared: false,
             parse_bytes: Some(parse_bytes),
-            write_class,
+            effects,
         };
         debug!("parsed statement insert {}", parsed.statement_name);
 

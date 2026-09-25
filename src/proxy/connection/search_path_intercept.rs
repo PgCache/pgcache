@@ -49,6 +49,9 @@ pub(in crate::proxy::connection) enum OriginIntercept {
     /// its LSN bounds each table's active tier holding writes up to
     /// `stamp_seq` (a table with a later write is skipped and re-probed).
     WalLsnProbe { stamp_seq: u64 },
+    /// Isolation-level discovery (PGC-387): an injected `SHOW
+    /// default_transaction_isolation` whose response is fully swallowed.
+    DefaultTransactionIsolation,
 }
 
 /// Sub-state for `OriginIntercept::TrailingShowSearchPath`.
@@ -187,6 +190,13 @@ impl ConnectionState {
 
             &OriginIntercept::TrailingShowSearchPath(state) => {
                 self.trailing_show_search_path_handle(state, msg)
+            }
+
+            OriginIntercept::DefaultTransactionIsolation => {
+                if self.default_transaction_isolation_handle(msg) {
+                    self.origin_intercept = OriginIntercept::None;
+                }
+                true
             }
 
             &OriginIntercept::WalLsnProbe { stamp_seq } => {

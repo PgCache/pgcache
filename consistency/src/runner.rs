@@ -18,7 +18,7 @@ use crate::db;
 use crate::invariants::{MonotonicTracker, intra_snapshot_reduce, pair_check};
 use crate::scenario::Scenario;
 use crate::snapshot;
-use crate::workload::{OpCounts, reader_task, writer_task};
+use crate::workload::{OpCounts, TxnIsolation, TxnMix, reader_task, writer_task};
 
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(60);
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
@@ -48,8 +48,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         duration_secs = cli.duration_secs,
         cdc_lag_ms = cli.cdc_lag_ms,
         population_delay_ms = cli.population_delay_ms,
+        txn_reads = cli.txn_reads,
+        txn_isolation = ?cli.txn_isolation,
         "starting consistency stress run (use --seed {seed} to reproduce)"
     );
+    let txn = TxnMix {
+        enabled: cli.txn_reads,
+        isolation: cli.txn_isolation,
+    };
 
     let mut env = Vec::new();
     if let Some(ms) = cli.cdc_lag_ms.filter(|ms| *ms > 0) {
@@ -139,6 +145,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             seed ^ (0x1000 + i as u64),
             cli.write_think_ms,
             cli.bump_groups,
+            txn,
             deadline,
         )));
     }
@@ -148,6 +155,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             stack.cache_url.clone(),
             scenario.clone(),
             seed ^ (0x2000 + i as u64),
+            txn,
             deadline,
         )));
     }
@@ -207,6 +215,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         return Err(e);
     }
 
+    if txn.enabled
+        && let Err(e) = txn_metrics_check(&stack.metrics_url, txn.isolation).await
+    {
+        failure_diagnostics(&stack.metrics_url, &stack.origin_url, &stack.cache_db_url).await;
+        db::teardown_begin();
+        stack.shutdown().await;
+        return Err(e);
+    }
+
     // Final convergence: cache must equal origin once everything drains.
     let check = EqualityCheck {
         metrics_url: &stack.metrics_url,
@@ -239,6 +256,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         pk_updates = counts.pk_update,
         inserts = counts.insert,
         deletes = counts.delete,
+        serialization_failures = counts.serialization_failure,
         final_rows,
         "consistency stress run passed"
     );
@@ -388,6 +406,73 @@ async fn equality_converge(c: &EqualityCheck<'_>) -> Result<usize> {
     }
 }
 
+/// The in-transaction serving expectation for the configured isolation level
+/// (PGC-387): READ COMMITTED must have served in-block reads from cache;
+/// stricter levels must have served none and forwarded on isolation.
+async fn txn_metrics_check(metrics_url: &str, isolation: TxnIsolation) -> Result<()> {
+    let http = reqwest::Client::new();
+    let served = metric_sum(&http, metrics_url, "pgcache_txn_served").await?;
+    let strict = metric_sum(
+        &http,
+        metrics_url,
+        "pgcache_txn_forwards{reason=\"isolation_strict\"}",
+    )
+    .await?;
+    let pending = metric_sum(
+        &http,
+        metrics_url,
+        "pgcache_txn_forwards{reason=\"pending_write\"}",
+    )
+    .await?;
+    let unknown = metric_sum(
+        &http,
+        metrics_url,
+        "pgcache_txn_forwards{reason=\"isolation_unknown\"}",
+    )
+    .await?;
+    let failed = metric_sum(
+        &http,
+        metrics_url,
+        "pgcache_txn_forwards{reason=\"failed\"}",
+    )
+    .await?;
+    let hits = metric_sum(&http, metrics_url, "pgcache_queries_cache_hit").await?;
+    let misses = metric_sum(&http, metrics_url, "pgcache_queries_cache_miss").await?;
+    tracing::info!(
+        cache_hits = hits,
+        cache_misses = misses,
+        served,
+        forwarded_isolation_strict = strict,
+        forwarded_isolation_unknown = unknown,
+        forwarded_failed = failed,
+        forwarded_pending_write = pending,
+        "in-transaction serving metrics"
+    );
+    // Served counts depend on the run's hit rate (low under the harness's write
+    // churn), so READ COMMITTED asserts the gate's decisions, not a hit quota.
+    match isolation {
+        TxnIsolation::ReadCommitted => {
+            if strict > 0.0 {
+                bail!("--txn-reads at READ COMMITTED forwarded {strict} reads as isolation-strict");
+            }
+            if pending <= 0.0 {
+                bail!("--txn-reads at READ COMMITTED never forwarded an own-write read");
+            }
+        }
+        TxnIsolation::RepeatableRead => {
+            if served > 0.0 {
+                bail!(
+                    "--txn-reads at {isolation:?} served {served} in-transaction reads from cache"
+                );
+            }
+            if strict <= 0.0 {
+                bail!("--txn-reads at {isolation:?} recorded no isolation-strict forwards");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Block until the writer's query/CDC/internal channel queues are all empty, so
 /// the final comparison doesn't race work the writer has accepted but not yet
 /// applied. These depths are only on `/metrics`, not `/status`.
@@ -466,8 +551,15 @@ async fn writer_queue_depth(http: &reqwest::Client, metrics_url: &str) -> Result
         "pgcache_cache_writer_cdc_queue",
         "pgcache_cache_writer_internal_queue",
     ];
-    let body = http
-        .get(metrics_url)
+    let body = metrics_body(http, metrics_url).await?;
+    Ok(NAMES
+        .iter()
+        .map(|name| metrics_lines_sum(&body, name))
+        .sum())
+}
+
+async fn metrics_body(http: &reqwest::Client, metrics_url: &str) -> Result<String> {
+    http.get(metrics_url)
         .send()
         .await
         .context("GET /metrics")?
@@ -475,26 +567,33 @@ async fn writer_queue_depth(http: &reqwest::Client, metrics_url: &str) -> Result
         .context("/metrics status")?
         .text()
         .await
-        .context("/metrics body")?;
+        .context("/metrics body")
+}
 
+/// Sum of every sample of `name` (a bare name matches all its label sets; a
+/// name with labels matches that series only).
+async fn metric_sum(http: &reqwest::Client, metrics_url: &str, name: &str) -> Result<f64> {
+    let body = metrics_body(http, metrics_url).await?;
+    Ok(metrics_lines_sum(&body, name))
+}
+
+fn metrics_lines_sum(body: &str, name: &str) -> f64 {
     let mut sum = 0.0;
     for line in body.lines() {
         if line.starts_with('#') {
             continue;
         }
-        for name in NAMES {
-            if let Some(rest) = line.strip_prefix(name)
-                && matches!(rest.chars().next(), Some(' ') | Some('{'))
-                && let Some(value) = rest
-                    .rsplit(' ')
-                    .next()
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-            {
-                sum += value;
-            }
+        if let Some(rest) = line.strip_prefix(name)
+            && matches!(rest.chars().next(), Some(' ') | Some('{'))
+            && let Some(value) = rest
+                .rsplit(' ')
+                .next()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+        {
+            sum += value;
         }
     }
-    Ok(sum)
+    sum
 }
 
 async fn origin_lsn(client: &Client) -> Result<u64> {

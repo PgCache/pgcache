@@ -57,6 +57,13 @@ pub struct MetricsSnapshot {
     pub raw_serve_disjoint_insert: u64,
     pub raw_serve_disjoint_delete: u64,
     pub raw_serve_disjoint_update: u64,
+    /// In-transaction serving (PGC-387).
+    pub txn_served: u64,
+    pub txn_forward_failed: u64,
+    pub txn_forward_isolation_unknown: u64,
+    pub txn_forward_isolation_strict: u64,
+    pub txn_forward_pending_write: u64,
+    pub txn_isolation_probes: u64,
 }
 
 /// Fetch metrics via HTTP from the Prometheus endpoint.
@@ -94,6 +101,12 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut raw_serve_disjoint_insert = 0u64;
     let mut raw_serve_disjoint_delete = 0u64;
     let mut raw_serve_disjoint_update = 0u64;
+    let mut txn_served = 0u64;
+    let mut txn_forward_failed = 0u64;
+    let mut txn_forward_isolation_unknown = 0u64;
+    let mut txn_forward_isolation_strict = 0u64;
+    let mut txn_forward_pending_write = 0u64;
+    let mut txn_isolation_probes = 0u64;
     let mut queries_invalid = 0u64;
     let mut queries_cache_hit = 0u64;
     let mut queries_cache_miss = 0u64;
@@ -146,6 +159,18 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_raw_serve_disjoint_insert" => raw_serve_disjoint_insert = value,
                 "pgcache_raw_serve_disjoint_delete" => raw_serve_disjoint_delete = value,
                 "pgcache_raw_serve_disjoint_update" => raw_serve_disjoint_update = value,
+                "pgcache_txn_served" => txn_served = value,
+                "pgcache_txn_forwards{reason=\"failed\"}" => txn_forward_failed = value,
+                "pgcache_txn_forwards{reason=\"isolation_unknown\"}" => {
+                    txn_forward_isolation_unknown = value;
+                }
+                "pgcache_txn_forwards{reason=\"isolation_strict\"}" => {
+                    txn_forward_isolation_strict = value;
+                }
+                "pgcache_txn_forwards{reason=\"pending_write\"}" => {
+                    txn_forward_pending_write = value;
+                }
+                "pgcache_txn_isolation_probes" => txn_isolation_probes = value,
                 "pgcache_queries_invalid" => queries_invalid = value,
                 "pgcache_queries_cache_hit" => queries_cache_hit = value,
                 "pgcache_queries_cache_miss" => queries_cache_miss = value,
@@ -248,6 +273,12 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         raw_serve_disjoint_insert,
         raw_serve_disjoint_delete,
         raw_serve_disjoint_update,
+        txn_served,
+        txn_forward_failed,
+        txn_forward_isolation_unknown,
+        txn_forward_isolation_strict,
+        txn_forward_pending_write,
+        txn_isolation_probes,
     })
 }
 
@@ -305,6 +336,15 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
             - before.raw_serve_disjoint_delete,
         raw_serve_disjoint_update: after.raw_serve_disjoint_update
             - before.raw_serve_disjoint_update,
+        txn_served: after.txn_served - before.txn_served,
+        txn_forward_failed: after.txn_forward_failed - before.txn_forward_failed,
+        txn_forward_isolation_unknown: after.txn_forward_isolation_unknown
+            - before.txn_forward_isolation_unknown,
+        txn_forward_isolation_strict: after.txn_forward_isolation_strict
+            - before.txn_forward_isolation_strict,
+        txn_forward_pending_write: after.txn_forward_pending_write
+            - before.txn_forward_pending_write,
+        txn_isolation_probes: after.txn_isolation_probes - before.txn_isolation_probes,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

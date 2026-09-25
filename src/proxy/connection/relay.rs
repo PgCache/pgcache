@@ -36,7 +36,7 @@ use crate::{
         ProtocolError,
         backend::{
             AUTHENTICATION_SASL, PgBackendMessage, PgBackendMessageCodec, PgBackendMessageType,
-            authentication_type, parameter_status_parse,
+            TransactionStatus, authentication_type, parameter_status_parse,
         },
         frontend::{
             PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType,
@@ -58,7 +58,7 @@ use super::super::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
 use crate::query::transform::query_expr_parameters_replace;
-use crate::query::write::WriteClass;
+use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
 
 use super::*;
@@ -157,7 +157,6 @@ async fn handle_connection(
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
     cacheability_store: Arc<CacheabilityStore>,
-    read_your_writes: bool,
 ) -> ConnectionResult<()> {
     // Track active connections - guard ensures decrement on any exit path
     crate::metrics::handles().conn.active.increment(1.0);
@@ -185,7 +184,6 @@ async fn handle_connection(
         func_volatility,
         origin_database,
         cacheability_store,
-        read_your_writes,
         dispatch_handle.clone(),
     );
 
@@ -253,6 +251,27 @@ async fn handle_connection(
 
                 crate::metrics::handles().query.cacheable.increment(1);
 
+                // Transaction gate (PGC-387): inside a block, serve only when the
+                // block is healthy and READ COMMITTED. Checked here, not at
+                // message time, because every earlier response (a pipelined
+                // BEGIN's RFQ, an error that failed the block) has been sealed
+                // by the time the slot reaches the head.
+                if let Err(reason) = state.transaction_serve_check() {
+                    let m = crate::metrics::handles();
+                    match reason {
+                        TransactionForwardReason::Failed => m.txn.forward_failed.increment(1),
+                        TransactionForwardReason::IsolationUnknown => {
+                            m.txn.forward_isolation_unknown.increment(1);
+                        }
+                        TransactionForwardReason::IsolationStrict => {
+                            m.txn.forward_isolation_strict.increment(1);
+                        }
+                    }
+                    debug!(?reason, "in-transaction read forwarded to origin");
+                    state.cache_slot_forward_to_origin(msg);
+                    continue;
+                }
+
                 // Read-after-write gate (PGC-124): if this cacheable read could
                 // be superseded by a still-pending write on this connection,
                 // forward it to origin rather than serve a value that predates
@@ -287,22 +306,33 @@ async fn handle_connection(
                         let m = crate::metrics::handles();
                         match state.write_log.decide(read_query, read_ranges.as_ref()) {
                             RawDecision::Forward(reason, blocker) => {
-                                match reason {
-                                    RawForwardReason::Table => m.raw.forwards_table.increment(1),
-                                    RawForwardReason::Connection => {
-                                        m.raw.forwards_connection.increment(1)
+                                // Inside a block the intersecting write is the
+                                // block's own uncommitted one (never stamped until
+                                // commit), which is not a clearance delay: count
+                                // it under the transaction gate, not PGC-440's
+                                // stage attribution.
+                                if state.in_transaction() {
+                                    m.txn.forward_pending_write.increment(1);
+                                } else {
+                                    match reason {
+                                        RawForwardReason::Table => {
+                                            m.raw.forwards_table.increment(1)
+                                        }
+                                        RawForwardReason::Connection => {
+                                            m.raw.forwards_connection.increment(1)
+                                        }
                                     }
-                                }
-                                let received = state.dispatch_handle.received_lsn();
-                                match forward_cause(blocker, received) {
-                                    RawForwardCause::Unstamped => {
-                                        m.raw.forward_blocked_unstamped.increment(1);
-                                    }
-                                    RawForwardCause::DeliveryLag => {
-                                        m.raw.forward_blocked_delivery_lag.increment(1);
-                                    }
-                                    RawForwardCause::ApplyLag => {
-                                        m.raw.forward_blocked_apply_lag.increment(1);
+                                    let received = state.dispatch_handle.received_lsn();
+                                    match forward_cause(blocker, received) {
+                                        RawForwardCause::Unstamped => {
+                                            m.raw.forward_blocked_unstamped.increment(1);
+                                        }
+                                        RawForwardCause::DeliveryLag => {
+                                            m.raw.forward_blocked_delivery_lag.increment(1);
+                                        }
+                                        RawForwardCause::ApplyLag => {
+                                            m.raw.forward_blocked_apply_lag.increment(1);
+                                        }
                                     }
                                 }
                                 state.cache_slot_forward_to_origin(msg);
@@ -335,6 +365,7 @@ async fn handle_connection(
                     search_path: resolved_search_path,
                     timing,
                     pipeline: state.extended.pipeline_take(),
+                    transaction_status: state.transaction_status,
                 };
 
                 // Inline dispatch: the connection dispatches against the shared
@@ -368,6 +399,10 @@ async fn handle_connection(
                                 // `OriginDrain` to serve the next batched slot,
                                 // or `Read` when the batch is done / forwarded.
                                 socket = returned;
+                                if state.close_requested {
+                                    debug!("closing connection after an abandoned in-block serve");
+                                    break;
+                                }
                             }
                             Err(err) => {
                                 debug!("cache serve error [{}]", err);
@@ -436,7 +471,6 @@ pub async fn connection_task(
     func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
     origin_database: EcoString,
     cacheability_store: Arc<CacheabilityStore>,
-    read_your_writes: bool,
 ) {
     debug!("task spawn");
 
@@ -469,7 +503,6 @@ pub async fn connection_task(
         func_volatility,
         origin_database,
         cacheability_store,
-        read_your_writes,
     )
     .await;
 
@@ -551,7 +584,6 @@ impl ConnectionState {
         func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
         origin_database: EcoString,
         cacheability_store: Arc<CacheabilityStore>,
-        read_your_writes: bool,
         dispatch_handle: CacheDispatchHandle,
     ) -> Self {
         Self {
@@ -559,7 +591,13 @@ impl ConnectionState {
             egress: EgressQueue::new(),
             flush_describe_pending: false,
             cacheability_cache: CacheabilityCache::new(cacheability_store),
-            in_transaction: false,
+            transaction_status: TransactionStatus::Idle,
+            session_isolation: IsolationState::Unknown,
+            block_isolation: IsolationState::Unknown,
+            pending_block_isolation: None,
+            begins_forwarded: 0,
+            isolation_mutated_in_block: false,
+            close_requested: false,
             proxy_mode: ProxyMode::Read,
             proxy_status: ProxyStatus::Normal,
             prepared_statements: HashMap::new(),
@@ -575,22 +613,38 @@ impl ConnectionState {
             origin_database,
             cache_disabled: false,
             describe_cache: LruCache::new(DESCRIBE_CACHE_CAPACITY),
-            write_log: WriteLog::new(read_your_writes),
+            write_log: WriteLog::new(),
             dispatch_handle,
         }
     }
-    /// Analyze a forwarded statement purely to record any write it performs into
-    /// the read-after-write log. Reads (and cache/explain verdicts) record
-    /// nothing; an unparseable statement records conservatively at connection
-    /// scope. Used on paths that forward without a cache decision (in-txn).
-    async fn write_log_record_forwarded(&mut self, data: &BytesMut) {
-        if !self.write_log.is_enabled() {
-            return;
+    /// Apply what a statement being forwarded to origin does to the
+    /// connection's tracked state: its write lands in the read-after-write
+    /// log, its isolation effect and block boundary in the isolation tracker.
+    /// The single apply point for every forward path.
+    pub(in crate::proxy::connection) fn forwarded_effects_apply(
+        &mut self,
+        effects: &StatementEffects,
+    ) {
+        if let Some(class) = &effects.write {
+            self.write_log.record(class);
         }
+        self.isolation_effects_apply(effects);
+    }
+
+    /// Analyze a statement forwarded without a cache decision (failed block,
+    /// cache-disabled connection) and apply its effects. A cacheable read here
+    /// is being forwarded so origin reports the aborted-block error; it is
+    /// never dispatched, so its forward is counted here.
+    async fn forwarded_statement_effects_apply(&mut self, data: &BytesMut) {
         match handle_query(data, &mut self.cacheability_cache, &self.func_volatility).await {
-            Ok(Action::ForwardWrite(_, class)) => self.write_log.record(&class),
-            Ok(_) => {}
-            Err(_) => self.write_log.record(&WriteClass::Connection),
+            Ok(Action::Forward(_, effects)) => self.forwarded_effects_apply(&effects),
+            Ok(Action::CacheCheck(_)) => {
+                if self.transaction_status == TransactionStatus::Failed {
+                    crate::metrics::handles().txn.forward_failed.increment(1);
+                }
+            }
+            Ok(Action::Explain(_)) => {}
+            Err(_) => self.forwarded_effects_apply(&StatementEffects::unknown()),
         }
     }
 
@@ -634,7 +688,7 @@ impl ConnectionState {
 
                 self.search_path_inspect_query(&mut msg);
 
-                if !self.in_transaction && !self.cache_disabled {
+                if self.cache_dispatch_possible() {
                     self.proxy_mode = match handle_query(
                         &msg.data,
                         &mut self.cacheability_cache,
@@ -642,14 +696,9 @@ impl ConnectionState {
                     )
                     .await
                     {
-                        Ok(Action::Forward(reason)) => {
+                        Ok(Action::Forward(reason, effects)) => {
                             forward_reason_metric(reason);
-                            self.origin_dispatch(msg.data, None);
-                            ProxyMode::Read
-                        }
-                        Ok(Action::ForwardWrite(reason, class)) => {
-                            forward_reason_metric(reason);
-                            self.write_log.record(&class);
+                            self.forwarded_effects_apply(&effects);
                             self.origin_dispatch(msg.data, None);
                             ProxyMode::Read
                         }
@@ -679,18 +728,19 @@ impl ConnectionState {
                             error!("handle_query {}", e);
                             // Unparseable: can't rule out a write — record
                             // connection-scoped so no read is served stale.
-                            self.write_log.record(&WriteClass::Connection);
+                            self.forwarded_effects_apply(&StatementEffects::unknown());
                             self.origin_dispatch(msg.data, None);
                             ProxyMode::Read
                         }
                     };
                 } else {
                     m.query.uncacheable.increment(1);
-                    // In-transaction statements are never cache-served, but a
-                    // write among them must still land in the log so post-commit
-                    // reads on this connection aren't served stale. Analyze here
-                    // (memoized) purely to classify; reads record nothing.
-                    self.write_log_record_forwarded(&msg.data).await;
+                    // A failed block (or cache-disabled connection) never
+                    // cache-serves, but a write among its statements must still
+                    // land in the log so later reads on this connection aren't
+                    // served stale, and a SET must still be tracked. Analyze
+                    // here (memoized) purely to classify.
+                    self.forwarded_statement_effects_apply(&msg.data).await;
                     self.origin_dispatch(msg.data, None);
                 }
             }
@@ -753,7 +803,7 @@ impl ConnectionState {
                 // Legacy fast-path function call: executes a function that may
                 // write, and it carries no SQL to classify — record
                 // conservatively so a subsequent read isn't served stale.
-                self.write_log.record(&WriteClass::Connection);
+                self.forwarded_effects_apply(&StatementEffects::unknown());
                 self.origin_write_buf.push_back(msg.data);
             }
             _ => {
@@ -777,6 +827,17 @@ impl ConnectionState {
         if self.origin_intercept_handle(&msg) {
             // Swallowed by an intercept (injected SHOW, lazy ParseComplete, …):
             // these have no client egress slot, so an RFQ here seals nothing.
+            // A completed intercept's RFQ is still a quiescent point: chain the
+            // isolation probe / commit-LSN probe now rather than waiting for
+            // client traffic. Only the isolation probe chains (it is never
+            // injected while a block is open, so it cannot fail-and-loop);
+            // a search_path SHOW retries at the next client-visible RFQ.
+            if matches!(msg.message_type, PgBackendMessageType::ReadyForQuery)
+                && matches!(self.origin_intercept, OriginIntercept::None)
+            {
+                self.isolation_probe_inject();
+                self.write_log_maintain();
+            }
             return;
         }
 
@@ -864,13 +925,14 @@ impl ConnectionState {
                 // 'I' = idle (not in transaction)
                 // 'T' = in transaction block
                 // 'E' = in failed transaction block
-                let was_in_transaction = self.in_transaction;
-                self.in_transaction = msg.data.get(5).is_some_and(|&b| b == b'T' || b == b'E');
+                let previous_status = self.transaction_status;
+                let was_in_transaction = self.in_transaction();
+                self.transaction_status = TransactionStatus::from_ready_for_query(&msg.data);
 
                 self.telemetry.origin_complete();
 
                 // Clean up unnamed portals when transaction ends
-                if !self.in_transaction {
+                if !self.in_transaction() {
                     self.portals.retain(|name, _| !name.is_empty());
                 }
 
@@ -882,7 +944,7 @@ impl ConnectionState {
                 // search_path — marking unknown would clobber that fresh
                 // value.
                 if was_in_transaction
-                    && !self.in_transaction
+                    && !self.in_transaction()
                     && !self.search_path_just_piggyback_resolved
                     && !self.search_path_auto_reported
                 {
@@ -890,21 +952,13 @@ impl ConnectionState {
                     self.search_path_mark_unknown();
                 }
                 self.search_path_just_piggyback_resolved = false;
+                self.isolation_block_transition(previous_status);
 
-                // If search_path is unknown (initial discovery on pre-PG18, or
-                // after a detected mutation / txn-end), inject a SHOW query to
-                // re-sync. Skipped if another intercept is active — another
-                // RFQ will follow.
-                if let SearchPathState::Unknown = self.search_path_state
-                    && matches!(self.origin_intercept, OriginIntercept::None)
-                {
-                    debug!("search_path unknown, sending SHOW search_path query");
-                    self.origin_intercept = OriginIntercept::SearchPath;
-                    let query_msg = simple_query_message_build("SHOW search_path;");
-                    // Injected query: its response is fully swallowed by the
-                    // SearchPath intercept, so it gets no client egress slot.
-                    self.origin_write_buf.push_back(query_msg);
-                }
+                // Re-sync any unknown session state (search_path on pre-PG18,
+                // the isolation default) with an injected SHOW. Skipped if
+                // another intercept is active — its completion chains the
+                // isolation probe.
+                self.session_discovery_inject();
             }
             _ => {}
         }
@@ -945,7 +999,7 @@ impl ConnectionState {
         // the writes recorded through `stamp_seq`. A write racing in after the
         // sample is caught by `WriteLog::stamp`'s seq guard.
         if matches!(self.proxy_mode, ProxyMode::Read)
-            && !self.in_transaction
+            && !self.in_transaction()
             && matches!(self.origin_intercept, OriginIntercept::None)
             && self.origin_write_buf.is_empty()
             && self.egress.origin_all_sealed()
@@ -968,11 +1022,16 @@ impl ConnectionState {
                 CacheOutcome::Complete(_) => "Complete",
                 CacheOutcome::Forward(_, _) => "Forward",
                 CacheOutcome::Error(_) => "Error",
+                CacheOutcome::Abandon => "Abandon",
             }
         );
         match outcome {
             CacheOutcome::Complete(timing) => {
-                crate::metrics::handles().query.cache_hit.increment(1);
+                let m = crate::metrics::handles();
+                m.query.cache_hit.increment(1);
+                if self.in_transaction() {
+                    m.txn.served.increment(1);
+                }
                 self.telemetry.cache_complete(timing);
 
                 // Cache hit: the worker wrote the full response directly to the
@@ -991,6 +1050,19 @@ impl ConnectionState {
                 crate::metrics::handles().query.cache_error.increment(1);
                 debug!("forwarding to origin");
                 self.cache_reply_forward(buf, None);
+            }
+            // A serve failed after bytes reached the client inside a block:
+            // the client got an ErrorResponse but origin's block is healthy,
+            // and no synthesized ReadyForQuery can reconcile the two (a `T`
+            // would let a later COMMIT commit what the client believes
+            // failed). Close the connection: origin rolls the block back.
+            CacheOutcome::Abandon => {
+                crate::metrics::handles().query.cache_error.increment(1);
+                warn!(
+                    "cache serve failed mid-response inside a transaction block; closing the connection so origin rolls the block back"
+                );
+                self.egress.cache_done();
+                self.close_requested = true;
             }
             CacheOutcome::Forward(buf, timing) => {
                 crate::metrics::handles().query.cache_miss.increment(1);
@@ -1045,9 +1117,18 @@ impl ConnectionState {
         self.forward_current_and_rest(bytes);
     }
 
-    /// Whether the connection's global state currently permits cache serving.
-    pub(in crate::proxy::connection) fn cache_globally_enabled(&self) -> bool {
-        !self.in_transaction && !self.cache_disabled && self.proxy_status == ProxyStatus::Normal
+    /// Whether a cacheable read may be queued for cache dispatch at all. Inside
+    /// a healthy block it may; the per-slot transaction gate then decides
+    /// against the state current when the slot reaches the head (PGC-387).
+    /// A degraded proxy still queues (the dispatch-unavailable fallback
+    /// forwards per query and the connection recovers with the cache).
+    pub(in crate::proxy::connection) fn cache_dispatch_possible(&self) -> bool {
+        self.transaction_status != TransactionStatus::Failed && !self.cache_disabled
+    }
+
+    /// Whether origin is inside a transaction block (open or failed).
+    pub(in crate::proxy::connection) fn in_transaction(&self) -> bool {
+        self.transaction_status != TransactionStatus::Idle
     }
 
     /// Dispatch the result of an origin-read poll: handle the message, or map a

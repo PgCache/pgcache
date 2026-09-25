@@ -6,9 +6,8 @@ use tokio::sync::mpsc::error::SendError;
 use tokio_util::bytes::{Buf, Bytes};
 use tracing::{debug, trace};
 
-use crate::pg::protocol::encode::{
-    BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG,
-};
+use crate::pg::protocol::backend::TransactionStatus;
+use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG};
 use crate::query::{Fingerprint, QueryShape};
 
 use crate::cache::fast_path::{self, MvDecision};
@@ -32,6 +31,12 @@ struct MemoServe {
     /// with Describe). When false the stored leading RowDescription is sliced off.
     wants_row_description: bool,
     emit_rfq: bool,
+}
+
+/// The trailing ReadyForQuery a serve appends, or `None` when the client
+/// expects none (a non-trailing or Flush-terminated extended execute).
+fn trailing_rfq(emit_rfq: bool, status: TransactionStatus) -> Option<&'static [u8]> {
+    emit_rfq.then(|| status.ready_for_query_message())
 }
 
 impl CacheDispatch {
@@ -174,8 +179,8 @@ impl CacheDispatch {
             buf.push(Bytes::from_static(BIND_COMPLETE_MSG));
         }
         buf.push(core);
-        if emit_rfq {
-            buf.push(Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+        if let Some(rfq) = trailing_rfq(emit_rfq, msg.transaction_status) {
+            buf.push(Bytes::from_static(rfq));
         }
 
         let served = buf.remaining() as u64;
@@ -283,6 +288,7 @@ impl CacheDispatch {
             timing: msg.timing,
             limit: msg.cacheable_query.query().limit.clone(),
             emit_rfq,
+            transaction_status: msg.transaction_status,
             has_parse,
             has_bind,
             pipeline_describe,

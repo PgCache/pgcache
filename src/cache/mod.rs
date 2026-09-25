@@ -99,6 +99,9 @@ error_set! {
         CacheServerError {
             sqlstate: Option<[u8; 5]>,
         },
+        /// A serve failed after bytes reached the client inside a transaction
+        /// block (PGC-387): the connection must close rather than forward.
+        ServeAbandonedInBlock,
     }
 
     DbError := {

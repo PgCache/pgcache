@@ -7,6 +7,7 @@ use tokio_util::bytes::{Bytes, BytesMut};
 
 use super::query::CacheableQuery;
 use super::reply::ReplySender;
+use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::{ClientSocket, ExplainSpec};
 use crate::timing::QueryTiming;
@@ -158,6 +159,10 @@ pub enum CacheOutcome {
     Forward(BytesMut, QueryTiming),
     /// Query execution failed. Contains buffered bytes for origin fallback.
     Error(BytesMut),
+    /// The serve failed after bytes reached the client inside a transaction
+    /// block: the client was sent an ErrorResponse and the connection must
+    /// close (no ReadyForQuery can describe origin's still-healthy block).
+    Abandon,
 }
 
 /// Message from proxy containing query and connection details
@@ -173,4 +178,7 @@ pub struct ProxyMessage {
     /// Pipeline context for atomic extended query dispatch.
     /// None for simple queries and cold-path extended queries (no pipeline active).
     pub pipeline: Option<PipelineContext>,
+    /// The client's transaction status, echoed in the trailing ReadyForQuery a
+    /// cache serve appends (in-transaction serving, PGC-387).
+    pub transaction_status: TransactionStatus,
 }

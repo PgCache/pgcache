@@ -19,9 +19,10 @@ use crate::cache::reply::ReplySender;
 use crate::cache::runtime::serve_pool::ConnectionGuard;
 use crate::cache::types::{CacheStateView, SharedResolved};
 use crate::pg::cache_connection::{CacheConnection, ExplainOutcome};
+use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::encode::{
-    READY_FOR_QUERY_IDLE_MSG, command_complete_tag_encode, data_row_text_encode,
-    notice_response_encode, row_description_text_encode,
+    command_complete_tag_encode, data_row_text_encode, notice_response_encode,
+    row_description_text_encode,
 };
 use crate::proxy::ClientSocket;
 use crate::query::resolved::ResolvedQueryExpr;
@@ -35,6 +36,8 @@ pub struct ExplainJob {
     pub client_socket: ClientSocket,
     pub reply_tx: ReplySender<CacheReply>,
     pub timing: QueryTiming,
+    /// The client's transaction status for the trailing ReadyForQuery.
+    pub transaction_status: TransactionStatus,
     pub kind: ExplainKind,
 }
 
@@ -67,6 +70,7 @@ pub async fn handle_explain_request(
         mut client_socket,
         reply_tx,
         mut timing,
+        transaction_status,
         kind,
     } = job;
     timing.worker_start_at = Some(Instant::now());
@@ -74,7 +78,7 @@ pub async fn handle_explain_request(
 
     let response = match kind {
         ExplainKind::Unavailable { message } => {
-            explain_response_encode(&[], &[format!("pgcache: {message}")])
+            explain_response_encode(&[], &[format!("pgcache: {message}")], transaction_status)
         }
         ExplainKind::Run {
             fingerprint,
@@ -95,17 +99,22 @@ pub async fn handle_explain_request(
                 memoized,
             );
             match guard.conn.take() {
-                None => explain_response_encode(&[], &["pgcache: no cache connection".to_owned()]),
+                None => explain_response_encode(
+                    &[],
+                    &["pgcache: no cache connection".to_owned()],
+                    transaction_status,
+                ),
                 Some(mut conn) => match conn.explain_collect(&explain_sql, &literals).await {
                     Ok(ExplainOutcome::Plan(lines)) => {
                         guard.conn = Some(conn);
-                        explain_response_encode(&notices, &lines)
+                        explain_response_encode(&notices, &lines, transaction_status)
                     }
                     Ok(ExplainOutcome::CacheError(message)) => {
                         guard.conn = Some(conn);
                         explain_response_encode(
                             &[],
                             &[format!("pgcache: cache DB error: {message}")],
+                            transaction_status,
                         )
                     }
                     Err(_) => {
@@ -114,6 +123,7 @@ pub async fn handle_explain_request(
                         explain_response_encode(
                             &[],
                             &["pgcache: explain failed (cache connection error)".to_owned()],
+                            transaction_status,
                         )
                     }
                 },
@@ -217,7 +227,11 @@ fn explain_prefix_build(options: &str) -> String {
 /// Encode the synthesized client response: one NOTICE per diagnostics line, then
 /// a one-column `QUERY PLAN` result with one row per plan line,
 /// `CommandComplete EXPLAIN`, and `ReadyForQuery`.
-fn explain_response_encode(notices: &[String], plan_lines: &[String]) -> BytesMut {
+fn explain_response_encode(
+    notices: &[String],
+    plan_lines: &[String],
+    transaction_status: TransactionStatus,
+) -> BytesMut {
     let mut buf = BytesMut::new();
     for notice in notices {
         notice_response_encode(notice, &mut buf);
@@ -227,7 +241,7 @@ fn explain_response_encode(notices: &[String], plan_lines: &[String]) -> BytesMu
         data_row_text_encode(Some(line), &mut buf);
     }
     command_complete_tag_encode("EXPLAIN", &mut buf);
-    buf.extend_from_slice(READY_FOR_QUERY_IDLE_MSG);
+    buf.extend_from_slice(transaction_status.ready_for_query_message());
     buf
 }
 
@@ -258,7 +272,7 @@ mod tests {
             "Seq Scan on orders".to_owned(),
             "  Filter: (id = 1)".to_owned(),
         ];
-        let buf = explain_response_encode(&notices, &lines);
+        let buf = explain_response_encode(&notices, &lines, TransactionStatus::Idle);
 
         // Collect frame tags in order by walking the length-prefixed frames.
         let mut tags = Vec::new();
@@ -287,7 +301,11 @@ mod tests {
 
     #[test]
     fn test_explain_response_encode_without_notice_starts_with_row_description() {
-        let buf = explain_response_encode(&[], &["pgcache: query not cached".to_owned()]);
+        let buf = explain_response_encode(
+            &[],
+            &["pgcache: query not cached".to_owned()],
+            TransactionStatus::Idle,
+        );
         assert_eq!(buf[0], ROW_DESCRIPTION_TAG);
     }
 }

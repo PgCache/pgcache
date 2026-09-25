@@ -13,18 +13,23 @@ use tokio_util::bytes::BytesMut;
 
 use crate::{
     cache::{CacheDispatchHandle, CacheMessage},
-    pg::protocol::session::{Portal, PreparedStatement},
+    pg::protocol::{
+        backend::TransactionStatus,
+        session::{Portal, PreparedStatement},
+    },
     proxy::egress::EgressQueue,
 };
 
 use super::query::CacheabilityCache;
 use super::{ProxyMode, ProxyStatus};
+use crate::query::write::IsolationLevel;
 
 mod describe_cache;
 mod extended;
 mod relay;
 mod search_path_intercept;
 mod telemetry;
+mod transaction_isolation;
 mod write_log;
 
 pub(in crate::proxy::connection) use super::origin_stream::{
@@ -38,6 +43,9 @@ pub use relay::connection_task;
 pub(in crate::proxy::connection) use relay::forward_lazy_parse_install;
 pub(in crate::proxy::connection) use search_path_intercept::{OriginIntercept, SearchPathState};
 pub(in crate::proxy::connection) use telemetry::QueryTelemetry;
+pub(in crate::proxy::connection) use transaction_isolation::{
+    IsolationState, TransactionForwardReason,
+};
 pub(in crate::proxy::connection) use write_log::{
     RawDecision, RawForwardCause, RawForwardReason, WriteLog, forward_cause,
 };
@@ -64,8 +72,35 @@ pub(super) struct ConnectionState {
     /// interning store.
     pub(in crate::proxy::connection) cacheability_cache: CacheabilityCache,
 
-    /// Whether the connection is currently in a transaction
-    pub(in crate::proxy::connection) in_transaction: bool,
+    /// Origin's transaction status as of the last ReadyForQuery. Cache serves
+    /// echo it in their own ReadyForQuery, and only `InTransaction` (never
+    /// `Failed`) may be cache-served inside a block (PGC-387).
+    pub(in crate::proxy::connection) transaction_status: TransactionStatus,
+
+    /// The session's `default_transaction_isolation`, probed once and tracked
+    /// through the statements that can change it (PGC-387).
+    pub(in crate::proxy::connection) session_isolation: IsolationState,
+
+    /// The open block's isolation level, fixed on the idle→in-block edge from
+    /// `pending_block_isolation` or the session default; tightened by `SET
+    /// TRANSACTION`. Meaningless outside a block.
+    pub(in crate::proxy::connection) block_isolation: IsolationState,
+
+    /// A `BEGIN ... ISOLATION LEVEL` clause forwarded but not yet acknowledged
+    /// by the block's ReadyForQuery.
+    pub(in crate::proxy::connection) pending_block_isolation: Option<IsolationLevel>,
+
+    /// Forwarded `BEGIN`s whose idle→in-block ReadyForQuery has not arrived:
+    /// a following pipelined statement already belongs to that block.
+    pub(in crate::proxy::connection) begins_forwarded: u32,
+
+    /// The session default was changed inside a block, so it must be re-probed
+    /// once the block ends (a `SET` can revert with the block).
+    pub(in crate::proxy::connection) isolation_mutated_in_block: bool,
+
+    /// A cache serve was abandoned mid-response inside a block: the connection
+    /// closes once the serve returns so origin rolls the block back.
+    pub(in crate::proxy::connection) close_requested: bool,
 
     /// Current proxy mode (reading, writing to client/origin/cache)
     pub(in crate::proxy::connection) proxy_mode: ProxyMode,

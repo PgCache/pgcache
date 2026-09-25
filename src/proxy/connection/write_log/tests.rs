@@ -51,7 +51,7 @@ fn query(sql: &str) -> QueryExpr {
 
 #[test]
 fn test_intersects_referenced_table_only() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     assert_eq!(
         log.decide(&query("SELECT * FROM orders WHERE id = 1"), None),
@@ -65,7 +65,7 @@ fn test_intersects_referenced_table_only() {
 
 #[test]
 fn test_intersects_connection_scope_poisons_all_reads() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&WriteClass::Connection);
     assert_eq!(
         log.decide(&query("SELECT * FROM whatever"), None),
@@ -75,7 +75,7 @@ fn test_intersects_connection_scope_poisons_all_reads() {
 
 #[test]
 fn test_intersects_covers_joins_and_subqueries() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     assert_eq!(
         log.decide(
@@ -102,7 +102,7 @@ fn test_intersects_covers_joins_and_subqueries() {
 
 #[test]
 fn test_intersects_schema_matching() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&WriteClass::Table(RelationRef {
         schema: Some("sales".into()),
         name: "orders".into(),
@@ -143,7 +143,7 @@ fn ranges(col: &str, range: ColumnRange) -> HashMap<EcoString, ColumnRange> {
 
 #[test]
 fn test_intersects_insert_row_level_disjointness() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&insert_int("orders", "id", &[2]));
     let q = query("SELECT * FROM orders WHERE id = 1");
 
@@ -174,7 +174,7 @@ fn test_intersects_insert_row_level_disjointness() {
 
 #[test]
 fn test_intersects_insert_multi_row() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&insert_int("orders", "id", &[2, 3, 4]));
     let q = query("SELECT * FROM orders");
 
@@ -201,7 +201,7 @@ fn test_intersects_insert_int_float_numeric() {
     // A pending INSERT of a float value against an integer-literal read must
     // compare by numeric value, not `LiteralValue` variant (PGC-124): `= 10`
     // is disjoint from `10.0` only when the numbers differ.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&WriteClass::InsertRows(Arc::new(InsertStatement {
         relation: RelationRef {
             schema: None,
@@ -238,7 +238,7 @@ fn test_intersects_insert_int_float_numeric() {
 fn test_intersects_insert_unknown_cell_forwards() {
     // A row whose predicate-column value is unknown (DEFAULT/expr) can't be
     // proven disjoint.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&WriteClass::InsertRows(Arc::new(InsertStatement {
         relation: RelationRef {
             schema: None,
@@ -256,7 +256,7 @@ fn test_intersects_insert_unknown_cell_forwards() {
 
 #[test]
 fn test_insert_overflow_degrades_to_opaque() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     let first: Vec<i64> = (0..600).collect();
     let second: Vec<i64> = (600..1200).collect(); // 600 + 600 > cap
     log.record(&insert_int("orders", "id", &first));
@@ -295,7 +295,7 @@ fn test_insert_wide_rows_hit_cells_cap() {
             rows,
         }))
     }
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&wide_insert(300));
     // Still precise below the budget.
     let r = ranges("c0", ColumnRange::Equal(LiteralValue::Integer(-1)));
@@ -319,7 +319,7 @@ fn test_insert_row_at_a_time_stays_precise() {
     // The motivating workload: an ORM inserting rows one statement at a
     // time. Hundreds of single-row INSERTs must keep row-level precision
     // (the old per-statement cap degraded to opaque at 64).
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for i in 0..500 {
         log.record(&insert_int("orders", "id", &[i]));
     }
@@ -344,7 +344,7 @@ fn test_insert_diverging_column_lists() {
     // Statements with different column lists fold into one aggregate; a
     // column a row's statement didn't mention is unknown for that row and
     // can never prove disjointness.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&insert_int("orders", "a", &[1]));
     log.record(&insert_int("orders", "b", &[2]));
     let q = query("SELECT * FROM orders WHERE a = 5");
@@ -379,7 +379,7 @@ fn test_insert_diverging_column_lists() {
 fn test_non_insert_write_dominates_inserts() {
     // An UPDATE (opaque) after an INSERT forces table-level regardless of the
     // read's disjointness from the earlier inserted rows.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&insert_int("orders", "id", &[2]));
     log.record(&table("orders"));
     let r5 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(5)));
@@ -401,7 +401,7 @@ fn delete_eq(table: &str, col: &str, value: i64) -> WriteClass {
 
 #[test]
 fn test_decide_delete_predicate_disjointness() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&delete_eq("orders", "id", 5));
     let q = query("SELECT * FROM orders WHERE id = 1");
 
@@ -431,7 +431,7 @@ fn test_decide_delete_predicate_disjointness() {
 
 #[test]
 fn test_decide_delete_only_forwards_referenced_table() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&delete_eq("orders", "id", 5));
     // A read of an unrelated table is unaffected.
     assert_eq!(
@@ -456,7 +456,7 @@ fn delete_range(table: &str, col: &str, below: i64) -> WriteClass {
 fn test_delete_row_at_a_time_stays_precise() {
     // The motivating workload: hundreds of single-row equality DELETEs must
     // keep row-level precision (the old per-statement cap degraded at 64).
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for i in 0..500 {
         log.record(&delete_eq("orders", "id", i));
     }
@@ -478,7 +478,7 @@ fn test_delete_row_at_a_time_stays_precise() {
 
 #[test]
 fn test_delete_merged_overflow_degrades_to_opaque() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for i in 0..=MERGED_PREDICATE_CAP {
         log.record(&delete_eq(
             "orders",
@@ -496,7 +496,7 @@ fn test_delete_merged_overflow_degrades_to_opaque() {
 
 #[test]
 fn test_delete_legacy_overflow_degrades_to_opaque() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     // Range deletes don't merge; one past the per-statement cap degrades.
     for i in 0..=UPDATE_DELETE_PREDICATE_CAP {
         log.record(&delete_range(
@@ -516,7 +516,7 @@ fn test_delete_legacy_overflow_degrades_to_opaque() {
 fn test_delete_mixed_merged_and_legacy_shapes() {
     // Equality deletes (merged) and a range delete (legacy) on one table:
     // the read must be disjoint from both stores to serve.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&delete_eq("orders", "id", 5));
     log.record(&delete_range("orders", "id", 3)); // id < 3
     let q = query("SELECT * FROM orders WHERE id = 10");
@@ -554,7 +554,7 @@ fn test_delete_multi_column_equality_tuples() {
             ],
         }))
     }
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&delete_ab(1, 10));
     log.record(&delete_ab(2, 20));
     let q = query("SELECT * FROM orders WHERE a = 2 AND b = 10");
@@ -597,7 +597,7 @@ fn test_delete_multi_column_equality_tuples() {
 fn test_delete_duplicate_column_routes_legacy() {
     // `id = 1 AND id = 2` is contradictory — the legacy range path folds it
     // to `Empty` (matches nothing), so any read is disjoint from it.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&WriteClass::DeleteRows(Arc::new(DeleteStatement {
         relation: RelationRef {
             schema: None,
@@ -622,7 +622,7 @@ fn test_delete_duplicate_column_routes_legacy() {
 fn test_opaque_write_dominates_delete() {
     // A later whole-table (opaque) write forces table-level regardless of the
     // read's disjointness from an earlier delete predicate.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&delete_eq("orders", "id", 5));
     log.record(&table("orders"));
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
@@ -659,7 +659,7 @@ fn update_eq(
 fn test_decide_update_disjoint_serves() {
     // UPDATE ... WHERE id = 5; a read on id = 1 is disjoint from both the
     // matched rows and their image → serve.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&update_eq("orders", "id", 5, &[("v", Some(99))]));
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     assert_eq!(
@@ -681,7 +681,7 @@ fn test_decide_update_disjoint_serves() {
 fn test_decide_update_grow_forwards() {
     // UPDATE ... SET id = 1 WHERE id = 5 moves a row *into* `id = 1`: the
     // WHERE is disjoint from the read, but the image is not → forward.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&update_eq("orders", "id", 5, &[("id", Some(1))]));
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     assert_eq!(
@@ -693,7 +693,7 @@ fn test_decide_update_grow_forwards() {
 #[test]
 fn test_decide_update_value_change_forwards() {
     // UPDATE ... SET v = 99 WHERE id = 1 changes a value in the read set.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&update_eq("orders", "id", 1, &[("v", Some(99))]));
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     assert_eq!(
@@ -705,7 +705,7 @@ fn test_decide_update_value_change_forwards() {
 #[test]
 fn test_decide_update_unknown_set_disjoint_serves() {
     // A non-literal SET (unknown image) on id = 5 rows doesn't touch id = 1.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&update_eq("orders", "id", 5, &[("v", None)]));
     let r1 = ranges("id", ColumnRange::Equal(LiteralValue::Integer(1)));
     assert_eq!(
@@ -722,7 +722,7 @@ fn test_update_merged_survives_tier_collision() {
     // Saturating the waiting queue folds the incoming batch into the newest
     // tier; its merged UPDATE tuples must survive the fold — losing them
     // serves stale reads of the still-pending rows.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for id in 1i64..=9 {
         log.record(&update_eq("orders", "id", id, &[("v", Some(0))]));
         let seq = log.stamp_seq().expect("bound pending");
@@ -754,7 +754,7 @@ fn test_update_merged_survives_tier_collision() {
 
 #[test]
 fn test_delete_merged_survives_tier_collision() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for id in 1i64..=9 {
         log.record(&delete_eq("orders", "id", id));
         let seq = log.stamp_seq().expect("bound pending");
@@ -785,7 +785,7 @@ fn test_update_row_at_a_time_stays_precise() {
     // Hundreds of single-row `UPDATE ... SET v = ? WHERE id = ?` statements
     // must keep row-level precision (the old per-statement cap degraded at
     // 64).
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for i in 0..500 {
         log.record(&update_eq("orders", "id", i, &[("v", Some(i))]));
     }
@@ -809,7 +809,7 @@ fn test_update_row_at_a_time_stays_precise() {
 fn test_update_merged_grow_forwards() {
     // The grow case must survive the merged path: with many merged updates
     // pending, one whose SET moves a row *into* the read still forwards.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for i in 100..200 {
         log.record(&update_eq("orders", "id", i, &[("v", Some(0))]));
     }
@@ -825,7 +825,7 @@ fn test_update_merged_grow_forwards() {
 fn test_update_set_order_shares_one_shape() {
     // `SET a = ?, b = ?` and `SET b = ?, a = ?` are the same shape; an ORM
     // iterating a hash-ordered dirty set must not fragment the store.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&update_eq(
         "orders",
         "id",
@@ -858,7 +858,7 @@ fn test_update_set_order_shares_one_shape() {
 #[test]
 fn test_update_delete_share_merged_cap() {
     // Merged deletes and updates draw on one combined budget.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for i in 0..600 {
         log.record(&delete_eq("orders", "id", i));
     }
@@ -878,7 +878,7 @@ fn test_update_duplicate_set_column_routes_legacy() {
     // `SET v = 1, v = 2` (last wins) can't merge; the legacy map path keeps
     // the override semantics: the final image v = 2 is what the read must
     // be disjoint from.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&update_eq(
         "orders",
         "id",
@@ -906,7 +906,7 @@ fn test_update_duplicate_set_column_routes_legacy() {
 
 #[test]
 fn test_intersects_none_after_purge() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     let seq = log.stamp_seq().expect("bound pending");
     log.stamp(seq, Lsn::from_raw(100));
@@ -919,7 +919,7 @@ fn test_intersects_none_after_purge() {
 
 #[test]
 fn test_record_aggregates_per_table() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     log.record(&table("orders"));
     log.record(&insert("users"));
@@ -931,21 +931,21 @@ fn test_record_aggregates_per_table() {
 
 #[test]
 fn test_disabled_records_nothing() {
-    let mut log = WriteLog::new(false);
+    let mut log = WriteLog::with_enabled(false);
     log.record(&table("orders"));
     assert!(log.is_empty());
 }
 
 #[test]
 fn test_connection_scope_write() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&WriteClass::Connection);
     assert!(connection_pending(&log));
 }
 
 #[test]
 fn test_stamp_then_purge_clears_table() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     let seq = log.stamp_seq().expect("active awaiting a bound");
     log.stamp(seq, Lsn::from_raw(100));
@@ -959,7 +959,7 @@ fn test_stamp_then_purge_clears_table() {
 
 #[test]
 fn test_stamp_partial_on_race() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     let seq = log.stamp_seq().expect("bound pending");
     // A write races in after the probe sampled its bound.
@@ -981,7 +981,7 @@ fn test_stamp_partial_on_race() {
 fn test_stamp_same_table_race_holds_earlier_writes() {
     // A racing write to the SAME table keeps that table's earlier writes
     // pending too: one active tier per table, guarded by its latest seq.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     let seq = log.stamp_seq().expect("bound pending");
     log.record(&table("orders"));
@@ -993,7 +993,7 @@ fn test_stamp_same_table_race_holds_earlier_writes() {
 #[test]
 fn test_active_waiting_separation() {
     // A fresh write must not gate an older, already-applied batch.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     let seq = log.stamp_seq().expect("bound pending");
     log.stamp(seq, Lsn::from_raw(100)); // orders waiting @ 100
@@ -1008,7 +1008,7 @@ fn test_active_waiting_separation() {
 fn test_tables_clear_on_own_bounds() {
     // Per-table bounds: a table stamped low clears without waiting for a
     // table stamped high (the cross-table coupling the segmented log had).
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for (i, tbl) in ["a", "b", "c"].iter().enumerate() {
         log.record(&table(tbl));
         let seq = log.stamp_seq().expect("bound pending");
@@ -1026,7 +1026,7 @@ fn test_tables_clear_on_own_bounds() {
 fn test_waiting_tiers_drain_independently() {
     // Two stamps before anything clears occupy both waiting slots; the
     // older batch drains on its own lower bound, not the newer one's.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&insert_int("orders", "id", &[1]));
     let seq = log.stamp_seq().expect("bound pending");
     log.stamp(seq, Lsn::from_raw(100));
@@ -1070,7 +1070,7 @@ fn test_waiting_saturation_folds_into_newest() {
     // A stamp past the cap folds into the *newest* tier under the later
     // bound: coarsening lands on the freshest writes, while every older
     // tier keeps its anchored bound and drains on schedule (ADR-051).
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for id in 1i64..=9 {
         log.record(&insert_int("orders", "id", &[id]));
         let seq = log.stamp_seq().expect("bound pending");
@@ -1114,7 +1114,7 @@ fn test_saturation_keeps_oldest_anchored_under_sustained_stamping() {
     // past the cap, the oldest tier's bound must never move — a reader
     // blocked on the oldest write clears as soon as settle passes *its*
     // bound, no matter how many later stamps arrive.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     for id in 1i64..=20 {
         log.record(&insert_int("orders", "id", &[id]));
         let seq = log.stamp_seq().expect("bound pending");
@@ -1141,7 +1141,7 @@ fn test_saturation_keeps_oldest_anchored_under_sustained_stamping() {
 
 #[test]
 fn test_unstampable_never_clears() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&WriteClass::ConnectionUnstampable);
     // A probe cannot bound a 2PC prepare.
     assert_eq!(log.stamp_seq(), None);
@@ -1154,7 +1154,7 @@ fn test_unstampable_connection_never_takes_a_bound() {
     // Defense in depth for the deleted PendingLsn::Unstampable type guard:
     // even if a future change records a connection-scoped write while
     // unstampable (today `record` refuses), a probe must not bound it.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&WriteClass::ConnectionUnstampable);
     log.connection.active = Some(log.next_seq);
     log.stamp(log.next_seq, Lsn::from_raw(100));
@@ -1167,7 +1167,7 @@ fn test_unstampable_drops_and_blocks_table_state() {
     // Once the connection is unstampable (2PC prepare), every read forwards
     // until close, so per-table state is unreachable — dropped, and later
     // writes aren't recorded.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     log.record(&WriteClass::ConnectionUnstampable);
     assert!(!table_pending(&log, "orders"));
@@ -1184,18 +1184,17 @@ fn test_unstampable_drops_and_blocks_table_state() {
 
 #[test]
 fn test_disable_clears_existing() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     log.disable();
     assert!(log.is_empty());
-    assert!(!log.is_enabled());
     log.record(&table("orders"));
     assert!(log.is_empty());
 }
 
 #[test]
 fn test_blocker_stamped_tier_carries_its_bound() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     let seq = log.stamp_seq().expect("active awaiting a bound");
     log.stamp(seq, Lsn::from_raw(100));
@@ -1212,7 +1211,7 @@ fn test_blocker_stamped_tier_carries_its_bound() {
 fn test_blocker_unstamped_dominates_stamped() {
     // A stamped tier and a fresh unstamped write both block: no watermark
     // advance can clear the unstamped one, so it must win the attribution.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&table("orders"));
     let seq = log.stamp_seq().expect("active awaiting a bound");
     log.stamp(seq, Lsn::from_raw(100));
@@ -1227,7 +1226,7 @@ fn test_blocker_unstamped_dominates_stamped() {
 fn test_blocker_disjoint_tier_does_not_bind() {
     // Only the tiers the read actually intersects contribute to the blocker:
     // a later stamped tier whose rows are disjoint must not raise the bound.
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&delete_eq("orders", "id", 5));
     let seq = log.stamp_seq().expect("active awaiting a bound");
     log.stamp(seq, Lsn::from_raw(100));
@@ -1246,7 +1245,7 @@ fn test_blocker_disjoint_tier_does_not_bind() {
 
 #[test]
 fn test_blocker_connection_stamped_carries_its_bound() {
-    let mut log = WriteLog::new(true);
+    let mut log = WriteLog::with_enabled(true);
     log.record(&WriteClass::Connection);
     let seq = log.stamp_seq().expect("active awaiting a bound");
     log.stamp(seq, Lsn::from_raw(100));

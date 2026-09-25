@@ -37,6 +37,13 @@ pub enum Violation {
         group_b: i32,
         version_b: i32,
     },
+    /// A read inside a transaction block did not show the block's own
+    /// uncommitted bump (PGC-387).
+    OwnWrite {
+        group: i32,
+        expected: i32,
+        observed: i32,
+    },
 }
 
 impl fmt::Display for Violation {
@@ -69,6 +76,16 @@ impl fmt::Display for Violation {
                 f,
                 "paired-group: group {group_a}=v{version_a} but group {group_b}=v{version_b} \
                  (a cross-group transaction applied torn)"
+            ),
+            Violation::OwnWrite {
+                group,
+                expected,
+                observed,
+            } => write!(
+                f,
+                "own-write: group {group} bumped to v{expected} inside a transaction but a read \
+                 in the same transaction showed v{observed} (served from cache past the block's \
+                 own write)"
             ),
         }
     }

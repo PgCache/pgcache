@@ -16,9 +16,8 @@ use crate::pg::cache_connection::{CacheConnection, ParkedConnection, PrepareOutc
 use crate::pg::protocol::PgMessage;
 use crate::pg::protocol::backend::PgBackendMessageCodec;
 use crate::pg::protocol::backend::PgBackendMessageType;
-use crate::pg::protocol::encode::{
-    BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG, SERVE_ERROR_MSG,
-};
+use crate::pg::protocol::backend::TransactionStatus;
+use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, SERVE_ERROR_MSG};
 use crate::query::ast::{AstNode, Deparse, LiteralValue};
 use crate::query::query_shape_derive;
 use crate::timing::QueryTiming;
@@ -131,6 +130,7 @@ pub(crate) mod fault {
     static POISON_SERVES: AtomicU64 = AtomicU64::new(0);
     static LOSE_SERVES: AtomicU64 = AtomicU64::new(0);
     static DESYNC_SERVES: AtomicU64 = AtomicU64::new(0);
+    static MIDSTREAM_SERVES: AtomicU64 = AtomicU64::new(0);
     static INIT: Once = Once::new();
 
     fn env_budget(var: &str, budget: &AtomicU64) {
@@ -152,6 +152,7 @@ pub(crate) mod fault {
         INIT.call_once(|| {
             env_budget("PGCACHE_FAULT_POISON_SERVES", &POISON_SERVES);
             env_budget("PGCACHE_FAULT_LOSE_SERVES", &LOSE_SERVES);
+            env_budget("PGCACHE_FAULT_MIDSTREAM_SERVES", &MIDSTREAM_SERVES);
             env_budget("PGCACHE_FAULT_DESYNC_SERVES", &DESYNC_SERVES);
         });
     }
@@ -163,6 +164,13 @@ pub(crate) mod fault {
 
     /// Abandon the serve after the connection left the guard, without
     /// poisoning — exercises the lost-slot replenish branch (PGC-278).
+    /// Fail the first N serves after bytes have reached the client, exercising
+    /// the PGC-291 error-the-client path (and its in-block variant, PGC-387).
+    pub(crate) fn midstream_serve() -> bool {
+        init();
+        budget_consume(&MIDSTREAM_SERVES)
+    }
+
     pub(crate) fn lose_serve() -> bool {
         budget_consume(&LOSE_SERVES)
     }
@@ -220,7 +228,8 @@ async fn serve_failure_resolve<W: tokio::io::AsyncWrite + Unpin>(
     client_bytes_sent: bool,
     client_socket: &mut W,
     write_queue: &mut WriteQueue,
-    emit_rfq: bool,
+    trailing_rfq: Option<&'static [u8]>,
+    in_block: bool,
     bytes_served: usize,
     forward_error: rootcause::Report<CacheError>,
 ) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
@@ -229,8 +238,16 @@ async fn serve_failure_resolve<W: tokio::io::AsyncWrite + Unpin>(
     }
     write_queue.clear();
     write_queue.push(Bytes::from_static(SERVE_ERROR_MSG));
-    if emit_rfq {
-        write_queue.push(Bytes::from_static(READY_FOR_QUERY_IDLE_MSG));
+    // Inside a block no ReadyForQuery is right: origin's block is healthy, so
+    // `T` would let the client commit what it just saw fail, and `E` would
+    // misreport origin. Send the error alone and have the connection close
+    // (PGC-387); origin then rolls the block back.
+    if in_block {
+        let _ = client_socket.write_all_buf(write_queue).await;
+        return Err(CacheError::ServeAbandonedInBlock.into());
+    }
+    if let Some(rfq) = trailing_rfq {
+        write_queue.push(Bytes::from_static(rfq));
     }
     let _ = client_socket.write_all_buf(write_queue).await;
     Ok((bytes_served, Vec::new()))
@@ -332,7 +349,8 @@ pub async fn handle_cached_query(
     // Captured before the `client_socket` borrow below so the post-commit error
     // path (PGC-291) can decide whether to append a ReadyForQuery: the client
     // expects one iff it terminated this entry with a Sync (or is simple-query).
-    let emit_rfq = query_type == QueryType::Simple || msg.emit_rfq;
+    let trailing_rfq = msg.trailing_rfq();
+    let in_block = msg.transaction_status == TransactionStatus::InTransaction;
 
     // Begin a result-memo capture for hot source-row serves. Stamps read-relation
     // versions now, before the serve query is issued (capture ordering invariant).
@@ -446,17 +464,28 @@ pub async fn handle_cached_query(
                 crate::metrics::handles().cache.serve_stall_total.increment(1);
                 serve_poison(&mut guard, &mut relay).await;
                 return serve_failure_resolve(
-                    client_bytes_sent, client_socket, &mut write_queue, emit_rfq,
+                    client_bytes_sent, client_socket, &mut write_queue, trailing_rfq, in_block,
                     relay.bytes_served, CacheError::Write.into(),
                 ).await;
             }
             frame = framed.next() => {
+                // Fault (tests): once any response bytes exist, push them to the
+                // client and fail — the PGC-291 "already on the wire" shape.
+                #[cfg(feature = "fault-injection")]
+                if (client_bytes_sent || !write_queue.is_empty()) && fault::midstream_serve() {
+                    let _ = client_socket.write_all_buf(&mut write_queue).await;
+                    serve_poison(&mut guard, &mut relay).await;
+                    return serve_failure_resolve(
+                        true, client_socket, &mut write_queue, trailing_rfq, in_block,
+                        relay.bytes_served, CacheError::InvalidMessage.into(),
+                    ).await;
+                }
                 let frame = match frame {
                     Some(Ok(frame)) => frame,
                     Some(Err(_)) | None => {
                         serve_poison(&mut guard, &mut relay).await;
                         return serve_failure_resolve(
-                            client_bytes_sent, client_socket, &mut write_queue, emit_rfq,
+                            client_bytes_sent, client_socket, &mut write_queue, trailing_rfq, in_block,
                             relay.bytes_served, CacheError::InvalidMessage.into(),
                         ).await;
                     }
@@ -469,7 +498,7 @@ pub async fn handle_cached_query(
                         .await
                 {
                     return serve_failure_resolve(
-                        client_bytes_sent, client_socket, &mut write_queue, emit_rfq,
+                        client_bytes_sent, client_socket, &mut write_queue, trailing_rfq, in_block,
                         relay.bytes_served, e,
                     ).await;
                 }
@@ -874,13 +903,9 @@ async fn serve_response_finish(
 
     // Simple-query clients always terminate with ReadyForQuery; extended clients
     // do when their trailing Execute carried the Sync.
-    if msg.query_type == QueryType::Simple || msg.emit_rfq {
+    if let Some(rfq) = msg.trailing_rfq() {
         trace!("net: cache→client ReadyForQuery");
-        push_and_broadcast(
-            write_queue,
-            &relay.broadcast,
-            Bytes::from_static(READY_FOR_QUERY_IDLE_MSG),
-        );
+        push_and_broadcast(write_queue, &relay.broadcast, Bytes::from_static(rfq));
     }
 
     let outcomes = match relay.broadcast.take() {

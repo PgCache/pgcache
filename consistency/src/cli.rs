@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::scenario::Variant;
+use crate::workload::TxnIsolation;
 
 /// Consistency stress harness for pgcache: drives concurrent reads + writes
 /// against the group-version schema and checks the served view stays
@@ -92,6 +93,22 @@ pub struct Cli {
     /// `--features fault-injection` (the run aborts loudly otherwise).
     #[arg(long)]
     pub cdc_lag_ms: Option<u64>,
+
+    /// Wrap a share of reader reads and writer bumps in explicit transactions
+    /// (PGC-387): reads inside a READ COMMITTED block serve from cache and are
+    /// checked for intra-group atomicity; a bump inside a block is read back
+    /// inside the same block and must show the bumped version on every row
+    /// (read-your-own-uncommitted-write). After the run the `pgcache.txn.*`
+    /// metrics are checked against `--txn-isolation`.
+    #[arg(long)]
+    pub txn_reads: bool,
+
+    /// Isolation level for `--txn-reads` blocks. READ COMMITTED expects the
+    /// transaction gate to serve (and to forward own-write reads); REPEATABLE
+    /// READ expects every in-block read to forward (`pgcache.txn.served` stays
+    /// zero).
+    #[arg(long, value_enum, default_value = "read-committed")]
+    pub txn_isolation: TxnIsolation,
 
     /// Artificial population delay in milliseconds: every population sleeps
     /// this long between its snapshot read and its insert, stretching the

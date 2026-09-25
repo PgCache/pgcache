@@ -34,11 +34,13 @@ Each connection maintains a per-connection **write log** of the writes it forwar
 - Never serves stale: every uncertainty forwards.
 - No added latency on the read hot path (wait-free watermark read); the writing connection carries the cost.
 - Memory is bounded regardless of write volume.
-- Ships behind the `read_your_writes` kill switch (default on).
+- Always on: the former `read_your_writes` kill switch was removed with ADR-054
+  (the log is the correctness mechanism for in-transaction serving); the
+  integration harness disables it through a fault-injection-only hook.
 
 ### Negative
 - Extra origin forwards during the commit→apply window on the writing connection — the freshness tradeoff; observable via metrics.
-- Row-level precision covers single-table INSERT reads only; joins, `UPDATE`/`DELETE`, and in-transaction serving stay table/connection-conservative (later stages).
+- Row-level precision covers single-table INSERT reads only; joins and `UPDATE`/`DELETE` stay table/connection-conservative (later stages: ADR-049 for UPDATE/DELETE, ADR-054 for in-transaction serving).
 - Clearance liveness floor: when the WAL tail is non-decodable, entries clear only at the next keepalive, so the forward window can extend to the keepalive cadence (extra forwards, not a wedge).
 - The commit-LSN probe adds one origin round-trip per write-then-idle boundary.
 - **Known exclusion (PGC-447)**: the gate matches pending writes to reads by

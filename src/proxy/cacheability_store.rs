@@ -151,9 +151,10 @@ mod tests {
 
     use super::*;
     use crate::proxy::query::ForwardReason;
+    use crate::query::write::StatementEffects;
 
     fn forward() -> Action {
-        Action::Forward(ForwardReason::Invalid)
+        Action::Forward(ForwardReason::Invalid, StatementEffects::default())
     }
 
     #[test]

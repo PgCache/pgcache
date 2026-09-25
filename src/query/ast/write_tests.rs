@@ -5,9 +5,11 @@
 use ecow::EcoString;
 
 use crate::query::ast::*;
+use crate::query::write::IsolationEffect::{SessionDefault, SessionUnknown, Transaction};
+use crate::query::write::IsolationLevel::{ReadCommitted, RepeatableRead, Serializable};
 use crate::query::write::{
-    DeleteStatement, INSERT_MAX_ROWS, InsertStatement, RelationRef, TransactionBoundary,
-    UpdateStatement, WriteClass,
+    DeleteStatement, INSERT_MAX_ROWS, InsertStatement, IsolationEffect, RelationRef,
+    TransactionBoundary, UpdateStatement, WriteClass,
 };
 
 /// Classify one SQL statement through the public entry point.
@@ -46,9 +48,103 @@ fn assert_read_only(sql: &str) {
 
 fn transaction_of(sql: &str) -> Option<TransactionBoundary> {
     match classify(sql) {
-        Ok(RawStatement::ReadOnlyUtility { transaction }) => transaction,
+        Ok(RawStatement::ReadOnlyUtility { transaction, .. }) => transaction,
         other => panic!("expected ReadOnlyUtility for {sql:?}, got {other:?}"),
     }
+}
+
+fn isolation_of(sql: &str) -> IsolationEffect {
+    match classify(sql) {
+        Ok(RawStatement::ReadOnlyUtility { isolation, .. }) => isolation,
+        other => panic!("expected ReadOnlyUtility for {sql:?}, got {other:?}"),
+    }
+}
+
+/// PGC-387: transaction-control and SET statements report their effect on the
+/// tracked isolation level.
+#[test]
+fn test_isolation_effect_transaction_scoped() {
+    assert_eq!(isolation_of("BEGIN"), IsolationEffect::None);
+    assert_eq!(isolation_of("START TRANSACTION"), IsolationEffect::None);
+    assert_eq!(
+        isolation_of("BEGIN ISOLATION LEVEL REPEATABLE READ"),
+        Transaction(RepeatableRead)
+    );
+    assert_eq!(
+        isolation_of("START TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY"),
+        Transaction(Serializable)
+    );
+    assert_eq!(
+        isolation_of("BEGIN ISOLATION LEVEL READ COMMITTED"),
+        Transaction(ReadCommitted)
+    );
+    assert_eq!(
+        isolation_of("BEGIN ISOLATION LEVEL READ UNCOMMITTED"),
+        Transaction(ReadCommitted)
+    );
+    assert_eq!(
+        isolation_of("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"),
+        Transaction(RepeatableRead)
+    );
+    assert_eq!(
+        isolation_of("SET TRANSACTION READ ONLY"),
+        IsolationEffect::None
+    );
+    assert_eq!(
+        isolation_of("SET transaction_isolation = 'serializable'"),
+        Transaction(Serializable)
+    );
+    // An unreadable transaction-level value can only be stricter than provable.
+    assert_eq!(
+        isolation_of("SET transaction_isolation TO DEFAULT"),
+        Transaction(Serializable)
+    );
+}
+
+#[test]
+fn test_isolation_effect_session_scoped() {
+    assert_eq!(
+        isolation_of("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+        SessionDefault(Serializable)
+    );
+    assert_eq!(
+        isolation_of("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY"),
+        IsolationEffect::None
+    );
+    assert_eq!(
+        isolation_of("SET default_transaction_isolation = 'repeatable read'"),
+        SessionDefault(RepeatableRead)
+    );
+    assert_eq!(
+        isolation_of("SET SESSION default_transaction_isolation TO 'read committed'"),
+        SessionDefault(ReadCommitted)
+    );
+    assert_eq!(
+        isolation_of("SET Default_Transaction_Isolation = 'Serializable'"),
+        SessionDefault(Serializable)
+    );
+    assert_eq!(
+        isolation_of("SET LOCAL default_transaction_isolation = 'serializable'"),
+        SessionUnknown
+    );
+    assert_eq!(
+        isolation_of("SET default_transaction_isolation TO DEFAULT"),
+        SessionUnknown
+    );
+    assert_eq!(
+        isolation_of("SET default_transaction_isolation = 'bogus'"),
+        SessionUnknown
+    );
+    assert_eq!(
+        isolation_of("RESET default_transaction_isolation"),
+        SessionUnknown
+    );
+    assert_eq!(isolation_of("RESET ALL"), SessionUnknown);
+    assert_eq!(isolation_of("DISCARD ALL"), SessionUnknown);
+    assert_eq!(isolation_of("DISCARD PLANS"), IsolationEffect::None);
+    assert_eq!(isolation_of("SET work_mem = '1MB'"), IsolationEffect::None);
+    assert_eq!(isolation_of("RESET work_mem"), IsolationEffect::None);
+    assert_eq!(isolation_of("COMMIT"), IsolationEffect::None);
 }
 
 #[test]

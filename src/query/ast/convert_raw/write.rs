@@ -11,8 +11,8 @@ use ecow::EcoString;
 use pg_query::pg_nodes as pg;
 
 use crate::query::write::{
-    DeleteStatement, INSERT_MAX_ROWS, InsertRow, InsertStatement, RelationRef, SetAssignment,
-    TransactionBoundary, UpdateStatement, WriteClass, WriteComparison,
+    DeleteStatement, INSERT_MAX_ROWS, InsertRow, InsertStatement, IsolationEffect, IsolationLevel,
+    RelationRef, SetAssignment, TransactionBoundary, UpdateStatement, WriteClass, WriteComparison,
 };
 
 use super::super::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
@@ -24,8 +24,115 @@ pub(super) enum NonSelectClass {
     Write(WriteClass),
     /// Provably cannot modify table data (transaction control, SET, SHOW,
     /// FETCH, ...). Kept to an explicit whitelist; everything else is a write.
-    /// Carries the transaction boundary for transaction-control statements.
-    ReadOnly(Option<TransactionBoundary>),
+    /// Carries the transaction boundary for transaction-control statements and
+    /// the statement's effect on isolation-level state (PGC-387).
+    ReadOnly {
+        transaction: Option<TransactionBoundary>,
+        isolation: IsolationEffect,
+    },
+}
+
+/// A read-only classification with no isolation effect.
+fn read_only(transaction: Option<TransactionBoundary>) -> NonSelectClass {
+    NonSelectClass::ReadOnly {
+        transaction,
+        isolation: IsolationEffect::None,
+    }
+}
+
+/// The isolation level named by an `A_Const` string argument (`'read
+/// committed'` and friends); `None` for anything else.
+unsafe fn isolation_level_of_arg(arg: NodePtr) -> Option<IsolationLevel> {
+    unsafe {
+        if arg.is_null() || node_tag(arg) != pg::NodeTag_T_A_Const {
+            return None;
+        }
+        match const_value_extract(cast::<pg::A_Const>(arg)) {
+            Ok(LiteralValue::String(value)) => IsolationLevel::parse(&value),
+            _ => None,
+        }
+    }
+}
+
+/// Scan a `DefElem` option list (`BEGIN`/`SET TRANSACTION`/`SET SESSION
+/// CHARACTERISTICS`) for `transaction_isolation`. `None` when absent;
+/// `Some(None)` when present but unreadable.
+unsafe fn isolation_defelem_find(options: *const pg::List) -> Option<Option<IsolationLevel>> {
+    unsafe {
+        for node in list_nodes(options) {
+            if node_tag(node) != pg::NodeTag_T_DefElem {
+                continue;
+            }
+            let def = cast::<pg::DefElem>(node);
+            if cstr((*def).defname).eq_ignore_ascii_case("transaction_isolation") {
+                return Some(isolation_level_of_arg((*def).arg as NodePtr));
+            }
+        }
+        None
+    }
+}
+
+/// Isolation effect of a `BEGIN` / `START TRANSACTION` option list.
+unsafe fn begin_isolation_effect(options: *const pg::List) -> IsolationEffect {
+    unsafe {
+        match isolation_defelem_find(options) {
+            None => IsolationEffect::None,
+            Some(Some(level)) => IsolationEffect::Transaction(level),
+            // An unreadable level can only be stricter than we can prove.
+            Some(None) => IsolationEffect::Transaction(IsolationLevel::Serializable),
+        }
+    }
+}
+
+/// Isolation effect of a `SET` / `RESET` statement.
+unsafe fn variable_set_isolation_effect(s: *const pg::VariableSetStmt) -> IsolationEffect {
+    unsafe {
+        let name = cstr((*s).name);
+        let kind = (*s).kind;
+        if kind == pg::VariableSetKind_VAR_RESET_ALL {
+            return IsolationEffect::SessionUnknown;
+        }
+        if kind == pg::VariableSetKind_VAR_SET_MULTI {
+            // SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS TRANSACTION ...
+            let scope_transaction = name.eq_ignore_ascii_case("TRANSACTION");
+            let scope_session = name.eq_ignore_ascii_case("SESSION CHARACTERISTICS");
+            if !scope_transaction && !scope_session {
+                return IsolationEffect::None;
+            }
+            return match isolation_defelem_find((*s).args) {
+                None => IsolationEffect::None,
+                Some(Some(level)) if scope_transaction => IsolationEffect::Transaction(level),
+                Some(Some(level)) => IsolationEffect::SessionDefault(level),
+                Some(None) if scope_transaction => {
+                    IsolationEffect::Transaction(IsolationLevel::Serializable)
+                }
+                Some(None) => IsolationEffect::SessionUnknown,
+            };
+        }
+        let default_guc = name.eq_ignore_ascii_case("default_transaction_isolation");
+        let transaction_guc = name.eq_ignore_ascii_case("transaction_isolation");
+        if !default_guc && !transaction_guc {
+            return IsolationEffect::None;
+        }
+        if kind != pg::VariableSetKind_VAR_SET_VALUE || (*s).is_local {
+            // RESET, SET ... TO DEFAULT, SET FROM CURRENT, SET LOCAL: the
+            // resulting value is not readable from the statement.
+            return if transaction_guc {
+                IsolationEffect::Transaction(IsolationLevel::Serializable)
+            } else {
+                IsolationEffect::SessionUnknown
+            };
+        }
+        let level = list_nodes((*s).args)
+            .next()
+            .and_then(|arg| isolation_level_of_arg(arg));
+        match (level, transaction_guc) {
+            (Some(level), true) => IsolationEffect::Transaction(level),
+            (Some(level), false) => IsolationEffect::SessionDefault(level),
+            (None, true) => IsolationEffect::Transaction(IsolationLevel::Serializable),
+            (None, false) => IsolationEffect::SessionUnknown,
+        }
+    }
 }
 
 /// Classify a non-`SelectStmt` root statement.
@@ -48,7 +155,7 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                     // COPY (WITH x AS (INSERT ...) ...) TO — the query writes.
                     Write(WriteClass::Connection)
                 } else {
-                    ReadOnly(None)
+                    read_only(None)
                 }
             }
             pg::NodeTag_T_TruncateStmt => {
@@ -65,13 +172,14 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                 let s = cast::<pg::TransactionStmt>(stmt);
                 match (*s).kind {
                     pg::TransactionStmtKind_TRANS_STMT_BEGIN
-                    | pg::TransactionStmtKind_TRANS_STMT_START => {
-                        ReadOnly(Some(TransactionBoundary::Begin))
-                    }
+                    | pg::TransactionStmtKind_TRANS_STMT_START => ReadOnly {
+                        transaction: Some(TransactionBoundary::Begin),
+                        isolation: begin_isolation_effect((*s).options),
+                    },
                     // AND CHAIN immediately re-enters a transaction.
                     pg::TransactionStmtKind_TRANS_STMT_COMMIT
                     | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK => {
-                        ReadOnly(Some(if (*s).chain {
+                        read_only(Some(if (*s).chain {
                             TransactionBoundary::Begin
                         } else {
                             TransactionBoundary::End
@@ -79,7 +187,7 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                     }
                     pg::TransactionStmtKind_TRANS_STMT_SAVEPOINT
                     | pg::TransactionStmtKind_TRANS_STMT_RELEASE
-                    | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO => ReadOnly(None),
+                    | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO => read_only(None),
                     // PREPARE TRANSACTION commits later, possibly from another
                     // session — the entry must never be LSN-stamped.
                     pg::TransactionStmtKind_TRANS_STMT_PREPARE => {
@@ -88,16 +196,25 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                     _ => Write(WriteClass::Connection),
                 }
             }
-            pg::NodeTag_T_VariableSetStmt
-            | pg::NodeTag_T_VariableShowStmt
-            | pg::NodeTag_T_DiscardStmt
+            pg::NodeTag_T_VariableSetStmt => ReadOnly {
+                transaction: None,
+                isolation: variable_set_isolation_effect(cast::<pg::VariableSetStmt>(stmt)),
+            },
+            pg::NodeTag_T_DiscardStmt => ReadOnly {
+                transaction: None,
+                isolation: match (*cast::<pg::DiscardStmt>(stmt)).target {
+                    pg::DiscardMode_DISCARD_ALL => IsolationEffect::SessionUnknown,
+                    _ => IsolationEffect::None,
+                },
+            },
+            pg::NodeTag_T_VariableShowStmt
             | pg::NodeTag_T_DeallocateStmt
             | pg::NodeTag_T_ClosePortalStmt
             | pg::NodeTag_T_FetchStmt
             | pg::NodeTag_T_PrepareStmt
             | pg::NodeTag_T_ListenStmt
             | pg::NodeTag_T_UnlistenStmt
-            | pg::NodeTag_T_NotifyStmt => ReadOnly(None),
+            | pg::NodeTag_T_NotifyStmt => read_only(None),
             // ExecuteStmt runs a SQL-level prepared statement whose body may be
             // DML; ExplainStmt with ANALYZE executes its argument. Everything
             // else (DDL, CALL, DO, unknown) is a potential write.

@@ -68,6 +68,8 @@ pub const BIND_COMPLETE_MSG: &[u8] = &[b'2', 0, 0, 0, 4];
 pub const CLOSE_COMPLETE_MSG: &[u8] = &[b'3', 0, 0, 0, 4];
 pub const NO_DATA_MSG: &[u8] = &[b'n', 0, 0, 0, 4];
 pub const READY_FOR_QUERY_IDLE_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
+pub const READY_FOR_QUERY_IN_TRANSACTION_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'T'];
+pub const READY_FOR_QUERY_FAILED_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'E'];
 
 /// Fixed `ErrorResponse` for a cache serve that already streamed bytes to the
 /// client and so cannot be transparently forwarded to origin (PGC-291). Fields:

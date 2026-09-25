@@ -5,6 +5,7 @@ use ecow::EcoString;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::bytes::{Bytes, BytesMut};
 
+use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::ClientSocket;
 use crate::query::ast::LimitClause;
@@ -56,6 +57,8 @@ pub struct QueryRequest {
     pub timing: QueryTiming,
     /// Pipeline context from the proxy (None for simple queries and cold-path extended)
     pub pipeline: Option<PipelineContext>,
+    /// The client's transaction status for the trailing ReadyForQuery.
+    pub transaction_status: TransactionStatus,
 }
 
 /// Request sent to cache serve for executing cached queries.
@@ -87,6 +90,8 @@ pub struct ServeRequest {
     /// Whether the serve path should append ReadyForQuery after this execute's
     /// response (the trailing execute of a Sync-terminated dispatch).
     pub emit_rfq: bool,
+    /// The client's transaction status for that ReadyForQuery.
+    pub transaction_status: TransactionStatus,
     /// Whether Parse was buffered in the pipeline.
     /// False for Bind-only pipelines (named statement re-execution without Parse).
     pub has_parse: bool,
@@ -103,6 +108,16 @@ pub struct ServeRequest {
     /// Additional clients to receive the same response bytes.
     /// Empty for non-coalesced requests.
     pub coalesced: Vec<CoalescedClient>,
+}
+
+impl ServeRequest {
+    /// The trailing ReadyForQuery this serve appends: simple-query clients
+    /// always expect one, extended clients when their trailing Execute carried
+    /// the Sync. Its status byte echoes the client's transaction state.
+    pub fn trailing_rfq(&self) -> Option<&'static [u8]> {
+        (self.query_type == QueryType::Simple || self.emit_rfq)
+            .then(|| self.transaction_status.ready_for_query_message())
+    }
 }
 
 /// A unit of work for the serve pool: a normal cache serve, or a one-shot

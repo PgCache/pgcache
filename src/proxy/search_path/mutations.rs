@@ -26,9 +26,9 @@ pub enum MutationKind {
     /// simple-query strings in. So the piggyback path must skip it and rely
     /// on the lazy SHOW-on-RFQ fallback.
     DiscardAll,
-    /// `COMMIT` or `ROLLBACK`. `SET LOCAL` and any `SET` inside an aborted
-    /// transaction revert at this point, so the cached search_path is
-    /// conservatively marked stale on every txn end.
+    /// `COMMIT`, `ROLLBACK`, or `ROLLBACK TO SAVEPOINT`. `SET LOCAL` and any
+    /// `SET` inside an aborted transaction (or rolled-back savepoint) revert at
+    /// this point, so the cached search_path is conservatively marked stale.
     TxnEnd,
 }
 
@@ -79,6 +79,7 @@ unsafe fn stmt_classify_raw(stmt: NodePtr) -> Option<MutationKind> {
             pg::NodeTag_T_TransactionStmt => match (*cast::<pg::TransactionStmt>(stmt)).kind {
                 pg::TransactionStmtKind_TRANS_STMT_COMMIT
                 | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK
+                | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO
                 | pg::TransactionStmtKind_TRANS_STMT_COMMIT_PREPARED
                 | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_PREPARED => {
                     Some(MutationKind::TxnEnd)
@@ -171,6 +172,9 @@ mod tests {
         assert!(mutates_any("ROLLBACK"));
         assert!(mutates_any("END"));
         assert!(mutates_any("ABORT"));
+        // A rolled-back savepoint reverts a SET made after it while the block
+        // stays open (in-block cache serving relies on the value, PGC-387).
+        assert!(mutates_any("ROLLBACK TO SAVEPOINT sp"));
     }
 
     #[test]
@@ -180,7 +184,7 @@ mod tests {
         assert!(!mutates_any("RESET work_mem"));
         assert!(!mutates_any("BEGIN"));
         assert!(!mutates_any("SAVEPOINT sp"));
-        assert!(!mutates_any("ROLLBACK TO SAVEPOINT sp"));
+        assert!(!mutates_any("RELEASE SAVEPOINT sp"));
     }
 
     #[test]

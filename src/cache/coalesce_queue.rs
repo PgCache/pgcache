@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::query::ast::LimitClause;
 use crate::query::{Fingerprint, FingerprintMap};
@@ -58,6 +59,9 @@ pub(crate) fn coalesce_deadline(estimate_ms: Option<f64>) -> Duration {
 pub(super) struct CoalesceKey {
     query_type: QueryType,
     emit_rfq: bool,
+    /// Waiters in different transaction states need different trailing
+    /// ReadyForQuery bytes, so they never share one broadcast (PGC-387).
+    transaction_status: TransactionStatus,
     has_parse: bool,
     has_bind: bool,
     pipeline_describe: PipelineDescribe,
@@ -75,6 +79,7 @@ impl CoalesceKey {
         CoalesceKey {
             query_type: msg.query_type,
             emit_rfq,
+            transaction_status: msg.transaction_status,
             has_parse,
             has_bind,
             pipeline_describe,

@@ -11,6 +11,7 @@ use tokio_util::bytes::BytesMut;
 use tracing::{debug, error, info, instrument, trace};
 
 use crate::pg::Lsn;
+use crate::pg::protocol::backend::TransactionStatus;
 use crate::proxy::{ClientSocket, ExplainSpec, ExplainTarget};
 use crate::query::Fingerprint;
 use crate::query::ast::{query_expr_convert_raw, query_expr_fingerprint};
@@ -160,12 +161,13 @@ impl CacheDispatch {
             search_path,
             timing,
             pipeline,
+            transaction_status,
         } = proxy_msg;
 
         // `pgcache_explain(...)` is a diagnostic that runs against cached state
         // directly; route it before CDC-liveness gating and query conversion.
         if let CacheMessage::Explain(spec, _) = message {
-            self.explain_dispatch(spec, client_socket, reply_tx, timing);
+            self.explain_dispatch(spec, client_socket, reply_tx, timing, transaction_status);
             return;
         }
 
@@ -188,6 +190,7 @@ impl CacheDispatch {
                     search_path,
                     timing,
                     pipeline,
+                    transaction_status,
                 };
                 if let Err(e) = self.query_dispatch(request).await {
                     error!(
@@ -212,12 +215,14 @@ impl CacheDispatch {
         client_socket: ClientSocket,
         reply_tx: ReplySender<CacheReply>,
         timing: QueryTiming,
+        transaction_status: TransactionStatus,
     ) {
         let kind = self.explain_kind_build(spec);
         let job = ExplainJob {
             client_socket,
             reply_tx,
             timing,
+            transaction_status,
             kind,
         };
         if self.serve_tx.send(ServeJob::Explain(job)).is_err() {

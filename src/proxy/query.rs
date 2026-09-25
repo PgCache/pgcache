@@ -19,7 +19,7 @@ use crate::{
         AstError, LiteralValue, QueryBody, QueryExpr, RawStatement, ScalarExpr, SelectColumn,
         SelectColumns, statement_convert_raw,
     },
-    query::write::WriteClass,
+    query::write::{IsolationEffect, StatementEffects, WriteClass},
 };
 
 use super::{ParseError, cacheability_store::CacheabilityStore};
@@ -270,10 +270,9 @@ fn ast_error_forward_reason(ast_error: &AstError) -> ForwardReason {
 /// and `Explain` are `Arc`s; `Forward` is `Copy`).
 #[derive(Clone)]
 pub(super) enum Action {
-    Forward(ForwardReason),
-    /// A forwarded statement that may modify table data; carries the write
-    /// classification for the connection's read-after-write log (PGC-124).
-    ForwardWrite(ForwardReason, WriteClass),
+    /// A forwarded statement, with everything it does to the connection's
+    /// tracked state (write log, isolation, block boundary).
+    Forward(ForwardReason, StatementEffects),
     CacheCheck(Arc<CacheableQuery>),
     /// `SELECT pgcache_explain(...)` — route to the cache to explain a cached
     /// query's cache-side plan rather than forward to origin (PGC-345).
@@ -288,6 +287,16 @@ pub(super) async fn handle_query(
 ) -> Result<Action, ParseError> {
     let query = query_sql_extract(data).ok_or(ParseError::InvalidUtf8)?;
     analyze(query, cacheability_cache, func_volatility)
+}
+
+/// Whether the statement text contains a `set_config` call (case-insensitive),
+/// which can change any GUC — including the isolation default — from inside a
+/// query.
+fn sql_mentions_set_config(sql: &str) -> bool {
+    const NEEDLE: &[u8] = b"set_config";
+    sql.as_bytes()
+        .windows(NEEDLE.len())
+        .any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }
 
 /// Extract the SQL text from a simple-query (`Q`) frame: tag (1) + length (4) +
@@ -336,6 +345,15 @@ pub(super) fn analyze(
     let convert_result =
         pg_query::parse_raw_scoped(sql, |tree| unsafe { statement_convert_raw(tree) })?;
 
+    // `set_config('default_transaction_isolation', ...)` can hide in any
+    // forwarded statement (a SELECT, a DO block, a CALL); a text scan is the
+    // conservative catch-all, and a false positive only costs a re-probe.
+    let isolation = if sql_mentions_set_config(sql) {
+        IsolationEffect::SessionUnknown
+    } else {
+        IsolationEffect::None
+    };
+
     let action = match convert_result {
         Ok(RawStatement::Select {
             converted: Ok(query),
@@ -352,7 +370,10 @@ pub(super) fn analyze(
                     // cannot fail; forward conservatively if it ever disagrees.
                     Ok(()) => match CacheableQuery::try_new(*query, func_volatility) {
                         Ok(cacheable_query) => Action::CacheCheck(Arc::new(cacheable_query)),
-                        Err(_) => Action::Forward(ForwardReason::UncacheableSelect),
+                        Err(_) => Action::Forward(
+                            ForwardReason::UncacheableSelect,
+                            StatementEffects::read_only(isolation, None),
+                        ),
                     },
                     Err(cacheability_error) => {
                         debug!(%cacheability_error, "uncacheable SELECT");
@@ -361,14 +382,12 @@ pub(super) fn analyze(
                         // carrying one is a potential write (PGC-124). Scanned
                         // only now that the query is known uncacheable — the
                         // cacheable path never pays for it.
-                        if query_has_volatile_function(&query, func_volatility) {
-                            Action::ForwardWrite(
-                                ForwardReason::UncacheableSelect,
-                                WriteClass::Connection,
-                            )
+                        let effects = if query_has_volatile_function(&query, func_volatility) {
+                            StatementEffects::write(WriteClass::Connection, isolation)
                         } else {
-                            Action::Forward(ForwardReason::UncacheableSelect)
-                        }
+                            StatementEffects::read_only(isolation, None)
+                        };
+                        Action::Forward(ForwardReason::UncacheableSelect, effects)
                     }
                 }
             }
@@ -380,30 +399,49 @@ pub(super) fn analyze(
             let reason = ast_error_forward_reason(&ast_error);
             match cte_write {
                 // A data-modifying CTE: the "select" writes.
-                Some(class) => Action::ForwardWrite(reason, class),
+                Some(class) => Action::Forward(reason, StatementEffects::write(class, isolation)),
                 // No converted tree to scan for volatile (writing) functions,
                 // and a partial raw-tree scan would be unsound in exactly the
                 // way it is meant to prevent — so the failure direction is
                 // "assume it wrote", the same policy as a parse failure
                 // (PGC-449). Conversion failures are rare, exotic SELECTs;
                 // the converted-but-uncacheable arm keeps the precise scan.
-                None => Action::ForwardWrite(reason, WriteClass::Connection),
+                None => Action::Forward(
+                    reason,
+                    StatementEffects::write(WriteClass::Connection, isolation),
+                ),
             }
         }
-        Ok(RawStatement::Write(class)) => {
-            Action::ForwardWrite(ForwardReason::UnsupportedStatement, class)
-        }
-        Ok(RawStatement::ReadOnlyUtility { .. }) => {
-            Action::Forward(ForwardReason::UnsupportedStatement)
-        }
+        Ok(RawStatement::Write(class)) => Action::Forward(
+            ForwardReason::UnsupportedStatement,
+            StatementEffects::write(class, isolation),
+        ),
+        Ok(RawStatement::ReadOnlyUtility {
+            transaction,
+            isolation: statement_isolation,
+        }) => Action::Forward(
+            ForwardReason::UnsupportedStatement,
+            // Only a whitelisted utility carries a parsed effect; the
+            // set_config scan still applies (a SET can't call it, so this is
+            // just the general rule).
+            StatementEffects::read_only(
+                if statement_isolation == IsolationEffect::None {
+                    isolation
+                } else {
+                    statement_isolation
+                },
+                transaction,
+            ),
+        ),
         Err(ast_error) => {
             let reason = ast_error_forward_reason(&ast_error);
             // Any statement of a multi-statement batch can write.
-            if matches!(ast_error, AstError::MultipleStatements) {
-                Action::ForwardWrite(reason, WriteClass::Connection)
+            let effects = if matches!(ast_error, AstError::MultipleStatements) {
+                StatementEffects::write(WriteClass::Connection, isolation)
             } else {
-                Action::Forward(reason)
-            }
+                StatementEffects::read_only(isolation, None)
+            };
+            Action::Forward(reason, effects)
         }
     };
 
@@ -412,7 +450,7 @@ pub(super) fn analyze(
     // can carry a per-statement payload (INSERT rows). Interning them would
     // grow the per-connection memo and the shared store with data they never
     // serve. Reads intern as before.
-    if matches!(action, Action::ForwardWrite(..)) {
+    if matches!(&action, Action::Forward(_, effects) if effects.write.is_some()) {
         return Ok(action);
     }
     let interned = cacheability_cache.store.intern(key, action);
@@ -430,6 +468,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::proxy::cacheability_store::CacheabilityStore;
+    use crate::query::write::IsolationLevel;
 
     fn empty_volatility() -> HashMap<EcoString, FunctionVolatility> {
         HashMap::new()
@@ -615,9 +654,12 @@ mod tests {
     fn test_analyze_dml_classifies_as_write() {
         let fv = HashMap::new();
         match analyze_fresh("INSERT INTO t (a) VALUES (1)", &fv) {
-            Action::ForwardWrite(
+            Action::Forward(
                 ForwardReason::UnsupportedStatement,
-                WriteClass::InsertRows(_),
+                StatementEffects {
+                    write: Some(WriteClass::InsertRows(_)),
+                    ..
+                },
             ) => {}
             other => panic!(
                 "expected InsertRows write, got {:?}",
@@ -626,13 +668,22 @@ mod tests {
         }
         // No WHERE → whole-table opaque.
         match analyze_fresh("UPDATE t SET a = 1", &fv) {
-            Action::ForwardWrite(ForwardReason::UnsupportedStatement, WriteClass::Table(_)) => {}
+            Action::Forward(
+                ForwardReason::UnsupportedStatement,
+                StatementEffects {
+                    write: Some(WriteClass::Table(_)),
+                    ..
+                },
+            ) => {}
             other => panic!("expected Table write, got {:?}", discriminant_name(&other)),
         }
         match analyze_fresh("UPDATE t SET a = 1 WHERE id = 2", &fv) {
-            Action::ForwardWrite(
+            Action::Forward(
                 ForwardReason::UnsupportedStatement,
-                WriteClass::UpdateRows(_),
+                StatementEffects {
+                    write: Some(WriteClass::UpdateRows(_)),
+                    ..
+                },
             ) => {}
             other => panic!(
                 "expected UpdateRows write, got {:?}",
@@ -640,15 +691,78 @@ mod tests {
             ),
         }
         match analyze_fresh("DELETE FROM t WHERE id = 1", &fv) {
-            Action::ForwardWrite(
+            Action::Forward(
                 ForwardReason::UnsupportedStatement,
-                WriteClass::DeleteRows(_),
+                StatementEffects {
+                    write: Some(WriteClass::DeleteRows(_)),
+                    ..
+                },
             ) => {}
             other => panic!(
                 "expected DeleteRows write, got {:?}",
                 discriminant_name(&other)
             ),
         }
+    }
+
+    /// PGC-387: a `set_config()` call anywhere in a forwarded statement
+    /// invalidates the tracked isolation default; whitelisted SET statements
+    /// carry their parsed effect.
+    #[test]
+    fn test_analyze_isolation_effects() {
+        let fv = HashMap::new();
+        assert!(matches!(
+            analyze_fresh(
+                "SELECT set_config('default_transaction_isolation', 'serializable', false)",
+                &fv
+            ),
+            Action::Forward(
+                _,
+                StatementEffects {
+                    write: Some(WriteClass::Connection),
+                    isolation: IsolationEffect::SessionUnknown,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            analyze_fresh(
+                "DO $$ BEGIN PERFORM SET_CONFIG('x', 'y', false); END $$",
+                &fv
+            ),
+            Action::Forward(
+                _,
+                StatementEffects {
+                    write: Some(WriteClass::Connection),
+                    isolation: IsolationEffect::SessionUnknown,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            analyze_fresh("BEGIN ISOLATION LEVEL SERIALIZABLE", &fv),
+            Action::Forward(
+                ForwardReason::UnsupportedStatement,
+                StatementEffects {
+                    isolation: IsolationEffect::Transaction(IsolationLevel::Serializable),
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            analyze_fresh("SET search_path TO public", &fv),
+            Action::Forward(
+                ForwardReason::UnsupportedStatement,
+                StatementEffects {
+                    isolation: IsolationEffect::None,
+                    ..
+                }
+            )
+        ));
+        assert!(matches!(
+            analyze_fresh("SELECT * FROM t WHERE id = 1", &fv),
+            Action::CacheCheck(_)
+        ));
     }
 
     #[test]
@@ -658,7 +772,7 @@ mod tests {
             assert!(
                 matches!(
                     analyze_fresh(sql, &fv),
-                    Action::Forward(ForwardReason::UnsupportedStatement)
+                    Action::Forward(ForwardReason::UnsupportedStatement, _)
                 ),
                 "for {sql:?}"
             );
@@ -680,14 +794,23 @@ mod tests {
             assert!(
                 matches!(
                     analyze_fresh(sql, &fv),
-                    Action::ForwardWrite(ForwardReason::UncacheableSelect, WriteClass::Connection)
+                    Action::Forward(
+                        ForwardReason::UncacheableSelect,
+                        StatementEffects {
+                            write: Some(WriteClass::Connection),
+                            ..
+                        }
+                    )
                 ),
                 "for {sql:?}"
             );
         }
         assert!(matches!(
             analyze_fresh("SELECT * FROM t WHERE f_stable(a) = 1", &fv),
-            Action::Forward(ForwardReason::UncacheableSelect)
+            Action::Forward(
+                ForwardReason::UncacheableSelect,
+                StatementEffects { write: None, .. }
+            )
         ));
     }
 
@@ -703,14 +826,23 @@ mod tests {
         assert!(
             matches!(
                 analyze_fresh("SELECT * FROM t WHERE f_stable(f_volatile(a)) = 1", &fv),
-                Action::ForwardWrite(ForwardReason::UncacheableSelect, WriteClass::Connection)
+                Action::Forward(
+                    ForwardReason::UncacheableSelect,
+                    StatementEffects {
+                        write: Some(WriteClass::Connection),
+                        ..
+                    }
+                )
             ),
             "stable wrapping volatile must be a write"
         );
         // Stable wrapping stable is still just a read.
         assert!(matches!(
             analyze_fresh("SELECT * FROM t WHERE f_stable(f_stable(a)) = 1", &fv),
-            Action::Forward(ForwardReason::UncacheableSelect)
+            Action::Forward(
+                ForwardReason::UncacheableSelect,
+                StatementEffects { write: None, .. }
+            )
         ));
     }
 
@@ -718,7 +850,13 @@ mod tests {
     fn test_analyze_multi_statement_is_a_write() {
         assert!(matches!(
             analyze_fresh("SELECT 1; SELECT 2", &HashMap::new()),
-            Action::ForwardWrite(ForwardReason::Invalid, WriteClass::Connection)
+            Action::Forward(
+                ForwardReason::Invalid,
+                StatementEffects {
+                    write: Some(WriteClass::Connection),
+                    ..
+                }
+            )
         ));
     }
 
@@ -730,7 +868,7 @@ mod tests {
         // and its class can carry a row payload).
         assert!(matches!(
             analyze("INSERT INTO t (a) VALUES (1)", &mut cache, &fv),
-            Ok(Action::ForwardWrite(..))
+            Ok(Action::Forward(_, StatementEffects { write: Some(_), .. }))
         ));
         assert!(cache.entries.is_empty(), "writes must not be memoized");
 
@@ -744,8 +882,8 @@ mod tests {
 
     fn discriminant_name(action: &Action) -> &'static str {
         match action {
-            Action::Forward(_) => "Forward",
-            Action::ForwardWrite(..) => "ForwardWrite",
+            Action::Forward(_, StatementEffects { write: None, .. }) => "Forward",
+            Action::Forward(_, StatementEffects { write: Some(_), .. }) => "ForwardWrite",
             Action::CacheCheck(_) => "CacheCheck",
             Action::Explain(_) => "Explain",
         }

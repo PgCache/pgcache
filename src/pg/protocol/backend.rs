@@ -5,6 +5,9 @@ use tokio_util::{
 };
 
 use super::*;
+use encode::{
+    READY_FOR_QUERY_FAILED_MSG, READY_FOR_QUERY_IDLE_MSG, READY_FOR_QUERY_IN_TRANSACTION_MSG,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgBackendMessageType {
@@ -261,6 +264,41 @@ impl Decoder for PgBackendMessageCodec {
 /// Message format: 'S' | int32 len | string name (null-terminated) | string value (null-terminated)
 ///
 /// Returns `None` if the message is malformed.
+/// The backend transaction status carried by every `ReadyForQuery`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TransactionStatus {
+    /// `'I'`: not in a transaction block.
+    #[default]
+    Idle,
+    /// `'T'`: in a transaction block.
+    InTransaction,
+    /// `'E'`: in a failed transaction block — origin rejects every statement
+    /// until the block ends.
+    Failed,
+}
+
+impl TransactionStatus {
+    /// Parse the status byte of a `ReadyForQuery` frame (byte 5). A malformed
+    /// or unknown byte reads as `Failed`: the most conservative state (never
+    /// cache-served), and origin will report the real state on the next RFQ.
+    pub fn from_ready_for_query(data: &[u8]) -> Self {
+        match data.get(5) {
+            Some(b'I') => Self::Idle,
+            Some(b'T') => Self::InTransaction,
+            _ => Self::Failed,
+        }
+    }
+
+    /// The complete `ReadyForQuery` frame announcing this status.
+    pub fn ready_for_query_message(self) -> &'static [u8] {
+        match self {
+            Self::Idle => READY_FOR_QUERY_IDLE_MSG,
+            Self::InTransaction => READY_FOR_QUERY_IN_TRANSACTION_MSG,
+            Self::Failed => READY_FOR_QUERY_FAILED_MSG,
+        }
+    }
+}
+
 pub fn parameter_status_parse(data: &[u8]) -> Option<(&str, &str)> {
     // Skip tag ('S') and length (4 bytes)
     let payload = data.get(5..)?;

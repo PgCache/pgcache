@@ -36,8 +36,26 @@ pub(in crate::proxy::connection) struct WriteLog {
     enabled: bool,
 }
 
+/// Test-only read-after-write disable (fault-injection feature): the integration
+/// harness writes and reads back on one connection, where the gate would turn
+/// deterministic cache hits into timing-dependent forwards. Always enabled in a
+/// production build.
+#[cfg(feature = "fault-injection")]
+fn fault_read_your_writes_off() -> bool {
+    std::env::var("PGCACHE_FAULT_READ_YOUR_WRITES_OFF")
+        .is_ok_and(|v| !matches!(v.to_lowercase().as_str(), "" | "0" | "off" | "false"))
+}
+#[cfg(not(feature = "fault-injection"))]
+fn fault_read_your_writes_off() -> bool {
+    false
+}
+
 impl WriteLog {
-    pub(in crate::proxy::connection) fn new(enabled: bool) -> Self {
+    pub(in crate::proxy::connection) fn new() -> Self {
+        Self::with_enabled(!fault_read_your_writes_off())
+    }
+
+    pub(in crate::proxy::connection) fn with_enabled(enabled: bool) -> Self {
         Self {
             tables: HashMap::new(),
             connection: ConnectionTiers::default(),
@@ -52,10 +70,6 @@ impl WriteLog {
         self.enabled = false;
         self.tables.clear();
         self.connection = ConnectionTiers::default();
-    }
-
-    pub(in crate::proxy::connection) fn is_enabled(&self) -> bool {
-        self.enabled
     }
 
     pub(in crate::proxy::connection) fn is_empty(&self) -> bool {

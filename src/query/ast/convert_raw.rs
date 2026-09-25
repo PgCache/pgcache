@@ -15,7 +15,7 @@ use pg_query::pg_nodes as pg;
 
 use crate::query::cast::cast_target_from_canonical;
 use crate::query::transform::query_expr_constant_fold;
-use crate::query::write::{TransactionBoundary, WriteClass};
+use crate::query::write::{IsolationEffect, TransactionBoundary, WriteClass};
 
 use super::raw::{
     NodePtr, aexpr_kind_name, cast, cstr, list_is_empty, list_nodes, node_tag, node_tag_name,
@@ -72,6 +72,8 @@ pub enum RawStatement {
     ReadOnlyUtility {
         /// Set for transaction-control statements.
         transaction: Option<TransactionBoundary>,
+        /// Effect on the session's isolation-level state (PGC-387).
+        isolation: IsolationEffect,
     },
 }
 
@@ -102,9 +104,13 @@ pub unsafe fn statement_convert_raw(tree_root: *const c_void) -> Result<RawState
             }
             _ => match write::non_select_classify(stmt) {
                 write::NonSelectClass::Write(class) => RawStatement::Write(class),
-                write::NonSelectClass::ReadOnly(transaction) => {
-                    RawStatement::ReadOnlyUtility { transaction }
-                }
+                write::NonSelectClass::ReadOnly {
+                    transaction,
+                    isolation,
+                } => RawStatement::ReadOnlyUtility {
+                    transaction,
+                    isolation,
+                },
             },
         })
     }

@@ -201,6 +201,12 @@ impl Scenario {
         }
     }
 
+    /// [`Self::version_bump`] returning `(group_id, version)` per bumped
+    /// group-row, for the in-transaction own-write check.
+    pub fn version_bump_returning(&self) -> String {
+        format!("{} RETURNING group_id, version", self.version_bump())
+    }
+
     /// Delete one item from a group, `$1 = group_id`.
     pub fn item_delete(&self) -> String {
         format!(

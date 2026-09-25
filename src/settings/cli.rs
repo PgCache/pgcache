@@ -191,7 +191,6 @@ pub(super) struct CliArgs {
     pub(super) pinned_queries: Option<String>,
     pub(super) pinned_tables: Option<String>,
     pub(super) telemetry_off: bool,
-    pub(super) read_your_writes_off: bool,
     pub(super) check: bool,
 }
 
@@ -259,7 +258,6 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("pinned_tables") => args.pinned_tables = Some(arg_string(&mut parser)?),
             Long("telemetry_off") => args.telemetry_off = true,
             Long("check") => args.check = true,
-            Long("read_your_writes_off") => args.read_your_writes_off = true,
             Long("help") => {
                 Settings::print_usage_and_exit(parser.bin_name().unwrap_or_default());
             }
@@ -293,20 +291,6 @@ fn telemetry_resolve(cli_off: bool, toml_value: Option<bool>) -> bool {
         return v;
     }
     if let Ok(v) = std::env::var("PGCACHE_TELEMETRY") {
-        return !matches!(v.to_lowercase().as_str(), "off" | "false" | "0");
-    }
-    true
-}
-
-/// Resolve read-your-writes enabled state from CLI > TOML > env var > default (true).
-fn read_your_writes_resolve(cli_off: bool, toml_value: Option<bool>) -> bool {
-    if cli_off {
-        return false;
-    }
-    if let Some(v) = toml_value {
-        return v;
-    }
-    if let Ok(v) = std::env::var("PGCACHE_READ_YOUR_WRITES") {
         return !matches!(v.to_lowercase().as_str(), "off" | "false" | "0");
     }
     true
@@ -644,10 +628,6 @@ pub(super) fn settings_build_with_config(
             csv_parse(args.pinned_tables).or(config.pinned_tables.take()),
         ),
         telemetry: telemetry_resolve(args.telemetry_off, config.telemetry),
-        read_your_writes: read_your_writes_resolve(
-            args.read_your_writes_off,
-            config.read_your_writes,
-        ),
     })
 }
 
@@ -719,7 +699,6 @@ pub(super) fn settings_build_cli_only(mut args: CliArgs) -> ConfigResult<Setting
             csv_parse(args.pinned_tables),
         ),
         telemetry: telemetry_resolve(args.telemetry_off, None),
-        read_your_writes: read_your_writes_resolve(args.read_your_writes_off, None),
     })
 }
 
@@ -768,7 +747,6 @@ impl Settings {
             [--pinned_tables TABLE1,TABLE2,...] (pin SELECT * FROM table for each table) \n \
             [--log_level LEVEL] (e.g., debug, info, pgcache_lib::cache=debug) \n \
             [--telemetry_off] (disable anonymous telemetry) \n \
-            [--read_your_writes_off] (disable per-connection read-after-write consistency) \n \
             [--check] (check the origin is ready for pgcache, print a report and exit; cache settings not needed)"
         );
         std::process::exit(1);

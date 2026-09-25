@@ -29,6 +29,99 @@ pub enum TransactionBoundary {
     End,
 }
 
+/// Transaction isolation levels as they matter to in-transaction cache
+/// serving (PGC-387). `READ UNCOMMITTED` folds into `ReadCommitted`, which is
+/// how PostgreSQL treats it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl IsolationLevel {
+    /// Parse a level as PostgreSQL spells it in `SHOW` output, `SET` values
+    /// and `ISOLATION LEVEL` clauses (case-insensitive, whitespace-normalized).
+    pub fn parse(value: &str) -> Option<Self> {
+        let mut words = value.split_whitespace().map(str::to_ascii_lowercase);
+        let first = words.next()?;
+        let second = words.next();
+        if words.next().is_some() {
+            return None;
+        }
+        match (first.as_str(), second.as_deref()) {
+            ("read", Some("committed" | "uncommitted")) => Some(Self::ReadCommitted),
+            ("repeatable", Some("read")) => Some(Self::RepeatableRead),
+            ("serializable", None) => Some(Self::Serializable),
+            _ => None,
+        }
+    }
+}
+
+/// How a forwarded statement changes the session's isolation-level state, as
+/// tracked by the proxy for in-transaction cache serving (PGC-387). Produced at
+/// cacheability-analysis time (memoized per statement text).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolationEffect {
+    /// No effect on isolation state.
+    #[default]
+    None,
+    /// Sets the level of the current (or, for `BEGIN`, the starting)
+    /// transaction: `BEGIN/START TRANSACTION ... ISOLATION LEVEL`,
+    /// `SET TRANSACTION ISOLATION LEVEL`, `SET transaction_isolation`.
+    Transaction(IsolationLevel),
+    /// Sets the session default: `SET [SESSION] default_transaction_isolation`,
+    /// `SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL`.
+    SessionDefault(IsolationLevel),
+    /// The session default is no longer known: `RESET`, `RESET ALL`,
+    /// `DISCARD ALL`, `SET ... TO DEFAULT`, `SET LOCAL`, a `set_config()` call,
+    /// or a level the parser couldn't read.
+    SessionUnknown,
+}
+
+/// Everything a forwarded statement does to the proxy's per-connection state,
+/// bundled so every forward path (simple query, extended Sync, extended Flush,
+/// forward-without-cache-decision) applies it the same way.
+#[derive(Debug, Clone, Default)]
+pub struct StatementEffects {
+    /// Write classification for the read-after-write log (PGC-124); `None` =
+    /// provably read-only.
+    pub write: Option<WriteClass>,
+    /// Effect on the session's isolation-level state (PGC-387).
+    pub isolation: IsolationEffect,
+    /// Transaction-control boundary, for block-scoped isolation bookkeeping.
+    pub transaction: Option<TransactionBoundary>,
+}
+
+impl StatementEffects {
+    pub fn read_only(isolation: IsolationEffect, transaction: Option<TransactionBoundary>) -> Self {
+        Self {
+            write: None,
+            isolation,
+            transaction,
+        }
+    }
+
+    pub fn write(class: WriteClass, isolation: IsolationEffect) -> Self {
+        Self {
+            write: Some(class),
+            isolation,
+            transaction: None,
+        }
+    }
+
+    /// A statement the proxy could not classify (parse failure, unresolvable
+    /// extended-protocol portal): assume a connection-scoped write and a
+    /// changed isolation default. Every fallback widens, never misses.
+    pub fn unknown() -> Self {
+        Self {
+            write: Some(WriteClass::Connection),
+            isolation: IsolationEffect::SessionUnknown,
+            transaction: None,
+        }
+    }
+}
+
 /// A table reference as written in a DML statement. Never schema-resolved —
 /// the proxy has no catalog knowledge, so consumers must treat an unqualified
 /// name conservatively (same-name ⇒ possibly the same table).
@@ -106,4 +199,33 @@ pub struct UpdateStatement {
     pub relation: RelationRef,
     pub where_comparisons: Vec<WriteComparison>,
     pub set: Vec<SetAssignment>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_isolation_level_parse() {
+        assert_eq!(
+            IsolationLevel::parse("read committed"),
+            Some(IsolationLevel::ReadCommitted)
+        );
+        assert_eq!(
+            IsolationLevel::parse("READ  Uncommitted"),
+            Some(IsolationLevel::ReadCommitted)
+        );
+        assert_eq!(
+            IsolationLevel::parse(" repeatable read "),
+            Some(IsolationLevel::RepeatableRead)
+        );
+        assert_eq!(
+            IsolationLevel::parse("Serializable"),
+            Some(IsolationLevel::Serializable)
+        );
+        assert_eq!(IsolationLevel::parse(""), None);
+        assert_eq!(IsolationLevel::parse("read"), None);
+        assert_eq!(IsolationLevel::parse("serializable read"), None);
+        assert_eq!(IsolationLevel::parse("snapshot"), None);
+    }
 }

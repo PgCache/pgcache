@@ -83,6 +83,17 @@ pub mod names {
     pub const RAW_CAP_DEGRADED_INSERT: &str = "pgcache.raw.cap_degraded_insert";
     pub const RAW_CAP_DEGRADED_UPDATE_DELETE: &str = "pgcache.raw.cap_degraded_update_delete";
 
+    // In-transaction serving (PGC-387)
+    /// Cacheable reads served from cache inside a transaction block.
+    pub const TXN_SERVED: &str = "pgcache.txn.served";
+    /// Cacheable reads inside a transaction block forwarded to origin by the
+    /// transaction gate. Labeled `reason` = failed (aborted block) |
+    /// isolation_unknown | isolation_strict | pending_write (the block's own
+    /// uncommitted writes intersect the read).
+    pub const TXN_FORWARDS: &str = "pgcache.txn.forwards";
+    /// `SHOW default_transaction_isolation` probes injected on origin sockets.
+    pub const TXN_ISOLATION_PROBES: &str = "pgcache.txn.isolation_probes";
+
     // Histogram metrics (latency in seconds per Prometheus convention)
     /// End-to-end latency for cache hits: client message received → response written to client.
     pub const CACHE_QUERY_LATENCY_SECONDS: &str = "pgcache.query.cache_latency_seconds";
@@ -422,6 +433,17 @@ pub struct Handles {
     pub state: StateHandles,
     /// Per-connection read-after-write tracking (PGC-124).
     pub raw: RawHandles,
+    /// In-transaction cache serving (PGC-387).
+    pub txn: TxnHandles,
+}
+
+pub struct TxnHandles {
+    pub served: Counter,
+    pub forward_failed: Counter,
+    pub forward_isolation_unknown: Counter,
+    pub forward_isolation_strict: Counter,
+    pub forward_pending_write: Counter,
+    pub isolation_probes: Counter,
 }
 
 pub struct RawHandles {
@@ -865,6 +887,14 @@ impl Handles {
                 serve_disjoint_update: metrics::counter!(RAW_SERVE_DISJOINT_UPDATE),
                 cap_degraded_insert: metrics::counter!(RAW_CAP_DEGRADED_INSERT),
                 cap_degraded_update_delete: metrics::counter!(RAW_CAP_DEGRADED_UPDATE_DELETE),
+            },
+            txn: TxnHandles {
+                served: metrics::counter!(TXN_SERVED),
+                forward_failed: metrics::counter!(TXN_FORWARDS, "reason" => "failed"),
+                forward_isolation_unknown: metrics::counter!(TXN_FORWARDS, "reason" => "isolation_unknown"),
+                forward_isolation_strict: metrics::counter!(TXN_FORWARDS, "reason" => "isolation_strict"),
+                forward_pending_write: metrics::counter!(TXN_FORWARDS, "reason" => "pending_write"),
+                isolation_probes: metrics::counter!(TXN_ISOLATION_PROBES),
             },
         }
     }

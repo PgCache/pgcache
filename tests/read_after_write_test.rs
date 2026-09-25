@@ -11,10 +11,11 @@ use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_a
 
 mod util;
 
-/// Enable per-connection read-after-write, which the shared test harness turns
-/// off by default (most tests write and read on one connection and would then
-/// forward instead of cache-hit). These tests exercise the feature itself.
-const RAW_ON: (&str, &str) = ("PGCACHE_READ_YOUR_WRITES", "on");
+/// Re-enable per-connection read-after-write, which the shared test harness
+/// turns off by default through its fault hook (most tests write and read on one
+/// connection and would then forward instead of cache-hit). These tests exercise
+/// the feature itself.
+const RAW_ON: (&str, &str) = ("PGCACHE_FAULT_READ_YOUR_WRITES_OFF", "0");
 
 fn row_count(msgs: &[SimpleQueryMessage]) -> usize {
     msgs.iter()
