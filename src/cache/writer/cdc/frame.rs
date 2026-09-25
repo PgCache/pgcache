@@ -74,6 +74,7 @@ impl WriterCdc {
         // rows may still exist (PGC-250). The recovery's own truncate re-adds the
         // affected relations in `frame_recover`.
         core.frame_deleted_keys.clear();
+        core.frame_toast_stale_keys.clear();
         core.frame_truncated_relations.clear();
         core.batch_deleted_pks.clear();
         core.toast_overlay_reset();
@@ -329,6 +330,11 @@ impl WriterCdc {
                         for (rel, key) in frame_deletes {
                             core.population_deleted_keys.record(rel, key, *commit_lsn);
                         }
+                        let frame_stale = std::mem::take(&mut core.frame_toast_stale_keys);
+                        for (rel, key) in frame_stale {
+                            core.population_deleted_keys
+                                .record_toast_stale(rel, key, *commit_lsn);
+                        }
                         let frame_truncated = std::mem::take(&mut core.frame_truncated_relations);
                         for rel in frame_truncated {
                             core.population_deleted_keys.abort_below(rel, *commit_lsn);
@@ -468,6 +474,11 @@ impl WriterCdc {
         let frame_deletes = std::mem::take(&mut core.frame_deleted_keys);
         for (relation_oid, key) in frame_deletes {
             core.population_deleted_keys.record(relation_oid, key, lsn);
+        }
+        let frame_stale = std::mem::take(&mut core.frame_toast_stale_keys);
+        for (relation_oid, key) in frame_stale {
+            core.population_deleted_keys
+                .record_toast_stale(relation_oid, key, lsn);
         }
         let frame_truncated = std::mem::take(&mut core.frame_truncated_relations);
         for relation_oid in frame_truncated {

@@ -71,6 +71,13 @@ struct DeletedKeyEntry {
     /// Bumped whenever the key *set* changes (not an LSN restamp), so a merge
     /// can reuse its rendered filter across chunks until the set moves.
     version: u64,
+    /// PK tuple body → commit LSN of a toast fallback on that row (PGC-464): a
+    /// row CDC could neither upsert (incomplete image) nor record as deleted
+    /// (alive at origin). A population whose staged snapshot holds the row
+    /// from before that LSN cannot be repaired at merge and must repopulate.
+    stale_keys: HashMap<EcoString, Lsn>,
+    /// Bumped whenever `stale_keys` changes, for the merge's probe cache.
+    stale_version: u64,
     /// Set once `keys` exceeds the cap; keys are dropped and *every* merge over
     /// the relation aborts (keys genuinely lost) until the last population leaves.
     overflowed: bool,
@@ -90,6 +97,23 @@ impl DeletedKeyEntry {
             return;
         };
         self.keys_retain(|lsn| lsn > min_floor);
+        self.stale_keys_retain(|lsn| lsn > min_floor);
+    }
+
+    fn stale_key_insert(&mut self, key: EcoString, lsn: Lsn) {
+        // Later fallback on the same key: keep the later LSN (a population
+        // floored between the two still holds a copy from before the later).
+        let slot = self.stale_keys.entry(key).or_insert(lsn);
+        *slot = (*slot).max(lsn);
+        self.stale_version += 1;
+    }
+
+    fn stale_keys_retain(&mut self, keep: impl Fn(Lsn) -> bool) {
+        let before = self.stale_keys.len();
+        self.stale_keys.retain(|_, lsn| keep(*lsn));
+        if self.stale_keys.len() != before {
+            self.stale_version += 1;
+        }
     }
 
     fn key_insert(&mut self, key: EcoString, lsn: Lsn) {
@@ -120,8 +144,11 @@ impl DeletedKeyEntry {
     fn disable(&mut self) {
         self.keys.clear();
         self.keys.shrink_to_fit();
+        self.stale_keys.clear();
+        self.stale_keys.shrink_to_fit();
         self.overflowed = true;
         self.version += 1;
+        self.stale_version += 1;
     }
 
     /// A bulk invalidation committed at `lsn` emptied/dropped rows; raise the
@@ -130,6 +157,7 @@ impl DeletedKeyEntry {
     fn abort_below(&mut self, lsn: Lsn) {
         self.aborted_below = self.aborted_below.max(lsn);
         self.keys_retain(|key_lsn| key_lsn > lsn);
+        self.stale_keys_retain(|key_lsn| key_lsn > lsn);
     }
 
     /// Whether a merge whose snapshot is `snapshot_lsn` must abort: keys were
@@ -201,6 +229,10 @@ impl PopulationDeletedKeys {
         if entry.overflowed {
             return;
         }
+        // A delete after a fallback supersedes it: the merge omits the row.
+        if entry.stale_keys.remove(&key).is_some() {
+            entry.stale_version += 1;
+        }
         entry.key_insert(key, lsn);
         if entry.keys.len() > POPULATION_DELETED_KEY_CAP {
             entry.disable();
@@ -210,6 +242,100 @@ impl PopulationDeletedKeys {
                  affected populations will repopulate"
             );
         }
+    }
+
+    /// Record a toast fallback on the row at `key` (PGC-464), stamped with the
+    /// fallback's commit LSN, if a population is recording `relation_oid`.
+    /// The row is alive at origin, so it also cancels any tracked delete of
+    /// the key. Shares the deleted-key cap: overflow aborts every merge over
+    /// the relation until the last population leaves.
+    pub(super) fn record_toast_stale(&mut self, relation_oid: Oid, key: EcoString, lsn: Lsn) {
+        let Some(entry) = self.relations.get_mut(&relation_oid) else {
+            return;
+        };
+        if entry.overflowed {
+            return;
+        }
+        entry.key_remove(&key);
+        entry.stale_key_insert(key, lsn);
+        if entry.stale_keys.len() > POPULATION_DELETED_KEY_CAP {
+            entry.disable();
+            error!(
+                relation_oid = %relation_oid,
+                "population toast-stale key set overflowed cap {POPULATION_DELETED_KEY_CAP}; \
+                 affected populations will repopulate"
+            );
+        }
+    }
+
+    /// Drop a toast-stale key whose row CDC has re-written with a complete
+    /// image (PGC-464): the live row is in the shared table, which merges never
+    /// overwrite, so no staged copy can regress it. Returns whether the key was
+    /// tracked, so the caller applies the same force-upsert rule as
+    /// [`Self::cancel`] (PGC-260).
+    pub(super) fn cancel_toast_stale(&mut self, relation_oid: Oid, key: &str) -> bool {
+        let Some(entry) = self.relations.get_mut(&relation_oid) else {
+            return false;
+        };
+        let removed = entry.stale_keys.remove(key).is_some();
+        if removed {
+            entry.stale_version += 1;
+        }
+        removed
+    }
+
+    /// The anchor floor a population registered for `relation_oid` at
+    /// dispatch: a lower bound on its snapshot, so any event at or below it is
+    /// reflected in what it staged.
+    pub(super) fn floor(
+        &self,
+        relation_oid: Oid,
+        fingerprint: Fingerprint,
+        generation: u64,
+    ) -> Option<Lsn> {
+        self.relations
+            .get(&relation_oid)?
+            .floors
+            .get(&(fingerprint, generation))
+            .copied()
+    }
+
+    /// Version of the toast-stale key set for `relation_oid`, or `None` when
+    /// there is nothing above `floor` to probe. Changes exactly when the set a
+    /// merge would probe with could, so the merge can cache its probe result.
+    pub(super) fn stale_version_above(&self, relation_oid: Oid, floor: Lsn) -> Option<u64> {
+        let entry = self.relations.get(&relation_oid)?;
+        entry
+            .stale_keys
+            .values()
+            .any(|lsn| *lsn > floor)
+            .then_some(entry.stale_version)
+    }
+
+    /// Render the `(<pk cols>) IN (...)` membership predicate over the
+    /// toast-stale keys above `floor`, or `None` when there are none.
+    pub(super) fn stale_predicate(
+        &self,
+        relation_oid: Oid,
+        floor: Lsn,
+        pk_columns_paren: &str,
+    ) -> Option<String> {
+        let entry = self.relations.get(&relation_oid)?;
+        let mut tuples = String::new();
+        for key in entry
+            .stale_keys
+            .iter()
+            .filter(|(_, lsn)| **lsn > floor)
+            .map(|(key, _)| key)
+        {
+            if !tuples.is_empty() {
+                tuples.push(',');
+            }
+            tuples.push('(');
+            tuples.push_str(key);
+            tuples.push(')');
+        }
+        (!tuples.is_empty()).then(|| format!("{pk_columns_paren} IN ({tuples})"))
     }
 
     /// Whether any population is recording deletes for `relation_oid`. Lets the
@@ -432,10 +558,12 @@ impl WriterCore {
     /// A CDC insert/update re-wrote the row at `row_data`'s PK — cancel any
     /// tracked deletion of that key (PGC-260): the frame-pending entry (an
     /// earlier delete in this frame nets out, in event order) and the recorded
-    /// set (deletes from earlier frames). A lingering key would make population
-    /// merges omit a legitimately live row. Returns whether anything was
-    /// tracked, so the insert path can force-upsert an otherwise-unmatched row
-    /// (the live row in the shared table is what makes cancellation safe).
+    /// set (deletes from earlier frames), and any toast-stale record of it
+    /// (PGC-464). A lingering key would make population merges omit — or
+    /// needlessly abort over — a legitimately live row. Returns whether
+    /// anything was tracked, so the insert path can force-upsert an
+    /// otherwise-unmatched row (the live row in the shared table is what makes
+    /// cancellation safe).
     pub(super) fn population_deleted_key_cancel(
         &mut self,
         relation_oid: Oid,
@@ -463,6 +591,9 @@ impl WriterCore {
             });
         }
         tracked |= self.population_deleted_keys.cancel(relation_oid, &key);
+        tracked |= self
+            .population_deleted_keys
+            .cancel_toast_stale(relation_oid, &key);
         tracked
     }
 

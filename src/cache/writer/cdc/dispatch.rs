@@ -64,6 +64,7 @@ impl WriterCdc {
                     core.frame_rows.clear();
                     core.frame_chunk_flushed = false;
                     core.frame_deleted_keys.clear();
+                    core.frame_toast_stale_keys.clear();
                     core.frame_truncated_relations.clear();
                     core.batch_deleted_pks.clear();
                     core.toast_overlay_reset();
@@ -710,18 +711,18 @@ impl WriterCdc {
     /// must never reach the shared cache table, and predicates over the elided
     /// columns can't be evaluated.
     ///
-    /// With no population recording the relation: invalidate every query that
-    /// might be affected (structural sensitivity, or membership match — the
-    /// matched row can't be upserted); provably unaffected queries need
-    /// nothing beyond the row's eviction.
+    /// Invalidate every query that might be affected (structural sensitivity,
+    /// or membership match — the matched row can't be upserted); provably
+    /// unaffected queries need nothing beyond the row's eviction.
     ///
-    /// With recording active, the PGC-261 hazard applies: the row is alive at
-    /// origin, so deleting it with a lost-key record makes later populations'
-    /// merges omit it — including merges for queries registered *after* this
-    /// event, which no invalidation here can cover. Instead invalidate every
-    /// query over the relation (superseding their in-flight populations via
-    /// the generation bump) and evict the stale row without a record; later
-    /// populations snapshot post-update origin and merge cleanly.
+    /// With a population recording the relation, the PGC-261 hazard applies:
+    /// the row is alive at origin, so deleting it with a lost-key record would
+    /// make later merges omit it, yet a population that staged the row before
+    /// this event would merge a copy the cache can't repair. The row is
+    /// evicted without a record and its key goes into the toast-stale set
+    /// (PGC-464): the merge aborts exactly the populations whose staging holds
+    /// it, and every other population — including ones registered after this
+    /// event, which snapshot post-update origin — merges cleanly.
     // Trace level: at info/debug the fmt layer allocates per-span extensions,
     // which would put a heap allocation on every CDC event.
     #[instrument(skip_all, level = "trace")]
@@ -749,51 +750,52 @@ impl WriterCdc {
             core.cache.update_queries.get(&relation_oid),
             core.cache.tables.get1(&relation_oid),
         ) {
-            if recording {
-                fp_list.extend(
-                    update_queries
-                        .queries
-                        .values()
-                        .map(|q| q.fingerprint)
-                        .filter(|fp| !core.frame_invalidations.contains(fp)),
-                );
-            } else {
-                let mut pg_eval: Vec<&UpdateQuery> = Vec::new();
-                for update_query in update_queries.queries.values() {
-                    if core.frame_invalidations.contains(&update_query.fingerprint) {
-                        continue;
-                    }
-                    if Self::toast_fallback_structural_invalidate(
-                        update_query,
-                        table_metadata,
-                        new_row_data,
-                        key_data,
-                        toasted_columns,
-                    ) {
-                        fp_list.push(update_query.fingerprint);
-                        continue;
-                    }
-                    match update_query.eval_strategy {
-                        UpdateEvalStrategy::LocalEval => {
-                            if update_query_matches_locally(
-                                update_query,
-                                table_metadata,
-                                new_row_data,
-                            ) {
-                                fp_list.push(update_query.fingerprint);
-                            }
-                        }
-                        UpdateEvalStrategy::PgEval => pg_eval.push(update_query),
-                    }
+            let mut pg_eval: Vec<&UpdateQuery> = Vec::new();
+            for update_query in update_queries.queries.values() {
+                if core.frame_invalidations.contains(&update_query.fingerprint) {
+                    continue;
                 }
-                if !pg_eval.is_empty() {
-                    let matched = self
-                        .pg_eval_matches(&pg_eval, table_metadata, new_row_data)
-                        .await
-                        .attach_loc("toast fallback membership eval")?;
-                    fp_list.extend(matched);
+                if Self::toast_fallback_structural_invalidate(
+                    update_query,
+                    table_metadata,
+                    new_row_data,
+                    key_data,
+                    toasted_columns,
+                ) {
+                    fp_list.push(update_query.fingerprint);
+                    continue;
+                }
+                match update_query.eval_strategy {
+                    UpdateEvalStrategy::LocalEval => {
+                        if update_query_matches_locally(update_query, table_metadata, new_row_data)
+                        {
+                            fp_list.push(update_query.fingerprint);
+                        }
+                    }
+                    UpdateEvalStrategy::PgEval => pg_eval.push(update_query),
                 }
             }
+            if !pg_eval.is_empty() {
+                let matched = self
+                    .pg_eval_matches(&pg_eval, table_metadata, new_row_data)
+                    .await
+                    .attach_loc("toast fallback membership eval")?;
+                fp_list.extend(matched);
+            }
+        }
+        // Under recording an in-flight population may have staged this row
+        // from before the event; the merge cannot repair it (incomplete image)
+        // nor omit it (alive at origin). Record the key so the merge aborts
+        // exactly the populations whose staging holds it (PGC-464) instead of
+        // invalidating every query over the relation.
+        // Only the row's live (new) PK: after a PK change the old PK's row is
+        // genuinely dead at origin and its recorded delete below lets merges
+        // omit it, which is exact where a stale key would only abort.
+        if recording
+            && let Some(table_metadata) = core.cache.tables.get1(&relation_oid)
+            && let Some(key) = pk_body_render(table_metadata, new_row_data)
+        {
+            core.frame_toast_stale_keys.push((relation_oid, key));
         }
         trace!(
             relation_oid = %relation_oid,

@@ -150,6 +150,34 @@ struct FilterCache {
     predicate: String,
 }
 
+/// What one merge step reads from the active drain up front.
+struct MergeStepInputs {
+    cursor: DrainCursor,
+    chunk_blocks: u32,
+    generation: u64,
+    staged: Vec<(Oid, EcoString)>,
+    /// `(fingerprint, generation)` of an applying merge; `None` for a discard.
+    population: Option<(Fingerprint, u64)>,
+}
+
+/// One heap-page window of a staging table, the unit a merge step drains.
+struct ChunkWindow {
+    /// Index into the drain's `staged` list.
+    index: usize,
+    lo_block: u32,
+    hi_block: u32,
+    /// Total blocks in the relation's staging table.
+    blocks: u32,
+}
+
+/// The toast-stale key set a drain last probed its staging table against
+/// (PGC-464), so a chunk re-probes only when the set moved.
+#[derive(Clone, Copy)]
+struct StaleProbeCache {
+    relation_oid: Oid,
+    version: u64,
+}
+
 /// What the writer's input queues held when the active drain last took a
 /// chunk (or started). Under a backlog the next chunk is due only once each
 /// queue has yielded its unit of foreground work since: a CDC batch flush,
@@ -188,6 +216,7 @@ pub(super) struct MergeInProgress {
     chunk_blocks: u32,
     boundary: ChunkBoundary,
     filter: Option<FilterCache>,
+    stale_probe: Option<StaleProbeCache>,
     /// Rows drained from staging so far (before the deleted-key filter).
     pub(super) drained_rows: u64,
     pub(super) chunks: u64,
@@ -212,6 +241,7 @@ impl MergeInProgress {
             chunk_blocks: fault_merge_chunk_blocks().unwrap_or(MERGE_CHUNK_BLOCKS_INITIAL),
             boundary,
             filter: None,
+            stale_probe: None,
             drained_rows: 0,
             chunks: 0,
             started_at: Instant::now(),
@@ -246,6 +276,48 @@ impl MergeInProgress {
             });
         }
         self.filter.as_ref().map(|c| c.predicate.as_str())
+    }
+
+    /// The toast-stale membership predicate to probe the staging table with
+    /// before the chunk, or `None` when the set is unchanged since the last
+    /// probe (or empty above this population's floor).
+    fn stale_probe_predicate(
+        &mut self,
+        keys: &PopulationDeletedKeys,
+        relation_oid: Oid,
+        floor: Lsn,
+        pk_columns_paren: &str,
+    ) -> Option<String> {
+        let version = keys.stale_version_above(relation_oid, floor)?;
+        let probed = self
+            .stale_probe
+            .is_some_and(|c| c.relation_oid == relation_oid && c.version == version);
+        if probed {
+            return None;
+        }
+        let predicate = keys.stale_predicate(relation_oid, floor, pk_columns_paren)?;
+        self.stale_probe = Some(StaleProbeCache {
+            relation_oid,
+            version,
+        });
+        Some(predicate)
+    }
+
+    /// Account a drained window and move the cursor past it (into the next
+    /// relation once the table is exhausted).
+    fn chunk_finish(&mut self, window: &ChunkWindow, count: u64, elapsed: Duration) {
+        self.chunks += 1;
+        self.drained_rows += count;
+        self.chunk_blocks_adapt(elapsed);
+        self.cursor = if window.hi_block >= window.blocks {
+            DrainCursor::after_relation(window.index + 1, self.staged.len())
+        } else {
+            DrainCursor::InRelation {
+                index: window.index,
+                next_block: window.hi_block,
+                blocks: window.blocks,
+            }
+        };
     }
 
     /// Scale the next chunk toward `MERGE_CHUNK_TARGET` from the last chunk's
@@ -639,64 +711,179 @@ impl WriterCore {
     /// while staging rows remain; on `Done` / `Aborted` the caller takes the
     /// active drain and finalizes.
     pub(super) async fn population_merge_step(&mut self) -> CacheResult<MergeStep> {
-        let Some(in_progress) = self.merges.active.as_ref() else {
+        let Some(step) = self.merge_step_inputs() else {
             return Ok(MergeStep::Done);
         };
-        let staged_len = in_progress.staged.len();
-        let (index, lo_block, blocks) = match in_progress.cursor {
+        let window = match step.cursor {
             DrainCursor::Done => return Ok(MergeStep::Done),
             DrainCursor::RelationStart { index } => {
-                let Some((_, staging)) = in_progress.staged.get(index) else {
-                    return Ok(MergeStep::Done);
-                };
-                let blocks = self.staging_blocks(staging).await?;
-                let cursor = if blocks == 0 {
-                    DrainCursor::after_relation(index + 1, staged_len)
-                } else {
-                    DrainCursor::InRelation {
-                        index,
-                        next_block: 0,
-                        blocks,
-                    }
-                };
-                if let Some(in_progress) = self.merges.active.as_mut() {
-                    in_progress.cursor = cursor;
-                }
+                self.merge_relation_enter(index).await?;
                 return Ok(MergeStep::Continue);
             }
             DrainCursor::InRelation {
                 index,
                 next_block,
                 blocks,
-            } => (index, next_block, blocks),
+            } => ChunkWindow {
+                index,
+                lo_block: next_block,
+                hi_block: next_block.saturating_add(step.chunk_blocks).min(blocks),
+                blocks,
+            },
         };
-        let Some((relation_oid, staging)) = in_progress.staged.get(index).cloned() else {
+        let Some((relation_oid, staging)) = step.staged.get(window.index).cloned() else {
             return Ok(MergeStep::Done);
         };
-        // Abort if any relation lost keys (overflow) or was bulk-invalidated
-        // (TRUNCATE / recovery) at an LSN past this population's snapshot —
-        // a later chunk could resurrect removed rows. Checked per chunk:
-        // either can happen in a CDC frame applied between chunks.
-        if let DrainTarget::Apply(merge) = &in_progress.target
-            && in_progress.staged.iter().any(|(oid, _)| {
-                self.population_deleted_keys
-                    .should_abort(*oid, merge.snapshot_lsn)
-            })
+        if self.merge_keys_lost() {
+            return Ok(MergeStep::Aborted);
+        }
+        // A relation evicted mid-population has no cache table to merge into;
+        // its staging rows are discarded in chunks like the rest.
+        let plan = step
+            .population
+            .and_then(|_| self.cache.tables.get1(&relation_oid).map(MergePlan::build));
+        if let (Some(plan), Some((fingerprint, generation))) = (&plan, step.population)
+            && self
+                .merge_toast_stale_hit(relation_oid, &staging, plan, fingerprint, generation)
+                .await?
         {
             return Ok(MergeStep::Aborted);
         }
-        let generation = in_progress.generation;
-        let hi_block = lo_block
-            .saturating_add(in_progress.chunk_blocks)
-            .min(blocks);
 
-        // A relation evicted mid-population has no cache table to merge into;
-        // its staging rows are discarded in chunks like the rest.
-        let plan = match &in_progress.target {
-            DrainTarget::Apply(_) => self.cache.tables.get1(&relation_oid).map(MergePlan::build),
-            DrainTarget::Discard => None,
+        let (count, elapsed) = self
+            .merge_chunk_run(
+                plan.as_ref(),
+                relation_oid,
+                &staging,
+                step.generation,
+                &window,
+            )
+            .await?;
+        if let Some(in_progress) = self.merges.active.as_mut() {
+            in_progress.chunk_finish(&window, count, elapsed);
+        }
+        Ok(MergeStep::Continue)
+    }
+
+    /// The active drain's state a step reads before it touches `self`
+    /// mutably, or `None` when no drain is active.
+    fn merge_step_inputs(&self) -> Option<MergeStepInputs> {
+        let in_progress = self.merges.active.as_ref()?;
+        Some(MergeStepInputs {
+            cursor: in_progress.cursor,
+            chunk_blocks: in_progress.chunk_blocks,
+            generation: in_progress.generation,
+            staged: in_progress.staged.clone(),
+            population: match &in_progress.target {
+                DrainTarget::Apply(merge) => Some((merge.fingerprint, merge.generation)),
+                DrainTarget::Discard => None,
+            },
+        })
+    }
+
+    /// Enter `staged[index]`: size its staging table and point the cursor at
+    /// its first window (or past it, if it is empty).
+    async fn merge_relation_enter(&mut self, index: usize) -> CacheResult<()> {
+        let Some(in_progress) = self.merges.active.as_ref() else {
+            return Ok(());
         };
-        let sql = match &plan {
+        let staged_len = in_progress.staged.len();
+        let Some((_, staging)) = in_progress.staged.get(index) else {
+            return Ok(());
+        };
+        let staging = staging.clone();
+        let blocks = self.staging_blocks(&staging).await?;
+        let cursor = if blocks == 0 {
+            DrainCursor::after_relation(index + 1, staged_len)
+        } else {
+            DrainCursor::InRelation {
+                index,
+                next_block: 0,
+                blocks,
+            }
+        };
+        if let Some(in_progress) = self.merges.active.as_mut() {
+            in_progress.cursor = cursor;
+        }
+        Ok(())
+    }
+
+    /// Whether the active merge must abort because a relation lost keys
+    /// (overflow) or was bulk-invalidated (TRUNCATE / recovery) at an LSN past
+    /// this population's snapshot — a later chunk could resurrect removed rows.
+    /// Checked per chunk: either can happen in a CDC frame applied between
+    /// chunks. Discards never abort.
+    fn merge_keys_lost(&self) -> bool {
+        let Some(in_progress) = self.merges.active.as_ref() else {
+            return false;
+        };
+        let DrainTarget::Apply(merge) = &in_progress.target else {
+            return false;
+        };
+        in_progress.staged.iter().any(|(oid, _)| {
+            self.population_deleted_keys
+                .should_abort(*oid, merge.snapshot_lsn)
+        })
+    }
+
+    /// Whether this population staged a row a toast fallback has since left
+    /// unrepairable (PGC-464): keys recorded above its anchor floor that are
+    /// present in its staging table. Probed only when that key set moved since
+    /// the last chunk.
+    async fn merge_toast_stale_hit(
+        &mut self,
+        relation_oid: Oid,
+        staging: &str,
+        plan: &MergePlan,
+        fingerprint: Fingerprint,
+        generation: u64,
+    ) -> CacheResult<bool> {
+        let Some(floor) = self
+            .population_deleted_keys
+            .floor(relation_oid, fingerprint, generation)
+        else {
+            return Ok(false);
+        };
+        let Some(predicate) = self.merges.active.as_mut().and_then(|in_progress| {
+            in_progress.stale_probe_predicate(
+                &self.population_deleted_keys,
+                relation_oid,
+                floor,
+                &plan.pk_columns_paren,
+            )
+        }) else {
+            return Ok(false);
+        };
+        let probe = format!("SELECT 1 FROM pgcache_stage.{staging} WHERE {predicate} LIMIT 1");
+        let hit = self
+            .db_cache
+            .simple_query(&probe)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("population merge toast-stale probe")?
+            .iter()
+            .any(|m| matches!(m, SimpleQueryMessage::Row(_)));
+        if hit {
+            crate::metrics::handles()
+                .cdc
+                .toast_stale_aborts
+                .increment(1);
+        }
+        Ok(hit)
+    }
+
+    /// Drain one window of a staging table: a filtered upsert into the cache
+    /// table under `plan`, or a plain discard without one. Returns the rows
+    /// drained and the statement's wall time.
+    async fn merge_chunk_run(
+        &mut self,
+        plan: Option<&MergePlan>,
+        relation_oid: Oid,
+        staging: &str,
+        generation: u64,
+        window: &ChunkWindow,
+    ) -> CacheResult<(u64, Duration)> {
+        let sql = match plan {
             Some(plan) => {
                 let filter = self.merges.active.as_mut().and_then(|in_progress| {
                     in_progress.filter_predicate(
@@ -705,9 +892,15 @@ impl WriterCore {
                         &plan.pk_columns_paren,
                     )
                 });
-                plan.chunk_sql(&staging, generation, lo_block, hi_block, filter)
+                plan.chunk_sql(
+                    staging,
+                    generation,
+                    window.lo_block,
+                    window.hi_block,
+                    filter,
+                )
             }
-            None => discard_sql(&staging, lo_block, hi_block),
+            None => discard_sql(staging, window.lo_block, window.hi_block),
         };
 
         let started = Instant::now();
@@ -718,35 +911,19 @@ impl WriterCore {
             .map_into_report::<CacheError>()
             .attach_loc("population merge chunk")?;
         let elapsed = started.elapsed();
-        let count = match &plan {
+        let count = match plan {
             Some(_) => chunk_result_parse(&messages)?,
             None => discard_result_parse(&messages),
         };
         fault_merge_chunk_delay().await;
 
         let mh = crate::metrics::handles();
-        match &plan {
+        match plan {
             Some(_) => mh.reg.merge_chunks.increment(1),
             None => mh.reg.merge_discard_chunks.increment(1),
         }
         mh.reg.merge_chunk.record(elapsed.as_secs_f64());
-
-        let Some(in_progress) = self.merges.active.as_mut() else {
-            return Ok(MergeStep::Done);
-        };
-        in_progress.chunks += 1;
-        in_progress.drained_rows += count;
-        in_progress.chunk_blocks_adapt(elapsed);
-        in_progress.cursor = if hi_block >= blocks {
-            DrainCursor::after_relation(index + 1, staged_len)
-        } else {
-            DrainCursor::InRelation {
-                index,
-                next_block: hi_block,
-                blocks,
-            }
-        };
-        Ok(MergeStep::Continue)
+        Ok((count, elapsed))
     }
 
     /// Heap blocks in a staging table's main fork, from the file size.
@@ -828,6 +1005,69 @@ mod tests {
 
         assert!(keys.cancel(REL, "7"));
         assert!(drain.filter_predicate(&keys, REL, "(id)").is_none());
+    }
+
+    /// PGC-464: toast-stale keys render only above the population's floor, the
+    /// probe predicate is re-rendered exactly when that set moves, a delete
+    /// supersedes a stale key, and a stale key cancels a tracked delete.
+    #[test]
+    fn test_stale_probe_follows_key_set_and_floor() {
+        let mut keys = keys_recording();
+        let mut drain = drain();
+        let floor = Lsn::from_raw(5);
+        assert!(
+            drain
+                .stale_probe_predicate(&keys, REL, floor, "(id)")
+                .is_none()
+        );
+
+        // At or below the floor: the population's snapshot already reflects it.
+        keys.record_toast_stale(REL, EcoString::from("4"), Lsn::from_raw(5));
+        assert!(
+            drain
+                .stale_probe_predicate(&keys, REL, floor, "(id)")
+                .is_none()
+        );
+
+        keys.record_toast_stale(REL, EcoString::from("7"), Lsn::from_raw(10));
+        let first = drain
+            .stale_probe_predicate(&keys, REL, floor, "(id)")
+            .expect("predicate present");
+        assert!(first.contains("(7)") && !first.contains("(4)"), "{first}");
+        assert!(
+            drain
+                .stale_probe_predicate(&keys, REL, floor, "(id)")
+                .is_none(),
+            "unchanged set is not re-probed"
+        );
+
+        // A stale key cancels a tracked delete of the same row (alive at origin).
+        keys.record(REL, EcoString::from("9"), Lsn::from_raw(11));
+        assert!(
+            keys.filter_predicate(REL, "(id)")
+                .expect("delete filter")
+                .contains("(9)")
+        );
+        keys.record_toast_stale(REL, EcoString::from("9"), Lsn::from_raw(12));
+        assert!(keys.filter_predicate(REL, "(id)").is_none());
+        let grown = drain
+            .stale_probe_predicate(&keys, REL, floor, "(id)")
+            .expect("predicate present");
+        assert!(grown.contains("(7)") && grown.contains("(9)"), "{grown}");
+
+        // A later delete supersedes the stale key: the merge omits the row.
+        keys.record(REL, EcoString::from("9"), Lsn::from_raw(13));
+        let shrunk = drain
+            .stale_probe_predicate(&keys, REL, floor, "(id)")
+            .expect("predicate present");
+        assert!(
+            shrunk.contains("(7)") && !shrunk.contains("(9)"),
+            "{shrunk}"
+        );
+        assert_eq!(
+            keys.floor(REL, Fingerprint::from_raw(1), 1),
+            Some(Lsn::from_raw(1))
+        );
     }
 
     fn plan() -> MergePlan {

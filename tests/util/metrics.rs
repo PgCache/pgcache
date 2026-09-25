@@ -57,6 +57,10 @@ pub struct MetricsSnapshot {
     pub raw_serve_disjoint_insert: u64,
     pub raw_serve_disjoint_delete: u64,
     pub raw_serve_disjoint_update: u64,
+    /// Unchanged-toast repair outcomes (PGC-264 / PGC-464).
+    pub cache_cdc_toast_repairs: u64,
+    pub cache_cdc_toast_fallbacks: u64,
+    pub cache_cdc_toast_stale_aborts: u64,
     /// In-transaction serving (PGC-387).
     pub txn_served: u64,
     pub txn_forward_failed: u64,
@@ -101,6 +105,9 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut raw_serve_disjoint_insert = 0u64;
     let mut raw_serve_disjoint_delete = 0u64;
     let mut raw_serve_disjoint_update = 0u64;
+    let mut cache_cdc_toast_repairs = 0u64;
+    let mut cache_cdc_toast_fallbacks = 0u64;
+    let mut cache_cdc_toast_stale_aborts = 0u64;
     let mut txn_served = 0u64;
     let mut txn_forward_failed = 0u64;
     let mut txn_forward_isolation_unknown = 0u64;
@@ -159,6 +166,9 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_raw_serve_disjoint_insert" => raw_serve_disjoint_insert = value,
                 "pgcache_raw_serve_disjoint_delete" => raw_serve_disjoint_delete = value,
                 "pgcache_raw_serve_disjoint_update" => raw_serve_disjoint_update = value,
+                "pgcache_cache_cdc_toast_repairs" => cache_cdc_toast_repairs = value,
+                "pgcache_cache_cdc_toast_fallbacks" => cache_cdc_toast_fallbacks = value,
+                "pgcache_cache_cdc_toast_stale_aborts" => cache_cdc_toast_stale_aborts = value,
                 "pgcache_txn_served" => txn_served = value,
                 "pgcache_txn_forwards{reason=\"failed\"}" => txn_forward_failed = value,
                 "pgcache_txn_forwards{reason=\"isolation_unknown\"}" => {
@@ -273,6 +283,9 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         raw_serve_disjoint_insert,
         raw_serve_disjoint_delete,
         raw_serve_disjoint_update,
+        cache_cdc_toast_repairs,
+        cache_cdc_toast_fallbacks,
+        cache_cdc_toast_stale_aborts,
         txn_served,
         txn_forward_failed,
         txn_forward_isolation_unknown,
@@ -336,6 +349,11 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
             - before.raw_serve_disjoint_delete,
         raw_serve_disjoint_update: after.raw_serve_disjoint_update
             - before.raw_serve_disjoint_update,
+        cache_cdc_toast_repairs: after.cache_cdc_toast_repairs - before.cache_cdc_toast_repairs,
+        cache_cdc_toast_fallbacks: after.cache_cdc_toast_fallbacks
+            - before.cache_cdc_toast_fallbacks,
+        cache_cdc_toast_stale_aborts: after.cache_cdc_toast_stale_aborts
+            - before.cache_cdc_toast_stale_aborts,
         txn_served: after.txn_served - before.txn_served,
         txn_forward_failed: after.txn_forward_failed - before.txn_forward_failed,
         txn_forward_isolation_unknown: after.txn_forward_isolation_unknown

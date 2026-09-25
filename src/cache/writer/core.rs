@@ -229,6 +229,10 @@ pub struct WriterCore {
     /// frame's commit LSN (rolled-back frames clear it instead). Buffered because
     /// the commit LSN isn't known until the frame commits.
     pub(super) frame_deleted_keys: Vec<(Oid, EcoString)>,
+    /// PK tuple bodies of toast fallbacks in the in-progress frame (PGC-464),
+    /// drained at `CommitMark` into `population_deleted_keys`' toast-stale set
+    /// — same commit-LSN deferral as `frame_deleted_keys`.
+    pub(super) frame_toast_stale_keys: Vec<(Oid, EcoString)>,
     /// Relations bulk-invalidated by the in-progress frame (TRUNCATE, or 40P01
     /// recovery), drained at `CommitMark` to raise their deleted-key abort
     /// watermark to the commit LSN — same commit-LSN-deferral as
@@ -715,6 +719,7 @@ impl WriterCore {
             last_received_lsn: Lsn::from_raw(0),
             last_applied_lsn: Lsn::from_raw(0),
             frame_deleted_keys: Vec::new(),
+            frame_toast_stale_keys: Vec::new(),
             frame_truncated_relations: Vec::new(),
             batch_truncated_relations: Vec::new(),
             batch_frames: 0,
