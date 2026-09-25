@@ -1,0 +1,54 @@
+{
+  "rule_sets": [
+    {
+      "matching_content_path": "**/tests/**",
+      "thresholds": [
+        {
+          "name": "function_lines_of_code_warning",
+          "value": 150
+        }
+      ],
+      "rules": [
+        {
+          "name": "Large Assertion Blocks",
+          "weight": 0.0
+        },
+        {
+          "name": "Duplicated Assertion Blocks",
+          "weight": 0.0
+        },
+        {
+          "name": "Code Duplication",
+          "weight": 0.5
+        },
+        {
+          "name": "Low Cohesion",
+          "weight": 0.0
+        }
+      ],
+      "content_filter": "test_code"
+    },
+    {
+      "matching_content_path": "**/*",
+      "content_filter": "test_code",
+      "rules": [
+        {
+          "name": "Large Assertion Blocks",
+          "weight": 0.0
+        },
+        {
+          "name": "Duplicated Assertion Blocks",
+          "weight": 0.0
+        },
+        {
+          "name": "Code Duplication",
+          "weight": 0.5
+        },
+        {
+          "name": "Low Cohesion",
+          "weight": 0.0
+        }
+      ]
+    }
+  ]
+}
