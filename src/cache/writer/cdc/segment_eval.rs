@@ -27,9 +27,8 @@ use super::super::super::{CacheError, CacheResult, MapIntoReport};
 use super::super::core::WriterCore;
 use super::super::frame::{FrameRowEvent, OverlayEntry};
 use super::super::staging::pk_body_render;
-use super::invalidation::{
-    OLD_IS_NULL_ALIAS_PREFIX, OLD_LESS_THAN_ALIAS_PREFIX, row_change_column_fold,
-    table_has_reserved_columns,
+use super::row_changes::{
+    RowChangeProjection, relation_order_columns, row_change_column_fold, table_has_reserved_columns,
 };
 use crate::result::error_chain_format;
 
@@ -66,42 +65,26 @@ fn chunk_arrays_build<'a, R>(
 }
 
 /// Append the row-change SELECT list — `SELECT v.<idx>, o.X IS DISTINCT FROM
-/// v.X AS X, …` — shared by the prepared and inline row-change builders so the
-/// changed-column contract can't drift between them. Limit-window ORDER BY key
-/// columns additionally project old-vs-new ordering (`o.X < v.X`,
-/// `o.X IS NULL`) for the window-direction check (PGC-334).
+/// v.X AS X, …` — via the projection shared with the per-row builder.
+/// Limit-window ORDER BY key columns additionally project old-vs-new ordering
+/// for the window-direction check (PGC-334).
 fn row_change_select_into(
     buf: &mut String,
     table_metadata: &TableMetadata,
-    order_columns: &HashSet<&EcoString>,
+    order_columns: HashSet<&EcoString>,
     spec: &RelationFetchSpec,
 ) {
     buf.push_str("SELECT v.");
     buf.push_str(BATCH_IDX_COLUMN);
     if spec.needs_changes {
+        let projection = RowChangeProjection {
+            old_qualifier: "o.",
+            order_columns,
+        };
         for column_meta in &table_metadata.columns {
-            let order_projection = order_columns.contains(&column_meta.name);
-            // Identifiers are quoted throughout: cache-table DDL quotes column
-            // names, so reserved-word / mixed-case columns exist and unquoted
-            // references would error (or case-fold) against them. Quoting the
-            // aliases also makes result column names exact-case, keeping the
-            // fold and its consumers keyed by the real column names.
             let name = escape::escape_identifier(&column_meta.name);
-            let _ = write!(buf, ", o.{name} IS DISTINCT FROM v.{name} AS {name}");
-            if order_projection {
-                let less_than_alias = escape::escape_identifier(&format!(
-                    "{OLD_LESS_THAN_ALIAS_PREFIX}{}",
-                    column_meta.name
-                ));
-                let is_null_alias = escape::escape_identifier(&format!(
-                    "{OLD_IS_NULL_ALIAS_PREFIX}{}",
-                    column_meta.name
-                ));
-                let _ = write!(
-                    buf,
-                    ", o.{name} < v.{name} AS {less_than_alias}, o.{name} IS NULL AS {is_null_alias}",
-                );
-            }
+            buf.push_str(", ");
+            projection.column_into(buf, &column_meta.name, format_args!("v.{name}"));
         }
     }
     // Old-image values for the wire-canonical eval-index columns (PGC-255),
@@ -123,14 +106,6 @@ fn row_change_select_into(
             let _ = write!(buf, ", o.{name}::text AS {alias}");
         }
     }
-}
-
-/// The relation's limit-window ORDER BY key columns — the set
-/// `row_change_select_into` projects ordering for.
-fn relation_order_columns(update_queries: Option<&UpdateQueries>) -> HashSet<&EcoString> {
-    update_queries
-        .map(|uq| uq.limit_order_columns().collect())
-        .unwrap_or_default()
 }
 
 /// Append the row-change PK join — ` JOIN <schema>.<table> o ON o.pk = v.pk…`
@@ -558,7 +533,7 @@ impl WriterCdc {
                         !update_queries.queries.values().any(|q| {
                             q.eval_strategy == UpdateEvalStrategy::LocalEval
                                 && !core.frame_invalidations.contains(&q.fingerprint)
-                                && update_query_matches_locally(q, table_metadata, row)
+                                && update_query_matches_locally(q, row)
                         })
                     })
                     .copied()
@@ -1055,7 +1030,7 @@ impl WriterCdc {
             row_change_select_into(
                 &mut self.pg_eval_buf,
                 table_metadata,
-                &relation_order_columns(update_queries),
+                relation_order_columns(update_queries),
                 spec,
             );
             let _ = write!(
@@ -1159,7 +1134,7 @@ impl WriterCdc {
         row_change_select_into(
             &mut self.pg_eval_buf,
             table_metadata,
-            &relation_order_columns(core.cache.update_queries.get(&table_metadata.relation_oid)),
+            relation_order_columns(core.cache.update_queries.get(&table_metadata.relation_oid)),
             spec,
         );
         self.pg_eval_buf.push_str(" FROM (VALUES ");

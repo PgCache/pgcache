@@ -469,25 +469,27 @@ impl WriterCdc {
         let mut local_candidates = core.candidate_set_take();
         eval_candidates_into(core, relation_oid, row_data, &mut local_candidates);
 
-        let fp_list = self
-            .update_queries_check_invalidate(
-                core,
-                relation_oid,
-                None,
-                row_data,
-                None,
-                CdcOperation::Upsert,
-                &local_candidates,
-            )
-            .attach_loc("checking for query invalidations")?;
+        let insert_event = RowEvent {
+            row_data,
+            key_data: None,
+            operation: CdcOperation::Upsert,
+            row_changes: None,
+        };
+        let fp_list =
+            update_queries_check_invalidate(core, relation_oid, &insert_event, &local_candidates);
 
         // Defer the actual invalidation to just before the frame COMMIT
         // (frame_invalidations_flush) so it is atomic with the maintenance
         // it accompanies rather than visible mid-frame.
         core.frame_invalidations.extend(fp_list);
 
+        let membership_row = MembershipRow {
+            row_data,
+            candidates: &local_candidates,
+            batch,
+        };
         let matched = self
-            .update_queries_execute_batch(core, relation_oid, row_data, batch, &local_candidates)
+            .update_queries_execute_batch(core, relation_oid, membership_row)
             .await?;
 
         // Rung 3b: evict memos this insert grows into. An INSERT only adds the
@@ -616,15 +618,18 @@ impl WriterCdc {
             };
             trace!("row_changes {:?}", row_changes);
 
-            let fp_list = self.update_queries_check_invalidate(
+            let update_event = RowEvent {
+                row_data: new_row_data,
+                key_data: Some(key_data),
+                operation: CdcOperation::Upsert,
+                row_changes,
+            };
+            let fp_list = update_queries_check_invalidate(
                 core,
                 relation_oid,
-                row_changes,
-                new_row_data,
-                Some(key_data),
-                CdcOperation::Upsert,
+                &update_event,
                 &local_candidates,
-            )?;
+            );
             trace!("invalidation_count {}", fp_list.len());
             // Deferred to frame_invalidations_flush (see handle_insert).
             core.frame_invalidations.extend(fp_list);
@@ -643,14 +648,13 @@ impl WriterCdc {
                 .chain(old_candidates.iter().copied()),
         );
 
+        let membership_row = MembershipRow {
+            row_data: new_row_data,
+            candidates: &local_candidates,
+            batch,
+        };
         let matched = self
-            .update_queries_execute_batch(
-                core,
-                relation_oid,
-                new_row_data,
-                batch,
-                &local_candidates,
-            )
+            .update_queries_execute_batch(core, relation_oid, membership_row)
             .await?;
 
         if matched {
@@ -750,16 +754,21 @@ impl WriterCdc {
             core.cache.update_queries.get(&relation_oid),
             core.cache.tables.get1(&relation_oid),
         ) {
+            let toast_event = RowEvent {
+                row_data: new_row_data,
+                key_data: Some(key_data),
+                operation: CdcOperation::Upsert,
+                row_changes: None,
+            };
             let mut pg_eval: Vec<&UpdateQuery> = Vec::new();
             for update_query in update_queries.queries.values() {
                 if core.frame_invalidations.contains(&update_query.fingerprint) {
                     continue;
                 }
-                if Self::toast_fallback_structural_invalidate(
+                if toast_fallback_structural_invalidate(
                     update_query,
                     table_metadata,
-                    new_row_data,
-                    key_data,
+                    &toast_event,
                     toasted_columns,
                 ) {
                     fp_list.push(update_query.fingerprint);
@@ -767,8 +776,7 @@ impl WriterCdc {
                 }
                 match update_query.eval_strategy {
                     UpdateEvalStrategy::LocalEval => {
-                        if update_query_matches_locally(update_query, table_metadata, new_row_data)
-                        {
+                        if update_query_matches_locally(update_query, new_row_data) {
                             fp_list.push(update_query.fingerprint);
                         }
                     }
@@ -895,17 +903,18 @@ impl WriterCdc {
             // `has_limit_from ∪ always_check` (ADR-045): a delete invalidates
             // all limit queries unconditionally, non-limit FromClause deletes
             // never invalidate, and subquery/outer-join queries are always_check.
-            let fp_list = self
-                .update_queries_check_invalidate(
-                    core,
-                    relation_oid,
-                    None,
-                    row_data,
-                    None,
-                    CdcOperation::Delete,
-                    &FingerprintSet::default(),
-                )
-                .attach_loc("checking delete invalidations")?;
+            let delete_event = RowEvent {
+                row_data,
+                key_data: None,
+                operation: CdcOperation::Delete,
+                row_changes: None,
+            };
+            let fp_list = update_queries_check_invalidate(
+                core,
+                relation_oid,
+                &delete_event,
+                &FingerprintSet::default(),
+            );
 
             // Deferred to frame_invalidations_flush (see handle_insert).
             core.frame_invalidations.extend(fp_list);

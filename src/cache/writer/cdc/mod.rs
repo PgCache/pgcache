@@ -10,12 +10,20 @@ use tokio_postgres::{Client, Statement};
 mod dispatch;
 mod frame;
 mod invalidation;
+mod membership;
+mod row_changes;
+mod row_match;
 mod segment_eval;
 mod sql;
 mod toast_repair;
 
 pub(in crate::cache::writer::cdc) use invalidation::{
-    eval_candidates_into, memo_frame_accumulate, update_pk_changed, update_query_matches_locally,
+    RowEvent, eval_candidates_into, memo_frame_accumulate, toast_fallback_structural_invalidate,
+    update_queries_check_invalidate,
+};
+pub(in crate::cache::writer::cdc) use membership::MembershipRow;
+pub(in crate::cache::writer::cdc) use row_match::{
+    update_pk_changed, update_query_matches_locally,
 };
 pub(in crate::cache::writer::cdc) use segment_eval::{
     BatchEvalView, PreparedEvalKey, SegmentMembership,
