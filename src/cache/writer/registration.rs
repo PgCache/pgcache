@@ -25,7 +25,8 @@ use crate::cache::coalesce_queue::fetch_stage_ewma_update;
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{AdmitAction, QueryCommand, SubsumptionResult},
-    mv::{ShapeGate, resolved_has_join, resolved_has_window},
+    mv::{resolved_has_join, resolved_has_window},
+    mv_shape::ShapeGate,
     population_pool::PopulationPool,
     query::CacheableQuery,
     types::{CachedQuery, QueryMetrics, SharedResolved},

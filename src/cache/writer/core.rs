@@ -25,7 +25,8 @@ use crate::cache::status::StatusRequest;
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{CdcCommand, QueryCommand, WriterNotify},
-    mv::{MvMeta, ShapeGate},
+    mv::MvMeta,
+    mv_shape::ShapeGate,
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
     },

@@ -26,7 +26,8 @@ use tracing::{error, trace};
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{MvBuildOutcome, QueryCommand},
-    mv::{ShapeGate, mv_table_name},
+    mv::mv_table_name,
+    mv_shape::ShapeGate,
     types::SharedResolved,
 };
 use crate::pg;

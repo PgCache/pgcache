@@ -11,7 +11,7 @@ use super::update_classify::{
     predicate_columns_collect, update_eval_strategy_classify,
 };
 use super::{AdmissionAnalysis, TableAdmission};
-use crate::cache::mv::{ShapeGate, shape_classify};
+use crate::cache::mv_shape::{ShapeGate, shape_classify};
 use crate::cache::query::limit_rows_needed;
 use crate::cache::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
 use crate::cache::{CacheError, CacheResult};

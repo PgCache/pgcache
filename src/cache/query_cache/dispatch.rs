@@ -17,7 +17,8 @@ use crate::cache::messages::{
     AdmitAction, CacheMessage, CacheOutcome, CacheReply, PipelineContext, ProxyMessage,
     QueryCommand, SubsumptionResult, slices_concat,
 };
-use crate::cache::mv::{MvMeta, MvServe, MvState, ShapeGate};
+use crate::cache::mv::{MvMeta, MvServe, MvState};
+use crate::cache::mv_shape::ShapeGate;
 use crate::cache::query::{CacheableQuery, limit_rows_needed};
 use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;

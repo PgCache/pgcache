@@ -7,7 +7,7 @@
 //! table opens a new name scope ([`ResolvedSelectNode::direct_table_nodes`]),
 //! and an aggregate or window nested inside a scalar subquery does not make the
 //! *outer* expression aggregating or windowed ([`ResolvedScalarExpr::has_aggregate`],
-//! `cache::mv::shape_classify`). Each such site says so at its definition; treat
+//! `cache::mv_shape::shape_classify`). Each such site says so at its definition; treat
 //! that as load-bearing, not as duplication waiting to be collapsed.
 
 use std::any::Any;

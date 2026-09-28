@@ -31,9 +31,9 @@ mod fast_path;
 pub(crate) mod memo;
 #[cfg(feature = "proxy")]
 pub(crate) mod messages;
-// MV build/backoff paths are writer-only; the analysis-only build sees them as dead.
-#[cfg_attr(not(feature = "proxy"), allow(dead_code))]
+#[cfg(feature = "proxy")]
 pub(crate) mod mv;
+pub(crate) mod mv_shape;
 #[cfg(feature = "proxy")]
 mod population_pool;
 pub mod query;
@@ -67,10 +67,9 @@ pub use query::{CacheabilityError, CacheableQuery, QueryParameter, QueryParamete
 
 #[cfg(feature = "proxy")]
 pub use messages::{CacheMessage, CacheOutcome, CacheReply, DataStreamState, ProxyMessage};
-pub use mv::{
-    MvMeta, MvServe, MvState, ShapeGate, mv_serve_sql_into, mv_state_initial, mv_table_name,
-    shape_classify,
-};
+#[cfg(feature = "proxy")]
+pub use mv::{MvMeta, MvServe, MvState, mv_serve_sql_into, mv_state_initial, mv_table_name};
+pub use mv_shape::{ShapeGate, shape_classify};
 #[cfg(feature = "proxy")]
 pub use query_cache::{CacheDispatchHandle, CacheDispatchPublisher, CacheDispatchUpdater};
 #[cfg(feature = "proxy")]
