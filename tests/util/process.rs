@@ -26,7 +26,7 @@ fn crypto_provider_init() {
     });
 }
 
-pub fn find_available_port() -> Result<u16, Error> {
+pub(super) fn find_available_port() -> Result<u16, Error> {
     // Bind to port 0 to let the OS assign an available port
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -37,7 +37,7 @@ pub fn find_available_port() -> Result<u16, Error> {
 
 /// Guard structure that automatically kills and waits for the pgcache process on drop.
 /// This ensures proper cleanup even if tests panic.
-pub struct PgCacheProcess {
+pub(crate) struct PgCacheProcess {
     child: Child,
 }
 
@@ -75,7 +75,7 @@ impl DerefMut for PgCacheProcess {
     }
 }
 
-pub fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), Error> {
+pub(crate) fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), Error> {
     const NEEDLE: &str = "Listening to";
     //wait for listening message from proxy before proceeding
     let mut buf = BytesMut::new();
@@ -112,12 +112,12 @@ pub fn proxy_wait_for_ready(pgcache: &mut PgCacheProcess) -> Result<(), Error> {
     Ok(())
 }
 
-pub struct TempDBs {
+pub(crate) struct TempDBs {
     pub origin: PgTempDB,
     pub cache: PgTempDB,
 }
 
-pub async fn start_databases() -> Result<(TempDBs, Client), Error> {
+pub(crate) async fn start_databases() -> Result<(TempDBs, Client), Error> {
     let db = PgTempDBBuilder::new()
         .with_dbname("origin_test")
         .with_config_param("wal_level", "logical")
@@ -293,7 +293,7 @@ fn pgcache_spawn_env(
 }
 
 /// Connect a plain TCP client to pgcache.
-pub async fn pgcache_client_connect(listen_port: u16) -> Result<Client, Error> {
+pub(crate) async fn pgcache_client_connect(listen_port: u16) -> Result<Client, Error> {
     let (client, connection) = Config::new()
         .host("localhost")
         .port(listen_port)
@@ -312,7 +312,9 @@ pub async fn pgcache_client_connect(listen_port: u16) -> Result<Client, Error> {
     Ok(client)
 }
 
-pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
+pub(crate) async fn connect_pgcache(
+    dbs: &TempDBs,
+) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
     let listen_port = find_available_port()?;
     let metrics_port = find_available_port()?;
     let mut pgcache = pgcache_spawn(dbs, listen_port, metrics_port, &["--cache_policy", "fifo"]);
@@ -323,7 +325,7 @@ pub async fn connect_pgcache(dbs: &TempDBs) -> Result<(PgCacheProcess, u16, u16,
 
 /// Connect to pgcache with extra CLI args appended after the default
 /// `--cache_policy fifo` (e.g. per-test gate thresholds).
-pub async fn connect_pgcache_args(
+pub(super) async fn connect_pgcache_args(
     dbs: &TempDBs,
     extra_args: &[&str],
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
@@ -339,7 +341,7 @@ pub async fn connect_pgcache_args(
 
 /// Connect to pgcache with fault-injection environment variables set on the
 /// child process (requires the binary built with `--features fault-injection`).
-pub async fn connect_pgcache_fault(
+pub(super) async fn connect_pgcache_fault(
     dbs: &TempDBs,
     env: &[(&str, &str)],
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
@@ -358,7 +360,7 @@ pub async fn connect_pgcache_fault(
 }
 
 /// Connect to pgcache with clock eviction policy.
-pub async fn connect_pgcache_clock(
+pub(crate) async fn connect_pgcache_clock(
     dbs: &TempDBs,
     admission_threshold: u32,
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
@@ -383,7 +385,7 @@ pub async fn connect_pgcache_clock(
 
 /// Connect to pgcache that force-evicts down to `max_cached_queries` via the
 /// fault-injection count cap (requires `--features fault-injection`).
-pub async fn connect_pgcache_small_cache(
+pub(crate) async fn connect_pgcache_small_cache(
     dbs: &TempDBs,
     max_cached_queries: usize,
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
@@ -403,7 +405,7 @@ pub async fn connect_pgcache_small_cache(
 }
 
 /// Connect to pgcache with a table allowlist.
-pub async fn connect_pgcache_allowlist(
+pub(crate) async fn connect_pgcache_allowlist(
     dbs: &TempDBs,
     allowed_tables: &str,
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
@@ -421,7 +423,7 @@ pub async fn connect_pgcache_allowlist(
 }
 
 /// Connect to pgcache with pinned queries (FIFO policy).
-pub async fn connect_pgcache_pinned(
+pub(crate) async fn connect_pgcache_pinned(
     dbs: &TempDBs,
     pinned_queries: &str,
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
@@ -441,7 +443,7 @@ pub async fn connect_pgcache_pinned(
 /// Connect to pgcache with pinned queries that force-evicts down to
 /// `max_cached_queries` via the fault-injection count cap (FIFO policy;
 /// requires `--features fault-injection`).
-pub async fn connect_pgcache_pinned_small_cache(
+pub(crate) async fn connect_pgcache_pinned_small_cache(
     dbs: &TempDBs,
     pinned_queries: &str,
     max_cached_queries: usize,
@@ -464,7 +466,7 @@ pub async fn connect_pgcache_pinned_small_cache(
 /// Connect to pgcache with pinned queries and fault-injection environment
 /// variables set on the child process (requires the binary built with
 /// `--features fault-injection`).
-pub async fn connect_pgcache_pinned_fault(
+pub(crate) async fn connect_pgcache_pinned_fault(
     dbs: &TempDBs,
     pinned_queries: &str,
     env: &[(&str, &str)],
@@ -484,7 +486,7 @@ pub async fn connect_pgcache_pinned_fault(
 }
 
 /// Connect to pgcache with TLS enabled on the proxy.
-pub async fn connect_pgcache_tls(
+pub(crate) async fn connect_pgcache_tls(
     dbs: &TempDBs,
 ) -> Result<(PgCacheProcess, u16, u16, Client), Error> {
     crypto_provider_init();
@@ -530,7 +532,7 @@ pub async fn connect_pgcache_tls(
 
 /// Connect directly to the cache database (bypassing pgcache proxy).
 /// Useful for verifying internal cache state like indexes.
-pub async fn connect_cache_db(dbs: &TempDBs) -> Result<Client, Error> {
+pub(crate) async fn connect_cache_db(dbs: &TempDBs) -> Result<Client, Error> {
     let (client, connection) = Config::new()
         .host("localhost")
         .port(dbs.cache.db_port())

@@ -7,7 +7,7 @@ use crate::cache::StatusRequest;
 // channel (the only remaining proxy→cache channel; dispatch is now inline).
 // ---------------------------------------------------------------------------
 
-pub type StatusSenderInner = Sender<StatusRequest>;
+pub(super) type StatusSenderInner = Sender<StatusRequest>;
 
 /// Cloneable wrapper for the admin HTTP server to send status requests.
 ///

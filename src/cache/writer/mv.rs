@@ -360,7 +360,7 @@ impl WriterCore {
     /// Fills a caller-provided scratch set (cleared first). The old-image wildcard
     /// probe over-returns to a large set; reusing the buffer keeps that big backing
     /// allocation instead of re-allocating it per row (PGC-341/344).
-    pub(in crate::cache::writer) fn eval_candidates_removed_into(
+    pub(super) fn eval_candidates_removed_into(
         &self,
         relation_oid: Oid,
         old_row: &[Option<ByteString>],
@@ -396,7 +396,7 @@ impl WriterCore {
     /// reuse it for MV instead of probing the `eval_index` twice (ADR-045).
     /// O(candidates): `mv_dirty_mark` self-gates, so non-dirtiable entries are
     /// cheap no-ops.
-    pub(in crate::cache::writer) fn mv_dirty_mark_candidates(&self, candidates: &FingerprintSet) {
+    pub(super) fn mv_dirty_mark_candidates(&self, candidates: &FingerprintSet) {
         for fingerprint in candidates {
             self.mv_dirty_mark(*fingerprint);
         }
@@ -496,11 +496,7 @@ impl WriterCore {
     /// The single choke point for writing an MV's state: `MvMeta.state` is
     /// writer-module-private, so every writer transition routes here. No-op when
     /// the entry is gone (evicted during a build).
-    pub(in crate::cache::writer) fn mv_state_write(
-        &self,
-        fingerprint: Fingerprint,
-        new_state: MvState,
-    ) {
+    pub(super) fn mv_state_write(&self, fingerprint: Fingerprint, new_state: MvState) {
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
             view.mv.state_set(new_state);
         }

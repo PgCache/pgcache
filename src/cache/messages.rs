@@ -14,16 +14,16 @@ use crate::proxy::{ClientSocket, ExplainSpec};
 use crate::query::Fingerprint;
 use crate::timing::QueryTiming;
 
-pub use super::serve_decision::AdmitAction;
+pub(crate) use super::serve_decision::AdmitAction;
 
 mod cdc_command;
 mod query_command;
 
-pub use cdc_command::{CdcCommand, CdcValue, cdc_values_convert};
-pub use query_command::{MvBuildOutcome, PopulationMerge, QueryCommand, SubsumptionResult};
+pub(crate) use cdc_command::{CdcCommand, CdcValue, cdc_values_convert};
+pub(crate) use query_command::{MvBuildOutcome, PopulationMerge, QueryCommand, SubsumptionResult};
 
 /// Notifications from writer to dispatch for coalescing queue drain.
-pub enum WriterNotify {
+pub(crate) enum WriterNotify {
     /// Population completed — query is Ready.
     Ready {
         fingerprint: Fingerprint,

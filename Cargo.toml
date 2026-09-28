@@ -18,6 +18,7 @@ path = "src/lib.rs"
 doctest = false
 
 [lints.rust]
+unreachable_pub = "warn"
 # `tokio_unstable` is set via RUSTFLAGS for the task-dump / console builds.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 

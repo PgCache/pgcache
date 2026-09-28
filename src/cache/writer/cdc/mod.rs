@@ -18,17 +18,13 @@ mod segment_eval;
 mod sql;
 mod toast_repair;
 
-pub(in crate::cache::writer::cdc) use invalidation::{
+use invalidation::{
     RowEvent, eval_candidates_into, memo_frame_accumulate, toast_fallback_structural_invalidate,
     update_queries_check_invalidate,
 };
-pub(in crate::cache::writer::cdc) use membership::MembershipRow;
-pub(in crate::cache::writer::cdc) use row_match::{
-    update_pk_changed, update_query_matches_locally,
-};
-pub(in crate::cache::writer::cdc) use segment_eval::{
-    BatchEvalView, PreparedEvalKey, SegmentMembership,
-};
+use membership::MembershipRow;
+use row_match::{update_pk_changed, update_query_matches_locally};
+use segment_eval::{BatchEvalView, PreparedEvalKey, SegmentMembership};
 
 /// Default capacity for dynamically built SQL strings.
 pub(super) const SQL_BUFFER_CAPACITY: usize = 1024;

@@ -11,37 +11,36 @@ use crate::pg::protocol::{
 };
 
 /// Bounded per connection so dynamic-SQL workloads can't grow it unbounded.
-pub(in crate::proxy::connection) const DESCRIBE_CACHE_CAPACITY: NonZeroUsize =
-    NonZeroUsize::new(256).unwrap();
+pub(super) const DESCRIBE_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
 
 /// A given SQL can have different `ParameterDescription` responses depending
 /// on the OID hints the client supplied in its `Parse` message, so both go
 /// into the key.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
-pub(in crate::proxy::connection) struct DescribeKey {
-    pub(in crate::proxy::connection) sql: ByteString,
-    pub(in crate::proxy::connection) parameter_oids: Vec<u32>,
+pub(super) struct DescribeKey {
+    pub(super) sql: ByteString,
+    pub(super) parameter_oids: Vec<u32>,
 }
 
 /// `row_description` is `None` when origin returned `NoData`.
 #[derive(Debug, Clone)]
-pub(in crate::proxy::connection) struct DescribeCacheEntry {
-    pub(in crate::proxy::connection) parameter_description: Bytes,
-    pub(in crate::proxy::connection) row_description: Option<Bytes>,
+pub(super) struct DescribeCacheEntry {
+    pub(super) parameter_description: Bytes,
+    pub(super) row_description: Option<Bytes>,
     /// Origin-resolved parameter OIDs, parsed once from `parameter_description`
     /// at populate time (`None` if it didn't parse).
-    pub(in crate::proxy::connection) parameter_oids: Option<Vec<u32>>,
+    pub(super) parameter_oids: Option<Vec<u32>>,
     /// Pre-assembled ParseComplete + ParameterDescription + (RowDescription |
     /// NoData) + ReadyForQuery('I') — a synth hit serves a refcount clone of
     /// this instead of building the response per hit.
-    pub(in crate::proxy::connection) describe_response: Bytes,
+    pub(super) describe_response: Bytes,
 }
 
 impl ConnectionState {
     /// Populate `describe_cache` from a freshly-Described statement. No-op for
     /// non-cacheable statements and for statements where origin errored before
     /// returning a parameter description.
-    pub(in crate::proxy::connection) fn describe_cache_populate(&mut self, stmt_name: &str) {
+    pub(super) fn describe_cache_populate(&mut self, stmt_name: &str) {
         let Some(stmt) = self.prepared_statements.get(stmt_name) else {
             return;
         };

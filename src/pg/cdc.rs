@@ -20,11 +20,11 @@ error_set! {
 }
 
 /// Result type with location-tracking error reports for CDC operations.
-pub type PgCdcResult<T> = Result<T, Report<PgCdcError>>;
+pub(crate) type PgCdcResult<T> = Result<T, Report<PgCdcError>>;
 
 /// Ensures publication and replication slot exist on origin.
 /// Uses a regular (non-replication) connection since replication connections can't run SQL.
-pub async fn replication_provision(settings: &Settings) -> PgCdcResult<()> {
+pub(crate) async fn replication_provision(settings: &Settings) -> PgCdcResult<()> {
     let publication_name = &settings.cdc.publication_name;
     let slot_name = &settings.cdc.slot_name;
 
@@ -91,7 +91,7 @@ pub async fn replication_provision(settings: &Settings) -> PgCdcResult<()> {
 
 /// Cleanup publication and replication slot from origin.
 /// Uses a regular (non-replication) connection since replication connections can't run SQL.
-pub async fn replication_cleanup(settings: &Settings) -> PgCdcResult<()> {
+pub(crate) async fn replication_cleanup(settings: &Settings) -> PgCdcResult<()> {
     let publication_name = &settings.cdc.publication_name;
     let slot_name = &settings.cdc.slot_name;
 
@@ -133,7 +133,7 @@ pub async fn replication_cleanup(settings: &Settings) -> PgCdcResult<()> {
 ///
 /// Returns `Some(lsn)` if the slot exists, `None` if the slot has been dropped.
 /// A never-consumed slot may have a NULL confirmed_flush_lsn, which is returned as 0.
-pub async fn slot_confirmed_lsn(settings: &Settings) -> PgCdcResult<Option<Lsn>> {
+pub(crate) async fn slot_confirmed_lsn(settings: &Settings) -> PgCdcResult<Option<Lsn>> {
     let slot_name = &settings.cdc.slot_name;
 
     let client = connect(&settings.origin, "slot LSN check")
@@ -162,7 +162,10 @@ pub async fn slot_confirmed_lsn(settings: &Settings) -> PgCdcResult<Option<Lsn>>
 /// Connect to a PostgreSQL database in logical replication mode.
 ///
 /// This is used for CDC streaming connections that receive logical replication events.
-pub async fn connect_replication(settings: &PgSettings, context: &str) -> Result<Client, Error> {
+pub(crate) async fn connect_replication(
+    settings: &PgSettings,
+    context: &str,
+) -> Result<Client, Error> {
     let mut config = config_build(settings);
     config.replication_mode(ReplicationMode::Logical);
     debug!(

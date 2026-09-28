@@ -7,7 +7,7 @@ use tokio_util::{
 use super::{PgConnectionState, PgMessage, PgMessageType, ProtocolError};
 
 #[derive(Debug, Clone, Copy)]
-pub enum PgFrontendMessageType {
+pub(crate) enum PgFrontendMessageType {
     Startup,
     CancelRequest,
     SslRequest,
@@ -34,7 +34,7 @@ pub enum PgFrontendMessageType {
 
 impl PgMessageType for PgFrontendMessageType {}
 
-pub type PgFrontendMessage = PgMessage<PgFrontendMessageType>;
+pub(crate) type PgFrontendMessage = PgMessage<PgFrontendMessageType>;
 
 const FRONTEND_MESSAGE_TYPE_MAP: phf::Map<u8, PgFrontendMessageType> = phf_map! {
     b'B' => PgFrontendMessageType::Bind,
@@ -55,7 +55,7 @@ const FRONTEND_MESSAGE_TYPE_MAP: phf::Map<u8, PgFrontendMessageType> = phf_map! 
 };
 
 #[derive(Debug, Default)]
-pub struct PgFrontendMessageCodec {
+pub(crate) struct PgFrontendMessageCodec {
     pub state: PgConnectionState,
 }
 
@@ -67,7 +67,7 @@ pub struct PgFrontendMessageCodec {
 /// - Null-terminated key-value pairs until empty key
 ///
 /// Returns `Some(&str)` if the key is found, `None` otherwise.
-pub fn startup_message_parameter<'a>(data: &'a [u8], key: &str) -> Option<&'a str> {
+pub(crate) fn startup_message_parameter<'a>(data: &'a [u8], key: &str) -> Option<&'a str> {
     // Skip length (4 bytes) and protocol version (4 bytes)
     let params = data.get(8..)?;
 
@@ -89,7 +89,7 @@ pub fn startup_message_parameter<'a>(data: &'a [u8], key: &str) -> Option<&'a st
 /// Build a simple query message for sending to the backend.
 ///
 /// Message format: 'Q' | int32 len | string query (null-terminated)
-pub fn simple_query_message_build(query: &str) -> BytesMut {
+pub(crate) fn simple_query_message_build(query: &str) -> BytesMut {
     let query_bytes = query.as_bytes();
     // Length includes: 4 bytes for length field + query bytes + 1 null terminator
     let len = i32::try_from(4 + query_bytes.len() + 1).expect("query message fits in i32");

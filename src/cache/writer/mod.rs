@@ -14,5 +14,5 @@ mod status;
 mod subsumption;
 mod table;
 
-pub use self::core::writer_run;
+pub(super) use self::core::writer_run;
 pub(super) use self::registration::PopulationWork;

@@ -10,7 +10,7 @@ use crate::pg::protocol::backend::{
 };
 
 #[instrument(skip_all)]
-pub fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
+pub(crate) fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
     // PostgreSQL caps columns per relation at 1664, so the count always fits in i16.
     let field_cnt = i16::try_from(desc.len()).expect("column count fits in i16");
     let string_len: usize = desc.iter().map(|col| col.name().len() + 1).sum();
@@ -33,7 +33,7 @@ pub fn row_description_encode(desc: &Arc<[SimpleColumn]>, buf: &mut BytesMut) {
 }
 
 #[instrument(skip_all)]
-pub fn simple_query_row_encode(row: &SimpleQueryRow, buf: &mut BytesMut) {
+pub(crate) fn simple_query_row_encode(row: &SimpleQueryRow, buf: &mut BytesMut) {
     let field_cnt = i16::try_from(row.len()).expect("column count fits in i16");
     let value_len: usize = (0..row.len())
         .map(|i| row.get(i).unwrap_or_default().len())
@@ -52,7 +52,7 @@ pub fn simple_query_row_encode(row: &SimpleQueryRow, buf: &mut BytesMut) {
 }
 
 #[instrument(skip_all)]
-pub fn command_complete_encode(cnt: u64, buf: &mut BytesMut) {
+pub(crate) fn command_complete_encode(cnt: u64, buf: &mut BytesMut) {
     let msg = format!("SELECT {cnt}");
     let msg_len = i32::try_from(4 + msg.len() + 1).expect("CommandComplete fits in i32");
 
@@ -63,37 +63,37 @@ pub fn command_complete_encode(cnt: u64, buf: &mut BytesMut) {
 }
 
 /// Fixed protocol messages as static byte slices — no heap allocation.
-pub const PARSE_COMPLETE_MSG: &[u8] = &[b'1', 0, 0, 0, 4];
-pub const BIND_COMPLETE_MSG: &[u8] = &[b'2', 0, 0, 0, 4];
-pub const CLOSE_COMPLETE_MSG: &[u8] = &[b'3', 0, 0, 0, 4];
-pub const NO_DATA_MSG: &[u8] = &[b'n', 0, 0, 0, 4];
-pub const READY_FOR_QUERY_IDLE_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
-pub const READY_FOR_QUERY_IN_TRANSACTION_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'T'];
-pub const READY_FOR_QUERY_FAILED_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'E'];
+pub(crate) const PARSE_COMPLETE_MSG: &[u8] = &[b'1', 0, 0, 0, 4];
+pub(crate) const BIND_COMPLETE_MSG: &[u8] = &[b'2', 0, 0, 0, 4];
+pub(crate) const CLOSE_COMPLETE_MSG: &[u8] = &[b'3', 0, 0, 0, 4];
+pub(crate) const NO_DATA_MSG: &[u8] = &[b'n', 0, 0, 0, 4];
+pub(crate) const READY_FOR_QUERY_IDLE_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'I'];
+pub(crate) const READY_FOR_QUERY_IN_TRANSACTION_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'T'];
+pub(crate) const READY_FOR_QUERY_FAILED_MSG: &[u8] = &[b'Z', 0, 0, 0, 5, b'E'];
 
 /// Fixed `ErrorResponse` for a cache serve that already streamed bytes to the
 /// client and so cannot be transparently forwarded to origin (PGC-291). Fields:
 /// Severity=ERROR, SQLSTATE=58000 (system_error), generic message (no SQL
 /// leaked). Static bytes — no allocation on the serve path. Layout is validated
 /// against `error_response_frame` in the serve tests.
-pub const SERVE_ERROR_MSG: &[u8] =
+pub(crate) const SERVE_ERROR_MSG: &[u8] =
     b"E\x00\x00\x00\x30SERROR\x00C58000\x00Mpgcache: cache serve failed\x00\x00";
 
 #[instrument(skip_all)]
-pub fn ready_for_query_encode(buf: &mut BytesMut) {
+pub(crate) fn ready_for_query_encode(buf: &mut BytesMut) {
     buf.put_u8(READY_FOR_QUERY_TAG);
     buf.put_i32(5);
     buf.put_u8(b'I');
 }
 
 /// Encodes a ParseComplete message (tag '1', 5 bytes total, no payload).
-pub fn parse_complete_encode(buf: &mut BytesMut) {
+pub(crate) fn parse_complete_encode(buf: &mut BytesMut) {
     buf.put_u8(PARSE_COMPLETE_TAG);
     buf.put_i32(4);
 }
 
 /// Encodes a BindComplete message (tag '2', 5 bytes total, no payload).
-pub fn bind_complete_encode(buf: &mut BytesMut) {
+pub(crate) fn bind_complete_encode(buf: &mut BytesMut) {
     buf.put_u8(BIND_COMPLETE_TAG);
     buf.put_i32(4);
 }
@@ -106,7 +106,7 @@ const TEXT_TYPE_OID: u32 = 25;
 /// diagnostics to a synthesized response without polluting the result set.
 /// Fields: `S`=severity, `C`=SQLSTATE, `M`=message, each a null-terminated
 /// string, then a final field-list terminator.
-pub fn notice_response_encode(message: &str, buf: &mut BytesMut) {
+pub(crate) fn notice_response_encode(message: &str, buf: &mut BytesMut) {
     let body_len = 1 + b"NOTICE".len() + 1   // 'S' + "NOTICE" + \0
         + 1 + b"00000".len() + 1              // 'C' + "00000" + \0
         + 1 + message.len() + 1               // 'M' + message + \0
@@ -130,7 +130,7 @@ pub fn notice_response_encode(message: &str, buf: &mut BytesMut) {
 /// Encode a `RowDescription` for a single `text` column with the given name.
 /// Layout matches [`row_description_encode`] for one field; type is `text`
 /// (OID 25), variable width (size -1, modifier -1), text format.
-pub fn row_description_text_encode(column_name: &str, buf: &mut BytesMut) {
+pub(crate) fn row_description_text_encode(column_name: &str, buf: &mut BytesMut) {
     let msg_len =
         i32::try_from(6 + 18 + column_name.len() + 1).expect("RowDescription fits in i32");
     buf.put_u8(ROW_DESCRIPTION_TAG);
@@ -148,7 +148,7 @@ pub fn row_description_text_encode(column_name: &str, buf: &mut BytesMut) {
 
 /// Encode a `DataRow` for a single `text` column. `None` encodes a SQL NULL
 /// (length -1); `Some(value)` encodes its bytes.
-pub fn data_row_text_encode(value: Option<&str>, buf: &mut BytesMut) {
+pub(crate) fn data_row_text_encode(value: Option<&str>, buf: &mut BytesMut) {
     let value_len = value.map_or(0, str::len);
     let msg_len = i32::try_from(6 + 4 + value_len).expect("DataRow fits in i32");
     buf.put_u8(DATA_ROW_TAG);
@@ -165,7 +165,7 @@ pub fn data_row_text_encode(value: Option<&str>, buf: &mut BytesMut) {
 
 /// Encode a `CommandComplete` carrying an arbitrary command tag (e.g. `EXPLAIN`),
 /// unlike [`command_complete_encode`] which always reports `SELECT <count>`.
-pub fn command_complete_tag_encode(tag: &str, buf: &mut BytesMut) {
+pub(crate) fn command_complete_tag_encode(tag: &str, buf: &mut BytesMut) {
     let msg_len = i32::try_from(4 + tag.len() + 1).expect("CommandComplete fits in i32");
     buf.put_u8(COMMAND_COMPLETE_TAG);
     buf.put_i32(msg_len);

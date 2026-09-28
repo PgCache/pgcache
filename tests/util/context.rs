@@ -18,7 +18,7 @@ use super::process::{
 /// Fields are ordered for correct drop sequence: drop clients first
 /// (closing connections and allowing spawned tasks to exit), then kill
 /// pgcache, and finally tear down temp databases.
-pub struct TestContext {
+pub(crate) struct TestContext {
     pub cache: Client,     // connected through pgcache proxy
     pub origin: Client,    // direct connection to origin database
     pub cache_port: u16,   // port pgcache proxy is listening on
@@ -39,7 +39,7 @@ struct CdcStatusSnapshot {
 }
 
 impl TestContext {
-    pub async fn setup() -> Result<Self, Error> {
+    pub(crate) async fn setup() -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) = connect_pgcache(&dbs).await?;
         Ok(Self {
@@ -55,7 +55,7 @@ impl TestContext {
     /// Set up a test context with extra pgcache CLI args (e.g.
     /// `--mv_compute_min_rows 0` to force MV materialization of `Gated` shapes
     /// regardless of size).
-    pub async fn setup_with_args(extra_args: &[&str]) -> Result<Self, Error> {
+    pub(crate) async fn setup_with_args(extra_args: &[&str]) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) =
             connect_pgcache_args(&dbs, extra_args).await?;
@@ -71,7 +71,7 @@ impl TestContext {
 
     /// Set up a test context with fault-injection environment variables set on
     /// the pgcache process (requires the binary built with `fault-injection`).
-    pub async fn setup_fault(env: &[(&str, &str)]) -> Result<Self, Error> {
+    pub(crate) async fn setup_fault(env: &[(&str, &str)]) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) = connect_pgcache_fault(&dbs, env).await?;
         Ok(Self {
@@ -86,7 +86,7 @@ impl TestContext {
 
     /// Set up a test context that force-evicts down to `max_cached_queries` via
     /// the fault-injection count cap (requires `--features fault-injection`).
-    pub async fn setup_small_cache(max_cached_queries: usize) -> Result<Self, Error> {
+    pub(crate) async fn setup_small_cache(max_cached_queries: usize) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) =
             connect_pgcache_small_cache(&dbs, max_cached_queries).await?;
@@ -101,7 +101,7 @@ impl TestContext {
     }
 
     /// Set up a test context with clock eviction policy.
-    pub async fn setup_clock(admission_threshold: u32) -> Result<Self, Error> {
+    pub(crate) async fn setup_clock(admission_threshold: u32) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) =
             connect_pgcache_clock(&dbs, admission_threshold).await?;
@@ -116,7 +116,7 @@ impl TestContext {
     }
 
     /// Set up a test context with a table allowlist.
-    pub async fn setup_allowlist(allowed_tables: &str) -> Result<Self, Error> {
+    pub(crate) async fn setup_allowlist(allowed_tables: &str) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) =
             connect_pgcache_allowlist(&dbs, allowed_tables).await?;
@@ -134,7 +134,10 @@ impl TestContext {
     /// The `before_start` closure runs against the origin database after tables
     /// are created but before pgcache spawns, so pinned queries can reference
     /// existing tables.
-    pub async fn setup_pinned<F, Fut>(pinned_queries: &str, before_start: F) -> Result<Self, Error>
+    pub(crate) async fn setup_pinned<F, Fut>(
+        pinned_queries: &str,
+        before_start: F,
+    ) -> Result<Self, Error>
     where
         F: FnOnce(Client) -> Fut,
         Fut: std::future::Future<Output = Result<Client, Error>>,
@@ -158,7 +161,7 @@ impl TestContext {
     /// `max_cached_queries` via the fault-injection count cap (requires
     /// `--features fault-injection`).
     /// Pinned queries plus fault-injection environment on the child process.
-    pub async fn setup_pinned_fault<F, Fut>(
+    pub(crate) async fn setup_pinned_fault<F, Fut>(
         pinned_queries: &str,
         env: &[(&str, &str)],
         before_start: F,
@@ -181,7 +184,7 @@ impl TestContext {
         })
     }
 
-    pub async fn setup_pinned_small_cache<F, Fut>(
+    pub(crate) async fn setup_pinned_small_cache<F, Fut>(
         pinned_queries: &str,
         max_cached_queries: usize,
         before_start: F,
@@ -205,7 +208,7 @@ impl TestContext {
     }
 
     /// Create an additional client connection through the pgcache proxy.
-    pub async fn proxy_client_connect(&self) -> Result<Client, Error> {
+    pub(crate) async fn proxy_client_connect(&self) -> Result<Client, Error> {
         let (client, connection) = Config::new()
             .host("localhost")
             .port(self.cache_port)
@@ -225,7 +228,7 @@ impl TestContext {
     }
 
     /// Execute query through pgcache proxy
-    pub async fn query<T>(
+    pub(crate) async fn query<T>(
         &mut self,
         statement: &T,
         params: &[&(dyn ToSql + Sync)],
@@ -240,7 +243,7 @@ impl TestContext {
     }
 
     /// Execute query directly on origin (bypassing pgcache)
-    pub async fn origin_query<T>(
+    pub(crate) async fn origin_query<T>(
         &mut self,
         statement: &T,
         params: &[&(dyn ToSql + Sync)],
@@ -255,22 +258,25 @@ impl TestContext {
     }
 
     /// Execute simple query through pgcache proxy
-    pub async fn simple_query(&mut self, query: &str) -> Result<Vec<SimpleQueryMessage>, Error> {
+    pub(crate) async fn simple_query(
+        &mut self,
+        query: &str,
+    ) -> Result<Vec<SimpleQueryMessage>, Error> {
         self.cache.simple_query(query).await.map_err(Error::other)
     }
 
     /// Get metrics from pgcache HTTP endpoint
-    pub async fn metrics(&mut self) -> Result<MetricsSnapshot, Error> {
+    pub(crate) async fn metrics(&mut self) -> Result<MetricsSnapshot, Error> {
         super::metrics::metrics_http_get(self.metrics_port).await
     }
 
     /// Prepare a statement through pgcache proxy
-    pub async fn prepare(&self, query: &str) -> Result<Statement, Error> {
+    pub(crate) async fn prepare(&self, query: &str) -> Result<Statement, Error> {
         self.cache.prepare(query).await.map_err(Error::other)
     }
 
     /// Execute query_one through pgcache proxy
-    pub async fn query_one<T>(
+    pub(crate) async fn query_one<T>(
         &self,
         statement: &T,
         params: &[&(dyn ToSql + Sync)],
@@ -297,14 +303,17 @@ impl TestContext {
     /// one can return while a delivered commit's effects are still pending.
     ///
     /// Times out after 5 seconds.
-    pub async fn cdc_decode_settle(&self) -> Result<(), Error> {
+    pub(crate) async fn cdc_decode_settle(&self) -> Result<(), Error> {
         self.cdc_decode_settle_with_timeout(Duration::from_secs(5))
             .await
     }
 
     /// Same as [`cdc_decode_settle`](Self::cdc_decode_settle) with an explicit
     /// timeout.
-    pub async fn cdc_decode_settle_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
+    pub(crate) async fn cdc_decode_settle_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), Error> {
         let captured_lsn_str = self.flush_lsn_capture().await?;
         let captured_lsn = lsn_parse(&captured_lsn_str)?;
         let deadline = Instant::now() + timeout;
@@ -334,7 +343,7 @@ impl TestContext {
     /// — so an invalidation or in-place update is visible once it returns.
     ///
     /// Times out after 5 seconds.
-    pub async fn cdc_apply_settle(&self) -> Result<(), Error> {
+    pub(crate) async fn cdc_apply_settle(&self) -> Result<(), Error> {
         self.cdc_apply_settle_with_timeout(Duration::from_secs(5))
             .await
     }
@@ -348,7 +357,10 @@ impl TestContext {
     /// the settled watermark covers via keepalives processed at drained
     /// points, so no idle-window fallback is needed: the watermark itself
     /// asserts that everything decodable at or below it is applied.
-    pub async fn cdc_apply_settle_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
+    pub(crate) async fn cdc_apply_settle_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<(), Error> {
         let captured_lsn_str = self.flush_lsn_capture().await?;
         let captured_lsn = lsn_parse(&captured_lsn_str)?;
         let deadline = Instant::now() + timeout;
@@ -418,12 +430,12 @@ impl TestContext {
     /// `Loading` state we then wait to leave.
     ///
     /// Times out after 5 seconds. The error lists the offending entries.
-    pub async fn cache_settle(&self) -> Result<(), Error> {
+    pub(crate) async fn cache_settle(&self) -> Result<(), Error> {
         self.cache_settle_with_timeout(Duration::from_secs(5)).await
     }
 
     /// Same as `cache_settle` with an explicit timeout.
-    pub async fn cache_settle_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
+    pub(crate) async fn cache_settle_with_timeout(&self, timeout: Duration) -> Result<(), Error> {
         cache_settle_at(self.metrics_port, timeout).await
     }
 }
@@ -431,7 +443,7 @@ impl TestContext {
 /// Free-function variant of `TestContext::cache_settle_with_timeout` for
 /// tests that don't use `TestContext` (e.g. those that drive the proxy
 /// through a custom client like `connect_pgcache_tls`).
-pub async fn cache_settle_at(metrics_port: u16, timeout: Duration) -> Result<(), Error> {
+pub(crate) async fn cache_settle_at(metrics_port: u16, timeout: Duration) -> Result<(), Error> {
     // Grace window for the registration message to reach the writer.
     // Typical hop latency is sub-millisecond; 20 ms is comfortably above.
     // If registration takes longer, the subsequent poll will observe
@@ -489,7 +501,7 @@ pub async fn cache_settle_at(metrics_port: u16, timeout: Duration) -> Result<(),
 /// Parse a PostgreSQL LSN in `"X/Y"` hex form (as returned by
 /// `pg_current_wal_lsn()::text`) into a `u64` matching the wire-protocol
 /// encoding used in `cdc.last_applied_lsn`.
-pub fn lsn_parse(s: &str) -> Result<u64, Error> {
+pub(crate) fn lsn_parse(s: &str) -> Result<u64, Error> {
     let (hi, lo) = s
         .split_once('/')
         .ok_or_else(|| Error::other(format!("invalid LSN format: {s}")))?;

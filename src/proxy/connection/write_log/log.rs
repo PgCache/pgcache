@@ -26,7 +26,7 @@ use crate::query::write::{RelationRef, WriteClass};
 type SchemaBucket = HashMap<Option<EcoString>, TableTiers>;
 
 /// Per-connection write log. See the module docs for the model.
-pub(in crate::proxy::connection) struct WriteLog {
+pub(crate) struct WriteLog {
     pub(super) tables: HashMap<EcoString, SchemaBucket>,
     pub(super) connection: ConnectionTiers,
     pub(super) next_seq: u64,
@@ -50,11 +50,11 @@ fn fault_read_your_writes_off() -> bool {
 }
 
 impl WriteLog {
-    pub(in crate::proxy::connection) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_enabled(!fault_read_your_writes_off())
     }
 
-    pub(in crate::proxy::connection) fn with_enabled(enabled: bool) -> Self {
+    pub(crate) fn with_enabled(enabled: bool) -> Self {
         Self {
             tables: HashMap::new(),
             connection: ConnectionTiers::default(),
@@ -65,20 +65,20 @@ impl WriteLog {
 
     /// Disable recording (e.g. the connection's database didn't match and the
     /// cache is off for its lifetime).
-    pub(in crate::proxy::connection) fn disable(&mut self) {
+    pub(crate) fn disable(&mut self) {
         self.enabled = false;
         self.tables.clear();
         self.connection = ConnectionTiers::default();
     }
 
-    pub(in crate::proxy::connection) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.tables.is_empty() && self.connection.is_empty()
     }
 
     /// Whether any pending write is row-enumerable (an INSERT, DELETE, or
     /// UPDATE) — the cases that benefit from deriving the read's per-column
     /// ranges (PGC-369/381/382). Opaque/connection writes ignore them.
-    pub(in crate::proxy::connection) fn has_row_predicates(&self) -> bool {
+    pub(crate) fn has_row_predicates(&self) -> bool {
         self.tiers()
             .any(|tiers| tiers.aggregates().any(TableAggregate::has_row_predicates))
     }
@@ -89,7 +89,7 @@ impl WriteLog {
 
     /// Record a forwarded write into its table's (or the connection's) active
     /// tier. No-op when disabled.
-    pub(in crate::proxy::connection) fn record(&mut self, class: &WriteClass) {
+    pub(crate) fn record(&mut self, class: &WriteClass) {
         if !self.enabled {
             return;
         }
@@ -203,7 +203,7 @@ impl WriteLog {
     /// The sequence to hand the probe at injection: writes recorded up to and
     /// including this may be stamped with the probe's LSN. `None` when there is
     /// nothing to stamp (no active tier awaiting a bound).
-    pub(in crate::proxy::connection) fn stamp_seq(&self) -> Option<u64> {
+    pub(crate) fn stamp_seq(&self) -> Option<u64> {
         let tables = self
             .tiers()
             .filter_map(|tiers| tiers.active.as_ref().map(|(seq, _)| *seq));
@@ -215,7 +215,7 @@ impl WriteLog {
     /// stamp_seq`). A table with a later write is skipped on its own (the sample
     /// may predate that write's commit) and a subsequent probe retries it;
     /// every other table still stamps.
-    pub(in crate::proxy::connection) fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
+    pub(crate) fn stamp(&mut self, stamp_seq: u64, lsn: Lsn) {
         for tiers in self.tables.values_mut().flat_map(HashMap::values_mut) {
             tiers.stamp(stamp_seq, lsn);
         }
@@ -226,7 +226,7 @@ impl WriteLog {
     /// tiers and an unstampable connection entry never clear here. Runs per
     /// gated read, but the scan is over the handful of tables with pending
     /// writes — no derived fast-path state to keep consistent.
-    pub(in crate::proxy::connection) fn purge(&mut self, watermark: Lsn) {
+    pub(crate) fn purge(&mut self, watermark: Lsn) {
         let clearance = &crate::metrics::handles().raw.clearance;
         self.tables.retain(|_, bucket| {
             bucket.retain(|_, tiers| {
@@ -255,7 +255,7 @@ impl WriteLog {
     /// (PGC-369), used for row-level INSERT disjointness; `None` (a multi-table
     /// read, or one whose ranges couldn't be derived) makes any pending insert
     /// forward conservatively.
-    pub(in crate::proxy::connection) fn decide(
+    pub(crate) fn decide(
         &self,
         query: &QueryExpr,
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
@@ -375,7 +375,7 @@ impl WriteLog {
     /// INSERT, DELETE, or UPDATE). Cheap gate so the read-after-write gate skips
     /// the expensive per-column range derivation for reads no such write could
     /// affect (PGC-369, PGC-381, PGC-382).
-    pub(in crate::proxy::connection) fn table_has_row_predicate(&self, table: &TableNode) -> bool {
+    pub(crate) fn table_has_row_predicate(&self, table: &TableNode) -> bool {
         self.tables.get(&table.name).is_some_and(|bucket| {
             bucket.iter().any(|(schema, tiers)| {
                 schema_matches(schema, &table.schema)

@@ -26,7 +26,7 @@ fn query_message_sql(data: &BytesMut) -> Option<&str> {
 
 /// State machine for intercepting origin responses that shouldn't reach the client.
 /// Only one intercept can be active at a time.
-pub(in crate::proxy::connection) enum OriginIntercept {
+pub(super) enum OriginIntercept {
     /// No intercept active — origin messages forwarded normally.
     None,
     /// Intercepting SHOW search_path response (pre-PG18 fallback).
@@ -52,7 +52,7 @@ pub(in crate::proxy::connection) enum OriginIntercept {
 
 /// Sub-state for `OriginIntercept::TrailingShowSearchPath`.
 #[derive(Debug, Clone, Copy)]
-pub(in crate::proxy::connection) enum TrailingShowState {
+pub(super) enum TrailingShowState {
     /// Before the first `CommandComplete` or `ErrorResponse` — forwarding
     /// responses for the original (client-written) statement.
     PreShow,
@@ -82,7 +82,7 @@ fn query_message_append_show_search_path(data: &BytesMut) -> Option<BytesMut> {
 /// send it only via an explicit `SHOW search_path` query, so we discover and
 /// re-discover it around detected mutations (see `search_path_mutates_*`) and
 /// transaction boundaries.
-pub(in crate::proxy::connection) enum SearchPathState {
+pub(super) enum SearchPathState {
     /// No authoritative value: either before the first ReadyForQuery, or after
     /// a detected mutation (SET/RESET search_path, DISCARD ALL, COMMIT/ROLLBACK).
     /// Cacheable queries are forwarded until the next SHOW response (or
@@ -99,7 +99,7 @@ impl SearchPathState {
     /// Build the resolved state from a raw search_path value, expanding $user
     /// to session_user. session_user comes from the startup message, so it is
     /// final before any of the transitions into this state.
-    pub(in crate::proxy::connection) fn resolved(value: &str, session_user: Option<&str>) -> Self {
+    pub(super) fn resolved(value: &str, session_user: Option<&str>) -> Self {
         let search_path = SearchPath::parse(value);
         Self::Resolved(
             search_path
@@ -110,7 +110,7 @@ impl SearchPathState {
     }
 
     /// The resolved search_path, if available.
-    pub(in crate::proxy::connection) fn resolve(&self) -> Option<Arc<[EcoString]>> {
+    pub(super) fn resolve(&self) -> Option<Arc<[EcoString]>> {
         match self {
             Self::Unknown => None,
             Self::Resolved(search_path) => Some(Arc::clone(search_path)),
@@ -122,7 +122,7 @@ impl ConnectionState {
     /// Mark search_path as needing rediscovery and clear the describe-cache:
     /// RowDescription column type_oids depend on the resolved search_path,
     /// so cached entries could carry stale column metadata.
-    pub(in crate::proxy::connection) fn search_path_mark_unknown(&mut self) {
+    pub(super) fn search_path_mark_unknown(&mut self) {
         self.search_path_state = SearchPathState::Unknown;
         if !self.describe_cache.is_empty() {
             let n = self.describe_cache.len();
@@ -137,10 +137,7 @@ impl ConnectionState {
     /// Handle an origin message during an active intercept.
     /// Returns true if the message was consumed (caller should not forward).
     #[expect(clippy::wildcard_enum_match_arm)]
-    pub(in crate::proxy::connection) fn origin_intercept_handle(
-        &mut self,
-        msg: &PgBackendMessage,
-    ) -> bool {
+    pub(super) fn origin_intercept_handle(&mut self, msg: &PgBackendMessage) -> bool {
         match &self.origin_intercept {
             OriginIntercept::None => false,
 
@@ -226,7 +223,7 @@ impl ConnectionState {
     /// `search_path_state`. If the original statement errored, the SHOW is
     /// skipped by PostgreSQL and everything forwards through to the RFQ.
     #[expect(clippy::wildcard_enum_match_arm)]
-    pub(in crate::proxy::connection) fn trailing_show_search_path_handle(
+    pub(super) fn trailing_show_search_path_handle(
         &mut self,
         state: TrailingShowState,
         msg: &PgBackendMessage,
@@ -288,10 +285,7 @@ impl ConnectionState {
     /// `TrailingShowSearchPath` intercept so the SHOW's response is captured
     /// and stripped before reaching the client — avoiding the extra round
     /// trip a lazy SHOW would cost.
-    pub(in crate::proxy::connection) fn search_path_inspect_query(
-        &mut self,
-        msg: &mut PgFrontendMessage,
-    ) {
+    pub(super) fn search_path_inspect_query(&mut self, msg: &mut PgFrontendMessage) {
         // Fast path: PG18+ auto-reports search_path via ParameterStatus, so
         // the origin will push every change before the next RFQ. Defensive
         // marking and the piggyback SHOW just waste cycles.
@@ -330,7 +324,7 @@ impl ConnectionState {
     /// Detect a search_path mutation in an extended-protocol Parse and mark the
     /// cached search_path stale. Pre-PG18 only (PG18+ auto-reports search_path);
     /// no piggyback for extended — the lazy SHOW-on-RFQ path handles rediscovery.
-    pub(in crate::proxy::connection) fn search_path_parse_inspect(&mut self, sql: &str) {
+    pub(super) fn search_path_parse_inspect(&mut self, sql: &str) {
         if self.search_path_auto_reported {
             return;
         }

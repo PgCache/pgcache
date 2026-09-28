@@ -192,7 +192,7 @@ impl CacheabilityCache {
     /// Feed a memory-pressure sample through to the shared store. Called where
     /// the connection already holds a `CacheDispatch`, which carries the flag
     /// for the current cache generation.
-    pub(in crate::proxy) fn pressure_observe(&self, pressured: bool) {
+    pub(super) fn pressure_observe(&self, pressured: bool) {
         self.store.pressure_observed(pressured);
     }
 
@@ -209,7 +209,7 @@ impl CacheabilityCache {
     /// Reconcile against a wholesale drop: clearing the store alone frees
     /// nothing while connections still hold `Arc`s, so each connection drains
     /// when it notices the epoch move.
-    pub(in crate::proxy) fn epoch_reconcile(&mut self) {
+    pub(super) fn epoch_reconcile(&mut self) {
         let current = self.store.epoch();
         if current != self.epoch {
             self.drain();

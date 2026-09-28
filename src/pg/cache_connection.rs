@@ -75,7 +75,7 @@ impl PreparedStatements {
 
 /// What `pipelined_named_query_send` put on the wire, so the caller's response
 /// state machine knows which completion messages to expect.
-pub struct PrepareOutcome {
+pub(crate) struct PrepareOutcome {
     /// A Parse for the `set_config` generation-stamp statement was sent (expect a
     /// ParseComplete before its BindComplete). First serve per connection only.
     pub sent_setgen_parse: bool,
@@ -90,7 +90,7 @@ pub struct PrepareOutcome {
 ///
 /// Avoids per-row overhead of tokio-postgres by providing direct access
 /// to the underlying stream and codec for zero-copy frame forwarding.
-pub struct CacheConnection {
+pub(crate) struct CacheConnection {
     pub stream: TcpStream,
     pub read_buf: BytesMut,
     pub codec: PgBackendMessageCodec,
@@ -165,7 +165,7 @@ impl CacheConnection {
 
     /// Connect to the cache database and complete the PG startup handshake.
     /// Assumes trust authentication (no password exchange).
-    pub async fn connect(settings: &PgSettings) -> CacheResult<Self> {
+    pub(crate) async fn connect(settings: &PgSettings) -> CacheResult<Self> {
         let addr = format!("{}:{}", settings.host, settings.port);
         let stream = TcpStream::connect(&addr)
             .await
@@ -283,7 +283,7 @@ impl CacheConnection {
     /// machine knows which completion messages to expect. Built into the recycled
     /// `write_buf`, sent in one write.
     #[allow(clippy::too_many_arguments)]
-    pub async fn pipelined_named_query_send(
+    pub(crate) async fn pipelined_named_query_send(
         &mut self,
         shape_key: ShapeKey,
         generation: u64,
@@ -367,7 +367,7 @@ impl CacheConnection {
     /// the SELECT in `self.sql_buf` (MV reads: no generation SET — MV tables
     /// aren't `pgcache_pgrx`-tracked — and the LIMIT is baked into the SQL).
     /// Built into the recycled `write_buf`.
-    pub async fn extended_query_unnamed_send(
+    pub(crate) async fn extended_query_unnamed_send(
         &mut self,
         include_describe: bool,
         binary_results: bool,
@@ -423,7 +423,7 @@ impl CacheConnection {
     /// through `ReadyForQuery`, leaving the connection protocol-clean for reuse;
     /// a cache-DB `ErrorResponse` is captured rather than failing the connection.
     /// Not a hot path — clarity over zero-copy.
-    pub async fn explain_collect(
+    pub(crate) async fn explain_collect(
         &mut self,
         explain_sql: &str,
         literals: &[LiteralValue],
@@ -475,7 +475,7 @@ impl CacheConnection {
 }
 
 /// Outcome of [`CacheConnection::explain_collect`].
-pub enum ExplainOutcome {
+pub(crate) enum ExplainOutcome {
     /// Plan text — one entry per `QUERY PLAN` row from the cache DB.
     Plan(Vec<String>),
     /// The cache DB rejected the statement (bad EXPLAIN options, or the cache

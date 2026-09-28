@@ -94,7 +94,7 @@ tls_connection_ops_impl!(rustls::ClientConnection);
 ///
 /// For TLS connections, the TCP stream and TLS state are stored separately
 /// to allow borrowed splits where both halves can access the TLS state.
-pub enum TlsStream<T: TlsConnectionOps> {
+pub(super) enum TlsStream<T: TlsConnectionOps> {
     /// Plain TCP connection (no encryption)
     Plain(TcpStream),
     /// TLS-encrypted connection
@@ -106,12 +106,12 @@ pub enum TlsStream<T: TlsConnectionOps> {
 
 impl<T: TlsConnectionOps> TlsStream<T> {
     /// Create a plain TCP stream.
-    pub fn plain(tcp: TcpStream) -> Self {
+    pub(super) fn plain(tcp: TcpStream) -> Self {
         TlsStream::Plain(tcp)
     }
 
     /// Create a TLS stream with existing TLS state.
-    pub fn tls(tcp: TcpStream, tls_state: SharedTlsState<T>) -> Self {
+    pub(super) fn tls(tcp: TcpStream, tls_state: SharedTlsState<T>) -> Self {
         TlsStream::Tls { tcp, tls_state }
     }
 
@@ -119,7 +119,7 @@ impl<T: TlsConnectionOps> TlsStream<T> {
     ///
     /// The write half has `.writable()` which delegates to the underlying TCP stream.
     /// Both halves share the TLS state for encrypted connections.
-    pub fn split(&mut self) -> (TlsReadHalf<'_, T>, TlsWriteHalf<'_, T>) {
+    pub(super) fn split(&mut self) -> (TlsReadHalf<'_, T>, TlsWriteHalf<'_, T>) {
         match self {
             TlsStream::Plain(tcp) => {
                 let (read, write) = tcp.split();
@@ -146,7 +146,7 @@ impl<T: TlsConnectionOps> TlsStream<T> {
     /// reactor registration. Unlike [`Self::split`], the halves are `'static`
     /// and `Send`, so the write half can be moved to another task (e.g. leased
     /// to the cache worker). Both halves share the TLS state.
-    pub fn into_split(self) -> (OwnedTlsReadHalf<T>, OwnedTlsWriteHalf<T>) {
+    pub(super) fn into_split(self) -> (OwnedTlsReadHalf<T>, OwnedTlsWriteHalf<T>) {
         match self {
             TlsStream::Plain(tcp) => {
                 let (read, write) = tcp.into_split();
@@ -178,7 +178,7 @@ impl<T: TlsConnectionOps> TlsStream<T> {
 // ============================================================================
 
 /// Borrowed read half of a TlsStream.
-pub enum TlsReadHalf<'a, T: TlsConnectionOps> {
+pub(super) enum TlsReadHalf<'a, T: TlsConnectionOps> {
     Plain(ReadHalf<'a>),
     Tls {
         tcp: ReadHalf<'a>,
@@ -307,7 +307,7 @@ pub struct PendingWrite {
 ///
 /// Has `.writable()` method that delegates to the underlying TCP stream,
 /// providing proper backpressure handling in select loops.
-pub enum TlsWriteHalf<'a, T: TlsConnectionOps> {
+pub(super) enum TlsWriteHalf<'a, T: TlsConnectionOps> {
     Plain(WriteHalf<'a>),
     Tls {
         tcp: WriteHalf<'a>,
@@ -321,7 +321,7 @@ impl<T: TlsConnectionOps> TlsWriteHalf<'_, T> {
     ///
     /// This delegates to the TCP stream's `.writable()` method, which properly
     /// integrates with tokio's reactor for efficient backpressure handling.
-    pub async fn writable(&self) -> io::Result<()> {
+    pub(super) async fn writable(&self) -> io::Result<()> {
         match self {
             TlsWriteHalf::Plain(tcp) => tcp.writable().await,
             TlsWriteHalf::Tls { tcp, .. } => tcp.writable().await,
@@ -375,7 +375,7 @@ impl<T: TlsConnectionOps> AsyncWrite for TlsWriteHalf<'_, T> {
 /// TCP write returns `Pending` or is partial, re-encrypting the same plaintext
 /// on retry would produce a record with the wrong sequence number, causing the
 /// peer to fail AEAD decryption.
-pub fn tls_poll_write<T, W>(
+pub(super) fn tls_poll_write<T, W>(
     tcp: Pin<&mut W>,
     tls_state: &SharedTlsState<T>,
     cx: &mut Context<'_>,
@@ -434,7 +434,7 @@ where
 /// Send TLS close_notify and shutdown the TCP stream.
 ///
 /// This is the core TLS shutdown implementation shared by TlsWriteHalf and ClientSocket.
-pub fn tls_poll_shutdown<T, W>(
+pub(super) fn tls_poll_shutdown<T, W>(
     mut tcp: Pin<&mut W>,
     tls_state: &SharedTlsState<T>,
     cx: &mut Context<'_>,

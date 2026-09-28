@@ -28,7 +28,7 @@ use crate::settings::Settings;
 
 impl WriterCdc {
     /// Handle a CDC command, dispatching to the appropriate method.
-    pub async fn cdc_command_handle(
+    pub(crate) async fn cdc_command_handle(
         &mut self,
         core: &mut WriterCore,
         cmd: CdcCommand,
@@ -448,7 +448,7 @@ impl WriterCdc {
     // which would put a heap allocation on every CDC event.
     #[instrument(skip_all, level = "trace")]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(in crate::cache::writer::cdc) async fn handle_insert(
+    pub(super) async fn handle_insert(
         &mut self,
         core: &mut WriterCore,
         relation_oid: Oid,
@@ -524,7 +524,7 @@ impl WriterCdc {
     // which would put a heap allocation on every CDC event.
     #[instrument(skip_all, level = "trace")]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(in crate::cache::writer::cdc) async fn handle_update(
+    pub(super) async fn handle_update(
         &mut self,
         core: &mut WriterCore,
         relation_oid: Oid,
@@ -854,7 +854,7 @@ impl WriterCdc {
     // Trace level: at info/debug the fmt layer allocates per-span extensions,
     // which would put a heap allocation on every CDC event.
     #[instrument(skip_all, level = "trace")]
-    pub(in crate::cache::writer::cdc) async fn handle_delete(
+    pub(super) async fn handle_delete(
         &mut self,
         core: &mut WriterCore,
         relation_oid: Oid,
@@ -938,7 +938,7 @@ impl WriterCdc {
     /// in ways the in-place model can't track, so those queries repopulate
     /// from origin.
     #[instrument(skip_all)]
-    pub async fn handle_truncate(
+    pub(crate) async fn handle_truncate(
         &mut self,
         core: &mut WriterCore,
         relation_oids: &[Oid],
@@ -964,7 +964,7 @@ impl WriterCdc {
 }
 
 impl WriterCdc {
-    pub async fn new(settings: &Settings, settled_lsn: Arc<AtomicU64>) -> CacheResult<Self> {
+    pub(crate) async fn new(settings: &Settings, settled_lsn: Arc<AtomicU64>) -> CacheResult<Self> {
         let cache_eval_conn = pg::connect(&settings.cache, "cache eval")
             .await
             .map_into_report::<CacheError>()?;

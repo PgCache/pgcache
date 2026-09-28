@@ -42,7 +42,7 @@ pub(super) const INSERT_MERGED_ROWS_CAP: usize = 1024;
 pub(super) const INSERT_MERGED_CELLS_CAP: usize = 8192;
 /// Pending write state for one table within a tier.
 #[derive(Debug, Default, Clone)]
-pub(in crate::proxy::connection) struct TableAggregate {
+pub(crate) struct TableAggregate {
     /// A non-row-enumerable write (MERGE/TRUNCATE, or a degraded
     /// INSERT/DELETE/UPDATE) is pending against this table → any read of it
     /// intersects, regardless of `inserts`/`deletes`/`updates`.
@@ -84,7 +84,7 @@ pub(in crate::proxy::connection) struct TableAggregate {
 /// bounds the rows it touches (the shrink/value-change side); `image` bounds
 /// their post-update column values (the grow side — a row moving *into* a read).
 #[derive(Debug, Clone)]
-pub(in crate::proxy::connection) struct UpdatePredicate {
+pub(crate) struct UpdatePredicate {
     pub(super) where_ranges: HashMap<EcoString, ColumnRange>,
     pub(super) image_ranges: HashMap<EcoString, ColumnRange>,
 }
@@ -95,7 +95,7 @@ pub(in crate::proxy::connection) struct UpdatePredicate {
 /// Bounded by [`INSERT_MERGED_ROWS_CAP`] rows; beyond the cap the table
 /// degrades to `opaque`.
 #[derive(Debug, Clone, Default)]
-pub(in crate::proxy::connection) struct InsertAggregate {
+pub(crate) struct InsertAggregate {
     /// Union of the folded statements' column lists, in first-seen order.
     columns: Vec<EcoString>,
     /// Positionally aligned with `columns`. `None` = cell value unknown

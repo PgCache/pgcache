@@ -12,7 +12,7 @@ use tokio_util::{
 use super::{PgConnectionState, PgMessage, PgMessageType, ProtocolError, encode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PgBackendMessageType {
+pub(crate) enum PgBackendMessageType {
     // startup
     SslRequestResponse,
     Authentication,
@@ -53,30 +53,30 @@ impl PgMessageType for PgBackendMessageType {}
 
 pub(crate) type PgBackendMessage = PgMessage<PgBackendMessageType>;
 
-pub const AUTHENTICATION_TAG: u8 = b'R'; // => PgBackendMessageType::Authentication,
-pub const BACKEND_KEY_DATA_TAG: u8 = b'K'; // => PgBackendMessageType::BackendKeyData,
-pub const BIND_COMPLETE_TAG: u8 = b'2'; // => PgBackendMessageType::BindComplete,
-pub const CLOSE_COMPLETE_TAG: u8 = b'3'; // => PgBackendMessageType::CloseComplete,
-pub const COMMAND_COMPLETE_TAG: u8 = b'C'; // => PgBackendMessageType::CommandComplete,
-pub const COPY_DATA_TAG: u8 = b'd'; // => PgBackendMessageType::CopyData,
-pub const COPY_DONE_TAG: u8 = b'c'; // => PgBackendMessageType::CopyDone,
-pub const COPY_IN_RESPONSE_TAG: u8 = b'G'; // => PgBackendMessageType::CopyInResponse,
-pub const COPY_OUT_RESPONSE_TAG: u8 = b'H'; // => PgBackendMessageType::CopyOutResponse,
-pub const COPY_BOTH_RESPONSE_TAG: u8 = b'W'; // => PgBackendMessageType::CopyBothResponse,
-pub const DATA_ROW_TAG: u8 = b'D'; // => PgBackendMessageType::DataRow,
-pub const EMPTY_QUERY_RESPONSE_TAG: u8 = b'I'; // => PgBackendMessageType::EmptyQueryResponse,
-pub const ERROR_RESPONSE_TAG: u8 = b'E'; // => PgBackendMessageType::ErrorResponse,
-pub const FUNCTION_CALL_RESPONSE_TAG: u8 = b'V'; // => PgBackendMessageType::FunctionCallResponse,
-pub const NEGOTIATE_PROTOCOL_VERSION_TAG: u8 = b'v'; // => PgBackendMessageType::NegotiateProtocolVersion,
-pub const NO_DATA_TAG: u8 = b'n'; // => PgBackendMessageType::NoData,
-pub const NOTICE_RESPONSE_TAG: u8 = b'N'; // => PgBackendMessageType::NoticeResponse,
-pub const NOTIFICATION_RESPONSE_TAG: u8 = b'A'; // => PgBackendMessageType::NotificationResponse,
-pub const PARAMETER_DESCRIPTION_TAG: u8 = b't'; // => PgBackendMessageType::ParameterDescription,
-pub const PARAMETER_STATUS_TAG: u8 = b'S'; // => PgBackendMessageType::ParameterStatus,
-pub const PARSE_COMPLETE_TAG: u8 = b'1'; // => PgBackendMessageType::ParseComplete,
-pub const PORTAL_SUSPENDED_TAG: u8 = b's'; // => PgBackendMessageType::PortalSuspended,
-pub const READY_FOR_QUERY_TAG: u8 = b'Z'; // => PgBackendMessageType::ReadyForQuery,
-pub const ROW_DESCRIPTION_TAG: u8 = b'T'; // => PgBackendMessageType::RowDescription,
+pub(crate) const AUTHENTICATION_TAG: u8 = b'R'; // => PgBackendMessageType::Authentication,
+pub(crate) const BACKEND_KEY_DATA_TAG: u8 = b'K'; // => PgBackendMessageType::BackendKeyData,
+pub(crate) const BIND_COMPLETE_TAG: u8 = b'2'; // => PgBackendMessageType::BindComplete,
+pub(crate) const CLOSE_COMPLETE_TAG: u8 = b'3'; // => PgBackendMessageType::CloseComplete,
+pub(crate) const COMMAND_COMPLETE_TAG: u8 = b'C'; // => PgBackendMessageType::CommandComplete,
+pub(crate) const COPY_DATA_TAG: u8 = b'd'; // => PgBackendMessageType::CopyData,
+pub(crate) const COPY_DONE_TAG: u8 = b'c'; // => PgBackendMessageType::CopyDone,
+pub(crate) const COPY_IN_RESPONSE_TAG: u8 = b'G'; // => PgBackendMessageType::CopyInResponse,
+pub(crate) const COPY_OUT_RESPONSE_TAG: u8 = b'H'; // => PgBackendMessageType::CopyOutResponse,
+pub(crate) const COPY_BOTH_RESPONSE_TAG: u8 = b'W'; // => PgBackendMessageType::CopyBothResponse,
+pub(crate) const DATA_ROW_TAG: u8 = b'D'; // => PgBackendMessageType::DataRow,
+pub(crate) const EMPTY_QUERY_RESPONSE_TAG: u8 = b'I'; // => PgBackendMessageType::EmptyQueryResponse,
+pub(crate) const ERROR_RESPONSE_TAG: u8 = b'E'; // => PgBackendMessageType::ErrorResponse,
+pub(crate) const FUNCTION_CALL_RESPONSE_TAG: u8 = b'V'; // => PgBackendMessageType::FunctionCallResponse,
+pub(crate) const NEGOTIATE_PROTOCOL_VERSION_TAG: u8 = b'v'; // => PgBackendMessageType::NegotiateProtocolVersion,
+pub(crate) const NO_DATA_TAG: u8 = b'n'; // => PgBackendMessageType::NoData,
+pub(crate) const NOTICE_RESPONSE_TAG: u8 = b'N'; // => PgBackendMessageType::NoticeResponse,
+pub(crate) const NOTIFICATION_RESPONSE_TAG: u8 = b'A'; // => PgBackendMessageType::NotificationResponse,
+pub(crate) const PARAMETER_DESCRIPTION_TAG: u8 = b't'; // => PgBackendMessageType::ParameterDescription,
+pub(crate) const PARAMETER_STATUS_TAG: u8 = b'S'; // => PgBackendMessageType::ParameterStatus,
+pub(crate) const PARSE_COMPLETE_TAG: u8 = b'1'; // => PgBackendMessageType::ParseComplete,
+pub(crate) const PORTAL_SUSPENDED_TAG: u8 = b's'; // => PgBackendMessageType::PortalSuspended,
+pub(crate) const READY_FOR_QUERY_TAG: u8 = b'Z'; // => PgBackendMessageType::ReadyForQuery,
+pub(crate) const ROW_DESCRIPTION_TAG: u8 = b'T'; // => PgBackendMessageType::RowDescription,
 
 const BACKEND_MESSAGE_TYPE_MAP: phf::Map<u8, PgBackendMessageType> = phf_map! {
     b'R' => PgBackendMessageType::Authentication,
@@ -105,19 +105,19 @@ const BACKEND_MESSAGE_TYPE_MAP: phf::Map<u8, PgBackendMessageType> = phf_map! {
     b'T' => PgBackendMessageType::RowDescription,
 };
 
-pub const AUTHENTICATION_OK: i32 = 0;
-pub const AUTHENTICATION_KERBEROSV5: i32 = 2;
-pub const AUTHENTICATION_CLEARTEXT_PASSWORD: i32 = 3;
-pub const AUTHENTICATION_MD5_PASSWORD: i32 = 5;
-pub const AUTHENTICATION_GSS: i32 = 7;
-pub const AUTHENTICATION_GSS_CONTINUE: i32 = 8;
-pub const AUTHENTICATION_SSPI: i32 = 9;
-pub const AUTHENTICATION_SASL: i32 = 10;
-pub const AUTHENTICATION_SASL_CONTINUE: i32 = 11;
-pub const AUTHENTICATION_SASL_FINAL: i32 = 12;
+pub(crate) const AUTHENTICATION_OK: i32 = 0;
+pub(crate) const AUTHENTICATION_KERBEROSV5: i32 = 2;
+pub(crate) const AUTHENTICATION_CLEARTEXT_PASSWORD: i32 = 3;
+pub(crate) const AUTHENTICATION_MD5_PASSWORD: i32 = 5;
+pub(crate) const AUTHENTICATION_GSS: i32 = 7;
+pub(crate) const AUTHENTICATION_GSS_CONTINUE: i32 = 8;
+pub(crate) const AUTHENTICATION_SSPI: i32 = 9;
+pub(crate) const AUTHENTICATION_SASL: i32 = 10;
+pub(crate) const AUTHENTICATION_SASL_CONTINUE: i32 = 11;
+pub(crate) const AUTHENTICATION_SASL_FINAL: i32 = 12;
 
 #[derive(Debug, Default)]
-pub struct PgBackendMessageCodec {
+pub(crate) struct PgBackendMessageCodec {
     pub state: PgConnectionState,
 }
 
@@ -301,7 +301,7 @@ impl TransactionStatus {
     }
 }
 
-pub fn parameter_status_parse(data: &[u8]) -> Option<(&str, &str)> {
+pub(crate) fn parameter_status_parse(data: &[u8]) -> Option<(&str, &str)> {
     // Skip tag ('S') and length (4 bytes)
     let payload = data.get(5..)?;
 
@@ -319,7 +319,7 @@ pub fn parameter_status_parse(data: &[u8]) -> Option<(&str, &str)> {
 /// Message format: 'R' | int32 len | int32 auth_type | ...
 ///
 /// Returns `None` if the message is too short.
-pub fn authentication_type(data: &BytesMut) -> Option<i32> {
+pub(crate) fn authentication_type(data: &BytesMut) -> Option<i32> {
     let auth_type_bytes = data.get(5..9)?;
     Some(i32::from_be_bytes(auth_type_bytes.try_into().ok()?))
 }
@@ -329,7 +329,7 @@ pub fn authentication_type(data: &BytesMut) -> Option<i32> {
 /// Message format: 'D' | int32 len | int16 column_count | (int32 col_len | bytes col_data)*
 ///
 /// Returns `None` if the message is malformed or the column is NULL.
-pub fn data_row_first_column(data: &[u8]) -> Option<&str> {
+pub(crate) fn data_row_first_column(data: &[u8]) -> Option<&str> {
     // Skip tag ('D') and length (4 bytes) and column count (2 bytes)
     let payload = data.get(7..)?;
 
@@ -350,7 +350,7 @@ pub fn data_row_first_column(data: &[u8]) -> Option<&str> {
 /// individually (rather than relaying the frame verbatim) must walk them all —
 /// reading only the first would silently drop the rest (e.g. all but the top
 /// line of a multi-row `EXPLAIN` plan).
-pub fn data_rows_first_columns(data: &[u8], out: &mut Vec<String>) {
+pub(crate) fn data_rows_first_columns(data: &[u8], out: &mut Vec<String>) {
     let mut pos = 0;
     while let Some(&tag) = data.get(pos) {
         if tag != DATA_ROW_TAG {

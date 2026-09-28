@@ -22,7 +22,7 @@ where
 
 /// Parsed Parse message data
 #[derive(Debug, Clone)]
-pub struct ParsedParseMessage {
+pub(crate) struct ParsedParseMessage {
     pub statement_name: EcoString,
     /// Zero-copy view into the Parse frame passed to `parse_parse_message`.
     pub sql: ByteString,
@@ -31,7 +31,7 @@ pub struct ParsedParseMessage {
 
 /// Parsed Bind message data
 #[derive(Debug, Clone)]
-pub struct ParsedBindMessage {
+pub(crate) struct ParsedBindMessage {
     pub portal_name: EcoString,
     pub statement_name: EcoString,
     pub parameter_formats: Vec<i16>,
@@ -41,27 +41,27 @@ pub struct ParsedBindMessage {
 
 /// Parsed Execute message data
 #[derive(Debug, Clone)]
-pub struct ParsedExecuteMessage {
+pub(crate) struct ParsedExecuteMessage {
     pub portal_name: EcoString,
     pub max_rows: i32,
 }
 
 /// Parsed Describe message data
 #[derive(Debug, Clone)]
-pub struct ParsedDescribeMessage {
+pub(crate) struct ParsedDescribeMessage {
     pub describe_type: u8, // b'S' for statement, b'P' for portal
     pub name: EcoString,
 }
 
 /// Parsed ParameterDescription message data (backend response)
 #[derive(Debug, Clone)]
-pub struct ParsedParameterDescription {
+pub(crate) struct ParsedParameterDescription {
     pub parameter_oids: Vec<u32>,
 }
 
 /// Parsed Close message data
 #[derive(Debug, Clone)]
-pub struct ParsedCloseMessage {
+pub(crate) struct ParsedCloseMessage {
     pub close_type: u8, // b'S' for statement, b'P' for portal
     pub name: EcoString,
 }
@@ -98,7 +98,7 @@ fn read_cstring<'a>(buf: &mut &'a [u8]) -> ProtocolResult<&'a str> {
 /// Int16 - number of parameter data types
 /// For each parameter:
 ///     Int32 - OID of parameter data type (0 = unspecified)
-pub fn parse_parse_message(data: &Bytes) -> ProtocolResult<ParsedParseMessage> {
+pub(crate) fn parse_parse_message(data: &Bytes) -> ProtocolResult<ParsedParseMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -165,7 +165,7 @@ pub fn parse_parse_message(data: &Bytes) -> ProtocolResult<ParsedParseMessage> {
 /// Int16 - number of result column format codes
 /// For each format code:
 ///     Int16 - format code (0=text, 1=binary)
-pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> {
+pub(crate) fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -291,7 +291,7 @@ pub fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> 
 /// Int32 - message length
 /// String - portal name (empty string for unnamed)
 /// Int32 - maximum number of rows to return (0 = unlimited)
-pub fn parse_execute_message(data: &BytesMut) -> ProtocolResult<ParsedExecuteMessage> {
+pub(crate) fn parse_execute_message(data: &BytesMut) -> ProtocolResult<ParsedExecuteMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -326,7 +326,7 @@ pub fn parse_execute_message(data: &BytesMut) -> ProtocolResult<ParsedExecuteMes
 /// Int32 - message length
 /// Byte1 - 'S' for statement, 'P' for portal
 /// String - name of statement or portal
-pub fn parse_describe_message(data: &BytesMut) -> ProtocolResult<ParsedDescribeMessage> {
+pub(crate) fn parse_describe_message(data: &BytesMut) -> ProtocolResult<ParsedDescribeMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -362,7 +362,7 @@ pub fn parse_describe_message(data: &BytesMut) -> ProtocolResult<ParsedDescribeM
 /// Int32 - message length
 /// Byte1 - 'S' for statement, 'P' for portal
 /// String - name of statement or portal
-pub fn parse_close_message(data: &BytesMut) -> ProtocolResult<ParsedCloseMessage> {
+pub(crate) fn parse_close_message(data: &BytesMut) -> ProtocolResult<ParsedCloseMessage> {
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -396,7 +396,9 @@ pub fn parse_close_message(data: &BytesMut) -> ProtocolResult<ParsedCloseMessage
 /// Int16 - number of parameters
 /// For each parameter:
 ///     Int32 - OID of parameter data type
-pub fn parse_parameter_description(data: &[u8]) -> ProtocolResult<ParsedParameterDescription> {
+pub(crate) fn parse_parameter_description(
+    data: &[u8],
+) -> ProtocolResult<ParsedParameterDescription> {
     // Need at least 7 bytes: tag(1) + length(4) + param_count(2)
     let Some(buf) = data.get(5..) else {
         return Err(ProtocolError::IoError(std::io::Error::new(

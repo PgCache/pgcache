@@ -33,7 +33,7 @@ use crate::timing::QueryTiming;
 mod coalesce;
 mod sqlstate;
 
-pub use coalesce::CoalescedOutcome;
+pub(super) use coalesce::CoalescedOutcome;
 use coalesce::{
     BroadcastState, broadcast_error_reply, broadcast_join, broadcast_setup, push_and_broadcast,
 };
@@ -317,7 +317,7 @@ enum ServeResponseState {
 // extensions, which would put one heap allocation on every cache hit.
 #[instrument(skip_all, level = "trace")]
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub async fn handle_cached_query(
+pub(super) async fn handle_cached_query(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     replenish_tx: UnboundedSender<()>,

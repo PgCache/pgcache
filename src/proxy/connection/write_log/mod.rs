@@ -38,12 +38,12 @@ mod tiers;
 
 use crate::pg::Lsn;
 
-pub(in crate::proxy::connection) use log::WriteLog;
+pub(super) use log::WriteLog;
 
 /// Reason the read-after-write gate forwarded a cacheable read to origin
 /// instead of serving it from cache (PGC-124), for metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::proxy::connection) enum RawForwardReason {
+pub(super) enum RawForwardReason {
     /// A pending write against a table the read references.
     Table,
     /// A connection-scoped pending write (unknown target table): every read on
@@ -55,7 +55,7 @@ pub(in crate::proxy::connection) enum RawForwardReason {
 /// Side-effect-free so the caller records metrics exactly once per read; the three
 /// variants make the illegal "forwarding yet proven disjoint" state unrepresentable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::proxy::connection) enum RawDecision {
+pub(super) enum RawDecision {
     /// Serve from cache — no pending write on this connection touches the read.
     Serve,
     /// Serve from cache — a pending row-enumerable write on a referenced table
@@ -71,7 +71,7 @@ pub(in crate::proxy::connection) enum RawDecision {
 /// blocker among the first blocking table's tiers (or the connection scope) —
 /// what must resolve before an identical read could serve (PGC-440).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::proxy::connection) enum RawBlocker {
+pub(super) enum RawBlocker {
     /// A blocking write has no commit-LSN bound yet (probe outstanding, or the
     /// connection scope is unstampable): no watermark advance can clear it.
     Unstamped,
@@ -94,7 +94,7 @@ impl RawBlocker {
 /// Which pipeline stage a forward's blocker is stuck at, for the
 /// `raw.forward_blocked` cause metric (PGC-440).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::proxy::connection) enum RawForwardCause {
+pub(super) enum RawForwardCause {
     /// No commit-LSN bound yet: waiting on the post-commit probe.
     Unstamped,
     /// Bound past the decode-stage receive cursor: origin hasn't delivered the
@@ -108,10 +108,7 @@ pub(in crate::proxy::connection) enum RawForwardCause {
 /// (`None` = cache down/restarting: nothing delivered this generation, so a
 /// stamped bound is by definition undelivered). The settled watermark needs no
 /// comparison — the caller purges settled writes immediately before deciding.
-pub(in crate::proxy::connection) fn forward_cause(
-    blocker: RawBlocker,
-    received: Option<Lsn>,
-) -> RawForwardCause {
+pub(super) fn forward_cause(blocker: RawBlocker, received: Option<Lsn>) -> RawForwardCause {
     match blocker {
         RawBlocker::Unstamped => RawForwardCause::Unstamped,
         RawBlocker::Stamped(bound) => match received {
@@ -124,7 +121,7 @@ pub(in crate::proxy::connection) fn forward_cause(
 /// Which pending write kinds a served read was proven disjoint from (PGC-384).
 /// A read can be disjoint from several kinds at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(in crate::proxy::connection) struct DisjointKinds {
+pub(super) struct DisjointKinds {
     pub insert: bool,
     pub delete: bool,
     pub update: bool,

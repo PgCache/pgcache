@@ -68,7 +68,7 @@ async fn fault_cdc_deliver_delay(_active_relations: &ActiveRelations) {}
 
 /// Handles Change Data Capture (CDC) processing from PostgreSQL logical replication.
 /// Processes replication messages and synchronizes changes with the cache database.
-pub struct CdcProcessor {
+pub(super) struct CdcProcessor {
     cdc_client: Client,
     publication_name: EcoString,
     slot_name: EcoString,
@@ -99,7 +99,7 @@ pub struct CdcProcessor {
 
 impl CdcProcessor {
     /// Creates a new CdcProcessor with the provided CDC client and cache.
-    pub async fn new(
+    pub(super) async fn new(
         settings: &Settings,
         cdc_tx: UnboundedSender<CdcCommand>,
         active_relations: ActiveRelations,
@@ -133,14 +133,14 @@ impl CdcProcessor {
     }
 
     /// Returns the last LSN acknowledged to PostgreSQL.
-    pub fn last_flushed_lsn(&self) -> Lsn {
+    pub(super) fn last_flushed_lsn(&self) -> Lsn {
         self.last_flushed_lsn
     }
 
     /// Starts the CDC replication stream and processes incoming messages.
     /// Uses tokio::select! for concurrent message processing and periodic keep-alives.
     /// Returns Ok(()) on graceful shutdown via cancellation token.
-    pub async fn run(&mut self, cancel: CancellationToken) -> Result<(), Error> {
+    pub(super) async fn run(&mut self, cancel: CancellationToken) -> Result<(), Error> {
         // Start replication stream
         let slot = self.slot_name.as_str();
         let publ = self.publication_name.as_str();

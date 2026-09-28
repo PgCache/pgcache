@@ -69,7 +69,7 @@ const MAX_MEMO_ENTRY_BYTES: usize = 128 * 1024;
 /// higher gate mainly delays relief: under a high-cardinality registration storm
 /// it leaves most cache hits on the serve pool until each key clears the gate.
 /// Capturing on the first serve maximizes serve-pool relief (PGC-277).
-pub const MEMO_CAPTURE_MIN_HITS: u64 = 1;
+pub(crate) const MEMO_CAPTURE_MIN_HITS: u64 = 1;
 
 /// A dependency slot a memoized result is invalidated against. The CDC path
 /// bumps slots; a memo stamps the slots it read and is served only while every
@@ -474,7 +474,7 @@ impl ResultMemo {
 /// bytes provably reflect exactly the stamped version — any CDC change to a read
 /// relation during the serve drops the capture rather than storing a snapshot
 /// that might predate it.
-pub struct MemoCapture {
+pub(crate) struct MemoCapture {
     key: MemoKey,
     stamped: Box<[(SlotKey, u64)]>,
     buf: BytesMut,
@@ -491,7 +491,7 @@ impl MemoCapture {
     /// Begin a capture for `key` over `relation_oids`. Returns `None` when
     /// memoization is disabled or any read relation is mid-write (odd slot) —
     /// the caller skips capturing and serves normally.
-    pub fn begin(memo: &ResultMemo, key: MemoKey, relation_oids: &[Oid]) -> Option<Self> {
+    pub(crate) fn begin(memo: &ResultMemo, key: MemoKey, relation_oids: &[Oid]) -> Option<Self> {
         if !memo.enabled() {
             return None;
         }
@@ -529,7 +529,7 @@ impl MemoCapture {
     }
 
     /// Record the leading `RowDescription` frame (must precede any data).
-    pub fn row_description_push(&mut self, data: &[u8]) {
+    pub(crate) fn row_description_push(&mut self, data: &[u8]) {
         self.append(data);
         if !self.aborted {
             self.rd_len = self.buf.len();
@@ -537,18 +537,18 @@ impl MemoCapture {
     }
 
     /// Record a `DataRow` (or batched data) frame.
-    pub fn data_push(&mut self, data: &[u8]) {
+    pub(crate) fn data_push(&mut self, data: &[u8]) {
         self.append(data);
     }
 
     /// Record the trailing `CommandComplete` frame.
-    pub fn command_complete_push(&mut self, data: &[u8]) {
+    pub(crate) fn command_complete_push(&mut self, data: &[u8]) {
         self.append(data);
     }
 
     /// Finalize: insert the captured snapshot iff it wasn't aborted and no read
     /// relation changed since `begin`. Returns whether an entry was stored.
-    pub fn finish(self, memo: &ResultMemo) -> bool {
+    pub(crate) fn finish(self, memo: &ResultMemo) -> bool {
         if self.aborted || !memo.slots_valid(&self.stamped) {
             return false;
         }

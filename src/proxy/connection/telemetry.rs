@@ -7,22 +7,22 @@ use crate::{
 
 /// Timing instrumentation for the current query in flight.
 /// Tracks timestamps for metrics recording across the origin and cache paths.
-pub(in crate::proxy::connection) struct QueryTelemetry {
+pub(super) struct QueryTelemetry {
     /// When the client message arrived — measures end-to-end latency for both
     /// cache hits (CACHE_QUERY_LATENCY) and origin queries (ORIGIN_QUERY_LATENCY)
-    pub(in crate::proxy::connection) client_received_at: Option<Instant>,
+    pub(super) client_received_at: Option<Instant>,
 
     /// When the query was forwarded to origin — measures origin-only execution
     /// time (ORIGIN_EXECUTION), excluding parse and cacheability-check overhead
-    pub(in crate::proxy::connection) origin_sent_at: Option<Instant>,
+    pub(super) origin_sent_at: Option<Instant>,
 
     /// Per-stage timing breakdown that travels with the query through the cache
     /// pipeline (dispatch → worker) and back, only set for cache-path queries
-    pub(in crate::proxy::connection) cache_timing: Option<QueryTiming>,
+    pub(super) cache_timing: Option<QueryTiming>,
 }
 
 impl QueryTelemetry {
-    pub(in crate::proxy::connection) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             client_received_at: None,
             origin_sent_at: None,
@@ -31,14 +31,14 @@ impl QueryTelemetry {
     }
 
     /// Record that a client message was received.
-    pub(in crate::proxy::connection) fn query_receive(&mut self) {
+    pub(super) fn query_receive(&mut self) {
         self.client_received_at = Some(Instant::now());
     }
 
     /// Record that the query was forwarded to origin. Pass the QueryTiming
     /// returned by the cache thread to also stamp `forwarded_at` and retain
     /// it for per-stage histogram emission on completion.
-    pub(in crate::proxy::connection) fn origin_forward(&mut self, timing: Option<QueryTiming>) {
+    pub(super) fn origin_forward(&mut self, timing: Option<QueryTiming>) {
         let now = Instant::now();
         self.origin_sent_at = Some(now);
         if let Some(mut t) = timing {
@@ -48,7 +48,7 @@ impl QueryTelemetry {
     }
 
     /// Create cache timing for a cacheable query.
-    pub(in crate::proxy::connection) fn cache_timing_start(&mut self, fingerprint: Fingerprint) {
+    pub(super) fn cache_timing_start(&mut self, fingerprint: Fingerprint) {
         let query_id = QueryId::new(fingerprint.get());
         let received_at = self.client_received_at.unwrap_or_else(Instant::now);
         let mut timing = QueryTiming::new(query_id, received_at);
@@ -60,7 +60,7 @@ impl QueryTelemetry {
     /// ORIGIN_QUERY_LATENCY_SECONDS, and — when forward-path timing was
     /// threaded back from the cache thread — records the per-stage breakdown
     /// via `timing_record`.
-    pub(in crate::proxy::connection) fn origin_complete(&mut self) {
+    pub(super) fn origin_complete(&mut self) {
         let now = Instant::now();
         let m = crate::metrics::handles();
         if let Some(start) = self.origin_sent_at.take() {
@@ -84,10 +84,7 @@ impl QueryTelemetry {
 
     /// Record cache query completion. Records CACHE_QUERY_LATENCY_SECONDS
     /// and per-stage timing breakdown.
-    pub(in crate::proxy::connection) fn cache_complete(
-        &mut self,
-        reply_timing: Option<QueryTiming>,
-    ) {
+    pub(super) fn cache_complete(&mut self, reply_timing: Option<QueryTiming>) {
         if let Some(start) = self.client_received_at.take() {
             crate::metrics::handles()
                 .query
@@ -101,7 +98,7 @@ impl QueryTelemetry {
 
     /// Take the cache timing for dispatch to the cache pipeline.
     /// Sets dispatched_at before returning.
-    pub(in crate::proxy::connection) fn cache_timing_dispatch(&mut self) -> QueryTiming {
+    pub(super) fn cache_timing_dispatch(&mut self) -> QueryTiming {
         let mut t = self
             .cache_timing
             .take()

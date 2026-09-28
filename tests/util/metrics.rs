@@ -10,7 +10,7 @@ use super::context::TestContext;
 /// Point-in-time snapshot of metrics for test assertions.
 /// Populated by parsing metrics from the Prometheus HTTP endpoint.
 #[derive(Debug, Clone)]
-pub struct MetricsSnapshot {
+pub(crate) struct MetricsSnapshot {
     pub queries_total: u64,
     pub queries_cacheable: u64,
     pub queries_uncacheable: u64,
@@ -71,7 +71,7 @@ pub struct MetricsSnapshot {
 }
 
 /// Fetch metrics via HTTP from the Prometheus endpoint.
-pub async fn metrics_http_get(port: u16) -> Result<MetricsSnapshot, Error> {
+pub(crate) async fn metrics_http_get(port: u16) -> Result<MetricsSnapshot, Error> {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
         .await
         .map_err(Error::other)?;
@@ -297,7 +297,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
 
 /// Calculate metrics delta between two snapshots.
 /// Useful for asserting metrics within a consolidated test where metrics accumulate.
-pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> MetricsSnapshot {
+pub(crate) fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> MetricsSnapshot {
     MetricsSnapshot {
         queries_total: after.queries_total - before.queries_total,
         queries_cacheable: after.queries_cacheable - before.queries_cacheable,
@@ -370,7 +370,7 @@ pub fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> Metri
 }
 
 /// Assert the last cacheable query was a cache miss. Returns updated snapshot.
-pub async fn assert_cache_miss(
+pub(crate) async fn assert_cache_miss(
     ctx: &mut TestContext,
     before: MetricsSnapshot,
 ) -> Result<MetricsSnapshot, Error> {
@@ -382,7 +382,7 @@ pub async fn assert_cache_miss(
 }
 
 /// Assert the last cacheable query was a cache hit. Returns updated snapshot.
-pub async fn assert_cache_hit(
+pub(crate) async fn assert_cache_hit(
     ctx: &mut TestContext,
     before: MetricsSnapshot,
 ) -> Result<MetricsSnapshot, Error> {
@@ -395,7 +395,7 @@ pub async fn assert_cache_hit(
 
 /// Assert that the last query was subsumed (cache hit via subsumption).
 /// Returns updated metrics snapshot for chaining.
-pub async fn assert_subsume_hit(
+pub(crate) async fn assert_subsume_hit(
     ctx: &mut TestContext,
     before: MetricsSnapshot,
 ) -> Result<MetricsSnapshot, Error> {
@@ -412,7 +412,7 @@ pub async fn assert_subsume_hit(
 
 /// Assert that the last query was NOT subsumed.
 /// Returns updated metrics snapshot for chaining.
-pub async fn assert_not_subsumed(
+pub(crate) async fn assert_not_subsumed(
     ctx: &mut TestContext,
     before: MetricsSnapshot,
 ) -> Result<MetricsSnapshot, Error> {

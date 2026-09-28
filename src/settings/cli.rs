@@ -20,7 +20,7 @@ use crate::result::MapIntoReport;
 
 /// Parse an allowlist entry string into (optional schema, table name).
 /// Supports "table" and "schema.table" forms.
-pub fn allowlist_entry_parse(entry: &str) -> AllowlistEntry {
+pub(super) fn allowlist_entry_parse(entry: &str) -> AllowlistEntry {
     let entry = entry.trim();
     match entry.rsplit_once('.') {
         Some((schema, table)) => (Some(schema.to_lowercase()), table.to_lowercase()),
@@ -29,7 +29,7 @@ pub fn allowlist_entry_parse(entry: &str) -> AllowlistEntry {
 }
 
 /// Parse config strings into a ready-to-match allowlist.
-pub fn allowlist_parse(tables: &Option<Vec<String>>) -> Allowlist {
+pub(super) fn allowlist_parse(tables: &Option<Vec<String>>) -> Allowlist {
     tables
         .as_ref()
         .filter(|v| !v.is_empty())
@@ -57,7 +57,7 @@ impl PgSettingsPartial {
 /// 1. Origin defaults (base)
 /// 2. TOML `[replication]` partial (if present)
 /// 3. CLI `--replication_*` overrides (if present)
-pub fn replication_settings_resolve(
+pub(super) fn replication_settings_resolve(
     origin: &PgSettings,
     toml_replication: Option<PgSettingsPartial>,
     cli_overrides: PgSettingsPartial,

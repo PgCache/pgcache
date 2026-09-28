@@ -47,7 +47,7 @@ use crate::settings::Settings;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
 /// Work item for population worker pool.
-pub struct PopulationWork {
+pub(crate) struct PopulationWork {
     pub fingerprint: Fingerprint,
     pub generation: u64,
     pub table_metadata: Vec<TableMetadata>,
@@ -128,7 +128,7 @@ pub(super) struct WriterRegistration {
 }
 
 impl WriterRegistration {
-    pub async fn new(
+    pub(super) async fn new(
         settings: &Settings,
         db_origin: &Rc<Client>,
         query_tx: UnboundedSender<QueryCommand>,
@@ -187,7 +187,7 @@ impl WriterRegistration {
     /// target (PGC-437). Called from the writer's 1s gauge tick; scale-down is
     /// claimed by surplus workers themselves between work items, so only
     /// scale-up needs action here.
-    pub fn population_pool_reconcile(&self) {
+    pub(super) fn population_pool_reconcile(&self) {
         let pool = &self.spawn_ctx.pool;
         if pool.spawn_failure_take() {
             self.spawn_cooldown_until
@@ -232,7 +232,7 @@ impl WriterRegistration {
     }
 
     /// Handle a query command, dispatching to the appropriate method.
-    pub async fn query_command_handle(
+    pub(super) async fn query_command_handle(
         &mut self,
         core: &mut WriterCore,
         cmd: QueryCommand,
@@ -703,7 +703,7 @@ impl WriterRegistration {
     #[instrument(skip_all)]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     #[allow(clippy::too_many_arguments)]
-    pub async fn query_register(
+    pub(super) async fn query_register(
         &mut self,
         core: &mut WriterCore,
         fingerprint: Fingerprint,
@@ -909,7 +909,7 @@ impl WriterRegistration {
 
     /// Mark a query as ready after successful population.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub fn query_ready_mark(
+    pub(super) fn query_ready_mark(
         &self,
         core: &mut WriterCore,
         fingerprint: Fingerprint,
@@ -1197,7 +1197,7 @@ impl WriterRegistration {
     /// rejected the query). Without this, a failed Register would leave
     /// `state_view` stuck in `Loading` and every subsequent client request for
     /// that fingerprint would coalesce into `waiting` and hang.
-    pub fn query_failed_cleanup(&self, core: &mut WriterCore, fingerprint: Fingerprint) {
+    pub(super) fn query_failed_cleanup(&self, core: &mut WriterCore, fingerprint: Fingerprint) {
         trace!("query_failed_cleanup {fingerprint}");
 
         // Deleted-key tracking is released per `(fingerprint, generation)` by the
@@ -1231,7 +1231,7 @@ impl WriterRegistration {
     /// Bumps the generation number, updates max_limit, and re-populates.
     /// During re-population the query state goes to Loading.
     #[instrument(skip_all)]
-    pub async fn limit_bump_handle(
+    pub(super) async fn limit_bump_handle(
         &mut self,
         core: &mut WriterCore,
         fingerprint: Fingerprint,

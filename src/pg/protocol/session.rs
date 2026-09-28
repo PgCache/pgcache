@@ -16,7 +16,7 @@ use crate::query::write::StatementEffects;
 
 /// Classification of a prepared statement based on SQL analysis
 #[derive(Debug, Clone)]
-pub enum StatementType {
+pub(crate) enum StatementType {
     /// SELECT statement that can be cached
     Cacheable(Arc<CacheableQuery>),
     /// Non-SELECT statement (INSERT, UPDATE, DELETE, DDL, etc.)
@@ -29,7 +29,7 @@ pub enum StatementType {
 
 /// Prepared statement stored in connection state
 #[derive(Debug, Clone)]
-pub struct PreparedStatement {
+pub(crate) struct PreparedStatement {
     pub name: EcoString,
     /// `ByteString`: a refcounted view into the Parse frame, so storing and
     /// cloning the SQL (e.g. into the describe-cache key) never copies it.
@@ -96,7 +96,7 @@ impl ResultFormats {
 
 /// Portal (bound prepared statement) stored in connection state
 #[derive(Debug, Clone)]
-pub struct Portal {
+pub(crate) struct Portal {
     pub name: EcoString,
     pub statement_name: EcoString,
     pub parameter_values: Vec<Option<Bytes>>,
@@ -107,7 +107,7 @@ pub struct Portal {
 impl Portal {
     /// Check if any parameter uses binary format (format code 1).
     /// Returns true if binary format is detected, false otherwise.
-    pub fn has_binary_parameters(&self) -> bool {
+    pub(crate) fn has_binary_parameters(&self) -> bool {
         self.parameter_formats.contains(&1)
     }
 }

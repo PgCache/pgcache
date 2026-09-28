@@ -16,13 +16,13 @@ use crate::{
 // ============================================================================
 
 /// Origin database connection stream, either plain TCP or TLS-encrypted.
-pub type OriginStream = TlsStream<rustls::ClientConnection>;
+pub(super) type OriginStream = TlsStream<rustls::ClientConnection>;
 
 /// Borrowed read half of an OriginStream.
-pub type OriginReadHalf<'a> = TlsReadHalf<'a, rustls::ClientConnection>;
+pub(super) type OriginReadHalf<'a> = TlsReadHalf<'a, rustls::ClientConnection>;
 
 /// Borrowed write half of an OriginStream.
-pub type OriginWriteHalf<'a> = TlsWriteHalf<'a, rustls::ClientConnection>;
+pub(super) type OriginWriteHalf<'a> = TlsWriteHalf<'a, rustls::ClientConnection>;
 
 /// Create an OriginStream from a tokio-rustls TlsStream.
 ///

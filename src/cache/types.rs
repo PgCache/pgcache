@@ -26,9 +26,9 @@ use crate::{
 
 /// Shared resolved query expression, wrapped in Arc to avoid deep cloning
 /// on every cache hit (the dispatch→serve path).
-pub type SharedResolved = Arc<ResolvedQueryExpr>;
+pub(super) type SharedResolved = Arc<ResolvedQueryExpr>;
 
-pub use super::serve_decision::CachedQueryState;
+pub(super) use super::serve_decision::CachedQueryState;
 
 /// A cached query with its metadata and state
 #[derive(Debug)]
@@ -141,7 +141,7 @@ impl Cache {
 
 /// Shared set of relation OIDs that have active cached queries.
 /// Written by the writer thread, read by the CDC processor.
-pub type ActiveRelations = Arc<ArcSwap<HashSet<Oid>>>;
+pub(super) type ActiveRelations = Arc<ArcSwap<HashSet<Oid>>>;
 
 /// Per-query operational metrics.
 ///
@@ -249,13 +249,13 @@ pub struct CacheStateView {
     pub recycle_count: Arc<AtomicUsize>,
     /// BBR-lite adaptive registration gate (PGC-277): writer-published drain +
     /// backlog signals and the controller's paced admit rate.
-    pub reg_gate: Arc<RegGate>,
+    pub(super) reg_gate: Arc<RegGate>,
     /// Elastic population worker pool (PGC-437): worker-published demand and
     /// service-time counters, and the controller's worker-count target.
     pub population_pool: Arc<PopulationPool>,
     /// Elastic cache serve pool (ADR-053): serve-loop-published demand and
     /// service-time counters, and the controller's connection-count target.
-    pub serve_pool: Arc<ServePool>,
+    pub(super) serve_pool: Arc<ServePool>,
     /// Settled watermark (raw `Lsn`) published by the writer so
     /// per-connection read-after-write logs can clear their pending writes once
     /// it passes each write's commit-LSN bound (PGC-124): every origin

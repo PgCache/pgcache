@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 
 /// One backend message: its tag byte and body (excluding the length field).
 #[derive(Debug, Clone)]
-pub struct WireMessage {
+pub(crate) struct WireMessage {
     pub tag: u8,
     pub body: Vec<u8>,
 }
@@ -17,25 +17,25 @@ pub struct WireMessage {
 /// The responses to one simple query: every message up to and including its
 /// `ReadyForQuery`.
 #[derive(Debug, Clone)]
-pub struct WireResponse {
+pub(crate) struct WireResponse {
     pub messages: Vec<WireMessage>,
 }
 
 impl WireResponse {
     /// The transaction status byte of the terminating `ReadyForQuery`.
-    pub fn ready_status(&self) -> u8 {
+    pub(crate) fn ready_status(&self) -> u8 {
         self.messages
             .last()
             .and_then(|m| m.body.first().copied())
             .unwrap_or(0)
     }
 
-    pub fn data_row_count(&self) -> usize {
+    pub(crate) fn data_row_count(&self) -> usize {
         self.messages.iter().filter(|m| m.tag == b'D').count()
     }
 
     /// The SQLSTATE of the first `ErrorResponse`, if any.
-    pub fn error_sqlstate(&self) -> Option<String> {
+    pub(crate) fn error_sqlstate(&self) -> Option<String> {
         let err = self.messages.iter().find(|m| m.tag == b'E')?;
         err.body
             .split(|b| *b == 0)
@@ -45,14 +45,14 @@ impl WireResponse {
     }
 }
 
-pub struct WireClient {
+pub(crate) struct WireClient {
     stream: TcpStream,
 }
 
 impl WireClient {
     /// Connect to the proxy on `port` as `postgres` / `origin_test` (trust
     /// auth) and consume the startup exchange through the first `ReadyForQuery`.
-    pub async fn connect(port: u16) -> Result<Self, Error> {
+    pub(crate) async fn connect(port: u16) -> Result<Self, Error> {
         let stream = TcpStream::connect(("127.0.0.1", port)).await?;
         let mut client = Self { stream };
         let mut body = Vec::new();
@@ -78,7 +78,7 @@ impl WireClient {
     }
 
     /// Send one simple `Query` message without waiting for its response.
-    pub async fn query_send(&mut self, sql: &str) -> Result<(), Error> {
+    pub(crate) async fn query_send(&mut self, sql: &str) -> Result<(), Error> {
         let len = u32::try_from(sql.len() + 5).map_err(Error::other)?;
         self.stream.write_all(b"Q").await?;
         self.stream.write_all(&len.to_be_bytes()).await?;
@@ -88,7 +88,7 @@ impl WireClient {
     }
 
     /// Read messages through the next `ReadyForQuery`.
-    pub async fn response_read(&mut self) -> Result<WireResponse, Error> {
+    pub(crate) async fn response_read(&mut self) -> Result<WireResponse, Error> {
         let mut messages = Vec::new();
         loop {
             let mut header = [0u8; 5];
@@ -105,7 +105,7 @@ impl WireClient {
     }
 
     /// Send one simple query and read its full response.
-    pub async fn query(&mut self, sql: &str) -> Result<WireResponse, Error> {
+    pub(crate) async fn query(&mut self, sql: &str) -> Result<WireResponse, Error> {
         self.query_send(sql).await?;
         self.response_read().await
     }

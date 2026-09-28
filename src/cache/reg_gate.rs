@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 ///   backlog window via `queue_observe`.
 /// - Controller writes: `reg_rate`.
 /// - Dispatch token bucket reads: `reg_rate`.
-pub struct RegGate {
+pub(super) struct RegGate {
     /// Admit rate (registrations/sec) the token bucket refills at — f64 in an
     /// AtomicU64. `INFINITY` means "no gate yet" (admit all); the controller
     /// replaces it with a finite paced rate once it has signal.
@@ -42,7 +42,7 @@ pub struct RegGate {
 }
 
 impl RegGate {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             reg_rate_bits: AtomicU64::new(f64::INFINITY.to_bits()),
             completed: AtomicU64::new(0),
@@ -54,34 +54,34 @@ impl RegGate {
     }
 
     /// Current admit rate (registrations/sec). `INFINITY` ⇒ ungated.
-    pub fn rate(&self) -> f64 {
+    pub(super) fn rate(&self) -> f64 {
         f64::from_bits(self.reg_rate_bits.load(Ordering::Relaxed))
     }
 
     /// Controller: set the paced admit rate.
-    pub fn rate_set(&self, rate: f64) {
+    pub(super) fn rate_set(&self, rate: f64) {
         self.reg_rate_bits.store(rate.to_bits(), Ordering::Relaxed);
     }
 
     /// Writer: a registration reached Ready (one unit of drained work).
-    pub fn completed_inc(&self) {
+    pub(super) fn completed_inc(&self) {
         self.completed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Controller: monotonic completed count, for the drain-rate delta.
-    pub fn completed_count(&self) -> u64 {
+    pub(super) fn completed_count(&self) -> u64 {
         self.completed.load(Ordering::Relaxed)
     }
 
     /// Writer: fold the current backlog depth into this window's min/max.
-    pub fn queue_observe(&self, depth: usize) {
+    pub(super) fn queue_observe(&self, depth: usize) {
         self.queue_min.fetch_min(depth, Ordering::Relaxed);
         self.queue_max.fetch_max(depth, Ordering::Relaxed);
     }
 
     /// Controller: read and reset the backlog window. Returns `(min, max)`;
     /// `min` is `0` when the window saw an empty backlog (or saw no samples).
-    pub fn window_take(&self) -> (usize, usize) {
+    pub(super) fn window_take(&self) -> (usize, usize) {
         let max = self.queue_max.swap(0, Ordering::Relaxed);
         let min = self.queue_min.swap(usize::MAX, Ordering::Relaxed);
         (if min == usize::MAX { 0 } else { min }, max)
@@ -89,22 +89,22 @@ impl RegGate {
 
     /// Writer gauge tick: publish the authoritative `Loading` count (population
     /// in-flight) from the state scan.
-    pub fn loading_set(&self, count: usize) {
+    pub(super) fn loading_set(&self, count: usize) {
         self.loading.store(count, Ordering::Relaxed);
     }
 
     /// Controller: current population in-flight (queries still populating).
-    pub fn loading_get(&self) -> usize {
+    pub(super) fn loading_get(&self) -> usize {
         self.loading.load(Ordering::Relaxed)
     }
 
     /// Dispatch: the token bucket denied a registration (shed to origin).
-    pub fn denied_inc(&self) {
+    pub(super) fn denied_inc(&self) {
         self.denied.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Controller: monotonic denied count, for the per-window shed delta.
-    pub fn denied_count(&self) -> u64 {
+    pub(super) fn denied_count(&self) -> u64 {
         self.denied.load(Ordering::Relaxed)
     }
 }

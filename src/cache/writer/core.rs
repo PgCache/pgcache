@@ -113,7 +113,7 @@ const CANDIDATE_SCRATCH_MAX: usize = 8;
 /// `WriterCdc` and `WriterRegistration` borrow `&mut WriterCore` per command;
 /// the single-owner `writer_run` select loop serializes mutations (no
 /// locking), preserving the no-race-between-registration-and-purging invariant.
-pub struct WriterCore {
+pub(super) struct WriterCore {
     pub(super) cache: Cache,
     pub(super) db_cache: Client,
     pub(super) db_origin: Rc<Client>,
@@ -360,7 +360,7 @@ async fn data_directory_query(client: &Client) -> Option<PathBuf> {
 /// managers (`WriterCdc`, `WriterRegistration`) and serializes their access
 /// to the core through one select loop.
 #[allow(clippy::too_many_arguments)]
-pub fn writer_run(
+pub(crate) fn writer_run(
     settings: &Settings,
     mut query_rx: UnboundedReceiver<QueryCommand>,
     mut cdc_rx: UnboundedReceiver<CdcCommand>,
@@ -651,7 +651,7 @@ pub fn writer_run(
 
 impl WriterCore {
     #[allow(clippy::too_many_arguments)]
-    pub async fn new(
+    pub(super) async fn new(
         settings: &Settings,
         state_view: Arc<CacheStateView>,
         active_relations: ActiveRelations,

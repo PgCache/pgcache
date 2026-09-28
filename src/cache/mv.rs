@@ -125,18 +125,18 @@ impl MvState {
 
 /// A `Fresh` MV dirtied before living this long counts as a wasted build:
 /// its build cost was never amortized (PGC-364 discard-backoff).
-pub const MV_PAYOFF_WINDOW: Duration = Duration::from_secs(5);
+pub(crate) const MV_PAYOFF_WINDOW: Duration = Duration::from_secs(5);
 /// First backoff interval, doubling per additional consecutive wasted build.
-pub const MV_BACKOFF_BASE: Duration = Duration::from_secs(1);
+pub(crate) const MV_BACKOFF_BASE: Duration = Duration::from_secs(1);
 /// Backoff ceiling — a permanently thrashing MV still probes this often, so
 /// the worst-case aggregate rebuild rate is N-thrashers / cap.
-pub const MV_BACKOFF_CAP: Duration = Duration::from_secs(300);
+pub(crate) const MV_BACKOFF_CAP: Duration = Duration::from_secs(300);
 
 /// Rebuild cooldown after `wasted` consecutive no-payoff builds: `None` below
 /// the engagement threshold (one wasted build is normal — any write to a
 /// cached table causes one), then exponential from [`MV_BACKOFF_BASE`] capped
 /// at [`MV_BACKOFF_CAP`].
-pub fn backoff_duration(wasted: u32) -> Option<Duration> {
+pub(crate) fn backoff_duration(wasted: u32) -> Option<Duration> {
     if wasted < 2 {
         return None;
     }
@@ -219,13 +219,13 @@ impl MvMeta {
     }
 
     /// Stamp the `→ Fresh` flip so the next dirty can judge the build's payoff.
-    pub(in crate::cache) fn fresh_mark(&mut self, now: Instant) {
+    pub(super) fn fresh_mark(&mut self, now: Instant) {
         self.fresh_at = Some(now);
     }
 
     /// Record a no-payoff build (discarded, failed, or short-lived `Fresh`) and
     /// arm the rebuild cooldown once past the engagement threshold.
-    pub(in crate::cache) fn waste_record(&mut self, now: Instant) {
+    pub(super) fn waste_record(&mut self, now: Instant) {
         self.wasted_builds = self.wasted_builds.saturating_add(1);
         self.retry_after = backoff_duration(self.wasted_builds).map(|d| now + d);
     }
@@ -237,7 +237,7 @@ impl MvMeta {
     /// `Building → BuildingDirty` flip records nothing here — that build's
     /// waste is counted once, at completion discard. No-op for non-dirtiable
     /// states.
-    pub(in crate::cache) fn dirty_apply(&mut self, now: Instant) {
+    pub(super) fn dirty_apply(&mut self, now: Instant) {
         let Some(next) = self.state.dirtied() else {
             return;
         };
@@ -258,7 +258,7 @@ impl MvMeta {
     /// dirtiable-MV index consistent (PGC-338); call this directly only for the
     /// non-dirtiable dispatch-side transition (`mv_schedule`), which the index
     /// never tracks.
-    pub(in crate::cache) fn state_set(&mut self, state: MvState) {
+    pub(super) fn state_set(&mut self, state: MvState) {
         self.state = state;
     }
 }
@@ -516,7 +516,7 @@ fn select_has_join(select: &ResolvedSelectNode) -> bool {
 
 /// Top-level body is a SELECT with a join. Only joins get an MV LIMIT
 /// cap; other reducers collapse the input regardless.
-pub fn resolved_has_join(resolved: &ResolvedQueryExpr) -> bool {
+pub(crate) fn resolved_has_join(resolved: &ResolvedQueryExpr) -> bool {
     match &resolved.body {
         ResolvedQueryBody::Select(s) => select_has_join(s),
         ResolvedQueryBody::SetOp(_) | ResolvedQueryBody::Values(_) => false,
@@ -526,7 +526,7 @@ pub fn resolved_has_join(resolved: &ResolvedQueryExpr) -> bool {
 /// Top-level SELECT projects a window function. A window MV must store the whole
 /// result (the window depends on the full partition), so it's excluded from the
 /// join top-N `mv_limit` cap even when it also contains a join.
-pub fn resolved_has_window(resolved: &ResolvedQueryExpr) -> bool {
+pub(crate) fn resolved_has_window(resolved: &ResolvedQueryExpr) -> bool {
     match &resolved.body {
         ResolvedQueryBody::Select(s) => columns_any(&s.columns, &scalar_expr_has_window),
         ResolvedQueryBody::SetOp(_) | ResolvedQueryBody::Values(_) => false,

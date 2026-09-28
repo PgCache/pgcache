@@ -72,7 +72,7 @@ pub struct ColumnChange {
 
 /// Column → change info for one CDC UPDATE row, from `query_row_changes` or
 /// the batched segment eval.
-pub type RowChanges = HashMap<EcoString, ColumnChange>;
+pub(super) type RowChanges = HashMap<EcoString, ColumnChange>;
 
 /// Whether an update query was derived from a direct table or a subquery table
 #[derive(Debug, Clone, Copy, PartialEq)]

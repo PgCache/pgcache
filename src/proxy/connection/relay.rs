@@ -109,7 +109,7 @@ impl Drop for ActiveConnectionGuard {
 ///
 /// Free function (not a method) to allow disjoint field borrows from the
 /// event-loop call sites that work with `state.*` after partial moves.
-pub(in crate::proxy::connection) fn forward_lazy_parse_install(
+pub(super) fn forward_lazy_parse_install(
     stmt_name: &str,
     prepared_statements: &HashMap<EcoString, PreparedStatement>,
     origin_write_buf: &mut VecDeque<BytesMut>,
@@ -580,7 +580,7 @@ fn forward_reason_metric(reason: ForwardReason) {
 }
 
 impl ConnectionState {
-    pub(in crate::proxy::connection) fn new(
+    pub(super) fn new(
         func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
         origin_database: EcoString,
         cacheability_store: Arc<CacheabilityStore>,
@@ -621,10 +621,7 @@ impl ConnectionState {
     /// connection's tracked state: its write lands in the read-after-write
     /// log, its isolation effect and block boundary in the isolation tracker.
     /// The single apply point for every forward path.
-    pub(in crate::proxy::connection) fn forwarded_effects_apply(
-        &mut self,
-        effects: &StatementEffects,
-    ) {
+    pub(super) fn forwarded_effects_apply(&mut self, effects: &StatementEffects) {
         if let Some(class) = &effects.write {
             self.write_log.record(class);
         }
@@ -651,11 +648,7 @@ impl ConnectionState {
     /// Push a Sync-terminated batch to origin, recording the forward in
     /// telemetry and reserving an ordered client-response slot so locally
     /// produced responses (synth, cache) can't jump ahead of this one.
-    pub(in crate::proxy::connection) fn origin_dispatch(
-        &mut self,
-        bytes: BytesMut,
-        timing: Option<QueryTiming>,
-    ) {
+    pub(super) fn origin_dispatch(&mut self, bytes: BytesMut, timing: Option<QueryTiming>) {
         self.telemetry.origin_forward(timing);
         self.egress.origin_open();
         self.origin_write_buf.push_back(bytes);
@@ -664,10 +657,7 @@ impl ConnectionState {
     /// Handle a message from the client (frontend).
     /// Determines whether to forward to origin, check cache, or take other action.
     #[expect(clippy::wildcard_enum_match_arm)]
-    pub(in crate::proxy::connection) async fn handle_client_message(
-        &mut self,
-        mut msg: PgFrontendMessage,
-    ) {
+    pub(super) async fn handle_client_message(&mut self, mut msg: PgFrontendMessage) {
         trace!("net: client→proxy {:?}", msg.message_type);
 
         // A prior Flush forwarded a Describe sub-request whose response carries
@@ -818,10 +808,7 @@ impl ConnectionState {
     /// Handle a message from the origin database (backend).
     /// Updates transaction state, captures parameter OIDs, and forwards to client.
     #[expect(clippy::wildcard_enum_match_arm)]
-    pub(in crate::proxy::connection) fn handle_origin_message(
-        &mut self,
-        mut msg: PgBackendMessage,
-    ) {
+    pub(super) fn handle_origin_message(&mut self, mut msg: PgBackendMessage) {
         trace!("net: origin→proxy {:?}", msg.message_type);
 
         if self.origin_intercept_handle(&msg) {
@@ -1015,7 +1002,7 @@ impl ConnectionState {
     /// Handle the outcome of a cache reply (the leased socket has already been
     /// recovered by `cache_serve_wait`). If the cache indicates error or needs
     /// forwarding, send the query to origin instead.
-    pub(in crate::proxy::connection) fn handle_cache_outcome(&mut self, outcome: CacheOutcome) {
+    pub(super) fn handle_cache_outcome(&mut self, outcome: CacheOutcome) {
         trace!(
             "net: cache→proxy reply={}",
             match &outcome {
@@ -1077,10 +1064,7 @@ impl ConnectionState {
     /// bytes followed by the rest of the batch and a single trailing Sync, and
     /// return to `Read`. Shared by every cache→origin fallback (miss/error,
     /// search_path-unknown, cache-unavailable).
-    pub(in crate::proxy::connection) fn forward_current_and_rest(
-        &mut self,
-        current_bytes: BytesMut,
-    ) {
+    pub(super) fn forward_current_and_rest(&mut self, current_bytes: BytesMut) {
         self.egress.cache_to_origin();
         if let Some(stmt_name) = self.extended.pending_lazy_parse.take() {
             forward_lazy_parse_install(
@@ -1097,11 +1081,7 @@ impl ConnectionState {
 
     /// Forward a cache miss/error to origin: the worker returns the missed
     /// entry's bytes, which we forward along with the rest of the batch.
-    pub(in crate::proxy::connection) fn cache_reply_forward(
-        &mut self,
-        buf: BytesMut,
-        timing: Option<QueryTiming>,
-    ) {
+    pub(super) fn cache_reply_forward(&mut self, buf: BytesMut, timing: Option<QueryTiming>) {
         self.telemetry.origin_forward(timing);
         self.forward_current_and_rest(buf);
     }
@@ -1109,7 +1089,7 @@ impl ConnectionState {
     /// Fall back to forwarding a cacheable query to origin after it was taken
     /// from its egress slot (search_path unknown or client-socket creation
     /// failed): forward the pipeline/raw bytes plus the rest of the batch.
-    pub(in crate::proxy::connection) fn cache_slot_forward_to_origin(&mut self, msg: CacheMessage) {
+    pub(super) fn cache_slot_forward_to_origin(&mut self, msg: CacheMessage) {
         let bytes = self
             .extended
             .pipeline_take()
@@ -1122,18 +1102,18 @@ impl ConnectionState {
     /// against the state current when the slot reaches the head (PGC-387).
     /// A degraded proxy still queues (the dispatch-unavailable fallback
     /// forwards per query and the connection recovers with the cache).
-    pub(in crate::proxy::connection) fn cache_dispatch_possible(&self) -> bool {
+    pub(super) fn cache_dispatch_possible(&self) -> bool {
         self.transaction_status != TransactionStatus::Failed && !self.cache_disabled
     }
 
     /// Whether origin is inside a transaction block (open or failed).
-    pub(in crate::proxy::connection) fn in_transaction(&self) -> bool {
+    pub(super) fn in_transaction(&self) -> bool {
         self.transaction_status != TransactionStatus::Idle
     }
 
     /// Dispatch the result of an origin-read poll: handle the message, or map a
     /// decode error / EOF to a connection error. Shared by the select loops.
-    pub(in crate::proxy::connection) fn origin_read_dispatch(
+    pub(super) fn origin_read_dispatch(
         &mut self,
         res: Option<Result<PgBackendMessage, ProtocolError>>,
     ) -> ConnectionResult<()> {
@@ -1163,7 +1143,7 @@ impl ConnectionState {
         clippy::indexing_slicing,
         reason = "VecDeque access guarded by !is_empty() at the call site"
     )]
-    pub(in crate::proxy::connection) async fn origin_write_flush(
+    pub(super) async fn origin_write_flush(
         &mut self,
         origin_write: &mut Pin<&mut OriginWriteHalf<'_>>,
     ) -> ConnectionResult<()> {
@@ -1179,7 +1159,7 @@ impl ConnectionState {
 
     /// Write the next ready egress chunk to the client. Guard the call site with
     /// `self.egress.has_writable()`.
-    pub(in crate::proxy::connection) async fn client_egress_flush(
+    pub(super) async fn client_egress_flush(
         &mut self,
         client_write: &mut ClientSocket,
     ) -> ConnectionResult<()> {
@@ -1191,7 +1171,7 @@ impl ConnectionState {
         Ok(())
     }
 
-    pub(in crate::proxy::connection) async fn connection_select<'b>(
+    pub(super) async fn connection_select<'b>(
         &mut self,
         origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
         client_read: &mut Pin<&mut FramedRead<OwnedClientReadHalf, PgFrontendMessageCodec>>,
@@ -1248,7 +1228,7 @@ impl ConnectionState {
     /// worker, so this does **not** write the client — origin messages that
     /// arrive meanwhile buffer in the egress queue and flush once the socket is
     /// restored and we are back in `Read`.
-    pub(in crate::proxy::connection) async fn cache_serve_wait<'b>(
+    pub(super) async fn cache_serve_wait<'b>(
         &mut self,
         origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
         origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,
@@ -1302,7 +1282,7 @@ impl ConnectionState {
     /// responses. Drains origin and flushes the egress queue **without reading
     /// the client**, so no later request is processed before the queued cache
     /// query — preserving response order until the cache slot reaches the head.
-    pub(in crate::proxy::connection) async fn connection_select_drain<'b>(
+    pub(super) async fn connection_select_drain<'b>(
         &mut self,
         origin_read: &mut Pin<&mut FramedRead<OriginReadHalf<'b>, PgBackendMessageCodec>>,
         origin_write: &mut Pin<&mut OriginWriteHalf<'b>>,

@@ -4,17 +4,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Make a raw HTTP GET request and return (status_code, body).
-pub async fn http_get(port: u16, path: &str) -> Result<(u16, String), Error> {
+pub(crate) async fn http_get(port: u16, path: &str) -> Result<(u16, String), Error> {
     http_request(port, "GET", path, "").await
 }
 
 /// Make a raw HTTP PUT request with a JSON body and return (status_code, body).
-pub async fn http_put(port: u16, path: &str, json_body: &str) -> Result<(u16, String), Error> {
+pub(crate) async fn http_put(
+    port: u16,
+    path: &str,
+    json_body: &str,
+) -> Result<(u16, String), Error> {
     http_request(port, "PUT", path, json_body).await
 }
 
 /// Make a raw HTTP POST request and return (status_code, body).
-pub async fn http_post(port: u16, path: &str) -> Result<(u16, String), Error> {
+pub(crate) async fn http_post(port: u16, path: &str) -> Result<(u16, String), Error> {
     http_request(port, "POST", path, "").await
 }
 

@@ -59,7 +59,7 @@ pub enum ExplainKind {
 
 /// Handle one [`ExplainJob`]: run the EXPLAIN (when applicable), synthesize the
 /// `QUERY PLAN` response, write it to the client, and return the connection.
-pub async fn handle_explain_request(
+pub(super) async fn handle_explain_request(
     conn: CacheConnection,
     return_tx: Sender<CacheConnection>,
     replenish_tx: UnboundedSender<()>,

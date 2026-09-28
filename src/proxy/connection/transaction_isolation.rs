@@ -46,7 +46,7 @@ const DEFAULT_TRANSACTION_ISOLATION_PROBE: &str = "SHOW default_transaction_isol
 /// An isolation level as the proxy knows it — for the session default, and
 /// for the block currently open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::proxy::connection) enum IsolationState {
+pub(super) enum IsolationState {
     /// Not yet probed, or invalidated by a mutation. In-transaction reads
     /// forward while a block is in this state.
     Unknown,
@@ -55,7 +55,7 @@ pub(in crate::proxy::connection) enum IsolationState {
 
 /// Why an in-transaction cacheable read was forwarded instead of served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::proxy::connection) enum TransactionForwardReason {
+pub(super) enum TransactionForwardReason {
     /// The block is in the failed state: origin rejects every statement until
     /// it ends, and the client must see that error.
     Failed,
@@ -76,10 +76,7 @@ impl ConnectionState {
     /// A statement can only tighten what is known: an explicit READ COMMITTED
     /// is confirmed by re-probing rather than trusted (it may have failed at
     /// origin, e.g. `SET TRANSACTION` after the first query).
-    pub(in crate::proxy::connection) fn isolation_effects_apply(
-        &mut self,
-        effects: &StatementEffects,
-    ) {
+    pub(super) fn isolation_effects_apply(&mut self, effects: &StatementEffects) {
         let begins = effects.transaction == Some(TransactionBoundary::Begin);
         match effects.isolation {
             IsolationEffect::None => {}
@@ -117,9 +114,7 @@ impl ConnectionState {
     /// Whether a cacheable read may be served from cache given the current
     /// transaction state: outside a block always; inside one only when the
     /// block is healthy and started at READ COMMITTED.
-    pub(in crate::proxy::connection) fn transaction_serve_check(
-        &self,
-    ) -> Result<(), TransactionForwardReason> {
+    pub(super) fn transaction_serve_check(&self) -> Result<(), TransactionForwardReason> {
         match self.transaction_status {
             TransactionStatus::Idle => Ok(()),
             TransactionStatus::Failed => Err(TransactionForwardReason::Failed),
@@ -136,10 +131,7 @@ impl ConnectionState {
     /// session default as known now); in-block→idle drops it and, if the
     /// session default was touched inside the block, re-probes it — a `SET`
     /// inside a rolled-back block reverts, and `SET LOCAL` reverts regardless.
-    pub(in crate::proxy::connection) fn isolation_block_transition(
-        &mut self,
-        previous: TransactionStatus,
-    ) {
+    pub(super) fn isolation_block_transition(&mut self, previous: TransactionStatus) {
         let was_in_block = previous != TransactionStatus::Idle;
         if !was_in_block && self.in_transaction() {
             self.block_isolation = match self.pending_block_isolation.take() {
@@ -160,7 +152,7 @@ impl ConnectionState {
     /// Inject the next pending session-discovery probe, if any, at a
     /// client-visible ReadyForQuery: search_path first (pre-PG18 only), then
     /// the isolation default. One intercept at a time.
-    pub(in crate::proxy::connection) fn session_discovery_inject(&mut self) {
+    pub(super) fn session_discovery_inject(&mut self) {
         if !matches!(self.origin_intercept, OriginIntercept::None) {
             return;
         }
@@ -182,7 +174,7 @@ impl ConnectionState {
     /// error). Also the only probe chained onto another intercept's
     /// completion: a probe that leaves the state unknown is not retried until
     /// the next client-visible ReadyForQuery, so nothing can loop.
-    pub(in crate::proxy::connection) fn isolation_probe_inject(&mut self) {
+    pub(super) fn isolation_probe_inject(&mut self) {
         if self.session_isolation != IsolationState::Unknown
             || self.in_transaction()
             || !matches!(self.origin_intercept, OriginIntercept::None)
@@ -200,10 +192,7 @@ impl ConnectionState {
     /// Consume one origin message under the isolation probe intercept. Returns
     /// whether the intercept is complete (its ReadyForQuery arrived).
     #[expect(clippy::wildcard_enum_match_arm)]
-    pub(in crate::proxy::connection) fn default_transaction_isolation_handle(
-        &mut self,
-        msg: &PgBackendMessage,
-    ) -> bool {
+    pub(super) fn default_transaction_isolation_handle(&mut self, msg: &PgBackendMessage) -> bool {
         match msg.message_type {
             PgBackendMessageType::DataRows => {
                 // Unreadable output stays Unknown (forward) rather than re-probe

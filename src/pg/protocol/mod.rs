@@ -40,7 +40,7 @@ error_set! {
 }
 
 /// Result type with location-tracking error reports for protocol operations.
-pub type ProtocolResult<T> = Result<T, Report<ProtocolError>>;
+pub(crate) type ProtocolResult<T> = Result<T, Report<ProtocolError>>;
 
 /// Immutable UTF-8 string backed by a refcounted `Bytes` slice, typically a
 /// view into a wire frame. Cloning is a refcount bump, not a deep copy.
@@ -139,10 +139,10 @@ pub(crate) enum PgConnectionState {
     // AwaitingSync,
 }
 
-pub trait PgMessageType {}
+pub(crate) trait PgMessageType {}
 
 #[derive(Debug)]
-pub struct PgMessage<T: PgMessageType> {
+pub(crate) struct PgMessage<T: PgMessageType> {
     pub message_type: T,
     pub data: BytesMut,
 }

@@ -134,7 +134,7 @@ mod imp {
 
 #[cfg(all(not(target_os = "linux"), target_os = "macos"))]
 mod imp {
-    pub fn process_rss_bytes() -> Option<u64> {
+    pub(super) fn process_rss_bytes() -> Option<u64> {
         None
     }
 
@@ -144,7 +144,7 @@ mod imp {
     /// (which needs `system_used_bytes`) remains disabled on the dev box. Shells
     /// out rather than add a `libc` FFI dep — this prototype path is queried once
     /// at startup.
-    pub fn total_budget_bytes() -> Option<u64> {
+    pub(super) fn total_budget_bytes() -> Option<u64> {
         let out = std::process::Command::new("sysctl")
             .args(["-n", "hw.memsize"])
             .output()
@@ -153,10 +153,10 @@ mod imp {
         (size > 0).then_some(size)
     }
 
-    pub fn system_used_bytes() -> Option<u64> {
+    pub(super) fn system_used_bytes() -> Option<u64> {
         None
     }
-    pub fn system_private_bytes() -> Option<u64> {
+    pub(super) fn system_private_bytes() -> Option<u64> {
         None
     }
 }

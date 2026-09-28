@@ -36,7 +36,7 @@ pub(super) struct CgroupMemory {
 impl CgroupMemory {
     /// Usage minus reclaimable page cache — the figure the throttle should
     /// compare against the limit (Kubernetes "working set" convention).
-    pub fn working_set(&self) -> u64 {
+    pub(super) fn working_set(&self) -> u64 {
         self.current.saturating_sub(self.inactive_file)
     }
 }

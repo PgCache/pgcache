@@ -27,7 +27,7 @@ use crate::query::ast::{
 /// Implementors override the hooks they care about and pass an instance
 /// to [`query_expr_walk_mut`] (or [`select_node_walk_mut`] for a
 /// `SelectNode`-scoped walk).
-pub trait QueryWalkerMut {
+pub(super) trait QueryWalkerMut {
     type Error;
 
     /// Called after a `ScalarExpr`'s children have been walked. The
@@ -44,7 +44,7 @@ pub trait QueryWalkerMut {
 }
 
 /// Drive a full `QueryExpr` walk: CTEs, body, LIMIT, top-level ORDER BY.
-pub fn query_expr_walk_mut<W: QueryWalkerMut>(
+pub(super) fn query_expr_walk_mut<W: QueryWalkerMut>(
     expr: &mut QueryExpr,
     walker: &mut W,
 ) -> Result<(), W::Error> {
@@ -69,7 +69,7 @@ pub fn query_expr_walk_mut<W: QueryWalkerMut>(
 /// Drive a `SelectNode`-scoped walk: columns, FROM, WHERE, HAVING.
 /// Top-level ORDER BY and LIMIT live on `QueryExpr`, not `SelectNode`,
 /// and are not reached here.
-pub fn select_node_walk_mut<W: QueryWalkerMut>(
+pub(super) fn select_node_walk_mut<W: QueryWalkerMut>(
     node: &mut SelectNode,
     walker: &mut W,
 ) -> Result<(), W::Error> {

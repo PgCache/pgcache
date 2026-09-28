@@ -27,7 +27,7 @@ const INLINE_CAP: usize = 8;
 /// at once (large result drained by a slow client). It's a ring — not a Vec with
 /// a read cursor — so slots are reused as chunks are advanced out the front,
 /// bounding the inline capacity by live chunks rather than total pushes.
-pub struct WriteQueue {
+pub(super) struct WriteQueue {
     /// Ring of live chunks: FIFO order is `inline[head], inline[(head+1) % CAP],
     /// …` for `len` elements.
     inline: [Bytes; INLINE_CAP],
@@ -44,7 +44,7 @@ impl WriteQueue {
     /// Create an empty queue. Performs no heap allocation — the inline ring holds
     /// the first [`INLINE_CAP`] live chunks, and the spill `VecDeque` stays at
     /// capacity 0 until a push overflows the ring.
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             inline: [const { Bytes::new() }; INLINE_CAP],
             head: 0,
@@ -56,7 +56,7 @@ impl WriteQueue {
     /// Push a chunk onto the back of the queue. Empty chunks are silently ignored.
     ///
     /// Accepts `BytesMut` (zero-cost freeze) or `Bytes` (e.g. `from_static`).
-    pub fn push(&mut self, buf: impl Into<Bytes>) {
+    pub(super) fn push(&mut self, buf: impl Into<Bytes>) {
         let buf = buf.into();
         if !buf.has_remaining() {
             return;
@@ -74,13 +74,13 @@ impl WriteQueue {
         self.spill.push_back(buf);
     }
 
-    pub fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.len == 0 && self.spill.is_empty()
     }
 
     /// Drop all queued chunks (used when the client is gone and the remaining
     /// cache-DB response is being drained rather than relayed).
-    pub fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         for slot in &mut self.inline {
             *slot = Bytes::new();
         }

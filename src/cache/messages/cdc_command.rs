@@ -15,7 +15,7 @@ use crate::pg::protocol::ByteString;
 // refcounted view into its replication frame, so decoding and cloning never
 // copy the text. The view pins its frame, which is bounded by the row size.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CdcValue {
+pub(crate) enum CdcValue {
     Null,
     Text(ByteString),
     Toasted,
@@ -28,7 +28,7 @@ pub enum CdcValue {
 /// output). Past the writer's repair step the indexes must be empty or
 /// handled — this is the only path from `CdcValue` rows to
 /// `Option<ByteString>` rows.
-pub fn cdc_values_convert(
+pub(crate) fn cdc_values_convert(
     values: Vec<CdcValue>,
     row_data: &mut Vec<Option<ByteString>>,
 ) -> Vec<usize> {
@@ -49,7 +49,7 @@ pub fn cdc_values_convert(
 
 /// Commands for CDC mutations and relation tracking, sent to the writer thread
 #[derive(Debug)]
-pub enum CdcCommand {
+pub(crate) enum CdcCommand {
     /// Source-transaction begin marker. Emitted by the CDC processor for each
     /// pgoutput BEGIN, carrying the source transaction's `xid`. The explicit
     /// delimiter lets the writer enter a frame deterministically (rather than

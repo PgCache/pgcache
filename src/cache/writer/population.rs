@@ -149,7 +149,7 @@ pub(super) async fn population_worker_run(
 /// and the dispatcher pairs the next work item with the next idle slot, so no
 /// item is ever bound to a busy worker (no head-of-line blocking) and worker
 /// count can change without re-routing.
-pub async fn population_dispatcher(
+pub(super) async fn population_dispatcher(
     mut work_rx: UnboundedReceiver<PopulationWork>,
     mut idle_rx: UnboundedReceiver<oneshot::Sender<PopulationWork>>,
     query_tx: UnboundedSender<QueryCommand>,
@@ -194,7 +194,7 @@ pub async fn population_dispatcher(
 /// executes the work item it is handed, repeat. Each worker owns its own
 /// origin and cache database connections. A worker that finds the pool above
 /// its target retires itself between work items (PGC-437).
-pub async fn population_worker(
+pub(super) async fn population_worker(
     id: usize,
     ctx: PopulationSpawnContext,
     mut db_origin: Client,

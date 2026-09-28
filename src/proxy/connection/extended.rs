@@ -106,23 +106,23 @@ fn write_class_bind(class: &WriteClass, portal: &Portal, stmt: &PreparedStatemen
 /// statement, so `self.portals` / `prepared_statements` reflect only the *last*
 /// Bind/Parse by Sync time. Snapshotting per entry keeps each execute's own
 /// parameters and query.
-pub(in crate::proxy::connection) struct CacheCandidate {
-    pub(in crate::proxy::connection) cacheable_query: Arc<CacheableQuery>,
-    pub(in crate::proxy::connection) parameters: QueryParameters,
-    pub(in crate::proxy::connection) result_formats: ResultFormats,
+pub(super) struct CacheCandidate {
+    pub(super) cacheable_query: Arc<CacheableQuery>,
+    pub(super) parameters: QueryParameters,
+    pub(super) result_formats: ResultFormats,
     /// ParameterDescription bytes, present only for a Describe('S') entry.
-    pub(in crate::proxy::connection) parameter_description: Option<Bytes>,
+    pub(super) parameter_description: Option<Bytes>,
     /// Target statement name (for the lazy-Parse-on-forward decision).
-    pub(in crate::proxy::connection) statement_name: EcoString,
+    pub(super) statement_name: EcoString,
     /// Whether origin already knows the statement (no lazy Parse needed).
-    pub(in crate::proxy::connection) origin_prepared: bool,
+    pub(super) origin_prepared: bool,
 }
 
 impl CacheCandidate {
     /// Whether forwarding a Bind-without-Parse execute against this candidate
     /// requires prepending a lazy Parse (origin doesn't know the named
     /// statement). Combine with the entry's `has_parse` at the call site.
-    pub(in crate::proxy::connection) fn lazy_parse_needed(&self) -> bool {
+    pub(super) fn lazy_parse_needed(&self) -> bool {
         !self.origin_prepared && !self.statement_name.is_empty()
     }
 }
@@ -130,63 +130,63 @@ impl CacheCandidate {
 /// Parse/Bind/Describe messages accumulated toward the next Execute. Sealed
 /// into an [`ExecuteEntry`] when an Execute arrives.
 #[derive(Default)]
-pub(in crate::proxy::connection) struct Segment {
+pub(super) struct Segment {
     /// Raw bytes of the segment's messages, one refcounted slice per message in
     /// arrival order. Accumulating `Bytes` (zero-copy frozen from the codec
     /// split) avoids deep-copying every Parse/Bind/Describe into a contiguous
     /// buffer that is only ever needed on the (cold) forward path. Inline-stored
     /// (`MessageSlices`) so the common segment never heap-allocates.
-    pub(in crate::proxy::connection) bytes: MessageSlices,
+    pub(super) bytes: MessageSlices,
     /// Whether a Parse was buffered in this segment.
-    pub(in crate::proxy::connection) has_parse: bool,
+    pub(super) has_parse: bool,
     /// Whether a Bind was buffered in this segment.
-    pub(in crate::proxy::connection) has_bind: bool,
+    pub(super) has_bind: bool,
     /// Whether/what Describe was buffered in this segment.
-    pub(in crate::proxy::connection) describe: PipelineDescribe,
+    pub(super) describe: PipelineDescribe,
     /// Statement name of each Parse in this segment, in order. One per Parse —
     /// a dirty segment has several. Drives `pending_parse_statements` on forward.
-    pub(in crate::proxy::connection) parse_statement_names: SmallVec<[EcoString; 1]>,
+    pub(super) parse_statement_names: SmallVec<[EcoString; 1]>,
     /// Statement name of each Describe('S') in this segment, in order.
-    pub(in crate::proxy::connection) describe_statement_names: SmallVec<[EcoString; 1]>,
+    pub(super) describe_statement_names: SmallVec<[EcoString; 1]>,
     /// True once the segment holds more than one of any Parse/Bind/Describe —
     /// i.e. more than one executable's worth of prep. Such a segment can't be
     /// served from cache (the worker synthesizes exactly one ParseComplete /
     /// BindComplete / Describe response), so it forces the forward path.
-    pub(in crate::proxy::connection) dirty: bool,
+    pub(super) dirty: bool,
 }
 
 /// One Execute plus the Parse/Bind/Describe messages that preceded it since the
 /// previous Execute (or batch start). Sealed at Execute; carries its own bytes
 /// so it can be dispatched independently (cached) or concatenated for forward.
-pub(in crate::proxy::connection) struct ExecuteEntry {
+pub(super) struct ExecuteEntry {
     /// Raw bytes of this execute's Parse/Bind/Describe/Execute run, one
     /// refcounted slice per message in order.
-    pub(in crate::proxy::connection) bytes: MessageSlices,
+    pub(super) bytes: MessageSlices,
     /// Portal name from Execute (None if the Execute failed to parse).
-    pub(in crate::proxy::connection) portal_name: Option<EcoString>,
-    pub(in crate::proxy::connection) has_parse: bool,
-    pub(in crate::proxy::connection) has_bind: bool,
-    pub(in crate::proxy::connection) describe: PipelineDescribe,
+    pub(super) portal_name: Option<EcoString>,
+    pub(super) has_parse: bool,
+    pub(super) has_bind: bool,
+    pub(super) describe: PipelineDescribe,
     /// Statement name of each Parse / Describe('S') in this entry, in order.
     /// A clean (cacheable) entry has at most one of each.
-    pub(in crate::proxy::connection) parse_statement_names: SmallVec<[EcoString; 1]>,
-    pub(in crate::proxy::connection) describe_statement_names: SmallVec<[EcoString; 1]>,
+    pub(super) parse_statement_names: SmallVec<[EcoString; 1]>,
+    pub(super) describe_statement_names: SmallVec<[EcoString; 1]>,
     /// Carried from the segment: more than one P/B/D, so not cacheable.
-    pub(in crate::proxy::connection) dirty: bool,
+    pub(super) dirty: bool,
     /// Cacheable-query snapshot captured at Execute time, if this execute is a
     /// cacheable SELECT with a resolvable portal. `None` ⇒ not cacheable.
-    pub(in crate::proxy::connection) candidate: Option<CacheCandidate>,
+    pub(super) candidate: Option<CacheCandidate>,
     /// What forwarding this execute does to the connection's tracked state,
     /// captured at Execute time with this execute's own bind values — the same
     /// rebind hazard `candidate` documents (PGC-445). An unresolvable
     /// portal/statement snapshots the conservative unknown effects.
-    pub(in crate::proxy::connection) effects: StatementEffects,
+    pub(super) effects: StatementEffects,
 }
 
 impl ExecuteEntry {
     /// Whether forwarding this entry to origin requires prepending a lazy Parse
     /// (Bind-without-Parse against a named statement origin doesn't yet know).
-    pub(in crate::proxy::connection) fn needs_lazy_parse(&self) -> bool {
+    pub(super) fn needs_lazy_parse(&self) -> bool {
         !self.has_parse
             && self
                 .candidate
@@ -198,16 +198,16 @@ impl ExecuteEntry {
 /// Buffered extended protocol messages, accumulated until Sync/Flush.
 /// All decision-making (cache vs. forward) is deferred to Sync/Flush time.
 #[derive(Default)]
-pub(in crate::proxy::connection) struct ExtendedBuffer {
+pub(super) struct ExtendedBuffer {
     /// Sealed executes, in arrival order. One per Execute message.
-    pub(in crate::proxy::connection) entries: SmallVec<[ExecuteEntry; 1]>,
+    pub(super) entries: SmallVec<[ExecuteEntry; 1]>,
     /// Messages accumulated since the last Execute (or batch start).
-    pub(in crate::proxy::connection) pending: Segment,
+    pub(super) pending: Segment,
 }
 
 impl ExtendedBuffer {
     /// Seal the pending segment together with this Execute's bytes into an entry.
-    pub(in crate::proxy::connection) fn pending_seal(
+    pub(super) fn pending_seal(
         &mut self,
         execute_bytes: Bytes,
         portal_name: Option<EcoString>,
@@ -234,7 +234,7 @@ impl ExtendedBuffer {
     /// the trailing pending segment) — one per Parse. Drives the ordered
     /// `pending_parse_statements` queue so each origin ParseComplete marks the
     /// right statement `origin_prepared`.
-    pub(in crate::proxy::connection) fn parse_statements_all(&self) -> impl Iterator<Item = &str> {
+    pub(super) fn parse_statements_all(&self) -> impl Iterator<Item = &str> {
         self.entries
             .iter()
             .flat_map(|e| e.parse_statement_names.iter())
@@ -243,9 +243,7 @@ impl ExtendedBuffer {
     }
 
     /// Every Describe('S') statement name across the window in wire order.
-    pub(in crate::proxy::connection) fn describe_statements_all(
-        &self,
-    ) -> impl Iterator<Item = &str> {
+    pub(super) fn describe_statements_all(&self) -> impl Iterator<Item = &str> {
         self.entries
             .iter()
             .flat_map(|e| e.describe_statement_names.iter())
@@ -256,7 +254,7 @@ impl ExtendedBuffer {
     /// Concatenate all buffered bytes (entries in order, then the trailing
     /// pending segment) into the wire stream as originally received. Only the
     /// (cold) forward path needs the contiguous form.
-    pub(in crate::proxy::connection) fn bytes_concat(&self) -> BytesMut {
+    pub(super) fn bytes_concat(&self) -> BytesMut {
         let mut out = BytesMut::new();
         for entry in &self.entries {
             for slice in &entry.bytes {
@@ -270,7 +268,7 @@ impl ExtendedBuffer {
     }
 
     /// Whether any Parse was buffered across the whole window.
-    pub(in crate::proxy::connection) fn any_has_parse(&self) -> bool {
+    pub(super) fn any_has_parse(&self) -> bool {
         self.pending.has_parse || self.entries.iter().any(|e| e.has_parse)
     }
 }
@@ -278,42 +276,42 @@ impl ExtendedBuffer {
 /// State for the extended query protocol pipeline.
 /// Accumulates messages until Sync/Flush, then tracks pending origin responses
 /// and pipeline context for cache dispatch.
-pub(in crate::proxy::connection) struct ExtendedPending {
+pub(super) struct ExtendedPending {
     /// Statement names whose ParseCompletes we're awaiting from origin, in wire
     /// order — one per forwarded Parse. Each origin ParseComplete pops the front
     /// and marks that statement `origin_prepared`.
-    pub(in crate::proxy::connection) pending_parse_statements: VecDeque<EcoString>,
+    pub(super) pending_parse_statements: VecDeque<EcoString>,
 
     /// Statement names being described, in wire order — one per forwarded
     /// Describe('S'). ParameterDescription peeks the front; RowDescription/NoData
     /// pops it.
-    pub(in crate::proxy::connection) pending_describe_statements: VecDeque<EcoString>,
+    pub(super) pending_describe_statements: VecDeque<EcoString>,
 
     /// Statement name to lazily Parse on the next origin forward. Set at Sync
     /// time for Bind-without-Parse batches against statements origin doesn't
     /// know; consumed by the forward paths in `handle_cache_reply`. Cleared on
     /// every Sync so stale state from a prior cache hit doesn't leak.
-    pub(in crate::proxy::connection) pending_lazy_parse: Option<EcoString>,
+    pub(super) pending_lazy_parse: Option<EcoString>,
 
     /// Buffered extended protocol messages accumulated until Sync/Flush.
     /// Decision-making deferred to Sync time.
-    pub(in crate::proxy::connection) buffer: Option<ExtendedBuffer>,
+    pub(super) buffer: Option<ExtendedBuffer>,
 
     /// Pipeline context ready for cache dispatch.
     /// Built at Sync time from ExtendedBuffer, consumed by ProxyMessage.
-    pub(in crate::proxy::connection) pipeline_context: Option<PipelineContext>,
+    pub(super) pipeline_context: Option<PipelineContext>,
 
     /// Remaining cache slots of a multi-execute batch, queued in order. The
     /// current in-flight slot lives in `pipeline_context` (+ the egress Cache
     /// slot); each hit advances to the next here. On a miss the remainder is
     /// forwarded to origin as one run.
-    pub(in crate::proxy::connection) batch: VecDeque<DispatchContext>,
+    pub(super) batch: VecDeque<DispatchContext>,
 
     /// Whether the in-flight cache dispatch is an extended-protocol pipeline (vs
     /// a self-terminating simple `Query`). Gates the synthesized trailing `Sync`
     /// on the forward-fallback path: extended entries carry no `Sync`, a simple
     /// `Query` already triggers its own `ReadyForQuery`.
-    pub(in crate::proxy::connection) dispatch_is_extended: bool,
+    pub(super) dispatch_is_extended: bool,
 
     /// Count of `Close(statement)` messages handled locally (statement never
     /// `origin_prepared`, so the origin never knew it) whose `CloseComplete` is
@@ -321,35 +319,31 @@ pub(in crate::proxy::connection) struct ExtendedPending {
     /// next Sync (or before any origin forward, to preserve response order).
     /// PGC-234: avoids forwarding useless Close+Sync round-trips to origin for
     /// cache-served statements.
-    pub(in crate::proxy::connection) deferred_close_completes: u32,
+    pub(super) deferred_close_completes: u32,
 
     /// Whether anything was forwarded to origin in the current Sync group (a
     /// forwarded Close or a Flush). Gates the bare-Sync local-`ReadyForQuery`
     /// optimization: only synthesize the RFQ when the group is purely local.
-    pub(in crate::proxy::connection) group_origin_forwarded: bool,
+    pub(super) group_origin_forwarded: bool,
 }
 
 /// Everything needed to dispatch one execute as a cache slot, computed at Sync
 /// from an [`ExecuteEntry`]'s snapshot. Held in `ExtendedPending::batch` until
 /// its turn; on dispatch the pipeline/statement state is applied to the
 /// connection and the message is leased to a worker.
-pub(in crate::proxy::connection) struct DispatchContext {
-    pub(in crate::proxy::connection) msg: CacheMessage,
-    pub(in crate::proxy::connection) pipeline: PipelineContext,
-    pub(in crate::proxy::connection) fingerprint: Fingerprint,
-    pub(in crate::proxy::connection) lazy_parse: Option<EcoString>,
-    pub(in crate::proxy::connection) parse_statement: Option<EcoString>,
-    pub(in crate::proxy::connection) describe_statement: Option<EcoString>,
+pub(super) struct DispatchContext {
+    pub(super) msg: CacheMessage,
+    pub(super) pipeline: PipelineContext,
+    pub(super) fingerprint: Fingerprint,
+    pub(super) lazy_parse: Option<EcoString>,
+    pub(super) parse_statement: Option<EcoString>,
+    pub(super) describe_statement: Option<EcoString>,
 }
 
 impl DispatchContext {
     /// Assemble a dispatch context from an entry and its cache candidate.
     /// `is_last` carries the single trailing `ReadyForQuery` for the batch.
-    pub(in crate::proxy::connection) fn build(
-        entry: ExecuteEntry,
-        candidate: CacheCandidate,
-        is_last: bool,
-    ) -> Self {
+    pub(super) fn build(entry: ExecuteEntry, candidate: CacheCandidate, is_last: bool) -> Self {
         let fingerprint = query_expr_fingerprint(candidate.cacheable_query.query());
         let lazy_parse = (!entry.has_parse && candidate.lazy_parse_needed())
             .then(|| candidate.statement_name.clone());
@@ -384,7 +378,7 @@ impl DispatchContext {
 }
 
 impl ExtendedPending {
-    pub(in crate::proxy::connection) fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             pending_parse_statements: VecDeque::new(),
             pending_describe_statements: VecDeque::new(),
@@ -399,17 +393,17 @@ impl ExtendedPending {
     }
 
     /// Get or create the ExtendedBuffer for accumulating messages.
-    pub(in crate::proxy::connection) fn buffer_get_or_create(&mut self) -> &mut ExtendedBuffer {
+    pub(super) fn buffer_get_or_create(&mut self) -> &mut ExtendedBuffer {
         self.buffer.get_or_insert_with(ExtendedBuffer::default)
     }
 
     /// Take the buffer contents. Returns None if no buffer was active.
-    pub(in crate::proxy::connection) fn buffer_take(&mut self) -> Option<ExtendedBuffer> {
+    pub(super) fn buffer_take(&mut self) -> Option<ExtendedBuffer> {
         self.buffer.take()
     }
 
     /// Borrow the active buffer, if any — for inspecting entries before a flush.
-    pub(in crate::proxy::connection) fn buffer_peek(&self) -> Option<&ExtendedBuffer> {
+    pub(super) fn buffer_peek(&self) -> Option<&ExtendedBuffer> {
         self.buffer.as_ref()
     }
 
@@ -417,10 +411,7 @@ impl ExtendedPending {
     /// order, into the pending origin-response queues (shared by the flush and
     /// forward paths). Replaces any prior contents — this forwards a whole
     /// buffer, so the queues describe exactly its responses.
-    pub(in crate::proxy::connection) fn pending_statements_capture(
-        &mut self,
-        buffer: &ExtendedBuffer,
-    ) {
+    pub(super) fn pending_statements_capture(&mut self, buffer: &ExtendedBuffer) {
         self.pending_parse_statements =
             buffer.parse_statements_all().map(EcoString::from).collect();
         self.pending_describe_statements = buffer
@@ -432,7 +423,7 @@ impl ExtendedPending {
     /// Flush any buffered extended protocol messages.
     /// Extracts pending statement names from buffer metadata.
     /// Returns the buffer's bytes for the caller to push to origin.
-    pub(in crate::proxy::connection) fn buffer_flush(&mut self) -> Option<BytesMut> {
+    pub(super) fn buffer_flush(&mut self) -> Option<BytesMut> {
         let buffer = self.buffer.take()?;
         self.pending_statements_capture(&buffer);
         Some(buffer.bytes_concat())
@@ -441,7 +432,7 @@ impl ExtendedPending {
     /// Forward buffer to origin with trailing bytes (Sync or Flush).
     /// Extracts pending statement names from buffer metadata.
     /// Returns bytes to push to origin.
-    pub(in crate::proxy::connection) fn buffer_forward(
+    pub(super) fn buffer_forward(
         &mut self,
         buffer: ExtendedBuffer,
         trailing_bytes: &[u8],
@@ -454,7 +445,7 @@ impl ExtendedPending {
 
     /// Handle ParseComplete from origin: mark the next awaited statement as
     /// origin_prepared (one ParseComplete per forwarded Parse, in order).
-    pub(in crate::proxy::connection) fn parse_complete(
+    pub(super) fn parse_complete(
         &mut self,
         prepared_statements: &mut HashMap<EcoString, PreparedStatement>,
     ) {
@@ -468,7 +459,7 @@ impl ExtendedPending {
 
     /// Update the front pending statement's parameter OIDs. Peeks (does not pop)
     /// the queue; the following `RowDescription` or `NoData` pops it.
-    pub(in crate::proxy::connection) fn parameter_description_received(
+    pub(super) fn parameter_description_received(
         &mut self,
         msg_data: &BytesMut,
         prepared_statements: &mut HashMap<EcoString, PreparedStatement>,
@@ -489,7 +480,7 @@ impl ExtendedPending {
     /// Store the raw RowDescription on the front pending statement and pop it.
     /// Returns the statement name so the caller can populate the per-connection
     /// describe cache.
-    pub(in crate::proxy::connection) fn row_description_received(
+    pub(super) fn row_description_received(
         &mut self,
         msg_data: &BytesMut,
         prepared_statements: &mut HashMap<EcoString, PreparedStatement>,
@@ -504,7 +495,7 @@ impl ExtendedPending {
     /// Record NoData (statement has no result columns, e.g. INSERT without
     /// RETURNING) on the front pending statement and pop it. Returns the
     /// statement name so the caller can populate the per-connection describe cache.
-    pub(in crate::proxy::connection) fn no_data_received(
+    pub(super) fn no_data_received(
         &mut self,
         prepared_statements: &mut HashMap<EcoString, PreparedStatement>,
     ) -> Option<EcoString> {
@@ -516,14 +507,14 @@ impl ExtendedPending {
     }
 
     /// Take pipeline context (for origin fallback or cache dispatch).
-    pub(in crate::proxy::connection) fn pipeline_take(&mut self) -> Option<PipelineContext> {
+    pub(super) fn pipeline_take(&mut self) -> Option<PipelineContext> {
         self.pipeline_context.take()
     }
 }
 
 impl ConnectionState {
     /// Flush any buffered extended protocol messages to origin.
-    pub(in crate::proxy::connection) fn extended_buffer_flush_to_origin(&mut self) {
+    pub(super) fn extended_buffer_flush_to_origin(&mut self) {
         // A Flush forwards the whole buffer, including sealed Executes — apply
         // their effects before the buffer is consumed.
         if let Some(effects) = self.extended.buffer_peek().map(buffer_effects) {
@@ -538,7 +529,7 @@ impl ConnectionState {
 
     /// Forward an extended buffer to origin, appending the trailing message bytes (Sync or Flush).
     /// Records metrics for any Execute in the buffer.
-    pub(in crate::proxy::connection) fn extended_buffer_forward_to_origin(
+    pub(super) fn extended_buffer_forward_to_origin(
         &mut self,
         buffer: ExtendedBuffer,
         trailing_bytes: &[u8],
@@ -590,7 +581,7 @@ impl ConnectionState {
     }
 
     /// Handle Parse message — analyze cacheability, store statement, buffer bytes.
-    pub(in crate::proxy::connection) fn handle_parse_message(&mut self, msg: PgFrontendMessage) {
+    pub(super) fn handle_parse_message(&mut self, msg: PgFrontendMessage) {
         // Freeze the codec's zero-copy slice up front so the parsed SQL can be
         // a refcounted view into the frame instead of a fresh String.
         let data = msg.data.freeze();
@@ -656,7 +647,7 @@ impl ConnectionState {
     }
 
     /// Handle Bind message — store portal, buffer bytes.
-    pub(in crate::proxy::connection) fn handle_bind_message(&mut self, msg: PgFrontendMessage) {
+    pub(super) fn handle_bind_message(&mut self, msg: PgFrontendMessage) {
         if let Ok(parsed) = parse_bind_message(&msg.data) {
             self.portal_store(parsed);
 
@@ -674,7 +665,7 @@ impl ConnectionState {
 
     /// Handle Execute message — record metrics, parse portal name, buffer bytes.
     /// Decision-making deferred to Sync.
-    pub(in crate::proxy::connection) fn handle_execute_message(&mut self, msg: PgFrontendMessage) {
+    pub(super) fn handle_execute_message(&mut self, msg: PgFrontendMessage) {
         let m = crate::metrics::handles();
         m.query.total.increment(1);
         m.conn.extended_queries.increment(1);
@@ -736,7 +727,7 @@ impl ConnectionState {
     /// Returns None when the portal/statement doesn't resolve to a cacheable
     /// SELECT with uniform result formats (and, for Describe('S'), a cached
     /// ParameterDescription). Global cache gating is checked separately at Sync.
-    pub(in crate::proxy::connection) fn execute_cache_candidate(
+    pub(super) fn execute_cache_candidate(
         &self,
         portal_name: Option<&str>,
         describe: PipelineDescribe,
@@ -782,7 +773,7 @@ impl ConnectionState {
     }
 
     /// Handle Describe message — buffer bytes and track describe metadata.
-    pub(in crate::proxy::connection) fn handle_describe_message(&mut self, msg: PgFrontendMessage) {
+    pub(super) fn handle_describe_message(&mut self, msg: PgFrontendMessage) {
         if let Ok(parsed) = parse_describe_message(&msg.data) {
             let seg = &mut self.extended.buffer_get_or_create().pending;
             if seg.describe != PipelineDescribe::None {
@@ -811,7 +802,7 @@ impl ConnectionState {
     /// statements the origin never prepared) as one ordered synth slot, so they
     /// keep their place ahead of whatever origin/cache response follows. Returns
     /// the count flushed.
-    pub(in crate::proxy::connection) fn deferred_close_completes_flush(&mut self) -> u32 {
+    pub(super) fn deferred_close_completes_flush(&mut self) -> u32 {
         let n = self.extended.deferred_close_completes;
         if n == 1 {
             self.extended.deferred_close_completes = 0;
@@ -836,7 +827,7 @@ impl ConnectionState {
     /// Everything else forwards as before: origin-prepared statements, portals, a
     /// Close mid-batch (`buffer` present), or once anything has already been
     /// forwarded this group (so deferred completions can't reorder ahead of it).
-    pub(in crate::proxy::connection) fn handle_close_message(&mut self, msg: PgFrontendMessage) {
+    pub(super) fn handle_close_message(&mut self, msg: PgFrontendMessage) {
         if let Ok(parsed) = parse_close_message(&msg.data) {
             if parsed.close_type == b'S'
                 && self.extended.buffer.is_none()
@@ -871,7 +862,7 @@ impl ConnectionState {
     /// If every Execute in the batch is an independently cacheable read, each is
     /// dispatched as its own cache slot (in order). Otherwise the batch is
     /// synthesized (Parse-only) or forwarded whole to origin.
-    pub(in crate::proxy::connection) fn handle_sync_message(&mut self, msg: PgFrontendMessage) {
+    pub(super) fn handle_sync_message(&mut self, msg: PgFrontendMessage) {
         // Emit any deferred CloseCompletes (locally-handled Closes) as an ordered
         // synth slot before this Sync's responses (PGC-234).
         let local_closes = self.deferred_close_completes_flush();
@@ -912,10 +903,7 @@ impl ConnectionState {
     /// clean `[P?][B?][D?] E` shape per entry, no trailing prep, global cache
     /// gating, and at most one entry needing a lazy Parse on forward (the
     /// single-intercept forward path can absorb only one).
-    pub(in crate::proxy::connection) fn cache_batch_eligible(
-        &self,
-        buffer: &ExtendedBuffer,
-    ) -> bool {
+    pub(super) fn cache_batch_eligible(&self, buffer: &ExtendedBuffer) -> bool {
         !buffer.entries.is_empty()
             && buffer.pending.bytes.is_empty()
             && self.cache_dispatch_possible()
@@ -935,10 +923,7 @@ impl ConnectionState {
     /// Build a dispatch context per entry, queue them, and begin the first slot.
     /// Caller guarantees [`Self::cache_batch_eligible`] (every entry has a
     /// candidate and the list is non-empty).
-    pub(in crate::proxy::connection) fn cache_batch_dispatch(
-        &mut self,
-        entries: SmallVec<[ExecuteEntry; 1]>,
-    ) {
+    pub(super) fn cache_batch_dispatch(&mut self, entries: SmallVec<[ExecuteEntry; 1]>) {
         // Common case: a single Parse/Bind/Describe/Execute. Begin it directly
         // without allocating a batch queue (the trailing-most slots empty).
         if entries.len() == 1 {
@@ -970,7 +955,7 @@ impl ConnectionState {
     /// Apply a dispatch context as the current in-flight cache slot: stamp
     /// timing, install pipeline + forward-fallback state, and push the egress
     /// Cache slot.
-    pub(in crate::proxy::connection) fn cache_slot_begin(&mut self, ctx: DispatchContext) {
+    pub(super) fn cache_slot_begin(&mut self, ctx: DispatchContext) {
         self.telemetry.cache_timing_start(ctx.fingerprint);
         self.extended.dispatch_is_extended = true;
         self.extended.pipeline_context = Some(ctx.pipeline);
@@ -990,7 +975,7 @@ impl ConnectionState {
 
     /// Advance the batch after a cache hit: begin the next queued slot (staying
     /// in `OriginDrain`) or, when the batch is exhausted, return to `Read`.
-    pub(in crate::proxy::connection) fn cache_batch_advance(&mut self) {
+    pub(super) fn cache_batch_advance(&mut self) {
         if let Some(next) = self.extended.batch.pop_front() {
             self.cache_slot_begin(next);
             self.proxy_mode = ProxyMode::OriginDrain;
@@ -1003,7 +988,7 @@ impl ConnectionState {
     /// synthesized `Sync`, so origin runs them in a single implicit transaction
     /// and emits exactly one ReadyForQuery. Installs a lazy Parse for any entry
     /// that needs one (eligibility bounds this to at most one across the batch).
-    pub(in crate::proxy::connection) fn batch_remaining_forward(&mut self) {
+    pub(super) fn batch_remaining_forward(&mut self) {
         while let Some(next) = self.extended.batch.pop_front() {
             if let Some(stmt_name) = next.lazy_parse {
                 forward_lazy_parse_install(
@@ -1041,10 +1026,7 @@ impl ConnectionState {
     /// resolve against the txn's snapshot. Portal Describe is excluded
     /// because no portal exists without a Bind. Unnamed statements are
     /// excluded because origin's unnamed slot is one-shot per Sync.
-    pub(in crate::proxy::connection) fn synth_eligible<'a>(
-        &self,
-        buffer: &'a ExtendedBuffer,
-    ) -> Option<&'a str> {
+    pub(super) fn synth_eligible<'a>(&self, buffer: &'a ExtendedBuffer) -> Option<&'a str> {
         // Synthesize only applies to a Parse-only batch: no Execute (no entries),
         // a Parse but no Bind in the pending segment.
         if !buffer.entries.is_empty() {
@@ -1078,7 +1060,7 @@ impl ConnectionState {
     /// hit, in which case the synthesized response was pushed (or deferred)
     /// and the caller must not forward to origin. Returns `false` on miss
     /// or ineligible batch — caller falls through to the normal forward.
-    pub(in crate::proxy::connection) fn try_synthesize_parse_describe_response(
+    pub(super) fn try_synthesize_parse_describe_response(
         &mut self,
         buffer: &ExtendedBuffer,
     ) -> bool {
@@ -1136,7 +1118,7 @@ impl ConnectionState {
 
     /// Handle Flush message — forward buffer to origin, no cache attempt.
     /// Handles JDBC pattern: Parse/Bind/Describe/Flush then Execute/Sync.
-    pub(in crate::proxy::connection) fn handle_flush_message(&mut self, msg: PgFrontendMessage) {
+    pub(super) fn handle_flush_message(&mut self, msg: PgFrontendMessage) {
         // Anything reaching origin must come after any deferred CloseCompletes,
         // and marks the group as having origin work (PGC-234).
         self.deferred_close_completes_flush();
@@ -1159,7 +1141,7 @@ impl ConnectionState {
     /// For unnamed statements (empty name), always overwrite — the protocol allows reuse of
     /// the unnamed slot with a new Parse. For named statements, `or_insert` preserves existing
     /// metadata (parameter_description, origin_prepared) accumulated during the cold path.
-    pub(in crate::proxy::connection) fn statement_store(
+    pub(super) fn statement_store(
         &mut self,
         parsed: ParsedParseMessage,
         sql_type: StatementType,
@@ -1203,7 +1185,7 @@ impl ConnectionState {
     }
 
     /// Store a portal in connection state.
-    pub(in crate::proxy::connection) fn portal_store(&mut self, parsed: ParsedBindMessage) {
+    pub(super) fn portal_store(&mut self, parsed: ParsedBindMessage) {
         let portal = Portal {
             name: parsed.portal_name.clone(),
             statement_name: parsed.statement_name,
@@ -1217,7 +1199,7 @@ impl ConnectionState {
     }
 
     /// Remove a prepared statement from connection state.
-    pub(in crate::proxy::connection) fn statement_close(&mut self, name: &str) {
+    pub(super) fn statement_close(&mut self, name: &str) {
         if self.prepared_statements.remove(name).is_some() {
             crate::metrics::handles()
                 .conn
@@ -1227,19 +1209,19 @@ impl ConnectionState {
     }
 
     /// Remove a portal from connection state.
-    pub(in crate::proxy::connection) fn portal_close(&mut self, name: &str) {
+    pub(super) fn portal_close(&mut self, name: &str) {
         self.portals.remove(name);
     }
 
     /// Clear all prepared statements from connection state.
     #[expect(unused)]
-    pub(in crate::proxy::connection) fn statements_clear(&mut self) {
+    pub(super) fn statements_clear(&mut self) {
         self.prepared_statements.clear();
     }
 
     /// Clear all portals from connection state.
     #[expect(unused)]
-    pub(in crate::proxy::connection) fn portals_clear(&mut self) {
+    pub(super) fn portals_clear(&mut self) {
         self.portals.clear();
     }
 }

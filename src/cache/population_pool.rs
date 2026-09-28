@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 /// hold-ladder cap, short enough that an origin connection the workload
 /// stopped needing is released (ADR-050's no-idle-connections intent —
 /// bounded to exactly one pair, briefly).
-pub const POPULATION_PARK_EXPIRY: Duration = Duration::from_secs(300);
+pub(super) const POPULATION_PARK_EXPIRY: Duration = Duration::from_secs(300);
 
 /// Shared state for the elastic population worker pool (PGC-437).
 ///

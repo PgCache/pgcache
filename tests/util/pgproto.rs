@@ -3,7 +3,7 @@ use std::process::Command;
 /// Run a pgproto data file against the proxy and return the combined output.
 /// pgproto prints protocol trace to stderr; we merge stdout and stderr.
 /// Panics if pgproto is not found or exits with a non-zero status.
-pub fn pgproto_run(port: u16, data_file: &str) -> String {
+pub(crate) fn pgproto_run(port: u16, data_file: &str) -> String {
     let output = Command::new("/opt/local/bin/pgproto")
         .arg("-h")
         .arg("127.0.0.1")

@@ -16,7 +16,7 @@ use super::tls_stream::{OwnedTlsReadHalf, OwnedTlsWriteHalf, TlsStream};
 ///
 /// Uses `rustls::ServerConnection` because the proxy acts as a TLS server for
 /// incoming client connections.
-pub type ClientStream = TlsStream<rustls::ServerConnection>;
+pub(super) type ClientStream = TlsStream<rustls::ServerConnection>;
 
 /// Owned read half of a `ClientStream` (from `into_split`), held by the
 /// connection's `FramedRead`.

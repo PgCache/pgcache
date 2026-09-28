@@ -4,7 +4,7 @@ use tokio_postgres::SimpleQueryMessage;
 
 /// All data rows of a simple-query result, in order.
 #[allow(clippy::wildcard_enum_match_arm)]
-pub fn rows_of(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow> {
+pub(crate) fn rows_of(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQueryRow> {
     messages
         .iter()
         .filter_map(|m| match m {
@@ -16,7 +16,7 @@ pub fn rows_of(messages: &[SimpleQueryMessage]) -> Vec<&tokio_postgres::SimpleQu
 
 /// Extract a row from SimpleQueryMessage results at the specified index.
 /// Returns an error with context if the message at that index is not a Row.
-pub fn extract_row(
+pub(crate) fn extract_row(
     results: &[SimpleQueryMessage],
     index: usize,
 ) -> Result<&tokio_postgres::SimpleQueryRow, Error> {
@@ -36,7 +36,7 @@ pub fn extract_row(
 
 /// Assert that a row contains the expected field values.
 /// Panics with a descriptive message if any assertion fails.
-pub fn assert_row_fields(row: &tokio_postgres::SimpleQueryRow, expected: &[(&str, &str)]) {
+pub(crate) fn assert_row_fields(row: &tokio_postgres::SimpleQueryRow, expected: &[(&str, &str)]) {
     for (field, expected_value) in expected {
         assert_eq!(
             row.get::<&str>(field),
@@ -48,7 +48,7 @@ pub fn assert_row_fields(row: &tokio_postgres::SimpleQueryRow, expected: &[(&str
 }
 
 /// Convenience function combining row extraction and field assertion.
-pub fn assert_row_at(
+pub(crate) fn assert_row_at(
     results: &[SimpleQueryMessage],
     index: usize,
     expected: &[(&str, &str)],

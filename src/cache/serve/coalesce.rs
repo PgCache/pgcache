@@ -11,7 +11,7 @@ use crate::cache::query_cache::{CoalescedClient, ServeRequest};
 use crate::cache::write_queue::WriteQueue;
 
 /// Outcome of a coalesced client's write task.
-pub enum CoalescedOutcome {
+pub(crate) enum CoalescedOutcome {
     /// All bytes were delivered successfully.
     Complete(CoalescedClient),
     /// Write failed or broadcast lagged — byte stream is corrupted.
