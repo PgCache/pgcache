@@ -1,16 +1,13 @@
-use crate::oid::Oid;
-use crate::query::FingerprintSet;
-
 use tracing::trace;
 
-use crate::pg::protocol::ByteString;
-
-use super::super::super::CacheResult;
-use super::super::super::update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery};
-use super::super::core::WriterCore;
 use super::row_match::update_query_matches_locally;
-
-use super::*;
+use super::{BatchEvalView, WriterCdc};
+use crate::cache::CacheResult;
+use crate::cache::update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery};
+use crate::cache::writer::core::WriterCore;
+use crate::oid::Oid;
+use crate::pg::protocol::ByteString;
+use crate::query::FingerprintSet;
 
 /// One CDC row's membership-evaluation inputs.
 pub(super) struct MembershipRow<'a> {

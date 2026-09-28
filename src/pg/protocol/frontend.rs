@@ -4,7 +4,7 @@ use tokio_util::{
     codec::Decoder,
 };
 
-use super::*;
+use super::{PgConnectionState, PgMessage, PgMessageType, ProtocolError};
 
 #[derive(Debug, Clone, Copy)]
 pub enum PgFrontendMessageType {

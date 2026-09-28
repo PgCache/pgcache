@@ -13,9 +13,15 @@
 use std::any::Any;
 use std::ops::ControlFlow;
 
+use super::{
+    ResolvedArithmeticExpr, ResolvedBinaryExpr, ResolvedCaseExpr, ResolvedCaseWhen,
+    ResolvedColumnNode, ResolvedFrameBound, ResolvedFunctionCall, ResolvedJoinNode,
+    ResolvedMultiExpr, ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr,
+    ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode,
+    ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource, ResolvedTableSubqueryNode,
+    ResolvedUnaryExpr, ResolvedWhereExpr, ResolvedWindowFrame, ResolvedWindowSpec,
+};
 use crate::query::ast::AstNode;
-
-use super::*;
 
 impl AstNode for ResolvedTableNode {
     fn try_for_each_node<'a, N: Any, B>(

@@ -5,10 +5,9 @@ use std::time::Instant;
 
 use smallvec::SmallVec;
 
-use crate::pg::Lsn;
-
 use super::RawBlocker;
 use super::aggregate::TableAggregate;
+use crate::pg::Lsn;
 
 /// Stamped tiers a table holds before a further stamp coarsens the newest.
 /// Merges stay absent while settle lag is under `WAITING_TIERS_MAX` stamp

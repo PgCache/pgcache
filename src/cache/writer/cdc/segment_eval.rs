@@ -1,5 +1,3 @@
-use crate::oid::Oid;
-use crate::query::{Fingerprint, FingerprintSet};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -10,29 +8,26 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::{SimpleQueryMessage, Statement};
 use tracing::{error, warn};
 
+use super::row_changes::{
+    RowChangeProjection, relation_order_columns, row_change_column_fold, table_has_reserved_columns,
+};
+use super::{PG_EVAL_CHUNK, PG_EVAL_ROW_CHUNK, WriterCdc, update_query_matches_locally};
+use crate::cache::update_query::{RowChanges, UpdateEvalStrategy, UpdateQueries, UpdateQuery};
+use crate::cache::writer::core::WriterCore;
+use crate::cache::writer::frame::{FrameRowEvent, OverlayEntry};
+use crate::cache::writer::staging::pk_body_render;
+use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::{ColumnMetadata, TableMetadata};
+use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
-
 use crate::query::ast::Deparse;
 use crate::query::evaluate::bool_wire_text_parse;
 use crate::query::transform::{
     BATCH_IDX_COLUMN, resolved_select_node_table_replace_with_unnest,
     resolved_select_node_table_replace_with_values_batch,
 };
-
-use super::super::super::update_query::{
-    RowChanges, UpdateEvalStrategy, UpdateQueries, UpdateQuery,
-};
-use super::super::super::{CacheError, CacheResult, MapIntoReport};
-use super::super::core::WriterCore;
-use super::super::frame::{FrameRowEvent, OverlayEntry};
-use super::super::staging::pk_body_render;
-use super::row_changes::{
-    RowChangeProjection, relation_order_columns, row_change_column_fold, table_has_reserved_columns,
-};
+use crate::query::{Fingerprint, FingerprintSet};
 use crate::result::error_chain_format;
-
-use super::*;
 
 /// Shared array params for a prepared eval statement over one row chunk:
 /// `$1` = row ordinals, `$2..` = one `text[]` per column in

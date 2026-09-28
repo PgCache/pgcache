@@ -6,6 +6,8 @@ use ecow::EcoString;
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
+use super::entry::query_expr_resolve_scoped;
+use super::join_using::MergedJoinColumn;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
 use crate::oid::Oid;
 use crate::query::ast::QueryExpr;
@@ -13,9 +15,6 @@ use crate::query::resolved::{
     ResolveResult, ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
     ResolvedSelectColumns,
 };
-
-use super::entry::query_expr_resolve_scoped;
-use super::join_using::MergedJoinColumn;
 
 /// A FROM-clause entry visible in scope. Entries are kept in FROM order,
 /// which `*` expansion must follow (PostgreSQL expands `*` in FROM order).

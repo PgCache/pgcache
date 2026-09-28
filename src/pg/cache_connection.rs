@@ -1,5 +1,3 @@
-use crate::query::ShapeKey;
-use crate::query::ast::LiteralValue;
 use std::collections::{HashSet, VecDeque};
 use std::io;
 
@@ -9,9 +7,6 @@ use tokio_util::bytes::{BufMut, BytesMut};
 use tokio_util::codec::{Decoder, FramedRead};
 use tracing::debug;
 
-use crate::cache::{CacheError, CacheResult, MapIntoReport};
-use crate::settings::PgSettings;
-
 use super::protocol::PgMessage;
 use super::protocol::backend::{
     AUTHENTICATION_OK, PgBackendMessageCodec, PgBackendMessageType, data_rows_first_columns,
@@ -20,6 +15,10 @@ use super::protocol::frontend_encode::{
     INT8_OID, SETGEN_SQL, SETGEN_STATEMENT_NAME, TEXT_OID, extended_query_build,
     frontend_msg_append, startup_message_build, statement_name_bytes,
 };
+use crate::cache::{CacheError, CacheResult, MapIntoReport};
+use crate::query::ShapeKey;
+use crate::query::ast::LiteralValue;
+use crate::settings::PgSettings;
 
 /// FIFO cap on named prepared statements per connection. Statements key by query
 /// *shape* (PGC-294), so the working set is bounded by query-shape diversity —

@@ -11,11 +11,10 @@ use postgres_replication::protocol::{
 use tokio_postgres::Error;
 use tracing::error;
 
+use crate::cache::messages::CdcValue;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata, cache_type_name_resolve};
 use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
-
-use super::super::messages::CdcValue;
 
 /// Parse RelationBody into TableMetadata for cache registration.
 pub(super) fn parse_relation_to_table_metadata(relation_body: &RelationBody) -> TableMetadata {

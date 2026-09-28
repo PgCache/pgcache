@@ -7,17 +7,15 @@
 use std::sync::Arc;
 
 use ecow::EcoString;
-
 use pg_query::pg_nodes as pg;
 
+use super::where_clause::{const_value_extract, param_ref_extract, where_expr_convert};
+use crate::query::ast::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
+use crate::query::ast::{BinaryExpr, BinaryOp, LiteralValue, ScalarExpr, WhereExpr};
 use crate::query::write::{
     DeleteStatement, INSERT_MAX_ROWS, InsertRow, InsertStatement, IsolationEffect, IsolationLevel,
     RelationRef, SetAssignment, TransactionBoundary, UpdateStatement, WriteClass, WriteComparison,
 };
-
-use super::super::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
-use super::super::{BinaryExpr, BinaryOp, LiteralValue, ScalarExpr, WhereExpr};
-use super::where_clause::{const_value_extract, param_ref_extract, where_expr_convert};
 
 /// Classification of a non-SELECT root statement.
 pub(super) enum NonSelectClass {

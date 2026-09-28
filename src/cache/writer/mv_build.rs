@@ -12,7 +12,6 @@
 //! against CDC dirty-marking (a build raced by a relevant change is observed
 //! as `BuildingDirty` and discarded).
 
-use crate::query::Fingerprint;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -24,7 +23,14 @@ use tokio_postgres::{Client, SimpleQueryMessage};
 use tokio_stream::StreamExt;
 use tracing::{error, trace};
 
+use crate::cache::{
+    CacheError, CacheResult, MapIntoReport, ReportExt,
+    messages::{MvBuildOutcome, QueryCommand},
+    mv::{ShapeGate, mv_table_name},
+    types::SharedResolved,
+};
 use crate::pg;
+use crate::query::Fingerprint;
 use crate::query::ast::{Deparse, LiteralValue, SetOpType};
 use crate::query::resolved::{
     ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
@@ -32,13 +38,6 @@ use crate::query::resolved::{
 };
 use crate::result::error_chain_format;
 use crate::settings::PgSettings;
-
-use super::super::{
-    CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::{MvBuildOutcome, QueryCommand},
-    mv::{ShapeGate, mv_table_name},
-    types::SharedResolved,
-};
 
 /// Connections dedicated to MV builds — also the build concurrency limit.
 /// Deliberately separate from the serve pool: a build is a multi-statement

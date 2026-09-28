@@ -6,9 +6,9 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use tokio::task::JoinHandle;
 use tokio_util::bytes::Bytes;
 
-use super::super::messages::{CacheOutcome, CacheReply};
-use super::super::query_cache::{CoalescedClient, ServeRequest};
-use super::super::write_queue::WriteQueue;
+use crate::cache::messages::{CacheOutcome, CacheReply};
+use crate::cache::query_cache::{CoalescedClient, ServeRequest};
+use crate::cache::write_queue::WriteQueue;
 
 /// Outcome of a coalesced client's write task.
 pub enum CoalescedOutcome {

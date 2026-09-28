@@ -1,13 +1,12 @@
-use crate::oid::Oid;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use postgres_protocol::escape;
 use tracing::debug;
 
-use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
-
-use super::core::*;
+use super::core::WriterCore;
+use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
+use crate::oid::Oid;
 
 impl WriterCore {
     /// Increment refcounts for each relation_oid the new cached_query

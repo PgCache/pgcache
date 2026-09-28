@@ -2,13 +2,12 @@
 
 use ordered_float::NotNan;
 
+use super::ColumnForms;
 use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::LiteralValue;
 use crate::query::constraints::ColumnRange;
 use crate::query::evaluate::bool_wire_text_parse;
-
-use super::ColumnForms;
 
 /// Coerce a CDC row's value for `column` into the point-probe forms: every
 /// keyable interpretation of the wire text, as `Equal` ranges. A present

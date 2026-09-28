@@ -5,14 +5,6 @@ use ecow::EcoString;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::bytes::{Bytes, BytesMut};
 
-use crate::pg::protocol::backend::TransactionStatus;
-use crate::pg::protocol::session::ResultFormats;
-use crate::proxy::ClientSocket;
-use crate::query::ast::LimitClause;
-use crate::query::{Fingerprint, QueryShape};
-use crate::settings::DynamicConfigHandle;
-use crate::timing::QueryTiming;
-
 use super::coalesce_queue::CoalesceQueue;
 use super::explain::ExplainJob;
 use super::messages::{CacheReply, MessageSlices, PipelineContext, PipelineDescribe, QueryCommand};
@@ -21,6 +13,13 @@ use super::query::CacheableQuery;
 use super::reg_bucket::RegRateBucket;
 use super::reply::ReplySender;
 use super::types::{CacheStateView, SharedResolved};
+use crate::pg::protocol::backend::TransactionStatus;
+use crate::pg::protocol::session::ResultFormats;
+use crate::proxy::ClientSocket;
+use crate::query::ast::LimitClause;
+use crate::query::{Fingerprint, QueryShape};
+use crate::settings::DynamicConfigHandle;
+use crate::timing::QueryTiming;
 
 mod coalesce;
 mod dispatch;

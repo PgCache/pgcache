@@ -6,10 +6,8 @@ use tokio::sync::mpsc::error::SendError;
 use tokio_util::bytes::{Buf, Bytes};
 use tracing::{debug, trace};
 
-use crate::pg::protocol::backend::TransactionStatus;
-use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG};
-use crate::query::{Fingerprint, QueryShape};
-
+use super::dispatch::reply_forward;
+use super::{CacheDispatch, CoalescedClient, QueryRequest, QueryType, ServeJob, ServeRequest};
 use crate::cache::fast_path::{self, MvDecision};
 use crate::cache::memo::{MemoHit, MemoKey, MemoShape};
 use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe, slices_concat};
@@ -17,9 +15,9 @@ use crate::cache::mv::MvServe;
 use crate::cache::types::SharedResolved;
 use crate::cache::write_queue::WriteQueue;
 use crate::cache::{CacheError, CacheResult};
-
-use super::dispatch::reply_forward;
-use super::{CacheDispatch, CoalescedClient, QueryRequest, QueryType, ServeJob, ServeRequest};
+use crate::pg::protocol::backend::TransactionStatus;
+use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG};
+use crate::query::{Fingerprint, QueryShape};
 
 /// A pre-checked plan to serve a request from an in-process memo snapshot: the
 /// matched snapshot plus which envelope frames to regenerate around its core.

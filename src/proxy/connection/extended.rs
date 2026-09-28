@@ -5,10 +5,14 @@ use std::{
 
 use ecow::EcoString;
 use smallvec::SmallVec;
-
 use tokio_util::bytes::{BufMut, Bytes, BytesMut};
 use tracing::{debug, trace};
 
+use super::{ConnectionState, DescribeKey, forward_lazy_parse_install};
+use crate::pg::protocol::backend::TransactionStatus;
+use crate::proxy::ProxyMode;
+use crate::proxy::ProxyStatus;
+use crate::proxy::query::{Action, ForwardReason, analyze};
 use crate::{
     cache::{
         CacheMessage, QueryParameters,
@@ -35,11 +39,6 @@ use crate::{
         write::{StatementEffects, WriteClass},
     },
 };
-
-use super::super::ProxyMode;
-use super::super::query::{Action, ForwardReason, analyze};
-
-use super::*;
 
 /// Synth response for a Parse-only batch (no Describe): ParseComplete + RFQ('I').
 const PARSE_COMPLETE_RFQ_IDLE: &[u8] = &[b'1', 0, 0, 0, 4, b'Z', 0, 0, 0, 5, b'I'];

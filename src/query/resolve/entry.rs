@@ -3,13 +3,6 @@
 
 use iddqd::BiHashMap;
 
-use crate::catalog::TableMetadata;
-use crate::query::ast::{QueryBody, QueryExpr, SelectNode};
-use crate::query::resolved::{
-    ResolveResult, ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectNode,
-    ResolvedSetOpNode,
-};
-
 use super::clauses::{
     group_by_resolve, having_resolve, limit_resolve, order_by_as_identifiers, order_by_resolve,
     select_columns_resolve,
@@ -17,6 +10,12 @@ use super::clauses::{
 use super::expr::where_expr_resolve;
 use super::scope::ResolutionScope;
 use super::table::table_source_resolve;
+use crate::catalog::TableMetadata;
+use crate::query::ast::{QueryBody, QueryExpr, SelectNode};
+use crate::query::resolved::{
+    ResolveResult, ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectNode,
+    ResolvedSetOpNode,
+};
 
 // ============================================================================
 // Resolution functions for new QueryExpr type hierarchy

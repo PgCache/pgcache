@@ -2,14 +2,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::cache::messages::PipelineDescribe;
+use crate::cache::query_cache::{QueryRequest, QueryType};
+use crate::cache::types::{CacheStateView, CachedQueryState};
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::query::ast::LimitClause;
 use crate::query::{Fingerprint, FingerprintMap};
-
-use crate::cache::messages::PipelineDescribe;
-use crate::cache::query_cache::{QueryRequest, QueryType};
-use crate::cache::types::{CacheStateView, CachedQueryState};
 
 /// Coalesce-forward deadline policy (PGC-335 fix A). A request parked on a
 /// `Loading` query is forwarded to origin once it has waited this long, so serve

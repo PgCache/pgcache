@@ -7,16 +7,18 @@
 
 use ecow::EcoString;
 use ordered_float::NotNan;
-
 use pg_query::pg_nodes as pg;
 
-use super::super::raw::{
-    NodePtr, aexpr_kind_name, cast, cstr, list_is_empty, list_nodes, node_tag, string_node_value,
-};
-use super::super::*;
 use super::{
     aexpr_arithmetic_convert, arithmetic_op_from_str, operator_name_single, scalar_expr_convert,
     select_stmt_to_query_expr, sublink_type_map,
+};
+use crate::query::ast::raw::{
+    NodePtr, aexpr_kind_name, cast, cstr, list_is_empty, list_nodes, node_tag, string_node_value,
+};
+use crate::query::ast::{
+    AstError, BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, ScalarExpr,
+    SubLinkType, UnaryExpr, UnaryOp, WhereExpr, WhereParseError,
 };
 
 // ---------- Literal / column / param extraction ----------

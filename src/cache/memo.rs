@@ -50,14 +50,14 @@
 //! The writer is single-threaded and processes frames serially, so `begin`/`end`
 //! are balanced per relation per frame and the version never sticks odd.
 
-use crate::oid::Oid;
-use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 
+use crate::oid::Oid;
 use crate::query::ast::{LimitClause, LiteralValue};
+use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 use crate::settings::DynamicConfigHandle;
 
 /// Per-entry size cap. Results above this are never memoized — the in-memory

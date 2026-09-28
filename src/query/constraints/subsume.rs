@@ -9,11 +9,10 @@ use std::collections::HashMap;
 
 use ecow::EcoString;
 
-use crate::query::ast::{BinaryOp, LiteralValue};
-use crate::query::cast::CastTarget;
-
 use super::range::{ColumnRange, column_range_build, column_range_subsumes};
 use super::{QueryConstraints, TableConstraint};
+use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::cast::CastTarget;
 
 /// Reduce a set of bare-column `column op literal` comparisons (from a raw-tree
 /// DELETE/UPDATE WHERE, PGC-381) to a per-column [`ColumnRange`] map — the write

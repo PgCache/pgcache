@@ -22,6 +22,7 @@ doctest = false
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [lints.clippy]
+wildcard_imports = "warn"
 panic = "deny"
 string_slice = "deny"
 indexing_slicing = "warn"

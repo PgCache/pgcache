@@ -14,26 +14,25 @@
 //! discarded (the data a build reads is snapshot-consistent either way; the
 //! race is only about whether the table may claim to be current).
 
-use crate::oid::Oid;
-use crate::pg::protocol::ByteString;
-use crate::query::constraint_index::row_value_forms;
-use crate::query::constraints::ColumnRange;
-use crate::query::{Fingerprint, FingerprintSet};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::{debug, error, trace};
 
-use crate::result::error_chain_format;
-
-use super::super::{
+use super::core::WriterCore;
+use super::mv_build::{MvBuildContext, mv_build_spawn};
+use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{MvBuildOutcome, QueryCommand},
     mv::{MvState, mv_table_name},
     types::CachedQueryState,
 };
-use super::core::WriterCore;
-use super::mv_build::{MvBuildContext, mv_build_spawn};
+use crate::oid::Oid;
+use crate::pg::protocol::ByteString;
+use crate::query::constraint_index::row_value_forms;
+use crate::query::constraints::ColumnRange;
+use crate::query::{Fingerprint, FingerprintSet};
+use crate::result::error_chain_format;
 
 impl WriterCore {
     /// Pinned queries bypass the dispatch-driven "first hit triggers MV

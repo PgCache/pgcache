@@ -1,18 +1,18 @@
 use std::{collections::HashMap, sync::Arc, thread};
 
 use ecow::EcoString;
-
 use metrics_exporter_prometheus::PrometheusHandle;
 use rootcause::Report;
-
-use crate::result::{MapIntoReport, ReportExt};
 use tokio::{net::TcpListener, runtime::Builder};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
 
-use crate::admin::admin_server_spawn;
-
 use super::SharedProxyStatus;
+use super::{
+    CacheabilityStore, ConnectionError, ConnectionResult, StatusSenderUpdater, connection_task,
+};
+use crate::admin::admin_server_spawn;
+use crate::result::{MapIntoReport, ReportExt};
 use crate::{
     cache::query::CacheableQuery,
     cache::{CacheDispatchUpdater, PinnedQuery, cache_generation_start, cache_supervise},
@@ -21,10 +21,6 @@ use crate::{
     query::ast::{query_expr_convert_raw, query_expr_fingerprint},
     settings::Settings,
     telemetry, tls,
-};
-
-use super::{
-    CacheabilityStore, ConnectionError, ConnectionResult, StatusSenderUpdater, connection_task,
 };
 
 fn tls_config_load(settings: &Settings) -> ConnectionResult<Option<Arc<tls::TlsAcceptor>>> {
@@ -401,12 +397,11 @@ mod tests {
 
     use std::collections::HashMap;
 
+    use super::pinned_queries_validate;
     use crate::catalog::FunctionVolatility;
     use crate::settings::{
         CdcSettings, DynamicConfigHandle, ListenSettings, PgSettings, Settings, SslMode,
     };
-
-    use super::pinned_queries_validate;
 
     fn test_settings(pinned_queries: Option<Vec<String>>) -> Settings {
         let pg = PgSettings {

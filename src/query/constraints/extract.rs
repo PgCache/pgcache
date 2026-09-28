@@ -9,6 +9,10 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
+use super::range::{
+    literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
+};
+use super::{ColumnConstraint, ColumnEquivalence, QueryConstraints, TableConstraint};
 use crate::query::ast::{BinaryOp, LiteralValue, MultiOp};
 use crate::query::cast::{
     canonicalize_comparison, cast_target_is_coercion_supported, resolved_where_scalar_leaf,
@@ -16,11 +20,6 @@ use crate::query::cast::{
 use crate::query::resolved::{
     ResolvedScalarExpr, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
 };
-
-use super::range::{
-    literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
-};
-use super::{ColumnConstraint, ColumnEquivalence, QueryConstraints, TableConstraint};
 
 /// Extract constraint information from any resolved WHERE expression.
 /// Handles equality, inequality, and BETWEEN operators on column-vs-literal comparisons.

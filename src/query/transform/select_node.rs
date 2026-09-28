@@ -45,15 +45,15 @@ pub fn resolved_select_node_update_replace(
 
 #[cfg(test)]
 mod tests {
+    use postgres_types::Type;
+
+    use super::*;
     use crate::catalog::ColumnMetadata;
     use crate::query::ast::{BinaryOp, LiteralValue};
     use crate::query::resolved::{
         ResolvedBinaryExpr, ResolvedColumnNode, ResolvedScalarExpr, ResolvedTableNode,
         ResolvedTableSource, ResolvedWhereExpr,
     };
-    use postgres_types::Type;
-
-    use super::*;
 
     #[test]
     fn test_resolved_select_node_replace_strips_group_by() {

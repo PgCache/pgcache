@@ -1,6 +1,9 @@
 //! Resolve expressions: WHERE predicates, scalar expressions, and the window
 //! specifications / frames that hang off a window function call.
 
+use super::clauses::order_by_resolve;
+use super::column::column_resolve;
+use super::scope::ResolutionScope;
 use crate::query::ast::{FrameBound, ScalarExpr, WhereExpr, WindowFrame, WindowSpec};
 use crate::query::resolved::{
     ResolveResult, ResolvedArithmeticExpr, ResolvedBinaryExpr, ResolvedCaseExpr, ResolvedCaseWhen,
@@ -8,10 +11,6 @@ use crate::query::resolved::{
     ResolvedScalarExpr, ResolvedUnaryExpr, ResolvedWhereExpr, ResolvedWindowFrame,
     ResolvedWindowSpec,
 };
-
-use super::clauses::order_by_resolve;
-use super::column::column_resolve;
-use super::scope::ResolutionScope;
 
 /// Resolve a WHERE expression
 pub(super) fn where_expr_resolve(

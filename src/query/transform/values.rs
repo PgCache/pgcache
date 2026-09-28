@@ -1,9 +1,10 @@
-use crate::oid::Oid;
 use ecow::EcoString;
 use rootcause::Report;
 
+use super::{AstTransformError, AstTransformResult};
 use crate::cache::SubqueryKind;
 use crate::catalog::TableMetadata;
+use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::{
     Deparse, LiteralValue, TableAlias, ValuesClause, emit_escaped_string_literal,
@@ -12,8 +13,6 @@ use crate::query::resolved::{
     ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
     ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource, ResolvedTableSubqueryNode,
 };
-
-use super::{AstTransformError, AstTransformResult};
 
 mod alias_rewrite;
 
@@ -524,6 +523,7 @@ mod tests {
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
+    use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::{
         BinaryOp, Deparse, JoinType, LiteralValue, QueryBody, query_expr_parse,
@@ -534,8 +534,6 @@ mod tests {
         ResolvedSelectColumn, ResolvedTableNode, ResolvedTableSource, ResolvedWhereExpr,
     };
     use crate::query::transform::AstTransformError;
-
-    use super::*;
 
     fn column_metadata(name: &str, position: i16, type_name: &str) -> ColumnMetadata {
         let (type_oid, data_type) = match type_name {

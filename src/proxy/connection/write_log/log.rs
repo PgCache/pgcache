@@ -6,19 +6,18 @@ use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
-use crate::pg::Lsn;
-use crate::query::ast::{AstNode, QueryExpr, TableNode};
-use crate::query::constraints::{
-    ColumnRange, column_ranges_disjoint, column_ranges_from_comparisons,
-};
-use crate::query::write::{RelationRef, WriteClass};
-
 use super::aggregate::{
     MERGED_PREDICATE_CAP, TableAggregate, UPDATE_DELETE_PREDICATE_CAP, equality_tuple_build,
     merged_tuples_disjoint, merged_updates_disjoint, update_predicate_build, update_tuple_build,
 };
 use super::tiers::{ConnectionTiers, TableTiers};
 use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
+use crate::pg::Lsn;
+use crate::query::ast::{AstNode, QueryExpr, TableNode};
+use crate::query::constraints::{
+    ColumnRange, column_ranges_disjoint, column_ranges_from_comparisons,
+};
+use crate::query::write::{RelationRef, WriteClass};
 
 /// The schema variants of one table name with pending writes. Keyed by bare
 /// name so the gate's fuzzy schema matching (an unqualified side matches any

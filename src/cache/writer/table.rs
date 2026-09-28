@@ -1,17 +1,16 @@
-use crate::oid::Oid;
 use ecow::EcoString;
 use postgres_protocol::escape;
 use tokio_postgres::Row;
 use tokio_postgres::types::Type;
 use tracing::{debug, error, info, instrument, warn};
 
+use super::core::WriterCore;
+use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::{
     ColumnMetadata, ColumnStore, IndexMetadata, TableMetadata, cache_type_name_resolve,
 };
+use crate::oid::Oid;
 use crate::result::error_chain_format;
-
-use super::super::{CacheError, CacheResult, MapIntoReport};
-use super::core::WriterCore;
 
 /// A column's resolved type triple — one resolution shared by both
 /// metadata-derivation paths (registration and CDC Relation re-resolve),

@@ -19,9 +19,8 @@ use std::sync::{
 use dashmap::DashMap;
 use tokio::sync::watch;
 
-use crate::id_hash::BuildIdHasher;
-
 use super::query::{Action, SqlTextHash};
+use crate::id_hash::BuildIdHasher;
 
 /// Interned cacheability verdicts shared by every connection.
 ///

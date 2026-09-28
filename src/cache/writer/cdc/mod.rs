@@ -1,11 +1,12 @@
-use crate::oid::Oid;
-use crate::pg::Lsn;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use lru::LruCache;
 use tokio_postgres::{Client, Statement};
+
+use crate::oid::Oid;
+use crate::pg::Lsn;
 
 mod dispatch;
 mod frame;

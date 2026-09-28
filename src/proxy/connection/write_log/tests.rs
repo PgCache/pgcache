@@ -1,3 +1,9 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use ecow::EcoString;
+use ordered_float::NotNan;
+
 use super::aggregate::{MERGED_PREDICATE_CAP, UPDATE_DELETE_PREDICATE_CAP};
 use super::log::WriteLog;
 use super::tiers::TableTiers;
@@ -8,10 +14,6 @@ use crate::query::constraints::ColumnRange;
 use crate::query::write::{
     DeleteStatement, InsertRow, InsertStatement, RelationRef, UpdateStatement, WriteClass,
 };
-use ecow::EcoString;
-use ordered_float::NotNan;
-use std::collections::HashMap;
-use std::sync::Arc;
 
 fn table(name: &str) -> WriteClass {
     WriteClass::Table(RelationRef {

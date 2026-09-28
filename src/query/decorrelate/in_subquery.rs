@@ -1,14 +1,17 @@
 use rootcause::Report;
 
+use super::predicate::{
+    boxed_scalar_column, correlated_exists_inner_prepare, correlated_not_exists_inner_prepare,
+    correlation_predicates_to_condition, from_sources_to_table_source, inner_query_select,
+    merge_where_clauses, where_clause_correlation_partition,
+};
+use super::{CorrelationPredicates, DecorrelateError, DecorrelateResult};
 use crate::query::ast::{BinaryOp, JoinType, UnaryOp};
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedJoinQual, ResolvedQueryExpr,
     ResolvedScalarExpr, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource,
     ResolvedUnaryExpr, ResolvedWhereExpr,
 };
-
-use super::predicate::*;
-use super::{CorrelationPredicates, DecorrelateError, DecorrelateResult};
 
 /// Extract the single output column from an IN subquery's SELECT list.
 ///

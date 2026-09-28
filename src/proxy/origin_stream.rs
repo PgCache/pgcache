@@ -3,14 +3,13 @@ use std::{io, net::SocketAddr, sync::Arc};
 use rootcause::Report;
 use tokio::net::TcpStream;
 
+use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
+use super::{ConnectionError, ConnectionResult};
+use crate::result::ReportExt;
 use crate::{
     settings::SslMode,
     tls::{self},
 };
-
-use super::tls_stream::{TlsReadHalf, TlsStream, TlsWriteHalf};
-use super::{ConnectionError, ConnectionResult};
-use crate::result::ReportExt;
 
 // ============================================================================
 // OriginStream - type aliases using generic TLS stream types

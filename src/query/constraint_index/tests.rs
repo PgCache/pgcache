@@ -1,3 +1,7 @@
+use ecow::EcoString;
+use ordered_float::NotNan;
+use postgres_types::Type;
+
 use super::classify::{Classification, classify, column_set_powerset};
 use super::*;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
@@ -7,9 +11,6 @@ use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::CastTarget;
 use crate::query::constraints::TableConstraint;
 use crate::query::{Fingerprint, FingerprintSet};
-use ecow::EcoString;
-use ordered_float::NotNan;
-use postgres_types::Type;
 
 fn col(s: &str) -> EcoString {
     EcoString::from(s)

@@ -1,11 +1,11 @@
 use std::io;
 
-use crate::oid::Oid;
 use error_set::error_set;
 use rootcause::Report;
 #[cfg(feature = "proxy")]
 use tokio_postgres::Error;
 
+use crate::oid::Oid;
 use crate::query::{
     decorrelate::DecorrelateError, resolved::ResolveError, transform::AstTransformError,
 };

@@ -1,18 +1,16 @@
-use crate::pg::Lsn;
 use std::num::NonZeroU64;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use tokio::task::yield_now;
 
+use super::core::WriterCore;
 use crate::cache::status::{
     CacheStatusData, CdcStatusData, LatencyStats, QueryStatusData, StatusRequest, StatusResponse,
 };
+use crate::cache::types::{CachedQuery, CachedQueryState, QueryMetrics};
+use crate::pg::Lsn;
 use crate::query::ast::Deparse;
-
-use super::super::types::{CachedQuery, CachedQueryState, QueryMetrics};
-
-use super::core::*;
 
 impl WriterCore {
     /// Update cache state gauges with current values.

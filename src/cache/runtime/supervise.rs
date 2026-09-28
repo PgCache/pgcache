@@ -7,13 +7,12 @@ use tokio::sync::mpsc::channel;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use super::CacheGeneration;
+use super::setup::cache_setup;
 use crate::cache::{CacheDispatchUpdater, CacheResult, PinnedQuery, StatusRequest};
 use crate::proxy::StatusSenderUpdater;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
-
-use super::CacheGeneration;
-use super::setup::cache_setup;
 
 /// Initial backoff before rebuilding the cache subsystem after a failure.
 const RESTART_INITIAL_BACKOFF: Duration = Duration::from_millis(500);

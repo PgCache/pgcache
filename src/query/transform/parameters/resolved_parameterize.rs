@@ -231,13 +231,14 @@ fn frame_bound_walk<F: FnMut(&mut LiteralValue)>(bound: &mut ResolvedFrameBound,
 
 #[cfg(test)]
 mod tests {
+    use iddqd::BiHashMap;
+    use postgres_types::Type;
+
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::oid::Oid;
     use crate::query::ast::{Deparse, query_expr_parse};
     use crate::query::resolve::query_expr_resolve;
-    use iddqd::BiHashMap;
-    use postgres_types::Type;
 
     fn users_table() -> TableMetadata {
         let columns = ColumnStore::new([

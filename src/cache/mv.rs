@@ -7,9 +7,6 @@
 //!
 //! See `docs/materialized-results.md` for the full design.
 
-#[cfg(test)]
-use crate::oid::Oid;
-use crate::query::Fingerprint;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -18,6 +15,9 @@ use std::time::{Duration, Instant};
 use ecow::EcoString;
 use postgres_protocol::escape::escape_identifier;
 
+#[cfg(test)]
+use crate::oid::Oid;
+use crate::query::Fingerprint;
 use crate::query::ast::{Deparse, LimitClause, OrderDirection, SetOpType};
 use crate::query::resolved::{
     ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,

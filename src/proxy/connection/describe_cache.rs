@@ -2,14 +2,13 @@ use std::num::NonZeroUsize;
 
 use tokio_util::bytes::{BufMut, Bytes, BytesMut};
 
+use super::ConnectionState;
 use crate::pg::protocol::{
     ByteString,
     encode::{NO_DATA_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG},
     extended::parse_parameter_description,
     session::StatementType,
 };
-
-use super::*;
 
 /// Bounded per connection so dynamic-SQL workloads can't grow it unbounded.
 pub(in crate::proxy::connection) const DESCRIBE_CACHE_CAPACITY: NonZeroUsize =

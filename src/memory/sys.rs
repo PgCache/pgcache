@@ -87,8 +87,8 @@ fn budget_from(host: Option<u64>, cgroup: Option<u64>) -> Option<u64> {
 mod imp {
     use std::fs;
 
-    use super::super::cgroup::cgroup_memory_snapshot;
     use super::{budget_from, field_kb};
+    use crate::memory::cgroup::cgroup_memory_snapshot;
 
     pub fn process_rss_bytes() -> Option<u64> {
         // VmRSS in /proc/self/status is the resident size in kB (what `top`

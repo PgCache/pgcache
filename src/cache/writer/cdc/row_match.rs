@@ -1,12 +1,10 @@
+use crate::cache::update_query::{ColumnChange, OrderByKey, RowChanges, UpdateQuery};
 use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
-
 use crate::query::ast::BinaryOp;
 use crate::query::cast::cast_target_coerce_text;
 use crate::query::constraints::{QueryConstraints, TableConstraint};
 use crate::query::evaluate::{literal_compare, where_value_compare_string};
-
-use super::super::super::update_query::{ColumnChange, OrderByKey, RowChanges, UpdateQuery};
 
 /// Check that every WHERE constraint for `table_metadata` matches `row_data`.
 /// Returns true when there are no constraints for this table (full-scan
@@ -221,13 +219,14 @@ pub(super) fn join_membership_unchanged(
 
 #[cfg(test)]
 mod tests {
+    use ecow::EcoString;
+    use tokio_postgres::types::Type;
+
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore};
     use crate::oid::Oid;
     use crate::query::ast::LiteralValue;
     use crate::query::cast::CastTarget;
-    use ecow::EcoString;
-    use tokio_postgres::types::Type;
 
     // Row layout: [id INT4 (PK), name TEXT, created_at TIMESTAMP].
     fn fixture_table() -> TableMetadata {

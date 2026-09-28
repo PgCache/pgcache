@@ -9,17 +9,16 @@ use std::time::Instant;
 use ecow::EcoString;
 use tracing::{debug, error};
 
+use super::core::WriterCore;
+use super::registration::{QueryResolution, WriterRegistration};
+use crate::cache::admission::{SubsumerCandidate, SubsumerSource, subsumption_covered};
+use crate::cache::types::{Cache, SharedResolved};
+use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::constraints::{TableConstraint, analyze_query_constraints};
 use crate::result::error_chain_format;
 use crate::timing::duration_to_ns_u64;
-
-use super::super::admission::{SubsumerCandidate, SubsumerSource, subsumption_covered};
-use super::super::types::{Cache, SharedResolved};
-use super::super::{CacheError, CacheResult, MapIntoReport};
-use super::core::WriterCore;
-use super::registration::{QueryResolution, WriterRegistration};
 
 /// Candidate source over the writer's per-relation subsumption index plus
 /// parent readiness state.

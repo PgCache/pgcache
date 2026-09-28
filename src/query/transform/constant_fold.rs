@@ -22,9 +22,8 @@ use std::convert::Infallible;
 
 use ordered_float::NotNan;
 
-use crate::query::ast::{ArithmeticOp, LiteralValue, QueryExpr, ScalarExpr};
-
 use super::walk::{QueryWalkerMut, query_expr_walk_mut};
+use crate::query::ast::{ArithmeticOp, LiteralValue, QueryExpr, ScalarExpr};
 
 /// Fold pure-literal arithmetic subtrees in `expr` in place.
 pub fn query_expr_constant_fold(expr: &mut QueryExpr) {
@@ -109,12 +108,13 @@ fn float_op(a: f64, op: ArithmeticOp, b: f64) -> Option<LiteralValue> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use postgres_types::Type as PgType;
+
     use super::*;
     use crate::cache::QueryParameters;
     use crate::query::ast::{WhereExpr, query_expr_fingerprint, query_expr_parse};
     use crate::query::transform::query_expr_parameters_replace;
-    use bytes::Bytes;
-    use postgres_types::Type as PgType;
 
     fn parse_and_fold(sql: &str) -> QueryExpr {
         let mut q = query_expr_parse(sql).unwrap();

@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use crate::oid::Oid;
-use crate::pg::Lsn;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ecow::EcoString;
@@ -14,6 +14,8 @@ use postgres_replication::{
     },
 };
 use postgres_types::PgLsn;
+use tokio::sync::Notify;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::{
     pin,
     time::{Interval, interval},
@@ -22,14 +24,10 @@ use tokio_postgres::{Client, Error};
 use tokio_stream::StreamExt;
 use tokio_util::bytes::Bytes;
 use tokio_util::sync::CancellationToken;
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use tokio::sync::Notify;
-use tokio::sync::mpsc::UnboundedSender;
 use tracing::{debug, error, trace};
 
+use crate::oid::Oid;
+use crate::pg::Lsn;
 use crate::pg::cdc::connect_replication;
 use crate::result::error_chain_format;
 use crate::settings::Settings;

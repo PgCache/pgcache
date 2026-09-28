@@ -3,10 +3,9 @@ use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
+use super::{AstNode, CteMaterialization, QueryExpr, SelectNode, WhereExpr};
 use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::query::ast::Deparse;
-
-use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableAlias {

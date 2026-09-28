@@ -19,14 +19,12 @@ use ecow::EcoString;
 use postgres_protocol::escape;
 use tracing::error;
 
+use super::core::WriterCore;
+use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::Lsn;
-use crate::query::Fingerprint;
-
-use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
-
-use super::core::WriterCore;
+use crate::query::Fingerprint;
 
 /// Per-relation backstop cap on retained distinct deleted-key tuples. The
 /// primary bound is the LSN-anchored prune (`DeletedKeyEntry::prune`): a deleted

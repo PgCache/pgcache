@@ -1,11 +1,10 @@
-use crate::oid::Oid;
-
 use ecow::EcoString;
 use error_set::error_set;
 use rootcause::Report;
 
 use crate::cache::SubqueryKind;
 use crate::catalog::ColumnMetadata;
+use crate::oid::Oid;
 use crate::query::ast::{
     ArithmeticOp, BinaryOp, FrameExclusion, FrameMode, JoinType, LiteralValue, MultiOp, NullOrder,
     OrderDirection, SetOpType, SubLinkType, TableAlias, UnaryOp, ValuesClause,

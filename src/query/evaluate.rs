@@ -375,6 +375,10 @@ fn literal_is_canonical_date(literal: &LiteralValue) -> bool {
 #[cfg(test)]
 mod tests {
 
+    use ecow::EcoString;
+    use ordered_float::NotNan;
+    use postgres_types::Type;
+
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::{BinaryOp, LiteralValue, MultiOp, SubLinkType, UnaryOp};
@@ -383,9 +387,6 @@ mod tests {
         ResolvedFunctionCall, ResolvedMultiExpr, ResolvedQueryBody, ResolvedQueryExpr,
         ResolvedSelectNode, ResolvedUnaryExpr,
     };
-    use ecow::EcoString;
-    use ordered_float::NotNan;
-    use postgres_types::Type;
 
     // ------------------------------------------------------------------
     // Fixtures

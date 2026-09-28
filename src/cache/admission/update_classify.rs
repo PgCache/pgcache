@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 use ecow::EcoString;
 
+use crate::cache::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuerySource};
 use crate::oid::Oid;
 use crate::query::ast::{AstNode, NullOrder, OrderDirection};
 use crate::query::evaluate::resolved_where_expr_supported;
@@ -12,8 +13,6 @@ use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns,
     ResolvedTableNode,
 };
-
-use super::super::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuerySource};
 
 /// Decide whether CDC can evaluate this update query's WHERE in Rust.
 ///
@@ -267,13 +266,12 @@ pub(super) fn predicate_columns_collect(
 #[cfg(test)]
 mod classify_tests {
 
-    use super::*;
-
     use std::collections::HashMap;
 
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
+    use super::*;
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::query_expr_parse;

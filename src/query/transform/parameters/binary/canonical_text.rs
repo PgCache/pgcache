@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use postgres_protocol::types as pg_types;
 use rootcause::Report;
 
-use super::super::super::{AstTransformError, AstTransformResult};
+use crate::query::transform::{AstTransformError, AstTransformResult};
 
 /// JDN of `2000-01-01`, PG's epoch for both `date` and `timestamp[tz]`.
 pub(super) const POSTGRES_EPOCH_JDATE: i32 = 2_451_545;

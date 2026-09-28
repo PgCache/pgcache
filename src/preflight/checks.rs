@@ -5,12 +5,11 @@
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, Error};
 
+use super::{CheckResult, Environment};
 use crate::pg::cdc::connect_replication;
 use crate::pg::connect;
 use crate::result::error_chain_format;
 use crate::settings::{Allowlist, CdcSettings, PgSettings};
-
-use super::{CheckResult, Environment};
 
 const MIN_SERVER_VERSION_NUM: i32 = 160_000;
 const NAMES_SHOWN: usize = 5;

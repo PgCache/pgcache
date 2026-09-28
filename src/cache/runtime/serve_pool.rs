@@ -8,6 +8,7 @@ use tokio::sync::mpsc::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
+use super::pool_controller::{PoolController, PoolControllerConfig, StepKind, TickSample};
 use crate::cache::explain::handle_explain_request;
 use crate::cache::messages::{CacheOutcome, CacheReply, slices_concat};
 use crate::cache::query_cache::{ServeJob, ServeRequest};
@@ -20,8 +21,6 @@ use crate::query::Fingerprint;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
 use crate::timing::duration_to_us_u64;
-
-use super::pool_controller::{PoolController, PoolControllerConfig, StepKind, TickSample};
 
 /// Elastic serve-pool bounds (ADR-053): the floor keeps light traffic served
 /// without ramp-up latency; the ceiling is the cache-PG protection bound and

@@ -1,6 +1,11 @@
+use super::{
+    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns,
+    ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
+};
+use crate::cache::SubqueryKind;
 use crate::cache::UpdateQuerySource;
-
-use super::*;
+use crate::query::ast::SubLinkType;
+use crate::query::ast::UnaryOp;
 
 impl ResolvedWhereExpr {
     /// Recursively collect subquery branches with source tracking.

@@ -7,10 +7,9 @@ mod replace;
 mod resolved_parameterize;
 mod text;
 
+use super::AstTransformResult;
 use crate::cache::QueryParameter;
 use crate::query::ast::LiteralValue;
-
-use super::AstTransformResult;
 
 pub(crate) use replace::{
     delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,

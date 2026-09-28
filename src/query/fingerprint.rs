@@ -59,8 +59,9 @@ pub type FingerprintDashSet = DashSet<Fingerprint, BuildIdHasher<Fingerprint>>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::hash::BuildHasher;
+
+    use super::*;
 
     /// The load-bearing invariant for the identity-hashed maps: a `Fingerprint`
     /// hashes (under the passthrough hasher) to exactly its own `u64`. If the

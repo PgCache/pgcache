@@ -23,15 +23,14 @@ use tokio::sync::Notify;
 use tokio_postgres::SimpleQueryMessage;
 use tracing::debug;
 
+use super::core::WriterCore;
+use super::staging::PopulationDeletedKeys;
+use crate::cache::messages::PopulationMerge;
+use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::Fingerprint;
-
-use super::super::messages::PopulationMerge;
-use super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
-use super::core::WriterCore;
-use super::staging::PopulationDeletedKeys;
 
 /// How long a population merge may stay gated on the apply watermark before the
 /// writer forces an origin WAL flush (`origin_flush_force`) to make its snapshot

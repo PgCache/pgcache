@@ -10,15 +10,14 @@
 use ecow::EcoString;
 use rootcause::Report;
 
+use super::column::column_resolve;
+use super::scope::ResolutionScope;
 use crate::query::ast::{BinaryOp, ColumnNode, JoinType};
 use crate::query::resolved::{
     ResolveError, ResolveResult, ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall,
     ResolvedJoinQual, ResolvedScalarExpr, ResolvedWhereExpr,
 };
 use crate::query::transform::where_expr_conjuncts_join;
-
-use super::column::column_resolve;
-use super::scope::ResolutionScope;
 
 /// A `USING`/`NATURAL` join's merged output column. Postgres exposes
 /// the join column(s) once (not per side); for an outer join its value

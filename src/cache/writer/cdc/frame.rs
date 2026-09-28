@@ -1,18 +1,19 @@
-use crate::oid::Oid;
-use crate::pg::Lsn;
-use crate::query::Fingerprint;
 use std::sync::atomic::Ordering;
 
 use ecow::EcoString;
 use tracing::{error, info};
 
-use super::super::super::memo::SlotKey;
-use super::super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
-use super::super::core::WriterCore;
-use super::super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
-use super::super::frame::{FRAME_BUF_CAPACITY, FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState};
-
-use super::*;
+use super::{SegmentMembership, WriterCdc};
+use crate::cache::memo::SlotKey;
+use crate::cache::writer::core::WriterCore;
+use crate::cache::writer::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
+use crate::cache::writer::frame::{
+    FRAME_BUF_CAPACITY, FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState,
+};
+use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
+use crate::oid::Oid;
+use crate::pg::Lsn;
+use crate::query::Fingerprint;
 
 impl WriterCdc {
     /// Finish a buffered statement: append the separator, then chunk-flush if

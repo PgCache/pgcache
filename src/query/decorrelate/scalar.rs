@@ -4,6 +4,14 @@ use ecow::EcoString;
 use postgres_types::Type;
 use rootcause::Report;
 
+use super::predicate::{
+    boxed_scalar_column, from_sources_to_table_source, inner_query_select,
+    where_clause_correlation_partition,
+};
+use super::{
+    CorrelationPredicate, DecorrelateError, DecorrelateResult, DecorrelateState,
+    ScalarDecorrelateResult,
+};
 use crate::cache::SubqueryKind;
 use crate::catalog::ColumnMetadata;
 use crate::query::ast::{BinaryOp, JoinType, SubLinkType, TableAlias};
@@ -12,12 +20,6 @@ use crate::query::resolved::{
     ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
     ResolvedSelectNode, ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedUnaryExpr,
     ResolvedWhereExpr,
-};
-
-use super::predicate::*;
-use super::{
-    CorrelationPredicate, DecorrelateError, DecorrelateResult, DecorrelateState,
-    ScalarDecorrelateResult,
 };
 
 /// Validate and clean an inner query for scalar subquery decorrelation.

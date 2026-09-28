@@ -3,6 +3,9 @@
 
 use ecow::EcoString;
 
+use super::column::column_resolve;
+use super::expr::{scalar_expr_resolve, where_expr_resolve};
+use super::scope::ResolutionScope;
 use crate::query::ast::{
     ColumnNode, LimitClause, LiteralValue, OrderByClause, ScalarExpr, SelectColumn, SelectColumns,
     WhereExpr,
@@ -12,10 +15,6 @@ use crate::query::resolved::{
     ResolvedLimitClause, ResolvedOrderByClause, ResolvedScalarExpr, ResolvedSelectColumn,
     ResolvedSelectColumns, ResolvedWhereExpr,
 };
-
-use super::column::column_resolve;
-use super::expr::{scalar_expr_resolve, where_expr_resolve};
-use super::scope::ResolutionScope;
 
 /// Resolve SELECT columns
 ///

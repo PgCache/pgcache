@@ -1,11 +1,12 @@
-#[cfg(test)]
-use crate::oid::Oid;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use bytes::Bytes;
 use ecow::EcoString;
+use error_set::error_set;
 
+#[cfg(test)]
+use crate::oid::Oid;
 use crate::query::transform::{AstTransformResult, query_expr_parameters_replace};
 use crate::{
     catalog::FunctionVolatility,
@@ -21,7 +22,6 @@ use crate::{
         },
     },
 };
-use error_set::error_set;
 
 // Each variant names the item that triggered it: pgcache-fit's per-statement
 // detail and the proxy's passthrough log both print it (never the SQL body).

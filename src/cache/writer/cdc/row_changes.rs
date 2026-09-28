@@ -1,4 +1,3 @@
-use crate::oid::Oid;
 use std::collections::HashSet;
 use std::fmt::{Display, Write};
 
@@ -6,15 +5,14 @@ use ecow::EcoString;
 use postgres_protocol::escape;
 use tokio_postgres::{SimpleQueryMessage, SimpleQueryRow};
 
+use super::{SQL_BUFFER_CAPACITY, WriterCdc};
+use crate::cache::update_query::{RowChanges, UpdateQueries};
+use crate::cache::writer::core::WriterCore;
+use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::TableMetadata;
+use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
 use crate::query::evaluate::bool_wire_text_parse;
-
-use super::super::super::update_query::{RowChanges, UpdateQueries};
-use super::super::super::{CacheError, CacheResult, MapIntoReport};
-use super::super::core::WriterCore;
-
-use super::*;
 
 /// Alias prefixes for the ordering projections the row-change SQL emits for
 /// limit-window ORDER BY columns (PGC-334), folded back into the base column's

@@ -3,7 +3,7 @@
 //! (population retries with backoff; CDC recovers by invalidating the
 //! affected relations) — the detection lives here so both agree on it.
 
-use super::super::CacheError;
+use crate::cache::CacheError;
 
 /// Postgres `deadlock_detected`.
 pub(super) const SQLSTATE_DEADLOCK: &str = "40P01";

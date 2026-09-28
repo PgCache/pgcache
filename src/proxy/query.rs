@@ -5,12 +5,12 @@ use std::{
     sync::Arc,
 };
 
-use lru::LruCache;
-
 use ecow::EcoString;
+use lru::LruCache;
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, trace};
 
+use super::{ParseError, cacheability_store::CacheabilityStore};
 use crate::{
     cache::query::{CacheableQuery, query_has_volatile_function},
     catalog::FunctionVolatility,
@@ -21,8 +21,6 @@ use crate::{
     },
     query::write::{IsolationEffect, StatementEffects, WriteClass},
 };
-
-use super::{ParseError, cacheability_store::CacheabilityStore};
 
 /// Name of the pseudo-function the proxy intercepts to explain a cached query
 /// against the cache database (PGC-345). It is never executed as a real
@@ -463,10 +461,9 @@ pub(super) fn analyze(
 mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
-    use super::*;
-
     use std::sync::Arc;
 
+    use super::*;
     use crate::proxy::cacheability_store::CacheabilityStore;
     use crate::query::write::IsolationLevel;
 

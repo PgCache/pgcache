@@ -6,8 +6,7 @@ use postgres_types::Type as PgType;
 use rootcause::Report;
 
 use crate::query::ast::LiteralValue;
-
-use super::super::{AstTransformError, AstTransformResult};
+use crate::query::transform::{AstTransformError, AstTransformResult};
 
 pub(super) fn text_parameter_to_literal(
     bytes: &[u8],
@@ -58,9 +57,10 @@ mod tests {
 
     use crate::cache::{QueryParameter, QueryParameters};
     use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_parse};
-
-    use super::super::super::AstTransformError;
-    use super::super::{parameter_to_literal, select_node_parameters_replace};
+    use crate::query::transform::AstTransformError;
+    use crate::query::transform::parameters::{
+        parameter_to_literal, select_node_parameters_replace,
+    };
 
     fn parse_select_node(sql: &str) -> SelectNode {
         let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");

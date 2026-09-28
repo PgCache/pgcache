@@ -5,6 +5,10 @@ use ecow::EcoString;
 use iddqd::BiHashMap;
 use rootcause::Report;
 
+use super::entry::query_expr_resolve;
+use super::expr::where_expr_resolve;
+use super::join_using::{JoinScopeRanges, join_natural_common_columns, join_using_or_cross};
+use super::scope::ResolutionScope;
 use crate::cache::SubqueryKind;
 use crate::catalog::TableMetadata;
 use crate::query::ast::{JoinQual, TableAlias, TableNode, TableSource};
@@ -12,11 +16,6 @@ use crate::query::resolved::{
     ResolveError, ResolveResult, ResolvedJoinNode, ResolvedJoinQual, ResolvedTableNode,
     ResolvedTableSource, ResolvedTableSubqueryNode,
 };
-
-use super::entry::query_expr_resolve;
-use super::expr::where_expr_resolve;
-use super::join_using::{JoinScopeRanges, join_natural_common_columns, join_using_or_cross};
-use super::scope::ResolutionScope;
 
 /// Find table metadata for a table reference.
 ///

@@ -1,3 +1,5 @@
+use std::error::Error;
+use std::fmt;
 use std::fs::read_to_string;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -7,10 +9,14 @@ use std::sync::Arc;
 use lexopt::prelude::*;
 use rootcause::Report;
 
-use crate::result::MapIntoReport;
-
 use super::dynamic::{DynamicConfig, DynamicConfigHandle};
-use super::*;
+use super::{
+    Allowlist, AllowlistEntry, BoxedError, CachePolicy, CdcSettings, ConfigError, ConfigResult,
+    DEFAULT_PUBLICATION_NAME, DEFAULT_SLOT_NAME, ListenSettings, MetricsSettings, PgSettings,
+    PgSettingsPartial, PreflightSettings, RunMode, Settings, SettingsToml, SslMode,
+    StaticConfigSnapshot,
+};
+use crate::result::MapIntoReport;
 
 /// Parse an allowlist entry string into (optional schema, table name).
 /// Supports "table" and "schema.table" forms.

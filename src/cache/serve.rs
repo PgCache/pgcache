@@ -1,26 +1,13 @@
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
-use crate::oid::Oid;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio_stream::StreamExt;
 use tokio_util::bytes::{Buf, Bytes};
-use tracing::{debug, error, instrument, trace, warn};
-
-use crate::cache::messages::PipelineDescribe;
-use tokio::net::TcpStream;
 use tokio_util::codec::FramedRead;
-
-use crate::pg::cache_connection::{CacheConnection, ParkedConnection, PrepareOutcome};
-use crate::pg::protocol::PgMessage;
-use crate::pg::protocol::backend::PgBackendMessageCodec;
-use crate::pg::protocol::backend::PgBackendMessageType;
-use crate::pg::protocol::backend::TransactionStatus;
-use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, SERVE_ERROR_MSG};
-use crate::query::ast::{AstNode, Deparse, LiteralValue};
-use crate::query::query_shape_derive;
-use crate::timing::QueryTiming;
+use tracing::{debug, error, instrument, trace, warn};
 
 use super::{
     CacheError, CacheResult,
@@ -30,7 +17,18 @@ use super::{
     types::CacheStateView,
     write_queue::WriteQueue,
 };
+use crate::cache::messages::PipelineDescribe;
+use crate::oid::Oid;
+use crate::pg::cache_connection::{CacheConnection, ParkedConnection, PrepareOutcome};
+use crate::pg::protocol::PgMessage;
+use crate::pg::protocol::backend::PgBackendMessageCodec;
+use crate::pg::protocol::backend::PgBackendMessageType;
+use crate::pg::protocol::backend::TransactionStatus;
+use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, SERVE_ERROR_MSG};
+use crate::query::ast::{AstNode, Deparse, LiteralValue};
+use crate::query::query_shape_derive;
 use crate::query::resolved::ResolvedTableNode;
+use crate::timing::QueryTiming;
 
 mod coalesce;
 mod sqlstate;

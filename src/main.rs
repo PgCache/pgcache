@@ -11,12 +11,11 @@ use pgcache_lib::preflight::{preflight_run, report_render};
 use pgcache_lib::proxy::SharedProxyStatus;
 use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::{PreflightSettings, RunMode};
-use rootcause::Report;
-use tokio_util::sync::CancellationToken;
-
 #[cfg(not(feature = "console"))]
 use pgcache_lib::tracing_utils::SimpeFormatter;
+use rootcause::Report;
 use tokio::io;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 #[cfg(not(feature = "console"))]
 use tracing_appender::non_blocking::NonBlockingBuilder;

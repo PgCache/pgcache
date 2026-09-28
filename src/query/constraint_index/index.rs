@@ -5,16 +5,15 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
-use crate::id_hash::IdHashable;
-use crate::query::constraints::TableConstraint;
-
 use super::classify::{
     Classification, classify, column_ranges, column_set_powerset, value_key_product,
 };
 use super::column_index::ComplexIndex;
 use super::value_key::ValueKey;
 use super::{ClassForms, ClassKeys, ColumnForms, ColumnSet, ConstraintIndex, IdSet};
+use crate::id_hash::IdHashable;
 use crate::query::constraints::ColumnRange;
+use crate::query::constraints::TableConstraint;
 
 #[derive(Debug)]
 pub(super) struct SubsumptionClass<K> {

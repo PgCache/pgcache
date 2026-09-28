@@ -5,7 +5,6 @@
 //! serve decision. They operate on the `Send` shared state ([`CacheStateView`])
 //! and are factored out so the dispatch logic stays readable.
 
-use crate::query::Fingerprint;
 use std::num::NonZeroU64;
 use std::ops::ControlFlow;
 use std::sync::atomic::Ordering;
@@ -13,16 +12,16 @@ use std::time::Instant;
 
 use tracing::error;
 
-use crate::query::ast::{AstNode, QueryExpr, TableNode};
-use crate::settings::{Allowlist, CachePolicy};
-use crate::timing::duration_to_ns_u64;
-
 use super::{
     messages::QueryCommand,
     mv::{MvServe, MvState},
     query::limit_is_sufficient,
     types::CacheStateView,
 };
+use crate::query::Fingerprint;
+use crate::query::ast::{AstNode, QueryExpr, TableNode};
+use crate::settings::{Allowlist, CachePolicy};
+use crate::timing::duration_to_ns_u64;
 
 /// MV serve decision.
 pub(crate) enum MvDecision {

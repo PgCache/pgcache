@@ -6,29 +6,29 @@
 //! Implements the `MakeTlsConnect` trait for tokio-postgres integration.
 
 use std::convert::TryFrom;
+use std::fs::File;
 use std::future::Future;
 use std::io;
+use std::io::BufReader;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use error_set::error_set;
 use rootcause::Report;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
-
-use crate::result::MapIntoReport;
-use crate::settings::SslMode;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 use rustls_pemfile::{certs, private_key};
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_postgres::tls::{ChannelBinding, TlsConnect, TlsStream};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream as RustlsTlsStream;
+
+use crate::result::MapIntoReport;
+use crate::settings::SslMode;
 
 error_set! {
     /// Errors that can occur during TLS connection setup
@@ -481,9 +481,11 @@ where
 #[cfg(test)]
 mod tests {
 
-    use super::*;
     use std::sync::Once;
+
     use tokio_postgres::tls::MakeTlsConnect;
+
+    use super::*;
 
     static INIT: Once = Once::new();
 

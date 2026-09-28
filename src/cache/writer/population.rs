@@ -1,11 +1,7 @@
-use crate::cache::population_pool::POPULATION_PARK_EXPIRY;
-use crate::oid::Oid;
-use crate::pg::Lsn;
-use crate::query::Fingerprint;
-use crate::settings::PgSettings;
 use std::collections::HashSet;
 use std::fmt::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ecow::EcoString;
@@ -20,20 +16,23 @@ use tokio_postgres::{Client, SimpleColumn, SimpleQueryMessage, SimpleQueryRow};
 use tokio_stream::StreamExt;
 use tracing::{debug, error, trace};
 
-use crate::catalog::TableMetadata;
-use crate::pg;
-use crate::query::ast::Deparse;
-use crate::query::resolved::{ResolvedSelectNode, ResolvedTableNode};
-use crate::query::transform::resolved_select_node_replace;
-
-use super::super::{
+use super::PopulationWork;
+use super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
+use crate::cache::population_pool::POPULATION_PARK_EXPIRY;
+use crate::cache::{
     CacheError, CacheResult, MapIntoReport,
     messages::{PopulationMerge, QueryCommand},
     population_pool::PopulationPool,
 };
-use super::PopulationWork;
-use super::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::catalog::TableMetadata;
+use crate::oid::Oid;
+use crate::pg;
+use crate::pg::Lsn;
+use crate::query::Fingerprint;
+use crate::query::ast::Deparse;
+use crate::query::resolved::{ResolvedSelectNode, ResolvedTableNode};
+use crate::query::transform::resolved_select_node_replace;
+use crate::settings::PgSettings;
 
 /// Number of rows to batch per INSERT statement sent to the cache database.
 const POPULATION_INSERT_BATCH_SIZE: usize = 200;

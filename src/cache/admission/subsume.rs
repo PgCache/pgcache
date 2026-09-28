@@ -3,10 +3,9 @@
 //! supplies candidates from its per-relation index plus parent state,
 //! pgcache-fit from its offline registry.
 
+use super::{SubsumerCandidate, SubsumerSource};
 use crate::oid::Oid;
 use crate::query::constraints::{QueryConstraints, TableConstraint, table_constraints_subsumed};
-
-use super::{SubsumerCandidate, SubsumerSource};
 
 /// Whether every relation of the new query is covered by some registered
 /// candidate whose constraints are implied by the new query's. Candidate

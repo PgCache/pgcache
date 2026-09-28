@@ -8,11 +8,10 @@
 //! not part of this decision. Coalescing has no offline analogue (population
 //! completes instantly without a time axis), so fit never observes `Loading`.
 
-use crate::settings::CachePolicy;
-
 use super::query::limit_is_sufficient;
 #[cfg(feature = "proxy")]
 use super::types::CachedQueryView;
+use crate::settings::CachePolicy;
 
 /// State of a cached query
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

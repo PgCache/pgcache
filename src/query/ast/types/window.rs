@@ -3,9 +3,8 @@ use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
+use super::{AstNode, OrderByClause, ScalarExpr, WhereExpr};
 use crate::query::ast::Deparse;
-
-use super::*;
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct FunctionCall {

@@ -1,28 +1,30 @@
-use crate::oid::Oid;
-use crate::query::{Fingerprint, FingerprintSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use ecow::EcoString;
+use lru::LruCache;
 use tracing::{error, instrument, trace};
 
-use lru::LruCache;
-
-use crate::pg;
-use crate::pg::protocol::ByteString;
-use crate::settings::Settings;
-
-use super::super::super::messages::CdcCommand;
-use super::super::super::update_query::{RowChanges, UpdateEvalStrategy, UpdateQuery};
-use super::super::super::{CacheError, CacheResult, MapIntoReport, ReportExt};
-use super::super::core::WriterCore;
-use super::super::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState};
-use super::super::staging::pk_body_render;
-
-use super::*;
+use super::{
+    BATCH_FRAMES_MAX, BatchEvalView, CdcOperation, MembershipRow, PREPARED_EVAL_CACHE_CAPACITY,
+    PreparedEvalKey, RowEvent, SQL_BUFFER_CAPACITY, WriterCdc, eval_candidates_into,
+    memo_frame_accumulate, toast_fallback_structural_invalidate, update_pk_changed,
+    update_queries_check_invalidate, update_query_matches_locally,
+};
+use crate::cache::messages::CdcCommand;
+use crate::cache::update_query::{RowChanges, UpdateEvalStrategy, UpdateQuery};
+use crate::cache::writer::core::WriterCore;
+use crate::cache::writer::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState};
+use crate::cache::writer::staging::pk_body_render;
+use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::TableMetadata;
+use crate::oid::Oid;
+use crate::pg;
 use crate::pg::Lsn;
+use crate::pg::protocol::ByteString;
+use crate::query::{Fingerprint, FingerprintSet};
+use crate::settings::Settings;
 
 impl WriterCdc {
     /// Handle a CDC command, dispatching to the appropriate method.

@@ -11,8 +11,7 @@ use postgres_types::Type as PgType;
 use rootcause::Report;
 
 use crate::query::ast::LiteralValue;
-
-use super::super::{AstTransformError, AstTransformResult};
+use crate::query::transform::{AstTransformError, AstTransformResult};
 
 mod canonical_text;
 
@@ -384,17 +383,16 @@ mod tests {
     use bytes::Bytes;
     use postgres_types::Type as PgType;
 
+    use super::canonical_text::{
+        NUMERIC_NEG, NUMERIC_NINF, NUMERIC_PINF, NUMERIC_POS, USECS_PER_DAY,
+    };
     use crate::cache::{QueryParameter, QueryParameters};
     use crate::query::ast::{
         Deparse, LiteralValue, QueryBody, SelectNode, query_expr_fingerprint, query_expr_parse,
     };
-
-    use super::super::super::AstTransformError;
-    use super::super::{
+    use crate::query::transform::AstTransformError;
+    use crate::query::transform::parameters::{
         parameter_to_literal, query_expr_parameters_replace, select_node_parameters_replace,
-    };
-    use super::canonical_text::{
-        NUMERIC_NEG, NUMERIC_NINF, NUMERIC_PINF, NUMERIC_POS, USECS_PER_DAY,
     };
     // NUMERIC_NAN is also used; pull in too.
     use super::canonical_text::NUMERIC_NAN;

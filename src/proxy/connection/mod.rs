@@ -3,14 +3,14 @@ use std::{
     sync::Arc,
 };
 
-use lru::LruCache;
-
 use ecow::EcoString;
-
-use crate::catalog::FunctionVolatility;
-
+use lru::LruCache;
 use tokio_util::bytes::BytesMut;
 
+use super::query::CacheabilityCache;
+use super::{ProxyMode, ProxyStatus};
+use crate::catalog::FunctionVolatility;
+use crate::query::write::IsolationLevel;
 use crate::{
     cache::{CacheDispatchHandle, CacheMessage},
     pg::protocol::{
@@ -19,10 +19,6 @@ use crate::{
     },
     proxy::egress::EgressQueue,
 };
-
-use super::query::CacheabilityCache;
-use super::{ProxyMode, ProxyStatus};
-use crate::query::write::IsolationLevel;
 
 mod describe_cache;
 mod extended;

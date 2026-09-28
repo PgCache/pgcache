@@ -3,6 +3,7 @@
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
+use super::*;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
 use crate::oid::Oid;
 use crate::query::ast::{Deparse, JoinType, UnaryOp, query_expr_parse};
@@ -10,8 +11,6 @@ use crate::query::resolved::{
     ResolvedJoinNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumns,
     ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr, query_expr_resolve,
 };
-
-use super::*;
 
 /// Create test table metadata with given column names.
 /// First column is the primary key (INT4), rest are TEXT.

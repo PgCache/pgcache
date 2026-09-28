@@ -1,6 +1,3 @@
-use crate::oid::Oid;
-use crate::pg::Lsn;
-use crate::query::{Fingerprint, FingerprintSet};
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -18,13 +15,14 @@ use tokio_postgres::Client;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error};
 
+use super::cdc::WriterCdc;
+use super::frame::{FRAME_BUF_CAPACITY, FrameRowEvent, FrameState, OverlayEntry};
+use super::merge_queue::{InputQueues, MergeQueue};
+use super::mv_build::MvBuildPool;
+use super::registration::WriterRegistration;
+use super::staging::{PopulationDeletedKeys, StagingPool};
 use crate::cache::status::StatusRequest;
-use crate::pg;
-use crate::pg::protocol::ByteString;
-use crate::result::error_chain_format;
-use crate::settings::Settings;
-
-use super::super::{
+use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{CdcCommand, QueryCommand, WriterNotify},
     mv::{MvMeta, ShapeGate},
@@ -32,13 +30,13 @@ use super::super::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
     },
 };
-use super::cdc::WriterCdc;
-use super::merge_queue::{InputQueues, MergeQueue};
-use super::mv_build::MvBuildPool;
-use super::registration::WriterRegistration;
-use super::staging::{PopulationDeletedKeys, StagingPool};
-
-use super::frame::*;
+use crate::oid::Oid;
+use crate::pg;
+use crate::pg::Lsn;
+use crate::pg::protocol::ByteString;
+use crate::query::{Fingerprint, FingerprintSet};
+use crate::result::error_chain_format;
+use crate::settings::Settings;
 
 /// Deterministic fault injection for the restart supervisor: kill the writer on
 /// a sentinel CDC insert so a test can drive a real subsystem death → rebuild.

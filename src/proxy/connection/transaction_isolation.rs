@@ -32,13 +32,12 @@
 
 use tracing::debug;
 
+use super::{ConnectionState, OriginIntercept, SearchPathState};
 use crate::pg::protocol::{
     backend::{PgBackendMessage, PgBackendMessageType, TransactionStatus, data_row_first_column},
     frontend::simple_query_message_build,
 };
 use crate::query::write::{IsolationEffect, IsolationLevel, StatementEffects, TransactionBoundary};
-
-use super::*;
 
 /// Injected probe for the session default; its response is swallowed by
 /// [`OriginIntercept::DefaultTransactionIsolation`].

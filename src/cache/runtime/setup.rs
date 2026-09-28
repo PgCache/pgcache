@@ -8,6 +8,12 @@ use tokio::sync::mpsc::{Receiver, UnboundedReceiver, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument};
 
+use super::cdc_driver::cdc_run;
+use super::memory_monitor::{memory_monitor, shared_buffers_bytes_query};
+use super::population_pool::population_pool_controller;
+use super::reg_gate::reg_gate_controller;
+use super::reset::cache_database_reset;
+use super::serve_pool::{serve_loop, serve_pool_bounds, serve_pool_controller};
 use crate::cache::messages::WriterNotify;
 use crate::cache::query_cache::CacheDispatch;
 use crate::cache::types::{ActiveRelations, CacheStateView};
@@ -19,13 +25,6 @@ use crate::cache::{
 use crate::pg::cdc::replication_provision;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
-
-use super::cdc_driver::cdc_run;
-use super::memory_monitor::{memory_monitor, shared_buffers_bytes_query};
-use super::population_pool::population_pool_controller;
-use super::reg_gate::reg_gate_controller;
-use super::reset::cache_database_reset;
-use super::serve_pool::{serve_loop, serve_pool_bounds, serve_pool_controller};
 
 /// Build one generation of the cache subsystem.
 ///

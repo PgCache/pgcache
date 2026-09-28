@@ -2,10 +2,9 @@ use std::fs;
 use std::fs::read_to_string;
 use std::path::Path;
 
-use crate::result::MapIntoReport;
-
 use super::dynamic::DynamicConfig;
-use super::*;
+use super::{BoxedError, CachePolicy, ConfigError, ConfigResult, DynamicConfigPatch, SettingsToml};
+use crate::result::MapIntoReport;
 
 /// Extract dynamic config fields from a parsed TOML config file.
 fn dynamic_config_from_toml(config: &SettingsToml) -> DynamicConfig {

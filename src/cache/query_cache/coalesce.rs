@@ -4,15 +4,13 @@ use std::time::Instant;
 use ecow::EcoString;
 use tracing::error;
 
-use crate::query::Fingerprint;
-use crate::result::error_chain_format;
-
+use super::dispatch::reply_forward;
+use super::{CacheDispatch, CoalescedClient};
 use crate::cache::messages::slices_concat;
 use crate::cache::query::{limit_is_sufficient, limit_rows_needed};
 use crate::cache::types::SharedResolved;
-
-use super::dispatch::reply_forward;
-use super::{CacheDispatch, CoalescedClient};
+use crate::query::Fingerprint;
+use crate::result::error_chain_format;
 
 impl CacheDispatch {
     /// Total number of requests waiting across all coalescing groups.

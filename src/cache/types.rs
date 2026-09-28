@@ -1,4 +1,3 @@
-use crate::oid::Oid;
 use std::collections::{BTreeSet, HashSet};
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -9,9 +8,13 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use ecow::EcoString;
 use hdrhistogram::Histogram;
-
 use iddqd::{BiHashItem, BiHashMap, IdHashMap, bi_upcast};
 
+use super::population_pool::PopulationPool;
+use super::reg_gate::RegGate;
+use super::serve_pool_state::ServePool;
+use super::update_query::UpdateQueries;
+use crate::oid::Oid;
 use crate::{
     cache::{memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::TableMetadata,
@@ -20,11 +23,6 @@ use crate::{
     },
     settings::{DynamicConfigHandle, Settings},
 };
-
-use super::population_pool::PopulationPool;
-use super::reg_gate::RegGate;
-use super::serve_pool_state::ServePool;
-use super::update_query::UpdateQueries;
 
 /// Shared resolved query expression, wrapped in Arc to avoid deep cloning
 /// on every cache hit (the dispatch→serve path).

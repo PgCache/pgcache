@@ -4,10 +4,9 @@ use std::ops::ControlFlow;
 use ecow::EcoString;
 use smallvec::SmallVec;
 
+use super::{AstNode, ColumnNode, LiteralValue, ScalarExpr, TableNode, TableSource, WhereExpr};
 use crate::cache::UpdateQuerySource;
 use crate::query::ast::Deparse;
-
-use super::*;
 
 // ============================================================================
 // New Query Type Hierarchy (for UNION/INTERSECT/EXCEPT support)

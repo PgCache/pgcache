@@ -1,9 +1,15 @@
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
-use crate::query::ast::AstNode;
+use ecow::EcoString;
 
-use super::*;
+use super::{
+    ResolvedJoinNode, ResolvedJoinQual, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
+    ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableNode,
+    ResolvedTableSource, ResolvedWhereExpr,
+};
+use crate::query::ast::AstNode;
+use crate::query::ast::BinaryOp;
 
 impl ResolvedWhereExpr {
     /// Compute the maximum subquery nesting depth in this WHERE expression.

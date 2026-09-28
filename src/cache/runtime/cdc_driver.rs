@@ -1,9 +1,13 @@
+#[cfg(feature = "fault-injection")]
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::UnboundedSender;
+#[cfg(feature = "fault-injection")]
+use tokio::sync::mpsc::unbounded_channel;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
@@ -14,11 +18,6 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::pg::cdc::slot_confirmed_lsn;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
-
-#[cfg(feature = "fault-injection")]
-use std::collections::VecDeque;
-#[cfg(feature = "fault-injection")]
-use tokio::sync::mpsc::unbounded_channel;
 
 /// Test-only constant CDC apply lag (fault-injection feature): when
 /// `PGCACHE_FAULT_CDC_APPLY_LAG_MS` is set, every `CdcCommand` is held for

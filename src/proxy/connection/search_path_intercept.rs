@@ -2,20 +2,16 @@ use std::sync::Arc;
 
 use ecow::EcoString;
 use postgres_types::PgLsn;
-
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, trace};
 
+use super::ConnectionState;
 use crate::pg::Lsn;
-
 use crate::pg::protocol::{
     backend::{PgBackendMessage, PgBackendMessageType, data_row_first_column},
     frontend::{PgFrontendMessage, simple_query_message_build},
 };
-
-use super::super::search_path::{SearchPath, search_path_mutations_raw};
-
-use super::*;
+use crate::proxy::search_path::{SearchPath, search_path_mutations_raw};
 
 /// Extract the SQL text (without the trailing null) from a simple-query
 /// `'Q'` message body. Returns `None` if the frame is malformed or the text

@@ -1,27 +1,25 @@
-use crate::oid::Oid;
-use crate::query::{Fingerprint, FingerprintSet};
 use std::time::Instant;
 
 use ecow::EcoString;
 use tracing::debug;
 
-use crate::catalog::TableMetadata;
-use crate::pg::protocol::ByteString;
-use crate::query::constraint_index::row_value_forms;
-use crate::settings::CachePolicy;
-
-use super::super::super::CacheResult;
-use super::super::super::messages::QueryCommand;
-use super::super::super::types::CachedQueryState;
-use super::super::super::update_query::{
-    RowChanges, SubqueryKind, UpdateQueries, UpdateQuery, UpdateQuerySource,
-};
-use super::super::core::WriterCore;
 use super::row_match::{
     join_membership_unchanged, row_constraints_match, window_move_is_promotion,
 };
-
-use super::*;
+use super::{CdcOperation, WriterCdc};
+use crate::cache::CacheResult;
+use crate::cache::messages::QueryCommand;
+use crate::cache::types::CachedQueryState;
+use crate::cache::update_query::{
+    RowChanges, SubqueryKind, UpdateQueries, UpdateQuery, UpdateQuerySource,
+};
+use crate::cache::writer::core::WriterCore;
+use crate::catalog::TableMetadata;
+use crate::oid::Oid;
+use crate::pg::protocol::ByteString;
+use crate::query::constraint_index::row_value_forms;
+use crate::query::{Fingerprint, FingerprintSet};
+use crate::settings::CachePolicy;
 
 /// One CDC row event as the invalidation checks see it.
 pub(super) struct RowEvent<'a> {

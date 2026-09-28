@@ -19,13 +19,12 @@ use std::ops::ControlFlow;
 
 use rootcause::Report;
 
-use crate::query::ast::{AstNode, BinaryOp, LiteralValue, MultiOp};
-
 use super::{
     ResolveError, ResolveResult, ResolvedCaseExpr, ResolvedColumnNode, ResolvedFunctionCall,
     ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
     ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
 };
+use crate::query::ast::{AstNode, BinaryOp, LiteralValue, MultiOp};
 
 /// Check a resolved query for order-dependent enum usage. `Err` carries the
 /// first offending column and its position; registration turns it into a
@@ -299,12 +298,11 @@ mod tests {
     use iddqd::BiHashMap;
     use postgres_types::{Kind, Type};
 
+    use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::oid::Oid;
     use crate::query::ast::query_expr_parse;
-
-    use super::super::query_expr_resolve;
-    use super::*;
+    use crate::query::resolved::query_expr_resolve;
 
     fn severity_type() -> Type {
         Type::new(

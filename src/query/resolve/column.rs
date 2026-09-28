@@ -4,10 +4,9 @@
 use ecow::EcoString;
 use rootcause::Report;
 
+use super::scope::ResolutionScope;
 use crate::query::ast::ColumnNode;
 use crate::query::resolved::{ResolveError, ResolveResult, ResolvedColumnNode, ResolvedScalarExpr};
-
-use super::scope::ResolutionScope;
 
 /// Resolve a column reference to a resolved column node.
 ///

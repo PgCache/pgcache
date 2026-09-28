@@ -6,6 +6,15 @@ use std::collections::HashSet;
 use ecow::EcoString;
 use iddqd::BiHashMap;
 
+use super::update_classify::{
+    limit_order_keys_collect, limit_window_columns_collect, pg_batchable_classify,
+    predicate_columns_collect, update_eval_strategy_classify,
+};
+use super::{AdmissionAnalysis, TableAdmission};
+use crate::cache::mv::{ShapeGate, shape_classify};
+use crate::cache::query::limit_rows_needed;
+use crate::cache::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
+use crate::cache::{CacheError, CacheResult};
 use crate::catalog::TableMetadata;
 use crate::query::Fingerprint;
 use crate::query::ast::{AstNode, QueryBody, QueryExpr};
@@ -16,16 +25,6 @@ use crate::query::resolved::{ResolvedQueryExpr, ResolvedTableNode};
 use crate::query::transform::PgEvalTemplate;
 use crate::query::update::query_table_update_queries;
 use crate::result::ReportExt;
-
-use super::super::mv::{ShapeGate, shape_classify};
-use super::super::query::limit_rows_needed;
-use super::super::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
-use super::super::{CacheError, CacheResult};
-use super::update_classify::{
-    limit_order_keys_collect, limit_window_columns_collect, pg_batchable_classify,
-    predicate_columns_collect, update_eval_strategy_classify,
-};
-use super::{AdmissionAnalysis, TableAdmission};
 
 /// How much of each [`TableAdmission`] to build. The writer needs the full
 /// [`UpdateQuery`] including its CDC-eval caches; offline analysis

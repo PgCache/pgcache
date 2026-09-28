@@ -1,5 +1,3 @@
-use crate::oid::Oid;
-use crate::pg::Lsn;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -8,14 +6,14 @@ use postgres_protocol::escape;
 use tokio_postgres::SimpleQueryMessage;
 use tracing::{debug, error};
 
+use super::{SQL_BUFFER_CAPACITY, WriterCdc, update_pk_changed};
+use crate::cache::writer::core::WriterCore;
+use crate::cache::writer::frame::{FrameRowEvent, OverlayEntry};
+use crate::cache::writer::staging::pk_body_render;
 use crate::catalog::TableMetadata;
+use crate::oid::Oid;
+use crate::pg::Lsn;
 use crate::pg::protocol::ByteString;
-
-use super::super::core::WriterCore;
-use super::super::frame::{FrameRowEvent, OverlayEntry};
-use super::super::staging::pk_body_render;
-
-use super::*;
 
 /// One queued toast repair awaiting the batched pre-batch-image lookup
 /// (PGC-264).

@@ -72,13 +72,12 @@ mod tests {
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
+    use super::*;
     use crate::cache::SubqueryKind;
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
     use crate::query::ast::{Deparse, query_expr_parse};
     use crate::query::resolved::query_expr_resolve;
-
-    use super::*;
 
     /// Helper to parse SQL and return a CacheableQuery
     fn parse_cacheable(sql: &str) -> CacheableQuery {

@@ -10,9 +10,8 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
-use crate::query::ast::{BinaryOp, LiteralValue};
-
 use super::TableConstraint;
+use crate::query::ast::{BinaryOp, LiteralValue};
 
 /// One end of a column's value range
 #[derive(Debug, Clone)]

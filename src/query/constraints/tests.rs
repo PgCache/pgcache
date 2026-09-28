@@ -3,15 +3,13 @@
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
-use crate::oid::Oid;
-
-use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-use crate::query::ast::{QueryBody, query_expr_parse};
-use crate::query::resolved::{ResolvedSelectNode, select_node_resolve};
-
 use super::extract::analyze_query_constraints;
 use super::subsume::table_constraints_subsumed;
 use super::*;
+use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+use crate::oid::Oid;
+use crate::query::ast::{QueryBody, query_expr_parse};
+use crate::query::resolved::{ResolvedSelectNode, select_node_resolve};
 
 // Helper function to parse SQL and resolve to ResolvedSelectNode
 fn resolve_sql(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedSelectNode {

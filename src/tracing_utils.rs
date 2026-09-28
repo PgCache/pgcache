@@ -1,5 +1,6 @@
-use nu_ansi_term::{Color, Style};
 use std::{fmt, thread};
+
+use nu_ansi_term::{Color, Style};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::registry::LookupSpan;

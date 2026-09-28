@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use ecow::EcoString;
 
+use super::{CorrelationPredicate, CorrelationPredicates, DecorrelateError, DecorrelateResult};
 use crate::query::ast::{BinaryOp, JoinType};
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedJoinQual, ResolvedQueryBody,
@@ -9,8 +10,6 @@ use crate::query::resolved::{
     ResolvedWhereExpr,
 };
 use crate::query::transform::{where_expr_conjuncts_join, where_expr_conjuncts_split};
-
-use super::{CorrelationPredicate, CorrelationPredicates, DecorrelateError, DecorrelateResult};
 
 /// Wrap a resolved column node as a boxed `WhereExpr::Scalar(Column(...))` leaf.
 pub(super) fn boxed_scalar_column(col: ResolvedColumnNode) -> Box<ResolvedWhereExpr> {

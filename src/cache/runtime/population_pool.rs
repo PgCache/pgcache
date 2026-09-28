@@ -3,9 +3,8 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::cache::types::CacheStateView;
-
 use super::pool_controller::{PoolController, PoolControllerConfig, StepKind, TickSample};
+use crate::cache::types::CacheStateView;
 
 /// Controller tick.
 const TICK: Duration = Duration::from_secs(1);

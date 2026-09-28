@@ -1,15 +1,13 @@
-use crate::oid::Oid;
-use crate::pg::Lsn;
 use std::collections::HashMap;
 
 use ecow::EcoString;
 
-use crate::pg::protocol::ByteString;
-
-use super::super::messages::{CdcValue, cdc_values_convert};
-
-use super::core::*;
+use super::core::WriterCore;
 use super::staging::pk_body_render;
+use crate::cache::messages::{CdcValue, cdc_values_convert};
+use crate::oid::Oid;
+use crate::pg::Lsn;
+use crate::pg::protocol::ByteString;
 
 /// Preallocated capacity for the per-frame SQL write buffer (PGC-228). Fixed up
 /// front so the buffer never reallocates in steady state; also the byte

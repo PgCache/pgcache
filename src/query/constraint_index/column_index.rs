@@ -4,12 +4,11 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::value_key::{Placement, ValueKey, placement};
+use super::{ColumnForms, IdSet};
 use crate::id_hash::IdHashable;
 use crate::query::ast::LiteralValue;
 use crate::query::constraints::ColumnRange;
-
-use super::value_key::{Placement, ValueKey, placement};
-use super::{ColumnForms, IdSet};
 
 /// Intersect per-column match sets, smallest first so the accumulator shrinks
 /// as fast as possible, short-circuiting once it empties.

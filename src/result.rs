@@ -125,9 +125,11 @@ pub fn error_chain_format(e: &dyn std::error::Error) -> String {
 #[cfg(test)]
 mod tests {
 
-    use super::*;
-    use rootcause::prelude::ResultExt;
     use std::fmt;
+
+    use rootcause::prelude::ResultExt;
+
+    use super::*;
 
     #[derive(Debug)]
     struct TestError(&'static str);

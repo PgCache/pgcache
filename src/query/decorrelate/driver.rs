@@ -3,6 +3,11 @@ use std::collections::HashSet;
 use ecow::EcoString;
 use rootcause::Report;
 
+use super::exists::{conjunct_exists_try_decorrelate, conjunct_not_exists_try_decorrelate};
+use super::in_subquery::{conjunct_in_any_try_decorrelate, conjunct_not_in_all_try_decorrelate};
+use super::predicate::{scalar_expr_has_correlation, where_expr_has_correlation};
+use super::scalar::{conjunct_scalar_decorrelate, left_join_derived, subquery_scalar_decorrelate};
+use super::{DecorrelateError, DecorrelateOutcome, DecorrelateResult, DecorrelateState};
 use crate::query::ast::{BinaryOp, SubLinkType, UnaryOp};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
@@ -10,12 +15,6 @@ use crate::query::resolved::{
     ResolvedWhereExpr,
 };
 use crate::query::transform::{where_expr_conjuncts_join, where_expr_conjuncts_split};
-
-use super::exists::*;
-use super::in_subquery::*;
-use super::predicate::*;
-use super::scalar::*;
-use super::{DecorrelateError, DecorrelateOutcome, DecorrelateResult, DecorrelateState};
 
 impl<'a> DecorrelateState<'a> {
     fn new(aggregate_functions: &'a HashSet<EcoString>) -> Self {

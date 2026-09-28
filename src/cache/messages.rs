@@ -1,4 +1,3 @@
-use crate::query::Fingerprint;
 use std::sync::Arc;
 
 use ecow::EcoString;
@@ -6,14 +5,14 @@ use smallvec::SmallVec;
 use tokio_util::bytes::{Bytes, BytesMut};
 
 use super::query::CacheableQuery;
+use super::query::QueryParameters;
 use super::reply::ReplySender;
+use super::types::SharedResolved;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::{ClientSocket, ExplainSpec};
+use crate::query::Fingerprint;
 use crate::timing::QueryTiming;
-
-use super::query::QueryParameters;
-use super::types::SharedResolved;
 
 pub use super::serve_decision::AdmitAction;
 

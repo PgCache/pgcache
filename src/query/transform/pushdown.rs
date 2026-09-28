@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-#[cfg(test)]
-use crate::oid::Oid;
 use ecow::EcoString;
 
+#[cfg(test)]
+use crate::oid::Oid;
 use crate::query::ast::{AstNode, BinaryOp};
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedMultiExpr, ResolvedQueryBody,

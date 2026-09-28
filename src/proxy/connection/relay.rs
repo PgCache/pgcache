@@ -11,14 +11,9 @@ use std::{
     time::Instant,
 };
 
-use lru::LruCache;
-
 use ecow::EcoString;
-
-use crate::catalog::FunctionVolatility;
-use crate::proxy::CacheabilityStore;
+use lru::LruCache;
 use tokio::sync::watch;
-
 use tokio::{io::AsyncWriteExt, net::TcpStream, select};
 use tokio_stream::StreamExt;
 use tokio_util::{
@@ -27,6 +22,22 @@ use tokio_util::{
 };
 use tracing::{debug, error, instrument, trace, warn};
 
+use super::{
+    ConnectionState, DESCRIBE_CACHE_CAPACITY, ExtendedPending, IsolationState, OriginIntercept,
+    OriginReadHalf, OriginWriteHalf, QueryTelemetry, RawDecision, RawForwardCause,
+    RawForwardReason, SearchPathState, TransactionForwardReason, WriteLog, forward_cause,
+    origin_connect,
+};
+use crate::catalog::FunctionVolatility;
+use crate::proxy::CacheabilityStore;
+use crate::proxy::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
+use crate::proxy::query::{Action, CacheabilityCache, ForwardReason, handle_query};
+use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
+use crate::query::ast::{AstNode, QueryExpr, TableNode};
+use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
+use crate::query::transform::query_expr_parameters_replace;
+use crate::query::write::StatementEffects;
+use crate::result::ReportExt;
 use crate::{
     cache::{
         CacheDispatchHandle, CacheMessage, CacheOutcome, CacheReply, ProxyMessage, ReplySlot,
@@ -51,17 +62,6 @@ use crate::{
     timing::QueryTiming,
     tls::{self},
 };
-
-use super::super::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
-use super::super::query::{Action, CacheabilityCache, ForwardReason, handle_query};
-use super::super::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
-use crate::query::ast::{AstNode, QueryExpr, TableNode};
-use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
-use crate::query::transform::query_expr_parameters_replace;
-use crate::query::write::StatementEffects;
-use crate::result::ReportExt;
-
-use super::*;
 
 /// Process-global "log at most once per window" gate, shared across all
 /// connections. A flapping cache subsystem can drop one client per query; this

@@ -1,7 +1,8 @@
-use crate::pg::Lsn;
-use crate::query::Fingerprint;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
+
+use crate::pg::Lsn;
+use crate::query::Fingerprint;
 
 /// Request for current cache status, sent from the admin HTTP handler.
 pub struct StatusRequest {

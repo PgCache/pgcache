@@ -4,13 +4,15 @@
 use std::collections::HashMap;
 
 use ecow::EcoString;
+use pg_query::pg_nodes as pg;
 use smallvec::SmallVec;
 
-use pg_query::pg_nodes as pg;
-
-use super::super::raw::{NodePtr, cast, cstr, list_nodes, node_tag, node_tag_name};
-use super::super::*;
 use super::{null_order_map, order_dir_map, scalar_expr_convert};
+use crate::query::ast::raw::{NodePtr, cast, cstr, list_nodes, node_tag, node_tag_name};
+use crate::query::ast::{
+    AstError, AstNode, FrameBound, FrameExclusion, FrameMode, OrderByClause, QueryExpr, ScalarExpr,
+    SelectColumn, SelectColumns, WindowFrame, WindowSpec,
+};
 
 // Window `frameOptions` bitmask from PostgreSQL `parsenodes.h`. libpg_query
 // exposes these only as C `#define`s, which bindgen does not emit, so they are

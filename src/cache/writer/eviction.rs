@@ -1,18 +1,18 @@
-use crate::oid::Oid;
-use crate::query::Fingerprint;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use tracing::{debug, error, trace, warn};
 
+use super::core::WriterCore;
+#[cfg(feature = "fault-injection")]
+use super::core::fault;
+use crate::cache::memo::SlotKey;
+use crate::cache::{CacheError, CacheResult, MapIntoReport, types::CachedQueryState};
+use crate::oid::Oid;
+use crate::query::Fingerprint;
 use crate::query::ast::Deparse;
 use crate::result::error_chain_format;
 use crate::settings::CachePolicy;
-
-use super::super::memo::SlotKey;
-use super::super::{CacheError, CacheResult, MapIntoReport, types::CachedQueryState};
-
-use super::core::*;
 
 impl WriterCore {
     /// Refresh the cached `statvfs` reading for the cache PG data directory (one

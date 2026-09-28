@@ -6,11 +6,10 @@ use ordered_float::NotNan;
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
+use super::{AstNode, FunctionCall, QueryExpr, SelectNode};
 use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::query::ast::Deparse;
 use crate::query::cast::{CastTarget, cast_target_deparse};
-
-use super::*;
 
 // Core literal value types that can appear in SQL expressions.
 //

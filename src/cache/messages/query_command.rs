@@ -8,15 +8,14 @@ use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
 
 use crate::cache::serve_decision::AdmitAction;
+use crate::cache::types::SharedResolved;
+use crate::cache::{
+    CacheError, CacheMessage, Report, query::CacheableQuery, query_cache::QueryType,
+};
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::pg::protocol::session::ResultFormats;
 use crate::query::Fingerprint;
-
-use super::super::types::SharedResolved;
-use super::super::{
-    CacheError, CacheMessage, Report, query::CacheableQuery, query_cache::QueryType,
-};
 
 /// Result of a subsumption check, sent from the writer back to the dispatch
 /// via a oneshot channel included in the Register command.

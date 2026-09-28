@@ -1,16 +1,16 @@
-use crate::pg::Lsn;
+use std::io;
+
 use error_set::error_set;
 use postgres_types::PgLsn;
 use rootcause::Report;
-use std::io;
 use tokio_postgres::config::ReplicationMode;
 use tokio_postgres::{Client, Error};
 use tracing::{debug, error};
 
+use super::connect::{config_build, config_connect, connect};
+use crate::pg::Lsn;
 use crate::result::{MapIntoReport, ReportExt, error_chain_format};
 use crate::settings::{PgSettings, Settings};
-
-use super::connect::{config_build, config_connect, connect};
 
 error_set! {
     PgCdcError := {

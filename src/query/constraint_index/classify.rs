@@ -6,11 +6,10 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
-use crate::query::ast::{BinaryOp, LiteralValue};
-use crate::query::constraints::{ColumnRange, TableConstraint, column_range_build};
-
 use super::value_key::ValueKey;
 use super::{ColumnKeys, ColumnSet};
+use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::constraints::{ColumnRange, TableConstraint, column_range_build};
 
 pub(super) enum Classification {
     EqualityPure {

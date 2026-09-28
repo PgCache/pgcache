@@ -22,12 +22,13 @@
 
 use ecow::EcoString;
 
+use super::TableOccurrence;
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
     ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
 };
-
-use super::{AstTransformError, AstTransformResult, TableOccurrence};
+use crate::query::transform::AstTransformError;
+use crate::query::transform::AstTransformResult;
 
 struct AliasRewrite<'a> {
     schema: &'a str,

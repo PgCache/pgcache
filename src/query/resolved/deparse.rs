@@ -1,7 +1,18 @@
+use super::{
+    ResolvedArithmeticExpr, ResolvedCaseExpr, ResolvedColumnNode, ResolvedFrameBound,
+    ResolvedFunctionCall, ResolvedJoinNode, ResolvedJoinQual, ResolvedOrderByClause,
+    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
+    ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode,
+    ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedWhereExpr, ResolvedWindowFrame,
+    ResolvedWindowSpec,
+};
+use crate::query::ast::BinaryOp;
 use crate::query::ast::Deparse;
+use crate::query::ast::MultiOp;
+use crate::query::ast::OrderDirection;
+use crate::query::ast::SubLinkType;
+use crate::query::ast::UnaryOp;
 use crate::query::cast::cast_target_deparse;
-
-use super::*;
 
 impl Deparse for ResolvedTableNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {

@@ -10,15 +10,7 @@ use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, error, info, instrument, trace};
 
-use crate::pg::Lsn;
-use crate::pg::protocol::backend::TransactionStatus;
-use crate::proxy::{ClientSocket, ExplainSpec, ExplainTarget};
-use crate::query::Fingerprint;
-use crate::query::ast::{query_expr_convert_raw, query_expr_fingerprint};
-use crate::result::error_chain_format;
-use crate::settings::{CachePolicy, Settings};
-use crate::timing::{QueryTiming, duration_to_ns_u64};
-
+use super::{CacheDispatch, QueryRequest, ServeJob};
 use crate::cache::coalesce_queue::{CoalesceKey, CoalesceQueue, coalesce_deadline};
 use crate::cache::explain::{ExplainJob, ExplainKind};
 use crate::cache::messages::{
@@ -34,8 +26,14 @@ use crate::cache::types::{
     CacheStateView, CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics, SharedResolved,
 };
 use crate::cache::{CacheError, CacheResult, fast_path};
-
-use super::{CacheDispatch, QueryRequest, ServeJob};
+use crate::pg::Lsn;
+use crate::pg::protocol::backend::TransactionStatus;
+use crate::proxy::{ClientSocket, ExplainSpec, ExplainTarget};
+use crate::query::Fingerprint;
+use crate::query::ast::{query_expr_convert_raw, query_expr_fingerprint};
+use crate::result::error_chain_format;
+use crate::settings::{CachePolicy, Settings};
+use crate::timing::{QueryTiming, duration_to_ns_u64};
 
 /// Minimum credit stamped on a Pending entry. Provides a survival floor during
 /// cold start (when `last_hits_per_gc` is zero) and for low-traffic workloads.

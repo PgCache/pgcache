@@ -3,13 +3,12 @@
 
 use rootcause::Report;
 
+use super::parameter_to_literal;
 use crate::cache::QueryParameters;
 use crate::query::ast::{LiteralValue, QueryExpr, ScalarExpr, SelectNode};
+use crate::query::transform::walk::{QueryWalkerMut, query_expr_walk_mut, select_node_walk_mut};
+use crate::query::transform::{AstTransformError, AstTransformResult};
 use crate::query::write::{DeleteStatement, InsertRow, InsertStatement, UpdateStatement};
-
-use super::super::walk::{QueryWalkerMut, query_expr_walk_mut, select_node_walk_mut};
-use super::super::{AstTransformError, AstTransformResult};
-use super::parameter_to_literal;
 
 pub fn query_expr_parameters_replace(
     query_expr: &QueryExpr,
@@ -21,7 +20,7 @@ pub fn query_expr_parameters_replace(
 
     // Bind-time substitution can newly expose pure-literal arithmetic that the
     // convert-time fold couldn't reach (e.g. `$1 % 10 + 1` once $1 is bound).
-    super::super::query_expr_constant_fold(&mut new_query);
+    crate::query::transform::query_expr_constant_fold(&mut new_query);
 
     Ok(new_query)
 }
@@ -174,18 +173,17 @@ mod tests {
     use bytes::Bytes;
     use postgres_types::Type as PgType;
 
-    use crate::cache::QueryParameters;
-    use crate::query::ast::{
-        BinaryOp, Deparse, LiteralValue, QueryBody, SelectNode, query_expr_parse,
-    };
-    use crate::query::write::{DeleteStatement, InsertStatement, RelationRef, UpdateStatement};
-
-    use super::super::super::AstTransformError;
     use super::{
         delete_statement_parameterize, insert_statement_parameterize,
         query_expr_parameters_replace, select_node_parameters_replace,
         update_statement_parameterize,
     };
+    use crate::cache::QueryParameters;
+    use crate::query::ast::{
+        BinaryOp, Deparse, LiteralValue, QueryBody, SelectNode, query_expr_parse,
+    };
+    use crate::query::transform::AstTransformError;
+    use crate::query::write::{DeleteStatement, InsertStatement, RelationRef, UpdateStatement};
 
     fn relation(name: &str) -> RelationRef {
         RelationRef {

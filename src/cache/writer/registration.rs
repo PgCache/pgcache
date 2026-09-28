@@ -1,6 +1,3 @@
-use crate::oid::Oid;
-use crate::pg::Lsn;
-use crate::query::{Fingerprint, QueryShape, query_shape_derive};
 use std::cmp::Reverse;
 use std::num::NonZeroU64;
 use std::rc::Rc;
@@ -15,23 +12,17 @@ use tokio::task::spawn_local;
 use tokio_postgres::Client;
 use tracing::{debug, error, instrument, trace};
 
-use crate::cache::coalesce_queue::fetch_stage_ewma_update;
-use crate::catalog::{TableMetadata, aggregate_functions_load};
-use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode};
-use crate::query::decorrelate::query_expr_decorrelate;
-use crate::query::resolved::{
-    ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, enum_order_dependence_check,
-    query_expr_resolve,
+use super::core::WriterCore;
+use super::merge_queue::{DrainTarget, HeapStop, MERGE_FLUSH_FORCE_AFTER, MergeStep, PendingMerge};
+use super::population::{
+    POPULATION_SPAWN_COOLDOWN, PopulationSpawnContext, population_dispatcher,
+    population_worker_connect, population_worker_run,
 };
-use crate::query::transform::predicate_pushdown_apply;
-use crate::result::error_chain_format;
-use crate::settings::Settings;
-use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
-
-use super::super::admission::{
+use crate::cache::admission::{
     AdmissionDepth, base_query_prepare, query_admission_analyze, shape_gate_classify,
 };
-use super::super::{
+use crate::cache::coalesce_queue::fetch_stage_ewma_update;
+use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{AdmitAction, QueryCommand, SubsumptionResult},
     mv::{ShapeGate, resolved_has_join, resolved_has_window},
@@ -40,12 +31,20 @@ use super::super::{
     types::{CachedQuery, QueryMetrics, SharedResolved},
     update_query::UpdateQueries,
 };
-use super::core::WriterCore;
-use super::merge_queue::{DrainTarget, HeapStop, MERGE_FLUSH_FORCE_AFTER, MergeStep, PendingMerge};
-use super::population::{
-    POPULATION_SPAWN_COOLDOWN, PopulationSpawnContext, population_dispatcher,
-    population_worker_connect, population_worker_run,
+use crate::catalog::{TableMetadata, aggregate_functions_load};
+use crate::oid::Oid;
+use crate::pg::Lsn;
+use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode};
+use crate::query::decorrelate::query_expr_decorrelate;
+use crate::query::resolved::{
+    ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode, enum_order_dependence_check,
+    query_expr_resolve,
 };
+use crate::query::transform::predicate_pushdown_apply;
+use crate::query::{Fingerprint, QueryShape, query_shape_derive};
+use crate::result::error_chain_format;
+use crate::settings::Settings;
+use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
 /// Work item for population worker pool.
 pub struct PopulationWork {

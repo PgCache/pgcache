@@ -1,23 +1,19 @@
-use crate::oid::Oid;
-use crate::query::Fingerprint;
-
 use postgres_protocol::escape;
 use tokio_postgres::{Client, SimpleQueryMessage, SimpleQueryRow};
 use tracing::{error, instrument, trace, warn};
 
+use super::{PG_EVAL_CHUNK, SQL_BUFFER_CAPACITY, WriterCdc};
+use crate::cache::update_query::UpdateQuery;
+use crate::cache::writer::core::WriterCore;
+use crate::cache::{CacheError, CacheResult};
 use crate::catalog::TableMetadata;
+use crate::oid::Oid;
 use crate::pg::identifier_quote_into;
 use crate::pg::protocol::ByteString;
-
+use crate::query::Fingerprint;
 use crate::query::ast::Deparse;
 use crate::query::transform::resolved_select_node_table_replace_with_values_all;
-
-use super::super::super::update_query::UpdateQuery;
-use super::super::super::{CacheError, CacheResult};
-use super::super::core::WriterCore;
 use crate::result::error_chain_format;
-
-use super::*;
 
 /// Append the tail of an upsert SQL: either ` DO UPDATE SET <non-pk cols>` or
 /// ` DO NOTHING` if the table has no non-PK columns. PG rejects `DO UPDATE SET`
@@ -357,9 +353,8 @@ mod tests {
     use bytes::Bytes;
     use tokio_postgres::types::Type;
 
-    use crate::catalog::{ColumnMetadata, ColumnStore};
-
     use super::*;
+    use crate::catalog::{ColumnMetadata, ColumnStore};
 
     /// A table exercising every identifier hazard: mixed-case name,
     /// reserved-word column (`user`), mixed-case column, embedded quote.

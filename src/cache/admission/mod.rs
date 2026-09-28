@@ -7,10 +7,9 @@
 
 use ecow::EcoString;
 
+use super::update_query::UpdateQuery;
 use crate::oid::Oid;
 use crate::query::constraints::{QueryConstraints, TableConstraint};
-
-use super::update_query::UpdateQuery;
 
 mod analyze;
 mod subsume;

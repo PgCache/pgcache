@@ -3,6 +3,7 @@
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
+use super::*;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
 use crate::oid::Oid;
 use crate::query::ast::{
@@ -13,8 +14,6 @@ use crate::query::resolved::{
     ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode,
     ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource, ResolvedWhereExpr,
 };
-
-use super::*;
 
 /// Parse SQL and return a SelectNode (for tests using new types)
 fn parse_select_node(sql: &str) -> SelectNode {
