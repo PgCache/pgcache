@@ -51,6 +51,28 @@ Pasted SQL and stderr logs (best-effort) work too. Setup for each is under
 
 ## Quickstart
 
+On a laptop or dev machine with Docker, one command gets you a running pgcache:
+
+```bash
+curl -fsSL https://pgcache.com/try.sh | bash
+```
+
+It works out which database to point at (`--upstream`, `DATABASE_URL`, a `.env` file, the
+`PG*` variables, or a running PostgreSQL container), checks that the origin is ready and says
+how to fix anything that isn't, starts pgcache as a container named `pgcache-try`, and prints
+the connection string to switch your app to. Then:
+
+```bash
+curl -fsSL https://pgcache.com/try.sh | bash -s -- status   # live hit rate
+curl -fsSL https://pgcache.com/try.sh | bash -s -- stop     # remove the container
+```
+
+The script is plain bash, so [read it](https://pgcache.com/try.sh) before you run it if you
+like. The [Getting Started guide](https://www.pgcache.com/docs/getting-started/) covers what it
+automates, step by step.
+
+### Running pgcache yourself
+
 pgcache needs three things: your **origin** database with logical replication enabled, a
 dedicated **cache** PostgreSQL that has the [`pgcache_pgrx`](#the-pgcache_pgrx-extension)
 extension, and a config file (or CLI flags) telling it how to reach both.
@@ -111,9 +133,10 @@ run `pgcache --help` for the full list.
 Writes still go to your primary; reads are served from cache when safe and forwarded to
 origin otherwise.
 
-> **Just want to try it?** The [Docker image](https://hub.docker.com/r/pgcache/pgcache) bundles the cache
+> **Deploying with Docker?** The [Docker image](https://hub.docker.com/r/pgcache/pgcache) bundles the cache
 > PostgreSQL (with `pgcache_pgrx` already preloaded) and wraps all of the above behind a
-> single `--upstream postgres://…` flag.
+> single `--upstream postgres://…` flag. The try script above runs this same image;
+> [Deploy → Docker](https://www.pgcache.com/docs/docker/) covers Compose, TLS, and production settings.
 
 ## How it works
 
