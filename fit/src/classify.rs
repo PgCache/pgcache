@@ -85,7 +85,9 @@ pub fn statement_parse(sql: &str, trace_parameters: &[Option<EcoString>]) -> Par
             }
         },
         Ok(Ok(RawStatement::Write(write_class))) => ParseOutcome::Write(write_class),
-        Ok(Ok(RawStatement::ReadOnlyUtility { transaction })) => ParseOutcome::Utility(transaction),
+        Ok(Ok(RawStatement::ReadOnlyUtility { transaction, .. })) => {
+            ParseOutcome::Utility(transaction)
+        }
     };
     ParsedStatement {
         outcome,
@@ -469,7 +471,7 @@ mod tests {
     #[test]
     fn test_update_classified_as_write() {
         let verdict = classify("UPDATE users SET name = 'b' WHERE id = 1");
-        assert!(matches!(verdict, Verdict::Write(WriteClass::Table(_))));
+        assert!(matches!(verdict, Verdict::Write(WriteClass::UpdateRows(_))));
     }
 
     #[test]
