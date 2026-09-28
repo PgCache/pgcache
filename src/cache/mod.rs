@@ -41,6 +41,7 @@ pub mod query;
 mod query_cache;
 #[cfg(feature = "proxy")]
 mod reg_bucket;
+#[cfg(feature = "proxy")]
 mod reg_gate;
 #[cfg(feature = "proxy")]
 mod reply;
@@ -49,6 +50,7 @@ mod runtime;
 #[cfg(feature = "proxy")]
 mod serve;
 pub mod serve_decision;
+#[cfg(feature = "proxy")]
 mod serve_pool_state;
 #[cfg(feature = "proxy")]
 pub(crate) mod status;

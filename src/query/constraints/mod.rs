@@ -8,6 +8,8 @@
 //!   ([`ColumnRange`] and its subsumption rules), also consumed by
 //!   `query::constraint_index`.
 //! * [`subsume`] — reduces both sides to per-column ranges and compares them.
+//! * `range_overlap` — read-after-write containment/disjointness over the same
+//!   ranges; proxy-only.
 //!
 //! This module holds only the shared types.
 
@@ -21,6 +23,8 @@ use crate::query::resolved::ResolvedColumnNode;
 
 mod extract;
 mod range;
+#[cfg(feature = "proxy")]
+mod range_overlap;
 mod subsume;
 #[cfg(test)]
 mod tests;
@@ -28,10 +32,12 @@ mod tests;
 pub use extract::analyze_query_constraints;
 pub use subsume::table_constraints_subsumed;
 
-pub(crate) use range::{
-    ColumnRange, column_range_build, column_range_contains, column_ranges_disjoint,
+pub(crate) use range::{ColumnRange, column_range_build};
+#[cfg(feature = "proxy")]
+pub(crate) use range_overlap::{
+    column_range_contains, column_ranges_disjoint, column_ranges_from_comparisons,
+    table_column_ranges,
 };
-pub(crate) use subsume::{column_ranges_from_comparisons, table_column_ranges};
 
 /// A column constraint extracted from WHERE/JOIN conditions
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

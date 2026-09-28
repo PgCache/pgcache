@@ -6,16 +6,19 @@ mod binary;
 mod replace;
 mod resolved_parameterize;
 mod text;
+#[cfg(feature = "proxy")]
+mod write_parameterize;
 
 use super::AstTransformResult;
 use crate::cache::QueryParameter;
 use crate::query::ast::LiteralValue;
 
-pub(crate) use replace::{
-    delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,
-};
 pub use replace::{query_expr_parameters_replace, select_node_parameters_replace};
 pub use resolved_parameterize::resolved_query_expr_parameterize;
+#[cfg(feature = "proxy")]
+pub(crate) use write_parameterize::{
+    delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,
+};
 
 fn parameter_to_literal(param: &QueryParameter) -> AstTransformResult<LiteralValue> {
     match &param.value {
