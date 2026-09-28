@@ -1,16 +1,14 @@
 //! The [`ConstraintIndex`](super::ConstraintIndex) operations: insert, remove,
-//! and the two candidate lookups (constraint-set and point probe).
+//! and the constraint-set candidate lookup (the point probe is in `point`).
 
 use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
-use super::classify::{
-    Classification, classify, column_ranges, column_set_powerset, value_key_product,
-};
+use super::classify::{Classification, classify, column_ranges, column_set_powerset};
 use super::column_index::ComplexIndex;
 use super::value_key::ValueKey;
-use super::{ClassForms, ClassKeys, ColumnForms, ColumnSet, ConstraintIndex, IdSet};
+use super::{ColumnSet, ConstraintIndex, IdSet};
 use crate::id_hash::IdHashable;
 use crate::query::constraints::ColumnRange;
 use crate::query::constraints::TableConstraint;
@@ -19,10 +17,10 @@ use crate::query::constraints::TableConstraint;
 pub(super) struct SubsumptionClass<K> {
     /// Entries whose constraints on every class column are pure `Equal(v)`.
     /// Keyed by joint value tuple in class-column order.
-    equality: HashMap<Vec<ValueKey>, Vec<K>>,
+    pub(super) equality: HashMap<Vec<ValueKey>, Vec<K>>,
     /// Entries with at least one non-equality constraint on any class
     /// column. Indexed per-column for sub-linear candidate lookup (PGC-129).
-    complex: ComplexIndex<K>,
+    pub(super) complex: ComplexIndex<K>,
 }
 
 impl<K: IdHashable + Copy> SubsumptionClass<K> {
@@ -217,75 +215,6 @@ impl<K: IdHashable + Copy> ConstraintIndex<K> {
     /// is a wildcard that matches every entry constraining the column, so this
     /// **never under-returns** — load-bearing for the CDC/memo consumers,
     /// where a miss is a stale read, not just a lost optimization.
-    /// Returning convenience wrapper over [`candidates_point_into`] — production
-    /// CDC paths use the `_into` form to reuse a scratch set (PGC-341/344).
-    #[cfg(test)]
-    pub(crate) fn candidates_point<F>(&self, col_forms_fn: F) -> IdSet<K>
-    where
-        F: Fn(&str) -> ColumnForms,
-    {
-        let mut candidates = IdSet::default();
-        self.candidates_point_into(col_forms_fn, &mut candidates);
-        candidates
-    }
-
-    /// Like [`candidates_point`], but fills a caller-provided set (cleared first)
-    /// instead of allocating a fresh one — lets the CDC hot path reuse a scratch
-    /// set, retaining its (possibly large) capacity across probes (PGC-341/344).
-    pub(crate) fn candidates_point_into<F>(&self, col_forms_fn: F, candidates: &mut IdSet<K>)
-    where
-        F: Fn(&str) -> ColumnForms,
-    {
-        candidates.clear();
-        for (column_set, class) in &self.classes {
-            let col_forms: ClassForms = column_set
-                .columns()
-                .iter()
-                .map(|c| col_forms_fn(c.as_str()))
-                .collect();
-            // Equality-pure entries (in `class.equality`) are reachable only
-            // through this bucket. Per column, collect the `ValueKey`s of its
-            // `Equal` forms; an empty set (Unknown / non-keyable) is a wildcard
-            // for that position. All columns keyed → probe the small cartesian
-            // product of joint tuples; any wildcard → scan the bucket, matching
-            // non-wildcard positions against their key sets.
-            let key_sets: ClassKeys = col_forms
-                .iter()
-                .map(|forms| {
-                    forms.each_ref().map(|slot| {
-                        slot.as_ref().and_then(|r| match r {
-                            ColumnRange::Equal(v) => ValueKey::try_new(v),
-                            ColumnRange::Unknown
-                            | ColumnRange::Unconstrained
-                            | ColumnRange::Empty
-                            | ColumnRange::InSet(_)
-                            | ColumnRange::Range { .. } => None,
-                        })
-                    })
-                })
-                .collect();
-            if key_sets.iter().all(|ks| ks.iter().any(Option::is_some)) {
-                for tuple in value_key_product(&key_sets) {
-                    if let Some(fps) = class.equality.get(&tuple) {
-                        candidates.extend(fps);
-                    }
-                }
-            } else {
-                for (tuple, fps) in &class.equality {
-                    let matches = key_sets.iter().zip(tuple).all(|(ks, t)| {
-                        // No keyable form for this column → wildcard; else the
-                        // tuple value must match one of the column's keys.
-                        ks.iter().all(Option::is_none) || ks.iter().flatten().any(|k| k == t)
-                    });
-                    if matches {
-                        candidates.extend(fps);
-                    }
-                }
-            }
-            candidates.extend(class.complex.candidates_point(&col_forms));
-        }
-    }
-
     /// Union of the columns any class consults — the columns a recovered old
     /// image must carry for `candidates_point_into` to probe at full precision
     /// (PGC-255). The unconstrained class contributes nothing; when this is

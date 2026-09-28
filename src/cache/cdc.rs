@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -444,13 +442,6 @@ impl CdcProcessor {
                 Ok(())
             }
         }
-    }
-
-    /// Gets keep-alive statistics for debugging purposes.
-    fn get_keep_alive_stats(&self) -> (Option<Instant>, u64) {
-        let last_sent = self.last_flush_sent;
-        let count = self.keep_alive_sent_count;
-        (last_sent, count)
     }
 
     /// Processes transaction begin messages.

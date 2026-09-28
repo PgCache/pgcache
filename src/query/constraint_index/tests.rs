@@ -1,12 +1,8 @@
 use ecow::EcoString;
 use ordered_float::NotNan;
-use postgres_types::Type;
 
 use super::classify::{Classification, classify, column_set_powerset};
 use super::*;
-use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-use crate::oid::Oid;
-use crate::pg::protocol::ByteString;
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::CastTarget;
 use crate::query::constraints::TableConstraint;
@@ -54,52 +50,6 @@ fn cast_eq(c: &str, cast: CastTarget, v: LiteralValue) -> TableConstraint {
 
 fn float_lit(x: f64) -> LiteralValue {
     LiteralValue::Float(NotNan::new(x).unwrap())
-}
-
-fn bs(s: &str) -> Option<ByteString> {
-    Some(ByteString::from_utf8(bytes::Bytes::copy_from_slice(s.as_bytes())).expect("utf8"))
-}
-
-/// `[id int4 (pk), name text, active bool]` — row layout `[id, name, active]`.
-fn point_table() -> TableMetadata {
-    let columns = ColumnStore::new([
-        ColumnMetadata {
-            name: "id".into(),
-            position: 1,
-            type_oid: 23,
-            data_type: Type::INT4,
-            type_name: "integer".into(),
-            cache_type_name: "int4".into(),
-            is_primary_key: true,
-        },
-        ColumnMetadata {
-            name: "name".into(),
-            position: 2,
-            type_oid: 25,
-            data_type: Type::TEXT,
-            type_name: "text".into(),
-            cache_type_name: "text".into(),
-            is_primary_key: false,
-        },
-        ColumnMetadata {
-            name: "active".into(),
-            position: 3,
-            type_oid: 16,
-            data_type: Type::BOOL,
-            type_name: "boolean".into(),
-            cache_type_name: "bool".into(),
-            is_primary_key: false,
-        },
-    ]);
-    TableMetadata {
-        replica_identity_full: false,
-        name: "t".into(),
-        schema: "public".into(),
-        relation_oid: Oid::from_raw(1),
-        primary_key_columns: vec!["id".into()],
-        columns,
-        indexes: Vec::new(),
-    }
 }
 
 #[test]
@@ -868,195 +818,253 @@ fn test_numeric_unification_range_cross_variant() {
     assert!(!idx2.candidates(&[eq("price", int(200))]).contains(&fp(2)));
 }
 
-// Point probe: the row is an `Equal`-on-every-column degenerate query.
+#[cfg(feature = "proxy")]
+mod point {
+    use postgres_types::Type;
 
-#[test]
-fn test_point_probe_basic() {
-    let mut idx = ConstraintIndex::<Fingerprint>::new();
-    idx.insert(fp(1), &[eq("id", int(200))]);
-    idx.insert(fp(2), &[eq("id", int(999))]);
-    idx.insert(fp(3), &[]); // unconstrained — matches every row
+    use super::*;
+    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::oid::Oid;
+    use crate::pg::protocol::ByteString;
+    use crate::query::constraint_index::point::{ColumnForms, row_value_forms};
+    use crate::query::constraints::ColumnRange;
 
-    let got = idx.candidates_point(|c| match c {
-        "id" => [Some(ColumnRange::Equal(int(200))), None, None],
-        _ => [Some(ColumnRange::Unknown), None, None],
-    });
-    assert!(got.contains(&fp(1)));
-    assert!(got.contains(&fp(3)));
-    assert!(
-        !got.contains(&fp(2)),
-        "id=999 must be excluded for a id=200 row"
-    );
-}
+    fn bs(s: &str) -> Option<ByteString> {
+        Some(ByteString::from_utf8(bytes::Bytes::copy_from_slice(s.as_bytes())).expect("utf8"))
+    }
 
-#[test]
-fn test_point_probe_unknown_is_conservative() {
-    let mut idx = ConstraintIndex::<Fingerprint>::new();
-    idx.insert(fp(1), &[eq("id", int(200))]); // equality-pure bucket
-    idx.insert(fp(2), &[gt("id", int(100))]); // complex bucket
+    /// `[id int4 (pk), name text, active bool]` — row layout `[id, name, active]`.
+    fn point_table() -> TableMetadata {
+        let columns = ColumnStore::new([
+            ColumnMetadata {
+                name: "id".into(),
+                position: 1,
+                type_oid: 23,
+                data_type: Type::INT4,
+                type_name: "integer".into(),
+                cache_type_name: "int4".into(),
+                is_primary_key: true,
+            },
+            ColumnMetadata {
+                name: "name".into(),
+                position: 2,
+                type_oid: 25,
+                data_type: Type::TEXT,
+                type_name: "text".into(),
+                cache_type_name: "text".into(),
+                is_primary_key: false,
+            },
+            ColumnMetadata {
+                name: "active".into(),
+                position: 3,
+                type_oid: 16,
+                data_type: Type::BOOL,
+                type_name: "boolean".into(),
+                cache_type_name: "bool".into(),
+                is_primary_key: false,
+            },
+        ]);
+        TableMetadata {
+            replica_identity_full: false,
+            name: "t".into(),
+            schema: "public".into(),
+            relation_oid: Oid::from_raw(1),
+            primary_key_columns: vec!["id".into()],
+            columns,
+            indexes: Vec::new(),
+        }
+    }
 
-    // An `Unknown` column (NULL / unchanged-TOAST) must return every entry
-    // constraining it — both buckets — never drop one.
-    let got = idx.candidates_point(|_| [Some(ColumnRange::Unknown), None, None]);
-    assert!(
-        got.contains(&fp(1)),
-        "equality-pure entry must not be dropped under Unknown"
-    );
-    assert!(
-        got.contains(&fp(2)),
-        "complex entry must not be dropped under Unknown"
-    );
-}
+    // Point probe: the row is an `Equal`-on-every-column degenerate query.
 
-#[test]
-fn test_point_probe_partial_unknown_filters_known_columns() {
-    let mut idx = ConstraintIndex::<Fingerprint>::new();
-    // Two-column equality-pure entries on {id, region}.
-    idx.insert(fp(1), &[eq("id", int(1)), eq("region", int(5))]);
-    idx.insert(fp(2), &[eq("id", int(2)), eq("region", int(5))]);
+    #[test]
+    fn test_point_probe_basic() {
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[eq("id", int(200))]);
+        idx.insert(fp(2), &[eq("id", int(999))]);
+        idx.insert(fp(3), &[]); // unconstrained — matches every row
 
-    // region pinned to 5, id unknown: both match on the pinned column.
-    let got = idx.candidates_point(|c| match c {
-        "region" => [Some(ColumnRange::Equal(int(5))), None, None],
-        _ => [Some(ColumnRange::Unknown), None, None],
-    });
-    assert!(got.contains(&fp(1)));
-    assert!(got.contains(&fp(2)));
+        let got = idx.candidates_point(|c| match c {
+            "id" => [Some(ColumnRange::Equal(int(200))), None, None],
+            _ => [Some(ColumnRange::Unknown), None, None],
+        });
+        assert!(got.contains(&fp(1)));
+        assert!(got.contains(&fp(3)));
+        assert!(
+            !got.contains(&fp(2)),
+            "id=999 must be excluded for a id=200 row"
+        );
+    }
 
-    // region pinned to a non-matching value excludes both.
-    let none = idx.candidates_point(|c| match c {
-        "region" => [Some(ColumnRange::Equal(int(9))), None, None],
-        _ => [Some(ColumnRange::Unknown), None, None],
-    });
-    assert!(none.is_empty());
-}
+    #[test]
+    fn test_point_probe_unknown_is_conservative() {
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[eq("id", int(200))]); // equality-pure bucket
+        idx.insert(fp(2), &[gt("id", int(100))]); // complex bucket
 
-// `row_value_forms`: every keyable interpretation of the wire text.
+        // An `Unknown` column (NULL / unchanged-TOAST) must return every entry
+        // constraining it — both buckets — never drop one.
+        let got = idx.candidates_point(|_| [Some(ColumnRange::Unknown), None, None]);
+        assert!(
+            got.contains(&fp(1)),
+            "equality-pure entry must not be dropped under Unknown"
+        );
+        assert!(
+            got.contains(&fp(2)),
+            "complex entry must not be dropped under Unknown"
+        );
+    }
 
-fn has_str_form(forms: &ColumnForms, s: &str) -> bool {
-    forms
-        .iter()
-        .flatten()
-        .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::String(v)) if v == s))
-}
-fn has_num_form(forms: &ColumnForms, x: f64) -> bool {
-    forms.iter().flatten().any(
-        |r| matches!(r, ColumnRange::Equal(LiteralValue::Float(n)) if *n == NotNan::new(x).unwrap()),
-    )
-}
+    #[test]
+    fn test_point_probe_partial_unknown_filters_known_columns() {
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        // Two-column equality-pure entries on {id, region}.
+        idx.insert(fp(1), &[eq("id", int(1)), eq("region", int(5))]);
+        idx.insert(fp(2), &[eq("id", int(2)), eq("region", int(5))]);
 
-#[test]
-fn test_row_value_forms_coercion() {
-    let t = point_table();
-    let row = [bs("200"), bs("alice"), bs("t")];
+        // region pinned to 5, id unknown: both match on the pinned column.
+        let got = idx.candidates_point(|c| match c {
+            "region" => [Some(ColumnRange::Equal(int(5))), None, None],
+            _ => [Some(ColumnRange::Unknown), None, None],
+        });
+        assert!(got.contains(&fp(1)));
+        assert!(got.contains(&fp(2)));
 
-    // numeric column "200" → BOTH the String and Float forms (an entry may
-    // be keyed under either, e.g. `id = 200` vs `id::text = '200'`).
-    let id = row_value_forms(&t, &row, "id");
-    assert!(has_str_form(&id, "200"));
-    assert!(has_num_form(&id, 200.0));
+        // region pinned to a non-matching value excludes both.
+        let none = idx.candidates_point(|c| match c {
+            "region" => [Some(ColumnRange::Equal(int(9))), None, None],
+            _ => [Some(ColumnRange::Unknown), None, None],
+        });
+        assert!(none.is_empty());
+    }
 
-    // text column "alice" → String form only (not numerically parseable).
-    let name = row_value_forms(&t, &row, "name");
-    assert!(has_str_form(&name, "alice"));
-    assert!(
-        !name
+    // `row_value_forms`: every keyable interpretation of the wire text.
+
+    fn has_str_form(forms: &ColumnForms, s: &str) -> bool {
+        forms
             .iter()
             .flatten()
-            .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_))))
-    );
+            .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::String(v)) if v == s))
+    }
+    fn has_num_form(forms: &ColumnForms, x: f64) -> bool {
+        forms.iter().flatten().any(
+            |r| matches!(r, ColumnRange::Equal(LiteralValue::Float(n)) if *n == NotNan::new(x).unwrap()),
+        )
+    }
 
-    // bool column "t" → String("t") plus Boolean(true).
-    let active = row_value_forms(&t, &row, "active");
-    assert!(has_str_form(&active, "t"));
-    assert!(
-        active
-            .iter()
-            .flatten()
-            .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Boolean(true))))
-    );
+    #[test]
+    fn test_row_value_forms_coercion() {
+        let t = point_table();
+        let row = [bs("200"), bs("alice"), bs("t")];
 
-    // SQL NULL / absent column → [Unknown] (wildcard).
-    let null_row = [None, bs("bob"), bs("f")];
-    assert!(matches!(
-        row_value_forms(&t, &null_row, "id"),
-        [Some(ColumnRange::Unknown), None, None]
-    ));
-    assert!(matches!(
-        row_value_forms(&t, &row, "nope"),
-        [Some(ColumnRange::Unknown), None, None]
-    ));
+        // numeric column "200" → BOTH the String and Float forms (an entry may
+        // be keyed under either, e.g. `id = 200` vs `id::text = '200'`).
+        let id = row_value_forms(&t, &row, "id");
+        assert!(has_str_form(&id, "200"));
+        assert!(has_num_form(&id, 200.0));
 
-    // numeric-looking-but-textual: a non-numeric text yields only String.
-    let bad_row = [bs("abc"), bs("bob"), bs("f")];
-    let bad = row_value_forms(&t, &bad_row, "id");
-    assert!(has_str_form(&bad, "abc"));
-    assert!(
-        !bad.iter()
-            .flatten()
-            .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_))))
-    );
-}
+        // text column "alice" → String form only (not numerically parseable).
+        let name = row_value_forms(&t, &row, "name");
+        assert!(has_str_form(&name, "alice"));
+        assert!(
+            !name
+                .iter()
+                .flatten()
+                .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_))))
+        );
 
-#[test]
-fn test_row_value_forms_drives_point_probe() {
-    let t = point_table();
-    let mut idx = ConstraintIndex::<Fingerprint>::new();
-    idx.insert(fp(1), &[eq("id", int(200))]);
-    idx.insert(fp(2), &[eq("id", int(7))]);
+        // bool column "t" → String("t") plus Boolean(true).
+        let active = row_value_forms(&t, &row, "active");
+        assert!(has_str_form(&active, "t"));
+        assert!(
+            active
+                .iter()
+                .flatten()
+                .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Boolean(true))))
+        );
 
-    let row = [bs("200"), bs("alice"), bs("t")];
-    let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
-    assert!(got.contains(&fp(1)));
-    assert!(!got.contains(&fp(2)));
-}
+        // SQL NULL / absent column → [Unknown] (wildcard).
+        let null_row = [None, bs("bob"), bs("f")];
+        assert!(matches!(
+            row_value_forms(&t, &null_row, "id"),
+            [Some(ColumnRange::Unknown), None, None]
+        ));
+        assert!(matches!(
+            row_value_forms(&t, &row, "nope"),
+            [Some(ColumnRange::Unknown), None, None]
+        ));
 
-// Regression: a numeric column can hold a String-literal constraint via an
-// identity `::text` cast (`val::text = '42'` → `Comparison(val, Eq,
-// String("42"))`). The point probe must find it through the String form,
-// while still finding ordinary `Num`-keyed entries through the Float form.
+        // numeric-looking-but-textual: a non-numeric text yields only String.
+        let bad_row = [bs("abc"), bs("bob"), bs("f")];
+        let bad = row_value_forms(&t, &bad_row, "id");
+        assert!(has_str_form(&bad, "abc"));
+        assert!(
+            !bad.iter()
+                .flatten()
+                .any(|r| matches!(r, ColumnRange::Equal(LiteralValue::Float(_))))
+        );
+    }
 
-#[test]
-fn test_point_probe_numeric_column_string_literal_equality() {
-    let t = point_table();
-    let mut idx = ConstraintIndex::<Fingerprint>::new();
-    idx.insert(fp(1), &[eq("id", text("200"))]); // id::text = '200' → String
-    idx.insert(fp(2), &[eq("id", int(200))]); // id = 200 → Num
-    idx.insert(fp(3), &[eq("id", text("7"))]); // non-matching String
+    #[test]
+    fn test_row_value_forms_drives_point_probe() {
+        let t = point_table();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[eq("id", int(200))]);
+        idx.insert(fp(2), &[eq("id", int(7))]);
 
-    let row = [bs("200"), bs("alice"), bs("t")];
-    let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
-    assert!(
-        got.contains(&fp(1)),
-        "String('200') entry found via the String form"
-    );
-    assert!(
-        got.contains(&fp(2)),
-        "Integer(200) entry found via the Float form"
-    );
-    assert!(
-        !got.contains(&fp(3)),
-        "String('7') entry must not match a '200' row"
-    );
-}
+        let row = [bs("200"), bs("alice"), bs("t")];
+        let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
+        assert!(got.contains(&fp(1)));
+        assert!(!got.contains(&fp(2)));
+    }
 
-#[test]
-fn test_point_probe_numeric_column_string_literal_range() {
-    // A String-keyed range walks the lexicographic `Str` region; a '42'
-    // row must satisfy `> '10'` lexicographically and not be under-returned.
-    let t = point_table();
-    let mut idx = ConstraintIndex::<Fingerprint>::new();
-    idx.insert(fp(1), &[gt("id", text("10"))]); // id::text > '10'
+    // Regression: a numeric column can hold a String-literal constraint via an
+    // identity `::text` cast (`val::text = '42'` → `Comparison(val, Eq,
+    // String("42"))`). The point probe must find it through the String form,
+    // while still finding ordinary `Num`-keyed entries through the Float form.
 
-    let row = [bs("42"), bs("alice"), bs("t")];
-    let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
-    assert!(
-        got.contains(&fp(1)),
-        "'42' > '10' lexicographically — must be a candidate"
-    );
+    #[test]
+    fn test_point_probe_numeric_column_string_literal_equality() {
+        let t = point_table();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[eq("id", text("200"))]); // id::text = '200' → String
+        idx.insert(fp(2), &[eq("id", int(200))]); // id = 200 → Num
+        idx.insert(fp(3), &[eq("id", text("7"))]); // non-matching String
 
-    // A row whose text is lexicographically below '10' must be excluded.
-    let row_lo = [bs("09"), bs("alice"), bs("t")];
-    let got_lo = idx.candidates_point(|c| row_value_forms(&t, &row_lo, c));
-    assert!(!got_lo.contains(&fp(1)), "'09' < '10' lexicographically");
+        let row = [bs("200"), bs("alice"), bs("t")];
+        let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
+        assert!(
+            got.contains(&fp(1)),
+            "String('200') entry found via the String form"
+        );
+        assert!(
+            got.contains(&fp(2)),
+            "Integer(200) entry found via the Float form"
+        );
+        assert!(
+            !got.contains(&fp(3)),
+            "String('7') entry must not match a '200' row"
+        );
+    }
+
+    #[test]
+    fn test_point_probe_numeric_column_string_literal_range() {
+        // A String-keyed range walks the lexicographic `Str` region; a '42'
+        // row must satisfy `> '10'` lexicographically and not be under-returned.
+        let t = point_table();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        idx.insert(fp(1), &[gt("id", text("10"))]); // id::text > '10'
+
+        let row = [bs("42"), bs("alice"), bs("t")];
+        let got = idx.candidates_point(|c| row_value_forms(&t, &row, c));
+        assert!(
+            got.contains(&fp(1)),
+            "'42' > '10' lexicographically — must be a candidate"
+        );
+
+        // A row whose text is lexicographically below '10' must be excluded.
+        let row_lo = [bs("09"), bs("alice"), bs("t")];
+        let got_lo = idx.candidates_point(|c| row_value_forms(&t, &row_lo, c));
+        assert!(!got_lo.contains(&fp(1)), "'09' < '10' lexicographically");
+    }
 }

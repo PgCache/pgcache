@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
+use super::ColumnSet;
 use super::value_key::ValueKey;
-use super::{ColumnKeys, ColumnSet};
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::{ColumnRange, TableConstraint, column_range_build};
 
@@ -107,27 +107,6 @@ pub(super) fn column_set_powerset(set: &ColumnSet) -> impl Iterator<Item = Colum
         // `cols` is sorted, so the subset stays sorted by construction.
         ColumnSet(subset)
     })
-}
-
-/// Cartesian product of per-column key sets, for the point-probe equality
-/// lookup. Empty input → one empty tuple (the unconstrained class). Each
-/// column carries ≤3 forms and classes have few columns, so the product stays
-/// tiny.
-pub(super) fn value_key_product(key_sets: &[ColumnKeys]) -> Vec<Vec<ValueKey>> {
-    let mut result: Vec<Vec<ValueKey>> = vec![Vec::new()];
-    for ks in key_sets {
-        let present = ks.iter().flatten().count();
-        let mut next = Vec::with_capacity(result.len() * present);
-        for prefix in &result {
-            for k in ks.iter().flatten() {
-                let mut tuple = prefix.clone();
-                tuple.push(k.clone());
-                next.push(tuple);
-            }
-        }
-        result = next;
-    }
-    result
 }
 
 // ============================================================================

@@ -248,9 +248,7 @@ fn explain_response_encode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pg::protocol::backend::{
-        COMMAND_COMPLETE_TAG, DATA_ROW_TAG, READY_FOR_QUERY_TAG, ROW_DESCRIPTION_TAG,
-    };
+    use crate::pg::protocol::backend::{COMMAND_COMPLETE_TAG, DATA_ROW_TAG, ROW_DESCRIPTION_TAG};
 
     #[test]
     fn test_explain_prefix_build() {
@@ -294,7 +292,7 @@ mod tests {
                 DATA_ROW_TAG,         // plan line 1
                 DATA_ROW_TAG,         // plan line 2
                 COMMAND_COMPLETE_TAG, // CommandComplete
-                READY_FOR_QUERY_TAG,  // ReadyForQuery
+                b'Z',                 // ReadyForQuery
             ]
         );
     }

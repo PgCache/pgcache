@@ -43,6 +43,13 @@ pub(crate) struct ParsedBindMessage {
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedExecuteMessage {
     pub portal_name: EcoString,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "cache hits ignore partial-fetch Execute (PGC-467)"
+        )
+    )]
     pub max_rows: i32,
 }
 

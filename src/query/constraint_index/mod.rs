@@ -18,51 +18,27 @@
 use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
-use smallvec::SmallVec;
 
 use crate::id_hash::{BuildIdHasher, IdHashable};
-use crate::query::constraints::ColumnRange;
 
 mod classify;
 mod column_index;
 mod index;
-mod row_forms;
+#[cfg(feature = "proxy")]
+mod point;
 #[cfg(test)]
 mod tests;
 mod value_key;
 
 use index::{Membership, SubsumptionClass};
-use value_key::ValueKey;
 
-#[cfg(any(feature = "proxy", test))]
-pub(crate) use row_forms::row_value_forms;
+#[cfg(feature = "proxy")]
+pub(crate) use point::row_value_forms;
 
 /// `HashMap` keyed by an id type with the passthrough identity hasher.
 type IdMap<K, V> = HashMap<K, V, BuildIdHasher<K>>;
 /// `HashSet` of an id type with the passthrough identity hasher.
 type IdSet<K> = HashSet<K, BuildIdHasher<K>>;
-
-/// Per-column candidate forms a CDC row value can take: the literal string plus
-/// optional float/bool reinterpretations. A fixed array (one slot per form) so
-/// the per-row point probe never heap-allocates on this axis (PGC-341), and so
-/// adding a fourth reinterpretation is a compile error (`[_; 3]` can't hold it)
-/// — forcing a deliberate decision about the capacity rather than a silent
-/// heap spill. Empty slots are `None`; iterate with `.iter().flatten()`.
-pub(crate) type ColumnForms = [Option<ColumnRange>; 3];
-
-/// Per-column `ValueKey`s extracted from a column's `Equal` forms — one slot per
-/// `ColumnForms` slot (a form is keyable or it isn't), same fixed-array rules.
-type ColumnKeys = [Option<ValueKey>; 3];
-
-/// Per-class collection: one `ColumnForms` per column in the class. Unlike the
-/// per-column forms (always ≤3), the column count is data-dependent and
-/// unbounded (wide composite predicates), so this is a `SmallVec` — inline for
-/// the common 1–2 column case, with a correct heap spill for wider classes,
-/// rather than a fixed array (PGC-341).
-type ClassForms = SmallVec<[ColumnForms; 2]>;
-
-/// Per-class collection of `ColumnKeys`, same shape and rationale as `ClassForms`.
-type ClassKeys = SmallVec<[ColumnKeys; 2]>;
 
 /// Sorted, deduplicated set of column names — canonical key for a
 /// subsumption class. Two queries constraining the same columns hash to

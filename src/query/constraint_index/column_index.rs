@@ -4,8 +4,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
+use super::IdSet;
+#[cfg(feature = "proxy")]
+use super::point::ColumnForms;
 use super::value_key::{Placement, ValueKey, placement};
-use super::{ColumnForms, IdSet};
 use crate::id_hash::IdHashable;
 use crate::query::ast::LiteralValue;
 use crate::query::constraints::ColumnRange;
@@ -105,6 +107,7 @@ impl<K: IdHashable + Copy> ComplexIndex<K> {
     /// column's forms, then intersect across columns — mirrors `candidates`'
     /// smallest-first intersection. A `[Unknown]` column unions to every entry
     /// on that column (wildcard, no filtering).
+    #[cfg(feature = "proxy")]
     pub(super) fn candidates_point(&self, col_forms: &[ColumnForms]) -> Vec<K> {
         if self.len == 0 {
             return Vec::new();

@@ -1,14 +1,10 @@
-#![allow(dead_code)]
 use std::borrow::Borrow;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::io;
 use std::ops::Deref;
 use std::str::Utf8Error;
 
-use bytes::{Bytes, BytesMut};
-use error_set::error_set;
-use rootcause::Report;
+use bytes::Bytes;
 
 #[cfg(feature = "proxy")]
 pub(crate) mod backend;
@@ -21,26 +17,14 @@ pub(crate) mod frontend;
 #[cfg(feature = "proxy")]
 pub(crate) mod frontend_encode;
 #[cfg(feature = "proxy")]
+mod message;
+#[cfg(feature = "proxy")]
 pub(crate) mod session;
 
-error_set! {
-    ProtocolError := {
-        #[display("Invalid protocal version: {major}.{minor}")]
-        InvalidProtocolVersion {
-            major: i16,
-            minor: i16,
-        },
-        InvalidStartupFrame,
-        #[display("Unrecognized message type: {tag}")]
-        UnrecognizedMessageType {
-            tag: String,
-        },
-        IoError(io::Error),
-    }
-}
-
-/// Result type with location-tracking error reports for protocol operations.
-pub(crate) type ProtocolResult<T> = Result<T, Report<ProtocolError>>;
+#[cfg(feature = "proxy")]
+pub(crate) use message::{
+    PgConnectionState, PgMessage, PgMessageType, ProtocolError, ProtocolResult,
+};
 
 /// Immutable UTF-8 string backed by a refcounted `Bytes` slice, typically a
 /// view into a wire frame. Cloning is a refcount bump, not a deep copy.
@@ -122,27 +106,4 @@ impl From<&str> for ByteString {
     fn from(s: &str) -> Self {
         Self(Bytes::copy_from_slice(s.as_bytes()))
     }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) enum PgConnectionState {
-    #[default]
-    Startup,
-    Authentication,
-    Query,
-    // FunctionCall,
-    // Copy,
-    // Termination,
-    // ReadyForQuery,
-    // QueryInProgress,
-    // CopyInProgress(bool),
-    // AwaitingSync,
-}
-
-pub(crate) trait PgMessageType {}
-
-#[derive(Debug)]
-pub(crate) struct PgMessage<T: PgMessageType> {
-    pub message_type: T,
-    pub data: BytesMut,
 }

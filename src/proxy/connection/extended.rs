@@ -1150,7 +1150,6 @@ impl ConnectionState {
     ) {
         let client_parameter_oids = parsed.parameter_oids.clone();
         let stmt = PreparedStatement {
-            name: parsed.statement_name.clone(),
             sql: parsed.sql,
             parameter_oids: parsed.parameter_oids,
             client_parameter_oids,
@@ -1187,7 +1186,6 @@ impl ConnectionState {
     /// Store a portal in connection state.
     pub(super) fn portal_store(&mut self, parsed: ParsedBindMessage) {
         let portal = Portal {
-            name: parsed.portal_name.clone(),
             statement_name: parsed.statement_name,
             parameter_values: parsed.parameter_values,
             parameter_formats: parsed.parameter_formats,

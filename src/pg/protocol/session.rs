@@ -30,7 +30,6 @@ pub(crate) enum StatementType {
 /// Prepared statement stored in connection state
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedStatement {
-    pub name: EcoString,
     /// `ByteString`: a refcounted view into the Parse frame, so storing and
     /// cloning the SQL (e.g. into the describe-cache key) never copies it.
     pub sql: ByteString,
@@ -97,89 +96,8 @@ impl ResultFormats {
 /// Portal (bound prepared statement) stored in connection state
 #[derive(Debug, Clone)]
 pub(crate) struct Portal {
-    pub name: EcoString,
     pub statement_name: EcoString,
     pub parameter_values: Vec<Option<Bytes>>,
     pub parameter_formats: Vec<i16>, // 0=text, 1=binary
     pub result_formats: ResultFormats,
-}
-
-impl Portal {
-    /// Check if any parameter uses binary format (format code 1).
-    /// Returns true if binary format is detected, false otherwise.
-    pub(crate) fn has_binary_parameters(&self) -> bool {
-        self.parameter_formats.contains(&1)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_portal_has_binary_parameters_all_text() {
-        let portal = Portal {
-            name: "p1".into(),
-            statement_name: "s1".into(),
-            parameter_values: vec![Some(Bytes::from_static(b"42"))],
-            parameter_formats: vec![0], // text format
-            result_formats: ResultFormats::Uniform(0),
-        };
-
-        assert!(
-            !portal.has_binary_parameters(),
-            "All text parameters should return false"
-        );
-    }
-
-    #[test]
-    fn test_portal_has_binary_parameters_with_binary() {
-        let portal = Portal {
-            name: "p1".into(),
-            statement_name: "s1".into(),
-            parameter_values: vec![Some(Bytes::from_static(&[0, 0, 0, 42]))],
-            parameter_formats: vec![1], // binary format
-            result_formats: ResultFormats::Uniform(0),
-        };
-
-        assert!(
-            portal.has_binary_parameters(),
-            "Binary parameter should return true"
-        );
-    }
-
-    #[test]
-    fn test_portal_has_binary_parameters_mixed() {
-        let portal = Portal {
-            name: "p1".into(),
-            statement_name: "s1".into(),
-            parameter_values: vec![
-                Some(Bytes::from_static(b"text")),
-                Some(Bytes::from_static(&[0, 0, 0, 42])),
-            ],
-            parameter_formats: vec![0, 1], // text, then binary
-            result_formats: ResultFormats::Uniform(0),
-        };
-
-        assert!(
-            portal.has_binary_parameters(),
-            "Mixed formats with any binary should return true"
-        );
-    }
-
-    #[test]
-    fn test_portal_has_binary_parameters_empty() {
-        let portal = Portal {
-            name: "p1".into(),
-            statement_name: "s1".into(),
-            parameter_values: vec![],
-            parameter_formats: vec![],
-            result_formats: ResultFormats::Implicit,
-        };
-
-        assert!(
-            !portal.has_binary_parameters(),
-            "No parameters should return false"
-        );
-    }
 }
