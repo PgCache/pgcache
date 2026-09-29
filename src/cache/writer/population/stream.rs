@@ -14,7 +14,6 @@ use std::time::Instant;
 use ecow::EcoString;
 use postgres_protocol::escape;
 use postgres_types::PgLsn;
-use rootcause::prelude::ResultExt;
 #[cfg(feature = "fault-injection")]
 use tokio::time::sleep;
 use tokio_postgres::{Client, SimpleColumn, SimpleQueryMessage, SimpleQueryRow, SimpleQueryStream};
@@ -22,7 +21,7 @@ use tokio_stream::StreamExt;
 use tracing::trace;
 
 use super::{PopulationConnections, PopulationOutcome, PopulationWork};
-use crate::cache::{CacheError, CacheResult, MapIntoReport};
+use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::Lsn;
@@ -100,7 +99,7 @@ pub(super) async fn population_task(
                 staging_table_create(&connections.cache, table, &staging).await?;
             }
             let sql = population_select_build(table, table_node, branch, work.max_limit);
-            let (bytes, rows) = population_stream(connections, sql, table, &staging).await?;
+            let (bytes, rows) = population_stream(connections, &sql, table, &staging).await?;
             cached_bytes += bytes;
             row_count += rows;
             if fresh {
@@ -226,7 +225,7 @@ async fn origin_snapshot_lsn(db_origin: &Client) -> CacheResult<Lsn> {
 /// Stream one table's rows into its staging table, recording the stream time.
 async fn population_stream(
     connections: &PopulationConnections,
-    sql: String,
+    sql: &str,
     table: &TableMetadata,
     staging: &str,
 ) -> CacheResult<(usize, u64)> {
@@ -249,18 +248,18 @@ async fn population_stream(
 /// `(cached_bytes, row_count)`.
 async fn staging_rows_load(
     connections: &PopulationConnections,
-    sql: String,
+    sql: &str,
     table: &TableMetadata,
     staging: &str,
 ) -> CacheResult<(usize, u64)> {
     let stream = connections
         .origin
-        .simple_query_raw(&sql)
+        .simple_query_raw(sql)
         .await
         .map_into_report::<CacheError>()?;
     tokio::pin!(stream);
 
-    let Some(row_description) = row_description_read(stream.as_mut(), sql).await? else {
+    let Some(row_description) = row_description_read(stream.as_mut()).await? else {
         return Ok((0, 0));
     };
     let mut batch = StagingBatch::new(
@@ -286,14 +285,12 @@ async fn staging_rows_load(
 /// Read the stream's leading RowDescription; `None` for an empty stream.
 async fn row_description_read(
     mut stream: Pin<&mut SimpleQueryStream>,
-    sql: String,
 ) -> CacheResult<Option<Arc<[SimpleColumn]>>> {
     match stream.next().await {
         Some(Ok(SimpleQueryMessage::RowDescription(cols))) => Ok(Some(cols)),
         Some(Ok(_)) => Err(CacheError::InvalidMessage.into()),
         Some(Err(e)) => {
-            let report: CacheResult<Option<Arc<[SimpleColumn]>>> = Err(CacheError::from(e).into());
-            report.attach(sql)
+            Err(CacheError::from(e).into()).attach_loc("reading population row description")
         }
         None => Ok(None),
     }
