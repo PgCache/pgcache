@@ -32,13 +32,12 @@ use crate::settings::Settings;
 
 mod decode;
 
+use super::{
+    CacheError, CacheResult, MapIntoReport, ReportExt, messages::CdcCommand, types::ActiveRelations,
+};
 use decode::{
     parse_delete_row_data, parse_insert_row_data, parse_relation_to_table_metadata,
     parse_update_row_data,
-};
-
-use super::{
-    CacheError, CacheResult, MapIntoReport, ReportExt, messages::CdcCommand, types::ActiveRelations,
 };
 
 /// Test-only CDC delivery delay (fault-injection feature, PGC-250 Slice B).

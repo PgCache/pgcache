@@ -33,14 +33,13 @@ use crate::timing::QueryTiming;
 mod coalesce;
 mod sqlstate;
 
+use super::runtime::serve_pool::ConnectionGuard;
 pub(super) use coalesce::CoalescedOutcome;
 use coalesce::{
     BroadcastState, broadcast_error_reply, broadcast_join, broadcast_setup, push_and_broadcast,
 };
 pub(crate) use sqlstate::SQLSTATE_UNDEFINED_TABLE;
 use sqlstate::sqlstate_extract;
-
-use super::runtime::serve_pool::ConnectionGuard;
 
 /// Max gap between cache-DB frames while draining a response for a departed
 /// primary client before the connection is treated as stalled and discarded.

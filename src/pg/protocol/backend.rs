@@ -1,8 +1,5 @@
 use std::hash::Hash;
 
-use encode::{
-    READY_FOR_QUERY_FAILED_MSG, READY_FOR_QUERY_IDLE_MSG, READY_FOR_QUERY_IN_TRANSACTION_MSG,
-};
 use phf::phf_map;
 use tokio_util::{
     bytes::{Buf, BytesMut},
@@ -10,6 +7,9 @@ use tokio_util::{
 };
 
 use super::{PgConnectionState, PgMessage, PgMessageType, ProtocolError, encode};
+use encode::{
+    READY_FOR_QUERY_FAILED_MSG, READY_FOR_QUERY_IDLE_MSG, READY_FOR_QUERY_IN_TRANSACTION_MSG,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PgBackendMessageType {

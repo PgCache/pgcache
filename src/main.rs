@@ -4,6 +4,15 @@ use std::thread;
 use std::thread::sleep;
 use std::time::Duration;
 
+use rootcause::Report;
+use tokio::io;
+use tokio_util::sync::CancellationToken;
+use tracing::info;
+#[cfg(not(feature = "console"))]
+use tracing_appender::non_blocking::NonBlockingBuilder;
+#[cfg(not(feature = "console"))]
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
 use pgcache_lib::metrics::metrics_recorder_install;
 #[cfg(not(feature = "console"))]
 use pgcache_lib::metrics::names::LOG_DROPPED_LINES;
@@ -13,14 +22,6 @@ use pgcache_lib::proxy::{ConnectionError, proxy_run};
 use pgcache_lib::settings::{PreflightSettings, RunMode};
 #[cfg(not(feature = "console"))]
 use pgcache_lib::tracing_utils::SimpeFormatter;
-use rootcause::Report;
-use tokio::io;
-use tokio_util::sync::CancellationToken;
-use tracing::info;
-#[cfg(not(feature = "console"))]
-use tracing_appender::non_blocking::NonBlockingBuilder;
-#[cfg(not(feature = "console"))]
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Depth of the log queue. A stalled stdout reader is the only thing that backs
 /// it up, and at that point dropping is the intended behaviour — so keep it deep
