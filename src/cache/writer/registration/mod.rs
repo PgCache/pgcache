@@ -251,13 +251,8 @@ impl WriterRegistration {
         // scale-up spawns are best-effort (see population_pool_reconcile).
         for _ in 0..settings.population_workers_min {
             let id = spawn_ctx.pool.worker_reserve();
-            let (origin_conn, cache_conn) = population_worker_connect(&spawn_ctx, id).await?;
-            spawn_local(population_worker_run(
-                spawn_ctx.clone(),
-                id,
-                origin_conn,
-                cache_conn,
-            ));
+            let connections = population_worker_connect(&spawn_ctx, id).await?;
+            spawn_local(population_worker_run(spawn_ctx.clone(), id, connections));
         }
 
         Ok(Self {

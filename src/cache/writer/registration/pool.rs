@@ -69,9 +69,7 @@ impl WriterRegistration {
         let ctx = self.spawn_ctx.clone();
         spawn_local(async move {
             match population_worker_connect(&ctx, id).await {
-                Ok((origin_conn, cache_conn)) => {
-                    population_worker_run(ctx, id, origin_conn, cache_conn).await;
-                }
+                Ok(connections) => population_worker_run(ctx, id, connections).await,
                 Err(e) => {
                     error!(
                         "population worker {id} scale-up connect failed: {}",
