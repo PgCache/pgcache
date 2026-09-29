@@ -6,11 +6,12 @@ use ecow::EcoString;
 use lru::LruCache;
 use tracing::{error, instrument, trace};
 
+use super::segment_eval::{BatchEvalView, PreparedEvalKey};
 use super::{
-    BATCH_FRAMES_MAX, BatchEvalView, CdcOperation, MembershipRow, PREPARED_EVAL_CACHE_CAPACITY,
-    PreparedEvalKey, RowEvent, SQL_BUFFER_CAPACITY, WriterCdc, eval_candidates_into,
-    memo_frame_accumulate, toast_fallback_structural_invalidate, update_pk_changed,
-    update_queries_check_invalidate, update_query_matches_locally,
+    BATCH_FRAMES_MAX, CdcOperation, MembershipRow, PREPARED_EVAL_CACHE_CAPACITY, RowEvent,
+    SQL_BUFFER_CAPACITY, WriterCdc, eval_candidates_into, memo_frame_accumulate,
+    toast_fallback_structural_invalidate, update_pk_changed, update_queries_check_invalidate,
+    update_query_matches_locally,
 };
 use crate::cache::messages::CdcCommand;
 use crate::cache::update_query::{RowChanges, UpdateEvalStrategy, UpdateQuery};

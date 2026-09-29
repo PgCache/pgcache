@@ -24,7 +24,7 @@ use invalidation::{
 };
 use membership::MembershipRow;
 use row_match::{update_pk_changed, update_query_matches_locally};
-use segment_eval::{BatchEvalView, PreparedEvalKey, SegmentMembership};
+use segment_eval::PreparedEvalKey;
 
 /// Default capacity for dynamically built SQL strings.
 pub(super) const SQL_BUFFER_CAPACITY: usize = 1024;

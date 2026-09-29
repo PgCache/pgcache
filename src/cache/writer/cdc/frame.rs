@@ -3,7 +3,8 @@ use std::sync::atomic::Ordering;
 use ecow::EcoString;
 use tracing::{error, info};
 
-use super::{SegmentMembership, WriterCdc};
+use super::WriterCdc;
+use super::segment_eval::SegmentMembership;
 use crate::cache::memo::SlotKey;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};

@@ -1,7 +1,8 @@
 use tracing::trace;
 
+use super::WriterCdc;
 use super::row_match::update_query_matches_locally;
-use super::{BatchEvalView, WriterCdc};
+use super::segment_eval::BatchEvalView;
 use crate::cache::CacheResult;
 use crate::cache::update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery};
 use crate::cache::writer::core::WriterCore;
