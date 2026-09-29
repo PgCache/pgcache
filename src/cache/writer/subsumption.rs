@@ -10,12 +10,13 @@ use ecow::EcoString;
 use tracing::{debug, error};
 
 use super::core::WriterCore;
-use super::registration::{QueryResolution, WriterRegistration};
+use super::registration::{
+    QueryResolution, RegistrationIdentity, WriterRegistration, cached_query_insert,
+};
 use crate::cache::admission::{SubsumerCandidate, SubsumerSource, subsumption_covered};
 use crate::cache::types::{Cache, SharedResolved};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::oid::Oid;
-use crate::query::Fingerprint;
 use crate::query::constraints::{TableConstraint, analyze_query_constraints};
 use crate::result::error_chain_format;
 use crate::timing::duration_to_ns_u64;
@@ -101,25 +102,16 @@ impl WriterRegistration {
     pub(super) async fn query_subsume(
         &self,
         core: &mut WriterCore,
-        fingerprint: Fingerprint,
+        identity: RegistrationIdentity,
         resolution: QueryResolution,
-        started_at: Instant,
-        pinned: bool,
     ) -> CacheResult<Option<(u64, SharedResolved, EcoString)>> {
         let subsume_start = Instant::now();
+        let fingerprint = identity.fingerprint;
+        let resolved = Arc::clone(&resolution.resolved);
+        let deparsed_sql = resolution.deparsed_sql.clone();
+        let max_limit = resolution.max_limit;
 
-        let (generation, relations_changed) = self.cached_query_insert(
-            core,
-            fingerprint,
-            resolution.relation_oids,
-            resolution.base_query,
-            Arc::clone(&resolution.resolved),
-            resolution.deparsed_sql.clone(),
-            resolution.serve_shape.clone(),
-            resolution.max_limit,
-            started_at,
-            pinned,
-        );
+        let (generation, relations_changed) = cached_query_insert(core, identity, resolution);
 
         if relations_changed {
             core.publication_update().await?;
@@ -142,7 +134,7 @@ impl WriterRegistration {
 
         let cache_exec_result = core
             .db_cache
-            .batch_execute(resolution.deparsed_sql.as_str())
+            .batch_execute(deparsed_sql.as_str())
             .await
             .map_into_report::<CacheError>();
 
@@ -163,9 +155,9 @@ impl WriterRegistration {
         core.state_ready_transition(
             fingerprint,
             generation,
-            Arc::clone(&resolution.resolved),
-            resolution.deparsed_sql.clone(),
-            resolution.max_limit,
+            Arc::clone(&resolved),
+            deparsed_sql.clone(),
+            max_limit,
         );
 
         // Clear registration_started_at to signal completion
@@ -187,10 +179,6 @@ impl WriterRegistration {
             .record(subsume_start.elapsed().as_secs_f64());
 
         debug!("query subsumed {fingerprint}");
-        Ok(Some((
-            generation,
-            resolution.resolved,
-            resolution.deparsed_sql,
-        )))
+        Ok(Some((generation, resolved, deparsed_sql)))
     }
 }

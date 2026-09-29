@@ -275,9 +275,7 @@ impl WriterCore {
         let resolved = Arc::clone(&query.resolved);
 
         // 1. Assign new generation (insert before removing old — keeps old gen valid for re-stamp)
-        self.cache.generation_counter += 1;
-        let new_generation = self.cache.generation_counter;
-        self.cache.generations.insert(new_generation);
+        let new_generation = self.cache.generation_allocate();
 
         // 2. Set query generation on cache DB connection for row tracking
         let set_gen_sql = format!("SET mem.query_generation = {new_generation}");

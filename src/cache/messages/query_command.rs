@@ -83,22 +83,25 @@ impl CacheMessage {
     }
 }
 
+/// Payload for `QueryCommand::Register`.
+pub struct RegisterRequest {
+    pub fingerprint: Fingerprint,
+    pub cacheable_query: Arc<CacheableQuery>,
+    pub search_path: Arc<[EcoString]>,
+    pub started_at: Instant,
+    /// Writer sends subsumption result back so the dispatch can route the held request.
+    pub subsumption_tx: oneshot::Sender<SubsumptionResult>,
+    /// What to do when the query is not subsumed by existing cached data.
+    pub admit_action: AdmitAction,
+    /// Pinned queries are protected from eviction and auto-readmitted after invalidation.
+    pub pinned: bool,
+}
+
 /// Commands for query registration lifecycle, sent to the writer thread
 pub enum QueryCommand {
     /// Register a new query. The writer checks subsumption and responds
     /// via `subsumption_tx` before optionally dispatching population.
-    Register {
-        fingerprint: Fingerprint,
-        cacheable_query: Arc<CacheableQuery>,
-        search_path: Arc<[EcoString]>,
-        started_at: Instant,
-        /// Writer sends subsumption result back so the dispatch can route the held request.
-        subsumption_tx: oneshot::Sender<SubsumptionResult>,
-        /// What to do when the query is not subsumed by existing cached data.
-        admit_action: AdmitAction,
-        /// Pinned queries are protected from eviction and auto-readmitted after invalidation.
-        pinned: bool,
-    },
+    Register(RegisterRequest),
 
     /// Query population failed. `generation` identifies which population (a
     /// query can have a superseded generation still in flight) so the writer
@@ -148,9 +151,9 @@ pub enum QueryCommand {
 impl std::fmt::Debug for QueryCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Register { fingerprint, .. } => f
+            Self::Register(request) => f
                 .debug_struct("Register")
-                .field("fingerprint", fingerprint)
+                .field("fingerprint", &request.fingerprint)
                 .finish_non_exhaustive(),
             Self::Failed {
                 fingerprint,

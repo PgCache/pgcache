@@ -114,6 +114,13 @@ impl Cache {
         }
     }
 
+    /// Allocate the next generation and register it as active.
+    pub fn generation_allocate(&mut self) -> u64 {
+        self.generation_counter += 1;
+        self.generations.insert(self.generation_counter);
+        self.generation_counter
+    }
+
     /// Returns the minimum generation that can be safely purged.
     /// This is the highest generation that is less than all active generations
     /// or the current generation_counter if there are no active generations

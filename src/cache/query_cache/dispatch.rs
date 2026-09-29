@@ -15,7 +15,7 @@ use crate::cache::coalesce_queue::{CoalesceKey, CoalesceQueue, coalesce_deadline
 use crate::cache::explain::{ExplainJob, ExplainKind};
 use crate::cache::messages::{
     AdmitAction, CacheMessage, CacheOutcome, CacheReply, PipelineContext, ProxyMessage,
-    QueryCommand, SubsumptionResult, slices_concat,
+    QueryCommand, RegisterRequest, SubsumptionResult, slices_concat,
 };
 use crate::cache::mv::{MvMeta, MvServe, MvState};
 use crate::cache::mv_shape::ShapeGate;
@@ -616,7 +616,7 @@ impl CacheDispatch {
 
             let (subsumption_tx, _subsumption_rx) = oneshot::channel();
             self.query_tx
-                .send(QueryCommand::Register {
+                .send(QueryCommand::Register(RegisterRequest {
                     fingerprint: pq.fingerprint,
                     cacheable_query: Arc::clone(&pq.cacheable_query),
                     search_path: vec!["public".into()].into(),
@@ -624,7 +624,7 @@ impl CacheDispatch {
                     subsumption_tx,
                     admit_action: AdmitAction::Admit,
                     pinned: true,
-                })
+                }))
                 .map_err(|_| CacheError::WriterSend)?;
         }
         Ok(())
@@ -640,7 +640,7 @@ impl CacheDispatch {
         admit_action: AdmitAction,
     ) -> CacheResult<()> {
         self.query_tx
-            .send(QueryCommand::Register {
+            .send(QueryCommand::Register(RegisterRequest {
                 fingerprint,
                 cacheable_query,
                 search_path,
@@ -648,7 +648,7 @@ impl CacheDispatch {
                 subsumption_tx,
                 admit_action,
                 pinned: false,
-            })
+            }))
             .map_err(|_| CacheError::WriterSend.into())
     }
 
