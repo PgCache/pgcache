@@ -3,8 +3,8 @@ use std::sync::atomic::Ordering;
 use ecow::EcoString;
 use tracing::{error, info};
 
-use super::WriterCdc;
 use super::segment_eval::SegmentMembership;
+use super::{RelationRow, RelationUpdate, WriterCdc};
 use crate::cache::memo::SlotKey;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
@@ -236,8 +236,7 @@ impl WriterCdc {
                     } => (
                         self.handle_insert(
                             core,
-                            *relation_oid,
-                            row_data,
+                            RelationRow::new(*relation_oid, row_data),
                             membership.view(*relation_oid, i),
                         )
                         .await,
@@ -250,9 +249,7 @@ impl WriterCdc {
                     } => (
                         self.handle_update(
                             core,
-                            *relation_oid,
-                            key_data,
-                            new_row_data,
+                            RelationUpdate::new(*relation_oid, key_data, new_row_data),
                             membership.view(*relation_oid, i),
                         )
                         .await,
@@ -266,9 +263,7 @@ impl WriterCdc {
                     } => (
                         self.handle_update_toast_fallback(
                             core,
-                            *relation_oid,
-                            key_data,
-                            new_row_data,
+                            RelationUpdate::new(*relation_oid, key_data, new_row_data),
                             toasted_columns,
                         )
                         .await,
@@ -300,9 +295,7 @@ impl WriterCdc {
                         (
                             self.handle_update_toast_fallback(
                                 core,
-                                *relation_oid,
-                                key_data,
-                                new_row_data,
+                                RelationUpdate::new(*relation_oid, key_data, new_row_data),
                                 &toasted_columns,
                             )
                             .await,
@@ -315,8 +308,7 @@ impl WriterCdc {
                     } => (
                         self.handle_delete(
                             core,
-                            *relation_oid,
-                            row_data,
+                            RelationRow::new(*relation_oid, row_data),
                             membership.view(*relation_oid, i),
                         )
                         .await,

@@ -5,9 +5,12 @@ use std::sync::atomic::AtomicU64;
 use lru::LruCache;
 use tokio_postgres::{Client, Statement};
 
+use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::Lsn;
+use crate::pg::protocol::ByteString;
 
+mod apply;
 mod dispatch;
 mod frame;
 mod invalidation;
@@ -64,6 +67,59 @@ pub(super) const BATCH_FRAMES_MAX: usize = 256;
 pub(super) enum CdcOperation {
     Upsert,
     Delete,
+}
+
+/// One replayed row of a relation: an INSERT's new image or a DELETE's
+/// key / old image.
+#[derive(Clone, Copy)]
+pub(super) struct RelationRow<'a> {
+    relation_oid: Oid,
+    row_data: &'a [Option<ByteString>],
+}
+
+impl<'a> RelationRow<'a> {
+    pub(super) fn new(relation_oid: Oid, row_data: &'a [Option<ByteString>]) -> Self {
+        Self {
+            relation_oid,
+            row_data,
+        }
+    }
+}
+
+/// One replayed UPDATE: its key (old) tuple and new image.
+#[derive(Clone, Copy)]
+pub(super) struct RelationUpdate<'a> {
+    relation_oid: Oid,
+    key_data: &'a [Option<ByteString>],
+    new_row_data: &'a [Option<ByteString>],
+}
+
+impl<'a> RelationUpdate<'a> {
+    pub(super) fn new(
+        relation_oid: Oid,
+        key_data: &'a [Option<ByteString>],
+        new_row_data: &'a [Option<ByteString>],
+    ) -> Self {
+        Self {
+            relation_oid,
+            key_data,
+            new_row_data,
+        }
+    }
+
+    fn pk_changed(&self, table_metadata: &TableMetadata) -> bool {
+        update_pk_changed(table_metadata, self.key_data, self.new_row_data)
+    }
+
+    /// The row a PK-only removed-row probe keys on: the old key after a PK
+    /// change, else the new image (same PK).
+    fn removed_probe_row(&self, pk_changed: bool) -> &'a [Option<ByteString>] {
+        if pk_changed {
+            self.key_data
+        } else {
+            self.new_row_data
+        }
+    }
 }
 
 /// Owns the CDC apply path: consumes `CdcCommand`s and applies mutations /
