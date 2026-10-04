@@ -7,7 +7,7 @@ use ecow::EcoString;
 use fallible_iterator::FallibleIterator;
 use ordered_float::NotNan;
 use postgres_protocol::types as pg_types;
-use postgres_types::Type as PgType;
+use postgres_types::{Kind, Type as PgType};
 use rootcause::Report;
 
 use crate::query::ast::LiteralValue;
@@ -21,11 +21,59 @@ use canonical_text::{
     ymd_to_text,
 };
 
+/// A family decoder's answer: `None` when the type isn't one of its own.
+type FamilyDecode = Option<AstTransformResult<LiteralValue>>;
+
+fn invalid_value(message: impl Into<String>) -> Report<AstTransformError> {
+    Report::from(AstTransformError::InvalidParameterValue {
+        message: message.into(),
+    })
+}
+
 /// Wrap a decode failure for `type_name`'s binary wire format.
 fn invalid_param(type_name: &str, e: impl std::fmt::Display) -> Report<AstTransformError> {
-    Report::from(AstTransformError::InvalidParameterValue {
-        message: format!("invalid binary {type_name}: {e}"),
-    })
+    invalid_value(format!("invalid binary {type_name}: {e}"))
+}
+
+fn length_invalid(type_name: &str, expected: usize, got: usize) -> Report<AstTransformError> {
+    invalid_value(format!(
+        "invalid {type_name} length: expected {expected} bytes, got {got}"
+    ))
+}
+
+fn unsupported(oid: u32) -> Report<AstTransformError> {
+    Report::from(AstTransformError::UnsupportedBinaryFormat { oid })
+}
+
+/// A wire value that must be exactly `N` bytes.
+fn fixed_width<'a, const N: usize>(
+    bytes: &'a [u8],
+    type_name: &str,
+) -> AstTransformResult<&'a [u8; N]> {
+    bytes
+        .try_into()
+        .map_err(|_| length_invalid(type_name, N, bytes.len()))
+}
+
+fn be_i64(bytes: &[u8], at: usize) -> Option<i64> {
+    let field = bytes.get(at..at.checked_add(8)?)?;
+    field.try_into().ok().map(i64::from_be_bytes)
+}
+
+fn be_i32(bytes: &[u8], at: usize) -> Option<i32> {
+    let field = bytes.get(at..at.checked_add(4)?)?;
+    field.try_into().ok().map(i32::from_be_bytes)
+}
+
+/// Canonical text carrying an explicit cast to `ty`.
+fn cast_literal(text: impl Into<EcoString>, ty: &PgType) -> LiteralValue {
+    LiteralValue::StringWithCast(text.into(), ty.name().into())
+}
+
+fn float_literal(value: f64) -> AstTransformResult<LiteralValue> {
+    NotNan::new(value)
+        .map(LiteralValue::Float)
+        .map_err(|_| invalid_value("NaN is not a valid float value"))
 }
 
 pub(super) fn binary_parameter_to_literal(
@@ -33,310 +81,245 @@ pub(super) fn binary_parameter_to_literal(
     oid: u32,
 ) -> AstTransformResult<LiteralValue> {
     if let Some(ty) = PgType::from_oid(oid)
-        && matches!(ty.kind(), postgres_types::Kind::Array(_))
+        && matches!(ty.kind(), Kind::Array(_))
     {
         return binary_array_to_literal(bytes, oid);
     }
     binary_parameter_to_literal_scalar(bytes, oid)
 }
 
+/// Unknown OIDs and types without a decoder route to
+/// `UnsupportedBinaryFormat` so the query falls through to origin uncached.
 fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
-    let pg_type = PgType::from_oid(oid);
-
-    // Fail-closed Kind dispatch: types without an explicit per-OID arm
-    // below route to `UnsupportedBinaryFormat` so the query falls through
-    // to origin uncached. The previous UTF-8 catch-all silently corrupted
-    // SQL whenever a binary wire format happened to be valid UTF-8.
-    if let Some(ref ty) = pg_type {
-        match ty.kind() {
-            postgres_types::Kind::Array(_) => {
-                return Err(AstTransformError::UnsupportedBinaryFormat { oid }.into());
-            }
-            postgres_types::Kind::Domain(base) => {
-                return binary_parameter_to_literal_scalar(bytes, base.oid());
-            }
-            postgres_types::Kind::Enum(_) => {
-                let s = std::str::from_utf8(bytes).map_err(|_| {
-                    Report::from(AstTransformError::InvalidParameterValue {
-                        message: "binary enum value is not valid UTF-8".to_owned(),
-                    })
-                })?;
-                return Ok(LiteralValue::String(s.into()));
-            }
-            postgres_types::Kind::Composite(_)
-            | postgres_types::Kind::Range(_)
-            | postgres_types::Kind::Multirange(_)
-            | postgres_types::Kind::Pseudo => {
-                return Err(AstTransformError::UnsupportedBinaryFormat { oid }.into());
-            }
-            postgres_types::Kind::Simple => {}
-            // `Kind` is `#[non_exhaustive]`; new variants must be opted in.
-            _ => {
-                return Err(AstTransformError::UnsupportedBinaryFormat { oid }.into());
-            }
-        }
+    let Some(ty) = PgType::from_oid(oid) else {
+        return Err(unsupported(oid));
+    };
+    if let Some(decoded) = kind_dispatch(bytes, &ty) {
+        return decoded;
     }
+    number_decode(bytes, &ty)
+        .or_else(|| text_decode(bytes, &ty))
+        .or_else(|| datetime_decode(bytes, &ty))
+        .or_else(|| network_decode(bytes, &ty))
+        .unwrap_or_else(|| Err(unsupported(oid)))
+}
 
-    match pg_type {
-        Some(PgType::BOOL) => {
-            let value = pg_types::bool_from_sql(bytes).map_err(|e| invalid_param("bool", e))?;
-            Ok(LiteralValue::Boolean(value))
-        }
-        Some(PgType::INT2) => {
-            let value = pg_types::int2_from_sql(bytes).map_err(|e| invalid_param("int2", e))?;
-            Ok(LiteralValue::Integer(value as i64))
-        }
-        Some(PgType::INT4) => {
-            let value = pg_types::int4_from_sql(bytes).map_err(|e| invalid_param("int4", e))?;
-            Ok(LiteralValue::Integer(value as i64))
-        }
-        Some(PgType::INT8) => {
-            let value = pg_types::int8_from_sql(bytes).map_err(|e| invalid_param("int8", e))?;
-            Ok(LiteralValue::Integer(value))
-        }
-        Some(PgType::FLOAT4) => {
-            let value = pg_types::float4_from_sql(bytes).map_err(|e| invalid_param("float4", e))?;
-            let value = NotNan::new(value as f64).map_err(|_| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: "NaN is not a valid float value".to_owned(),
-                })
-            })?;
-            Ok(LiteralValue::Float(value))
-        }
-        Some(PgType::FLOAT8) => {
-            let value = pg_types::float8_from_sql(bytes).map_err(|e| invalid_param("float8", e))?;
-            let value = NotNan::new(value).map_err(|_| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: "NaN is not a valid float value".to_owned(),
-                })
-            })?;
-            Ok(LiteralValue::Float(value))
-        }
-        Some(
-            PgType::TEXT
-            | PgType::VARCHAR
-            | PgType::BPCHAR
-            | PgType::NAME
-            | PgType::CHAR
-            | PgType::UNKNOWN,
-        ) => {
-            let value = pg_types::text_from_sql(bytes).map_err(|e| invalid_param("text", e))?;
-            Ok(LiteralValue::String(value.into()))
-        }
-        Some(PgType::UUID) => {
-            let bytes: &[u8; 16] = bytes.try_into().map_err(|_| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!(
-                        "invalid UUID length: expected 16 bytes, got {}",
-                        bytes.len()
-                    ),
-                })
-            })?;
-            let uuid_str = format!(
-                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                bytes[0],
-                bytes[1],
-                bytes[2],
-                bytes[3],
-                bytes[4],
-                bytes[5],
-                bytes[6],
-                bytes[7],
-                bytes[8],
-                bytes[9],
-                bytes[10],
-                bytes[11],
-                bytes[12],
-                bytes[13],
-                bytes[14],
-                bytes[15]
-            );
-            Ok(LiteralValue::String(uuid_str.into()))
-        }
-        Some(PgType::BYTEA) => {
-            // The leading `\` in `\x<hex>` forces `escape_literal` into
-            // E-string form so the SQL stays well-formed.
-            let raw = pg_types::bytea_from_sql(bytes);
-            Ok(LiteralValue::StringWithCast(
-                bytea_to_hex_literal(raw).into(),
-                PgType::BYTEA.name().into(),
-            ))
-        }
-        Some(PgType::TIME) => {
-            let micros = pg_types::time_from_sql(bytes).map_err(|e| invalid_param("time", e))?;
-            Ok(LiteralValue::StringWithCast(
-                time_micros_to_text(micros).into(),
-                PgType::TIME.name().into(),
-            ))
-        }
-        Some(PgType::DATE) => {
-            // ±i32 sentinels are PG14+ `infinity` / `-infinity`.
-            let days = pg_types::date_from_sql(bytes).map_err(|e| invalid_param("date", e))?;
-            let text = match days {
-                i32::MAX => "infinity".to_owned(),
-                i32::MIN => "-infinity".to_owned(),
-                _ => {
-                    let (y, m, d) = pg_days_to_ymd(days);
-                    ymd_to_text(y, m, d)
-                }
-            };
-            Ok(LiteralValue::StringWithCast(
-                text.into(),
-                PgType::DATE.name().into(),
-            ))
-        }
-        Some(PgType::TIMESTAMP) => {
-            let micros =
-                pg_types::timestamp_from_sql(bytes).map_err(|e| invalid_param("timestamp", e))?;
-            let text = match micros {
-                i64::MAX => "infinity".to_owned(),
-                i64::MIN => "-infinity".to_owned(),
-                _ => timestamp_micros_to_text(micros),
-            };
-            Ok(LiteralValue::StringWithCast(
-                text.into(),
-                PgType::TIMESTAMP.name().into(),
-            ))
-        }
-        Some(PgType::TIMESTAMPTZ) => {
-            // Emit explicit `+00` so PG re-parses with zone regardless of
-            // session `TimeZone` setting. Wire format matches TIMESTAMP.
-            let micros =
-                pg_types::timestamp_from_sql(bytes).map_err(|e| invalid_param("timestamptz", e))?;
-            let text = match micros {
-                i64::MAX => "infinity".to_owned(),
-                i64::MIN => "-infinity".to_owned(),
-                _ => format!("{}+00", timestamp_micros_to_text(micros)),
-            };
-            Ok(LiteralValue::StringWithCast(
-                text.into(),
-                PgType::TIMESTAMPTZ.name().into(),
-            ))
-        }
-        Some(PgType::MACADDR) => {
-            let octets =
-                pg_types::macaddr_from_sql(bytes).map_err(|e| invalid_param("macaddr", e))?;
-            Ok(LiteralValue::StringWithCast(
-                macaddr_to_text(&octets).into(),
-                PgType::MACADDR.name().into(),
-            ))
-        }
-        Some(PgType::MACADDR8) => {
-            let octets: &[u8; 8] = bytes.try_into().map_err(|_| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!(
-                        "invalid macaddr8 length: expected 8 bytes, got {}",
-                        bytes.len()
-                    ),
-                })
-            })?;
-            Ok(LiteralValue::StringWithCast(
-                macaddr_to_text(octets).into(),
-                PgType::MACADDR8.name().into(),
-            ))
-        }
-        Some(PgType::INET) => {
-            let inet = pg_types::inet_from_sql(bytes).map_err(|e| invalid_param("inet", e))?;
-            Ok(LiteralValue::StringWithCast(
-                inet_to_text(&inet, false).into(),
-                PgType::INET.name().into(),
-            ))
-        }
-        Some(PgType::CIDR) => {
-            let inet = pg_types::inet_from_sql(bytes).map_err(|e| invalid_param("cidr", e))?;
-            Ok(LiteralValue::StringWithCast(
-                inet_to_text(&inet, true).into(),
-                PgType::CIDR.name().into(),
-            ))
-        }
-        Some(PgType::NUMERIC) => {
-            let (weight, sign, dscale, digits) = numeric_parse_wire(bytes)?;
-            let text = numeric_to_text(weight, sign, dscale, &digits).ok_or_else(|| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!("invalid numeric sign code: 0x{sign:04x}"),
-                })
-            })?;
-            Ok(LiteralValue::StringWithCast(
-                text.into(),
-                PgType::NUMERIC.name().into(),
-            ))
-        }
-        Some(PgType::TIMETZ) => {
-            // 12 bytes: i64 micros-since-midnight + i32 zone-secs-west-of-UTC.
-            let arr: &[u8; 12] = bytes.try_into().map_err(|_| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!(
-                        "invalid timetz length: expected 12 bytes, got {}",
-                        bytes.len()
-                    ),
-                })
-            })?;
-            let micros = i64::from_be_bytes(arr[0..8].try_into().expect("8-byte time component"));
-            let zone = i32::from_be_bytes(arr[8..12].try_into().expect("4-byte zone component"));
-            Ok(LiteralValue::StringWithCast(
-                timetz_to_text(micros, zone).into(),
-                PgType::TIMETZ.name().into(),
-            ))
-        }
-        Some(PgType::INTERVAL) => {
-            // 16 bytes: i64 micros + i32 days + i32 months.
-            let arr: &[u8; 16] = bytes.try_into().map_err(|_| {
-                Report::from(AstTransformError::InvalidParameterValue {
-                    message: format!(
-                        "invalid interval length: expected 16 bytes, got {}",
-                        bytes.len()
-                    ),
-                })
-            })?;
-            let micros = i64::from_be_bytes(arr[0..8].try_into().expect("8-byte time component"));
-            let days = i32::from_be_bytes(arr[8..12].try_into().expect("4-byte days component"));
-            let months =
-                i32::from_be_bytes(arr[12..16].try_into().expect("4-byte months component"));
-            Ok(LiteralValue::StringWithCast(
-                interval_to_text(micros, days, months).into(),
-                PgType::INTERVAL.name().into(),
-            ))
-        }
-        Some(PgType::JSON) => {
-            // JSON binary format is plain UTF-8 JSON text — no version
-            // prefix or other framing — so it round-trips as a string
-            // literal, just with an explicit `::json` cast to preserve
-            // the column's expected type.
-            let value = pg_types::text_from_sql(bytes).map_err(|e| invalid_param("json", e))?;
-            Ok(LiteralValue::StringWithCast(
-                value.into(),
-                PgType::JSON.name().into(),
-            ))
-        }
-        Some(PgType::JSONB) => {
-            // JSONB binary format prepends a 1-byte version (currently
-            // 0x01); the rest is UTF-8 JSON text. Strip the prefix so the
-            // deparsed SQL is `'<json>'::jsonb` rather than carrying the
-            // SOH control byte into the literal.
-            match bytes.split_first() {
-                Some((&0x01, json)) => {
-                    let value = std::str::from_utf8(json).map_err(|_| {
-                        Report::from(AstTransformError::InvalidParameterValue {
-                            message: "jsonb body is not valid UTF-8".to_owned(),
-                        })
-                    })?;
-                    Ok(LiteralValue::StringWithCast(
-                        value.into(),
-                        PgType::JSONB.name().into(),
-                    ))
-                }
-                _ => Err(AstTransformError::InvalidParameterValue {
-                    message: "missing or unknown jsonb version byte".to_owned(),
-                }
-                .into()),
-            }
-        }
-        // Fail-closed catch-all — see the Kind dispatch above.
-        _ => Err(AstTransformError::UnsupportedBinaryFormat { oid }.into()),
+/// Fail-closed Kind dispatch: only `Simple` types reach the per-OID
+/// decoders. The previous UTF-8 catch-all silently corrupted SQL whenever a
+/// binary wire format happened to be valid UTF-8.
+fn kind_dispatch(bytes: &[u8], ty: &PgType) -> FamilyDecode {
+    match ty.kind() {
+        Kind::Simple => None,
+        Kind::Domain(base) => Some(binary_parameter_to_literal_scalar(bytes, base.oid())),
+        Kind::Enum(_) => Some(
+            std::str::from_utf8(bytes)
+                .map(|s| LiteralValue::String(s.into()))
+                .map_err(|_| invalid_value("binary enum value is not valid UTF-8")),
+        ),
+        Kind::Array(_)
+        | Kind::Composite(_)
+        | Kind::Range(_)
+        | Kind::Multirange(_)
+        | Kind::Pseudo => Some(Err(unsupported(ty.oid()))),
+        // `Kind` is `#[non_exhaustive]`; new variants must be opted in.
+        _ => Some(Err(unsupported(ty.oid()))),
     }
 }
 
-/// holding a PG text array literal like `'{1,2,NULL,3}'::int4[]`.
+fn number_decode(bytes: &[u8], ty: &PgType) -> FamilyDecode {
+    let decoded = match *ty {
+        PgType::BOOL => pg_types::bool_from_sql(bytes)
+            .map(LiteralValue::Boolean)
+            .map_err(|e| invalid_param("bool", e)),
+        PgType::INT2 => pg_types::int2_from_sql(bytes)
+            .map(|value| LiteralValue::Integer(i64::from(value)))
+            .map_err(|e| invalid_param("int2", e)),
+        PgType::INT4 => pg_types::int4_from_sql(bytes)
+            .map(|value| LiteralValue::Integer(i64::from(value)))
+            .map_err(|e| invalid_param("int4", e)),
+        PgType::INT8 => pg_types::int8_from_sql(bytes)
+            .map(LiteralValue::Integer)
+            .map_err(|e| invalid_param("int8", e)),
+        PgType::FLOAT4 => pg_types::float4_from_sql(bytes)
+            .map_err(|e| invalid_param("float4", e))
+            .and_then(|value| float_literal(f64::from(value))),
+        PgType::FLOAT8 => pg_types::float8_from_sql(bytes)
+            .map_err(|e| invalid_param("float8", e))
+            .and_then(float_literal),
+        PgType::NUMERIC => numeric_decode(bytes),
+        _ => return None,
+    };
+    Some(decoded)
+}
+
+fn numeric_decode(bytes: &[u8]) -> AstTransformResult<LiteralValue> {
+    let (weight, sign, dscale, digits) = numeric_parse_wire(bytes)?;
+    let text = numeric_to_text(weight, sign, dscale, &digits)
+        .ok_or_else(|| invalid_value(format!("invalid numeric sign code: 0x{sign:04x}")))?;
+    Ok(cast_literal(text, &PgType::NUMERIC))
+}
+
+fn text_decode(bytes: &[u8], ty: &PgType) -> FamilyDecode {
+    let decoded = match *ty {
+        PgType::TEXT
+        | PgType::VARCHAR
+        | PgType::BPCHAR
+        | PgType::NAME
+        | PgType::CHAR
+        | PgType::UNKNOWN => pg_types::text_from_sql(bytes)
+            .map(|value| LiteralValue::String(value.into()))
+            .map_err(|e| invalid_param("text", e)),
+        PgType::UUID => uuid_decode(bytes),
+        // The leading `\` in `\x<hex>` forces `escape_literal` into E-string
+        // form so the SQL stays well-formed.
+        PgType::BYTEA => Ok(cast_literal(
+            bytea_to_hex_literal(pg_types::bytea_from_sql(bytes)),
+            ty,
+        )),
+        // JSON binary format is plain UTF-8 JSON text — no version prefix or
+        // other framing — so it round-trips as a string literal, just with an
+        // explicit `::json` cast to preserve the column's expected type.
+        PgType::JSON => pg_types::text_from_sql(bytes)
+            .map(|value| cast_literal(value, ty))
+            .map_err(|e| invalid_param("json", e)),
+        PgType::JSONB => jsonb_decode(bytes),
+        _ => return None,
+    };
+    Some(decoded)
+}
+
+fn uuid_decode(bytes: &[u8]) -> AstTransformResult<LiteralValue> {
+    let bytes = fixed_width::<16>(bytes, "UUID")?;
+    let uuid_str = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    );
+    Ok(LiteralValue::String(uuid_str.into()))
+}
+
+/// JSONB binary format prepends a 1-byte version (currently 0x01); the rest
+/// is UTF-8 JSON text. Strip the prefix so the deparsed SQL is
+/// `'<json>'::jsonb` rather than carrying the SOH control byte into the
+/// literal.
+fn jsonb_decode(bytes: &[u8]) -> AstTransformResult<LiteralValue> {
+    let Some((&0x01, json)) = bytes.split_first() else {
+        return Err(invalid_value("missing or unknown jsonb version byte"));
+    };
+    let value =
+        std::str::from_utf8(json).map_err(|_| invalid_value("jsonb body is not valid UTF-8"))?;
+    Ok(cast_literal(value, &PgType::JSONB))
+}
+
+fn datetime_decode(bytes: &[u8], ty: &PgType) -> FamilyDecode {
+    let decoded = match *ty {
+        PgType::TIME => pg_types::time_from_sql(bytes)
+            .map(|micros| cast_literal(time_micros_to_text(micros), ty))
+            .map_err(|e| invalid_param("time", e)),
+        PgType::DATE => pg_types::date_from_sql(bytes)
+            .map(|days| cast_literal(date_text(days), ty))
+            .map_err(|e| invalid_param("date", e)),
+        PgType::TIMESTAMP => pg_types::timestamp_from_sql(bytes)
+            .map(|micros| cast_literal(timestamp_text(micros, ""), ty))
+            .map_err(|e| invalid_param("timestamp", e)),
+        // Emit explicit `+00` so PG re-parses with zone regardless of session
+        // `TimeZone` setting. Wire format matches TIMESTAMP.
+        PgType::TIMESTAMPTZ => pg_types::timestamp_from_sql(bytes)
+            .map(|micros| cast_literal(timestamp_text(micros, "+00"), ty))
+            .map_err(|e| invalid_param("timestamptz", e)),
+        PgType::TIMETZ => timetz_decode(bytes),
+        PgType::INTERVAL => interval_decode(bytes),
+        _ => return None,
+    };
+    Some(decoded)
+}
+
+/// ±i32 sentinels are PG14+ `infinity` / `-infinity`.
+fn date_text(days: i32) -> String {
+    match days {
+        i32::MAX => "infinity".to_owned(),
+        i32::MIN => "-infinity".to_owned(),
+        _ => {
+            let (y, m, d) = pg_days_to_ymd(days);
+            ymd_to_text(y, m, d)
+        }
+    }
+}
+
+/// ±i64 sentinels are `infinity` / `-infinity`; finite values carry
+/// `zone_suffix`.
+fn timestamp_text(micros: i64, zone_suffix: &str) -> String {
+    match micros {
+        i64::MAX => "infinity".to_owned(),
+        i64::MIN => "-infinity".to_owned(),
+        _ => {
+            let mut text = timestamp_micros_to_text(micros);
+            text.push_str(zone_suffix);
+            text
+        }
+    }
+}
+
+/// 12 bytes: i64 micros-since-midnight + i32 zone-secs-west-of-UTC.
+fn timetz_decode(bytes: &[u8]) -> AstTransformResult<LiteralValue> {
+    match (bytes.len(), be_i64(bytes, 0), be_i32(bytes, 8)) {
+        (12, Some(micros), Some(zone)) => {
+            Ok(cast_literal(timetz_to_text(micros, zone), &PgType::TIMETZ))
+        }
+        _ => Err(length_invalid("timetz", 12, bytes.len())),
+    }
+}
+
+/// 16 bytes: i64 micros + i32 days + i32 months.
+fn interval_decode(bytes: &[u8]) -> AstTransformResult<LiteralValue> {
+    match (
+        bytes.len(),
+        be_i64(bytes, 0),
+        be_i32(bytes, 8),
+        be_i32(bytes, 12),
+    ) {
+        (16, Some(micros), Some(days), Some(months)) => Ok(cast_literal(
+            interval_to_text(micros, days, months),
+            &PgType::INTERVAL,
+        )),
+        _ => Err(length_invalid("interval", 16, bytes.len())),
+    }
+}
+
+fn network_decode(bytes: &[u8], ty: &PgType) -> FamilyDecode {
+    let decoded = match *ty {
+        PgType::MACADDR => pg_types::macaddr_from_sql(bytes)
+            .map(|octets| cast_literal(macaddr_to_text(&octets), ty))
+            .map_err(|e| invalid_param("macaddr", e)),
+        PgType::MACADDR8 => fixed_width::<8>(bytes, "macaddr8")
+            .map(|octets| cast_literal(macaddr_to_text(octets), ty)),
+        PgType::INET => pg_types::inet_from_sql(bytes)
+            .map(|inet| cast_literal(inet_to_text(&inet, false), ty))
+            .map_err(|e| invalid_param("inet", e)),
+        PgType::CIDR => pg_types::inet_from_sql(bytes)
+            .map(|inet| cast_literal(inet_to_text(&inet, true), ty))
+            .map_err(|e| invalid_param("cidr", e)),
+        _ => return None,
+    };
+    Some(decoded)
+}
+
+/// Decode a binary array into a `LiteralValue::Array`, which deparses as a PG
+/// text array literal like `'{1,2,NULL,3}'::int4[]`.
 ///
 /// Multi-dim arrays and arrays whose element type isn't in the supported
 /// scalar set (the same set `binary_parameter_to_literal` handles directly)
@@ -347,14 +330,13 @@ fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Literal
 
     // 1-D arrays only. Multi-dim falls through to origin uncached.
     let mut dims = array.dimensions();
-    let bad_dim = |_| Report::from(AstTransformError::UnsupportedBinaryFormat { oid });
+    let bad_dim = |_| unsupported(oid);
     let _ = dims.next().map_err(bad_dim)?;
     if dims.next().map_err(bad_dim)?.is_some() {
-        return Err(AstTransformError::UnsupportedBinaryFormat { oid }.into());
+        return Err(unsupported(oid));
     }
 
-    let element_type = PgType::from_oid(array.element_type())
-        .ok_or_else(|| Report::from(AstTransformError::UnsupportedBinaryFormat { oid }))?;
+    let element_type = PgType::from_oid(array.element_type()).ok_or_else(|| unsupported(oid))?;
     let element_oid = element_type.oid();
 
     // Element errors are remapped to the array OID — the query falls
@@ -366,7 +348,7 @@ fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Literal
         let lit = match value {
             None => LiteralValue::Null,
             Some(elem_bytes) => binary_parameter_to_literal_scalar(elem_bytes, element_oid)
-                .map_err(|_| Report::from(AstTransformError::UnsupportedBinaryFormat { oid }))?,
+                .map_err(|_| unsupported(oid))?,
         };
         elements.push(lit);
     }
@@ -384,7 +366,7 @@ mod tests {
     use postgres_types::Type as PgType;
 
     use super::canonical_text::{
-        NUMERIC_NEG, NUMERIC_NINF, NUMERIC_PINF, NUMERIC_POS, USECS_PER_DAY,
+        NUMERIC_NAN, NUMERIC_NEG, NUMERIC_NINF, NUMERIC_PINF, NUMERIC_POS, USECS_PER_DAY,
     };
     use crate::cache::{QueryParameter, QueryParameters};
     use crate::query::ast::{
@@ -394,8 +376,6 @@ mod tests {
     use crate::query::transform::parameters::{
         parameter_to_literal, query_expr_parameters_replace, select_node_parameters_replace,
     };
-    // NUMERIC_NAN is also used; pull in too.
-    use super::canonical_text::NUMERIC_NAN;
 
     fn parse_select_node(sql: &str) -> SelectNode {
         let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
@@ -416,6 +396,94 @@ mod tests {
             formats: vec![1; len],
             oids,
         }
+    }
+
+    fn binary_param(bytes: &[u8], oid: u32) -> QueryParameter {
+        QueryParameter {
+            value: Some(Bytes::copy_from_slice(bytes)),
+            format: 1,
+            oid,
+        }
+    }
+
+    fn binary_decode(bytes: &[u8], ty: PgType) -> LiteralValue {
+        parameter_to_literal(&binary_param(bytes, ty.oid())).expect("decode binary parameter")
+    }
+
+    fn assert_binary_decodes(bytes: &[u8], ty: PgType, expected: LiteralValue) {
+        assert_eq!(binary_decode(bytes, ty), expected, "wire bytes {bytes:?}");
+    }
+
+    fn assert_binary_cast(bytes: &[u8], ty: PgType, text: &str) {
+        let cast = ty.name().into();
+        assert_binary_decodes(bytes, ty, LiteralValue::StringWithCast(text.into(), cast));
+    }
+
+    fn binary_float(bytes: &[u8], ty: PgType) -> f64 {
+        match binary_decode(bytes, ty) {
+            LiteralValue::Float(f) => f.into_inner(),
+            other => panic!("expected Float literal, got {other:?}"),
+        }
+    }
+
+    /// Substitute one binary parameter into `sql` and deparse it; the result
+    /// must never carry a raw NUL from the wire bytes.
+    fn binary_query_render(sql: &str, bytes: &[u8], ty: PgType) -> String {
+        let mut node = parse_select_node(sql);
+        let params = binary_params(vec![(Some(bytes), ty)]);
+        select_node_parameters_replace(&mut node, &params).expect("substitute binary parameter");
+        let mut buf = String::new();
+        node.deparse(&mut buf);
+        assert!(
+            !buf.as_bytes().contains(&0),
+            "deparsed SQL must not contain NUL bytes; got {buf:?}"
+        );
+        buf
+    }
+
+    /// A 1-D binary array of `elem_type` holding `elements`, each
+    /// length-prefixed.
+    fn array_bytes(elem_type: PgType, elements: &[&[u8]]) -> Vec<u8> {
+        let count = i32::try_from(elements.len()).expect("test element count fits in i32");
+        let mut buf = array_header_bytes(elem_type, count);
+        for element in elements {
+            let len = i32::try_from(element.len()).expect("test element fits in i32");
+            buf.extend_from_slice(&len.to_be_bytes());
+            buf.extend_from_slice(element);
+        }
+        buf
+    }
+
+    /// The decoded form of a 1-D array of `elem_type` values with these
+    /// canonical texts.
+    fn cast_array(elem_type: PgType, texts: &[&str]) -> LiteralValue {
+        let elements = texts
+            .iter()
+            .map(|text| LiteralValue::StringWithCast((*text).into(), elem_type.name().into()))
+            .collect();
+        LiteralValue::Array(elements, format!("{}[]", elem_type.name()).into())
+    }
+
+    fn binary_decode_error(bytes: &[u8], oid: u32) -> AstTransformError {
+        parameter_to_literal(&binary_param(bytes, oid))
+            .expect_err("reject binary parameter")
+            .into_current_context()
+    }
+
+    fn assert_binary_unsupported(bytes: &[u8], oid: u32) {
+        let error = binary_decode_error(bytes, oid);
+        assert!(
+            matches!(error, AstTransformError::UnsupportedBinaryFormat { .. }),
+            "expected UnsupportedBinaryFormat, got {error:?}"
+        );
+    }
+
+    fn assert_binary_invalid(bytes: &[u8], oid: u32) {
+        let error = binary_decode_error(bytes, oid);
+        assert!(
+            matches!(error, AstTransformError::InvalidParameterValue { .. }),
+            "expected InvalidParameterValue, got {error:?}"
+        );
     }
 
     /// Build the 20-byte header (`ndim=1, hasnull=0, elemtype, dim_len,
@@ -471,16 +539,10 @@ mod tests {
     }
 
     fn assert_numeric(bytes: Vec<u8>, expected: &str) {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::NUMERIC.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary numeric");
-        assert_eq!(
-            literal,
+        assert_binary_decodes(
+            &bytes,
+            PgType::NUMERIC,
             LiteralValue::StringWithCast(expected.into(), "numeric".into()),
-            "wire bytes {bytes:?}"
         );
     }
 
@@ -508,106 +570,58 @@ mod tests {
 
     #[test]
     fn test_binary_parameter_bool_true() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[1])),
-            format: 1,
-            oid: PgType::BOOL.oid(),
-        };
-        let result = parameter_to_literal(&param).expect("to convert parameter");
-        assert_eq!(result, LiteralValue::Boolean(true));
+        assert_binary_decodes(&[1], PgType::BOOL, LiteralValue::Boolean(true));
     }
 
     #[test]
     fn test_binary_parameter_bool_false() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0])),
-            format: 1,
-            oid: PgType::BOOL.oid(),
-        };
-        let result = parameter_to_literal(&param).expect("to convert parameter");
-        assert_eq!(result, LiteralValue::Boolean(false));
+        assert_binary_decodes(&[0], PgType::BOOL, LiteralValue::Boolean(false));
     }
 
     #[test]
     fn test_binary_parameter_int2() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x00, 0x2A])),
-            format: 1,
-            oid: PgType::INT2.oid(),
-        };
-        let result = parameter_to_literal(&param).expect("to convert parameter");
-        assert_eq!(result, LiteralValue::Integer(42));
+        assert_binary_decodes(&[0x00, 0x2A], PgType::INT2, LiteralValue::Integer(42));
     }
 
     #[test]
     fn test_binary_parameter_int4() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x2A])),
-            format: 1,
-            oid: PgType::INT4.oid(),
-        };
-        let result = parameter_to_literal(&param).expect("to convert parameter");
-        assert_eq!(result, LiteralValue::Integer(42));
+        assert_binary_decodes(
+            &[0x00, 0x00, 0x00, 0x2A],
+            PgType::INT4,
+            LiteralValue::Integer(42),
+        );
     }
 
     #[test]
     fn test_binary_parameter_int8() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[
-                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A,
-            ])),
-            format: 1,
-            oid: PgType::INT8.oid(),
-        };
-        let result = parameter_to_literal(&param).expect("to convert parameter");
-        assert_eq!(result, LiteralValue::Integer(42));
+        assert_binary_decodes(
+            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2A],
+            PgType::INT8,
+            LiteralValue::Integer(42),
+        );
     }
 
     #[test]
     fn test_binary_parameter_float4() {
         let value: f32 = 2.73;
         let bytes = value.to_be_bytes();
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::FLOAT4.oid(),
-        };
-        let result = parameter_to_literal(&param).expect("to convert parameter");
-        match result {
-            LiteralValue::Float(f) => {
-                assert!((f.into_inner() - 2.73).abs() < 0.001);
-            }
-            _ => panic!("Expected Float literal"),
-        }
+        assert!((binary_float(&bytes, PgType::FLOAT4) - 2.73).abs() < 0.001);
     }
 
     #[test]
     fn test_binary_parameter_float8() {
         let value: f64 = 2.73821;
         let bytes = value.to_be_bytes();
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::FLOAT8.oid(),
-        };
-        let result = parameter_to_literal(&param).expect("to convert parameter");
-        match result {
-            LiteralValue::Float(f) => {
-                assert!((f.into_inner() - 2.73821).abs() < 0.00001);
-            }
-            _ => panic!("Expected Float literal"),
-        }
+        assert!((binary_float(&bytes, PgType::FLOAT8) - 2.73821).abs() < 0.00001);
     }
 
     #[test]
     fn test_binary_parameter_text() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(b"hello world")),
-            format: 1,
-            oid: PgType::TEXT.oid(),
-        };
-        let result = parameter_to_literal(&param).expect("to convert parameter");
-        assert_eq!(result, LiteralValue::String("hello world".into()));
+        assert_binary_decodes(
+            b"hello world",
+            PgType::TEXT,
+            LiteralValue::String("hello world".into()),
+        );
     }
 
     #[test]
@@ -616,15 +630,10 @@ mod tests {
             0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4, 0xa7, 0x16, 0x44, 0x66, 0x55, 0x44,
             0x00, 0x00,
         ];
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&uuid_bytes)),
-            format: 1,
-            oid: PgType::UUID.oid(),
-        };
-        let result = parameter_to_literal(&param).expect("to convert parameter");
-        assert_eq!(
-            result,
-            LiteralValue::String("550e8400-e29b-41d4-a716-446655440000".into())
+        assert_binary_decodes(
+            &uuid_bytes,
+            PgType::UUID,
+            LiteralValue::String("550e8400-e29b-41d4-a716-446655440000".into()),
         );
     }
 
@@ -632,92 +641,42 @@ mod tests {
     fn test_binary_parameter_unsupported_type_with_invalid_utf8() {
         // POINT has no decoder arm; bytes are arbitrary garbage. The
         // assertion is that the function rejects rather than coercing.
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0xFF, 0xFE])),
-            format: 1,
-            oid: PgType::POINT.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::UnsupportedBinaryFormat { .. })
-        ));
+        assert_binary_unsupported(&[0xFF, 0xFE], PgType::POINT.oid());
     }
 
     #[test]
     fn test_binary_parameter_range_rejected() {
         // `Kind::Range(Int4)`: builtin int4range. Even if the binary range
         // wire format happens to be valid UTF-8, the Kind dispatch rejects.
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x01])),
-            format: 1,
-            oid: PgType::INT4_RANGE.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::UnsupportedBinaryFormat { .. })
-        ));
+        assert_binary_unsupported(&[0x01], PgType::INT4_RANGE.oid());
     }
 
     #[test]
     fn test_binary_parameter_multirange_rejected() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x00])),
-            format: 1,
-            oid: PgType::INT4MULTI_RANGE.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::UnsupportedBinaryFormat { .. })
-        ));
+        assert_binary_unsupported(&[0x00, 0x00, 0x00, 0x00], PgType::INT4MULTI_RANGE.oid());
     }
 
     #[test]
     fn test_binary_parameter_pseudo_rejected() {
         // `record` and `any` are both `Kind::Pseudo`; reject either.
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x00, 0x00, 0x00, 0x01])),
-            format: 1,
-            oid: PgType::RECORD.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::UnsupportedBinaryFormat { .. })
-        ));
+        assert_binary_unsupported(&[0x00, 0x00, 0x00, 0x01], PgType::RECORD.oid());
     }
 
     #[test]
     fn test_binary_parameter_unknown_oid_rejected() {
         // OID that `PgType::from_oid` can't resolve falls through the Kind
         // dispatch into the fail-closed catch-all in the OID match.
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(b"42")),
-            format: 1,
-            oid: 999_999,
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::UnsupportedBinaryFormat { .. })
-        ));
+        assert_binary_unsupported(b"42", 999_999);
     }
 
     #[test]
     fn test_binary_parameter_json() {
         // JSON binary format is plain UTF-8 JSON, no framing.
         let json = br#"{"a":1,"b":[2,3]}"#;
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(json)),
-            format: 1,
-            oid: PgType::JSON.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary json");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast(r#"{"a":1,"b":[2,3]}"#.into(), "json".into())
+        assert_binary_decodes(
+            json,
+            PgType::JSON,
+            LiteralValue::StringWithCast(r#"{"a":1,"b":[2,3]}"#.into(), "json".into()),
         );
     }
 
@@ -727,15 +686,10 @@ mod tests {
         // not end up in the deparsed SQL literal.
         let mut bytes = vec![0x01u8];
         bytes.extend_from_slice(br#"{"k":"v"}"#);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::JSONB.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary jsonb");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast(r#"{"k":"v"}"#.into(), "jsonb".into())
+        assert_binary_decodes(
+            &bytes,
+            PgType::JSONB,
+            LiteralValue::StringWithCast(r#"{"k":"v"}"#.into(), "jsonb".into()),
         );
     }
 
@@ -743,85 +697,36 @@ mod tests {
     fn test_binary_parameter_jsonb_unknown_version_rejected() {
         // Anything other than the documented 0x01 prefix is malformed.
         let bytes = [0x02, b'{', b'}'];
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::JSONB.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::InvalidParameterValue { .. })
-        ));
+        assert_binary_invalid(&bytes, PgType::JSONB.oid());
     }
 
     #[test]
     fn test_binary_parameter_bytea() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef])),
-            format: 1,
-            oid: PgType::BYTEA.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary bytea");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("\\xdeadbeef".into(), "bytea".into())
-        );
+        assert_binary_cast(&[0xde, 0xad, 0xbe, 0xef], PgType::BYTEA, "\\xdeadbeef");
     }
 
     #[test]
     fn test_binary_parameter_bytea_empty() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[])),
-            format: 1,
-            oid: PgType::BYTEA.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode empty bytea");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("\\x".into(), "bytea".into())
-        );
+        assert_binary_cast(&[], PgType::BYTEA, "\\x");
     }
 
     #[test]
     fn test_binary_bytea_in_query_renders_clean_sql() {
-        let mut node = parse_select_node("SELECT id FROM blobs WHERE data = $1");
-        let params = binary_params(vec![(Some(&[0xde, 0xad, 0xbe, 0xef]), PgType::BYTEA)]);
-        select_node_parameters_replace(&mut node, &params).expect("substitute binary bytea");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert!(
-            !buf.as_bytes().contains(&0),
-            "deparsed SQL must not contain NUL bytes; got {buf:?}"
-        );
         assert_eq!(
-            buf,
+            binary_query_render(
+                "SELECT id FROM blobs WHERE data = $1",
+                &[0xde, 0xad, 0xbe, 0xef],
+                PgType::BYTEA
+            ),
             r"SELECT id FROM blobs WHERE data = E'\\xdeadbeef'::bytea"
         );
     }
 
     #[test]
     fn test_binary_bytea_array() {
-        let mut bytes = array_header_bytes(PgType::BYTEA, 2);
-        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x01]);
-        bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0xAB]);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::BYTEA_ARRAY.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode bytea[]");
-        assert_eq!(
-            literal,
-            LiteralValue::Array(
-                vec![
-                    LiteralValue::StringWithCast("\\x01".into(), "bytea".into()),
-                    LiteralValue::StringWithCast("\\xab".into(), "bytea".into()),
-                ],
-                "bytea[]".into()
-            )
-        );
+        let bytes = array_bytes(PgType::BYTEA, &[&[0x01], &[0xAB]]);
+        let literal = binary_decode(&bytes, PgType::BYTEA_ARRAY);
+        assert_eq!(literal, cast_array(PgType::BYTEA, &["\\x01", "\\xab"]));
 
         // Each `\` is doubled twice on the way out: once by PG-array-text
         // quoting (`\x01` → `"\\x01"`), once by SQL E-string escaping
@@ -834,76 +739,37 @@ mod tests {
     #[test]
     fn test_binary_parameter_time_noon() {
         let micros: i64 = 12 * 3600 * 1_000_000;
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&micros.to_be_bytes())),
-            format: 1,
-            oid: PgType::TIME.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary time");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("12:00:00.000000".into(), "time".into())
-        );
+        assert_binary_cast(&micros.to_be_bytes(), PgType::TIME, "12:00:00.000000");
     }
 
     #[test]
     fn test_binary_parameter_time_with_micros() {
         // 13:45:30.123456 — exercises the fractional path.
         let micros: i64 = (13 * 3600 + 45 * 60 + 30) * 1_000_000 + 123_456;
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&micros.to_be_bytes())),
-            format: 1,
-            oid: PgType::TIME.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary time");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("13:45:30.123456".into(), "time".into())
-        );
+        assert_binary_cast(&micros.to_be_bytes(), PgType::TIME, "13:45:30.123456");
     }
 
     #[test]
     fn test_binary_time_in_query_renders_clean_sql() {
-        let mut node = parse_select_node("SELECT id FROM events WHERE start = $1");
         let micros: i64 = 9 * 3600 * 1_000_000;
-        let bytes = micros.to_be_bytes();
-        let params = binary_params(vec![(Some(&bytes), PgType::TIME)]);
-        select_node_parameters_replace(&mut node, &params).expect("substitute time");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert!(!buf.as_bytes().contains(&0));
         assert_eq!(
-            buf,
+            binary_query_render(
+                "SELECT id FROM events WHERE start = $1",
+                &micros.to_be_bytes(),
+                PgType::TIME
+            ),
             "SELECT id FROM events WHERE start = '09:00:00.000000'::time"
         );
     }
 
     #[test]
     fn test_binary_time_array() {
-        let t0: i64 = 0;
-        let t1: i64 = 12 * 3600 * 1_000_000;
-        let mut bytes = array_header_bytes(PgType::TIME, 2);
-        for t in [t0, t1] {
-            bytes.extend_from_slice(&8_i32.to_be_bytes());
-            bytes.extend_from_slice(&t.to_be_bytes());
-        }
-
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::TIME_ARRAY.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode time[]");
-        assert_eq!(
-            literal,
-            LiteralValue::Array(
-                vec![
-                    LiteralValue::StringWithCast("00:00:00.000000".into(), "time".into()),
-                    LiteralValue::StringWithCast("12:00:00.000000".into(), "time".into()),
-                ],
-                "time[]".into()
-            )
+        let noon: i64 = 12 * 3600 * 1_000_000;
+        let bytes = array_bytes(PgType::TIME, &[&0_i64.to_be_bytes(), &noon.to_be_bytes()]);
+        assert_binary_decodes(
+            &bytes,
+            PgType::TIME_ARRAY,
+            cast_array(PgType::TIME, &["00:00:00.000000", "12:00:00.000000"]),
         );
     }
 
@@ -911,16 +777,7 @@ mod tests {
     fn test_binary_parameter_timetz_utc() {
         let micros: i64 = 12 * 3600 * 1_000_000;
         let bytes = timetz_bytes(micros, 0);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::TIMETZ.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary timetz");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("12:00:00.000000+00".into(), "timetz".into())
-        );
+        assert_binary_cast(&bytes, PgType::TIMETZ, "12:00:00.000000+00");
     }
 
     #[test]
@@ -929,32 +786,14 @@ mod tests {
         // west; +05 east is negative-west).
         let micros: i64 = 12 * 3600 * 1_000_000;
         let bytes = timetz_bytes(micros, -5 * 3600);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::TIMETZ.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary timetz");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("12:00:00.000000+05".into(), "timetz".into())
-        );
+        assert_binary_cast(&bytes, PgType::TIMETZ, "12:00:00.000000+05");
     }
 
     #[test]
     fn test_binary_parameter_timetz_west_of_utc() {
         let micros: i64 = 12 * 3600 * 1_000_000;
         let bytes = timetz_bytes(micros, 8 * 3600);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::TIMETZ.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary timetz");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("12:00:00.000000-08".into(), "timetz".into())
-        );
+        assert_binary_cast(&bytes, PgType::TIMETZ, "12:00:00.000000-08");
     }
 
     #[test]
@@ -962,45 +801,18 @@ mod tests {
         // India: UTC+05:30 → zone = -(5*3600 + 30*60) = -19800.
         let micros: i64 = 9 * 3600 * 1_000_000;
         let bytes = timetz_bytes(micros, -(5 * 3600 + 30 * 60));
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::TIMETZ.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary timetz");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("09:00:00.000000+05:30".into(), "timetz".into())
-        );
+        assert_binary_cast(&bytes, PgType::TIMETZ, "09:00:00.000000+05:30");
     }
 
     #[test]
     fn test_binary_timetz_invalid_length_rejected() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0u8; 11])),
-            format: 1,
-            oid: PgType::TIMETZ.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::InvalidParameterValue { .. })
-        ));
+        assert_binary_invalid(&[0u8; 11], PgType::TIMETZ.oid());
     }
 
     #[test]
     fn test_binary_parameter_interval_zero() {
         let bytes = interval_bytes(0, 0, 0);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::INTERVAL.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary interval");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("0 mons 0 days 00:00:00.000000".into(), "interval".into())
-        );
+        assert_binary_cast(&bytes, PgType::INTERVAL, "0 mons 0 days 00:00:00.000000");
     }
 
     #[test]
@@ -1008,16 +820,7 @@ mod tests {
         // 2 months, 3 days, 4h 5m 6.7s
         let micros: i64 = (4 * 3600 + 5 * 60 + 6) * 1_000_000 + 700_000;
         let bytes = interval_bytes(micros, 3, 2);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::INTERVAL.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary interval");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("2 mons 3 days 04:05:06.700000".into(), "interval".into())
-        );
+        assert_binary_cast(&bytes, PgType::INTERVAL, "2 mons 3 days 04:05:06.700000");
     }
 
     #[test]
@@ -1025,164 +828,72 @@ mod tests {
         // Each component is signed independently. -1 month, -2 days, -1 hour.
         let micros: i64 = -3_600_000_000;
         let bytes = interval_bytes(micros, -2, -1);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::INTERVAL.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary interval");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast(
-                "-1 mons -2 days -01:00:00.000000".into(),
-                "interval".into()
-            )
-        );
+        assert_binary_cast(&bytes, PgType::INTERVAL, "-1 mons -2 days -01:00:00.000000");
     }
 
     #[test]
     fn test_binary_interval_in_query_renders_clean_sql() {
-        let mut node = parse_select_node("SELECT id FROM events WHERE age > $1");
         let bytes = interval_bytes(0, 7, 0);
-        let params = binary_params(vec![(Some(&bytes), PgType::INTERVAL)]);
-        select_node_parameters_replace(&mut node, &params).expect("substitute interval");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert!(!buf.as_bytes().contains(&0));
         assert_eq!(
-            buf,
+            binary_query_render(
+                "SELECT id FROM events WHERE age > $1",
+                &bytes,
+                PgType::INTERVAL
+            ),
             "SELECT id FROM events WHERE age > '0 mons 7 days 00:00:00.000000'::interval"
         );
     }
 
     #[test]
     fn test_binary_interval_invalid_length_rejected() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0u8; 15])),
-            format: 1,
-            oid: PgType::INTERVAL.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::InvalidParameterValue { .. })
-        ));
+        assert_binary_invalid(&[0u8; 15], PgType::INTERVAL.oid());
     }
 
     #[test]
     fn test_binary_parameter_date_epoch() {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&0_i32.to_be_bytes())),
-            format: 1,
-            oid: PgType::DATE.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary date");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("2000-01-01".into(), "date".into())
-        );
+        assert_binary_cast(&0_i32.to_be_bytes(), PgType::DATE, "2000-01-01");
     }
 
     #[test]
     fn test_binary_parameter_date_next_day() {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&1_i32.to_be_bytes())),
-            format: 1,
-            oid: PgType::DATE.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary date");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("2000-01-02".into(), "date".into())
-        );
+        assert_binary_cast(&1_i32.to_be_bytes(), PgType::DATE, "2000-01-02");
     }
 
     #[test]
     fn test_binary_parameter_date_yesterday() {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&(-1_i32).to_be_bytes())),
-            format: 1,
-            oid: PgType::DATE.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary date");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("1999-12-31".into(), "date".into())
-        );
+        assert_binary_cast(&(-1_i32).to_be_bytes(), PgType::DATE, "1999-12-31");
     }
 
     #[test]
     fn test_binary_parameter_date_year_1_ad() {
         // 0001-01-01 (proleptic Gregorian) is JDN 1721426; days from
         // 2000-01-01 (JDN 2451545) is -730119.
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&(-730_119_i32).to_be_bytes())),
-            format: 1,
-            oid: PgType::DATE.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary date");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("0001-01-01".into(), "date".into())
-        );
+        assert_binary_cast(&(-730_119_i32).to_be_bytes(), PgType::DATE, "0001-01-01");
     }
 
     #[test]
     fn test_binary_parameter_date_one_bc() {
         // 1 BC Jan 1 (year 0 in proleptic Gregorian) is JDN 1721060;
         // days from 2000-01-01 = -730485.
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&(-730_485_i32).to_be_bytes())),
-            format: 1,
-            oid: PgType::DATE.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary date");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("0001-01-01 BC".into(), "date".into())
-        );
+        assert_binary_cast(&(-730_485_i32).to_be_bytes(), PgType::DATE, "0001-01-01 BC");
     }
 
     #[test]
     fn test_binary_parameter_date_infinity() {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&i32::MAX.to_be_bytes())),
-            format: 1,
-            oid: PgType::DATE.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode infinity date");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("infinity".into(), "date".into())
-        );
+        assert_binary_cast(&i32::MAX.to_be_bytes(), PgType::DATE, "infinity");
     }
 
     #[test]
     fn test_binary_parameter_date_negative_infinity() {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&i32::MIN.to_be_bytes())),
-            format: 1,
-            oid: PgType::DATE.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode -infinity date");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("-infinity".into(), "date".into())
-        );
+        assert_binary_cast(&i32::MIN.to_be_bytes(), PgType::DATE, "-infinity");
     }
 
     #[test]
     fn test_binary_parameter_timestamp_epoch() {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&0_i64.to_be_bytes())),
-            format: 1,
-            oid: PgType::TIMESTAMP.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary timestamp");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("2000-01-01 00:00:00.000000".into(), "timestamp".into())
+        assert_binary_cast(
+            &0_i64.to_be_bytes(),
+            PgType::TIMESTAMP,
+            "2000-01-01 00:00:00.000000",
         );
     }
 
@@ -1190,15 +901,10 @@ mod tests {
     fn test_binary_parameter_timestamp_with_time() {
         // 2000-01-02 12:34:56.123456 = 1 day + 12h34m56.123456s.
         let micros: i64 = USECS_PER_DAY + (12 * 3600 + 34 * 60 + 56) * 1_000_000 + 123_456;
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&micros.to_be_bytes())),
-            format: 1,
-            oid: PgType::TIMESTAMP.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary timestamp");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("2000-01-02 12:34:56.123456".into(), "timestamp".into())
+        assert_binary_cast(
+            &micros.to_be_bytes(),
+            PgType::TIMESTAMP,
+            "2000-01-02 12:34:56.123456",
         );
     }
 
@@ -1207,158 +913,78 @@ mod tests {
         // Negative micros must use floor-division (rem_euclid) so the
         // sub-day component stays in [0, USECS_PER_DAY). Otherwise -1
         // would yield "2000-01-01 -00:00:00.-000001".
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&(-1_i64).to_be_bytes())),
-            format: 1,
-            oid: PgType::TIMESTAMP.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary timestamp");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("1999-12-31 23:59:59.999999".into(), "timestamp".into())
+        assert_binary_cast(
+            &(-1_i64).to_be_bytes(),
+            PgType::TIMESTAMP,
+            "1999-12-31 23:59:59.999999",
         );
     }
 
     #[test]
     fn test_binary_parameter_timestamp_infinity() {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&i64::MAX.to_be_bytes())),
-            format: 1,
-            oid: PgType::TIMESTAMP.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode infinity timestamp");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("infinity".into(), "timestamp".into())
-        );
+        assert_binary_cast(&i64::MAX.to_be_bytes(), PgType::TIMESTAMP, "infinity");
     }
 
     #[test]
     fn test_binary_parameter_timestamptz_epoch() {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&0_i64.to_be_bytes())),
-            format: 1,
-            oid: PgType::TIMESTAMPTZ.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary timestamptz");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast(
-                "2000-01-01 00:00:00.000000+00".into(),
-                "timestamptz".into()
-            )
+        assert_binary_cast(
+            &0_i64.to_be_bytes(),
+            PgType::TIMESTAMPTZ,
+            "2000-01-01 00:00:00.000000+00",
         );
     }
 
     #[test]
     fn test_binary_parameter_timestamptz_negative_infinity() {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&i64::MIN.to_be_bytes())),
-            format: 1,
-            oid: PgType::TIMESTAMPTZ.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode -infinity timestamptz");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("-infinity".into(), "timestamptz".into())
-        );
+        assert_binary_cast(&i64::MIN.to_be_bytes(), PgType::TIMESTAMPTZ, "-infinity");
     }
 
     #[test]
     fn test_binary_date_in_query_renders_clean_sql() {
-        let mut node = parse_select_node("SELECT id FROM events WHERE day = $1");
         let bytes = 1_i32.to_be_bytes();
-        let params = binary_params(vec![(Some(&bytes), PgType::DATE)]);
-        select_node_parameters_replace(&mut node, &params).expect("substitute date");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert!(!buf.as_bytes().contains(&0));
-        assert_eq!(buf, "SELECT id FROM events WHERE day = '2000-01-02'::date");
+        assert_eq!(
+            binary_query_render("SELECT id FROM events WHERE day = $1", &bytes, PgType::DATE),
+            "SELECT id FROM events WHERE day = '2000-01-02'::date"
+        );
     }
 
     #[test]
     fn test_binary_date_array() {
-        let mut bytes = array_header_bytes(PgType::DATE, 2);
-        for days in [0_i32, 1] {
-            bytes.extend_from_slice(&4_i32.to_be_bytes());
-            bytes.extend_from_slice(&days.to_be_bytes());
-        }
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::DATE_ARRAY.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode date[]");
-        assert_eq!(
-            literal,
-            LiteralValue::Array(
-                vec![
-                    LiteralValue::StringWithCast("2000-01-01".into(), "date".into()),
-                    LiteralValue::StringWithCast("2000-01-02".into(), "date".into()),
-                ],
-                "date[]".into()
-            )
+        let bytes = array_bytes(PgType::DATE, &[&0_i32.to_be_bytes(), &1_i32.to_be_bytes()]);
+        assert_binary_decodes(
+            &bytes,
+            PgType::DATE_ARRAY,
+            cast_array(PgType::DATE, &["2000-01-01", "2000-01-02"]),
         );
     }
 
     #[test]
     fn test_binary_parameter_macaddr() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55])),
-            format: 1,
-            oid: PgType::MACADDR.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary macaddr");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("00:11:22:33:44:55".into(), "macaddr".into())
+        assert_binary_cast(
+            &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            PgType::MACADDR,
+            "00:11:22:33:44:55",
         );
     }
 
     #[test]
     fn test_binary_parameter_macaddr_invalid_length_rejected() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[0x00, 0x11, 0x22, 0x33, 0x44])),
-            format: 1,
-            oid: PgType::MACADDR.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::InvalidParameterValue { .. })
-        ));
+        assert_binary_invalid(&[0x00, 0x11, 0x22, 0x33, 0x44], PgType::MACADDR.oid());
     }
 
     #[test]
     fn test_binary_parameter_macaddr8() {
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[
-                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            ])),
-            format: 1,
-            oid: PgType::MACADDR8.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary macaddr8");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("00:11:22:33:44:55:66:77".into(), "macaddr8".into())
+        assert_binary_cast(
+            &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77],
+            PgType::MACADDR8,
+            "00:11:22:33:44:55:66:77",
         );
     }
 
     #[test]
     fn test_binary_parameter_inet_v4_with_prefix() {
         let bytes = inet_bytes(&[192, 168, 1, 0], 24, false);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::INET.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary inet");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("192.168.1.0/24".into(), "inet".into())
-        );
+        assert_binary_cast(&bytes, PgType::INET, "192.168.1.0/24");
     }
 
     #[test]
@@ -1366,16 +992,7 @@ mod tests {
         // INET with default mask (32) for v4 omits `/32` to match PG's
         // canonical output.
         let bytes = inet_bytes(&[192, 168, 1, 1], 32, false);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::INET.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary inet");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("192.168.1.1".into(), "inet".into())
-        );
+        assert_binary_cast(&bytes, PgType::INET, "192.168.1.1");
     }
 
     #[test]
@@ -1387,31 +1004,13 @@ mod tests {
         addr[2] = 0x0d;
         addr[3] = 0xb8;
         let bytes = inet_bytes(&addr, 64, false);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::INET.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary inet v6");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("2001:db8::/64".into(), "inet".into())
-        );
+        assert_binary_cast(&bytes, PgType::INET, "2001:db8::/64");
     }
 
     #[test]
     fn test_binary_parameter_cidr_v4() {
         let bytes = inet_bytes(&[10, 0, 0, 0], 8, true);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::CIDR.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary cidr");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("10.0.0.0/8".into(), "cidr".into())
-        );
+        assert_binary_cast(&bytes, PgType::CIDR, "10.0.0.0/8");
     }
 
     #[test]
@@ -1419,56 +1018,31 @@ mod tests {
         // Unlike INET, CIDR always emits the prefix even at the default
         // mask — `/32` distinguishes it semantically from a bare host.
         let bytes = inet_bytes(&[192, 168, 1, 1], 32, true);
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::CIDR.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode binary cidr");
-        assert_eq!(
-            literal,
-            LiteralValue::StringWithCast("192.168.1.1/32".into(), "cidr".into())
-        );
+        assert_binary_cast(&bytes, PgType::CIDR, "192.168.1.1/32");
     }
 
     #[test]
     fn test_binary_inet_in_query_renders_clean_sql() {
-        let mut node = parse_select_node("SELECT id FROM nodes WHERE addr = $1");
         let bytes = inet_bytes(&[10, 0, 0, 5], 32, false);
-        let params = binary_params(vec![(Some(&bytes), PgType::INET)]);
-        select_node_parameters_replace(&mut node, &params).expect("substitute inet");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert!(!buf.as_bytes().contains(&0));
-        assert_eq!(buf, "SELECT id FROM nodes WHERE addr = '10.0.0.5'::inet");
+        assert_eq!(
+            binary_query_render("SELECT id FROM nodes WHERE addr = $1", &bytes, PgType::INET),
+            "SELECT id FROM nodes WHERE addr = '10.0.0.5'::inet"
+        );
     }
 
     #[test]
     fn test_binary_macaddr_array() {
-        let mut bytes = array_header_bytes(PgType::MACADDR, 2);
-        for octets in [
-            [0x00u8, 0x11, 0x22, 0x33, 0x44, 0x55],
-            [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
-        ] {
-            bytes.extend_from_slice(&6_i32.to_be_bytes());
-            bytes.extend_from_slice(&octets);
-        }
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::MACADDR_ARRAY.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode macaddr[]");
-        assert_eq!(
-            literal,
-            LiteralValue::Array(
-                vec![
-                    LiteralValue::StringWithCast("00:11:22:33:44:55".into(), "macaddr".into()),
-                    LiteralValue::StringWithCast("aa:bb:cc:dd:ee:ff".into(), "macaddr".into()),
-                ],
-                "macaddr[]".into()
-            )
+        let bytes = array_bytes(
+            PgType::MACADDR,
+            &[
+                &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+            ],
+        );
+        assert_binary_decodes(
+            &bytes,
+            PgType::MACADDR_ARRAY,
+            cast_array(PgType::MACADDR, &["00:11:22:33:44:55", "aa:bb:cc:dd:ee:ff"]),
         );
     }
 
@@ -1537,16 +1111,7 @@ mod tests {
     #[test]
     fn test_binary_parameter_numeric_invalid_sign_rejected() {
         // 0xE000 isn't a defined sign code.
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&numeric_bytes(0, 0xE000, 0, &[]))),
-            format: 1,
-            oid: PgType::NUMERIC.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::InvalidParameterValue { .. })
-        ));
+        assert_binary_invalid(&numeric_bytes(0, 0xE000, 0, &[]), PgType::NUMERIC.oid());
     }
 
     #[test]
@@ -1559,16 +1124,7 @@ mod tests {
         bytes.extend_from_slice(&0_u16.to_be_bytes());
         bytes.extend_from_slice(&0_i16.to_be_bytes());
 
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::NUMERIC.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::InvalidParameterValue { .. })
-        ));
+        assert_binary_invalid(&bytes, PgType::NUMERIC.oid());
     }
 
     #[test]
@@ -1581,78 +1137,44 @@ mod tests {
         bytes.extend_from_slice(&0_i16.to_be_bytes());
         bytes.extend_from_slice(&42_i16.to_be_bytes());
 
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::NUMERIC.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::InvalidParameterValue { .. })
-        ));
+        assert_binary_invalid(&bytes, PgType::NUMERIC.oid());
     }
 
     #[test]
     fn test_binary_parameter_numeric_digit_out_of_range_rejected() {
         // 10000 is one past the legal max.
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&numeric_bytes(
-                0,
-                NUMERIC_POS,
-                0,
-                &[10000],
-            ))),
-            format: 1,
-            oid: PgType::NUMERIC.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::InvalidParameterValue { .. })
-        ));
+        assert_binary_invalid(
+            &numeric_bytes(0, NUMERIC_POS, 0, &[10000]),
+            PgType::NUMERIC.oid(),
+        );
     }
 
     #[test]
     fn test_binary_numeric_in_query_renders_clean_sql() {
-        let mut node = parse_select_node("SELECT id FROM ledger WHERE balance > $1");
         let bytes = numeric_bytes(0, NUMERIC_POS, 2, &[3, 1400]);
-        let params = binary_params(vec![(Some(&bytes), PgType::NUMERIC)]);
-        select_node_parameters_replace(&mut node, &params).expect("substitute numeric");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert!(!buf.as_bytes().contains(&0));
-        assert_eq!(buf, "SELECT id FROM ledger WHERE balance > '3.14'::numeric");
+        assert_eq!(
+            binary_query_render(
+                "SELECT id FROM ledger WHERE balance > $1",
+                &bytes,
+                PgType::NUMERIC
+            ),
+            "SELECT id FROM ledger WHERE balance > '3.14'::numeric"
+        );
     }
 
     #[test]
     fn test_binary_numeric_array() {
-        let mut bytes = array_header_bytes(PgType::NUMERIC, 2);
-        for elem in [
-            numeric_bytes(0, NUMERIC_POS, 1, &[42, 5000]), // "42.5"
-            numeric_bytes(0, NUMERIC_NEG, 2, &[3, 1400]),  // "-3.14"
-        ] {
-            let len = i32::try_from(elem.len()).expect("test element fits in i32");
-            bytes.extend_from_slice(&len.to_be_bytes());
-            bytes.extend_from_slice(&elem);
-        }
-
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::NUMERIC_ARRAY.oid(),
-        };
-        let literal = parameter_to_literal(&param).expect("decode numeric[]");
-        assert_eq!(
-            literal,
-            LiteralValue::Array(
-                vec![
-                    LiteralValue::StringWithCast("42.5".into(), "numeric".into()),
-                    LiteralValue::StringWithCast("-3.14".into(), "numeric".into()),
-                ],
-                "numeric[]".into()
-            )
+        let bytes = array_bytes(
+            PgType::NUMERIC,
+            &[
+                &numeric_bytes(0, NUMERIC_POS, 1, &[42, 5000]), // "42.5"
+                &numeric_bytes(0, NUMERIC_NEG, 2, &[3, 1400]),  // "-3.14"
+            ],
+        );
+        assert_binary_decodes(
+            &bytes,
+            PgType::NUMERIC_ARRAY,
+            cast_array(PgType::NUMERIC, &["42.5", "-3.14"]),
         );
     }
 
@@ -1662,18 +1184,10 @@ mod tests {
         // not fall through to a `String` literal — that would silently
         // corrupt SQL. POINT exercises the per-OID match's fail-closed
         // catch-all rather than the Kind-dispatch path.
-        let param = QueryParameter {
-            value: Some(Bytes::from_static(&[
-                0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ])),
-            format: 1,
-            oid: PgType::POINT.oid(),
-        };
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(matches!(
-            result,
-            Err(AstTransformError::UnsupportedBinaryFormat { .. })
-        ));
+        assert_binary_unsupported(
+            &[0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+            PgType::POINT.oid(),
+        );
     }
 
     #[test]
@@ -1700,19 +1214,13 @@ mod tests {
 
     #[test]
     fn test_binary_int4_array_decoded() {
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&binary_int4_array_42_100())),
-            format: 1,
-            oid: PgType::INT4_ARRAY.oid(),
-        };
-
-        let literal = parameter_to_literal(&param).expect("decode binary int4[]");
-        assert_eq!(
-            literal,
+        assert_binary_decodes(
+            &binary_int4_array_42_100(),
+            PgType::INT4_ARRAY,
             LiteralValue::Array(
                 vec![LiteralValue::Integer(42), LiteralValue::Integer(100)],
-                "int4[]".into()
-            )
+                "int4[]".into(),
+            ),
         );
     }
 
@@ -1760,22 +1268,13 @@ mod tests {
 
     #[test]
     fn test_binary_int4_array_in_query_renders_clean_sql() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE id = ANY($1)");
-
         let array_bytes = binary_int4_array_42_100();
-        let params = binary_params(vec![(Some(&array_bytes), PgType::INT4_ARRAY)]);
-
-        select_node_parameters_replace(&mut node, &params).expect("substitute binary int4[]");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-
-        assert!(
-            !buf.as_bytes().contains(&0),
-            "deparsed SQL must not contain NUL bytes; got {buf:?}"
-        );
         assert_eq!(
-            buf,
+            binary_query_render(
+                "SELECT id FROM users WHERE id = ANY($1)",
+                &array_bytes,
+                PgType::INT4_ARRAY
+            ),
             "SELECT id FROM users WHERE id = ANY ('{42,100}'::int4[])"
         );
     }
@@ -1787,14 +1286,11 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // hasnull = 0
             0x00, 0x00, 0x00, 0x17, // elemtype = 23 (int4)
         ];
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::INT4_ARRAY.oid(),
-        };
-
-        let literal = parameter_to_literal(&param).expect("decode empty int4[]");
-        assert_eq!(literal, LiteralValue::Array(vec![], "int4[]".into()));
+        assert_binary_decodes(
+            &bytes,
+            PgType::INT4_ARRAY,
+            LiteralValue::Array(vec![], "int4[]".into()),
+        );
     }
 
     #[test]
@@ -1809,23 +1305,17 @@ mod tests {
             0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00,
             0x00, 0x04, 0x00, 0x00, 0x00, 0x03,
         ];
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::INT4_ARRAY.oid(),
-        };
-
-        let literal = parameter_to_literal(&param).expect("decode int4[] with null");
-        assert_eq!(
-            literal,
+        assert_binary_decodes(
+            &bytes,
+            PgType::INT4_ARRAY,
             LiteralValue::Array(
                 vec![
                     LiteralValue::Integer(1),
                     LiteralValue::Null,
                     LiteralValue::Integer(3),
                 ],
-                "int4[]".into()
-            )
+                "int4[]".into(),
+            ),
         );
     }
 
@@ -1843,13 +1333,7 @@ mod tests {
             bytes.extend_from_slice(&array_text_element_bytes(s));
         }
 
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::TEXT_ARRAY.oid(),
-        };
-
-        let literal = parameter_to_literal(&param).expect("decode text[]");
+        let literal = binary_decode(&bytes, PgType::TEXT_ARRAY);
         assert_eq!(
             literal,
             LiteralValue::Array(
@@ -1883,13 +1367,7 @@ mod tests {
         bytes.extend_from_slice(&array_text_element_bytes("NULL"));
         bytes.extend_from_slice(&array_text_element_bytes("a"));
 
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::TEXT_ARRAY.oid(),
-        };
-
-        let literal = parameter_to_literal(&param).expect("decode text[]");
+        let literal = binary_decode(&bytes, PgType::TEXT_ARRAY);
         assert_eq!(
             literal,
             LiteralValue::Array(
@@ -1916,20 +1394,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
             0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2A,
         ];
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::INT4_ARRAY.oid(),
-        };
-
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(
-            matches!(
-                result,
-                Err(AstTransformError::UnsupportedBinaryFormat { .. })
-            ),
-            "expected UnsupportedBinaryFormat for 2-D array, got {result:?}"
-        );
+        assert_binary_unsupported(&bytes, PgType::INT4_ARRAY.oid());
     }
 
     #[test]
@@ -1939,19 +1404,6 @@ mod tests {
         bytes.extend_from_slice(&16_i32.to_be_bytes());
         bytes.extend_from_slice(&[0u8; 16]);
 
-        let param = QueryParameter {
-            value: Some(Bytes::copy_from_slice(&bytes)),
-            format: 1,
-            oid: PgType::POINT_ARRAY.oid(),
-        };
-
-        let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());
-        assert!(
-            matches!(
-                result,
-                Err(AstTransformError::UnsupportedBinaryFormat { .. })
-            ),
-            "expected UnsupportedBinaryFormat for point[], got {result:?}"
-        );
+        assert_binary_unsupported(&bytes, PgType::POINT_ARRAY.oid());
     }
 }
