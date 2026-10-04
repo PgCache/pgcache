@@ -17,7 +17,7 @@ use super::serve_pool::{serve_loop, serve_pool_bounds, serve_pool_controller};
 use crate::cache::messages::WriterNotify;
 use crate::cache::query_cache::CacheDispatch;
 use crate::cache::types::{ActiveRelations, CacheStateView};
-use crate::cache::writer::writer_run;
+use crate::cache::writer::{WriterChannels, WriterShared, writer_run};
 use crate::cache::{
     CacheDispatchPublisher, CacheError, CacheResult, MapIntoReport, PinnedQuery, ReportExt,
     StatusRequest,
@@ -91,18 +91,20 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     let writer_handle = thread::Builder::new()
         .name("cache writer".to_owned())
         .spawn_scoped(scope, move || {
-            let result = writer_run(
-                &settings_writer,
+            let channels = WriterChannels {
                 query_rx,
-                cdc_cmd_rx,
-                state_view_writer,
-                active_relations_writer,
-                notify_tx,
-                cancel_writer,
+                cdc_rx: cdc_cmd_rx,
                 status_rx,
-                watermark_nudge_writer,
-                shared_runtime_writer,
-            );
+                cancel: cancel_writer,
+            };
+            let shared = WriterShared {
+                state_view: state_view_writer,
+                active_relations: active_relations_writer,
+                notify_tx,
+                watermark_nudge: watermark_nudge_writer,
+                runtime: shared_runtime_writer,
+            };
+            let result = writer_run(&settings_writer, channels, shared);
             if let Err(ref e) = result {
                 error!(
                     "writer thread exiting with error: {}",

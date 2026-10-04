@@ -1,30 +1,23 @@
-use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use ecow::EcoString;
 use postgres_types::PgLsn;
-use tokio::runtime::{Builder, Handle};
+use tokio::runtime::Handle;
 use tokio::sync::Notify;
-use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender};
-use tokio::task::LocalSet;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_postgres::Client;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error};
+use tracing::debug;
 
-use super::cdc::WriterCdc;
 use super::frame::{FRAME_BUF_CAPACITY, FrameRowEvent, FrameState, OverlayEntry};
-use super::merge_queue::{InputQueues, MergeQueue};
+use super::merge_queue::MergeQueue;
 use super::mv_build::MvBuildPool;
-use super::registration::WriterRegistration;
 use super::staging::{PopulationDeletedKeys, StagingPool};
-use crate::cache::status::StatusRequest;
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
-    messages::{CdcCommand, QueryCommand, WriterNotify},
+    messages::{QueryCommand, WriterNotify},
     mv::MvMeta,
     mv_shape::ShapeGate,
     types::{
@@ -36,8 +29,7 @@ use crate::pg;
 use crate::pg::Lsn;
 use crate::pg::protocol::ByteString;
 use crate::query::{Fingerprint, FingerprintSet};
-use crate::result::error_chain_format;
-use crate::settings::Settings;
+use crate::settings::{PgSettings, Settings};
 
 /// Deterministic fault injection for the restart supervisor: kill the writer on
 /// a sentinel CDC insert so a test can drive a real subsystem death → rebuild.
@@ -99,16 +91,43 @@ pub(crate) mod fault {
     }
 }
 
-/// Max full evictions per periodic-tick `eviction_run` call (PGC-251). Bounds the
-/// single-threaded writer stall when reclaiming a large count-cap overshoot; the
-/// remainder is reclaimed on subsequent ticks.
-const EVICTION_TICK_BUDGET: usize = 512;
-
 /// Cap on retained candidate scratch sets. At most two are alive at once
 /// (`handle_update`), so this is generous headroom; it bounds the pool the way
 /// `ROW_VEC_POOL_MAX` / `TOAST_OVERLAY_POOL_MAX` bound their pools, in case a
 /// future caller ever returns more sets than it took.
 const CANDIDATE_SCRATCH_MAX: usize = 8;
+
+/// Handles the writer shares with the rest of the cache subsystem, moved into
+/// `WriterCore` at startup.
+pub(crate) struct WriterShared {
+    pub(crate) state_view: Arc<CacheStateView>,
+    /// Shared set of relation OIDs with active cached queries (read by CDC processor).
+    pub(crate) active_relations: ActiveRelations,
+    /// Notifications to dispatch for coalescing queue drain.
+    pub(crate) notify_tx: UnboundedSender<WriterNotify>,
+    /// Prompts the CDC thread for an immediate keepalive when a populated
+    /// query is gated on the apply watermark (PGC-250 Slice B).
+    pub(crate) watermark_nudge: Arc<Notify>,
+    /// Shared multi-thread runtime; MV build tasks are spawned here.
+    pub(crate) runtime: Handle,
+}
+
+/// What a cached query serves at a generation: mirrored into the state view
+/// on every Loading / Ready transition and sent with the Ready notify.
+pub(super) struct QueryServing {
+    pub(super) generation: u64,
+    pub(super) resolved: SharedResolved,
+    pub(super) deparsed_sql: EcoString,
+    pub(super) max_limit: Option<u64>,
+}
+
+/// The cache volume, as read once at startup (PGC-251 Slice 2).
+struct InitialDiskStats {
+    data_dir: Option<PathBuf>,
+    total: u64,
+    available: u64,
+    limit_effective: u64,
+}
 
 /// Shared writer state for the CDC apply and registration/population paths.
 /// `WriterCdc` and `WriterRegistration` borrow `&mut WriterCore` per command;
@@ -357,335 +376,57 @@ async fn data_directory_query(client: &Client) -> Option<PathBuf> {
     }
 }
 
-/// Main writer runtime. Owns `WriterCore` plus the two responsibility
-/// managers (`WriterCdc`, `WriterRegistration`) and serializes their access
-/// to the core through one select loop.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn writer_run(
-    settings: &Settings,
-    mut query_rx: UnboundedReceiver<QueryCommand>,
-    mut cdc_rx: UnboundedReceiver<CdcCommand>,
-    state_view: Arc<CacheStateView>,
-    active_relations: ActiveRelations,
-    notify_tx: UnboundedSender<WriterNotify>,
-    cancel: CancellationToken,
-    mut status_rx: Receiver<StatusRequest>,
-    watermark_nudge: Arc<Notify>,
-    shared_runtime: Handle,
-) -> CacheResult<()> {
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_into_report::<CacheError>()?;
+async fn initial_disk_stats(cache_client: &Client, settings: &Settings) -> InitialDiskStats {
+    let data_dir = data_directory_query(cache_client).await;
+    let (total, available) = data_dir
+        .as_deref()
+        .and_then(crate::memory::disk_stats_bytes)
+        .unwrap_or((0, 0));
+    let limit_effective =
+        crate::memory::disk_limit_resolve(total, settings.dynamic.load().disk_limit);
+    InitialDiskStats {
+        data_dir,
+        total,
+        available,
+        limit_effective,
+    }
+}
 
-    debug!("writer loop");
-    rt.block_on(async {
-        // Create internal channel for population workers to send query commands back
-        let (query_tx, mut internal_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        // Boxed: the writer future's state machine has outgrown clippy's
-        // large-futures threshold; one heap allocation at startup keeps it
-        // off the spawning task's stack.
-        LocalSet::new()
-            .run_until(Box::pin(async move {
-                // Built inside the LocalSet so WriterRegistration can spawn_local
-                // its population workers.
-                let mut core = WriterCore::new(
-                    settings,
-                    state_view,
-                    active_relations,
-                    notify_tx,
-                    query_tx.clone(),
-                    watermark_nudge,
-                    shared_runtime,
-                )
-                .await?;
-                let mut registration = WriterRegistration::new(
-                    settings,
-                    &core.db_origin,
-                    query_tx,
-                    Arc::clone(&core.state_view.registration_throttled),
-                    Arc::clone(&core.state_view.population_pool),
-                )
-                .await?;
-                let mut writer_cdc =
-                    WriterCdc::new(settings, Arc::clone(&core.state_view.settled_lsn)).await?;
-
-                // Gauges (queries_loading/pending/invalidated, disk_used_bytes,
-                // generation, tables_tracked, update_queries_total/max) used to
-                // be emitted from every query/CDC command. state_gauges_update
-                // iterates the entire state_view DashMap, which dominated
-                // writer per-command time at scale. Emit on a 1s tick instead —
-                // well below typical Prometheus scrape intervals.
-                let mut gauges_interval = tokio::time::interval(Duration::from_secs(1));
-                gauges_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-                #[cfg(feature = "fault-injection")]
-                fault::init();
-
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            debug!("writer shutdown signal received");
-                            break;
-                        }
-                        _ = gauges_interval.tick() => {
-                            // Diagnose merge-gate stalls (PGC-290): if merges are
-                            // parked, report why the drain gate (frame_state ==
-                            // Idle && watermark >= min snapshot_lsn) is not firing.
-                            if !core.merges.pending.is_empty() {
-                                let min_snap =
-                                    core.merges.pending.peek().map(|Reverse(m)| m.0.snapshot_lsn);
-                                debug!(
-                                    "merge-gate: frame_state={:?} frame_open={} pending={} min_snapshot_lsn={:?} watermark={:?}",
-                                    core.frame_state,
-                                    core.frame_open,
-                                    core.merges.pending.len(),
-                                    min_snap,
-                                    writer_cdc.last_received_lsn,
-                                );
-                            }
-                            #[allow(clippy::cast_precision_loss)]
-                            crate::metrics::handles()
-                                .reg
-                                .merge_pending_depth
-                                .set(core.merges.pending.len() as f64);
-                            core.disk_stats_refresh();
-                            core.stale_entries_cleanup();
-                            core.state_gauges_update();
-                            core.writer_scale_gauges_update();
-                            registration.population_pool_reconcile();
-                            core.state_view.memo.gc();
-                            core.state_view.memo.metrics_publish();
-                            // Eviction runs only here now (not per Ready, PGC-276).
-                            // Enforce the memory count cap independently of
-                            // registration: under throttle-freeze no Ready events
-                            // arrive (PGC-251). Bounded per tick; log-and-continue so a
-                            // periodic best-effort eviction never kills the writer.
-                            if let Err(e) = core.eviction_run(Some(EVICTION_TICK_BUDGET)).await {
-                                error!(
-                                    "periodic eviction failed: {}",
-                                    error_chain_format(e.current_context())
-                                );
-                            }
-                            // Disk-pressure throttle + escalating reclaim (PGC-276).
-                            if let Err(e) = core.disk_pressure_handle().await {
-                                error!(
-                                    "disk pressure handling failed: {}",
-                                    error_chain_format(e.current_context())
-                                );
-                            }
-                        }
-                        // Handle query commands from dispatch
-                        msg = query_rx.recv() => {
-                            match msg {
-                                Some(cmd) => {
-                                    if let Err(e) =
-                                        registration.query_command_handle(&mut core, cmd).await
-                                    {
-                                        error!(
-                                            "writer query command failed: {}",
-                                            error_chain_format(e.current_context()),
-                                        );
-                                    }
-                                    core.merges.command_handled();
-                                }
-                                None => {
-                                    debug!("writer query channel closed, shutting down");
-                                    break;
-                                }
-                            }
-                        }
-                        // Handle CDC commands from the CDC thread
-                        msg = cdc_rx.recv() => {
-                            match msg {
-                                Some(cmd) => {
-                                    // A run of consecutive keepalive marks is
-                                    // handled as one at its highest LSN, plus
-                                    // the command that ended the run (PGC-420):
-                                    // a keepalive burst then costs this one
-                                    // iteration instead of one each.
-                                    let (cmd, trailing) = cdc_keepalive_run_coalesce(cmd, &mut cdc_rx);
-                                    for cmd in std::iter::once(cmd).chain(trailing) {
-                                        #[cfg(feature = "fault-injection")]
-                                        if let CdcCommand::Insert { row_data, .. } = &cmd
-                                            && fault::writer_die_check(row_data)
-                                        {
-                                            error!("fault injection: writer exiting on sentinel CDC insert to exercise restart");
-                                            return Err(CacheError::CdcFailure.into());
-                                        }
-                                        // Queue depth after this command drives the
-                                        // batch flush decision (PGC-242): an empty
-                                        // queue flushes immediately; a backlog
-                                        // accumulates frames.
-                                        let queued = cdc_rx.len();
-                                        if let Err(e) = writer_cdc
-                                            .cdc_command_handle(&mut core, cmd, queued)
-                                            .await
-                                        {
-                                            // Propagate: tears down the cache
-                                            // subsystem so the supervisor restart
-                                            // rebuilds it from a clean reset.
-                                            error!(
-                                                "writer cdc command failed, resetting cache: {}",
-                                                error_chain_format(e.current_context()),
-                                            );
-                                            return Err(e);
-                                        }
-                                    }
-                                }
-                                None => {
-                                    debug!("writer cdc channel closed, shutting down");
-                                    break;
-                                }
-                            }
-                        }
-                        // Handle commands from spawned population tasks
-                        msg = internal_rx.recv() => {
-                            match msg {
-                                Some(cmd) => {
-                                    if let Err(e) =
-                                        registration.query_command_handle(&mut core, cmd).await
-                                    {
-                                        error!(
-                                            "writer internal command failed: {}",
-                                            error_chain_format(e.current_context()),
-                                        );
-                                    }
-                                }
-                                None => {
-                                    debug!("writer internal channel closed, shutting down");
-                                    break;
-                                }
-                            }
-                        }
-                        // Handle status requests from admin HTTP server
-                        msg = status_rx.recv() => {
-                            if let Some(req) = msg {
-                                core.status_respond(req, writer_cdc.last_received_lsn).await;
-                            }
-                        }
-                        // Advance the in-progress population merge by one chunk
-                        // (PGC-418). Runs when every input queue is drained —
-                        // never ahead of queued real work, and the select is
-                        // unbiased so a ready chunk would otherwise win random
-                        // picks against queued commands — or, under a backlog,
-                        // once each queue has yielded its unit since the last
-                        // chunk (a batch flush; the commands queued at that
-                        // chunk) so the merge cannot starve. Only while no
-                        // frame is open — a chunk on db_cache mid-frame would
-                        // join the frame's transaction.
-                        () = std::future::ready(()),
-                            if core.frame_state == FrameState::Idle
-                                && core.merges.chunk_due(InputQueues {
-                                    cdc_empty: cdc_rx.is_empty(),
-                                    query_empty: query_rx.is_empty(),
-                                    internal_empty: internal_rx.is_empty(),
-                                }) => {
-                            if let Err(e) = registration.merge_in_progress_step(&mut core).await {
-                                error!(
-                                    "population merge step failed: {}",
-                                    error_chain_format(e.current_context()),
-                                );
-                            }
-                            core.merges.chunk_boundary_mark(query_rx.len());
-                        }
-                    }
-
-                    // Drain population merges while the writer is quiescent
-                    // (no CDC frame open), so neither the merge nor eviction
-                    // (both on db_cache) races the CDC writer's frame txn on
-                    // the shared cache table (PGC-250). Each merge is
-                    // additionally gated on the apply watermark reaching its
-                    // snapshot LSN (PGC-272); the watermark advances on the
-                    // CDC path, so re-check on every quiescent iteration —
-                    // also while a drain is active, so a gated head behind it
-                    // keeps being nudged (only starting the next drain waits).
-                    if core.frame_state == FrameState::Idle
-                        && (!core.merges.pending.is_empty() || !core.merges.discards.is_empty())
-                    {
-                        let slot_was_free = core.merges.active.is_none();
-                        if let Err(e) = registration
-                            .pending_merges_drain(&mut core, writer_cdc.last_received_lsn)
-                            .await
-                        {
-                            error!(
-                                "population merge drain failed: {}",
-                                error_chain_format(e.current_context()),
-                            );
-                        }
-                        if slot_was_free && core.merges.active.is_some() {
-                            core.merges.chunk_boundary_mark(query_rx.len());
-                        }
-                    }
-
-                    // Fold the writer backlog into the adaptive-gate window every
-                    // iteration (PGC-277): catches the drain-to-empty moments the
-                    // controller's coarse tick would miss. The internal channel
-                    // (population completions) is the backlog that saturates first.
-                    let internal_depth = internal_rx.len();
-                    core.state_view.reg_gate.queue_observe(internal_depth);
-
-                    // Channel depths are reported as f64 gauges; queue sizes never approach 2^53.
-                    #[allow(clippy::cast_precision_loss)]
-                    {
-                        crate::metrics::handles()
-                            .state
-                            .queue_writer_query
-                            .set(query_rx.len() as f64);
-                        crate::metrics::handles()
-                            .state
-                            .queue_writer_cdc
-                            .set(cdc_rx.len() as f64);
-                        crate::metrics::handles()
-                            .state
-                            .queue_writer_internal
-                            .set(internal_depth as f64);
-                    }
-                }
-
-                Ok(())
-            }))
-            .await
-    })
+/// Connect the writer's origin session. `origin_flush_force` relies on its
+/// marker's commit flushing WAL before returning, so its LSN is reachable by
+/// the apply watermark (PGC-290). This is the only session that writes the
+/// marker; reads/DDL here are unaffected by the durability setting.
+async fn writer_origin_connect(origin: &PgSettings) -> CacheResult<Client> {
+    let origin_client = pg::connect(origin, "writer origin")
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("connecting to origin database")?;
+    origin_client
+        .batch_execute("SET synchronous_commit = on")
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("setting synchronous_commit on writer origin")?;
+    Ok(origin_client)
 }
 
 impl WriterCore {
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn new(
         settings: &Settings,
-        state_view: Arc<CacheStateView>,
-        active_relations: ActiveRelations,
-        notify_tx: UnboundedSender<WriterNotify>,
+        shared: WriterShared,
         query_tx: UnboundedSender<QueryCommand>,
-        watermark_nudge: Arc<Notify>,
-        runtime: Handle,
     ) -> CacheResult<Self> {
         let cache_client = pg::connect(&settings.cache, "writer cache")
             .await
             .map_into_report::<CacheError>()?;
-
-        let origin_client = pg::connect(&settings.origin, "writer origin")
-            .await
-            .map_into_report::<CacheError>()
-            .attach_loc("connecting to origin database")?;
-        // `origin_flush_force` relies on its marker's commit flushing WAL before
-        // returning, so its LSN is reachable by the apply watermark (PGC-290).
-        // This is the only session that writes the marker; reads/DDL here are
-        // unaffected by the durability setting.
-        origin_client
-            .batch_execute("SET synchronous_commit = on")
-            .await
-            .map_into_report::<CacheError>()
-            .attach_loc("setting synchronous_commit on writer origin")?;
-
-        let data_dir = data_directory_query(&cache_client).await;
-        let (disk_total, disk_available) = data_dir
-            .as_deref()
-            .and_then(crate::memory::disk_stats_bytes)
-            .unwrap_or((0, 0));
-        let disk_limit_effective =
-            crate::memory::disk_limit_resolve(disk_total, settings.dynamic.load().disk_limit);
+        let origin_client = writer_origin_connect(&settings.origin).await?;
+        let disk = initial_disk_stats(&cache_client, settings).await;
+        let WriterShared {
+            state_view,
+            active_relations,
+            notify_tx,
+            watermark_nudge,
+            runtime,
+        } = shared;
 
         Ok(Self {
             cache: Cache::new(settings),
@@ -733,17 +474,15 @@ impl WriterCore {
             batch_old_image_epochs: HashMap::new(),
             row_vec_pool: Vec::new(),
             batch_toast_guard_oids: HashSet::new(),
-            data_dir,
-            disk_total,
-            disk_available,
-            disk_limit_effective,
+            data_dir: disk.data_dir,
+            disk_total: disk.total,
+            disk_available: disk.available,
+            disk_limit_effective: disk.limit_effective,
             disk_pressure_ticks: 0,
             disk_drop_backoff: false,
         })
     }
 
-    /// Whether the population identified by `(fingerprint, generation)` is still
-    /// the live, non-invalidated cached query — i.e. a parked merge/ready entry
     /// Borrow a cleared candidate `FingerprintSet` from the scratch pool
     /// (PGC-341/344). Reuses a previously-returned set — retaining its backing
     /// capacity — or allocates a fresh one when the pool is empty. Pair with
@@ -763,6 +502,8 @@ impl WriterCore {
         self.candidate_scratch.push(set);
     }
 
+    /// Whether the population identified by `(fingerprint, generation)` is still
+    /// the live, non-invalidated cached query — i.e. a parked merge/ready entry
     /// hasn't been superseded by a readmit (generation bump), invalidated, or
     /// evicted while it waited (PGC-250).
     pub(super) fn population_is_current(&self, fingerprint: Fingerprint, generation: u64) -> bool {
@@ -774,11 +515,6 @@ impl WriterCore {
         population_finalize_allowed(live, generation)
     }
 
-    /// Sync the origin publication to `active_relations` and drop any cache
-    /// tables that just fell out of the active set. The drop happens here,
-    /// after the ALTER PUBLICATION, because `oids_to_table_list` resolves
-    /// oid → schema.name from `cache.tables` — if we dropped first that
-    /// lookup would return empty.
     /// Force the origin to flush WAL past a stuck merge snapshot.
     ///
     /// Emits a tiny transactional logical-decoding marker; the session's
@@ -799,7 +535,12 @@ impl WriterCore {
         Ok(Lsn::from(row.get::<_, PgLsn>(0)))
     }
 
-    // Helper methods
+    /// Whether the population merge drain has work and the writer is
+    /// quiescent (no CDC frame open).
+    pub(super) fn merges_drain_wanted(&self) -> bool {
+        self.frame_state == FrameState::Idle
+            && (!self.merges.pending.is_empty() || !self.merges.discards.is_empty())
+    }
 
     /// Set the shape-gate classification and derive the initial MvState for a
     /// cached query. Called once per fresh registration (not on readmit / limit
@@ -824,10 +565,7 @@ impl WriterCore {
         &self,
         fingerprint: Fingerprint,
         state: CachedQueryState,
-        generation: u64,
-        resolved: &SharedResolved,
-        deparsed_sql: &EcoString,
-        max_limit: Option<u64>,
+        serving: &QueryServing,
     ) {
         // The serve shape mirrors `CachedQuery.serve_shape`; the cached query is
         // already inserted at every transition, so read it from there rather
@@ -842,20 +580,20 @@ impl WriterCore {
             .entry(fingerprint)
             .and_modify(|v| {
                 v.state = state;
-                v.generation = generation;
-                v.resolved = Some(Arc::clone(resolved));
-                v.deparsed_sql = Some(deparsed_sql.clone());
+                v.generation = serving.generation;
+                v.resolved = Some(Arc::clone(&serving.resolved));
+                v.deparsed_sql = Some(serving.deparsed_sql.clone());
                 v.serve_shape = serve_shape.clone();
-                v.max_limit = max_limit;
+                v.max_limit = serving.max_limit;
                 v.referenced = false;
             })
             .or_insert_with(|| CachedQueryView {
                 state,
-                generation,
-                resolved: Some(Arc::clone(resolved)),
-                deparsed_sql: Some(deparsed_sql.clone()),
+                generation: serving.generation,
+                resolved: Some(Arc::clone(&serving.resolved)),
+                deparsed_sql: Some(serving.deparsed_sql.clone()),
                 serve_shape,
-                max_limit,
+                max_limit: serving.max_limit,
                 referenced: false,
                 mv: MvMeta::new(ShapeGate::Skip, None),
             });
@@ -866,39 +604,21 @@ impl WriterCore {
     pub(super) fn state_loading_transition(
         &self,
         fingerprint: Fingerprint,
-        generation: u64,
-        resolved: &SharedResolved,
-        deparsed_sql: &EcoString,
-        max_limit: Option<u64>,
+        serving: &QueryServing,
     ) {
-        self.state_view_write(
-            fingerprint,
-            CachedQueryState::Loading,
-            generation,
-            resolved,
-            deparsed_sql,
-            max_limit,
-        );
+        self.state_view_write(fingerprint, CachedQueryState::Loading, serving);
     }
 
     /// Mark Ready and notify the cache loop. Skipping the notify leaves
     /// coalesced waiters hung forever — always go through this wrapper.
-    pub(super) fn state_ready_transition(
-        &self,
-        fingerprint: Fingerprint,
-        generation: u64,
-        resolved: SharedResolved,
-        deparsed_sql: EcoString,
-        max_limit: Option<u64>,
-    ) {
-        self.state_view_write(
-            fingerprint,
-            CachedQueryState::Ready,
+    pub(super) fn state_ready_transition(&self, fingerprint: Fingerprint, serving: QueryServing) {
+        self.state_view_write(fingerprint, CachedQueryState::Ready, &serving);
+        let QueryServing {
             generation,
-            &resolved,
-            &deparsed_sql,
+            resolved,
+            deparsed_sql,
             max_limit,
-        );
+        } = serving;
         let _ = self.notify_tx.send(WriterNotify::Ready {
             fingerprint,
             generation,
@@ -919,91 +639,9 @@ impl WriterCore {
     }
 }
 
-/// Collapse the run of consecutive `KeepAliveMark`s starting at `first` into
-/// one mark at the run's highest LSN (PGC-420). Marks are monotonic and the
-/// handler's watermark advance is a max, so one flush + one advance yields the
-/// same state as handling each in turn — and no frame command can sit inside
-/// the run, because it stops at the first non-keepalive. That command is
-/// already off the queue, so it is returned for handling in the same
-/// iteration. A non-keepalive `first` is returned untouched.
-fn cdc_keepalive_run_coalesce(
-    first: CdcCommand,
-    cdc_rx: &mut UnboundedReceiver<CdcCommand>,
-) -> (CdcCommand, Option<CdcCommand>) {
-    let CdcCommand::KeepAliveMark { mut lsn } = first else {
-        return (first, None);
-    };
-    let mut absorbed = 0u64;
-    let trailing = loop {
-        match cdc_rx.try_recv() {
-            Ok(CdcCommand::KeepAliveMark { lsn: next }) => {
-                lsn = lsn.max(next);
-                absorbed += 1;
-            }
-            Ok(other) => break Some(other),
-            Err(_) => break None,
-        }
-    };
-    if absorbed > 0 {
-        crate::metrics::handles()
-            .cdc
-            .keepalive_marks_coalesced
-            .increment(absorbed);
-    }
-    (CdcCommand::KeepAliveMark { lsn }, trailing)
-}
-
 #[cfg(test)]
 mod tests {
-    use tokio::sync::mpsc::unbounded_channel;
-
-    use super::{CdcCommand, Lsn, cdc_keepalive_run_coalesce, population_finalize_allowed};
-
-    fn mark(lsn: u64) -> CdcCommand {
-        CdcCommand::KeepAliveMark {
-            lsn: Lsn::from_raw(lsn),
-        }
-    }
-
-    #[test]
-    fn test_keepalive_run_collapses_to_max_and_returns_the_command_that_ended_it() {
-        let (tx, mut rx) = unbounded_channel();
-        tx.send(mark(7)).expect("queue mark");
-        tx.send(mark(5)).expect("queue mark");
-        tx.send(CdcCommand::Begin { xid: 42 }).expect("queue begin");
-        tx.send(mark(9)).expect("queue mark after begin");
-
-        let (first, trailing) = cdc_keepalive_run_coalesce(mark(3), &mut rx);
-        assert!(matches!(first, CdcCommand::KeepAliveMark { lsn } if lsn == Lsn::from_raw(7)));
-        assert!(matches!(trailing, Some(CdcCommand::Begin { xid: 42 })));
-        // The mark after the run is left for the next iteration, in order.
-        assert!(
-            matches!(rx.try_recv(), Ok(CdcCommand::KeepAliveMark { lsn }) if lsn == Lsn::from_raw(9))
-        );
-    }
-
-    #[test]
-    fn test_keepalive_run_drains_to_empty_without_trailing_command() {
-        let (tx, mut rx) = unbounded_channel();
-        tx.send(mark(2)).expect("queue mark");
-        let (first, trailing) = cdc_keepalive_run_coalesce(mark(1), &mut rx);
-        assert!(matches!(first, CdcCommand::KeepAliveMark { lsn } if lsn == Lsn::from_raw(2)));
-        assert!(trailing.is_none());
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn test_non_keepalive_first_command_is_passed_through_untouched() {
-        let (tx, mut rx) = unbounded_channel();
-        tx.send(mark(2)).expect("queue mark");
-        let (first, trailing) = cdc_keepalive_run_coalesce(CdcCommand::Begin { xid: 1 }, &mut rx);
-        assert!(matches!(first, CdcCommand::Begin { xid: 1 }));
-        assert!(trailing.is_none());
-        assert!(
-            rx.try_recv().is_ok(),
-            "queued mark is left for the next iteration"
-        );
-    }
+    use super::population_finalize_allowed;
 
     /// Live query at the parked generation, not invalidated → finalize.
     #[test]

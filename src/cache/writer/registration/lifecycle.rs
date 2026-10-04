@@ -11,7 +11,7 @@ use super::{PopulationTarget, WriterRegistration};
 use crate::cache::CacheResult;
 use crate::cache::coalesce_queue::fetch_stage_ewma_update;
 use crate::cache::messages::PopulationMerge;
-use crate::cache::writer::core::WriterCore;
+use crate::cache::writer::core::{QueryServing, WriterCore};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
@@ -80,9 +80,12 @@ impl WriterRegistration {
             return Ok(());
         };
 
-        let resolved = Arc::clone(&cached.resolved);
-        let deparsed_sql = cached.deparsed_sql.clone();
-        let max_limit = cached.max_limit;
+        let serving = QueryServing {
+            generation: new_generation,
+            resolved: Arc::clone(&cached.resolved),
+            deparsed_sql: cached.deparsed_sql.clone(),
+            max_limit: cached.max_limit,
+        };
 
         cached.generation = new_generation;
         cached.invalidated = false;
@@ -91,21 +94,15 @@ impl WriterRegistration {
         // Refcount unchanged — readmit reuses the existing relation_oids set.
         core.cache.cached_queries.insert_overwrite(cached);
 
-        core.state_loading_transition(
-            fingerprint,
-            new_generation,
-            &resolved,
-            &deparsed_sql,
-            max_limit,
-        );
+        core.state_loading_transition(fingerprint, &serving);
 
         self.population_start(
             core,
             PopulationTarget {
                 fingerprint,
-                generation: new_generation,
-                resolved: &resolved,
-                max_limit,
+                generation: serving.generation,
+                resolved: &serving.resolved,
+                max_limit: serving.max_limit,
             },
         )?;
         trace!("readmission population queued for query {fingerprint}");
@@ -124,15 +121,15 @@ impl WriterRegistration {
             .map(|mut query| {
                 query.cached_bytes = merge.cached_bytes;
                 let started_at = query.registration_started_at.take();
-                (
-                    query.generation,
-                    Arc::clone(&query.resolved),
-                    query.deparsed_sql.clone(),
-                    query.max_limit,
-                    started_at,
-                )
+                let serving = QueryServing {
+                    generation: query.generation,
+                    resolved: Arc::clone(&query.resolved),
+                    deparsed_sql: query.deparsed_sql.clone(),
+                    max_limit: query.max_limit,
+                };
+                (serving, started_at)
             });
-        let Some((generation, resolved, deparsed_sql, max_limit, started_at)) = update_info else {
+        let Some((serving, started_at)) = update_info else {
             return;
         };
 
@@ -159,7 +156,7 @@ impl WriterRegistration {
             ));
         }
 
-        core.state_ready_transition(fingerprint, generation, resolved, deparsed_sql, max_limit);
+        core.state_ready_transition(fingerprint, serving);
 
         // One unit of drained registration work, for the adaptive-gate
         // drain-rate (capacity) estimate (PGC-277).
@@ -229,21 +226,21 @@ impl WriterRegistration {
 
         subsumption_limit_reindex(core, fingerprint, &relation_oids, new_max_limit.is_some());
 
-        core.state_loading_transition(
-            fingerprint,
-            new_generation,
-            &resolved,
-            &deparsed_sql,
-            new_max_limit,
-        );
+        let serving = QueryServing {
+            generation: new_generation,
+            resolved,
+            deparsed_sql,
+            max_limit: new_max_limit,
+        };
+        core.state_loading_transition(fingerprint, &serving);
 
         self.population_start(
             core,
             PopulationTarget {
                 fingerprint,
-                generation: new_generation,
-                resolved: &resolved,
-                max_limit: new_max_limit,
+                generation: serving.generation,
+                resolved: &serving.resolved,
+                max_limit: serving.max_limit,
             },
         )?;
         trace!("limit bump population queued for query {fingerprint}");

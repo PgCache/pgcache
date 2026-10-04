@@ -1,6 +1,7 @@
 mod cdc;
 mod core;
 mod deadlock;
+mod event_loop;
 mod eviction;
 mod frame;
 mod merge_queue;
@@ -14,5 +15,6 @@ mod status;
 mod subsumption;
 mod table;
 
-pub(super) use self::core::writer_run;
+pub(super) use self::core::WriterShared;
+pub(super) use self::event_loop::{WriterChannels, writer_run};
 pub(super) use self::registration::PopulationWork;

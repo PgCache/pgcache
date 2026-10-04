@@ -9,7 +9,7 @@ use std::time::Instant;
 use ecow::EcoString;
 use tracing::{debug, error};
 
-use super::core::WriterCore;
+use super::core::{QueryServing, WriterCore};
 use super::registration::{
     QueryResolution, RegistrationIdentity, WriterRegistration, cached_query_insert,
 };
@@ -154,10 +154,12 @@ impl WriterRegistration {
 
         core.state_ready_transition(
             fingerprint,
-            generation,
-            Arc::clone(&resolved),
-            deparsed_sql.clone(),
-            max_limit,
+            QueryServing {
+                generation,
+                resolved: Arc::clone(&resolved),
+                deparsed_sql: deparsed_sql.clone(),
+                max_limit,
+            },
         );
 
         // Clear registration_started_at to signal completion
