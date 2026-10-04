@@ -17,13 +17,14 @@ pub(super) const POPULATION_PARK_EXPIRY: Duration = Duration::from_secs(300);
 /// publish monotonic demand/service counters here, the controller (runtime
 /// side) reads them and writes `desired_workers`, and the writer reconciles
 /// the live worker set toward the target on its loop tick. Population tasks
-/// are origin-I/O-bound, so the right worker count follows Little's law
-/// (arrival rate × service time), not the CPU-derived `num_workers`.
+/// are origin-I/O-bound, so the worker count is sized by probe-and-verify
+/// against measured throughput (ADR-052), not the CPU-derived `num_workers`.
 pub struct PopulationPool {
     /// Monotonic sum of population task time, in microseconds, and its count.
-    /// The controller's service-time estimate (S) is `Δsum / Δcount`; its
-    /// windowed minimum is the uncongested baseline (à la BBR min_rtt), and
-    /// inflation above that baseline is the origin-congestion back-off signal.
+    /// Per tick, `Δsum / Δcount` is the mean service time that scales an
+    /// upward probe's verify threshold, and `Δsum` over live worker time is
+    /// the utilization that drives shrink. No baseline is kept: a windowed
+    /// minimum loses to regime changes (ADR-052).
     task_us: AtomicU64,
     task_count: AtomicU64,
     /// Monotonic sum of queue wait, in microseconds, and its count. The

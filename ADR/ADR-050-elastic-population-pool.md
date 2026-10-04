@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted
+Accepted. Controller core (decision 3) superseded by ADR-052; queue, bounds, and
+writer-side pool mechanics stand.
 
 ## Context
 
