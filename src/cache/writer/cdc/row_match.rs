@@ -224,16 +224,16 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore};
-    use crate::oid::Oid;
+    use crate::oid::{Oid, TypeOid};
     use crate::query::ast::LiteralValue;
     use crate::query::cast::CastTarget;
 
     // Row layout: [id INT4 (PK), name TEXT, created_at TIMESTAMP].
     fn fixture_table() -> TableMetadata {
-        let column = |name: &str, position, type_oid, data_type, type_name: &str| ColumnMetadata {
+        let column = |name: &str, position, data_type: Type, type_name: &str| ColumnMetadata {
             name: name.into(),
             position,
-            type_oid,
+            type_oid: TypeOid::from_type(&data_type),
             data_type,
             type_name: type_name.into(),
             cache_type_name: type_name.into(),
@@ -246,9 +246,9 @@ mod tests {
             schema: "public".into(),
             primary_key_columns: vec!["id".into()],
             columns: ColumnStore::new([
-                column("id", 1, 23, Type::INT4, "int4"),
-                column("name", 2, 25, Type::TEXT, "text"),
-                column("created_at", 3, 1114, Type::TIMESTAMP, "timestamp"),
+                column("id", 1, Type::INT4, "int4"),
+                column("name", 2, Type::TEXT, "text"),
+                column("created_at", 3, Type::TIMESTAMP, "timestamp"),
             ]),
             indexes: Vec::new(),
         }

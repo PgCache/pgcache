@@ -84,6 +84,7 @@ mod tests {
     use postgres_types::Type as PgType;
 
     use super::*;
+    use crate::oid::TypeOid;
     use crate::query::ast::{BinaryOp, LiteralValue};
     use crate::query::write::RelationRef;
 
@@ -91,7 +92,7 @@ mod tests {
         let len = values.len();
         let (values, oids): (Vec<_>, Vec<_>) = values
             .into_iter()
-            .map(|(v, t)| (v.map(Bytes::copy_from_slice), t.oid()))
+            .map(|(v, t)| (v.map(Bytes::copy_from_slice), TypeOid::from_type(&t)))
             .unzip();
         QueryParameters {
             values,

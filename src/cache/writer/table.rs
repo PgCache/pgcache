@@ -9,7 +9,7 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::{
     ColumnMetadata, ColumnStore, IndexMetadata, TableMetadata, cache_type_name_resolve,
 };
-use crate::oid::Oid;
+use crate::oid::{Oid, TypeOid};
 use crate::result::error_chain_format;
 
 /// A column's resolved type triple — one resolution shared by both
@@ -25,12 +25,15 @@ impl WriterCore {
     /// Resolve a column type oid: builtin fast path via `Type::from_oid`,
     /// else origin catalog lookup (memoized per connection), then the
     /// cache-side type mapping.
-    pub(super) async fn column_type_resolve(&self, type_oid: u32) -> CacheResult<ColumnTypeInfo> {
-        let data_type = match Type::from_oid(type_oid) {
+    pub(super) async fn column_type_resolve(
+        &self,
+        type_oid: TypeOid,
+    ) -> CacheResult<ColumnTypeInfo> {
+        let data_type = match type_oid.pg_type() {
             Some(t) => t,
             None => self
                 .db_origin
-                .get_type(type_oid)
+                .get_type(type_oid.get())
                 .await
                 .map_into_report::<CacheError>()?,
         };
@@ -56,14 +59,14 @@ impl WriterCore {
         if metadata
             .columns
             .iter()
-            .all(|c| Type::from_oid(c.type_oid).is_some())
+            .all(|c| c.type_oid.pg_type().is_some())
         {
             return;
         }
 
         let mut columns: Vec<ColumnMetadata> = metadata.columns.iter().cloned().collect();
         for column in &mut columns {
-            if Type::from_oid(column.type_oid).is_some() {
+            if column.type_oid.pg_type().is_some() {
                 continue;
             }
             match self.column_type_resolve(column.type_oid).await {
@@ -119,7 +122,7 @@ impl WriterCore {
                 schema = Some(row.get("table_schema"));
             }
 
-            let type_oid: u32 = row.get("type_oid");
+            let type_oid: TypeOid = row.get("type_oid");
             let type_info = self.column_type_resolve(type_oid).await?;
             let pg_position: i64 = row.get("position");
 

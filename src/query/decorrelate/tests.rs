@@ -5,7 +5,7 @@ use postgres_types::Type;
 
 use super::*;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-use crate::oid::Oid;
+use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{Deparse, JoinType, UnaryOp, query_expr_parse};
 use crate::query::resolved::{
     ResolvedJoinNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumns,
@@ -20,7 +20,7 @@ fn test_table(name: &str, relation_oid: Oid, column_names: &[&str]) -> TableMeta
         ColumnMetadata {
             name: (*col_name).into(),
             position: i16::try_from(i + 1).expect("column position fits in i16"),
-            type_oid: if is_pk { 23 } else { 25 },
+            type_oid: TypeOid::from_raw(if is_pk { 23 } else { 25 }),
             data_type: if is_pk { Type::INT4 } else { Type::TEXT },
             type_name: if is_pk { "int4" } else { "text" }.into(),
             cache_type_name: if is_pk { "int4" } else { "text" }.into(),

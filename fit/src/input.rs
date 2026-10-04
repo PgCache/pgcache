@@ -6,6 +6,7 @@ use bytes::Bytes;
 use clap::ValueEnum;
 use ecow::EcoString;
 use pgcache_lib::cache::QueryParameters;
+use pgcache_lib::oid::TypeOid;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -486,8 +487,8 @@ fn pgss_read(content: &str) -> anyhow::Result<TraceRead> {
 /// written with inline literals. Returns the count of numeric inferences for
 /// the assumptions block.
 pub fn query_parameters_infer(values: &[Option<EcoString>]) -> (QueryParameters, usize) {
-    const OID_INT8: u32 = 20;
-    const OID_FLOAT8: u32 = 701;
+    const OID_INT8: TypeOid = TypeOid::from_raw(20);
+    const OID_FLOAT8: TypeOid = TypeOid::from_raw(701);
 
     let mut inferred = 0;
     let mut bytes_values = Vec::with_capacity(values.len());
@@ -496,7 +497,7 @@ pub fn query_parameters_infer(values: &[Option<EcoString>]) -> (QueryParameters,
         match value {
             None => {
                 bytes_values.push(None);
-                oids.push(0);
+                oids.push(TypeOid::UNSPECIFIED);
             }
             Some(text) => {
                 let oid = if text.parse::<i64>().is_ok() {
@@ -506,7 +507,7 @@ pub fn query_parameters_infer(values: &[Option<EcoString>]) -> (QueryParameters,
                     inferred += 1;
                     OID_FLOAT8
                 } else {
-                    0
+                    TypeOid::UNSPECIFIED
                 };
                 bytes_values.push(Some(Bytes::copy_from_slice(text.as_bytes())));
                 oids.push(oid);
@@ -674,7 +675,15 @@ query,calls,total_exec_time
             Some(EcoString::from("hello")),
             None,
         ]);
-        assert_eq!(params.oids, vec![20, 701, 0, 0]);
+        assert_eq!(
+            params.oids,
+            vec![
+                TypeOid::from_raw(20),
+                TypeOid::from_raw(701),
+                TypeOid::UNSPECIFIED,
+                TypeOid::UNSPECIFIED
+            ]
+        );
         assert_eq!(inferred, 2);
         assert_eq!(params.values[3], None);
     }

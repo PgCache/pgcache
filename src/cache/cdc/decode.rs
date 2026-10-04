@@ -13,7 +13,7 @@ use tracing::error;
 
 use crate::cache::messages::CdcValue;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata, cache_type_name_resolve};
-use crate::oid::Oid;
+use crate::oid::{Oid, TypeOid};
 use crate::pg::protocol::ByteString;
 
 /// Parse RelationBody into TableMetadata for cache registration.
@@ -29,8 +29,9 @@ pub(super) fn parse_relation_to_table_metadata(relation_body: &RelationBody) -> 
     for (idx, column) in relation_body.columns().iter().enumerate() {
         let is_primary_key = column.flags() == 1; // flags field is 1 when column is part of primary key
 
-        let type_oid = column.type_id().cast_unsigned();
-        let data_type = tokio_postgres::types::Type::from_oid(type_oid)
+        let type_oid = TypeOid::from_raw(column.type_id().cast_unsigned());
+        let data_type = type_oid
+            .pg_type()
             .unwrap_or(tokio_postgres::types::Type::TEXT); // Fallback for unknown types
 
         let type_name = data_type.name().to_owned();
@@ -41,7 +42,8 @@ pub(super) fn parse_relation_to_table_metadata(relation_body: &RelationBody) -> 
 
         let column_metadata = ColumnMetadata {
             name: column.name().unwrap_or("unknown_column").into(),
-            position: i16::try_from(idx + 1).expect("column position fits in i16"),
+            // PostgreSQL caps tables at 1600 columns.
+            position: i16::try_from(idx + 1).unwrap_or(i16::MAX),
             type_oid,
             data_type,
             type_name: type_name.into(),

@@ -113,6 +113,7 @@ mod tests {
 
     use super::*;
     use crate::cache::QueryParameters;
+    use crate::oid::TypeOid;
     use crate::query::ast::{WhereExpr, query_expr_fingerprint, query_expr_parse};
     use crate::query::transform::query_expr_parameters_replace;
 
@@ -240,7 +241,7 @@ mod tests {
         QueryParameters {
             values: vec![Some(Bytes::from(value.to_string().into_bytes()))],
             formats: vec![0],
-            oids: vec![PgType::INT8.oid()],
+            oids: vec![TypeOid::from_type(&PgType::INT8)],
         }
     }
 

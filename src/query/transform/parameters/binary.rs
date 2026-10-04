@@ -10,6 +10,7 @@ use postgres_protocol::types as pg_types;
 use postgres_types::{Kind, Type as PgType};
 use rootcause::Report;
 
+use crate::oid::TypeOid;
 use crate::query::ast::LiteralValue;
 use crate::query::transform::{AstTransformError, AstTransformResult};
 
@@ -41,7 +42,7 @@ fn length_invalid(type_name: &str, expected: usize, got: usize) -> Report<AstTra
     ))
 }
 
-fn unsupported(oid: u32) -> Report<AstTransformError> {
+fn unsupported(oid: TypeOid) -> Report<AstTransformError> {
     Report::from(AstTransformError::UnsupportedBinaryFormat { oid })
 }
 
@@ -78,9 +79,9 @@ fn float_literal(value: f64) -> AstTransformResult<LiteralValue> {
 
 pub(super) fn binary_parameter_to_literal(
     bytes: &[u8],
-    oid: u32,
+    oid: TypeOid,
 ) -> AstTransformResult<LiteralValue> {
-    if let Some(ty) = PgType::from_oid(oid)
+    if let Some(ty) = oid.pg_type()
         && matches!(ty.kind(), Kind::Array(_))
     {
         return binary_array_to_literal(bytes, oid);
@@ -90,8 +91,11 @@ pub(super) fn binary_parameter_to_literal(
 
 /// Unknown OIDs and types without a decoder route to
 /// `UnsupportedBinaryFormat` so the query falls through to origin uncached.
-fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
-    let Some(ty) = PgType::from_oid(oid) else {
+fn binary_parameter_to_literal_scalar(
+    bytes: &[u8],
+    oid: TypeOid,
+) -> AstTransformResult<LiteralValue> {
+    let Some(ty) = oid.pg_type() else {
         return Err(unsupported(oid));
     };
     if let Some(decoded) = kind_dispatch(bytes, &ty) {
@@ -110,7 +114,10 @@ fn binary_parameter_to_literal_scalar(bytes: &[u8], oid: u32) -> AstTransformRes
 fn kind_dispatch(bytes: &[u8], ty: &PgType) -> FamilyDecode {
     match ty.kind() {
         Kind::Simple => None,
-        Kind::Domain(base) => Some(binary_parameter_to_literal_scalar(bytes, base.oid())),
+        Kind::Domain(base) => Some(binary_parameter_to_literal_scalar(
+            bytes,
+            TypeOid::from_type(base),
+        )),
         Kind::Enum(_) => Some(
             std::str::from_utf8(bytes)
                 .map(|s| LiteralValue::String(s.into()))
@@ -120,9 +127,9 @@ fn kind_dispatch(bytes: &[u8], ty: &PgType) -> FamilyDecode {
         | Kind::Composite(_)
         | Kind::Range(_)
         | Kind::Multirange(_)
-        | Kind::Pseudo => Some(Err(unsupported(ty.oid()))),
+        | Kind::Pseudo => Some(Err(unsupported(TypeOid::from_type(ty)))),
         // `Kind` is `#[non_exhaustive]`; new variants must be opted in.
-        _ => Some(Err(unsupported(ty.oid()))),
+        _ => Some(Err(unsupported(TypeOid::from_type(ty)))),
     }
 }
 
@@ -325,7 +332,7 @@ fn network_decode(bytes: &[u8], ty: &PgType) -> FamilyDecode {
 /// scalar set (the same set `binary_parameter_to_literal` handles directly)
 /// return `UnsupportedBinaryFormat` so the caller can fall through to
 /// origin uncached.
-fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<LiteralValue> {
+fn binary_array_to_literal(bytes: &[u8], oid: TypeOid) -> AstTransformResult<LiteralValue> {
     let array = pg_types::array_from_sql(bytes).map_err(|e| invalid_param("array", e))?;
 
     // 1-D arrays only. Multi-dim falls through to origin uncached.
@@ -337,7 +344,7 @@ fn binary_array_to_literal(bytes: &[u8], oid: u32) -> AstTransformResult<Literal
     }
 
     let element_type = PgType::from_oid(array.element_type()).ok_or_else(|| unsupported(oid))?;
-    let element_oid = element_type.oid();
+    let element_oid = TypeOid::from_type(&element_type);
 
     // Element errors are remapped to the array OID — the query falls
     // through to origin uncached either way, but error context names the
@@ -369,6 +376,7 @@ mod tests {
         NUMERIC_NAN, NUMERIC_NEG, NUMERIC_NINF, NUMERIC_PINF, NUMERIC_POS, USECS_PER_DAY,
     };
     use crate::cache::{QueryParameter, QueryParameters};
+    use crate::oid::TypeOid;
     use crate::query::ast::{
         Deparse, LiteralValue, QueryBody, SelectNode, query_expr_fingerprint, query_expr_parse,
     };
@@ -389,7 +397,7 @@ mod tests {
         let len = values.len();
         let (values, oids): (Vec<_>, Vec<_>) = values
             .into_iter()
-            .map(|(v, t)| (v.map(Bytes::copy_from_slice), t.oid()))
+            .map(|(v, t)| (v.map(Bytes::copy_from_slice), TypeOid::from_type(&t)))
             .unzip();
         QueryParameters {
             values,
@@ -398,7 +406,7 @@ mod tests {
         }
     }
 
-    fn binary_param(bytes: &[u8], oid: u32) -> QueryParameter {
+    fn binary_param(bytes: &[u8], oid: TypeOid) -> QueryParameter {
         QueryParameter {
             value: Some(Bytes::copy_from_slice(bytes)),
             format: 1,
@@ -407,7 +415,8 @@ mod tests {
     }
 
     fn binary_decode(bytes: &[u8], ty: PgType) -> LiteralValue {
-        parameter_to_literal(&binary_param(bytes, ty.oid())).expect("decode binary parameter")
+        parameter_to_literal(&binary_param(bytes, TypeOid::from_type(&ty)))
+            .expect("decode binary parameter")
     }
 
     fn assert_binary_decodes(bytes: &[u8], ty: PgType, expected: LiteralValue) {
@@ -464,13 +473,13 @@ mod tests {
         LiteralValue::Array(elements, format!("{}[]", elem_type.name()).into())
     }
 
-    fn binary_decode_error(bytes: &[u8], oid: u32) -> AstTransformError {
+    fn binary_decode_error(bytes: &[u8], oid: TypeOid) -> AstTransformError {
         parameter_to_literal(&binary_param(bytes, oid))
             .expect_err("reject binary parameter")
             .into_current_context()
     }
 
-    fn assert_binary_unsupported(bytes: &[u8], oid: u32) {
+    fn assert_binary_unsupported(bytes: &[u8], oid: TypeOid) {
         let error = binary_decode_error(bytes, oid);
         assert!(
             matches!(error, AstTransformError::UnsupportedBinaryFormat { .. }),
@@ -478,7 +487,7 @@ mod tests {
         );
     }
 
-    fn assert_binary_invalid(bytes: &[u8], oid: u32) {
+    fn assert_binary_invalid(bytes: &[u8], oid: TypeOid) {
         let error = binary_decode_error(bytes, oid);
         assert!(
             matches!(error, AstTransformError::InvalidParameterValue { .. }),
@@ -641,32 +650,38 @@ mod tests {
     fn test_binary_parameter_unsupported_type_with_invalid_utf8() {
         // POINT has no decoder arm; bytes are arbitrary garbage. The
         // assertion is that the function rejects rather than coercing.
-        assert_binary_unsupported(&[0xFF, 0xFE], PgType::POINT.oid());
+        assert_binary_unsupported(&[0xFF, 0xFE], TypeOid::from_type(&PgType::POINT));
     }
 
     #[test]
     fn test_binary_parameter_range_rejected() {
         // `Kind::Range(Int4)`: builtin int4range. Even if the binary range
         // wire format happens to be valid UTF-8, the Kind dispatch rejects.
-        assert_binary_unsupported(&[0x01], PgType::INT4_RANGE.oid());
+        assert_binary_unsupported(&[0x01], TypeOid::from_type(&PgType::INT4_RANGE));
     }
 
     #[test]
     fn test_binary_parameter_multirange_rejected() {
-        assert_binary_unsupported(&[0x00, 0x00, 0x00, 0x00], PgType::INT4MULTI_RANGE.oid());
+        assert_binary_unsupported(
+            &[0x00, 0x00, 0x00, 0x00],
+            TypeOid::from_type(&PgType::INT4MULTI_RANGE),
+        );
     }
 
     #[test]
     fn test_binary_parameter_pseudo_rejected() {
         // `record` and `any` are both `Kind::Pseudo`; reject either.
-        assert_binary_unsupported(&[0x00, 0x00, 0x00, 0x01], PgType::RECORD.oid());
+        assert_binary_unsupported(
+            &[0x00, 0x00, 0x00, 0x01],
+            TypeOid::from_type(&PgType::RECORD),
+        );
     }
 
     #[test]
     fn test_binary_parameter_unknown_oid_rejected() {
         // OID that `PgType::from_oid` can't resolve falls through the Kind
         // dispatch into the fail-closed catch-all in the OID match.
-        assert_binary_unsupported(b"42", 999_999);
+        assert_binary_unsupported(b"42", TypeOid::from_raw(999_999));
     }
 
     #[test]
@@ -697,7 +712,7 @@ mod tests {
     fn test_binary_parameter_jsonb_unknown_version_rejected() {
         // Anything other than the documented 0x01 prefix is malformed.
         let bytes = [0x02, b'{', b'}'];
-        assert_binary_invalid(&bytes, PgType::JSONB.oid());
+        assert_binary_invalid(&bytes, TypeOid::from_type(&PgType::JSONB));
     }
 
     #[test]
@@ -806,7 +821,7 @@ mod tests {
 
     #[test]
     fn test_binary_timetz_invalid_length_rejected() {
-        assert_binary_invalid(&[0u8; 11], PgType::TIMETZ.oid());
+        assert_binary_invalid(&[0u8; 11], TypeOid::from_type(&PgType::TIMETZ));
     }
 
     #[test]
@@ -846,7 +861,7 @@ mod tests {
 
     #[test]
     fn test_binary_interval_invalid_length_rejected() {
-        assert_binary_invalid(&[0u8; 15], PgType::INTERVAL.oid());
+        assert_binary_invalid(&[0u8; 15], TypeOid::from_type(&PgType::INTERVAL));
     }
 
     #[test]
@@ -969,7 +984,10 @@ mod tests {
 
     #[test]
     fn test_binary_parameter_macaddr_invalid_length_rejected() {
-        assert_binary_invalid(&[0x00, 0x11, 0x22, 0x33, 0x44], PgType::MACADDR.oid());
+        assert_binary_invalid(
+            &[0x00, 0x11, 0x22, 0x33, 0x44],
+            TypeOid::from_type(&PgType::MACADDR),
+        );
     }
 
     #[test]
@@ -1111,7 +1129,10 @@ mod tests {
     #[test]
     fn test_binary_parameter_numeric_invalid_sign_rejected() {
         // 0xE000 isn't a defined sign code.
-        assert_binary_invalid(&numeric_bytes(0, 0xE000, 0, &[]), PgType::NUMERIC.oid());
+        assert_binary_invalid(
+            &numeric_bytes(0, 0xE000, 0, &[]),
+            TypeOid::from_type(&PgType::NUMERIC),
+        );
     }
 
     #[test]
@@ -1124,7 +1145,7 @@ mod tests {
         bytes.extend_from_slice(&0_u16.to_be_bytes());
         bytes.extend_from_slice(&0_i16.to_be_bytes());
 
-        assert_binary_invalid(&bytes, PgType::NUMERIC.oid());
+        assert_binary_invalid(&bytes, TypeOid::from_type(&PgType::NUMERIC));
     }
 
     #[test]
@@ -1137,7 +1158,7 @@ mod tests {
         bytes.extend_from_slice(&0_i16.to_be_bytes());
         bytes.extend_from_slice(&42_i16.to_be_bytes());
 
-        assert_binary_invalid(&bytes, PgType::NUMERIC.oid());
+        assert_binary_invalid(&bytes, TypeOid::from_type(&PgType::NUMERIC));
     }
 
     #[test]
@@ -1145,7 +1166,7 @@ mod tests {
         // 10000 is one past the legal max.
         assert_binary_invalid(
             &numeric_bytes(0, NUMERIC_POS, 0, &[10000]),
-            PgType::NUMERIC.oid(),
+            TypeOid::from_type(&PgType::NUMERIC),
         );
     }
 
@@ -1186,7 +1207,7 @@ mod tests {
         // catch-all rather than the Kind-dispatch path.
         assert_binary_unsupported(
             &[0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            PgType::POINT.oid(),
+            TypeOid::from_type(&PgType::POINT),
         );
     }
 
@@ -1195,7 +1216,7 @@ mod tests {
         let param = QueryParameter {
             value: None,
             format: 1,
-            oid: PgType::INT4.oid(),
+            oid: TypeOid::from_type(&PgType::INT4),
         };
         let result = parameter_to_literal(&param).expect("to convert parameter");
         assert_eq!(result, LiteralValue::Null);
@@ -1394,7 +1415,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
             0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x2A,
         ];
-        assert_binary_unsupported(&bytes, PgType::INT4_ARRAY.oid());
+        assert_binary_unsupported(&bytes, TypeOid::from_type(&PgType::INT4_ARRAY));
     }
 
     #[test]
@@ -1404,6 +1425,6 @@ mod tests {
         bytes.extend_from_slice(&16_i32.to_be_bytes());
         bytes.extend_from_slice(&[0u8; 16]);
 
-        assert_binary_unsupported(&bytes, PgType::POINT_ARRAY.oid());
+        assert_binary_unsupported(&bytes, TypeOid::from_type(&PgType::POINT_ARRAY));
     }
 }

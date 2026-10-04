@@ -5,7 +5,7 @@ use rootcause::Report;
 #[cfg(feature = "proxy")]
 use tokio_postgres::Error;
 
-use crate::oid::Oid;
+use crate::oid::{Oid, TypeOid};
 use crate::query::{
     decorrelate::DecorrelateError, resolved::ResolveError, transform::AstTransformError,
 };
@@ -145,7 +145,7 @@ error_set! {
         },
         #[display("Unknown type OID {type_oid} ('{type_name}') for column '{column_name}' in table '{table_name}'")]
         UnknownType {
-            type_oid: u32,
+            type_oid: TypeOid,
             type_name: String,
             column_name: String,
             table_name: String,

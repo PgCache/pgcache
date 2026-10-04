@@ -12,6 +12,7 @@ use tokio_util::bytes::Bytes;
 
 use super::ByteString;
 use crate::cache::query::CacheableQuery;
+use crate::oid::TypeOid;
 use crate::query::write::StatementEffects;
 
 /// Classification of a prepared statement based on SQL analysis
@@ -36,10 +37,10 @@ pub(crate) struct PreparedStatement {
     /// Parameter type OIDs as resolved by origin's `ParameterDescription`,
     /// falling back to the client-supplied OIDs until origin replies. Used
     /// for query fingerprinting under cacheable execution.
-    pub parameter_oids: Vec<u32>,
+    pub parameter_oids: Vec<TypeOid>,
     /// Immutable snapshot of the client-supplied OIDs from `Parse`. Used in
     /// the describe-cache key so populate and lookup hash identically.
-    pub client_parameter_oids: Vec<u32>,
+    pub client_parameter_oids: Vec<TypeOid>,
     pub sql_type: StatementType,
     /// Raw ParameterDescription bytes from origin, used for Describe('S') in
     /// pipeline. `Bytes` (not `BytesMut`): written once from origin, then only

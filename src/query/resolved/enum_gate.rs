@@ -300,7 +300,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-    use crate::oid::Oid;
+    use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
     use crate::query::resolved::query_expr_resolve;
 
@@ -321,7 +321,7 @@ mod tests {
         ColumnMetadata {
             name: name.into(),
             position,
-            type_oid: data_type.oid(),
+            type_oid: TypeOid::from_type(&data_type),
             data_type: data_type.clone(),
             type_name: data_type.name().into(),
             cache_type_name: match data_type.kind() {

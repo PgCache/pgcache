@@ -355,6 +355,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore};
+    use crate::oid::TypeOid;
 
     /// A table exercising every identifier hazard: mixed-case name,
     /// reserved-word column (`user`), mixed-case column, embedded quote.
@@ -362,7 +363,7 @@ mod tests {
         let column = |name: &str, position: i16, is_primary_key: bool| ColumnMetadata {
             name: name.into(),
             position,
-            type_oid: 25,
+            type_oid: TypeOid::from_raw(25),
             data_type: Type::TEXT,
             type_name: "text".into(),
             cache_type_name: "text".into(),

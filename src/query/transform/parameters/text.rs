@@ -5,16 +5,17 @@ use ordered_float::NotNan;
 use postgres_types::Type as PgType;
 use rootcause::Report;
 
+use crate::oid::TypeOid;
 use crate::query::ast::LiteralValue;
 use crate::query::transform::{AstTransformError, AstTransformResult};
 
 pub(super) fn text_parameter_to_literal(
     bytes: &[u8],
-    oid: u32,
+    oid: TypeOid,
 ) -> AstTransformResult<LiteralValue> {
     let s = std::str::from_utf8(bytes).map_err(|_| Report::from(AstTransformError::InvalidUtf8))?;
 
-    let pg_type = PgType::from_oid(oid);
+    let pg_type = oid.pg_type();
 
     match pg_type {
         Some(PgType::BOOL) => {
@@ -56,6 +57,7 @@ mod tests {
     use postgres_types::Type as PgType;
 
     use crate::cache::{QueryParameter, QueryParameters};
+    use crate::oid::TypeOid;
     use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_parse};
     use crate::query::transform::AstTransformError;
     use crate::query::transform::parameters::{
@@ -74,7 +76,7 @@ mod tests {
         let len = values.len();
         let (values, oids): (Vec<_>, Vec<_>) = values
             .into_iter()
-            .map(|(v, t)| (v.map(Bytes::copy_from_slice), t.oid()))
+            .map(|(v, t)| (v.map(Bytes::copy_from_slice), TypeOid::from_type(&t)))
             .unzip();
         QueryParameters {
             values,
@@ -121,7 +123,7 @@ mod tests {
         let param = QueryParameter {
             value: Some(Bytes::from_static(b"not_a_number")),
             format: 0,
-            oid: PgType::INT4.oid(),
+            oid: TypeOid::from_type(&PgType::INT4),
         };
 
         let result = parameter_to_literal(&param).map_err(|e| e.into_current_context());

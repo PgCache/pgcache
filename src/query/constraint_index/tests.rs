@@ -824,7 +824,7 @@ mod point {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-    use crate::oid::Oid;
+    use crate::oid::{Oid, TypeOid};
     use crate::pg::protocol::ByteString;
     use crate::query::constraint_index::point::{ColumnForms, row_value_forms};
     use crate::query::constraints::ColumnRange;
@@ -839,7 +839,7 @@ mod point {
             ColumnMetadata {
                 name: "id".into(),
                 position: 1,
-                type_oid: 23,
+                type_oid: TypeOid::from_raw(23),
                 data_type: Type::INT4,
                 type_name: "integer".into(),
                 cache_type_name: "int4".into(),
@@ -848,7 +848,7 @@ mod point {
             ColumnMetadata {
                 name: "name".into(),
                 position: 2,
-                type_oid: 25,
+                type_oid: TypeOid::from_raw(25),
                 data_type: Type::TEXT,
                 type_name: "text".into(),
                 cache_type_name: "text".into(),
@@ -857,7 +857,7 @@ mod point {
             ColumnMetadata {
                 name: "active".into(),
                 position: 3,
-                type_oid: 16,
+                type_oid: TypeOid::from_raw(16),
                 data_type: Type::BOOL,
                 type_name: "boolean".into(),
                 cache_type_name: "bool".into(),

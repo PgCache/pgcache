@@ -9,6 +9,8 @@ use ecow::EcoString;
 use error_set::error_set;
 use rootcause::Report;
 
+use crate::oid::TypeOid;
+
 error_set! {
     AstTransformError := {
         MissingTable,
@@ -21,7 +23,7 @@ error_set! {
         #[display("Invalid parameter value: {message}")]
         InvalidParameterValue { message: String },
         #[display("Unsupported binary format for OID {oid}")]
-        UnsupportedBinaryFormat { oid: u32 },
+        UnsupportedBinaryFormat { oid: TypeOid },
         #[display("Table {table} is re-opened under the same alias in a subquery")]
         ShadowedTable { table: EcoString },
         #[display("Table {table} occurs more than once (self-join); a single-occurrence substitution is not a complete membership test")]

@@ -379,6 +379,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::oid::TypeOid;
     use crate::query::ast::{LiteralValue, query_expr_parse};
     use crate::query::resolved::query_expr_resolve;
 
@@ -395,7 +396,7 @@ mod tests {
                     .map(|(i, col_name)| ColumnMetadata {
                         name: (*col_name).into(),
                         position: i16::try_from(i + 1).expect("column position fits in i16"),
-                        type_oid: 25,
+                        type_oid: TypeOid::from_raw(25),
                         data_type: Type::TEXT,
                         type_name: "text".into(),
                         cache_type_name: "text".into(),

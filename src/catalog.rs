@@ -15,7 +15,7 @@ use postgres_types::{Kind, Type};
 use tokio_postgres::{Client, Error};
 
 use crate::cache::CacheError;
-use crate::oid::Oid;
+use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{ColumnNode, ScalarExpr, SelectColumn, SelectColumns, TableAlias};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
@@ -219,7 +219,7 @@ pub struct ColumnMetadata {
     /// 1-based position in table (matches PostgreSQL attnum)
     pub position: i16,
     /// PostgreSQL type OID (original from origin database, used in RowDescription)
-    pub type_oid: u32,
+    pub type_oid: TypeOid,
     /// Parsed PostgreSQL type (may be Domain, Enum, etc.)
     pub data_type: Type,
     /// Human-readable type name from origin (e.g., "year", "mood")

@@ -7,7 +7,7 @@ use super::extract::analyze_query_constraints;
 use super::subsume::table_constraints_subsumed;
 use super::*;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-use crate::oid::Oid;
+use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{QueryBody, query_expr_parse};
 use crate::query::resolved::{ResolvedSelectNode, select_node_resolve};
 
@@ -26,7 +26,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
         ColumnMetadata {
             name: "id".into(),
             position: 1,
-            type_oid: 23,
+            type_oid: TypeOid::from_raw(23),
             data_type: Type::INT4,
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
@@ -35,7 +35,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
         ColumnMetadata {
             name: "name".into(),
             position: 2,
-            type_oid: 25,
+            type_oid: TypeOid::from_raw(25),
             data_type: Type::TEXT,
             type_name: "text".into(),
             cache_type_name: "text".into(),
@@ -161,7 +161,7 @@ fn test_transitive_propagation() {
         columns: ColumnStore::new([ColumnMetadata {
             name: "id".into(),
             position: 1,
-            type_oid: 23,
+            type_oid: TypeOid::from_raw(23),
             data_type: Type::INT4,
             type_name: "int4".into(),
             cache_type_name: "int4".into(),

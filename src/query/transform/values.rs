@@ -525,6 +525,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::oid::TypeOid;
     use crate::query::ast::{
         BinaryOp, Deparse, JoinType, LiteralValue, QueryBody, query_expr_parse,
     };
@@ -537,8 +538,8 @@ mod tests {
 
     fn column_metadata(name: &str, position: i16, type_name: &str) -> ColumnMetadata {
         let (type_oid, data_type) = match type_name {
-            "int4" => (23, Type::INT4),
-            _ => (25, Type::TEXT),
+            "int4" => (TypeOid::from_type(&Type::INT4), Type::INT4),
+            _ => (TypeOid::from_type(&Type::TEXT), Type::TEXT),
         };
         ColumnMetadata {
             name: name.into(),

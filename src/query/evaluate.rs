@@ -381,6 +381,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::oid::TypeOid;
     use crate::query::ast::{BinaryOp, LiteralValue, MultiOp, SubLinkType, UnaryOp};
     use crate::query::predicate::CompiledPredicate;
     use crate::query::resolved::{
@@ -397,7 +398,7 @@ mod tests {
             ColumnMetadata {
                 name: "id".into(),
                 position: 1,
-                type_oid: 23,
+                type_oid: TypeOid::from_raw(23),
                 data_type: Type::INT4,
                 type_name: "integer".into(),
                 cache_type_name: "int4".into(),
@@ -406,7 +407,7 @@ mod tests {
             ColumnMetadata {
                 name: "name".into(),
                 position: 2,
-                type_oid: 25,
+                type_oid: TypeOid::from_raw(25),
                 data_type: Type::TEXT,
                 type_name: "text".into(),
                 cache_type_name: "text".into(),
@@ -415,7 +416,7 @@ mod tests {
             ColumnMetadata {
                 name: "active".into(),
                 position: 3,
-                type_oid: 16,
+                type_oid: TypeOid::from_raw(16),
                 data_type: Type::BOOL,
                 type_name: "boolean".into(),
                 cache_type_name: "bool".into(),
@@ -441,7 +442,7 @@ mod tests {
             ColumnMetadata {
                 name: "id".into(),
                 position: 1,
-                type_oid: 23,
+                type_oid: TypeOid::from_raw(23),
                 data_type: Type::INT4,
                 type_name: "integer".into(),
                 cache_type_name: "int4".into(),
@@ -450,7 +451,7 @@ mod tests {
             ColumnMetadata {
                 name: "name".into(),
                 position: 2,
-                type_oid: 25,
+                type_oid: TypeOid::from_raw(25),
                 data_type: Type::TEXT,
                 type_name: "text".into(),
                 cache_type_name: "text".into(),
@@ -459,7 +460,7 @@ mod tests {
             ColumnMetadata {
                 name: "created_at".into(),
                 position: 3,
-                type_oid: 1114,
+                type_oid: TypeOid::from_raw(1114),
                 data_type: Type::TIMESTAMP,
                 type_name: "timestamp".into(),
                 cache_type_name: "timestamp".into(),
@@ -468,7 +469,7 @@ mod tests {
             ColumnMetadata {
                 name: "received_at".into(),
                 position: 4,
-                type_oid: 1184,
+                type_oid: TypeOid::from_raw(1184),
                 data_type: Type::TIMESTAMPTZ,
                 type_name: "timestamptz".into(),
                 cache_type_name: "timestamptz".into(),
@@ -2069,7 +2070,7 @@ mod tests {
         cols.push(ColumnMetadata {
             name: "price".into(),
             position: 4,
-            type_oid: 701,
+            type_oid: TypeOid::from_raw(701),
             data_type: Type::FLOAT8,
             type_name: "double precision".into(),
             cache_type_name: "float8".into(),

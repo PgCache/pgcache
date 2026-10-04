@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use ecow::EcoString;
 use iddqd::BiHashMap;
 use pgcache_lib::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-use pgcache_lib::oid::Oid;
+use pgcache_lib::oid::{Oid, TypeOid};
 use pgcache_lib::query::ast::{
     AstNode, ColumnNode, JoinQual, LiteralValue, OrderByClause, QueryBody, QueryExpr, ScalarExpr,
     SelectColumn, SelectColumns, SelectNode, TableSource, WhereExpr,
@@ -423,27 +423,27 @@ impl Synthesizer {
 
             let columns = ColumnStore::new(column_names.iter().enumerate().map(|(i, name)| {
                 let is_primary_key = *name == primary_key;
-                let (type_oid, data_type, type_name) = match facts.evidence.get(name) {
+                let (data_type, type_name) = match facts.evidence.get(name) {
                     Some(TypeEvidence::Integer) => {
                         stats.inferred_columns += 1;
-                        (20, Type::INT8, "int8")
+                        (Type::INT8, "int8")
                     }
                     Some(TypeEvidence::Float) => {
                         stats.inferred_columns += 1;
-                        (701, Type::FLOAT8, "float8")
+                        (Type::FLOAT8, "float8")
                     }
-                    Some(TypeEvidence::Text) => (25, Type::TEXT, "text"),
+                    Some(TypeEvidence::Text) => (Type::TEXT, "text"),
                     Some(TypeEvidence::Conflicted) => {
                         stats.conflicted_columns += 1;
-                        (25, Type::TEXT, "text")
+                        (Type::TEXT, "text")
                     }
-                    None if is_primary_key => (23, Type::INT4, "int4"),
-                    None => (25, Type::TEXT, "text"),
+                    None if is_primary_key => (Type::INT4, "int4"),
+                    None => (Type::TEXT, "text"),
                 };
                 ColumnMetadata {
                     name: name.clone(),
                     position: i16::try_from(i + 1).unwrap_or(i16::MAX),
-                    type_oid,
+                    type_oid: TypeOid::from_type(&data_type),
                     data_type,
                     type_name: type_name.into(),
                     cache_type_name: type_name.into(),

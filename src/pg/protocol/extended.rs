@@ -3,6 +3,7 @@ use tokio_util::bytes::{Buf, Bytes, BytesMut};
 
 use super::session::ResultFormats;
 use super::{ByteString, ProtocolError, ProtocolResult};
+use crate::oid::TypeOid;
 
 /// Convert a wire-protocol count (`i16` or `i32`) into a `usize`, returning a parse
 /// error for negative values rather than silently sign-extending into a huge length.
@@ -26,7 +27,7 @@ pub(crate) struct ParsedParseMessage {
     pub statement_name: EcoString,
     /// Zero-copy view into the Parse frame passed to `parse_parse_message`.
     pub sql: ByteString,
-    pub parameter_oids: Vec<u32>,
+    pub parameter_oids: Vec<TypeOid>,
 }
 
 /// Parsed Bind message data
@@ -63,7 +64,7 @@ pub(crate) struct ParsedDescribeMessage {
 /// Parsed ParameterDescription message data (backend response)
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedParameterDescription {
-    pub parameter_oids: Vec<u32>,
+    pub parameter_oids: Vec<TypeOid>,
 }
 
 /// Parsed Close message data
@@ -145,7 +146,7 @@ pub(crate) fn parse_parse_message(data: &Bytes) -> ProtocolResult<ParsedParseMes
             ))
             .into());
         }
-        parameter_oids.push(buf.get_u32());
+        parameter_oids.push(TypeOid::from_raw(buf.get_u32()));
     }
 
     Ok(ParsedParseMessage {
@@ -436,7 +437,7 @@ pub(crate) fn parse_parameter_description(
             ))
             .into());
         }
-        parameter_oids.push(buf.get_u32());
+        parameter_oids.push(TypeOid::from_raw(buf.get_u32()));
     }
 
     Ok(ParsedParameterDescription { parameter_oids })
@@ -482,7 +483,10 @@ mod tests {
         let result = parse_parse_message(&data.freeze()).unwrap();
         assert_eq!(result.statement_name, "");
         assert_eq!(result.sql, "SELECT $1, $2");
-        assert_eq!(result.parameter_oids, vec![23, 25]);
+        assert_eq!(
+            result.parameter_oids,
+            vec![TypeOid::from_raw(23), TypeOid::from_raw(25)]
+        );
     }
 
     #[test]
@@ -639,7 +643,7 @@ mod tests {
         let result = parse_parse_message(&data.freeze()).unwrap();
         assert_eq!(result.statement_name, "stmt1");
         assert_eq!(result.sql, "SELECT id, data FROM test WHERE id = $1");
-        assert_eq!(result.parameter_oids, vec![23]);
+        assert_eq!(result.parameter_oids, vec![TypeOid::from_raw(23)]);
 
         // Test that this SQL would be cacheable
         let query = query_expr_parse(&result.sql).unwrap();

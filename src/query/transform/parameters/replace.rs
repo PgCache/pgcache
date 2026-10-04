@@ -104,6 +104,7 @@ mod tests {
 
     use super::{query_expr_parameters_replace, select_node_parameters_replace};
     use crate::cache::QueryParameters;
+    use crate::oid::TypeOid;
     use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_parse};
     use crate::query::transform::AstTransformError;
 
@@ -123,7 +124,7 @@ mod tests {
                 .map(|v| v.map(Bytes::copy_from_slice))
                 .collect(),
             formats: vec![0; len],
-            oids: vec![PgType::TEXT.oid(); len],
+            oids: vec![TypeOid::from_type(&PgType::TEXT); len],
         }
     }
 
@@ -131,7 +132,7 @@ mod tests {
         let len = values.len();
         let (values, oids): (Vec<_>, Vec<_>) = values
             .into_iter()
-            .map(|(v, t)| (v.map(Bytes::copy_from_slice), t.oid()))
+            .map(|(v, t)| (v.map(Bytes::copy_from_slice), TypeOid::from_type(&t)))
             .unzip();
         QueryParameters {
             values,

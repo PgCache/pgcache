@@ -9,7 +9,7 @@ use postgres_types::Type;
 use super::entry::query_expr_resolve_scoped;
 use super::join_using::MergedJoinColumn;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-use crate::oid::Oid;
+use crate::oid::{Oid, TypeOid};
 use crate::query::ast::QueryExpr;
 use crate::query::resolved::{
     ResolveResult, ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
@@ -282,7 +282,7 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                     | ResolvedScalarExpr::TypeCast { .. } => ColumnMetadata {
                         name: name.clone(),
                         position: i16::try_from(i + 1).expect("column position fits in i16"),
-                        type_oid: 25, // TEXT OID
+                        type_oid: TypeOid::from_raw(25), // TEXT OID
                         data_type: Type::TEXT,
                         type_name: EcoString::from("text"),
                         cache_type_name: EcoString::from("text"),

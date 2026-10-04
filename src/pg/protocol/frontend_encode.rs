@@ -10,14 +10,15 @@ use ecow::EcoString;
 use tokio_util::bytes::{BufMut, BytesMut};
 
 use crate::cache::{CacheError, CacheResult};
+use crate::oid::TypeOid;
 use crate::query::ShapeKey;
 use crate::query::ast::LiteralValue;
 
 /// Postgres `int8` (bigint) type OID, declared for the parameterized
 /// `LIMIT $1 OFFSET $2` placeholders so the planner doesn't have to infer it.
-pub(crate) const INT8_OID: u32 = 20;
+pub(crate) const INT8_OID: TypeOid = TypeOid::from_raw(20);
 /// Postgres `text` type OID, declared for the `set_config` value parameter.
-pub(crate) const TEXT_OID: u32 = 25;
+pub(crate) const TEXT_OID: TypeOid = TypeOid::from_raw(25);
 
 /// Prepared statement (one per connection) that stamps the query generation
 /// before a serve. `set_config(...)` takes a bound parameter (a bare `SET`
@@ -126,7 +127,7 @@ pub(crate) fn extended_query_build(
     sql: &str,
     send_parse: bool,
     literal_params: &[LiteralValue],
-    tail_param_oids: &[u32],
+    tail_param_oids: &[TypeOid],
     tail_params: &[Option<&str>],
     include_describe: bool,
     binary_results: bool,
@@ -144,7 +145,7 @@ pub(crate) fn extended_query_build(
                 b.put_u32(0); // inferred from context
             }
             for &oid in tail_param_oids {
-                b.put_u32(oid);
+                b.put_u32(oid.get());
             }
             Ok(())
         })?;

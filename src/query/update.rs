@@ -76,6 +76,7 @@ mod tests {
     use crate::cache::SubqueryKind;
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::oid::TypeOid;
     use crate::query::ast::{Deparse, query_expr_parse};
     use crate::query::resolved::query_expr_resolve;
 
@@ -93,7 +94,7 @@ mod tests {
             ColumnMetadata {
                 name: (*col_name).into(),
                 position: i16::try_from(i + 1).expect("column position fits in i16"),
-                type_oid: if is_pk { 23 } else { 25 },
+                type_oid: TypeOid::from_raw(if is_pk { 23 } else { 25 }),
                 data_type: if is_pk { Type::INT4 } else { Type::TEXT },
                 type_name: if is_pk { "int4" } else { "text" }.into(),
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),

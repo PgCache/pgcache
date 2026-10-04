@@ -566,7 +566,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-    use crate::oid::Oid;
+    use crate::oid::{Oid, TypeOid};
     use crate::query::ast::{
         AstNode, ColumnNode, FunctionCall, QueryExpr, SelectNode, SetOpNode, SetOpType, TableNode,
         query_expr_parse,
@@ -579,7 +579,7 @@ mod tests {
             ColumnMetadata {
                 name: (*c).into(),
                 position: i16::try_from(i + 1).expect("column position fits in i16"),
-                type_oid: if is_pk { 23 } else { 25 },
+                type_oid: TypeOid::from_raw(if is_pk { 23 } else { 25 }),
                 data_type: if is_pk { Type::INT4 } else { Type::TEXT },
                 type_name: if is_pk { "int4" } else { "text" }.into(),
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),

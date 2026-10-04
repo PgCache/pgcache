@@ -3,6 +3,7 @@ use std::num::NonZeroUsize;
 use tokio_util::bytes::{BufMut, Bytes, BytesMut};
 
 use super::ConnectionState;
+use crate::oid::TypeOid;
 use crate::pg::protocol::{
     ByteString,
     encode::{NO_DATA_MSG, PARSE_COMPLETE_MSG, READY_FOR_QUERY_IDLE_MSG},
@@ -19,7 +20,7 @@ pub(super) const DESCRIBE_CACHE_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub(super) struct DescribeKey {
     pub(super) sql: ByteString,
-    pub(super) parameter_oids: Vec<u32>,
+    pub(super) parameter_oids: Vec<TypeOid>,
 }
 
 /// `row_description` is `None` when origin returned `NoData`.
@@ -29,7 +30,7 @@ pub(super) struct DescribeCacheEntry {
     pub(super) row_description: Option<Bytes>,
     /// Origin-resolved parameter OIDs, parsed once from `parameter_description`
     /// at populate time (`None` if it didn't parse).
-    pub(super) parameter_oids: Option<Vec<u32>>,
+    pub(super) parameter_oids: Option<Vec<TypeOid>>,
     /// Pre-assembled ParseComplete + ParameterDescription + (RowDescription |
     /// NoData) + ReadyForQuery('I') — a synth hit serves a refcount clone of
     /// this instead of building the response per hit.

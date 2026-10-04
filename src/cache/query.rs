@@ -7,6 +7,7 @@ use error_set::error_set;
 
 #[cfg(test)]
 use crate::oid::Oid;
+use crate::oid::TypeOid;
 use crate::query::transform::{AstTransformResult, query_expr_parameters_replace};
 use crate::{
     catalog::FunctionVolatility,
@@ -748,7 +749,7 @@ mod tests {
             ColumnMetadata {
                 name: (*col_name).into(),
                 position: i16::try_from(i + 1).expect("column position fits in i16"),
-                type_oid: if is_pk { 23 } else { 25 },
+                type_oid: TypeOid::from_raw(if is_pk { 23 } else { 25 }),
                 data_type: if is_pk { Type::INT4 } else { Type::TEXT },
                 type_name: if is_pk { "int4" } else { "text" }.into(),
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),
@@ -1662,7 +1663,7 @@ mod tests {
 pub struct QueryParameters {
     pub values: Vec<Option<Bytes>>,
     pub formats: Vec<i16>,
-    pub oids: Vec<u32>,
+    pub oids: Vec<TypeOid>,
 }
 
 impl QueryParameters {
@@ -1680,7 +1681,7 @@ impl QueryParameters {
             codes => *codes.get(index)?,
         };
         let oid = match self.oids.as_slice() {
-            [] => 0,
+            [] => TypeOid::UNSPECIFIED,
             [single] => *single,
             oids => *oids.get(index)?,
         };
@@ -1705,5 +1706,5 @@ impl QueryParameters {
 pub struct QueryParameter {
     pub value: Option<Bytes>,
     pub format: i16,
-    pub oid: u32,
+    pub oid: TypeOid,
 }

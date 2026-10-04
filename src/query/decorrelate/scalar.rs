@@ -14,6 +14,7 @@ use super::{
 };
 use crate::cache::SubqueryKind;
 use crate::catalog::ColumnMetadata;
+use crate::oid::TypeOid;
 use crate::query::ast::{BinaryOp, JoinType, SubLinkType, TableAlias};
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedJoinQual, ResolvedQueryBody,
@@ -100,7 +101,7 @@ fn synthetic_text_metadata(name: &str, position: i16) -> ColumnMetadata {
     ColumnMetadata {
         name: EcoString::from(name),
         position,
-        type_oid: 25,
+        type_oid: TypeOid::from_raw(25),
         data_type: Type::TEXT,
         type_name: EcoString::from("text"),
         cache_type_name: EcoString::from("text"),

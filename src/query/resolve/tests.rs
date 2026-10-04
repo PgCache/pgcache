@@ -5,7 +5,7 @@ use postgres_types::Type;
 
 use super::*;
 use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
-use crate::oid::Oid;
+use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{
     AstNode, BinaryOp, Deparse, JoinType, LiteralValue, OrderDirection, SelectNode, SubLinkType,
 };
@@ -63,7 +63,7 @@ fn test_resolved_column_node_construction() {
         column_metadata: ColumnMetadata {
             name: "id".into(),
             position: 1,
-            type_oid: 23,
+            type_oid: TypeOid::from_raw(23),
             data_type: Type::INT4,
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
@@ -97,7 +97,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
         ColumnMetadata {
             name: "id".into(),
             position: 1,
-            type_oid: 23,
+            type_oid: TypeOid::from_raw(23),
             data_type: Type::INT4,
             type_name: "int4".into(),
             cache_type_name: "int4".into(),
@@ -106,7 +106,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
         ColumnMetadata {
             name: "name".into(),
             position: 2,
-            type_oid: 25,
+            type_oid: TypeOid::from_raw(25),
             data_type: Type::TEXT,
             type_name: "text".into(),
             cache_type_name: "text".into(),
@@ -139,7 +139,7 @@ fn test_table_metadata_with_columns(
                 .map(|(i, col_name)| ColumnMetadata {
                     name: (*col_name).into(),
                     position: i16::try_from(i + 1).expect("column position fits in i16"),
-                    type_oid: 25,
+                    type_oid: TypeOid::from_raw(25),
                     data_type: Type::TEXT,
                     type_name: "text".into(),
                     cache_type_name: "text".into(),
@@ -939,7 +939,7 @@ fn id_column_metadata() -> ColumnMetadata {
     ColumnMetadata {
         name: "id".into(),
         position: 1,
-        type_oid: 23,
+        type_oid: TypeOid::from_raw(23),
         data_type: Type::INT4,
         type_name: "int4".into(),
         cache_type_name: "int4".into(),

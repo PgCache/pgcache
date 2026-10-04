@@ -49,6 +49,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::ColumnMetadata;
+    use crate::oid::TypeOid;
     use crate::query::ast::{BinaryOp, LiteralValue};
     use crate::query::resolved::{
         ResolvedBinaryExpr, ResolvedColumnNode, ResolvedScalarExpr, ResolvedTableNode,
@@ -60,7 +61,7 @@ mod tests {
         let col_meta = ColumnMetadata {
             name: "status".into(),
             position: 1,
-            type_oid: 25,
+            type_oid: TypeOid::from_raw(25),
             data_type: Type::TEXT,
             type_name: "text".into(),
             cache_type_name: "text".into(),
