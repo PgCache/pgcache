@@ -60,7 +60,9 @@ async fn test_request_coalescing() -> Result<(), Error> {
     // Wait for population to finish and metrics to settle
     ctx.cache_settle().await?;
 
-    let m_after = ctx.metrics().await?;
+    let m_after = ctx
+        .metrics_after_outcomes(&m_before, num_clients as u64)
+        .await?;
     let delta = metrics_delta(&m_before, &m_after);
 
     // All N queries should have been processed

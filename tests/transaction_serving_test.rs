@@ -61,7 +61,7 @@ async fn test_in_transaction_read_served_with_transaction_status() -> Result<(),
         b'T',
         "a cache-served read inside a block must report in-transaction status"
     );
-    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
     assert_eq!(delta.queries_cache_hit, 1, "expected an in-txn cache hit");
     assert_eq!(delta.txn_served, 1);
 
@@ -101,7 +101,7 @@ async fn test_in_transaction_own_write_intersection_forwards_disjoint_serves() -
     let before = ctx.metrics().await?;
     let res = ctx.simple_query(READ_TWO).await?;
     assert_row_at(&res, 1, &[("v", "20")])?;
-    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
     assert_eq!(delta.queries_cache_hit, 1, "disjoint read must serve");
     assert_eq!(delta.txn_served, 1);
 
@@ -189,7 +189,7 @@ async fn test_strict_isolation_forwards_read_committed_serves() -> Result<(), Er
         .await?;
     ctx.simple_query("BEGIN").await?;
     ctx.simple_query(READ_ONE).await?;
-    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
     assert!(delta.txn_isolation_probes >= 1, "expected a re-probe");
     assert_eq!(delta.queries_cache_hit, 1, "READ COMMITTED serves again");
     assert_eq!(delta.txn_served, 1);
@@ -283,7 +283,7 @@ async fn test_extended_protocol_read_in_transaction_served() -> Result<(), Error
     let before = ctx.metrics().await?;
     let rows = txn.query(&stmt, &[]).await.map_err(Error::other)?;
     assert_eq!(rows[0].get::<_, i32>(0), 10);
-    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
     assert_eq!(delta.queries_cache_hit, 1);
     assert_eq!(delta.txn_served, 1);
     txn.execute("UPDATE txn_items SET v = 12 WHERE id = 2", &[])
@@ -315,7 +315,7 @@ async fn test_pipelined_begin_then_read_reports_transaction_status() -> Result<(
     let read = wire.response_read().await?;
     assert_eq!(read.data_row_count(), 1);
     assert_eq!(read.ready_status(), b'T');
-    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
     assert_eq!(delta.queries_cache_hit, 1);
     assert_eq!(delta.txn_served, 1);
     let rollback = wire.query("ROLLBACK").await?;

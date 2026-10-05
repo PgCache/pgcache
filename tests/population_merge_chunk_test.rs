@@ -137,7 +137,7 @@ async fn test_cdc_applies_between_merge_chunks() -> Result<(), Error> {
     loop {
         let before = ctx.metrics().await?;
         let served = ctx.simple_query(q1).await?;
-        let after = ctx.metrics().await?;
+        let after = ctx.metrics_after_outcomes(&before, 1).await?;
         let ids: Vec<String> = served
             .iter()
             .filter_map(|m| match m {
@@ -178,7 +178,7 @@ async fn test_cdc_applies_between_merge_chunks() -> Result<(), Error> {
         .await?;
     let before = ctx.metrics().await?;
     let count = first_cell(&ctx.simple_query(q2).await?).unwrap_or_default();
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&before, 1).await?;
     assert_eq!(count, POPULATED_ROWS.to_string());
     assert_eq!(after.queries_cache_hit - before.queries_cache_hit, 1);
     Ok(())
@@ -207,7 +207,7 @@ async fn test_delete_between_chunks_is_not_resurrected() -> Result<(), Error> {
     ctx.cdc_apply_settle().await?;
     let before = ctx.metrics().await?;
     let count = first_cell(&ctx.simple_query(q2).await?).unwrap_or_default();
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&before, 1).await?;
     assert_eq!(
         count,
         (POPULATED_ROWS - 1).to_string(),
@@ -284,7 +284,7 @@ async fn test_abandoned_merge_discards_staging_in_chunks() -> Result<(), Error> 
     loop {
         let before = ctx.metrics().await?;
         let served = ctx.simple_query(q1).await?;
-        let after = ctx.metrics().await?;
+        let after = ctx.metrics_after_outcomes(&before, 1).await?;
         let ids: Vec<String> = served
             .iter()
             .filter_map(|m| match m {

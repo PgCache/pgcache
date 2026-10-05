@@ -363,7 +363,7 @@ async fn test_pgproto_multi_execute() -> Result<(), Error> {
         1,
         "expected one RFQ for the batch:\n{output}"
     );
-    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 2).await?);
     assert_eq!(
         delta.queries_cache_hit, 2,
         "expected both executes served from cache, got {}",

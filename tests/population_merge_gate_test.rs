@@ -97,7 +97,7 @@ async fn test_population_merge_does_not_expose_future_rows() -> Result<(), Error
     loop {
         let before = ctx.metrics().await?;
         let served = ctx.simple_query(q1).await?;
-        let after = ctx.metrics().await?;
+        let after = ctx.metrics_after_outcomes(&before, 1).await?;
         let rows = id_v_rows(&served);
         if rows.iter().any(|(id, _)| id == "2") {
             let a = rows

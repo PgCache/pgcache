@@ -2,7 +2,8 @@ use std::io::Error;
 
 use crate::util::{
     TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, cache_settle_at,
-    connect_cache_db, connect_pgcache_tls, metrics_http_get, start_databases,
+    connect_cache_db, connect_pgcache_tls, metrics_after_outcomes, metrics_http_get,
+    start_databases,
 };
 
 mod util;
@@ -561,6 +562,7 @@ async fn test_client_tls() -> Result<(), Error> {
     cache_settle_at(metrics_port, std::time::Duration::from_secs(5)).await?;
 
     // Second query - should be a cache hit
+    let before_hit = metrics_http_get(metrics_port).await?;
     let rows = client
         .query("SELECT id, data FROM tls_test WHERE id = $1", &[&1i32])
         .await
@@ -573,7 +575,7 @@ async fn test_client_tls() -> Result<(), Error> {
     assert_eq!(data, "encrypted");
 
     // Verify metrics show 1 cache hit
-    let metrics = metrics_http_get(metrics_port).await?;
+    let metrics = metrics_after_outcomes(metrics_port, &before_hit, 1).await?;
     assert_eq!(metrics.queries_cache_hit, 1, "Expected 1 cache hit");
     assert_eq!(metrics.queries_cache_miss, 1, "Expected 1 cache miss");
 

@@ -17,7 +17,7 @@ mod util;
 async fn probe(ctx: &mut TestContext, sql: &str) -> Result<(u64, u64), Error> {
     let before = ctx.metrics().await?;
     ctx.simple_query(sql).await?;
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&before, 1).await?;
     Ok((
         after.queries_cache_hit - before.queries_cache_hit,
         after.queries_cache_miss - before.queries_cache_miss,

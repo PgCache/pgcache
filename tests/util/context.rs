@@ -270,6 +270,16 @@ impl TestContext {
         super::metrics::metrics_http_get(self.metrics_port).await
     }
 
+    /// Metrics once `outcomes` cache outcomes have been recorded since
+    /// `before` (see [`super::metrics::metrics_after_outcomes`]).
+    pub(crate) async fn metrics_after_outcomes(
+        &self,
+        before: &MetricsSnapshot,
+        outcomes: u64,
+    ) -> Result<MetricsSnapshot, Error> {
+        super::metrics::metrics_after_outcomes(self.metrics_port, before, outcomes).await
+    }
+
     /// Prepare a statement through pgcache proxy
     pub(crate) async fn prepare(&self, query: &str) -> Result<Statement, Error> {
         self.cache.prepare(query).await.map_err(Error::other)

@@ -72,7 +72,7 @@ async fn test_eviction_does_not_strand_a_pinned_query_mid_population() -> Result
 
     let before = ctx.metrics().await?;
     ctx.simple_query(pinned).await?;
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&before, 1).await?;
     assert_eq!(
         after.queries_cache_hit - before.queries_cache_hit,
         1,

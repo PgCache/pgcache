@@ -90,7 +90,9 @@ async fn measure(
         h.await.map_err(Error::other)??;
     }
 
-    let m_post = ctx.metrics().await?;
+    let outcomes = u64::try_from(concurrency * sqls.len()).expect("query count fits u64")
+        * u64::try_from(pages_per_worker).expect("page count is non-negative");
+    let m_post = ctx.metrics_after_outcomes(&m_pre, outcomes).await?;
     let commit_post = origin_xact_commit(ctx).await?;
 
     Ok((

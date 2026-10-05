@@ -75,7 +75,7 @@ async fn test_filter_aggregate_two_predicates() -> Result<(), Error> {
         1,
         "FILTER predicate (posttypeid=2) must survive AST round-trip"
     );
-    let m2 = ctx.metrics().await?;
+    let m2 = ctx.metrics_after_outcomes(&m1, 1).await?;
     let d = metrics_delta(&m1, &m2);
     assert_eq!(d.queries_cache_hit, 1, "expected cache hit on second query");
 

@@ -1,6 +1,7 @@
 #![allow(clippy::indexing_slicing)]
 
 use std::io::Error;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -369,12 +370,43 @@ pub(crate) fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -
     }
 }
 
+/// How long [`metrics_after_outcomes`] waits for outcomes to be recorded.
+const OUTCOME_WAIT: Duration = Duration::from_secs(2);
+const OUTCOME_POLL: Duration = Duration::from_millis(10);
+
+/// Cache hits, misses and errors recorded between two snapshots.
+fn outcomes_recorded(before: &MetricsSnapshot, after: &MetricsSnapshot) -> u64 {
+    (after.queries_cache_hit + after.queries_cache_miss + after.queries_cache_error)
+        - (before.queries_cache_hit + before.queries_cache_miss + before.queries_cache_error)
+}
+
+/// Re-read metrics until `outcomes` cache outcomes (hit, miss or error) have
+/// been recorded since `before`, or the wait runs out — the caller's
+/// assertion then reports the shortfall. A hit is counted by the proxy only
+/// after the serve worker has written the response to the client, so a read
+/// straight after the response can precede it (PGC-469); misses and errors
+/// are counted before the query is forwarded.
+pub(crate) async fn metrics_after_outcomes(
+    metrics_port: u16,
+    before: &MetricsSnapshot,
+    outcomes: u64,
+) -> Result<MetricsSnapshot, Error> {
+    let deadline = Instant::now() + OUTCOME_WAIT;
+    loop {
+        let after = metrics_http_get(metrics_port).await?;
+        if outcomes_recorded(before, &after) >= outcomes || Instant::now() >= deadline {
+            return Ok(after);
+        }
+        tokio::time::sleep(OUTCOME_POLL).await;
+    }
+}
+
 /// Assert the last cacheable query was a cache miss. Returns updated snapshot.
 pub(crate) async fn assert_cache_miss(
     ctx: &mut TestContext,
     before: MetricsSnapshot,
 ) -> Result<MetricsSnapshot, Error> {
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&before, 1).await?;
     let delta = metrics_delta(&before, &after);
     assert_eq!(delta.queries_cache_miss, 1, "expected cache miss");
     assert_eq!(delta.queries_cache_hit, 0, "unexpected cache hit");
@@ -386,7 +418,7 @@ pub(crate) async fn assert_cache_hit(
     ctx: &mut TestContext,
     before: MetricsSnapshot,
 ) -> Result<MetricsSnapshot, Error> {
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&before, 1).await?;
     let delta = metrics_delta(&before, &after);
     assert_eq!(delta.queries_cache_hit, 1, "expected cache hit");
     assert_eq!(delta.queries_cache_miss, 0, "unexpected cache miss");
@@ -399,7 +431,7 @@ pub(crate) async fn assert_subsume_hit(
     ctx: &mut TestContext,
     before: MetricsSnapshot,
 ) -> Result<MetricsSnapshot, Error> {
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&before, 1).await?;
     let delta = metrics_delta(&before, &after);
     assert_eq!(
         delta.queries_cache_hit, 1,

@@ -55,7 +55,7 @@ async fn test_cache_restart_recovers_after_writer_death() -> Result<(), Error> {
     let before = ctx.metrics().await?;
     let rows = ctx.query(q, &[]).await?;
     assert_eq!(rows.len(), 10, "query returns 10 rows");
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&before, 1).await?;
     assert!(
         after.queries_cache_hit > before.queries_cache_hit,
         "query is served from cache before the restart"
@@ -238,7 +238,7 @@ async fn test_connection_survives_query_during_restart_window() -> Result<(), Er
         .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
         .count();
     assert_eq!(rows, 2, "wrong rows after recovery");
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&before, 1).await?;
     assert_eq!(
         after.queries_cache_hit - before.queries_cache_hit,
         1,

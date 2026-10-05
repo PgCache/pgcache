@@ -78,7 +78,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
     let m1 = ctx.metrics().await?;
     let row = ctx.query_one("SELECT count(*) FROM mv_count", &[]).await?;
     assert_eq!(row.get::<_, i64>(0), 20);
-    let m2 = ctx.metrics().await?;
+    let m2 = ctx.metrics_after_outcomes(&m1, 1).await?;
     let d = metrics_delta(&m1, &m2);
     assert_eq!(d.queries_cache_hit, 1, "expected cache hit (fallthrough)");
     assert_eq!(d.cache_mv_hits, 0, "MeasurePending doesn't hit MV");
@@ -113,7 +113,7 @@ async fn test_mv_count_lifecycle() -> Result<(), Error> {
         21,
         "fallthrough serve must reflect new row"
     );
-    let m4 = ctx.metrics().await?;
+    let m4 = ctx.metrics_after_outcomes(&m3, 1).await?;
     let d = metrics_delta(&m3, &m4);
     assert_eq!(d.queries_cache_hit, 1, "expected cache hit (fallthrough)");
     assert_eq!(d.cache_mv_hits, 0, "MV should have been Dirty, not Fresh");

@@ -228,7 +228,7 @@ async fn test_gate_row_level_insert_precision() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let res = ctx.simple_query("SELECT v FROM t WHERE id = 1").await?;
     assert_row_at(&res, 1, &[("v", "10")])?;
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&m, 1).await?;
     let delta = metrics_delta(&m, &after);
     assert_eq!(
         delta.queries_cache_hit, 1,
@@ -294,7 +294,7 @@ async fn test_gate_int_float_numeric_precision() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let res = ctx.simple_query("SELECT id FROM nf WHERE k = 99").await?;
     assert_eq!(row_count(&res), 0);
-    let after = ctx.metrics().await?;
+    let after = ctx.metrics_after_outcomes(&m, 1).await?;
     let delta = metrics_delta(&m, &after);
     assert_eq!(
         delta.queries_cache_hit, 1,
@@ -345,7 +345,7 @@ async fn test_gate_parameterized_insert_precision() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let res = ctx.simple_query("SELECT v FROM t WHERE id = 1").await?;
     assert_row_at(&res, 1, &[("v", "10")])?;
-    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 1).await?);
     assert_eq!(
         delta.queries_cache_hit, 1,
         "disjoint read must serve from cache"
@@ -540,7 +540,7 @@ async fn test_gate_prepared_read_disjoint_precision() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let rows = ctx.query(read, &[&2i32]).await?;
     assert_eq!(rows[0].get::<_, i32>(0), 20);
-    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 1).await?);
     assert_eq!(
         delta.queries_cache_hit, 1,
         "disjoint prepared read must serve from cache"
@@ -623,7 +623,7 @@ async fn test_gate_parameterized_update_precision() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let rows = ctx.query(read, &[&2i32]).await?;
     assert_eq!(rows[0].get::<_, i32>(0), 20);
-    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 1).await?);
     assert_eq!(
         delta.queries_cache_hit, 1,
         "disjoint read must serve from cache"
@@ -671,7 +671,7 @@ async fn test_gate_delete_row_level_precision() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let res = ctx.simple_query("SELECT v FROM d WHERE id = 3").await?;
     assert_row_at(&res, 1, &[("v", "30")])?;
-    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 1).await?);
     assert_eq!(
         delta.queries_cache_hit, 1,
         "disjoint read must serve from cache"
@@ -733,7 +733,7 @@ async fn test_gate_update_row_level_precision() -> Result<(), Error> {
     let m = ctx.metrics().await?;
     let res = ctx.simple_query("SELECT v FROM u WHERE id = 1").await?;
     assert_row_at(&res, 1, &[("v", "10")])?;
-    let delta = metrics_delta(&m, &ctx.metrics().await?);
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 1).await?);
     assert_eq!(
         delta.queries_cache_hit, 1,
         "disjoint read must serve from cache"
