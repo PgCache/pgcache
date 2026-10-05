@@ -1,9 +1,11 @@
+use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc, thread};
 
 use ecow::EcoString;
 use metrics_exporter_prometheus::PrometheusHandle;
 use rootcause::Report;
-use tokio::{net::TcpListener, runtime::Builder};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::runtime::{Builder, Handle};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace};
 
@@ -15,11 +17,14 @@ use crate::admin::admin_server_spawn;
 use crate::result::{MapIntoReport, ReportExt};
 use crate::{
     cache::query::CacheableQuery,
-    cache::{CacheDispatchUpdater, PinnedQuery, cache_generation_start, cache_supervise},
+    cache::{
+        CacheDispatchHandle, CacheDispatchUpdater, PinnedQuery, cache_generation_start,
+        cache_supervise,
+    },
     catalog::{FunctionVolatility, function_volatility_map_load},
     pg::{cdc::replication_cleanup, connect},
     query::ast::{query_expr_convert_raw, query_expr_fingerprint},
-    settings::Settings,
+    settings::{Settings, SslMode},
     telemetry, tls,
 };
 
@@ -218,43 +223,22 @@ pub fn proxy_run(
         // distinct text instead of each retaining its own AST.
         let cacheability_store = Arc::new(CacheabilityStore::new());
 
-        // Periodic metrics maintenance, on a 1s tick.
-        //
-        // Publishing the store's size here rather than on every membership change
-        // keeps an all-shards operation off the churn path: `DashMap::len`
-        // read-locks every shard (the trap `state_gauges_update` hit on the
-        // writer). 1s is well below typical Prometheus scrape intervals.
-        //
-        // The upkeep call is what bounds histogram memory. `Histogram::record`
-        // appends raw (value, instant) pairs to an unbounded list and a
-        // `/metrics` render is the only other drain, so without this a process
-        // that is never scraped retains every sample it has ever recorded —
-        // ~180 bytes per query, which is unbounded growth under load. Draining
-        // every second also keeps each drain small and improves the time
-        // attribution of samples into the exporter's rolling windows.
-        {
-            let store = Arc::clone(&cacheability_store);
-            let upkeep = upkeep_metrics;
-            let cancel = cancel.child_token();
-            rt_handle.spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tick.tick() => {
-                            store.gauge_publish();
-                            upkeep.run_upkeep();
-                        }
-                    }
-                }
-            });
-        }
+        metrics_upkeep_spawn(
+            &rt_handle,
+            Arc::clone(&cacheability_store),
+            upkeep_metrics,
+            cancel.child_token(),
+        );
 
-        // Origin connection params, resolved once and cloned into each task.
-        let ssl_mode = settings.origin.ssl_mode;
-        let server_name = EcoString::from(settings.origin.host.as_str());
-        let origin_database = EcoString::from(settings.origin.database.as_str());
+        let context = ConnectionContext {
+            ssl_mode: settings.origin.ssl_mode,
+            server_name: EcoString::from(settings.origin.host.as_str()),
+            origin_database: EcoString::from(settings.origin.database.as_str()),
+            dispatch_handle,
+            tls_acceptor,
+            func_volatility: Arc::clone(&func_volatility),
+            cacheability_store,
+        };
 
         // Accept connections on a dedicated scoped thread so the proxy thread is
         // free to run the cache restart supervisor. Connections dispatch against
@@ -263,105 +247,16 @@ pub fn proxy_run(
         // cancels the proxy token so the supervisor unwinds too.
         let accept_cancel = cancel.clone();
         let accept_rt = rt_handle.clone();
-        let accept_status = shared_proxy_status;
         let accept_handle = thread::Builder::new()
             .name("accept".to_owned())
             .spawn_scoped(scope, move || {
                 debug!("accept loop");
-                let result = accept_rt.block_on(async {
-                    // Task-dump on SIGUSR2 (deadlock debugging). Build with
-                    // `RUSTFLAGS="--cfg tokio_unstable" cargo build --features taskdump`
-                    // (Linux x86_64/aarch64). On signal, logs every tokio task's
-                    // suspended-await backtrace — works even when the runtime is
-                    // wedged, since SIGUSR2 wakes this task via the io driver.
-                    #[cfg(all(feature = "taskdump", tokio_unstable))]
-                    {
-                        let dump_handle = tokio::runtime::Handle::current();
-                        tokio::spawn(async move {
-                            let mut sig = match tokio::signal::unix::signal(
-                                tokio::signal::unix::SignalKind::user_defined2(),
-                            ) {
-                                Ok(s) => s,
-                                Err(e) => {
-                                    tracing::error!(
-                                        "taskdump: failed to install SIGUSR2 handler: {e}"
-                                    );
-                                    return;
-                                }
-                            };
-                            info!("taskdump: armed — send SIGUSR2 to dump tokio task backtraces");
-                            while sig.recv().await.is_some() {
-                                info!("taskdump: capturing task dump...");
-                                let dump = dump_handle.dump().await;
-                                let count = dump.tasks().iter().count();
-                                for (i, task) in dump.tasks().iter().enumerate() {
-                                    info!("taskdump task[{i}] id={}:\n{}", task.id(), task.trace());
-                                }
-                                info!("taskdump: complete ({count} tasks)");
-                            }
-                        });
-                    }
-
-                    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((
-                        settings.origin.host.as_str(),
-                        settings.origin.port,
-                    ))
-                    .await
-                    .map_into_report::<ConnectionError>()
-                    .attach_loc("resolving origin host")?
-                    .collect();
-
-                    let listener =
-                        TcpListener::bind(settings.listen.socket)
-                            .await
-                            .map_err(|e| {
-                                Report::from(ConnectionError::IoError(std::io::Error::other(
-                                    format!("bind error [{}] {e}", settings.listen.socket),
-                                )))
-                            })?;
-                    // Listener is bound — only now is the proxy ready to accept
-                    // connections, so flip `/readyz` to ready (it reports
-                    // not-ready through the preceding cache setup).
-                    accept_status.listening_set();
-                    info!("Listening to {}", &settings.listen.socket);
-
-                    loop {
-                        tokio::select! {
-                            _ = accept_cancel.cancelled() => {
-                                info!("proxy shutdown signal received");
-                                break;
-                            }
-                            result = listener.accept() => {
-                                let (socket, _) = result.map_err(|e| {
-                                    Report::from(ConnectionError::IoError(std::io::Error::other(
-                                        format!("accept error: {e}"),
-                                    )))
-                                })?;
-                                let _ = socket.set_nodelay(true);
-                                crate::metrics::handles().conn.total.increment(1);
-                                debug!("socket accepted");
-
-                                tokio::spawn(connection_task(
-                                    socket,
-                                    addrs.clone(),
-                                    ssl_mode,
-                                    server_name.clone(),
-                                    dispatch_handle.clone(),
-                                    tls_acceptor.clone(),
-                                    Arc::clone(&func_volatility),
-                                    origin_database.clone(),
-                                    Arc::clone(&cacheability_store),
-                                ));
-                            }
-                        }
-                    }
-
-                    replication_cleanup(settings)
-                        .await
-                        .map_err(|r| r.context_transform(ConnectionError::CdcError))
-                        .attach_loc("cleaning up replication")?;
-                    Ok(())
-                });
+                let result = accept_rt.block_on(accept_run(
+                    settings,
+                    context,
+                    shared_proxy_status,
+                    accept_cancel.clone(),
+                ));
                 // Whether the accept loop stopped on shutdown or a startup error,
                 // cancel the proxy token so the supervisor unwinds and the proxy
                 // exits rather than restarting the cache forever against a dead
@@ -390,6 +285,158 @@ pub fn proxy_run(
             Err(ConnectionError::IoError(std::io::Error::other("accept thread panicked")).into())
         })
     })
+}
+
+/// Per-connection values cloned into every accepted connection's task.
+struct ConnectionContext {
+    ssl_mode: SslMode,
+    server_name: EcoString,
+    origin_database: EcoString,
+    dispatch_handle: CacheDispatchHandle,
+    tls_acceptor: Option<Arc<tls::TlsAcceptor>>,
+    func_volatility: Arc<HashMap<EcoString, FunctionVolatility>>,
+    cacheability_store: Arc<CacheabilityStore>,
+}
+
+impl ConnectionContext {
+    fn connection_spawn(&self, socket: TcpStream, addrs: &[SocketAddr]) {
+        let _ = socket.set_nodelay(true);
+        crate::metrics::handles().conn.total.increment(1);
+        debug!("socket accepted");
+
+        tokio::spawn(connection_task(
+            socket,
+            addrs.to_vec(),
+            self.ssl_mode,
+            self.server_name.clone(),
+            self.dispatch_handle.clone(),
+            self.tls_acceptor.clone(),
+            Arc::clone(&self.func_volatility),
+            self.origin_database.clone(),
+            Arc::clone(&self.cacheability_store),
+        ));
+    }
+}
+
+/// Resolve the origin, bind the listener, and accept connections until
+/// `cancel`; then clean up the replication slot.
+async fn accept_run(
+    settings: &Settings,
+    context: ConnectionContext,
+    status: SharedProxyStatus,
+    cancel: CancellationToken,
+) -> ConnectionResult<()> {
+    #[cfg(all(feature = "taskdump", tokio_unstable))]
+    taskdump_spawn();
+
+    let addrs: Vec<SocketAddr> =
+        tokio::net::lookup_host((settings.origin.host.as_str(), settings.origin.port))
+            .await
+            .map_into_report::<ConnectionError>()
+            .attach_loc("resolving origin host")?
+            .collect();
+
+    let listener = TcpListener::bind(settings.listen.socket)
+        .await
+        .map_err(|e| {
+            Report::from(ConnectionError::IoError(std::io::Error::other(format!(
+                "bind error [{}] {e}",
+                settings.listen.socket
+            ))))
+        })?;
+    // Listener is bound — only now is the proxy ready to accept connections,
+    // so flip `/readyz` to ready (it reports not-ready through the preceding
+    // cache setup).
+    status.listening_set();
+    info!("Listening to {}", &settings.listen.socket);
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("proxy shutdown signal received");
+                break;
+            }
+            result = listener.accept() => {
+                let (socket, _) = result.map_err(|e| {
+                    Report::from(ConnectionError::IoError(std::io::Error::other(
+                        format!("accept error: {e}"),
+                    )))
+                })?;
+                context.connection_spawn(socket, &addrs);
+            }
+        }
+    }
+
+    replication_cleanup(settings)
+        .await
+        .map_err(|r| r.context_transform(ConnectionError::CdcError))
+        .attach_loc("cleaning up replication")?;
+    Ok(())
+}
+
+/// Periodic metrics maintenance, on a 1s tick.
+///
+/// Publishing the store's size here rather than on every membership change
+/// keeps an all-shards operation off the churn path: `DashMap::len`
+/// read-locks every shard (the trap `state_gauges_update` hit on the
+/// writer). 1s is well below typical Prometheus scrape intervals.
+///
+/// The upkeep call is what bounds histogram memory. `Histogram::record`
+/// appends raw (value, instant) pairs to an unbounded list and a
+/// `/metrics` render is the only other drain, so without this a process
+/// that is never scraped retains every sample it has ever recorded —
+/// ~180 bytes per query, which is unbounded growth under load. Draining
+/// every second also keeps each drain small and improves the time
+/// attribution of samples into the exporter's rolling windows.
+fn metrics_upkeep_spawn(
+    rt_handle: &Handle,
+    store: Arc<CacheabilityStore>,
+    metrics: PrometheusHandle,
+    cancel: CancellationToken,
+) {
+    rt_handle.spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tick.tick() => {
+                    store.gauge_publish();
+                    metrics.run_upkeep();
+                }
+            }
+        }
+    });
+}
+
+/// Task-dump on SIGUSR2 (deadlock debugging). Build with
+/// `RUSTFLAGS="--cfg tokio_unstable" cargo build --features taskdump`
+/// (Linux x86_64/aarch64). On signal, logs every tokio task's suspended-await
+/// backtrace — works even when the runtime is wedged, since SIGUSR2 wakes this
+/// task via the io driver.
+#[cfg(all(feature = "taskdump", tokio_unstable))]
+fn taskdump_spawn() {
+    let dump_handle = tokio::runtime::Handle::current();
+    tokio::spawn(async move {
+        let mut sig =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined2()) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("taskdump: failed to install SIGUSR2 handler: {e}");
+                    return;
+                }
+            };
+        info!("taskdump: armed — send SIGUSR2 to dump tokio task backtraces");
+        while sig.recv().await.is_some() {
+            info!("taskdump: capturing task dump...");
+            let dump = dump_handle.dump().await;
+            let count = dump.tasks().iter().count();
+            for (i, task) in dump.tasks().iter().enumerate() {
+                info!("taskdump task[{i}] id={}:\n{}", task.id(), task.trace());
+            }
+            info!("taskdump: complete ({count} tasks)");
+        }
+    });
 }
 
 #[cfg(test)]
