@@ -133,110 +133,105 @@ impl Decoder for PgBackendMessageCodec {
         }
 
         match self.state {
-            PgConnectionState::Startup => {
-                let Some(&first_byte) = buf.first() else {
-                    return Ok(None);
-                };
-
-                match first_byte {
-                    b'S' | b'N' => Ok(Some(PgBackendMessage {
-                        message_type: PgBackendMessageType::SslRequestResponse,
-                        data: buf.split_to(1),
-                    })),
-                    b'R' => self.handle_authentication_message(buf),
-                    _ => Err(ProtocolError::InvalidStartupFrame),
-                }
-            }
+            PgConnectionState::Startup => self.startup_decode(buf),
             PgConnectionState::Authentication => self.handle_authentication_message(buf),
-            _ => {
-                let Some(&first_byte) = buf.first() else {
-                    return Ok(None);
-                };
-
-                let Some(msg_type) = BACKEND_MESSAGE_TYPE_MAP.get(&first_byte) else {
-                    return Err(ProtocolError::UnrecognizedMessageType {
-                        tag: first_byte.escape_ascii().to_string(),
-                    });
-                };
-
-                const MIN_MESSAGE_LEN: usize = 5;
-                if buf.remaining() < MIN_MESSAGE_LEN {
-                    return Ok(None);
-                }
-
-                let (_, mut len_slice) = buf.split_at(1);
-                let msg_len = usize::try_from(len_slice.get_i32()).map_err(|_| {
-                    ProtocolError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "negative backend message length",
-                    ))
-                })? + 1;
-                if buf.remaining() < msg_len {
-                    return Ok(None);
-                }
-
-                if *msg_type == PgBackendMessageType::DataRows {
-                    const MAX_BATCH_SIZE: usize = 64 * 1024;
-
-                    // Start with the first DataRow message
-                    let mut total_bytes = msg_len;
-                    let mut position = msg_len;
-
-                    // Look ahead for more consecutive DataRow messages
-                    while position + 5 <= buf.remaining() {
-                        let Some(&next_tag) = buf.get(position) else {
-                            break;
-                        };
-
-                        // Stop if not a DataRow message
-                        if next_tag != DATA_ROW_TAG {
-                            break;
-                        }
-
-                        // Read the next message length
-                        let (_, mut next_len_slice) = buf.split_at(position + 1);
-                        let Ok(next_msg_len) =
-                            usize::try_from(next_len_slice.get_i32()).map(|n| n + 1)
-                        else {
-                            break;
-                        };
-
-                        // Stop if message is incomplete in buffer
-                        if position + next_msg_len > buf.remaining() {
-                            break;
-                        }
-
-                        // Stop if we would exceed the 64KB limit
-                        if total_bytes + next_msg_len > MAX_BATCH_SIZE {
-                            break;
-                        }
-
-                        // Accumulate this message
-                        total_bytes += next_msg_len;
-                        position += next_msg_len;
-                    }
-
-                    // Return all accumulated DataRow messages
-                    Ok(Some(PgBackendMessage {
-                        message_type: PgBackendMessageType::DataRows,
-                        data: buf.split_to(total_bytes),
-                    }))
-                } else {
-                    Ok(Some(PgBackendMessage {
-                        message_type: *msg_type,
-                        data: buf.split_to(msg_len),
-                    }))
-                }
-            }
+            _ => message_decode(buf),
         }
     }
 }
 
-/// Parse a ParameterStatus message to extract name and value.
-///
-/// Message format: 'S' | int32 len | string name (null-terminated) | string value (null-terminated)
-///
-/// Returns `None` if the message is malformed.
+impl PgBackendMessageCodec {
+    /// The server's first bytes: a one-byte SSL response, or an Authentication
+    /// message.
+    fn startup_decode(
+        &mut self,
+        buf: &mut BytesMut,
+    ) -> Result<Option<PgBackendMessage>, ProtocolError> {
+        let Some(&first_byte) = buf.first() else {
+            return Ok(None);
+        };
+        match first_byte {
+            b'S' | b'N' => Ok(Some(PgBackendMessage {
+                message_type: PgBackendMessageType::SslRequestResponse,
+                data: buf.split_to(1),
+            })),
+            b'R' => self.handle_authentication_message(buf),
+            _ => Err(ProtocolError::InvalidStartupFrame),
+        }
+    }
+}
+
+/// Decode one tagged backend message once it is complete in `buf`. Consecutive
+/// DataRows come back as one batched message.
+fn message_decode(buf: &mut BytesMut) -> Result<Option<PgBackendMessage>, ProtocolError> {
+    const MIN_MESSAGE_LEN: usize = 5;
+
+    let Some(&first_byte) = buf.first() else {
+        return Ok(None);
+    };
+    let Some(&message_type) = BACKEND_MESSAGE_TYPE_MAP.get(&first_byte) else {
+        return Err(ProtocolError::UnrecognizedMessageType {
+            tag: first_byte.escape_ascii().to_string(),
+        });
+    };
+    if buf.remaining() < MIN_MESSAGE_LEN {
+        return Ok(None);
+    }
+    let msg_len = frame_len_at(buf, 0).ok_or_else(|| {
+        ProtocolError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "negative backend message length",
+        ))
+    })?;
+    if buf.remaining() < msg_len {
+        return Ok(None);
+    }
+
+    let len = if message_type == PgBackendMessageType::DataRows {
+        data_rows_batch_len(buf, msg_len)
+    } else {
+        msg_len
+    };
+    Ok(Some(PgBackendMessage {
+        message_type,
+        data: buf.split_to(len),
+    }))
+}
+
+/// Total length (tag included) of the message starting at `position`, from its
+/// length word; `None` if the word is not in `buf` or is negative.
+fn frame_len_at(buf: &[u8], position: usize) -> Option<usize> {
+    let word = buf.get(position + 1..position + 5)?;
+    let len = i32::from_be_bytes(word.try_into().ok()?);
+    usize::try_from(len).ok().map(|n| n + 1)
+}
+
+/// How many bytes of `buf` to return as one DataRows batch, given the first
+/// row's length: following DataRows are taken while each is complete in the
+/// buffer and the batch stays within 64KB.
+fn data_rows_batch_len(buf: &[u8], first_len: usize) -> usize {
+    const MAX_BATCH_SIZE: usize = 64 * 1024;
+
+    let mut total = first_len;
+    while let Some(next_len) = next_data_row_len(buf, total) {
+        if total + next_len > MAX_BATCH_SIZE {
+            break;
+        }
+        total += next_len;
+    }
+    total
+}
+
+/// Length of the complete DataRow at `position`, or `None` if the next message
+/// is not a DataRow, has a negative length, or is not yet fully buffered.
+fn next_data_row_len(buf: &[u8], position: usize) -> Option<usize> {
+    if *buf.get(position)? != DATA_ROW_TAG {
+        return None;
+    }
+    let len = frame_len_at(buf, position)?;
+    (position + len <= buf.len()).then_some(len)
+}
+
 /// The backend transaction status carried by every `ReadyForQuery`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum TransactionStatus {
@@ -272,6 +267,11 @@ impl TransactionStatus {
     }
 }
 
+/// Parse a ParameterStatus message to extract name and value.
+///
+/// Message format: 'S' | int32 len | string name (null-terminated) | string value (null-terminated)
+///
+/// Returns `None` if the message is malformed.
 pub(crate) fn parameter_status_parse(data: &[u8]) -> Option<(&str, &str)> {
     // Skip tag ('S') and length (4 bytes)
     let payload = data.get(5..)?;
@@ -361,6 +361,75 @@ mod tests {
         frame.extend_from_slice(&i32::try_from(value.len()).unwrap().to_be_bytes());
         frame.extend_from_slice(value.as_bytes());
         frame
+    }
+
+    fn rows(values: &[&str]) -> Vec<u8> {
+        values.iter().flat_map(|v| data_row(v)).collect()
+    }
+
+    #[test]
+    fn test_data_rows_batch_len_takes_consecutive_complete_rows() {
+        let buf = rows(&["a", "bb", "ccc"]);
+        let first = data_row("a").len();
+        assert_eq!(data_rows_batch_len(&buf, first), buf.len());
+    }
+
+    #[test]
+    fn test_data_rows_batch_len_stops_at_non_data_row() {
+        let mut buf = rows(&["a", "bb"]);
+        let rows_len = buf.len();
+        buf.extend_from_slice(&[COMMAND_COMPLETE_TAG, 0, 0, 0, 4]);
+        assert_eq!(data_rows_batch_len(&buf, data_row("a").len()), rows_len);
+    }
+
+    #[test]
+    fn test_data_rows_batch_len_stops_at_incomplete_or_negative_row() {
+        let complete = rows(&["a", "bb"]);
+        let mut truncated = complete.clone();
+        truncated.extend_from_slice(&data_row("ccc")[..6]);
+        assert_eq!(
+            data_rows_batch_len(&truncated, data_row("a").len()),
+            complete.len()
+        );
+
+        let mut negative = complete.clone();
+        negative.extend_from_slice(&[DATA_ROW_TAG, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(
+            data_rows_batch_len(&negative, data_row("a").len()),
+            complete.len()
+        );
+    }
+
+    #[test]
+    fn test_data_rows_batch_len_caps_the_batch_at_64k() {
+        let big = "x".repeat(30_000);
+        let buf = rows(&[&big, &big, &big]);
+        let row_len = data_row(&big).len();
+        assert_eq!(data_rows_batch_len(&buf, row_len), 2 * row_len);
+    }
+
+    #[test]
+    fn test_message_decode_batches_data_rows_then_returns_the_next_message() {
+        let mut buf = BytesMut::from(&rows(&["a", "bb"])[..]);
+        buf.extend_from_slice(&[COMMAND_COMPLETE_TAG, 0, 0, 0, 4]);
+        let batch = message_decode(&mut buf)
+            .expect("decode data rows")
+            .expect("complete batch");
+        assert_eq!(batch.message_type, PgBackendMessageType::DataRows);
+        assert_eq!(batch.data.len(), rows(&["a", "bb"]).len());
+        let next = message_decode(&mut buf)
+            .expect("decode command complete")
+            .expect("complete message");
+        assert_eq!(next.message_type, PgBackendMessageType::CommandComplete);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_message_decode_waits_for_a_complete_frame() {
+        let row = data_row("abc");
+        let mut buf = BytesMut::from(&row[..row.len() - 1]);
+        assert!(message_decode(&mut buf).expect("decode partial").is_none());
+        assert_eq!(buf.len(), row.len() - 1);
     }
 
     #[test]
