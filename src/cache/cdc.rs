@@ -65,6 +65,16 @@ async fn fault_cdc_deliver_delay(_active_relations: &ActiveRelations) {}
 
 /// Handles Change Data Capture (CDC) processing from PostgreSQL logical replication.
 /// Processes replication messages and synchronizes changes with the cache database.
+/// The handles a CDC processor shares with the rest of the cache subsystem;
+/// cloned into each (re)connected processor.
+#[derive(Clone)]
+pub(super) struct CdcProcessorHandles {
+    pub(super) cdc_tx: UnboundedSender<CdcCommand>,
+    pub(super) active_relations: ActiveRelations,
+    pub(super) watermark_nudge: Arc<Notify>,
+    pub(super) received_lsn: Arc<AtomicU64>,
+}
+
 pub(super) struct CdcProcessor {
     cdc_client: Client,
     publication_name: EcoString,
@@ -98,11 +108,14 @@ impl CdcProcessor {
     /// Creates a new CdcProcessor with the provided CDC client and cache.
     pub(super) async fn new(
         settings: &Settings,
-        cdc_tx: UnboundedSender<CdcCommand>,
-        active_relations: ActiveRelations,
-        watermark_nudge: Arc<Notify>,
-        received_lsn_shared: Arc<AtomicU64>,
+        handles: CdcProcessorHandles,
     ) -> CacheResult<Self> {
+        let CdcProcessorHandles {
+            cdc_tx,
+            active_relations,
+            watermark_nudge,
+            received_lsn: received_lsn_shared,
+        } = handles;
         let origin_cdc_client = connect_replication(&settings.replication, "CDC replication")
             .await
             .map_into_report::<CacheError>()

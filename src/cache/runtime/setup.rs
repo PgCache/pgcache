@@ -14,6 +14,7 @@ use super::population_pool::population_pool_controller;
 use super::reg_gate::reg_gate_controller;
 use super::reset::cache_database_reset;
 use super::serve_pool::{serve_loop, serve_pool_bounds, serve_pool_controller};
+use crate::cache::cdc::CdcProcessorHandles;
 use crate::cache::messages::WriterNotify;
 use crate::cache::query_cache::CacheDispatch;
 use crate::cache::types::{ActiveRelations, CacheStateView};
@@ -119,23 +120,18 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     // CDC thread (sends CdcCommand to writer, sets the cdc_connected flag).
     // Holds the subsystem cancel (not a child) so a fatal CDC error tears down
     // the whole cache subsystem.
-    let active_relations_cdc = Arc::clone(&active_relations);
+    let cdc_handles = CdcProcessorHandles {
+        cdc_tx: cdc_cmd_tx,
+        active_relations: Arc::clone(&active_relations),
+        watermark_nudge: Arc::clone(&watermark_nudge),
+        received_lsn: Arc::clone(&state_view.received_lsn),
+    };
     let cancel_cdc = cache_cancel.clone();
     let cdc_connected_cdc = Arc::clone(&cdc_connected);
-    let watermark_nudge_cdc = Arc::clone(&watermark_nudge);
-    let received_lsn_cdc = Arc::clone(&state_view.received_lsn);
     let cdc_handle = match thread::Builder::new()
         .name("cdc worker".to_owned())
         .spawn_scoped(scope, move || {
-            let result = cdc_run(
-                settings,
-                cdc_cmd_tx,
-                active_relations_cdc,
-                cancel_cdc,
-                cdc_connected_cdc,
-                watermark_nudge_cdc,
-                received_lsn_cdc,
-            );
+            let result = cdc_run(settings, cdc_handles, cancel_cdc, cdc_connected_cdc);
             if let Err(ref e) = result {
                 error!(
                     "cdc thread exiting with error: {}",
