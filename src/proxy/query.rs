@@ -16,8 +16,8 @@ use crate::{
     catalog::FunctionVolatility,
     id_hash::{BuildIdHasher, impl_id_hashable},
     query::ast::{
-        AstError, LiteralValue, QueryBody, QueryExpr, RawStatement, ScalarExpr, SelectColumn,
-        SelectColumns, statement_convert_raw,
+        AstError, FunctionCall, LiteralValue, QueryBody, QueryExpr, RawStatement, ScalarExpr,
+        SelectColumn, SelectColumns, SelectNode, statement_convert_raw,
     },
     query::write::{IsolationEffect, StatementEffects, WriteClass},
 };
@@ -58,50 +58,68 @@ pub struct ExplainSpec {
 /// span the full `u64` range, which PostgreSQL parses as a float literal whose
 /// value the shared literal converter would round to `f64`, losing precision.
 fn explain_spec_extract(query: &QueryExpr) -> Option<ExplainSpec> {
-    // Must be exactly the bare projection `SELECT pgcache_explain(...)`: no CTEs,
-    // ORDER BY, LIMIT, FROM, WHERE, GROUP BY, HAVING, or DISTINCT — otherwise a
-    // real query that merely mentions the function would be intercepted.
-    if !query.ctes.is_empty() || !query.order_by.is_empty() || query.limit.is_some() {
+    let select = bare_select(query)?;
+    let func = single_function_column(select)?;
+    // `func.name` is the last name component, so a schema-qualified
+    // `x.pgcache_explain(...)` also matches. Acceptable: the name is
+    // pgcache-reserved, so shadowing a real user function of that name is not a
+    // concern worth carrying the raw funcname list to detect.
+    if func.name != EXPLAIN_FUNCTION_NAME || !plain_call(func) {
+        return None;
+    }
+    explain_spec_build(&func.args)
+}
+
+/// The SELECT of a bare projection — no CTEs, ORDER BY, LIMIT, FROM, WHERE,
+/// GROUP BY, HAVING, or DISTINCT — otherwise a real query that merely mentions
+/// the function would be intercepted.
+fn bare_select(query: &QueryExpr) -> Option<&SelectNode> {
+    let unordered = query.order_by.is_empty() && query.limit.is_none();
+    if !query.ctes.is_empty() || !unordered {
         return None;
     }
     let QueryBody::Select(select) = &query.body else {
         return None;
     };
-    if !select.from.is_empty()
-        || select.where_clause.is_some()
-        || !select.group_by.is_empty()
-        || select.having.is_some()
-        || select.distinct
-    {
-        return None;
-    }
+    select_is_bare(select).then_some(select.as_ref())
+}
+
+fn select_is_bare(select: &SelectNode) -> bool {
+    let unfiltered = select.from.is_empty() && select.where_clause.is_none();
+    let ungrouped = select.group_by.is_empty() && select.having.is_none();
+    unfiltered && ungrouped && !select.distinct
+}
+
+/// The function call a SELECT projects as its only column.
+fn single_function_column(select: &SelectNode) -> Option<&FunctionCall> {
     let SelectColumns::Columns(columns) = &select.columns else {
         return None;
     };
-    let [
-        SelectColumn::Expr {
-            expr: ScalarExpr::Function(func),
-            ..
-        },
-    ] = columns.as_slice()
-    else {
-        return None;
-    };
-    // `func.name` is the last name component, so a schema-qualified
-    // `x.pgcache_explain(...)` also matches. Acceptable: the name is
-    // pgcache-reserved, so shadowing a real user function of that name is not a
-    // concern worth carrying the raw funcname list to detect.
-    if func.name != EXPLAIN_FUNCTION_NAME
-        || func.agg_star
-        || func.agg_distinct
-        || func.over.is_some()
-        || func.agg_filter.is_some()
-        || !func.agg_order.is_empty()
-    {
-        return None;
+    match columns.as_slice() {
+        [
+            SelectColumn::Expr {
+                expr: ScalarExpr::Function(func),
+                ..
+            },
+        ] => Some(func),
+        _ => None,
     }
+}
 
-    let (first, options) = match func.args.as_slice() {
+/// A plain call: not an aggregate (`*`, DISTINCT, FILTER, ORDER BY) or window
+/// (OVER) form.
+fn plain_call(func: &FunctionCall) -> bool {
+    let no_aggregate_form = !func.agg_star && !func.agg_distinct;
+    let unfiltered = func.over.is_none() && func.agg_filter.is_none();
+    let unordered = unfiltered && func.agg_order.is_empty();
+    no_aggregate_form && unordered
+}
+
+/// The spec from `pgcache_explain`'s one or two string arguments: a target
+/// that parses as `u64` is a fingerprint, otherwise inline SQL; the second is
+/// the option list.
+fn explain_spec_build(args: &[ScalarExpr]) -> Option<ExplainSpec> {
+    let (first, options) = match args {
         [first] => (first, EcoString::new()),
         [first, second] => (first, EcoString::from(arg_string_extract(second)?)),
         _ => return None,
