@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use tokio_postgres::SimpleQueryMessage;
 
-use crate::util::{TestContext, assert_cache_hit};
+use crate::util::{TestContext, assert_cache_hit, metrics_delta};
 
 mod util;
 
@@ -451,6 +451,50 @@ async fn test_unchanged_toast_pk_change_then_toasted_update() -> Result<(), Erro
     assert_eq!(
         after.cache_invalidations, before.cache_invalidations,
         "repair chain fell back to invalidation"
+    );
+
+    Ok(())
+}
+
+/// The batched repair lookup must quote identifiers (PGC-470): a mixed-case
+/// table and toastable column need quoting, and an unquoted lookup fails,
+/// silently turning every repair on such a table into a fallback.
+#[tokio::test]
+async fn test_unchanged_toast_repair_quoted_identifiers() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.simple_query(r#"create table "ToastQuoted" ("Id" int primary key, "Big" text, n int)"#)
+        .await?;
+    ctx.simple_query(r#"alter table "ToastQuoted" alter column "Big" set storage external"#)
+        .await?;
+
+    let big = big_value('q');
+    ctx.simple_query(&format!(
+        r#"insert into "ToastQuoted" ("Id", "Big", n) values (1, '{big}', 1)"#
+    ))
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let q = r#"select "Big", n from "ToastQuoted" where "Id" = 1"#;
+    ctx.simple_query(q).await?;
+    ctx.cache_settle().await?;
+
+    // A lone toasted update has no in-batch overlay entry, so it repairs
+    // through the batched lookup.
+    let before_update = ctx.metrics().await?;
+    ctx.origin_query(r#"update "ToastQuoted" set n = 2 where "Id" = 1"#, &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let toast = metrics_delta(&before_update, &ctx.metrics().await?);
+    assert_eq!(toast.cache_cdc_toast_fallbacks, 0, "toast repair fell back");
+    assert_eq!(toast.cache_cdc_toast_repairs, 1, "expected a lookup repair");
+
+    let before = ctx.metrics().await?;
+    let served = ctx.simple_query(q).await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(
+        first_two_values(&served),
+        Some((big, "2".to_owned())),
+        "repaired row serves the wrong value"
     );
 
     Ok(())

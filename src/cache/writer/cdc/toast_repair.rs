@@ -306,7 +306,7 @@ fn column_list_push<'a>(sql: &mut String, columns: impl Iterator<Item = &'a EcoS
         if i > 0 {
             sql.push_str(", ");
         }
-        sql.push_str(column);
+        sql.push_str(&escape::escape_identifier(column));
     }
 }
 
@@ -357,7 +357,8 @@ fn toast_lookup_sql(
     let _ = write!(
         sql,
         " FROM {}.{} WHERE ",
-        table_metadata.schema, table_metadata.name
+        escape::escape_identifier(&table_metadata.schema),
+        escape::escape_identifier(&table_metadata.name)
     );
     let multi_pk = pk_columns.len() > 1;
     if multi_pk {
@@ -365,7 +366,7 @@ fn toast_lookup_sql(
         column_list_push(&mut sql, pk_columns.iter().copied());
         sql.push(')');
     } else {
-        sql.push_str(pk_columns.first()?);
+        sql.push_str(&escape::escape_identifier(pk_columns.first()?));
     }
     sql.push_str(" IN (");
     pk_literals_push(&mut sql, pendings, multi_pk);
