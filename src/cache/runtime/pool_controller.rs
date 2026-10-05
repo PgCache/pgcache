@@ -61,6 +61,43 @@ pub(super) struct TickSample {
     pub tick_seconds: f64,
 }
 
+impl TickSample {
+    /// Nothing observed but work pending: every member is mid-task longer
+    /// than the tick — a saturated pool, not an idle one (PGC-452).
+    fn saturated_without_signal(&self) -> bool {
+        let observed = self.task_count > 0 || self.wait_count > 0;
+        !observed && self.backlog > 0 && self.live > 0
+    }
+
+    /// Completions per second.
+    // Per-tick counts are small (bounded by demand per second), far below
+    // f64's 52-bit mantissa.
+    #[allow(clippy::cast_precision_loss)]
+    fn throughput(&self) -> f64 {
+        self.task_count as f64 / self.tick_seconds
+    }
+
+    fn wait_mean(&self) -> Duration {
+        self.wait_us
+            .checked_div(self.wait_count)
+            .map_or(Duration::ZERO, Duration::from_micros)
+    }
+
+    /// Mean task service time in seconds; meaningful only with completions.
+    #[allow(clippy::cast_precision_loss)]
+    fn service_seconds(&self) -> f64 {
+        self.task_us as f64 / self.task_count as f64 / 1e6
+    }
+
+    /// Live members were busy less than `rho` of their combined time.
+    #[allow(clippy::cast_precision_loss)]
+    fn underutilized(&self, rho: f64) -> bool {
+        let busy = self.task_us as f64 / 1e6;
+        let capacity = self.live as f64 * self.tick_seconds;
+        self.live > 0 && busy < rho * capacity
+    }
+}
+
 /// What the controller did this tick, for metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StepKind {
@@ -76,17 +113,21 @@ pub(super) enum StepKind {
 #[derive(Debug, Clone, Copy)]
 enum ProbeState {
     Idle,
-    /// A step to `target` members is in flight; judge the throughput delta
-    /// against `baseline_x` once the member is live.
-    AwaitVerify {
-        baseline_x: f64,
-        target: usize,
-        ticks_waited: u32,
-    },
+    /// A step is in flight; judge it once the member is live.
+    AwaitVerify(Verify),
     /// A refuted probe backs off and holds before re-probing.
     Hold {
         ticks_left: u32,
     },
+}
+
+/// An in-flight upward step to `target` members, judged by the throughput
+/// delta against `baseline_x` once the member is live.
+#[derive(Debug, Clone, Copy)]
+struct Verify {
+    baseline_x: f64,
+    target: usize,
+    ticks_waited: u32,
 }
 
 /// Consecutive healthy (sub-target wait) ticks before the probe state and the
@@ -123,131 +164,137 @@ impl PoolController {
     }
 
     /// Advance one tick and return the new desired member count.
-    // Per-tick counts are small (bounded by demand per second), far below
-    // f64's 52-bit mantissa.
-    #[allow(clippy::cast_precision_loss)]
     pub(super) fn step(&mut self, sample: TickSample, desired: usize) -> (usize, StepKind) {
-        let clamp = |n: usize| n.clamp(self.min, self.max);
-        // A tick with nothing observed but work pending is a saturated pool,
-        // not an idle one: every member is mid-task longer than the tick.
-        // No signal — freeze all streaks and holds rather than shrink the
-        // pool at the moment capacity is most needed (PGC-452).
-        if sample.task_count == 0 && sample.wait_count == 0 && sample.backlog > 0 && sample.live > 0
-        {
-            return (clamp(desired), StepKind::Hold);
+        // A saturated pool gives no signal — freeze all streaks and holds
+        // rather than shrink at the moment capacity is most needed (PGC-452).
+        if sample.saturated_without_signal() {
+            return (self.clamped(desired), StepKind::Hold);
         }
-        let x_now = sample.task_count as f64 / sample.tick_seconds;
-        let wait_now = sample
-            .wait_us
-            .checked_div(sample.wait_count)
-            .map_or(Duration::ZERO, Duration::from_micros);
-
-        if wait_now <= self.config.wait_target {
-            // Healthy queue: after a sustained streak (not one noisy tick at
-            // a hovering ceiling), re-arm the probe and the hold ladder; and
-            // consider shrinking on sustained low utilization of the live
-            // members.
-            self.healthy_streak += 1;
-            if self.healthy_streak >= HEALTHY_RESET_TICKS {
-                self.probe = ProbeState::Idle;
-                self.backstop_ticks = 0;
-                self.consecutive_refutes = 0;
-            }
-            let busy = sample.task_us as f64 / 1e6;
-            let capacity = sample.live as f64 * sample.tick_seconds;
-            if sample.live > 0 && desired > self.min && busy < self.config.rho_shrink * capacity {
-                self.shrink_streak += 1;
-                if self.shrink_streak >= self.config.down_ticks {
-                    self.shrink_streak = 0;
-                    return (clamp(desired - 1), StepKind::Shrink);
-                }
-            } else {
-                self.shrink_streak = 0;
-            }
-            return (clamp(desired), StepKind::Hold);
+        if sample.wait_mean() <= self.config.wait_target {
+            return self.healthy_tick(sample, desired);
         }
+        self.breached_tick(sample, desired)
+    }
 
-        // Wait breached: probe upward.
+    fn clamped(&self, n: usize) -> usize {
+        n.clamp(self.min, self.max)
+    }
+
+    /// Healthy queue: after a sustained streak (not one noisy tick at a
+    /// hovering ceiling), re-arm the probe and the hold ladder; and consider
+    /// shrinking on sustained low utilization of the live members.
+    fn healthy_tick(&mut self, sample: TickSample, desired: usize) -> (usize, StepKind) {
+        self.healthy_streak += 1;
+        if self.healthy_streak >= HEALTHY_RESET_TICKS {
+            self.probe = ProbeState::Idle;
+            self.backstop_ticks = 0;
+            self.consecutive_refutes = 0;
+        }
+        let underused = desired > self.min && sample.underutilized(self.config.rho_shrink);
+        if !underused {
+            self.shrink_streak = 0;
+            return (self.clamped(desired), StepKind::Hold);
+        }
+        self.shrink_streak += 1;
+        if self.shrink_streak < self.config.down_ticks {
+            return (self.clamped(desired), StepKind::Hold);
+        }
+        self.shrink_streak = 0;
+        (self.clamped(desired - 1), StepKind::Shrink)
+    }
+
+    /// Wait breached: probe upward.
+    fn breached_tick(&mut self, sample: TickSample, desired: usize) -> (usize, StepKind) {
         self.shrink_streak = 0;
         self.healthy_streak = 0;
         match self.probe {
-            ProbeState::Hold { ticks_left } => {
-                self.probe = if ticks_left > 1 {
-                    ProbeState::Hold {
-                        ticks_left: ticks_left - 1,
-                    }
-                } else {
-                    ProbeState::Idle
-                };
-                (clamp(desired), StepKind::Hold)
+            ProbeState::Hold { ticks_left } => self.hold_tick(ticks_left, desired),
+            // Step only when prior steps have materialized: if spawn is
+            // stuck, running `desired` further ahead of `live` helps nothing.
+            ProbeState::Idle if sample.live >= desired => {
+                self.probe_step(sample.throughput(), desired, StepKind::Grow)
             }
-            ProbeState::Idle => {
-                // Step only when prior steps have materialized: if spawn is
-                // stuck, running `desired` further ahead of `live` helps
-                // nothing.
-                if sample.live >= desired {
-                    self.probe_step(x_now, desired, StepKind::Grow)
-                } else {
-                    (clamp(desired), StepKind::Hold)
-                }
-            }
-            ProbeState::AwaitVerify {
-                baseline_x,
-                target,
-                ticks_waited,
-            } => {
-                if sample.live < target {
-                    // The stepped member hasn't materialized yet; judging now
-                    // would refute a member that never ran. Bounded wait, then
-                    // re-evaluate from scratch.
-                    if ticks_waited >= self.config.spawn_wait_ticks {
-                        self.probe = ProbeState::Idle;
-                    } else {
-                        self.probe = ProbeState::AwaitVerify {
-                            baseline_x,
-                            target,
-                            ticks_waited: ticks_waited + 1,
-                        };
-                    }
-                    return (clamp(desired), StepKind::Hold);
-                }
-                if sample.task_count < self.config.verify_min_completions {
-                    // Indeterminate: too few completions to judge (long tasks,
-                    // or the backend so slow nothing finishes —
-                    // indistinguishable). Grow on the slow bounded cadence
-                    // rather than stall (field-proven bad) or grow freely
-                    // (amplifies the one regime the verify exists for).
-                    self.backstop_ticks += 1;
-                    if self.backstop_ticks >= self.config.backstop_ticks {
-                        self.backstop_ticks = 0;
-                        return self.probe_step(x_now, desired, StepKind::GrowBackstop);
-                    }
-                    return (clamp(desired), StepKind::Hold);
-                }
-                self.backstop_ticks = 0;
-                let s_now = sample.task_us as f64 / sample.task_count as f64 / 1e6;
-                let expected = self.config.verify_beta / s_now.max(1e-6);
-                if x_now - baseline_x >= expected {
-                    // Confirmed: the added member delivered; keep stepping,
-                    // and reset the hold ladder — the ceiling moved.
-                    self.consecutive_refutes = 0;
-                    self.probe_step(x_now, desired, StepKind::Grow)
-                } else {
-                    // Refuted with a valid measurement: adding a member did
-                    // not raise throughput — the backend is the bottleneck.
-                    // Back off and hold, doubling the hold per consecutive
-                    // refute so a stable ceiling converges to a slow cadence.
-                    let hold = self
-                        .config
-                        .probe_hold_ticks
-                        .saturating_mul(1 << self.consecutive_refutes.min(6))
-                        .min(self.config.probe_hold_max_ticks);
-                    self.consecutive_refutes = self.consecutive_refutes.saturating_add(1);
-                    self.probe = ProbeState::Hold { ticks_left: hold };
-                    (clamp(desired.saturating_sub(1)), StepKind::Shrink)
-                }
-            }
+            ProbeState::Idle => (self.clamped(desired), StepKind::Hold),
+            ProbeState::AwaitVerify(verify) => self.verify_tick(verify, sample, desired),
         }
+    }
+
+    fn hold_tick(&mut self, ticks_left: u32, desired: usize) -> (usize, StepKind) {
+        self.probe = if ticks_left > 1 {
+            ProbeState::Hold {
+                ticks_left: ticks_left - 1,
+            }
+        } else {
+            ProbeState::Idle
+        };
+        (self.clamped(desired), StepKind::Hold)
+    }
+
+    fn verify_tick(
+        &mut self,
+        verify: Verify,
+        sample: TickSample,
+        desired: usize,
+    ) -> (usize, StepKind) {
+        if sample.live < verify.target {
+            return self.spawn_wait_tick(verify, desired);
+        }
+        if sample.task_count < self.config.verify_min_completions {
+            return self.backstop_tick(sample, desired);
+        }
+        self.backstop_ticks = 0;
+        let expected = self.config.verify_beta / sample.service_seconds().max(1e-6);
+        if sample.throughput() - verify.baseline_x >= expected {
+            // Confirmed: the added member delivered; keep stepping, and reset
+            // the hold ladder — the ceiling moved.
+            self.consecutive_refutes = 0;
+            return self.probe_step(sample.throughput(), desired, StepKind::Grow);
+        }
+        // Refuted with a valid measurement: adding a member did not raise
+        // throughput — the backend is the bottleneck. Back off and hold.
+        self.probe = ProbeState::Hold {
+            ticks_left: self.refute_hold(),
+        };
+        (self.clamped(desired.saturating_sub(1)), StepKind::Shrink)
+    }
+
+    /// The stepped member hasn't materialized yet; judging now would refute
+    /// a member that never ran. Bounded wait, then re-evaluate from scratch.
+    fn spawn_wait_tick(&mut self, verify: Verify, desired: usize) -> (usize, StepKind) {
+        self.probe = if verify.ticks_waited >= self.config.spawn_wait_ticks {
+            ProbeState::Idle
+        } else {
+            ProbeState::AwaitVerify(Verify {
+                ticks_waited: verify.ticks_waited + 1,
+                ..verify
+            })
+        };
+        (self.clamped(desired), StepKind::Hold)
+    }
+
+    /// Indeterminate: too few completions to judge (long tasks, or the
+    /// backend so slow nothing finishes — indistinguishable). Grow on the slow
+    /// bounded cadence rather than stall (field-proven bad) or grow freely
+    /// (amplifies the one regime the verify exists for).
+    fn backstop_tick(&mut self, sample: TickSample, desired: usize) -> (usize, StepKind) {
+        self.backstop_ticks += 1;
+        if self.backstop_ticks < self.config.backstop_ticks {
+            return (self.clamped(desired), StepKind::Hold);
+        }
+        self.backstop_ticks = 0;
+        self.probe_step(sample.throughput(), desired, StepKind::GrowBackstop)
+    }
+
+    /// The hold after a refute, doubling per consecutive refute so a stable
+    /// ceiling converges to a slow probing cadence.
+    fn refute_hold(&mut self) -> u32 {
+        let hold = self
+            .config
+            .probe_hold_ticks
+            .saturating_mul(1 << self.consecutive_refutes.min(6))
+            .min(self.config.probe_hold_max_ticks);
+        self.consecutive_refutes = self.consecutive_refutes.saturating_add(1);
+        hold
     }
 
     fn probe_step(&mut self, x_now: f64, desired: usize, kind: StepKind) -> (usize, StepKind) {
@@ -256,12 +303,12 @@ impl PoolController {
             return (self.max, StepKind::Hold);
         }
         let target = desired + 1;
-        self.probe = ProbeState::AwaitVerify {
+        self.probe = ProbeState::AwaitVerify(Verify {
             baseline_x: x_now,
             target,
             ticks_waited: 0,
-        };
-        (target.clamp(self.min, self.max), kind)
+        });
+        (self.clamped(target), kind)
     }
 }
 
@@ -282,22 +329,9 @@ mod tests {
         down_ticks: 30,
     };
 
-    /// A breached-wait tick where `live` members each complete `per_member`
-    /// tasks of `task_ms`.
-    pub(super) fn storm(live: usize, per_member: u64, task_ms: u64) -> TickSample {
-        let count = live as u64 * per_member;
-        TickSample {
-            task_us: task_ms * 1000 * count,
-            task_count: count,
-            wait_us: 2_000_000 * count.max(1),
-            wait_count: count.max(1),
-            live,
-            backlog: 0,
-            tick_seconds: 1.0,
-        }
-    }
-
-    pub(super) fn calm(live: usize, count: u64, task_ms: u64, wait_ms: u64) -> TickSample {
+    /// A tick where `live` members complete `count` tasks of `task_ms`, each
+    /// having waited `wait_ms` in the queue.
+    fn sample(live: usize, count: u64, task_ms: u64, wait_ms: u64) -> TickSample {
         TickSample {
             task_us: task_ms * 1000 * count,
             task_count: count,
@@ -309,18 +343,20 @@ mod tests {
         }
     }
 
+    /// A breached-wait tick where `live` members each complete `per_member`
+    /// tasks of `task_ms`.
+    pub(super) fn storm(live: usize, per_member: u64, task_ms: u64) -> TickSample {
+        congested(live, live as u64 * per_member, task_ms)
+    }
+
+    pub(super) fn calm(live: usize, count: u64, task_ms: u64, wait_ms: u64) -> TickSample {
+        sample(live, count, task_ms, wait_ms)
+    }
+
     /// A breached tick where total completions stay fixed no matter how many
     /// members are live — the congestion signature.
     pub(super) fn congested(live: usize, count: u64, task_ms: u64) -> TickSample {
-        TickSample {
-            task_us: task_ms * 1000 * count,
-            task_count: count,
-            wait_us: 2_000_000 * count.max(1),
-            wait_count: count.max(1),
-            live,
-            backlog: 0,
-            tick_seconds: 1.0,
-        }
+        sample(live, count, task_ms, 2_000)
     }
 
     #[test]
@@ -541,31 +577,34 @@ mod ladder_tests {
     use super::tests::{CFG, calm, storm};
     use super::*;
 
+    /// Step a congested pool until the next refute, then count the hold
+    /// ticks until it probes again.
+    fn hold_after_next_refute(c: &mut PoolController, desired: &mut usize) -> u32 {
+        let mut hold_run = 0;
+        let mut refuted = false;
+        loop {
+            let (next, kind) = c.step(congested(*desired, 40, 90), *desired);
+            *desired = next;
+            match kind {
+                StepKind::Shrink => {
+                    refuted = true;
+                    hold_run = 0;
+                }
+                StepKind::Hold if refuted => hold_run += 1,
+                StepKind::Grow if refuted => return hold_run,
+                _ => {}
+            }
+        }
+    }
+
     /// Run refute cycles at a fixed ceiling and return the hold length (ticks
     /// between a refute and the next probe) of each cycle.
     fn hold_gaps(cycles: usize) -> Vec<u32> {
         let mut c = PoolController::new(2, 16, CFG);
         let mut desired = 4;
-        let mut gaps = Vec::new();
-        let mut hold_run: u32 = 0;
-        let mut seen_refute = false;
-        while gaps.len() < cycles {
-            let (next, kind) = c.step(congested(desired, 40, 90), desired);
-            match kind {
-                StepKind::Shrink => {
-                    seen_refute = true;
-                    hold_run = 0;
-                }
-                StepKind::Hold if seen_refute => hold_run += 1,
-                StepKind::Grow if seen_refute => {
-                    gaps.push(hold_run);
-                    hold_run = 0;
-                }
-                _ => {}
-            }
-            desired = next;
-        }
-        gaps
+        (0..cycles)
+            .map(|_| hold_after_next_refute(&mut c, &mut desired))
+            .collect()
     }
 
     #[test]
@@ -593,21 +632,7 @@ mod ladder_tests {
             }
         }
         // ...so after the next refute, the hold is back to the base length.
-        let mut hold_run = 0;
-        let mut refuted = false;
-        loop {
-            let (next, kind) = c.step(congested(desired, 40, 90), desired);
-            desired = next;
-            match kind {
-                StepKind::Shrink => {
-                    refuted = true;
-                    hold_run = 0;
-                }
-                StepKind::Hold if refuted => hold_run += 1,
-                StepKind::Grow if refuted => break,
-                _ => {}
-            }
-        }
+        let hold_run = hold_after_next_refute(&mut c, &mut desired);
         assert_eq!(hold_run, 5, "confirm must reset the hold ladder");
     }
 
@@ -624,21 +649,7 @@ mod ladder_tests {
             let (next, _) = c.step(calm(desired, 40, 10, 1), desired);
             desired = next;
         }
-        let mut hold_run = 0;
-        let mut refuted = false;
-        loop {
-            let (next, kind) = c.step(congested(desired, 40, 90), desired);
-            desired = next;
-            match kind {
-                StepKind::Shrink => {
-                    refuted = true;
-                    hold_run = 0;
-                }
-                StepKind::Hold if refuted => hold_run += 1,
-                StepKind::Grow if refuted => break,
-                _ => {}
-            }
-        }
+        let hold_run = hold_after_next_refute(&mut c, &mut desired);
         assert_eq!(hold_run, 5, "sustained healthy must reset the hold ladder");
     }
 
@@ -659,21 +670,7 @@ mod ladder_tests {
         let (next, _) = c.step(calm(desired, 40, 10, 1), desired);
         desired = next;
         // ...must not reset: the third refuted cycle still holds for 20.
-        let mut hold_run = 0;
-        let mut refuted = false;
-        loop {
-            let (next, kind) = c.step(congested(desired, 40, 90), desired);
-            desired = next;
-            match kind {
-                StepKind::Shrink => {
-                    refuted = true;
-                    hold_run = 0;
-                }
-                StepKind::Hold if refuted => hold_run += 1,
-                StepKind::Grow if refuted => break,
-                _ => {}
-            }
-        }
+        let hold_run = hold_after_next_refute(&mut c, &mut desired);
         assert_eq!(hold_run, 20, "one healthy tick must not reset the ladder");
     }
 }
