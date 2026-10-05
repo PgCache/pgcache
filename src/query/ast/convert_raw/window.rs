@@ -7,7 +7,8 @@ use ecow::EcoString;
 use pg_query::pg_nodes as pg;
 use smallvec::SmallVec;
 
-use super::{null_order_map, order_dir_map, scalar_expr_convert};
+use super::scalar::scalar_expr_convert;
+use super::{null_order_map, order_dir_map};
 use crate::query::ast::raw::{NodePtr, cast, cstr, list_nodes, node_tag, node_tag_name};
 use crate::query::ast::{
     AstError, AstNode, FrameBound, FrameExclusion, FrameMode, OrderByClause, QueryExpr, ScalarExpr,
