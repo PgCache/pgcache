@@ -14,6 +14,22 @@ use crate::query::ast::Deparse;
 use crate::result::error_chain_format;
 use crate::settings::CachePolicy;
 
+/// Maximum number of generation bumps (second chances) per eviction round.
+/// Bounds re-stamping work and prevents pathological case where all queries
+/// are referenced.
+const MAX_BUMPS: usize = 5;
+
+/// What eviction does with one candidate.
+enum CandidateAction {
+    /// Pinned and Ready: bump past it (never evicted).
+    PinnedBump,
+    /// Referenced and Ready under CLOCK: second chance.
+    ClockBump,
+    /// Would be bumped but isn't Ready: revisit next round.
+    Skip,
+    Evict,
+}
+
 impl WriterCore {
     /// Refresh the cached `statvfs` reading for the cache PG data directory (one
     /// syscall); a no-op leaving the last reading if the data directory wasn't
@@ -76,13 +92,10 @@ impl WriterCore {
         if self.frame_holds_locks() {
             return Ok(());
         }
-        /// Maximum number of generation bumps (second chances) per eviction round.
-        /// Bounds re-stamping work and prevents pathological case where all queries are referenced.
-        const MAX_BUMPS: usize = 5;
         let mut bumps = 0;
         let mut evicted = 0usize;
 
-        let cfg = self.cache.dynamic.load();
+        let cache_policy = self.cache.dynamic.load().cache_policy;
         // Memory count cap (PGC-251): evict down to it. `usize::MAX` = uncapped.
         // Disk pressure is handled separately (throttle + escalating reclaim in
         // `disk_pressure_handle`, PGC-276), not here.
@@ -91,7 +104,7 @@ impl WriterCore {
         debug!(
             count = self.cache.cached_queries.len(),
             count_cap,
-            cache_policy = ?cfg.cache_policy,
+            cache_policy = ?cache_policy,
             "eviction_run entry"
         );
 
@@ -107,72 +120,30 @@ impl WriterCore {
             let Some(query) = self.cache.cached_queries.get2(&candidate_gen) else {
                 continue;
             };
-            let fingerprint = query.fingerprint;
-            let query_pinned = query.pinned;
-
-            // A generation bump re-keys the query; a population or merge in
-            // flight is keyed by the old generation and would be abandoned
-            // with nothing to finalize or readmit it, leaving the query
-            // Loading forever (PGC-418 review). Only a Ready query is bumped;
-            // anything else at the head of the order is skipped this round
-            // and revisited once it settles.
-            let ready = self
-                .state_view
-                .cached_queries
-                .get(&fingerprint)
-                .is_some_and(|e| e.state == CachedQueryState::Ready);
-
-            // Pinned queries are never evicted — bump to move past them.
-            // Unlike CLOCK bumps, pinned bumps are not bounded by MAX_BUMPS.
-            if query_pinned {
-                if ready {
-                    trace!("pinned bump {fingerprint}");
+            let (fingerprint, pinned) = (query.fingerprint, query.pinned);
+            let clock_bump_allowed = cache_policy == CachePolicy::Clock && bumps < MAX_BUMPS;
+            match self.eviction_candidate_action(fingerprint, pinned, clock_bump_allowed) {
+                CandidateAction::PinnedBump => {
                     crate::metrics::handles()
                         .state
                         .evictions_pinned_bump
                         .increment(1);
                     self.cache_query_generation_bump(fingerprint).await?;
-                } else {
-                    trace!("pinned not Ready, skipped this round {fingerprint}");
                 }
-                continue;
-            }
-
-            // CLOCK second-chance: referenced queries get bumped (bounded by
-            // MAX_BUMPS). A referenced query that is not Ready keeps its
-            // chance without the bump.
-            if cfg.cache_policy == CachePolicy::Clock && bumps < MAX_BUMPS {
-                let referenced = self
-                    .state_view
-                    .cached_queries
-                    .get(&fingerprint)
-                    .map(|e| e.referenced)
-                    .unwrap_or(false);
-
-                if referenced {
-                    if ready {
-                        trace!("clock bump {fingerprint}");
-                        crate::metrics::handles().state.evictions_bump.increment(1);
-                        self.cache_query_generation_bump(fingerprint).await?;
-                        bumps += 1;
-                    } else {
-                        trace!("clock referenced but not Ready, skipped this round {fingerprint}");
+                CandidateAction::ClockBump => {
+                    crate::metrics::handles().state.evictions_bump.increment(1);
+                    self.cache_query_generation_bump(fingerprint).await?;
+                    bumps += 1;
+                }
+                CandidateAction::Skip => {}
+                CandidateAction::Evict => {
+                    self.candidate_evict(fingerprint).await?;
+                    bumps = 0;
+                    evicted += 1;
+                    if max_evictions.is_some_and(|m| evicted >= m) {
+                        break;
                     }
-                    continue;
                 }
-            }
-
-            // Evict (full removal) — cache_query_evict emits its own entry log
-            crate::metrics::handles().state.evictions.increment(1);
-            self.cache_query_evict(fingerprint).await?;
-            // publication_dirty_drain drops the orphaned cache tables; the freed
-            // disk space is reclaimed asynchronously and observed by a later
-            // tick's statvfs read, not measured here (PGC-276).
-            self.publication_dirty_drain().await?;
-            bumps = 0;
-            evicted += 1;
-            if max_evictions.is_some_and(|m| evicted >= m) {
-                break;
             }
         }
 
@@ -180,6 +151,57 @@ impl WriterCore {
         // it is GC of dead Pending/Invalidated entries, not eviction-critical,
         // and its O(cached_queries) scan would dominate Ready handling.
         Ok(())
+    }
+
+    /// What eviction does with the candidate at the head of the generation
+    /// order. A generation bump re-keys the query; a population or merge in
+    /// flight is keyed by the old generation and would be abandoned with
+    /// nothing to finalize or readmit it, leaving the query Loading forever
+    /// (PGC-418 review). So only a Ready query is bumped; anything else that
+    /// would be bumped is skipped this round and revisited once it settles.
+    fn eviction_candidate_action(
+        &self,
+        fingerprint: Fingerprint,
+        pinned: bool,
+        clock_bump_allowed: bool,
+    ) -> CandidateAction {
+        let view = self.state_view.cached_queries.get(&fingerprint);
+        let ready = view
+            .as_ref()
+            .is_some_and(|e| e.state == CachedQueryState::Ready);
+        // Pinned queries are never evicted — bump to move past them. Unlike
+        // CLOCK bumps, pinned bumps are not bounded by MAX_BUMPS.
+        if pinned {
+            if ready {
+                trace!("pinned bump {fingerprint}");
+                return CandidateAction::PinnedBump;
+            }
+            trace!("pinned not Ready, skipped this round {fingerprint}");
+            return CandidateAction::Skip;
+        }
+        // CLOCK second-chance: referenced queries get bumped (bounded by
+        // MAX_BUMPS). A referenced query that is not Ready keeps its chance
+        // without the bump.
+        let referenced = view.as_ref().is_some_and(|e| e.referenced);
+        if !(clock_bump_allowed && referenced) {
+            return CandidateAction::Evict;
+        }
+        if ready {
+            trace!("clock bump {fingerprint}");
+            return CandidateAction::ClockBump;
+        }
+        trace!("clock referenced but not Ready, skipped this round {fingerprint}");
+        CandidateAction::Skip
+    }
+
+    /// Fully evict a candidate (`cache_query_evict` emits its own entry log).
+    async fn candidate_evict(&mut self, fingerprint: Fingerprint) -> CacheResult<()> {
+        crate::metrics::handles().state.evictions.increment(1);
+        self.cache_query_evict(fingerprint).await?;
+        // publication_dirty_drain drops the orphaned cache tables; the freed
+        // disk space is reclaimed asynchronously and observed by a later
+        // tick's statvfs read, not measured here (PGC-276).
+        self.publication_dirty_drain().await
     }
 
     /// Disk-pressure handling on the 1 s tick (PGC-276). Disk is cheap and
