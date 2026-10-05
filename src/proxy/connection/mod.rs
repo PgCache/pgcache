@@ -20,8 +20,11 @@ use crate::{
     proxy::egress::EgressQueue,
 };
 
+mod cache_batch;
 mod describe_cache;
+mod describe_synth;
 mod extended;
+mod extended_buffer;
 mod relay;
 mod search_path_intercept;
 mod telemetry;
@@ -30,7 +33,7 @@ mod write_log;
 
 use super::origin_stream::{OriginReadHalf, OriginWriteHalf, origin_connect};
 use describe_cache::{DESCRIBE_CACHE_CAPACITY, DescribeCacheEntry, DescribeKey};
-use extended::ExtendedPending;
+use extended_buffer::ExtendedPending;
 pub use relay::connection_task;
 use relay::forward_lazy_parse_install;
 use search_path_intercept::{OriginIntercept, SearchPathState};
