@@ -70,14 +70,35 @@ unsafe fn isolation_defelem_find(options: *const pg::List) -> Option<Option<Isol
     }
 }
 
+/// Which isolation state a statement sets: the open block's, or the session
+/// default.
+#[derive(Clone, Copy)]
+enum IsolationScope {
+    Transaction,
+    Session,
+}
+
+impl IsolationScope {
+    /// The effect of setting this scope's level to `level`; `None` is a level
+    /// that cannot be read from the statement. An unreadable transaction level
+    /// can only be stricter than we can prove; an unreadable session default is
+    /// unknown until re-probed.
+    fn effect(self, level: Option<IsolationLevel>) -> IsolationEffect {
+        match (self, level) {
+            (Self::Transaction, Some(level)) => IsolationEffect::Transaction(level),
+            (Self::Transaction, None) => IsolationEffect::Transaction(IsolationLevel::Serializable),
+            (Self::Session, Some(level)) => IsolationEffect::SessionDefault(level),
+            (Self::Session, None) => IsolationEffect::SessionUnknown,
+        }
+    }
+}
+
 /// Isolation effect of a `BEGIN` / `START TRANSACTION` option list.
 unsafe fn begin_isolation_effect(options: *const pg::List) -> IsolationEffect {
     unsafe {
         match isolation_defelem_find(options) {
             None => IsolationEffect::None,
-            Some(Some(level)) => IsolationEffect::Transaction(level),
-            // An unreadable level can only be stricter than we can prove.
-            Some(None) => IsolationEffect::Transaction(IsolationLevel::Serializable),
+            Some(level) => IsolationScope::Transaction.effect(level),
         }
     }
 }
@@ -91,45 +112,48 @@ unsafe fn variable_set_isolation_effect(s: *const pg::VariableSetStmt) -> Isolat
             return IsolationEffect::SessionUnknown;
         }
         if kind == pg::VariableSetKind_VAR_SET_MULTI {
-            // SET TRANSACTION ... / SET SESSION CHARACTERISTICS AS TRANSACTION ...
-            let scope_transaction = name.eq_ignore_ascii_case("TRANSACTION");
-            let scope_session = name.eq_ignore_ascii_case("SESSION CHARACTERISTICS");
-            if !scope_transaction && !scope_session {
-                return IsolationEffect::None;
-            }
-            return match isolation_defelem_find((*s).args) {
-                None => IsolationEffect::None,
-                Some(Some(level)) if scope_transaction => IsolationEffect::Transaction(level),
-                Some(Some(level)) => IsolationEffect::SessionDefault(level),
-                Some(None) if scope_transaction => {
-                    IsolationEffect::Transaction(IsolationLevel::Serializable)
-                }
-                Some(None) => IsolationEffect::SessionUnknown,
-            };
+            return set_characteristics_effect(name, (*s).args);
         }
-        let default_guc = name.eq_ignore_ascii_case("default_transaction_isolation");
-        let transaction_guc = name.eq_ignore_ascii_case("transaction_isolation");
-        if !default_guc && !transaction_guc {
+        let Some(scope) = isolation_guc_scope(name) else {
             return IsolationEffect::None;
-        }
+        };
         if kind != pg::VariableSetKind_VAR_SET_VALUE || (*s).is_local {
             // RESET, SET ... TO DEFAULT, SET FROM CURRENT, SET LOCAL: the
             // resulting value is not readable from the statement.
-            return if transaction_guc {
-                IsolationEffect::Transaction(IsolationLevel::Serializable)
-            } else {
-                IsolationEffect::SessionUnknown
-            };
+            return scope.effect(None);
         }
         let level = list_nodes((*s).args)
             .next()
             .and_then(|arg| isolation_level_of_arg(arg));
-        match (level, transaction_guc) {
-            (Some(level), true) => IsolationEffect::Transaction(level),
-            (Some(level), false) => IsolationEffect::SessionDefault(level),
-            (None, true) => IsolationEffect::Transaction(IsolationLevel::Serializable),
-            (None, false) => IsolationEffect::SessionUnknown,
+        scope.effect(level)
+    }
+}
+
+/// `SET TRANSACTION ...` / `SET SESSION CHARACTERISTICS AS TRANSACTION ...`.
+unsafe fn set_characteristics_effect(name: &str, args: *const pg::List) -> IsolationEffect {
+    unsafe {
+        let scope = if name.eq_ignore_ascii_case("TRANSACTION") {
+            IsolationScope::Transaction
+        } else if name.eq_ignore_ascii_case("SESSION CHARACTERISTICS") {
+            IsolationScope::Session
+        } else {
+            return IsolationEffect::None;
+        };
+        match isolation_defelem_find(args) {
+            None => IsolationEffect::None,
+            Some(level) => scope.effect(level),
         }
+    }
+}
+
+/// The scope an isolation GUC sets, or `None` for any other variable.
+fn isolation_guc_scope(name: &str) -> Option<IsolationScope> {
+    if name.eq_ignore_ascii_case("transaction_isolation") {
+        Some(IsolationScope::Transaction)
+    } else if name.eq_ignore_ascii_case("default_transaction_isolation") {
+        Some(IsolationScope::Session)
+    } else {
+        None
     }
 }
 
@@ -145,54 +169,10 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                 let s = cast::<pg::MergeStmt>(stmt);
                 Write(dml_table_classify((*s).relation, (*s).withClause))
             }
-            pg::NodeTag_T_CopyStmt => {
-                let s = cast::<pg::CopyStmt>(stmt);
-                if (*s).is_from {
-                    Write(dml_table_classify((*s).relation, std::ptr::null()))
-                } else if copy_to_query_writes((*s).query as NodePtr) {
-                    // COPY (WITH x AS (INSERT ...) ...) TO — the query writes.
-                    Write(WriteClass::Connection)
-                } else {
-                    read_only(None)
-                }
-            }
-            pg::NodeTag_T_TruncateStmt => {
-                let s = cast::<pg::TruncateStmt>(stmt);
-                let mut relations = list_nodes((*s).relations);
-                match (relations.next(), relations.next()) {
-                    (Some(only), None) if node_tag(only) == pg::NodeTag_T_RangeVar => {
-                        Write(table_class(cast::<pg::RangeVar>(only)))
-                    }
-                    _ => Write(WriteClass::Connection),
-                }
-            }
+            pg::NodeTag_T_CopyStmt => copy_classify(cast::<pg::CopyStmt>(stmt)),
+            pg::NodeTag_T_TruncateStmt => Write(truncate_classify(cast::<pg::TruncateStmt>(stmt))),
             pg::NodeTag_T_TransactionStmt => {
-                let s = cast::<pg::TransactionStmt>(stmt);
-                match (*s).kind {
-                    pg::TransactionStmtKind_TRANS_STMT_BEGIN
-                    | pg::TransactionStmtKind_TRANS_STMT_START => ReadOnly {
-                        transaction: Some(TransactionBoundary::Begin),
-                        isolation: begin_isolation_effect((*s).options),
-                    },
-                    // AND CHAIN immediately re-enters a transaction.
-                    pg::TransactionStmtKind_TRANS_STMT_COMMIT
-                    | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK => {
-                        read_only(Some(if (*s).chain {
-                            TransactionBoundary::Begin
-                        } else {
-                            TransactionBoundary::End
-                        }))
-                    }
-                    pg::TransactionStmtKind_TRANS_STMT_SAVEPOINT
-                    | pg::TransactionStmtKind_TRANS_STMT_RELEASE
-                    | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO => read_only(None),
-                    // PREPARE TRANSACTION commits later, possibly from another
-                    // session — the entry must never be LSN-stamped.
-                    pg::TransactionStmtKind_TRANS_STMT_PREPARE => {
-                        Write(WriteClass::ConnectionUnstampable)
-                    }
-                    _ => Write(WriteClass::Connection),
-                }
+                transaction_classify(cast::<pg::TransactionStmt>(stmt))
             }
             pg::NodeTag_T_VariableSetStmt => ReadOnly {
                 transaction: None,
@@ -217,6 +197,60 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
             // DML; ExplainStmt with ANALYZE executes its argument. Everything
             // else (DDL, CALL, DO, unknown) is a potential write.
             _ => Write(WriteClass::Connection),
+        }
+    }
+}
+
+unsafe fn copy_classify(s: *const pg::CopyStmt) -> NonSelectClass {
+    unsafe {
+        if (*s).is_from {
+            NonSelectClass::Write(dml_table_classify((*s).relation, std::ptr::null()))
+        } else if copy_to_query_writes((*s).query as NodePtr) {
+            // COPY (WITH x AS (INSERT ...) ...) TO — the query writes.
+            NonSelectClass::Write(WriteClass::Connection)
+        } else {
+            read_only(None)
+        }
+    }
+}
+
+unsafe fn truncate_classify(s: *const pg::TruncateStmt) -> WriteClass {
+    unsafe {
+        let mut relations = list_nodes((*s).relations);
+        match (relations.next(), relations.next()) {
+            (Some(only), None) if node_tag(only) == pg::NodeTag_T_RangeVar => {
+                table_class(cast::<pg::RangeVar>(only))
+            }
+            _ => WriteClass::Connection,
+        }
+    }
+}
+
+unsafe fn transaction_classify(s: *const pg::TransactionStmt) -> NonSelectClass {
+    unsafe {
+        match (*s).kind {
+            pg::TransactionStmtKind_TRANS_STMT_BEGIN | pg::TransactionStmtKind_TRANS_STMT_START => {
+                NonSelectClass::ReadOnly {
+                    transaction: Some(TransactionBoundary::Begin),
+                    isolation: begin_isolation_effect((*s).options),
+                }
+            }
+            // AND CHAIN immediately re-enters a transaction.
+            pg::TransactionStmtKind_TRANS_STMT_COMMIT
+            | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK => read_only(Some(if (*s).chain {
+                TransactionBoundary::Begin
+            } else {
+                TransactionBoundary::End
+            })),
+            pg::TransactionStmtKind_TRANS_STMT_SAVEPOINT
+            | pg::TransactionStmtKind_TRANS_STMT_RELEASE
+            | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO => read_only(None),
+            // PREPARE TRANSACTION commits later, possibly from another
+            // session — the entry must never be LSN-stamped.
+            pg::TransactionStmtKind_TRANS_STMT_PREPARE => {
+                NonSelectClass::Write(WriteClass::ConnectionUnstampable)
+            }
+            _ => NonSelectClass::Write(WriteClass::Connection),
         }
     }
 }
@@ -315,71 +349,112 @@ unsafe fn table_class(relation: *const pg::RangeVar) -> WriteClass {
     }
 }
 
+/// The single table a DML statement targets, or the class to return instead:
+/// connection scope for a missing relation or a data-modifying CTE (which
+/// targets a *different* table), or a non-table class from [`table_class`].
+unsafe fn single_table_target(
+    relation: *const pg::RangeVar,
+    with: *const pg::WithClause,
+) -> Result<RelationRef, WriteClass> {
+    unsafe {
+        if relation.is_null() || with_clause_has_dml(with) {
+            return Err(WriteClass::Connection);
+        }
+        match table_class(relation) {
+            WriteClass::Table(relation_ref) => Ok(relation_ref),
+            other => Err(other),
+        }
+    }
+}
+
 unsafe fn insert_classify(insert: *const pg::InsertStmt) -> WriteClass {
     unsafe {
-        let relation = (*insert).relation;
-        if relation.is_null() {
-            return WriteClass::Connection;
-        }
-        // A data-modifying CTE targets a different table than the INSERT.
-        if with_clause_has_dml((*insert).withClause) {
-            return WriteClass::Connection;
-        }
-        let table = table_class(relation);
-        let WriteClass::Table(relation_ref) = &table else {
-            return table;
+        let relation_ref = match single_table_target((*insert).relation, (*insert).withClause) {
+            Ok(relation_ref) => relation_ref,
+            Err(class) => return class,
         };
-
-        // ON CONFLICT can touch existing rows; an omitted column list needs
-        // catalog column order the proxy doesn't have.
-        if !(*insert).onConflictClause.is_null() || list_is_empty((*insert).cols) {
-            return table;
+        match insert_rows_extract(insert, &relation_ref) {
+            Some(statement) => WriteClass::InsertRows(statement),
+            None => WriteClass::Table(relation_ref),
         }
-        let mut columns: Vec<EcoString> = Vec::with_capacity(list_nodes((*insert).cols).len());
-        for col_node in list_nodes((*insert).cols) {
+    }
+}
+
+/// The INSERT's literal rows, or `None` to degrade to table level.
+unsafe fn insert_rows_extract(
+    insert: *const pg::InsertStmt,
+    relation_ref: &RelationRef,
+) -> Option<Arc<InsertStatement>> {
+    unsafe {
+        // ON CONFLICT can touch existing rows.
+        if !(*insert).onConflictClause.is_null() {
+            return None;
+        }
+        let columns = insert_columns_extract((*insert).cols)?;
+        let rows = insert_values_rows_extract((*insert).selectStmt as NodePtr, columns.len())?;
+        Some(Arc::new(InsertStatement {
+            relation: relation_ref.clone(),
+            columns,
+            rows,
+        }))
+    }
+}
+
+/// The INSERT's explicit column list. An omitted list needs catalog column
+/// order the proxy doesn't have.
+unsafe fn insert_columns_extract(cols: *const pg::List) -> Option<Vec<EcoString>> {
+    unsafe {
+        if list_is_empty(cols) {
+            return None;
+        }
+        let mut columns: Vec<EcoString> = Vec::with_capacity(list_nodes(cols).len());
+        for col_node in list_nodes(cols) {
             if node_tag(col_node) != pg::NodeTag_T_ResTarget {
-                return table;
+                return None;
             }
             let res = cast::<pg::ResTarget>(col_node);
             let name = cstr((*res).name);
             // Indirection (`INSERT INTO t (a[1])`) writes part of a value.
             if name.is_empty() || !list_is_empty((*res).indirection) {
-                return table;
+                return None;
             }
             columns.push(EcoString::from(name));
         }
+        Some(columns)
+    }
+}
 
-        // The VALUES/SELECT arm: `DEFAULT VALUES` has no select; a select
-        // without valuesLists is INSERT...SELECT.
-        let select = (*insert).selectStmt as NodePtr;
+/// The VALUES rows, each `column_count` wide and at most [`INSERT_MAX_ROWS`].
+/// `DEFAULT VALUES` has no select; a select without valuesLists is
+/// INSERT...SELECT.
+unsafe fn insert_values_rows_extract(
+    select: NodePtr,
+    column_count: usize,
+) -> Option<Vec<InsertRow>> {
+    unsafe {
         if select.is_null() || node_tag(select) != pg::NodeTag_T_SelectStmt {
-            return table;
+            return None;
         }
         let select = cast::<pg::SelectStmt>(select);
         if list_is_empty((*select).valuesLists) {
-            return table;
+            return None;
         }
         let row_nodes = list_nodes((*select).valuesLists);
         if row_nodes.len() > INSERT_MAX_ROWS {
-            return table;
+            return None;
         }
         let mut rows: Vec<InsertRow> = Vec::with_capacity(row_nodes.len());
         for row_node in row_nodes {
             if node_tag(row_node) != pg::NodeTag_T_List {
-                return table;
+                return None;
             }
             let cells = list_nodes(row_node as *const pg::List);
-            if cells.len() != columns.len() {
-                return table;
+            if cells.len() != column_count {
+                return None;
             }
             rows.push(cells.map(|cell| insert_cell_extract(cell)).collect());
         }
-
-        WriteClass::InsertRows(Arc::new(InsertStatement {
-            relation: relation_ref.clone(),
-            columns,
-            rows,
-        }))
+        Some(rows)
     }
 }
 
@@ -390,33 +465,22 @@ unsafe fn insert_classify(insert: *const pg::InsertStmt) -> WriteClass {
 /// walker can't reduce degrades to table-level opaque.
 unsafe fn delete_classify(s: *const pg::DeleteStmt) -> WriteClass {
     unsafe {
-        let relation = (*s).relation;
-        if relation.is_null() || with_clause_has_dml((*s).withClause) {
-            return WriteClass::Connection;
-        }
-        let table = table_class(relation);
-        let WriteClass::Table(relation_ref) = &table else {
-            return table;
+        let relation_ref = match single_table_target((*s).relation, (*s).withClause) {
+            Ok(relation_ref) => relation_ref,
+            Err(class) => return class,
         };
         // USING joins other tables into the predicate — not single-table.
-        if !list_is_empty((*s).usingClause) {
-            return table;
-        }
-        let where_node = (*s).whereClause as NodePtr;
-        if where_node.is_null() {
-            return table; // whole-table delete: any read of it intersects
-        }
-        let Ok(where_expr) = where_expr_convert(where_node) else {
-            return table; // unconvertible WHERE → opaque
+        let comparisons = if list_is_empty((*s).usingClause) {
+            where_comparisons_extract((*s).whereClause as NodePtr)
+        } else {
+            None
         };
-        match where_expr_comparisons(&where_expr) {
-            Some(comparisons) if !comparisons.is_empty() => {
-                WriteClass::DeleteRows(Arc::new(DeleteStatement {
-                    relation: relation_ref.clone(),
-                    comparisons,
-                }))
-            }
-            _ => table, // non-extractable predicate → opaque
+        match comparisons {
+            Some(comparisons) => WriteClass::DeleteRows(Arc::new(DeleteStatement {
+                relation: relation_ref,
+                comparisons,
+            })),
+            None => WriteClass::Table(relation_ref),
         }
     }
 }
@@ -428,38 +492,47 @@ unsafe fn delete_classify(s: *const pg::DeleteStmt) -> WriteClass {
 /// WHERE, or a SET target the walker can't reduce degrades to table-level opaque.
 unsafe fn update_classify(s: *const pg::UpdateStmt) -> WriteClass {
     unsafe {
-        let relation = (*s).relation;
-        if relation.is_null() || with_clause_has_dml((*s).withClause) {
-            return WriteClass::Connection;
-        }
-        let table = table_class(relation);
-        let WriteClass::Table(relation_ref) = &table else {
-            return table;
+        let relation_ref = match single_table_target((*s).relation, (*s).withClause) {
+            Ok(relation_ref) => relation_ref,
+            Err(class) => return class,
         };
+        match update_parts_extract(s) {
+            Some((where_comparisons, set)) => WriteClass::UpdateRows(Arc::new(UpdateStatement {
+                relation: relation_ref,
+                where_comparisons,
+                set,
+            })),
+            None => WriteClass::Table(relation_ref),
+        }
+    }
+}
+
+/// An UPDATE's WHERE comparisons and SET list, or `None` to degrade.
+unsafe fn update_parts_extract(
+    s: *const pg::UpdateStmt,
+) -> Option<(Vec<WriteComparison>, Vec<SetAssignment>)> {
+    unsafe {
         // A FROM clause joins other tables into the predicate — not single-table.
         if !list_is_empty((*s).fromClause) {
-            return table;
+            return None;
         }
-        let Some(set) = update_set_extract((*s).targetList) else {
-            return table; // multi-assign / subscripted target → opaque
-        };
-        let where_node = (*s).whereClause as NodePtr;
+        // Multi-assign / subscripted target → opaque.
+        let set = update_set_extract((*s).targetList)?;
+        let where_comparisons = where_comparisons_extract((*s).whereClause as NodePtr)?;
+        Some((where_comparisons, set))
+    }
+}
+
+/// The WHERE's comparisons, or `None` when there is no WHERE (any read of the
+/// table intersects a whole-table write), it doesn't convert, or it doesn't
+/// reduce to bare-column comparisons.
+unsafe fn where_comparisons_extract(where_node: NodePtr) -> Option<Vec<WriteComparison>> {
+    unsafe {
         if where_node.is_null() {
-            return table; // whole-table update: any read of it intersects
+            return None;
         }
-        let Ok(where_expr) = where_expr_convert(where_node) else {
-            return table;
-        };
-        match where_expr_comparisons(&where_expr) {
-            Some(where_comparisons) if !where_comparisons.is_empty() => {
-                WriteClass::UpdateRows(Arc::new(UpdateStatement {
-                    relation: relation_ref.clone(),
-                    where_comparisons,
-                    set,
-                }))
-            }
-            _ => table,
-        }
+        let where_expr = where_expr_convert(where_node).ok()?;
+        where_expr_comparisons(&where_expr).filter(|comparisons| !comparisons.is_empty())
     }
 }
 
