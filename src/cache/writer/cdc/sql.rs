@@ -15,8 +15,56 @@ use crate::query::ast::Deparse;
 use crate::query::transform::resolved_select_node_table_replace_with_values_all;
 use crate::result::error_chain_format;
 
+/// Append `items` to `buf` separated by `sep`, each rendered by `render`.
+/// Returns false when there were no items.
+fn separated_into<T>(
+    buf: &mut String,
+    sep: &str,
+    items: impl IntoIterator<Item = T>,
+    mut render: impl FnMut(&mut String, T),
+) -> bool {
+    let mut any = false;
+    for item in items {
+        if any {
+            buf.push_str(sep);
+        }
+        render(buf, item);
+        any = true;
+    }
+    any
+}
+
+/// Append the table's quoted `"schema"."name"`.
+fn table_name_quote_into(buf: &mut String, table_metadata: &TableMetadata) {
+    identifier_quote_into(&table_metadata.schema, buf);
+    buf.push('.');
+    identifier_quote_into(&table_metadata.name, buf);
+}
+
+/// Append a column value as an escaped SQL literal, or `NULL`.
+fn sql_literal_into(buf: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            let _ = escape::escape_literal_into(value, buf);
+        }
+        None => buf.push_str("NULL"),
+    }
+}
+
+/// The columns `row_data` carries a value slot for, in position order.
+fn row_columns<'a>(
+    table_metadata: &'a TableMetadata,
+    row_data: &'a [Option<ByteString>],
+) -> impl Iterator<Item = (&'a str, &'a Option<ByteString>)> {
+    table_metadata.columns.iter().filter_map(|column_meta| {
+        row_data
+            .get(column_meta.index())
+            .map(|value| (column_meta.name.as_str(), value))
+    })
+}
+
 /// Append the tail of an upsert SQL: either ` DO UPDATE SET <non-pk cols>` or
-/// ` DO NOTHING` if the table has no non-PK columns. PG rejects `DO UPDATE SET`
+/// ` DO NOTHING` if the row has no non-PK columns. PG rejects `DO UPDATE SET`
 /// with an empty SET list, so PK-only tables must use `DO NOTHING`.
 ///
 /// Assumes the caller has already emitted `INSERT INTO ... ON CONFLICT (<pk>)`.
@@ -31,25 +79,48 @@ fn cdc_on_conflict_tail_append(
             .iter()
             .any(|pk| pk.as_str() == name)
     };
-    let mut first = true;
-    for column_meta in &table_metadata.columns {
-        if row_data.get(column_meta.index()).is_none() || is_pk(column_meta.name.as_str()) {
-            continue;
-        }
-        if first {
-            sql.push_str(" DO UPDATE SET ");
-        } else {
-            sql.push_str(", ");
-        }
-        let col = column_meta.name.as_str();
-        identifier_quote_into(col, sql);
+    let mark = sql.len();
+    sql.push_str(" DO UPDATE SET ");
+    let non_pk = row_columns(table_metadata, row_data).filter(|(name, _)| !is_pk(name));
+    let any = separated_into(sql, ", ", non_pk, |sql, (name, _)| {
+        identifier_quote_into(name, sql);
         sql.push_str(" = EXCLUDED.");
-        identifier_quote_into(col, sql);
-        first = false;
-    }
-    if first {
+        identifier_quote_into(name, sql);
+    });
+    if !any {
+        sql.truncate(mark);
         sql.push_str(" DO NOTHING");
     }
+}
+
+/// `TRUNCATE <cache table>, ...`, or `None` for no tables.
+fn truncate_sql<'a>(tables: impl Iterator<Item = &'a TableMetadata>) -> Option<String> {
+    let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
+    sql.push_str("TRUNCATE ");
+    separated_into(&mut sql, ", ", tables, table_name_quote_into).then_some(sql)
+}
+
+/// Render `update_query`'s precomputed predicate template (PGC-343) with the
+/// row's literals into `buf`, skipping the per-row clone + deparse. The
+/// template is only built for single-occurrence relations, so one `EXISTS` is
+/// the whole predicate. False (and `buf` untouched) when there is no template
+/// or it declines a short/partial row.
+fn pg_eval_template_render(
+    buf: &mut String,
+    update_query: &UpdateQuery,
+    row_data: &[Option<ByteString>],
+) -> bool {
+    let Some(template) = &update_query.pg_eval_template else {
+        return false;
+    };
+    let mark = buf.len();
+    buf.push_str("EXISTS (");
+    if template.render_into(buf, row_data) {
+        buf.push(')');
+        return true;
+    }
+    buf.truncate(mark);
+    false
 }
 
 impl WriterCdc {
@@ -60,21 +131,30 @@ impl WriterCdc {
         core: &WriterCore,
         oids: impl Iterator<Item = Oid>,
     ) -> Option<String> {
-        let mut sql = String::with_capacity(SQL_BUFFER_CAPACITY);
-        sql.push_str("TRUNCATE ");
-        let mut first = true;
-        for oid in oids {
-            if let Some(table_metadata) = core.cache.tables.get1(&oid) {
-                if !first {
-                    sql.push_str(", ");
-                }
-                identifier_quote_into(&table_metadata.schema, &mut sql);
-                sql.push('.');
-                identifier_quote_into(&table_metadata.name, &mut sql);
-                first = false;
+        truncate_sql(oids.filter_map(|oid| core.cache.tables.get1(&oid)))
+    }
+
+    /// Build one chunk's combined predicate `SELECT` into `pg_eval_buf`, the
+    /// predicates joined by `sep`.
+    fn pg_eval_chunk_sql(
+        &mut self,
+        chunk: &[&UpdateQuery],
+        sep: &str,
+        table_metadata: &TableMetadata,
+        row_data: &[Option<ByteString>],
+    ) -> CacheResult<()> {
+        let buf = &mut self.pg_eval_buf;
+        buf.clear();
+        buf.push_str("SELECT ");
+        for (i, update_query) in chunk.iter().enumerate() {
+            if i > 0 {
+                buf.push_str(sep);
             }
+            buf.push('(');
+            Self::cache_predicate_into(buf, update_query, table_metadata, row_data)?;
+            buf.push(')');
         }
-        if first { None } else { Some(sql) }
+        Ok(())
     }
 
     /// Evaluate each query's membership predicate against the CDC row and return
@@ -90,40 +170,23 @@ impl WriterCdc {
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<Vec<Fingerprint>> {
-        if queries.is_empty() {
-            return Ok(Vec::new());
-        }
         let mut hits = Vec::new();
         for chunk in queries.chunks(PG_EVAL_CHUNK) {
-            self.pg_eval_buf.clear();
-            self.pg_eval_buf.push_str("SELECT ");
-            for (i, update_query) in chunk.iter().enumerate() {
-                if i > 0 {
-                    self.pg_eval_buf.push_str(", ");
-                }
-                self.pg_eval_buf.push('(');
-                Self::cache_predicate_into(
-                    &mut self.pg_eval_buf,
-                    update_query,
-                    table_metadata,
-                    row_data,
-                )?;
-                self.pg_eval_buf.push(')');
-            }
+            self.pg_eval_chunk_sql(chunk, ", ", table_metadata, row_data)?;
             let Some(row) =
                 Self::pg_eval_chunk_row(&self.cache_eval_conn, &self.pg_eval_buf).await?
             else {
                 continue;
             };
             // One boolean column per query; column `i` ↔ `chunk[i]`.
-            for (i, update_query) in chunk.iter().enumerate() {
-                if row.get(i) == Some("t") {
-                    trace!(
-                        "update_queries pg-eval matched fingerprint {}",
-                        update_query.fingerprint
-                    );
-                    hits.push(update_query.fingerprint);
-                }
+            let matched = chunk
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| row.get(*i) == Some("t"))
+                .map(|(_, update_query)| update_query.fingerprint);
+            for fingerprint in matched {
+                trace!("update_queries pg-eval matched fingerprint {fingerprint}");
+                hits.push(fingerprint);
             }
         }
         Ok(hits)
@@ -140,31 +203,10 @@ impl WriterCdc {
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<bool> {
-        if queries.is_empty() {
-            return Ok(false);
-        }
         for chunk in queries.chunks(PG_EVAL_CHUNK) {
-            self.pg_eval_buf.clear();
-            self.pg_eval_buf.push_str("SELECT ");
-            for (i, update_query) in chunk.iter().enumerate() {
-                if i > 0 {
-                    self.pg_eval_buf.push_str(" OR ");
-                }
-                self.pg_eval_buf.push('(');
-                Self::cache_predicate_into(
-                    &mut self.pg_eval_buf,
-                    update_query,
-                    table_metadata,
-                    row_data,
-                )?;
-                self.pg_eval_buf.push(')');
-            }
-            let Some(row) =
-                Self::pg_eval_chunk_row(&self.cache_eval_conn, &self.pg_eval_buf).await?
-            else {
-                continue;
-            };
-            if row.get(0) == Some("t") {
+            self.pg_eval_chunk_sql(chunk, " OR ", table_metadata, row_data)?;
+            let row = Self::pg_eval_chunk_row(&self.cache_eval_conn, &self.pg_eval_buf).await?;
+            if row.is_some_and(|row| row.get(0) == Some("t")) {
                 return Ok(true);
             }
         }
@@ -208,19 +250,8 @@ impl WriterCdc {
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
-        // Fast path: render the row's literals into the precomputed template
-        // (PGC-343), skipping the per-row clone + deparse. The template is only
-        // built for single-occurrence relations, so one `EXISTS` is the whole
-        // predicate. `render_into` declines short/partial rows, falling through
-        // to the general path below.
-        if let Some(template) = &update_query.pg_eval_template {
-            let mark = buf.len();
-            buf.push_str("EXISTS (");
-            if template.render_into(buf, row_data) {
-                buf.push(')');
-                return Ok(());
-            }
-            buf.truncate(mark);
+        if pg_eval_template_render(buf, update_query, row_data) {
+            return Ok(());
         }
         let resolved_select = update_query
             .resolved
@@ -232,118 +263,86 @@ impl WriterCdc {
             row_data,
         )
         .map_err(|e| e.context_transform(CacheError::from))?;
-        for (i, value_select) in value_selects.iter().enumerate() {
-            if i > 0 {
-                buf.push_str(" OR ");
-            }
+        separated_into(buf, " OR ", &value_selects, |buf, value_select| {
             buf.push_str("EXISTS (");
             Deparse::deparse(value_select, buf);
             buf.push(')');
-        }
+        });
         Ok(())
     }
 
-    /// Build an unconditional UPSERT for the row — `INSERT ... ON CONFLICT DO UPDATE`
-    /// with no WHERE predicate. Used by the LocalEval fast path once the Rust
-    /// evaluator has already decided the row belongs in cache.
+    /// Append an unconditional upsert for `row_data` into `buf` —
+    /// `INSERT ... ON CONFLICT DO UPDATE` with no WHERE predicate. Used by the
+    /// LocalEval fast path once the Rust evaluator has already decided the row
+    /// belongs in cache. Builders write into the reused frame buffer instead of
+    /// allocating a per-statement `String` (PGC-228): the row's columns are
+    /// emitted in passes over the position-sorted column store, with no
+    /// per-event Vec or String.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    /// Append an unconditional upsert for `row_data` into `buf` (PGC-228:
-    /// builders write into the reused frame buffer instead of allocating a
-    /// per-statement `String`).
     pub(super) fn cache_upsert_unconditional_into(
         buf: &mut String,
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
     ) {
-        // Columns with a value in `row_data` are emitted in three passes
-        // (names, values, conflict tail) over the position-sorted column
-        // store, writing straight into `buf` — no per-event Vec or String.
         buf.push_str("INSERT INTO ");
-        identifier_quote_into(&table_metadata.schema, buf);
-        buf.push('.');
-        identifier_quote_into(&table_metadata.name, buf);
+        table_name_quote_into(buf, table_metadata);
         buf.push_str(" (");
-        let mut first = true;
-        for column_meta in &table_metadata.columns {
-            if row_data.get(column_meta.index()).is_none() {
-                continue;
-            }
-            if !first {
-                buf.push_str(", ");
-            }
-            identifier_quote_into(column_meta.name.as_str(), buf);
-            first = false;
-        }
+        separated_into(
+            buf,
+            ", ",
+            row_columns(table_metadata, row_data),
+            |buf, (name, _)| {
+                identifier_quote_into(name, buf);
+            },
+        );
         buf.push_str(") VALUES (");
-        let mut first = true;
-        for column_meta in &table_metadata.columns {
-            let Some(row_value) = row_data.get(column_meta.index()) else {
-                continue;
-            };
-            if !first {
-                buf.push_str(", ");
-            }
-            match row_value.as_deref() {
-                Some(value) => {
-                    let _ = escape::escape_literal_into(value, buf);
-                }
-                None => buf.push_str("NULL"),
-            }
-            first = false;
-        }
+        separated_into(
+            buf,
+            ", ",
+            row_columns(table_metadata, row_data),
+            |buf, (_, value)| {
+                sql_literal_into(buf, value.as_deref());
+            },
+        );
         buf.push_str(") ON CONFLICT (");
-        for (i, pk) in table_metadata.primary_key_columns.iter().enumerate() {
-            if i > 0 {
-                buf.push_str(", ");
-            }
+        separated_into(buf, ", ", &table_metadata.primary_key_columns, |buf, pk| {
             identifier_quote_into(pk, buf);
-        }
+        });
         buf.push(')');
         cdc_on_conflict_tail_append(buf, table_metadata, row_data);
     }
 
+    /// Append a PK-qualified delete for `row_data` into `buf` (PGC-228).
     // Trace level: at info/debug the fmt layer allocates per-span extensions,
     // which would put a heap allocation on every CDC event.
     #[instrument(skip_all, level = "trace")]
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    /// Append a PK-qualified delete for `row_data` into `buf` (PGC-228).
     pub(super) fn cache_delete_into(
         buf: &mut String,
         table_metadata: &TableMetadata,
         row_data: &[Option<ByteString>],
     ) -> CacheResult<()> {
         buf.push_str("DELETE FROM ");
-        identifier_quote_into(&table_metadata.schema, buf);
-        buf.push('.');
-        identifier_quote_into(&table_metadata.name, buf);
+        table_name_quote_into(buf, table_metadata);
         buf.push_str(" WHERE ");
-
-        let mut has_pk = false;
-        for pk_column in &table_metadata.primary_key_columns {
-            if let Some(column_meta) = table_metadata.columns.get(pk_column.as_str()) {
-                let position = column_meta.index();
-                if let Some(row_value) = row_data.get(position) {
-                    if has_pk {
-                        buf.push_str(" AND ");
-                    }
-                    identifier_quote_into(pk_column, buf);
-                    buf.push_str(" = ");
-                    match row_value.as_deref() {
-                        Some(value) => {
-                            let _ = escape::escape_literal_into(value, buf);
-                        }
-                        None => buf.push_str("NULL"),
-                    }
-                    has_pk = true;
-                }
-            }
-        }
-
+        let pk_values = table_metadata
+            .primary_key_columns
+            .iter()
+            .filter_map(|pk_column| {
+                let column_meta = table_metadata.columns.get(pk_column.as_str())?;
+                row_data
+                    .get(column_meta.index())
+                    .map(|value| (pk_column, value))
+            });
+        let has_pk = separated_into(buf, " AND ", pk_values, |buf, (pk_column, value)| {
+            identifier_quote_into(pk_column, buf);
+            buf.push_str(" = ");
+            sql_literal_into(buf, value.as_deref());
+        });
         if !has_pk {
             error!("Cannot build DELETE WHERE clause: no primary key values found");
             return Err(CacheError::NoPrimaryKey.into());
         }
-
         Ok(())
     }
 }
@@ -404,6 +403,42 @@ mod tests {
              \"camelCase\" = EXCLUDED.\"camelCase\", \
              \"we\"\"ird\" = EXCLUDED.\"we\"\"ird\""
         );
+    }
+
+    #[test]
+    fn test_upsert_pk_only_row_does_nothing_on_conflict() {
+        let table = quoted_table_metadata();
+        let row = vec![cell("1")];
+        let mut buf = String::new();
+        WriterCdc::cache_upsert_unconditional_into(&mut buf, &table, &row);
+        assert_eq!(
+            buf,
+            "INSERT INTO \"public\".\"Order\" (\"id\") VALUES ('1') \
+             ON CONFLICT (\"id\") DO NOTHING"
+        );
+    }
+
+    #[test]
+    fn test_delete_without_pk_value_is_rejected() {
+        let table = quoted_table_metadata();
+        let mut buf = String::new();
+        let result = WriterCdc::cache_delete_into(&mut buf, &table, &[]);
+        assert!(matches!(
+            result.map_err(|e| e.into_current_context()),
+            Err(CacheError::NoPrimaryKey)
+        ));
+    }
+
+    #[test]
+    fn test_truncate_lists_quoted_tables() {
+        let first = quoted_table_metadata();
+        let mut second = quoted_table_metadata();
+        second.name = "line".into();
+        assert_eq!(
+            truncate_sql([&first, &second].into_iter()).as_deref(),
+            Some("TRUNCATE \"public\".\"Order\", \"public\".\"line\"")
+        );
+        assert_eq!(truncate_sql(std::iter::empty()), None);
     }
 
     #[test]
