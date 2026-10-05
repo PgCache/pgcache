@@ -14,7 +14,7 @@ use super::segment_eval::PreparedEvalKey;
 use super::{BATCH_FRAMES_MAX, PREPARED_EVAL_CACHE_CAPACITY, SQL_BUFFER_CAPACITY, WriterCdc};
 use crate::cache::messages::{CdcCommand, CdcValue};
 use crate::cache::writer::core::WriterCore;
-use crate::cache::writer::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState};
+use crate::cache::writer::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, ToastState};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
@@ -89,19 +89,16 @@ fn update_command_event(
     // Toasted images are resolved by the replay pre-pass
     // (`toast_repair_events`) — batched there instead of a per-event lookup
     // here.
-    Some(if toasted.is_empty() {
-        FrameRowEvent::Update {
-            relation_oid,
-            key_data,
-            new_row_data,
-        }
+    let toast = if toasted.is_empty() {
+        ToastState::Complete
     } else {
-        FrameRowEvent::UpdateToasted {
-            relation_oid,
-            key_data,
-            new_row_data,
-            toasted,
-        }
+        ToastState::Pending(toasted)
+    };
+    Some(FrameRowEvent::Update {
+        relation_oid,
+        key_data,
+        new_row_data,
+        toast,
     })
 }
 
@@ -313,12 +310,6 @@ impl WriterCdc {
                         relation_oid: r, ..
                     }
                     | FrameRowEvent::Update {
-                        relation_oid: r, ..
-                    }
-                    | FrameRowEvent::UpdateToasted {
-                        relation_oid: r, ..
-                    }
-                    | FrameRowEvent::UpdateToastFallback {
                         relation_oid: r, ..
                     }
                     | FrameRowEvent::Delete {

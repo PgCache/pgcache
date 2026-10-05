@@ -42,30 +42,9 @@ pub(super) enum FrameRowEvent {
         relation_oid: Oid,
         key_data: Vec<Option<ByteString>>,
         new_row_data: Vec<Option<ByteString>>,
-    },
-    /// An UPDATE whose image carries unchanged-toast markers, awaiting repair
-    /// (PGC-264). Resolved by the replay pre-pass (`toast_repair_events`) into
-    /// a plain `Update` (values from the batch overlay or the batched cache
-    /// lookup) or an `UpdateToastFallback` — no other consumer ever sees one.
-    /// `Toasted` values are already mapped to `None` in `new_row_data`;
-    /// `toasted` holds their column indexes.
-    UpdateToasted {
-        relation_oid: Oid,
-        key_data: Vec<Option<ByteString>>,
-        new_row_data: Vec<Option<ByteString>>,
-        toasted: Vec<usize>,
-    },
-    /// An UPDATE whose unchanged-toast columns could not be repaired (row
-    /// absent from the cache table, or its in-batch state untrustworthy —
-    /// PGC-264). Excluded from segment eval; the decide pass conservatively
-    /// invalidates affected queries instead of upserting the incomplete image.
-    /// `Toasted` values are already mapped to `None` in `new_row_data`;
-    /// `toasted_columns` names the elided columns.
-    UpdateToastFallback {
-        relation_oid: Oid,
-        key_data: Vec<Option<ByteString>>,
-        new_row_data: Vec<Option<ByteString>>,
-        toasted_columns: Vec<EcoString>,
+        /// Whether the new image is complete (PGC-264). `Toasted` values are
+        /// mapped to `None` in `new_row_data` until repaired.
+        toast: ToastState,
     },
     Delete {
         relation_oid: Oid,
@@ -82,6 +61,22 @@ pub(super) enum FrameRowEvent {
     Boundary {
         commit_lsn: Lsn,
     },
+}
+
+/// An UPDATE image's unchanged-toast status (PGC-264).
+pub(super) enum ToastState {
+    /// Every column carries a real value.
+    Complete,
+    /// Awaiting repair: positions of the elided columns. Resolved by the
+    /// replay pre-pass (`toast_repair_events`) into `Complete` (values from
+    /// the batch overlay or the batched cache lookup) or `Unrepaired` — no
+    /// other consumer ever sees one.
+    Pending(Vec<usize>),
+    /// Could not be repaired (row absent from the cache table, or its
+    /// in-batch state untrustworthy): names of the elided columns. Excluded
+    /// from segment eval; the decide pass conservatively invalidates
+    /// affected queries instead of upserting the incomplete image.
+    Unrepaired(Vec<EcoString>),
 }
 
 /// One entry of `batch_toast_overlay` (PGC-264): what this batch last did to
@@ -339,16 +334,6 @@ impl WriterCore {
                 (Some(row_data), None)
             }
             FrameRowEvent::Update {
-                key_data,
-                new_row_data,
-                ..
-            }
-            | FrameRowEvent::UpdateToasted {
-                key_data,
-                new_row_data,
-                ..
-            }
-            | FrameRowEvent::UpdateToastFallback {
                 key_data,
                 new_row_data,
                 ..

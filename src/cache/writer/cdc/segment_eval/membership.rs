@@ -13,7 +13,7 @@ use crate::cache::update_query::{UpdateEvalStrategy, UpdateQueries, UpdateQuery}
 use crate::cache::writer::cdc::row_match::update_query_matches_locally;
 use crate::cache::writer::cdc::{PG_EVAL_CHUNK, PG_EVAL_ROW_CHUNK, WriterCdc};
 use crate::cache::writer::core::WriterCore;
-use crate::cache::writer::frame::FrameRowEvent;
+use crate::cache::writer::frame::{FrameRowEvent, ToastState};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
@@ -31,10 +31,10 @@ type EventRow<'a> = (usize, &'a [Option<ByteString>]);
 
 /// The row image an event asks a membership question about: the new row for
 /// inserts and updates. Deletes carry no membership question.
-/// `UpdateToastFallback` is excluded by design: its row image is incomplete,
-/// so the decide pass invalidates instead of evaluating membership from it.
-/// `UpdateToasted` no longer exists at eval time (resolved by the repair
-/// pre-pass) (PGC-264).
+/// An `Unrepaired` toast image is excluded by design: it is incomplete, so
+/// the decide pass invalidates instead of evaluating membership from it.
+/// `Pending` no longer exists at eval time (resolved by the repair pre-pass)
+/// (PGC-264).
 fn event_membership_row(event: &FrameRowEvent) -> Option<(Oid, &[Option<ByteString>])> {
     match event {
         FrameRowEvent::Insert {
@@ -44,10 +44,13 @@ fn event_membership_row(event: &FrameRowEvent) -> Option<(Oid, &[Option<ByteStri
         FrameRowEvent::Update {
             relation_oid,
             new_row_data,
+            toast: ToastState::Complete,
             ..
         } => Some((*relation_oid, new_row_data)),
-        FrameRowEvent::UpdateToasted { .. }
-        | FrameRowEvent::UpdateToastFallback { .. }
+        FrameRowEvent::Update {
+            toast: ToastState::Pending(_) | ToastState::Unrepaired(_),
+            ..
+        }
         | FrameRowEvent::Delete { .. }
         | FrameRowEvent::Truncate { .. }
         | FrameRowEvent::Boundary { .. } => None,

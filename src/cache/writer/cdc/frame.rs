@@ -1,15 +1,15 @@
 use std::sync::atomic::Ordering;
 
-use ecow::EcoString;
 use tracing::{error, info};
 
 use super::segment_eval::SegmentMembership;
+use super::toast_repair::toasted_column_names;
 use super::{RelationRow, RelationUpdate, WriterCdc};
 use crate::cache::memo::SlotKey;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
 use crate::cache::writer::frame::{
-    FRAME_BUF_CAPACITY, FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState,
+    FRAME_BUF_CAPACITY, FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, ToastState,
 };
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::oid::Oid;
@@ -246,6 +246,7 @@ impl WriterCdc {
                         relation_oid,
                         key_data,
                         new_row_data,
+                        toast: ToastState::Complete,
                     } => (
                         self.handle_update(
                             core,
@@ -255,11 +256,11 @@ impl WriterCdc {
                         .await,
                         "cdc replay update",
                     ),
-                    FrameRowEvent::UpdateToastFallback {
+                    FrameRowEvent::Update {
                         relation_oid,
                         key_data,
                         new_row_data,
-                        toasted_columns,
+                        toast: ToastState::Unrepaired(toasted_columns),
                     } => (
                         self.handle_update_toast_fallback(
                             core,
@@ -272,26 +273,16 @@ impl WriterCdc {
                     // Unreachable by construction (`toast_repair_events`
                     // resolved every one before the segment loop); degrade to
                     // the conservative fallback rather than panicking.
-                    FrameRowEvent::UpdateToasted {
+                    FrameRowEvent::Update {
                         relation_oid,
                         key_data,
                         new_row_data,
-                        toasted,
+                        toast: ToastState::Pending(toasted),
                     } => {
-                        debug_assert!(false, "UpdateToasted survived the repair pre-pass");
+                        debug_assert!(false, "pending toast survived the repair pre-pass");
                         error!(relation_oid = %relation_oid, "unrepaired toasted update at decide time");
-                        let toasted_columns: Vec<EcoString> = core
-                            .cache
-                            .tables
-                            .get1(relation_oid)
-                            .map(|t| {
-                                t.columns
-                                    .iter()
-                                    .filter(|c| toasted.contains(&c.index()))
-                                    .map(|c| c.name.clone())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
+                        let toasted_columns =
+                            toasted_column_names(core.cache.tables.get1(relation_oid), toasted);
                         (
                             self.handle_update_toast_fallback(
                                 core,

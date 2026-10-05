@@ -8,11 +8,10 @@ use tracing::{debug, error};
 
 use super::{SQL_BUFFER_CAPACITY, WriterCdc, update_pk_changed};
 use crate::cache::writer::core::WriterCore;
-use crate::cache::writer::frame::{FrameRowEvent, OverlayEntry};
+use crate::cache::writer::frame::{FrameRowEvent, OverlayEntry, ToastState};
 use crate::cache::writer::staging::pk_body_render;
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
-use crate::pg::Lsn;
 use crate::pg::protocol::ByteString;
 
 /// Toastable-column `(position, value)` pairs of one row image.
@@ -43,78 +42,77 @@ enum ToastResolution {
     Fallback,
 }
 
-/// An `UpdateToasted` event taken out of the event log for resolution.
-struct ToastedUpdate {
+/// A toast-pending update's fields, borrowed in place from the event log:
+/// resolution patches `new_row_data` and moves `toast` to `Complete` or
+/// `Unrepaired` without taking the event out.
+struct PendingUpdate<'a> {
     relation_oid: Oid,
-    key_data: Vec<Option<ByteString>>,
-    new_row_data: Vec<Option<ByteString>>,
-    toasted: Vec<usize>,
+    key_data: &'a [Option<ByteString>],
+    new_row_data: &'a mut [Option<ByteString>],
+    toast: &'a mut ToastState,
 }
 
-impl ToastedUpdate {
-    /// Take the update out of `event`, leaving a placeholder the caller
-    /// overwrites; `None` (event untouched) for any other variant.
-    fn take(event: &mut FrameRowEvent) -> Option<Self> {
-        if !matches!(event, FrameRowEvent::UpdateToasted { .. }) {
-            return None;
-        }
-        let placeholder = FrameRowEvent::Boundary {
-            commit_lsn: Lsn::from_raw(0),
-        };
-        match std::mem::replace(event, placeholder) {
-            FrameRowEvent::UpdateToasted {
+impl<'a> PendingUpdate<'a> {
+    /// The event's fields when it is an update still awaiting repair.
+    fn of(event: &'a mut FrameRowEvent) -> Option<Self> {
+        match event {
+            FrameRowEvent::Update {
                 relation_oid,
                 key_data,
                 new_row_data,
-                toasted,
-            } => Some(Self {
-                relation_oid,
+                toast,
+            } if matches!(toast, ToastState::Pending(_)) => Some(Self {
+                relation_oid: *relation_oid,
                 key_data,
                 new_row_data,
-                toasted,
+                toast,
             }),
-            other @ (FrameRowEvent::Insert { .. }
-            | FrameRowEvent::Update { .. }
-            | FrameRowEvent::UpdateToastFallback { .. }
+            FrameRowEvent::Update { .. }
+            | FrameRowEvent::Insert { .. }
             | FrameRowEvent::Delete { .. }
             | FrameRowEvent::Truncate { .. }
-            | FrameRowEvent::Boundary { .. }) => {
-                *event = other;
-                None
-            }
+            | FrameRowEvent::Boundary { .. } => None,
         }
     }
 
     fn pk_changed(&self, table_metadata: &TableMetadata) -> bool {
-        update_pk_changed(table_metadata, &self.key_data, &self.new_row_data)
+        update_pk_changed(table_metadata, self.key_data, self.new_row_data)
     }
 
     /// The row the unchanged-toast marker refers to: the cached copy lives
     /// under the row's PRE-image key, so after a PK change it is the old PK.
     fn source_row(&self, pk_changed: bool) -> &[Option<ByteString>] {
         if pk_changed {
-            &self.key_data
+            self.key_data
         } else {
-            &self.new_row_data
+            self.new_row_data
         }
     }
+}
 
-    fn into_update(self) -> FrameRowEvent {
-        FrameRowEvent::Update {
-            relation_oid: self.relation_oid,
-            key_data: self.key_data,
-            new_row_data: self.new_row_data,
-        }
+/// The elided column positions of a pending toast state.
+fn pending_positions(toast: &ToastState) -> &[usize] {
+    match toast {
+        ToastState::Pending(positions) => positions,
+        ToastState::Complete | ToastState::Unrepaired(_) => &[],
     }
+}
 
-    fn into_queued(self) -> FrameRowEvent {
-        FrameRowEvent::UpdateToasted {
-            relation_oid: self.relation_oid,
-            key_data: self.key_data,
-            new_row_data: self.new_row_data,
-            toasted: self.toasted,
-        }
-    }
+/// Names of the elided columns at `positions`.
+pub(super) fn toasted_column_names(
+    table_metadata: Option<&TableMetadata>,
+    positions: &[usize],
+) -> Vec<EcoString> {
+    table_metadata
+        .map(|table_metadata| {
+            table_metadata
+                .columns
+                .iter()
+                .filter(|c| positions.contains(&c.index()))
+                .map(|c| c.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Collect a row image's toastable-column `(position, value)` pairs into
@@ -190,7 +188,7 @@ fn toasted_values_apply(
 fn toast_resolution(
     core: &WriterCore,
     table_metadata: &TableMetadata,
-    update: &ToastedUpdate,
+    update: &PendingUpdate<'_>,
     pk_changed: bool,
 ) -> ToastResolution {
     let source_row = update.source_row(pk_changed);
@@ -201,8 +199,10 @@ fn toast_resolution(
         .batch_toast_overlay
         .get(&(update.relation_oid, key.clone()))
     {
-        Some(OverlayEntry::Values(values)) => overlay_values_pick(values, &update.toasted)
-            .map_or(ToastResolution::Fallback, ToastResolution::Repaired),
+        Some(OverlayEntry::Values(values)) => {
+            overlay_values_pick(values, pending_positions(update.toast))
+                .map_or(ToastResolution::Fallback, ToastResolution::Repaired)
+        }
         Some(OverlayEntry::Deleted) => ToastResolution::Fallback,
         None if core.batch_toast_guard_oids.contains(&update.relation_oid) => {
             ToastResolution::Fallback
@@ -288,7 +288,7 @@ impl ToastChain {
     /// Flush the chain's final post-images. `or_insert`: a pass-1 entry always
     /// stems from a complete write later in arrival order than every queued
     /// event, so it must win; tombstones were already recorded eagerly (pass-1
-    /// Queue branch for vacated old PKs, `toast_fallback_build` for
+    /// Queue branch for vacated old PKs, `toast_fallback_mark` for
     /// fallen-back rows).
     fn flush(self, core: &mut WriterCore, relation_oid: Oid) {
         for (key, entry) in self.entries {
@@ -483,6 +483,7 @@ impl WriterCdc {
                 relation_oid,
                 key_data,
                 new_row_data,
+                toast: ToastState::Complete,
             } => {
                 Self::toast_overlay_record_write(core, *relation_oid, new_row_data);
                 // Under REPLICA IDENTITY FULL `key_data` is present on every
@@ -505,14 +506,16 @@ impl WriterCdc {
                     core.toast_overlay_relation_invalidate(oid);
                 }
             }
-            FrameRowEvent::Boundary { .. }
-            | FrameRowEvent::UpdateToastFallback { .. }
-            | FrameRowEvent::UpdateToasted { .. } => {}
+            FrameRowEvent::Update {
+                toast: ToastState::Pending(_) | ToastState::Unrepaired(_),
+                ..
+            }
+            | FrameRowEvent::Boundary { .. } => {}
         }
     }
 
-    /// Resolve every `UpdateToasted` in one replay's events (PGC-264), in two
-    /// passes over the arrival order:
+    /// Resolve every toast-pending update in one replay's events (PGC-264),
+    /// in two passes over the arrival order:
     ///
     /// 1. Maintain the batch toast overlay (`toast_overlay_event_track`;
     ///    writes after a truncate re-arm repair). A toasted update whose
@@ -531,14 +534,12 @@ impl WriterCdc {
     ///    post-images then land in the overlay without displacing pass-1
     ///    entries, which always stem from arrival-later complete writes.
     ///
-    /// No `UpdateToasted` remains in `events` afterwards.
+    /// No `ToastState::Pending` remains in `events` afterwards.
     pub(super) async fn toast_repair_events(core: &mut WriterCore, events: &mut [FrameRowEvent]) {
         let mut pending: HashMap<Oid, Vec<PendingRepairSlot>> = HashMap::new();
         for (idx, event) in events.iter_mut().enumerate() {
-            match ToastedUpdate::take(event) {
-                Some(update) => {
-                    *event = Self::toast_resolve_from_overlay(core, &mut pending, idx, update);
-                }
+            match PendingUpdate::of(event) {
+                Some(update) => Self::toast_resolve_from_overlay(core, &mut pending, idx, update),
                 None => Self::toast_overlay_event_track(core, event),
             }
         }
@@ -547,53 +548,51 @@ impl WriterCdc {
         }
     }
 
-    /// Pass-1 resolution of one `UpdateToasted`: repair from the overlay,
-    /// fall back, or queue for the batched lookup (returning the event
-    /// unchanged). Also performs the event's own overlay bookkeeping.
+    /// Pass-1 resolution of one pending update: repair from the overlay,
+    /// fall back, or queue for the batched lookup (leaving it pending). Also
+    /// performs the event's own overlay bookkeeping.
     fn toast_resolve_from_overlay(
         core: &mut WriterCore,
         pending: &mut HashMap<Oid, Vec<PendingRepairSlot>>,
         event_idx: usize,
-        mut update: ToastedUpdate,
-    ) -> FrameRowEvent {
-        let Some(table_metadata) = core.cache.tables.get1(&update.relation_oid) else {
+        update: PendingUpdate<'_>,
+    ) {
+        let relation_oid = update.relation_oid;
+        let Some(table_metadata) = core.cache.tables.get1(&relation_oid) else {
             // Unknown relation: handlers no-op on it either way.
-            return update.into_update();
+            *update.toast = ToastState::Complete;
+            return;
         };
         let pk_changed = update.pk_changed(table_metadata);
         let resolution = toast_resolution(core, table_metadata, &update, pk_changed);
-        let relation_oid = update.relation_oid;
         // A vacated old PK is gone whatever happens to the new one; on a
         // queued update the new PK's overlay entry is written by pass 2.
         if pk_changed {
-            Self::toast_overlay_record_delete(core, relation_oid, &update.key_data);
+            Self::toast_overlay_record_delete(core, relation_oid, update.key_data);
         }
         match resolution {
             ToastResolution::Repaired(values) => {
                 for (t, v) in values {
-                    if let Some(slot) = update.new_row_data.get_mut(t) {
-                        *slot = v;
+                    if let Some(cell) = update.new_row_data.get_mut(t) {
+                        *cell = v;
                     }
                 }
                 crate::metrics::handles().cdc.toast_repairs.increment(1);
-                Self::toast_overlay_record_write(core, relation_oid, &update.new_row_data);
-                update.into_update()
+                Self::toast_overlay_record_write(core, relation_oid, update.new_row_data);
+                *update.toast = ToastState::Complete;
             }
             ToastResolution::Queue {
                 overlay_key,
                 raw_pk,
-            } => {
-                pending
-                    .entry(relation_oid)
-                    .or_default()
-                    .push(PendingRepairSlot {
-                        event_idx,
-                        overlay_key,
-                        raw_pk,
-                    });
-                update.into_queued()
-            }
-            ToastResolution::Fallback => Self::toast_fallback_build(core, update),
+            } => pending
+                .entry(relation_oid)
+                .or_default()
+                .push(PendingRepairSlot {
+                    event_idx,
+                    overlay_key,
+                    raw_pk,
+                }),
+            ToastResolution::Fallback => Self::toast_fallback_mark(core, update),
         }
     }
 
@@ -608,13 +607,10 @@ impl WriterCdc {
         let lookup = Self::toast_lookup_batch(core, relation_oid, &pendings).await;
         let mut chain = ToastChain::new(lookup);
         for slot in pendings {
-            let Some(event) = events.get_mut(slot.event_idx) else {
+            let Some(update) = events.get_mut(slot.event_idx).and_then(PendingUpdate::of) else {
                 continue;
             };
-            let Some(update) = ToastedUpdate::take(event) else {
-                continue;
-            };
-            *event = Self::toast_chain_resolve(core, &mut chain, slot, update);
+            Self::toast_chain_resolve(core, &mut chain, slot, update);
         }
         chain.flush(core, relation_oid);
     }
@@ -624,10 +620,10 @@ impl WriterCdc {
         core: &mut WriterCore,
         chain: &mut ToastChain,
         slot: PendingRepairSlot,
-        mut update: ToastedUpdate,
-    ) -> FrameRowEvent {
+        update: PendingUpdate<'_>,
+    ) {
         let repaired = chain.source(&slot).is_some_and(|values| {
-            toasted_values_apply(values, &update.toasted, &mut update.new_row_data)
+            toasted_values_apply(values, pending_positions(update.toast), update.new_row_data)
         });
         let table_metadata = core.cache.tables.get1(&update.relation_oid);
         let pk_changed = table_metadata.is_some_and(|t| update.pk_changed(t));
@@ -637,48 +633,35 @@ impl WriterCdc {
                 chain.advance(
                     table_metadata,
                     slot.overlay_key,
-                    &update.new_row_data,
+                    update.new_row_data,
                     pk_changed,
                 );
             }
-            return update.into_update();
+            *update.toast = ToastState::Complete;
+            return;
         }
         chain.tombstone(
             table_metadata,
             slot.overlay_key,
-            &update.new_row_data,
+            update.new_row_data,
             pk_changed,
         );
-        Self::toast_fallback_build(core, update)
+        Self::toast_fallback_mark(core, update);
     }
 
-    /// Build the conservative fallback event for an unrepairable toasted
-    /// update, tombstoning its (to-be-deleted) row in the overlay.
-    fn toast_fallback_build(core: &mut WriterCore, update: ToastedUpdate) -> FrameRowEvent {
-        let toasted_columns: Vec<EcoString> = core
-            .cache
-            .tables
-            .get1(&update.relation_oid)
-            .map(|table_metadata| {
-                table_metadata
-                    .columns
-                    .iter()
-                    .filter(|c| update.toasted.contains(&c.index()))
-                    .map(|c| c.name.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+    /// Mark an unrepairable update `Unrepaired`, tombstoning its
+    /// (to-be-deleted) row in the overlay.
+    fn toast_fallback_mark(core: &mut WriterCore, update: PendingUpdate<'_>) {
+        let toasted_columns = toasted_column_names(
+            core.cache.tables.get1(&update.relation_oid),
+            pending_positions(update.toast),
+        );
         // The fallback handler deletes the row; later in-batch repairs must
         // not trust either image.
-        Self::toast_overlay_record_delete(core, update.relation_oid, &update.new_row_data);
+        Self::toast_overlay_record_delete(core, update.relation_oid, update.new_row_data);
         crate::metrics::handles().cdc.toast_fallbacks.increment(1);
         debug!(relation_oid = %update.relation_oid, "toast repair fell back");
-        FrameRowEvent::UpdateToastFallback {
-            relation_oid: update.relation_oid,
-            key_data: update.key_data,
-            new_row_data: update.new_row_data,
-            toasted_columns,
-        }
+        *update.toast = ToastState::Unrepaired(toasted_columns);
     }
 
     /// One batched pre-batch-image lookup for a relation's queued repairs,

@@ -10,7 +10,7 @@ use super::SegmentMembership;
 use super::lookup::LookupRow;
 use crate::cache::writer::cdc::row_changes::table_has_reserved_columns;
 use crate::cache::writer::core::WriterCore;
-use crate::cache::writer::frame::{FrameRowEvent, OverlayEntry};
+use crate::cache::writer::frame::{FrameRowEvent, OverlayEntry, ToastState};
 use crate::cache::writer::staging::pk_body_render;
 use crate::catalog::ColumnMetadata;
 use crate::oid::Oid;
@@ -266,18 +266,22 @@ impl<'a, 'c> OldImagePrepass<'a, 'c> {
                 relation_oid,
                 key_data,
                 new_row_data,
+                toast: ToastState::Complete,
             } => self.update(event_idx, *relation_oid, key_data, new_row_data),
             FrameRowEvent::Delete {
                 relation_oid,
                 row_data,
             } => self.delete(event_idx, *relation_oid, row_data),
-            FrameRowEvent::UpdateToastFallback {
+            FrameRowEvent::Update {
                 relation_oid,
                 key_data,
                 new_row_data,
-                ..
+                toast: ToastState::Unrepaired(_),
             } => self.toast_fallback(*relation_oid, key_data, new_row_data),
-            FrameRowEvent::UpdateToasted { .. }
+            FrameRowEvent::Update {
+                toast: ToastState::Pending(_),
+                ..
+            }
             | FrameRowEvent::Truncate { .. }
             | FrameRowEvent::Boundary { .. } => {}
         }
