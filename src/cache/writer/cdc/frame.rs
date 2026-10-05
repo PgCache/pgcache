@@ -1,8 +1,10 @@
+use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
+use ecow::EcoString;
 use tracing::{error, info};
 
-use super::segment_eval::SegmentMembership;
+use super::segment_eval::{BatchEvalView, SegmentMembership};
 use super::toast_repair::toasted_column_names;
 use super::{RelationRow, RelationUpdate, WriterCdc};
 use crate::cache::memo::SlotKey;
@@ -183,6 +185,8 @@ impl WriterCdc {
     /// the remaining events are dropped, matching the per-arrival path where
     /// post-deadlock commands skip handling.
     async fn frame_rows_replay(&mut self, core: &mut WriterCore) -> CacheResult<()> {
+        // Taken out for the walk (the handlers need `&mut core`) and handed
+        // back cleared below, so its capacity is reused across frames.
         let mut events = std::mem::take(&mut core.frame_rows);
         // Resolve unchanged-toast images first (PGC-264): segment eval and
         // the decide pass below must only ever see complete row images.
@@ -192,162 +196,155 @@ impl WriterCdc {
         // eval is built from, so eval never spans one. `base` keeps the global
         // event index — the identity the eval matrix is keyed by.
         let mut base = 0;
-        'segments: for segment in
-            events.split_inclusive(|e| matches!(e, FrameRowEvent::Truncate { .. }))
-        {
+        for segment in events.split_inclusive(|e| matches!(e, FrameRowEvent::Truncate { .. })) {
             if core.frame_state == FrameState::Recovering {
                 break;
             }
-            let (rows, trailing_truncate) = match segment.split_last() {
-                Some((FrameRowEvent::Truncate { relation_oids }, rows)) => {
-                    (rows, Some(relation_oids))
-                }
-                _ => (segment, None),
-            };
-
-            // Batched membership + row-change for the segment's rows
-            // (PGC-241), then the ordered decide/emit pass over the same
-            // events.
-            let membership = if rows.is_empty() {
-                SegmentMembership::default()
-            } else {
-                match self.segment_eval(core, rows, base).await {
-                    Ok(m) => m,
-                    Err(e) => {
-                        self.frame_dml_result(core, Err(e))
-                            .await
-                            .attach_loc("cdc segment batch eval")?;
-                        // Swallowed 40P01 → Recovering; the loop exits above.
-                        base += segment.len();
-                        continue;
-                    }
-                }
-            };
-
-            for (offset, event) in rows.iter().enumerate() {
-                if core.frame_state == FrameState::Recovering {
-                    break 'segments;
-                }
-                let i = base + offset;
-                let (r, loc) = match event {
-                    FrameRowEvent::Insert {
-                        relation_oid,
-                        row_data,
-                    } => (
-                        self.handle_insert(
-                            core,
-                            RelationRow::new(*relation_oid, row_data),
-                            membership.view(*relation_oid, i),
-                        )
-                        .await,
-                        "cdc replay insert",
-                    ),
-                    FrameRowEvent::Update {
-                        relation_oid,
-                        key_data,
-                        new_row_data,
-                        toast: ToastState::Complete,
-                    } => (
-                        self.handle_update(
-                            core,
-                            RelationUpdate::new(*relation_oid, key_data, new_row_data),
-                            membership.view(*relation_oid, i),
-                        )
-                        .await,
-                        "cdc replay update",
-                    ),
-                    FrameRowEvent::Update {
-                        relation_oid,
-                        key_data,
-                        new_row_data,
-                        toast: ToastState::Unrepaired(toasted_columns),
-                    } => (
-                        self.handle_update_toast_fallback(
-                            core,
-                            RelationUpdate::new(*relation_oid, key_data, new_row_data),
-                            toasted_columns,
-                        )
-                        .await,
-                        "cdc replay update toast fallback",
-                    ),
-                    // Unreachable by construction (`toast_repair_events`
-                    // resolved every one before the segment loop); degrade to
-                    // the conservative fallback rather than panicking.
-                    FrameRowEvent::Update {
-                        relation_oid,
-                        key_data,
-                        new_row_data,
-                        toast: ToastState::Pending(toasted),
-                    } => {
-                        debug_assert!(false, "pending toast survived the repair pre-pass");
-                        error!(relation_oid = %relation_oid, "unrepaired toasted update at decide time");
-                        let toasted_columns =
-                            toasted_column_names(core.cache.tables.get1(relation_oid), toasted);
-                        (
-                            self.handle_update_toast_fallback(
-                                core,
-                                RelationUpdate::new(*relation_oid, key_data, new_row_data),
-                                &toasted_columns,
-                            )
-                            .await,
-                            "cdc replay unrepaired toasted update",
-                        )
-                    }
-                    FrameRowEvent::Delete {
-                        relation_oid,
-                        row_data,
-                    } => (
-                        self.handle_delete(
-                            core,
-                            RelationRow::new(*relation_oid, row_data),
-                            membership.view(*relation_oid, i),
-                        )
-                        .await,
-                        "cdc replay delete",
-                    ),
-                    // Unreachable by construction (`split_last` separated the
-                    // trailing Truncate); a no-op keeps this panic-free.
-                    FrameRowEvent::Truncate { .. } => (Ok(()), "cdc replay truncate"),
-                    // Frame commit boundary (PGC-242): stamp the bookkeeping
-                    // this frame's replay produced with its commit LSN.
-                    FrameRowEvent::Boundary { commit_lsn } => {
-                        let frame_deletes = std::mem::take(&mut core.frame_deleted_keys);
-                        for (rel, key) in frame_deletes {
-                            core.population_deleted_keys.record(rel, key, *commit_lsn);
-                        }
-                        let frame_stale = std::mem::take(&mut core.frame_toast_stale_keys);
-                        for (rel, key) in frame_stale {
-                            core.population_deleted_keys
-                                .record_toast_stale(rel, key, *commit_lsn);
-                        }
-                        let frame_truncated = std::mem::take(&mut core.frame_truncated_relations);
-                        for rel in frame_truncated {
-                            core.population_deleted_keys.abort_below(rel, *commit_lsn);
-                        }
-                        (Ok(()), "cdc replay boundary")
-                    }
-                };
-                self.frame_dml_result(core, r).await.attach_loc(loc)?;
-            }
-
-            if let Some(relation_oids) = trailing_truncate
-                && core.frame_state != FrameState::Recovering
-            {
-                let r = self.handle_truncate(core, relation_oids).await;
-                self.frame_dml_result(core, r)
-                    .await
-                    .attach_loc("cdc frame replay truncate")?;
-            }
+            self.segment_replay(core, segment, base).await?;
             base += segment.len();
         }
-        // Hand the cleared buffer back so its capacity is reused across
-        // frames, recycling each event's row Vecs into the pool on the way.
-        let mut events = events;
+        // Recycle each event's row Vecs into the pool on the way back.
         for event in events.drain(..) {
             core.row_vecs_recycle(event);
         }
         core.frame_rows = events;
         Ok(())
+    }
+
+    /// Replay one segment: batched membership + row-change for its rows
+    /// (PGC-241), the ordered decide/emit pass over the same events, then its
+    /// trailing Truncate. Stops as soon as the frame enters `Recovering`.
+    async fn segment_replay(
+        &mut self,
+        core: &mut WriterCore,
+        segment: &[FrameRowEvent],
+        base: usize,
+    ) -> CacheResult<()> {
+        let (rows, trailing_truncate) = match segment.split_last() {
+            Some((FrameRowEvent::Truncate { relation_oids }, rows)) => (rows, Some(relation_oids)),
+            _ => (segment, None),
+        };
+        let Some(membership) = self.segment_membership(core, rows, base).await? else {
+            return Ok(());
+        };
+        for (offset, event) in rows.iter().enumerate() {
+            if core.frame_state == FrameState::Recovering {
+                return Ok(());
+            }
+            let slot = EventSlot {
+                membership: &membership,
+                index: base + offset,
+            };
+            let (r, loc) = self.event_replay(core, event, slot).await;
+            self.frame_dml_result(core, r).await.attach_loc(loc)?;
+        }
+        if let Some(relation_oids) = trailing_truncate
+            && core.frame_state != FrameState::Recovering
+        {
+            let r = self.handle_truncate(core, relation_oids).await;
+            self.frame_dml_result(core, r)
+                .await
+                .attach_loc("cdc frame replay truncate")?;
+        }
+        Ok(())
+    }
+
+    /// The segment's batched membership; `None` when the eval hit a `40P01`
+    /// that was swallowed into `Recovering`.
+    async fn segment_membership(
+        &mut self,
+        core: &mut WriterCore,
+        rows: &[FrameRowEvent],
+        base: usize,
+    ) -> CacheResult<Option<SegmentMembership>> {
+        if rows.is_empty() {
+            return Ok(Some(SegmentMembership::default()));
+        }
+        match self.segment_eval(core, rows, base).await {
+            Ok(membership) => Ok(Some(membership)),
+            Err(e) => {
+                self.frame_dml_result(core, Err(e))
+                    .await
+                    .attach_loc("cdc segment batch eval")?;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Run one row event's decide/emit handler; returns its result and the
+    /// breadcrumb to attach.
+    async fn event_replay(
+        &mut self,
+        core: &mut WriterCore,
+        event: &FrameRowEvent,
+        slot: EventSlot<'_>,
+    ) -> (CacheResult<()>, &'static str) {
+        match event {
+            FrameRowEvent::Insert {
+                relation_oid,
+                row_data,
+            } => (
+                self.handle_insert(
+                    core,
+                    RelationRow::new(*relation_oid, row_data),
+                    slot.view(*relation_oid),
+                )
+                .await,
+                "cdc replay insert",
+            ),
+            FrameRowEvent::Update {
+                relation_oid,
+                key_data,
+                new_row_data,
+                toast: ToastState::Complete,
+            } => (
+                self.handle_update(
+                    core,
+                    RelationUpdate::new(*relation_oid, key_data, new_row_data),
+                    slot.view(*relation_oid),
+                )
+                .await,
+                "cdc replay update",
+            ),
+            FrameRowEvent::Update {
+                relation_oid,
+                key_data,
+                new_row_data,
+                toast: toast @ (ToastState::Unrepaired(_) | ToastState::Pending(_)),
+            } => {
+                let (toasted_columns, loc) = fallback_columns(core, *relation_oid, toast);
+                (
+                    self.handle_update_toast_fallback(
+                        core,
+                        RelationUpdate::new(*relation_oid, key_data, new_row_data),
+                        &toasted_columns,
+                    )
+                    .await,
+                    loc,
+                )
+            }
+            FrameRowEvent::Delete {
+                relation_oid,
+                row_data,
+            } => (
+                self.handle_delete(
+                    core,
+                    RelationRow::new(*relation_oid, row_data),
+                    slot.view(*relation_oid),
+                )
+                .await,
+                "cdc replay delete",
+            ),
+            // Unreachable by construction (`split_last` separated the trailing
+            // Truncate); a no-op keeps this panic-free.
+            FrameRowEvent::Truncate { .. } => (Ok(()), "cdc replay truncate"),
+            // Frame commit boundary (PGC-242): stamp the bookkeeping this
+            // frame's replay produced with its commit LSN.
+            FrameRowEvent::Boundary { commit_lsn } => {
+                frame_keys_stamp(core, *commit_lsn);
+                (Ok(()), "cdc replay boundary")
+            }
+        }
     }
 
     /// Mid-frame partial replay once the event log reaches its cap, bounding
@@ -370,72 +367,42 @@ impl WriterCdc {
     /// frame's commit), and run the deferred bookkeeping. With an empty queue
     /// every CommitMark flushes its own frame — the pre-batching behavior.
     pub(super) async fn batch_flush(&mut self, core: &mut WriterCore, lsn: Lsn) -> CacheResult<()> {
-        // In-process memo seqlock (PGC-236, rung 1): bracket the batch's
-        // visibility with begin (even→odd) before and end (odd→even) after,
-        // over every relation the batched frames touched, so any memo over
-        // them is invalidated atomically with the batch becoming visible.
-        // Conceptually the relation-granularity twin of the per-query MV
-        // dirty hooks in `frame_finalize`.
-        //
-        // Gated on the store being non-empty rather than on `enabled()`:
-        // when no memo exists there is nothing to bust, and (unlike an
-        // `enabled()` gate) this keeps the seqlock authoritative even
-        // while memoization is toggled off at runtime — a change landing
-        // during the disabled window still bumps the slot, so a later
-        // re-enable cannot serve a snapshot that predates it.
         // Replay the buffered row events first (PGC-241): this opens the cache
         // txn (`Active → TxnOpen`) or enters `Recovering`, and — for rung 3b —
         // runs the per-row handlers that accumulate the predicate-matched
-        // `frame_memo_evictions`. It MUST precede the memo seqlock `begin` below
-        // so begin/end bracket the identical (now-final) eviction set across the
-        // commit. Buffered writes go to `frame_buf`; the COMMIT is in
-        // `frame_finalize`, which the bracket spans.
+        // `frame_memo_evictions`. It MUST precede the memo bracket so begin/end
+        // bracket the identical (now-final) eviction set across the commit.
+        // Buffered writes go to `frame_buf`; the COMMIT is in `frame_finalize`,
+        // which the bracket spans.
         self.frame_rows_replay(core).await?;
 
-        let memo_active = !core.state_view.memo.is_empty();
-        // Rung 3b: bump `Memo(F)` only for the predicate-matched eviction set
-        // (`frame_memo_evictions`) — a change that doesn't touch a memo's
-        // predicate/membership leaves it intact. The `Relation` slot is still
-        // bumped for every touched relation as the capture-window guard.
-        if memo_active {
-            for &oid in &core.frame_relation_oids {
-                core.state_view
-                    .memo
-                    .slot_dirty_begin(SlotKey::Relation(oid));
-            }
-        }
-        for &fp in &core.frame_memo_evictions {
-            core.state_view.memo.slot_dirty_begin(SlotKey::Memo(fp));
-        }
-
+        let memo_active = memo_bracket_begin(core);
         // Always publish the post-commit version (end the seqlock) before
         // propagating any finalize error: a slot left odd would permanently
         // disable memo serving for that relation on a live subsystem.
         let finalize = self.frame_finalize(core).await;
-        if memo_active {
-            for &oid in &core.frame_relation_oids {
-                core.state_view.memo.slot_dirty_end(SlotKey::Relation(oid));
-            }
-        }
-        for &fp in &core.frame_memo_evictions {
-            core.state_view.memo.slot_dirty_end(SlotKey::Memo(fp));
-        }
+        memo_bracket_end(core, memo_active);
         finalize?;
 
-        core.frame_state = FrameState::Idle;
-        core.merges.batch_flushed();
-        core.frame_invalidations.clear();
-        core.frame_memo_evictions.clear();
-        core.frame_relation_oids.clear();
-        core.frame_buf.clear();
-        core.frame_buf_relations.clear();
-        core.frame_rows.clear();
-        core.frame_chunk_flushed = false;
-        core.batch_frames = 0;
-        core.batch_events = 0;
-        core.batch_deleted_pks.clear();
-        core.toast_overlay_reset();
-        core.batch_toast_guard_oids.clear();
+        batch_state_reset(core);
+        self.applied_lsn_advance(core, lsn);
+        // Per-frame deletes/truncates were stamped by Boundary events during
+        // replay; this catches what replay didn't reach — pending entries from
+        // a frame that entered `Recovering` before its boundary (no-ops in the
+        // normal path, where the lists are already empty).
+        frame_keys_stamp(core, lsn);
+        // Bulk invalidations recorded outside replay (mid-batch DDL drops,
+        // 40P01 recovery) — flush-LSN-stamped by design (an upper bound on the
+        // triggering frame's commit; over-aborts, never under-aborts).
+        for relation_oid in core.batch_truncated_relations.drain(..) {
+            core.population_deleted_keys.abort_below(relation_oid, lsn);
+        }
+        deferred_purge_run(core).await
+    }
+
+    /// Advance the received and the commit-only applied watermarks to a
+    /// flushed batch's `lsn`.
+    fn applied_lsn_advance(&mut self, core: &mut WriterCore, lsn: Lsn) {
         self.received_lsn_advance(lsn);
         core.last_received_lsn = self.last_received_lsn;
         // The commit-only watermark advances *only here*, on an actual cache
@@ -452,51 +419,15 @@ impl WriterCdc {
             self.settled_lsn.fetch_max(lsn.get(), Ordering::Relaxed);
         }
         core.last_applied_lsn = self.last_applied_lsn;
-        // Per-frame deletes/truncates were stamped by Boundary events during
-        // replay; these drains catch what replay didn't reach — pending
-        // entries from a frame that entered `Recovering` before its boundary
-        // (no-ops in the normal path, where the lists are already empty).
-        let frame_deletes = std::mem::take(&mut core.frame_deleted_keys);
-        for (relation_oid, key) in frame_deletes {
-            core.population_deleted_keys.record(relation_oid, key, lsn);
-        }
-        let frame_stale = std::mem::take(&mut core.frame_toast_stale_keys);
-        for (relation_oid, key) in frame_stale {
-            core.population_deleted_keys
-                .record_toast_stale(relation_oid, key, lsn);
-        }
-        let frame_truncated = std::mem::take(&mut core.frame_truncated_relations);
-        for relation_oid in frame_truncated {
-            core.population_deleted_keys.abort_below(relation_oid, lsn);
-        }
-        // Bulk invalidations recorded outside replay (mid-batch DDL drops,
-        // 40P01 recovery) — flush-LSN-stamped by design (an upper bound on
-        // the triggering frame's commit; over-aborts, never under-aborts).
-        let batch_truncated = std::mem::take(&mut core.batch_truncated_relations);
-        for relation_oid in batch_truncated {
-            core.population_deleted_keys.abort_below(relation_oid, lsn);
-        }
-        // The batch is closed; flush maintenance that was deferred while it
-        // was open (it would have deadlocked on the frame's locks).
-        if core.purge_pending {
-            let threshold = core.cache.generation_purge_threshold();
-            core.generation_purge(threshold)
-                .await
-                .attach_loc("deferred generation purge")?;
-            core.purge_pending = false;
-        }
-        Ok(())
     }
 
-    /// Apply a `CommitMark`: flush the frame's deferred invalidations and commit
-    /// (or recover) per its state. Extracted from the `CommitMark` handler so the
-    /// memo seqlock bracket can publish the post-commit version on every exit
-    /// path — including an error return from here.
     /// Commit (or recover) the frame. The caller (`batch_flush`) must have
-    /// already run `frame_rows_replay` — that opens the txn (`Active → TxnOpen`)
-    /// or enters `Recovering` and, for rung 3b, accumulates
+    /// already run `frame_rows_replay` — that opens the txn (`Active →
+    /// TxnOpen`) or enters `Recovering` and, for rung 3b, accumulates
     /// `frame_memo_evictions` — so the memo seqlock bracket sees the final
-    /// state/eviction-set before the commit this performs.
+    /// state/eviction-set before the commit this performs. Extracted from
+    /// `batch_flush` so the bracket can publish the post-commit version on
+    /// every exit path, including an error return from here.
     async fn frame_finalize(&mut self, core: &mut WriterCore) -> CacheResult<()> {
         match core.frame_state {
             FrameState::TxnOpen => {
@@ -552,5 +483,130 @@ impl WriterCdc {
                 .applied_lsn
                 .set(lsn.get() as f64);
         }
+    }
+}
+
+/// One event's position in its segment's batched-membership matrix.
+#[derive(Clone, Copy)]
+struct EventSlot<'m> {
+    membership: &'m SegmentMembership,
+    index: usize,
+}
+
+impl<'m> EventSlot<'m> {
+    fn view(self, relation_oid: Oid) -> Option<BatchEvalView<'m>> {
+        self.membership.view(relation_oid, self.index)
+    }
+}
+
+/// Record the frame's deferred bookkeeping against `lsn`: deleted keys
+/// (PGC-250), toast-stale keys (PGC-464), and truncate abort watermarks.
+/// Drained in place so the buffers keep their capacity across frames.
+fn frame_keys_stamp(core: &mut WriterCore, lsn: Lsn) {
+    for (relation_oid, key) in core.frame_deleted_keys.drain(..) {
+        core.population_deleted_keys.record(relation_oid, key, lsn);
+    }
+    for (relation_oid, key) in core.frame_toast_stale_keys.drain(..) {
+        core.population_deleted_keys
+            .record_toast_stale(relation_oid, key, lsn);
+    }
+    for relation_oid in core.frame_truncated_relations.drain(..) {
+        core.population_deleted_keys.abort_below(relation_oid, lsn);
+    }
+}
+
+/// Open the in-process memo seqlock bracket (PGC-236, rung 1): begin
+/// (even→odd) over every relation the batched frames touched, so any memo
+/// over them is invalidated atomically with the batch becoming visible —
+/// the relation-granularity twin of the per-query MV dirty hooks in
+/// `frame_finalize`. Rung 3b bumps `Memo(F)` only for the predicate-matched
+/// eviction set (`frame_memo_evictions`); the `Relation` slot is still bumped
+/// for every touched relation as the capture-window guard.
+///
+/// Gated on the store being non-empty rather than on `enabled()`: when no
+/// memo exists there is nothing to bust, and (unlike an `enabled()` gate)
+/// this keeps the seqlock authoritative even while memoization is toggled
+/// off at runtime — a change landing during the disabled window still bumps
+/// the slot, so a later re-enable cannot serve a snapshot that predates it.
+/// Returns whether the relation slots were bracketed.
+fn memo_bracket_begin(core: &WriterCore) -> bool {
+    let memo_active = !core.state_view.memo.is_empty();
+    if memo_active {
+        for &oid in &core.frame_relation_oids {
+            core.state_view
+                .memo
+                .slot_dirty_begin(SlotKey::Relation(oid));
+        }
+    }
+    for &fp in &core.frame_memo_evictions {
+        core.state_view.memo.slot_dirty_begin(SlotKey::Memo(fp));
+    }
+    memo_active
+}
+
+/// Close the bracket opened by [`memo_bracket_begin`] (odd→even).
+fn memo_bracket_end(core: &WriterCore, memo_active: bool) {
+    if memo_active {
+        for &oid in &core.frame_relation_oids {
+            core.state_view.memo.slot_dirty_end(SlotKey::Relation(oid));
+        }
+    }
+    for &fp in &core.frame_memo_evictions {
+        core.state_view.memo.slot_dirty_end(SlotKey::Memo(fp));
+    }
+}
+
+/// Reset the per-batch state once the batch has committed (or recovered).
+fn batch_state_reset(core: &mut WriterCore) {
+    core.frame_state = FrameState::Idle;
+    core.merges.batch_flushed();
+    core.frame_invalidations.clear();
+    core.frame_memo_evictions.clear();
+    core.frame_relation_oids.clear();
+    core.frame_buf.clear();
+    core.frame_buf_relations.clear();
+    core.frame_rows.clear();
+    core.frame_chunk_flushed = false;
+    core.batch_frames = 0;
+    core.batch_events = 0;
+    core.batch_deleted_pks.clear();
+    core.toast_overlay_reset();
+    core.batch_toast_guard_oids.clear();
+}
+
+/// The batch is closed; flush maintenance that was deferred while it was
+/// open (it would have deadlocked on the frame's locks).
+async fn deferred_purge_run(core: &mut WriterCore) -> CacheResult<()> {
+    if !core.purge_pending {
+        return Ok(());
+    }
+    let threshold = core.cache.generation_purge_threshold();
+    core.generation_purge(threshold)
+        .await
+        .attach_loc("deferred generation purge")?;
+    core.purge_pending = false;
+    Ok(())
+}
+
+/// The elided column names a toast-fallback update is replayed with, and its
+/// breadcrumb. A `Pending` image is unreachable here by construction
+/// (`toast_repair_events` resolved every one before the segment loop); it
+/// degrades to the conservative fallback rather than panicking.
+fn fallback_columns<'t>(
+    core: &WriterCore,
+    relation_oid: Oid,
+    toast: &'t ToastState,
+) -> (Cow<'t, [EcoString]>, &'static str) {
+    match toast {
+        ToastState::Unrepaired(columns) => {
+            (Cow::Borrowed(columns), "cdc replay update toast fallback")
+        }
+        ToastState::Pending(positions) => {
+            debug_assert!(false, "pending toast survived the repair pre-pass");
+            error!(relation_oid = %relation_oid, "unrepaired toasted update at decide time");
+            let columns = toasted_column_names(core.cache.tables.get1(&relation_oid), positions);
+            (Cow::Owned(columns), "cdc replay unrepaired toasted update")
+        }
+        ToastState::Complete => (Cow::Borrowed(&[]), "cdc replay update toast fallback"),
     }
 }
