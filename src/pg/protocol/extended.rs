@@ -1,4 +1,5 @@
 use ecow::EcoString;
+use rootcause::Report;
 use tokio_util::bytes::{Buf, Bytes, BytesMut};
 
 use super::session::ResultFormats;
@@ -74,14 +75,50 @@ pub(crate) struct ParsedCloseMessage {
     pub name: EcoString,
 }
 
+/// A truncated-message error describing what was missing.
+fn truncated(what: &'static str) -> Report<ProtocolError> {
+    ProtocolError::IoError(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, what)).into()
+}
+
+/// The message body past the tag byte and length word, or `too_short`.
+fn message_body<'a>(data: &'a [u8], too_short: &'static str) -> ProtocolResult<&'a [u8]> {
+    data.get(5..).ok_or_else(|| truncated(too_short))
+}
+
+fn read_u8(buf: &mut &[u8], missing: &'static str) -> ProtocolResult<u8> {
+    if buf.is_empty() {
+        return Err(truncated(missing));
+    }
+    Ok(buf.get_u8())
+}
+
+fn read_i16(buf: &mut &[u8], missing: &'static str) -> ProtocolResult<i16> {
+    if buf.len() < 2 {
+        return Err(truncated(missing));
+    }
+    Ok(buf.get_i16())
+}
+
+fn read_i32(buf: &mut &[u8], missing: &'static str) -> ProtocolResult<i32> {
+    if buf.len() < 4 {
+        return Err(truncated(missing));
+    }
+    Ok(buf.get_i32())
+}
+
+fn read_u32(buf: &mut &[u8], missing: &'static str) -> ProtocolResult<u32> {
+    if buf.len() < 4 {
+        return Err(truncated(missing));
+    }
+    Ok(buf.get_u32())
+}
+
 /// Read a null-terminated string from the buffer
 fn read_cstring<'a>(buf: &mut &'a [u8]) -> ProtocolResult<&'a str> {
-    let null_pos = buf.iter().position(|&b| b == 0).ok_or_else(|| {
-        ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "missing null terminator",
-        ))
-    })?;
+    let null_pos = buf
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| truncated("missing null terminator"))?;
 
     let (bytes, rest) = buf.split_at(null_pos);
     let s = std::str::from_utf8(bytes).map_err(|_| {
@@ -96,6 +133,21 @@ fn read_cstring<'a>(buf: &mut &'a [u8]) -> ProtocolResult<&'a str> {
     Ok(s)
 }
 
+/// An `Int16` count followed by that many type OIDs (`Int32`).
+fn type_oids_read(
+    buf: &mut &[u8],
+    count_missing: &'static str,
+    count_what: &'static str,
+    oid_missing: &'static str,
+) -> ProtocolResult<Vec<TypeOid>> {
+    let count = count_to_usize(read_i16(buf, count_missing)?, count_what)?;
+    let mut oids = Vec::with_capacity(count);
+    for _ in 0..count {
+        oids.push(TypeOid::from_raw(read_u32(buf, oid_missing)?));
+    }
+    Ok(oids)
+}
+
 /// Parse a Parse message ('P')
 ///
 /// Format:
@@ -107,15 +159,7 @@ fn read_cstring<'a>(buf: &mut &'a [u8]) -> ProtocolResult<&'a str> {
 /// For each parameter:
 ///     Int32 - OID of parameter data type (0 = unspecified)
 pub(crate) fn parse_parse_message(data: &Bytes) -> ProtocolResult<ParsedParseMessage> {
-    let Some(buf) = data.get(5..) else {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Parse message too short",
-        ))
-        .into());
-    };
-
-    let mut buf = buf; // Skip message tag (1 byte) and length (4 bytes)
+    let mut buf = message_body(data, "Parse message too short")?;
 
     let statement_name = read_cstring(&mut buf)?.into();
     // Zero-copy: the SQL is a refcounted slice of the frame, not a fresh String.
@@ -126,28 +170,12 @@ pub(crate) fn parse_parse_message(data: &Bytes) -> ProtocolResult<ParsedParseMes
             "invalid UTF-8 in SQL",
         ))
     })?;
-
-    if buf.len() < 2 {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "missing parameter count",
-        ))
-        .into());
-    }
-
-    let param_count = count_to_usize(buf.get_i16(), "Parse parameter count")?;
-    let mut parameter_oids = Vec::with_capacity(param_count);
-
-    for _ in 0..param_count {
-        if buf.len() < 4 {
-            return Err(ProtocolError::IoError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "missing parameter OID",
-            ))
-            .into());
-        }
-        parameter_oids.push(TypeOid::from_raw(buf.get_u32()));
-    }
+    let parameter_oids = type_oids_read(
+        &mut buf,
+        "missing parameter count",
+        "Parse parameter count",
+        "missing parameter OID",
+    )?;
 
     Ok(ParsedParseMessage {
         statement_name,
@@ -174,114 +202,13 @@ pub(crate) fn parse_parse_message(data: &Bytes) -> ProtocolResult<ParsedParseMes
 /// For each format code:
 ///     Int16 - format code (0=text, 1=binary)
 pub(crate) fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMessage> {
-    let Some(buf) = data.get(5..) else {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Bind message too short",
-        ))
-        .into());
-    };
-
-    let mut buf = buf; // Skip message tag and length
+    let mut buf = message_body(data, "Bind message too short")?;
 
     let portal_name = read_cstring(&mut buf)?.into();
     let statement_name = read_cstring(&mut buf)?.into();
-
-    // Read parameter format codes
-    if buf.len() < 2 {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "missing format code count",
-        ))
-        .into());
-    }
-    let format_code_count = count_to_usize(buf.get_i16(), "Bind format code count")?;
-    let mut parameter_formats = Vec::with_capacity(format_code_count);
-
-    for _ in 0..format_code_count {
-        if buf.len() < 2 {
-            return Err(ProtocolError::IoError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "missing format code",
-            ))
-            .into());
-        }
-        parameter_formats.push(buf.get_i16());
-    }
-
-    // Read parameter values
-    if buf.len() < 2 {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "missing parameter value count",
-        ))
-        .into());
-    }
-    let param_value_count = count_to_usize(buf.get_i16(), "Bind parameter value count")?;
-    let mut parameter_values = Vec::with_capacity(param_value_count);
-
-    for _ in 0..param_value_count {
-        if buf.len() < 4 {
-            return Err(ProtocolError::IoError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "missing parameter length",
-            ))
-            .into());
-        }
-        let param_len = buf.get_i32();
-
-        if param_len == -1 {
-            // NULL value
-            parameter_values.push(None);
-        } else {
-            let param_len = count_to_usize(param_len, "Bind parameter length")?;
-            let Some(value_bytes) = buf.get(..param_len) else {
-                return Err(ProtocolError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "parameter value truncated",
-                ))
-                .into());
-            };
-            let value = Bytes::copy_from_slice(value_bytes);
-            buf.advance(param_len);
-            parameter_values.push(Some(value));
-        }
-    }
-
-    // Read result format codes
-    if buf.len() < 2 {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "missing result format code count",
-        ))
-        .into());
-    }
-    let result_format_count = count_to_usize(buf.get_i16(), "Bind result format count")?;
-    let mut result_formats = ResultFormats::Implicit;
-
-    for index in 0..result_format_count {
-        if buf.len() < 2 {
-            return Err(ProtocolError::IoError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "missing result format code",
-            ))
-            .into());
-        }
-        let code = buf.get_i16();
-        result_formats = match result_formats {
-            ResultFormats::Implicit => ResultFormats::Uniform(code),
-            ResultFormats::Uniform(first) if first == code => ResultFormats::Uniform(first),
-            ResultFormats::Uniform(first) => {
-                let mut codes = vec![first; index];
-                codes.push(code);
-                ResultFormats::PerColumn(codes)
-            }
-            ResultFormats::PerColumn(mut codes) => {
-                codes.push(code);
-                ResultFormats::PerColumn(codes)
-            }
-        };
-    }
+    let parameter_formats = parameter_formats_read(&mut buf)?;
+    let parameter_values = parameter_values_read(&mut buf)?;
+    let result_formats = result_formats_read(&mut buf)?;
 
     Ok(ParsedBindMessage {
         portal_name,
@@ -292,6 +219,77 @@ pub(crate) fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMe
     })
 }
 
+fn parameter_formats_read(buf: &mut &[u8]) -> ProtocolResult<Vec<i16>> {
+    let count = count_to_usize(
+        read_i16(buf, "missing format code count")?,
+        "Bind format code count",
+    )?;
+    let mut formats = Vec::with_capacity(count);
+    for _ in 0..count {
+        formats.push(read_i16(buf, "missing format code")?);
+    }
+    Ok(formats)
+}
+
+/// The Bind parameter values: each an `Int32` length (`-1` = NULL) and that
+/// many bytes.
+fn parameter_values_read(buf: &mut &[u8]) -> ProtocolResult<Vec<Option<Bytes>>> {
+    let count = count_to_usize(
+        read_i16(buf, "missing parameter value count")?,
+        "Bind parameter value count",
+    )?;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(parameter_value_read(buf)?);
+    }
+    Ok(values)
+}
+
+fn parameter_value_read(buf: &mut &[u8]) -> ProtocolResult<Option<Bytes>> {
+    let param_len = read_i32(buf, "missing parameter length")?;
+    if param_len == -1 {
+        return Ok(None);
+    }
+    let param_len = count_to_usize(param_len, "Bind parameter length")?;
+    let value_bytes = buf
+        .get(..param_len)
+        .ok_or_else(|| truncated("parameter value truncated"))?;
+    let value = Bytes::copy_from_slice(value_bytes);
+    buf.advance(param_len);
+    Ok(Some(value))
+}
+
+fn result_formats_read(buf: &mut &[u8]) -> ProtocolResult<ResultFormats> {
+    let count = count_to_usize(
+        read_i16(buf, "missing result format code count")?,
+        "Bind result format count",
+    )?;
+    let mut result_formats = ResultFormats::Implicit;
+    for index in 0..count {
+        let code = read_i16(buf, "missing result format code")?;
+        result_formats = result_format_push(result_formats, index, code);
+    }
+    Ok(result_formats)
+}
+
+/// Fold the `index`th result format code into the formats so far: uniform
+/// while every code matches, per-column from the first that differs.
+fn result_format_push(formats: ResultFormats, index: usize, code: i16) -> ResultFormats {
+    match formats {
+        ResultFormats::Implicit => ResultFormats::Uniform(code),
+        ResultFormats::Uniform(first) if first == code => ResultFormats::Uniform(first),
+        ResultFormats::Uniform(first) => {
+            let mut codes = vec![first; index];
+            codes.push(code);
+            ResultFormats::PerColumn(codes)
+        }
+        ResultFormats::PerColumn(mut codes) => {
+            codes.push(code);
+            ResultFormats::PerColumn(codes)
+        }
+    }
+}
+
 /// Parse an Execute message ('E')
 ///
 /// Format:
@@ -300,31 +298,22 @@ pub(crate) fn parse_bind_message(data: &BytesMut) -> ProtocolResult<ParsedBindMe
 /// String - portal name (empty string for unnamed)
 /// Int32 - maximum number of rows to return (0 = unlimited)
 pub(crate) fn parse_execute_message(data: &BytesMut) -> ProtocolResult<ParsedExecuteMessage> {
-    let Some(buf) = data.get(5..) else {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Execute message too short",
-        ))
-        .into());
-    };
-
-    let mut buf = buf; // Skip message tag and length
-
+    let mut buf = message_body(data, "Execute message too short")?;
     let portal_name = read_cstring(&mut buf)?.into();
-
-    if buf.len() < 4 {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "missing max_rows",
-        ))
-        .into());
-    }
-    let max_rows = buf.get_i32();
-
+    let max_rows = read_i32(&mut buf, "missing max_rows")?;
     Ok(ParsedExecuteMessage {
         portal_name,
         max_rows,
     })
+}
+
+/// A Describe or Close body: `Byte1` — 'S' for statement, 'P' for portal —
+/// then the statement or portal name.
+fn target_message_parse(data: &[u8], too_short: &'static str) -> ProtocolResult<(u8, EcoString)> {
+    let mut buf = message_body(data, too_short)?;
+    let target = read_u8(&mut buf, too_short)?;
+    let name = read_cstring(&mut buf)?.into();
+    Ok((target, name))
 }
 
 /// Parse a Describe message ('D')
@@ -335,28 +324,7 @@ pub(crate) fn parse_execute_message(data: &BytesMut) -> ProtocolResult<ParsedExe
 /// Byte1 - 'S' for statement, 'P' for portal
 /// String - name of statement or portal
 pub(crate) fn parse_describe_message(data: &BytesMut) -> ProtocolResult<ParsedDescribeMessage> {
-    let Some(buf) = data.get(5..) else {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Describe message too short",
-        ))
-        .into());
-    };
-
-    // Need at least 1 byte for describe_type
-    if buf.is_empty() {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Describe message too short",
-        ))
-        .into());
-    }
-
-    let mut buf = buf; // Skip message tag and length
-
-    let describe_type = buf.get_u8();
-    let name = read_cstring(&mut buf)?.into();
-
+    let (describe_type, name) = target_message_parse(data, "Describe message too short")?;
     Ok(ParsedDescribeMessage {
         describe_type,
         name,
@@ -371,28 +339,7 @@ pub(crate) fn parse_describe_message(data: &BytesMut) -> ProtocolResult<ParsedDe
 /// Byte1 - 'S' for statement, 'P' for portal
 /// String - name of statement or portal
 pub(crate) fn parse_close_message(data: &BytesMut) -> ProtocolResult<ParsedCloseMessage> {
-    let Some(buf) = data.get(5..) else {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Close message too short",
-        ))
-        .into());
-    };
-
-    // Need at least 1 byte for close_type
-    if buf.is_empty() {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "Close message too short",
-        ))
-        .into());
-    }
-
-    let mut buf = buf; // Skip message tag and length
-
-    let close_type = buf.get_u8();
-    let name = read_cstring(&mut buf)?.into();
-
+    let (close_type, name) = target_message_parse(data, "Close message too short")?;
     Ok(ParsedCloseMessage { close_type, name })
 }
 
@@ -407,39 +354,14 @@ pub(crate) fn parse_close_message(data: &BytesMut) -> ProtocolResult<ParsedClose
 pub(crate) fn parse_parameter_description(
     data: &[u8],
 ) -> ProtocolResult<ParsedParameterDescription> {
-    // Need at least 7 bytes: tag(1) + length(4) + param_count(2)
-    let Some(buf) = data.get(5..) else {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "ParameterDescription message too short",
-        ))
-        .into());
-    };
-
-    if buf.len() < 2 {
-        return Err(ProtocolError::IoError(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "ParameterDescription message too short",
-        ))
-        .into());
-    }
-
-    let mut buf = buf; // Skip message tag and length
-
-    let param_count = count_to_usize(buf.get_i16(), "ParameterDescription parameter count")?;
-    let mut parameter_oids = Vec::with_capacity(param_count);
-
-    for _ in 0..param_count {
-        if buf.len() < 4 {
-            return Err(ProtocolError::IoError(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "missing parameter OID in ParameterDescription",
-            ))
-            .into());
-        }
-        parameter_oids.push(TypeOid::from_raw(buf.get_u32()));
-    }
-
+    let too_short = "ParameterDescription message too short";
+    let mut buf = message_body(data, too_short)?;
+    let parameter_oids = type_oids_read(
+        &mut buf,
+        too_short,
+        "ParameterDescription parameter count",
+        "missing parameter OID in ParameterDescription",
+    )?;
     Ok(ParsedParameterDescription { parameter_oids })
 }
 
@@ -451,6 +373,16 @@ mod tests {
     use super::*;
     use crate::cache::query::CacheableQuery;
     use crate::query::ast::{QueryBody, query_expr_parse};
+
+    /// A frontend message: `tag`, the length word (counting itself), `body`.
+    fn frame(tag: u8, body: &[u8]) -> BytesMut {
+        let len = i32::try_from(body.len() + 4).expect("test frame length fits i32");
+        let mut data = BytesMut::new();
+        data.extend_from_slice(&[tag]);
+        data.extend_from_slice(&len.to_be_bytes());
+        data.extend_from_slice(body);
+        data
+    }
 
     #[test]
     fn test_parse_parse_message() {
@@ -537,11 +469,7 @@ mod tests {
     #[test]
     fn test_parse_execute_message() {
         // Execute message: portal "p1", max_rows 100
-        let mut data = BytesMut::new();
-        data.extend_from_slice(b"E");
-        data.extend_from_slice(&[0, 0, 0, 11]); // length
-        data.extend_from_slice(b"p1\0"); // portal name
-        data.extend_from_slice(&[0, 0, 0, 100]); // max_rows = 100
+        let data = frame(b'E', b"p1\0\0\0\0\x64");
 
         let result = parse_execute_message(&data).unwrap();
         assert_eq!(result.portal_name, "p1");
@@ -550,12 +478,8 @@ mod tests {
 
     #[test]
     fn test_parse_execute_message_unlimited() {
-        // Execute message: unnamed portal, unlimited rows
-        let mut data = BytesMut::new();
-        data.extend_from_slice(b"E");
-        data.extend_from_slice(&[0, 0, 0, 9]); // length
-        data.extend_from_slice(b"\0"); // unnamed portal
-        data.extend_from_slice(&[0, 0, 0, 0]); // max_rows = 0 (unlimited)
+        // Execute message: unnamed portal, max_rows = 0 (unlimited)
+        let data = frame(b'E', b"\0\0\0\0\0");
 
         let result = parse_execute_message(&data).unwrap();
         assert_eq!(result.portal_name, "");
@@ -564,12 +488,7 @@ mod tests {
 
     #[test]
     fn test_parse_describe_message_statement() {
-        // Describe statement "stmt1"
-        let mut data = BytesMut::new();
-        data.extend_from_slice(b"D");
-        data.extend_from_slice(&[0, 0, 0, 11]); // length
-        data.extend_from_slice(b"S"); // describe statement
-        data.extend_from_slice(b"stmt1\0"); // name
+        let data = frame(b'D', b"Sstmt1\0");
 
         let result = parse_describe_message(&data).unwrap();
         assert_eq!(result.describe_type, b'S');
@@ -578,12 +497,7 @@ mod tests {
 
     #[test]
     fn test_parse_describe_message_portal() {
-        // Describe portal "p1"
-        let mut data = BytesMut::new();
-        data.extend_from_slice(b"D");
-        data.extend_from_slice(&[0, 0, 0, 8]); // length
-        data.extend_from_slice(b"P"); // describe portal
-        data.extend_from_slice(b"p1\0"); // name
+        let data = frame(b'D', b"Pp1\0");
 
         let result = parse_describe_message(&data).unwrap();
         assert_eq!(result.describe_type, b'P');
@@ -592,12 +506,7 @@ mod tests {
 
     #[test]
     fn test_parse_close_message_statement() {
-        // Close statement "stmt1"
-        let mut data = BytesMut::new();
-        data.extend_from_slice(b"C");
-        data.extend_from_slice(&[0, 0, 0, 11]); // length
-        data.extend_from_slice(b"S"); // close statement
-        data.extend_from_slice(b"stmt1\0"); // name
+        let data = frame(b'C', b"Sstmt1\0");
 
         let result = parse_close_message(&data).unwrap();
         assert_eq!(result.close_type, b'S');
@@ -606,12 +515,7 @@ mod tests {
 
     #[test]
     fn test_parse_close_message_portal() {
-        // Close portal "p1"
-        let mut data = BytesMut::new();
-        data.extend_from_slice(b"C");
-        data.extend_from_slice(&[0, 0, 0, 8]); // length
-        data.extend_from_slice(b"P"); // close portal
-        data.extend_from_slice(b"p1\0"); // name
+        let data = frame(b'C', b"Pp1\0");
 
         let result = parse_close_message(&data).unwrap();
         assert_eq!(result.close_type, b'P');
