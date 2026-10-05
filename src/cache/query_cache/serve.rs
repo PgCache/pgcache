@@ -304,9 +304,9 @@ impl CacheDispatch {
             let buf = req
                 .forward_bytes
                 .map_or(req.data, |slices| slices_concat(&slices));
-            let _ = reply_forward(req.reply_tx, req.client_socket, None, buf, req.timing);
+            let _ = reply_forward(req.reply_tx, req.client_socket, buf, req.timing);
             for c in req.coalesced {
-                let _ = reply_forward(c.reply_tx, c.client_socket, None, c.data, c.timing);
+                let _ = reply_forward(c.reply_tx, c.client_socket, c.data, c.timing);
             }
         }
         Ok(())

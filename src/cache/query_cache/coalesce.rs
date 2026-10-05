@@ -4,7 +4,6 @@ use std::time::Instant;
 use ecow::EcoString;
 use tracing::error;
 
-use super::dispatch::reply_forward;
 use super::{CacheDispatch, CoalescedClient};
 use crate::cache::messages::slices_concat;
 use crate::cache::query::{limit_is_sufficient, limit_rows_needed};
@@ -56,21 +55,9 @@ impl CacheDispatch {
             // Check whether the cached rows cover this group's LIMIT
             let primary_needed = limit_rows_needed(&primary.cacheable_query.query().limit);
             if !limit_is_sufficient(max_limit, primary_needed) {
-                let _ = reply_forward(
-                    primary.reply_tx,
-                    primary.client_socket,
-                    primary.pipeline,
-                    primary.data,
-                    primary.timing,
-                );
+                let _ = primary.forward();
                 for msg in waiters {
-                    let _ = reply_forward(
-                        msg.reply_tx,
-                        msg.client_socket,
-                        msg.pipeline,
-                        msg.data,
-                        msg.timing,
-                    );
+                    let _ = msg.forward();
                 }
                 continue;
             }
@@ -139,13 +126,7 @@ impl CacheDispatch {
             let drain_started = Instant::now();
             for mut msg in waiters {
                 msg.timing.drain_started_at = Some(drain_started);
-                let _ = reply_forward(
-                    msg.reply_tx,
-                    msg.client_socket,
-                    msg.pipeline,
-                    msg.data,
-                    msg.timing,
-                );
+                let _ = msg.forward();
             }
         }
 
@@ -170,13 +151,7 @@ impl CacheDispatch {
         let drain_started = Instant::now();
         for mut msg in expired {
             msg.timing.drain_started_at = Some(drain_started);
-            let _ = reply_forward(
-                msg.reply_tx,
-                msg.client_socket,
-                msg.pipeline,
-                msg.data,
-                msg.timing,
-            );
+            let _ = msg.forward();
         }
         crate::metrics::handles()
             .cache

@@ -23,7 +23,9 @@ use crate::timing::QueryTiming;
 
 mod coalesce;
 mod dispatch;
+mod explain;
 mod handle;
+mod register;
 mod serve;
 
 pub use handle::{CacheDispatchHandle, CacheDispatchPublisher, CacheDispatchUpdater};
