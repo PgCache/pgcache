@@ -80,35 +80,42 @@ impl ConnectionState {
         let begins = effects.transaction == Some(TransactionBoundary::Begin);
         match effects.isolation {
             IsolationEffect::None => {}
-            IsolationEffect::Transaction(level) => {
-                if level != IsolationLevel::ReadCommitted {
-                    if begins {
-                        // `BEGIN ... ISOLATION LEVEL`: takes effect on the
-                        // idle→in-block edge this statement produces.
-                        self.pending_block_isolation = Some(level);
-                    } else if self.forwarding_into_block() {
-                        // `SET TRANSACTION` inside a block tightens it; outside
-                        // one PostgreSQL ignores it with a warning.
-                        self.block_isolation = IsolationState::Known(level);
-                    }
-                }
+            IsolationEffect::Transaction(level) => self.transaction_isolation_apply(level, begins),
+            IsolationEffect::SessionDefault(IsolationLevel::ReadCommitted)
+            | IsolationEffect::SessionUnknown => {
+                self.session_isolation_set(IsolationState::Unknown)
             }
             IsolationEffect::SessionDefault(level) => {
-                self.session_isolation = if level == IsolationLevel::ReadCommitted {
-                    IsolationState::Unknown
-                } else {
-                    IsolationState::Known(level)
-                };
-                self.isolation_mutated_in_block |= self.forwarding_into_block();
-            }
-            IsolationEffect::SessionUnknown => {
-                self.session_isolation = IsolationState::Unknown;
-                self.isolation_mutated_in_block |= self.forwarding_into_block();
+                self.session_isolation_set(IsolationState::Known(level));
             }
         }
         if begins {
             self.begins_forwarded = self.begins_forwarded.saturating_add(1);
         }
+    }
+
+    /// A transaction-scoped level (`BEGIN ... ISOLATION LEVEL`, `SET
+    /// TRANSACTION`). READ COMMITTED never tightens anything, so it is ignored.
+    fn transaction_isolation_apply(&mut self, level: IsolationLevel, begins: bool) {
+        if level == IsolationLevel::ReadCommitted {
+            return;
+        }
+        if begins {
+            // `BEGIN ... ISOLATION LEVEL`: takes effect on the idle→in-block
+            // edge this statement produces.
+            self.pending_block_isolation = Some(level);
+        } else if self.forwarding_into_block() {
+            // `SET TRANSACTION` inside a block tightens it; outside one
+            // PostgreSQL ignores it with a warning.
+            self.block_isolation = IsolationState::Known(level);
+        }
+    }
+
+    /// A session-default change. Inside a block it may revert (rollback, `SET
+    /// LOCAL`), so the block's end re-probes.
+    fn session_isolation_set(&mut self, state: IsolationState) {
+        self.session_isolation = state;
+        self.isolation_mutated_in_block |= self.forwarding_into_block();
     }
 
     /// Whether a cacheable read may be served from cache given the current
@@ -133,27 +140,45 @@ impl ConnectionState {
     /// inside a rolled-back block reverts, and `SET LOCAL` reverts regardless.
     pub(super) fn isolation_block_transition(&mut self, previous: TransactionStatus) {
         let was_in_block = previous != TransactionStatus::Idle;
-        if !was_in_block && self.in_transaction() {
-            self.block_isolation = match self.pending_block_isolation.take() {
-                Some(level) => IsolationState::Known(level),
-                None => self.session_isolation,
-            };
-            self.begins_forwarded = self.begins_forwarded.saturating_sub(1);
-        } else if was_in_block && !self.in_transaction() {
-            self.block_isolation = IsolationState::Unknown;
-            if self.isolation_mutated_in_block {
-                self.isolation_mutated_in_block = false;
-                debug!("txn ended after an isolation mutation, marking default unknown");
-                self.session_isolation = IsolationState::Unknown;
-            }
+        match (was_in_block, self.in_transaction()) {
+            (false, true) => self.block_enter(),
+            (true, false) => self.block_exit(),
+            (false, false) | (true, true) => {}
         }
+    }
+
+    fn block_enter(&mut self) {
+        self.block_isolation = match self.pending_block_isolation.take() {
+            Some(level) => IsolationState::Known(level),
+            None => self.session_isolation,
+        };
+        self.begins_forwarded = self.begins_forwarded.saturating_sub(1);
+    }
+
+    fn block_exit(&mut self) {
+        self.block_isolation = IsolationState::Unknown;
+        if self.isolation_mutated_in_block {
+            self.isolation_mutated_in_block = false;
+            debug!("txn ended after an isolation mutation, marking default unknown");
+            self.session_isolation = IsolationState::Unknown;
+        }
+    }
+
+    /// No origin intercept is in flight.
+    fn origin_intercept_idle(&self) -> bool {
+        matches!(self.origin_intercept, OriginIntercept::None)
+    }
+
+    /// The session default is unknown and no block is open to hide it.
+    fn isolation_probe_needed(&self) -> bool {
+        self.session_isolation == IsolationState::Unknown && !self.in_transaction()
     }
 
     /// Inject the next pending session-discovery probe, if any, at a
     /// client-visible ReadyForQuery: search_path first (pre-PG18 only), then
     /// the isolation default. One intercept at a time.
     pub(super) fn session_discovery_inject(&mut self) {
-        if !matches!(self.origin_intercept, OriginIntercept::None) {
+        if !self.origin_intercept_idle() {
             return;
         }
         if let SearchPathState::Unknown = self.search_path_state {
@@ -175,10 +200,7 @@ impl ConnectionState {
     /// completion: a probe that leaves the state unknown is not retried until
     /// the next client-visible ReadyForQuery, so nothing can loop.
     pub(super) fn isolation_probe_inject(&mut self) {
-        if self.session_isolation != IsolationState::Unknown
-            || self.in_transaction()
-            || !matches!(self.origin_intercept, OriginIntercept::None)
-        {
+        if !self.isolation_probe_needed() || !self.origin_intercept_idle() {
             return;
         }
         debug!("default_transaction_isolation unknown, probing");
