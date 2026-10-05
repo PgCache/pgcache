@@ -1,8 +1,37 @@
 use std::io::Error;
+use std::time::{Duration, Instant};
 
 use crate::util::{TestContext, http_get, lsn_parse};
 
 mod util;
+
+/// The first cached query in `/status` once its served bytes have been
+/// recorded, or at the deadline (the caller's assertions then report it).
+/// `total_bytes_served` is recorded after the serve has written the response,
+/// so a read straight after the response can precede it; the hit counters
+/// are recorded at dispatch.
+async fn status_query_after_serve(metrics_port: u16) -> Result<serde_json::Value, Error> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let (status, body) = http_get(metrics_port, "/status").await?;
+        assert_eq!(status, 200);
+        let json: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
+        let query = json
+            .get("queries")
+            .and_then(|queries| queries.get(0))
+            .cloned()
+            .unwrap_or_default();
+        let served = query
+            .get("total_bytes_served")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if served > 0 || Instant::now() >= deadline {
+            return Ok(query);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 
 /// /healthz always returns 200 OK
 #[tokio::test]
@@ -170,11 +199,7 @@ async fn test_status_shows_cached_queries() -> Result<(), Error> {
     ctx.simple_query("SELECT id, name FROM status_test WHERE id = 1")
         .await?;
 
-    let (status, body) = http_get(ctx.metrics_port, "/status").await?;
-    assert_eq!(status, 200);
-    let json: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
-    let q = &json["queries"].as_array().unwrap()[0];
+    let q = status_query_after_serve(ctx.metrics_port).await?;
 
     assert_eq!(
         q["hit_count"].as_u64(),
