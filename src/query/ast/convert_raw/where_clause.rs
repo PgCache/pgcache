@@ -149,17 +149,32 @@ pub(super) unsafe fn sublink_convert(
 
 pub(super) unsafe fn operator_name_string_extract<'a>(
     oper_name: *const pg::List,
-    context: &str,
+    construct: &str,
 ) -> Result<&'a str, WhereParseError> {
     unsafe {
-        let names: Vec<_> = list_nodes(oper_name).collect();
-        let [name_node] = names.as_slice() else {
+        let mut names = list_nodes(oper_name);
+        let (Some(name_node), None) = (names.next(), names.next()) else {
             return Err(WhereParseError::Other {
-                error: format!("{context}: expected single name node"),
+                error: format!("{construct} operator: expected single name node"),
             });
         };
-        string_node_value(*name_node).ok_or_else(|| WhereParseError::Other {
-            error: format!("{context}: expected string node"),
+        string_node_value(name_node).ok_or_else(|| WhereParseError::Other {
+            error: format!("{construct} operator: expected string node"),
+        })
+    }
+}
+
+/// Map the single operator name of a `construct` (IN, LIKE, ANY, ALL) with
+/// `map`, failing with the unsupported operator.
+unsafe fn operator_map<T>(
+    oper_name: *const pg::List,
+    construct: &str,
+    map: impl FnOnce(&str) -> Option<T>,
+) -> Result<T, WhereParseError> {
+    unsafe {
+        let op = operator_name_string_extract(oper_name, construct)?;
+        map(op).ok_or_else(|| WhereParseError::UnsupportedOperator {
+            operator: format!("{construct} with operator '{op}'"),
         })
     }
 }
@@ -167,16 +182,7 @@ pub(super) unsafe fn operator_name_string_extract<'a>(
 pub(super) unsafe fn sublink_all_operator_check(
     oper_name: *const pg::List,
 ) -> Result<(), WhereParseError> {
-    unsafe {
-        let op = operator_name_string_extract(oper_name, "ALL operator")?;
-        if op == "<>" {
-            Ok(())
-        } else {
-            Err(WhereParseError::UnsupportedOperator {
-                operator: format!("ALL with operator '{op}'"),
-            })
-        }
-    }
+    unsafe { operator_map(oper_name, "ALL", |op| (op == "<>").then_some(())) }
 }
 
 /// An ANY sublink is only IN-equivalent for `=`: plain `IN`/`NOT IN`
@@ -191,14 +197,7 @@ pub(super) unsafe fn sublink_any_operator_check(
         if list_is_empty(oper_name) {
             return Ok(());
         }
-        let op = operator_name_string_extract(oper_name, "ANY operator")?;
-        if op == "=" {
-            Ok(())
-        } else {
-            Err(WhereParseError::UnsupportedOperator {
-                operator: format!("ANY with operator '{op}'"),
-            })
-        }
+        operator_map(oper_name, "ANY", |op| (op == "=").then_some(()))
     }
 }
 
@@ -256,93 +255,28 @@ pub(super) unsafe fn boolean_test_convert(
 
 pub(super) unsafe fn a_expr_convert(expr: *const pg::A_Expr) -> Result<WhereExpr, WhereParseError> {
     unsafe {
-        let kind = (*expr).kind;
-        let name = (*expr).name;
-        let lexpr = (*expr).lexpr as NodePtr;
-        let rexpr = (*expr).rexpr as NodePtr;
-
-        match kind {
-            pg::A_Expr_Kind_AEXPR_OP => {
-                // Extract the operator name once and classify it, rather than
-                // speculatively running (and discarding) the arithmetic path.
-                let op_name = operator_name_single(name).ok_or_else(|| WhereParseError::Other {
-                    error: "Multi-part operator names not supported".to_owned(),
-                })?;
-                if arithmetic_op_from_str(op_name).is_some() {
-                    let arith = aexpr_arithmetic_convert(expr)?;
-                    return Ok(WhereExpr::Scalar(ScalarExpr::Arithmetic(arith)));
-                }
-                let op = binary_op_from_str(op_name).ok_or_else(|| {
-                    WhereParseError::UnsupportedOperator {
-                        operator: op_name.to_owned(),
-                    }
-                })?;
-                if lexpr.is_null() || rexpr.is_null() {
-                    return Err(WhereParseError::MissingExpression);
-                }
-                Ok(WhereExpr::Binary(BinaryExpr {
-                    op,
-                    lexpr: Box::new(where_expr_convert(lexpr)?),
-                    rexpr: Box::new(where_expr_convert(rexpr)?),
-                }))
+        match (*expr).kind {
+            pg::A_Expr_Kind_AEXPR_OP => a_expr_operator_convert(expr),
+            pg::A_Expr_Kind_AEXPR_IN => a_expr_in_convert(expr),
+            pg::A_Expr_Kind_AEXPR_BETWEEN => a_expr_between_convert(expr, MultiOp::Between),
+            pg::A_Expr_Kind_AEXPR_NOT_BETWEEN => a_expr_between_convert(expr, MultiOp::NotBetween),
+            pg::A_Expr_Kind_AEXPR_BETWEEN_SYM => {
+                a_expr_between_convert(expr, MultiOp::BetweenSymmetric)
             }
-            pg::A_Expr_Kind_AEXPR_IN => {
-                let op = in_operator_extract(name)?;
-                if lexpr.is_null() || rexpr.is_null() {
-                    return Err(WhereParseError::MissingExpression);
-                }
-                let left_expr = where_expr_convert(lexpr)?;
-                let values = in_list_extract(rexpr)?;
-                let mut exprs = vec![left_expr];
-                exprs.extend(values);
-                Ok(WhereExpr::Multi(MultiExpr { op, exprs }))
-            }
-            pg::A_Expr_Kind_AEXPR_BETWEEN
-            | pg::A_Expr_Kind_AEXPR_NOT_BETWEEN
-            | pg::A_Expr_Kind_AEXPR_BETWEEN_SYM
-            | pg::A_Expr_Kind_AEXPR_NOT_BETWEEN_SYM => {
-                let op = match kind {
-                    pg::A_Expr_Kind_AEXPR_BETWEEN => MultiOp::Between,
-                    pg::A_Expr_Kind_AEXPR_NOT_BETWEEN => MultiOp::NotBetween,
-                    pg::A_Expr_Kind_AEXPR_BETWEEN_SYM => MultiOp::BetweenSymmetric,
-                    _ => MultiOp::NotBetweenSymmetric,
-                };
-                if lexpr.is_null() || rexpr.is_null() {
-                    return Err(WhereParseError::MissingExpression);
-                }
-                let left_expr = where_expr_convert(lexpr)?;
-                let bounds = between_bounds_extract(rexpr)?;
-                Ok(WhereExpr::Multi(MultiExpr {
-                    op,
-                    exprs: vec![left_expr, bounds.0, bounds.1],
-                }))
+            pg::A_Expr_Kind_AEXPR_NOT_BETWEEN_SYM => {
+                a_expr_between_convert(expr, MultiOp::NotBetweenSymmetric)
             }
             pg::A_Expr_Kind_AEXPR_LIKE | pg::A_Expr_Kind_AEXPR_ILIKE => {
-                let op = like_operator_extract(name)?;
-                if lexpr.is_null() || rexpr.is_null() {
-                    return Err(WhereParseError::MissingExpression);
-                }
-                Ok(WhereExpr::Binary(BinaryExpr {
-                    op,
-                    lexpr: Box::new(where_expr_convert(lexpr)?),
-                    rexpr: Box::new(where_expr_convert(rexpr)?),
-                }))
+                let op = like_operator_extract((*expr).name)?;
+                binary_convert(expr, op)
             }
-            pg::A_Expr_Kind_AEXPR_OP_ANY | pg::A_Expr_Kind_AEXPR_OP_ALL => {
-                let comparison = operator_extract(name)?;
-                let op = match kind {
-                    pg::A_Expr_Kind_AEXPR_OP_ANY => MultiOp::Any { comparison },
-                    _ => MultiOp::All { comparison },
-                };
-                if lexpr.is_null() || rexpr.is_null() {
-                    return Err(WhereParseError::MissingExpression);
-                }
-                let left_expr = where_expr_convert(lexpr)?;
-                let right_expr = any_all_rexpr_convert(rexpr)?;
-                Ok(WhereExpr::Multi(MultiExpr {
-                    op,
-                    exprs: vec![left_expr, right_expr],
-                }))
+            pg::A_Expr_Kind_AEXPR_OP_ANY => {
+                let comparison = operator_extract((*expr).name)?;
+                a_expr_any_all_convert(expr, MultiOp::Any { comparison })
+            }
+            pg::A_Expr_Kind_AEXPR_OP_ALL => {
+                let comparison = operator_extract((*expr).name)?;
+                a_expr_any_all_convert(expr, MultiOp::All { comparison })
             }
             other => Err(WhereParseError::UnsupportedAExpr {
                 expr: format!("{} in WHERE", aexpr_kind_name(other)),
@@ -351,17 +285,104 @@ pub(super) unsafe fn a_expr_convert(expr: *const pg::A_Expr) -> Result<WhereExpr
     }
 }
 
+/// Both operands of an operator expression, or `MissingExpression`.
+unsafe fn a_expr_operands(expr: *const pg::A_Expr) -> Result<(NodePtr, NodePtr), WhereParseError> {
+    unsafe {
+        let lexpr = (*expr).lexpr as NodePtr;
+        let rexpr = (*expr).rexpr as NodePtr;
+        if lexpr.is_null() || rexpr.is_null() {
+            return Err(WhereParseError::MissingExpression);
+        }
+        Ok((lexpr, rexpr))
+    }
+}
+
+/// `lexpr op rexpr`, both sides converted as WHERE expressions.
+unsafe fn binary_convert(
+    expr: *const pg::A_Expr,
+    op: BinaryOp,
+) -> Result<WhereExpr, WhereParseError> {
+    unsafe {
+        let (lexpr, rexpr) = a_expr_operands(expr)?;
+        Ok(WhereExpr::Binary(BinaryExpr {
+            op,
+            lexpr: Box::new(where_expr_convert(lexpr)?),
+            rexpr: Box::new(where_expr_convert(rexpr)?),
+        }))
+    }
+}
+
+/// A plain operator: arithmetic yields a scalar, anything else a comparison.
+unsafe fn a_expr_operator_convert(expr: *const pg::A_Expr) -> Result<WhereExpr, WhereParseError> {
+    unsafe {
+        // Extract the operator name once and classify it, rather than
+        // speculatively running (and discarding) the arithmetic path.
+        let op_name = operator_name_single((*expr).name).ok_or_else(|| WhereParseError::Other {
+            error: "Multi-part operator names not supported".to_owned(),
+        })?;
+        if arithmetic_op_from_str(op_name).is_some() {
+            let arith = aexpr_arithmetic_convert(expr)?;
+            return Ok(WhereExpr::Scalar(ScalarExpr::Arithmetic(arith)));
+        }
+        let op =
+            binary_op_from_str(op_name).ok_or_else(|| WhereParseError::UnsupportedOperator {
+                operator: op_name.to_owned(),
+            })?;
+        binary_convert(expr, op)
+    }
+}
+
+unsafe fn a_expr_in_convert(expr: *const pg::A_Expr) -> Result<WhereExpr, WhereParseError> {
+    unsafe {
+        let op = in_operator_extract((*expr).name)?;
+        let (lexpr, rexpr) = a_expr_operands(expr)?;
+        let left_expr = where_expr_convert(lexpr)?;
+        let values = in_list_extract(rexpr)?;
+        let mut exprs = vec![left_expr];
+        exprs.extend(values);
+        Ok(WhereExpr::Multi(MultiExpr { op, exprs }))
+    }
+}
+
+unsafe fn a_expr_between_convert(
+    expr: *const pg::A_Expr,
+    op: MultiOp,
+) -> Result<WhereExpr, WhereParseError> {
+    unsafe {
+        let (lexpr, rexpr) = a_expr_operands(expr)?;
+        let left_expr = where_expr_convert(lexpr)?;
+        let (low, high) = between_bounds_extract(rexpr)?;
+        Ok(WhereExpr::Multi(MultiExpr {
+            op,
+            exprs: vec![left_expr, low, high],
+        }))
+    }
+}
+
+unsafe fn a_expr_any_all_convert(
+    expr: *const pg::A_Expr,
+    op: MultiOp,
+) -> Result<WhereExpr, WhereParseError> {
+    unsafe {
+        let (lexpr, rexpr) = a_expr_operands(expr)?;
+        let left_expr = where_expr_convert(lexpr)?;
+        let right_expr = any_all_rexpr_convert(rexpr)?;
+        Ok(WhereExpr::Multi(MultiExpr {
+            op,
+            exprs: vec![left_expr, right_expr],
+        }))
+    }
+}
+
 pub(super) unsafe fn in_operator_extract(
     name: *const pg::List,
 ) -> Result<MultiOp, WhereParseError> {
     unsafe {
-        match operator_name_string_extract(name, "IN operator")? {
-            "=" => Ok(MultiOp::In),
-            "<>" => Ok(MultiOp::NotIn),
-            other => Err(WhereParseError::UnsupportedOperator {
-                operator: format!("IN with operator '{other}'"),
-            }),
-        }
+        operator_map(name, "IN", |op| match op {
+            "=" => Some(MultiOp::In),
+            "<>" => Some(MultiOp::NotIn),
+            _ => None,
+        })
     }
 }
 
@@ -417,15 +438,13 @@ pub(super) unsafe fn like_operator_extract(
     name: *const pg::List,
 ) -> Result<BinaryOp, WhereParseError> {
     unsafe {
-        match operator_name_string_extract(name, "LIKE operator")? {
-            "~~" => Ok(BinaryOp::Like),
-            "!~~" => Ok(BinaryOp::NotLike),
-            "~~*" => Ok(BinaryOp::ILike),
-            "!~~*" => Ok(BinaryOp::NotILike),
-            other => Err(WhereParseError::UnsupportedOperator {
-                operator: format!("LIKE with operator '{other}'"),
-            }),
-        }
+        operator_map(name, "LIKE", |op| match op {
+            "~~" => Some(BinaryOp::Like),
+            "!~~" => Some(BinaryOp::NotLike),
+            "~~*" => Some(BinaryOp::ILike),
+            "!~~*" => Some(BinaryOp::NotILike),
+            _ => None,
+        })
     }
 }
 
