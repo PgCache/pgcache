@@ -1,13 +1,11 @@
 use std::fmt::Write as _;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
 use tokio_stream::StreamExt;
-use tokio_util::bytes::{Buf, Bytes};
-use tokio_util::codec::FramedRead;
-use tracing::{debug, error, instrument, trace, warn};
+use tokio_util::bytes::Bytes;
+use tracing::{debug, instrument, trace, warn};
 
 use super::{
     CacheError, CacheResult,
@@ -19,27 +17,24 @@ use super::{
 };
 use crate::cache::messages::PipelineDescribe;
 use crate::oid::Oid;
-use crate::pg::cache_connection::{CacheConnection, ParkedConnection, PrepareOutcome};
-use crate::pg::protocol::PgMessage;
-use crate::pg::protocol::backend::PgBackendMessageCodec;
-use crate::pg::protocol::backend::PgBackendMessageType;
+use crate::pg::cache_connection::{CacheConnection, PrepareOutcome};
 use crate::pg::protocol::backend::TransactionStatus;
-use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG, SERVE_ERROR_MSG};
+use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG};
 use crate::query::ast::{AstNode, Deparse, LiteralValue};
 use crate::query::query_shape_derive;
 use crate::query::resolved::ResolvedTableNode;
-use crate::timing::QueryTiming;
 
 mod coalesce;
+mod relay;
+mod response_state;
 mod sqlstate;
 
 use super::runtime::serve_pool::ConnectionGuard;
 pub(super) use coalesce::CoalescedOutcome;
-use coalesce::{
-    BroadcastState, broadcast_error_reply, broadcast_join, broadcast_setup, push_and_broadcast,
-};
+use coalesce::{broadcast_setup, push_and_broadcast};
+use relay::{Relay, ServeClient, ServeDiagnostics};
+use response_state::ServeResponseState;
 pub(crate) use sqlstate::SQLSTATE_UNDEFINED_TABLE;
-use sqlstate::sqlstate_extract;
 
 /// Max gap between cache-DB frames while draining a response for a departed
 /// primary client before the connection is treated as stalled and discarded.
@@ -179,77 +174,6 @@ pub(crate) mod fault {
     }
 }
 
-/// Handle an `ErrorResponse` from the cache DB on the hit path. Poisons the
-/// connection (the trailing ReadyForQuery would otherwise leak to the next
-/// user) and returns a typed error so `handle_serve_request` forwards to
-/// origin via `CacheReply::Error`.
-///
-/// Safe to call only when `bytes_served == 0` — the cache emits ErrorResponse
-/// before RowDescription/DataRow, so the serve pool has not streamed any cache
-/// payload toward the client yet. A mid-stream error would need a different
-/// recovery path.
-async fn cache_error_response_handle(
-    guard: &mut ConnectionGuard,
-    frame_data: &[u8],
-    bytes_served: usize,
-    broadcast: &mut Option<BroadcastState>,
-) -> rootcause::Report<CacheError> {
-    guard.poisoned = true;
-    let sqlstate = sqlstate_extract(frame_data);
-    let sqlstate_str = sqlstate
-        .as_ref()
-        .and_then(|s| std::str::from_utf8(s).ok())
-        .unwrap_or("?");
-    debug!(
-        "cache ErrorResponse sqlstate={sqlstate_str} bytes_served={bytes_served} — \
-         forwarding to origin"
-    );
-    if let Some(bc) = broadcast.take() {
-        broadcast_error_reply(bc).await;
-    }
-    CacheError::CacheServerError { sqlstate }.into()
-}
-
-/// PGC-291: resolve a serve failure under the A+C invariant. If any byte already
-/// reached the client (`client_bytes_sent`), the serve can no longer fall back to
-/// origin — origin would replay the already-sent prefix (e.g. a duplicate
-/// `BindComplete`) and desync the client. Terminate this entry on the client with
-/// a synthetic `ErrorResponse` (plus `ReadyForQuery` when the client sent a Sync)
-/// and return `Ok`. Otherwise nothing is on the wire, so return `forward_error`
-/// and the caller forwards to origin transparently.
-///
-/// Termination reuses the existing queue with static bytes — no allocation.
-/// Best-effort: if the client is already gone the write just fails and the
-/// connection is torn down.
-async fn serve_failure_resolve<W: tokio::io::AsyncWrite + Unpin>(
-    client_bytes_sent: bool,
-    client_socket: &mut W,
-    write_queue: &mut WriteQueue,
-    trailing_rfq: Option<&'static [u8]>,
-    in_block: bool,
-    bytes_served: usize,
-    forward_error: rootcause::Report<CacheError>,
-) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
-    if !client_bytes_sent {
-        return Err(forward_error);
-    }
-    write_queue.clear();
-    write_queue.push(Bytes::from_static(SERVE_ERROR_MSG));
-    // Inside a block no ReadyForQuery is right: origin's block is healthy, so
-    // `T` would let the client commit what it just saw fail, and `E` would
-    // misreport origin. Send the error alone and have the connection close
-    // (PGC-387); origin then rolls the block back.
-    if in_block {
-        let _ = client_socket.write_all_buf(write_queue).await;
-        return Err(CacheError::ServeAbandonedInBlock.into());
-    }
-    if let Some(rfq) = trailing_rfq {
-        write_queue.push(Bytes::from_static(rfq));
-    }
-    let _ = client_socket.write_all_buf(write_queue).await;
-    Ok((bytes_served, Vec::new()))
-}
-
 /// Render a `LIMIT`/`OFFSET` clause field into text for its `$1`/`$2` bind. An
 /// integer limit — virtually every real one — formats into the caller's stack
 /// `itoa::Buffer` with no allocation. Any other literal (e.g. a float) deparses
@@ -271,528 +195,6 @@ fn limit_bind_text<'a>(
             Some(other.as_str())
         }
     }
-}
-
-/// Response state machine for the unified serve path (text and binary clients;
-/// source-row uses a named prepared statement, MV an unnamed one). Result
-/// format (text/binary) is chosen per client; the message *sequence* is the
-/// same.
-///
-/// Source-row pipeline (PGC-235): set_config(generation) + [Close] +
-/// Parse/Bind/[Describe('P')]/Execute under one Sync, producing
-/// [SetGen ParseComplete →] SetGen BindComplete → SetGen DataRow → SetGen
-/// CommandComplete → [CloseComplete →] [SELECT ParseComplete →] BindComplete →
-/// [RowDescription →] DataRow* → CommandComplete (SELECT) → ReadyForQuery. The
-/// set_config response (a one-row SELECT) is consumed, not relayed; only the
-/// SELECT's BindComplete-onward reaches the client. MV path has no set_config
-/// prefix and starts at `ParseComplete`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServeResponseState {
-    /// Waiting for the set_config statement's ParseComplete (first serve only)
-    SetGenParse,
-    /// Waiting for the set_config statement's BindComplete
-    SetGenBind,
-    /// Consuming the set_config one-row result (DataRow then CommandComplete)
-    SetGenData,
-    /// Waiting for CloseComplete (only when a statement was evicted)
-    CloseComplete,
-    /// Waiting for ParseComplete
-    ParseComplete,
-    /// Waiting for BindComplete
-    BindComplete,
-    /// Waiting for RowDescription (only when include_describe is true)
-    DescribeRow,
-    /// Streaming DataRow messages
-    DataRows,
-    /// Done — final ReadyForQuery received
-    Done,
-}
-
-/// Serve a cache hit: execute the cached query on a pooled cache-DB connection
-/// (a named prepared statement for source-row, unnamed extended for MV) and
-/// relay the response to the client in its requested format. Returns the DataRow
-/// bytes served and any coalesced client outcomes.
-// Span at trace level: at info/debug the fmt layer allocates per-span
-// extensions, which would put one heap allocation on every cache hit.
-#[instrument(skip_all, level = "trace")]
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(super) async fn handle_cached_query(
-    conn: CacheConnection,
-    return_tx: Sender<CacheConnection>,
-    replenish_tx: UnboundedSender<()>,
-    msg: &mut ServeRequest,
-    state_view: &CacheStateView,
-) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
-    debug!("message query generation {}", msg.generation);
-    let mut guard = ConnectionGuard::new(conn, return_tx, replenish_tx);
-
-    // Fault injection: poison this serve (discard the connection, fall through to
-    // origin) to exercise serve-pool replenishment under induced poison churn.
-    #[cfg(feature = "fault-injection")]
-    if fault::poison_serve() {
-        guard.poisoned = true;
-        return Err(CacheError::InvalidMessage.into());
-    }
-
-    let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
-
-    // Serve in the client's result format (text/binary). Simple-query clients
-    // always expect a RowDescription, so request Describe from the cache DB even
-    // when no Describe message was pipelined.
-    let binary_results = msg.result_formats.is_binary();
-    let query_type = msg.query_type;
-    let include_describe =
-        query_type == QueryType::Simple || msg.pipeline_describe != PipelineDescribe::None;
-    // Captured before the `client_socket` borrow below so the post-commit error
-    // path (PGC-291) can decide whether to append a ReadyForQuery: the client
-    // expects one iff it terminated this entry with a Sync (or is simple-query).
-    let trailing_rfq = msg.trailing_rfq();
-    let in_block = msg.transaction_status == TransactionStatus::InTransaction;
-
-    // Begin a result-memo capture for hot source-row serves. Stamps read-relation
-    // versions now, before the serve query is issued (capture ordering invariant).
-    let memo_capture = memo_capture_begin(state_view, msg, binary_results);
-
-    // Issue the query on the cache-DB connection; `prepare` records what was sent
-    // so the response state machine knows which completions to expect.
-    let prepare = serve_query_send(&mut conn, msg, include_describe, binary_results)
-        .await
-        .inspect_err(|_| {
-            guard.poisoned = true;
-        })?;
-
-    // Create broadcast for coalesced clients (after query is sent, before streaming)
-    let broadcast = broadcast_setup(msg);
-
-    // Stream results to client: move the read half into a FramedRead and park
-    // the rest of the connection to restore once the response is drained.
-    let (mut framed, parked) = conn.into_framed();
-
-    // Fault (tests): drop the serve with the connection checked out and NOT
-    // poisoned — the guard must replenish the lost slot (PGC-278).
-    #[cfg(feature = "fault-injection")]
-    if fault::lose_serve() {
-        return Err(CacheError::InvalidMessage.into());
-    }
-
-    let parameter_description = msg.parameter_description.take();
-    let client_socket = &mut msg.client_socket;
-
-    let mut write_queue = WriteQueue::new();
-
-    if msg.has_parse {
-        push_and_broadcast(
-            &mut write_queue,
-            &broadcast,
-            Bytes::from_static(PARSE_COMPLETE_MSG),
-        );
-    }
-    if msg.has_bind {
-        push_and_broadcast(
-            &mut write_queue,
-            &broadcast,
-            Bytes::from_static(BIND_COMPLETE_MSG),
-        );
-    }
-
-    // MV path: no set_config prefix, so start at the SELECT's ParseComplete.
-    // Source-row path: consume the set_config response first — its Parse only on
-    // the first serve of this connection, otherwise straight to its BindComplete.
-    let initial_state = if matches!(msg.mv, MvServe::Mv(_)) {
-        ServeResponseState::ParseComplete
-    } else if prepare.sent_setgen_parse {
-        ServeResponseState::SetGenParse
-    } else {
-        ServeResponseState::SetGenBind
-    };
-
-    // Everything the response state machine touches, except the select-bound
-    // `write_queue` / `client_gone` locals (see `Relay`).
-    let mut relay = Relay {
-        state: initial_state,
-        broadcast,
-        memo_capture,
-        parameter_description,
-        bytes_served: 0,
-        prepare,
-        include_describe,
-        pipeline_describe: msg.pipeline_describe,
-    };
-    // Set when a client write fails mid-serve. The cache-DB connection is still
-    // healthy, so rather than poison it we stop relaying and drain the remaining
-    // cache-DB response, returning the connection to the pool protocol-clean.
-    let mut client_gone = false;
-
-    // PGC-291. Two flags enforce the invariant "a serve that has put bytes on the
-    // client wire can never be transparently forwarded to origin" (origin would
-    // replay the already-sent prefix — e.g. a duplicate BindComplete — desyncing
-    // the client). `committed` defers the first client flush until the cache-DB
-    // confirms the query plan (relay reaches the data phase), so a stall/error
-    // *before* that leaves nothing on the wire and forwards cleanly.
-    // `client_bytes_sent` records whether any byte actually reached the client; if
-    // so, a later failure terminates the entry with a synthetic ErrorResponse
-    // instead of forwarding.
-    let mut committed = false;
-    let mut client_bytes_sent = false;
-
-    // PGC-278: bound the whole serve. The primary read arm (`framed.next()`) has
-    // no per-read timeout, so a stalled cache-DB connection or a response desync
-    // would park here forever holding the pooled connection. On the deadline,
-    // poison (discard + replenish) and forward to origin.
-    let serve_deadline = tokio::time::Instant::now() + SERVE_STALL_TIMEOUT;
-
-    loop {
-        tokio::select! {
-            _ = tokio::time::sleep_until(serve_deadline) => {
-                warn!(
-                    fingerprint = %msg.fingerprint,
-                    state = ?relay.state,
-                    bytes_served = relay.bytes_served,
-                    client_gone,
-                    has_parse = msg.has_parse,
-                    has_bind = msg.has_bind,
-                    include_describe,
-                    mv = matches!(msg.mv, MvServe::Mv(_)),
-                    sent_setgen_parse = relay.prepare.sent_setgen_parse,
-                    sent_parse = relay.prepare.sent_parse,
-                    sent_close = relay.prepare.sent_close,
-                    "cache serve exceeded stall deadline; poisoning connection; forwarding to origin if no bytes sent, else erroring the client (PGC-278/PGC-291)"
-                );
-                crate::metrics::handles().cache.serve_stall_total.increment(1);
-                serve_poison(&mut guard, &mut relay).await;
-                return serve_failure_resolve(
-                    client_bytes_sent, client_socket, &mut write_queue, trailing_rfq, in_block,
-                    relay.bytes_served, CacheError::Write.into(),
-                ).await;
-            }
-            frame = framed.next() => {
-                // Fault (tests): once any response bytes exist, push them to the
-                // client and fail — the PGC-291 "already on the wire" shape.
-                #[cfg(feature = "fault-injection")]
-                if (client_bytes_sent || !write_queue.is_empty()) && fault::midstream_serve() {
-                    let _ = client_socket.write_all_buf(&mut write_queue).await;
-                    serve_poison(&mut guard, &mut relay).await;
-                    return serve_failure_resolve(
-                        true, client_socket, &mut write_queue, trailing_rfq, in_block,
-                        relay.bytes_served, CacheError::InvalidMessage.into(),
-                    ).await;
-                }
-                let frame = match frame {
-                    Some(Ok(frame)) => frame,
-                    Some(Err(_)) | None => {
-                        serve_poison(&mut guard, &mut relay).await;
-                        return serve_failure_resolve(
-                            client_bytes_sent, client_socket, &mut write_queue, trailing_rfq, in_block,
-                            relay.bytes_served, CacheError::InvalidMessage.into(),
-                        ).await;
-                    }
-                };
-                // relay_frame_apply errors only on a cache-DB ErrorResponse, where
-                // it has already poisoned the guard and replied to coalesced
-                // waiters. Same PGC-291 invariant: forward only if nothing was sent.
-                if let Err(e) =
-                    relay_frame_apply(&mut relay, frame, &mut write_queue, &mut guard, &mut msg.timing)
-                        .await
-                {
-                    return serve_failure_resolve(
-                        client_bytes_sent, client_socket, &mut write_queue, trailing_rfq, in_block,
-                        relay.bytes_served, e,
-                    ).await;
-                }
-            }
-            result = client_socket.write_buf(&mut write_queue),
-                if committed && !write_queue.is_empty() && !client_gone =>
-            {
-                match result {
-                    Ok(cnt) => {
-                        if cnt > 0 {
-                            client_bytes_sent = true;
-                        }
-                        trace!("net: cache→client flush (serve, partial write, {} bytes)", cnt);
-                    }
-                    Err(_) => {
-                        // Primary client went away mid-serve. The cache-DB
-                        // connection is healthy — do NOT poison it. Stop relaying
-                        // to the primary but keep reading (and broadcasting) the
-                        // rest of the response: coalesced waiters are independent
-                        // and must still be served. Draining to completion also
-                        // returns the connection to the pool protocol-clean
-                        // (avoids serve-pool exhaustion).
-                        debug!("primary client write failed mid-serve; draining cache-DB response, coalesced waiters still served");
-                        client_gone = true;
-                    }
-                }
-            }
-            // Bound the drain: if the cache-DB goes silent while we're draining
-            // for a departed primary, the connection is mid-response and unsafe
-            // to reuse. Discard it (poison) rather than hold a pool slot forever
-            // (PGC-238 replenish heals the pool).
-            _ = tokio::time::sleep(DRAIN_STALL_TIMEOUT), if client_gone => {
-                debug!("cache-DB stalled while draining for departed client; discarding connection");
-                serve_poison(&mut guard, &mut relay).await;
-                return Err(CacheError::Write.into());
-            }
-        }
-
-        // PGC-291: once the relay reaches the data phase the cache-DB has
-        // confirmed the query plan (BindComplete) and rows/CommandComplete are
-        // imminent — commit, releasing the buffered response prefix to flush.
-        // Before this point write_queue stays unflushed, so a stall/error
-        // forwards transparently with nothing on the client wire.
-        if matches!(
-            relay.state,
-            ServeResponseState::DataRows | ServeResponseState::Done
-        ) {
-            committed = true;
-        }
-
-        // While draining for a departed client, discard the relay buffer so it
-        // can't grow with the rest of the response.
-        if client_gone {
-            write_queue.clear();
-        }
-
-        if relay.state == ServeResponseState::Done {
-            break;
-        }
-    }
-
-    connection_return_or_discard(&mut guard, framed, parked, msg, &relay, include_describe);
-
-    serve_response_finish(guard, &mut write_queue, relay, msg, client_gone, state_view).await
-}
-
-/// Poison the cache-DB connection and fail any coalesced waiters. The caller
-/// then resolves the primary client's fate (forward vs. terminate) separately —
-/// see [`serve_failure_resolve`].
-async fn serve_poison(guard: &mut ConnectionGuard, relay: &mut Relay) {
-    guard.poisoned = true;
-    if let Some(bc) = relay.broadcast.take() {
-        broadcast_error_reply(bc).await;
-    }
-}
-
-/// Return the cache-DB connection to the pool, or discard it if the serve left
-/// bytes unread.
-///
-/// PGC-278: the response is fully consumed at `Done` — the single trailing Sync
-/// means `ReadyForQuery` is the last frame, and no next response arrives until
-/// this connection serves again. Any bytes still buffered are therefore a
-/// response desync introduced by THIS serve (the state machine consumed the
-/// wrong number of frames for its pipeline shape). Discard the connection
-/// (poison ⇒ replenish) rather than hand the leftover frame to the next
-/// borrower, and record it at its source. The client's reply is unaffected — it
-/// already received a complete response.
-fn connection_return_or_discard(
-    guard: &mut ConnectionGuard,
-    framed: FramedRead<TcpStream, PgBackendMessageCodec>,
-    parked: ParkedConnection,
-    msg: &ServeRequest,
-    relay: &Relay,
-    include_describe: bool,
-) {
-    let residual = framed.read_buffer().len();
-    if residual == 0 {
-        guard.conn = Some(CacheConnection::from_framed(framed, parked));
-        return;
-    }
-
-    let lead = framed.read_buffer().first().copied().map(char::from);
-    warn!(
-        fingerprint = %msg.fingerprint,
-        residual_bytes = residual,
-        ?lead,
-        has_parse = msg.has_parse,
-        has_bind = msg.has_bind,
-        include_describe,
-        mv = matches!(msg.mv, MvServe::Mv(_)),
-        sent_setgen_parse = relay.prepare.sent_setgen_parse,
-        sent_parse = relay.prepare.sent_parse,
-        sent_close = relay.prepare.sent_close,
-        "serve left unconsumed cache-DB bytes after ReadyForQuery (response desync); discarding connection (PGC-278)"
-    );
-    crate::metrics::handles()
-        .cache
-        .serve_dirty_return_total
-        .increment(1);
-    guard.poisoned = true;
-    // Drop the dirty connection; the poisoned guard's `Drop` replenishes.
-    drop(framed);
-    drop(parked);
-}
-
-/// Mutable relay state plus read-only config for one serve's response stream.
-/// Holds everything the response state machine touches *except* the two values
-/// bound by the `select!` loop (`write_queue`, `client_gone`), which stay loose
-/// locals so the read and write arms can borrow them independently.
-struct Relay {
-    state: ServeResponseState,
-    /// Broadcast handle for coalesced clients (`None` when not coalesced).
-    broadcast: Option<BroadcastState>,
-    /// In-flight memo capture (`None` when this serve isn't being memoized).
-    memo_capture: Option<MemoCapture>,
-    /// Pending Describe('S') ParameterDescription, relayed before RowDescription.
-    parameter_description: Option<Bytes>,
-    bytes_served: usize,
-    // Read-only for the relay's duration:
-    prepare: PrepareOutcome,
-    include_describe: bool,
-    pipeline_describe: PipelineDescribe,
-}
-
-/// Advance the response state machine for one cache-DB frame: update `relay.state`,
-/// relay the frame to the primary client (and broadcast to coalesced clients),
-/// and feed the memo capture. Returns `Err` on a cache-DB `ErrorResponse` — the
-/// connection is poisoned and coalesced waiters get an error reply. The caller
-/// breaks the loop once `relay.state` reaches `Done`.
-async fn relay_frame_apply(
-    relay: &mut Relay,
-    frame: PgMessage<PgBackendMessageType>,
-    write_queue: &mut WriteQueue,
-    guard: &mut ConnectionGuard,
-    timing: &mut QueryTiming,
-) -> CacheResult<()> {
-    // Fault (tests): corrupt the frame type so it lands in the desync arm.
-    #[cfg(feature = "fault-injection")]
-    let frame = {
-        let mut frame = frame;
-        if fault::desync_serve() {
-            frame.message_type = PgBackendMessageType::CopyData;
-        }
-        frame
-    };
-    match (relay.state, frame.message_type) {
-        (ServeResponseState::SetGenParse, PgBackendMessageType::ParseComplete) => {
-            relay.state = ServeResponseState::SetGenBind;
-        }
-        (ServeResponseState::SetGenBind, PgBackendMessageType::BindComplete) => {
-            relay.state = ServeResponseState::SetGenData;
-        }
-        // set_config returns one row; consume it without relaying.
-        (ServeResponseState::SetGenData, PgBackendMessageType::DataRows) => {}
-        (ServeResponseState::SetGenData, PgBackendMessageType::CommandComplete) => {
-            // set_config done. A Close (if a statement was evicted) precedes the
-            // SELECT; on statement reuse neither Close nor Parse is sent, so skip
-            // straight to Bind.
-            relay.state = if relay.prepare.sent_close {
-                ServeResponseState::CloseComplete
-            } else if relay.prepare.sent_parse {
-                ServeResponseState::ParseComplete
-            } else {
-                ServeResponseState::BindComplete
-            };
-        }
-        (ServeResponseState::CloseComplete, PgBackendMessageType::CloseComplete) => {
-            // A reconciliation Close can ride a reuse serve (no Parse), so the
-            // Parse only follows when one was actually sent.
-            relay.state = if relay.prepare.sent_parse {
-                ServeResponseState::ParseComplete
-            } else {
-                ServeResponseState::BindComplete
-            };
-        }
-        (ServeResponseState::ParseComplete, PgBackendMessageType::ParseComplete) => {
-            relay.state = ServeResponseState::BindComplete;
-        }
-        (ServeResponseState::BindComplete, PgBackendMessageType::BindComplete) => {
-            relay.state = if relay.include_describe {
-                ServeResponseState::DescribeRow
-            } else {
-                ServeResponseState::DataRows
-            };
-        }
-        (ServeResponseState::DescribeRow, PgBackendMessageType::RowDescription) => {
-            if relay.pipeline_describe == PipelineDescribe::Statement
-                && let Some(param_desc) = relay.parameter_description.take()
-            {
-                trace!(
-                    "net: cache→client ParameterDescription (serve, {} bytes)",
-                    param_desc.len()
-                );
-                push_and_broadcast(write_queue, &relay.broadcast, param_desc);
-            }
-            trace!(
-                "net: cache→client RowDescription (serve, {} bytes)",
-                frame.data.len()
-            );
-            if let Some(cap) = &mut relay.memo_capture {
-                cap.row_description_push(&frame.data);
-            }
-            push_and_broadcast(write_queue, &relay.broadcast, frame.data);
-            relay.state = ServeResponseState::DataRows;
-        }
-        (ServeResponseState::DataRows, PgBackendMessageType::DataRows) => {
-            trace!(
-                "net: cache→client DataRow (serve, {} bytes)",
-                frame.data.len()
-            );
-            relay.bytes_served += frame.data.len();
-            if let Some(cap) = &mut relay.memo_capture {
-                cap.data_push(&frame.data);
-            }
-            push_and_broadcast(write_queue, &relay.broadcast, frame.data);
-        }
-        (ServeResponseState::DataRows, PgBackendMessageType::CommandComplete) => {
-            trace!(
-                "net: cache→client CommandComplete (serve, {} bytes)",
-                frame.data.len()
-            );
-            if let Some(cap) = &mut relay.memo_capture {
-                cap.command_complete_push(&frame.data);
-            }
-            push_and_broadcast(write_queue, &relay.broadcast, frame.data);
-            timing.query_done_at = Some(Instant::now());
-        }
-        // Single trailing Sync → one terminal ReadyForQuery. It can't arrive
-        // mid-set_config (those advance on Parse/Bind/Data/CC).
-        (_, PgBackendMessageType::ReadyForQuery)
-            if !matches!(
-                relay.state,
-                ServeResponseState::SetGenParse
-                    | ServeResponseState::SetGenBind
-                    | ServeResponseState::SetGenData
-            ) =>
-        {
-            relay.state = ServeResponseState::Done;
-        }
-        (_, PgBackendMessageType::ErrorResponse) => {
-            return Err(cache_error_response_handle(
-                guard,
-                &frame.data,
-                relay.bytes_served,
-                &mut relay.broadcast,
-            )
-            .await);
-        }
-        // Async session messages can arrive at any point in the exchange
-        // and carry no sequencing meaning — pass over them.
-        (
-            _,
-            PgBackendMessageType::ParameterStatus
-            | PgBackendMessageType::NoticeResponse
-            | PgBackendMessageType::NotificationResponse,
-        ) => {}
-        // Any other frame is a protocol desync: poison immediately rather
-        // than letting the stall deadline catch it 10s later (PGC-278).
-        // NoData is intentionally NOT special-cased: a row-returning
-        // portal Describe always yields RowDescription (zero-field for a
-        // column-less SELECT), so NoData here would itself be a desync.
-        (state, message_type) => {
-            warn!(
-                "unexpected cache backend frame {message_type:?} in serve state {state:?}; poisoning connection"
-            );
-            crate::metrics::handles()
-                .cache
-                .serve_desync_total
-                .increment(1);
-            guard.poisoned = true;
-            if let Some(bc) = relay.broadcast.take() {
-                broadcast_error_reply(bc).await;
-            }
-            return Err(CacheError::InvalidMessage.into());
-        }
-    }
-    Ok(())
 }
 
 /// Issue the cached query on the pooled cache-DB connection and return what was
@@ -879,66 +281,230 @@ async fn serve_query_send(
     .await
 }
 
-/// Finalize a completed serve: return the connection to the pool, append the
-/// trailing ReadyForQuery when the client expects one, join the coalesced
-/// broadcast, flush any buffered bytes to the primary, and store the memo
-/// capture. The connection must already be reattached to `guard`.
-async fn serve_response_finish(
-    guard: ConnectionGuard,
-    write_queue: &mut WriteQueue,
-    mut relay: Relay,
+/// Serve a cache hit: execute the cached query on a pooled cache-DB connection
+/// (a named prepared statement for source-row, unnamed extended for MV) and
+/// relay the response to the client in its requested format. Returns the DataRow
+/// bytes served and any coalesced client outcomes.
+// Span at trace level: at info/debug the fmt layer allocates per-span
+// extensions, which would put one heap allocation on every cache hit.
+#[instrument(skip_all, level = "trace")]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(super) async fn handle_cached_query(
+    conn: CacheConnection,
+    return_tx: Sender<CacheConnection>,
+    replenish_tx: UnboundedSender<()>,
     msg: &mut ServeRequest,
-    client_gone: bool,
     state_view: &CacheStateView,
 ) -> CacheResult<(usize, Vec<CoalescedOutcome>)> {
-    if let Err(e) = guard.release().await {
-        if let Some(bc) = relay.broadcast.take() {
-            broadcast_error_reply(bc).await;
-        }
-        return Err(e);
+    debug!("message query generation {}", msg.generation);
+    let mut guard = ConnectionGuard::new(conn, return_tx, replenish_tx);
+
+    // Fault injection: poison this serve (discard the connection, fall through to
+    // origin) to exercise serve-pool replenishment under induced poison churn.
+    #[cfg(feature = "fault-injection")]
+    if fault::poison_serve() {
+        guard.poisoned = true;
+        return Err(CacheError::InvalidMessage.into());
     }
 
-    // Simple-query clients always terminate with ReadyForQuery; extended clients
-    // do when their trailing Execute carried the Sync.
-    if let Some(rfq) = msg.trailing_rfq() {
-        trace!("net: cache→client ReadyForQuery");
-        push_and_broadcast(write_queue, &relay.broadcast, Bytes::from_static(rfq));
+    let mut conn = guard.conn.take().ok_or(CacheError::NoConnection)?;
+
+    // Serve in the client's result format (text/binary). Simple-query clients
+    // always expect a RowDescription, so request Describe from the cache DB even
+    // when no Describe message was pipelined.
+    let binary_results = msg.result_formats.is_binary();
+    let include_describe =
+        msg.query_type == QueryType::Simple || msg.pipeline_describe != PipelineDescribe::None;
+
+    // Begin a result-memo capture for hot source-row serves. Stamps read-relation
+    // versions now, before the serve query is issued (capture ordering invariant).
+    let memo_capture = memo_capture_begin(state_view, msg, binary_results);
+
+    // Issue the query on the cache-DB connection; `prepare` records what was sent
+    // so the response state machine knows which completions to expect.
+    let prepare = serve_query_send(&mut conn, msg, include_describe, binary_results)
+        .await
+        .inspect_err(|_| {
+            guard.poisoned = true;
+        })?;
+
+    // Create broadcast for coalesced clients (after query is sent, before streaming)
+    let broadcast = broadcast_setup(msg);
+
+    // Stream results to client: move the read half into a FramedRead and park
+    // the rest of the connection to restore once the response is drained.
+    let (mut framed, parked) = conn.into_framed();
+
+    // Fault (tests): drop the serve with the connection checked out and NOT
+    // poisoned — the guard must replenish the lost slot (PGC-278).
+    #[cfg(feature = "fault-injection")]
+    if fault::lose_serve() {
+        return Err(CacheError::InvalidMessage.into());
     }
 
-    let outcomes = match relay.broadcast.take() {
-        Some(bc) => broadcast_join(bc).await,
-        None => vec![],
+    let mut relay = Relay {
+        state: ServeResponseState::initial(&msg.mv, &prepare),
+        guard,
+        broadcast,
+        memo_capture,
+        parameter_description: msg.parameter_description.take(),
+        bytes_served: 0,
+        prepare,
+        include_describe,
+        pipeline_describe: msg.pipeline_describe,
+        diagnostics: ServeDiagnostics {
+            fingerprint: msg.fingerprint,
+            has_parse: msg.has_parse,
+            has_bind: msg.has_bind,
+            mv: matches!(msg.mv, MvServe::Mv(_)),
+        },
+    };
+    let mut client = ServeClient {
+        // Captured before the `client_socket` borrow so the post-commit error
+        // path (PGC-291) can decide whether to append a ReadyForQuery.
+        trailing_rfq: msg.trailing_rfq(),
+        in_block: msg.transaction_status == TransactionStatus::InTransaction,
+        socket: &mut msg.client_socket,
+        write_queue: WriteQueue::new(),
+        committed: false,
+        bytes_sent: false,
+        gone: false,
     };
 
-    // The primary socket is dead when client_gone; its buffered reply is moot.
-    // Coalesced waiters were served via the broadcast above.
-    if !client_gone && !write_queue.is_empty() {
-        trace!(
-            "net: cache→client final flush (serve, {} bytes remaining)",
-            write_queue.remaining()
+    if relay.diagnostics.has_parse {
+        push_and_broadcast(
+            &mut client.write_queue,
+            &relay.broadcast,
+            Bytes::from_static(PARSE_COMPLETE_MSG),
         );
-        if let Err(e) = msg.client_socket.write_all_buf(write_queue).await {
-            error!("no client: {e}");
-            return Err(CacheError::Write.into());
+    }
+    if relay.diagnostics.has_bind {
+        push_and_broadcast(
+            &mut client.write_queue,
+            &relay.broadcast,
+            Bytes::from_static(BIND_COMPLETE_MSG),
+        );
+    }
+
+    // PGC-278: bound the whole serve. The primary read arm (`framed.next()`) has
+    // no per-read timeout, so a stalled cache-DB connection or a response desync
+    // would park here forever holding the pooled connection. On the deadline,
+    // poison (discard + replenish) and forward to origin.
+    let serve_deadline = tokio::time::Instant::now() + SERVE_STALL_TIMEOUT;
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(serve_deadline) => {
+                let diagnostics = &relay.diagnostics;
+                warn!(
+                    fingerprint = %diagnostics.fingerprint,
+                    state = ?relay.state,
+                    bytes_served = relay.bytes_served,
+                    client_gone = client.gone,
+                    has_parse = diagnostics.has_parse,
+                    has_bind = diagnostics.has_bind,
+                    include_describe,
+                    mv = diagnostics.mv,
+                    sent_setgen_parse = relay.prepare.sent_setgen_parse,
+                    sent_parse = relay.prepare.sent_parse,
+                    sent_close = relay.prepare.sent_close,
+                    "cache serve exceeded stall deadline; poisoning connection; forwarding to origin if no bytes sent, else erroring the client (PGC-278/PGC-291)"
+                );
+                crate::metrics::handles().cache.serve_stall_total.increment(1);
+                relay.poison().await;
+                return client.failure_resolve(relay.bytes_served, CacheError::Write.into()).await;
+            }
+            frame = framed.next() => {
+                // Fault (tests): once any response bytes exist, push them to the
+                // client and fail — the PGC-291 "already on the wire" shape.
+                #[cfg(feature = "fault-injection")]
+                if (client.bytes_sent || !client.write_queue.is_empty()) && fault::midstream_serve() {
+                    let _ = client.socket.write_all_buf(&mut client.write_queue).await;
+                    client.bytes_sent = true;
+                    relay.poison().await;
+                    return client
+                        .failure_resolve(relay.bytes_served, CacheError::InvalidMessage.into())
+                        .await;
+                }
+                let Some(Ok(frame)) = frame else {
+                    relay.poison().await;
+                    return client
+                        .failure_resolve(relay.bytes_served, CacheError::InvalidMessage.into())
+                        .await;
+                };
+                // frame_apply errors only on a cache-DB ErrorResponse or desync,
+                // where it has already poisoned the guard and replied to coalesced
+                // waiters. Same PGC-291 invariant: forward only if nothing was sent.
+                if let Err(e) = relay.frame_apply(frame, &mut client.write_queue, &mut msg.timing).await {
+                    return client.failure_resolve(relay.bytes_served, e).await;
+                }
+            }
+            result = client.socket.write_buf(&mut client.write_queue),
+                if client.committed && !client.write_queue.is_empty() && !client.gone =>
+            {
+                match result {
+                    Ok(cnt) => {
+                        if cnt > 0 {
+                            client.bytes_sent = true;
+                        }
+                        trace!("net: cache→client flush (serve, partial write, {} bytes)", cnt);
+                    }
+                    Err(_) => {
+                        // Primary client went away mid-serve. The cache-DB
+                        // connection is healthy — do NOT poison it. Stop relaying
+                        // to the primary but keep reading (and broadcasting) the
+                        // rest of the response: coalesced waiters are independent
+                        // and must still be served. Draining to completion also
+                        // returns the connection to the pool protocol-clean
+                        // (avoids serve-pool exhaustion).
+                        debug!("primary client write failed mid-serve; draining cache-DB response, coalesced waiters still served");
+                        client.gone = true;
+                    }
+                }
+            }
+            // Bound the drain: if the cache-DB goes silent while we're draining
+            // for a departed primary, the connection is mid-response and unsafe
+            // to reuse. Discard it (poison) rather than hold a pool slot forever
+            // (PGC-238 replenish heals the pool).
+            _ = tokio::time::sleep(DRAIN_STALL_TIMEOUT), if client.gone => {
+                debug!("cache-DB stalled while draining for departed client; discarding connection");
+                relay.poison().await;
+                return Err(CacheError::Write.into());
+            }
+        }
+
+        // PGC-291: once the relay reaches the data phase the cache-DB has
+        // confirmed the query plan (BindComplete) and rows/CommandComplete are
+        // imminent — commit, releasing the buffered response prefix to flush.
+        // Before this point write_queue stays unflushed, so a stall/error
+        // forwards transparently with nothing on the client wire.
+        if matches!(
+            relay.state,
+            ServeResponseState::DataRows | ServeResponseState::Done
+        ) {
+            client.committed = true;
+        }
+
+        // While draining for a departed client, discard the relay buffer so it
+        // can't grow with the rest of the response.
+        if client.gone {
+            client.write_queue.clear();
+        }
+
+        if relay.state == ServeResponseState::Done {
+            break;
         }
     }
 
-    msg.timing.response_written_at = Some(Instant::now());
-
-    // Store the captured snapshot iff the serve completed cleanly and no CDC
-    // change touched a read relation across the capture (re-checked in `finish`).
-    // Error paths returned earlier, so reaching here means a clean response.
-    if let Some(cap) = relay.memo_capture {
-        cap.finish(&state_view.memo);
-    }
-
-    debug!("cache hit");
-    Ok((relay.bytes_served, outcomes))
+    relay.connection_return_or_discard(framed, parked);
+    relay.finish(&mut client, &mut msg.timing, state_view).await
 }
 
 #[cfg(test)]
 mod tests {
+    use super::sqlstate::sqlstate_extract;
     use super::*;
+    use crate::pg::protocol::encode::SERVE_ERROR_MSG;
 
     /// Build a minimal PG ErrorResponse frame with the given (code, value)
     /// fields. Layout: `'E' | len(u32 BE) | (code: u8, value: cstring)* | 0`.
