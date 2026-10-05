@@ -30,6 +30,7 @@ use super::{
 };
 use crate::catalog::FunctionVolatility;
 use crate::proxy::CacheabilityStore;
+use crate::proxy::ParseError;
 use crate::proxy::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
 use crate::proxy::query::{Action, CacheabilityCache, ForwardReason, handle_query};
 use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
@@ -570,6 +571,39 @@ fn single_table(query: &QueryExpr) -> Option<&TableNode> {
 }
 
 /// Increment the per-reason counter for a forwarded (non-cacheable) statement.
+/// Strip `SCRAM-SHA-256-PLUS` from a SASL authentication request's mechanism
+/// list, in place: channel binding cannot be supported because the proxy
+/// terminates TLS. The post-strip length field (bytes 1-4, big-endian i32,
+/// excludes the tag byte) is computed before mutating, so an out-of-range
+/// length (unreachable: auth messages are tiny) leaves the message
+/// unmodified rather than panicking — the strip is best-effort anyway.
+fn sasl_plus_mechanism_strip(data: &mut BytesMut) {
+    let needle = b"SCRAM-SHA-256-PLUS\0";
+    let Some(pos) = data
+        .windows(needle.len())
+        .position(|window| window == needle)
+    else {
+        return;
+    };
+    let Some(new_len) = data
+        .len()
+        .checked_sub(needle.len() + 1)
+        .and_then(|n| i32::try_from(n).ok())
+    else {
+        return;
+    };
+    // Remove needle in place using split/unsplit
+    let mut tail = data.split_off(pos);
+    let after_needle = tail.split_off(needle.len());
+    data.unsplit(after_needle);
+
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "PostgreSQL message format guarantees 5+ bytes"
+    )]
+    data[1..5].copy_from_slice(&new_len.to_be_bytes());
+}
+
 fn forward_reason_metric(reason: ForwardReason) {
     let m = crate::metrics::handles();
     match reason {
@@ -657,7 +691,7 @@ impl ConnectionState {
     /// Handle a message from the client (frontend).
     /// Determines whether to forward to origin, check cache, or take other action.
     #[expect(clippy::wildcard_enum_match_arm)]
-    pub(super) async fn handle_client_message(&mut self, mut msg: PgFrontendMessage) {
+    pub(super) async fn handle_client_message(&mut self, msg: PgFrontendMessage) {
         trace!("net: client→proxy {:?}", msg.message_type);
 
         // A prior Flush forwarded a Describe sub-request whose response carries
@@ -670,70 +704,7 @@ impl ConnectionState {
             self.egress.origin_seal();
         }
         match msg.message_type {
-            PgFrontendMessageType::Query => {
-                let m = crate::metrics::handles();
-                m.query.total.increment(1);
-                m.conn.simple_queries.increment(1);
-                self.telemetry.query_receive();
-
-                self.search_path_inspect_query(&mut msg);
-
-                if self.cache_dispatch_possible() {
-                    self.proxy_mode = match handle_query(
-                        &msg.data,
-                        &mut self.cacheability_cache,
-                        &self.func_volatility,
-                    )
-                    .await
-                    {
-                        Ok(Action::Forward(reason, effects)) => {
-                            forward_reason_metric(reason);
-                            self.forwarded_effects_apply(&effects);
-                            self.origin_dispatch(msg.data, None);
-                            ProxyMode::Read
-                        }
-                        Ok(Action::CacheCheck(ast)) => {
-                            let fingerprint = query_expr_fingerprint(ast.query());
-                            self.telemetry.cache_timing_start(fingerprint);
-                            self.extended.dispatch_is_extended = false;
-                            self.egress.cache_push(CacheMessage::Query(msg.data, ast));
-                            ProxyMode::OriginDrain
-                        }
-                        // `SELECT pgcache_explain(...)` — route to the cache to
-                        // explain a cached query's cache-side plan (PGC-345)
-                        // rather than forward to origin like a normal statement
-                        // the cache can't serve.
-                        Ok(Action::Explain(spec)) => {
-                            self.extended.dispatch_is_extended = false;
-                            // Carry the original bytes so a cache-unavailable
-                            // fallback can forward to origin instead of an empty
-                            // frame (PGC-345).
-                            self.egress
-                                .cache_push(CacheMessage::Explain(spec.as_ref().clone(), msg.data));
-                            ProxyMode::OriginDrain
-                        }
-                        Err(e) => {
-                            m.query.uncacheable.increment(1);
-                            m.query.invalid.increment(1);
-                            error!("handle_query {}", e);
-                            // Unparseable: can't rule out a write — record
-                            // connection-scoped so no read is served stale.
-                            self.forwarded_effects_apply(&StatementEffects::unknown());
-                            self.origin_dispatch(msg.data, None);
-                            ProxyMode::Read
-                        }
-                    };
-                } else {
-                    m.query.uncacheable.increment(1);
-                    // A failed block (or cache-disabled connection) never
-                    // cache-serves, but a write among its statements must still
-                    // land in the log so later reads on this connection aren't
-                    // served stale, and a SET must still be tracked. Analyze
-                    // here (memoized) purely to classify.
-                    self.forwarded_statement_effects_apply(&msg.data).await;
-                    self.origin_dispatch(msg.data, None);
-                }
-            }
+            PgFrontendMessageType::Query => self.simple_query_handle(msg).await,
             PgFrontendMessageType::Parse => {
                 self.handle_parse_message(msg);
             }
@@ -755,26 +726,7 @@ impl ConnectionState {
             PgFrontendMessageType::Flush => {
                 self.handle_flush_message(msg);
             }
-            PgFrontendMessageType::Startup => {
-                self.session_user = startup_message_parameter(&msg.data, "user").map(String::from);
-
-                // The cache is connected to a specific database and cannot serve queries
-                // for other databases.
-                if let Some(client_db) = startup_message_parameter(&msg.data, "database")
-                    && client_db != self.origin_database.as_str()
-                {
-                    warn!(
-                        "client database '{}' does not match cache database '{}', caching disabled for this connection",
-                        client_db, self.origin_database
-                    );
-                    self.cache_disabled = true;
-                    // The connection never serves from cache, so its write log
-                    // would only accrue dead weight.
-                    self.write_log.disable();
-                }
-
-                self.origin_write_buf.push_back(msg.data);
-            }
+            PgFrontendMessageType::Startup => self.startup_handle(msg),
             PgFrontendMessageType::SslRequest => {
                 // SSLRequest should be handled during connection setup before framing begins.
                 // If we receive it here, something unexpected happened - log a warning.
@@ -805,6 +757,105 @@ impl ConnectionState {
         }
     }
 
+    /// Handle a simple-protocol `Query`: route it to the cache, explain it, or
+    /// forward it to origin, recording its effects on the way.
+    async fn simple_query_handle(&mut self, mut msg: PgFrontendMessage) {
+        let m = crate::metrics::handles();
+        m.query.total.increment(1);
+        m.conn.simple_queries.increment(1);
+        self.telemetry.query_receive();
+
+        self.search_path_inspect_query(&mut msg);
+
+        if self.cache_dispatch_possible() {
+            let analyzed = handle_query(
+                &msg.data,
+                &mut self.cacheability_cache,
+                &self.func_volatility,
+            )
+            .await;
+            self.proxy_mode = self.simple_query_route(analyzed, msg);
+        } else {
+            m.query.uncacheable.increment(1);
+            // A failed block (or cache-disabled connection) never
+            // cache-serves, but a write among its statements must still
+            // land in the log so later reads on this connection aren't
+            // served stale, and a SET must still be tracked. Analyze
+            // here (memoized) purely to classify.
+            self.forwarded_statement_effects_apply(&msg.data).await;
+            self.origin_dispatch(msg.data, None);
+        }
+    }
+
+    /// Act on a simple query's analysis; returns the proxy mode it leaves the
+    /// connection in.
+    fn simple_query_route(
+        &mut self,
+        analyzed: Result<Action, ParseError>,
+        msg: PgFrontendMessage,
+    ) -> ProxyMode {
+        match analyzed {
+            Ok(Action::Forward(reason, effects)) => {
+                forward_reason_metric(reason);
+                self.forwarded_effects_apply(&effects);
+                self.origin_dispatch(msg.data, None);
+                ProxyMode::Read
+            }
+            Ok(Action::CacheCheck(ast)) => {
+                let fingerprint = query_expr_fingerprint(ast.query());
+                self.telemetry.cache_timing_start(fingerprint);
+                self.extended.dispatch_is_extended = false;
+                self.egress.cache_push(CacheMessage::Query(msg.data, ast));
+                ProxyMode::OriginDrain
+            }
+            // `SELECT pgcache_explain(...)` — route to the cache to explain a
+            // cached query's cache-side plan (PGC-345) rather than forward to
+            // origin like a normal statement the cache can't serve.
+            Ok(Action::Explain(spec)) => {
+                self.extended.dispatch_is_extended = false;
+                // Carry the original bytes so a cache-unavailable fallback can
+                // forward to origin instead of an empty frame (PGC-345).
+                self.egress
+                    .cache_push(CacheMessage::Explain(spec.as_ref().clone(), msg.data));
+                ProxyMode::OriginDrain
+            }
+            Err(e) => {
+                let m = crate::metrics::handles();
+                m.query.uncacheable.increment(1);
+                m.query.invalid.increment(1);
+                error!("handle_query {}", e);
+                // Unparseable: can't rule out a write — record
+                // connection-scoped so no read is served stale.
+                self.forwarded_effects_apply(&StatementEffects::unknown());
+                self.origin_dispatch(msg.data, None);
+                ProxyMode::Read
+            }
+        }
+    }
+
+    /// Handle the client's `StartupMessage`: note the session user, and
+    /// disable caching for a database other than the one the cache mirrors.
+    fn startup_handle(&mut self, msg: PgFrontendMessage) {
+        self.session_user = startup_message_parameter(&msg.data, "user").map(String::from);
+
+        // The cache is connected to a specific database and cannot serve queries
+        // for other databases.
+        if let Some(client_db) = startup_message_parameter(&msg.data, "database")
+            && client_db != self.origin_database.as_str()
+        {
+            warn!(
+                "client database '{}' does not match cache database '{}', caching disabled for this connection",
+                client_db, self.origin_database
+            );
+            self.cache_disabled = true;
+            // The connection never serves from cache, so its write log
+            // would only accrue dead weight.
+            self.write_log.disable();
+        }
+
+        self.origin_write_buf.push_back(msg.data);
+    }
+
     /// Handle a message from the origin database (backend).
     /// Updates transaction state, captures parameter OIDs, and forwards to client.
     #[expect(clippy::wildcard_enum_match_arm)]
@@ -812,44 +863,12 @@ impl ConnectionState {
         trace!("net: origin→proxy {:?}", msg.message_type);
 
         if self.origin_intercept_handle(&msg) {
-            // Swallowed by an intercept (injected SHOW, lazy ParseComplete, …):
-            // these have no client egress slot, so an RFQ here seals nothing.
-            // A completed intercept's RFQ is still a quiescent point: chain the
-            // isolation probe / commit-LSN probe now rather than waiting for
-            // client traffic. Only the isolation probe chains (it is never
-            // injected while a block is open, so it cannot fail-and-loop);
-            // a search_path SHOW retries at the next client-visible RFQ.
-            if matches!(msg.message_type, PgBackendMessageType::ReadyForQuery)
-                && matches!(self.origin_intercept, OriginIntercept::None)
-            {
-                self.isolation_probe_inject();
-                self.write_log_maintain();
-            }
+            self.intercept_ready_followup(&msg);
             return;
         }
 
         match msg.message_type {
-            PgBackendMessageType::ParameterStatus => {
-                if let Some((name, value)) = parameter_status_parse(&msg.data) {
-                    match name {
-                        "search_path" => {
-                            // PG18+ reports search_path as a GUC_REPORT parameter,
-                            // emitting this message on every change (including
-                            // startup, SET, DISCARD ALL, and SET LOCAL reverts at
-                            // transaction end). First arrival tells us we can
-                            // skip the defensive SHOW machinery.
-                            debug!("received search_path from ParameterStatus: {}", value);
-                            self.search_path_state =
-                                SearchPathState::resolved(value, self.session_user.as_deref());
-                            self.search_path_auto_reported = true;
-                        }
-                        "server_version" => {
-                            pg_version_set(value.to_owned());
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            PgBackendMessageType::ParameterStatus => self.parameter_status_handle(&msg.data),
             PgBackendMessageType::ParameterDescription => {
                 self.extended
                     .parameter_description_received(&msg.data, &mut self.prepared_statements);
@@ -875,81 +894,97 @@ impl ConnectionState {
             }
             PgBackendMessageType::Authentication => {
                 if authentication_type(&msg.data).is_some_and(|v| v == AUTHENTICATION_SASL) {
-                    // Strip SCRAM-SHA-256-PLUS from SASL authentication options.
-                    // Channel binding cannot be supported because the proxy terminates TLS.
-                    let needle = b"SCRAM-SHA-256-PLUS\0";
-                    if let Some(pos) = msg
-                        .data
-                        .windows(needle.len())
-                        .position(|window| window == needle)
-                    {
-                        // Post-strip length field (bytes 1-4, big-endian i32, excludes tag byte).
-                        // Computed before mutating so an out-of-range length (unreachable: auth
-                        // messages are tiny) degrades to forwarding the message unmodified rather
-                        // than panicking — the strip is best-effort anyway.
-                        if let Some(new_len) = msg
-                            .data
-                            .len()
-                            .checked_sub(needle.len() + 1)
-                            .and_then(|n| i32::try_from(n).ok())
-                        {
-                            // Remove needle in place using split/unsplit
-                            let mut tail = msg.data.split_off(pos);
-                            let after_needle = tail.split_off(needle.len());
-                            msg.data.unsplit(after_needle);
-
-                            #[expect(
-                                clippy::indexing_slicing,
-                                reason = "PostgreSQL message format guarantees 5+ bytes"
-                            )]
-                            msg.data[1..5].copy_from_slice(&new_len.to_be_bytes());
-                        }
-                    }
+                    sasl_plus_mechanism_strip(&mut msg.data);
                 }
             }
-            PgBackendMessageType::ReadyForQuery => {
-                // ReadyForQuery message contains transaction status at byte 5
-                // 'I' = idle (not in transaction)
-                // 'T' = in transaction block
-                // 'E' = in failed transaction block
-                let previous_status = self.transaction_status;
-                let was_in_transaction = self.in_transaction();
-                self.transaction_status = TransactionStatus::from_ready_for_query(&msg.data);
+            PgBackendMessageType::ReadyForQuery => self.ready_for_query_handle(&msg.data),
+            _ => {}
+        }
+        self.origin_message_relay(msg);
+    }
 
-                self.telemetry.origin_complete();
+    /// A message swallowed by an intercept (injected SHOW, lazy ParseComplete,
+    /// …) has no client egress slot, so its RFQ seals nothing. A completed
+    /// intercept's RFQ is still a quiescent point: chain the isolation probe /
+    /// commit-LSN probe now rather than waiting for client traffic. Only the
+    /// isolation probe chains (it is never injected while a block is open, so
+    /// it cannot fail-and-loop); a search_path SHOW retries at the next
+    /// client-visible RFQ.
+    fn intercept_ready_followup(&mut self, msg: &PgBackendMessage) {
+        if matches!(msg.message_type, PgBackendMessageType::ReadyForQuery)
+            && matches!(self.origin_intercept, OriginIntercept::None)
+        {
+            self.isolation_probe_inject();
+            self.write_log_maintain();
+        }
+    }
 
-                // Clean up unnamed portals when transaction ends
-                if !self.in_transaction() {
-                    self.portals.retain(|name, _| !name.is_empty());
-                }
-
-                // Transaction ended: any SET (including SET LOCAL) within the
-                // txn reverts, so the cached search_path may no longer match.
-                // Skipped on PG18+: ParameterStatus already arrived earlier in
-                // this same batch with the post-txn value. Also skipped if a
-                // piggyback intercept in this batch has already resolved
-                // search_path — marking unknown would clobber that fresh
-                // value.
-                if was_in_transaction
-                    && !self.in_transaction()
-                    && !self.search_path_just_piggyback_resolved
-                    && !self.search_path_auto_reported
-                {
-                    debug!("txn ended, marking search_path unknown");
-                    self.search_path_mark_unknown();
-                }
-                self.search_path_just_piggyback_resolved = false;
-                self.isolation_block_transition(previous_status);
-
-                // Re-sync any unknown session state (search_path on pre-PG18,
-                // the isolation default) with an injected SHOW. Skipped if
-                // another intercept is active — its completion chains the
-                // isolation probe.
-                self.session_discovery_inject();
+    fn parameter_status_handle(&mut self, data: &BytesMut) {
+        let Some((name, value)) = parameter_status_parse(data) else {
+            return;
+        };
+        match name {
+            "search_path" => {
+                // PG18+ reports search_path as a GUC_REPORT parameter, emitting
+                // this message on every change (including startup, SET, DISCARD
+                // ALL, and SET LOCAL reverts at transaction end). First arrival
+                // tells us we can skip the defensive SHOW machinery.
+                debug!("received search_path from ParameterStatus: {}", value);
+                self.search_path_state =
+                    SearchPathState::resolved(value, self.session_user.as_deref());
+                self.search_path_auto_reported = true;
+            }
+            "server_version" => {
+                pg_version_set(value.to_owned());
             }
             _ => {}
         }
+    }
 
+    /// Track a `ReadyForQuery`: transaction status (byte 5: 'I' idle, 'T' in
+    /// a block, 'E' failed block) and everything that hangs off a block ending.
+    fn ready_for_query_handle(&mut self, data: &BytesMut) {
+        let previous_status = self.transaction_status;
+        let was_in_transaction = self.in_transaction();
+        self.transaction_status = TransactionStatus::from_ready_for_query(data);
+
+        self.telemetry.origin_complete();
+
+        // Clean up unnamed portals when transaction ends
+        if !self.in_transaction() {
+            self.portals.retain(|name, _| !name.is_empty());
+        }
+
+        if self.search_path_reset_needed(was_in_transaction) {
+            debug!("txn ended, marking search_path unknown");
+            self.search_path_mark_unknown();
+        }
+        self.search_path_just_piggyback_resolved = false;
+        self.isolation_block_transition(previous_status);
+
+        // Re-sync any unknown session state (search_path on pre-PG18, the
+        // isolation default) with an injected SHOW. Skipped if another
+        // intercept is active — its completion chains the isolation probe.
+        self.session_discovery_inject();
+    }
+
+    /// Transaction ended: any SET (including SET LOCAL) within the txn
+    /// reverts, so the cached search_path may no longer match. Skipped on
+    /// PG18+: ParameterStatus already arrived earlier in this same batch with
+    /// the post-txn value. Also skipped if a piggyback intercept in this batch
+    /// has already resolved search_path — marking unknown would clobber that
+    /// fresh value.
+    fn search_path_reset_needed(&self, was_in_transaction: bool) -> bool {
+        let txn_ended = was_in_transaction && !self.in_transaction();
+        let already_known =
+            self.search_path_just_piggyback_resolved || self.search_path_auto_reported;
+        txn_ended && !already_known
+    }
+
+    /// Relay an origin message to the client's egress queue. ReadyForQuery
+    /// ends this request's response: seal its slot so the next slot (and any
+    /// locally-produced response behind it) can flush.
+    fn origin_message_relay(&mut self, msg: PgBackendMessage) {
         trace!(
             "net: origin→client {:?} ({} bytes)",
             msg.message_type,
@@ -958,8 +993,6 @@ impl ConnectionState {
         let was_rfq = matches!(msg.message_type, PgBackendMessageType::ReadyForQuery);
         self.egress.origin_append(msg.data.freeze());
         if was_rfq {
-            // ReadyForQuery ends this request's response: seal its slot so the
-            // next slot (and any locally-produced response behind it) can flush.
             self.egress.origin_seal();
             // The current request's slot is now sealed, so the quiescence check
             // inside `write_log_maintain` sees only genuinely in-flight work.
@@ -985,11 +1018,7 @@ impl ConnectionState {
         // flight, so the probe's LSN is the next thing back and bounds exactly
         // the writes recorded through `stamp_seq`. A write racing in after the
         // sample is caught by `WriteLog::stamp`'s seq guard.
-        if matches!(self.proxy_mode, ProxyMode::Read)
-            && !self.in_transaction()
-            && matches!(self.origin_intercept, OriginIntercept::None)
-            && self.origin_write_buf.is_empty()
-            && self.egress.origin_all_sealed()
+        if self.write_log_probe_ready()
             && let Some(stamp_seq) = self.write_log.stamp_seq()
         {
             self.origin_intercept = OriginIntercept::WalLsnProbe { stamp_seq };
@@ -997,6 +1026,16 @@ impl ConnectionState {
                 .push_back(simple_query_message_build(WAL_INSERT_LSN_PROBE));
             crate::metrics::handles().raw.probes.increment(1);
         }
+    }
+
+    /// Whether a commit-LSN probe may be injected now: the connection is idle
+    /// (post-commit) and nothing is in flight on the origin socket.
+    fn write_log_probe_ready(&self) -> bool {
+        let idle = matches!(self.proxy_mode, ProxyMode::Read) && !self.in_transaction();
+        let origin_quiet = matches!(self.origin_intercept, OriginIntercept::None)
+            && self.origin_write_buf.is_empty()
+            && self.egress.origin_all_sealed();
+        idle && origin_quiet
     }
 
     /// Handle the outcome of a cache reply (the leased socket has already been
