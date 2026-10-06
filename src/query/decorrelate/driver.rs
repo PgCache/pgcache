@@ -12,7 +12,7 @@ use crate::query::ast::{BinaryOp, SubLinkType, UnaryOp};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
     ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode,
-    ResolvedWhereExpr,
+    ResolvedTableSource, ResolvedWhereExpr,
 };
 use crate::query::transform::{where_expr_conjuncts_join, where_expr_conjuncts_split};
 
@@ -50,77 +50,48 @@ fn select_columns_decorrelate(
 
     let mut new_cols = Vec::with_capacity(cols.len());
     let mut transformed = false;
-
     for col in cols {
-        match &col.expr {
-            ResolvedScalarExpr::Subquery(query, outer_refs) if !outer_refs.is_empty() => {
-                let result = subquery_scalar_decorrelate(query, outer_refs, state)?;
-                match left_join_derived(&select.from, result.derived_table, result.join_condition) {
-                    Some(new_from) => {
-                        select.from = new_from;
-                        new_cols.push(ResolvedSelectColumn {
-                            expr: ResolvedScalarExpr::Column(result.scalar_column_ref),
-                            alias: col.alias.clone(),
-                        });
-                        transformed = true;
-                    }
-                    None => {
-                        new_cols.push(col.clone());
-                    }
-                }
-            }
-            other @ (ResolvedScalarExpr::Column(_)
-            | ResolvedScalarExpr::Identifier(_)
-            | ResolvedScalarExpr::Function(_)
-            | ResolvedScalarExpr::Literal(_)
-            | ResolvedScalarExpr::Case(_)
-            | ResolvedScalarExpr::Arithmetic(_)
-            | ResolvedScalarExpr::Subquery(..)
-            | ResolvedScalarExpr::Array(_)
-            | ResolvedScalarExpr::TypeCast { .. }) => {
-                // Reject nested correlation in non-Subquery exprs (e.g., CASE with
-                // correlated subquery) — we don't walk into arbitrary column exprs.
-                if scalar_expr_has_correlation(other) {
-                    return Err(DecorrelateError::NonDecorrelatable {
-                        reason: "correlated subquery nested in SELECT expression".to_owned(),
-                    }
-                    .into());
-                }
-                new_cols.push(col.clone());
-            }
-        }
+        let (new_col, col_transformed) = select_column_decorrelate(col, &mut select.from, state)?;
+        new_cols.push(new_col);
+        transformed |= col_transformed;
     }
 
     select.columns = ResolvedSelectColumns::Columns(new_cols);
     Ok(transformed)
 }
 
-/// Apply a join-based decorrelation result to the iteration state.
-///
-/// On `Some`: replaces current_select with the new node, re-splits its WHERE into
-/// remaining_conjuncts so subsequent iterations build on top. Returns true.
-/// On `None`: pushes the original conjunct as residual. Returns false.
-fn join_result_apply(
-    result: Option<ResolvedSelectNode>,
-    conjunct: &ResolvedWhereExpr,
-    current_select: &mut ResolvedSelectNode,
-    remaining_conjuncts: &mut Vec<ResolvedWhereExpr>,
-) -> bool {
-    match result {
-        Some(new_select) => {
-            *current_select = new_select;
-            remaining_conjuncts.clear();
-            if let Some(w) = &current_select.where_clause {
-                *remaining_conjuncts = where_expr_conjuncts_split(w.clone());
-            }
-            current_select.where_clause = None;
-            true
-        }
-        None => {
-            remaining_conjuncts.push(conjunct.clone());
-            false
-        }
+/// One SELECT column: a correlated scalar subquery becomes a column of a LEFT
+/// JOINed derived table added to `from`; any other correlated expression is
+/// rejected; everything else is kept.
+fn select_column_decorrelate(
+    col: &ResolvedSelectColumn,
+    from: &mut Vec<ResolvedTableSource>,
+    state: &mut DecorrelateState<'_>,
+) -> DecorrelateResult<(ResolvedSelectColumn, bool)> {
+    if let ResolvedScalarExpr::Subquery(query, outer_refs) = &col.expr
+        && !outer_refs.is_empty()
+    {
+        let result = subquery_scalar_decorrelate(query, outer_refs, state)?;
+        let Some(new_from) = left_join_derived(from, result.derived_table, result.join_condition)
+        else {
+            return Ok((col.clone(), false));
+        };
+        *from = new_from;
+        let column = ResolvedSelectColumn {
+            expr: ResolvedScalarExpr::Column(result.scalar_column_ref),
+            alias: col.alias.clone(),
+        };
+        return Ok((column, true));
     }
+    // Reject nested correlation in non-Subquery exprs (e.g., CASE with
+    // correlated subquery) — we don't walk into arbitrary column exprs.
+    if scalar_expr_has_correlation(&col.expr) {
+        return Err(DecorrelateError::NonDecorrelatable {
+            reason: "correlated subquery nested in SELECT expression".to_owned(),
+        }
+        .into());
+    }
+    Ok((col.clone(), false))
 }
 
 /// A WHERE conjunct classified as a join-based decorrelation target, with the
@@ -181,6 +152,45 @@ impl JoinDecorrelation<'_> {
     }
 }
 
+/// A correlated subquery predicate, borrowed out of a WHERE expression.
+#[derive(Clone, Copy)]
+struct CorrelatedSubquery<'a> {
+    sublink_type: SubLinkType,
+    query: &'a ResolvedQueryExpr,
+    outer_refs: &'a [ResolvedColumnNode],
+    test_expr: Option<&'a ResolvedScalarExpr>,
+}
+
+impl<'a> CorrelatedSubquery<'a> {
+    /// `expr` as a subquery predicate that references the outer query.
+    fn of(expr: &'a ResolvedWhereExpr) -> Option<Self> {
+        let ResolvedWhereExpr::Subquery {
+            query,
+            sublink_type,
+            test_expr,
+            outer_refs,
+        } = expr
+        else {
+            return None;
+        };
+        (!outer_refs.is_empty()).then(|| Self {
+            sublink_type: *sublink_type,
+            query,
+            outer_refs,
+            test_expr: test_expr.as_deref(),
+        })
+    }
+
+    /// The IN / NOT IN test expression, which a join rewrite requires.
+    fn test(&self, label: &str) -> DecorrelateResult<&'a ResolvedScalarExpr> {
+        self.test_expr.ok_or_else(|| {
+            Report::from(DecorrelateError::NonDecorrelatable {
+                reason: format!("correlated {label} without test expression"),
+            })
+        })
+    }
+}
+
 /// Classify a WHERE conjunct as a join-based decorrelation target.
 ///
 /// Returns `Ok(Some(_))` for a correlated EXISTS / NOT EXISTS / IN / NOT IN
@@ -190,75 +200,152 @@ impl JoinDecorrelation<'_> {
 fn conjunct_join_classify(
     conjunct: &ResolvedWhereExpr,
 ) -> DecorrelateResult<Option<JoinDecorrelation<'_>>> {
-    let missing_test = |label: &str| {
-        Report::from(DecorrelateError::NonDecorrelatable {
-            reason: format!("correlated {label} without test expression"),
-        })
-    };
-    let kind = match conjunct {
-        ResolvedWhereExpr::Subquery {
-            sublink_type: SubLinkType::Exists,
-            outer_refs,
-            query,
-            ..
-        } if !outer_refs.is_empty() => JoinDecorrelation::Exists { query, outer_refs },
-
-        ResolvedWhereExpr::Subquery {
-            sublink_type: SubLinkType::Any,
-            outer_refs,
-            query,
-            test_expr,
-        } if !outer_refs.is_empty() => JoinDecorrelation::InAny {
-            query,
-            outer_refs,
-            test: test_expr.as_deref().ok_or_else(|| missing_test("IN"))?,
-        },
-
-        ResolvedWhereExpr::Subquery {
-            sublink_type: SubLinkType::All,
-            outer_refs,
-            query,
-            test_expr,
-        } if !outer_refs.is_empty() => JoinDecorrelation::NotInAll {
-            query,
-            outer_refs,
-            test: test_expr.as_deref().ok_or_else(|| missing_test("NOT IN"))?,
-        },
-
-        // NOT EXISTS / NOT IN spelled as NOT(EXISTS) / NOT(ANY).
-        ResolvedWhereExpr::Unary(unary) if unary.op == UnaryOp::Not => match unary.expr.as_ref() {
-            ResolvedWhereExpr::Subquery {
-                sublink_type: SubLinkType::Exists,
-                outer_refs,
-                query,
-                ..
-            } if !outer_refs.is_empty() => JoinDecorrelation::NotExists { query, outer_refs },
-
-            ResolvedWhereExpr::Subquery {
-                sublink_type: SubLinkType::Any,
-                outer_refs,
-                query,
-                test_expr,
-            } if !outer_refs.is_empty() => JoinDecorrelation::NotInAll {
-                query,
-                outer_refs,
-                test: test_expr.as_deref().ok_or_else(|| missing_test("NOT IN"))?,
-            },
-
-            ResolvedWhereExpr::Scalar(_)
-            | ResolvedWhereExpr::Unary(_)
-            | ResolvedWhereExpr::Binary(_)
-            | ResolvedWhereExpr::Multi(_)
-            | ResolvedWhereExpr::Subquery { .. } => return Ok(None),
-        },
-
+    let (negated, predicate) = match conjunct {
+        ResolvedWhereExpr::Unary(unary) if unary.op == UnaryOp::Not => (true, unary.expr.as_ref()),
         ResolvedWhereExpr::Scalar(_)
         | ResolvedWhereExpr::Unary(_)
         | ResolvedWhereExpr::Binary(_)
         | ResolvedWhereExpr::Multi(_)
-        | ResolvedWhereExpr::Subquery { .. } => return Ok(None),
+        | ResolvedWhereExpr::Subquery { .. } => (false, conjunct),
+    };
+    let Some(subquery) = CorrelatedSubquery::of(predicate) else {
+        return Ok(None);
+    };
+    let CorrelatedSubquery {
+        query, outer_refs, ..
+    } = subquery;
+    let kind = match (negated, subquery.sublink_type) {
+        (false, SubLinkType::Exists) => JoinDecorrelation::Exists { query, outer_refs },
+        (true, SubLinkType::Exists) => JoinDecorrelation::NotExists { query, outer_refs },
+        (false, SubLinkType::Any) => JoinDecorrelation::InAny {
+            query,
+            outer_refs,
+            test: subquery.test("IN")?,
+        },
+        // `x NOT IN (...)` parses as NOT(ANY); `x <> ALL (...)` — the only ALL
+        // form AST conversion admits — is the same predicate spelled as a bare ALL.
+        (true, SubLinkType::Any) | (false, SubLinkType::All) => JoinDecorrelation::NotInAll {
+            query,
+            outer_refs,
+            test: subquery.test("NOT IN")?,
+        },
+        (false, SubLinkType::Expr) | (true, SubLinkType::All | SubLinkType::Expr) => {
+            return Ok(None);
+        }
     };
     Ok(Some(kind))
+}
+
+/// What the residual path does with a conjunct that isn't join-family.
+enum Residual {
+    Keep,
+    /// A correlated scalar subquery embedded in an expression (e.g.
+    /// `col > (SELECT ...)`), decorrelated through a LEFT JOIN.
+    ScalarDecorrelate,
+}
+
+/// Classify a non-join conjunct, rejecting correlation under OR or under a
+/// NOT the join family doesn't cover.
+fn residual_classify(conjunct: &ResolvedWhereExpr) -> DecorrelateResult<Residual> {
+    let correlated = where_expr_has_correlation(conjunct);
+    match conjunct {
+        ResolvedWhereExpr::Binary(binary) if binary.op == BinaryOp::Or => {
+            if correlated {
+                return Err(DecorrelateError::NonDecorrelatable {
+                    reason: "correlated subquery inside OR".to_owned(),
+                }
+                .into());
+            }
+            Ok(Residual::Keep)
+        }
+        ResolvedWhereExpr::Unary(unary) if unary.op == UnaryOp::Not => {
+            if CorrelatedSubquery::of(&unary.expr).is_some() {
+                return Err(DecorrelateError::NonDecorrelatable {
+                    reason: "correlated NOT-wrapped non-EXISTS subquery".to_owned(),
+                }
+                .into());
+            }
+            Ok(Residual::Keep)
+        }
+        ResolvedWhereExpr::Scalar(_)
+        | ResolvedWhereExpr::Unary(_)
+        | ResolvedWhereExpr::Binary(_)
+        | ResolvedWhereExpr::Multi(_)
+        | ResolvedWhereExpr::Subquery { .. } => Ok(if correlated {
+            Residual::ScalarDecorrelate
+        } else {
+            Residual::Keep
+        }),
+    }
+}
+
+/// The WHERE-conjunct pass over one SELECT: the node as rewritten so far, the
+/// conjuncts still to rejoin as its WHERE, and whether anything changed.
+struct WhereDecorrelation {
+    select: ResolvedSelectNode,
+    remaining: Vec<ResolvedWhereExpr>,
+    transformed: bool,
+}
+
+impl WhereDecorrelation {
+    /// Flatten a join-family conjunct against the node built so far. On success
+    /// the rewritten node's WHERE is re-split into `remaining` so later
+    /// conjuncts build on top; otherwise the conjunct stays as a residual.
+    fn join_apply(
+        &mut self,
+        kind: &JoinDecorrelation<'_>,
+        conjunct: &ResolvedWhereExpr,
+    ) -> DecorrelateResult<()> {
+        self.select.where_clause = where_expr_conjuncts_join(self.remaining.clone());
+        match kind.try_decorrelate(&self.select)? {
+            Some(new_select) => {
+                self.select = new_select;
+                self.remaining = self
+                    .select
+                    .where_clause
+                    .take()
+                    .map(where_expr_conjuncts_split)
+                    .unwrap_or_default();
+                self.transformed = true;
+            }
+            None => self.remaining.push(conjunct.clone()),
+        }
+        Ok(())
+    }
+
+    fn residual_apply(
+        &mut self,
+        conjunct: ResolvedWhereExpr,
+        state: &mut DecorrelateState<'_>,
+    ) -> DecorrelateResult<()> {
+        match residual_classify(&conjunct)? {
+            Residual::Keep => self.remaining.push(conjunct),
+            Residual::ScalarDecorrelate => {
+                let (new_conjunct, was_transformed) =
+                    conjunct_scalar_decorrelate(&conjunct, &mut self.select, state)?;
+                self.remaining.push(new_conjunct);
+                self.transformed |= was_transformed;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> (ResolvedSelectNode, bool) {
+        self.select.where_clause = where_expr_conjuncts_join(self.remaining);
+        (self.select, self.transformed)
+    }
+}
+
+fn having_correlation_reject(select: &ResolvedSelectNode) -> DecorrelateResult<()> {
+    if let Some(having) = &select.having
+        && where_expr_has_correlation(having)
+    {
+        return Err(DecorrelateError::NonDecorrelatable {
+            reason: "correlated subquery in HAVING clause".to_owned(),
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// Main entry point: decorrelate correlated subqueries in a single SELECT node.
@@ -283,92 +370,28 @@ fn select_node_decorrelate(
     state: &mut DecorrelateState<'_>,
 ) -> DecorrelateResult<(ResolvedSelectNode, bool)> {
     let mut current_select = select.clone();
-    let mut transformed = false;
 
     // Phase 1: Decorrelate scalar subqueries in SELECT columns
-    transformed |= select_columns_decorrelate(&mut current_select, state)?;
+    let columns_transformed = select_columns_decorrelate(&mut current_select, state)?;
+    having_correlation_reject(&current_select)?;
 
-    // Reject correlated subqueries in HAVING
-    if let Some(having) = &current_select.having
-        && where_expr_has_correlation(having)
-    {
-        return Err(DecorrelateError::NonDecorrelatable {
-            reason: "correlated subquery in HAVING clause".to_owned(),
-        }
-        .into());
-    }
-
-    // Phase 2: Decorrelate subqueries in WHERE conjuncts
-    let Some(where_clause) = &current_select.where_clause else {
-        return Ok((current_select, transformed));
+    // Phase 2: Decorrelate subqueries in WHERE conjuncts. EXISTS / NOT EXISTS /
+    // IN / NOT IN flatten to a JOIN; everything else takes the residual path.
+    let Some(where_clause) = current_select.where_clause.clone() else {
+        return Ok((current_select, columns_transformed));
     };
-
-    let conjuncts = where_expr_conjuncts_split(where_clause.clone());
-    let mut remaining_conjuncts = Vec::new();
-
-    for conjunct in conjuncts {
-        // EXISTS / NOT EXISTS / IN / NOT IN flatten to a JOIN through one shared
-        // apply path; everything else (OR-rejection, scalar subqueries, residual
-        // predicates) is handled below.
-        if let Some(kind) = conjunct_join_classify(&conjunct)? {
-            current_select.where_clause = where_expr_conjuncts_join(remaining_conjuncts.clone());
-            let result = kind.try_decorrelate(&current_select)?;
-            transformed |= join_result_apply(
-                result,
-                &conjunct,
-                &mut current_select,
-                &mut remaining_conjuncts,
-            );
-            continue;
-        }
-
-        match &conjunct {
-            // Correlated subquery inside OR — reject
-            ResolvedWhereExpr::Binary(binary) if binary.op == BinaryOp::Or => {
-                if where_expr_has_correlation(&conjunct) {
-                    return Err(DecorrelateError::NonDecorrelatable {
-                        reason: "correlated subquery inside OR".to_owned(),
-                    }
-                    .into());
-                }
-                remaining_conjuncts.push(conjunct);
-            }
-
-            // NOT wrapping a correlated non-EXISTS/non-IN subquery
-            ResolvedWhereExpr::Unary(unary) if unary.op == UnaryOp::Not => {
-                if matches!(
-                    unary.expr.as_ref(),
-                    ResolvedWhereExpr::Subquery { outer_refs, .. } if !outer_refs.is_empty()
-                ) {
-                    return Err(DecorrelateError::NonDecorrelatable {
-                        reason: "correlated NOT-wrapped non-EXISTS subquery".to_owned(),
-                    }
-                    .into());
-                }
-                remaining_conjuncts.push(conjunct);
-            }
-
-            // Catch-all: non-correlated or non-subquery predicates, and scalar
-            // correlated subqueries embedded in expressions (e.g., col > (SELECT ...))
-            ResolvedWhereExpr::Scalar(_)
-            | ResolvedWhereExpr::Unary(_)
-            | ResolvedWhereExpr::Binary(_)
-            | ResolvedWhereExpr::Multi(_)
-            | ResolvedWhereExpr::Subquery { .. } => {
-                if where_expr_has_correlation(&conjunct) {
-                    let (new_conjunct, was_transformed) =
-                        conjunct_scalar_decorrelate(&conjunct, &mut current_select, state)?;
-                    remaining_conjuncts.push(new_conjunct);
-                    transformed |= was_transformed;
-                } else {
-                    remaining_conjuncts.push(conjunct);
-                }
-            }
+    let mut pass = WhereDecorrelation {
+        select: current_select,
+        remaining: Vec::new(),
+        transformed: columns_transformed,
+    };
+    for conjunct in where_expr_conjuncts_split(where_clause) {
+        match conjunct_join_classify(&conjunct)? {
+            Some(kind) => pass.join_apply(&kind, &conjunct)?,
+            None => pass.residual_apply(conjunct, state)?,
         }
     }
-
-    current_select.where_clause = where_expr_conjuncts_join(remaining_conjuncts);
-    Ok((current_select, transformed))
+    Ok(pass.finish())
 }
 
 /// Top-level entry: decorrelate correlated subqueries in a resolved query expression.
