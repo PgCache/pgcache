@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::cache::messages::PipelineDescribe;
@@ -113,6 +113,13 @@ impl CoalesceQueue {
         }
     }
 
+    /// The waiting queue, recovered if a panicking holder poisoned the lock:
+    /// the map stays structurally valid, and a waiter lost mid-update drops
+    /// its reply sender, which the connection already handles.
+    fn waiting(&self) -> MutexGuard<'_, WaitingQueue> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Enqueue `msg` as a coalesced waiter iff `fingerprint` is still `Loading`
     /// (re-checked under the lock). Returns `Err(msg)` when the state has
     /// advanced so the caller can re-dispatch against the current state.
@@ -126,7 +133,7 @@ impl CoalesceQueue {
         key: CoalesceKey,
         msg: QueryRequest,
     ) -> Result<(), QueryRequest> {
-        let mut guard = self.inner.lock().expect("lock coalesce queue");
+        let mut guard = self.waiting();
         let still_loading = state_view.cached_queries.get(&fingerprint).map(|e| e.state)
             == Some(CachedQueryState::Loading);
         if !still_loading {
@@ -146,10 +153,7 @@ impl CoalesceQueue {
         &self,
         fingerprint: Fingerprint,
     ) -> Option<HashMap<CoalesceKey, Vec<QueryRequest>>> {
-        self.inner
-            .lock()
-            .expect("lock coalesce queue")
-            .remove(&fingerprint)
+        self.waiting().remove(&fingerprint)
     }
 
     /// Remove and return all waiters whose forward deadline has passed
@@ -157,7 +161,7 @@ impl CoalesceQueue {
     /// slow-population waiters to origin (PGC-335). Races safely with `drain`:
     /// both mutate under the same lock, so each waiter is removed exactly once.
     pub(super) fn drain_expired(&self, now: Instant) -> Vec<QueryRequest> {
-        let mut guard = self.inner.lock().expect("lock coalesce queue");
+        let mut guard = self.waiting();
         let mut expired = Vec::new();
         guard.retain(|_fingerprint, groups| {
             groups.retain(|_key, waiters| {
@@ -179,9 +183,7 @@ impl CoalesceQueue {
 
     /// Total waiters across all groups (gauge).
     pub(super) fn waiter_count(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("lock coalesce queue")
+        self.waiting()
             .values()
             .flat_map(|groups| groups.values())
             .map(Vec::len)

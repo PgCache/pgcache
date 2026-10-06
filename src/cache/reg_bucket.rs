@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tracing::info;
@@ -53,7 +53,8 @@ impl RegRateBucket {
             return false;
         }
         let burst = (rate * 0.5).max(8.0);
-        let mut g = self.inner.lock().expect("lock registration bucket");
+        // A poisoned lock still holds a usable token count.
+        let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         let elapsed = now.duration_since(g.1).as_secs_f64();
         g.1 = now;
