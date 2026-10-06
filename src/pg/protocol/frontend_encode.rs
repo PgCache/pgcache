@@ -221,7 +221,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn statement_name_bytes_matches_format() {
+    fn test_statement_name_bytes_matches_format() {
         for key in [0u64, 1, 0xdead_beef, 0x0123_4567_89ab_cdef, u64::MAX] {
             let expected = format!("pgc_{key:016x}");
             let got = statement_name_bytes(ShapeKey::from_raw(key));

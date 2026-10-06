@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_escaped_string_literal_matches_prior_output() {
+    fn test_emit_escaped_string_literal_matches_prior_output() {
         let cases = [
             "",
             "plain",
@@ -1066,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_escaped_string_literal_appends_without_clobbering() {
+    fn test_emit_escaped_string_literal_appends_without_clobbering() {
         let mut buf = String::from("prefix ");
         emit_escaped_string_literal("a\\b", &mut buf);
         assert_eq!(buf, format!("prefix {}", old_emit("a\\b")));

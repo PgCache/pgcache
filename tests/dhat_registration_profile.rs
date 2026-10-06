@@ -30,7 +30,7 @@ mod util;
 
 #[tokio::test]
 #[ignore = "profiling driver; run explicitly with --features dhat-heap"]
-async fn dhat_registration_workload() -> Result<(), Error> {
+async fn test_dhat_registration_workload() -> Result<(), Error> {
     let n: i32 = std::env::var("REG_QUERIES")
         .ok()
         .and_then(|s| s.parse().ok())

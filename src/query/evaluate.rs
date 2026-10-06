@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn where_value_compare_string_cases() {
+    fn test_where_value_compare_string_cases() {
         use BinaryOp::{Equal, GreaterThan, LessThan, NotEqual};
         use LiteralValue::{Boolean, Integer, Null, Parameter};
         // (label, filter literal, row text, op, expected)
@@ -584,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn literal_compare_cases() {
+    fn test_literal_compare_cases() {
         use BinaryOp::{Equal, LessThan, NotEqual};
         use LiteralValue::{Boolean, Integer};
         // (label, left, op, right, expected). "0042" parses to 42 (numeric, not
@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn expr_comparison_evaluate_cases() {
+    fn test_expr_comparison_evaluate_cases() {
         use BinaryOp::{
             Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, NotEqual,
         };
@@ -681,7 +681,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn where_expr_evaluate_simple_equality() {
+    fn test_where_expr_evaluate_simple_equality() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), Some("true")]);
 
@@ -691,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_and_operation_both_true() {
+    fn test_where_expr_evaluate_and_operation_both_true() {
         let table = test_table_metadata();
         let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_and_operation_one_false() {
+    fn test_where_expr_evaluate_and_operation_one_false() {
         let table = test_table_metadata();
         let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
@@ -719,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_or_operation_one_true() {
+    fn test_where_expr_evaluate_or_operation_one_true() {
         let table = test_table_metadata();
         let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
@@ -733,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_or_operation_both_false() {
+    fn test_where_expr_evaluate_or_operation_both_false() {
         let table = test_table_metadata();
         let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
@@ -747,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_greater_than() {
+    fn test_where_expr_evaluate_greater_than() {
         let table = test_table_metadata();
         let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
@@ -757,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_unsupported_expression_type() {
+    fn test_where_expr_evaluate_unsupported_expression_type() {
         let table = test_table_metadata();
         let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
@@ -786,7 +786,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_identity_text_cast_matches() {
+    fn test_where_expr_evaluate_identity_text_cast_matches() {
         // `name::text = 'john'` on a TEXT column — cast is identity, must match.
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), Some("true")]);
@@ -798,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_identity_text_cast_no_match() {
+    fn test_where_expr_evaluate_identity_text_cast_no_match() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("alice"), Some("true")]);
 
@@ -809,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_identity_text_cast_on_int_column_matches() {
+    fn test_where_expr_evaluate_identity_text_cast_on_int_column_matches() {
         // PGC-177: ::text on int column is identity — wire-text matches
         // canonical int→text exactly.
         let table = test_table_metadata();
@@ -822,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_cast_on_bool_column_is_opaque() {
+    fn test_where_expr_evaluate_text_cast_on_bool_column_is_opaque() {
         // bool wire-text is `t`/`f`; `::text` on bool returns `true`/`false`.
         // Not identity — evaluator must bail back to opaque (return false).
         let table = test_table_metadata();
@@ -837,7 +837,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_identity_text_cast_rhs_position() {
+    fn test_where_expr_evaluate_identity_text_cast_rhs_position() {
         // `'john' = name::text` — cast on RHS, still must match.
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), Some("true")]);
@@ -849,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_where_expr_supported_admits_identity_text_cast() {
+    fn test_resolved_where_expr_supported_admits_identity_text_cast() {
         let table = test_table_metadata();
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
         let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("john")));
@@ -858,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_where_expr_supported_rejects_non_identity_text_cast() {
+    fn test_resolved_where_expr_supported_rejects_non_identity_text_cast() {
         // ::text on a bool column is not identity (wire-text `t`/`f` vs
         // canonical `true`/`false`) → must remain unsupported so the
         // classifier routes through PgEval.
@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_int4_coercion_matches() {
+    fn test_where_expr_evaluate_text_to_int4_coercion_matches() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("42"), Some("true")]);
 
@@ -901,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_int4_coercion_no_match() {
+    fn test_where_expr_evaluate_text_to_int4_coercion_no_match() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("42"), Some("true")]);
 
@@ -919,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_int4_unparseable_row_excluded() {
+    fn test_where_expr_evaluate_text_to_int4_unparseable_row_excluded() {
         // `'abc'::int4` raises in postgres; here the row is excluded.
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("abc"), Some("true")]);
@@ -938,7 +938,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_int4_with_string_literal() {
+    fn test_where_expr_evaluate_text_to_int4_with_string_literal() {
         // ORM-generated `text_col::int = '42'` — string literal whose
         // content parses as int. Must coerce both sides to int and compare.
         let table = test_table_metadata();
@@ -954,7 +954,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_int4_inequality_compares_numerically() {
+    fn test_where_expr_evaluate_text_to_int4_inequality_compares_numerically() {
         // Numerical compare avoids the lexicographic-string trap:
         // "100" < "42" by bytes, but 100 > 42 by value.
         let table = test_table_metadata();
@@ -974,7 +974,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_int8_wide_range_matches() {
+    fn test_where_expr_evaluate_text_to_int8_wide_range_matches() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("9223372036854775807"), Some("true")]);
 
@@ -992,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_where_expr_supported_admits_text_to_int4_coercion() {
+    fn test_resolved_where_expr_supported_admits_text_to_int4_coercion() {
         let table = test_table_metadata();
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1008,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_where_expr_supported_rejects_int4_cast_on_unsupported_base() {
+    fn test_resolved_where_expr_supported_rejects_int4_cast_on_unsupported_base() {
         // ::int4 on a bool column isn't in the coercion whitelist → unsupported.
         let table = test_table_metadata();
         let cast_col = typecast(
@@ -1031,7 +1031,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn where_expr_evaluate_literal_lhs_less_than_column() {
+    fn test_where_expr_evaluate_literal_lhs_less_than_column() {
         // SQL `WHERE 5 < id` with id=10 → true (5 < 10).
         let table = test_table_metadata();
         let row_data = row(&[Some("10"), Some("john"), Some("true")]);
@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_literal_lhs_greater_than_column() {
+    fn test_where_expr_evaluate_literal_lhs_greater_than_column() {
         // SQL `WHERE 5 > id` with id=10 → false (5 > 10 is false).
         let table = test_table_metadata();
         let row_data = row(&[Some("10"), Some("john"), Some("true")]);
@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_literal_lhs_less_than_column_no_match() {
+    fn test_where_expr_evaluate_literal_lhs_less_than_column_no_match() {
         // SQL `WHERE 100 < id` with id=10 → false (100 < 10 is false).
         let table = test_table_metadata();
         let row_data = row(&[Some("10"), Some("john"), Some("true")]);
@@ -1076,7 +1076,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_literal_lhs_less_than_cast_column() {
+    fn test_where_expr_evaluate_literal_lhs_less_than_cast_column() {
         // SQL `WHERE 5 < name::int4` with name="10" → true (5 < 10).
         // Same flip semantics on the cast-coercion path.
         let table = test_table_metadata();
@@ -1096,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_literal_lhs_greater_than_or_equal_column() {
+    fn test_where_expr_evaluate_literal_lhs_greater_than_or_equal_column() {
         // SQL `WHERE 10 >= id` with id=10 → true (10 >= 10).
         let table = test_table_metadata();
         let row_data = row(&[Some("10"), Some("john"), Some("true")]);
@@ -1115,7 +1115,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn where_expr_evaluate_text_to_bool_coercion_matches() {
+    fn test_where_expr_evaluate_text_to_bool_coercion_matches() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("true"), Some("true")]);
 
@@ -1133,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_bool_coercion_no_match() {
+    fn test_where_expr_evaluate_text_to_bool_coercion_no_match() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("false"), Some("true")]);
 
@@ -1151,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_bool_short_forms() {
+    fn test_where_expr_evaluate_text_to_bool_short_forms() {
         let table = test_table_metadata();
         for (stored, literal_b, expected) in [
             ("t", true, true),
@@ -1184,7 +1184,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_bool_with_string_literal() {
+    fn test_where_expr_evaluate_text_to_bool_with_string_literal() {
         // ORM-generated `text_col::bool = 't'` — string literal that parses as bool.
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("true"), Some("true")]);
@@ -1199,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_bool_with_integer_literal() {
+    fn test_where_expr_evaluate_text_to_bool_with_integer_literal() {
         // Postgres coerces `1` → true / `0` → false in bool comparisons; our
         // evaluator mirrors that so the CDC fast path doesn't silently drop rows.
         let table = test_table_metadata();
@@ -1218,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_bool_inequality_op_rejected() {
+    fn test_where_expr_evaluate_text_to_bool_inequality_op_rejected() {
         // `<` on bool isn't supported by the wedge — eval returns false.
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("true"), Some("true")]);
@@ -1236,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_text_to_bool_unparseable_row_excluded() {
+    fn test_where_expr_evaluate_text_to_bool_unparseable_row_excluded() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("garbage"), Some("true")]);
 
@@ -1254,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_where_expr_supported_admits_text_to_bool_coercion() {
+    fn test_resolved_where_expr_supported_admits_text_to_bool_coercion() {
         let table = test_table_metadata();
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1283,7 +1283,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_timestamp_to_date_coercion_matches() {
+    fn test_where_expr_evaluate_timestamp_to_date_coercion_matches() {
         let table = test_table_metadata_with_timestamp();
         let row_data = row(&[Some("1"), Some("alice"), Some("2024-01-15 23:45:00"), None]);
 
@@ -1297,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_timestamp_to_date_coercion_no_match() {
+    fn test_where_expr_evaluate_timestamp_to_date_coercion_no_match() {
         let table = test_table_metadata_with_timestamp();
         let row_data = row(&[Some("1"), Some("alice"), Some("2024-01-15 23:45:00"), None]);
 
@@ -1311,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_timestamp_to_date_inequality_compares_chronologically() {
+    fn test_where_expr_evaluate_timestamp_to_date_inequality_compares_chronologically() {
         let table = test_table_metadata_with_timestamp();
         let row_data = row(&[Some("1"), Some("alice"), Some("2024-03-15 09:00:00"), None]);
 
@@ -1329,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_timestamp_to_date_literal_lhs_flips() {
+    fn test_where_expr_evaluate_timestamp_to_date_literal_lhs_flips() {
         // Locks PGC-186 fix for the date path too: `'2024-01-01' < ts::date`.
         let table = test_table_metadata_with_timestamp();
         let row_data = row(&[Some("1"), Some("alice"), Some("2024-03-15 09:00:00"), None]);
@@ -1344,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_timestamp_to_date_with_typed_literal() {
+    fn test_where_expr_evaluate_timestamp_to_date_with_typed_literal() {
         // ORM-generated `created_at::date = '2024-01-15'::date` arrives as
         // `LiteralValue::StringWithCast(...)`. Classifier must accept it and
         // evaluator must compare it the same as a plain String literal.
@@ -1368,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_where_expr_supported_admits_timestamp_to_date() {
+    fn test_resolved_where_expr_supported_admits_timestamp_to_date() {
         let table = test_table_metadata_with_timestamp();
         let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
             &table,
@@ -1380,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_where_expr_supported_rejects_timestamptz_to_date() {
+    fn test_resolved_where_expr_supported_rejects_timestamptz_to_date() {
         // Deferred until PGC-187 (session-TZ tracking).
         let table = test_table_metadata_with_timestamp();
         let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
@@ -1393,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_where_expr_supported_rejects_non_canonical_date_literal() {
+    fn test_resolved_where_expr_supported_rejects_non_canonical_date_literal() {
         // `'2024-1-15'` would compare wrong lexicographically; classifier
         // must keep it on the PgEval path.
         let table = test_table_metadata_with_timestamp();
@@ -1407,7 +1407,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_where_expr_supported_rejects_non_string_date_literal() {
+    fn test_resolved_where_expr_supported_rejects_non_string_date_literal() {
         let table = test_table_metadata_with_timestamp();
         let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
             &table,
@@ -1427,7 +1427,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn where_expr_evaluate_is_true_with_true_value() {
+    fn test_where_expr_evaluate_is_true_with_true_value() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), Some("t")]);
 
@@ -1437,7 +1437,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_is_true_with_false_value() {
+    fn test_where_expr_evaluate_is_true_with_false_value() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), Some("f")]);
 
@@ -1447,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_is_true_with_null_value() {
+    fn test_where_expr_evaluate_is_true_with_null_value() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), None]);
 
@@ -1458,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_is_false_with_false_value() {
+    fn test_where_expr_evaluate_is_false_with_false_value() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), Some("f")]);
 
@@ -1468,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_is_false_with_true_value() {
+    fn test_where_expr_evaluate_is_false_with_true_value() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), Some("t")]);
 
@@ -1478,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_is_not_true_with_false_value() {
+    fn test_where_expr_evaluate_is_not_true_with_false_value() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), Some("f")]);
 
@@ -1489,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_is_not_true_with_null_value() {
+    fn test_where_expr_evaluate_is_not_true_with_null_value() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), None]);
 
@@ -1500,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_is_not_false_with_true_value() {
+    fn test_where_expr_evaluate_is_not_false_with_true_value() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), Some("t")]);
 
@@ -1510,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_is_not_false_with_null_value() {
+    fn test_where_expr_evaluate_is_not_false_with_null_value() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), None]);
 
@@ -1521,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_is_null_via_unary() {
+    fn test_where_expr_evaluate_is_null_via_unary() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), None]);
 
@@ -1531,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn where_expr_evaluate_is_not_null_via_unary() {
+    fn test_where_expr_evaluate_is_not_null_via_unary() {
         let table = test_table_metadata();
         let row_data = row(&[Some("1"), Some("john"), Some("t")]);
 
@@ -1549,7 +1549,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn expr_comparison_evaluate_float_operations() {
+    fn test_expr_comparison_evaluate_float_operations() {
         let mut table = test_table_metadata();
 
         let mut cols: Vec<ColumnMetadata> = table.columns.iter().cloned().collect();
@@ -1586,7 +1586,7 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn where_expr_evaluate_cross_table_column_returns_false() {
+    fn test_where_expr_evaluate_cross_table_column_returns_false() {
         // Column from "other_table" — row_data belongs to "test_table"
         let table = test_table_metadata();
         let mut other_col = resolved_column(&table, "id");
@@ -1607,14 +1607,14 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn supported_bare_equality() {
+    fn test_supported_bare_equality() {
         let table = test_table_metadata();
         let expr = col_cmp(&table, "id", BinaryOp::Equal, int(5));
         assert!(resolved_where_expr_supported(&expr));
     }
 
     #[test]
-    fn supported_nested_and_or() {
+    fn test_supported_nested_and_or() {
         let table = test_table_metadata();
         let expr = binary_expr(
             BinaryOp::And,
@@ -1629,7 +1629,7 @@ mod tests {
     }
 
     #[test]
-    fn supported_is_null_and_is_true() {
+    fn test_supported_is_null_and_is_true() {
         let table = test_table_metadata();
         assert!(resolved_where_expr_supported(&unary_expr(
             UnaryOp::IsNull,
@@ -1642,14 +1642,14 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_like() {
+    fn test_unsupported_like() {
         let table = test_table_metadata();
         let expr = col_cmp(&table, "name", BinaryOp::Like, text("j%"));
         assert!(!resolved_where_expr_supported(&expr));
     }
 
     #[test]
-    fn unsupported_column_to_column_comparison() {
+    fn test_unsupported_column_to_column_comparison() {
         // The evaluator only handles Column op Value / Value op Column.
         // Column op Column falls through to false; classifier must mark unsupported.
         let table = test_table_metadata();
@@ -1662,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_multi_in() {
+    fn test_unsupported_multi_in() {
         let table = test_table_metadata();
         let expr = ResolvedWhereExpr::Multi(ResolvedMultiExpr {
             op: MultiOp::In,
@@ -1676,7 +1676,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_function() {
+    fn test_unsupported_function() {
         let expr = ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Function(ResolvedFunctionCall {
             name: EcoString::from("upper"),
             args: vec![],
@@ -1690,7 +1690,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_subquery() {
+    fn test_unsupported_subquery() {
         let select_node: Box<ResolvedSelectNode> = Box::default();
         let query = Box::new(ResolvedQueryExpr {
             body: ResolvedQueryBody::Select(select_node),
@@ -1707,7 +1707,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_and_short_circuits_on_unsupported_child() {
+    fn test_unsupported_and_short_circuits_on_unsupported_child() {
         // An otherwise-supported AND becomes unsupported if either child is unsupported
         let table = test_table_metadata();
         let expr = binary_expr(
@@ -1719,7 +1719,7 @@ mod tests {
     }
 
     #[test]
-    fn unary_expr_evaluate_cross_table_is_null_returns_true() {
+    fn test_unary_expr_evaluate_cross_table_is_null_returns_true() {
         // IS NULL on a cross-table column: column_value_get returns None,
         // so IS NULL evaluates true. Matches the prior evaluator's behavior
         // for a column absent from the passed-in table metadata.
@@ -1773,7 +1773,7 @@ mod tests {
     }
 
     #[test]
-    fn compiled_predicate_matches_oracle_across_shapes() {
+    fn test_compiled_predicate_matches_oracle_across_shapes() {
         let table = test_table_metadata();
         let exprs = vec![
             // bare comparisons (both operand orders), every operator

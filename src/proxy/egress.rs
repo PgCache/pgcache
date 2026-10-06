@@ -266,7 +266,7 @@ mod tests {
     type TestQueue = EgressQueue<&'static str>;
 
     #[test]
-    fn empty_queue_is_idle() {
+    fn test_empty_queue_is_idle() {
         let q = TestQueue::new();
         assert!(q.is_empty());
         assert!(!q.has_writable());
@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn origin_streams_then_pops_on_seal() {
+    fn test_origin_streams_then_pops_on_seal() {
         let mut q = TestQueue::new();
         q.origin_open();
         q.origin_append(Bytes::from_static(b"row1"));
@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn synth_flushes_and_pops() {
+    fn test_synth_flushes_and_pops() {
         let mut q = TestQueue::new();
         q.synth_push(Bytes::from_static(b"12345"));
         assert!(q.has_writable());
@@ -307,14 +307,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_synth_ignored() {
+    fn test_empty_synth_ignored() {
         let mut q = TestQueue::new();
         q.synth_push(Bytes::new());
         assert!(q.is_empty());
     }
 
     #[test]
-    fn synth_does_not_jump_ahead_of_earlier_unsealed_origin() {
+    fn test_synth_does_not_jump_ahead_of_earlier_unsealed_origin() {
         // R1 forwarded (origin), R2 synth: the synth must wait behind R1.
         let mut q = TestQueue::new();
         q.origin_open(); // R1
@@ -336,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn origin_append_targets_oldest_unsealed_slot() {
+    fn test_origin_append_targets_oldest_unsealed_slot() {
         // R1 and R3 both forwarded; origin answers R1 first.
         let mut q = TestQueue::new();
         q.origin_open(); // R1
@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn cache_dispatches_only_at_head() {
+    fn test_cache_dispatches_only_at_head() {
         let mut q = TestQueue::new();
         q.origin_open(); // R1 ahead of the cache query
         q.cache_push("q2"); // R2 cacheable

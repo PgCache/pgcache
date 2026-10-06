@@ -288,19 +288,19 @@ mod tests {
     }
 
     #[test]
-    fn no_constraints_for_table_matches() {
+    fn test_no_constraints_for_table_matches() {
         let constraints = QueryConstraints::default();
         let row = row(Some("alice"), None);
         assert!(row_constraints_match(&constraints, &fixture_table(), &row));
     }
 
     #[test]
-    fn bare_comparison_matches_when_value_equal() {
+    fn test_bare_comparison_matches_when_value_equal() {
         assert!(constraint_matches(id_equals(1), &row(Some("alice"), None)));
     }
 
     #[test]
-    fn bare_comparison_misses_when_value_differs() {
+    fn test_bare_comparison_misses_when_value_differs() {
         assert!(!constraint_matches(id_equals(2), &row(Some("alice"), None)));
     }
 
@@ -308,26 +308,26 @@ mod tests {
     // the cast target before comparing.
 
     #[test]
-    fn cast_comparison_int4_matches_when_coerced_value_equal() {
+    fn test_cast_comparison_int4_matches_when_coerced_value_equal() {
         let constraint = name_int4(BinaryOp::Equal, 42);
         assert!(constraint_matches(constraint, &row(Some("42"), None)));
     }
 
     #[test]
-    fn cast_comparison_int4_misses_when_coerced_value_differs() {
+    fn test_cast_comparison_int4_misses_when_coerced_value_differs() {
         let constraint = name_int4(BinaryOp::Equal, 42);
         assert!(!constraint_matches(constraint, &row(Some("99"), None)));
     }
 
     #[test]
-    fn cast_comparison_int4_misses_when_row_unparseable() {
+    fn test_cast_comparison_int4_misses_when_row_unparseable() {
         // `'abc'::int4` raises in postgres; locally we treat it as non-match.
         let constraint = name_int4(BinaryOp::Equal, 42);
         assert!(!constraint_matches(constraint, &row(Some("abc"), None)));
     }
 
     #[test]
-    fn cast_comparison_bool_matches_via_pg_bool_spelling() {
+    fn test_cast_comparison_bool_matches_via_pg_bool_spelling() {
         let constraint = cast(
             "name",
             CastTarget::Bool,
@@ -338,7 +338,7 @@ mod tests {
     }
 
     #[test]
-    fn cast_comparison_date_matches_via_timestamp_prefix() {
+    fn test_cast_comparison_date_matches_via_timestamp_prefix() {
         let constraint = cast(
             "created_at",
             CastTarget::Date,
@@ -350,13 +350,13 @@ mod tests {
     }
 
     #[test]
-    fn cast_comparison_null_row_value_misses() {
+    fn test_cast_comparison_null_row_value_misses() {
         let constraint = name_int4(BinaryOp::Equal, 42);
         assert!(!constraint_matches(constraint, &row(None, None)));
     }
 
     #[test]
-    fn cast_comparison_inequality_compares_numerically() {
+    fn test_cast_comparison_inequality_compares_numerically() {
         // Locks the PGC-186 op-flip fix on the CDC pre-filter path too:
         // `name::int4 > 100` matches when name="500".
         let constraint = name_int4(BinaryOp::GreaterThan, 100);

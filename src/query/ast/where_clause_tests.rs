@@ -116,7 +116,7 @@ fn where_cases_check(cases: Vec<(&str, &str, Option<WhereExpr>)>) {
 }
 
 #[test]
-fn fingerprint_literals_differ() {
+fn test_fingerprint_literals_differ() {
     let q1 = query_expr_parse("select id, str from test where str = 'hello'").unwrap();
     let q2 = query_expr_parse("select id, str from test where str = 'bye'").unwrap();
 
@@ -124,7 +124,7 @@ fn fingerprint_literals_differ() {
 }
 
 #[test]
-fn select_columns() {
+fn test_select_columns() {
     let q = query_expr_parse("select id, str from test where str = 'hello'").unwrap();
     let select = q.as_select().unwrap();
     let SelectColumns::Columns(cols) = &select.columns else {
@@ -166,7 +166,7 @@ fn where_clause_rhs(sql: &str) -> ScalarExpr {
 }
 
 #[test]
-fn where_clause_arithmetic_deparse() {
+fn test_where_clause_arithmetic_deparse() {
     // Round-trip a non-foldable arithmetic query to confirm Scalar wrapping deparses cleanly.
     let q = query_expr_parse("SELECT * FROM t WHERE x = a % 10000 + 1").unwrap();
     let mut buf = String::new();
@@ -177,7 +177,7 @@ fn where_clause_arithmetic_deparse() {
 }
 
 #[test]
-fn where_clause_typecast_column() {
+fn test_where_clause_typecast_column() {
     // PGC-120: column cast on the left of a comparison. Must parse as
     // WhereExpr::Scalar(ScalarExpr::TypeCast{...}), not UnsupportedPattern.
     let where_clause = where_clause_parse("SELECT * FROM t WHERE col::text = 'foo'")
@@ -194,7 +194,7 @@ fn where_clause_typecast_column() {
 }
 
 #[test]
-fn where_clause_typecast_deparse() {
+fn test_where_clause_typecast_deparse() {
     // PGC-120: round-trip a few common cast shapes through Deparse.
     for sql in [
         "SELECT * FROM t WHERE col::text = 'foo'",

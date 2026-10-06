@@ -17,7 +17,7 @@ fn base_settings() -> PgSettings {
 }
 
 #[test]
-fn partial_merge_empty_uses_all_base_values() {
+fn test_partial_merge_empty_uses_all_base_values() {
     let base = base_settings();
     let partial = PgSettingsPartial::default();
 
@@ -32,7 +32,7 @@ fn partial_merge_empty_uses_all_base_values() {
 }
 
 #[test]
-fn partial_merge_host_only_override() {
+fn test_partial_merge_host_only_override() {
     let base = base_settings();
     let partial = PgSettingsPartial {
         host: Some("override.example.com".to_owned()),
@@ -50,7 +50,7 @@ fn partial_merge_host_only_override() {
 }
 
 #[test]
-fn partial_merge_multiple_fields_override() {
+fn test_partial_merge_multiple_fields_override() {
     let base = base_settings();
     let partial = PgSettingsPartial {
         host: Some("override.example.com".to_owned()),
@@ -70,7 +70,7 @@ fn partial_merge_multiple_fields_override() {
 }
 
 #[test]
-fn partial_merge_all_fields_override() {
+fn test_partial_merge_all_fields_override() {
     let base = base_settings();
     let partial = PgSettingsPartial {
         host: Some("override.example.com".to_owned()),
@@ -92,7 +92,7 @@ fn partial_merge_all_fields_override() {
 }
 
 #[test]
-fn partial_merge_password_override_when_base_has_none() {
+fn test_partial_merge_password_override_when_base_has_none() {
     let mut base = base_settings();
     base.password = None;
 
@@ -107,7 +107,7 @@ fn partial_merge_password_override_when_base_has_none() {
 }
 
 #[test]
-fn partial_merge_password_inherited_when_partial_has_none() {
+fn test_partial_merge_password_inherited_when_partial_has_none() {
     let base = base_settings();
     let partial = PgSettingsPartial {
         host: Some("override.example.com".to_owned()),
@@ -121,7 +121,7 @@ fn partial_merge_password_inherited_when_partial_has_none() {
 }
 
 #[test]
-fn partial_merge_both_passwords_none() {
+fn test_partial_merge_both_passwords_none() {
     let mut base = base_settings();
     base.password = None;
 
@@ -133,7 +133,7 @@ fn partial_merge_both_passwords_none() {
 }
 
 #[test]
-fn toml_parse_no_replication_section() {
+fn test_toml_parse_no_replication_section() {
     let toml_str = r#"
 num_workers = 4
 
@@ -176,7 +176,7 @@ socket = "127.0.0.1:5434"
 }
 
 #[test]
-fn toml_parse_partial_replication_section() {
+fn test_toml_parse_partial_replication_section() {
     let toml_str = r#"
 num_workers = 4
 
@@ -230,7 +230,7 @@ socket = "127.0.0.1:5434"
 }
 
 #[test]
-fn toml_parse_full_replication_section() {
+fn test_toml_parse_full_replication_section() {
     let toml_str = r#"
 num_workers = 4
 
@@ -277,7 +277,7 @@ socket = "127.0.0.1:5434"
 }
 
 #[test]
-fn toml_parse_replication_host_only() {
+fn test_toml_parse_replication_host_only() {
     let toml_str = r#"
 num_workers = 4
 
@@ -322,7 +322,7 @@ socket = "127.0.0.1:5434"
 // ==================== replication_settings_resolve Tests ====================
 
 #[test]
-fn replication_resolve_no_toml_no_cli_defaults_to_origin() {
+fn test_replication_resolve_no_toml_no_cli_defaults_to_origin() {
     let origin = base_settings();
 
     let result = replication_settings_resolve(&origin, None, PgSettingsPartial::default());
@@ -336,7 +336,7 @@ fn replication_resolve_no_toml_no_cli_defaults_to_origin() {
 }
 
 #[test]
-fn replication_resolve_toml_partial_merges_with_origin() {
+fn test_replication_resolve_toml_partial_merges_with_origin() {
     let origin = base_settings();
     let toml_partial = PgSettingsPartial {
         host: Some("replica.example.com".to_owned()),
@@ -356,7 +356,7 @@ fn replication_resolve_toml_partial_merges_with_origin() {
 }
 
 #[test]
-fn replication_resolve_cli_overrides_origin_when_no_toml() {
+fn test_replication_resolve_cli_overrides_origin_when_no_toml() {
     let origin = base_settings();
     let cli = PgSettingsPartial {
         host: Some("cli-host.example.com".to_owned()),
@@ -373,7 +373,7 @@ fn replication_resolve_cli_overrides_origin_when_no_toml() {
 }
 
 #[test]
-fn replication_resolve_cli_overrides_toml_partial() {
+fn test_replication_resolve_cli_overrides_toml_partial() {
     let origin = base_settings();
     let toml_partial = PgSettingsPartial {
         host: Some("toml-replica.example.com".to_owned()),
@@ -398,7 +398,7 @@ fn replication_resolve_cli_overrides_toml_partial() {
 }
 
 #[test]
-fn replication_resolve_cli_overrides_all_fields() {
+fn test_replication_resolve_cli_overrides_all_fields() {
     let origin = base_settings();
     let toml_partial = PgSettingsPartial {
         host: Some("toml-replica.example.com".to_owned()),
@@ -425,7 +425,7 @@ fn replication_resolve_cli_overrides_all_fields() {
 }
 
 #[test]
-fn replication_resolve_cli_password_overrides_toml_password() {
+fn test_replication_resolve_cli_password_overrides_toml_password() {
     let origin = base_settings();
     let toml_partial = PgSettingsPartial {
         password: Some("toml_password".to_owned()),
@@ -442,7 +442,7 @@ fn replication_resolve_cli_password_overrides_toml_password() {
 }
 
 #[test]
-fn replication_resolve_cli_password_not_set_preserves_toml_password() {
+fn test_replication_resolve_cli_password_not_set_preserves_toml_password() {
     let origin = base_settings();
     let toml_partial = PgSettingsPartial {
         password: Some("toml_password".to_owned()),
@@ -456,7 +456,7 @@ fn replication_resolve_cli_password_not_set_preserves_toml_password() {
 }
 
 #[test]
-fn replication_resolve_full_toml_with_no_cli_uses_toml() {
+fn test_replication_resolve_full_toml_with_no_cli_uses_toml() {
     let origin = base_settings();
     let toml_partial = PgSettingsPartial {
         host: Some("replica.example.com".to_owned()),
@@ -479,7 +479,7 @@ fn replication_resolve_full_toml_with_no_cli_uses_toml() {
 }
 
 #[test]
-fn replication_resolve_cli_port_only_with_toml_host() {
+fn test_replication_resolve_cli_port_only_with_toml_host() {
     let origin = base_settings();
     let toml_partial = PgSettingsPartial {
         host: Some("toml-host.example.com".to_owned()),
@@ -552,7 +552,7 @@ fn base_toml_config() -> SettingsToml {
 }
 
 #[test]
-fn settings_build_no_replication_defaults_to_origin() {
+fn test_settings_build_no_replication_defaults_to_origin() {
     let config = base_toml_config();
     let args = CliArgs::default();
 
@@ -569,7 +569,7 @@ fn settings_build_no_replication_defaults_to_origin() {
 }
 
 #[test]
-fn settings_build_toml_replication_partial_merges_with_origin() {
+fn test_settings_build_toml_replication_partial_merges_with_origin() {
     let mut config = base_toml_config();
     config.replication = Some(PgSettingsPartial {
         host: Some("replica.example.com".to_owned()),
@@ -589,7 +589,7 @@ fn settings_build_toml_replication_partial_merges_with_origin() {
 }
 
 #[test]
-fn settings_build_cli_replication_overrides_no_toml_section() {
+fn test_settings_build_cli_replication_overrides_no_toml_section() {
     let config = base_toml_config();
     let args = CliArgs {
         replication: PgSettingsPartial {
@@ -614,7 +614,7 @@ fn settings_build_cli_replication_overrides_no_toml_section() {
 }
 
 #[test]
-fn settings_build_cli_replication_overrides_toml_replication() {
+fn test_settings_build_cli_replication_overrides_toml_replication() {
     let mut config = base_toml_config();
     config.replication = Some(PgSettingsPartial {
         host: Some("toml-replica.example.com".to_owned()),
@@ -640,7 +640,7 @@ fn settings_build_cli_replication_overrides_toml_replication() {
 }
 
 #[test]
-fn settings_build_cli_origin_override_cascades_to_replication() {
+fn test_settings_build_cli_origin_override_cascades_to_replication() {
     let config = base_toml_config();
     let args = CliArgs {
         origin: PgSettingsPartial {
@@ -659,7 +659,7 @@ fn settings_build_cli_origin_override_cascades_to_replication() {
 }
 
 #[test]
-fn settings_build_cdc_names_lowercased() {
+fn test_settings_build_cdc_names_lowercased() {
     let mut config = base_toml_config();
     config.cdc.publication_name = "MY_PUB".to_owned();
     config.cdc.slot_name = "MY_SLOT".to_owned();
@@ -700,7 +700,7 @@ fn base_cli_args() -> CliArgs {
 }
 
 #[test]
-fn settings_build_cli_only_replication_defaults_to_origin() {
+fn test_settings_build_cli_only_replication_defaults_to_origin() {
     let args = base_cli_args();
 
     let settings = settings_build(args, None, None).expect("build settings");
@@ -717,7 +717,7 @@ fn settings_build_cli_only_replication_defaults_to_origin() {
 }
 
 #[test]
-fn settings_build_cli_only_replication_host_override() {
+fn test_settings_build_cli_only_replication_host_override() {
     let args = CliArgs {
         replication: PgSettingsPartial {
             host: Some("replica.example.com".to_owned()),
@@ -740,7 +740,7 @@ fn settings_build_cli_only_replication_host_override() {
 }
 
 #[test]
-fn settings_build_cli_only_replication_all_fields_override() {
+fn test_settings_build_cli_only_replication_all_fields_override() {
     let args = CliArgs {
         replication: PgSettingsPartial {
             host: Some("replica.example.com".to_owned()),
@@ -767,7 +767,7 @@ fn settings_build_cli_only_replication_all_fields_override() {
 }
 
 #[test]
-fn settings_build_cli_only_missing_origin_host_errors() {
+fn test_settings_build_cli_only_missing_origin_host_errors() {
     let mut args = base_cli_args();
     args.origin.host = None;
 
@@ -776,7 +776,7 @@ fn settings_build_cli_only_missing_origin_host_errors() {
 }
 
 #[test]
-fn settings_build_cli_only_defaults() {
+fn test_settings_build_cli_only_defaults() {
     let args = base_cli_args();
 
     let settings = settings_build(args, None, None).expect("build settings");
@@ -790,7 +790,7 @@ fn settings_build_cli_only_defaults() {
 }
 
 #[test]
-fn settings_build_cli_only_cdc_names_lowercased() {
+fn test_settings_build_cli_only_cdc_names_lowercased() {
     let args = CliArgs {
         cdc_publication_name: Some("MY_PUB".to_owned()),
         cdc_slot_name: Some("MY_SLOT".to_owned()),
@@ -806,14 +806,14 @@ fn settings_build_cli_only_cdc_names_lowercased() {
 // ==================== pinned_queries Tests ====================
 
 #[test]
-fn settings_build_pinned_queries_default_none() {
+fn test_settings_build_pinned_queries_default_none() {
     let args = base_cli_args();
     let settings = settings_build(args, None, None).expect("build settings");
     assert!(settings.pinned_queries.is_none());
 }
 
 #[test]
-fn settings_build_pinned_queries_from_toml() {
+fn test_settings_build_pinned_queries_from_toml() {
     let mut config = base_toml_config();
     config.pinned_queries = Some(vec![
         "SELECT * FROM users".to_owned(),
@@ -830,7 +830,7 @@ fn settings_build_pinned_queries_from_toml() {
 }
 
 #[test]
-fn settings_build_pinned_queries_cli_semicolon() {
+fn test_settings_build_pinned_queries_cli_semicolon() {
     let args = CliArgs {
         pinned_queries: Some("SELECT id, name FROM a;SELECT id, name FROM b".to_owned()),
         ..base_cli_args()
@@ -845,7 +845,7 @@ fn settings_build_pinned_queries_cli_semicolon() {
 }
 
 #[test]
-fn settings_build_pinned_queries_cli_overrides_toml() {
+fn test_settings_build_pinned_queries_cli_overrides_toml() {
     let mut config = base_toml_config();
     config.pinned_queries = Some(vec!["SELECT * FROM toml_table".to_owned()]);
     let args = CliArgs {
@@ -861,7 +861,7 @@ fn settings_build_pinned_queries_cli_overrides_toml() {
 }
 
 #[test]
-fn toml_parse_pinned_queries() {
+fn test_toml_parse_pinned_queries() {
     let toml_str = r#"
 num_workers = 4
 
@@ -901,7 +901,7 @@ socket = "127.0.0.1:5434"
 // ==================== pinned_tables Tests ====================
 
 #[test]
-fn settings_build_pinned_tables_expands_to_queries() {
+fn test_settings_build_pinned_tables_expands_to_queries() {
     let mut config = base_toml_config();
     config.pinned_tables = Some(vec!["settings".to_owned(), "products".to_owned()]);
     let args = CliArgs::default();
@@ -915,7 +915,7 @@ fn settings_build_pinned_tables_expands_to_queries() {
 }
 
 #[test]
-fn settings_build_pinned_tables_merged_with_pinned_queries() {
+fn test_settings_build_pinned_tables_merged_with_pinned_queries() {
     let mut config = base_toml_config();
     config.pinned_queries = Some(vec!["SELECT id, name FROM users".to_owned()]);
     config.pinned_tables = Some(vec!["settings".to_owned()]);
@@ -930,7 +930,7 @@ fn settings_build_pinned_tables_merged_with_pinned_queries() {
 }
 
 #[test]
-fn settings_build_pinned_tables_cli_csv() {
+fn test_settings_build_pinned_tables_cli_csv() {
     let args = CliArgs {
         pinned_tables: Some("settings,products".to_owned()),
         ..base_cli_args()
@@ -945,7 +945,7 @@ fn settings_build_pinned_tables_cli_csv() {
 }
 
 #[test]
-fn settings_build_pinned_tables_schema_qualified() {
+fn test_settings_build_pinned_tables_schema_qualified() {
     let mut config = base_toml_config();
     config.pinned_tables = Some(vec!["analytics.events".to_owned()]);
     let args = CliArgs::default();
@@ -958,7 +958,7 @@ fn settings_build_pinned_tables_schema_qualified() {
 }
 
 #[test]
-fn settings_build_pinned_tables_cli_merges_with_pinned_queries_cli() {
+fn test_settings_build_pinned_tables_cli_merges_with_pinned_queries_cli() {
     let args = CliArgs {
         pinned_queries: Some("SELECT id FROM users".to_owned()),
         pinned_tables: Some("settings".to_owned()),
@@ -974,7 +974,7 @@ fn settings_build_pinned_tables_cli_merges_with_pinned_queries_cli() {
 }
 
 #[test]
-fn toml_parse_pinned_tables() {
+fn test_toml_parse_pinned_tables() {
     let toml_str = r#"
 num_workers = 4
 
@@ -1026,7 +1026,7 @@ fn base_dynamic_config() -> DynamicConfig {
 }
 
 #[test]
-fn config_patch_apply_empty_preserves_current() {
+fn test_config_patch_apply_empty_preserves_current() {
     let current = base_dynamic_config();
     let patch = DynamicConfigPatch {
         cache_size: None,
@@ -1051,7 +1051,7 @@ fn config_patch_apply_empty_preserves_current() {
 }
 
 #[test]
-fn config_patch_apply_set_values() {
+fn test_config_patch_apply_set_values() {
     let current = base_dynamic_config();
     let patch = DynamicConfigPatch {
         cache_size: Some(Some(2_000_000)),
@@ -1077,7 +1077,7 @@ fn config_patch_apply_set_values() {
 }
 
 #[test]
-fn config_patch_apply_unset_optional_fields() {
+fn test_config_patch_apply_unset_optional_fields() {
     let current = base_dynamic_config();
     let patch = DynamicConfigPatch {
         cache_size: Some(None),
@@ -1099,7 +1099,7 @@ fn config_patch_apply_unset_optional_fields() {
 }
 
 #[test]
-fn config_patch_json_deserialize() {
+fn test_config_patch_json_deserialize() {
     let json = r#"{"cache_size": 500, "admission_threshold": 3}"#;
     let patch: DynamicConfigPatch = serde_json::from_str(json).expect("parse JSON");
     assert_eq!(patch.cache_size, Some(Some(500)));
@@ -1110,7 +1110,7 @@ fn config_patch_json_deserialize() {
 }
 
 #[test]
-fn config_patch_json_null_unsets() {
+fn test_config_patch_json_null_unsets() {
     let json = r#"{"cache_size": null, "log_level": null}"#;
     let patch: DynamicConfigPatch = serde_json::from_str(json).expect("parse JSON");
     assert_eq!(patch.cache_size, Some(None));
@@ -1118,7 +1118,7 @@ fn config_patch_json_null_unsets() {
 }
 
 #[test]
-fn config_file_toml_round_trip() {
+fn test_config_file_toml_round_trip() {
     let toml_content = r#"# Main config
 num_workers = 4
 cache_size = 1000000

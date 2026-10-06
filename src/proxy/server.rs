@@ -483,14 +483,14 @@ mod tests {
     }
 
     #[test]
-    fn pinned_queries_validate_none_returns_empty() {
+    fn test_pinned_queries_validate_none_returns_empty() {
         let settings = test_settings(None);
         let result = pinned_queries_validate(&settings, &HashMap::new());
         assert!(result.is_empty());
     }
 
     #[test]
-    fn pinned_queries_validate_valid_query_accepted() {
+    fn test_pinned_queries_validate_valid_query_accepted() {
         let settings = test_settings(Some(vec![
             "SELECT id, name FROM users WHERE active = true".to_owned(),
         ]));
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_queries_validate_multiple_queries() {
+    fn test_pinned_queries_validate_multiple_queries() {
         let settings = test_settings(Some(vec![
             "SELECT * FROM users".to_owned(),
             "SELECT * FROM orders".to_owned(),
@@ -512,14 +512,14 @@ mod tests {
     }
 
     #[test]
-    fn pinned_queries_validate_unparseable_skipped() {
+    fn test_pinned_queries_validate_unparseable_skipped() {
         let settings = test_settings(Some(vec!["NOT VALID SQL !!!".to_owned()]));
         let result = pinned_queries_validate(&settings, &HashMap::new());
         assert!(result.is_empty());
     }
 
     #[test]
-    fn pinned_queries_validate_non_cacheable_skipped() {
+    fn test_pinned_queries_validate_non_cacheable_skipped() {
         // INSERT is not cacheable
         let settings = test_settings(Some(vec!["INSERT INTO users (id) VALUES (1)".to_owned()]));
         let result = pinned_queries_validate(&settings, &HashMap::new());
@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_queries_validate_mixed_valid_and_invalid() {
+    fn test_pinned_queries_validate_mixed_valid_and_invalid() {
         let settings = test_settings(Some(vec![
             "SELECT * FROM users".to_owned(),
             "NOT VALID SQL".to_owned(),
@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_queries_validate_non_cacheable_function_in_where_rejected() {
+    fn test_pinned_queries_validate_non_cacheable_function_in_where_rejected() {
         let mut fv = HashMap::new();
         fv.insert("random".into(), FunctionVolatility::Volatile);
 

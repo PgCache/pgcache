@@ -75,7 +75,7 @@ async fn test_binary_int4_array_in_any_clause() -> Result<(), Error> {
 /// and option-B's safety gate refused the subsumption (every distinct
 /// array got its own miss).
 #[tokio::test]
-async fn test_pgc106_any_subsumes_narrower_any() -> Result<(), Error> {
+async fn test_any_subsumes_narrower_any() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
     ctx.query("create table widgets (id integer primary key)", &[])
@@ -123,7 +123,7 @@ async fn test_pgc106_any_subsumes_narrower_any() -> Result<(), Error> {
 /// array's cached rows — empty intersection, returning `[]` instead of
 /// the correct rows.
 #[tokio::test]
-async fn test_pgc106_distinct_arrays_get_distinct_cache_entries() -> Result<(), Error> {
+async fn test_distinct_arrays_get_distinct_cache_entries() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
 
     ctx.query("create table widgets (id integer primary key)", &[])

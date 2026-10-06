@@ -1308,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn pg_eval_template_matches_oracle_across_shapes() {
+    fn test_pg_eval_template_matches_oracle_across_shapes() {
         let onek = table_metadata(
             "onek",
             Oid::from_raw(7001),
@@ -1337,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn pg_eval_template_declines_short_row() {
+    fn test_pg_eval_template_declines_short_row() {
         let onek = table_metadata(
             "onek",
             Oid::from_raw(7002),

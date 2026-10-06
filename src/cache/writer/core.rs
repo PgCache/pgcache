@@ -645,25 +645,25 @@ mod tests {
 
     /// Live query at the parked generation, not invalidated → finalize.
     #[test]
-    fn finalize_allowed_when_current() {
+    fn test_finalize_allowed_when_current() {
         assert!(population_finalize_allowed(Some((5, false)), 5));
     }
 
     /// Readmit bumped the generation while the entry was parked → skip.
     #[test]
-    fn finalize_skipped_after_readmit() {
+    fn test_finalize_skipped_after_readmit() {
         assert!(!population_finalize_allowed(Some((8, false)), 5));
     }
 
     /// Query invalidated while parked (a growing change superseded it) → skip.
     #[test]
-    fn finalize_skipped_when_invalidated() {
+    fn test_finalize_skipped_when_invalidated() {
         assert!(!population_finalize_allowed(Some((5, true)), 5));
     }
 
     /// Query evicted while parked → skip.
     #[test]
-    fn finalize_skipped_when_evicted() {
+    fn test_finalize_skipped_when_evicted() {
         assert!(!population_finalize_allowed(None, 5));
     }
 }

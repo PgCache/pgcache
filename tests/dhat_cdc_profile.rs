@@ -28,7 +28,7 @@ mod util;
 
 #[tokio::test]
 #[ignore = "profiling driver; run explicitly with --features dhat-heap"]
-async fn dhat_cdc_apply_workload() -> Result<(), Error> {
+async fn test_dhat_cdc_apply_workload() -> Result<(), Error> {
     let events: usize = std::env::var("DHAT_CDC_EVENTS")
         .ok()
         .and_then(|s| s.parse().ok())

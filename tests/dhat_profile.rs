@@ -21,7 +21,7 @@ mod util;
 
 #[tokio::test]
 #[ignore = "profiling driver; run explicitly with --features dhat-heap"]
-async fn dhat_binary_serve_workload() -> Result<(), Error> {
+async fn test_dhat_binary_serve_workload() -> Result<(), Error> {
     let hits: usize = std::env::var("DHAT_HITS")
         .ok()
         .and_then(|s| s.parse().ok())

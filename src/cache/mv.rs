@@ -380,7 +380,7 @@ mod tests {
     use crate::query::resolved::query_expr_resolve;
 
     #[test]
-    fn mv_table_name_format() {
+    fn test_mv_table_name_format() {
         assert_eq!(mv_table_name(Fingerprint::from_raw(0)), "pgcache_mv.q_0");
         assert_eq!(mv_table_name(Fingerprint::from_raw(42)), "pgcache_mv.q_42");
         assert_eq!(
@@ -390,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn mv_state_initial_maps_from_gate() {
+    fn test_mv_state_initial_maps_from_gate() {
         assert_eq!(mv_state_initial(ShapeGate::Skip), MvState::Skipped);
         assert_eq!(
             mv_state_initial(ShapeGate::Gated),
@@ -399,7 +399,7 @@ mod tests {
     }
 
     #[test]
-    fn has_table_covers_only_on_disk_states() {
+    fn test_has_table_covers_only_on_disk_states() {
         assert!(!MvState::Skipped.has_table());
         assert!(!MvState::Ineligible.has_table());
         assert!(!MvState::Pending { has_table: false }.has_table());
@@ -414,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn dirtied_invalidates_fresh_and_marks_in_flight_builds() {
+    fn test_dirtied_invalidates_fresh_and_marks_in_flight_builds() {
         assert_eq!(
             MvState::Fresh.dirtied(),
             Some(MvState::Pending { has_table: true })
@@ -430,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn dirtied_is_noop_for_already_dirty_or_terminal_states() {
+    fn test_dirtied_is_noop_for_already_dirty_or_terminal_states() {
         assert_eq!(MvState::Skipped.dirtied(), None);
         assert_eq!(MvState::Ineligible.dirtied(), None);
         assert_eq!(MvState::Pending { has_table: true }.dirtied(), None);
@@ -570,13 +570,13 @@ mod tests {
     }
 
     #[test]
-    fn mv_serve_sql_no_order_by() {
+    fn test_mv_serve_sql_no_order_by() {
         let out = build_serve_sql("SELECT status, count(*) FROM orders GROUP BY status");
         assert_eq!(out, "SELECT * FROM pgcache_mv.q_42");
     }
 
     #[test]
-    fn mv_serve_sql_aliases_positional_columns_back() {
+    fn test_mv_serve_sql_aliases_positional_columns_back() {
         let out = build_serve_sql_named(
             "SELECT status, count(*) FROM orders GROUP BY status",
             &["status", "count"],
@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn mv_serve_sql_allows_duplicate_output_names() {
+    fn test_mv_serve_sql_allows_duplicate_output_names() {
         // PGC-136: two unaliased count(*) — illegal as table columns,
         // legal as a result set via positional storage + aliased serve.
         let out =
@@ -600,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn mv_serve_sql_aliased_with_positional_order_by() {
+    fn test_mv_serve_sql_aliased_with_positional_order_by() {
         let out = build_serve_sql_named(
             "SELECT status, count(*) FROM orders GROUP BY status ORDER BY count(*) DESC",
             &["status", "count"],
@@ -612,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn mv_serve_sql_positional_order_by_aggregate_desc() {
+    fn test_mv_serve_sql_positional_order_by_aggregate_desc() {
         let out = build_serve_sql(
             "SELECT status, count(*) FROM orders GROUP BY status ORDER BY count(*) DESC",
         );
@@ -620,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn mv_serve_sql_positional_order_by_column_asc() {
+    fn test_mv_serve_sql_positional_order_by_column_asc() {
         let out = build_serve_sql(
             "SELECT status, count(*) FROM orders GROUP BY status ORDER BY status ASC",
         );
@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[test]
-    fn mv_serve_sql_positional_order_by_multiple() {
+    fn test_mv_serve_sql_positional_order_by_multiple() {
         let out = build_serve_sql(
             "SELECT status, count(*) FROM orders GROUP BY status \
              ORDER BY count(*) DESC, status ASC",
@@ -639,13 +639,13 @@ mod tests {
     // ==================== SetOp body serve SQL ====================
 
     #[test]
-    fn mv_serve_sql_setop_no_order_by() {
+    fn test_mv_serve_sql_setop_no_order_by() {
         let out = build_serve_sql("SELECT id FROM orders UNION SELECT id FROM users");
         assert_eq!(out, "SELECT * FROM pgcache_mv.q_42");
     }
 
     #[test]
-    fn mv_serve_sql_setop_order_by_identifier_deparses_directly() {
+    fn test_mv_serve_sql_setop_order_by_identifier_deparses_directly() {
         // SetOp ORDER BY is Identifier-based; the bare name matches the MV
         // column, so we emit it directly (no positional indirection).
         let out =
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn mv_serve_sql_intersect_no_order_by() {
+    fn test_mv_serve_sql_intersect_no_order_by() {
         let out = build_serve_sql("SELECT id FROM orders INTERSECT SELECT id FROM users");
         assert_eq!(out, "SELECT * FROM pgcache_mv.q_42");
     }

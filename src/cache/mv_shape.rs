@@ -224,7 +224,7 @@ pub(super) mod tests {
     use crate::query::resolved::query_expr_resolve;
 
     #[test]
-    fn is_reducer_matches_non_projection_shapes() {
+    fn test_is_reducer_matches_non_projection_shapes() {
         assert!(ShapeGate::Gated.is_reducer());
         assert!(!ShapeGate::Skip.is_reducer());
     }
@@ -293,7 +293,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_plain_filter_is_skip() {
+    fn test_classify_plain_filter_is_skip() {
         assert_eq!(
             classify("SELECT * FROM orders WHERE id = 1"),
             ShapeGate::Skip
@@ -301,18 +301,18 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_projection_is_skip() {
+    fn test_classify_projection_is_skip() {
         assert_eq!(classify("SELECT id, status FROM orders"), ShapeGate::Skip);
     }
 
     #[test]
-    fn classify_bare_aggregate_is_gated() {
+    fn test_classify_bare_aggregate_is_gated() {
         assert_eq!(classify("SELECT count(*) FROM orders"), ShapeGate::Gated);
         assert_eq!(classify("SELECT sum(total) FROM orders"), ShapeGate::Gated);
     }
 
     #[test]
-    fn classify_group_by_is_gated() {
+    fn test_classify_group_by_is_gated() {
         assert_eq!(
             classify("SELECT status, count(*) FROM orders GROUP BY status"),
             ShapeGate::Gated
@@ -320,7 +320,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_having_is_gated() {
+    fn test_classify_having_is_gated() {
         // HAVING on a GROUP BY query — row reduction via either signal.
         assert_eq!(
             classify("SELECT status, count(*) FROM orders GROUP BY status HAVING count(*) > 5"),
@@ -329,7 +329,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_distinct_is_gated() {
+    fn test_classify_distinct_is_gated() {
         assert_eq!(
             classify("SELECT DISTINCT status FROM orders"),
             ShapeGate::Gated
@@ -337,7 +337,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_window_function_is_gated() {
+    fn test_classify_window_function_is_gated() {
         assert_eq!(
             classify("SELECT id, row_number() OVER (ORDER BY total) FROM orders"),
             ShapeGate::Gated
@@ -345,7 +345,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_window_with_group_by_is_gated() {
+    fn test_classify_window_with_group_by_is_gated() {
         // Even with GROUP BY, a window function plus GROUP BY is still Gated (the window
         // compute-expensive signal; row reduction is the size signal).
         assert_eq!(
@@ -358,7 +358,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_union_dedup_is_gated() {
+    fn test_classify_union_dedup_is_gated() {
         assert_eq!(
             classify("SELECT id FROM orders UNION SELECT id FROM users"),
             ShapeGate::Gated
@@ -366,7 +366,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_union_all_is_skip() {
+    fn test_classify_union_all_is_skip() {
         // UNION ALL is strictly additive — no dedup, branches already cached.
         assert_eq!(
             classify("SELECT id FROM orders UNION ALL SELECT id FROM users"),
@@ -375,7 +375,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_intersect_is_gated() {
+    fn test_classify_intersect_is_gated() {
         assert_eq!(
             classify("SELECT id FROM orders INTERSECT SELECT id FROM users"),
             ShapeGate::Gated
@@ -387,7 +387,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_except_is_gated() {
+    fn test_classify_except_is_gated() {
         assert_eq!(
             classify("SELECT id FROM orders EXCEPT SELECT id FROM users"),
             ShapeGate::Gated
@@ -399,7 +399,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_setop_order_by_identifier_in_select_is_gated() {
+    fn test_classify_setop_order_by_identifier_in_select_is_gated() {
         // `id` appears in the left branch's SELECT list; the set-op's output
         // column is named `id`, so `ORDER BY id` is serveable against the MV.
         assert_eq!(
@@ -409,7 +409,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_setop_order_by_unknown_identifier_is_skip() {
+    fn test_classify_setop_order_by_unknown_identifier_is_skip() {
         // `status` is NOT in the set-op's output (SELECT list is just `id`),
         // so MV can't preserve the sort — downgrade to Skip.
         assert_eq!(
@@ -419,7 +419,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_aggregate_inside_case_is_gated() {
+    fn test_classify_aggregate_inside_case_is_gated() {
         // Aggregate nested inside CASE branch should still be detected.
         assert_eq!(
             classify(
@@ -431,7 +431,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_aggregate_in_subquery_does_not_reduce_outer() {
+    fn test_classify_aggregate_in_subquery_does_not_reduce_outer() {
         // A scalar subquery with count() in the SELECT list doesn't make the
         // outer query a reduction shape — it.s a plain projection over orders.
         assert_eq!(
@@ -441,7 +441,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_join_without_aggregate_is_gated() {
+    fn test_classify_join_without_aggregate_is_gated() {
         // A plain join's result is the same predicate-scoped rows it scans, so
         // the row-reduction gate can't apply; its MV value is avoiding the
         // re-join, gated on input size (PGC-330).
@@ -452,7 +452,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_join_with_aggregate_is_gated() {
+    fn test_classify_join_with_aggregate_is_gated() {
         // The aggregate signal wins over the join: this reduces rows.
         assert_eq!(
             classify(
@@ -466,7 +466,7 @@ pub(super) mod tests {
     // ==================== ORDER BY interaction ====================
 
     #[test]
-    fn classify_gated_with_order_by_selected_aggregate_is_gated() {
+    fn test_classify_gated_with_order_by_selected_aggregate_is_gated() {
         // ORDER BY count(*) — count(*) is in SELECT, position lookup succeeds.
         assert_eq!(
             classify(
@@ -478,7 +478,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_gated_with_order_by_selected_group_column_is_gated() {
+    fn test_classify_gated_with_order_by_selected_group_column_is_gated() {
         assert_eq!(
             classify("SELECT status, count(*) FROM orders GROUP BY status ORDER BY status"),
             ShapeGate::Gated
@@ -486,7 +486,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_gated_aggregate_order_by_not_in_select_downgrades_to_skip() {
+    fn test_classify_gated_aggregate_order_by_not_in_select_downgrades_to_skip() {
         // ORDER BY sum(total) where sum is NOT in SELECT list — can't preserve
         // the sort into the MV (sum is not a stored column). Downgrade to Skip.
         assert_eq!(
@@ -499,7 +499,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn classify_gated_window_order_by_not_in_select_downgrades_to_skip() {
+    fn test_classify_gated_window_order_by_not_in_select_downgrades_to_skip() {
         // Window functions are Gated, but ORDER BY must still resolve
         // against the SELECT list.
         assert_eq!(

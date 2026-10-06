@@ -282,7 +282,7 @@ mod tests {
     ];
 
     #[test]
-    fn corpus_converts_and_roundtrips() {
+    fn test_corpus_converts_and_roundtrips() {
         let mut failures = Vec::new();
         for sql in CORPUS {
             let Ok(query) = query_expr_parse(sql) else {

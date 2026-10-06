@@ -329,7 +329,7 @@ mod classify_tests {
     }
 
     #[test]
-    fn simple_equality_is_local_eval() {
+    fn test_simple_equality_is_local_eval() {
         assert_eq!(
             classify_single_table("SELECT * FROM t WHERE id = 5"),
             UpdateEvalStrategy::LocalEval
@@ -337,7 +337,7 @@ mod classify_tests {
     }
 
     #[test]
-    fn no_where_is_local_eval() {
+    fn test_no_where_is_local_eval() {
         assert_eq!(
             classify_single_table("SELECT * FROM t"),
             UpdateEvalStrategy::LocalEval
@@ -345,7 +345,7 @@ mod classify_tests {
     }
 
     #[test]
-    fn and_or_with_comparisons_is_local_eval() {
+    fn test_and_or_with_comparisons_is_local_eval() {
         assert_eq!(
             classify_single_table("SELECT * FROM t WHERE (id = 1 OR id = 2) AND name IS NOT NULL"),
             UpdateEvalStrategy::LocalEval
@@ -353,7 +353,7 @@ mod classify_tests {
     }
 
     #[test]
-    fn in_list_is_pg_eval() {
+    fn test_in_list_is_pg_eval() {
         // IN is a Multi op — not yet evaluable in Rust
         assert_eq!(
             classify_single_table("SELECT * FROM t WHERE id IN (1, 2, 3)"),
@@ -362,7 +362,7 @@ mod classify_tests {
     }
 
     #[test]
-    fn like_is_pg_eval() {
+    fn test_like_is_pg_eval() {
         assert_eq!(
             classify_single_table("SELECT * FROM t WHERE name LIKE 'j%'"),
             UpdateEvalStrategy::PgEval
@@ -370,7 +370,7 @@ mod classify_tests {
     }
 
     #[test]
-    fn group_by_is_pg_eval() {
+    fn test_group_by_is_pg_eval() {
         assert_eq!(
             classify_single_table("SELECT status, count(*) FROM t GROUP BY status"),
             UpdateEvalStrategy::PgEval
@@ -378,7 +378,7 @@ mod classify_tests {
     }
 
     #[test]
-    fn multi_table_is_pg_eval() {
+    fn test_multi_table_is_pg_eval() {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(make_table("a", Oid::from_raw(1), &["id", "bid"]));
         tables.insert_overwrite(make_table("b", Oid::from_raw(2), &["id", "name"]));
@@ -390,7 +390,7 @@ mod classify_tests {
     }
 
     #[test]
-    fn non_fromclause_source_is_pg_eval() {
+    fn test_non_fromclause_source_is_pg_eval() {
         use crate::cache::SubqueryKind;
         let resolved = resolve("SELECT * FROM t WHERE id = 5", &{
             let mut tables = BiHashMap::new();

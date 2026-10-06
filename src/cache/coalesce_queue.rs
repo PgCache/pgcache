@@ -198,38 +198,38 @@ mod tests {
     }
 
     #[test]
-    fn cold_population_uses_fixed_short_deadline() {
+    fn test_cold_population_uses_fixed_short_deadline() {
         assert!((ms(coalesce_deadline(None)) - 200.0).abs() < 1e-6);
     }
 
     #[test]
-    fn cheap_repop_deadline_exceeds_estimate() {
+    fn test_cheap_repop_deadline_exceeds_estimate() {
         // Below the crossover: wait it out, serve from cache (no forward).
         assert!(ms(coalesce_deadline(Some(50.0))) > 50.0); // 0.8*50+100 = 140
         assert!((ms(coalesce_deadline(Some(50.0))) - 140.0).abs() < 1e-6);
     }
 
     #[test]
-    fn crossover_at_500ms() {
+    fn test_crossover_at_500ms() {
         // floor/(1-factor) = 100/0.2 = 500ms: deadline == estimate at the crossover.
         assert!((ms(coalesce_deadline(Some(500.0))) - 500.0).abs() < 1e-6);
     }
 
     #[test]
-    fn expensive_repop_deadline_below_estimate() {
+    fn test_expensive_repop_deadline_below_estimate() {
         // Above the crossover: forward early.
         assert!(ms(coalesce_deadline(Some(1000.0))) < 1000.0); // 900
         assert!(ms(coalesce_deadline(Some(10_000.0))) < 10_000.0); // 8100
     }
 
     #[test]
-    fn ceiling_clamps_runaway_estimate() {
+    fn test_ceiling_clamps_runaway_estimate() {
         // 0.8*P+100 would exceed 10s for P > 12_375ms; clamp holds at 10s.
         assert!((ms(coalesce_deadline(Some(50_000.0))) - 10_000.0).abs() < 1e-6);
     }
 
     #[test]
-    fn floor_holds_for_near_zero_estimate() {
+    fn test_floor_holds_for_near_zero_estimate() {
         assert!((ms(coalesce_deadline(Some(0.0))) - 100.0).abs() < 1e-6);
     }
 }

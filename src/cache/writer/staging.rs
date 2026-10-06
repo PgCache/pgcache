@@ -714,7 +714,7 @@ mod tests {
     /// Deactivating a population raises the relation's min floor, pruning deletes
     /// that predate every remaining in-flight population's snapshot.
     #[test]
-    fn deactivate_prunes_below_min_floor() {
+    fn test_deactivate_prunes_below_min_floor() {
         let mut keys = PopulationDeletedKeys::default();
         keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(100));
         keys.activate(Fingerprint::from_raw(2), GEN, &[REL], Lsn::from_raw(200));
@@ -740,7 +740,7 @@ mod tests {
     /// Two populations of the *same* fingerprint at different generations are
     /// tracked independently — deactivating one keeps the other recording.
     #[test]
-    fn generations_of_same_fingerprint_are_independent() {
+    fn test_generations_of_same_fingerprint_are_independent() {
         let mut keys = PopulationDeletedKeys::default();
         keys.activate(Fingerprint::from_raw(7), 5, &[REL], Lsn::from_raw(100)); // gen 5, parked
         keys.activate(Fingerprint::from_raw(7), 8, &[REL], Lsn::from_raw(100)); // gen 8, readmitted
@@ -761,7 +761,7 @@ mod tests {
 
     /// The relation's entry disappears once the last population leaves.
     #[test]
-    fn deactivate_last_population_clears_entry() {
+    fn test_deactivate_last_population_clears_entry() {
         let mut keys = PopulationDeletedKeys::default();
         keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(100));
         record(&mut keys, "5", Lsn::from_raw(150));
@@ -771,7 +771,7 @@ mod tests {
 
     /// Deletes for a relation no population is reading are dropped on the floor.
     #[test]
-    fn record_without_active_population_is_noop() {
+    fn test_record_without_active_population_is_noop() {
         let mut keys = PopulationDeletedKeys::default();
         record(&mut keys, "5", Lsn::from_raw(150));
         assert!(keys.filter_predicate(REL, "(id)").is_none());
@@ -779,7 +779,7 @@ mod tests {
 
     /// Exceeding the cap drops keys and aborts every merge over the relation.
     #[test]
-    fn overflow_aborts_and_disables_filtering() {
+    fn test_overflow_aborts_and_disables_filtering() {
         let mut keys = PopulationDeletedKeys::default();
         keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(0));
         for i in 0..=POPULATION_DELETED_KEY_CAP {
@@ -794,7 +794,7 @@ mod tests {
     /// population that snapshotted at/after it is unaffected (self-clearing),
     /// and now-stale keys are pruned.
     #[test]
-    fn abort_below_aborts_only_older_snapshots() {
+    fn test_abort_below_aborts_only_older_snapshots() {
         let mut keys = PopulationDeletedKeys::default();
         keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(100));
         record(&mut keys, "5", Lsn::from_raw(150));

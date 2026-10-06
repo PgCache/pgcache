@@ -538,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn limit_bind_text_binds_value_and_never_drops_non_integers() {
+    fn test_limit_bind_text_binds_value_and_never_drops_non_integers() {
         let mut itoa_buf = itoa::Buffer::new();
         let mut other = String::new();
 
@@ -570,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlstate_extract_undefined_table() {
+    fn test_sqlstate_extract_undefined_table() {
         let frame = error_response_frame(&[
             (b'S', b"ERROR"),
             (b'C', b"42P01"),
@@ -580,27 +580,27 @@ mod tests {
     }
 
     #[test]
-    fn sqlstate_extract_first_field() {
+    fn test_sqlstate_extract_first_field() {
         // SQLSTATE-first ordering should still parse.
         let frame = error_response_frame(&[(b'C', b"23505"), (b'S', b"ERROR")]);
         assert_eq!(sqlstate_extract(&frame), Some(*b"23505"));
     }
 
     #[test]
-    fn sqlstate_extract_missing_returns_none() {
+    fn test_sqlstate_extract_missing_returns_none() {
         let frame = error_response_frame(&[(b'S', b"ERROR"), (b'M', b"boom")]);
         assert_eq!(sqlstate_extract(&frame), None);
     }
 
     #[test]
-    fn sqlstate_extract_wrong_length_returns_none() {
+    fn test_sqlstate_extract_wrong_length_returns_none() {
         // SQLSTATE must be exactly 5 chars; anything else is malformed.
         let frame = error_response_frame(&[(b'C', b"42P0")]);
         assert_eq!(sqlstate_extract(&frame), None);
     }
 
     #[test]
-    fn sqlstate_extract_short_frame_returns_none() {
+    fn test_sqlstate_extract_short_frame_returns_none() {
         // Frame shorter than the 5-byte header (tag + length) — graceful None.
         assert_eq!(sqlstate_extract(b"E\x00"), None);
     }

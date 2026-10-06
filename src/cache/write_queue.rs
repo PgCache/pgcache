@@ -173,7 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_queue() {
+    fn test_empty_queue() {
         let q = WriteQueue::new();
         assert!(q.is_empty());
         assert_eq!(q.remaining(), 0);
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn push_bytes_mut() {
+    fn test_push_bytes_mut() {
         let mut q = WriteQueue::new();
         q.push(BytesMut::from(&b"hello"[..]));
         q.push(BytesMut::from(&b"world"[..]));
@@ -191,7 +191,7 @@ mod tests {
     }
 
     #[test]
-    fn push_static() {
+    fn test_push_static() {
         let mut q = WriteQueue::new();
         q.push(Bytes::from_static(b"static"));
         assert_eq!(q.remaining(), 6);
@@ -199,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn push_empty_ignored() {
+    fn test_push_empty_ignored() {
         let mut q = WriteQueue::new();
         q.push(BytesMut::new());
         q.push(Bytes::new());
@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_within_chunk() {
+    fn test_advance_within_chunk() {
         let mut q = WriteQueue::new();
         q.push(BytesMut::from(&b"hello"[..]));
         q.advance(3);
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_across_chunks() {
+    fn test_advance_across_chunks() {
         let mut q = WriteQueue::new();
         q.push(BytesMut::from(&b"ab"[..]));
         q.push(Bytes::from_static(b"cde"));
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn advance_drains_all() {
+    fn test_advance_drains_all() {
         let mut q = WriteQueue::new();
         q.push(BytesMut::from(&b"abc"[..]));
         q.advance(3);
@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn chunks_vectored_fills_dst() {
+    fn test_chunks_vectored_fills_dst() {
         let mut q = WriteQueue::new();
         q.push(BytesMut::from(&b"aa"[..]));
         q.push(Bytes::from_static(b"bb"));
@@ -250,7 +250,7 @@ mod tests {
     }
 
     #[test]
-    fn chunks_vectored_limited_by_dst_len() {
+    fn test_chunks_vectored_limited_by_dst_len() {
         let mut q = WriteQueue::new();
         q.push(BytesMut::from(&b"aa"[..]));
         q.push(BytesMut::from(&b"bb"[..]));
@@ -265,7 +265,7 @@ mod tests {
 
     /// Pushing past INLINE_CAP spills to the heap while preserving FIFO order.
     #[test]
-    fn spills_past_inline_cap_in_order() {
+    fn test_spills_past_inline_cap_in_order() {
         let mut q = WriteQueue::new();
         let total = INLINE_CAP + 3;
         for i in 0..total {
@@ -283,7 +283,7 @@ mod tests {
     /// The ring reuses slots: interleaving drains with pushes keeps total live
     /// chunks low, so a long stream never spills as long as it's drained.
     #[test]
-    fn ring_reuses_slots_without_spilling() {
+    fn test_ring_reuses_slots_without_spilling() {
         let mut q = WriteQueue::new();
         // Push/drain far more than INLINE_CAP total, but never more than 2 live.
         for i in 0..(INLINE_CAP * 4) {
@@ -302,7 +302,7 @@ mod tests {
     /// the inline ring frees slots — otherwise a newer chunk could jump ahead of
     /// older spilled ones and break FIFO order.
     #[test]
-    fn spill_is_sticky_until_drained() {
+    fn test_spill_is_sticky_until_drained() {
         let mut q = WriteQueue::new();
         for i in 0..INLINE_CAP {
             q.push(Bytes::from(vec![i as u8]));
@@ -333,7 +333,7 @@ mod tests {
 
     /// `remaining()` sums variable-length chunks across the inline/spill boundary.
     #[test]
-    fn remaining_counts_inline_and_spill() {
+    fn test_remaining_counts_inline_and_spill() {
         let mut q = WriteQueue::new();
         let mut expected = 0;
         for i in 0..(INLINE_CAP + 2) {
@@ -349,7 +349,7 @@ mod tests {
 
     /// vectored chunks span the inline ring and the spill in FIFO order.
     #[test]
-    fn chunks_vectored_spans_inline_and_spill() {
+    fn test_chunks_vectored_spans_inline_and_spill() {
         let mut q = WriteQueue::new();
         let total = INLINE_CAP + 2;
         for i in 0..total {
@@ -365,7 +365,7 @@ mod tests {
 
     /// After the ring head wraps, vectored order is still FIFO.
     #[test]
-    fn chunks_vectored_after_wraparound() {
+    fn test_chunks_vectored_after_wraparound() {
         let mut q = WriteQueue::new();
         // Fill, drain half so head moves forward, then refill into the freed slots.
         for i in 0..INLINE_CAP {

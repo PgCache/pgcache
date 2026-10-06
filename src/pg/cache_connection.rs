@@ -516,7 +516,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prepared_statements_insert_tracks_membership_no_eviction_under_cap() {
+    fn test_prepared_statements_insert_tracks_membership_no_eviction_under_cap() {
         let mut p = PreparedStatements::new();
         assert_eq!(p.insert(ShapeKey::from_raw(10)), None);
         assert_eq!(p.insert(ShapeKey::from_raw(20)), None);
@@ -530,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_statements_evicts_oldest_at_cap() {
+    fn test_prepared_statements_evicts_oldest_at_cap() {
         let mut p = PreparedStatements::new();
         for i in 0..PREPARED_STATEMENT_CAP as u64 {
             assert_eq!(p.insert(ShapeKey::from_raw(i)), None);

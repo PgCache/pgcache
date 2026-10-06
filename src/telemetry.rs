@@ -254,7 +254,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deployment_detect_bare_metal() {
+    fn test_deployment_detect_bare_metal() {
         // Without PGCACHE_DOCKER env var and without /.dockerenv, should return bare-metal
         // Note: this test may behave differently in CI Docker environments
         if std::env::var("PGCACHE_DOCKER").is_err() && !std::path::Path::new("/.dockerenv").exists()
@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn pg_version_default() {
+    fn test_pg_version_default() {
         // Before any connection sets the version, should return "unknown"
         // Note: OnceLock is process-global, so this test is order-dependent
         // Only assert if no other test has set it
@@ -274,13 +274,13 @@ mod tests {
     }
 
     #[test]
-    fn jitter_within_bounds() {
+    fn test_jitter_within_bounds() {
         let jitter = jitter_duration();
         assert!(jitter.as_secs() < HEARTBEAT_JITTER_SECS);
     }
 
     #[test]
-    fn payload_serialization() {
+    fn test_payload_serialization() {
         let payload = TelemetryPayload {
             id: "test-id".to_owned(),
             version: "0.4.7",
@@ -303,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn prometheus_metric_read_counter() {
+    fn test_prometheus_metric_read_counter() {
         let rendered = "\
 # HELP pgcache_queries_cache_hit Total cache hits
 # TYPE pgcache_queries_cache_hit counter
@@ -323,13 +323,13 @@ pgcache_queries_cache_miss 8
     }
 
     #[test]
-    fn prometheus_metric_read_missing() {
+    fn test_prometheus_metric_read_missing() {
         let rendered = "# nothing here\n";
         assert_eq!(prometheus_metric_read(rendered, "pgcache.queries.total"), 0);
     }
 
     #[test]
-    fn prometheus_metric_read_float() {
+    fn test_prometheus_metric_read_float() {
         let rendered = "pgcache_cache_queries_registered 15.0\n";
         assert_eq!(
             prometheus_metric_read(rendered, "pgcache.cache.queries_registered"),

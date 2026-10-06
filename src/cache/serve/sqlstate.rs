@@ -52,7 +52,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlstate_extract_undefined_table() {
+    fn test_sqlstate_extract_undefined_table() {
         let frame = error_response_frame(&[
             (b'S', b"ERROR"),
             (b'C', b"42P01"),
@@ -62,25 +62,25 @@ mod tests {
     }
 
     #[test]
-    fn sqlstate_extract_first_field() {
+    fn test_sqlstate_extract_first_field() {
         let frame = error_response_frame(&[(b'C', b"23505"), (b'M', b"dup")]);
         assert_eq!(sqlstate_extract(&frame), Some(*b"23505"));
     }
 
     #[test]
-    fn sqlstate_extract_missing_returns_none() {
+    fn test_sqlstate_extract_missing_returns_none() {
         let frame = error_response_frame(&[(b'S', b"ERROR"), (b'M', b"no code")]);
         assert_eq!(sqlstate_extract(&frame), None);
     }
 
     #[test]
-    fn sqlstate_extract_wrong_length_returns_none() {
+    fn test_sqlstate_extract_wrong_length_returns_none() {
         let frame = error_response_frame(&[(b'C', b"42P0")]);
         assert_eq!(sqlstate_extract(&frame), None);
     }
 
     #[test]
-    fn sqlstate_extract_short_frame_returns_none() {
+    fn test_sqlstate_extract_short_frame_returns_none() {
         assert_eq!(sqlstate_extract(&[b'E', 0, 0]), None);
     }
 }

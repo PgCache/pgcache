@@ -526,7 +526,7 @@ mod tests {
     /// Two populations that stream the same rows in different orders must emit
     /// byte-identical INSERT bodies so PG locks the PK index in the same order.
     #[test]
-    fn batch_sql_build_orders_by_pk() {
+    fn test_batch_sql_build_orders_by_pk() {
         let prefix = "INSERT INTO t(a,b) VALUES ";
         let suffix = " ON CONFLICT (a) DO NOTHING";
 
@@ -559,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_sql_build_composite_pk_no_separator_ambiguity() {
+    fn test_batch_sql_build_composite_pk_no_separator_ambiguity() {
         // ("a","b") vs ("ab", "") must not collide into the same sort key.
         let mut rows = vec![
             (
@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn escaped_tuple_build_matches_prior_output() {
+    fn test_escaped_tuple_build_matches_prior_output() {
         let cases: &[&[Option<&str>]] = &[
             &[Some("1"), Some("x")],
             &[Some("42"), None, Some("o'brien")], // NULL + quote-escaping
@@ -615,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn escaped_tuple_build_composite_pk() {
+    fn test_escaped_tuple_build_composite_pk() {
         let values = [Some("ab"), Some("cd"), Some("ef")];
         let (pk, tuple, _) = escaped_tuple_build(3, &[0, 2], |idx| values[idx]);
         assert_eq!(tuple, "('ab','cd','ef')");

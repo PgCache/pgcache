@@ -135,20 +135,20 @@ mod tests {
     }
 
     #[test]
-    fn fold_integer_add() {
+    fn test_fold_integer_add() {
         let q = parse_and_fold("SELECT id FROM t WHERE x = 1 + 2");
         assert_eq!(*where_rhs_literal(&q), LiteralValue::Integer(3));
     }
 
     #[test]
-    fn fold_integer_modulo_then_add() {
+    fn test_fold_integer_modulo_then_add() {
         // The PGC-118 bench query reduces to a single literal.
         let q = parse_and_fold("SELECT id FROM t WHERE user_id = 12345 % 10000 + 1");
         assert_eq!(*where_rhs_literal(&q), LiteralValue::Integer(2346));
     }
 
     #[test]
-    fn fold_distinct_inputs_same_result() {
+    fn test_fold_distinct_inputs_same_result() {
         // Two different sid values that fold to the same user_id share a fingerprint.
         let q1 = parse_and_fold("SELECT id FROM t WHERE user_id = 12345 % 10000 + 1");
         let q2 = parse_and_fold("SELECT id FROM t WHERE user_id = 22345 % 10000 + 1");
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_with_column_left_unfolded() {
+    fn test_fold_with_column_left_unfolded() {
         // Mixed literal+column cannot fold.
         let q = parse_and_fold("SELECT id FROM t WHERE x = a + 1");
         let select = q.as_select().expect("select");
@@ -169,7 +169,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_divide_by_zero_left_unfolded() {
+    fn test_fold_divide_by_zero_left_unfolded() {
         let q = parse_and_fold("SELECT id FROM t WHERE x = 10 / 0");
         let select = q.as_select().expect("select");
         let WhereExpr::Binary(binary) = select.where_clause.as_ref().expect("where") else {
@@ -181,7 +181,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_modulo_by_zero_left_unfolded() {
+    fn test_fold_modulo_by_zero_left_unfolded() {
         let q = parse_and_fold("SELECT id FROM t WHERE x = 10 % 0");
         let select = q.as_select().expect("select");
         let WhereExpr::Binary(binary) = select.where_clause.as_ref().expect("where") else {
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_integer_overflow_left_unfolded() {
+    fn test_fold_integer_overflow_left_unfolded() {
         // pg_query parses out-of-i32-range literals as Float, so this case
         // can only arise from binary parameter substitution binding a real
         // i64. Test `literal_arithmetic_fold` directly with i64 values.
@@ -216,7 +216,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_integer_plus_float_promotes() {
+    fn test_fold_integer_plus_float_promotes() {
         let q = parse_and_fold("SELECT id FROM t WHERE x = 1 + 2.5");
         let LiteralValue::Float(f) = where_rhs_literal(&q) else {
             panic!("expected float result from int+float");
@@ -225,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_parameter_left_unfolded() {
+    fn test_fold_parameter_left_unfolded() {
         // Pre-bind: $1 is a Parameter literal, not numeric — leave unfolded.
         let q = parse_and_fold("SELECT id FROM t WHERE x = $1 % 10");
         let select = q.as_select().expect("select");
@@ -246,7 +246,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_after_parameter_bind() {
+    fn test_fold_after_parameter_bind() {
         // Post-bind fold: `$1 % 10000 + 1` with $1=12345 folds to 2346.
         let parsed = query_expr_parse("SELECT id FROM t WHERE user_id = $1 % 10000 + 1").unwrap();
         let bound = query_expr_parameters_replace(&parsed, &int8_param(12345)).unwrap();
@@ -264,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_after_parameter_bind_collapses_fingerprints() {
+    fn test_fold_after_parameter_bind_collapses_fingerprints() {
         // Different $1 values that fold to the same user_id share a fingerprint
         // after bind-time fold — the writer-bottleneck fix that PGC-118 targets.
         let parsed = query_expr_parse("SELECT id FROM t WHERE user_id = $1 % 10000 + 1").unwrap();

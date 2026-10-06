@@ -20,7 +20,7 @@ mod util;
 
 #[tokio::test]
 #[ignore = "measurement driver; run explicitly"]
-async fn prepared_stmt_planning_measure() -> Result<(), Error> {
+async fn test_prepared_stmt_planning_measure() -> Result<(), Error> {
     let hits: usize = std::env::var("HITS")
         .ok()
         .and_then(|s| s.parse().ok())
