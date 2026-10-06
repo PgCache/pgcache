@@ -269,32 +269,9 @@ pub fn where_value_compare_string(
             .parse::<i64>()
             .is_ok_and(|row_int| ordering_satisfies_op(row_int.cmp(filter_int), op)),
         LiteralValue::Float(filter_float) => {
-            if let Ok(row_float) = row_value_str.parse::<f64>() {
-                let filter_f64 = filter_float.into_inner();
-                match op {
-                    BinaryOp::Equal => (row_float - filter_f64).abs() < f64::EPSILON,
-                    BinaryOp::NotEqual => (row_float - filter_f64).abs() >= f64::EPSILON,
-                    BinaryOp::LessThan => row_float < filter_f64,
-                    BinaryOp::LessThanOrEqual => row_float <= filter_f64,
-                    BinaryOp::GreaterThan => row_float > filter_f64,
-                    BinaryOp::GreaterThanOrEqual => row_float >= filter_f64,
-                    _ => false,
-                }
-            } else {
-                false // Can't parse as float
-            }
+            float_text_compare(row_value_str, filter_float.into_inner(), op)
         }
-        LiteralValue::Boolean(filter_bool) => {
-            if let Some(row_bool) = bool_wire_text_parse(row_value_str) {
-                match op {
-                    BinaryOp::Equal => row_bool == *filter_bool,
-                    BinaryOp::NotEqual => row_bool != *filter_bool,
-                    _ => false, // Boolean comparisons other than equality don't make sense
-                }
-            } else {
-                false // Can't parse as boolean
-            }
-        }
+        LiteralValue::Boolean(filter_bool) => bool_text_compare(row_value_str, *filter_bool, op),
         LiteralValue::Null => false, // Row has non-NULL value, filter expects NULL
         LiteralValue::NullWithCast(_) => false, // Row has non-NULL value, filter expects NULL
         LiteralValue::Parameter(_) => false, // Parameters not supported in cache matching
@@ -302,6 +279,33 @@ pub fn where_value_compare_string(
         // which the evaluator handles at the WHERE-expr level — never here
         // as a scalar comparison value.
         LiteralValue::Array(_, _) => false,
+    }
+}
+
+/// A float filter against a row's text: equality within `f64::EPSILON`; an
+/// unparseable row never matches.
+fn float_text_compare(row_value_str: &str, filter: f64, op: BinaryOp) -> bool {
+    let Ok(row_float) = row_value_str.parse::<f64>() else {
+        return false;
+    };
+    match op {
+        BinaryOp::Equal => (row_float - filter).abs() < f64::EPSILON,
+        BinaryOp::NotEqual => (row_float - filter).abs() >= f64::EPSILON,
+        BinaryOp::LessThan => row_float < filter,
+        BinaryOp::LessThanOrEqual => row_float <= filter,
+        BinaryOp::GreaterThan => row_float > filter,
+        BinaryOp::GreaterThanOrEqual => row_float >= filter,
+        _ => false,
+    }
+}
+
+/// A boolean filter against a row's text: only `=` and `<>` are meaningful;
+/// an unparseable row never matches.
+fn bool_text_compare(row_value_str: &str, filter: bool, op: BinaryOp) -> bool {
+    match (bool_wire_text_parse(row_value_str), op) {
+        (Some(row_bool), BinaryOp::Equal) => row_bool == filter,
+        (Some(row_bool), BinaryOp::NotEqual) => row_bool != filter,
+        _ => false,
     }
 }
 
@@ -393,99 +397,67 @@ mod tests {
     // Fixtures
     // ------------------------------------------------------------------
 
-    fn test_table_metadata() -> TableMetadata {
-        let columns = ColumnStore::new([
-            ColumnMetadata {
-                name: "id".into(),
-                position: 1,
-                type_oid: TypeOid::from_raw(23),
-                data_type: Type::INT4,
-                type_name: "integer".into(),
-                cache_type_name: "int4".into(),
-                is_primary_key: true,
-            },
-            ColumnMetadata {
-                name: "name".into(),
-                position: 2,
-                type_oid: TypeOid::from_raw(25),
-                data_type: Type::TEXT,
-                type_name: "text".into(),
-                cache_type_name: "text".into(),
-                is_primary_key: false,
-            },
-            ColumnMetadata {
-                name: "active".into(),
-                position: 3,
-                type_oid: TypeOid::from_raw(16),
-                data_type: Type::BOOL,
-                type_name: "boolean".into(),
-                cache_type_name: "bool".into(),
-                is_primary_key: false,
-            },
-        ]);
+    /// A column whose type OID comes from its `Type`; position 1 is the key.
+    fn column(name: &str, position: i16, data_type: Type, names: (&str, &str)) -> ColumnMetadata {
+        let (type_name, cache_type_name) = names;
+        ColumnMetadata {
+            name: name.into(),
+            position,
+            type_oid: TypeOid::from_type(&data_type),
+            data_type,
+            type_name: type_name.into(),
+            cache_type_name: cache_type_name.into(),
+            is_primary_key: position == 1,
+        }
+    }
 
+    fn table_metadata(
+        name: &str,
+        relation_oid: u32,
+        columns: Vec<ColumnMetadata>,
+    ) -> TableMetadata {
         TableMetadata {
             replica_identity_full: false,
-            name: "test_table".into(),
+            name: name.into(),
             schema: "public".into(),
-            relation_oid: Oid::from_raw(12345),
+            relation_oid: Oid::from_raw(relation_oid),
             primary_key_columns: vec!["id".into()],
-            columns,
+            columns: ColumnStore::new(columns),
             indexes: Vec::new(),
         }
     }
 
-    /// Sibling fixture with a `created_at TIMESTAMP` column for PGC-180
-    /// date-narrowing tests. Row layout: `[id, name, created_at]`.
-    fn test_table_metadata_with_timestamp() -> TableMetadata {
-        let columns = ColumnStore::new([
-            ColumnMetadata {
-                name: "id".into(),
-                position: 1,
-                type_oid: TypeOid::from_raw(23),
-                data_type: Type::INT4,
-                type_name: "integer".into(),
-                cache_type_name: "int4".into(),
-                is_primary_key: true,
-            },
-            ColumnMetadata {
-                name: "name".into(),
-                position: 2,
-                type_oid: TypeOid::from_raw(25),
-                data_type: Type::TEXT,
-                type_name: "text".into(),
-                cache_type_name: "text".into(),
-                is_primary_key: false,
-            },
-            ColumnMetadata {
-                name: "created_at".into(),
-                position: 3,
-                type_oid: TypeOid::from_raw(1114),
-                data_type: Type::TIMESTAMP,
-                type_name: "timestamp".into(),
-                cache_type_name: "timestamp".into(),
-                is_primary_key: false,
-            },
-            ColumnMetadata {
-                name: "received_at".into(),
-                position: 4,
-                type_oid: TypeOid::from_raw(1184),
-                data_type: Type::TIMESTAMPTZ,
-                type_name: "timestamptz".into(),
-                cache_type_name: "timestamptz".into(),
-                is_primary_key: false,
-            },
-        ]);
+    /// `test_table`: `[id int4, name text, active bool]`.
+    fn test_table_metadata() -> TableMetadata {
+        table_metadata(
+            "test_table",
+            12345,
+            vec![
+                column("id", 1, Type::INT4, ("integer", "int4")),
+                column("name", 2, Type::TEXT, ("text", "text")),
+                column("active", 3, Type::BOOL, ("boolean", "bool")),
+            ],
+        )
+    }
 
-        TableMetadata {
-            replica_identity_full: false,
-            name: "ts_table".into(),
-            schema: "public".into(),
-            relation_oid: Oid::from_raw(23456),
-            primary_key_columns: vec!["id".into()],
-            columns,
-            indexes: Vec::new(),
-        }
+    /// Sibling fixture with a `created_at TIMESTAMP` column for PGC-180
+    /// date-narrowing tests. Row layout: `[id, name, created_at, received_at]`.
+    fn test_table_metadata_with_timestamp() -> TableMetadata {
+        table_metadata(
+            "ts_table",
+            23456,
+            vec![
+                column("id", 1, Type::INT4, ("integer", "int4")),
+                column("name", 2, Type::TEXT, ("text", "text")),
+                column("created_at", 3, Type::TIMESTAMP, ("timestamp", "timestamp")),
+                column(
+                    "received_at",
+                    4,
+                    Type::TIMESTAMPTZ,
+                    ("timestamptz", "timestamptz"),
+                ),
+            ],
+        )
     }
 
     fn resolved_column(table: &TableMetadata, column: &str) -> ResolvedColumnNode {
@@ -536,256 +508,173 @@ mod tests {
 
     const TABLE: &str = "test_table";
 
+    fn text(value: &str) -> LiteralValue {
+        LiteralValue::String(value.into())
+    }
+
+    fn int(value: i64) -> LiteralValue {
+        LiteralValue::Integer(value)
+    }
+
+    fn row(values: &[Option<&str>]) -> Vec<Option<ByteString>> {
+        values.iter().map(|v| v.map(ByteString::from)).collect()
+    }
+
+    /// `column op literal` against `table`.
+    fn col_cmp(
+        table: &TableMetadata,
+        column: &str,
+        op: BinaryOp,
+        literal: LiteralValue,
+    ) -> ResolvedWhereExpr {
+        binary_expr(op, col_expr(table, column), val_expr(literal))
+    }
+
     // ------------------------------------------------------------------
     // where_value_compare_string tests (shape-agnostic)
     // ------------------------------------------------------------------
 
-    #[test]
-    fn where_value_compare_string_string_match() {
-        let filter_value = LiteralValue::String("hello".into());
-        assert!(where_value_compare_string(
-            &filter_value,
-            "hello",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value,
-            "world",
-            BinaryOp::Equal
-        ));
-        assert!(where_value_compare_string(
-            &filter_value,
-            "world",
-            BinaryOp::NotEqual
-        ));
+    fn float(v: f64) -> LiteralValue {
+        LiteralValue::Float(NotNan::new(v).expect("test float is not NaN"))
     }
 
     #[test]
-    fn where_value_compare_string_integer_match() {
-        let filter_value = LiteralValue::Integer(123);
-        assert!(where_value_compare_string(
-            &filter_value,
-            "123",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value,
-            "124",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value,
-            "abc",
-            BinaryOp::Equal
-        ));
-        assert!(where_value_compare_string(
-            &filter_value,
-            "100",
-            BinaryOp::LessThan
-        ));
-        assert!(where_value_compare_string(
-            &filter_value,
-            "150",
-            BinaryOp::GreaterThan
-        ));
+    fn where_value_compare_string_cases() {
+        use BinaryOp::{Equal, GreaterThan, LessThan, NotEqual};
+        use LiteralValue::{Boolean, Integer, Null, Parameter};
+        // (label, filter literal, row text, op, expected)
+        #[rustfmt::skip]
+        let cases = [
+            ("string equal",                 text("hello"),           "hello",    Equal,       true),
+            ("string unequal",               text("hello"),           "world",    Equal,       false),
+            ("string not-equal",             text("hello"),           "world",    NotEqual,    true),
+            ("integer equal",                Integer(123),            "123",      Equal,       true),
+            ("integer unequal",              Integer(123),            "124",      Equal,       false),
+            ("integer vs unparseable row",   Integer(123),            "abc",      Equal,       false),
+            ("integer row below",            Integer(123),            "100",      LessThan,    true),
+            ("integer row above",            Integer(123),            "150",      GreaterThan, true),
+            ("float equal",                  float(123.45),           "123.45",   Equal,       true),
+            ("float unequal",                float(123.45),           "123.46",   Equal,       false),
+            ("float vs unparseable row",     float(123.45),           "invalid",  Equal,       false),
+            ("float row below",              float(123.45),           "100.0",    LessThan,    true),
+            ("float row above",              float(123.45),           "150.0",    GreaterThan, true),
+            ("bool true = 'true'",           Boolean(true),           "true",     Equal,       true),
+            ("bool true = 'false'",          Boolean(true),           "false",    Equal,       false),
+            ("bool true = 't'",              Boolean(true),           "t",        Equal,       true),
+            ("bool true = 'f'",              Boolean(true),           "f",        Equal,       false),
+            ("bool false = 'false'",         Boolean(false),          "false",    Equal,       true),
+            ("bool false = 'true'",          Boolean(false),          "true",     Equal,       false),
+            ("bool false = 'f'",             Boolean(false),          "f",        Equal,       true),
+            ("bool false = 't'",             Boolean(false),          "t",        Equal,       false),
+            ("bool true never matches '1'",  Boolean(true),           "1",        Equal,       false),
+            ("bool false never matches '0'", Boolean(false),          "0",        Equal,       false),
+            ("null filter vs 'anything'",    Null,                    "anything", Equal,       false),
+            ("null filter vs 'null'",        Null,                    "null",     Equal,       false),
+            ("null filter vs 'NULL'",        Null,                    "NULL",     Equal,       false),
+            ("parameter vs its own text",    Parameter("$1".into()),  "$1",       Equal,       false),
+            ("parameter vs 'anything'",      Parameter("$1".into()),  "anything", Equal,       false),
+        ];
+        for (label, filter, row_text, op, expected) in cases {
+            let actual = where_value_compare_string(&filter, row_text, op);
+            assert_eq!(
+                actual, expected,
+                "{label}: expected {expected}, got {actual} (row {row_text:?} {op:?} filter {filter:?})"
+            );
+        }
     }
 
     #[test]
-    fn where_value_compare_string_float_match() {
-        let filter_value = LiteralValue::Float(NotNan::new(123.45).unwrap());
-        assert!(where_value_compare_string(
-            &filter_value,
-            "123.45",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value,
-            "123.46",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value,
-            "invalid",
-            BinaryOp::Equal
-        ));
-        assert!(where_value_compare_string(
-            &filter_value,
-            "100.0",
-            BinaryOp::LessThan
-        ));
-        assert!(where_value_compare_string(
-            &filter_value,
-            "150.0",
-            BinaryOp::GreaterThan
-        ));
+    fn literal_compare_cases() {
+        use BinaryOp::{Equal, LessThan, NotEqual};
+        use LiteralValue::{Boolean, Integer};
+        // (label, left, op, right, expected). "0042" parses to 42 (numeric, not
+        // lexicographic); bools also compare against parseable-bool strings
+        // and integer 0/1; ISO 8601 dates compare chronologically by bytes.
+        #[rustfmt::skip]
+        let cases = [
+            ("integers equal",                Integer(5),         Equal,    Integer(5),           true),
+            ("integers unequal",              Integer(5),         Equal,    Integer(6),           false),
+            ("integer less than",             Integer(5),         LessThan, Integer(6),           true),
+            ("integer vs parseable string",   Integer(42),        Equal,    text("42"),           true),
+            ("integer vs zero-padded string", Integer(42),        Equal,    text("0042"),         true),
+            ("integer vs unparseable string", Integer(42),        Equal,    text("not-a-number"), false),
+            ("bools equal",                   Boolean(true),      Equal,    Boolean(true),        true),
+            ("bools unequal",                 Boolean(true),      Equal,    Boolean(false),       false),
+            ("bools not-equal",               Boolean(true),      NotEqual, Boolean(false),       true),
+            ("bool vs 'yes'",                 Boolean(true),      Equal,    text("yes"),          true),
+            ("bool false vs integer 0",       Boolean(false),     Equal,    Integer(0),           true),
+            ("bool true vs integer 0",        Boolean(true),      Equal,    Integer(0),           false),
+            ("same date strings",             text("2024-01-15"), Equal,    text("2024-01-15"),   true),
+            ("earlier date string",           text("2024-01-15"), LessThan, text("2024-02-01"),   true),
+            ("later date string",             text("2024-03-01"), LessThan, text("2024-02-01"),   false),
+        ];
+        for (label, left, op, right, expected) in cases {
+            let actual = literal_compare(&left, op, &right);
+            assert_eq!(
+                actual, expected,
+                "{label}: expected {expected}, got {actual} ({left:?} {op:?} {right:?})"
+            );
+        }
     }
 
     #[test]
-    fn where_value_compare_string_boolean_match() {
-        let filter_value_true = LiteralValue::Boolean(true);
-        let filter_value_false = LiteralValue::Boolean(false);
-
-        assert!(where_value_compare_string(
-            &filter_value_true,
-            "true",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value_true,
-            "false",
-            BinaryOp::Equal
-        ));
-        assert!(where_value_compare_string(
-            &filter_value_true,
-            "t",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value_true,
-            "f",
-            BinaryOp::Equal
-        ));
-        assert!(where_value_compare_string(
-            &filter_value_false,
-            "false",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value_false,
-            "true",
-            BinaryOp::Equal
-        ));
-        assert!(where_value_compare_string(
-            &filter_value_false,
-            "f",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value_false,
-            "t",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value_true,
-            "1",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value_false,
-            "0",
-            BinaryOp::Equal
-        ));
-    }
-
-    #[test]
-    fn where_value_compare_string_null_never_matches() {
-        let filter_value = LiteralValue::Null;
-        assert!(!where_value_compare_string(
-            &filter_value,
-            "anything",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value,
-            "null",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value,
-            "NULL",
-            BinaryOp::Equal
-        ));
-    }
-
-    #[test]
-    fn where_value_compare_string_parameter_never_matches() {
-        let filter_value = LiteralValue::Parameter("$1".into());
-        assert!(!where_value_compare_string(
-            &filter_value,
-            "$1",
-            BinaryOp::Equal
-        ));
-        assert!(!where_value_compare_string(
-            &filter_value,
-            "anything",
-            BinaryOp::Equal
-        ));
+    fn expr_comparison_evaluate_cases() {
+        use BinaryOp::{
+            Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual, NotEqual,
+        };
+        use LiteralValue::{Integer, Null};
+        // Rows are `test_table` rows `[id, name, active]`: `id` with name
+        // 'john', or `None` for a row whose name is NULL. NULL comparisons
+        // other than equality are false.
+        // (label, row id, column, op, literal, literal written first, expected)
+        #[rustfmt::skip]
+        let cases = [
+            ("name = 'john'",           Some("1"),   "name", Equal,              text("john"),  false, true),
+            ("name = 'jane'",           Some("1"),   "name", Equal,              text("jane"),  false, false),
+            ("id = 123",                Some("123"), "id",   Equal,              Integer(123),  false, true),
+            ("NULL name = NULL",        None,        "name", Equal,              Null,          false, true),
+            ("'john' = name",           Some("1"),   "name", Equal,              text("john"),  true,  true),
+            ("name <> 'jane'",          Some("1"),   "name", NotEqual,           text("jane"),  false, true),
+            ("name <> 'john'",          Some("1"),   "name", NotEqual,           text("john"),  false, false),
+            ("id 50 < 100",             Some("50"),  "id",   LessThan,           Integer(100),  false, true),
+            ("id 150 < 100",            Some("150"), "id",   LessThan,           Integer(100),  false, false),
+            ("id 100 <= 100",           Some("100"), "id",   LessThanOrEqual,    Integer(100),  false, true),
+            ("id 50 <= 100",            Some("50"),  "id",   LessThanOrEqual,    Integer(100),  false, true),
+            ("id 150 <= 100",           Some("150"), "id",   LessThanOrEqual,    Integer(100),  false, false),
+            ("id 150 > 100",            Some("150"), "id",   GreaterThan,        Integer(100),  false, true),
+            ("id 50 > 100",             Some("50"),  "id",   GreaterThan,        Integer(100),  false, false),
+            ("id 100 >= 100",           Some("100"), "id",   GreaterThanOrEqual, Integer(100),  false, true),
+            ("id 150 >= 100",           Some("150"), "id",   GreaterThanOrEqual, Integer(100),  false, true),
+            ("id 50 >= 100",            Some("50"),  "id",   GreaterThanOrEqual, Integer(100),  false, false),
+            ("name 'john' < 'zebra'",   Some("1"),   "name", LessThan,           text("zebra"), false, true),
+            ("name 'john' > 'alice'",   Some("1"),   "name", GreaterThan,        text("alice"), false, true),
+            ("NULL name > 'test'",      None,        "name", GreaterThan,        text("test"),  false, false),
+        ];
+        let table = test_table_metadata();
+        for (label, row_id, column, op, literal, literal_first, expected) in cases {
+            let row = match row_id {
+                Some(id) => [Some(id), Some("john"), Some("true")],
+                None => [Some("1"), None, Some("true")],
+            };
+            let row_data: Vec<Option<ByteString>> =
+                row.iter().map(|v| v.map(ByteString::from)).collect();
+            let (lhs, rhs) = (col_expr(&table, column), val_expr(literal.clone()));
+            let expr = match literal_first {
+                true => binary(op, rhs, lhs),
+                false => binary(op, lhs, rhs),
+            };
+            let actual = expr_comparison_evaluate(&expr, &row_data, TABLE);
+            assert_eq!(
+                actual, expected,
+                "{label}: expected {expected}, got {actual} \
+                 (column {column} {op:?} {literal:?}, literal first: {literal_first}, row {row:?})"
+            );
+        }
     }
 
     // ------------------------------------------------------------------
     // expr_comparison_evaluate tests
     // ------------------------------------------------------------------
-
-    #[test]
-    fn expr_comparison_evaluate_string_match() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::Equal,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::String("john".into())),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_comparison_evaluate_string_no_match() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::Equal,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::String("jane".into())),
-        );
-
-        assert!(!expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_comparison_evaluate_integer_match() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::Equal,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(123)),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_comparison_evaluate_null_value() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), None, Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::Equal,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::Null),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_comparison_evaluate_reverse_order() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
-
-        // value = column (reverse order)
-        let expr = binary(
-            BinaryOp::Equal,
-            val_expr(LiteralValue::String("john".into())),
-            col_expr(&table, "name"),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
 
     // ------------------------------------------------------------------
     // where_expr_evaluate tests
@@ -794,13 +683,9 @@ mod tests {
     #[test]
     fn where_expr_evaluate_simple_equality() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("true")]);
 
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::String("john".into())),
-        );
+        let expr = col_cmp(&table, "name", BinaryOp::Equal, text("john"));
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
     }
@@ -808,20 +693,12 @@ mod tests {
     #[test]
     fn where_expr_evaluate_and_operation_both_true() {
         let table = test_table_metadata();
-        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
         let expr = binary_expr(
             BinaryOp::And,
-            binary_expr(
-                BinaryOp::Equal,
-                col_expr(&table, "id"),
-                val_expr(LiteralValue::Integer(123)),
-            ),
-            binary_expr(
-                BinaryOp::Equal,
-                col_expr(&table, "name"),
-                val_expr(LiteralValue::String("john".into())),
-            ),
+            col_cmp(&table, "id", BinaryOp::Equal, int(123)),
+            col_cmp(&table, "name", BinaryOp::Equal, text("john")),
         );
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
@@ -830,20 +707,12 @@ mod tests {
     #[test]
     fn where_expr_evaluate_and_operation_one_false() {
         let table = test_table_metadata();
-        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
         let expr = binary_expr(
             BinaryOp::And,
-            binary_expr(
-                BinaryOp::Equal,
-                col_expr(&table, "id"),
-                val_expr(LiteralValue::Integer(999)),
-            ),
-            binary_expr(
-                BinaryOp::Equal,
-                col_expr(&table, "name"),
-                val_expr(LiteralValue::String("john".into())),
-            ),
+            col_cmp(&table, "id", BinaryOp::Equal, int(999)),
+            col_cmp(&table, "name", BinaryOp::Equal, text("john")),
         );
 
         assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
@@ -852,20 +721,12 @@ mod tests {
     #[test]
     fn where_expr_evaluate_or_operation_one_true() {
         let table = test_table_metadata();
-        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
         let expr = binary_expr(
             BinaryOp::Or,
-            binary_expr(
-                BinaryOp::Equal,
-                col_expr(&table, "id"),
-                val_expr(LiteralValue::Integer(999)),
-            ),
-            binary_expr(
-                BinaryOp::Equal,
-                col_expr(&table, "name"),
-                val_expr(LiteralValue::String("john".into())),
-            ),
+            col_cmp(&table, "id", BinaryOp::Equal, int(999)),
+            col_cmp(&table, "name", BinaryOp::Equal, text("john")),
         );
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
@@ -874,20 +735,12 @@ mod tests {
     #[test]
     fn where_expr_evaluate_or_operation_both_false() {
         let table = test_table_metadata();
-        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
         let expr = binary_expr(
             BinaryOp::Or,
-            binary_expr(
-                BinaryOp::Equal,
-                col_expr(&table, "id"),
-                val_expr(LiteralValue::Integer(999)),
-            ),
-            binary_expr(
-                BinaryOp::Equal,
-                col_expr(&table, "name"),
-                val_expr(LiteralValue::String("jane".into())),
-            ),
+            col_cmp(&table, "id", BinaryOp::Equal, int(999)),
+            col_cmp(&table, "name", BinaryOp::Equal, text("jane")),
         );
 
         assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
@@ -896,13 +749,9 @@ mod tests {
     #[test]
     fn where_expr_evaluate_greater_than() {
         let table = test_table_metadata();
-        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
-        let expr = binary_expr(
-            BinaryOp::GreaterThan,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
+        let expr = col_cmp(&table, "id", BinaryOp::GreaterThan, int(100));
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
     }
@@ -910,7 +759,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_unsupported_expression_type() {
         let table = test_table_metadata();
-        let row_data = vec![Some("123".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("123"), Some("john"), Some("true")]);
 
         let expr = ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Function(ResolvedFunctionCall {
             name: EcoString::from("upper"),
@@ -940,14 +789,10 @@ mod tests {
     fn where_expr_evaluate_identity_text_cast_matches() {
         // `name::text = 'john'` on a TEXT column — cast is identity, must match.
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("true")]);
 
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("john".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("john")));
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
     }
@@ -955,14 +800,10 @@ mod tests {
     #[test]
     fn where_expr_evaluate_identity_text_cast_no_match() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("alice".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("alice"), Some("true")]);
 
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("john".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("john")));
 
         assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
     }
@@ -972,14 +813,10 @@ mod tests {
         // PGC-177: ::text on int column is identity — wire-text matches
         // canonical int→text exactly.
         let table = test_table_metadata();
-        let row_data = vec![Some("42".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("42"), Some("john"), Some("true")]);
 
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "id")));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("42".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("42")));
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
     }
@@ -989,16 +826,12 @@ mod tests {
         // bool wire-text is `t`/`f`; `::text` on bool returns `true`/`false`.
         // Not identity — evaluator must bail back to opaque (return false).
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("t".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("t")]);
 
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(
             &table, "active",
         )));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("true".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("true")));
 
         assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
     }
@@ -1007,14 +840,10 @@ mod tests {
     fn where_expr_evaluate_identity_text_cast_rhs_position() {
         // `'john' = name::text` — cast on RHS, still must match.
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("true")]);
 
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            val_expr(LiteralValue::String("john".into())),
-            cast_col,
-        );
+        let expr = binary_expr(BinaryOp::Equal, val_expr(text("john")), cast_col);
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
     }
@@ -1023,11 +852,7 @@ mod tests {
     fn resolved_where_expr_supported_admits_identity_text_cast() {
         let table = test_table_metadata();
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(&table, "name")));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("john".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("john")));
 
         assert!(resolved_where_expr_supported(&expr));
     }
@@ -1041,11 +866,7 @@ mod tests {
         let cast_col = typecast_text(ResolvedScalarExpr::Column(resolved_column(
             &table, "active",
         )));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("true".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("true")));
 
         assert!(!resolved_where_expr_supported(&expr));
     }
@@ -1064,7 +885,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_text_to_int4_coercion_matches() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("42".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("42"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1082,7 +903,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_text_to_int4_coercion_no_match() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("42".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("42"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1101,7 +922,7 @@ mod tests {
     fn where_expr_evaluate_text_to_int4_unparseable_row_excluded() {
         // `'abc'::int4` raises in postgres; here the row is excluded.
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("abc".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("abc"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1121,17 +942,13 @@ mod tests {
         // ORM-generated `text_col::int = '42'` — string literal whose
         // content parses as int. Must coerce both sides to int and compare.
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("42".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("42"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Int4,
             ResolvedScalarExpr::Column(resolved_column(&table, "name")),
         );
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("42".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("42")));
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
     }
@@ -1141,7 +958,7 @@ mod tests {
         // Numerical compare avoids the lexicographic-string trap:
         // "100" < "42" by bytes, but 100 > 42 by value.
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("100".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("100"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1159,11 +976,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_text_to_int8_wide_range_matches() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".into()),
-            Some("9223372036854775807".into()),
-            Some("true".into()),
-        ];
+        let row_data = row(&[Some("1"), Some("9223372036854775807"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Int8,
@@ -1211,49 +1024,6 @@ mod tests {
         assert!(!resolved_where_expr_supported(&expr));
     }
 
-    #[test]
-    fn literal_compare_integer_against_integer() {
-        assert!(literal_compare(
-            &LiteralValue::Integer(5),
-            BinaryOp::Equal,
-            &LiteralValue::Integer(5),
-        ));
-        assert!(!literal_compare(
-            &LiteralValue::Integer(5),
-            BinaryOp::Equal,
-            &LiteralValue::Integer(6),
-        ));
-        assert!(literal_compare(
-            &LiteralValue::Integer(5),
-            BinaryOp::LessThan,
-            &LiteralValue::Integer(6),
-        ));
-    }
-
-    #[test]
-    fn literal_compare_integer_against_parseable_string() {
-        assert!(literal_compare(
-            &LiteralValue::Integer(42),
-            BinaryOp::Equal,
-            &LiteralValue::String("42".into()),
-        ));
-        // String "0042" parses to 42 — numeric compare, not lexicographic.
-        assert!(literal_compare(
-            &LiteralValue::Integer(42),
-            BinaryOp::Equal,
-            &LiteralValue::String("0042".into()),
-        ));
-    }
-
-    #[test]
-    fn literal_compare_falls_through_on_unparseable_string() {
-        assert!(!literal_compare(
-            &LiteralValue::Integer(42),
-            BinaryOp::Equal,
-            &LiteralValue::String("not-a-number".into()),
-        ));
-    }
-
     // ------------------------------------------------------------------
     // Literal-LHS op-flip — `WHERE 5 < col` must evaluate the same as
     // `WHERE col > 5`. Bug pre-dated PGC-149 in `where_value_compare_string`
@@ -1264,7 +1034,7 @@ mod tests {
     fn where_expr_evaluate_literal_lhs_less_than_column() {
         // SQL `WHERE 5 < id` with id=10 → true (5 < 10).
         let table = test_table_metadata();
-        let row_data = vec![Some("10".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("10"), Some("john"), Some("true")]);
 
         let expr = binary_expr(
             BinaryOp::LessThan,
@@ -1279,7 +1049,7 @@ mod tests {
     fn where_expr_evaluate_literal_lhs_greater_than_column() {
         // SQL `WHERE 5 > id` with id=10 → false (5 > 10 is false).
         let table = test_table_metadata();
-        let row_data = vec![Some("10".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("10"), Some("john"), Some("true")]);
 
         let expr = binary_expr(
             BinaryOp::GreaterThan,
@@ -1294,7 +1064,7 @@ mod tests {
     fn where_expr_evaluate_literal_lhs_less_than_column_no_match() {
         // SQL `WHERE 100 < id` with id=10 → false (100 < 10 is false).
         let table = test_table_metadata();
-        let row_data = vec![Some("10".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("10"), Some("john"), Some("true")]);
 
         let expr = binary_expr(
             BinaryOp::LessThan,
@@ -1310,7 +1080,7 @@ mod tests {
         // SQL `WHERE 5 < name::int4` with name="10" → true (5 < 10).
         // Same flip semantics on the cast-coercion path.
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("10".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("10"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Int4,
@@ -1329,7 +1099,7 @@ mod tests {
     fn where_expr_evaluate_literal_lhs_greater_than_or_equal_column() {
         // SQL `WHERE 10 >= id` with id=10 → true (10 >= 10).
         let table = test_table_metadata();
-        let row_data = vec![Some("10".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("10"), Some("john"), Some("true")]);
 
         let expr = binary_expr(
             BinaryOp::GreaterThanOrEqual,
@@ -1347,7 +1117,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_text_to_bool_coercion_matches() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("true".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("true"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1365,7 +1135,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_text_to_bool_coercion_no_match() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("false".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("false"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1417,17 +1187,13 @@ mod tests {
     fn where_expr_evaluate_text_to_bool_with_string_literal() {
         // ORM-generated `text_col::bool = 't'` — string literal that parses as bool.
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("true".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("true"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Bool,
             ResolvedScalarExpr::Column(resolved_column(&table, "name")),
         );
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("t".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("t")));
 
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
     }
@@ -1437,7 +1203,7 @@ mod tests {
         // Postgres coerces `1` → true / `0` → false in bool comparisons; our
         // evaluator mirrors that so the CDC fast path doesn't silently drop rows.
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("true".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("true"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1455,7 +1221,7 @@ mod tests {
     fn where_expr_evaluate_text_to_bool_inequality_op_rejected() {
         // `<` on bool isn't supported by the wedge — eval returns false.
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("true".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("true"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1472,11 +1238,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_text_to_bool_unparseable_row_excluded() {
         let table = test_table_metadata();
-        let row_data = vec![
-            Some("1".into()),
-            Some("garbage".into()),
-            Some("true".into()),
-        ];
+        let row_data = row(&[Some("1"), Some("garbage"), Some("true")]);
 
         let cast_col = typecast(
             CastTarget::Bool,
@@ -1507,45 +1269,6 @@ mod tests {
         assert!(resolved_where_expr_supported(&expr));
     }
 
-    #[test]
-    fn literal_compare_boolean_pairs() {
-        assert!(literal_compare(
-            &LiteralValue::Boolean(true),
-            BinaryOp::Equal,
-            &LiteralValue::Boolean(true),
-        ));
-        assert!(!literal_compare(
-            &LiteralValue::Boolean(true),
-            BinaryOp::Equal,
-            &LiteralValue::Boolean(false),
-        ));
-        assert!(literal_compare(
-            &LiteralValue::Boolean(true),
-            BinaryOp::NotEqual,
-            &LiteralValue::Boolean(false),
-        ));
-    }
-
-    #[test]
-    fn literal_compare_boolean_against_string_and_integer() {
-        // Mixed bool currency: parseable-bool string and integer 0/1.
-        assert!(literal_compare(
-            &LiteralValue::Boolean(true),
-            BinaryOp::Equal,
-            &LiteralValue::String("yes".into()),
-        ));
-        assert!(literal_compare(
-            &LiteralValue::Boolean(false),
-            BinaryOp::Equal,
-            &LiteralValue::Integer(0),
-        ));
-        assert!(!literal_compare(
-            &LiteralValue::Boolean(true),
-            BinaryOp::Equal,
-            &LiteralValue::Integer(0),
-        ));
-    }
-
     // ------------------------------------------------------------------
     // PGC-180: ::date narrowing from timestamp in comparison eval/classifier
     // ------------------------------------------------------------------
@@ -1562,22 +1285,13 @@ mod tests {
     #[test]
     fn where_expr_evaluate_timestamp_to_date_coercion_matches() {
         let table = test_table_metadata_with_timestamp();
-        let row_data = vec![
-            Some("1".into()),
-            Some("alice".into()),
-            Some("2024-01-15 23:45:00".into()),
-            None,
-        ];
+        let row_data = row(&[Some("1"), Some("alice"), Some("2024-01-15 23:45:00"), None]);
 
         let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
             &table,
             "created_at",
         )));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("2024-01-15".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("2024-01-15")));
 
         assert!(where_expr_evaluate(&expr, &row_data, TS_TABLE));
     }
@@ -1585,22 +1299,13 @@ mod tests {
     #[test]
     fn where_expr_evaluate_timestamp_to_date_coercion_no_match() {
         let table = test_table_metadata_with_timestamp();
-        let row_data = vec![
-            Some("1".into()),
-            Some("alice".into()),
-            Some("2024-01-15 23:45:00".into()),
-            None,
-        ];
+        let row_data = row(&[Some("1"), Some("alice"), Some("2024-01-15 23:45:00"), None]);
 
         let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
             &table,
             "created_at",
         )));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("2024-01-16".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("2024-01-16")));
 
         assert!(!where_expr_evaluate(&expr, &row_data, TS_TABLE));
     }
@@ -1608,12 +1313,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_timestamp_to_date_inequality_compares_chronologically() {
         let table = test_table_metadata_with_timestamp();
-        let row_data = vec![
-            Some("1".into()),
-            Some("alice".into()),
-            Some("2024-03-15 09:00:00".into()),
-            None,
-        ];
+        let row_data = row(&[Some("1"), Some("alice"), Some("2024-03-15 09:00:00"), None]);
 
         let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
             &table,
@@ -1622,7 +1322,7 @@ mod tests {
         let expr = binary_expr(
             BinaryOp::GreaterThan,
             cast_col,
-            val_expr(LiteralValue::String("2024-01-31".into())),
+            val_expr(text("2024-01-31")),
         );
 
         assert!(where_expr_evaluate(&expr, &row_data, TS_TABLE));
@@ -1632,22 +1332,13 @@ mod tests {
     fn where_expr_evaluate_timestamp_to_date_literal_lhs_flips() {
         // Locks PGC-186 fix for the date path too: `'2024-01-01' < ts::date`.
         let table = test_table_metadata_with_timestamp();
-        let row_data = vec![
-            Some("1".into()),
-            Some("alice".into()),
-            Some("2024-03-15 09:00:00".into()),
-            None,
-        ];
+        let row_data = row(&[Some("1"), Some("alice"), Some("2024-03-15 09:00:00"), None]);
 
         let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
             &table,
             "created_at",
         )));
-        let expr = binary_expr(
-            BinaryOp::LessThan,
-            val_expr(LiteralValue::String("2024-01-01".into())),
-            cast_col,
-        );
+        let expr = binary_expr(BinaryOp::LessThan, val_expr(text("2024-01-01")), cast_col);
 
         assert!(where_expr_evaluate(&expr, &row_data, TS_TABLE));
     }
@@ -1658,12 +1349,7 @@ mod tests {
         // `LiteralValue::StringWithCast(...)`. Classifier must accept it and
         // evaluator must compare it the same as a plain String literal.
         let table = test_table_metadata_with_timestamp();
-        let row_data = vec![
-            Some("1".into()),
-            Some("alice".into()),
-            Some("2024-01-15 23:45:00".into()),
-            None,
-        ];
+        let row_data = row(&[Some("1"), Some("alice"), Some("2024-01-15 23:45:00"), None]);
 
         let cast_col = typecast_date(ResolvedScalarExpr::Column(resolved_column(
             &table,
@@ -1688,11 +1374,7 @@ mod tests {
             &table,
             "created_at",
         )));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("2024-01-15".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("2024-01-15")));
 
         assert!(resolved_where_expr_supported(&expr));
     }
@@ -1705,11 +1387,7 @@ mod tests {
             &table,
             "received_at",
         )));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("2024-01-15".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("2024-01-15")));
 
         assert!(!resolved_where_expr_supported(&expr));
     }
@@ -1723,11 +1401,7 @@ mod tests {
             &table,
             "created_at",
         )));
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            cast_col,
-            val_expr(LiteralValue::String("2024-1-15".into())),
-        );
+        let expr = binary_expr(BinaryOp::Equal, cast_col, val_expr(text("2024-1-15")));
 
         assert!(!resolved_where_expr_supported(&expr));
     }
@@ -1748,26 +1422,6 @@ mod tests {
         assert!(!resolved_where_expr_supported(&expr));
     }
 
-    #[test]
-    fn literal_compare_string_to_string_lex_order() {
-        // ISO 8601 dates compare chronologically by bytes.
-        assert!(literal_compare(
-            &LiteralValue::String("2024-01-15".into()),
-            BinaryOp::Equal,
-            &LiteralValue::String("2024-01-15".into()),
-        ));
-        assert!(literal_compare(
-            &LiteralValue::String("2024-01-15".into()),
-            BinaryOp::LessThan,
-            &LiteralValue::String("2024-02-01".into()),
-        ));
-        assert!(!literal_compare(
-            &LiteralValue::String("2024-03-01".into()),
-            BinaryOp::LessThan,
-            &LiteralValue::String("2024-02-01".into()),
-        ));
-    }
-
     // ------------------------------------------------------------------
     // IS TRUE / IS FALSE / IS NOT TRUE / IS NOT FALSE / IS NULL / IS NOT NULL
     // ------------------------------------------------------------------
@@ -1775,7 +1429,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_true_with_true_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("t".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("t")]);
 
         let expr = unary_expr(UnaryOp::IsTrue, col_expr(&table, "active"));
 
@@ -1785,7 +1439,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_true_with_false_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("f".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("f")]);
 
         let expr = unary_expr(UnaryOp::IsTrue, col_expr(&table, "active"));
 
@@ -1795,7 +1449,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_true_with_null_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), None];
+        let row_data = row(&[Some("1"), Some("john"), None]);
 
         let expr = unary_expr(UnaryOp::IsTrue, col_expr(&table, "active"));
 
@@ -1806,7 +1460,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_false_with_false_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("f".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("f")]);
 
         let expr = unary_expr(UnaryOp::IsFalse, col_expr(&table, "active"));
 
@@ -1816,7 +1470,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_false_with_true_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("t".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("t")]);
 
         let expr = unary_expr(UnaryOp::IsFalse, col_expr(&table, "active"));
 
@@ -1826,7 +1480,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_not_true_with_false_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("f".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("f")]);
 
         let expr = unary_expr(UnaryOp::IsNotTrue, col_expr(&table, "active"));
 
@@ -1837,7 +1491,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_not_true_with_null_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), None];
+        let row_data = row(&[Some("1"), Some("john"), None]);
 
         let expr = unary_expr(UnaryOp::IsNotTrue, col_expr(&table, "active"));
 
@@ -1848,7 +1502,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_not_false_with_true_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("t".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("t")]);
 
         let expr = unary_expr(UnaryOp::IsNotFalse, col_expr(&table, "active"));
 
@@ -1858,7 +1512,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_not_false_with_null_value() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), None];
+        let row_data = row(&[Some("1"), Some("john"), None]);
 
         let expr = unary_expr(UnaryOp::IsNotFalse, col_expr(&table, "active"));
 
@@ -1869,7 +1523,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_null_via_unary() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), None];
+        let row_data = row(&[Some("1"), Some("john"), None]);
 
         let expr = unary_expr(UnaryOp::IsNull, col_expr(&table, "active"));
 
@@ -1879,7 +1533,7 @@ mod tests {
     #[test]
     fn where_expr_evaluate_is_not_null_via_unary() {
         let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("t".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("t")]);
 
         let expr = unary_expr(UnaryOp::IsNotNull, col_expr(&table, "active"));
 
@@ -1889,174 +1543,6 @@ mod tests {
     // ------------------------------------------------------------------
     // Comparison operator coverage
     // ------------------------------------------------------------------
-
-    #[test]
-    fn expr_not_equal_evaluate_string_match() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::NotEqual,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::String("jane".into())),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_not_equal_evaluate_string_no_match() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::NotEqual,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::String("john".into())),
-        );
-
-        assert!(!expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_less_than_evaluate_integer_true() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("50".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::LessThan,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_less_than_evaluate_integer_false() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("150".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::LessThan,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
-
-        assert!(!expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_less_than_or_equal_evaluate_integer_equal() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("100".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::LessThanOrEqual,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_less_than_or_equal_evaluate_integer_less() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("50".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::LessThanOrEqual,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_less_than_or_equal_evaluate_integer_false() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("150".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::LessThanOrEqual,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
-
-        assert!(!expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_greater_than_evaluate_integer_true() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("150".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::GreaterThan,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_greater_than_evaluate_integer_false() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("50".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::GreaterThan,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
-
-        assert!(!expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_greater_than_or_equal_evaluate_integer_equal() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("100".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::GreaterThanOrEqual,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_greater_than_or_equal_evaluate_integer_greater() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("150".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::GreaterThanOrEqual,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
-
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_greater_than_or_equal_evaluate_integer_false() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("50".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::GreaterThanOrEqual,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(100)),
-        );
-
-        assert!(!expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
 
     // ------------------------------------------------------------------
     // Type-specific coverage
@@ -2078,12 +1564,7 @@ mod tests {
         });
         table.columns = ColumnStore::new(cols);
 
-        let row_data = vec![
-            Some("1".into()),
-            Some("john".into()),
-            Some("true".into()),
-            Some("99.50".into()),
-        ];
+        let row_data = row(&[Some("1"), Some("john"), Some("true"), Some("99.50")]);
 
         let expr = binary(
             BinaryOp::LessThan,
@@ -2096,48 +1577,6 @@ mod tests {
             BinaryOp::GreaterThan,
             col_expr(&table, "price"),
             val_expr(LiteralValue::Float(NotNan::new(50.0).unwrap())),
-        );
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_comparison_evaluate_string_operations() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
-
-        let expr = binary(
-            BinaryOp::LessThan,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::String("zebra".into())),
-        );
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-
-        let expr = binary(
-            BinaryOp::GreaterThan,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::String("alice".into())),
-        );
-        assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
-    }
-
-    #[test]
-    fn expr_comparison_evaluate_null_handling() {
-        let table = test_table_metadata();
-        let row_data = vec![Some("1".into()), None, Some("true".into())];
-
-        // NULL comparisons other than equality return false
-        let expr = binary(
-            BinaryOp::GreaterThan,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::String("test".into())),
-        );
-        assert!(!expr_comparison_evaluate(&expr, &row_data, TABLE));
-
-        // Equality with NULL filter + NULL row value matches
-        let expr = binary(
-            BinaryOp::Equal,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::Null),
         );
         assert!(expr_comparison_evaluate(&expr, &row_data, TABLE));
     }
@@ -2159,7 +1598,7 @@ mod tests {
             val_expr(LiteralValue::Integer(1)),
         );
 
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("true")]);
         assert!(!where_expr_evaluate(&expr, &row_data, TABLE));
     }
 
@@ -2170,11 +1609,7 @@ mod tests {
     #[test]
     fn supported_bare_equality() {
         let table = test_table_metadata();
-        let expr = binary_expr(
-            BinaryOp::Equal,
-            col_expr(&table, "id"),
-            val_expr(LiteralValue::Integer(5)),
-        );
+        let expr = col_cmp(&table, "id", BinaryOp::Equal, int(5));
         assert!(resolved_where_expr_supported(&expr));
     }
 
@@ -2185,16 +1620,8 @@ mod tests {
             BinaryOp::And,
             binary_expr(
                 BinaryOp::Or,
-                binary_expr(
-                    BinaryOp::Equal,
-                    col_expr(&table, "id"),
-                    val_expr(LiteralValue::Integer(1)),
-                ),
-                binary_expr(
-                    BinaryOp::Equal,
-                    col_expr(&table, "id"),
-                    val_expr(LiteralValue::Integer(2)),
-                ),
+                col_cmp(&table, "id", BinaryOp::Equal, int(1)),
+                col_cmp(&table, "id", BinaryOp::Equal, int(2)),
             ),
             unary_expr(UnaryOp::IsNotNull, col_expr(&table, "name")),
         );
@@ -2217,11 +1644,7 @@ mod tests {
     #[test]
     fn unsupported_like() {
         let table = test_table_metadata();
-        let expr = binary_expr(
-            BinaryOp::Like,
-            col_expr(&table, "name"),
-            val_expr(LiteralValue::String("j%".into())),
-        );
+        let expr = col_cmp(&table, "name", BinaryOp::Like, text("j%"));
         assert!(!resolved_where_expr_supported(&expr));
     }
 
@@ -2289,16 +1712,8 @@ mod tests {
         let table = test_table_metadata();
         let expr = binary_expr(
             BinaryOp::And,
-            binary_expr(
-                BinaryOp::Equal,
-                col_expr(&table, "id"),
-                val_expr(LiteralValue::Integer(1)),
-            ),
-            binary_expr(
-                BinaryOp::Like,
-                col_expr(&table, "name"),
-                val_expr(LiteralValue::String("j%".into())),
-            ),
+            col_cmp(&table, "id", BinaryOp::Equal, int(1)),
+            col_cmp(&table, "name", BinaryOp::Like, text("j%")),
         );
         assert!(!resolved_where_expr_supported(&expr));
     }
@@ -2317,7 +1732,7 @@ mod tests {
             ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(other_col)),
         );
 
-        let row_data = vec![Some("1".into()), Some("john".into()), Some("true".into())];
+        let row_data = row(&[Some("1"), Some("john"), Some("true")]);
         assert!(where_expr_evaluate(&expr, &row_data, TABLE));
     }
 
@@ -2362,21 +1777,9 @@ mod tests {
         let table = test_table_metadata();
         let exprs = vec![
             // bare comparisons (both operand orders), every operator
-            binary_expr(
-                BinaryOp::Equal,
-                col_expr(&table, "name"),
-                val_expr(LiteralValue::String("john".into())),
-            ),
-            binary_expr(
-                BinaryOp::NotEqual,
-                col_expr(&table, "name"),
-                val_expr(LiteralValue::String("john".into())),
-            ),
-            binary_expr(
-                BinaryOp::GreaterThan,
-                col_expr(&table, "id"),
-                val_expr(LiteralValue::Integer(5)),
-            ),
+            col_cmp(&table, "name", BinaryOp::Equal, text("john")),
+            col_cmp(&table, "name", BinaryOp::NotEqual, text("john")),
+            col_cmp(&table, "id", BinaryOp::GreaterThan, int(5)),
             binary_expr(
                 BinaryOp::LessThanOrEqual,
                 val_expr(LiteralValue::Integer(5)),
@@ -2390,38 +1793,15 @@ mod tests {
             // AND / OR / NOT
             binary_expr(
                 BinaryOp::And,
-                binary_expr(
-                    BinaryOp::Equal,
-                    col_expr(&table, "id"),
-                    val_expr(LiteralValue::Integer(1)),
-                ),
-                binary_expr(
-                    BinaryOp::Equal,
-                    col_expr(&table, "name"),
-                    val_expr(LiteralValue::String("john".into())),
-                ),
+                col_cmp(&table, "id", BinaryOp::Equal, int(1)),
+                col_cmp(&table, "name", BinaryOp::Equal, text("john")),
             ),
             binary_expr(
                 BinaryOp::Or,
-                binary_expr(
-                    BinaryOp::Equal,
-                    col_expr(&table, "id"),
-                    val_expr(LiteralValue::Integer(99)),
-                ),
-                binary_expr(
-                    BinaryOp::Equal,
-                    col_expr(&table, "active"),
-                    val_expr(LiteralValue::String("true".into())),
-                ),
+                col_cmp(&table, "id", BinaryOp::Equal, int(99)),
+                col_cmp(&table, "active", BinaryOp::Equal, text("true")),
             ),
-            unary_expr(
-                UnaryOp::Not,
-                binary_expr(
-                    BinaryOp::Equal,
-                    col_expr(&table, "id"),
-                    val_expr(LiteralValue::Integer(1)),
-                ),
-            ),
+            unary_expr(UnaryOp::Not, col_cmp(&table, "id", BinaryOp::Equal, int(1))),
             // IS [NOT] NULL / TRUE / FALSE on a column and on a cross-table column
             unary_expr(UnaryOp::IsNull, col_expr(&table, "name")),
             unary_expr(UnaryOp::IsNotNull, col_expr(&table, "name")),
@@ -2432,11 +1812,7 @@ mod tests {
             // !false = true; compiler must agree via Not(ConstFalse)
             unary_expr(
                 UnaryOp::Not,
-                binary_expr(
-                    BinaryOp::Like,
-                    col_expr(&table, "name"),
-                    val_expr(LiteralValue::String("j%".into())),
-                ),
+                col_cmp(&table, "name", BinaryOp::Like, text("j%")),
             ),
             // cast-coercion comparison: text col ::int4 = 42
             binary_expr(
@@ -2448,11 +1824,7 @@ mod tests {
                 val_expr(LiteralValue::Integer(42)),
             ),
             // unsupported shapes the oracle decides false for
-            binary_expr(
-                BinaryOp::Like,
-                col_expr(&table, "name"),
-                val_expr(LiteralValue::String("j%".into())),
-            ),
+            col_cmp(&table, "name", BinaryOp::Like, text("j%")),
             col_expr(&table, "id"), // bare Scalar
         ];
         for expr in &exprs {
