@@ -76,8 +76,11 @@ pub(super) fn pg_days_to_ymd(days: i32) -> (i32, u32, u32) {
     let month = (q + 10) % 12 + 1;
 
     let year_combined = i64::from(y) + i64::from(quad2) * 4 - 4_800;
-    let year = i32::try_from(year_combined.clamp(i64::from(i32::MIN), i64::from(i32::MAX)))
-        .expect("clamped to i32 range");
+    let year = i32::try_from(year_combined).unwrap_or(if year_combined < 0 {
+        i32::MIN
+    } else {
+        i32::MAX
+    });
     (year, month, day)
 }
 
