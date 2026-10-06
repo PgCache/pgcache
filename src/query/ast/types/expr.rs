@@ -35,17 +35,7 @@ pub enum LiteralValue {
     Array(Vec<LiteralValue>, EcoString),
 }
 
-impl AstNode for LiteralValue {
-    fn try_for_each_node<'a, N: Any, B>(
-        &'a self,
-        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
-        ControlFlow::Continue(())
-    }
-}
+impl AstNode for LiteralValue {}
 
 impl LiteralValue {
     /// Check if an Option<String> (from CDC row data) matches this LiteralValue.
@@ -237,17 +227,7 @@ pub struct ColumnNode {
     pub column: EcoString,
 }
 
-impl AstNode for ColumnNode {
-    fn try_for_each_node<'a, N: Any, B>(
-        &'a self,
-        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
-        ControlFlow::Continue(())
-    }
-}
+impl AstNode for ColumnNode {}
 
 impl Deparse for ColumnNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
@@ -410,13 +390,10 @@ pub struct UnaryExpr {
 }
 
 impl AstNode for UnaryExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.expr.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
@@ -468,13 +445,10 @@ pub struct BinaryExpr {
 }
 
 impl AstNode for BinaryExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.lexpr.try_for_each_node(f)?;
         self.rexpr.try_for_each_node(f)?;
         ControlFlow::Continue(())
@@ -528,13 +502,10 @@ pub struct MultiExpr {
 }
 
 impl AstNode for MultiExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         for expr in &self.exprs {
             expr.try_for_each_node(f)?;
         }
@@ -614,13 +585,10 @@ pub enum WhereExpr {
 }
 
 impl AstNode for WhereExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             WhereExpr::Scalar(scalar) => scalar.try_for_each_node(f)?,
             WhereExpr::Unary(unary) => unary.try_for_each_node(f)?,
@@ -799,13 +767,10 @@ pub struct ArithmeticExpr {
 }
 
 impl AstNode for ArithmeticExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.left.try_for_each_node(f)?;
         self.right.try_for_each_node(f)?;
         ControlFlow::Continue(())
@@ -853,13 +818,10 @@ pub enum ScalarExpr {
 }
 
 impl AstNode for ScalarExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             ScalarExpr::Column(col) => col.try_for_each_node(f)?,
             ScalarExpr::Function(func) => func.try_for_each_node(f)?,
@@ -998,13 +960,10 @@ pub struct CaseExpr {
 }
 
 impl AstNode for CaseExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         if let Some(a) = &self.arg {
             a.try_for_each_node(f)?;
         }
@@ -1059,7 +1018,7 @@ pub struct CaseWhen {
 }
 
 impl AstNode for CaseWhen {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {

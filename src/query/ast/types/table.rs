@@ -54,7 +54,7 @@ pub struct CteRefNode {
 }
 
 impl AstNode for TableSource {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -156,17 +156,7 @@ pub struct TableNode {
     pub alias: Option<TableAlias>,
 }
 
-impl AstNode for TableNode {
-    fn try_for_each_node<'a, N: Any, B>(
-        &'a self,
-        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
-        ControlFlow::Continue(())
-    }
-}
+impl AstNode for TableNode {}
 
 impl Deparse for TableNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
@@ -195,13 +185,10 @@ pub struct TableSubqueryNode {
 }
 
 impl AstNode for TableSubqueryNode {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.query.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
@@ -228,13 +215,10 @@ impl Deparse for TableSubqueryNode {
 }
 
 impl AstNode for CteRefNode {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.query.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
@@ -280,15 +264,10 @@ pub struct JoinNode {
 }
 
 impl AstNode for JoinNode {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        // Self-visit like every other node type, so `nodes::<JoinNode>()` finds
-        // a join called on directly (not only joins nested under a TableSource).
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.left.try_for_each_node(f)?;
         self.right.try_for_each_node(f)?;
         if let JoinQual::On(c) = &self.qual {

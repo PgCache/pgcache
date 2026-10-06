@@ -18,13 +18,10 @@ pub struct FunctionCall {
 }
 
 impl AstNode for FunctionCall {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         for arg in &self.args {
             arg.try_for_each_node(f)?;
         }
@@ -110,13 +107,10 @@ pub struct WindowSpec {
 }
 
 impl AstNode for WindowSpec {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         for p in &self.partition_by {
             p.try_for_each_node(f)?;
         }
@@ -155,13 +149,10 @@ pub struct WindowFrame {
 }
 
 impl AstNode for WindowFrame {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.start.try_for_each_node(f)?;
         self.end.try_for_each_node(f)?;
         ControlFlow::Continue(())
@@ -220,13 +211,10 @@ impl FrameBound {
 }
 
 impl AstNode for FrameBound {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             FrameBound::OffsetPreceding(e) | FrameBound::OffsetFollowing(e) => {
                 e.try_for_each_node(f)?;

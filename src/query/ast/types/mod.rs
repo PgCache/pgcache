@@ -11,13 +11,29 @@ pub use query::*;
 pub use table::*;
 pub use window::*;
 
-/// Traversable AST node. The zero-allocation `try_for_each_node` visitor is
-/// hand-written per type; `nodes()` is a provided collecting wrapper over it.
-pub trait AstNode {
+/// Traversable AST node: a zero-allocation pre-order walk. Each type implements
+/// only [`AstNode::try_for_each_child`]; visiting the node itself is provided,
+/// so no type can skip it or visit out of order.
+pub trait AstNode: Any + Sized {
+    /// Visit this node, then every descendant, in pre-order.
     fn try_for_each_node<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
-    ) -> ControlFlow<B>;
+    ) -> ControlFlow<B> {
+        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
+            f(r)?;
+        }
+        self.try_for_each_child(f)
+    }
+
+    /// Walk each direct child's subtree (via its `try_for_each_node`). Leaf
+    /// types have none.
+    fn try_for_each_child<'a, N: Any, B>(
+        &'a self,
+        _f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+    ) -> ControlFlow<B> {
+        ControlFlow::Continue(())
+    }
 
     /// Collect all descendant nodes of type `N` (provided).
     fn nodes<N: Any>(&self) -> impl Iterator<Item = &N> {

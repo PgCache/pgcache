@@ -42,7 +42,7 @@ fn reject(column: &ResolvedColumnNode, position: &'static str) -> Report<Resolve
 }
 
 /// First enum-ordered column reachable under `node`, if any.
-fn enum_column_find<N: AstNode + ?Sized>(node: &N) -> Option<&ResolvedColumnNode> {
+fn enum_column_find<N: AstNode>(node: &N) -> Option<&ResolvedColumnNode> {
     match node.try_for_each_node::<ResolvedColumnNode, &ResolvedColumnNode>(&mut |c| {
         if c.column_metadata.is_enum_ordered() {
             ControlFlow::Break(c)

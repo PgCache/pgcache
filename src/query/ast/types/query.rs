@@ -38,7 +38,7 @@ pub struct ValuesClause {
 }
 
 impl AstNode for ValuesClause {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -102,7 +102,7 @@ impl Default for SelectNode {
 }
 
 impl AstNode for SelectNode {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -223,13 +223,10 @@ pub struct SetOpNode {
 }
 
 impl AstNode for SetOpNode {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.left.try_for_each_node(f)?;
         self.right.try_for_each_node(f)?;
         ControlFlow::Continue(())
@@ -265,13 +262,10 @@ pub enum QueryBody {
 }
 
 impl AstNode for QueryBody {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             QueryBody::Select(select) => select.try_for_each_node(f)?,
             QueryBody::Values(values) => values.try_for_each_node(f)?,
@@ -349,13 +343,10 @@ pub struct CteDefinition {
 }
 
 impl AstNode for QueryExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         for c in &self.ctes {
             c.query.try_for_each_node(f)?;
         }
@@ -545,13 +536,10 @@ pub enum SelectColumns {
 }
 
 impl AstNode for SelectColumns {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             SelectColumns::None => {}
             SelectColumns::Columns(columns) => {
@@ -636,13 +624,10 @@ impl SelectColumn {
 }
 
 impl AstNode for SelectColumn {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             SelectColumn::Expr { expr, .. } => expr.try_for_each_node(f)?,
             SelectColumn::Star(_) => {}
@@ -682,13 +667,10 @@ pub struct OrderByClause {
 }
 
 impl AstNode for OrderByClause {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.expr.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
@@ -713,17 +695,7 @@ pub enum NullOrder {
     NullsLast,
 }
 
-impl AstNode for NullOrder {
-    fn try_for_each_node<'a, N: Any, B>(
-        &'a self,
-        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
-        ControlFlow::Continue(())
-    }
-}
+impl AstNode for NullOrder {}
 
 impl Deparse for NullOrder {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
@@ -742,17 +714,7 @@ pub enum OrderDirection {
     Desc,
 }
 
-impl AstNode for OrderDirection {
-    fn try_for_each_node<'a, N: Any, B>(
-        &'a self,
-        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
-        ControlFlow::Continue(())
-    }
-}
+impl AstNode for OrderDirection {}
 
 impl Deparse for OrderDirection {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {

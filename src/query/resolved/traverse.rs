@@ -23,51 +23,25 @@ use super::{
 };
 use crate::query::ast::AstNode;
 
-impl AstNode for ResolvedTableNode {
-    fn try_for_each_node<'a, N: Any, B>(
-        &'a self,
-        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
-        ControlFlow::Continue(())
-    }
-}
+impl AstNode for ResolvedTableNode {}
 
-impl AstNode for ResolvedColumnNode {
-    fn try_for_each_node<'a, N: Any, B>(
-        &'a self,
-        f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
-    ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
-        ControlFlow::Continue(())
-    }
-}
+impl AstNode for ResolvedColumnNode {}
 
 impl AstNode for ResolvedUnaryExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.expr.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
 }
 
 impl AstNode for ResolvedBinaryExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.lexpr.try_for_each_node(f)?;
         self.rexpr.try_for_each_node(f)?;
         ControlFlow::Continue(())
@@ -75,13 +49,10 @@ impl AstNode for ResolvedBinaryExpr {
 }
 
 impl AstNode for ResolvedMultiExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         for expr in &self.exprs {
             expr.try_for_each_node(f)?;
         }
@@ -90,13 +61,10 @@ impl AstNode for ResolvedMultiExpr {
 }
 
 impl AstNode for ResolvedWhereExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             ResolvedWhereExpr::Scalar(scalar) => scalar.try_for_each_node(f)?,
             ResolvedWhereExpr::Unary(unary) => unary.try_for_each_node(f)?,
@@ -116,13 +84,10 @@ impl AstNode for ResolvedWhereExpr {
 }
 
 impl AstNode for ResolvedArithmeticExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.left.try_for_each_node(f)?;
         self.right.try_for_each_node(f)?;
         ControlFlow::Continue(())
@@ -130,13 +95,10 @@ impl AstNode for ResolvedArithmeticExpr {
 }
 
 impl AstNode for ResolvedFunctionCall {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         for arg in &self.args {
             arg.try_for_each_node(f)?;
         }
@@ -154,13 +116,10 @@ impl AstNode for ResolvedFunctionCall {
 }
 
 impl AstNode for ResolvedWindowSpec {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         for p in &self.partition_by {
             p.try_for_each_node(f)?;
         }
@@ -175,13 +134,10 @@ impl AstNode for ResolvedWindowSpec {
 }
 
 impl AstNode for ResolvedWindowFrame {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.start.try_for_each_node(f)?;
         self.end.try_for_each_node(f)?;
         ControlFlow::Continue(())
@@ -189,13 +145,10 @@ impl AstNode for ResolvedWindowFrame {
 }
 
 impl AstNode for ResolvedFrameBound {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             ResolvedFrameBound::OffsetPreceding(e) | ResolvedFrameBound::OffsetFollowing(e) => {
                 e.try_for_each_node(f)?;
@@ -209,13 +162,10 @@ impl AstNode for ResolvedFrameBound {
 }
 
 impl AstNode for ResolvedScalarExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             ResolvedScalarExpr::Column(col) => col.try_for_each_node(f)?,
             ResolvedScalarExpr::Identifier(_) => {}
@@ -236,13 +186,10 @@ impl AstNode for ResolvedScalarExpr {
 }
 
 impl AstNode for ResolvedCaseExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         if let Some(a) = &self.arg {
             a.try_for_each_node(f)?;
         }
@@ -257,7 +204,7 @@ impl AstNode for ResolvedCaseExpr {
 }
 
 impl AstNode for ResolvedCaseWhen {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
@@ -268,26 +215,20 @@ impl AstNode for ResolvedCaseWhen {
 }
 
 impl AstNode for ResolvedSelectColumn {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.expr.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
 }
 
 impl AstNode for ResolvedSelectColumns {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             ResolvedSelectColumns::None => {}
             ResolvedSelectColumns::Columns(cols) => {
@@ -301,13 +242,10 @@ impl AstNode for ResolvedSelectColumns {
 }
 
 impl AstNode for ResolvedTableSource {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             ResolvedTableSource::Table(table) => table.try_for_each_node(f)?,
             ResolvedTableSource::Subquery(subquery) => subquery.try_for_each_node(f)?,
@@ -318,26 +256,20 @@ impl AstNode for ResolvedTableSource {
 }
 
 impl AstNode for ResolvedTableSubqueryNode {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.query.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
 }
 
 impl AstNode for ResolvedJoinNode {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.left.try_for_each_node(f)?;
         self.right.try_for_each_node(f)?;
         if let Some(c) = self.predicate() {
@@ -348,26 +280,20 @@ impl AstNode for ResolvedJoinNode {
 }
 
 impl AstNode for ResolvedOrderByClause {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.expr.try_for_each_node(f)?;
         ControlFlow::Continue(())
     }
 }
 
 impl AstNode for ResolvedSelectNode {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.columns.try_for_each_node(f)?;
         for t in &self.from {
             t.try_for_each_node(f)?;
@@ -386,13 +312,10 @@ impl AstNode for ResolvedSelectNode {
 }
 
 impl AstNode for ResolvedSetOpNode {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.left.try_for_each_node(f)?;
         self.right.try_for_each_node(f)?;
         ControlFlow::Continue(())
@@ -400,13 +323,10 @@ impl AstNode for ResolvedSetOpNode {
 }
 
 impl AstNode for ResolvedQueryBody {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         match self {
             ResolvedQueryBody::Select(select) => select.try_for_each_node(f)?,
             ResolvedQueryBody::Values(values) => values.try_for_each_node(f)?,
@@ -417,13 +337,10 @@ impl AstNode for ResolvedQueryBody {
 }
 
 impl AstNode for ResolvedQueryExpr {
-    fn try_for_each_node<'a, N: Any, B>(
+    fn try_for_each_child<'a, N: Any, B>(
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(r) = (self as &dyn Any).downcast_ref::<N>() {
-            f(r)?;
-        }
         self.body.try_for_each_node(f)?;
         for o in &self.order_by {
             o.try_for_each_node(f)?;
