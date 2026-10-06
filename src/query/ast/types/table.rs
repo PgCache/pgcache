@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
-use super::{AstNode, CteMaterialization, QueryExpr, SelectNode, WhereExpr};
+use super::{AstNode, CteMaterialization, QueryExpr, SelectNode, WhereExpr, children_visit};
 use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::query::ast::Deparse;
 
@@ -268,8 +268,7 @@ impl AstNode for JoinNode {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        self.left.try_for_each_node(f)?;
-        self.right.try_for_each_node(f)?;
+        children_visit([&*self.left, &*self.right], f)?;
         if let JoinQual::On(c) = &self.qual {
             c.try_for_each_node(f)?;
         }

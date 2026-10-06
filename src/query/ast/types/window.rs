@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
-use super::{AstNode, OrderByClause, ScalarExpr, WhereExpr};
+use super::{AstNode, OrderByClause, ScalarExpr, WhereExpr, children_visit};
 use crate::query::ast::Deparse;
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -22,19 +22,10 @@ impl AstNode for FunctionCall {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        for arg in &self.args {
-            arg.try_for_each_node(f)?;
-        }
-        for o in &self.agg_order {
-            o.try_for_each_node(f)?;
-        }
-        if let Some(filter) = &self.agg_filter {
-            filter.try_for_each_node(f)?;
-        }
-        if let Some(over) = &self.over {
-            over.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(&self.args, f)?;
+        children_visit(&self.agg_order, f)?;
+        children_visit(self.agg_filter.as_deref(), f)?;
+        children_visit(self.over.as_ref(), f)
     }
 }
 
@@ -111,16 +102,9 @@ impl AstNode for WindowSpec {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        for p in &self.partition_by {
-            p.try_for_each_node(f)?;
-        }
-        for o in &self.order_by {
-            o.try_for_each_node(f)?;
-        }
-        if let Some(frame) = &self.frame {
-            frame.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(&self.partition_by, f)?;
+        children_visit(&self.order_by, f)?;
+        children_visit(self.frame.as_ref(), f)
     }
 }
 
@@ -153,9 +137,7 @@ impl AstNode for WindowFrame {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        self.start.try_for_each_node(f)?;
-        self.end.try_for_each_node(f)?;
-        ControlFlow::Continue(())
+        children_visit([&self.start, &self.end], f)
     }
 }
 

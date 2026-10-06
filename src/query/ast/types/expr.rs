@@ -6,7 +6,7 @@ use ordered_float::NotNan;
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
-use super::{AstNode, FunctionCall, QueryExpr, SelectNode};
+use super::{AstNode, FunctionCall, QueryExpr, SelectNode, children_visit};
 use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::query::ast::Deparse;
 use crate::query::cast::{CastTarget, cast_target_deparse};
@@ -449,9 +449,7 @@ impl AstNode for BinaryExpr {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        self.lexpr.try_for_each_node(f)?;
-        self.rexpr.try_for_each_node(f)?;
-        ControlFlow::Continue(())
+        children_visit([&*self.lexpr, &*self.rexpr], f)
     }
 }
 
@@ -506,10 +504,7 @@ impl AstNode for MultiExpr {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        for expr in &self.exprs {
-            expr.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(&self.exprs, f)
     }
 }
 
@@ -771,9 +766,7 @@ impl AstNode for ArithmeticExpr {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        self.left.try_for_each_node(f)?;
-        self.right.try_for_each_node(f)?;
-        ControlFlow::Continue(())
+        children_visit([&*self.left, &*self.right], f)
     }
 }
 
@@ -830,9 +823,7 @@ impl AstNode for ScalarExpr {
             ScalarExpr::Arithmetic(arith) => arith.try_for_each_node(f)?,
             ScalarExpr::Subquery(query) => query.try_for_each_node(f)?,
             ScalarExpr::Array(elems) => {
-                for e in elems {
-                    e.try_for_each_node(f)?;
-                }
+                children_visit(elems, f)?;
             }
             ScalarExpr::TypeCast { expr, .. } => expr.try_for_each_node(f)?,
         }
@@ -964,16 +955,9 @@ impl AstNode for CaseExpr {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(a) = &self.arg {
-            a.try_for_each_node(f)?;
-        }
-        for w in &self.whens {
-            w.try_for_each_node(f)?;
-        }
-        if let Some(d) = &self.default {
-            d.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(self.arg.as_deref(), f)?;
+        children_visit(&self.whens, f)?;
+        children_visit(self.default.as_deref(), f)
     }
 }
 
@@ -1023,8 +1007,7 @@ impl AstNode for CaseWhen {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         self.condition.try_for_each_node(f)?;
-        self.result.try_for_each_node(f)?;
-        ControlFlow::Continue(())
+        self.result.try_for_each_node(f)
     }
 }
 

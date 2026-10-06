@@ -21,7 +21,7 @@ use super::{
     ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource, ResolvedTableSubqueryNode,
     ResolvedUnaryExpr, ResolvedWhereExpr, ResolvedWindowFrame, ResolvedWindowSpec,
 };
-use crate::query::ast::AstNode;
+use crate::query::ast::{AstNode, children_visit};
 
 impl AstNode for ResolvedTableNode {}
 
@@ -42,9 +42,7 @@ impl AstNode for ResolvedBinaryExpr {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        self.lexpr.try_for_each_node(f)?;
-        self.rexpr.try_for_each_node(f)?;
-        ControlFlow::Continue(())
+        children_visit([&*self.lexpr, &*self.rexpr], f)
     }
 }
 
@@ -53,10 +51,7 @@ impl AstNode for ResolvedMultiExpr {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        for expr in &self.exprs {
-            expr.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(&self.exprs, f)
     }
 }
 
@@ -88,9 +83,7 @@ impl AstNode for ResolvedArithmeticExpr {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        self.left.try_for_each_node(f)?;
-        self.right.try_for_each_node(f)?;
-        ControlFlow::Continue(())
+        children_visit([&*self.left, &*self.right], f)
     }
 }
 
@@ -99,19 +92,10 @@ impl AstNode for ResolvedFunctionCall {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        for arg in &self.args {
-            arg.try_for_each_node(f)?;
-        }
-        for o in &self.agg_order {
-            o.try_for_each_node(f)?;
-        }
-        if let Some(filter) = &self.agg_filter {
-            filter.try_for_each_node(f)?;
-        }
-        if let Some(w) = &self.over {
-            w.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(&self.args, f)?;
+        children_visit(&self.agg_order, f)?;
+        children_visit(self.agg_filter.as_deref(), f)?;
+        children_visit(self.over.as_ref(), f)
     }
 }
 
@@ -120,16 +104,9 @@ impl AstNode for ResolvedWindowSpec {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        for p in &self.partition_by {
-            p.try_for_each_node(f)?;
-        }
-        for o in &self.order_by {
-            o.try_for_each_node(f)?;
-        }
-        if let Some(frame) = &self.frame {
-            frame.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(&self.partition_by, f)?;
+        children_visit(&self.order_by, f)?;
+        children_visit(self.frame.as_ref(), f)
     }
 }
 
@@ -138,9 +115,7 @@ impl AstNode for ResolvedWindowFrame {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        self.start.try_for_each_node(f)?;
-        self.end.try_for_each_node(f)?;
-        ControlFlow::Continue(())
+        children_visit([&self.start, &self.end], f)
     }
 }
 
@@ -175,9 +150,7 @@ impl AstNode for ResolvedScalarExpr {
             ResolvedScalarExpr::Arithmetic(arith) => arith.try_for_each_node(f)?,
             ResolvedScalarExpr::Subquery(query, _) => query.try_for_each_node(f)?,
             ResolvedScalarExpr::Array(elems) => {
-                for e in elems {
-                    e.try_for_each_node(f)?;
-                }
+                children_visit(elems, f)?;
             }
             ResolvedScalarExpr::TypeCast { expr, .. } => expr.try_for_each_node(f)?,
         }
@@ -190,16 +163,9 @@ impl AstNode for ResolvedCaseExpr {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        if let Some(a) = &self.arg {
-            a.try_for_each_node(f)?;
-        }
-        for w in &self.whens {
-            w.try_for_each_node(f)?;
-        }
-        if let Some(d) = &self.default {
-            d.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(self.arg.as_deref(), f)?;
+        children_visit(&self.whens, f)?;
+        children_visit(self.default.as_deref(), f)
     }
 }
 
@@ -209,8 +175,7 @@ impl AstNode for ResolvedCaseWhen {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         self.condition.try_for_each_node(f)?;
-        self.result.try_for_each_node(f)?;
-        ControlFlow::Continue(())
+        self.result.try_for_each_node(f)
     }
 }
 
@@ -232,9 +197,7 @@ impl AstNode for ResolvedSelectColumns {
         match self {
             ResolvedSelectColumns::None => {}
             ResolvedSelectColumns::Columns(cols) => {
-                for col in cols {
-                    col.try_for_each_node(f)?;
-                }
+                children_visit(cols, f)?;
             }
         }
         ControlFlow::Continue(())
@@ -270,8 +233,7 @@ impl AstNode for ResolvedJoinNode {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        self.left.try_for_each_node(f)?;
-        self.right.try_for_each_node(f)?;
+        children_visit([&self.left, &self.right], f)?;
         if let Some(c) = self.predicate() {
             c.try_for_each_node(f)?;
         }
@@ -295,19 +257,10 @@ impl AstNode for ResolvedSelectNode {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         self.columns.try_for_each_node(f)?;
-        for t in &self.from {
-            t.try_for_each_node(f)?;
-        }
-        if let Some(w) = &self.where_clause {
-            w.try_for_each_node(f)?;
-        }
-        for c in &self.group_by {
-            c.try_for_each_node(f)?;
-        }
-        if let Some(h) = &self.having {
-            h.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(&self.from, f)?;
+        children_visit(self.where_clause.as_ref(), f)?;
+        children_visit(&self.group_by, f)?;
+        children_visit(self.having.as_ref(), f)
     }
 }
 
@@ -316,9 +269,7 @@ impl AstNode for ResolvedSetOpNode {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        self.left.try_for_each_node(f)?;
-        self.right.try_for_each_node(f)?;
-        ControlFlow::Continue(())
+        children_visit([&*self.left, &*self.right], f)
     }
 }
 
@@ -342,9 +293,6 @@ impl AstNode for ResolvedQueryExpr {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         self.body.try_for_each_node(f)?;
-        for o in &self.order_by {
-            o.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(&self.order_by, f)
     }
 }

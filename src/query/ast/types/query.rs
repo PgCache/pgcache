@@ -4,7 +4,10 @@ use std::ops::ControlFlow;
 use ecow::EcoString;
 use smallvec::SmallVec;
 
-use super::{AstNode, ColumnNode, LiteralValue, ScalarExpr, TableNode, TableSource, WhereExpr};
+use super::{
+    AstNode, ColumnNode, LiteralValue, ScalarExpr, TableNode, TableSource, WhereExpr,
+    children_visit,
+};
 use crate::cache::UpdateQuerySource;
 use crate::query::ast::Deparse;
 
@@ -43,9 +46,7 @@ impl AstNode for ValuesClause {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         for row in &self.rows {
-            for v in row {
-                v.try_for_each_node(f)?;
-            }
+            children_visit(row, f)?;
         }
         ControlFlow::Continue(())
     }
@@ -107,19 +108,10 @@ impl AstNode for SelectNode {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         self.columns.try_for_each_node(f)?;
-        for t in &self.from {
-            t.try_for_each_node(f)?;
-        }
-        if let Some(w) = &self.where_clause {
-            w.try_for_each_node(f)?;
-        }
-        for c in &self.group_by {
-            c.try_for_each_node(f)?;
-        }
-        if let Some(h) = &self.having {
-            h.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(&self.from, f)?;
+        children_visit(self.where_clause.as_ref(), f)?;
+        children_visit(&self.group_by, f)?;
+        children_visit(self.having.as_ref(), f)
     }
 }
 
@@ -224,9 +216,7 @@ impl AstNode for SetOpNode {
         &'a self,
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
-        self.left.try_for_each_node(f)?;
-        self.right.try_for_each_node(f)?;
-        ControlFlow::Continue(())
+        children_visit([&*self.left, &*self.right], f)
     }
 }
 
@@ -348,10 +338,7 @@ impl AstNode for QueryExpr {
             c.query.try_for_each_node(f)?;
         }
         self.body.try_for_each_node(f)?;
-        for o in &self.order_by {
-            o.try_for_each_node(f)?;
-        }
-        ControlFlow::Continue(())
+        children_visit(&self.order_by, f)
     }
 }
 
@@ -520,9 +507,7 @@ impl AstNode for SelectColumns {
         match self {
             SelectColumns::None => {}
             SelectColumns::Columns(columns) => {
-                for col in columns {
-                    col.try_for_each_node(f)?;
-                }
+                children_visit(columns, f)?;
             }
         }
         ControlFlow::Continue(())

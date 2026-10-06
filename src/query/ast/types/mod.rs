@@ -11,6 +11,18 @@ pub use query::*;
 pub use table::*;
 pub use window::*;
 
+/// Walk each of `children`'s subtrees in order: a list, an `Option` (zero or
+/// one), or an array of same-typed fields.
+pub(crate) fn children_visit<'a, T: AstNode + 'a, N: Any, B>(
+    children: impl IntoIterator<Item = &'a T>,
+    f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    for child in children {
+        child.try_for_each_node(f)?;
+    }
+    ControlFlow::Continue(())
+}
+
 /// Traversable AST node: a zero-allocation pre-order walk. Each type implements
 /// only [`AstNode::try_for_each_child`]; visiting the node itself is provided,
 /// so no type can skip it or visit out of order.
