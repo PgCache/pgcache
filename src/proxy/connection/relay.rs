@@ -41,8 +41,8 @@ use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
 use crate::{
     cache::{
-        CacheDispatchHandle, CacheMessage, CacheOutcome, CacheReply, ProxyMessage, ReplySlot,
-        ReplyState, messages::slices_concat,
+        CacheDispatchHandle, CacheMessage, CacheOutcome, CacheReply, Delivery, ProxyMessage,
+        ReplySlot, messages::slices_concat,
     },
     pg::protocol::{
         ProtocolError,
@@ -1284,11 +1284,11 @@ impl ConnectionState {
                 }
                 _ = &mut notified => {
                     match reply_slot.take() {
-                        ReplyState::Sent(reply) => {
+                        Some(Delivery::Sent(reply)) => {
                             self.handle_cache_outcome(reply.outcome);
                             return Ok(reply.socket);
                         }
-                        ReplyState::Dropped => {
+                        Some(Delivery::Dropped) => {
                             // Sender dropped without sending: cache died in flight.
                             if log_gate(&CACHE_DEAD_INFLIGHT_LOG, CACHE_DOWN_LOG_WINDOW_SECS) {
                                 warn!(
@@ -1300,7 +1300,7 @@ impl ConnectionState {
                             self.proxy_status = ProxyStatus::Degraded;
                             return Err(ConnectionError::CacheDead.into());
                         }
-                        ReplyState::Empty => {
+                        None => {
                             // Stale permit from a sender dropped while no query
                             // was waiting (dispatch-unavailable fallback): this
                             // query's outcome is still pending. The completed

@@ -77,7 +77,7 @@ pub use mv_shape::{ShapeGate, shape_classify};
 #[cfg(feature = "proxy")]
 pub use query_cache::{CacheDispatchHandle, CacheDispatchPublisher, CacheDispatchUpdater};
 #[cfg(feature = "proxy")]
-pub use reply::{ReplySender, ReplySlot, ReplyState};
+pub use reply::{Delivery, ReplySender, ReplySlot};
 #[cfg(feature = "proxy")]
 pub use runtime::{CacheGeneration, cache_generation_start, cache_supervise};
 pub use serve_decision::CachedQueryState;
