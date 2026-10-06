@@ -5,7 +5,7 @@ use ecow::EcoString;
 
 use super::column::column_resolve;
 use super::expr::{scalar_expr_resolve, where_expr_resolve};
-use super::scope::ResolutionScope;
+use super::scope::{ResolutionScope, ScopeEntry};
 use crate::query::ast::{
     ColumnNode, LimitClause, LiteralValue, OrderByClause, ScalarExpr, SelectColumn, SelectColumns,
     WhereExpr,
@@ -24,71 +24,85 @@ pub(super) fn select_columns_resolve(
     columns: &SelectColumns,
     scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<ResolvedSelectColumns> {
-    match columns {
-        SelectColumns::None => Ok(ResolvedSelectColumns::None),
-        SelectColumns::Columns(cols) => {
-            let mut resolved_cols = Vec::new();
-            for col in cols {
-                match col {
-                    SelectColumn::Star(qualifier) => {
-                        // Unqualified `*` over a USING/NATURAL join emits
-                        // the merged join column(s) once and first (as
-                        // Postgres does), then each table's remaining
-                        // (non-join) columns. Qualified `t.*` is that
-                        // table's columns verbatim (join column included).
-                        if qualifier.is_none() {
-                            for m in &scope.merged_columns {
-                                resolved_cols.push(ResolvedSelectColumn {
-                                    expr: m.expr.clone(),
-                                    alias: Some(m.name.clone()),
-                                });
-                            }
-                        }
-                        for entry in &scope.entries {
-                            let matches = match qualifier {
-                                None => true,
-                                Some(q) => entry.qualifier_matches(q),
-                            };
-                            if !matches {
-                                continue;
-                            }
-                            let table_metadata = entry.metadata();
-                            let key = entry.qualifier_key();
-                            for column_metadata in table_metadata.columns.iter() {
-                                // Skip columns merged into a USING/NATURAL
-                                // join column (only for unqualified `*`).
-                                if qualifier.is_none()
-                                    && scope.merged_consumed.iter().any(|(k, c)| {
-                                        k == key && c == column_metadata.name.as_str()
-                                    })
-                                {
-                                    continue;
-                                }
-                                resolved_cols.push(ResolvedSelectColumn {
-                                    expr: ResolvedScalarExpr::Column(ResolvedColumnNode {
-                                        schema: table_metadata.schema.clone(),
-                                        table: table_metadata.name.clone(),
-                                        table_alias: entry.alias().map(EcoString::from),
-                                        column: column_metadata.name.clone(),
-                                        column_metadata: column_metadata.clone(),
-                                    }),
-                                    alias: None,
-                                });
-                            }
-                        }
-                    }
-                    SelectColumn::Expr { expr, alias } => {
-                        let resolved_expr = scalar_expr_resolve(expr, scope)?;
-                        resolved_cols.push(ResolvedSelectColumn {
-                            expr: resolved_expr,
-                            alias: alias.as_deref().map(EcoString::from),
-                        });
-                    }
-                }
+    let SelectColumns::Columns(cols) = columns else {
+        return Ok(ResolvedSelectColumns::None);
+    };
+    let mut resolved_cols = Vec::new();
+    for col in cols {
+        match col {
+            SelectColumn::Star(qualifier) => {
+                star_expand(qualifier.as_deref(), scope, &mut resolved_cols);
             }
-            Ok(ResolvedSelectColumns::Columns(resolved_cols))
+            SelectColumn::Expr { expr, alias } => {
+                let resolved_expr = scalar_expr_resolve(expr, scope)?;
+                resolved_cols.push(ResolvedSelectColumn {
+                    expr: resolved_expr,
+                    alias: alias.as_deref().map(EcoString::from),
+                });
+            }
         }
     }
+    Ok(ResolvedSelectColumns::Columns(resolved_cols))
+}
+
+/// Expand `*` or `qualifier.*` into the matching tables' columns.
+///
+/// Unqualified `*` over a USING/NATURAL join emits the merged join column(s)
+/// once and first (as Postgres does), then each table's remaining (non-join)
+/// columns. Qualified `t.*` is that table's columns verbatim (join column
+/// included).
+fn star_expand(
+    qualifier: Option<&str>,
+    scope: &ResolutionScope<'_>,
+    out: &mut Vec<ResolvedSelectColumn>,
+) {
+    if qualifier.is_none() {
+        out.extend(scope.merged_columns.iter().map(|m| ResolvedSelectColumn {
+            expr: m.expr.clone(),
+            alias: Some(m.name.clone()),
+        }));
+    }
+    for entry in &scope.entries {
+        if qualifier.is_none_or(|q| entry.qualifier_matches(q)) {
+            entry_columns_expand(entry, qualifier.is_none(), scope, out);
+        }
+    }
+}
+
+/// One table's columns for `*`. Under unqualified `*`, columns merged into a
+/// USING/NATURAL join column are skipped (they were emitted once already).
+fn entry_columns_expand(
+    entry: &ScopeEntry<'_>,
+    unqualified: bool,
+    scope: &ResolutionScope<'_>,
+    out: &mut Vec<ResolvedSelectColumn>,
+) {
+    let table_metadata = entry.metadata();
+    let key = entry.qualifier_key();
+    for column_metadata in table_metadata.columns.iter() {
+        if unqualified && merged_join_column(scope, key, &column_metadata.name) {
+            continue;
+        }
+        out.push(ResolvedSelectColumn {
+            expr: ResolvedScalarExpr::Column(ResolvedColumnNode {
+                schema: table_metadata.schema.clone(),
+                table: table_metadata.name.clone(),
+                table_alias: entry.alias().map(EcoString::from),
+                column: column_metadata.name.clone(),
+                column_metadata: column_metadata.clone(),
+            }),
+            alias: None,
+        });
+    }
+}
+
+/// Whether `column` of the table keyed `key` was merged into a USING/NATURAL
+/// join column.
+fn merged_join_column(scope: &ResolutionScope<'_>, key: &str, column: &str) -> bool {
+    scope
+        .merged_consumed
+        .iter()
+        .any(|(k, c)| k == key && c == column)
 }
 
 /// Resolve ORDER BY clauses. When `select_columns` is provided, an unqualified
