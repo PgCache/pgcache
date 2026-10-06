@@ -448,6 +448,20 @@ pub struct TxnHandles {
     pub isolation_probes: Counter,
 }
 
+impl TxnHandles {
+    fn build() -> Self {
+        use names::{TXN_FORWARDS, TXN_ISOLATION_PROBES, TXN_SERVED};
+        Self {
+            served: metrics::counter!(TXN_SERVED),
+            forward_failed: metrics::counter!(TXN_FORWARDS, "reason" => "failed"),
+            forward_isolation_unknown: metrics::counter!(TXN_FORWARDS, "reason" => "isolation_unknown"),
+            forward_isolation_strict: metrics::counter!(TXN_FORWARDS, "reason" => "isolation_strict"),
+            forward_pending_write: metrics::counter!(TXN_FORWARDS, "reason" => "pending_write"),
+            isolation_probes: metrics::counter!(TXN_ISOLATION_PROBES),
+        }
+    }
+}
+
 pub struct RawHandles {
     pub writes_recorded: Counter,
     pub tier_merges: Counter,
@@ -474,6 +488,33 @@ pub struct RawHandles {
     pub cap_degraded_update_delete: Counter,
 }
 
+impl RawHandles {
+    fn build() -> Self {
+        use names::{
+            RAW_CAP_DEGRADED_INSERT, RAW_CAP_DEGRADED_UPDATE_DELETE, RAW_CLEARANCE_SECONDS,
+            RAW_FORWARD_BLOCKED, RAW_FORWARDS, RAW_PROBES, RAW_SERVE_DISJOINT_DELETE,
+            RAW_SERVE_DISJOINT_INSERT, RAW_SERVE_DISJOINT_UPDATE, RAW_TIER_MERGES,
+            RAW_WRITES_RECORDED,
+        };
+        Self {
+            writes_recorded: metrics::counter!(RAW_WRITES_RECORDED),
+            tier_merges: metrics::counter!(RAW_TIER_MERGES),
+            probes: metrics::counter!(RAW_PROBES),
+            forwards_table: metrics::counter!(RAW_FORWARDS, "scope" => "table"),
+            forwards_connection: metrics::counter!(RAW_FORWARDS, "scope" => "connection"),
+            forward_blocked_unstamped: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "unstamped"),
+            forward_blocked_delivery_lag: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "delivery_lag"),
+            forward_blocked_apply_lag: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "apply_lag"),
+            clearance: metrics::histogram!(RAW_CLEARANCE_SECONDS),
+            serve_disjoint_insert: metrics::counter!(RAW_SERVE_DISJOINT_INSERT),
+            serve_disjoint_delete: metrics::counter!(RAW_SERVE_DISJOINT_DELETE),
+            serve_disjoint_update: metrics::counter!(RAW_SERVE_DISJOINT_UPDATE),
+            cap_degraded_insert: metrics::counter!(RAW_CAP_DEGRADED_INSERT),
+            cap_degraded_update_delete: metrics::counter!(RAW_CAP_DEGRADED_UPDATE_DELETE),
+        }
+    }
+}
+
 pub struct ConnHandles {
     pub total: Counter,
     pub active: Gauge,
@@ -488,6 +529,33 @@ pub struct ConnHandles {
     pub describe_invalidations: Counter,
     pub lazy_parse_forwarded: Counter,
     pub close_local: Counter,
+}
+
+impl ConnHandles {
+    fn build() -> Self {
+        use names::{
+            CACHEABILITY_ENTRIES, CONNECTIONS_ACTIVE, CONNECTIONS_ERRORS, CONNECTIONS_TOTAL,
+            PROTOCOL_CLOSE_LOCAL, PROTOCOL_DESCRIBE_CACHE_EVICTIONS, PROTOCOL_DESCRIBE_CACHE_HITS,
+            PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS, PROTOCOL_DESCRIBE_CACHE_MISSES,
+            PROTOCOL_EXTENDED_QUERIES, PROTOCOL_LAZY_PARSE_FORWARDED, PROTOCOL_PREPARED_STATEMENTS,
+            PROTOCOL_SIMPLE_QUERIES,
+        };
+        Self {
+            total: metrics::counter!(CONNECTIONS_TOTAL),
+            active: metrics::gauge!(CONNECTIONS_ACTIVE),
+            errors: metrics::counter!(CONNECTIONS_ERRORS),
+            cacheability_entries: metrics::gauge!(CACHEABILITY_ENTRIES),
+            simple_queries: metrics::counter!(PROTOCOL_SIMPLE_QUERIES),
+            extended_queries: metrics::counter!(PROTOCOL_EXTENDED_QUERIES),
+            prepared_statements: metrics::gauge!(PROTOCOL_PREPARED_STATEMENTS),
+            describe_hits: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_HITS),
+            describe_misses: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_MISSES),
+            describe_evictions: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_EVICTIONS),
+            describe_invalidations: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS),
+            lazy_parse_forwarded: metrics::counter!(PROTOCOL_LAZY_PARSE_FORWARDED),
+            close_local: metrics::counter!(PROTOCOL_CLOSE_LOCAL),
+        }
+    }
 }
 
 pub struct QueryHandles {
@@ -505,6 +573,31 @@ pub struct QueryHandles {
     pub origin_execution: Histogram,
 }
 
+impl QueryHandles {
+    fn build() -> Self {
+        use names::{
+            CACHE_QUERY_LATENCY_SECONDS, ORIGIN_EXECUTION_SECONDS, ORIGIN_QUERY_LATENCY_SECONDS,
+            QUERIES_ALLOWLIST_SKIPPED, QUERIES_CACHE_ERROR, QUERIES_CACHE_HIT, QUERIES_CACHE_MISS,
+            QUERIES_CACHEABLE, QUERIES_INVALID, QUERIES_TOTAL, QUERIES_UNCACHEABLE,
+            QUERIES_UNSUPPORTED,
+        };
+        Self {
+            total: metrics::counter!(QUERIES_TOTAL),
+            cacheable: metrics::counter!(QUERIES_CACHEABLE),
+            uncacheable: metrics::counter!(QUERIES_UNCACHEABLE),
+            unsupported: metrics::counter!(QUERIES_UNSUPPORTED),
+            invalid: metrics::counter!(QUERIES_INVALID),
+            cache_hit: metrics::counter!(QUERIES_CACHE_HIT),
+            cache_miss: metrics::counter!(QUERIES_CACHE_MISS),
+            cache_error: metrics::counter!(QUERIES_CACHE_ERROR),
+            allowlist_skipped: metrics::counter!(QUERIES_ALLOWLIST_SKIPPED),
+            cache_latency: metrics::histogram!(CACHE_QUERY_LATENCY_SECONDS),
+            origin_latency: metrics::histogram!(ORIGIN_QUERY_LATENCY_SECONDS),
+            origin_execution: metrics::histogram!(ORIGIN_EXECUTION_SECONDS),
+        }
+    }
+}
+
 pub struct StageHandles {
     pub parse: Histogram,
     pub dispatch: Histogram,
@@ -518,6 +611,33 @@ pub struct StageHandles {
     pub coalesce_intake: Histogram,
     pub coalesce_wait: Histogram,
     pub total: Histogram,
+}
+
+impl StageHandles {
+    fn build() -> Self {
+        use names::{
+            QUERY_STAGE_COALESCE_INTAKE_SECONDS, QUERY_STAGE_COALESCE_WAIT_SECONDS,
+            QUERY_STAGE_CONN_WAIT_SECONDS, QUERY_STAGE_DISPATCH_SECONDS,
+            QUERY_STAGE_FORWARD_DECISION_SECONDS, QUERY_STAGE_LOOKUP_SECONDS,
+            QUERY_STAGE_PARSE_SECONDS, QUERY_STAGE_QUEUE_WAIT_SECONDS,
+            QUERY_STAGE_RESPONSE_WRITE_SECONDS, QUERY_STAGE_SPAWN_WAIT_SECONDS,
+            QUERY_STAGE_TOTAL_SECONDS, QUERY_STAGE_WORKER_EXEC_SECONDS,
+        };
+        Self {
+            parse: metrics::histogram!(QUERY_STAGE_PARSE_SECONDS),
+            dispatch: metrics::histogram!(QUERY_STAGE_DISPATCH_SECONDS),
+            lookup: metrics::histogram!(QUERY_STAGE_LOOKUP_SECONDS),
+            queue_wait: metrics::histogram!(QUERY_STAGE_QUEUE_WAIT_SECONDS),
+            conn_wait: metrics::histogram!(QUERY_STAGE_CONN_WAIT_SECONDS),
+            spawn_wait: metrics::histogram!(QUERY_STAGE_SPAWN_WAIT_SECONDS),
+            worker_exec: metrics::histogram!(QUERY_STAGE_WORKER_EXEC_SECONDS),
+            response_write: metrics::histogram!(QUERY_STAGE_RESPONSE_WRITE_SECONDS),
+            forward_decision: metrics::histogram!(QUERY_STAGE_FORWARD_DECISION_SECONDS),
+            coalesce_intake: metrics::histogram!(QUERY_STAGE_COALESCE_INTAKE_SECONDS),
+            coalesce_wait: metrics::histogram!(QUERY_STAGE_COALESCE_WAIT_SECONDS),
+            total: metrics::histogram!(QUERY_STAGE_TOTAL_SECONDS),
+        }
+    }
 }
 
 pub struct CacheHandles {
@@ -567,6 +687,63 @@ pub struct CacheHandles {
     pub reg_gate_loading: Gauge,
 }
 
+impl CacheHandles {
+    fn build() -> Self {
+        use names::{
+            CACHE_COALESCE_DEADLINE_FORWARD, CACHE_COALESCE_SERVED, CACHE_COALESCE_WAITING,
+            CACHE_LOOKUP_LATENCY_SECONDS, CACHE_MARGINAL_BYTES_PER_QUERY, CACHE_MEMO_BYTES,
+            CACHE_MEMO_CAPTURES, CACHE_MEMO_ENTRIES, CACHE_MEMO_EVICTIONS, CACHE_MEMO_HITS,
+            CACHE_MEMORY_BUDGET_BYTES, CACHE_MEMORY_USED_BYTES, CACHE_MV_BUILDS_SUPPRESSED,
+            CACHE_MV_FALLTHROUGH, CACHE_MV_HITS, CACHE_POOL_AVAILABLE, CACHE_POOL_RECYCLED,
+            CACHE_POOL_REPLENISHED, CACHE_QUERY_COUNT_CAP, CACHE_REG_GATE_BTLBW,
+            CACHE_REG_GATE_DRAIN_RATE, CACHE_REG_GATE_LOADING, CACHE_REG_GATE_QUEUE_MIN,
+            CACHE_REG_GATE_RATE, CACHE_REGISTRATION_THROTTLED, CACHE_REGISTRATION_THROTTLED_TOTAL,
+            CACHE_RESTARTS_TOTAL, CACHE_RSS_BYTES, CACHE_SERVE_DESYNC_TOTAL,
+            CACHE_SERVE_DIRTY_RETURN_TOTAL, CACHE_SERVE_POOL_BACKSTOP_GROWS,
+            CACHE_SERVE_POOL_SCALE_DOWN, CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE,
+            CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
+        };
+        Self {
+            lookup_latency: metrics::histogram!(CACHE_LOOKUP_LATENCY_SECONDS),
+            mv_hits: metrics::counter!(CACHE_MV_HITS),
+            mv_fallthrough: metrics::counter!(CACHE_MV_FALLTHROUGH),
+            mv_builds_suppressed: metrics::counter!(CACHE_MV_BUILDS_SUPPRESSED),
+            coalesce_waiting: metrics::gauge!(CACHE_COALESCE_WAITING),
+            coalesce_served: metrics::counter!(CACHE_COALESCE_SERVED),
+            coalesce_deadline_forward: metrics::counter!(CACHE_COALESCE_DEADLINE_FORWARD),
+            memo_hits: metrics::counter!(CACHE_MEMO_HITS),
+            memo_captures: metrics::counter!(CACHE_MEMO_CAPTURES),
+            memo_evictions: metrics::counter!(CACHE_MEMO_EVICTIONS),
+            memo_entries: metrics::gauge!(CACHE_MEMO_ENTRIES),
+            memo_bytes: metrics::gauge!(CACHE_MEMO_BYTES),
+            restarts_total: metrics::counter!(CACHE_RESTARTS_TOTAL),
+            pool_replenished: metrics::counter!(CACHE_POOL_REPLENISHED),
+            pool_recycled: metrics::counter!(CACHE_POOL_RECYCLED),
+            rss_bytes: metrics::gauge!(CACHE_RSS_BYTES),
+            memory_used_bytes: metrics::gauge!(CACHE_MEMORY_USED_BYTES),
+            memory_budget_bytes: metrics::gauge!(CACHE_MEMORY_BUDGET_BYTES),
+            query_count_cap: metrics::gauge!(CACHE_QUERY_COUNT_CAP),
+            marginal_bytes_per_query: metrics::gauge!(CACHE_MARGINAL_BYTES_PER_QUERY),
+            registration_throttled: metrics::gauge!(CACHE_REGISTRATION_THROTTLED),
+            registration_throttled_total: metrics::counter!(CACHE_REGISTRATION_THROTTLED_TOTAL),
+            serves_in_flight: metrics::gauge!(CACHE_SERVES_IN_FLIGHT),
+            pool_available: metrics::gauge!(CACHE_POOL_AVAILABLE),
+            serve_pool_size: metrics::gauge!(CACHE_SERVE_POOL_SIZE),
+            serve_pool_scale_up: metrics::counter!(CACHE_SERVE_POOL_SCALE_UP),
+            serve_pool_scale_down: metrics::counter!(CACHE_SERVE_POOL_SCALE_DOWN),
+            serve_pool_backstop_grows: metrics::counter!(CACHE_SERVE_POOL_BACKSTOP_GROWS),
+            serve_stall_total: metrics::counter!(CACHE_SERVE_STALL_TOTAL),
+            serve_dirty_return_total: metrics::counter!(CACHE_SERVE_DIRTY_RETURN_TOTAL),
+            serve_desync_total: metrics::counter!(CACHE_SERVE_DESYNC_TOTAL),
+            reg_gate_rate: metrics::gauge!(CACHE_REG_GATE_RATE),
+            reg_gate_btlbw: metrics::gauge!(CACHE_REG_GATE_BTLBW),
+            reg_gate_queue_min: metrics::gauge!(CACHE_REG_GATE_QUEUE_MIN),
+            reg_gate_drain_rate: metrics::gauge!(CACHE_REG_GATE_DRAIN_RATE),
+            reg_gate_loading: metrics::gauge!(CACHE_REG_GATE_LOADING),
+        }
+    }
+}
+
 pub struct CdcHandles {
     pub events_processed: Counter,
     pub inserts: Counter,
@@ -610,6 +787,56 @@ pub struct CdcHandles {
     pub keepalive_marks_coalesced: Counter,
 }
 
+impl CdcHandles {
+    fn build() -> Self {
+        use names::{
+            CACHE_CDC_LOCAL_EVAL_HITS, CACHE_CDC_PG_EVAL_HITS, CACHE_CDC_PREPARED_HITS,
+            CACHE_CDC_PREPARED_MISSES, CACHE_CDC_TOAST_FALLBACKS, CACHE_CDC_TOAST_REPAIRS,
+            CACHE_CDC_TOAST_STALE_ABORTS, CACHE_HANDLE_DELETE_SECONDS, CACHE_HANDLE_DELETES,
+            CACHE_HANDLE_INSERT_SECONDS, CACHE_HANDLE_INSERTS, CACHE_HANDLE_UPDATE_SECONDS,
+            CACHE_HANDLE_UPDATES, CACHE_INVALIDATIONS, CACHE_WRITER_COMMAND_HANDLE_SECONDS,
+            CDC_APPLIED_LSN, CDC_DELETES, CDC_EVENTS_PROCESSED, CDC_FLUSH_STALENESS_SECONDS,
+            CDC_FLUSHED_LSN, CDC_INSERTS, CDC_KEEPALIVE_MARKS_COALESCED, CDC_LAG_BYTES,
+            CDC_LAG_SECONDS, CDC_RECEIVED_LSN, CDC_UPDATES,
+        };
+        Self {
+            events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),
+            inserts: metrics::counter!(CDC_INSERTS),
+            updates: metrics::counter!(CDC_UPDATES),
+            deletes: metrics::counter!(CDC_DELETES),
+            lag_seconds: metrics::gauge!(CDC_LAG_SECONDS),
+            lag_bytes: metrics::gauge!(CDC_LAG_BYTES),
+            flush_staleness: metrics::gauge!(CDC_FLUSH_STALENESS_SECONDS),
+            received_lsn: metrics::gauge!(CDC_RECEIVED_LSN),
+            flushed_lsn: metrics::gauge!(CDC_FLUSHED_LSN),
+            applied_lsn: metrics::gauge!(CDC_APPLIED_LSN),
+            invalidations: metrics::counter!(CACHE_INVALIDATIONS),
+            local_eval_hits: metrics::counter!(CACHE_CDC_LOCAL_EVAL_HITS),
+            pg_eval_hits: metrics::counter!(CACHE_CDC_PG_EVAL_HITS),
+            toast_repairs: metrics::counter!(CACHE_CDC_TOAST_REPAIRS),
+            toast_fallbacks: metrics::counter!(CACHE_CDC_TOAST_FALLBACKS),
+            toast_stale_aborts: metrics::counter!(CACHE_CDC_TOAST_STALE_ABORTS),
+            prepared_hits: metrics::counter!(CACHE_CDC_PREPARED_HITS),
+            prepared_misses: metrics::counter!(CACHE_CDC_PREPARED_MISSES),
+            handle_inserts: metrics::counter!(CACHE_HANDLE_INSERTS),
+            handle_updates: metrics::counter!(CACHE_HANDLE_UPDATES),
+            handle_deletes: metrics::counter!(CACHE_HANDLE_DELETES),
+            handle_insert_seconds: metrics::histogram!(CACHE_HANDLE_INSERT_SECONDS),
+            handle_update_seconds: metrics::histogram!(CACHE_HANDLE_UPDATE_SECONDS),
+            handle_delete_seconds: metrics::histogram!(CACHE_HANDLE_DELETE_SECONDS),
+            cmd_begin: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_begin"),
+            cmd_table_register: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_table_register"),
+            cmd_insert: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_insert"),
+            cmd_update: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_update"),
+            cmd_delete: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_delete"),
+            cmd_truncate: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_truncate"),
+            cmd_commit_mark: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_commit_mark"),
+            cmd_keepalive_mark: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_keepalive_mark"),
+            keepalive_marks_coalesced: metrics::counter!(CDC_KEEPALIVE_MARKS_COALESCED),
+        }
+    }
+}
+
 pub struct MvHandles {
     pub rebuilds: Counter,
     pub skipped_rebuilds: Counter,
@@ -621,6 +848,25 @@ pub struct MvHandles {
     // MV first-build gate (PGC-330), one cached handle per label.
     pub gate_admit: Counter,
     pub gate_reject: Counter,
+}
+
+impl MvHandles {
+    fn build() -> Self {
+        use names::{
+            CACHE_MV_BUILD_DURATION_SECONDS, CACHE_MV_BUILD_QUEUE, CACHE_MV_DIRTY_TRUNCATES,
+            CACHE_MV_GATE, CACHE_MV_REBUILDS, CACHE_MV_SKIPPED_REBUILDS,
+        };
+        Self {
+            rebuilds: metrics::counter!(CACHE_MV_REBUILDS),
+            skipped_rebuilds: metrics::counter!(CACHE_MV_SKIPPED_REBUILDS),
+            dirty_truncates: metrics::counter!(CACHE_MV_DIRTY_TRUNCATES),
+            build_queue: metrics::gauge!(CACHE_MV_BUILD_QUEUE),
+            build_first_pop: metrics::histogram!(CACHE_MV_BUILD_DURATION_SECONDS, "kind" => "first_pop"),
+            build_rebuild: metrics::histogram!(CACHE_MV_BUILD_DURATION_SECONDS, "kind" => "rebuild"),
+            gate_admit: metrics::counter!(CACHE_MV_GATE, "outcome" => "admit"),
+            gate_reject: metrics::counter!(CACHE_MV_GATE, "outcome" => "reject"),
+        }
+    }
 }
 
 pub struct RegHandles {
@@ -658,6 +904,67 @@ pub struct RegHandles {
     pub merge_discard_chunks: Counter,
 }
 
+impl RegHandles {
+    fn build() -> Self {
+        use names::{
+            CACHE_MERGE_CHUNK_SECONDS, CACHE_MERGE_CHUNKS, CACHE_MERGE_DISCARD_CHUNKS,
+            CACHE_MERGE_PENDING_DEPTH, CACHE_MERGE_WAIT_SECONDS, CACHE_MERGES_APPLIED,
+            CACHE_POPULATION_BACKSTOP_GROWS, CACHE_POPULATION_SCALE_DOWN,
+            CACHE_POPULATION_SCALE_UP, CACHE_POPULATION_STREAM_SECONDS,
+            CACHE_POPULATION_TASK_SECONDS, CACHE_POPULATION_WAIT_SECONDS, CACHE_POPULATION_WORKERS,
+            CACHE_SUBSUMPTION_LATENCY_SECONDS, CACHE_SUBSUMPTIONS,
+            CACHE_WRITER_COMMAND_HANDLE_SECONDS, CACHE_WRITER_REGISTER_INSERT_SECONDS,
+            CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS,
+            CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS,
+            CACHE_WRITER_REGISTER_RESOLVE_SECONDS, CACHE_WRITER_REGISTER_SUBSUME_SECONDS,
+            CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS, CACHE_WRITER_RESOLVE_DEPARSE_SECONDS,
+            CACHE_WRITER_RESOLVE_UPDATE_QUERIES_REGISTER_SECONDS,
+            QUERY_REGISTRATION_LATENCY_SECONDS,
+        };
+        Self {
+            cmd_register: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "register"),
+            cmd_ready: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "ready"),
+            cmd_failed: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "failed"),
+            cmd_limit_bump: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "limit_bump"),
+            cmd_readmit: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "readmit"),
+            cmd_mv_build: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build"),
+            cmd_mv_build_complete: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build_complete"),
+            register_resolve: metrics::histogram!(CACHE_WRITER_REGISTER_RESOLVE_SECONDS),
+            register_subsumption_check: metrics::histogram!(
+                CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS
+            ),
+            register_subsume: metrics::histogram!(CACHE_WRITER_REGISTER_SUBSUME_SECONDS),
+            register_insert: metrics::histogram!(CACHE_WRITER_REGISTER_INSERT_SECONDS),
+            register_publication_update: metrics::histogram!(
+                CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS
+            ),
+            register_populate_dispatch: metrics::histogram!(
+                CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS
+            ),
+            resolve_update_queries_register: metrics::histogram!(
+                CACHE_WRITER_RESOLVE_UPDATE_QUERIES_REGISTER_SECONDS
+            ),
+            resolve_deparse: metrics::histogram!(CACHE_WRITER_RESOLVE_DEPARSE_SECONDS),
+            subsumptions: metrics::counter!(CACHE_SUBSUMPTIONS),
+            subsumption_latency: metrics::histogram!(CACHE_SUBSUMPTION_LATENCY_SECONDS),
+            registration_latency: metrics::histogram!(QUERY_REGISTRATION_LATENCY_SECONDS),
+            population_task: metrics::histogram!(CACHE_POPULATION_TASK_SECONDS),
+            population_stream: metrics::histogram!(CACHE_POPULATION_STREAM_SECONDS),
+            population_wait: metrics::histogram!(CACHE_POPULATION_WAIT_SECONDS),
+            population_workers: metrics::gauge!(CACHE_POPULATION_WORKERS),
+            population_scale_up: metrics::counter!(CACHE_POPULATION_SCALE_UP),
+            population_scale_down: metrics::counter!(CACHE_POPULATION_SCALE_DOWN),
+            population_backstop_grows: metrics::counter!(CACHE_POPULATION_BACKSTOP_GROWS),
+            merge_pending_depth: metrics::gauge!(CACHE_MERGE_PENDING_DEPTH),
+            merge_wait: metrics::histogram!(CACHE_MERGE_WAIT_SECONDS),
+            merges_applied: metrics::counter!(CACHE_MERGES_APPLIED),
+            merge_chunks: metrics::counter!(CACHE_MERGE_CHUNKS),
+            merge_chunk: metrics::histogram!(CACHE_MERGE_CHUNK_SECONDS),
+            merge_discard_chunks: metrics::counter!(CACHE_MERGE_DISCARD_CHUNKS),
+        }
+    }
+}
+
 pub struct StateHandles {
     pub queries_registered: Gauge,
     pub queries_loading: Gauge,
@@ -681,284 +988,56 @@ pub struct StateHandles {
     pub queue_worker: Gauge,
 }
 
-impl Handles {
+impl StateHandles {
     fn build() -> Self {
         use names::{
-            CACHE_CDC_LOCAL_EVAL_HITS, CACHE_CDC_PG_EVAL_HITS, CACHE_CDC_PREPARED_HITS,
-            CACHE_CDC_PREPARED_MISSES, CACHE_CDC_TOAST_FALLBACKS, CACHE_CDC_TOAST_REPAIRS,
-            CACHE_CDC_TOAST_STALE_ABORTS, CACHE_COALESCE_DEADLINE_FORWARD, CACHE_COALESCE_SERVED,
-            CACHE_COALESCE_WAITING, CACHE_DISK_AVAILABLE_BYTES, CACHE_DISK_LIMIT_BYTES,
-            CACHE_DISK_TOTAL_BYTES, CACHE_DISK_USED_BYTES, CACHE_EVICTIONS, CACHE_GENERATION,
-            CACHE_HANDLE_DELETE_SECONDS, CACHE_HANDLE_DELETES, CACHE_HANDLE_INSERT_SECONDS,
-            CACHE_HANDLE_INSERTS, CACHE_HANDLE_UPDATE_SECONDS, CACHE_HANDLE_UPDATES,
-            CACHE_INVALIDATIONS, CACHE_LOOKUP_LATENCY_SECONDS, CACHE_MARGINAL_BYTES_PER_QUERY,
-            CACHE_MEMO_BYTES, CACHE_MEMO_CAPTURES, CACHE_MEMO_ENTRIES, CACHE_MEMO_EVICTIONS,
-            CACHE_MEMO_HITS, CACHE_MEMORY_BUDGET_BYTES, CACHE_MEMORY_USED_BYTES,
-            CACHE_MERGE_CHUNK_SECONDS, CACHE_MERGE_CHUNKS, CACHE_MERGE_DISCARD_CHUNKS,
-            CACHE_MERGE_PENDING_DEPTH, CACHE_MERGE_WAIT_SECONDS, CACHE_MERGES_APPLIED,
-            CACHE_MV_BUILD_DURATION_SECONDS, CACHE_MV_BUILD_QUEUE, CACHE_MV_BUILDS_SUPPRESSED,
-            CACHE_MV_DIRTY_TRUNCATES, CACHE_MV_FALLTHROUGH, CACHE_MV_GATE, CACHE_MV_HITS,
-            CACHE_MV_REBUILDS, CACHE_MV_SKIPPED_REBUILDS, CACHE_POOL_AVAILABLE,
-            CACHE_POOL_RECYCLED, CACHE_POOL_REPLENISHED, CACHE_POPULATION_BACKSTOP_GROWS,
-            CACHE_POPULATION_SCALE_DOWN, CACHE_POPULATION_SCALE_UP,
-            CACHE_POPULATION_STREAM_SECONDS, CACHE_POPULATION_TASK_SECONDS,
-            CACHE_POPULATION_WAIT_SECONDS, CACHE_POPULATION_WORKERS, CACHE_QUERIES_INVALIDATED,
+            CACHE_DISK_AVAILABLE_BYTES, CACHE_DISK_LIMIT_BYTES, CACHE_DISK_TOTAL_BYTES,
+            CACHE_DISK_USED_BYTES, CACHE_EVICTIONS, CACHE_GENERATION, CACHE_QUERIES_INVALIDATED,
             CACHE_QUERIES_LOADING, CACHE_QUERIES_PENDING, CACHE_QUERIES_REGISTERED,
-            CACHE_QUERY_COUNT_CAP, CACHE_QUERY_LATENCY_SECONDS, CACHE_READMISSIONS,
-            CACHE_REG_GATE_BTLBW, CACHE_REG_GATE_DRAIN_RATE, CACHE_REG_GATE_LOADING,
-            CACHE_REG_GATE_QUEUE_MIN, CACHE_REG_GATE_RATE, CACHE_REGISTRATION_THROTTLED,
-            CACHE_REGISTRATION_THROTTLED_TOTAL, CACHE_RESTARTS_TOTAL, CACHE_RSS_BYTES,
-            CACHE_SERVE_DESYNC_TOTAL, CACHE_SERVE_DIRTY_RETURN_TOTAL,
-            CACHE_SERVE_POOL_BACKSTOP_GROWS, CACHE_SERVE_POOL_SCALE_DOWN,
-            CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE, CACHE_SERVE_STALL_TOTAL,
-            CACHE_SERVES_IN_FLIGHT, CACHE_SUBSUMPTION_LATENCY_SECONDS, CACHE_SUBSUMPTIONS,
-            CACHE_TABLES_TRACKED, CACHE_WORKER_QUEUE, CACHE_WRITER_CDC_QUEUE,
-            CACHE_WRITER_COMMAND_HANDLE_SECONDS, CACHE_WRITER_INTERNAL_QUEUE,
-            CACHE_WRITER_QUERY_QUEUE, CACHE_WRITER_REGISTER_INSERT_SECONDS,
-            CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS,
-            CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS,
-            CACHE_WRITER_REGISTER_RESOLVE_SECONDS, CACHE_WRITER_REGISTER_SUBSUME_SECONDS,
-            CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS, CACHE_WRITER_RESOLVE_DEPARSE_SECONDS,
-            CACHE_WRITER_RESOLVE_UPDATE_QUERIES_REGISTER_SECONDS,
+            CACHE_READMISSIONS, CACHE_TABLES_TRACKED, CACHE_WORKER_QUEUE, CACHE_WRITER_CDC_QUEUE,
+            CACHE_WRITER_INTERNAL_QUEUE, CACHE_WRITER_QUERY_QUEUE,
             CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION, CACHE_WRITER_UPDATE_QUERIES_TOTAL,
-            CACHEABILITY_ENTRIES, CDC_APPLIED_LSN, CDC_DELETES, CDC_EVENTS_PROCESSED,
-            CDC_FLUSH_STALENESS_SECONDS, CDC_FLUSHED_LSN, CDC_INSERTS,
-            CDC_KEEPALIVE_MARKS_COALESCED, CDC_LAG_BYTES, CDC_LAG_SECONDS, CDC_RECEIVED_LSN,
-            CDC_UPDATES, CONNECTIONS_ACTIVE, CONNECTIONS_ERRORS, CONNECTIONS_TOTAL,
-            ORIGIN_EXECUTION_SECONDS, ORIGIN_QUERY_LATENCY_SECONDS, PROTOCOL_CLOSE_LOCAL,
-            PROTOCOL_DESCRIBE_CACHE_EVICTIONS, PROTOCOL_DESCRIBE_CACHE_HITS,
-            PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS, PROTOCOL_DESCRIBE_CACHE_MISSES,
-            PROTOCOL_EXTENDED_QUERIES, PROTOCOL_LAZY_PARSE_FORWARDED, PROTOCOL_PREPARED_STATEMENTS,
-            PROTOCOL_SIMPLE_QUERIES, QUERIES_ALLOWLIST_SKIPPED, QUERIES_CACHE_ERROR,
-            QUERIES_CACHE_HIT, QUERIES_CACHE_MISS, QUERIES_CACHEABLE, QUERIES_INVALID,
-            QUERIES_TOTAL, QUERIES_UNCACHEABLE, QUERIES_UNSUPPORTED,
-            QUERY_REGISTRATION_LATENCY_SECONDS, QUERY_STAGE_COALESCE_INTAKE_SECONDS,
-            QUERY_STAGE_COALESCE_WAIT_SECONDS, QUERY_STAGE_CONN_WAIT_SECONDS,
-            QUERY_STAGE_DISPATCH_SECONDS, QUERY_STAGE_FORWARD_DECISION_SECONDS,
-            QUERY_STAGE_LOOKUP_SECONDS, QUERY_STAGE_PARSE_SECONDS, QUERY_STAGE_QUEUE_WAIT_SECONDS,
-            QUERY_STAGE_RESPONSE_WRITE_SECONDS, QUERY_STAGE_SPAWN_WAIT_SECONDS,
-            QUERY_STAGE_TOTAL_SECONDS, QUERY_STAGE_WORKER_EXEC_SECONDS, RAW_CAP_DEGRADED_INSERT,
-            RAW_CAP_DEGRADED_UPDATE_DELETE, RAW_CLEARANCE_SECONDS, RAW_FORWARD_BLOCKED,
-            RAW_FORWARDS, RAW_PROBES, RAW_SERVE_DISJOINT_DELETE, RAW_SERVE_DISJOINT_INSERT,
-            RAW_SERVE_DISJOINT_UPDATE, RAW_TIER_MERGES, RAW_WRITES_RECORDED, TXN_FORWARDS,
-            TXN_ISOLATION_PROBES, TXN_SERVED,
         };
         Self {
-            conn: ConnHandles {
-                total: metrics::counter!(CONNECTIONS_TOTAL),
-                active: metrics::gauge!(CONNECTIONS_ACTIVE),
-                errors: metrics::counter!(CONNECTIONS_ERRORS),
-                cacheability_entries: metrics::gauge!(CACHEABILITY_ENTRIES),
-                simple_queries: metrics::counter!(PROTOCOL_SIMPLE_QUERIES),
-                extended_queries: metrics::counter!(PROTOCOL_EXTENDED_QUERIES),
-                prepared_statements: metrics::gauge!(PROTOCOL_PREPARED_STATEMENTS),
-                describe_hits: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_HITS),
-                describe_misses: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_MISSES),
-                describe_evictions: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_EVICTIONS),
-                describe_invalidations: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS),
-                lazy_parse_forwarded: metrics::counter!(PROTOCOL_LAZY_PARSE_FORWARDED),
-                close_local: metrics::counter!(PROTOCOL_CLOSE_LOCAL),
-            },
-            query: QueryHandles {
-                total: metrics::counter!(QUERIES_TOTAL),
-                cacheable: metrics::counter!(QUERIES_CACHEABLE),
-                uncacheable: metrics::counter!(QUERIES_UNCACHEABLE),
-                unsupported: metrics::counter!(QUERIES_UNSUPPORTED),
-                invalid: metrics::counter!(QUERIES_INVALID),
-                cache_hit: metrics::counter!(QUERIES_CACHE_HIT),
-                cache_miss: metrics::counter!(QUERIES_CACHE_MISS),
-                cache_error: metrics::counter!(QUERIES_CACHE_ERROR),
-                allowlist_skipped: metrics::counter!(QUERIES_ALLOWLIST_SKIPPED),
-                cache_latency: metrics::histogram!(CACHE_QUERY_LATENCY_SECONDS),
-                origin_latency: metrics::histogram!(ORIGIN_QUERY_LATENCY_SECONDS),
-                origin_execution: metrics::histogram!(ORIGIN_EXECUTION_SECONDS),
-            },
-            stage: StageHandles {
-                parse: metrics::histogram!(QUERY_STAGE_PARSE_SECONDS),
-                dispatch: metrics::histogram!(QUERY_STAGE_DISPATCH_SECONDS),
-                lookup: metrics::histogram!(QUERY_STAGE_LOOKUP_SECONDS),
-                queue_wait: metrics::histogram!(QUERY_STAGE_QUEUE_WAIT_SECONDS),
-                conn_wait: metrics::histogram!(QUERY_STAGE_CONN_WAIT_SECONDS),
-                spawn_wait: metrics::histogram!(QUERY_STAGE_SPAWN_WAIT_SECONDS),
-                worker_exec: metrics::histogram!(QUERY_STAGE_WORKER_EXEC_SECONDS),
-                response_write: metrics::histogram!(QUERY_STAGE_RESPONSE_WRITE_SECONDS),
-                forward_decision: metrics::histogram!(QUERY_STAGE_FORWARD_DECISION_SECONDS),
-                coalesce_intake: metrics::histogram!(QUERY_STAGE_COALESCE_INTAKE_SECONDS),
-                coalesce_wait: metrics::histogram!(QUERY_STAGE_COALESCE_WAIT_SECONDS),
-                total: metrics::histogram!(QUERY_STAGE_TOTAL_SECONDS),
-            },
-            cache: CacheHandles {
-                lookup_latency: metrics::histogram!(CACHE_LOOKUP_LATENCY_SECONDS),
-                mv_hits: metrics::counter!(CACHE_MV_HITS),
-                mv_fallthrough: metrics::counter!(CACHE_MV_FALLTHROUGH),
-                mv_builds_suppressed: metrics::counter!(CACHE_MV_BUILDS_SUPPRESSED),
-                coalesce_waiting: metrics::gauge!(CACHE_COALESCE_WAITING),
-                coalesce_served: metrics::counter!(CACHE_COALESCE_SERVED),
-                coalesce_deadline_forward: metrics::counter!(CACHE_COALESCE_DEADLINE_FORWARD),
-                memo_hits: metrics::counter!(CACHE_MEMO_HITS),
-                memo_captures: metrics::counter!(CACHE_MEMO_CAPTURES),
-                memo_evictions: metrics::counter!(CACHE_MEMO_EVICTIONS),
-                memo_entries: metrics::gauge!(CACHE_MEMO_ENTRIES),
-                memo_bytes: metrics::gauge!(CACHE_MEMO_BYTES),
-                restarts_total: metrics::counter!(CACHE_RESTARTS_TOTAL),
-                pool_replenished: metrics::counter!(CACHE_POOL_REPLENISHED),
-                pool_recycled: metrics::counter!(CACHE_POOL_RECYCLED),
-                rss_bytes: metrics::gauge!(CACHE_RSS_BYTES),
-                memory_used_bytes: metrics::gauge!(CACHE_MEMORY_USED_BYTES),
-                memory_budget_bytes: metrics::gauge!(CACHE_MEMORY_BUDGET_BYTES),
-                query_count_cap: metrics::gauge!(CACHE_QUERY_COUNT_CAP),
-                marginal_bytes_per_query: metrics::gauge!(CACHE_MARGINAL_BYTES_PER_QUERY),
-                registration_throttled: metrics::gauge!(CACHE_REGISTRATION_THROTTLED),
-                registration_throttled_total: metrics::counter!(CACHE_REGISTRATION_THROTTLED_TOTAL),
-                serves_in_flight: metrics::gauge!(CACHE_SERVES_IN_FLIGHT),
-                pool_available: metrics::gauge!(CACHE_POOL_AVAILABLE),
-                serve_pool_size: metrics::gauge!(CACHE_SERVE_POOL_SIZE),
-                serve_pool_scale_up: metrics::counter!(CACHE_SERVE_POOL_SCALE_UP),
-                serve_pool_scale_down: metrics::counter!(CACHE_SERVE_POOL_SCALE_DOWN),
-                serve_pool_backstop_grows: metrics::counter!(CACHE_SERVE_POOL_BACKSTOP_GROWS),
-                serve_stall_total: metrics::counter!(CACHE_SERVE_STALL_TOTAL),
-                serve_dirty_return_total: metrics::counter!(CACHE_SERVE_DIRTY_RETURN_TOTAL),
-                serve_desync_total: metrics::counter!(CACHE_SERVE_DESYNC_TOTAL),
-                reg_gate_rate: metrics::gauge!(CACHE_REG_GATE_RATE),
-                reg_gate_btlbw: metrics::gauge!(CACHE_REG_GATE_BTLBW),
-                reg_gate_queue_min: metrics::gauge!(CACHE_REG_GATE_QUEUE_MIN),
-                reg_gate_drain_rate: metrics::gauge!(CACHE_REG_GATE_DRAIN_RATE),
-                reg_gate_loading: metrics::gauge!(CACHE_REG_GATE_LOADING),
-            },
-            cdc: CdcHandles {
-                events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),
-                inserts: metrics::counter!(CDC_INSERTS),
-                updates: metrics::counter!(CDC_UPDATES),
-                deletes: metrics::counter!(CDC_DELETES),
-                lag_seconds: metrics::gauge!(CDC_LAG_SECONDS),
-                lag_bytes: metrics::gauge!(CDC_LAG_BYTES),
-                flush_staleness: metrics::gauge!(CDC_FLUSH_STALENESS_SECONDS),
-                received_lsn: metrics::gauge!(CDC_RECEIVED_LSN),
-                flushed_lsn: metrics::gauge!(CDC_FLUSHED_LSN),
-                applied_lsn: metrics::gauge!(CDC_APPLIED_LSN),
-                invalidations: metrics::counter!(CACHE_INVALIDATIONS),
-                local_eval_hits: metrics::counter!(CACHE_CDC_LOCAL_EVAL_HITS),
-                pg_eval_hits: metrics::counter!(CACHE_CDC_PG_EVAL_HITS),
-                toast_repairs: metrics::counter!(CACHE_CDC_TOAST_REPAIRS),
-                toast_fallbacks: metrics::counter!(CACHE_CDC_TOAST_FALLBACKS),
-                toast_stale_aborts: metrics::counter!(CACHE_CDC_TOAST_STALE_ABORTS),
-                prepared_hits: metrics::counter!(CACHE_CDC_PREPARED_HITS),
-                prepared_misses: metrics::counter!(CACHE_CDC_PREPARED_MISSES),
-                handle_inserts: metrics::counter!(CACHE_HANDLE_INSERTS),
-                handle_updates: metrics::counter!(CACHE_HANDLE_UPDATES),
-                handle_deletes: metrics::counter!(CACHE_HANDLE_DELETES),
-                handle_insert_seconds: metrics::histogram!(CACHE_HANDLE_INSERT_SECONDS),
-                handle_update_seconds: metrics::histogram!(CACHE_HANDLE_UPDATE_SECONDS),
-                handle_delete_seconds: metrics::histogram!(CACHE_HANDLE_DELETE_SECONDS),
-                cmd_begin: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_begin"),
-                cmd_table_register: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_table_register"),
-                cmd_insert: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_insert"),
-                cmd_update: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_update"),
-                cmd_delete: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_delete"),
-                cmd_truncate: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_truncate"),
-                cmd_commit_mark: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_commit_mark"),
-                cmd_keepalive_mark: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "cdc_keepalive_mark"),
-                keepalive_marks_coalesced: metrics::counter!(CDC_KEEPALIVE_MARKS_COALESCED),
-            },
-            mv: MvHandles {
-                rebuilds: metrics::counter!(CACHE_MV_REBUILDS),
-                skipped_rebuilds: metrics::counter!(CACHE_MV_SKIPPED_REBUILDS),
-                dirty_truncates: metrics::counter!(CACHE_MV_DIRTY_TRUNCATES),
-                build_queue: metrics::gauge!(CACHE_MV_BUILD_QUEUE),
-                build_first_pop: metrics::histogram!(CACHE_MV_BUILD_DURATION_SECONDS, "kind" => "first_pop"),
-                build_rebuild: metrics::histogram!(CACHE_MV_BUILD_DURATION_SECONDS, "kind" => "rebuild"),
-                gate_admit: metrics::counter!(CACHE_MV_GATE, "outcome" => "admit"),
-                gate_reject: metrics::counter!(CACHE_MV_GATE, "outcome" => "reject"),
-            },
-            reg: RegHandles {
-                cmd_register: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "register"),
-                cmd_ready: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "ready"),
-                cmd_failed: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "failed"),
-                cmd_limit_bump: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "limit_bump"),
-                cmd_readmit: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "readmit"),
-                cmd_mv_build: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build"),
-                cmd_mv_build_complete: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "mv_build_complete"),
-                register_resolve: metrics::histogram!(CACHE_WRITER_REGISTER_RESOLVE_SECONDS),
-                register_subsumption_check: metrics::histogram!(
-                    CACHE_WRITER_REGISTER_SUBSUMPTION_CHECK_SECONDS
-                ),
-                register_subsume: metrics::histogram!(CACHE_WRITER_REGISTER_SUBSUME_SECONDS),
-                register_insert: metrics::histogram!(CACHE_WRITER_REGISTER_INSERT_SECONDS),
-                register_publication_update: metrics::histogram!(
-                    CACHE_WRITER_REGISTER_PUBLICATION_UPDATE_SECONDS
-                ),
-                register_populate_dispatch: metrics::histogram!(
-                    CACHE_WRITER_REGISTER_POPULATE_DISPATCH_SECONDS
-                ),
-                resolve_update_queries_register: metrics::histogram!(
-                    CACHE_WRITER_RESOLVE_UPDATE_QUERIES_REGISTER_SECONDS
-                ),
-                resolve_deparse: metrics::histogram!(CACHE_WRITER_RESOLVE_DEPARSE_SECONDS),
-                subsumptions: metrics::counter!(CACHE_SUBSUMPTIONS),
-                subsumption_latency: metrics::histogram!(CACHE_SUBSUMPTION_LATENCY_SECONDS),
-                registration_latency: metrics::histogram!(QUERY_REGISTRATION_LATENCY_SECONDS),
-                population_task: metrics::histogram!(CACHE_POPULATION_TASK_SECONDS),
-                population_stream: metrics::histogram!(CACHE_POPULATION_STREAM_SECONDS),
-                population_wait: metrics::histogram!(CACHE_POPULATION_WAIT_SECONDS),
-                population_workers: metrics::gauge!(CACHE_POPULATION_WORKERS),
-                population_scale_up: metrics::counter!(CACHE_POPULATION_SCALE_UP),
-                population_scale_down: metrics::counter!(CACHE_POPULATION_SCALE_DOWN),
-                population_backstop_grows: metrics::counter!(CACHE_POPULATION_BACKSTOP_GROWS),
-                merge_pending_depth: metrics::gauge!(CACHE_MERGE_PENDING_DEPTH),
-                merge_wait: metrics::histogram!(CACHE_MERGE_WAIT_SECONDS),
-                merges_applied: metrics::counter!(CACHE_MERGES_APPLIED),
-                merge_chunks: metrics::counter!(CACHE_MERGE_CHUNKS),
-                merge_chunk: metrics::histogram!(CACHE_MERGE_CHUNK_SECONDS),
-                merge_discard_chunks: metrics::counter!(CACHE_MERGE_DISCARD_CHUNKS),
-            },
-            state: StateHandles {
-                queries_registered: metrics::gauge!(CACHE_QUERIES_REGISTERED),
-                queries_loading: metrics::gauge!(CACHE_QUERIES_LOADING),
-                queries_pending: metrics::gauge!(CACHE_QUERIES_PENDING),
-                queries_invalidated: metrics::gauge!(CACHE_QUERIES_INVALIDATED),
-                disk_total: metrics::gauge!(CACHE_DISK_TOTAL_BYTES),
-                disk_available: metrics::gauge!(CACHE_DISK_AVAILABLE_BYTES),
-                disk_used: metrics::gauge!(CACHE_DISK_USED_BYTES),
-                disk_limit: metrics::gauge!(CACHE_DISK_LIMIT_BYTES),
-                generation: metrics::gauge!(CACHE_GENERATION),
-                tables_tracked: metrics::gauge!(CACHE_TABLES_TRACKED),
-                update_queries_total: metrics::gauge!(CACHE_WRITER_UPDATE_QUERIES_TOTAL),
-                update_queries_max_per_relation: metrics::gauge!(
-                    CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION
-                ),
-                evictions: metrics::counter!(CACHE_EVICTIONS),
-                evictions_pinned_bump: metrics::counter!(CACHE_EVICTIONS, "result" => "pinned_bump"),
-                evictions_bump: metrics::counter!(CACHE_EVICTIONS, "result" => "bump"),
-                readmissions: metrics::counter!(CACHE_READMISSIONS),
-                queue_writer_query: metrics::gauge!(CACHE_WRITER_QUERY_QUEUE),
-                queue_writer_cdc: metrics::gauge!(CACHE_WRITER_CDC_QUEUE),
-                queue_writer_internal: metrics::gauge!(CACHE_WRITER_INTERNAL_QUEUE),
-                queue_worker: metrics::gauge!(CACHE_WORKER_QUEUE),
-            },
-            raw: RawHandles {
-                writes_recorded: metrics::counter!(RAW_WRITES_RECORDED),
-                tier_merges: metrics::counter!(RAW_TIER_MERGES),
-                probes: metrics::counter!(RAW_PROBES),
-                forwards_table: metrics::counter!(RAW_FORWARDS, "scope" => "table"),
-                forwards_connection: metrics::counter!(RAW_FORWARDS, "scope" => "connection"),
-                forward_blocked_unstamped: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "unstamped"),
-                forward_blocked_delivery_lag: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "delivery_lag"),
-                forward_blocked_apply_lag: metrics::counter!(RAW_FORWARD_BLOCKED, "cause" => "apply_lag"),
-                clearance: metrics::histogram!(RAW_CLEARANCE_SECONDS),
-                serve_disjoint_insert: metrics::counter!(RAW_SERVE_DISJOINT_INSERT),
-                serve_disjoint_delete: metrics::counter!(RAW_SERVE_DISJOINT_DELETE),
-                serve_disjoint_update: metrics::counter!(RAW_SERVE_DISJOINT_UPDATE),
-                cap_degraded_insert: metrics::counter!(RAW_CAP_DEGRADED_INSERT),
-                cap_degraded_update_delete: metrics::counter!(RAW_CAP_DEGRADED_UPDATE_DELETE),
-            },
-            txn: TxnHandles {
-                served: metrics::counter!(TXN_SERVED),
-                forward_failed: metrics::counter!(TXN_FORWARDS, "reason" => "failed"),
-                forward_isolation_unknown: metrics::counter!(TXN_FORWARDS, "reason" => "isolation_unknown"),
-                forward_isolation_strict: metrics::counter!(TXN_FORWARDS, "reason" => "isolation_strict"),
-                forward_pending_write: metrics::counter!(TXN_FORWARDS, "reason" => "pending_write"),
-                isolation_probes: metrics::counter!(TXN_ISOLATION_PROBES),
-            },
+            queries_registered: metrics::gauge!(CACHE_QUERIES_REGISTERED),
+            queries_loading: metrics::gauge!(CACHE_QUERIES_LOADING),
+            queries_pending: metrics::gauge!(CACHE_QUERIES_PENDING),
+            queries_invalidated: metrics::gauge!(CACHE_QUERIES_INVALIDATED),
+            disk_total: metrics::gauge!(CACHE_DISK_TOTAL_BYTES),
+            disk_available: metrics::gauge!(CACHE_DISK_AVAILABLE_BYTES),
+            disk_used: metrics::gauge!(CACHE_DISK_USED_BYTES),
+            disk_limit: metrics::gauge!(CACHE_DISK_LIMIT_BYTES),
+            generation: metrics::gauge!(CACHE_GENERATION),
+            tables_tracked: metrics::gauge!(CACHE_TABLES_TRACKED),
+            update_queries_total: metrics::gauge!(CACHE_WRITER_UPDATE_QUERIES_TOTAL),
+            update_queries_max_per_relation: metrics::gauge!(
+                CACHE_WRITER_UPDATE_QUERIES_MAX_PER_RELATION
+            ),
+            evictions: metrics::counter!(CACHE_EVICTIONS),
+            evictions_pinned_bump: metrics::counter!(CACHE_EVICTIONS, "result" => "pinned_bump"),
+            evictions_bump: metrics::counter!(CACHE_EVICTIONS, "result" => "bump"),
+            readmissions: metrics::counter!(CACHE_READMISSIONS),
+            queue_writer_query: metrics::gauge!(CACHE_WRITER_QUERY_QUEUE),
+            queue_writer_cdc: metrics::gauge!(CACHE_WRITER_CDC_QUEUE),
+            queue_writer_internal: metrics::gauge!(CACHE_WRITER_INTERNAL_QUEUE),
+            queue_worker: metrics::gauge!(CACHE_WORKER_QUEUE),
+        }
+    }
+}
+
+impl Handles {
+    fn build() -> Self {
+        Self {
+            conn: ConnHandles::build(),
+            query: QueryHandles::build(),
+            stage: StageHandles::build(),
+            cache: CacheHandles::build(),
+            cdc: CdcHandles::build(),
+            mv: MvHandles::build(),
+            reg: RegHandles::build(),
+            state: StateHandles::build(),
+            raw: RawHandles::build(),
+            txn: TxnHandles::build(),
         }
     }
 }
