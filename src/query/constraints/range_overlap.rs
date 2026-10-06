@@ -4,14 +4,13 @@
 //! compiled out of the analysis-only build.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
-#[cfg(test)]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
 use super::range::{
-    ColumnRange, RangeBound, column_range_build, literal_value_is_incomparable, literal_value_order,
+    BoundSide, ColumnRange, RangeBound, RangeView, column_range_build,
+    literal_value_is_incomparable, literal_value_order,
 };
 use super::subsume::constraints_group_by_column;
 use super::{QueryConstraints, TableConstraint};
@@ -129,49 +128,47 @@ pub(crate) fn column_range_contains(range: &ColumnRange, value: &LiteralValue) -
         ColumnRange::Empty => Some(false),
         ColumnRange::Unknown => None,
         ColumnRange::Equal(v) => literal_value_eq(v, value),
-        ColumnRange::InSet(set) => {
-            // Excluded only if provably unequal to *every* element; an element
-            // incomparable to `value` leaves the membership undecidable.
-            let mut all_unequal = true;
-            for elem in set {
-                match literal_value_eq(elem, value) {
-                    Some(true) => return Some(true),
-                    Some(false) => {}
-                    None => all_unequal = false,
-                }
-            }
-            all_unequal.then_some(false)
-        }
+        ColumnRange::InSet(set) => in_set_contains(set, value),
         ColumnRange::Range {
             lower,
             upper,
             not_equal,
-        } => {
-            if not_equal
-                .iter()
-                .any(|nv| literal_value_eq(nv, value) == Some(true))
-            {
-                return Some(false);
-            }
-            let lower_ok = match lower {
-                Some(bound) => match literal_value_order_numeric(value, &bound.value)? {
-                    Ordering::Greater => true,
-                    Ordering::Equal => bound.inclusive,
-                    Ordering::Less => false,
-                },
-                None => true,
-            };
-            let upper_ok = match upper {
-                Some(bound) => match literal_value_order_numeric(value, &bound.value)? {
-                    Ordering::Less => true,
-                    Ordering::Equal => bound.inclusive,
-                    Ordering::Greater => false,
-                },
-                None => true,
-            };
-            Some(lower_ok && upper_ok)
+        } => range_contains(RangeView::new(lower, upper, not_equal), value),
+    }
+}
+
+/// Excluded only if provably unequal to *every* element; an element
+/// incomparable to `value` leaves the membership undecidable.
+fn in_set_contains(set: &HashSet<LiteralValue>, value: &LiteralValue) -> Option<bool> {
+    let mut all_unequal = true;
+    for elem in set {
+        match literal_value_eq(elem, value) {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => all_unequal = false,
         }
     }
+    all_unequal.then_some(false)
+}
+
+/// An explicit exclusion rules the value out; otherwise it must satisfy both
+/// bounds, and a bound incomparable to it leaves containment undecidable.
+fn range_contains(range: RangeView<'_>, value: &LiteralValue) -> Option<bool> {
+    if range
+        .not_equal
+        .iter()
+        .any(|nv| literal_value_eq(nv, value) == Some(true))
+    {
+        return Some(false);
+    }
+    let mut admitted = true;
+    for side in BoundSide::BOTH {
+        if let Some(bound) = range.bound(side) {
+            let ord = literal_value_order_numeric(value, &bound.value)?;
+            admitted &= side.admits(ord, bound.inclusive);
+        }
+    }
+    Some(admitted)
 }
 
 /// Whether two ranges over the same column are provably disjoint — no value can
