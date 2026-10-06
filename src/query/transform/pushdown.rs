@@ -420,6 +420,20 @@ mod tests {
         predicate_pushdown_apply(resolved)
     }
 
+    /// A catalog of text-column tables, given as (name, columns), with relation
+    /// OIDs from 1001 in order.
+    fn tables(specs: &[(&str, &[&str])]) -> BiHashMap<TableMetadata> {
+        let mut tables = BiHashMap::new();
+        for (oid, (name, columns)) in (1001..).zip(specs) {
+            tables.insert_overwrite(test_table_metadata_with_columns(
+                name,
+                Oid::from_raw(oid),
+                columns,
+            ));
+        }
+        tables
+    }
+
     // --- Navigation helpers ---
 
     fn as_select(query: &ResolvedQueryExpr) -> &ResolvedSelectNode {
@@ -446,22 +460,70 @@ mod tests {
         }
     }
 
-    /// Check whether a WHERE expression tree contains `table.column = 'value'`.
-    /// Walks through AND nodes to find the comparison anywhere in the tree.
-    fn where_has_eq(expr: &ResolvedWhereExpr, table: &str, column: &str, value: &str) -> bool {
+    /// The WHERE of a SELECT query, which the test expects to exist.
+    fn where_of<'a>(query: &'a ResolvedQueryExpr, label: &str) -> &'a ResolvedWhereExpr {
+        as_select(query).where_clause.as_ref().expect(label)
+    }
+
+    /// The FROM subquery of a SELECT whose WHERE was pushed into it.
+    fn outer_where_pushed(query: &ResolvedQueryExpr) -> &ResolvedQueryExpr {
+        let outer = as_select(query);
+        assert!(
+            outer.where_clause.is_none(),
+            "outer WHERE should be removed"
+        );
+        from_subquery_body(outer)
+    }
+
+    /// The left and right WHEREs of a UNION subquery the outer WHERE was
+    /// pushed into.
+    fn union_branch_wheres(query: &ResolvedQueryExpr) -> (&ResolvedWhereExpr, &ResolvedWhereExpr) {
+        let set_op = as_set_op(outer_where_pushed(query));
+        (
+            where_of(&set_op.left, "left WHERE"),
+            where_of(&set_op.right, "right WHERE"),
+        )
+    }
+
+    fn assert_outer_where_kept(sql: &str, tables: &BiHashMap<TableMetadata>, reason: &str) {
+        let result = resolve_and_pushdown(sql, tables);
+        assert!(as_select(&result).where_clause.is_some(), "{reason}");
+    }
+
+    /// An expected `table.column = 'value'` comparison.
+    struct ColumnEq<'a> {
+        qualified_column: &'a str,
+        value: &'a str,
+    }
+
+    fn column_eq<'a>(qualified_column: &'a str, value: &'a str) -> ColumnEq<'a> {
+        ColumnEq {
+            qualified_column,
+            value,
+        }
+    }
+
+    impl ColumnEq<'_> {
+        fn matches(&self, binary: &ResolvedBinaryExpr) -> bool {
+            let (
+                ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)),
+                ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(LiteralValue::String(v))),
+            ) = (binary.lexpr.as_ref(), binary.rexpr.as_ref())
+            else {
+                return false;
+            };
+            let qualified = format!("{}.{}", col.table, col.column);
+            qualified == self.qualified_column && v == self.value
+        }
+    }
+
+    /// Whether a WHERE expression tree contains the comparison, anywhere under
+    /// AND nodes.
+    fn where_has_eq(expr: &ResolvedWhereExpr, expected: &ColumnEq<'_>) -> bool {
         match expr {
-            ResolvedWhereExpr::Binary(b) if b.op == BinaryOp::Equal => {
-                matches!(
-                    (b.lexpr.as_ref(), b.rexpr.as_ref()),
-                    (
-                        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)),
-                        ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(LiteralValue::String(v)))
-                    ) if col.table == table && col.column == column && v == value
-                )
-            }
+            ResolvedWhereExpr::Binary(b) if b.op == BinaryOp::Equal => expected.matches(b),
             ResolvedWhereExpr::Binary(b) if b.op == BinaryOp::And => {
-                where_has_eq(&b.lexpr, table, column, value)
-                    || where_has_eq(&b.rexpr, table, column, value)
+                where_has_eq(&b.lexpr, expected) || where_has_eq(&b.rexpr, expected)
             }
             _ => false,
         }
@@ -471,307 +533,128 @@ mod tests {
 
     #[test]
     fn test_union_pushdown_both_branches() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t2",
-            Oid::from_raw(1002),
-            &["a", "b"],
-        ));
-
+        let tables = tables(&[("t1", &["a", "b"]), ("t2", &["a", "b"])]);
         let sql = "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
 
-        let outer = as_select(&result);
-        assert!(
-            outer.where_clause.is_none(),
-            "outer WHERE should be removed"
-        );
-
-        let set_op = as_set_op(from_subquery_body(outer));
-        let left = as_select(&set_op.left);
-        let right = as_select(&set_op.right);
-        assert!(where_has_eq(
-            left.where_clause.as_ref().expect("left WHERE"),
-            "t1",
-            "a",
-            "x"
-        ));
-        assert!(where_has_eq(
-            right.where_clause.as_ref().expect("right WHERE"),
-            "t2",
-            "a",
-            "x"
-        ));
+        let (left, right) = union_branch_wheres(&result);
+        assert!(where_has_eq(left, &column_eq("t1.a", "x")));
+        assert!(where_has_eq(right, &column_eq("t2.a", "x")));
     }
 
     #[test]
     fn test_union_column_alias_remapping() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t2",
-            Oid::from_raw(1002),
-            &["c", "d"],
-        ));
-
+        let tables = tables(&[("t1", &["a", "b"]), ("t2", &["c", "d"])]);
         let sql = "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT c, d FROM t2) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
 
-        let outer = as_select(&result);
-        assert!(
-            outer.where_clause.is_none(),
-            "outer WHERE should be removed"
-        );
-
-        let set_op = as_set_op(from_subquery_body(outer));
-        let left = as_select(&set_op.left);
-        let right = as_select(&set_op.right);
+        let (left, right) = union_branch_wheres(&result);
         // t1 branch: a → position 0 → t1.a
-        assert!(where_has_eq(
-            left.where_clause.as_ref().expect("left WHERE"),
-            "t1",
-            "a",
-            "x"
-        ));
+        assert!(where_has_eq(left, &column_eq("t1.a", "x")));
         // t2 branch: a → position 0 → t2.c (remapped)
-        assert!(where_has_eq(
-            right.where_clause.as_ref().expect("right WHERE"),
-            "t2",
-            "c",
-            "x"
-        ));
+        assert!(where_has_eq(right, &column_eq("t2.c", "x")));
     }
 
     #[test]
     fn test_existing_where_anded() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t2",
-            Oid::from_raw(1002),
-            &["a", "b"],
-        ));
-
+        let tables = tables(&[("t1", &["a", "b"]), ("t2", &["a", "b"])]);
         let sql = "SELECT * FROM (SELECT a, b FROM t1 WHERE b = 'y' UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
 
-        let outer = as_select(&result);
-        assert!(
-            outer.where_clause.is_none(),
-            "outer WHERE should be removed"
-        );
-
-        let set_op = as_set_op(from_subquery_body(outer));
-        let left = as_select(&set_op.left);
-        let left_where = left.where_clause.as_ref().expect("left WHERE");
+        let (left, _) = union_branch_wheres(&result);
         // t1 should have both: existing b = 'y' AND pushed a = 'x'
         assert!(
-            where_has_eq(left_where, "t1", "b", "y"),
+            where_has_eq(left, &column_eq("t1.b", "y")),
             "existing WHERE preserved"
         );
         assert!(
-            where_has_eq(left_where, "t1", "a", "x"),
+            where_has_eq(left, &column_eq("t1.a", "x")),
             "pushed predicate added"
         );
     }
 
     #[test]
     fn test_non_scalar_expr_no_pushdown() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-
-        let sql = "SELECT * FROM (SELECT a, 42 AS val FROM t1) sub WHERE sub.val = 99";
-        let result = resolve_and_pushdown(sql, &tables);
-
         // Position 1 maps to a literal — cannot push
-        let outer = as_select(&result);
-        assert!(outer.where_clause.is_some(), "outer WHERE should remain");
+        assert_outer_where_kept(
+            "SELECT * FROM (SELECT a, 42 AS val FROM t1) sub WHERE sub.val = 99",
+            &tables(&[("t1", &["a", "b"])]),
+            "outer WHERE should remain",
+        );
     }
 
     #[test]
     fn test_group_by_no_pushdown() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-
-        let sql =
-            "SELECT * FROM (SELECT a, count(b) AS cnt FROM t1 GROUP BY a) sub WHERE sub.a = 'x'";
-        let result = resolve_and_pushdown(sql, &tables);
-
-        let outer = as_select(&result);
-        assert!(
-            outer.where_clause.is_some(),
-            "outer WHERE should remain with GROUP BY"
+        assert_outer_where_kept(
+            "SELECT * FROM (SELECT a, count(b) AS cnt FROM t1 GROUP BY a) sub WHERE sub.a = 'x'",
+            &tables(&[("t1", &["a", "b"])]),
+            "outer WHERE should remain with GROUP BY",
         );
     }
 
     #[test]
     fn test_window_function_no_pushdown() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-
-        let sql = "SELECT * FROM (SELECT a, row_number() OVER (ORDER BY b) AS rn FROM t1) sub WHERE sub.a = 'x'";
-        let result = resolve_and_pushdown(sql, &tables);
-
-        let outer = as_select(&result);
-        assert!(
-            outer.where_clause.is_some(),
-            "outer WHERE should remain with window function"
+        assert_outer_where_kept(
+            "SELECT * FROM (SELECT a, row_number() OVER (ORDER BY b) AS rn FROM t1) sub WHERE sub.a = 'x'",
+            &tables(&[("t1", &["a", "b"])]),
+            "outer WHERE should remain with window function",
         );
     }
 
     #[test]
     fn test_multiple_conjuncts_all_pushed() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t2",
-            Oid::from_raw(1002),
-            &["a", "b"],
-        ));
-
+        let tables = tables(&[("t1", &["a", "b"]), ("t2", &["a", "b"])]);
         let sql = "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x' AND sub.b = 'y'";
         let result = resolve_and_pushdown(sql, &tables);
 
-        let outer = as_select(&result);
-        assert!(
-            outer.where_clause.is_none(),
-            "outer WHERE should be removed"
-        );
-
-        let set_op = as_set_op(from_subquery_body(outer));
-        let left_where = as_select(&set_op.left)
-            .where_clause
-            .as_ref()
-            .expect("left WHERE");
-        let right_where = as_select(&set_op.right)
-            .where_clause
-            .as_ref()
-            .expect("right WHERE");
-
-        assert!(where_has_eq(left_where, "t1", "a", "x"));
-        assert!(where_has_eq(left_where, "t1", "b", "y"));
-        assert!(where_has_eq(right_where, "t2", "a", "x"));
-        assert!(where_has_eq(right_where, "t2", "b", "y"));
+        let (left, right) = union_branch_wheres(&result);
+        assert!(where_has_eq(left, &column_eq("t1.a", "x")));
+        assert!(where_has_eq(left, &column_eq("t1.b", "y")));
+        assert!(where_has_eq(right, &column_eq("t2.a", "x")));
+        assert!(where_has_eq(right, &column_eq("t2.b", "y")));
     }
 
     #[test]
     fn test_plain_subquery_pushdown() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-
+        let tables = tables(&[("t1", &["a", "b"])]);
         let sql = "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
 
-        let outer = as_select(&result);
-        assert!(
-            outer.where_clause.is_none(),
-            "outer WHERE should be removed"
-        );
-
-        let inner = as_select(from_subquery_body(outer));
+        let inner = outer_where_pushed(&result);
         assert!(where_has_eq(
-            inner.where_clause.as_ref().expect("inner WHERE"),
-            "t1",
-            "a",
-            "x"
+            where_of(inner, "inner WHERE"),
+            &column_eq("t1.a", "x")
         ));
     }
 
     #[test]
     fn test_no_subquery_unchanged() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-
+        let tables = tables(&[("t1", &["a", "b"])]);
         let sql = "SELECT a, b FROM t1 WHERE a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
 
         // No FROM subquery — WHERE should be preserved as-is
-        let select = as_select(&result);
         assert!(where_has_eq(
-            select.where_clause.as_ref().expect("WHERE preserved"),
-            "t1",
-            "a",
-            "x"
+            where_of(&result, "WHERE preserved"),
+            &column_eq("t1.a", "x")
         ));
     }
 
     #[test]
     fn test_predicate_with_subquery_not_pushed() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t2",
-            Oid::from_raw(1002),
-            &["a", "b"],
-        ));
-
-        let sql = "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a IN (SELECT a FROM t2)";
-        let result = resolve_and_pushdown(sql, &tables);
-
-        let outer = as_select(&result);
-        assert!(
-            outer.where_clause.is_some(),
-            "outer WHERE should remain for subquery predicates"
+        assert_outer_where_kept(
+            "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a IN (SELECT a FROM t2)",
+            &tables(&[("t1", &["a", "b"]), ("t2", &["a", "b"])]),
+            "outer WHERE should remain for subquery predicates",
         );
     }
 
     #[test]
     fn test_subquery_with_limit_not_pushed() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-
-        let sql = "SELECT * FROM (SELECT a, b FROM t1 LIMIT 10) sub WHERE sub.a = 'x'";
-        let result = resolve_and_pushdown(sql, &tables);
-
-        let outer = as_select(&result);
-        assert!(
-            outer.where_clause.is_some(),
-            "outer WHERE should remain when subquery has LIMIT"
+        assert_outer_where_kept(
+            "SELECT * FROM (SELECT a, b FROM t1 LIMIT 10) sub WHERE sub.a = 'x'",
+            &tables(&[("t1", &["a", "b"])]),
+            "outer WHERE should remain when subquery has LIMIT",
         );
     }
 
@@ -811,18 +694,7 @@ mod tests {
 
     #[test]
     fn test_literal_columns_dont_block_pushdown() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t2",
-            Oid::from_raw(1002),
-            &["a", "b"],
-        ));
-
+        let tables = tables(&[("t1", &["a", "b"]), ("t2", &["a", "b"])]);
         // Branches have literal columns (NULL, constants) alongside real columns.
         // Predicate only references a real column — should still push down.
         let sql = "\
@@ -833,43 +705,14 @@ mod tests {
             ) sub WHERE sub.a = 'x'";
         let result = resolve_and_pushdown(sql, &tables);
 
-        let outer = as_select(&result);
-        assert!(
-            outer.where_clause.is_none(),
-            "outer WHERE should be removed"
-        );
-
-        let set_op = as_set_op(from_subquery_body(outer));
-        let left = as_select(&set_op.left);
-        let right = as_select(&set_op.right);
-        assert!(where_has_eq(
-            left.where_clause.as_ref().expect("left WHERE"),
-            "t1",
-            "a",
-            "x"
-        ));
-        assert!(where_has_eq(
-            right.where_clause.as_ref().expect("right WHERE"),
-            "t2",
-            "a",
-            "x"
-        ));
+        let (left, right) = union_branch_wheres(&result);
+        assert!(where_has_eq(left, &column_eq("t1.a", "x")));
+        assert!(where_has_eq(right, &column_eq("t2.a", "x")));
     }
 
     #[test]
     fn test_setop_branches_recurse() {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t1",
-            Oid::from_raw(1001),
-            &["a", "b"],
-        ));
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            "t2",
-            Oid::from_raw(1002),
-            &["a", "b"],
-        ));
-
+        let tables = tables(&[("t1", &["a", "b"]), ("t2", &["a", "b"])]);
         // Top-level UNION; each branch has a FROM subquery with a pushable outer WHERE
         let sql = "\
             SELECT * FROM (SELECT a, b FROM t1) sub1 WHERE sub1.a = 'x' \
@@ -878,34 +721,15 @@ mod tests {
         let result = resolve_and_pushdown(sql, &tables);
 
         let set_op = as_set_op(&result);
-
-        let left_outer = as_select(&set_op.left);
-        assert!(
-            left_outer.where_clause.is_none(),
-            "left outer WHERE should be removed"
-        );
-        let left_inner = as_select(from_subquery_body(left_outer));
+        let left_inner = outer_where_pushed(&set_op.left);
         assert!(where_has_eq(
-            left_inner.where_clause.as_ref().expect("left inner WHERE"),
-            "t1",
-            "a",
-            "x"
+            where_of(left_inner, "left inner WHERE"),
+            &column_eq("t1.a", "x")
         ));
-
-        let right_outer = as_select(&set_op.right);
-        assert!(
-            right_outer.where_clause.is_none(),
-            "right outer WHERE should be removed"
-        );
-        let right_inner = as_select(from_subquery_body(right_outer));
+        let right_inner = outer_where_pushed(&set_op.right);
         assert!(where_has_eq(
-            right_inner
-                .where_clause
-                .as_ref()
-                .expect("right inner WHERE"),
-            "t2",
-            "a",
-            "y"
+            where_of(right_inner, "right inner WHERE"),
+            &column_eq("t2.a", "y")
         ));
     }
 }
