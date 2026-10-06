@@ -2,6 +2,7 @@
 //! in Rust, can it be batched, and which columns does its predicate touch.
 
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
@@ -10,8 +11,8 @@ use crate::oid::Oid;
 use crate::query::ast::{AstNode, NullOrder, OrderDirection};
 use crate::query::evaluate::resolved_where_expr_supported;
 use crate::query::resolved::{
-    ResolvedColumnNode, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns,
-    ResolvedTableNode,
+    ResolvedColumnNode, ResolvedOrderByClause, ResolvedQueryExpr, ResolvedScalarExpr,
+    ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableNode,
 };
 
 /// Decide whether CDC can evaluate this update query's WHERE in Rust.
@@ -90,6 +91,51 @@ pub(super) fn pg_batchable_classify(
     }
 }
 
+/// Column names of one table, collected from column references anywhere
+/// under the nodes added.
+struct TableColumns<'t> {
+    table: &'t str,
+    columns: HashSet<EcoString>,
+}
+
+impl<'t> TableColumns<'t> {
+    fn new(table: &'t str) -> Self {
+        Self {
+            table,
+            columns: HashSet::new(),
+        }
+    }
+
+    fn add(&mut self, column: &ResolvedColumnNode) {
+        if column.table.as_str() == self.table {
+            self.columns.insert(column.column.clone());
+        }
+    }
+
+    /// Every column reference under `node` (zero-allocation walk).
+    fn add_refs<N: AstNode>(&mut self, node: &N) {
+        let _ = node.try_for_each_node::<ResolvedColumnNode, ()>(&mut |column| {
+            self.add(column);
+            ControlFlow::Continue(())
+        });
+    }
+}
+
+/// The SELECT-list expressions an `ORDER BY alias` names (output-name match).
+fn select_alias_exprs<'s>(
+    select: &'s ResolvedSelectNode,
+    name: &'s EcoString,
+) -> impl Iterator<Item = &'s ResolvedScalarExpr> {
+    let columns: &[ResolvedSelectColumn] = match &select.columns {
+        ResolvedSelectColumns::Columns(columns) => columns,
+        ResolvedSelectColumns::None => &[],
+    };
+    columns
+        .iter()
+        .filter(move |column| column.output_name() == Some(name))
+        .map(|column| &column.expr)
+}
+
 /// Collect column names on `table_name` that participate in the parent
 /// query's LIMIT-window definition: top-level ORDER BY, WHERE, and HAVING.
 ///
@@ -105,49 +151,29 @@ pub(super) fn limit_window_columns_collect(
     resolved: &ResolvedQueryExpr,
     table_name: &str,
 ) -> HashSet<EcoString> {
-    let mut cols = HashSet::new();
-    let mut push_if_local = |col: &ResolvedColumnNode| {
-        if col.table.as_str() == table_name {
-            cols.insert(col.column.clone());
-        }
-    };
-
+    let mut cols = TableColumns::new(table_name);
     let select = resolved.as_select();
-
     for clause in &resolved.order_by {
-        for col in clause.expr.nodes::<ResolvedColumnNode>() {
-            push_if_local(col);
-        }
+        cols.add_refs(&clause.expr);
         // Aliased `ORDER BY value` resolves to `Identifier`; chase it through
         // the SELECT-list to recover the underlying base-table column refs.
         if let ResolvedScalarExpr::Identifier(name) = &clause.expr
             && let Some(select) = select
-            && let ResolvedSelectColumns::Columns(select_cols) = &select.columns
         {
-            for select_col in select_cols {
-                if select_col.output_name() == Some(name) {
-                    for col in select_col.expr.nodes::<ResolvedColumnNode>() {
-                        push_if_local(col);
-                    }
-                }
+            for expr in select_alias_exprs(select, name) {
+                cols.add_refs(expr);
             }
         }
     }
-
     if let Some(select) = select {
         if let Some(where_expr) = &select.where_clause {
-            for col in where_expr.nodes::<ResolvedColumnNode>() {
-                push_if_local(col);
-            }
+            cols.add_refs(where_expr);
         }
         if let Some(having) = &select.having {
-            for col in having.nodes::<ResolvedColumnNode>() {
-                push_if_local(col);
-            }
+            cols.add_refs(having);
         }
     }
-
-    cols
+    cols.columns
 }
 
 /// The ORDER BY key spec for direction-aware window invalidation (PGC-334):
@@ -155,69 +181,65 @@ pub(super) fn limit_window_columns_collect(
 /// HAVING, or DISTINCT — their windows aren't row-level) and every key
 /// resolves to exactly one plain column of `table_name`, directly or through
 /// a bare-column SELECT alias. Anything else returns `None` and the window
-/// check stays direction-blind (always invalidates). `Default` null ordering
-/// resolves per PG semantics — NULLs sort larger than every value, so
-/// ASC → last, DESC → first.
+/// check stays direction-blind (always invalidates).
 pub(super) fn limit_order_keys_collect(
     resolved: &ResolvedQueryExpr,
     table_name: &str,
 ) -> Option<Box<[OrderByKey]>> {
     let select = resolved.as_select()?;
-    if select.distinct || !select.group_by.is_empty() || select.having.is_some() {
-        return None;
-    }
-    if resolved.order_by.is_empty() {
+    if !row_level_window(resolved, select) {
         return None;
     }
     let mut keys = Vec::with_capacity(resolved.order_by.len());
     for clause in &resolved.order_by {
-        let column = match &clause.expr {
-            ResolvedScalarExpr::Column(col) => col,
-            // Aliased `ORDER BY value`: usable only when the aliased SELECT
-            // expression is itself a bare column.
-            ResolvedScalarExpr::Identifier(name) => {
-                let ResolvedSelectColumns::Columns(select_cols) = &select.columns else {
-                    return None;
-                };
-                let aliased = select_cols
-                    .iter()
-                    .find(|sc| sc.output_name() == Some(name))?;
-                match &aliased.expr {
-                    ResolvedScalarExpr::Column(col) => col,
-                    ResolvedScalarExpr::Identifier(_)
-                    | ResolvedScalarExpr::Function(_)
-                    | ResolvedScalarExpr::Literal(_)
-                    | ResolvedScalarExpr::Case(_)
-                    | ResolvedScalarExpr::Arithmetic(_)
-                    | ResolvedScalarExpr::Subquery(..)
-                    | ResolvedScalarExpr::Array(_)
-                    | ResolvedScalarExpr::TypeCast { .. } => return None,
-                }
-            }
-            ResolvedScalarExpr::Function(_)
-            | ResolvedScalarExpr::Literal(_)
-            | ResolvedScalarExpr::Case(_)
-            | ResolvedScalarExpr::Arithmetic(_)
-            | ResolvedScalarExpr::Subquery(..)
-            | ResolvedScalarExpr::Array(_)
-            | ResolvedScalarExpr::TypeCast { .. } => return None,
-        };
+        let column = order_key_column(&clause.expr, select)?;
         if column.table.as_str() != table_name {
             return None;
         }
-        let descending = matches!(clause.direction, OrderDirection::Desc);
-        let nulls_first = match clause.null_order {
-            NullOrder::NullsFirst => true,
-            NullOrder::NullsLast => false,
-            NullOrder::Default => descending,
-        };
-        keys.push(OrderByKey {
-            column: column.column.clone(),
-            descending,
-            nulls_first,
-        });
+        keys.push(order_by_key(column, clause));
     }
     Some(keys.into())
+}
+
+/// A window whose rows are the SELECT's own rows: ordered, and no DISTINCT,
+/// GROUP BY or HAVING reshaping them.
+fn row_level_window(resolved: &ResolvedQueryExpr, select: &ResolvedSelectNode) -> bool {
+    let reshaped = select.distinct || !select.group_by.is_empty() || select.having.is_some();
+    !reshaped && !resolved.order_by.is_empty()
+}
+
+/// The plain column an ORDER BY key sorts by: the key itself, or the bare
+/// column an `ORDER BY alias` names.
+fn order_key_column<'s>(
+    expr: &'s ResolvedScalarExpr,
+    select: &'s ResolvedSelectNode,
+) -> Option<&'s ResolvedColumnNode> {
+    let target = if let ResolvedScalarExpr::Identifier(name) = expr {
+        select_alias_exprs(select, name).next()?
+    } else {
+        expr
+    };
+    if let ResolvedScalarExpr::Column(column) = target {
+        Some(column)
+    } else {
+        None
+    }
+}
+
+/// `Default` null ordering resolves per PG semantics — NULLs sort larger than
+/// every value, so ASC → last, DESC → first.
+fn order_by_key(column: &ResolvedColumnNode, clause: &ResolvedOrderByClause) -> OrderByKey {
+    let descending = matches!(clause.direction, OrderDirection::Desc);
+    let nulls_first = match clause.null_order {
+        NullOrder::NullsFirst => true,
+        NullOrder::NullsLast => false,
+        NullOrder::Default => descending,
+    };
+    OrderByKey {
+        column: column.column.clone(),
+        descending,
+        nulls_first,
+    }
 }
 
 /// Collect column names on `table_name` whose values CDC eval reads for this
@@ -229,38 +251,25 @@ pub(super) fn predicate_columns_collect(
     resolved: &ResolvedQueryExpr,
     table_name: &str,
 ) -> HashSet<EcoString> {
-    let local_columns = |cols: &mut HashSet<EcoString>, node: &ResolvedColumnNode| {
-        if node.table.as_str() == table_name {
-            cols.insert(node.column.clone());
-        }
-    };
-    let mut cols = HashSet::new();
+    let mut cols = TableColumns::new(table_name);
     let Some(select) = resolved.as_select() else {
         // Not a plain select (set-op branch): over-collect every reference.
-        for col in resolved.nodes::<ResolvedColumnNode>() {
-            local_columns(&mut cols, col);
-        }
-        return cols;
+        cols.add_refs(resolved);
+        return cols.columns;
     };
     for source in &select.from {
-        for col in source.nodes::<ResolvedColumnNode>() {
-            local_columns(&mut cols, col);
-        }
+        cols.add_refs(source);
     }
     if let Some(where_expr) = &select.where_clause {
-        for col in where_expr.nodes::<ResolvedColumnNode>() {
-            local_columns(&mut cols, col);
-        }
+        cols.add_refs(where_expr);
     }
-    for col in &select.group_by {
-        local_columns(&mut cols, col);
+    for column in &select.group_by {
+        cols.add(column);
     }
     if let Some(having) = &select.having {
-        for col in having.nodes::<ResolvedColumnNode>() {
-            local_columns(&mut cols, col);
-        }
+        cols.add_refs(having);
     }
-    cols
+    cols.columns
 }
 
 #[cfg(test)]
