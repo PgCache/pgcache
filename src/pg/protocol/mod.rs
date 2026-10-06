@@ -23,7 +23,7 @@ pub(crate) mod session;
 
 #[cfg(feature = "proxy")]
 pub(crate) use message::{
-    PgConnectionState, PgMessage, PgMessageType, ProtocolError, ProtocolResult,
+    PgConnectionState, PgMessage, PgMessageType, ProtocolError, ProtocolResult, message_length,
 };
 
 /// Immutable UTF-8 string backed by a refcounted `Bytes` slice, typically a

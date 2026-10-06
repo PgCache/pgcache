@@ -30,14 +30,14 @@ pub(crate) const SETGEN_SQL: &str = "SELECT set_config('mem.query_generation', $
 /// Build a PG startup message (protocol v3.0).
 ///
 /// Format: int32 len | int32 protocol_version(196608) | key\0value\0 pairs | \0
-pub(crate) fn startup_message_build(user: &str, database: &str) -> BytesMut {
+pub(crate) fn startup_message_build(user: &str, database: &str) -> CacheResult<BytesMut> {
     // Calculate total length
     let body_len = 4 // protocol version
         + 5 + user.len() + 1      // "user\0" + user + \0
         + 9 + database.len() + 1   // "database\0" + database + \0
         + 1; // final \0 terminator
     let total_len = 4 + body_len; // 4 for the length field itself
-    let total_len_i32 = i32::try_from(total_len).expect("startup message fits in i32");
+    let total_len_i32 = i32::try_from(total_len).map_err(|_| CacheError::InvalidMessage)?;
 
     let mut buf = BytesMut::with_capacity(total_len);
     buf.put_i32(total_len_i32);
@@ -49,7 +49,7 @@ pub(crate) fn startup_message_build(user: &str, database: &str) -> BytesMut {
     buf.put_slice(database.as_bytes());
     buf.put_u8(0);
     buf.put_u8(0); // terminator
-    buf
+    Ok(buf)
 }
 
 /// Append a frontend protocol message: the tag byte, a 4-byte length backfilled

@@ -35,13 +35,15 @@ use tracing::debug;
 use super::{ConnectionState, OriginIntercept, SearchPathState};
 use crate::pg::protocol::{
     backend::{PgBackendMessage, PgBackendMessageType, TransactionStatus, data_row_first_column},
-    frontend::simple_query_message_build,
+    frontend::ProbeQuery,
 };
 use crate::query::write::{IsolationEffect, IsolationLevel, StatementEffects, TransactionBoundary};
 
 /// Injected probe for the session default; its response is swallowed by
 /// [`OriginIntercept::DefaultTransactionIsolation`].
-const DEFAULT_TRANSACTION_ISOLATION_PROBE: &str = "SHOW default_transaction_isolation;";
+const DEFAULT_TRANSACTION_ISOLATION_PROBE: ProbeQuery =
+    ProbeQuery::new("SHOW default_transaction_isolation;");
+const SEARCH_PATH_PROBE: ProbeQuery = ProbeQuery::new("SHOW search_path;");
 
 /// An isolation level as the proxy knows it — for the session default, and
 /// for the block currently open.
@@ -186,8 +188,7 @@ impl ConnectionState {
             self.origin_intercept = OriginIntercept::SearchPath;
             // Injected query: its response is fully swallowed by the
             // SearchPath intercept, so it gets no client egress slot.
-            self.origin_write_buf
-                .push_back(simple_query_message_build("SHOW search_path;"));
+            self.origin_write_buf.push_back(SEARCH_PATH_PROBE.message());
             return;
         }
         self.isolation_probe_inject();
@@ -205,9 +206,8 @@ impl ConnectionState {
         }
         debug!("default_transaction_isolation unknown, probing");
         self.origin_intercept = OriginIntercept::DefaultTransactionIsolation;
-        self.origin_write_buf.push_back(simple_query_message_build(
-            DEFAULT_TRANSACTION_ISOLATION_PROBE,
-        ));
+        self.origin_write_buf
+            .push_back(DEFAULT_TRANSACTION_ISOLATION_PROBE.message());
         crate::metrics::handles().txn.isolation_probes.increment(1);
     }
 

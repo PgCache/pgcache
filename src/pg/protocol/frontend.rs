@@ -4,7 +4,9 @@ use tokio_util::{
     codec::Decoder,
 };
 
-use super::{PgConnectionState, PgMessage, PgMessageType, ProtocolError};
+use super::{
+    PgConnectionState, PgMessage, PgMessageType, ProtocolError, ProtocolResult, message_length,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PgFrontendMessageType {
@@ -86,13 +88,38 @@ pub(crate) fn startup_message_parameter<'a>(data: &'a [u8], key: &str) -> Option
     }
 }
 
+/// A constant query pgcache injects into an origin session. Its length is
+/// checked at compile time, so building its message cannot fail.
+pub(crate) struct ProbeQuery {
+    sql: &'static str,
+    message_len: i32,
+}
+
+impl ProbeQuery {
+    const MAX_LEN: usize = 1024;
+
+    pub(crate) const fn new(sql: &'static str) -> Self {
+        assert!(sql.len() <= Self::MAX_LEN, "probe query too long");
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // bounded above
+        let message_len = (4 + sql.len() + 1) as i32;
+        Self { sql, message_len }
+    }
+
+    pub(crate) fn message(&self) -> BytesMut {
+        simple_query_message_encode(self.sql.as_bytes(), self.message_len)
+    }
+}
+
 /// Build a simple query message for sending to the backend.
 ///
 /// Message format: 'Q' | int32 len | string query (null-terminated)
-pub(crate) fn simple_query_message_build(query: &str) -> BytesMut {
-    let query_bytes = query.as_bytes();
+pub(crate) fn simple_query_message_build(query: &str) -> ProtocolResult<BytesMut> {
     // Length includes: 4 bytes for length field + query bytes + 1 null terminator
-    let len = i32::try_from(4 + query_bytes.len() + 1).expect("query message fits in i32");
+    let len = message_length(4 + query.len() + 1)?;
+    Ok(simple_query_message_encode(query.as_bytes(), len))
+}
+
+fn simple_query_message_encode(query_bytes: &[u8], len: i32) -> BytesMut {
     let mut buf = BytesMut::with_capacity(1 + 4 + query_bytes.len() + 1);
     buf.extend_from_slice(b"Q");
     buf.extend_from_slice(&len.to_be_bytes());
@@ -200,5 +227,26 @@ impl Decoder for PgFrontendMessageCodec {
                 }))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_probe_query_message_matches_simple_query_build() {
+        const PROBE: ProbeQuery = ProbeQuery::new("SHOW search_path;");
+        assert_eq!(
+            PROBE.message(),
+            simple_query_message_build("SHOW search_path;").expect("build simple query")
+        );
+    }
+
+    #[test]
+    fn test_message_length_rejects_lengths_beyond_i32() {
+        let max = usize::try_from(i32::MAX).expect("i32::MAX as usize");
+        assert_eq!(message_length(max).expect("max length fits"), i32::MAX);
+        assert!(message_length(max + 1).is_err());
     }
 }

@@ -70,9 +70,7 @@ pub(super) enum TrailingShowState {
 /// one statement with a detected mutation.
 fn query_message_append_show_search_path(data: &BytesMut) -> Option<BytesMut> {
     let sql = query_message_sql(data)?;
-    Some(simple_query_message_build(&format!(
-        "{sql}; SHOW search_path"
-    )))
+    simple_query_message_build(&format!("{sql}; SHOW search_path")).ok()
 }
 
 /// Search path discovery state machine.

@@ -19,9 +19,10 @@ use crate::cache::reply::ReplySender;
 use crate::cache::runtime::serve_pool::ConnectionGuard;
 use crate::cache::types::{CacheStateView, SharedResolved};
 use crate::pg::cache_connection::{CacheConnection, ExplainOutcome};
+use crate::pg::protocol::ProtocolResult;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::encode::{
-    command_complete_tag_encode, data_row_text_encode, notice_response_encode,
+    SERVE_ERROR_MSG, command_complete_tag_encode, data_row_text_encode, notice_response_encode,
     row_description_text_encode,
 };
 use crate::proxy::ClientSocket;
@@ -131,6 +132,13 @@ pub(super) async fn handle_explain_request(
         }
     };
 
+    // A plan too large to frame gets the static serve error instead.
+    let response = response.unwrap_or_else(|e| {
+        debug!("explain response encode failed: {e}");
+        let mut buf = BytesMut::from(SERVE_ERROR_MSG);
+        buf.extend_from_slice(transaction_status.ready_for_query_message());
+        buf
+    });
     timing.response_written_at = Some(Instant::now());
     if let Err(e) = client_socket.write_all(&response).await {
         debug!("explain client write failed: {e}");
@@ -231,18 +239,18 @@ fn explain_response_encode(
     notices: &[String],
     plan_lines: &[String],
     transaction_status: TransactionStatus,
-) -> BytesMut {
+) -> ProtocolResult<BytesMut> {
     let mut buf = BytesMut::new();
     for notice in notices {
-        notice_response_encode(notice, &mut buf);
+        notice_response_encode(notice, &mut buf)?;
     }
-    row_description_text_encode("QUERY PLAN", &mut buf);
+    row_description_text_encode("QUERY PLAN", &mut buf)?;
     for line in plan_lines {
-        data_row_text_encode(Some(line), &mut buf);
+        data_row_text_encode(Some(line), &mut buf)?;
     }
-    command_complete_tag_encode("EXPLAIN", &mut buf);
+    command_complete_tag_encode("EXPLAIN", &mut buf)?;
     buf.extend_from_slice(transaction_status.ready_for_query_message());
-    buf
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -270,7 +278,8 @@ mod tests {
             "Seq Scan on orders".to_owned(),
             "  Filter: (id = 1)".to_owned(),
         ];
-        let buf = explain_response_encode(&notices, &lines, TransactionStatus::Idle);
+        let buf = explain_response_encode(&notices, &lines, TransactionStatus::Idle)
+            .expect("encode explain response");
 
         // Collect frame tags in order by walking the length-prefixed frames.
         let mut tags = Vec::new();
@@ -303,7 +312,8 @@ mod tests {
             &[],
             &["pgcache: query not cached".to_owned()],
             TransactionStatus::Idle,
-        );
+        )
+        .expect("encode explain response");
         assert_eq!(buf[0], ROW_DESCRIPTION_TAG);
     }
 }

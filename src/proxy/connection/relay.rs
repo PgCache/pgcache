@@ -51,8 +51,8 @@ use crate::{
             TransactionStatus, authentication_type, parameter_status_parse,
         },
         frontend::{
-            PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType,
-            simple_query_message_build, startup_message_parameter,
+            PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType, ProbeQuery,
+            startup_message_parameter,
         },
         session::PreparedStatement,
     },
@@ -86,7 +86,7 @@ const CACHE_DOWN_LOG_WINDOW_SECS: u64 = 5;
 /// Injected query that samples the origin's current WAL insert LSN — a safe
 /// upper bound on the commit LSN of every write forwarded before it, used to
 /// bound per-connection read-after-write log entries (PGC-124).
-const WAL_INSERT_LSN_PROBE: &str = "SELECT pg_current_wal_insert_lsn()";
+const WAL_INSERT_LSN_PROBE: ProbeQuery = ProbeQuery::new("SELECT pg_current_wal_insert_lsn()");
 
 /// Gate state: cache died with a query in flight (client connection dropped).
 static CACHE_DEAD_INFLIGHT_LOG: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -1023,7 +1023,7 @@ impl ConnectionState {
         {
             self.origin_intercept = OriginIntercept::WalLsnProbe { stamp_seq };
             self.origin_write_buf
-                .push_back(simple_query_message_build(WAL_INSERT_LSN_PROBE));
+                .push_back(WAL_INSERT_LSN_PROBE.message());
             crate::metrics::handles().raw.probes.increment(1);
         }
     }

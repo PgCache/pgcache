@@ -184,7 +184,7 @@ impl CacheConnection {
         };
 
         // Send startup message
-        let startup = startup_message_build(&settings.user, &settings.database);
+        let startup = startup_message_build(&settings.user, &settings.database)?;
         conn.stream
             .write_all(&startup)
             .await

@@ -20,11 +20,20 @@ error_set! {
             tag: String,
         },
         IoError(io::Error),
+        #[display("Message of {len} bytes exceeds the protocol's i32 length field")]
+        MessageTooLarge {
+            len: usize,
+        },
     }
 }
 
 /// Result type with location-tracking error reports for protocol operations.
 pub(crate) type ProtocolResult<T> = Result<T, Report<ProtocolError>>;
+
+/// A message's length as the protocol's `int32` length field.
+pub(crate) fn message_length(len: usize) -> ProtocolResult<i32> {
+    i32::try_from(len).map_err(|_| Report::from(ProtocolError::MessageTooLarge { len }))
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) enum PgConnectionState {
