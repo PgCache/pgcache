@@ -2,6 +2,8 @@ use std::fs;
 use std::fs::read_to_string;
 use std::path::Path;
 
+use rootcause::Report;
+
 use super::dynamic::DynamicConfig;
 use super::{BoxedError, CachePolicy, ConfigError, ConfigResult, DynamicConfigPatch, SettingsToml};
 use crate::result::MapIntoReport;
@@ -30,8 +32,6 @@ pub fn config_file_dynamic_extract(path: &Path) -> ConfigResult<DynamicConfig> {
 }
 
 /// Apply a patch to the TOML config file, preserving formatting and comments.
-/// Returns the new effective dynamic config after the update.
-#[allow(clippy::indexing_slicing)] // toml_edit doc[key] creates keys, does not panic
 pub fn config_file_dynamic_update(path: &Path, patch: &DynamicConfigPatch) -> ConfigResult<()> {
     let content = read_to_string(path).map_into_report::<ConfigError>()?;
     let mut doc: toml_edit::DocumentMut = content
@@ -39,92 +39,136 @@ pub fn config_file_dynamic_update(path: &Path, patch: &DynamicConfigPatch) -> Co
         .map_err(|e: toml_edit::TomlError| ConfigError::TomlError(BoxedError::new(e)))
         .map_into_report::<ConfigError>()?;
 
-    if let Some(v) = &patch.cache_size {
-        match v {
-            Some(size) => {
-                let size_i64 = i64::try_from(*size).expect("cache size fits in i64");
-                doc["cache_size"] = toml_edit::value(size_i64);
-            }
-            None => {
-                doc.remove("cache_size");
-            }
-        }
-    }
-
-    if let Some(policy) = &patch.cache_policy {
-        let s = match policy {
-            CachePolicy::Fifo => "fifo",
-            CachePolicy::Clock => "clock",
-        };
-        doc["cache_policy"] = toml_edit::value(s);
-    }
-
-    if let Some(threshold) = &patch.admission_threshold {
-        doc["admission_threshold"] = toml_edit::value(*threshold as i64);
-    }
-
-    if let Some(ratio) = &patch.mv_size_ratio {
-        doc["mv_size_ratio"] = toml_edit::value(*ratio as i64);
-    }
-
-    if let Some(min_rows) = &patch.mv_compute_min_rows {
-        let v_i64 = i64::try_from(*min_rows).expect("mv_compute_min_rows fits in i64");
-        doc["mv_compute_min_rows"] = toml_edit::value(v_i64);
-    }
-
-    if let Some(v) = &patch.memo_cache_size {
-        let v_i64 = i64::try_from(*v).expect("memo cache size fits in i64");
-        doc["memo_cache_size"] = toml_edit::value(v_i64);
-    }
-
-    if let Some(v) = &patch.memory_limit {
-        match v {
-            Some(limit) => {
-                let limit_i64 = i64::try_from(*limit).expect("memory limit fits in i64");
-                doc["memory_limit"] = toml_edit::value(limit_i64);
-            }
-            None => {
-                doc.remove("memory_limit");
-            }
-        }
-    }
-
-    if let Some(v) = &patch.disk_limit {
-        match v {
-            Some(limit) => {
-                let limit_i64 = i64::try_from(*limit).expect("disk limit fits in i64");
-                doc["disk_limit"] = toml_edit::value(limit_i64);
-            }
-            None => {
-                doc.remove("disk_limit");
-            }
-        }
-    }
-
-    if let Some(v) = &patch.allowed_tables {
-        match v {
-            Some(tables) => {
-                let mut arr = toml_edit::Array::new();
-                for t in tables {
-                    arr.push(t.as_str());
-                }
-                doc["allowed_tables"] = toml_edit::value(arr);
-            }
-            None => {
-                doc.remove("allowed_tables");
-            }
-        }
-    }
-
-    if let Some(v) = &patch.log_level {
-        match v {
-            Some(level) => doc["log_level"] = toml_edit::value(level.as_str()),
-            None => {
-                doc.remove("log_level");
-            }
-        }
+    let edits = [
+        ("cache_size", nullable_int_edit(patch.cache_size)?),
+        (
+            "cache_policy",
+            patch
+                .cache_policy
+                .map(|policy| Some(toml_edit::value(cache_policy_name(policy)))),
+        ),
+        ("admission_threshold", int_edit(patch.admission_threshold)?),
+        ("mv_size_ratio", int_edit(patch.mv_size_ratio)?),
+        ("mv_compute_min_rows", int_edit(patch.mv_compute_min_rows)?),
+        ("memo_cache_size", int_edit(patch.memo_cache_size)?),
+        ("memory_limit", nullable_int_edit(patch.memory_limit)?),
+        ("disk_limit", nullable_int_edit(patch.disk_limit)?),
+        (
+            "allowed_tables",
+            patch
+                .allowed_tables
+                .as_ref()
+                .map(|tables| tables.as_deref().map(string_array_item)),
+        ),
+        (
+            "log_level",
+            patch
+                .log_level
+                .as_ref()
+                .map(|level| level.as_deref().map(toml_edit::value)),
+        ),
+    ];
+    for (key, edit) in edits {
+        key_edit_apply(&mut doc, key, edit);
     }
 
     fs::write(path, doc.to_string()).map_into_report::<ConfigError>()?;
     Ok(())
+}
+
+/// Apply one key's patch: `None` leaves it, `Some(None)` removes it, and
+/// `Some(Some(item))` sets it. An existing key is overwritten in place so its
+/// own formatting (e.g. a comment line above it) survives.
+fn key_edit_apply(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    edit: Option<Option<toml_edit::Item>>,
+) {
+    match edit {
+        None => {}
+        Some(None) => {
+            doc.remove(key);
+        }
+        Some(Some(item)) => match doc.get_mut(key) {
+            Some(slot) => *slot = item,
+            None => {
+                doc.insert(key, item);
+            }
+        },
+    }
+}
+
+/// A TOML integer item. TOML integers are `i64`; a value beyond that is
+/// rejected rather than truncated.
+fn int_item<T: TryInto<i64> + Copy + std::fmt::Display>(value: T) -> ConfigResult<toml_edit::Item> {
+    let int: i64 = value.try_into().map_err(|_| {
+        Report::from(ConfigError::ArgumentError(BoxedError::new(format!(
+            "{value} exceeds the TOML integer range"
+        ))))
+    })?;
+    Ok(toml_edit::value(int))
+}
+
+/// The edit for a setting the patch sets or leaves alone.
+fn int_edit<T: TryInto<i64> + Copy + std::fmt::Display>(
+    value: Option<T>,
+) -> ConfigResult<Option<Option<toml_edit::Item>>> {
+    value.map(|v| int_item(v).map(Some)).transpose()
+}
+
+/// The edit for a setting the patch sets, clears or leaves alone.
+fn nullable_int_edit<T: TryInto<i64> + Copy + std::fmt::Display>(
+    value: Option<Option<T>>,
+) -> ConfigResult<Option<Option<toml_edit::Item>>> {
+    value.map(|v| v.map(int_item).transpose()).transpose()
+}
+
+fn cache_policy_name(policy: CachePolicy) -> &'static str {
+    match policy {
+        CachePolicy::Fifo => "fifo",
+        CachePolicy::Clock => "clock",
+    }
+}
+
+fn string_array_item(values: &[String]) -> toml_edit::Item {
+    let mut arr = toml_edit::Array::new();
+    for v in values {
+        arr.push(v.as_str());
+    }
+    toml_edit::value(arr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(text: &str) -> toml_edit::DocumentMut {
+        text.parse().expect("parse test TOML")
+    }
+
+    #[test]
+    fn test_key_edit_apply_overwrites_in_place_keeping_the_comment_above() {
+        let mut d = doc("# the limit\nmemory_limit = 1\nlog_level = \"info\"\n");
+        key_edit_apply(&mut d, "memory_limit", Some(Some(toml_edit::value(2))));
+        assert_eq!(
+            d.to_string(),
+            "# the limit\nmemory_limit = 2\nlog_level = \"info\"\n"
+        );
+    }
+
+    #[test]
+    fn test_key_edit_apply_inserts_removes_and_leaves() {
+        let mut d = doc("log_level = \"info\"\n");
+        key_edit_apply(&mut d, "disk_limit", Some(Some(toml_edit::value(5))));
+        key_edit_apply(&mut d, "log_level", Some(None));
+        key_edit_apply(&mut d, "cache_size", None);
+        assert_eq!(d.to_string(), "disk_limit = 5\n");
+    }
+
+    #[test]
+    fn test_int_item_rejects_values_beyond_i64() {
+        assert!(int_item(u64::MAX).is_err());
+        assert!(int_item(usize::MAX).is_err());
+        assert!(int_item(7u32).is_ok());
+    }
 }
