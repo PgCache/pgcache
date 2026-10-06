@@ -22,18 +22,82 @@ fn parse_select(sql: &str) -> SelectNode {
     }
 }
 
+/// The query's deparsed SQL.
+fn deparsed(sql: &str) -> String {
+    deparsed_node(&parse_query(sql))
+}
+
+fn deparsed_node(node: &impl Deparse) -> String {
+    let mut buf = String::new();
+    node.deparse(&mut buf);
+    buf
+}
+
+/// The SELECT list, which the test expects to be explicit columns.
+fn select_columns(select: &SelectNode) -> &[SelectColumn] {
+    let SelectColumns::Columns(columns) = &select.columns else {
+        panic!("expected columns, got {:?}", select.columns);
+    };
+    columns
+}
+
+/// Every (schema, name) table reference in the query.
+fn table_refs(ast: &QueryExpr) -> HashSet<(Option<&str>, &str)> {
+    ast.nodes::<TableNode>()
+        .map(|t| (t.schema.as_deref(), t.name.as_str()))
+        .collect()
+}
+
+fn only_table(select: &SelectNode) -> &TableNode {
+    let [TableSource::Table(table)] = select.from.as_slice() else {
+        panic!("expected a single table source, got {:?}", select.from);
+    };
+    table
+}
+
+fn only_join(select: &SelectNode) -> &JoinNode {
+    let [TableSource::Join(join)] = select.from.as_slice() else {
+        panic!("expected a single join, got {:?}", select.from);
+    };
+    join
+}
+
+/// The (qualifier, column) of every SELECT-list column reference.
+fn column_refs(select: &SelectNode) -> Vec<(Option<&str>, &str)> {
+    select_columns(select)
+        .iter()
+        .map(|col| match col.expr() {
+            Some(ScalarExpr::Column(c)) => (c.table.as_deref(), c.column.as_str()),
+            other => panic!("expected a column reference, got {other:?}"),
+        })
+        .collect()
+}
+
+/// The function call `sql` selects as its only column.
+fn only_function(sql: &str) -> FunctionCall {
+    let select = parse_select(sql);
+    let [column] = select_columns(&select) else {
+        panic!("expected exactly one column in {sql}");
+    };
+    let Some(ScalarExpr::Function(func)) = column.expr() else {
+        panic!("expected a function in {sql}, got {column:?}");
+    };
+    func.clone()
+}
+
+fn nested_function_name(arg: &ScalarExpr) -> Option<&str> {
+    let ScalarExpr::Function(inner) = arg else {
+        return None;
+    };
+    Some(inner.name.as_str())
+}
+
 #[test]
 fn test_query_expr_convert_simple_select() {
     let ast = parse_query("SELECT id, name FROM users WHERE id = 1");
-
     assert!(ast.is_single_table());
     assert!(ast.has_where_clause());
-    assert_eq!(
-        ast.nodes::<TableNode>()
-            .map(|t| (t.schema.as_deref(), t.name.as_str()))
-            .collect::<HashSet<_>>(),
-        HashSet::<(Option<&str>, _)>::from([(None, "users")])
-    );
+    assert_eq!(table_refs(&ast), HashSet::from([(None, "users")]));
 }
 
 /// PGC-183: `SELECT $1 FROM …` must parse — the SELECT-list converter
@@ -58,15 +122,9 @@ fn test_query_expr_convert_select_paramref() {
 #[test]
 fn test_query_expr_convert_select_star() {
     let ast = parse_query("SELECT * FROM products");
-
     assert!(ast.is_single_table());
     assert!(!ast.has_where_clause());
-    assert_eq!(
-        ast.nodes::<TableNode>()
-            .map(|t| (t.schema.as_deref(), t.name.as_str()))
-            .collect::<HashSet<_>>(),
-        HashSet::<(Option<&str>, _)>::from([(None, "products")])
-    );
+    assert_eq!(table_refs(&ast), HashSet::from([(None, "products")]));
 }
 
 #[test]
@@ -84,65 +142,25 @@ fn test_query_expr_convert_where_clause() {
 #[test]
 fn test_query_expr_convert_table_schema() {
     let select = parse_select("SELECT id, name FROM test.users WHERE active = true");
-
-    assert_eq!(select.from.len(), 1);
-
-    let TableSource::Table(table) = &select.from[0] else {
-        panic!("expected table");
-    };
-
+    let table = only_table(&select);
     assert_eq!(table.schema, Some(EcoString::from("test")));
     assert_eq!(table.name, "users");
     assert_eq!(table.alias, None);
-
-    // Check column references
-    if let SelectColumns::Columns(columns) = &select.columns {
-        assert_eq!(columns.len(), 2);
-
-        // First column: id
-        if let ScalarExpr::Column(col_ref) = &columns[0].expr().expect("non-star SELECT column") {
-            assert_eq!(col_ref.table, None);
-            assert_eq!(col_ref.column, "id");
-        }
-
-        // Second column: name
-        if let ScalarExpr::Column(col_ref) = &columns[1].expr().expect("non-star SELECT column") {
-            assert_eq!(col_ref.table, None);
-            assert_eq!(col_ref.column, "name");
-        }
-    }
+    assert_eq!(column_refs(&select), [(None, "id"), (None, "name")]);
 }
 
 #[test]
 fn test_query_expr_convert_table_alias() {
     let select = parse_select("SELECT u.id, u.name FROM users u WHERE u.active = true");
-
-    assert_eq!(select.from.len(), 1);
-
-    let TableSource::Table(table) = &select.from[0] else {
-        panic!("expected table");
-    };
-
+    let table = only_table(&select);
     assert_eq!(table.name, "users");
-    assert_eq!(table.alias.as_ref().unwrap().name, "u");
-    assert!(table.alias.as_ref().unwrap().columns.is_empty());
-
-    // Check column references
-    if let SelectColumns::Columns(columns) = &select.columns {
-        assert_eq!(columns.len(), 2);
-
-        // First column: u.id
-        if let ScalarExpr::Column(col_ref) = &columns[0].expr().expect("non-star SELECT column") {
-            assert_eq!(col_ref.table, Some(EcoString::from("u")));
-            assert_eq!(col_ref.column, "id");
-        }
-
-        // Second column: u.name
-        if let ScalarExpr::Column(col_ref) = &columns[1].expr().expect("non-star SELECT column") {
-            assert_eq!(col_ref.table, Some(EcoString::from("u")));
-            assert_eq!(col_ref.column, "name");
-        }
-    }
+    let alias = table.alias.as_ref().expect("table alias");
+    assert_eq!(alias.name, "u");
+    assert!(alias.columns.is_empty());
+    assert_eq!(
+        column_refs(&select),
+        [(Some("u"), "id"), (Some("u"), "name")]
+    );
 }
 
 #[test]
@@ -291,8 +309,7 @@ fn test_query_expr_mixed_join_types() {
 fn test_query_expr_multiple_joins_deparse() {
     let ast = parse_query("SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id");
 
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
+    let buf = deparsed_node(&ast);
 
     // Parse the deparsed SQL to verify it's valid
     let ast2 = parse_query(&buf);
@@ -362,16 +379,6 @@ fn test_query_expr_values() {
     assert_eq!(values_clause.rows.len(), 2);
     assert_eq!(values_clause.rows[0].len(), 3);
     assert_eq!(values_clause.rows[1].len(), 3);
-}
-
-#[test]
-fn test_query_expr_deparse_simple() {
-    let sql = "SELECT id, name FROM users";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
 }
 
 #[test]
@@ -712,139 +719,13 @@ fn test_unary_expr_deparse() {
 }
 
 #[test]
-fn test_deparse_not_with_and() {
-    // NOT has higher precedence than AND, so NOT (a AND b) must keep parens.
-    // Without them: NOT a AND b → (NOT a) AND b — different semantics.
-    let sql = "SELECT * FROM t WHERE NOT (x = 1 AND y = 2)";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-
-    assert!(
-        buf.contains("NOT (x = 1 AND y = 2)"),
-        "expected parentheses after NOT around AND, got: {buf}"
-    );
-}
-
-#[test]
-fn test_deparse_not_with_or() {
-    // Same issue: NOT (a OR b) must keep parens.
-    let sql = "SELECT * FROM t WHERE NOT (x = 1 OR y = 2)";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-
-    assert!(
-        buf.contains("NOT (x = 1 OR y = 2)"),
-        "expected parentheses after NOT around OR, got: {buf}"
-    );
-}
-
-#[test]
-fn test_select_deparse_with_where() {
-    let sql = "SELECT * FROM users WHERE id = 1";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
-fn test_select_deparse_distinct() {
-    let sql = "SELECT DISTINCT name FROM users";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
-fn test_select_deparse_multiple_tables() {
-    let sql = "SELECT * FROM users, orders";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
-fn test_select_deparse_schema_qualified() {
-    let sql = "SELECT * FROM public.users";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
-fn test_select_deparse_join() {
-    let sql = "SELECT first_name, last_name, film_id FROM actor a \
-            JOIN film_actor fa ON a.actor_id = fa.actor_id \
-            WHERE a.actor_id = 1";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
-fn test_select_deparse_left_join() {
-    let sql = "SELECT a.id, b.name FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id = 1";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
-fn test_select_deparse_right_join() {
-    let sql = "SELECT a.id, b.name FROM a RIGHT JOIN b ON a.id = b.a_id WHERE b.id = 1";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
-fn test_select_deparse_mixed_joins() {
-    let sql = "SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id WHERE a.id = 1";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
-fn test_select_deparse_table_values() {
-    let sql = "SELECT fa.actor_id \
-        FROM (VALUES ('1', '2'), ('3', '4')) fa(actor_id, film_id) \
-        WHERE a.actor_id = 1";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
 fn test_round_trip() {
     fn round_trip(sql: &str) {
         // Parse original
         let ast1 = query_expr_parse(sql).unwrap();
 
         // Deparse to string
-        let mut deparsed = String::with_capacity(1024);
-        ast1.deparse(&mut deparsed);
+        let deparsed = deparsed_node(&ast1);
 
         // Parse deparsed version
         let ast2 = query_expr_parse(&deparsed).unwrap();
@@ -864,59 +745,6 @@ fn test_round_trip() {
         FROM (SELECT * FROM users) u \
         WHERE active = true",
     );
-}
-
-#[test]
-fn test_parameterized_query_single_param() {
-    let sql = "SELECT * FROM users WHERE id = $1";
-    let ast = parse_query(sql);
-
-    // Verify the WHERE clause contains a parameter
-    let where_clause = ast.where_clause().unwrap();
-    let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
-    assert_eq!(literals.len(), 1);
-    assert_eq!(literals[0], &LiteralValue::Parameter("$1".into()));
-
-    // Test deparsing
-    let mut deparsed = String::with_capacity(1024);
-    ast.deparse(&mut deparsed);
-    assert_eq!(deparsed, sql);
-}
-
-#[test]
-fn test_parameterized_query_multiple_params() {
-    let sql = "SELECT * FROM users WHERE name = $1 AND age > $2";
-    let ast = parse_query(sql);
-
-    // Verify the WHERE clause contains both parameters
-    let where_clause = ast.where_clause().unwrap();
-    let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
-    assert_eq!(literals.len(), 2);
-    assert_eq!(literals[0], &LiteralValue::Parameter("$1".into()));
-    assert_eq!(literals[1], &LiteralValue::Parameter("$2".into()));
-
-    // Test deparsing
-    let mut deparsed = String::with_capacity(1024);
-    ast.deparse(&mut deparsed);
-    assert_eq!(deparsed, sql);
-}
-
-#[test]
-fn test_parameterized_query_mixed_params_and_literals() {
-    let sql = "SELECT * FROM users WHERE name = $1 AND active = true";
-    let ast = parse_query(sql);
-
-    // Verify the WHERE clause contains parameter and boolean literal
-    let where_clause = ast.where_clause().unwrap();
-    let literals: Vec<&LiteralValue> = where_clause.nodes().collect();
-    assert_eq!(literals.len(), 2);
-    assert_eq!(literals[0], &LiteralValue::Parameter("$1".into()));
-    assert_eq!(literals[1], &LiteralValue::Boolean(true));
-
-    // Test deparsing
-    let mut deparsed = String::with_capacity(1024);
-    ast.deparse(&mut deparsed);
-    assert_eq!(deparsed, sql);
 }
 
 #[test]
@@ -1254,45 +1082,6 @@ fn test_multi_expr_nodes() {
 }
 
 #[test]
-fn test_multi_expr_in_deparse() {
-    let multi = MultiExpr {
-        op: MultiOp::In,
-        exprs: vec![
-            WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("status"),
-            })),
-            WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String("active".into()))),
-            WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String("pending".into()))),
-        ],
-    };
-
-    let mut buf = String::new();
-    multi.deparse(&mut buf);
-    assert_eq!(buf, "status IN ('active', 'pending')");
-}
-
-#[test]
-fn test_multi_expr_not_in_deparse() {
-    let multi = MultiExpr {
-        op: MultiOp::NotIn,
-        exprs: vec![
-            WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("id"),
-            })),
-            WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(1))),
-            WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(2))),
-            WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(3))),
-        ],
-    };
-
-    let mut buf = String::new();
-    multi.deparse(&mut buf);
-    assert_eq!(buf, "id NOT IN (1, 2, 3)");
-}
-
-#[test]
 fn test_in_clause_parse_and_deparse() {
     // Test that IN clause round-trips through parse and deparse
     let select = parse_select("SELECT * FROM t WHERE status IN ('active', 'pending')");
@@ -1302,44 +1091,6 @@ fn test_in_clause_parse_and_deparse() {
     let mut buf = String::new();
     where_clause.deparse(&mut buf);
     assert_eq!(buf, "status IN ('active', 'pending')");
-}
-
-#[test]
-fn test_order_by_simple_asc() {
-    let ast = parse_query("SELECT * FROM users ORDER BY name ASC");
-
-    assert_eq!(ast.order_by.len(), 1);
-    assert_eq!(ast.order_by[0].direction, OrderDirection::Asc);
-
-    if let ScalarExpr::Column(col) = &ast.order_by[0].expr {
-        assert_eq!(col.column, "name");
-        assert_eq!(col.table, None);
-    } else {
-        panic!("Expected column expression");
-    }
-}
-
-#[test]
-fn test_order_by_simple_desc() {
-    let ast = parse_query("SELECT * FROM users ORDER BY age DESC");
-
-    assert_eq!(ast.order_by.len(), 1);
-    assert_eq!(ast.order_by[0].direction, OrderDirection::Desc);
-
-    if let ScalarExpr::Column(col) = &ast.order_by[0].expr {
-        assert_eq!(col.column, "age");
-    } else {
-        panic!("Expected column expression");
-    }
-}
-
-#[test]
-fn test_order_by_default_direction() {
-    let ast = parse_query("SELECT * FROM users ORDER BY name");
-
-    assert_eq!(ast.order_by.len(), 1);
-    // Default direction should be ASC
-    assert_eq!(ast.order_by[0].direction, OrderDirection::Asc);
 }
 
 #[test]
@@ -1389,36 +1140,6 @@ fn test_order_by_with_where() {
 }
 
 #[test]
-fn test_order_by_deparse_asc() {
-    let sql = "SELECT * FROM users ORDER BY name ASC";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
-fn test_order_by_deparse_desc() {
-    let sql = "SELECT * FROM users ORDER BY age DESC";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
-fn test_order_by_deparse_multiple() {
-    let sql = "SELECT * FROM users ORDER BY last_name ASC, first_name DESC";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-    assert_eq!(buf, sql);
-}
-
-#[test]
 fn test_order_by_round_trip() {
     let queries = vec![
         "SELECT * FROM users ORDER BY name ASC",
@@ -1432,8 +1153,7 @@ fn test_order_by_round_trip() {
         let ast1 = parse_query(sql);
 
         // Deparse to string
-        let mut deparsed = String::with_capacity(1024);
-        ast1.deparse(&mut deparsed);
+        let deparsed = deparsed_node(&ast1);
 
         // Parse deparsed version
         let ast2 = parse_query(&deparsed);
@@ -1579,146 +1299,10 @@ fn test_limit_and_offset_parameterized() {
 }
 
 #[test]
-fn test_has_subqueries_in_select_list() {
-    let select = parse_select("SELECT id, (SELECT x FROM other WHERE id = 1) as val FROM t");
-
-    assert!(
-        select.has_subqueries(),
-        "has_subqueries() should detect subquery in SELECT list"
-    );
-}
-
-#[test]
-fn test_has_subqueries_in_from_clause() {
-    let select = parse_select("SELECT * FROM (SELECT id FROM users) sub");
-
-    assert!(
-        select.has_subqueries(),
-        "has_subqueries() should detect subquery in FROM clause"
-    );
-}
-
-#[test]
-fn test_has_subqueries_in_join() {
-    let select = parse_select("SELECT * FROM a JOIN (SELECT id FROM b) sub ON a.id = sub.id");
-
-    assert!(
-        select.has_subqueries(),
-        "has_subqueries() should detect subquery in JOIN"
-    );
-}
-
-#[test]
-fn test_has_subqueries_in_where_clause() {
-    let select = parse_select("SELECT * FROM t WHERE id IN (SELECT id FROM other)");
-
-    assert!(
-        select.has_subqueries(),
-        "has_subqueries() should detect subquery in WHERE clause"
-    );
-}
-
-#[test]
-fn test_has_subqueries_no_subquery() {
-    let select = parse_select("SELECT id, name FROM users WHERE active = true");
-
-    assert!(
-        !select.has_subqueries(),
-        "has_subqueries() should return false when no subquery exists"
-    );
-}
-
-#[test]
-fn test_function_count_star() {
-    let select = parse_select("SELECT COUNT(*) FROM users");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    assert_eq!(columns.len(), 1);
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "count");
-    assert!(func.agg_star);
-    assert!(func.args.is_empty());
-}
-
-#[test]
-fn test_function_count_column() {
-    let select = parse_select("SELECT COUNT(id) FROM users");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "count");
-    assert!(!func.agg_star);
-    assert_eq!(func.args.len(), 1);
-}
-
-#[test]
-fn test_function_count_distinct() {
-    let select = parse_select("SELECT COUNT(DISTINCT status) FROM orders");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "count");
-    assert!(func.agg_distinct);
-}
-
-#[test]
-fn test_function_sum() {
-    let select = parse_select("SELECT SUM(amount) FROM orders WHERE tenant_id = 1");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "sum");
-}
-
-#[test]
-fn test_function_nested() {
-    // Use ROUND(AVG(...)) since COALESCE is parsed as a special CoalesceExpr
-    let select = parse_select("SELECT ROUND(AVG(value)) FROM data");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "round");
-    assert_eq!(func.args.len(), 1);
-
-    // First arg should be AVG(value)
-    let ScalarExpr::Function(inner) = &func.args[0] else {
-        panic!("expected nested function");
-    };
-    assert_eq!(inner.name, "avg");
-}
-
-#[test]
 fn test_function_with_alias() {
     let select = parse_select("SELECT COUNT(*) as total FROM users");
 
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
 
     assert_eq!(columns[0].alias().cloned(), Some(EcoString::from("total")));
 }
@@ -1727,9 +1311,7 @@ fn test_function_with_alias() {
 fn test_function_mixed_with_columns() {
     let select = parse_select("SELECT id, name, COUNT(*) as cnt FROM users GROUP BY id, name");
 
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
 
     assert_eq!(columns.len(), 3);
     assert!(matches!(
@@ -1750,9 +1332,7 @@ fn test_function_mixed_with_columns() {
 fn test_literal_in_select() {
     let select = parse_select("SELECT 42 as answer, 'hello' as greeting FROM t");
 
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
 
     assert_eq!(columns.len(), 2);
     assert!(matches!(
@@ -1801,137 +1381,6 @@ fn test_function_deparse_count_distinct() {
 }
 
 #[test]
-fn test_coalesce() {
-    let select = parse_select("SELECT COALESCE(name, 'unknown') FROM users");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "coalesce");
-    assert_eq!(func.args.len(), 2);
-}
-
-#[test]
-fn test_coalesce_nested_with_function() {
-    let select = parse_select("SELECT COALESCE(MAX(value), 0) FROM data");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "coalesce");
-    assert_eq!(func.args.len(), 2);
-
-    // First arg should be MAX(value)
-    let ScalarExpr::Function(inner) = &func.args[0] else {
-        panic!("expected nested function");
-    };
-    assert_eq!(inner.name, "max");
-}
-
-#[test]
-fn test_greatest() {
-    let select = parse_select("SELECT GREATEST(a, b, c) FROM t");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "greatest");
-    assert_eq!(func.args.len(), 3);
-}
-
-#[test]
-fn test_least() {
-    let select = parse_select("SELECT LEAST(a, b) FROM t");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "least");
-    assert_eq!(func.args.len(), 2);
-}
-
-#[test]
-fn test_nullif() {
-    let select = parse_select("SELECT NULLIF(status, 'deleted') FROM items");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "nullif");
-    assert_eq!(func.args.len(), 2);
-}
-
-#[test]
-fn test_case_searched() {
-    let select = parse_select("SELECT CASE WHEN status = 'active' THEN 1 ELSE 0 END FROM items");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Case(case) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected case expression");
-    };
-    assert!(case.arg.is_none(), "searched CASE should have no arg");
-    assert_eq!(case.whens.len(), 1);
-    assert!(case.default.is_some(), "should have ELSE clause");
-}
-
-#[test]
-fn test_case_simple() {
-    let select = parse_select(
-        "SELECT CASE status WHEN 'active' THEN 1 WHEN 'pending' THEN 2 ELSE 0 END FROM items",
-    );
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Case(case) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected case expression");
-    };
-    assert!(case.arg.is_some(), "simple CASE should have arg");
-    assert_eq!(case.whens.len(), 2);
-    assert!(case.default.is_some(), "should have ELSE clause");
-}
-
-#[test]
-fn test_case_no_else() {
-    let select = parse_select("SELECT CASE WHEN x > 0 THEN 'positive' END FROM items");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Case(case) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected case expression");
-    };
-    assert!(case.arg.is_none());
-    assert_eq!(case.whens.len(), 1);
-    assert!(case.default.is_none(), "should have no ELSE clause");
-}
-
-#[test]
 fn test_case_deparse() {
     let sql = "SELECT CASE WHEN status = 'active' THEN 1 ELSE 0 END FROM items WHERE id = 1";
     let ast = parse_query(sql);
@@ -1954,60 +1403,6 @@ fn test_case_has_subqueries() {
         select.has_subqueries(),
         "CASE with subquery should have sublink"
     );
-}
-
-#[test]
-fn test_window_function_simple() {
-    let select = parse_select("SELECT sum(amount) OVER (ORDER BY date) FROM orders");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "sum");
-    assert!(func.over.is_some(), "should have OVER clause");
-
-    let over = func.over.as_ref().unwrap();
-    assert!(over.partition_by.is_empty(), "no PARTITION BY");
-    assert_eq!(over.order_by.len(), 1, "one ORDER BY clause");
-}
-
-#[test]
-fn test_window_function_with_partition() {
-    let select =
-        parse_select("SELECT sum(amount) OVER (PARTITION BY category ORDER BY date) FROM orders");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert!(func.over.is_some(), "should have OVER clause");
-
-    let over = func.over.as_ref().unwrap();
-    assert_eq!(over.partition_by.len(), 1, "one PARTITION BY column");
-    assert_eq!(over.order_by.len(), 1, "one ORDER BY clause");
-}
-
-#[test]
-fn test_window_function_row_number() {
-    let select = parse_select("SELECT row_number() OVER (ORDER BY id) FROM users");
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-    assert_eq!(func.name, "row_number");
-    assert!(func.args.is_empty(), "row_number has no args");
-    assert!(func.over.is_some(), "should have OVER clause");
 }
 
 #[test]
@@ -2050,9 +1445,7 @@ fn test_window_function_deparse() {
 /// Deparse the OVER clause of the first SELECT-list function in `sql`.
 fn parse_over_deparse(sql: &str) -> String {
     let select = parse_select(sql);
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
     let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star column") else {
         panic!("expected function");
     };
@@ -2139,43 +1532,6 @@ fn test_undefined_window_reference_forwards() {
 }
 
 #[test]
-fn test_window_function_multiple_order_by() {
-    let sql = "SELECT sum(x) OVER (ORDER BY a ASC, b DESC) FROM t";
-    let select = parse_select(sql);
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-
-    let over = func.over.as_ref().unwrap();
-    assert_eq!(over.order_by.len(), 2, "two ORDER BY clauses");
-    assert_eq!(over.order_by[0].direction, OrderDirection::Asc);
-    assert_eq!(over.order_by[1].direction, OrderDirection::Desc);
-}
-
-#[test]
-fn test_aggregate_order_by_parse() {
-    let sql = "SELECT string_agg(name, ', ' ORDER BY name) FROM t";
-    let select = parse_select(sql);
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-
-    assert_eq!(func.name, "string_agg");
-    assert_eq!(func.agg_order.len(), 1, "should have one ORDER BY clause");
-    assert_eq!(func.agg_order[0].direction, OrderDirection::Asc);
-}
-
-#[test]
 fn test_aggregate_order_by_deparse() {
     let sql = "SELECT string_agg(name, ', ' ORDER BY name ASC) FROM t";
     let ast = parse_query(sql);
@@ -2189,62 +1545,6 @@ fn test_aggregate_order_by_deparse() {
     );
 }
 
-#[test]
-fn test_aggregate_distinct_and_order_by() {
-    let sql = "SELECT string_agg(DISTINCT name, ', ' ORDER BY name) FROM t";
-    let select = parse_select(sql);
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-
-    assert!(func.agg_distinct, "should have DISTINCT");
-    assert_eq!(func.agg_order.len(), 1, "should have ORDER BY");
-}
-
-#[test]
-fn test_aggregate_multiple_order_by() {
-    let sql = "SELECT array_agg(x ORDER BY y ASC, z DESC) FROM t";
-    let select = parse_select(sql);
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-
-    assert_eq!(func.name, "array_agg");
-    assert_eq!(func.agg_order.len(), 2, "should have two ORDER BY clauses");
-    assert_eq!(func.agg_order[0].direction, OrderDirection::Asc);
-    assert_eq!(func.agg_order[1].direction, OrderDirection::Desc);
-}
-
-#[test]
-fn test_filter_aggregate_parsed() {
-    let sql = "SELECT count(*) FILTER (WHERE x = 1) FROM t";
-    let select = parse_select(sql);
-
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
-
-    let ScalarExpr::Function(func) = &columns[0].expr().expect("non-star SELECT column") else {
-        panic!("expected function");
-    };
-
-    assert!(func.agg_star);
-    assert!(
-        func.agg_filter.is_some(),
-        "FILTER predicate should be captured on the FunctionCall"
-    );
-}
-
 /// Two FILTER aggregates with different predicates must round-trip to
 /// distinct function calls — they must not collapse to plain count(*).
 #[test]
@@ -2253,9 +1553,7 @@ fn test_filter_aggregate_distinct_predicates_roundtrip() {
                count(*) FILTER (WHERE posttypeid = 2) AS answers FROM posts";
     let select = parse_select(sql);
 
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
     assert_eq!(columns.len(), 2);
 
     let mut buf = String::new();
@@ -2323,9 +1621,7 @@ fn test_arithmetic_multiply_parse() {
     let sql = "SELECT amount * 2 FROM t";
     let select = parse_select(sql);
 
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
 
     let ScalarExpr::Arithmetic(arith) = &columns[0].expr().expect("non-star SELECT column") else {
         panic!("expected arithmetic expression");
@@ -2339,9 +1635,7 @@ fn test_arithmetic_multiply_negative() {
     let sql = "SELECT amount * -1 FROM t";
     let select = parse_select(sql);
 
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
 
     let ScalarExpr::Arithmetic(arith) = &columns[0].expr().expect("non-star SELECT column") else {
         panic!("expected arithmetic expression");
@@ -2360,9 +1654,7 @@ fn test_arithmetic_add() {
     let sql = "SELECT price + tax FROM t";
     let select = parse_select(sql);
 
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
 
     let ScalarExpr::Arithmetic(arith) = &columns[0].expr().expect("non-star SELECT column") else {
         panic!("expected arithmetic expression");
@@ -2376,9 +1668,7 @@ fn test_arithmetic_subtract() {
     let sql = "SELECT total - discount FROM t";
     let select = parse_select(sql);
 
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
 
     let ScalarExpr::Arithmetic(arith) = &columns[0].expr().expect("non-star SELECT column") else {
         panic!("expected arithmetic expression");
@@ -2392,9 +1682,7 @@ fn test_arithmetic_divide() {
     let sql = "SELECT total / count FROM t";
     let select = parse_select(sql);
 
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
 
     let ScalarExpr::Arithmetic(arith) = &columns[0].expr().expect("non-star SELECT column") else {
         panic!("expected arithmetic expression");
@@ -2424,9 +1712,7 @@ fn test_arithmetic_nested() {
     let sql = "SELECT (a + b) * c FROM t";
     let select = parse_select(sql);
 
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
 
     let ScalarExpr::Arithmetic(outer) = &columns[0].expr().expect("non-star SELECT column") else {
         panic!("expected arithmetic expression");
@@ -2528,9 +1814,7 @@ fn test_type_cast_deparse_round_trip() {
 #[test]
 fn test_type_cast_aliased() {
     let select = parse_select("SELECT COUNT(*)::INT AS n FROM t");
-    let SelectColumns::Columns(columns) = &select.columns else {
-        panic!("expected columns");
-    };
+    let columns = select_columns(&select);
     assert_eq!(columns[0].alias().cloned().as_deref(), Some("n"));
     assert!(matches!(
         &columns[0].expr().expect("non-star SELECT column"),
@@ -2572,32 +1856,23 @@ fn test_query_expr_select_star() {
 
 #[test]
 fn test_query_expr_select_star_with_column() {
-    let sql = "SELECT *, col FROM test";
-    let query_expr = query_expr_parse(sql).unwrap();
-
-    let SelectColumns::Columns(cols) = &query_expr.as_select().unwrap().columns else {
-        panic!("Expected Columns");
+    let select = parse_select("SELECT *, col FROM test");
+    let [star, column] = select_columns(&select) else {
+        panic!("expected two columns");
     };
-    assert_eq!(cols.len(), 2);
-    assert!(matches!(&cols[0], SelectColumn::Star(None)));
-    assert!(
-        matches!(&cols[1].expr().expect("non-star SELECT column"), ScalarExpr::Column(c) if c.column == "col")
-    );
+    assert!(matches!(star, SelectColumn::Star(None)));
+    assert!(matches!(column.expr(), Some(ScalarExpr::Column(c)) if c.column == "col"));
 }
 
 #[test]
 fn test_query_expr_select_qualified_star() {
-    let sql = "SELECT t1.*, t2.col FROM test t1 JOIN test2 t2 ON t2.id = t1.id";
-    let query_expr = query_expr_parse(sql).unwrap();
-
-    let SelectColumns::Columns(cols) = &query_expr.as_select().unwrap().columns else {
-        panic!("Expected Columns");
+    let select = parse_select("SELECT t1.*, t2.col FROM test t1 JOIN test2 t2 ON t2.id = t1.id");
+    let [star, column] = select_columns(&select) else {
+        panic!("expected two columns");
     };
-    assert_eq!(cols.len(), 2);
-    assert!(matches!(&cols[0], SelectColumn::Star(Some(t)) if t == "t1"));
-    assert!(
-        matches!(&cols[1].expr().expect("non-star SELECT column"), ScalarExpr::Column(c) if c.column == "col" && c.table.as_deref() == Some("t2"))
-    );
+    assert!(matches!(star, SelectColumn::Star(Some(t)) if t == "t1"));
+    assert!(matches!(column.expr(),
+        Some(ScalarExpr::Column(c)) if c.column == "col" && c.table.as_deref() == Some("t2")));
 }
 
 #[test]
@@ -2786,15 +2061,6 @@ fn test_query_expr_order_by_limit() {
 }
 
 #[test]
-fn test_select_nodes_simple_select() {
-    let sql = "SELECT id FROM users WHERE id = 1";
-    let query_expr = query_expr_parse(sql).unwrap();
-
-    let branches = query_expr.select_nodes();
-    assert_eq!(branches.len(), 1, "simple SELECT should have one branch");
-}
-
-#[test]
 fn test_select_nodes_union() {
     let sql = "SELECT id FROM users UNION SELECT id FROM admins";
     let query_expr = query_expr_parse(sql).unwrap();
@@ -2817,83 +2083,6 @@ fn test_select_nodes_union() {
 
     assert!(tables.contains(&"users"));
     assert!(tables.contains(&"admins"));
-}
-
-#[test]
-fn test_select_nodes_nested_union() {
-    let sql = "SELECT id FROM a UNION SELECT id FROM b UNION SELECT id FROM c";
-    let query_expr = query_expr_parse(sql).unwrap();
-
-    let branches = query_expr.select_nodes();
-    assert_eq!(branches.len(), 3, "nested UNION should have three branches");
-}
-
-#[test]
-fn test_select_nodes_from_subquery() {
-    // Derived table in FROM clause
-    let sql = "SELECT * FROM (SELECT id FROM users) sub";
-    let query_expr = query_expr_parse(sql).unwrap();
-
-    let branches = query_expr.select_nodes();
-    // Outer SELECT + inner SELECT in FROM subquery
-    assert_eq!(branches.len(), 2, "FROM subquery should add one branch");
-}
-
-#[test]
-fn test_select_nodes_where_subquery() {
-    // IN subquery in WHERE clause
-    let sql = "SELECT * FROM users WHERE id IN (SELECT user_id FROM active)";
-    let query_expr = query_expr_parse(sql).unwrap();
-
-    let branches = query_expr.select_nodes();
-    // Outer SELECT + inner SELECT in WHERE subquery
-    assert_eq!(branches.len(), 2, "WHERE IN subquery should add one branch");
-}
-
-#[test]
-fn test_select_nodes_exists_subquery() {
-    // EXISTS subquery in WHERE clause
-    let sql =
-        "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)";
-    let query_expr = query_expr_parse(sql).unwrap();
-
-    let branches = query_expr.select_nodes();
-    // Outer SELECT + inner SELECT in EXISTS subquery
-    assert_eq!(
-        branches.len(),
-        2,
-        "WHERE EXISTS subquery should add one branch"
-    );
-}
-
-#[test]
-fn test_select_nodes_scalar_subquery() {
-    // Scalar subquery in SELECT list
-    let sql = "SELECT id, (SELECT name FROM users WHERE users.id = orders.user_id) FROM orders";
-    let query_expr = query_expr_parse(sql).unwrap();
-
-    let branches = query_expr.select_nodes();
-    // Outer SELECT + inner SELECT in SELECT list subquery
-    assert_eq!(
-        branches.len(),
-        2,
-        "SELECT list subquery should add one branch"
-    );
-}
-
-#[test]
-fn test_select_nodes_nested_subqueries() {
-    // Nested subqueries
-    let sql = "SELECT * FROM (SELECT id FROM users WHERE id IN (SELECT user_id FROM active)) sub";
-    let query_expr = query_expr_parse(sql).unwrap();
-
-    let branches = query_expr.select_nodes();
-    // Outer SELECT + FROM subquery + nested IN subquery
-    assert_eq!(
-        branches.len(),
-        3,
-        "nested subqueries should add all branches"
-    );
 }
 
 // ==========================================================================
@@ -3196,19 +2385,11 @@ fn test_cte_with_join() {
         "WITH active AS (SELECT id, name FROM users WHERE active = true) \
          SELECT u.id, a.name FROM users u JOIN active a ON u.id = a.id",
     );
-
     assert_eq!(query.ctes.len(), 1);
-    let select = query.as_select().unwrap();
-    assert_eq!(select.from.len(), 1);
-
-    // Should be a Join with Table on left and CteRef on right
-    match &select.from[0] {
-        TableSource::Join(join) => {
-            assert!(matches!(*join.left, TableSource::Table(_)));
-            assert!(matches!(*join.right, TableSource::CteRef(_)));
-        }
-        other => panic!("expected Join, got {other:?}"),
-    }
+    // A join of a table (left) with the CTE reference (right)
+    let join = only_join(query.as_select().expect("SELECT"));
+    assert!(matches!(*join.left, TableSource::Table(_)));
+    assert!(matches!(*join.right, TableSource::CteRef(_)));
 }
 
 #[test]
@@ -3239,18 +2420,11 @@ fn test_cte_multiple_references() {
         "WITH x AS (SELECT id FROM users) \
          SELECT * FROM x a JOIN x b ON a.id = b.id",
     );
-
     assert_eq!(query.ctes.len(), 1);
-    let select = query.as_select().unwrap();
-
-    // Should be a Join with two CteRef nodes
-    match &select.from[0] {
-        TableSource::Join(join) => {
-            assert!(matches!(*join.left, TableSource::CteRef(_)));
-            assert!(matches!(*join.right, TableSource::CteRef(_)));
-        }
-        other => panic!("expected Join, got {other:?}"),
-    }
+    // Both join sides reference the CTE
+    let join = only_join(query.as_select().expect("SELECT"));
+    assert!(matches!(*join.left, TableSource::CteRef(_)));
+    assert!(matches!(*join.right, TableSource::CteRef(_)));
 }
 
 #[test]
@@ -3440,135 +2614,6 @@ fn test_cte_multiple_definitions() {
 // ==========================================================================
 
 #[test]
-fn test_select_nodes_with_source_simple() {
-    let query = parse_query("SELECT id FROM users WHERE id = 1");
-    let branches = query.select_nodes_with_source();
-
-    assert_eq!(branches.len(), 1);
-    assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
-}
-
-#[test]
-fn test_select_nodes_with_source_union() {
-    let query = parse_query("SELECT id FROM users UNION SELECT id FROM admins");
-    let branches = query.select_nodes_with_source();
-
-    assert_eq!(branches.len(), 2);
-    // Both branches of a UNION are FromClause
-    assert!(
-        branches
-            .iter()
-            .all(|(_, src)| *src == UpdateQuerySource::FromClause)
-    );
-}
-
-#[test]
-fn test_select_nodes_with_source_where_in() {
-    let query = parse_query("SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)");
-    let branches = query.select_nodes_with_source();
-
-    // Outer SELECT (FromClause) + IN subquery (Inclusion)
-    assert_eq!(branches.len(), 2);
-    assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
-    assert_eq!(
-        branches[1].1,
-        UpdateQuerySource::Subquery(SubqueryKind::Inclusion)
-    );
-}
-
-#[test]
-fn test_select_nodes_with_source_not_in() {
-    let query =
-        parse_query("SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)");
-    let branches = query.select_nodes_with_source();
-
-    assert_eq!(branches.len(), 2);
-    assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
-    // NOT IN is parsed as SubLinkType::All (already Exclusion)
-    // or as NOT wrapping Any (negated → Exclusion)
-    assert_eq!(
-        branches[1].1,
-        UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
-        "NOT IN subquery should be Exclusion"
-    );
-}
-
-#[test]
-fn test_select_nodes_with_source_exists() {
-    let query = parse_query(
-        "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)",
-    );
-    let branches = query.select_nodes_with_source();
-
-    assert_eq!(branches.len(), 2);
-    assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
-    assert_eq!(
-        branches[1].1,
-        UpdateQuerySource::Subquery(SubqueryKind::Inclusion)
-    );
-}
-
-#[test]
-fn test_select_nodes_with_source_not_exists() {
-    let query = parse_query(
-        "SELECT * FROM orders WHERE NOT EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)",
-    );
-    let branches = query.select_nodes_with_source();
-
-    assert_eq!(branches.len(), 2);
-    assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
-    assert_eq!(
-        branches[1].1,
-        UpdateQuerySource::Subquery(SubqueryKind::Exclusion),
-        "NOT EXISTS subquery should be Exclusion"
-    );
-}
-
-#[test]
-fn test_select_nodes_with_source_scalar_in_where() {
-    let query = parse_query("SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)");
-    let branches = query.select_nodes_with_source();
-
-    assert_eq!(branches.len(), 2);
-    assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
-    assert_eq!(
-        branches[1].1,
-        UpdateQuerySource::Subquery(SubqueryKind::Scalar),
-        "Scalar subquery in WHERE should be Scalar"
-    );
-}
-
-#[test]
-fn test_select_nodes_with_source_scalar_in_select() {
-    let query = parse_query(
-        "SELECT id, (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) FROM users",
-    );
-    let branches = query.select_nodes_with_source();
-
-    assert_eq!(branches.len(), 2);
-    assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
-    assert_eq!(
-        branches[1].1,
-        UpdateQuerySource::Subquery(SubqueryKind::Scalar),
-        "Scalar subquery in SELECT list should be Scalar"
-    );
-}
-
-#[test]
-fn test_select_nodes_with_source_from_subquery() {
-    let query = parse_query("SELECT * FROM (SELECT id FROM users) sub");
-    let branches = query.select_nodes_with_source();
-
-    assert_eq!(branches.len(), 2);
-    assert_eq!(branches[0].1, UpdateQuerySource::FromClause);
-    assert_eq!(
-        branches[1].1,
-        UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
-        "FROM subquery should be Inclusion"
-    );
-}
-
-#[test]
 fn test_select_nodes_with_source_cte() {
     let query = parse_query(
         "WITH active AS (SELECT id FROM users WHERE active = true) SELECT * FROM active",
@@ -3592,24 +2637,6 @@ fn test_select_nodes_with_source_cte() {
 }
 
 #[test]
-fn test_deparse_or_inside_and_preserves_parentheses() {
-    // When an OR expression is nested inside an AND chain, parentheses must
-    // be emitted to preserve semantics. Without them:
-    //   a AND (b OR c) AND d  →  a AND b OR c AND d
-    // which changes evaluation due to AND binding tighter than OR.
-    let sql = "SELECT * FROM t WHERE (x = 1 OR y = 2) AND z = 3";
-    let ast = parse_query(sql);
-
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
-
-    assert!(
-        buf.contains("(x = 1 OR y = 2)"),
-        "expected parentheses around OR inside AND chain, got: {buf}"
-    );
-}
-
-#[test]
 fn test_deparse_and_inside_or_no_unnecessary_parentheses() {
     // AND inside OR doesn't need parentheses because AND already binds
     // tighter than OR. The parser produces the same AST with or without
@@ -3617,8 +2644,7 @@ fn test_deparse_and_inside_or_no_unnecessary_parentheses() {
     let sql = "SELECT * FROM t WHERE x = 1 OR (y = 2 AND z = 3)";
     let ast = parse_query(sql);
 
-    let mut buf = String::with_capacity(1024);
-    ast.deparse(&mut buf);
+    let buf = deparsed_node(&ast);
 
     assert_eq!(
         buf, "SELECT * FROM t WHERE x = 1 OR y = 2 AND z = 3",
@@ -3841,6 +2867,378 @@ fn test_conversion_errors_name_the_construct() {
         assert!(
             !err.chars().last().is_some_and(|c| c.is_ascii_digit()),
             "{sql}: message ends in a raw number: {err}"
+        );
+    }
+}
+
+#[test]
+fn test_round_trip_deparse_cases() {
+    // Each statement deparses back to exactly its own text.
+    #[rustfmt::skip]
+    let cases = [
+        ("query expr deparse simple", "SELECT id, name FROM users"),
+        ("select deparse with where", "SELECT * FROM users WHERE id = 1"),
+        ("select deparse distinct", "SELECT DISTINCT name FROM users"),
+        ("select deparse multiple tables", "SELECT * FROM users, orders"),
+        ("select deparse schema qualified", "SELECT * FROM public.users"),
+        ("select deparse join", "SELECT first_name, last_name, film_id FROM actor a \
+            JOIN film_actor fa ON a.actor_id = fa.actor_id \
+            WHERE a.actor_id = 1"),
+        ("select deparse left join", "SELECT a.id, b.name FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id = 1"),
+        ("select deparse right join", "SELECT a.id, b.name FROM a RIGHT JOIN b ON a.id = b.a_id WHERE b.id = 1"),
+        ("select deparse mixed joins", "SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id WHERE a.id = 1"),
+        ("select deparse table values", "SELECT fa.actor_id \
+        FROM (VALUES ('1', '2'), ('3', '4')) fa(actor_id, film_id) \
+        WHERE a.actor_id = 1"),
+        ("order by deparse asc", "SELECT * FROM users ORDER BY name ASC"),
+        ("order by deparse desc", "SELECT * FROM users ORDER BY age DESC"),
+        ("order by deparse multiple", "SELECT * FROM users ORDER BY last_name ASC, first_name DESC"),
+    ];
+    for (label, sql) in cases {
+        assert_eq!(deparsed(sql), sql, "{label}");
+    }
+}
+
+#[test]
+fn test_deparse_keeps_parentheses_cases() {
+    // NOT binds tighter than AND/OR, and AND tighter than OR, so grouping
+    // parentheses must survive deparse or the predicate changes meaning.
+    #[rustfmt::skip]
+    let cases = [
+        // NOT has higher precedence than AND, so NOT (a AND b) must keep parens.
+        // Without them: NOT a AND b → (NOT a) AND b — different semantics.
+        ("deparse not with and", "SELECT * FROM t WHERE NOT (x = 1 AND y = 2)", "NOT (x = 1 AND y = 2)"),
+        // Same issue: NOT (a OR b) must keep parens.
+        ("deparse not with or", "SELECT * FROM t WHERE NOT (x = 1 OR y = 2)", "NOT (x = 1 OR y = 2)"),
+        // When an OR expression is nested inside an AND chain, parentheses must
+        // be emitted to preserve semantics. Without them:
+        //   a AND (b OR c) AND d  →  a AND b OR c AND d
+        // which changes evaluation due to AND binding tighter than OR.
+        ("deparse or inside and preserves parentheses", "SELECT * FROM t WHERE (x = 1 OR y = 2) AND z = 3", "(x = 1 OR y = 2)"),
+    ];
+    for (label, sql, fragment) in cases {
+        let text = deparsed(sql);
+        assert!(
+            text.contains(fragment),
+            "{label}: expected {fragment:?} in {text:?}"
+        );
+    }
+}
+
+#[test]
+fn test_has_subqueries_cases() {
+    #[rustfmt::skip]
+    let cases = [
+        ("has subqueries in select list", "SELECT id, (SELECT x FROM other WHERE id = 1) as val FROM t", true),
+        ("has subqueries in from clause", "SELECT * FROM (SELECT id FROM users) sub", true),
+        ("has subqueries in join", "SELECT * FROM a JOIN (SELECT id FROM b) sub ON a.id = sub.id", true),
+        ("has subqueries in where clause", "SELECT * FROM t WHERE id IN (SELECT id FROM other)", true),
+        ("has subqueries no subquery", "SELECT id, name FROM users WHERE active = true", false),
+    ];
+    for (label, sql, expected) in cases {
+        assert_eq!(
+            parse_select(sql).has_subqueries(),
+            expected,
+            "{label}: {sql}"
+        );
+    }
+}
+
+#[test]
+fn test_select_nodes_with_source_cases() {
+    use UpdateQuerySource::{FromClause, Subquery};
+    // The outer SELECT is FromClause; each subquery branch carries its kind.
+    #[rustfmt::skip]
+    let cases = [
+        ("select nodes with source simple", "SELECT id FROM users WHERE id = 1", vec![FromClause]),
+        // Both branches of a UNION are FromClause
+        ("select nodes with source union", "SELECT id FROM users UNION SELECT id FROM admins", vec![FromClause, FromClause]),
+        // Outer SELECT (FromClause) + IN subquery (Inclusion)
+        ("select nodes with source where in", "SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)", vec![FromClause, Subquery(SubqueryKind::Inclusion)]),
+        // NOT IN is parsed as SubLinkType::All (already Exclusion)
+        // or as NOT wrapping Any (negated → Exclusion)
+        ("select nodes with source not in", "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)", vec![FromClause, Subquery(SubqueryKind::Exclusion)]),
+        ("select nodes with source exists", "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)", vec![FromClause, Subquery(SubqueryKind::Inclusion)]),
+        ("select nodes with source not exists", "SELECT * FROM orders WHERE NOT EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)", vec![FromClause, Subquery(SubqueryKind::Exclusion)]),
+        ("select nodes with source scalar in where", "SELECT * FROM users WHERE age > (SELECT AVG(age) FROM users)", vec![FromClause, Subquery(SubqueryKind::Scalar)]),
+        ("select nodes with source scalar in select", "SELECT id, (SELECT COUNT(*) FROM orders WHERE orders.user_id = users.id) FROM users", vec![FromClause, Subquery(SubqueryKind::Scalar)]),
+        ("select nodes with source from subquery", "SELECT * FROM (SELECT id FROM users) sub", vec![FromClause, Subquery(SubqueryKind::Inclusion)]),
+    ];
+    for (label, sql, expected) in cases {
+        let query = parse_query(sql);
+        let sources: Vec<UpdateQuerySource> = query
+            .select_nodes_with_source()
+            .into_iter()
+            .map(|(_, source)| source)
+            .collect();
+        assert_eq!(sources, expected, "{label}: {sql}");
+    }
+}
+
+/// Expected properties of a parsed function call; `None` fields are not
+/// checked.
+#[derive(Default)]
+struct FunctionExpect {
+    name: Option<&'static str>,
+    args: Option<usize>,
+    agg_star: Option<bool>,
+    agg_distinct: Option<bool>,
+    has_filter: Option<bool>,
+    agg_order: Option<&'static [OrderDirection]>,
+    agg_order_len: Option<usize>,
+    /// Name of the function the first argument calls.
+    first_arg_function: Option<&'static str>,
+    window: Option<WindowExpect>,
+}
+
+/// Expected OVER clause; `None` fields are not checked.
+#[derive(Default)]
+struct WindowExpect {
+    partitions: Option<usize>,
+    order: Option<&'static [OrderDirection]>,
+    order_len: Option<usize>,
+}
+
+fn field_check<T: PartialEq + std::fmt::Debug>(
+    context: &str,
+    field: &str,
+    expected: Option<T>,
+    actual: T,
+) {
+    if let Some(expected) = expected {
+        assert_eq!(actual, expected, "{context}: {field}");
+    }
+}
+
+fn directions(clauses: &[OrderByClause]) -> Vec<OrderDirection> {
+    clauses.iter().map(|c| c.direction.clone()).collect()
+}
+
+impl FunctionExpect {
+    fn check(&self, func: &FunctionCall, context: &str) {
+        field_check(context, "name", self.name, func.name.as_str());
+        field_check(context, "argument count", self.args, func.args.len());
+        field_check(context, "agg_star", self.agg_star, func.agg_star);
+        field_check(
+            context,
+            "agg_distinct",
+            self.agg_distinct,
+            func.agg_distinct,
+        );
+        field_check(
+            context,
+            "FILTER",
+            self.has_filter,
+            func.agg_filter.is_some(),
+        );
+        field_check(
+            context,
+            "aggregate ORDER BY",
+            self.agg_order.map(<[_]>::to_vec),
+            directions(&func.agg_order),
+        );
+        field_check(
+            context,
+            "aggregate ORDER BY count",
+            self.agg_order_len,
+            func.agg_order.len(),
+        );
+        field_check(
+            context,
+            "first argument's function",
+            self.first_arg_function,
+            func.args
+                .first()
+                .and_then(nested_function_name)
+                .unwrap_or(""),
+        );
+        if let Some(window) = &self.window {
+            let over = func
+                .over
+                .as_ref()
+                .unwrap_or_else(|| panic!("{context}: expected OVER"));
+            field_check(
+                context,
+                "PARTITION BY count",
+                window.partitions,
+                over.partition_by.len(),
+            );
+            field_check(
+                context,
+                "window ORDER BY",
+                window.order.map(<[_]>::to_vec),
+                directions(&over.order_by),
+            );
+            field_check(
+                context,
+                "window ORDER BY count",
+                window.order_len,
+                over.order_by.len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_select_function_cases() {
+    use OrderDirection::{Asc, Desc};
+    // COALESCE / GREATEST / LEAST / NULLIF parse as plain function calls.
+    #[rustfmt::skip]
+    let cases = [
+        ("count(*)",                 "SELECT COUNT(*) FROM users",
+         FunctionExpect { name: Some("count"), agg_star: Some(true), args: Some(0), ..Default::default() }),
+        ("count(column)",            "SELECT COUNT(id) FROM users",
+         FunctionExpect { name: Some("count"), agg_star: Some(false), args: Some(1), ..Default::default() }),
+        ("count(DISTINCT)",          "SELECT COUNT(DISTINCT status) FROM orders",
+         FunctionExpect { name: Some("count"), agg_distinct: Some(true), ..Default::default() }),
+        ("sum",                      "SELECT SUM(amount) FROM orders WHERE tenant_id = 1",
+         FunctionExpect { name: Some("sum"), ..Default::default() }),
+        ("nested round(avg())",      "SELECT ROUND(AVG(value)) FROM data",
+         FunctionExpect { name: Some("round"), args: Some(1), first_arg_function: Some("avg"), ..Default::default() }),
+        ("coalesce",                 "SELECT COALESCE(name, 'unknown') FROM users",
+         FunctionExpect { name: Some("coalesce"), args: Some(2), ..Default::default() }),
+        ("coalesce(max(), 0)",       "SELECT COALESCE(MAX(value), 0) FROM data",
+         FunctionExpect { name: Some("coalesce"), args: Some(2), first_arg_function: Some("max"), ..Default::default() }),
+        ("greatest",                 "SELECT GREATEST(a, b, c) FROM t",
+         FunctionExpect { name: Some("greatest"), args: Some(3), ..Default::default() }),
+        ("least",                    "SELECT LEAST(a, b) FROM t",
+         FunctionExpect { name: Some("least"), args: Some(2), ..Default::default() }),
+        ("nullif",                   "SELECT NULLIF(status, 'deleted') FROM items",
+         FunctionExpect { name: Some("nullif"), args: Some(2), ..Default::default() }),
+        ("window ORDER BY",          "SELECT sum(amount) OVER (ORDER BY date) FROM orders",
+         FunctionExpect { name: Some("sum"), window: Some(WindowExpect { partitions: Some(0), order_len: Some(1), ..Default::default() }), ..Default::default() }),
+        ("window PARTITION BY",      "SELECT sum(amount) OVER (PARTITION BY category ORDER BY date) FROM orders",
+         FunctionExpect { window: Some(WindowExpect { partitions: Some(1), order_len: Some(1), ..Default::default() }), ..Default::default() }),
+        ("row_number()",             "SELECT row_number() OVER (ORDER BY id) FROM users",
+         FunctionExpect { name: Some("row_number"), args: Some(0), window: Some(WindowExpect::default()), ..Default::default() }),
+        ("window multi ORDER BY",    "SELECT sum(x) OVER (ORDER BY a ASC, b DESC) FROM t",
+         FunctionExpect { window: Some(WindowExpect { order: Some(&[Asc, Desc]), ..Default::default() }), ..Default::default() }),
+        ("aggregate ORDER BY",       "SELECT string_agg(name, ', ' ORDER BY name) FROM t",
+         FunctionExpect { name: Some("string_agg"), agg_order: Some(&[Asc]), ..Default::default() }),
+        ("DISTINCT with ORDER BY",   "SELECT string_agg(DISTINCT name, ', ' ORDER BY name) FROM t",
+         FunctionExpect { agg_distinct: Some(true), agg_order_len: Some(1), ..Default::default() }),
+        ("aggregate multi ORDER BY", "SELECT array_agg(x ORDER BY y ASC, z DESC) FROM t",
+         FunctionExpect { name: Some("array_agg"), agg_order: Some(&[Asc, Desc]), ..Default::default() }),
+        ("FILTER",                   "SELECT count(*) FILTER (WHERE x = 1) FROM t",
+         FunctionExpect { agg_star: Some(true), has_filter: Some(true), ..Default::default() }),
+    ];
+    for (label, sql, expect) in cases {
+        expect.check(&only_function(sql), &format!("{label}: {sql}"));
+    }
+}
+
+#[test]
+fn test_parameterized_where_cases() {
+    use LiteralValue::{Boolean, Parameter};
+    // WHERE literals in order; each statement also deparses back to itself.
+    #[rustfmt::skip]
+    let cases = [
+        ("single parameter",       "SELECT * FROM users WHERE id = $1",                      vec![Parameter("$1".into())]),
+        ("two parameters",         "SELECT * FROM users WHERE name = $1 AND age > $2",       vec![Parameter("$1".into()), Parameter("$2".into())]),
+        ("parameter and literal",  "SELECT * FROM users WHERE name = $1 AND active = true",  vec![Parameter("$1".into()), Boolean(true)]),
+    ];
+    for (label, sql, expected) in cases {
+        let ast = parse_query(sql);
+        let where_clause = ast.where_clause().expect("WHERE");
+        let literals: Vec<LiteralValue> = where_clause.nodes::<LiteralValue>().cloned().collect();
+        assert_eq!(literals, expected, "{label}: WHERE literals of {sql}");
+        assert_eq!(deparsed_node(&ast), sql, "{label}: deparse");
+    }
+}
+
+#[test]
+fn test_multi_expr_deparse_cases() {
+    use LiteralValue::{Integer, String};
+    #[rustfmt::skip]
+    let cases = [
+        ("IN",     MultiOp::In,    "status", vec![String("active".into()), String("pending".into())], "status IN ('active', 'pending')"),
+        ("NOT IN", MultiOp::NotIn, "id",     vec![Integer(1), Integer(2), Integer(3)],                 "id NOT IN (1, 2, 3)"),
+    ];
+    for (label, op, column, values, expected) in cases {
+        let mut exprs = vec![WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+            table: None,
+            column: EcoString::from(column),
+        }))];
+        exprs.extend(
+            values
+                .into_iter()
+                .map(|v| WhereExpr::Scalar(ScalarExpr::Literal(v))),
+        );
+        assert_eq!(deparsed_node(&MultiExpr { op, exprs }), expected, "{label}");
+    }
+}
+
+#[test]
+fn test_order_by_direction_cases() {
+    use OrderDirection::{Asc, Desc};
+    // An ORDER BY without a direction defaults to ASC.
+    #[rustfmt::skip]
+    let cases = [
+        ("explicit ASC",  "SELECT * FROM users ORDER BY name ASC", Some("name"), Asc),
+        ("explicit DESC", "SELECT * FROM users ORDER BY age DESC", Some("age"),  Desc),
+        ("default",       "SELECT * FROM users ORDER BY name",     None,         Asc),
+    ];
+    for (label, sql, column, direction) in cases {
+        let ast = parse_query(sql);
+        let [clause] = ast.order_by.as_slice() else {
+            panic!("{label}: expected one ORDER BY clause in {sql}");
+        };
+        assert_eq!(clause.direction, direction, "{label}: direction");
+        if let Some(column) = column {
+            let ScalarExpr::Column(col) = &clause.expr else {
+                panic!("{label}: expected a column in {sql}");
+            };
+            assert_eq!(
+                (col.table.as_deref(), col.column.as_str()),
+                (None, column),
+                "{label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_case_shape_cases() {
+    // Simple CASE carries the tested expression as `arg`; searched CASE has none.
+    #[rustfmt::skip]
+    let cases = [
+        ("searched",     "SELECT CASE WHEN status = 'active' THEN 1 ELSE 0 END FROM items",                    false, 1, true),
+        ("simple",       "SELECT CASE status WHEN 'active' THEN 1 WHEN 'pending' THEN 2 ELSE 0 END FROM items", true,  2, true),
+        ("without ELSE", "SELECT CASE WHEN x > 0 THEN 'positive' END FROM items",                               false, 1, false),
+    ];
+    for (label, sql, has_arg, whens, has_default) in cases {
+        let select = parse_select(sql);
+        let Some(ScalarExpr::Case(case)) = select_columns(&select)[0].expr() else {
+            panic!("{label}: expected a CASE in {sql}");
+        };
+        let actual = (case.arg.is_some(), case.whens.len(), case.default.is_some());
+        assert_eq!(
+            actual,
+            (has_arg, whens, has_default),
+            "{label}: (arg, WHENs, ELSE) of {sql}"
+        );
+    }
+}
+
+#[test]
+fn test_select_nodes_branch_count_cases() {
+    // Every SELECT a query contains: set-operation branches, FROM derived
+    // tables, and WHERE / SELECT-list subqueries.
+    #[rustfmt::skip]
+    let cases = [
+        ("simple SELECT",        "SELECT id FROM users WHERE id = 1",                                                  1),
+        ("nested UNION",         "SELECT id FROM a UNION SELECT id FROM b UNION SELECT id FROM c",                     3),
+        ("FROM subquery",        "SELECT * FROM (SELECT id FROM users) sub",                                           2),
+        ("WHERE IN subquery",    "SELECT * FROM users WHERE id IN (SELECT user_id FROM active)",                      2),
+        ("EXISTS subquery",      "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.order_id = orders.id)", 2),
+        ("SELECT-list subquery", "SELECT id, (SELECT name FROM users WHERE users.id = orders.user_id) FROM orders",    2),
+        ("nested subqueries",    "SELECT * FROM (SELECT id FROM users WHERE id IN (SELECT user_id FROM active)) sub", 3),
+    ];
+    for (label, sql, expected) in cases {
+        assert_eq!(
+            parse_query(sql).select_nodes().len(),
+            expected,
+            "{label}: {sql}"
         );
     }
 }
