@@ -48,62 +48,75 @@ pub(super) fn literal_value_is_incomparable(v: &LiteralValue) -> bool {
     )
 }
 
-/// Tighten a lower bound: keep the higher (more restrictive) of the two.
-/// At equal values, exclusive (>) is tighter than inclusive (>=).
-/// Returns None if values are incomparable.
-fn lower_bound_tighten(existing: &RangeBound, candidate: &RangeBound) -> Option<RangeBound> {
-    literal_value_order(&existing.value, &candidate.value).map(|ord| {
-        match ord {
-            // candidate is higher → tighter
-            Ordering::Less => candidate.clone(),
-            // existing is higher → keep it
-            Ordering::Greater => existing.clone(),
-            // same value: exclusive wins
-            Ordering::Equal => RangeBound {
-                value: existing.value.clone(),
-                inclusive: existing.inclusive && candidate.inclusive,
-            },
+/// Which end of a range a bound sits on. Every bound rule below is written for
+/// a lower bound; an upper bound is the same rule with the order reversed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BoundSide {
+    Lower,
+    Upper,
+}
+
+impl BoundSide {
+    pub(super) const BOTH: [Self; 2] = [Self::Lower, Self::Upper];
+
+    /// `ord` as seen from this side: for an upper bound, "greater" means
+    /// further inside the range.
+    fn orient(self, ord: Ordering) -> Ordering {
+        match self {
+            Self::Lower => ord,
+            Self::Upper => ord.reverse(),
         }
-    })
-}
+    }
 
-/// Tighten an upper bound: keep the lower (more restrictive) of the two.
-/// At equal values, exclusive (<) is tighter than inclusive (<=).
-/// Returns None if values are incomparable.
-fn upper_bound_tighten(existing: &RangeBound, candidate: &RangeBound) -> Option<RangeBound> {
-    literal_value_order(&existing.value, &candidate.value).map(|ord| {
-        match ord {
-            // candidate is lower → tighter
-            Ordering::Greater => candidate.clone(),
-            // existing is lower → keep it
-            Ordering::Less => existing.clone(),
-            // same value: exclusive wins
-            Ordering::Equal => RangeBound {
-                value: existing.value.clone(),
-                inclusive: existing.inclusive && candidate.inclusive,
-            },
+    /// Whether a value ordered `value_vs_bound` against a bound on this side
+    /// satisfies it.
+    pub(super) fn admits(self, value_vs_bound: Ordering, inclusive: bool) -> bool {
+        match self.orient(value_vs_bound) {
+            Ordering::Greater => true,
+            Ordering::Equal => inclusive,
+            Ordering::Less => false,
         }
+    }
+}
+
+/// Tighten a bound: keep the more restrictive of the two (the higher lower
+/// bound, the lower upper bound). At equal values, exclusive is tighter than
+/// inclusive. Returns None if values are incomparable.
+fn bound_tighten(
+    side: BoundSide,
+    existing: &RangeBound,
+    candidate: &RangeBound,
+) -> Option<RangeBound> {
+    literal_value_order(&existing.value, &candidate.value).map(|ord| match side.orient(ord) {
+        // candidate is further inside → tighter
+        Ordering::Less => candidate.clone(),
+        Ordering::Greater => existing.clone(),
+        // same value: exclusive wins
+        Ordering::Equal => RangeBound {
+            value: existing.value.clone(),
+            inclusive: existing.inclusive && candidate.inclusive,
+        },
     })
 }
 
-/// Check if a value satisfies a lower bound (value > bound or value >= bound).
-/// Returns None if values are incomparable.
-fn value_satisfies_lower(value: &LiteralValue, bound: &RangeBound) -> Option<bool> {
-    literal_value_order(value, &bound.value).map(|ord| match ord {
-        Ordering::Greater => true,
-        Ordering::Equal => bound.inclusive,
-        Ordering::Less => false,
-    })
+/// Whether `value` satisfies `bound`; None if incomparable.
+fn value_satisfies(side: BoundSide, value: &LiteralValue, bound: &RangeBound) -> Option<bool> {
+    literal_value_order(value, &bound.value).map(|ord| side.admits(ord, bound.inclusive))
 }
 
-/// Check if a value satisfies an upper bound (value < bound or value <= bound).
-/// Returns None if values are incomparable.
-fn value_satisfies_upper(value: &LiteralValue, bound: &RangeBound) -> Option<bool> {
-    literal_value_order(value, &bound.value).map(|ord| match ord {
-        Ordering::Less => true,
-        Ordering::Equal => bound.inclusive,
-        Ordering::Greater => false,
-    })
+/// Merge `candidate` into the bound on `side`; false if incomparable.
+fn bound_merge(slot: &mut Option<RangeBound>, side: BoundSide, candidate: RangeBound) -> bool {
+    let merged = match slot.as_ref() {
+        None => Some(candidate),
+        Some(existing) => bound_tighten(side, existing, &candidate),
+    };
+    match merged {
+        Some(bound) => {
+            *slot = Some(bound);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Build a ColumnRange from all constraints on a single column.
@@ -177,7 +190,12 @@ fn in_set_range_build(
                 ColumnRange::Empty
             }
         }
-        ColumnRange::InSet(_) => unreachable!("comparison_range_build never produces InSet"),
+        ColumnRange::InSet(_) => {
+            // comparison_range_build never produces InSet; Unknown is the safe
+            // answer (never claims subsumption) if that ever changes.
+            debug_assert!(false, "comparison_range_build never produces InSet");
+            ColumnRange::Unknown
+        }
         ColumnRange::Range {
             ref lower,
             ref upper,
@@ -185,7 +203,7 @@ fn in_set_range_build(
         } => {
             let mut iter = set_values
                 .iter()
-                .filter(|v| range_contains_value(lower, upper, not_equal, v))
+                .filter(|v| range_contains_value(RangeView::new(lower, upper, not_equal), v))
                 .cloned();
             match iter.next() {
                 None => ColumnRange::Empty,
@@ -231,26 +249,18 @@ fn comparison_range_build(comparisons: &[(BinaryOp, &LiteralValue)]) -> ColumnRa
                     value: value.clone(),
                     inclusive: op == BinaryOp::GreaterThanOrEqual,
                 };
-                lower = Some(match lower {
-                    None => candidate,
-                    Some(existing) => match lower_bound_tighten(&existing, &candidate) {
-                        Some(tighter) => tighter,
-                        None => return ColumnRange::Unknown,
-                    },
-                });
+                if !bound_merge(&mut lower, BoundSide::Lower, candidate) {
+                    return ColumnRange::Unknown;
+                }
             }
             BinaryOp::LessThan | BinaryOp::LessThanOrEqual => {
                 let candidate = RangeBound {
                     value: value.clone(),
                     inclusive: op == BinaryOp::LessThanOrEqual,
                 };
-                upper = Some(match upper {
-                    None => candidate,
-                    Some(existing) => match upper_bound_tighten(&existing, &candidate) {
-                        Some(tighter) => tighter,
-                        None => return ColumnRange::Unknown,
-                    },
-                });
+                if !bound_merge(&mut upper, BoundSide::Upper, candidate) {
+                    return ColumnRange::Unknown;
+                }
             }
             BinaryOp::And
             | BinaryOp::Or
@@ -263,15 +273,9 @@ fn comparison_range_build(comparisons: &[(BinaryOp, &LiteralValue)]) -> ColumnRa
 
     // If we have an equality, validate it against bounds and not-equals
     if let Some(eq_val) = equal_value {
-        if let Some(ref lb) = lower {
-            match value_satisfies_lower(eq_val, lb) {
-                Some(true) => {}
-                Some(false) => return ColumnRange::Empty,
-                None => return ColumnRange::Unknown,
-            }
-        }
-        if let Some(ref ub) = upper {
-            match value_satisfies_upper(eq_val, ub) {
+        for (side, bound) in [(BoundSide::Lower, &lower), (BoundSide::Upper, &upper)] {
+            let Some(bound) = bound else { continue };
+            match value_satisfies(side, eq_val, bound) {
                 Some(true) => {}
                 Some(false) => return ColumnRange::Empty,
                 None => return ColumnRange::Unknown,
@@ -309,96 +313,80 @@ fn comparison_range_build(comparisons: &[(BinaryOp, &LiteralValue)]) -> ColumnRa
     }
 }
 
-/// Check if a value falls within a range (satisfies bounds and isn't excluded).
-fn range_contains_value(
-    lower: &Option<RangeBound>,
-    upper: &Option<RangeBound>,
-    not_equal: &[LiteralValue],
-    value: &LiteralValue,
-) -> bool {
-    if let Some(lb) = lower {
-        match value_satisfies_lower(value, lb) {
-            Some(true) => {}
-            _ => return false, // fails bound or incomparable
-        }
-    }
-    if let Some(ub) = upper {
-        match value_satisfies_upper(value, ub) {
-            Some(true) => {}
-            _ => return false,
-        }
-    }
-    !not_equal.contains(value)
+/// The bounds and exclusions of a [`ColumnRange::Range`], borrowed.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RangeView<'a> {
+    pub(super) lower: &'a Option<RangeBound>,
+    pub(super) upper: &'a Option<RangeBound>,
+    pub(super) not_equal: &'a [LiteralValue],
 }
 
-/// Check if a lower bound `a` is at least as tight as lower bound `b`.
-/// "At least as tight" means a >= b (a excludes fewer values on the low end).
-fn lower_bound_at_least_as_tight(a: &RangeBound, b: &RangeBound) -> Option<bool> {
-    literal_value_order(&a.value, &b.value).map(|ord| match ord {
+impl<'a> RangeView<'a> {
+    pub(super) fn new(
+        lower: &'a Option<RangeBound>,
+        upper: &'a Option<RangeBound>,
+        not_equal: &'a [LiteralValue],
+    ) -> Self {
+        Self {
+            lower,
+            upper,
+            not_equal,
+        }
+    }
+
+    pub(super) fn bound(&self, side: BoundSide) -> Option<&'a RangeBound> {
+        match side {
+            BoundSide::Lower => self.lower.as_ref(),
+            BoundSide::Upper => self.upper.as_ref(),
+        }
+    }
+}
+
+/// Check if a value falls within a range (satisfies bounds and isn't
+/// excluded). An incomparable bound counts as not containing it.
+fn range_contains_value(range: RangeView<'_>, value: &LiteralValue) -> bool {
+    let within = BoundSide::BOTH.into_iter().all(|side| {
+        range
+            .bound(side)
+            .is_none_or(|bound| value_satisfies(side, value, bound) == Some(true))
+    });
+    within && !range.not_equal.contains(value)
+}
+
+/// Whether `a` is at least as restrictive as `b` on `side`. At the same value,
+/// `a` is at least as tight if it is exclusive or both are inclusive.
+fn bound_at_least_as_tight(side: BoundSide, a: &RangeBound, b: &RangeBound) -> Option<bool> {
+    literal_value_order(&a.value, &b.value).map(|ord| match side.orient(ord) {
         Ordering::Greater => true,
         Ordering::Less => false,
-        // Same value: a is at least as tight if a is exclusive or both are inclusive
         Ordering::Equal => !a.inclusive || b.inclusive,
     })
 }
 
-/// Check if an upper bound `a` is at least as tight as upper bound `b`.
-/// "At least as tight" means a <= b.
-fn upper_bound_at_least_as_tight(a: &RangeBound, b: &RangeBound) -> Option<bool> {
-    literal_value_order(&a.value, &b.value).map(|ord| match ord {
-        Ordering::Less => true,
-        Ordering::Greater => false,
-        Ordering::Equal => !a.inclusive || b.inclusive,
-    })
+/// A cached bound is covered when new has a bound on that side at least as
+/// tight; new being open-ended there is not covered.
+fn bound_covered(side: BoundSide, cached: Option<&RangeBound>, new: Option<&RangeBound>) -> bool {
+    match (cached, new) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(cached), Some(new)) => bound_at_least_as_tight(side, new, cached) == Some(true),
+    }
 }
 
-/// Check if new's range is contained within cached's range, and all cached
-/// exclusions are satisfied by new.
-fn range_subsumes_range(
-    cached_lower: &Option<RangeBound>,
-    cached_upper: &Option<RangeBound>,
-    cached_not_equal: &[LiteralValue],
-    new_lower: &Option<RangeBound>,
-    new_upper: &Option<RangeBound>,
-    new_not_equal: &[LiteralValue],
-) -> bool {
-    // Cached has lower bound → new must have one that's at least as tight
-    if let Some(cl) = cached_lower {
-        match new_lower {
-            None => return false, // new is open-ended below
-            Some(nl) => match lower_bound_at_least_as_tight(nl, cl) {
-                Some(true) => {}
-                _ => return false,
-            },
-        }
-    }
-
-    // Cached has upper bound → new must have one that's at least as tight
-    if let Some(cu) = cached_upper {
-        match new_upper {
-            None => return false, // new is open-ended above
-            Some(nu) => match upper_bound_at_least_as_tight(nu, cu) {
-                Some(true) => {}
-                _ => return false,
-            },
-        }
-    }
-
-    // Each cached not_equal must be excluded by new: either in new's not_equal
-    // list, or outside new's range entirely
-    for excluded in cached_not_equal {
-        if new_not_equal.contains(excluded) {
-            continue;
-        }
-        // Check if the excluded value is outside new's range
-        if !range_contains_value(new_lower, new_upper, &[], excluded) {
-            continue;
-        }
-        // The value is inside new's range and not in new's exclusion list
-        return false;
-    }
-
-    true
+fn range_subsumes_range(cached: RangeView<'_>, new: RangeView<'_>) -> bool {
+    let bounds_covered = BoundSide::BOTH
+        .into_iter()
+        .all(|side| bound_covered(side, cached.bound(side), new.bound(side)));
+    // Each cached exclusion must be excluded by new too: in new's own
+    // exclusions, or outside new's range entirely.
+    let new_bounds_only = RangeView {
+        not_equal: &[],
+        ..new
+    };
+    bounds_covered
+        && cached.not_equal.iter().all(|excluded| {
+            new.not_equal.contains(excluded) || !range_contains_value(new_bounds_only, excluded)
+        })
 }
 
 /// Check if cached's ColumnRange subsumes new's ColumnRange.
@@ -447,7 +435,7 @@ pub(super) fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> 
             ColumnRange::InSet(set),
         ) => set
             .iter()
-            .all(|v| range_contains_value(lower, upper, not_equal, v)),
+            .all(|v| range_contains_value(RangeView::new(lower, upper, not_equal), v)),
 
         // Range cached, Equal new: check point within interval
         (
@@ -457,7 +445,7 @@ pub(super) fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> 
                 not_equal,
             },
             ColumnRange::Equal(v),
-        ) => range_contains_value(lower, upper, not_equal, v),
+        ) => range_contains_value(RangeView::new(lower, upper, not_equal), v),
 
         // Range vs Range: full containment check
         (
@@ -471,7 +459,7 @@ pub(super) fn column_range_subsumes(cached: &ColumnRange, new: &ColumnRange) -> 
                 upper: nu,
                 not_equal: nne,
             },
-        ) => range_subsumes_range(cl, cu, cne, nl, nu, nne),
+        ) => range_subsumes_range(RangeView::new(cl, cu, cne), RangeView::new(nl, nu, nne)),
     }
 }
 
@@ -549,27 +537,6 @@ mod tests {
     }
 
     #[test]
-    fn test_column_range_build_equal_with_contradictory_bound() {
-        let range = range_from_comparisons(&[
-            (BinaryOp::Equal, LiteralValue::Integer(5)),
-            (BinaryOp::GreaterThan, LiteralValue::Integer(10)),
-        ]);
-        assert!(matches!(range, ColumnRange::Empty));
-    }
-
-    #[test]
-    fn test_column_range_build_equal_with_consistent_bound() {
-        let range = range_from_comparisons(&[
-            (BinaryOp::Equal, LiteralValue::Integer(5)),
-            (BinaryOp::GreaterThan, LiteralValue::Integer(3)),
-        ]);
-        assert!(matches!(
-            range,
-            ColumnRange::Equal(LiteralValue::Integer(5))
-        ));
-    }
-
-    #[test]
     fn test_column_range_build_equal_with_not_equal_contradiction() {
         let range = range_from_comparisons(&[
             (BinaryOp::Equal, LiteralValue::Integer(5)),
@@ -596,17 +563,65 @@ mod tests {
         assert!(matches!(range, ColumnRange::Empty));
     }
 
+    /// A labelled build input and a check on the range it produces.
+    type BuildCase = (
+        &'static str,
+        Vec<(BinaryOp, LiteralValue)>,
+        fn(&ColumnRange) -> bool,
+    );
+
+    fn is_equal_to(range: &ColumnRange, expected: i64) -> bool {
+        matches!(range, ColumnRange::Equal(LiteralValue::Integer(v)) if *v == expected)
+    }
+
+    fn bound_is(bound: &Option<RangeBound>, expected: i64, inclusive: bool) -> bool {
+        matches!(bound, Some(b) if b.value == LiteralValue::Integer(expected) && b.inclusive == inclusive)
+    }
+
     #[test]
-    fn test_column_range_build_bounds_equal_inclusive() {
-        // >= 5 AND <= 5 → collapses to Equal(5)
-        let range = range_from_comparisons(&[
-            (BinaryOp::GreaterThanOrEqual, LiteralValue::Integer(5)),
-            (BinaryOp::LessThanOrEqual, LiteralValue::Integer(5)),
-        ]);
-        assert!(matches!(
-            range,
-            ColumnRange::Equal(LiteralValue::Integer(5))
-        ));
+    fn test_column_range_build_bound_interactions() {
+        use BinaryOp::{Equal, GreaterThan, GreaterThanOrEqual, LessThan, LessThanOrEqual};
+        use LiteralValue::Integer;
+        let cases: [BuildCase; 5] = [
+            (
+                "= 5 AND > 10 contradicts",
+                vec![(Equal, Integer(5)), (GreaterThan, Integer(10))],
+                |r| matches!(r, ColumnRange::Empty),
+            ),
+            (
+                "= 5 AND > 3 keeps the point",
+                vec![(Equal, Integer(5)), (GreaterThan, Integer(3))],
+                |r| is_equal_to(r, 5),
+            ),
+            (
+                ">= 5 AND <= 5 collapses to a point",
+                vec![
+                    (GreaterThanOrEqual, Integer(5)),
+                    (LessThanOrEqual, Integer(5)),
+                ],
+                |r| is_equal_to(r, 5),
+            ),
+            (
+                "> 3 AND > 7 keeps the higher lower bound",
+                vec![(GreaterThan, Integer(3)), (GreaterThan, Integer(7))],
+                |r| {
+                    matches!(r, ColumnRange::Range { lower, upper: None, .. }
+                        if bound_is(lower, 7, false))
+                },
+            ),
+            (
+                "< 10 AND < 5 keeps the lower upper bound",
+                vec![(LessThan, Integer(10)), (LessThan, Integer(5))],
+                |r| {
+                    matches!(r, ColumnRange::Range { lower: None, upper, .. }
+                        if bound_is(upper, 5, false))
+                },
+            ),
+        ];
+        for (label, comparisons, expected) in cases {
+            let range = range_from_comparisons(&comparisons);
+            assert!(expected(&range), "{label}: got {range:?}");
+        }
     }
 
     #[test]
@@ -620,44 +635,6 @@ mod tests {
     fn test_column_range_build_null_unknown() {
         let range = range_from_comparisons(&[(BinaryOp::Equal, LiteralValue::Null)]);
         assert!(matches!(range, ColumnRange::Unknown));
-    }
-
-    #[test]
-    fn test_column_range_build_lower_tightening() {
-        let range = range_from_comparisons(&[
-            (BinaryOp::GreaterThan, LiteralValue::Integer(3)),
-            (BinaryOp::GreaterThan, LiteralValue::Integer(7)),
-        ]);
-        match range {
-            ColumnRange::Range {
-                lower: Some(lb),
-                upper: None,
-                ..
-            } => {
-                assert_eq!(lb.value, LiteralValue::Integer(7));
-                assert!(!lb.inclusive);
-            }
-            _ => panic!("expected Range with lower bound"),
-        }
-    }
-
-    #[test]
-    fn test_column_range_build_upper_tightening() {
-        let range = range_from_comparisons(&[
-            (BinaryOp::LessThan, LiteralValue::Integer(10)),
-            (BinaryOp::LessThan, LiteralValue::Integer(5)),
-        ]);
-        match range {
-            ColumnRange::Range {
-                lower: None,
-                upper: Some(ub),
-                ..
-            } => {
-                assert_eq!(ub.value, LiteralValue::Integer(5));
-                assert!(!ub.inclusive);
-            }
-            _ => panic!("expected Range with upper bound"),
-        }
     }
 
     /// The canonicalization comparator keeps a total byte order for strings —
