@@ -20,9 +20,10 @@ use std::ops::ControlFlow;
 use rootcause::Report;
 
 use super::{
-    ResolveError, ResolveResult, ResolvedCaseExpr, ResolvedColumnNode, ResolvedFunctionCall,
-    ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
-    ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
+    ResolveError, ResolveResult, ResolvedBinaryExpr, ResolvedCaseExpr, ResolvedColumnNode,
+    ResolvedFunctionCall, ResolvedMultiExpr, ResolvedOrderByClause, ResolvedQueryBody,
+    ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
+    ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
 };
 use crate::query::ast::{AstNode, BinaryOp, LiteralValue, MultiOp};
 
@@ -55,72 +56,83 @@ fn enum_column_find<N: AstNode>(node: &N) -> Option<&ResolvedColumnNode> {
     }
 }
 
+/// Reject at `position` if any of `nodes` reaches an enum-ordered column.
+fn enum_reject<'a, T: AstNode + 'a>(
+    nodes: impl IntoIterator<Item = &'a T>,
+    position: &'static str,
+) -> ResolveResult<()> {
+    match nodes.into_iter().find_map(|node| enum_column_find(node)) {
+        Some(c) => Err(reject(c, position)),
+        None => Ok(()),
+    }
+}
+
 fn order_by_check(
     clauses: &[ResolvedOrderByClause],
     body: &ResolvedQueryBody,
     position: &'static str,
 ) -> ResolveResult<()> {
     for clause in clauses {
-        if let Some(c) = enum_column_find(&clause.expr) {
-            return Err(reject(c, position));
-        }
-        // A set-op ORDER BY referencing an output name hides the column
-        // behind an Identifier; check the named output expression instead.
-        if let ResolvedScalarExpr::Identifier(name) = &clause.expr
-            && let Some(c) = output_enum_column_find(body, name)
-        {
-            return Err(reject(c, position));
-        }
-        // An ordinal (`ORDER BY 2`) resolves as an integer Literal but
-        // sorts by the referenced output column.
-        if let ResolvedScalarExpr::Literal(LiteralValue::Integer(ordinal)) = &clause.expr
-            && let Some(c) = output_ordinal_enum_column_find(body, *ordinal)
-        {
+        if let Some(c) = order_clause_enum_column(clause, body) {
             return Err(reject(c, position));
         }
     }
     Ok(())
 }
 
-/// Resolve an ORDER BY ordinal (1-based) to the select list (leftmost
-/// SELECT of a set operation) and return its enum column, if any.
-fn output_ordinal_enum_column_find(
-    body: &ResolvedQueryBody,
-    ordinal: i64,
-) -> Option<&ResolvedColumnNode> {
+/// The enum column an ORDER BY clause sorts by, if any.
+fn order_clause_enum_column<'a>(
+    clause: &'a ResolvedOrderByClause,
+    body: &'a ResolvedQueryBody,
+) -> Option<&'a ResolvedColumnNode> {
+    if let Some(c) = enum_column_find(&clause.expr) {
+        return Some(c);
+    }
+    // A set-op ORDER BY referencing an output name hides the column behind
+    // an Identifier; check the named output expression instead.
+    if let ResolvedScalarExpr::Identifier(name) = &clause.expr {
+        return output_enum_column_find(body, name);
+    }
+    // An ordinal (`ORDER BY 2`) resolves as an integer Literal but sorts by
+    // the referenced output column.
+    if let ResolvedScalarExpr::Literal(LiteralValue::Integer(ordinal)) = &clause.expr {
+        return output_ordinal_enum_column_find(body, *ordinal);
+    }
+    None
+}
+
+/// The select list ORDER BY output references resolve against: the SELECT's,
+/// or the leftmost SELECT's for a set operation.
+fn leftmost_select_columns(body: &ResolvedQueryBody) -> Option<&[ResolvedSelectColumn]> {
     match body {
-        ResolvedQueryBody::Select(select) => {
-            let ResolvedSelectColumns::Columns(cols) = &select.columns else {
-                return None;
-            };
-            let index = usize::try_from(ordinal.checked_sub(1)?).ok()?;
-            cols.get(index).and_then(|c| enum_column_find(&c.expr))
-        }
-        ResolvedQueryBody::SetOp(set_op) => {
-            output_ordinal_enum_column_find(&set_op.left.body, ordinal)
-        }
+        ResolvedQueryBody::Select(select) => match &select.columns {
+            ResolvedSelectColumns::Columns(cols) => Some(cols),
+            ResolvedSelectColumns::None => None,
+        },
+        ResolvedQueryBody::SetOp(set_op) => leftmost_select_columns(&set_op.left.body),
         ResolvedQueryBody::Values(_) => None,
     }
 }
 
-/// Resolve an ORDER BY output-name reference to the select list (leftmost
-/// SELECT of a set operation) and return its enum column, if any.
+/// The enum column of the select-list entry at an ORDER BY ordinal (1-based).
+fn output_ordinal_enum_column_find(
+    body: &ResolvedQueryBody,
+    ordinal: i64,
+) -> Option<&ResolvedColumnNode> {
+    let index = usize::try_from(ordinal.checked_sub(1)?).ok()?;
+    let column = leftmost_select_columns(body)?.get(index)?;
+    enum_column_find(&column.expr)
+}
+
+/// The enum column of the select-list entry an ORDER BY output name names.
 fn output_enum_column_find<'a>(
     body: &'a ResolvedQueryBody,
     name: &str,
 ) -> Option<&'a ResolvedColumnNode> {
-    match body {
-        ResolvedQueryBody::Select(select) => {
-            let ResolvedSelectColumns::Columns(cols) = &select.columns else {
-                return None;
-            };
-            cols.iter()
-                .find(|c| c.output_name().is_some_and(|n| n == name))
-                .and_then(|c| enum_column_find(&c.expr))
-        }
-        ResolvedQueryBody::SetOp(set_op) => output_enum_column_find(&set_op.left.body, name),
-        ResolvedQueryBody::Values(_) => None,
-    }
+    let column = leftmost_select_columns(body)?
+        .iter()
+        .find(|c| c.output_name().is_some_and(|n| n == name))?;
+    enum_column_find(&column.expr)
 }
 
 fn query_check(query: &ResolvedQueryExpr) -> ResolveResult<()> {
@@ -181,44 +193,49 @@ fn binary_op_is_range(op: BinaryOp) -> bool {
     )
 }
 
+/// BETWEEN forms always order; ANY/ALL order when their comparison is a range;
+/// IN / NOT IN are equality.
+fn multi_op_is_order_dependent(op: MultiOp) -> bool {
+    match op {
+        MultiOp::Between
+        | MultiOp::NotBetween
+        | MultiOp::BetweenSymmetric
+        | MultiOp::NotBetweenSymmetric => true,
+        MultiOp::Any { comparison } | MultiOp::All { comparison } => binary_op_is_range(comparison),
+        MultiOp::In | MultiOp::NotIn => false,
+    }
+}
+
 fn where_check(expr: &ResolvedWhereExpr) -> ResolveResult<()> {
     match expr {
         ResolvedWhereExpr::Scalar(scalar) => scalar_check(scalar),
         ResolvedWhereExpr::Unary(unary) => where_check(&unary.expr),
-        ResolvedWhereExpr::Binary(binary) => {
-            if binary_op_is_range(binary.op)
-                && let Some(c) = enum_column_find(binary.lexpr.as_ref())
-                    .or_else(|| enum_column_find(binary.rexpr.as_ref()))
-            {
-                return Err(reject(c, "range comparison"));
-            }
-            where_check(&binary.lexpr)?;
-            where_check(&binary.rexpr)
-        }
-        ResolvedWhereExpr::Multi(multi) => {
-            let order_dependent = match multi.op {
-                MultiOp::Between
-                | MultiOp::NotBetween
-                | MultiOp::BetweenSymmetric
-                | MultiOp::NotBetweenSymmetric => true,
-                MultiOp::Any { comparison } | MultiOp::All { comparison } => {
-                    binary_op_is_range(comparison)
-                }
-                MultiOp::In | MultiOp::NotIn => false,
-            };
-            for e in &multi.exprs {
-                if order_dependent && let Some(c) = enum_column_find(e) {
-                    return Err(reject(c, "range comparison"));
-                }
-                where_check(e)?;
-            }
-            Ok(())
-        }
+        ResolvedWhereExpr::Binary(binary) => binary_check(binary),
+        ResolvedWhereExpr::Multi(multi) => multi_check(multi),
         // Predicate sublinks carry equality semantics (IN/NOT IN; ALL is
         // restricted to `<>` at AST conversion), so the test expression is
         // safe; the subquery body still needs its own walk.
         ResolvedWhereExpr::Subquery { query, .. } => query_check(query),
     }
+}
+
+fn binary_check(binary: &ResolvedBinaryExpr) -> ResolveResult<()> {
+    if binary_op_is_range(binary.op) {
+        enum_reject([&*binary.lexpr, &*binary.rexpr], "range comparison")?;
+    }
+    where_check(&binary.lexpr)?;
+    where_check(&binary.rexpr)
+}
+
+fn multi_check(multi: &ResolvedMultiExpr) -> ResolveResult<()> {
+    let order_dependent = multi_op_is_order_dependent(multi.op);
+    for e in &multi.exprs {
+        if order_dependent {
+            enum_reject([e], "range comparison")?;
+        }
+        where_check(e)?;
+    }
+    Ok(())
 }
 
 fn scalar_check(expr: &ResolvedScalarExpr) -> ResolveResult<()> {
@@ -244,24 +261,8 @@ fn scalar_check(expr: &ResolvedScalarExpr) -> ResolveResult<()> {
 }
 
 fn function_check(function: &ResolvedFunctionCall) -> ResolveResult<()> {
-    if function.name.eq_ignore_ascii_case("min") || function.name.eq_ignore_ascii_case("max") {
-        for arg in &function.args {
-            if let Some(c) = enum_column_find(arg) {
-                return Err(reject(c, "min/max aggregate"));
-            }
-        }
-    }
-    for clause in &function.agg_order {
-        if let Some(c) = enum_column_find(&clause.expr) {
-            return Err(reject(c, "aggregate ORDER BY"));
-        }
-    }
+    function_order_positions_check(function)?;
     if let Some(over) = &function.over {
-        for clause in &over.order_by {
-            if let Some(c) = enum_column_find(&clause.expr) {
-                return Err(reject(c, "window ORDER BY"));
-            }
-        }
         // partition_by is equality semantics — allowed.
         for e in &over.partition_by {
             scalar_check(e)?;
@@ -272,6 +273,27 @@ fn function_check(function: &ResolvedFunctionCall) -> ResolveResult<()> {
     }
     if let Some(filter) = &function.agg_filter {
         where_check(filter)?;
+    }
+    Ok(())
+}
+
+/// The order-dependent positions of a call: min/max arguments, the aggregate
+/// ORDER BY, and the window ORDER BY.
+fn function_order_positions_check(function: &ResolvedFunctionCall) -> ResolveResult<()> {
+    let min_max =
+        function.name.eq_ignore_ascii_case("min") || function.name.eq_ignore_ascii_case("max");
+    if min_max {
+        enum_reject(&function.args, "min/max aggregate")?;
+    }
+    enum_reject(
+        function.agg_order.iter().map(|clause| &clause.expr),
+        "aggregate ORDER BY",
+    )?;
+    if let Some(over) = &function.over {
+        enum_reject(
+            over.order_by.iter().map(|clause| &clause.expr),
+            "window ORDER BY",
+        )?;
     }
     Ok(())
 }
