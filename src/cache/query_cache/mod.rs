@@ -13,6 +13,7 @@ use super::query::CacheableQuery;
 use super::reg_bucket::RegRateBucket;
 use super::reply::ReplySender;
 use super::types::{CacheStateView, SharedResolved};
+use crate::cache::Generation;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::ClientSocket;
@@ -77,7 +78,7 @@ pub struct ServeRequest {
     /// `None` for MV-backed serves, which keep the `deparsed_sql` path (PGC-294).
     pub serve_shape: Option<QueryShape>,
     /// Generation number for row tracking in pgcache_pgrx extension
-    pub generation: u64,
+    pub generation: Generation,
     /// Serve from the MV (carrying its aliased output column names) or
     /// from source rows. Decided on the dispatch path.
     pub mv: MvServe,

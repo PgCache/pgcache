@@ -5,6 +5,7 @@ use ecow::EcoString;
 use tracing::error;
 
 use super::{CacheDispatch, CoalescedClient};
+use crate::cache::Generation;
 use crate::cache::messages::slices_concat;
 use crate::cache::query::{limit_is_sufficient, limit_rows_needed};
 use crate::cache::types::SharedResolved;
@@ -23,7 +24,7 @@ impl CacheDispatch {
     pub fn waiting_drain_ready(
         &self,
         fingerprint: Fingerprint,
-        generation: u64,
+        generation: Generation,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
         max_limit: Option<u64>,

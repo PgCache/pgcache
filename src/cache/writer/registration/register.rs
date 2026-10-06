@@ -148,8 +148,8 @@ impl WriterRegistration {
             .cache
             .cached_queries
             .get1(&fingerprint)
-            .map_or(0, |q| q.generation);
-        if generation > 0 {
+            .map(|q| q.generation);
+        if let Some(generation) = generation {
             self.population_start(
                 core,
                 PopulationTarget {

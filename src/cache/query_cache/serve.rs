@@ -8,6 +8,7 @@ use tracing::{debug, trace};
 
 use super::dispatch::reply_forward;
 use super::{CacheDispatch, CoalescedClient, QueryRequest, QueryType, ServeJob, ServeRequest};
+use crate::cache::Generation;
 use crate::cache::fast_path::{self, MvDecision};
 use crate::cache::memo::{MemoHit, MemoKey, MemoShape};
 use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe, slices_concat};
@@ -53,7 +54,7 @@ impl CacheDispatch {
         resolved: SharedResolved,
         deparsed_sql: EcoString,
         serve_shape: Option<QueryShape>,
-        generation: u64,
+        generation: Generation,
         rows_needed: Option<u64>,
     ) -> CacheResult<()> {
         if let Some(serve) = self.memo_serve_plan(fingerprint, &msg) {
@@ -81,7 +82,7 @@ impl CacheDispatch {
         resolved: SharedResolved,
         deparsed_sql: EcoString,
         serve_shape: Option<QueryShape>,
-        generation: u64,
+        generation: Generation,
         mv: MvServe,
     ) -> CacheResult<()> {
         self.pool_serve_coalesced(
@@ -245,7 +246,7 @@ impl CacheDispatch {
         resolved: SharedResolved,
         deparsed_sql: EcoString,
         serve_shape: Option<QueryShape>,
-        generation: u64,
+        generation: Generation,
         mv: MvServe,
         coalesced: Vec<CoalescedClient>,
     ) -> CacheResult<()> {

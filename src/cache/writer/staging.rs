@@ -20,6 +20,7 @@ use postgres_protocol::escape;
 use tracing::error;
 
 use super::core::WriterCore;
+use crate::cache::Generation;
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::Lsn;
@@ -50,7 +51,7 @@ const POPULATION_DELETED_KEY_CAP: usize = 100_000;
 /// the pair (not fingerprint alone) keeps two populations of the same query —
 /// e.g. one parked post-merge while a readmit dispatches the next generation —
 /// tracked independently, so deactivating one never tears down the other.
-type PopulationKey = (Fingerprint, u64);
+type PopulationKey = (Fingerprint, Generation);
 
 #[derive(Default)]
 pub(super) struct PopulationDeletedKeys {
@@ -180,7 +181,7 @@ impl PopulationDeletedKeys {
     pub(super) fn activate(
         &mut self,
         fingerprint: Fingerprint,
-        generation: u64,
+        generation: Generation,
         relation_oids: &[Oid],
         anchor_floor: Lsn,
     ) {
@@ -201,7 +202,7 @@ impl PopulationDeletedKeys {
     /// Stop recording for a population: drop its floor and prune (its departure
     /// may have raised the relation's min floor). Removes a relation's entry once
     /// its last in-flight population leaves.
-    pub(super) fn deactivate(&mut self, fingerprint: Fingerprint, generation: u64) {
+    pub(super) fn deactivate(&mut self, fingerprint: Fingerprint, generation: Generation) {
         let key = (fingerprint, generation);
         let Some(oids) = self.inflight.remove(&key) else {
             return;
@@ -289,7 +290,7 @@ impl PopulationDeletedKeys {
         &self,
         relation_oid: Oid,
         fingerprint: Fingerprint,
-        generation: u64,
+        generation: Generation,
     ) -> Option<Lsn> {
         self.relations
             .get(&relation_oid)?
@@ -450,7 +451,7 @@ impl StagingPool {
     pub(super) fn checkout(
         &mut self,
         fingerprint: Fingerprint,
-        generation: u64,
+        generation: Generation,
         relation_oids: &[Oid],
     ) -> Vec<(Oid, EcoString, bool)> {
         let mut out = Vec::with_capacity(relation_oids.len());
@@ -481,14 +482,18 @@ impl StagingPool {
 
     /// Take the tables a population holds, for return to the pool. Empty if the
     /// population was never checked out. Each entry carries the epoch at checkout.
-    fn take(&mut self, fingerprint: Fingerprint, generation: u64) -> Vec<StagingHold> {
+    fn take(&mut self, fingerprint: Fingerprint, generation: Generation) -> Vec<StagingHold> {
         self.checked_out
             .remove(&(fingerprint, generation))
             .unwrap_or_default()
     }
 
     /// The tables a population currently holds, without releasing them.
-    pub(super) fn held(&self, fingerprint: Fingerprint, generation: u64) -> Vec<(Oid, EcoString)> {
+    pub(super) fn held(
+        &self,
+        fingerprint: Fingerprint,
+        generation: Generation,
+    ) -> Vec<(Oid, EcoString)> {
         self.checked_out
             .get(&(fingerprint, generation))
             .map(|holds| holds.iter().map(|(oid, t, _)| (*oid, t.clone())).collect())
@@ -519,7 +524,7 @@ impl StagingPool {
     /// Drop a population's checkout without returning the tables (rare
     /// dispatch-failure / shutdown path; a freshly minted slot was never created,
     /// and a reused table is orphaned until the next cache reset).
-    pub(super) fn forget(&mut self, fingerprint: Fingerprint, generation: u64) {
+    pub(super) fn forget(&mut self, fingerprint: Fingerprint, generation: Generation) {
         self.checked_out.remove(&(fingerprint, generation));
     }
 }
@@ -607,7 +612,11 @@ impl WriterCore {
     /// the very invalidation this scheme avoids). Called on every terminal path
     /// (merge / abort / failure / abandoned). Best-effort — a leak is recovered
     /// by the next cache reset.
-    pub(super) async fn staging_checkin(&mut self, fingerprint: Fingerprint, generation: u64) {
+    pub(super) async fn staging_checkin(
+        &mut self,
+        fingerprint: Fingerprint,
+        generation: Generation,
+    ) {
         for (oid, staging, epoch) in self.staging_pool.take(fingerprint, generation) {
             // A relation schema change since checkout makes this table's shape
             // stale (`epoch_current` false) — drop it rather than reuse it.
@@ -657,7 +666,7 @@ mod tests {
     use super::*;
 
     const REL: Oid = Oid::from_raw(10);
-    const GEN: u64 = 1;
+    const GEN: Generation = Generation::from_raw(1);
 
     fn record(keys: &mut PopulationDeletedKeys, body: &str, lsn: Lsn) {
         keys.record(REL, EcoString::from(body), lsn);
@@ -742,11 +751,21 @@ mod tests {
     #[test]
     fn test_generations_of_same_fingerprint_are_independent() {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(Fingerprint::from_raw(7), 5, &[REL], Lsn::from_raw(100)); // gen 5, parked
-        keys.activate(Fingerprint::from_raw(7), 8, &[REL], Lsn::from_raw(100)); // gen 8, readmitted
+        keys.activate(
+            Fingerprint::from_raw(7),
+            Generation::from_raw(5),
+            &[REL],
+            Lsn::from_raw(100),
+        ); // gen 5, parked
+        keys.activate(
+            Fingerprint::from_raw(7),
+            Generation::from_raw(8),
+            &[REL],
+            Lsn::from_raw(100),
+        ); // gen 8, readmitted
 
         // gen 5 finishes; gen 8 must still be recording for the relation.
-        keys.deactivate(Fingerprint::from_raw(7), 5);
+        keys.deactivate(Fingerprint::from_raw(7), Generation::from_raw(5));
         assert!(keys.is_recording(REL), "gen 8 still in flight");
         record(&mut keys, "5", Lsn::from_raw(150));
         assert!(
@@ -755,7 +774,7 @@ mod tests {
         );
 
         // Once gen 8 also leaves, the entry clears.
-        keys.deactivate(Fingerprint::from_raw(7), 8);
+        keys.deactivate(Fingerprint::from_raw(7), Generation::from_raw(8));
         assert!(!keys.is_recording(REL));
     }
 
@@ -831,16 +850,16 @@ mod tests {
         let mut pool = StagingPool::default();
         let fp = Fingerprint::from_raw(1);
 
-        let out = pool.checkout(fp, 1, &[REL]);
+        let out = pool.checkout(fp, Generation::from_raw(1), &[REL]);
         let (oid, name, needs_create) = out[0].clone();
         assert_eq!(oid, REL);
         assert!(needs_create, "first checkout mints a new slot");
 
-        for (o, t, _epoch) in pool.take(fp, 1) {
+        for (o, t, _epoch) in pool.take(fp, Generation::from_raw(1)) {
             pool.release(o, t);
         }
 
-        let out2 = pool.checkout(fp, 2, &[REL]);
+        let out2 = pool.checkout(fp, Generation::from_raw(2), &[REL]);
         let (_, name2, needs_create2) = out2[0].clone();
         assert_eq!(name2, name, "reuses the freed table");
         assert!(!needs_create2, "reused table is not recreated");
@@ -853,8 +872,8 @@ mod tests {
         let mut pool = StagingPool::default();
         let fp = Fingerprint::from_raw(1);
 
-        pool.checkout(fp, 1, &[REL]);
-        let held = pool.take(fp, 1);
+        pool.checkout(fp, Generation::from_raw(1), &[REL]);
+        let held = pool.take(fp, Generation::from_raw(1));
         let (oid, _name, epoch_at_checkout) = held[0].clone();
         assert!(pool.epoch_current(oid, epoch_at_checkout));
 
@@ -874,8 +893,10 @@ mod tests {
         let mut pool = StagingPool::default();
         let fp = Fingerprint::from_raw(1);
 
-        let name = pool.checkout(fp, 1, &[REL])[0].1.clone();
-        for (o, t, _epoch) in pool.take(fp, 1) {
+        let name = pool.checkout(fp, Generation::from_raw(1), &[REL])[0]
+            .1
+            .clone();
+        for (o, t, _epoch) in pool.take(fp, Generation::from_raw(1)) {
             pool.release(o, t);
         }
 
@@ -886,7 +907,7 @@ mod tests {
             "schema change returns free tables to drop"
         );
 
-        let out = pool.checkout(fp, 2, &[REL]);
+        let out = pool.checkout(fp, Generation::from_raw(2), &[REL]);
         assert!(out[0].2, "after purge the next checkout mints a fresh slot");
     }
 }

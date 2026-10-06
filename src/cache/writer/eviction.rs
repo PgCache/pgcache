@@ -6,6 +6,7 @@ use tracing::{debug, error, trace, warn};
 use super::core::WriterCore;
 #[cfg(feature = "fault-injection")]
 use super::core::fault;
+use crate::cache::Generation;
 use crate::cache::memo::SlotKey;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, types::CachedQueryState};
 use crate::oid::Oid;
@@ -112,7 +113,7 @@ impl WriterCore {
         // that is skipped (not Ready, see below) keeps its generation, so
         // re-reading the minimum would spin on it; the snapshot lets the round
         // move past it to the next candidate instead.
-        let candidates: Vec<u64> = self.cache.generations.iter().copied().collect();
+        let candidates: Vec<Generation> = self.cache.generations.iter().copied().collect();
         for candidate_gen in candidates {
             if self.cache.cached_queries.len() <= count_cap {
                 break;
@@ -401,13 +402,12 @@ impl WriterCore {
     /// Promote generation-0 entries to `generation_counter + 1` so they become
     /// purgeable in future cycles. Only bumps the counter if entries were promoted.
     async fn generation_zero_promote(&mut self) -> CacheResult<()> {
-        let new_gen = self.cache.generation_counter + 1;
-        let new_gen_i64 = i64::try_from(new_gen).expect("generation counter fits in i64");
+        let new_gen = self.cache.generation_counter.next();
         let promoted: i64 = self
             .db_cache
             .query_one(
                 "SELECT pgcache_generation_zero_promote($1)",
-                &[&new_gen_i64],
+                &[&new_gen.get()],
             )
             .await
             .map_into_report::<CacheError>()?
@@ -427,7 +427,7 @@ impl WriterCore {
     /// Returns `Ok(0)` *without purging* while a CDC frame is open (the purge
     /// is deferred to `CommitMark`). Callers must not treat that `0` as
     /// "nothing to reclaim" — the deferred purge runs once the frame commits.
-    pub(super) async fn generation_purge(&mut self, threshold: u64) -> CacheResult<i64> {
+    pub(super) async fn generation_purge(&mut self, threshold: Generation) -> CacheResult<i64> {
         // Defer while a CDC frame is open: pgcache_purge_rows DELETEs source
         // cache-table rows on db_cache, which would block on the frame's
         // uncommitted locks. Record the intent; flushed after frame_commit.
@@ -435,18 +435,20 @@ impl WriterCore {
             self.purge_pending = true;
             return Ok(0);
         }
-        debug!(threshold, "generation_purge entry");
+        debug!(threshold = threshold.get(), "generation_purge entry");
         self.generation_zero_promote().await?;
 
-        if threshold > 0 {
-            let threshold_i64 = i64::try_from(threshold).expect("generation threshold fits in i64");
+        if threshold > Generation::ZERO {
             let deleted: i64 = self
                 .db_cache
-                .query_one("SELECT pgcache_purge_rows($1)", &[&threshold_i64])
+                .query_one("SELECT pgcache_purge_rows($1)", &[&threshold.get()])
                 .await
                 .map_into_report::<CacheError>()?
                 .get(0);
-            debug!(threshold, deleted, "generation_purge complete");
+            debug!(
+                threshold = threshold.get(),
+                deleted, "generation_purge complete"
+            );
             Ok(deleted)
         } else {
             Ok(0)
@@ -479,7 +481,7 @@ impl WriterCore {
 
         debug!(
             fingerprint = %fingerprint,
-            generation = query.generation,
+            generation = query.generation.get(),
             relation_oids = ?query.relation_oids,
             "cache_query_evict entry"
         );

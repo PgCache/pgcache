@@ -9,6 +9,7 @@ use tokio::sync::oneshot;
 use tracing::debug;
 
 use super::{CacheDispatch, QueryRequest};
+use crate::cache::Generation;
 use crate::cache::messages::{AdmitAction, QueryCommand, RegisterRequest, SubsumptionResult};
 use crate::cache::mv::MvMeta;
 use crate::cache::mv_shape::ShapeGate;
@@ -27,7 +28,7 @@ impl CacheDispatch {
                 pq.fingerprint,
                 CachedQueryView {
                     state: CachedQueryState::Loading,
-                    generation: 0,
+                    generation: Generation::ZERO,
                     resolved: None,
                     deparsed_sql: None,
                     serve_shape: None,

@@ -146,10 +146,11 @@ pub(super) fn chunk_result_parse(messages: &[SimpleQueryMessage]) -> CacheResult
 mod tests {
 
     use super::*;
+    use crate::cache::Generation;
 
     fn statement(
         staging: &str,
-        generation: u64,
+        generation: Generation,
         lo_block: u32,
         hi_block: u32,
     ) -> ChunkStatement<'_> {
@@ -173,7 +174,7 @@ mod tests {
 
     #[test]
     fn test_chunk_sql_drains_a_page_window_and_stamps_generation_locally() {
-        let sql = plan().chunk_sql(statement("stage_1_0", 9, 3, 67), None);
+        let sql = plan().chunk_sql(statement("stage_1_0", Generation::from_raw(9), 3, 67), None);
         assert!(
             sql.starts_with("SET LOCAL mem.query_generation = 9;"),
             "{sql}"
@@ -201,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_discard_sql_is_the_same_page_window_without_the_insert() {
-        let sql = discard_sql(statement("stage_1_0", 0, 3, 67));
+        let sql = discard_sql(statement("stage_1_0", Generation::from_raw(0), 3, 67));
         assert_eq!(
             sql,
             "DELETE FROM pgcache_stage.stage_1_0 WHERE ctid >= '(3,0)'::tid AND ctid < '(67,0)'::tid"
@@ -210,7 +211,10 @@ mod tests {
 
     #[test]
     fn test_chunk_sql_applies_deleted_key_filter_to_insert_only() {
-        let sql = plan().chunk_sql(statement("s", 1, 0, 10), Some("(\"id\") NOT IN ((4))"));
+        let sql = plan().chunk_sql(
+            statement("s", Generation::from_raw(1), 0, 10),
+            Some("(\"id\") NOT IN ((4))"),
+        );
         assert!(
             sql.contains("FROM d WHERE (\"id\") NOT IN ((4)) ON CONFLICT"),
             "{sql}"

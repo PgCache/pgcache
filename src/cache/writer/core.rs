@@ -15,6 +15,7 @@ use super::frame::{FRAME_BUF_CAPACITY, FrameRowEvent, FrameState, OverlayEntry};
 use super::merge_queue::MergeQueue;
 use super::mv_build::MvBuildPool;
 use super::staging::{PopulationDeletedKeys, StagingPool};
+use crate::cache::Generation;
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{QueryCommand, WriterNotify},
@@ -115,7 +116,7 @@ pub(crate) struct WriterShared {
 /// What a cached query serves at a generation: mirrored into the state view
 /// on every Loading / Ready transition and sent with the Ready notify.
 pub(super) struct QueryServing {
-    pub(super) generation: u64,
+    pub(super) generation: Generation,
     pub(super) resolved: SharedResolved,
     pub(super) deparsed_sql: EcoString,
     pub(super) max_limit: Option<u64>,
@@ -353,7 +354,10 @@ pub(super) struct WriterCore {
 /// the live query exists, hasn't been superseded by a readmit (generation
 /// bumped), and isn't invalidated — otherwise the parked entry is stale and
 /// finalizing it would mark a superseded/invalidated result Ready (PGC-250).
-fn population_finalize_allowed(live: Option<(u64, bool)>, parked_generation: u64) -> bool {
+fn population_finalize_allowed(
+    live: Option<(Generation, bool)>,
+    parked_generation: Generation,
+) -> bool {
     matches!(live, Some((generation, invalidated)) if generation == parked_generation && !invalidated)
 }
 
@@ -506,7 +510,11 @@ impl WriterCore {
     /// the live, non-invalidated cached query — i.e. a parked merge/ready entry
     /// hasn't been superseded by a readmit (generation bump), invalidated, or
     /// evicted while it waited (PGC-250).
-    pub(super) fn population_is_current(&self, fingerprint: Fingerprint, generation: u64) -> bool {
+    pub(super) fn population_is_current(
+        &self,
+        fingerprint: Fingerprint,
+        generation: Generation,
+    ) -> bool {
         let live = self
             .cache
             .cached_queries
@@ -642,28 +650,38 @@ impl WriterCore {
 #[cfg(test)]
 mod tests {
     use super::population_finalize_allowed;
+    use crate::cache::Generation;
 
     /// Live query at the parked generation, not invalidated → finalize.
     #[test]
     fn test_finalize_allowed_when_current() {
-        assert!(population_finalize_allowed(Some((5, false)), 5));
+        assert!(population_finalize_allowed(
+            Some((Generation::from_raw(5), false)),
+            Generation::from_raw(5)
+        ));
     }
 
     /// Readmit bumped the generation while the entry was parked → skip.
     #[test]
     fn test_finalize_skipped_after_readmit() {
-        assert!(!population_finalize_allowed(Some((8, false)), 5));
+        assert!(!population_finalize_allowed(
+            Some((Generation::from_raw(8), false)),
+            Generation::from_raw(5)
+        ));
     }
 
     /// Query invalidated while parked (a growing change superseded it) → skip.
     #[test]
     fn test_finalize_skipped_when_invalidated() {
-        assert!(!population_finalize_allowed(Some((5, true)), 5));
+        assert!(!population_finalize_allowed(
+            Some((Generation::from_raw(5), true)),
+            Generation::from_raw(5)
+        ));
     }
 
     /// Query evicted while parked → skip.
     #[test]
     fn test_finalize_skipped_when_evicted() {
-        assert!(!population_finalize_allowed(None, 5));
+        assert!(!population_finalize_allowed(None, Generation::from_raw(5)));
     }
 }

@@ -10,6 +10,7 @@ use ecow::EcoString;
 use hdrhistogram::Histogram;
 use iddqd::{BiHashItem, BiHashMap, IdHashMap, bi_upcast};
 
+use super::generation::Generation;
 use super::population_pool::PopulationPool;
 use super::reg_gate::RegGate;
 use super::serve_pool_state::ServePool;
@@ -35,7 +36,7 @@ pub(super) use super::serve_decision::CachedQueryState;
 pub struct CachedQuery {
     pub fingerprint: Fingerprint,
     /// Generation number assigned when query was registered (monotonically increasing)
-    pub generation: u64,
+    pub generation: Generation,
     pub relation_oids: Vec<Oid>,
     pub query: QueryExpr,
     pub resolved: SharedResolved,
@@ -65,7 +66,7 @@ pub struct CachedQuery {
 
 impl BiHashItem for CachedQuery {
     type K1<'a> = Fingerprint;
-    type K2<'b> = u64;
+    type K2<'b> = Generation;
 
     fn key1(&self) -> Self::K1<'_> {
         self.fingerprint
@@ -95,9 +96,9 @@ pub struct Cache {
     pub update_queries: IdHashMap<UpdateQueries>,
     pub cached_queries: BiHashMap<CachedQuery>,
     /// Monotonically increasing generation counter (starts at 1)
-    pub generation_counter: u64,
+    pub generation_counter: Generation,
     /// Generations of active cached queries (for efficient min-tracking)
-    pub generations: BTreeSet<u64>,
+    pub generations: BTreeSet<Generation>,
     /// Dynamic config handle for runtime-adjustable cache settings
     pub dynamic: DynamicConfigHandle,
 }
@@ -108,15 +109,15 @@ impl Cache {
             tables: BiHashMap::new(),
             update_queries: IdHashMap::new(),
             cached_queries: BiHashMap::new(),
-            generation_counter: 0,
+            generation_counter: Generation::ZERO,
             generations: BTreeSet::new(),
             dynamic: settings.dynamic.clone(),
         }
     }
 
     /// Allocate the next generation and register it as active.
-    pub fn generation_allocate(&mut self) -> u64 {
-        self.generation_counter += 1;
+    pub fn generation_allocate(&mut self) -> Generation {
+        self.generation_counter = self.generation_counter.next();
         self.generations.insert(self.generation_counter);
         self.generation_counter
     }
@@ -124,10 +125,10 @@ impl Cache {
     /// Returns the minimum generation that can be safely purged.
     /// This is the highest generation that is less than all active generations
     /// or the current generation_counter if there are no active generations
-    pub fn generation_purge_threshold(&self) -> u64 {
+    pub fn generation_purge_threshold(&self) -> Generation {
         self.generations
             .first()
-            .map(|min| min.saturating_sub(1))
+            .map(|min| min.previous())
             .unwrap_or(self.generation_counter)
     }
 
@@ -328,7 +329,7 @@ impl CacheStateView {
 pub struct CachedQueryView {
     pub state: CachedQueryState,
     /// Generation number (0 for Loading placeholder before writer assigns real value)
-    pub generation: u64,
+    pub generation: Generation,
     /// Resolved query (None for Loading placeholder before writer resolves)
     pub resolved: Option<SharedResolved>,
     /// Precomputed deparsed SQL body (mirrors `CachedQuery.deparsed_sql`).

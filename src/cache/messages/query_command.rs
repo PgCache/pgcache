@@ -7,6 +7,7 @@ use ecow::EcoString;
 use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
 
+use crate::cache::Generation;
 use crate::cache::serve_decision::AdmitAction;
 use crate::cache::types::SharedResolved;
 use crate::cache::{
@@ -22,7 +23,7 @@ use crate::query::Fingerprint;
 pub enum SubsumptionResult {
     /// Data already in cache. State is Ready, serve immediately.
     Subsumed {
-        generation: u64,
+        generation: Generation,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
     },
@@ -108,7 +109,7 @@ pub enum QueryCommand {
     /// releases the right deleted-key tracking.
     Failed {
         fingerprint: Fingerprint,
-        generation: u64,
+        generation: Generation,
     },
 
     /// Bump the max_limit for a cached query and re-populate with higher limit.
@@ -197,7 +198,7 @@ impl std::fmt::Debug for QueryCommand {
 /// writer must merge each relation's staging table into the shared cache table.
 pub struct PopulationMerge {
     pub fingerprint: Fingerprint,
-    pub generation: u64,
+    pub generation: Generation,
     /// `(relation_oid, staging table name in pgcache_stage)` per relation read.
     pub staged: Vec<(Oid, EcoString)>,
     pub cached_bytes: usize,

@@ -12,6 +12,7 @@ use super::{
     ChunkStatement, ChunkTarget, ChunkWindow, DrainCursor, DrainTarget, KeyScope, MergeInProgress,
     MergeStep, StagingDiscard,
 };
+use crate::cache::Generation;
 use crate::cache::messages::PopulationMerge;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
@@ -22,10 +23,10 @@ use crate::query::Fingerprint;
 struct MergeStepInputs {
     cursor: DrainCursor,
     chunk_blocks: u32,
-    generation: u64,
+    generation: Generation,
     staged: Vec<(Oid, EcoString)>,
     /// `(fingerprint, generation)` of an applying merge; `None` for a discard.
-    population: Option<(Fingerprint, u64)>,
+    population: Option<(Fingerprint, Generation)>,
 }
 
 /// Test-only delay after each merge chunk (fault-injection feature): stretches
@@ -85,7 +86,11 @@ impl WriterCore {
     /// whose worker failed mid-stream. The tables are read from the pool's
     /// ledger, which keeps them checked out under the key until the discard's
     /// check-in.
-    pub(crate) fn population_discard_enqueue(&mut self, fingerprint: Fingerprint, generation: u64) {
+    pub(crate) fn population_discard_enqueue(
+        &mut self,
+        fingerprint: Fingerprint,
+        generation: Generation,
+    ) {
         let staged = self.staging_pool.held(fingerprint, generation);
         if staged.is_empty() {
             return;
@@ -246,7 +251,7 @@ impl WriterCore {
         &mut self,
         target: &ChunkTarget,
         plan: &MergePlan,
-        (fingerprint, generation): (Fingerprint, u64),
+        (fingerprint, generation): (Fingerprint, Generation),
     ) -> CacheResult<bool> {
         let relation_oid = target.relation_oid;
         let Some(floor) = self
@@ -293,7 +298,7 @@ impl WriterCore {
         &mut self,
         plan: Option<&MergePlan>,
         target: &ChunkTarget,
-        generation: u64,
+        generation: Generation,
     ) -> CacheResult<(u64, Duration)> {
         let statement = ChunkStatement {
             staging: &target.staging,

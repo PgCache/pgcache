@@ -20,6 +20,7 @@ use ecow::EcoString;
 use tokio::sync::Notify;
 
 use super::staging::PopulationDeletedKeys;
+use crate::cache::Generation;
 use crate::cache::messages::PopulationMerge;
 use crate::oid::Oid;
 use crate::pg::Lsn;
@@ -99,7 +100,7 @@ enum DrainCursor {
 /// A population's staging tables awaiting a chunked discard.
 pub(super) struct StagingDiscard {
     pub(super) fingerprint: Fingerprint,
-    pub(super) generation: u64,
+    pub(super) generation: Generation,
     pub(super) staged: Vec<(Oid, EcoString)>,
 }
 
@@ -136,7 +137,7 @@ struct KeyScope<'a> {
 #[derive(Clone, Copy)]
 struct ChunkStatement<'a> {
     staging: &'a str,
-    generation: u64,
+    generation: Generation,
     lo_block: u32,
     hi_block: u32,
 }
@@ -186,7 +187,7 @@ pub(super) struct InputQueues {
 /// over the whole staging table.
 pub(super) struct MergeInProgress {
     pub(super) fingerprint: Fingerprint,
-    pub(super) generation: u64,
+    pub(super) generation: Generation,
     /// `(relation_oid, staging table name in pgcache_stage)` per relation.
     staged: Vec<(Oid, EcoString)>,
     pub(super) target: DrainTarget,
@@ -217,7 +218,7 @@ impl MergeInProgress {
 pub(super) struct PendingMerge(pub(super) PopulationMerge);
 
 impl PendingMerge {
-    fn key(&self) -> (Lsn, u64) {
+    fn key(&self) -> (Lsn, Generation) {
         (self.0.snapshot_lsn, self.0.generation)
     }
 }
@@ -367,7 +368,7 @@ mod tests {
         let mut merges = MergeQueue::new(Arc::new(Notify::new()));
         merges.active = Some(MergeInProgress::new(
             Fingerprint::from_raw(1),
-            1,
+            Generation::from_raw(1),
             vec![],
             DrainTarget::Discard,
             merges.boundary(0),

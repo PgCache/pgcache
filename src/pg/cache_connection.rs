@@ -15,6 +15,7 @@ use super::protocol::frontend_encode::{
     INT8_OID, SETGEN_SQL, SETGEN_STATEMENT_NAME, TEXT_OID, extended_query_build,
     frontend_msg_append, startup_message_build, statement_name_bytes,
 };
+use crate::cache::Generation;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::query::ShapeKey;
 use crate::query::ast::LiteralValue;
@@ -286,7 +287,7 @@ impl CacheConnection {
     pub(crate) async fn pipelined_named_query_send(
         &mut self,
         shape_key: ShapeKey,
-        generation: u64,
+        generation: Generation,
         literals: &[LiteralValue],
         limit_text: Option<&str>,
         offset_text: Option<&str>,
@@ -309,7 +310,7 @@ impl CacheConnection {
         // bound to the generation as text, no Describe — its one-row result is
         // consumed by the caller's state machine. No trailing Sync (shared).
         let mut gen_buf = itoa::Buffer::new();
-        let gen_text = gen_buf.format(generation);
+        let gen_text = gen_buf.format(generation.get());
         extended_query_build(
             &mut self.write_buf,
             SETGEN_STATEMENT_NAME,

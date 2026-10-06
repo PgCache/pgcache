@@ -9,6 +9,7 @@ use super::{
     ChunkBoundary, ChunkWindow, DrainCursor, DrainTarget, FilterCache, KeyScope, MergeInProgress,
     StaleProbeCache,
 };
+use crate::cache::Generation;
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::query::Fingerprint;
@@ -49,7 +50,7 @@ impl DrainCursor {
 impl MergeInProgress {
     pub(super) fn new(
         fingerprint: Fingerprint,
-        generation: u64,
+        generation: Generation,
         staged: Vec<(Oid, EcoString)>,
         target: DrainTarget,
         boundary: ChunkBoundary,
@@ -187,7 +188,7 @@ mod tests {
     fn drain() -> MergeInProgress {
         MergeInProgress::new(
             Fingerprint::from_raw(1),
-            1,
+            Generation::from_raw(1),
             vec![(REL, EcoString::from("stage_10_0"))],
             DrainTarget::Discard,
             ChunkBoundary::default(),
@@ -204,7 +205,12 @@ mod tests {
 
     fn keys_recording() -> PopulationDeletedKeys {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(Fingerprint::from_raw(1), 1, &[REL], Lsn::from_raw(1));
+        keys.activate(
+            Fingerprint::from_raw(1),
+            Generation::from_raw(1),
+            &[REL],
+            Lsn::from_raw(1),
+        );
         keys
     }
 
@@ -294,7 +300,7 @@ mod tests {
             "{shrunk}"
         );
         assert_eq!(
-            keys.floor(REL, Fingerprint::from_raw(1), 1),
+            keys.floor(REL, Fingerprint::from_raw(1), Generation::from_raw(1)),
             Some(Lsn::from_raw(1))
         );
     }
@@ -317,7 +323,7 @@ mod tests {
     fn test_chunk_blocks_adapt_targets_chunk_time_within_clamps() {
         let merge = PopulationMerge {
             fingerprint: Fingerprint::from_raw(1),
-            generation: 1,
+            generation: Generation::from_raw(1),
             staged: vec![],
             cached_bytes: 0,
             row_count: 0,

@@ -27,7 +27,7 @@ pub struct StatusResponse {
 pub struct CacheStatusData {
     pub size_bytes: usize,
     pub size_limit_bytes: Option<usize>,
-    pub generation: u64,
+    pub generation: i64,
     pub tables_tracked: usize,
     pub policy: String,
     pub queries_registered: usize,

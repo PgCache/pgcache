@@ -10,6 +10,7 @@ use tracing::{debug, error, info, instrument, trace};
 
 use super::explain::ExplainClient;
 use super::{CacheDispatch, QueryRequest, ServeJob};
+use crate::cache::Generation;
 use crate::cache::coalesce_queue::{CoalesceKey, CoalesceQueue, coalesce_deadline};
 use crate::cache::messages::{
     CacheMessage, CacheOutcome, CacheReply, PipelineContext, ProxyMessage, QueryCommand,
@@ -517,7 +518,7 @@ impl CacheDispatch {
                 Entry::Vacant(slot) => {
                     slot.insert(CachedQueryView {
                         state: transition.new,
-                        generation: 0,
+                        generation: Generation::ZERO,
                         resolved: None,
                         deparsed_sql: None,
                         serve_shape: None,

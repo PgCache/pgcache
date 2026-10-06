@@ -23,6 +23,7 @@ use tokio_postgres::{Client, SimpleQueryMessage};
 use tokio_stream::StreamExt;
 use tracing::{error, trace};
 
+use crate::cache::Generation;
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{MvBuildOutcome, QueryCommand},
@@ -56,7 +57,7 @@ pub(super) struct MvBuildContext {
     pub shape_gate: ShapeGate,
     /// LIMIT cap for the MV body (joins only).
     pub max_limit: Option<u64>,
-    pub generation: u64,
+    pub generation: Generation,
     pub resolved: SharedResolved,
     /// Captured by a previous build; `None` means describe before building.
     pub output_columns: Option<Arc<[EcoString]>>,

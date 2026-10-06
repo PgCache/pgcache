@@ -13,6 +13,7 @@ use super::core::{QueryServing, WriterCore};
 use super::registration::{
     QueryResolution, RegistrationIdentity, WriterRegistration, cached_query_insert,
 };
+use crate::cache::Generation;
 use crate::cache::admission::{SubsumerCandidate, SubsumerSource, subsumption_covered};
 use crate::cache::types::{Cache, SharedResolved};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
@@ -104,7 +105,7 @@ impl WriterRegistration {
         core: &mut WriterCore,
         identity: RegistrationIdentity,
         resolution: QueryResolution,
-    ) -> CacheResult<Option<(u64, SharedResolved, EcoString)>> {
+    ) -> CacheResult<Option<(Generation, SharedResolved, EcoString)>> {
         let subsume_start = Instant::now();
         let fingerprint = identity.fingerprint;
         let resolved = Arc::clone(&resolution.resolved);

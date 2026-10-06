@@ -8,6 +8,7 @@ use super::query::CacheableQuery;
 use super::query::QueryParameters;
 use super::reply::ReplySender;
 use super::types::SharedResolved;
+use crate::cache::Generation;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::{ClientSocket, ExplainSpec};
@@ -29,7 +30,7 @@ pub(crate) enum WriterNotify {
     /// Population completed — query is Ready.
     Ready {
         fingerprint: Fingerprint,
-        generation: u64,
+        generation: Generation,
         resolved: SharedResolved,
         deparsed_sql: EcoString,
         max_limit: Option<u64>,

@@ -22,6 +22,7 @@ use super::merge_queue::PendingMerge;
 use super::population::{
     PopulationSpawnContext, population_dispatcher, population_worker_connect, population_worker_run,
 };
+use crate::cache::Generation;
 use crate::cache::messages::{QueryCommand, RegisterRequest};
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::population_pool::PopulationPool;
@@ -44,7 +45,7 @@ mod resolve;
 /// Work item for population worker pool.
 pub(crate) struct PopulationWork {
     pub fingerprint: Fingerprint,
-    pub generation: u64,
+    pub generation: Generation,
     pub table_metadata: Vec<TableMetadata>,
     /// SELECT branches extracted from the query at registration time.
     /// For simple SELECT queries, this contains one branch.
@@ -100,7 +101,7 @@ pub(super) struct RegistrationIdentity {
 /// One population to start: which query and generation, and what to fetch.
 struct PopulationTarget<'a> {
     fingerprint: Fingerprint,
-    generation: u64,
+    generation: Generation,
     resolved: &'a SharedResolved,
     max_limit: Option<u64>,
 }
@@ -113,7 +114,7 @@ pub(super) fn cached_query_insert(
     core: &mut WriterCore,
     identity: RegistrationIdentity,
     resolution: QueryResolution,
-) -> (u64, bool) {
+) -> (Generation, bool) {
     let generation = core.cache.generation_allocate();
     let changed = core.active_relations_acquire(&resolution.relation_oids);
     core.cache.cached_queries.insert_overwrite(CachedQuery {
@@ -316,7 +317,12 @@ impl WriterRegistration {
         }
     }
 
-    fn population_failed(&self, core: &mut WriterCore, fingerprint: Fingerprint, generation: u64) {
+    fn population_failed(
+        &self,
+        core: &mut WriterCore,
+        fingerprint: Fingerprint,
+        generation: Generation,
+    ) {
         core.population_deleted_keys
             .deactivate(fingerprint, generation);
         // Whatever the worker staged before failing is emptied in chunks, not

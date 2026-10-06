@@ -28,6 +28,8 @@ mod explain;
 #[cfg(feature = "proxy")]
 mod fast_path;
 #[cfg(feature = "proxy")]
+mod generation;
+#[cfg(feature = "proxy")]
 pub(crate) mod memo;
 #[cfg(feature = "proxy")]
 pub(crate) mod messages;
@@ -65,6 +67,8 @@ mod writer;
 // Re-export public types
 pub use query::{CacheabilityError, CacheableQuery, QueryParameter, QueryParameters};
 
+#[cfg(feature = "proxy")]
+pub use generation::Generation;
 #[cfg(feature = "proxy")]
 pub use messages::{CacheMessage, CacheOutcome, CacheReply, DataStreamState, ProxyMessage};
 #[cfg(feature = "proxy")]

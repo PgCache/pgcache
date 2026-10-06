@@ -74,7 +74,7 @@ impl WriterCore {
         crate::metrics::handles()
             .state
             .generation
-            .set(self.cache.generation_counter as f64);
+            .set(self.cache.generation_counter.get() as f64);
         crate::metrics::handles()
             .state
             .tables_tracked
@@ -118,7 +118,7 @@ impl WriterCore {
             size_limit_bytes: Some(
                 usize::try_from(self.disk_limit_effective).unwrap_or(usize::MAX),
             ),
-            generation: cache.generation_counter,
+            generation: cache.generation_counter.get(),
             tables_tracked: cache.tables.len(),
             policy: format!("{:?}", dynamic.cache_policy),
             queries_registered: cache.cached_queries.len(),

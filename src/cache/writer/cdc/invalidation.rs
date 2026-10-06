@@ -8,6 +8,7 @@ use super::row_match::{
 };
 use super::{CdcOperation, WriterCdc};
 use crate::cache::CacheResult;
+use crate::cache::Generation;
 use crate::cache::messages::QueryCommand;
 use crate::cache::types::CachedQueryState;
 use crate::cache::update_query::{
@@ -383,7 +384,7 @@ pub(super) fn update_queries_check_invalidate(
 /// Ready→Invalidated: stop serving the query's generation, keep the entry for
 /// metadata reuse on readmission, and drain waiters parked on its now-dead
 /// population.
-fn query_invalidated_mark(core: &mut WriterCore, fingerprint: Fingerprint, generation: u64) {
+fn query_invalidated_mark(core: &mut WriterCore, fingerprint: Fingerprint, generation: Generation) {
     if let Some(mut m) = core.state_view.metrics.get_mut(&fingerprint) {
         m.invalidation_count += 1;
         m.cached_since_ns = None;

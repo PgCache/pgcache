@@ -8,6 +8,7 @@ use std::time::Instant;
 use tracing::{debug, error};
 
 use super::WriterRegistration;
+use crate::cache::Generation;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::merge_queue::{
     DrainTarget, HeapStop, MERGE_FLUSH_FORCE_AFTER, MergeStep, PendingMerge,
@@ -104,7 +105,7 @@ async fn merge_stall_handle(core: &mut WriterCore, stop: HeapStop) -> CacheResul
 #[derive(Clone, Copy)]
 struct MergeHead {
     fingerprint: Fingerprint,
-    generation: u64,
+    generation: Generation,
     /// Applying a population (vs. discarding staging).
     applying: bool,
 }
