@@ -592,8 +592,11 @@ fn settings_build_toml_replication_partial_merges_with_origin() {
 fn settings_build_cli_replication_overrides_no_toml_section() {
     let config = base_toml_config();
     let args = CliArgs {
-        replication_host: Some("cli-replica.example.com".to_owned()),
-        replication_port: Some(6432),
+        replication: PgSettingsPartial {
+            host: Some("cli-replica.example.com".to_owned()),
+            port: Some(6432),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -619,7 +622,10 @@ fn settings_build_cli_replication_overrides_toml_replication() {
         ..Default::default()
     });
     let args = CliArgs {
-        replication_host: Some("cli-replica.example.com".to_owned()),
+        replication: PgSettingsPartial {
+            host: Some("cli-replica.example.com".to_owned()),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -637,7 +643,10 @@ fn settings_build_cli_replication_overrides_toml_replication() {
 fn settings_build_cli_origin_override_cascades_to_replication() {
     let config = base_toml_config();
     let args = CliArgs {
-        origin_host: Some("cli-origin.example.com".to_owned()),
+        origin: PgSettingsPartial {
+            host: Some("cli-origin.example.com".to_owned()),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -667,15 +676,21 @@ fn settings_build_cdc_names_lowercased() {
 /// All required CLI fields populated, no config file.
 fn base_cli_args() -> CliArgs {
     CliArgs {
-        origin_host: Some("origin.example.com".to_owned()),
-        origin_port: Some(5432),
-        origin_user: Some("origin_user".to_owned()),
-        origin_password: Some("origin_pass".to_owned()),
-        origin_database: Some("origin_db".to_owned()),
-        cache_host: Some("localhost".to_owned()),
-        cache_port: Some(5433),
-        cache_user: Some("cache_user".to_owned()),
-        cache_database: Some("cache_db".to_owned()),
+        origin: PgSettingsPartial {
+            host: Some("origin.example.com".to_owned()),
+            port: Some(5432),
+            user: Some("origin_user".to_owned()),
+            password: Some("origin_pass".to_owned()),
+            database: Some("origin_db".to_owned()),
+            ..Default::default()
+        },
+        cache: PgSettingsPartial {
+            host: Some("localhost".to_owned()),
+            port: Some(5433),
+            user: Some("cache_user".to_owned()),
+            database: Some("cache_db".to_owned()),
+            ..Default::default()
+        },
         cdc_publication_name: Some("pub".to_owned()),
         cdc_slot_name: Some("slot".to_owned()),
         listen_socket: Some("127.0.0.1:6432".parse().expect("valid socket addr")),
@@ -704,7 +719,10 @@ fn settings_build_cli_only_replication_defaults_to_origin() {
 #[test]
 fn settings_build_cli_only_replication_host_override() {
     let args = CliArgs {
-        replication_host: Some("replica.example.com".to_owned()),
+        replication: PgSettingsPartial {
+            host: Some("replica.example.com".to_owned()),
+            ..Default::default()
+        },
         ..base_cli_args()
     };
 
@@ -724,12 +742,14 @@ fn settings_build_cli_only_replication_host_override() {
 #[test]
 fn settings_build_cli_only_replication_all_fields_override() {
     let args = CliArgs {
-        replication_host: Some("replica.example.com".to_owned()),
-        replication_port: Some(6432),
-        replication_user: Some("repl_user".to_owned()),
-        replication_password: Some("repl_pass".to_owned()),
-        replication_database: Some("repl_db".to_owned()),
-        replication_ssl_mode: Some(SslMode::Require),
+        replication: PgSettingsPartial {
+            host: Some("replica.example.com".to_owned()),
+            port: Some(6432),
+            user: Some("repl_user".to_owned()),
+            password: Some("repl_pass".to_owned()),
+            database: Some("repl_db".to_owned()),
+            ssl_mode: Some(SslMode::Require),
+        },
         ..base_cli_args()
     };
 
@@ -749,7 +769,7 @@ fn settings_build_cli_only_replication_all_fields_override() {
 #[test]
 fn settings_build_cli_only_missing_origin_host_errors() {
     let mut args = base_cli_args();
-    args.origin_host = None;
+    args.origin.host = None;
 
     let err = settings_build(args, None, None).expect_err("missing origin_host");
     assert!(err.to_string().contains("origin_host"));

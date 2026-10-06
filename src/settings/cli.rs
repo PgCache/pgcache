@@ -106,30 +106,28 @@ fn require<T>(value: Option<T>, name: &'static str) -> ConfigResult<T> {
     value.ok_or_else(|| Report::from(ConfigError::ArgumentMissing { name }))
 }
 
-/// Parse a comma-separated string into `Option<Vec<String>>`.
-/// Returns `None` if the input is `None` or results in an empty list.
-fn csv_parse(csv: Option<String>) -> Option<Vec<String>> {
-    csv.map(|s| {
-        s.split(',')
-            .map(|t| t.trim().to_owned())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-    })
-    .filter(|v| !v.is_empty())
-}
-
-/// Parse a semicolon-separated string into `Option<Vec<String>>`.
-/// Semicolons are used instead of commas because SQL queries contain commas.
-/// Returns `None` if the input is `None` or results in an empty list.
-fn pinned_queries_parse(input: Option<String>) -> Option<Vec<String>> {
+/// Split `input` on `separator` into trimmed, non-empty entries; `None` if the
+/// input is `None` or leaves nothing.
+fn separated_parse(input: Option<String>, separator: char) -> Option<Vec<String>> {
     input
         .map(|s| {
-            s.split(';')
+            s.split(separator)
                 .map(|t| t.trim().to_owned())
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>()
         })
         .filter(|v| !v.is_empty())
+}
+
+/// Parse a comma-separated list.
+fn csv_parse(csv: Option<String>) -> Option<Vec<String>> {
+    separated_parse(csv, ',')
+}
+
+/// Parse a semicolon-separated query list. Semicolons are used instead of
+/// commas because SQL queries contain commas.
+fn pinned_queries_parse(input: Option<String>) -> Option<Vec<String>> {
+    separated_parse(input, ';')
 }
 
 /// Expand table names into pinned queries (`SELECT * FROM {table}`)
@@ -159,82 +157,251 @@ fn pinned_tables_expand_and_merge(
 /// Raw CLI argument values before merging with config file.
 #[derive(Default)]
 pub(super) struct CliArgs {
-    pub(super) origin_host: Option<String>,
-    pub(super) origin_port: Option<u16>,
-    pub(super) origin_user: Option<String>,
-    pub(super) origin_database: Option<String>,
-    pub(super) origin_ssl_mode: Option<SslMode>,
-    pub(super) origin_password: Option<String>,
-    pub(super) replication_host: Option<String>,
-    pub(super) replication_port: Option<u16>,
-    pub(super) replication_user: Option<String>,
-    pub(super) replication_database: Option<String>,
-    pub(super) replication_ssl_mode: Option<SslMode>,
-    pub(super) replication_password: Option<String>,
-    pub(super) cache_host: Option<String>,
-    pub(super) cache_port: Option<u16>,
-    pub(super) cache_user: Option<String>,
-    pub(super) cache_database: Option<String>,
+    pub(super) origin: PgSettingsPartial,
+    pub(super) replication: PgSettingsPartial,
+    /// Only host, port, user and database have flags; the cache is local,
+    /// with trust auth and no TLS.
+    pub(super) cache: PgSettingsPartial,
     pub(super) cdc_publication_name: Option<String>,
     pub(super) cdc_slot_name: Option<String>,
     pub(super) listen_socket: Option<SocketAddr>,
     pub(super) num_workers: Option<usize>,
     pub(super) population_workers_min: Option<usize>,
     pub(super) population_workers_max: Option<usize>,
-    pub(super) cache_size: Option<usize>,
     pub(super) tls_cert: Option<PathBuf>,
     pub(super) tls_key: Option<PathBuf>,
     pub(super) metrics_socket: Option<SocketAddr>,
-    pub(super) log_level: Option<String>,
-    pub(super) cache_policy: Option<CachePolicy>,
-    pub(super) admission_threshold: Option<u32>,
-    pub(super) mv_size_ratio: Option<u32>,
-    pub(super) mv_compute_min_rows: Option<u64>,
-    pub(super) memo_cache_size: Option<usize>,
-    pub(super) memory_limit: Option<usize>,
-    pub(super) disk_limit: Option<usize>,
-    pub(super) allowed_tables: Option<String>,
+    pub(super) dynamic: DynamicArgs,
     pub(super) pinned_queries: Option<String>,
     pub(super) pinned_tables: Option<String>,
     pub(super) telemetry_off: bool,
     pub(super) check: bool,
 }
 
+/// CLI values for the runtime-adjustable settings ([`DynamicConfig`]).
+#[derive(Default)]
+pub(super) struct DynamicArgs {
+    pub(super) cache_size: Option<usize>,
+    pub(super) cache_policy: Option<CachePolicy>,
+    pub(super) admission_threshold: Option<u32>,
+    pub(super) allowed_tables: Option<String>,
+    pub(super) log_level: Option<String>,
+    pub(super) mv_size_ratio: Option<u32>,
+    pub(super) mv_compute_min_rows: Option<u64>,
+    pub(super) memo_cache_size: Option<usize>,
+    pub(super) memory_limit: Option<usize>,
+    pub(super) disk_limit: Option<usize>,
+}
+
+/// TOML values for the runtime-adjustable settings; all `None` without a
+/// config file.
+#[derive(Default)]
+struct DynamicToml {
+    cache_size: Option<usize>,
+    cache_policy: Option<CachePolicy>,
+    admission_threshold: Option<u32>,
+    allowed_tables: Option<Vec<String>>,
+    log_level: Option<String>,
+    mv_size_ratio: Option<u32>,
+    mv_compute_min_rows: Option<u64>,
+    memo_cache_size: Option<usize>,
+    memory_limit: Option<usize>,
+    disk_limit: Option<usize>,
+}
+
+impl DynamicToml {
+    fn from_config(config: &mut SettingsToml) -> Self {
+        Self {
+            cache_size: config.cache_size,
+            cache_policy: config.cache_policy,
+            admission_threshold: config.admission_threshold,
+            allowed_tables: config.allowed_tables.take(),
+            log_level: config.log_level.clone(),
+            mv_size_ratio: config.mv_size_ratio,
+            mv_compute_min_rows: config.mv_compute_min_rows,
+            memo_cache_size: config.memo_cache_size,
+            memory_limit: config.memory_limit,
+            disk_limit: config.disk_limit,
+        }
+    }
+}
+
+/// Which connection a `--<target>_<field>` flag configures.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PgTarget {
+    Origin,
+    Replication,
+    Cache,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PgField {
+    Host,
+    Port,
+    User,
+    Database,
+    SslMode,
+    Password,
+}
+
+/// The connection setting a flag such as `origin_host` names, or `None`. The
+/// cache takes no password or TLS mode flag.
+fn pg_flag(name: &str) -> Option<(PgTarget, PgField)> {
+    let (target, field) = if let Some(field) = name.strip_prefix("origin_") {
+        (PgTarget::Origin, field)
+    } else if let Some(field) = name.strip_prefix("replication_") {
+        (PgTarget::Replication, field)
+    } else {
+        (PgTarget::Cache, name.strip_prefix("cache_")?)
+    };
+    let field = match field {
+        "host" => PgField::Host,
+        "port" => PgField::Port,
+        "user" => PgField::User,
+        "database" => PgField::Database,
+        "ssl_mode" => PgField::SslMode,
+        "password" => PgField::Password,
+        _ => return None,
+    };
+    let cache_only_local = matches!(field, PgField::SslMode | PgField::Password);
+    if target == PgTarget::Cache && cache_only_local {
+        return None;
+    }
+    Some((target, field))
+}
+
+#[derive(Clone, Copy)]
+enum DynamicField {
+    CacheSize,
+    CachePolicy,
+    AdmissionThreshold,
+    MvSizeRatio,
+    MvComputeMinRows,
+    MemoCacheSize,
+    MemoryLimit,
+    DiskLimit,
+    AllowedTables,
+    LogLevel,
+}
+
+/// A flag handled by a grouped setter rather than its own match arm. Resolved
+/// from the flag name before the value is read, so no borrow of the parser
+/// outlives the lookup.
+enum FlagRoute {
+    Pg(PgTarget, PgField),
+    Dynamic(DynamicField),
+}
+
+fn flag_route(name: &str) -> Option<FlagRoute> {
+    if let Some((target, field)) = pg_flag(name) {
+        return Some(FlagRoute::Pg(target, field));
+    }
+    let field = match name {
+        "cache_size" => DynamicField::CacheSize,
+        "cache_policy" => DynamicField::CachePolicy,
+        "admission_threshold" => DynamicField::AdmissionThreshold,
+        "mv_size_ratio" => DynamicField::MvSizeRatio,
+        "mv_compute_min_rows" => DynamicField::MvComputeMinRows,
+        "memo_cache_size" => DynamicField::MemoCacheSize,
+        "memory_limit" => DynamicField::MemoryLimit,
+        "disk_limit" => DynamicField::DiskLimit,
+        "allowed_tables" => DynamicField::AllowedTables,
+        "log_level" => DynamicField::LogLevel,
+        _ => return None,
+    };
+    Some(FlagRoute::Dynamic(field))
+}
+
+/// Flag names for the required fields of a connection built from CLI args
+/// alone.
+struct PgRequiredFlags {
+    host: &'static str,
+    port: &'static str,
+    user: &'static str,
+    database: &'static str,
+}
+
+const ORIGIN_REQUIRED_FLAGS: PgRequiredFlags = PgRequiredFlags {
+    host: "origin_host",
+    port: "origin_port",
+    user: "origin_user",
+    database: "origin_database",
+};
+
+const CACHE_REQUIRED_FLAGS: PgRequiredFlags = PgRequiredFlags {
+    host: "cache_host",
+    port: "cache_port",
+    user: "cache_user",
+    database: "cache_database",
+};
+
+const POPULATION_WORKERS_MIN_ENV: &str = "PGCACHE_POPULATION_WORKERS_MIN";
+const POPULATION_WORKERS_MAX_ENV: &str = "PGCACHE_POPULATION_WORKERS_MAX";
+
+impl PgSettingsPartial {
+    /// Set one field from the flag's value.
+    fn flag_set(&mut self, field: PgField, parser: &mut lexopt::Parser) -> ConfigResult<()> {
+        match field {
+            PgField::Host => self.host = Some(arg_string(parser)?),
+            PgField::Port => self.port = Some(arg_parse(parser)?),
+            PgField::User => self.user = Some(arg_string(parser)?),
+            PgField::Database => self.database = Some(arg_string(parser)?),
+            PgField::SslMode => self.ssl_mode = Some(arg_enum(parser)?),
+            PgField::Password => self.password = Some(arg_string(parser)?),
+        }
+        Ok(())
+    }
+
+    /// Settings from CLI args alone; host, port, user and database are required.
+    fn require(self, flags: &PgRequiredFlags) -> ConfigResult<PgSettings> {
+        Ok(PgSettings {
+            host: require(self.host, flags.host)?,
+            port: require(self.port, flags.port)?,
+            user: require(self.user, flags.user)?,
+            password: self.password,
+            database: require(self.database, flags.database)?,
+            ssl_mode: self.ssl_mode.unwrap_or_default(),
+        })
+    }
+}
+
+impl CliArgs {
+    fn pg_mut(&mut self, target: PgTarget) -> &mut PgSettingsPartial {
+        match target {
+            PgTarget::Origin => &mut self.origin,
+            PgTarget::Replication => &mut self.replication,
+            PgTarget::Cache => &mut self.cache,
+        }
+    }
+}
+
 fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathBuf>)> {
     let mut args = CliArgs::default();
-    let mut config = None;
     let mut config_path = None;
     let mut config_create = false;
     let mut parser = lexopt::Parser::from_env();
 
     while let Some(arg) = parser.next().map_into_report::<ConfigError>()? {
+        let routed = match &arg {
+            Long(name) => flag_route(name),
+            Short(_) | Value(_) => None,
+        };
+        match routed {
+            Some(FlagRoute::Pg(target, field)) => {
+                args.pg_mut(target).flag_set(field, &mut parser)?;
+                continue;
+            }
+            Some(FlagRoute::Dynamic(field)) => {
+                args.dynamic.flag_set(field, &mut parser)?;
+                continue;
+            }
+            None => {}
+        }
         match arg {
             Short('c') | Long("config") => {
                 config_path = Some(PathBuf::from(arg_string(&mut parser)?));
             }
             Long("config_create") => config_create = true,
-            Long("origin_host") => args.origin_host = Some(arg_string(&mut parser)?),
-            Long("origin_port") => args.origin_port = Some(arg_parse(&mut parser)?),
-            Long("origin_user") => args.origin_user = Some(arg_string(&mut parser)?),
-            Long("origin_database") => args.origin_database = Some(arg_string(&mut parser)?),
-            Long("origin_ssl_mode") => args.origin_ssl_mode = Some(arg_enum(&mut parser)?),
-            Long("origin_password") => args.origin_password = Some(arg_string(&mut parser)?),
-            Long("replication_host") => args.replication_host = Some(arg_string(&mut parser)?),
-            Long("replication_port") => args.replication_port = Some(arg_parse(&mut parser)?),
-            Long("replication_user") => args.replication_user = Some(arg_string(&mut parser)?),
-            Long("replication_database") => {
-                args.replication_database = Some(arg_string(&mut parser)?)
-            }
-            Long("replication_ssl_mode") => {
-                args.replication_ssl_mode = Some(arg_enum(&mut parser)?)
-            }
-            Long("replication_password") => {
-                args.replication_password = Some(arg_string(&mut parser)?)
-            }
-            Long("cache_host") => args.cache_host = Some(arg_string(&mut parser)?),
-            Long("cache_port") => args.cache_port = Some(arg_parse(&mut parser)?),
-            Long("cache_user") => args.cache_user = Some(arg_string(&mut parser)?),
-            Long("cache_database") => args.cache_database = Some(arg_string(&mut parser)?),
             Long("cdc_publication_name") => {
                 args.cdc_publication_name = Some(arg_string(&mut parser)?)
             }
@@ -247,19 +414,9 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
             Long("population_workers_max") => {
                 args.population_workers_max = Some(arg_parse(&mut parser)?);
             }
-            Long("cache_size") => args.cache_size = Some(arg_parse(&mut parser)?),
             Long("tls_cert") => args.tls_cert = Some(PathBuf::from(arg_string(&mut parser)?)),
             Long("tls_key") => args.tls_key = Some(PathBuf::from(arg_string(&mut parser)?)),
             Long("metrics_socket") => args.metrics_socket = Some(arg_parse(&mut parser)?),
-            Long("log_level") => args.log_level = Some(arg_string(&mut parser)?),
-            Long("cache_policy") => args.cache_policy = Some(arg_enum(&mut parser)?),
-            Long("admission_threshold") => args.admission_threshold = Some(arg_parse(&mut parser)?),
-            Long("mv_size_ratio") => args.mv_size_ratio = Some(arg_parse(&mut parser)?),
-            Long("mv_compute_min_rows") => args.mv_compute_min_rows = Some(arg_parse(&mut parser)?),
-            Long("memo_cache_size") => args.memo_cache_size = Some(arg_parse(&mut parser)?),
-            Long("memory_limit") => args.memory_limit = Some(arg_parse(&mut parser)?),
-            Long("disk_limit") => args.disk_limit = Some(arg_parse(&mut parser)?),
-            Long("allowed_tables") => args.allowed_tables = Some(arg_string(&mut parser)?),
             Long("pinned_queries") => args.pinned_queries = Some(arg_string(&mut parser)?),
             Long("pinned_tables") => args.pinned_tables = Some(arg_string(&mut parser)?),
             Long("telemetry_off") => args.telemetry_off = true,
@@ -273,19 +430,50 @@ fn cli_args_parse() -> ConfigResult<(CliArgs, Option<SettingsToml>, Option<PathB
         }
     }
 
-    // Read the config file after the loop so flag order is irrelevant. In create
-    // mode a missing file is expected — start from defaults and let the dynamic
-    // config write-back create it on the first `PUT /config`. Other IO errors
-    // (permissions, etc.) still fail even in create mode, since those aren't typos.
-    if let Some(path) = &config_path {
-        match read_to_string(path) {
-            Ok(file) => config = Some(toml::from_str(&file).map_into_report::<ConfigError>()?),
-            Err(e) if config_create && e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e).map_into_report::<ConfigError>(),
-        }
-    }
-
+    let config = config_read(config_path.as_ref(), config_create)?;
     Ok((args, config, config_path))
+}
+
+impl DynamicArgs {
+    /// Set one runtime-adjustable setting from the flag's value.
+    fn flag_set(&mut self, field: DynamicField, parser: &mut lexopt::Parser) -> ConfigResult<()> {
+        match field {
+            DynamicField::CacheSize => self.cache_size = Some(arg_parse(parser)?),
+            DynamicField::CachePolicy => self.cache_policy = Some(arg_enum(parser)?),
+            DynamicField::AdmissionThreshold => {
+                self.admission_threshold = Some(arg_parse(parser)?);
+            }
+            DynamicField::MvSizeRatio => self.mv_size_ratio = Some(arg_parse(parser)?),
+            DynamicField::MvComputeMinRows => self.mv_compute_min_rows = Some(arg_parse(parser)?),
+            DynamicField::MemoCacheSize => self.memo_cache_size = Some(arg_parse(parser)?),
+            DynamicField::MemoryLimit => self.memory_limit = Some(arg_parse(parser)?),
+            DynamicField::DiskLimit => self.disk_limit = Some(arg_parse(parser)?),
+            DynamicField::AllowedTables => self.allowed_tables = Some(arg_string(parser)?),
+            DynamicField::LogLevel => self.log_level = Some(arg_string(parser)?),
+        }
+        Ok(())
+    }
+}
+
+/// Read the config file. Read after the flag loop so flag order is irrelevant.
+/// In create mode a missing file is expected — start from defaults and let the
+/// dynamic config write-back create it on the first `PUT /config`. Other IO
+/// errors (permissions, etc.) still fail even in create mode, since those
+/// aren't typos.
+fn config_read(
+    config_path: Option<&PathBuf>,
+    config_create: bool,
+) -> ConfigResult<Option<SettingsToml>> {
+    let Some(path) = config_path else {
+        return Ok(None);
+    };
+    match read_to_string(path) {
+        Ok(file) => Ok(Some(
+            toml::from_str(&file).map_into_report::<ConfigError>()?,
+        )),
+        Err(e) if config_create && e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).map_into_report::<ConfigError>(),
+    }
 }
 
 /// Resolve telemetry enabled state from CLI > TOML > env var > default (true).
@@ -302,111 +490,48 @@ fn telemetry_resolve(cli_off: bool, toml_value: Option<bool>) -> bool {
     true
 }
 
-/// Resolve mv_size_ratio from CLI > TOML > env var.
-/// Returns None to fall through to `DEFAULT_MV_SIZE_RATIO` in `DynamicConfig::new`.
-fn mv_size_ratio_resolve(cli: Option<u32>, toml_value: Option<u32>) -> Option<u32> {
-    if let Some(v) = cli {
-        return Some(v);
-    }
-    if let Some(v) = toml_value {
-        return Some(v);
-    }
-    if let Ok(v) = std::env::var("PGCACHE_MV_SIZE_RATIO")
-        && let Ok(parsed) = v.parse::<u32>()
-    {
-        return Some(parsed);
-    }
-    None
-}
-
-/// Resolve mv_compute_min_rows from CLI > TOML > env var.
-/// Returns None to fall through to `DEFAULT_MV_COMPUTE_MIN_ROWS` in
-/// `DynamicConfig::new`.
-fn mv_compute_min_rows_resolve(cli: Option<u64>, toml_value: Option<u64>) -> Option<u64> {
-    if let Some(v) = cli {
-        return Some(v);
-    }
-    if let Some(v) = toml_value {
-        return Some(v);
-    }
-    if let Ok(v) = std::env::var("PGCACHE_MV_COMPUTE_MIN_ROWS")
-        && let Ok(parsed) = v.parse::<u64>()
-    {
-        return Some(parsed);
-    }
-    None
-}
-
-/// Resolve memo_cache_size from CLI > TOML > env var.
-/// Returns None to fall through to `DEFAULT_MEMO_CACHE_SIZE` in `DynamicConfig::new`.
-fn memo_cache_size_resolve(cli: Option<usize>, toml_value: Option<usize>) -> Option<usize> {
-    if let Some(v) = cli {
-        return Some(v);
-    }
-    if let Some(v) = toml_value {
-        return Some(v);
-    }
-    if let Ok(v) = std::env::var("PGCACHE_MEMO_CACHE_SIZE")
-        && let Ok(parsed) = v.parse::<usize>()
-    {
-        return Some(parsed);
-    }
-    None
-}
-
-/// Resolve memory_limit from CLI > TOML > env var.
-/// Returns None to leave the ceiling at the dynamic 80%-of-RAM default.
-fn memory_limit_resolve(cli: Option<usize>, toml_value: Option<usize>) -> Option<usize> {
-    if let Some(v) = cli {
-        return Some(v);
-    }
-    if let Some(v) = toml_value {
-        return Some(v);
-    }
-    if let Ok(v) = std::env::var("PGCACHE_MEMORY_LIMIT")
-        && let Ok(parsed) = v.parse::<usize>()
-    {
-        return Some(parsed);
-    }
-    None
-}
-
-/// Resolve disk_limit from CLI > TOML > env var.
-/// Returns None to auto-derive the limit from the cache volume's free space.
-fn disk_limit_resolve(cli: Option<usize>, toml_value: Option<usize>) -> Option<usize> {
-    if let Some(v) = cli {
-        return Some(v);
-    }
-    if let Some(v) = toml_value {
-        return Some(v);
-    }
-    if let Ok(v) = std::env::var("PGCACHE_DISK_LIMIT")
-        && let Ok(parsed) = v.parse::<usize>()
-    {
-        return Some(parsed);
-    }
-    None
-}
-
-/// Resolve one population worker bound from CLI > TOML > env var. Returns None
-/// to fall through to the num_workers-derived default.
-fn population_workers_resolve(
-    cli: Option<usize>,
-    toml_value: Option<usize>,
+/// Resolve a setting from CLI > TOML > `env_var` (when it parses). `None`
+/// falls through to the setting's own default.
+fn env_override_resolve<T: FromStr>(
+    cli: Option<T>,
+    toml_value: Option<T>,
     env_var: &str,
-) -> Option<usize> {
-    if let Some(v) = cli {
-        return Some(v);
-    }
-    if let Some(v) = toml_value {
-        return Some(v);
-    }
-    if let Ok(v) = std::env::var(env_var)
-        && let Ok(parsed) = v.parse::<usize>()
-    {
-        return Some(parsed);
-    }
-    None
+) -> Option<T> {
+    cli.or(toml_value)
+        .or_else(|| std::env::var(env_var).ok()?.parse().ok())
+}
+
+/// The runtime-adjustable settings, CLI over TOML over env var. A `None`
+/// falls through to the default in `DynamicConfig::new`: the MV gates and
+/// memo budget to their constants, `memory_limit` to 80% of RAM, and
+/// `disk_limit` to the cache volume's free space.
+fn dynamic_config_resolve(args: DynamicArgs, toml: DynamicToml) -> DynamicConfig {
+    let cache_size = args.cache_size.or(toml.cache_size);
+    cache_size_deprecation_warn(cache_size.is_some());
+    DynamicConfig::new(
+        cache_size,
+        args.cache_policy.or(toml.cache_policy),
+        args.admission_threshold.or(toml.admission_threshold),
+        csv_parse(args.allowed_tables).or(toml.allowed_tables),
+        args.log_level.or(toml.log_level),
+        env_override_resolve(
+            args.mv_size_ratio,
+            toml.mv_size_ratio,
+            "PGCACHE_MV_SIZE_RATIO",
+        ),
+        env_override_resolve(
+            args.mv_compute_min_rows,
+            toml.mv_compute_min_rows,
+            "PGCACHE_MV_COMPUTE_MIN_ROWS",
+        ),
+        env_override_resolve(
+            args.memo_cache_size,
+            toml.memo_cache_size,
+            "PGCACHE_MEMO_CACHE_SIZE",
+        ),
+        env_override_resolve(args.memory_limit, toml.memory_limit, "PGCACHE_MEMORY_LIMIT"),
+        env_override_resolve(args.disk_limit, toml.disk_limit, "PGCACHE_DISK_LIMIT"),
+    )
 }
 
 /// Effective (min, max) population worker bounds: apply the num_workers-derived
@@ -436,86 +561,44 @@ fn cache_size_deprecation_warn(set: bool) {
     }
 }
 
-fn origin_overrides_take(args: &mut CliArgs) -> PgSettingsPartial {
-    PgSettingsPartial {
-        host: args.origin_host.take(),
-        port: args.origin_port.take(),
-        user: args.origin_user.take(),
-        password: args.origin_password.take(),
-        database: args.origin_database.take(),
-        ssl_mode: args.origin_ssl_mode.take(),
-    }
-}
-
-fn replication_overrides_take(args: &mut CliArgs) -> PgSettingsPartial {
-    PgSettingsPartial {
-        host: args.replication_host.take(),
-        port: args.replication_port.take(),
-        user: args.replication_user.take(),
-        password: args.replication_password.take(),
-        database: args.replication_database.take(),
-        ssl_mode: args.replication_ssl_mode.take(),
-    }
-}
-
-/// Origin settings from CLI args alone; host, port, user and database are required.
-fn origin_require(args: &mut CliArgs) -> ConfigResult<PgSettings> {
-    Ok(PgSettings {
-        host: require(args.origin_host.take(), "origin_host")?,
-        port: require(args.origin_port.take(), "origin_port")?,
-        user: require(args.origin_user.take(), "origin_user")?,
-        password: args.origin_password.take(),
-        database: require(args.origin_database.take(), "origin_database")?,
-        ssl_mode: args.origin_ssl_mode.take().unwrap_or_default(),
-    })
-}
-
 /// Settings for `--check`: origin, replication and CDC names only. CDC names
 /// fall back to the defaults so a bare `--check --origin_*` invocation works.
 fn preflight_settings_build(
-    mut args: CliArgs,
+    args: CliArgs,
     config: Option<SettingsToml>,
 ) -> ConfigResult<PreflightSettings> {
     let (origin, replication, mut cdc, allowed_tables) = match config {
         Some(mut config) => {
-            let origin = origin_overrides_take(&mut args).merge_with(&config.origin);
-            let replication = replication_settings_resolve(
-                &origin,
-                config.replication.take(),
-                replication_overrides_take(&mut args),
-            );
+            let origin = args.origin.merge_with(&config.origin);
+            let replication =
+                replication_settings_resolve(&origin, config.replication.take(), args.replication);
             let cdc = CdcSettings {
                 publication_name: args
                     .cdc_publication_name
-                    .take()
                     .unwrap_or_else(|| config.cdc.publication_name.clone()),
                 slot_name: args
                     .cdc_slot_name
-                    .take()
                     .unwrap_or_else(|| config.cdc.slot_name.clone()),
             };
-            let allowed = csv_parse(args.allowed_tables.take()).or(config.allowed_tables.take());
+            let allowed = csv_parse(args.dynamic.allowed_tables).or(config.allowed_tables.take());
             (origin, replication, cdc, allowed)
         }
         None => {
-            let origin = origin_require(&mut args)?;
-            let replication =
-                replication_settings_resolve(&origin, None, replication_overrides_take(&mut args));
+            let origin = args.origin.require(&ORIGIN_REQUIRED_FLAGS)?;
+            let replication = replication_settings_resolve(&origin, None, args.replication);
             let cdc = CdcSettings {
                 publication_name: args
                     .cdc_publication_name
-                    .take()
                     .unwrap_or_else(|| DEFAULT_PUBLICATION_NAME.to_owned()),
                 slot_name: args
                     .cdc_slot_name
-                    .take()
                     .unwrap_or_else(|| DEFAULT_SLOT_NAME.to_owned()),
             };
             (
                 origin,
                 replication,
                 cdc,
-                csv_parse(args.allowed_tables.take()),
+                csv_parse(args.dynamic.allowed_tables),
             )
         }
     };
@@ -551,58 +634,46 @@ pub(super) fn settings_build(
     Ok(settings)
 }
 
+/// Pinned queries from explicit queries plus `SELECT *` for each pinned table,
+/// CLI over TOML for each list.
+fn pinned_queries_resolve(
+    cli_queries: Option<String>,
+    cli_tables: Option<String>,
+    toml_queries: Option<Vec<String>>,
+    toml_tables: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    pinned_tables_expand_and_merge(
+        pinned_queries_parse(cli_queries).or(toml_queries),
+        csv_parse(cli_tables).or(toml_tables),
+    )
+}
+
 /// Build settings by merging CLI args over a TOML config file.
 pub(super) fn settings_build_with_config(
-    mut args: CliArgs,
+    args: CliArgs,
     config: &mut SettingsToml,
     config_path: Option<PathBuf>,
 ) -> ConfigResult<Settings> {
-    let origin = origin_overrides_take(&mut args).merge_with(&config.origin);
-
-    let replication = replication_settings_resolve(
-        &origin,
-        config.replication.take(),
-        replication_overrides_take(&mut args),
-    );
-
-    let cache_overrides = PgSettingsPartial {
-        host: args.cache_host,
-        port: args.cache_port,
-        user: args.cache_user,
-        password: None,
-        database: args.cache_database,
-        ssl_mode: None,
-    };
-    let cache = cache_overrides.merge_with(&config.cache);
+    let origin = args.origin.merge_with(&config.origin);
+    let replication =
+        replication_settings_resolve(&origin, config.replication.take(), args.replication);
+    let cache = args.cache.merge_with(&config.cache);
 
     let num_workers = args.num_workers.unwrap_or(config.num_workers);
     let (population_workers_min, population_workers_max) = population_workers_bounds(
         num_workers,
-        population_workers_resolve(
+        env_override_resolve(
             args.population_workers_min,
             config.population_workers_min,
-            "PGCACHE_POPULATION_WORKERS_MIN",
+            POPULATION_WORKERS_MIN_ENV,
         ),
-        population_workers_resolve(
+        env_override_resolve(
             args.population_workers_max,
             config.population_workers_max,
-            "PGCACHE_POPULATION_WORKERS_MAX",
+            POPULATION_WORKERS_MAX_ENV,
         ),
     );
-
-    cache_size_deprecation_warn(args.cache_size.or(config.cache_size).is_some());
-    let dynamic = DynamicConfig::new(
-        args.cache_size.or(config.cache_size),
-        args.cache_policy.or(config.cache_policy),
-        args.admission_threshold.or(config.admission_threshold),
-        csv_parse(args.allowed_tables).or(config.allowed_tables.take()),
-        args.log_level.or_else(|| config.log_level.clone()),
-        mv_size_ratio_resolve(args.mv_size_ratio, config.mv_size_ratio),
-        mv_compute_min_rows_resolve(args.mv_compute_min_rows, config.mv_compute_min_rows),
-        memo_cache_size_resolve(args.memo_cache_size, config.memo_cache_size),
-        memory_limit_resolve(args.memory_limit, config.memory_limit),
-        disk_limit_resolve(args.disk_limit, config.disk_limit),
-    );
+    let dynamic = dynamic_config_resolve(args.dynamic, DynamicToml::from_config(config));
 
     Ok(Settings {
         origin,
@@ -629,47 +700,45 @@ pub(super) fn settings_build_with_config(
             .map(|socket| MetricsSettings { socket })
             .or_else(|| config.metrics.clone()),
         dynamic: DynamicConfigHandle::new(dynamic, config_path, None),
-        pinned_queries: pinned_tables_expand_and_merge(
-            pinned_queries_parse(args.pinned_queries).or(config.pinned_queries.take()),
-            csv_parse(args.pinned_tables).or(config.pinned_tables.take()),
+        pinned_queries: pinned_queries_resolve(
+            args.pinned_queries,
+            args.pinned_tables,
+            config.pinned_queries.take(),
+            config.pinned_tables.take(),
         ),
         telemetry: telemetry_resolve(args.telemetry_off, config.telemetry),
     })
 }
 
 /// Build settings from CLI args alone (no config file). Required fields must be present.
-pub(super) fn settings_build_cli_only(mut args: CliArgs) -> ConfigResult<Settings> {
-    let origin = origin_require(&mut args)?;
+pub(super) fn settings_build_cli_only(args: CliArgs) -> ConfigResult<Settings> {
+    let origin = args.origin.require(&ORIGIN_REQUIRED_FLAGS)?;
 
     // CLI-only mode: replication defaults to origin, with CLI overrides
-    let replication =
-        replication_settings_resolve(&origin, None, replication_overrides_take(&mut args));
+    let replication = replication_settings_resolve(&origin, None, args.replication);
+    let dynamic = dynamic_config_resolve(args.dynamic, DynamicToml::default());
 
-    cache_size_deprecation_warn(args.cache_size.is_some());
     let num_workers = require(args.num_workers, "num_workers")?;
     let (population_workers_min, population_workers_max) = population_workers_bounds(
         num_workers,
-        population_workers_resolve(
+        env_override_resolve(
             args.population_workers_min,
             None,
-            "PGCACHE_POPULATION_WORKERS_MIN",
+            POPULATION_WORKERS_MIN_ENV,
         ),
-        population_workers_resolve(
+        env_override_resolve(
             args.population_workers_max,
             None,
-            "PGCACHE_POPULATION_WORKERS_MAX",
+            POPULATION_WORKERS_MAX_ENV,
         ),
     );
     Ok(Settings {
         origin,
         replication,
+        // Cache is localhost: trust auth (no password flag) and no TLS.
         cache: PgSettings {
-            host: require(args.cache_host, "cache_host")?,
-            port: require(args.cache_port, "cache_port")?,
-            user: require(args.cache_user, "cache_user")?,
-            password: None, // Cache is localhost, uses trust auth
-            database: require(args.cache_database, "cache_database")?,
-            ssl_mode: SslMode::Disable, // Cache is always localhost, no TLS needed
+            ssl_mode: SslMode::Disable,
+            ..args.cache.require(&CACHE_REQUIRED_FLAGS)?
         },
         cdc: CdcSettings {
             publication_name: require(args.cdc_publication_name, "cdc_publication_name")?,
@@ -685,25 +754,10 @@ pub(super) fn settings_build_cli_only(mut args: CliArgs) -> ConfigResult<Setting
         tls_key: args.tls_key,
         metrics: args.metrics_socket.map(|socket| MetricsSettings { socket }),
         dynamic: DynamicConfigHandle::new(
-            DynamicConfig::new(
-                args.cache_size,
-                args.cache_policy,
-                args.admission_threshold,
-                csv_parse(args.allowed_tables),
-                args.log_level,
-                mv_size_ratio_resolve(args.mv_size_ratio, None),
-                mv_compute_min_rows_resolve(args.mv_compute_min_rows, None),
-                memo_cache_size_resolve(args.memo_cache_size, None),
-                memory_limit_resolve(args.memory_limit, None),
-                disk_limit_resolve(args.disk_limit, None),
-            ),
-            None, // no config file in CLI-only mode
+            dynamic, None, // no config file in CLI-only mode
             None, // snapshot set in settings_build
         ),
-        pinned_queries: pinned_tables_expand_and_merge(
-            pinned_queries_parse(args.pinned_queries),
-            csv_parse(args.pinned_tables),
-        ),
+        pinned_queries: pinned_queries_resolve(args.pinned_queries, args.pinned_tables, None, None),
         telemetry: telemetry_resolve(args.telemetry_off, None),
     })
 }
@@ -756,5 +810,52 @@ impl Settings {
             [--check] (check the origin is ready for pgcache, print a report and exit; cache settings not needed)"
         );
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pg_route(name: &str) -> Option<(PgTarget, PgField)> {
+        match flag_route(name)? {
+            FlagRoute::Pg(target, field) => Some((target, field)),
+            FlagRoute::Dynamic(_) => None,
+        }
+    }
+
+    #[test]
+    fn test_flag_route_connection_flags() {
+        assert!(pg_route("origin_host") == Some((PgTarget::Origin, PgField::Host)));
+        assert!(pg_route("origin_ssl_mode") == Some((PgTarget::Origin, PgField::SslMode)));
+        assert!(
+            pg_route("replication_password") == Some((PgTarget::Replication, PgField::Password))
+        );
+        assert!(pg_route("cache_database") == Some((PgTarget::Cache, PgField::Database)));
+    }
+
+    #[test]
+    fn test_flag_route_cache_has_no_password_or_ssl_mode_flag() {
+        assert!(flag_route("cache_password").is_none());
+        assert!(flag_route("cache_ssl_mode").is_none());
+    }
+
+    #[test]
+    fn test_flag_route_cache_prefixed_dynamic_settings() {
+        assert!(matches!(
+            flag_route("cache_size"),
+            Some(FlagRoute::Dynamic(DynamicField::CacheSize))
+        ));
+        assert!(matches!(
+            flag_route("cache_policy"),
+            Some(FlagRoute::Dynamic(DynamicField::CachePolicy))
+        ));
+    }
+
+    #[test]
+    fn test_flag_route_unknown_flags() {
+        assert!(flag_route("origin_hostname").is_none());
+        assert!(flag_route("num_workers").is_none());
+        assert!(flag_route("bogus").is_none());
     }
 }
