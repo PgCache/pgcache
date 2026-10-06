@@ -24,8 +24,9 @@ use ecow::EcoString;
 
 use super::TableOccurrence;
 use crate::query::resolved::{
-    ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
-    ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
+    ResolvedCaseExpr, ResolvedColumnNode, ResolvedFunctionCall, ResolvedQueryBody,
+    ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumns, ResolvedSelectNode,
+    ResolvedTableSource, ResolvedWhereExpr,
 };
 use crate::query::transform::AstTransformError;
 use crate::query::transform::AstTransformResult;
@@ -193,49 +194,60 @@ impl AliasRewrite<'_> {
     fn scalar_expr(&self, expr: &mut ResolvedScalarExpr) -> AstTransformResult<()> {
         match expr {
             ResolvedScalarExpr::Column(col) => self.column(col),
-            ResolvedScalarExpr::Function(func) => {
-                for arg in &mut func.args {
-                    self.scalar_expr(arg)?;
-                }
-                for clause in &mut func.agg_order {
-                    self.scalar_expr(&mut clause.expr)?;
-                }
-                if let Some(filter) = &mut func.agg_filter {
-                    self.where_expr(filter)?;
-                }
-                if let Some(window_spec) = &mut func.over {
-                    for col in &mut window_spec.partition_by {
-                        self.scalar_expr(col)?;
-                    }
-                    for clause in &mut window_spec.order_by {
-                        self.scalar_expr(&mut clause.expr)?;
-                    }
-                }
-            }
-            ResolvedScalarExpr::Case(case) => {
-                if let Some(arg) = &mut case.arg {
-                    self.scalar_expr(arg)?;
-                }
-                for when in &mut case.whens {
-                    self.where_expr(&mut when.condition)?;
-                    self.scalar_expr(&mut when.result)?;
-                }
-                if let Some(default) = &mut case.default {
-                    self.scalar_expr(default)?;
-                }
-            }
+            ResolvedScalarExpr::Function(func) => self.function_call(func)?,
+            ResolvedScalarExpr::Case(case) => self.case_expr(case)?,
             ResolvedScalarExpr::Arithmetic(arith) => {
                 self.scalar_expr(&mut arith.left)?;
                 self.scalar_expr(&mut arith.right)?;
             }
             ResolvedScalarExpr::Subquery(query, _) => self.query_expr(query)?,
-            ResolvedScalarExpr::Array(elems) => {
-                for elem in elems {
-                    self.scalar_expr(elem)?;
-                }
-            }
+            ResolvedScalarExpr::Array(elems) => self.scalar_exprs(elems)?,
             ResolvedScalarExpr::TypeCast { expr, .. } => self.scalar_expr(expr)?,
             ResolvedScalarExpr::Identifier(_) | ResolvedScalarExpr::Literal(_) => {}
+        }
+        Ok(())
+    }
+
+    fn scalar_exprs<'e>(
+        &self,
+        exprs: impl IntoIterator<Item = &'e mut ResolvedScalarExpr>,
+    ) -> AstTransformResult<()> {
+        for expr in exprs {
+            self.scalar_expr(expr)?;
+        }
+        Ok(())
+    }
+
+    /// Arguments, aggregate ORDER BY and FILTER, and the window's PARTITION BY
+    /// and ORDER BY.
+    fn function_call(&self, func: &mut ResolvedFunctionCall) -> AstTransformResult<()> {
+        self.scalar_exprs(&mut func.args)?;
+        self.scalar_exprs(func.agg_order.iter_mut().map(|clause| &mut clause.expr))?;
+        if let Some(filter) = &mut func.agg_filter {
+            self.where_expr(filter)?;
+        }
+        if let Some(window_spec) = &mut func.over {
+            self.scalar_exprs(&mut window_spec.partition_by)?;
+            self.scalar_exprs(
+                window_spec
+                    .order_by
+                    .iter_mut()
+                    .map(|clause| &mut clause.expr),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn case_expr(&self, case: &mut ResolvedCaseExpr) -> AstTransformResult<()> {
+        if let Some(arg) = &mut case.arg {
+            self.scalar_expr(arg)?;
+        }
+        for when in &mut case.whens {
+            self.where_expr(&mut when.condition)?;
+            self.scalar_expr(&mut when.result)?;
+        }
+        if let Some(default) = &mut case.default {
+            self.scalar_expr(default)?;
         }
         Ok(())
     }
