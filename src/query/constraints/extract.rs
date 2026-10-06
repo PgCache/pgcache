@@ -18,114 +18,134 @@ use crate::query::cast::{
     canonicalize_comparison, cast_target_is_coercion_supported, resolved_where_scalar_leaf,
 };
 use crate::query::resolved::{
-    ResolvedScalarExpr, ResolvedSelectNode, ResolvedTableSource, ResolvedWhereExpr,
+    ResolvedBinaryExpr, ResolvedMultiExpr, ResolvedScalarExpr, ResolvedSelectNode,
+    ResolvedTableSource, ResolvedWhereExpr,
 };
 
-/// Extract constraint information from any resolved WHERE expression.
-/// Handles equality, inequality, and BETWEEN operators on column-vs-literal comparisons.
+/// Accumulates the constraints and equivalences a query's predicates imply.
 ///
 /// `complete` is set to `false` whenever the analyzer drops an expression
 /// without extracting a constraint from it (e.g. `MultiOp::Any`, `OR`,
 /// non-comparison binary shapes, subqueries). The caller uses this to
 /// gate subsumption: a cached query with a WHERE clause we couldn't
 /// fully analyze must not be assumed to be a full table scan.
-fn analyze_constraint_expr(
-    expr: &ResolvedWhereExpr,
-    constraints: &mut HashSet<ColumnConstraint>,
-    equivalences: &mut HashSet<ColumnEquivalence>,
-    complete: &mut bool,
-) {
-    match expr {
-        // Comparison operators: column op value, value op column, column = column
-        ResolvedWhereExpr::Binary(binary) if binary.op.is_comparison() => {
-            // canonicalize_comparison handles both `col op lit` and
-            // `lit op col` (with op_flip), plus stripping identity casts
-            // and reporting non-identity cast targets.
-            if let Some((col, target, op, val)) = canonicalize_comparison(binary) {
-                match target {
-                    None => {
-                        constraints.insert(ColumnConstraint::Comparison {
-                            column: col.clone(),
-                            op,
-                            value: val.clone(),
-                        });
-                    }
-                    Some(cast)
-                        if cast_target_is_coercion_supported(
-                            cast,
-                            &col.column_metadata.data_type,
-                        ) =>
-                    {
-                        constraints.insert(ColumnConstraint::CastComparison {
-                            column: col.clone(),
-                            cast: cast.clone(),
-                            op,
-                            value: val.clone(),
-                        });
-                    }
-                    Some(_) => *complete = false,
+struct ConstraintCollector {
+    constraints: HashSet<ColumnConstraint>,
+    equivalences: HashSet<ColumnEquivalence>,
+    complete: bool,
+}
+
+impl ConstraintCollector {
+    /// Extract constraint information from a resolved WHERE expression:
+    /// equality, inequality, BETWEEN, IN and `= ANY` on column-vs-literal
+    /// comparisons, and column equalities, through any depth of AND.
+    fn where_analyze(&mut self, expr: &ResolvedWhereExpr) {
+        match expr {
+            // Comparison operators: column op value, value op column, column = column
+            ResolvedWhereExpr::Binary(binary) if binary.op.is_comparison() => {
+                self.comparison_analyze(binary);
+            }
+            // AND: recursively analyze both sides
+            ResolvedWhereExpr::Binary(binary) if binary.op == BinaryOp::And => {
+                self.where_analyze(&binary.lexpr);
+                self.where_analyze(&binary.rexpr);
+            }
+            ResolvedWhereExpr::Multi(multi) => self.multi_analyze(multi),
+            // Everything else: OR, subqueries, function calls, etc. — cannot
+            // extract constraints. Mark the analysis incomplete so subsumption
+            // falls back to "not subsumed".
+            ResolvedWhereExpr::Scalar(_)
+            | ResolvedWhereExpr::Unary(_)
+            | ResolvedWhereExpr::Binary(_)
+            | ResolvedWhereExpr::Subquery { .. } => self.complete = false,
+        }
+    }
+
+    fn comparison_analyze(&mut self, binary: &ResolvedBinaryExpr) {
+        // canonicalize_comparison handles both `col op lit` and `lit op col`
+        // (with op_flip), plus stripping identity casts and reporting
+        // non-identity cast targets.
+        if let Some((col, target, op, val)) = canonicalize_comparison(binary) {
+            match target {
+                None => {
+                    self.constraints.insert(ColumnConstraint::Comparison {
+                        column: col.clone(),
+                        op,
+                        value: val.clone(),
+                    });
                 }
-                return;
+                Some(cast)
+                    if cast_target_is_coercion_supported(cast, &col.column_metadata.data_type) =>
+                {
+                    self.constraints.insert(ColumnConstraint::CastComparison {
+                        column: col.clone(),
+                        cast: cast.clone(),
+                        op,
+                        value: val.clone(),
+                    });
+                }
+                Some(_) => self.complete = false,
             }
-            // column = column (equivalence) — equality only
-            if let (Some(ResolvedScalarExpr::Column(left)), Some(ResolvedScalarExpr::Column(right))) = (
-                resolved_where_scalar_leaf(&binary.lexpr),
-                resolved_where_scalar_leaf(&binary.rexpr),
-            ) && binary.op == BinaryOp::Equal
-            {
-                equivalences.insert(ColumnEquivalence {
-                    left: left.clone(),
-                    right: right.clone(),
-                });
-                return;
+            return;
+        }
+        // column = column (equivalence) — equality only
+        if let (Some(ResolvedScalarExpr::Column(left)), Some(ResolvedScalarExpr::Column(right))) = (
+            resolved_where_scalar_leaf(&binary.lexpr),
+            resolved_where_scalar_leaf(&binary.rexpr),
+        ) && binary.op == BinaryOp::Equal
+        {
+            self.equivalences.insert(ColumnEquivalence {
+                left: left.clone(),
+                right: right.clone(),
+            });
+            return;
+        }
+        self.complete = false;
+    }
+
+    fn multi_analyze(&mut self, multi: &ResolvedMultiExpr) {
+        match multi.op {
+            // BETWEEN / BETWEEN SYMMETRIC: extract as two inequality constraints
+            MultiOp::Between | MultiOp::BetweenSymmetric => {
+                between_constraints_extract(&multi.op, &multi.exprs, &mut self.constraints);
             }
-            *complete = false;
+            // IN: extract as set membership constraint
+            MultiOp::In => in_constraints_extract(&multi.exprs, &mut self.constraints),
+            // NOT IN: extract as individual NotEqual constraints
+            MultiOp::NotIn => not_in_constraints_extract(&multi.exprs, &mut self.constraints),
+            // PGC-106: `col = ANY(<array literal>)` is semantically equivalent
+            // to `col IN (<elements>)` for set membership. Extract as `InSet`
+            // so the existing per-column range subsumption math handles
+            // narrower-array-subsumed-by-wider-array correctly. Only the `=`
+            // comparison maps cleanly to set membership; other comparisons
+            // (`<`, `<>`, etc.) under ANY have different semantics and stay
+            // unhandled, marking the analysis incomplete.
+            MultiOp::Any {
+                comparison: BinaryOp::Equal,
+            } => {
+                any_eq_array_constraints_extract(
+                    &multi.exprs,
+                    &mut self.constraints,
+                    &mut self.complete,
+                );
+            }
+            // NOT BETWEEN, other ANY/ALL comparisons: cannot extract.
+            MultiOp::NotBetween
+            | MultiOp::NotBetweenSymmetric
+            | MultiOp::Any { .. }
+            | MultiOp::All { .. } => self.complete = false,
         }
+    }
 
-        // AND: recursively analyze both sides
-        ResolvedWhereExpr::Binary(binary) if binary.op == BinaryOp::And => {
-            analyze_constraint_expr(&binary.lexpr, constraints, equivalences, complete);
-            analyze_constraint_expr(&binary.rexpr, constraints, equivalences, complete);
-        }
-
-        // BETWEEN / BETWEEN SYMMETRIC: extract as two inequality constraints
-        ResolvedWhereExpr::Multi(multi)
-            if matches!(multi.op, MultiOp::Between | MultiOp::BetweenSymmetric) =>
-        {
-            between_constraints_extract(&multi.op, &multi.exprs, constraints);
-        }
-
-        // IN: extract as set membership constraint
-        ResolvedWhereExpr::Multi(multi) if multi.op == MultiOp::In => {
-            in_constraints_extract(&multi.exprs, constraints);
-        }
-
-        // NOT IN: extract as individual NotEqual constraints
-        ResolvedWhereExpr::Multi(multi) if multi.op == MultiOp::NotIn => {
-            not_in_constraints_extract(&multi.exprs, constraints);
-        }
-
-        // PGC-106: `col = ANY(<array literal>)` is semantically equivalent
-        // to `col IN (<elements>)` for set membership. Extract as `InSet`
-        // so the existing per-column range subsumption math handles
-        // narrower-array-subsumed-by-wider-array correctly. Only the `=`
-        // comparison maps cleanly to set membership; other comparisons
-        // (`<`, `<>`, etc.) under ANY have different semantics and stay
-        // unhandled, marking the analysis incomplete.
-        ResolvedWhereExpr::Multi(multi) if matches!(multi.op, MultiOp::Any { comparison } if comparison == BinaryOp::Equal) =>
-        {
-            any_eq_array_constraints_extract(&multi.exprs, constraints, complete);
-        }
-
-        // Everything else: OR, NOT BETWEEN, ANY/ALL, subqueries, function
-        // calls, etc. — cannot extract constraints. Mark the analysis
-        // incomplete so subsumption falls back to "not subsumed".
-        ResolvedWhereExpr::Scalar(_)
-        | ResolvedWhereExpr::Unary(_)
-        | ResolvedWhereExpr::Binary(_)
-        | ResolvedWhereExpr::Multi(_)
-        | ResolvedWhereExpr::Subquery { .. } => {
-            *complete = false;
+    /// Analyze each JOIN's predicate (the ON expr, or the synthesized
+    /// equi-join for USING/NATURAL), recursing into nested joins.
+    fn join_source_analyze(&mut self, source: &ResolvedTableSource) {
+        if let ResolvedTableSource::Join(join) = source {
+            if let Some(condition) = join.predicate() {
+                self.where_analyze(condition);
+            }
+            self.join_source_analyze(&join.left);
+            self.join_source_analyze(&join.right);
         }
     }
 }
@@ -297,57 +317,29 @@ fn not_in_constraints_extract(
     }
 }
 
-/// Collect constraints and equivalences from a table source (handles JOINs recursively)
-fn collect_from_table_source(
-    source: &ResolvedTableSource,
-    constraints: &mut HashSet<ColumnConstraint>,
-    equivalences: &mut HashSet<ColumnEquivalence>,
-    complete: &mut bool,
-) {
-    if let ResolvedTableSource::Join(join) = source {
-        // Analyze this join's predicate (the ON expr, or the
-        // synthesized equi-join for USING/NATURAL).
-        if let Some(condition) = join.predicate() {
-            analyze_constraint_expr(condition, constraints, equivalences, complete);
-        }
-
-        // Recurse into nested joins
-        collect_from_table_source(&join.left, constraints, equivalences, complete);
-        collect_from_table_source(&join.right, constraints, equivalences, complete);
-    }
-}
-
 /// Collect all constraints and equivalences from the entire query
 pub(super) fn collect_query_constraints(
     resolved: &ResolvedSelectNode,
 ) -> (HashSet<ColumnConstraint>, HashSet<ColumnEquivalence>, bool) {
-    let mut constraints = HashSet::new();
-    let mut equivalences = HashSet::new();
     // No WHERE clause is trivially complete — the cache holds the full
     // table for that source. Only set to false when the analyzer hits an
     // expression it can't extract constraints from.
-    let mut complete = true;
-
+    let mut collector = ConstraintCollector {
+        constraints: HashSet::new(),
+        equivalences: HashSet::new(),
+        complete: true,
+    };
     if let Some(where_expr) = &resolved.where_clause {
-        analyze_constraint_expr(
-            where_expr,
-            &mut constraints,
-            &mut equivalences,
-            &mut complete,
-        );
+        collector.where_analyze(where_expr);
     }
-
-    // Analyze JOIN conditions
     for table_source in &resolved.from {
-        collect_from_table_source(
-            table_source,
-            &mut constraints,
-            &mut equivalences,
-            &mut complete,
-        );
+        collector.join_source_analyze(table_source);
     }
-
-    (constraints, equivalences, complete)
+    (
+        collector.constraints,
+        collector.equivalences,
+        collector.complete,
+    )
 }
 
 /// Propagate constraints through column equivalences using fixpoint iteration
@@ -356,51 +348,52 @@ pub(super) fn propagate_constraints(
     equivalences: &HashSet<ColumnEquivalence>,
 ) -> HashSet<ColumnConstraint> {
     // Fixpoint iteration: propagate until no changes
-    let mut changed = true;
-    while changed {
-        changed = false;
-
-        let mut new_constraints = Vec::new();
-
-        for equiv in equivalences {
-            // Collect constraints on either side and propagate to the other
-            for constraint in &constraints {
-                let other = if *constraint.column() == equiv.left {
-                    &equiv.right
-                } else if *constraint.column() == equiv.right {
-                    &equiv.left
-                } else {
-                    continue;
-                };
-                let propagated = match constraint {
-                    ColumnConstraint::Comparison { op, value, .. } => {
-                        ColumnConstraint::Comparison {
-                            column: other.clone(),
-                            op: *op,
-                            value: value.clone(),
-                        }
-                    }
-                    ColumnConstraint::InSet { values, .. } => ColumnConstraint::InSet {
-                        column: other.clone(),
-                        values: values.clone(),
-                    },
-                    // CastComparison doesn't propagate — `val::int = 5 AND val = other_val`
-                    // does NOT imply `other_val::int = 5` unless we also know
-                    // `other_val` is cast-compatible. Conservative skip.
-                    ColumnConstraint::CastComparison { .. } => continue,
-                };
-                new_constraints.push(propagated);
-            }
-        }
-
+    loop {
+        let new_constraints: Vec<ColumnConstraint> = equivalences
+            .iter()
+            .flat_map(|equiv| {
+                constraints
+                    .iter()
+                    .filter_map(move |constraint| constraint.across(equiv))
+            })
+            .collect();
+        let mut changed = false;
         for constraint in new_constraints {
-            if constraints.insert(constraint) {
-                changed = true;
-            }
+            changed |= constraints.insert(constraint);
+        }
+        if !changed {
+            return constraints;
         }
     }
+}
 
-    constraints
+impl ColumnConstraint {
+    /// This constraint copied onto the other column of `equiv`, when it
+    /// constrains one of them.
+    fn across(&self, equiv: &ColumnEquivalence) -> Option<ColumnConstraint> {
+        let other = if *self.column() == equiv.left {
+            &equiv.right
+        } else if *self.column() == equiv.right {
+            &equiv.left
+        } else {
+            return None;
+        };
+        match self {
+            ColumnConstraint::Comparison { op, value, .. } => Some(ColumnConstraint::Comparison {
+                column: other.clone(),
+                op: *op,
+                value: value.clone(),
+            }),
+            ColumnConstraint::InSet { values, .. } => Some(ColumnConstraint::InSet {
+                column: other.clone(),
+                values: values.clone(),
+            }),
+            // CastComparison doesn't propagate — `val::int = 5 AND val = other_val`
+            // does NOT imply `other_val::int = 5` unless we also know
+            // `other_val` is cast-compatible. Conservative skip.
+            ColumnConstraint::CastComparison { .. } => None,
+        }
+    }
 }
 
 /// Analyze a resolved query to determine all constant constraints on columns.
