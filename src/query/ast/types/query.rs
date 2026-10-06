@@ -178,38 +178,35 @@ impl Deparse for SelectNode {
             buf.push_str(" DISTINCT");
         }
         self.columns.deparse(buf);
-
         if !self.from.is_empty() {
             buf.push_str(" FROM");
-            let mut sep = "";
-            for table in &self.from {
-                buf.push_str(sep);
-                table.deparse(buf);
-                sep = ",";
-            }
+            separated_deparse(buf, &self.from, ",");
         }
-
-        if let Some(expr) = &self.where_clause {
-            buf.push_str(" WHERE ");
-            expr.deparse(buf);
-        }
-
+        clause_deparse(buf, " WHERE ", self.where_clause.as_ref());
         if !self.group_by.is_empty() {
             buf.push_str(" GROUP BY ");
-            let mut sep = "";
-            for col in &self.group_by {
-                buf.push_str(sep);
-                col.deparse(buf);
-                sep = ", ";
-            }
+            separated_deparse(buf, &self.group_by, ", ");
         }
-
-        if let Some(expr) = &self.having {
-            buf.push_str(" HAVING ");
-            expr.deparse(buf);
-        }
-
+        clause_deparse(buf, " HAVING ", self.having.as_ref());
         buf
+    }
+}
+
+/// Deparse `items` with `separator` between them.
+fn separated_deparse<T: Deparse>(buf: &mut String, items: &[T], separator: &str) {
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(separator);
+        }
+        item.deparse(buf);
+    }
+}
+
+/// `keyword` then `expr`, when present.
+fn clause_deparse(buf: &mut String, keyword: &str, expr: Option<&impl Deparse>) {
+    if let Some(expr) = expr {
+        buf.push_str(keyword);
+        expr.deparse(buf);
     }
 }
 
@@ -473,58 +470,38 @@ impl Deparse for QueryExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         if !self.ctes.is_empty() {
             buf.push_str("WITH ");
-            for (i, cte) in self.ctes.iter().enumerate() {
-                if i > 0 {
-                    buf.push_str(", ");
-                }
-                cte.name.deparse(buf);
-                if !cte.column_aliases.is_empty() {
-                    buf.push('(');
-                    for (j, col) in cte.column_aliases.iter().enumerate() {
-                        if j > 0 {
-                            buf.push_str(", ");
-                        }
-                        col.deparse(buf);
-                    }
-                    buf.push(')');
-                }
-                buf.push_str(" AS ");
-                match cte.materialization {
-                    CteMaterialization::Default => {}
-                    CteMaterialization::Materialized => buf.push_str("MATERIALIZED "),
-                    CteMaterialization::NotMaterialized => buf.push_str("NOT MATERIALIZED "),
-                }
-                buf.push('(');
-                cte.query.deparse(buf);
-                buf.push(')');
-            }
+            separated_deparse(buf, &self.ctes, ", ");
             buf.push(' ');
         }
-
         self.body.deparse(buf);
-
         if !self.order_by.is_empty() {
-            buf.push_str(" ORDER BY");
-            let mut sep = "";
-            for order in &self.order_by {
-                buf.push_str(sep);
-                buf.push(' ');
-                order.deparse(buf);
-                sep = ",";
-            }
+            buf.push_str(" ORDER BY ");
+            separated_deparse(buf, &self.order_by, ", ");
         }
-
         if let Some(limit) = &self.limit {
-            if let Some(count) = &limit.count {
-                buf.push_str(" LIMIT ");
-                count.deparse(buf);
-            }
-            if let Some(offset) = &limit.offset {
-                buf.push_str(" OFFSET ");
-                offset.deparse(buf);
-            }
+            limit.deparse(buf);
         }
+        buf
+    }
+}
 
+impl Deparse for CteDefinition {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        self.name.deparse(buf);
+        if !self.column_aliases.is_empty() {
+            buf.push('(');
+            separated_deparse(buf, &self.column_aliases, ", ");
+            buf.push(')');
+        }
+        buf.push_str(" AS ");
+        match self.materialization {
+            CteMaterialization::Default => {}
+            CteMaterialization::Materialized => buf.push_str("MATERIALIZED "),
+            CteMaterialization::NotMaterialized => buf.push_str("NOT MATERIALIZED "),
+        }
+        buf.push('(');
+        self.query.deparse(buf);
+        buf.push(')');
         buf
     }
 }
