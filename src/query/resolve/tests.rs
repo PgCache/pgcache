@@ -10,9 +10,10 @@ use crate::query::ast::{
     AstNode, BinaryOp, Deparse, JoinType, LiteralValue, OrderDirection, SelectNode, SubLinkType,
 };
 use crate::query::resolved::{
-    ResolveError, ResolvedColumnNode, ResolvedFunctionCall, ResolvedQueryBody, ResolvedQueryExpr,
-    ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode,
-    ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource, ResolvedWhereExpr,
+    ResolveError, ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode,
+    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
+    ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode,
+    ResolvedTableSource, ResolvedWhereExpr,
 };
 
 /// Parse SQL and return a SelectNode (for tests using new types)
@@ -125,6 +126,137 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
     }
 }
 
+/// A catalog of `test_table_metadata` tables (`id int4`, `name text`), with
+/// relation OIDs from 1001 in order.
+fn catalog(names: &[&str]) -> BiHashMap<TableMetadata> {
+    let mut tables = BiHashMap::new();
+    for (oid, name) in (1001..).zip(names) {
+        tables.insert_overwrite(test_table_metadata(name, Oid::from_raw(oid)));
+    }
+    tables
+}
+
+/// A catalog of all-text tables given as (name, columns), OIDs from 1001.
+fn catalog_with_columns(specs: &[(&str, &[&str])]) -> BiHashMap<TableMetadata> {
+    let mut tables = BiHashMap::new();
+    for (oid, (name, columns)) in (1001..).zip(specs) {
+        tables.insert_overwrite(test_table_metadata_with_columns(
+            name,
+            Oid::from_raw(oid),
+            columns,
+        ));
+    }
+    tables
+}
+
+fn only_join(resolved: &ResolvedSelectNode) -> &ResolvedJoinNode {
+    match resolved.from.as_slice() {
+        [ResolvedTableSource::Join(join)] => join,
+        other => panic!("expected a single join source, got {other:?}"),
+    }
+}
+
+fn as_table(source: &ResolvedTableSource) -> &ResolvedTableNode {
+    let ResolvedTableSource::Table(table) = source else {
+        panic!("expected a table source, got {source:?}");
+    };
+    table
+}
+
+fn as_binary(expr: &ResolvedWhereExpr) -> &ResolvedBinaryExpr {
+    let ResolvedWhereExpr::Binary(binary) = expr else {
+        panic!("expected a binary expression, got {expr:?}");
+    };
+    binary
+}
+
+fn as_column(expr: &ResolvedWhereExpr) -> &ResolvedColumnNode {
+    let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(column)) = expr else {
+        panic!("expected a column, got {expr:?}");
+    };
+    column
+}
+
+fn column_ref(expr: &ResolvedWhereExpr) -> (&str, &str) {
+    let column = as_column(expr);
+    (column.table.as_str(), column.column.as_str())
+}
+
+/// The outer references of the first subquery: the WHERE predicate's, or the
+/// first SELECT-list scalar subquery's.
+fn subquery_outer_refs(resolved: &ResolvedSelectNode) -> Vec<(&str, &str)> {
+    let refs = match &resolved.where_clause {
+        Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) => outer_refs,
+        _ => {
+            let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+                panic!("expected a subquery in WHERE or the SELECT list");
+            };
+            cols.iter()
+                .find_map(|col| match &col.expr {
+                    ResolvedScalarExpr::Subquery(_, outer_refs) => Some(outer_refs),
+                    _ => None,
+                })
+                .expect("a SELECT-list subquery")
+        }
+    };
+    refs.iter()
+        .map(|c| (c.table.as_str(), c.column.as_str()))
+        .collect()
+}
+
+fn deparsed(node: &impl Deparse) -> String {
+    let mut buf = String::new();
+    node.deparse(&mut buf);
+    buf
+}
+
+#[test]
+fn test_table_and_column_resolve_cases() {
+    let tables = catalog(&["users"]);
+    // (label, SQL, expected FROM alias, WHERE lhs column, its type name if checked)
+    #[rustfmt::skip]
+    let cases = [
+        ("bare table, qualified column",   "SELECT * FROM users WHERE users.id = 1",          None,      "id",   Some("int4")),
+        ("aliased table, aliased column",  "SELECT * FROM users u WHERE u.name = 'john'",     Some("u"), "name", Some("text")),
+        ("bare table, unqualified column", "SELECT * FROM users WHERE id = 1",                None,      "id",   None),
+    ];
+    for (label, sql, alias, column, type_name) in cases {
+        let resolved = resolve_sql(sql, &tables);
+        let [ResolvedTableSource::Table(table)] = resolved.from.as_slice() else {
+            panic!("{label}: expected a single table source in {sql:?}");
+        };
+        let actual = (
+            table.schema.as_str(),
+            table.name.as_str(),
+            table.alias.as_deref(),
+            table.relation_oid.get(),
+        );
+        assert_eq!(
+            actual,
+            ("public", "users", alias, 1001),
+            "{label}: table of {sql:?}"
+        );
+        let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause else {
+            panic!("{label}: expected a binary WHERE in {sql:?}");
+        };
+        let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*binary.lexpr else {
+            panic!("{label}: expected a column on the left of the WHERE in {sql:?}");
+        };
+        let actual = (col.schema.as_str(), col.table.as_str(), col.column.as_str());
+        assert_eq!(
+            actual,
+            ("public", "users", column),
+            "{label}: WHERE column of {sql:?}"
+        );
+        if let Some(type_name) = type_name {
+            assert_eq!(
+                col.column_metadata.type_name, type_name,
+                "{label}: column type of {sql:?}"
+            );
+        }
+    }
+}
+
 /// Create test table metadata with custom column names (all text type, first is PK).
 fn test_table_metadata_with_columns(
     name: &str,
@@ -158,42 +290,6 @@ fn test_table_metadata_with_columns(
 }
 
 #[test]
-fn test_table_resolve_simple() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql("SELECT * FROM users", &tables);
-
-    assert_eq!(resolved.from.len(), 1);
-    if let ResolvedTableSource::Table(table) = &resolved.from[0] {
-        assert_eq!(table.schema, "public");
-        assert_eq!(table.name, "users");
-        assert_eq!(table.alias, None);
-        assert_eq!(table.relation_oid.get(), 1001);
-    } else {
-        panic!("Expected table source");
-    }
-}
-
-#[test]
-fn test_table_resolve_with_alias() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql("SELECT * FROM users u", &tables);
-
-    assert_eq!(resolved.from.len(), 1);
-    if let ResolvedTableSource::Table(table) = &resolved.from[0] {
-        assert_eq!(table.schema, "public");
-        assert_eq!(table.name, "users");
-        assert_eq!(table.alias.as_deref(), Some("u"));
-        assert_eq!(table.relation_oid.get(), 1001);
-    } else {
-        panic!("Expected table source");
-    }
-}
-
-#[test]
 fn test_table_resolve_not_found() {
     let tables = BiHashMap::new();
     let node = parse_select_node("SELECT * FROM users");
@@ -206,75 +302,8 @@ fn test_table_resolve_not_found() {
 }
 
 #[test]
-fn test_column_resolve_qualified() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql("SELECT * FROM users WHERE users.id = 1", &tables);
-
-    // Check WHERE clause resolved correctly
-    if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
-        if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*binary.lexpr {
-            assert_eq!(col.schema, "public");
-            assert_eq!(col.table, "users");
-            assert_eq!(col.column, "id");
-            assert_eq!(col.column_metadata.type_name, "int4");
-        } else {
-            panic!("Expected column in binary expression");
-        }
-    } else {
-        panic!("Expected binary WHERE expression");
-    }
-}
-
-#[test]
-fn test_column_resolve_with_alias() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql("SELECT * FROM users u WHERE u.name = 'john'", &tables);
-
-    // Check WHERE clause resolved correctly
-    if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
-        if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*binary.lexpr {
-            assert_eq!(col.schema, "public");
-            assert_eq!(col.table, "users");
-            assert_eq!(col.column, "name");
-            assert_eq!(col.column_metadata.type_name, "text");
-        } else {
-            panic!("Expected column in binary expression");
-        }
-    } else {
-        panic!("Expected binary WHERE expression");
-    }
-}
-
-#[test]
-fn test_column_resolve_unqualified() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
-
-    // Check WHERE clause resolved correctly
-    if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause {
-        if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*binary.lexpr {
-            assert_eq!(col.schema, "public");
-            assert_eq!(col.table, "users");
-            assert_eq!(col.column, "id");
-        } else {
-            panic!("Expected column in binary expression");
-        }
-    } else {
-        panic!("Expected binary WHERE expression");
-    }
-}
-
-#[test]
 fn test_column_resolve_ambiguous() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
+    let tables = catalog(&["users", "orders"]);
 
     // Both tables have 'id' column, unqualified reference is ambiguous
     let node = parse_select_node("SELECT * FROM users, orders WHERE id = 1");
@@ -288,8 +317,7 @@ fn test_column_resolve_ambiguous() {
 
 #[test]
 fn test_select_star_expansion() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql("SELECT * FROM users", &tables);
 
@@ -312,8 +340,7 @@ fn test_select_star_expansion() {
 
 #[test]
 fn test_select_specific_columns() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql("SELECT id, name FROM users", &tables);
 
@@ -341,8 +368,7 @@ fn test_select_specific_columns() {
 
 #[test]
 fn test_select_star_with_column() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql("SELECT *, name FROM users", &tables);
 
@@ -370,9 +396,7 @@ fn test_select_star_with_column() {
 
 #[test]
 fn test_select_qualified_star_with_column() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
+    let tables = catalog(&["users", "orders"]);
 
     let resolved = resolve_sql(
         "SELECT u.*, o.name FROM users u JOIN orders o ON o.id = u.id",
@@ -427,9 +451,7 @@ fn derived_column_assert(col: &ResolvedSelectColumn, alias: &str, column: &str) 
 /// merged join column plus each side's remaining columns.
 #[test]
 fn test_select_star_derived_using_inner() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
+    let tables = catalog(&["users", "orders"]);
 
     let resolved = resolve_sql(
         "SELECT * FROM (SELECT id, name FROM users) a \
@@ -451,9 +473,7 @@ fn test_select_star_derived_using_inner() {
 /// column is COALESCE, remaining columns follow in FROM order.
 #[test]
 fn test_select_star_derived_natural_left() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
+    let tables = catalog(&["users", "orders"]);
 
     let resolved = resolve_sql(
         "SELECT * FROM (SELECT name, id AS a_id FROM users) a \
@@ -475,91 +495,15 @@ fn test_select_star_derived_natural_left() {
 }
 
 /// PGC-359: mixed base-then-derived USING join expands both sides.
-#[test]
-fn test_select_star_mixed_base_first() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "orders",
-        Oid::from_raw(1002),
-        &["id", "total"],
-    ));
-
-    let resolved = resolve_sql(
-        "SELECT * FROM users u JOIN (SELECT id, total FROM orders) o USING (id)",
-        &tables,
-    );
-
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("Expected Columns");
-    };
-    assert_eq!(cols.len(), 3); // merged id, u.name, o.total
-    assert_eq!(cols[0].alias.as_deref(), Some("id"));
-    let base = select_column_node(&cols[1]);
-    assert_eq!(base.table, "users");
-    assert_eq!(base.column, "name");
-    derived_column_assert(&cols[2], "o", "total");
-}
-
 /// PGC-359: mixed derived-then-base USING join — `*` expands in FROM
 /// order (derived side's columns before the base table's).
-#[test]
-fn test_select_star_mixed_derived_first() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "orders",
-        Oid::from_raw(1002),
-        &["id", "total"],
-    ));
-
-    let resolved = resolve_sql(
-        "SELECT * FROM (SELECT id, total FROM orders) o JOIN users u USING (id)",
-        &tables,
-    );
-
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("Expected Columns");
-    };
-    assert_eq!(cols.len(), 3); // merged id, o.total, u.name
-    assert_eq!(cols[0].alias.as_deref(), Some("id"));
-    derived_column_assert(&cols[1], "o", "total");
-    let base = select_column_node(&cols[2]);
-    assert_eq!(base.table, "users");
-    assert_eq!(base.column, "name");
-}
-
 /// PGC-359: qualified `derived.*` expands that side verbatim — join
 /// column included, no merged-column injection.
-#[test]
-fn test_select_qualified_star_derived() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "orders",
-        Oid::from_raw(1002),
-        &["id", "total"],
-    ));
-
-    let resolved = resolve_sql(
-        "SELECT o.* FROM (SELECT id, total FROM orders) o JOIN users u USING (id)",
-        &tables,
-    );
-
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("Expected Columns");
-    };
-    assert_eq!(cols.len(), 2); // o.id, o.total
-    derived_column_assert(&cols[0], "o", "id");
-    derived_column_assert(&cols[1], "o", "total");
-}
-
 /// PGC-359 (latent case): `*` over a single derived table expands to
 /// the subquery's full output, not zero columns.
 #[test]
 fn test_select_star_single_derived() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql("SELECT * FROM (SELECT id, name FROM users) d", &tables);
 
@@ -605,143 +549,63 @@ fn test_select_star_derived_using_multi_column() {
 
 #[test]
 fn test_join_resolution() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
-
+    let tables = catalog(&["users", "orders"]);
     let resolved = resolve_sql(
         "SELECT * FROM users JOIN orders ON users.id = orders.id",
         &tables,
     );
-
-    // Check that JOIN was resolved
-    assert_eq!(resolved.from.len(), 1);
-    if let ResolvedTableSource::Join(join) = &resolved.from[0] {
-        assert_eq!(join.join_type, JoinType::Inner);
-
-        // Check left side
-        if let ResolvedTableSource::Table(left) = &join.left {
-            assert_eq!(left.name, "users");
-        } else {
-            panic!("Expected table on left side");
-        }
-
-        // Check right side
-        if let ResolvedTableSource::Table(right) = &join.right {
-            assert_eq!(right.name, "orders");
-        } else {
-            panic!("Expected table on right side");
-        }
-
-        // Check join condition
-        if let Some(ResolvedWhereExpr::Binary(cond)) = join.predicate() {
-            if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(left_col)) = &*cond.lexpr {
-                assert_eq!(left_col.table, "users");
-                assert_eq!(left_col.column, "id");
-            }
-            if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(right_col)) = &*cond.rexpr {
-                assert_eq!(right_col.table, "orders");
-                assert_eq!(right_col.column, "id");
-            }
-        } else {
-            panic!("Expected binary join condition");
-        }
-    } else {
-        panic!("Expected join source");
-    }
+    let join = only_join(&resolved);
+    assert_eq!(join.join_type, JoinType::Inner);
+    assert_eq!(as_table(&join.left).name, "users");
+    assert_eq!(as_table(&join.right).name, "orders");
+    let cond = as_binary(join.predicate().expect("join condition"));
+    assert_eq!(column_ref(&cond.lexpr), ("users", "id"));
+    assert_eq!(column_ref(&cond.rexpr), ("orders", "id"));
 }
 
 #[test]
 fn test_join_with_aliases() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
-
+    let tables = catalog(&["users", "orders"]);
     let resolved = resolve_sql(
         "SELECT * FROM users u JOIN orders o ON u.id = o.id",
         &tables,
     );
-
-    // Check that JOIN with aliases was resolved
-    if let ResolvedTableSource::Join(join) = &resolved.from[0] {
-        // Check left side has alias
-        if let ResolvedTableSource::Table(left) = &join.left {
-            assert_eq!(left.name, "users");
-            assert_eq!(left.alias.as_deref(), Some("u"));
-        } else {
-            panic!("Expected table on left side");
-        }
-
-        // Check right side has alias
-        if let ResolvedTableSource::Table(right) = &join.right {
-            assert_eq!(right.name, "orders");
-            assert_eq!(right.alias.as_deref(), Some("o"));
-        } else {
-            panic!("Expected table on right side");
-        }
-
-        // Check join condition uses aliases
-        if let Some(ResolvedWhereExpr::Binary(cond)) = join.predicate() {
-            if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(left_col)) = &*cond.lexpr {
-                // Should resolve to 'users' table even though alias 'u' was used
-                assert_eq!(left_col.table, "users");
-                assert_eq!(left_col.column, "id");
-            }
-            if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(right_col)) = &*cond.rexpr {
-                // Should resolve to 'orders' table even though alias 'o' was used
-                assert_eq!(right_col.table, "orders");
-                assert_eq!(right_col.column, "id");
-            }
-        }
-    } else {
-        panic!("Expected join source");
-    }
+    let join = only_join(&resolved);
+    let (left, right) = (as_table(&join.left), as_table(&join.right));
+    assert_eq!(
+        (left.name.as_str(), left.alias.as_deref()),
+        ("users", Some("u"))
+    );
+    assert_eq!(
+        (right.name.as_str(), right.alias.as_deref()),
+        ("orders", Some("o"))
+    );
+    // The condition's columns resolve to the real tables even though the
+    // aliases were used.
+    let cond = as_binary(join.predicate().expect("join condition"));
+    assert_eq!(column_ref(&cond.lexpr), ("users", "id"));
+    assert_eq!(column_ref(&cond.rexpr), ("orders", "id"));
 }
 
 #[test]
 fn test_where_expr_complex() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
+    let tables = catalog(&["users"]);
     let resolved = resolve_sql(
         "SELECT * FROM users WHERE id = 1 AND name = 'john'",
         &tables,
     );
-
-    // Check that complex WHERE was resolved
-    if let Some(ResolvedWhereExpr::Binary(and_expr)) = &resolved.where_clause {
-        assert_eq!(and_expr.op, BinaryOp::And);
-
-        // Left side: id = 1
-        if let ResolvedWhereExpr::Binary(left_binary) = &*and_expr.lexpr {
-            assert_eq!(left_binary.op, BinaryOp::Equal);
-            if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*left_binary.lexpr
-            {
-                assert_eq!(col.column, "id");
-            }
-        } else {
-            panic!("Expected binary expression on left");
-        }
-
-        // Right side: name = 'john'
-        if let ResolvedWhereExpr::Binary(right_binary) = &*and_expr.rexpr {
-            assert_eq!(right_binary.op, BinaryOp::Equal);
-            if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*right_binary.lexpr
-            {
-                assert_eq!(col.column, "name");
-            }
-        } else {
-            panic!("Expected binary expression on right");
-        }
-    } else {
-        panic!("Expected binary WHERE expression");
+    let and_expr = as_binary(resolved.where_clause.as_ref().expect("WHERE"));
+    assert_eq!(and_expr.op, BinaryOp::And);
+    for (side, column) in [(&and_expr.lexpr, "id"), (&and_expr.rexpr, "name")] {
+        let comparison = as_binary(side);
+        assert_eq!(comparison.op, BinaryOp::Equal);
+        assert_eq!(as_column(&comparison.lexpr).column, column);
     }
 }
 
 #[test]
 fn test_order_by_simple() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     // `SELECT *` expands `name` into the output list, so the unqualified
     // ORDER BY matches the output name and resolves to `Identifier` — PG's
@@ -766,8 +630,7 @@ fn test_order_by_simple() {
 
 #[test]
 fn test_order_by_multiple_columns() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_query(
         "SELECT users.name, users.id FROM users ORDER BY users.name ASC, users.id DESC",
@@ -795,8 +658,7 @@ fn test_order_by_multiple_columns() {
 
 #[test]
 fn test_order_by_qualified_column() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_query("SELECT * FROM users u ORDER BY u.name DESC", &tables);
 
@@ -816,8 +678,7 @@ fn test_order_by_qualified_column() {
 
 #[test]
 fn test_order_by_select_alias() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let sql = "SELECT id, name AS display_name FROM users ORDER BY display_name DESC";
     let resolved = resolve_query(sql, &tables);
@@ -832,8 +693,7 @@ fn test_order_by_select_alias() {
 
 #[test]
 fn test_order_by_aggregate_alias() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1001)));
+    let tables = catalog(&["orders"]);
 
     // Aggregate functions produce no column-derivable output name, so only an
     // explicit alias lets ORDER BY reference them — this is the key demo case.
@@ -849,8 +709,7 @@ fn test_order_by_aggregate_alias() {
 
 #[test]
 fn test_order_by_qualified_does_not_match_alias() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     // `u.name` is qualified — must resolve through the column path even if
     // an alias of the same name existed.
@@ -869,9 +728,7 @@ fn test_order_by_qualified_does_not_match_alias() {
 
 #[test]
 fn test_order_by_with_join() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
+    let tables = catalog(&["users", "orders"]);
 
     let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.id ORDER BY u.name ASC, o.id DESC";
     let resolved = resolve_query(sql, &tables);
@@ -898,8 +755,7 @@ fn test_order_by_with_join() {
 
 #[test]
 fn test_order_by_unqualified_column() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     // Select a column whose name doesn't appear in the output list to force
     // the unqualified ORDER BY through column resolution.
@@ -918,8 +774,7 @@ fn test_order_by_unqualified_column() {
 fn test_order_by_column_not_found() {
     use crate::query::ast::query_expr_parse;
 
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let sql = "SELECT * FROM users ORDER BY nonexistent_column ASC";
     let query_expr = query_expr_parse(sql).unwrap();
@@ -947,244 +802,8 @@ fn id_column_metadata() -> ColumnMetadata {
     }
 }
 
-#[test]
-fn test_resolved_column_node_deparse_with_alias() {
-    let mut buf = String::new();
-
-    // Column with alias - should use alias
-    ResolvedColumnNode {
-        schema: "public".into(),
-        table: "users".into(),
-        table_alias: Some("u".into()),
-        column: "id".into(),
-        column_metadata: id_column_metadata(),
-    }
-    .deparse(&mut buf);
-    assert_eq!(buf, "u.id");
-}
-
-#[test]
-fn test_resolved_column_node_deparse_without_alias() {
-    let mut buf = String::new();
-
-    // Column without alias - should use schema.table
-    ResolvedColumnNode {
-        schema: "public".into(),
-        table: "users".into(),
-        table_alias: None,
-        column: "id".into(),
-        column_metadata: id_column_metadata(),
-    }
-    .deparse(&mut buf);
-    assert_eq!(buf, "public.users.id");
-}
-
-#[test]
-fn test_resolved_column_node_deparse_quoting() {
-    let mut buf = String::new();
-
-    // Column without alias - should use schema.table
-    ResolvedColumnNode {
-        schema: "Public".into(),
-        table: "Users".into(),
-        table_alias: None,
-        column: "firstName".into(),
-        column_metadata: id_column_metadata(),
-    }
-    .deparse(&mut buf);
-    assert_eq!(buf, "\"Public\".\"Users\".\"firstName\"");
-}
-
 /// PGC-262: lowercase reserved keywords are identifiers too — they must
 /// deparse quoted, and an embedded `"` must be doubled.
-#[test]
-fn test_resolved_column_node_deparse_keyword_quoting() {
-    let mut buf = String::new();
-    ResolvedColumnNode {
-        schema: "public".into(),
-        table: "order".into(),
-        table_alias: None,
-        column: "user".into(),
-        column_metadata: id_column_metadata(),
-    }
-    .deparse(&mut buf);
-    assert_eq!(buf, "public.\"order\".\"user\"");
-
-    buf.clear();
-    ResolvedColumnNode {
-        schema: "public".into(),
-        table: "users".into(),
-        table_alias: None,
-        column: "we\"ird".into(),
-        column_metadata: id_column_metadata(),
-    }
-    .deparse(&mut buf);
-    assert_eq!(buf, "public.users.\"we\"\"ird\"");
-}
-
-#[test]
-fn test_resolved_table_node_deparse_with_alias() {
-    let mut buf = String::new();
-
-    ResolvedTableNode {
-        schema: "public".into(),
-        name: "users".into(),
-        alias: Some("u".into()),
-        relation_oid: Oid::from_raw(1001),
-    }
-    .deparse(&mut buf);
-    assert_eq!(buf, " public.users u");
-}
-
-#[test]
-fn test_resolved_table_node_deparse_without_alias() {
-    let mut buf = String::new();
-
-    ResolvedTableNode {
-        schema: "public".into(),
-        name: "users".into(),
-        alias: None,
-        relation_oid: Oid::from_raw(1001),
-    }
-    .deparse(&mut buf);
-    assert_eq!(buf, " public.users");
-}
-
-#[test]
-fn test_resolved_table_node_deparse_quoting() {
-    let mut buf = String::new();
-
-    ResolvedTableNode {
-        schema: "Public".into(),
-        name: "Users".into(),
-        alias: None,
-        relation_oid: Oid::from_raw(1001),
-    }
-    .deparse(&mut buf);
-    assert_eq!(buf, " \"Public\".\"Users\"");
-}
-
-#[test]
-fn test_resolved_select_deparse_with_where() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
-
-    let mut buf = String::new();
-    resolved.deparse(&mut buf);
-
-    // SELECT * is expanded to explicit columns, table and column references are fully qualified
-    assert_eq!(
-        buf,
-        "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1"
-    );
-}
-
-#[test]
-fn test_resolved_select_deparse_with_alias() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql("SELECT u.id, u.name FROM users u WHERE u.id = 1", &tables);
-
-    let mut buf = String::new();
-    resolved.deparse(&mut buf);
-
-    // With alias, uses alias.column
-    assert_eq!(
-        buf,
-        "SELECT u.id, u.name FROM public.users u WHERE u.id = 1"
-    );
-}
-
-#[test]
-fn test_resolved_select_deparse_join() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
-
-    let resolved = resolve_sql(
-        "SELECT u.id, o.name FROM users u JOIN orders o ON u.id = o.id WHERE u.id = 1",
-        &tables,
-    );
-
-    let mut buf = String::new();
-    resolved.deparse(&mut buf);
-
-    assert_eq!(
-        buf,
-        "SELECT u.id, o.name FROM public.users u JOIN public.orders o ON u.id = o.id WHERE u.id = 1"
-    );
-}
-
-#[test]
-fn test_resolved_query_deparse_order_by() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_query("SELECT id FROM users u ORDER BY name DESC", &tables);
-
-    let mut buf = String::new();
-    resolved.deparse(&mut buf);
-
-    assert_eq!(buf, "SELECT u.id FROM public.users u ORDER BY u.name DESC");
-}
-
-#[test]
-fn test_resolved_select_deparse_count_star() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql("SELECT COUNT(*) FROM users WHERE id = 1", &tables);
-
-    let mut buf = String::new();
-    resolved.deparse(&mut buf);
-
-    assert_eq!(
-        buf,
-        "SELECT count(*) FROM public.users WHERE public.users.id = 1"
-    );
-}
-
-#[test]
-fn test_resolved_select_deparse_count_distinct() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql(
-        "SELECT COUNT(DISTINCT name) FROM users WHERE id = 1",
-        &tables,
-    );
-
-    let mut buf = String::new();
-    resolved.deparse(&mut buf);
-
-    assert_eq!(
-        buf,
-        "SELECT count(DISTINCT public.users.name) FROM public.users WHERE public.users.id = 1"
-    );
-}
-
-#[test]
-fn test_resolved_select_deparse_case() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql(
-        "SELECT CASE WHEN name = 'admin' THEN 1 ELSE 0 END FROM users WHERE id = 1",
-        &tables,
-    );
-
-    let mut buf = String::new();
-    resolved.deparse(&mut buf);
-
-    assert_eq!(
-        buf,
-        "SELECT CASE WHEN public.users.name = 'admin' THEN 1 ELSE 0 END FROM public.users WHERE public.users.id = 1"
-    );
-}
-
 #[test]
 fn test_resolved_column_equality_ignores_alias() {
     // Two columns with same schema/table/column but different aliases should be equal
@@ -1222,76 +841,8 @@ fn test_resolved_column_equality_ignores_alias() {
 }
 
 #[test]
-fn test_complexity_single_table_no_where() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql("SELECT * FROM users", &tables);
-
-    // Single table, no predicates = complexity 0
-    assert_eq!(resolved.complexity(), 0);
-}
-
-#[test]
-fn test_complexity_single_table_with_where() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
-
-    // Single table, 1 predicate = complexity 1
-    assert_eq!(resolved.complexity(), 1);
-}
-
-#[test]
-fn test_complexity_single_table_multiple_predicates() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql(
-        "SELECT * FROM users WHERE id = 1 AND name = 'john'",
-        &tables,
-    );
-
-    // Single table, 2 predicates = complexity 2
-    assert_eq!(resolved.complexity(), 2);
-}
-
-#[test]
-fn test_complexity_join_no_where() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
-
-    let resolved = resolve_sql(
-        "SELECT * FROM users JOIN orders ON users.id = orders.id",
-        &tables,
-    );
-
-    // 2 tables (1 join) * 3 = 3, no WHERE predicates
-    assert_eq!(resolved.complexity(), 3);
-}
-
-#[test]
-fn test_complexity_join_with_where() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
-
-    let resolved = resolve_sql(
-        "SELECT * FROM users JOIN orders ON users.id = orders.id WHERE users.id = 1",
-        &tables,
-    );
-
-    // 2 tables (1 join) * 3 = 3, plus 1 WHERE predicate = 4
-    assert_eq!(resolved.complexity(), 4);
-}
-
-#[test]
 fn test_complexity_ordering() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
+    let tables = catalog(&["users", "orders"]);
 
     // Simple query: SELECT * FROM users
     let resolved1 = resolve_sql("SELECT * FROM users", &tables);
@@ -1312,9 +863,7 @@ fn test_complexity_ordering() {
 
 #[test]
 fn test_complexity_subquery_depth() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
+    let tables = catalog(&["users", "orders"]);
 
     // No subquery: complexity = 1 predicate
     let flat = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
@@ -1338,10 +887,7 @@ fn test_complexity_subquery_depth() {
 
 #[test]
 fn test_complexity_nested_subquery_depth() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("products", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("stores", Oid::from_raw(1002)));
-    tables.insert_overwrite(test_table_metadata("regions", Oid::from_raw(1003)));
+    let tables = catalog(&["products", "stores", "regions"]);
 
     // Double-nested: depth 2
     let double_nested = resolve_sql(
@@ -1377,22 +923,8 @@ fn test_complexity_nested_subquery_depth() {
 }
 
 #[test]
-fn test_complexity_from_subquery_depth() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    // FROM subquery: depth 1
-    let from_sub = resolve_sql(
-        "SELECT * FROM (SELECT * FROM users WHERE id = 1) sub",
-        &tables,
-    );
-    assert_eq!(from_sub.subquery_depth(), 1);
-}
-
-#[test]
 fn test_group_by_resolve_single_column() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql("SELECT name FROM users GROUP BY name", &tables);
 
@@ -1404,8 +936,7 @@ fn test_group_by_resolve_single_column() {
 
 #[test]
 fn test_group_by_resolve_multiple_columns() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql("SELECT id, name FROM users GROUP BY id, name", &tables);
 
@@ -1416,8 +947,7 @@ fn test_group_by_resolve_multiple_columns() {
 
 #[test]
 fn test_group_by_resolve_qualified_column() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql("SELECT u.name FROM users u GROUP BY u.name", &tables);
 
@@ -1429,8 +959,7 @@ fn test_group_by_resolve_qualified_column() {
 
 #[test]
 fn test_having_resolve() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql(
         "SELECT name FROM users GROUP BY name HAVING name = 'alice'",
@@ -1450,68 +979,8 @@ fn test_having_resolve() {
 }
 
 #[test]
-fn test_limit_resolve_count_only() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_query("SELECT * FROM users LIMIT 10", &tables);
-
-    let limit = resolved.limit.unwrap();
-    assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
-    assert_eq!(limit.offset, None);
-}
-
-#[test]
-fn test_limit_resolve_offset_only() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_query("SELECT * FROM users OFFSET 5", &tables);
-
-    let limit = resolved.limit.unwrap();
-    assert_eq!(limit.count, None);
-    assert_eq!(limit.offset, Some(LiteralValue::Integer(5)));
-}
-
-#[test]
-fn test_limit_resolve_count_and_offset() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_query("SELECT * FROM users LIMIT 10 OFFSET 20", &tables);
-
-    let limit = resolved.limit.unwrap();
-    assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
-    assert_eq!(limit.offset, Some(LiteralValue::Integer(20)));
-}
-
-#[test]
-fn test_limit_resolve_parameterized() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_query("SELECT * FROM users LIMIT $1 OFFSET $2", &tables);
-
-    // Parameterized values are preserved through resolution
-    let limit = resolved.limit.unwrap();
-    assert_eq!(limit.count, Some(LiteralValue::Parameter("$1".into())));
-    assert_eq!(limit.offset, Some(LiteralValue::Parameter("$2".into())));
-}
-
-#[test]
-fn test_no_limit_clause() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_query("SELECT * FROM users", &tables);
-
-    assert!(resolved.limit.is_none());
-}
-
-#[test]
 fn test_combined_group_by_having_limit_resolve() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let sql = "SELECT name FROM users GROUP BY name HAVING name != 'test' ORDER BY name LIMIT 10";
     let resolved = resolve_query(sql, &tables);
@@ -1534,8 +1003,7 @@ fn test_combined_group_by_having_limit_resolve() {
 
 #[test]
 fn test_resolved_window_function() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     // Use columns that exist in test_table_metadata: id, name
     let resolved = resolve_sql(
@@ -1565,8 +1033,7 @@ fn test_resolved_window_function() {
 
 #[test]
 fn test_resolved_window_function_deparse() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     // Use columns that exist in test_table_metadata: id, name
     let resolved = resolve_sql(
@@ -1749,9 +1216,7 @@ fn test_select_nodes_nested_union() {
 #[test]
 fn test_where_subquery_in_resolution() {
     // Test resolving WHERE ... IN (SELECT ...) subquery
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("active_users", Oid::from_raw(1002)));
+    let tables = catalog(&["users", "active_users"]);
 
     let resolved = resolve_sql(
         "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
@@ -1802,9 +1267,7 @@ fn test_where_subquery_in_resolution() {
 #[test]
 fn test_where_subquery_exists_resolution() {
     // Test resolving WHERE EXISTS (SELECT ...) subquery
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("items", Oid::from_raw(1002)));
+    let tables = catalog(&["orders", "items"]);
 
     let resolved = resolve_sql(
         "SELECT * FROM orders WHERE EXISTS (SELECT id FROM items)",
@@ -1839,8 +1302,7 @@ fn test_where_subquery_exists_resolution() {
 #[test]
 fn test_where_subquery_scalar_resolution() {
     // Test resolving scalar subquery in WHERE clause
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql(
         "SELECT * FROM users WHERE id > (SELECT id FROM users)",
@@ -1871,8 +1333,7 @@ fn test_where_subquery_scalar_resolution() {
 #[test]
 fn test_table_subquery_resolution() {
     // Test resolving subquery in FROM clause (derived table)
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     // Note: Column resolution from subqueries is limited, but the subquery itself should resolve
     let node = parse_select_node("SELECT * FROM (SELECT id FROM users) AS sub");
@@ -1906,8 +1367,7 @@ fn test_table_subquery_resolution() {
 #[test]
 fn test_table_subquery_requires_alias() {
     // Test that table subquery without alias fails resolution
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     // Parse a query with subquery without alias
     // Note: PostgreSQL parser typically requires alias, but we should still handle the error
@@ -1919,115 +1379,13 @@ fn test_table_subquery_requires_alias() {
     assert!(result.is_ok());
 }
 
-#[test]
-fn test_subquery_nodes_traversal() {
-    // Test that nodes() traverses into subqueries to find all tables
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("active_users", Oid::from_raw(1002)));
-
-    let resolved = resolve_sql(
-        "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
-        &tables,
-    );
-
-    // Should find both outer table and inner table via nodes() traversal
-    let table_nodes: Vec<&ResolvedTableNode> = resolved.nodes().collect();
-    assert_eq!(
-        table_nodes.len(),
-        2,
-        "Should find tables in both outer and inner query"
-    );
-
-    let table_names: Vec<&str> = table_nodes.iter().map(|t| t.name.as_str()).collect();
-    assert!(table_names.contains(&"users"), "Should find outer table");
-    assert!(
-        table_names.contains(&"active_users"),
-        "Should find inner table"
-    );
-}
-
-#[test]
-fn test_subquery_nodes_traversal_derived_table() {
-    // Test that nodes() traverses into FROM subqueries
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql(
-        "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",
-        &tables,
-    );
-
-    // Should find the table inside the derived table
-    let table_nodes: Vec<&ResolvedTableNode> = resolved.nodes().collect();
-    assert_eq!(table_nodes.len(), 1, "Should find table in FROM subquery");
-    assert_eq!(table_nodes[0].name, "users");
-}
-
-#[test]
-fn test_subquery_nodes_traversal_scalar() {
-    // Test that nodes() traverses into scalar subqueries in SELECT list
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1002)));
-
-    let resolved = resolve_sql(
-        "SELECT id, (SELECT COUNT(*) FROM users) AS user_count FROM orders WHERE id = 1",
-        &tables,
-    );
-
-    // Should find both tables
-    let table_nodes: Vec<&ResolvedTableNode> = resolved.nodes().collect();
-    assert_eq!(
-        table_nodes.len(),
-        2,
-        "Should find tables in outer and scalar subquery"
-    );
-
-    let table_names: Vec<&str> = table_nodes.iter().map(|t| t.name.as_str()).collect();
-    assert!(table_names.contains(&"orders"), "Should find outer table");
-    assert!(
-        table_names.contains(&"users"),
-        "Should find scalar subquery table"
-    );
-}
-
-#[test]
-fn test_subquery_nodes_traversal_nested() {
-    // Test that nodes() traverses into nested subqueries
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("a", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("b", Oid::from_raw(1002)));
-    tables.insert_overwrite(test_table_metadata("c", Oid::from_raw(1003)));
-
-    let resolved = resolve_sql(
-        "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE id IN (SELECT id FROM c))",
-        &tables,
-    );
-
-    // Should find all three tables
-    let table_nodes: Vec<&ResolvedTableNode> = resolved.nodes().collect();
-    assert_eq!(
-        table_nodes.len(),
-        3,
-        "Should find all tables in nested subqueries"
-    );
-
-    let table_names: Vec<&str> = table_nodes.iter().map(|t| t.name.as_str()).collect();
-    assert!(table_names.contains(&"a"), "Should find outermost table");
-    assert!(table_names.contains(&"b"), "Should find middle table");
-    assert!(table_names.contains(&"c"), "Should find innermost table");
-}
-
 // ==========================================================================
 // Direct Table Nodes Tests (population uses these, not nodes())
 // ==========================================================================
 
 #[test]
 fn test_direct_table_nodes_excludes_where_subquery() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("active_users", Oid::from_raw(1002)));
+    let tables = catalog(&["users", "active_users"]);
 
     let resolved = resolve_sql(
         "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
@@ -2090,8 +1448,7 @@ fn test_direct_table_nodes_with_join_and_subquery() {
 
 #[test]
 fn test_direct_table_nodes_derived_table() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql(
         "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",
@@ -2114,248 +1471,6 @@ fn test_direct_table_nodes_derived_table() {
 // ==========================================================================
 // Correlated Subquery Tests
 // ==========================================================================
-
-#[test]
-fn test_correlated_exists_subquery_resolves() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("items", Oid::from_raw(1002)));
-
-    let node = parse_select_node(
-        "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.id = orders.id)",
-    );
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    let resolved = result.expect("correlated EXISTS should resolve successfully");
-    let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
-        panic!("expected Subquery WHERE");
-    };
-    assert_eq!(outer_refs.len(), 1, "should have one outer ref");
-    assert_eq!(outer_refs[0].table, "orders");
-    assert_eq!(outer_refs[0].column, "id");
-}
-
-#[test]
-fn test_correlated_in_subquery_resolves() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
-
-    let node = parse_select_node(
-        "SELECT * FROM users WHERE id IN (SELECT id FROM orders WHERE orders.name = users.name)",
-    );
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    let resolved = result.expect("correlated IN should resolve successfully");
-    let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
-        panic!("expected Subquery WHERE");
-    };
-    assert_eq!(outer_refs.len(), 1, "should have one outer ref");
-    assert_eq!(outer_refs[0].table, "users");
-    assert_eq!(outer_refs[0].column, "name");
-}
-
-#[test]
-fn test_correlated_scalar_subquery_resolves() {
-    // Scalar correlated subquery in SELECT list
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
-
-    let node = parse_select_node(
-        "SELECT id, (SELECT COUNT(*) FROM orders WHERE orders.id = users.id) FROM users",
-    );
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    let resolved = result.expect("correlated scalar subquery should resolve successfully");
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("expected Columns");
-    };
-    let outer_refs = cols
-        .iter()
-        .find_map(|col| match &col.expr {
-            ResolvedScalarExpr::Subquery(_, outer_refs) => Some(outer_refs),
-            _ => None,
-        })
-        .expect("subquery column");
-    assert_eq!(outer_refs.len(), 1, "should have one outer ref");
-    assert_eq!(outer_refs[0].table, "users");
-    assert_eq!(outer_refs[0].column, "id");
-}
-
-#[test]
-fn test_correlated_subquery_with_alias_resolves() {
-    // Table alias in outer scope should be resolved to the aliased table
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("orders", Oid::from_raw(1002)));
-
-    let node = parse_select_node(
-        "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE orders.id = u.id)",
-    );
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    let resolved = result.expect("correlated subquery with alias should resolve successfully");
-    let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
-        panic!("expected Subquery WHERE");
-    };
-    assert_eq!(outer_refs.len(), 1, "should have one outer ref");
-    assert_eq!(outer_refs[0].table, "users");
-    assert_eq!(outer_refs[0].column, "id");
-}
-
-#[test]
-fn test_correlated_unqualified_column_in_where() {
-    // `email` only exists on `users`, not `orders` — bare `email` in the subquery
-    // is an implicit correlated reference resolved via outer scope fallback
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "users",
-        Oid::from_raw(1001),
-        &["id", "email"],
-    ));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "orders",
-        Oid::from_raw(1002),
-        &["id", "user_id", "total"],
-    ));
-
-    let node = parse_select_node(
-        "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE email = 'test@example.com')",
-    );
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    let resolved = result.expect("unqualified outer column should resolve successfully");
-    let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
-        panic!("expected Subquery WHERE");
-    };
-    assert_eq!(outer_refs.len(), 1, "should have one outer ref");
-    assert_eq!(outer_refs[0].table, "users");
-    assert_eq!(outer_refs[0].column, "email");
-}
-
-#[test]
-fn test_correlated_unqualified_column_in_select_list() {
-    // `id` exists in both `users` and `orders` — resolves to inner scope (non-correlated)
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "users",
-        Oid::from_raw(1001),
-        &["id", "email"],
-    ));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "orders",
-        Oid::from_raw(1002),
-        &["id", "user_id"],
-    ));
-
-    let node = parse_select_node(
-        "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE user_id = id)",
-    );
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    let resolved = result.expect("column present in both scopes should resolve to inner scope");
-    let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
-        panic!("expected Subquery WHERE");
-    };
-    // `id` resolves to `orders.id` in the inner scope — not a correlated reference
-    assert!(
-        outer_refs.is_empty(),
-        "inner-scope column should not appear in outer_refs"
-    );
-}
-
-#[test]
-fn test_correlated_unqualified_column_scalar_subquery() {
-    // `status` only exists on `users`, bare reference in SELECT-list scalar subquery
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "users",
-        Oid::from_raw(1001),
-        &["id", "status"],
-    ));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "orders",
-        Oid::from_raw(1002),
-        &["id", "amount"],
-    ));
-
-    let node = parse_select_node(
-        "SELECT id, (SELECT COUNT(*) FROM orders WHERE status = 'active') FROM users",
-    );
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    let resolved = result.expect("unqualified outer column in scalar subquery should resolve");
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("expected Columns");
-    };
-    let outer_refs = cols
-        .iter()
-        .find_map(|col| match &col.expr {
-            ResolvedScalarExpr::Subquery(_, outer_refs) => Some(outer_refs),
-            _ => None,
-        })
-        .expect("subquery column");
-    assert_eq!(outer_refs.len(), 1, "should have one outer ref");
-    assert_eq!(outer_refs[0].table, "users");
-    assert_eq!(outer_refs[0].column, "status");
-}
-
-#[test]
-fn test_non_correlated_subquery_has_empty_outer_refs() {
-    // Non-correlated subquery should have outer_refs: []
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-    tables.insert_overwrite(test_table_metadata("active_users", Oid::from_raw(1002)));
-
-    let node = parse_select_node("SELECT * FROM users WHERE id IN (SELECT id FROM active_users)");
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    let resolved = result.expect("non-correlated subquery should resolve successfully");
-    let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
-        panic!("expected Subquery WHERE");
-    };
-    assert!(
-        outer_refs.is_empty(),
-        "non-correlated subquery must have empty outer_refs"
-    );
-}
-
-#[test]
-fn test_correlated_mixed_inner_and_outer_columns() {
-    // Same predicate references both an inner-scope column and an outer-scope column.
-    // The inner column resolves normally; the outer column goes into outer_refs.
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "departments",
-        Oid::from_raw(1001),
-        &["id", "region"],
-    ));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "employees",
-        Oid::from_raw(1002),
-        &["id", "dept_id", "region"],
-    ));
-
-    // `employees.dept_id = departments.id` — dept_id is inner, departments.id is outer
-    let node = parse_select_node(
-        "SELECT d.id FROM departments d \
-         WHERE EXISTS (SELECT 1 FROM employees WHERE dept_id = d.id)",
-    );
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    let resolved = result.expect("mixed inner/outer predicate should resolve");
-    let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
-        panic!("expected Subquery WHERE");
-    };
-    assert_eq!(
-        outer_refs.len(),
-        1,
-        "only the outer-scope column should be in outer_refs"
-    );
-    assert_eq!(outer_refs[0].table, "departments");
-    assert_eq!(outer_refs[0].column, "id");
-}
 
 #[test]
 fn test_doubly_nested_correlated_subquery() {
@@ -2454,62 +1569,8 @@ fn resolved_having_lhs_function(node: &ResolvedSelectNode) -> &ResolvedFunctionC
 }
 
 #[test]
-fn test_having_filter_resolves() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql(
-        "SELECT name FROM users GROUP BY name \
-         HAVING COUNT(*) FILTER (WHERE id > 0) > 5",
-        &tables,
-    );
-
-    let func = resolved_having_lhs_function(&resolved);
-    assert_eq!(func.name, "count");
-    assert!(func.agg_star);
-    assert!(
-        func.agg_filter.is_some(),
-        "FILTER (WHERE ...) must survive resolution"
-    );
-}
-
-#[test]
-fn test_having_distinct_resolves() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql(
-        "SELECT name FROM users GROUP BY name HAVING COUNT(DISTINCT id) > 1",
-        &tables,
-    );
-
-    let func = resolved_having_lhs_function(&resolved);
-    assert!(func.agg_distinct, "DISTINCT must survive resolution");
-}
-
-#[test]
-fn test_having_aggregate_order_by_resolves() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
-
-    let resolved = resolve_sql(
-        "SELECT id FROM users GROUP BY id \
-         HAVING string_agg(name, ',' ORDER BY name) <> ''",
-        &tables,
-    );
-
-    let func = resolved_having_lhs_function(&resolved);
-    assert_eq!(func.name, "string_agg");
-    assert!(
-        !func.agg_order.is_empty(),
-        "aggregate ORDER BY must survive resolution"
-    );
-}
-
-#[test]
 fn test_having_filter_resolved_deparse_contains_filter() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata("users", Oid::from_raw(1001)));
+    let tables = catalog(&["users"]);
 
     let resolved = resolve_sql(
         "SELECT name FROM users GROUP BY name \
@@ -2523,4 +1584,278 @@ fn test_having_filter_resolved_deparse_contains_filter() {
         buf.contains("FILTER (WHERE "),
         "resolved deparse must keep FILTER, got: {buf}"
     );
+}
+
+#[test]
+fn test_resolved_column_node_deparse_cases() {
+    // (label, schema, table, alias, column, expected)
+    #[rustfmt::skip]
+    let cases = [
+        ("alias wins",              "public", "users", Some("u"), "id",        "u.id"),
+        ("schema-qualified",        "public", "users", None,      "id",        "public.users.id"),
+        ("mixed case is quoted",    "Public", "Users", None,      "firstName", "\"Public\".\"Users\".\"firstName\""),
+        ("keywords are quoted",     "public", "order", None,      "user",      "public.\"order\".\"user\""),
+        ("embedded quote doubled",  "public", "users", None,      "we\"ird",   "public.users.\"we\"\"ird\""),
+    ];
+    for (label, schema, table, alias, column, expected) in cases {
+        let node = ResolvedColumnNode {
+            schema: schema.into(),
+            table: table.into(),
+            table_alias: alias.map(Into::into),
+            column: column.into(),
+            column_metadata: id_column_metadata(),
+        };
+        assert_eq!(deparsed(&node), expected, "{label}");
+    }
+}
+
+#[test]
+fn test_resolved_table_node_deparse_cases() {
+    // (label, schema, name, alias, expected)
+    #[rustfmt::skip]
+    let cases = [
+        ("with alias",           "public", "users", Some("u"), " public.users u"),
+        ("without alias",        "public", "users", None,      " public.users"),
+        ("mixed case is quoted", "Public", "Users", None,      " \"Public\".\"Users\""),
+    ];
+    for (label, schema, name, alias, expected) in cases {
+        let node = ResolvedTableNode {
+            schema: schema.into(),
+            name: name.into(),
+            alias: alias.map(Into::into),
+            relation_oid: Oid::from_raw(1001),
+        };
+        assert_eq!(deparsed(&node), expected, "{label}");
+    }
+}
+
+#[test]
+fn test_resolved_query_deparse_cases() {
+    // `*` expands to explicit columns; references are fully qualified unless
+    // aliased.
+    #[rustfmt::skip]
+    let cases = [
+        ("WHERE",          "SELECT * FROM users WHERE id = 1",
+                           "SELECT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1"),
+        ("table alias",    "SELECT u.id, u.name FROM users u WHERE u.id = 1",
+                           "SELECT u.id, u.name FROM public.users u WHERE u.id = 1"),
+        ("join",           "SELECT u.id, o.name FROM users u JOIN orders o ON u.id = o.id WHERE u.id = 1",
+                           "SELECT u.id, o.name FROM public.users u JOIN public.orders o ON u.id = o.id WHERE u.id = 1"),
+        ("ORDER BY",       "SELECT id FROM users u ORDER BY name DESC",
+                           "SELECT u.id FROM public.users u ORDER BY u.name DESC"),
+        ("count(*)",       "SELECT COUNT(*) FROM users WHERE id = 1",
+                           "SELECT count(*) FROM public.users WHERE public.users.id = 1"),
+        ("count DISTINCT", "SELECT COUNT(DISTINCT name) FROM users WHERE id = 1",
+                           "SELECT count(DISTINCT public.users.name) FROM public.users WHERE public.users.id = 1"),
+        ("CASE",           "SELECT CASE WHEN name = 'admin' THEN 1 ELSE 0 END FROM users WHERE id = 1",
+                           "SELECT CASE WHEN public.users.name = 'admin' THEN 1 ELSE 0 END FROM public.users WHERE public.users.id = 1"),
+    ];
+    let tables = catalog(&["users", "orders"]);
+    for (label, sql, expected) in cases {
+        assert_eq!(
+            deparsed(&resolve_query(sql, &tables)),
+            expected,
+            "{label}: {sql}"
+        );
+    }
+}
+
+#[test]
+fn test_complexity_cases() {
+    // Each predicate counts 1, each join 3, each subquery level 5.
+    #[rustfmt::skip]
+    let cases = [
+        ("one table, no WHERE",        "SELECT * FROM users",                                                   0, 0),
+        ("one table, one predicate",   "SELECT * FROM users WHERE id = 1",                                      1, 0),
+        ("one table, two predicates",  "SELECT * FROM users WHERE id = 1 AND name = 'john'",                    2, 0),
+        ("join, no WHERE",             "SELECT * FROM users JOIN orders ON users.id = orders.id",               3, 0),
+        ("join plus one predicate",    "SELECT * FROM users JOIN orders ON users.id = orders.id WHERE users.id = 1", 4, 0),
+    ];
+    let tables = catalog(&["users", "orders"]);
+    for (label, sql, complexity, depth) in cases {
+        let resolved = resolve_sql(sql, &tables);
+        assert_eq!(
+            (resolved.complexity(), resolved.subquery_depth()),
+            (complexity, depth),
+            "{label}: (complexity, subquery depth) of {sql}"
+        );
+    }
+    // A FROM subquery counts as one level of depth.
+    let from_sub = resolve_sql(
+        "SELECT * FROM (SELECT * FROM users WHERE id = 1) sub",
+        &tables,
+    );
+    assert_eq!(from_sub.subquery_depth(), 1, "FROM subquery depth");
+}
+
+#[test]
+fn test_limit_resolve_cases() {
+    use LiteralValue::{Integer, Parameter};
+    // Parameterized values are preserved through resolution.
+    #[rustfmt::skip]
+    let cases = [
+        ("count only",         "SELECT * FROM users LIMIT 10",            Some((Some(Integer(10)), None))),
+        ("offset only",        "SELECT * FROM users OFFSET 5",            Some((None, Some(Integer(5))))),
+        ("count and offset",   "SELECT * FROM users LIMIT 10 OFFSET 20",  Some((Some(Integer(10)), Some(Integer(20))))),
+        ("parameterized",      "SELECT * FROM users LIMIT $1 OFFSET $2",  Some((Some(Parameter("$1".into())), Some(Parameter("$2".into()))))),
+        ("no LIMIT",           "SELECT * FROM users",                     None),
+    ];
+    let tables = catalog(&["users"]);
+    for (label, sql, expected) in cases {
+        let actual = resolve_query(sql, &tables)
+            .limit
+            .map(|l| (l.count, l.offset));
+        assert_eq!(actual, expected, "{label}: (count, offset) of {sql}");
+    }
+}
+
+#[test]
+fn test_subquery_nodes_traversal_cases() {
+    // nodes() reaches tables in WHERE subqueries, FROM subqueries, SELECT-list
+    // scalar subqueries and nested subqueries.
+    #[rustfmt::skip]
+    let cases: [(&str, &[&str], &str, &[&str]); 4] = [
+        ("WHERE subquery",  &["users", "active_users"], "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
+                            &["active_users", "users"]),
+        ("FROM subquery",   &["users"],                 "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",
+                            &["users"]),
+        ("scalar subquery", &["orders", "users"],       "SELECT id, (SELECT COUNT(*) FROM users) AS user_count FROM orders WHERE id = 1",
+                            &["orders", "users"]),
+        ("nested",          &["a", "b", "c"],           "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE id IN (SELECT id FROM c))",
+                            &["a", "b", "c"]),
+    ];
+    for (label, names, sql, expected) in cases {
+        let resolved = resolve_sql(sql, &catalog(names));
+        let mut found: Vec<&str> = resolved
+            .nodes::<ResolvedTableNode>()
+            .map(|t| t.name.as_str())
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, expected, "{label}: tables reached in {sql}");
+    }
+}
+
+#[test]
+fn test_correlated_subquery_outer_refs_cases() {
+    let users_orders = || catalog(&["users", "orders"]);
+    // Unqualified columns fall back to the outer scope only when the inner
+    // scope lacks them; a column in both scopes binds to the inner one.
+    #[rustfmt::skip]
+    let cases = [
+        ("EXISTS",                     catalog(&["orders", "items"]),
+         "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.id = orders.id)",                   vec![("orders", "id")]),
+        ("IN",                         users_orders(),
+         "SELECT * FROM users WHERE id IN (SELECT id FROM orders WHERE orders.name = users.name)",               vec![("users", "name")]),
+        ("SELECT-list scalar",         users_orders(),
+         "SELECT id, (SELECT COUNT(*) FROM orders WHERE orders.id = users.id) FROM users",                       vec![("users", "id")]),
+        ("outer table alias",          users_orders(),
+         "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE orders.id = u.id)",                     vec![("users", "id")]),
+        ("unqualified, outer only",    catalog_with_columns(&[("users", &["id", "email"]), ("orders", &["id", "user_id", "total"])]),
+         "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE email = 'test@example.com')",             vec![("users", "email")]),
+        ("unqualified, in both",       catalog_with_columns(&[("users", &["id", "email"]), ("orders", &["id", "user_id"])]),
+         "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE user_id = id)",                      vec![]),
+        ("unqualified, scalar",        catalog_with_columns(&[("users", &["id", "status"]), ("orders", &["id", "amount"])]),
+         "SELECT id, (SELECT COUNT(*) FROM orders WHERE status = 'active') FROM users",                          vec![("users", "status")]),
+        ("not correlated",             catalog(&["users", "active_users"]),
+         "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",                                         vec![]),
+        ("mixed inner and outer",      catalog_with_columns(&[("departments", &["id", "region"]), ("employees", &["id", "dept_id", "region"])]),
+         "SELECT d.id FROM departments d WHERE EXISTS (SELECT 1 FROM employees WHERE dept_id = d.id)",           vec![("departments", "id")]),
+    ];
+    for (label, tables, sql, expected) in cases {
+        let node = parse_select_node(sql);
+        let resolved = select_node_resolve(&node, &tables, &["public"])
+            .unwrap_or_else(|e| panic!("{label}: {sql} should resolve: {e:?}"));
+        assert_eq!(
+            subquery_outer_refs(&resolved),
+            expected,
+            "{label}: outer refs of {sql}"
+        );
+    }
+}
+
+/// An expected `*`-expansion output column.
+#[derive(Debug, Clone, Copy)]
+enum StarColumn {
+    /// A USING/NATURAL merged join column, emitted under its name.
+    Merged(&'static str),
+    /// A base-table column (table, column).
+    Base(&'static str, &'static str),
+    /// A derived-table column (derived alias, column).
+    Derived(&'static str, &'static str),
+}
+
+fn star_column_assert(col: &ResolvedSelectColumn, expected: StarColumn, context: &str) {
+    match expected {
+        StarColumn::Merged(name) => {
+            assert_eq!(col.alias.as_deref(), Some(name), "{context}: merged column")
+        }
+        StarColumn::Base(table, column) => {
+            let node = select_column_node(col);
+            assert_eq!(
+                (node.table.as_str(), node.column.as_str()),
+                (table, column),
+                "{context}"
+            );
+        }
+        StarColumn::Derived(alias, column) => derived_column_assert(col, alias, column),
+    }
+}
+
+#[test]
+fn test_select_star_mixed_derived_cases() {
+    use StarColumn::{Base, Derived, Merged};
+    let mut tables = catalog(&["users"]);
+    tables.insert_overwrite(test_table_metadata_with_columns(
+        "orders",
+        Oid::from_raw(1002),
+        &["id", "total"],
+    ));
+    // Unqualified `*` emits the merged USING column first, then each side's
+    // remaining columns in FROM order; qualified `o.*` is that side verbatim.
+    #[rustfmt::skip]
+    let cases: [(&str, &str, &[StarColumn]); 3] = [
+        ("base table first",    "SELECT * FROM users u JOIN (SELECT id, total FROM orders) o USING (id)",
+                                &[Merged("id"), Base("users", "name"), Derived("o", "total")]),
+        ("derived table first", "SELECT * FROM (SELECT id, total FROM orders) o JOIN users u USING (id)",
+                                &[Merged("id"), Derived("o", "total"), Base("users", "name")]),
+        ("qualified o.*",       "SELECT o.* FROM (SELECT id, total FROM orders) o JOIN users u USING (id)",
+                                &[Derived("o", "id"), Derived("o", "total")]),
+    ];
+    for (label, sql, expected) in cases {
+        let resolved = resolve_sql(sql, &tables);
+        let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
+            panic!("{label}: expected Columns for {sql}");
+        };
+        assert_eq!(cols.len(), expected.len(), "{label}: column count of {sql}");
+        for (i, (col, want)) in cols.iter().zip(expected).enumerate() {
+            star_column_assert(col, *want, &format!("{label}: column {i} of {sql}"));
+        }
+    }
+}
+
+/// A predicate over a resolved HAVING aggregate.
+type AggregateCheck = fn(&ResolvedFunctionCall) -> bool;
+
+#[test]
+fn test_having_aggregate_decorations_resolve_cases() {
+    // FILTER, aggregate ORDER BY and DISTINCT on a HAVING aggregate must
+    // survive resolution.
+    #[rustfmt::skip]
+    let cases: [(&str, &str, AggregateCheck); 3] = [
+        ("count(*) FILTER", "SELECT name FROM users GROUP BY name HAVING COUNT(*) FILTER (WHERE id > 0) > 5",
+         |f| f.name == "count" && f.agg_star && f.agg_filter.is_some()),
+        ("string_agg ORDER BY", "SELECT id FROM users GROUP BY id HAVING string_agg(name, ',' ORDER BY name) <> ''",
+         |f| f.name == "string_agg" && !f.agg_order.is_empty()),
+        ("count DISTINCT", "SELECT name FROM users GROUP BY name HAVING COUNT(DISTINCT id) > 1",
+         |f| f.agg_distinct),
+    ];
+    let tables = catalog(&["users"]);
+    for (label, sql, check) in cases {
+        let resolved = resolve_sql(sql, &tables);
+        let func = resolved_having_lhs_function(&resolved);
+        assert!(
+            check(func),
+            "{label}: HAVING aggregate of {sql} resolved to {func:?}"
+        );
+    }
 }
