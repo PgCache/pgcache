@@ -9,7 +9,7 @@ use super::{
     children_visit,
 };
 use crate::cache::UpdateQuerySource;
-use crate::query::ast::Deparse;
+use crate::query::ast::{Deparse, clause_deparse, separated_deparse};
 
 // ============================================================================
 // New Query Type Hierarchy (for UNION/INTERSECT/EXCEPT support)
@@ -181,24 +181,6 @@ impl Deparse for SelectNode {
         }
         clause_deparse(buf, " HAVING ", self.having.as_ref());
         buf
-    }
-}
-
-/// Deparse `items` with `separator` between them.
-fn separated_deparse<T: Deparse>(buf: &mut String, items: &[T], separator: &str) {
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            buf.push_str(separator);
-        }
-        item.deparse(buf);
-    }
-}
-
-/// `keyword` then `expr`, when present.
-fn clause_deparse(buf: &mut String, keyword: &str, expr: Option<&impl Deparse>) {
-    if let Some(expr) = expr {
-        buf.push_str(keyword);
-        expr.deparse(buf);
     }
 }
 

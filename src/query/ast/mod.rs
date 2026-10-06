@@ -66,6 +66,35 @@ pub trait Deparse {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String;
 }
 
+/// Deparse `items` with `separator` between them.
+pub(crate) fn separated_deparse<T: Deparse>(buf: &mut String, items: &[T], separator: &str) {
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            buf.push_str(separator);
+        }
+        item.deparse(buf);
+    }
+}
+
+/// `keyword` then `expr`, when present.
+pub(crate) fn clause_deparse(buf: &mut String, keyword: &str, expr: Option<&impl Deparse>) {
+    if let Some(expr) = expr {
+        buf.push_str(keyword);
+        expr.deparse(buf);
+    }
+}
+
+/// Deparse `item`, wrapped in parentheses when `parens` (precedence needs it).
+pub(crate) fn parenthesized_deparse(buf: &mut String, item: &impl Deparse, parens: bool) {
+    if parens {
+        buf.push('(');
+    }
+    item.deparse(buf);
+    if parens {
+        buf.push(')');
+    }
+}
+
 impl Deparse for String {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         self.as_str().deparse(buf)

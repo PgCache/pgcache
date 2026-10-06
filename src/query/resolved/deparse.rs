@@ -1,17 +1,18 @@
 use super::{
-    ResolvedArithmeticExpr, ResolvedCaseExpr, ResolvedColumnNode, ResolvedFrameBound,
-    ResolvedFunctionCall, ResolvedJoinNode, ResolvedJoinQual, ResolvedOrderByClause,
-    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
-    ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode,
-    ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedWhereExpr, ResolvedWindowFrame,
+    ResolvedArithmeticExpr, ResolvedBinaryExpr, ResolvedCaseExpr, ResolvedColumnNode,
+    ResolvedFrameBound, ResolvedFunctionCall, ResolvedJoinNode, ResolvedJoinQual,
+    ResolvedLimitClause, ResolvedMultiExpr, ResolvedOrderByClause, ResolvedQueryBody,
+    ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
+    ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode, ResolvedTableSource,
+    ResolvedTableSubqueryNode, ResolvedUnaryExpr, ResolvedWhereExpr, ResolvedWindowFrame,
     ResolvedWindowSpec,
 };
 use crate::query::ast::BinaryOp;
-use crate::query::ast::Deparse;
 use crate::query::ast::MultiOp;
 use crate::query::ast::OrderDirection;
 use crate::query::ast::SubLinkType;
 use crate::query::ast::UnaryOp;
+use crate::query::ast::{Deparse, clause_deparse, parenthesized_deparse, separated_deparse};
 use crate::query::cast::cast_target_deparse;
 
 impl Deparse for ResolvedTableNode {
@@ -48,165 +49,134 @@ impl Deparse for ResolvedWhereExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         match self {
             ResolvedWhereExpr::Scalar(scalar) => scalar.deparse(buf),
-            ResolvedWhereExpr::Unary(unary) => {
-                match unary.op {
-                    UnaryOp::IsNull
-                    | UnaryOp::IsNotNull
-                    | UnaryOp::IsTrue
-                    | UnaryOp::IsNotTrue
-                    | UnaryOp::IsFalse
-                    | UnaryOp::IsNotFalse => {
-                        // Postfix operators: expr IS NULL, expr IS TRUE, etc.
-                        unary.expr.deparse(buf);
-                        buf.push(' ');
-                        unary.op.deparse(buf);
-                    }
-                    UnaryOp::Not => {
-                        // Prefix operator: NOT expr
-                        // NOT has higher precedence than AND/OR, so NOT applied
-                        // to a logical binary expression needs parentheses.
-                        let needs_parens = matches!(
-                            unary.expr.as_ref(),
-                            ResolvedWhereExpr::Binary(child) if child.op.is_logical()
-                        );
-                        unary.op.deparse(buf);
-                        buf.push(' ');
-                        if needs_parens {
-                            buf.push('(');
-                        }
-                        unary.expr.deparse(buf);
-                        if needs_parens {
-                            buf.push(')');
-                        }
-                    }
-                }
-                buf
-            }
-            ResolvedWhereExpr::Binary(binary) => {
-                let left_needs_parens = matches!(
-                    (&binary.op, binary.lexpr.as_ref()),
-                    (BinaryOp::And, ResolvedWhereExpr::Binary(child)) if child.op == BinaryOp::Or
-                );
-                let right_needs_parens = matches!(
-                    (&binary.op, binary.rexpr.as_ref()),
-                    (BinaryOp::And, ResolvedWhereExpr::Binary(child)) if child.op == BinaryOp::Or
-                );
-
-                if left_needs_parens {
-                    buf.push('(');
-                }
-                binary.lexpr.deparse(buf);
-                if left_needs_parens {
-                    buf.push(')');
-                }
-
-                buf.push(' ');
-                binary.op.deparse(buf);
-                buf.push(' ');
-
-                if right_needs_parens {
-                    buf.push('(');
-                }
-                binary.rexpr.deparse(buf);
-                if right_needs_parens {
-                    buf.push(')');
-                }
-
-                buf
-            }
-            ResolvedWhereExpr::Multi(multi) => {
-                // Format: column IN (value1, value2, ...) or column NOT IN (...)
-                let [first, rest @ ..] = multi.exprs.as_slice() else {
-                    return buf;
-                };
-
-                // First expression is the column/left side
-                first.deparse(buf);
-
-                match multi.op {
-                    MultiOp::In => buf.push_str(" IN ("),
-                    MultiOp::NotIn => buf.push_str(" NOT IN ("),
-                    MultiOp::Between
-                    | MultiOp::NotBetween
-                    | MultiOp::BetweenSymmetric
-                    | MultiOp::NotBetweenSymmetric => {
-                        buf.push(' ');
-                        multi.op.deparse(buf);
-                        buf.push(' ');
-                        // BETWEEN low AND high — exactly 2 bounds
-                        let mut sep = "";
-                        for expr in rest {
-                            buf.push_str(sep);
-                            expr.deparse(buf);
-                            sep = " AND ";
-                        }
-                        return buf;
-                    }
-                    MultiOp::Any { .. } | MultiOp::All { .. } => {
-                        buf.push(' ');
-                        multi.op.deparse(buf);
-                        buf.push_str(" (");
-                    }
-                }
-
-                // Remaining expressions are the values
-                let mut sep = "";
-                for expr in rest {
-                    buf.push_str(sep);
-                    expr.deparse(buf);
-                    sep = ", ";
-                }
-                buf.push(')');
-                buf
-            }
+            ResolvedWhereExpr::Unary(unary) => unary.deparse(buf),
+            ResolvedWhereExpr::Binary(binary) => binary.deparse(buf),
+            ResolvedWhereExpr::Multi(multi) => multi.deparse(buf),
             ResolvedWhereExpr::Subquery {
                 query,
                 sublink_type,
                 test_expr,
                 ..
-            } => {
-                match sublink_type {
-                    SubLinkType::Exists => {
-                        buf.push_str("EXISTS (");
-                        query.deparse(buf);
-                        buf.push(')');
-                    }
-                    SubLinkType::Any => {
-                        // IN is a special case of ANY
-                        if let Some(test) = test_expr {
-                            test.deparse(buf);
-                            buf.push_str(" IN (");
-                            query.deparse(buf);
-                            buf.push(')');
-                        } else {
-                            buf.push('(');
-                            query.deparse(buf);
-                            buf.push(')');
-                        }
-                    }
-                    SubLinkType::All => {
-                        if let Some(test) = test_expr {
-                            test.deparse(buf);
-                            buf.push_str(" <> ALL (");
-                            query.deparse(buf);
-                            buf.push(')');
-                        } else {
-                            buf.push_str("ALL (");
-                            query.deparse(buf);
-                            buf.push(')');
-                        }
-                    }
-                    SubLinkType::Expr => {
-                        // Scalar subquery - just parenthesized query
-                        buf.push('(');
-                        query.deparse(buf);
-                        buf.push(')');
-                    }
-                }
-                buf
-            }
+            } => subquery_deparse(buf, query, *sublink_type, test_expr.as_deref()),
         }
     }
+}
+
+impl Deparse for ResolvedUnaryExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        match self.op {
+            UnaryOp::IsNull
+            | UnaryOp::IsNotNull
+            | UnaryOp::IsTrue
+            | UnaryOp::IsNotTrue
+            | UnaryOp::IsFalse
+            | UnaryOp::IsNotFalse => {
+                // Postfix operators: expr IS NULL, expr IS TRUE, etc.
+                self.expr.deparse(buf);
+                buf.push(' ');
+                self.op.deparse(buf);
+            }
+            UnaryOp::Not => {
+                // Prefix operator: NOT expr. NOT has higher precedence than
+                // AND/OR, so NOT applied to a logical binary expression needs
+                // parentheses.
+                let needs_parens = matches!(
+                    self.expr.as_ref(),
+                    ResolvedWhereExpr::Binary(child) if child.op.is_logical()
+                );
+                self.op.deparse(buf);
+                buf.push(' ');
+                parenthesized_deparse(buf, self.expr.as_ref(), needs_parens);
+            }
+        }
+        buf
+    }
+}
+
+impl ResolvedBinaryExpr {
+    /// An OR operand of an AND binds looser than the AND, so it needs
+    /// parentheses.
+    fn operand_needs_parens(&self, operand: &ResolvedWhereExpr) -> bool {
+        self.op == BinaryOp::And
+            && matches!(operand, ResolvedWhereExpr::Binary(child) if child.op == BinaryOp::Or)
+    }
+}
+
+impl Deparse for ResolvedBinaryExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        let left_parens = self.operand_needs_parens(&self.lexpr);
+        let right_parens = self.operand_needs_parens(&self.rexpr);
+        parenthesized_deparse(buf, self.lexpr.as_ref(), left_parens);
+        buf.push(' ');
+        self.op.deparse(buf);
+        buf.push(' ');
+        parenthesized_deparse(buf, self.rexpr.as_ref(), right_parens);
+        buf
+    }
+}
+
+impl Deparse for ResolvedMultiExpr {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        // The first expression is the tested left side; the rest are the
+        // values or bounds.
+        let [first, rest @ ..] = self.exprs.as_slice() else {
+            return buf;
+        };
+        first.deparse(buf);
+        match self.op {
+            MultiOp::In => buf.push_str(" IN ("),
+            MultiOp::NotIn => buf.push_str(" NOT IN ("),
+            MultiOp::Between
+            | MultiOp::NotBetween
+            | MultiOp::BetweenSymmetric
+            | MultiOp::NotBetweenSymmetric => {
+                // BETWEEN low AND high — exactly 2 bounds
+                buf.push(' ');
+                self.op.deparse(buf);
+                buf.push(' ');
+                separated_deparse(buf, rest, " AND ");
+                return buf;
+            }
+            MultiOp::Any { .. } | MultiOp::All { .. } => {
+                buf.push(' ');
+                self.op.deparse(buf);
+                buf.push_str(" (");
+            }
+        }
+        separated_deparse(buf, rest, ", ");
+        buf.push(')');
+        buf
+    }
+}
+
+/// A subquery predicate: `EXISTS (q)`, `test IN (q)`, `test <> ALL (q)`, or a
+/// parenthesized scalar subquery. Without a test expression ANY and ALL keep
+/// only their parenthesized form.
+fn subquery_deparse<'b>(
+    buf: &'b mut String,
+    query: &ResolvedQueryExpr,
+    sublink_type: SubLinkType,
+    test_expr: Option<&ResolvedScalarExpr>,
+) -> &'b mut String {
+    let opener = match (sublink_type, test_expr) {
+        (SubLinkType::Exists, _) => "EXISTS (",
+        // IN is a special case of ANY
+        (SubLinkType::Any, Some(test)) => {
+            test.deparse(buf);
+            " IN ("
+        }
+        (SubLinkType::All, Some(test)) => {
+            test.deparse(buf);
+            " <> ALL ("
+        }
+        (SubLinkType::All, None) => "ALL (",
+        // Scalar subquery, or ANY without a test expression
+        (SubLinkType::Any | SubLinkType::Expr, _) => "(",
+    };
+    buf.push_str(opener);
+    query.deparse(buf);
+    buf.push(')');
+    buf
 }
 
 impl Deparse for ResolvedArithmeticExpr {
@@ -296,31 +266,25 @@ impl Deparse for ResolvedFrameBound {
 impl Deparse for ResolvedWindowSpec {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         buf.push('(');
-        if !self.partition_by.is_empty() {
-            buf.push_str("PARTITION BY ");
-            let mut sep = "";
-            for col in &self.partition_by {
-                buf.push_str(sep);
-                col.deparse(buf);
-                sep = ", ";
+        let mut part_written = false;
+        let mut part_begin = |buf: &mut String| {
+            if part_written {
+                buf.push(' ');
             }
+            part_written = true;
+        };
+        if !self.partition_by.is_empty() {
+            part_begin(buf);
+            buf.push_str("PARTITION BY ");
+            separated_deparse(buf, &self.partition_by, ", ");
         }
         if !self.order_by.is_empty() {
-            if !self.partition_by.is_empty() {
-                buf.push(' ');
-            }
+            part_begin(buf);
             buf.push_str("ORDER BY ");
-            let mut sep = "";
-            for clause in &self.order_by {
-                buf.push_str(sep);
-                clause.deparse(buf);
-                sep = ", ";
-            }
+            separated_deparse(buf, &self.order_by, ", ");
         }
         if let Some(frame) = &self.frame {
-            if !self.partition_by.is_empty() || !self.order_by.is_empty() {
-                buf.push(' ');
-            }
+            part_begin(buf);
             frame.deparse(buf);
         }
         buf.push(')');
@@ -497,37 +461,16 @@ impl Deparse for ResolvedSelectNode {
             buf.push_str(" DISTINCT");
         }
         self.columns.deparse(buf);
-
         if !self.from.is_empty() {
             buf.push_str(" FROM");
-            let mut sep = "";
-            for table in &self.from {
-                buf.push_str(sep);
-                table.deparse(buf);
-                sep = ",";
-            }
+            separated_deparse(buf, &self.from, ",");
         }
-
-        if let Some(expr) = &self.where_clause {
-            buf.push_str(" WHERE ");
-            expr.deparse(buf);
-        }
-
+        clause_deparse(buf, " WHERE ", self.where_clause.as_ref());
         if !self.group_by.is_empty() {
             buf.push_str(" GROUP BY ");
-            let mut sep = "";
-            for col in &self.group_by {
-                buf.push_str(sep);
-                col.deparse(buf);
-                sep = ", ";
-            }
+            separated_deparse(buf, &self.group_by, ", ");
         }
-
-        if let Some(expr) = &self.having {
-            buf.push_str(" HAVING ");
-            expr.deparse(buf);
-        }
-
+        clause_deparse(buf, " HAVING ", self.having.as_ref());
         buf
     }
 }
@@ -559,29 +502,21 @@ impl Deparse for ResolvedQueryBody {
 impl Deparse for ResolvedQueryExpr {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
         self.body.deparse(buf);
-
         if !self.order_by.is_empty() {
-            buf.push_str(" ORDER BY");
-            let mut sep = "";
-            for order in &self.order_by {
-                buf.push_str(sep);
-                buf.push(' ');
-                order.deparse(buf);
-                sep = ",";
-            }
+            buf.push_str(" ORDER BY ");
+            separated_deparse(buf, &self.order_by, ", ");
         }
-
         if let Some(limit) = &self.limit {
-            if let Some(count) = &limit.count {
-                buf.push_str(" LIMIT ");
-                count.deparse(buf);
-            }
-            if let Some(offset) = &limit.offset {
-                buf.push_str(" OFFSET ");
-                offset.deparse(buf);
-            }
+            limit.deparse(buf);
         }
+        buf
+    }
+}
 
+impl Deparse for ResolvedLimitClause {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        clause_deparse(buf, " LIMIT ", self.count.as_ref());
+        clause_deparse(buf, " OFFSET ", self.offset.as_ref());
         buf
     }
 }
