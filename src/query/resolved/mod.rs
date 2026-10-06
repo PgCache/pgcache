@@ -39,6 +39,9 @@ error_set! {
         #[display("Invalid table reference")]
         InvalidTableRef,
 
+        #[display("Derived table '{alias}' has more columns than PostgreSQL allows")]
+        TooManyColumns { alias: String },
+
         #[display("Unsupported join qualifier (USING/NATURAL not yet cacheable)")]
         UnsupportedJoinQualifier,
 

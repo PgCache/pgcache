@@ -353,7 +353,7 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore};
+    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore};
     use crate::oid::TypeOid;
 
     /// A table exercising every identifier hazard: mixed-case name,
@@ -361,7 +361,7 @@ mod tests {
     fn quoted_table_metadata() -> TableMetadata {
         let column = |name: &str, position: i16, is_primary_key: bool| ColumnMetadata {
             name: name.into(),
-            position,
+            position: ColumnPosition::from_raw(position),
             type_oid: TypeOid::from_raw(25),
             data_type: Type::TEXT,
             type_name: "text".into(),

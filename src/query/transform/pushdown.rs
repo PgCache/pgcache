@@ -378,7 +378,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::{LiteralValue, query_expr_parse};
     use crate::query::resolved::query_expr_resolve;
@@ -395,7 +395,7 @@ mod tests {
                     .enumerate()
                     .map(|(i, col_name)| ColumnMetadata {
                         name: (*col_name).into(),
-                        position: i16::try_from(i + 1).expect("column position fits in i16"),
+                        position: ColumnPosition::from_index(i).expect("column position in range"),
                         type_oid: TypeOid::from_raw(25),
                         data_type: Type::TEXT,
                         type_name: "text".into(),

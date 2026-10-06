@@ -203,6 +203,36 @@ impl BiHashItem for TableMetadata {
     bi_upcast!();
 }
 
+/// A user column's 1-based position (PostgreSQL `attnum`), always in
+/// `1..=i16::MAX`, so its 0-based slice index cannot underflow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ColumnPosition(i16);
+
+impl ColumnPosition {
+    pub const FIRST: Self = Self(1);
+    pub const MAX: Self = Self(i16::MAX);
+
+    /// The position of the column at 0-based `index`; `None` past `i16::MAX`.
+    pub fn from_index(index: usize) -> Option<Self> {
+        Self::from_attnum(i64::try_from(index).ok()?.checked_add(1)?)
+    }
+
+    /// The position for a 1-based `attnum`; `None` outside `1..=i16::MAX`.
+    pub fn from_attnum(attnum: i64) -> Option<Self> {
+        i16::try_from(attnum).ok().filter(|n| *n >= 1).map(Self)
+    }
+
+    /// 0-based index into a user column array.
+    pub fn index(self) -> usize {
+        usize::from(self.0.unsigned_abs().saturating_sub(1))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn from_raw(attnum: i16) -> Self {
+        Self(attnum)
+    }
+}
+
 /// Metadata about a table column.
 ///
 /// Contains type information and position data for a single column
@@ -217,7 +247,7 @@ pub struct ColumnMetadata {
     /// Column name
     pub name: EcoString,
     /// 1-based position in table (matches PostgreSQL attnum)
-    pub position: i16,
+    pub position: ColumnPosition,
     /// PostgreSQL type OID (original from origin database, used in RowDescription)
     pub type_oid: TypeOid,
     /// Parsed PostgreSQL type (may be Domain, Enum, etc.)
@@ -232,12 +262,8 @@ pub struct ColumnMetadata {
 
 impl ColumnMetadata {
     /// 0-based index for a column's position in a user column array.
-    ///
-    /// Converts the PostgreSQL 1-based `attnum` to a usable Rust slice index.
-    /// User columns always have `position >= 1`; system columns (negative attnum)
-    /// are not represented here.
     pub fn index(&self) -> usize {
-        usize::try_from(self.position - 1).expect("user column position is >= 1")
+        self.position.index()
     }
 
     /// Enum, domain over enum (recursive), or array of such — types whose
@@ -423,5 +449,33 @@ pub fn cache_type_name_resolve(data_type: &Type) -> Result<String, CacheError> {
         }
         // Kind is non-exhaustive; treat unknown kinds as their type name
         _ => Ok(data_type.name().to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_column_position_bounds() {
+        assert_eq!(ColumnPosition::from_index(0), Some(ColumnPosition::FIRST));
+        assert_eq!(ColumnPosition::FIRST.index(), 0);
+        assert_eq!(
+            ColumnPosition::from_attnum(5).map(ColumnPosition::index),
+            Some(4)
+        );
+        assert_eq!(
+            ColumnPosition::from_attnum(i64::from(i16::MAX)),
+            Some(ColumnPosition::MAX)
+        );
+        for out_of_range in [0, -1, i64::from(i16::MAX) + 1] {
+            assert_eq!(
+                ColumnPosition::from_attnum(out_of_range),
+                None,
+                "attnum {out_of_range}"
+            );
+        }
+        let past_max = usize::try_from(i16::MAX).expect("i16::MAX as usize");
+        assert_eq!(ColumnPosition::from_index(past_max), None);
     }
 }

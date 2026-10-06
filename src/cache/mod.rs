@@ -160,6 +160,12 @@ error_set! {
             reason: String,
         },
         UnknownColumn,
+        #[display("Column '{column_name}' in table '{table_name}' has out-of-range position {position}")]
+        ColumnPositionOutOfRange {
+            position: i64,
+            column_name: String,
+            table_name: String,
+        },
         UnknownSchema,
         NoPrimaryKey,
     }

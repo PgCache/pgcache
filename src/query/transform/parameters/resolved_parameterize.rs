@@ -235,7 +235,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::{Deparse, query_expr_parse};
     use crate::query::resolve::query_expr_resolve;
@@ -244,7 +244,7 @@ mod tests {
         let columns = ColumnStore::new([
             ColumnMetadata {
                 name: "id".into(),
-                position: 1,
+                position: ColumnPosition::from_raw(1),
                 type_oid: TypeOid::from_raw(23),
                 data_type: Type::INT4,
                 type_name: "int4".into(),
@@ -253,7 +253,7 @@ mod tests {
             },
             ColumnMetadata {
                 name: "name".into(),
-                position: 2,
+                position: ColumnPosition::from_raw(2),
                 type_oid: TypeOid::from_raw(25),
                 data_type: Type::TEXT,
                 type_name: "text".into(),

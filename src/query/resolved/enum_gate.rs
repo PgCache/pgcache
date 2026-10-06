@@ -321,7 +321,7 @@ mod tests {
     use postgres_types::{Kind, Type};
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
     use crate::query::resolved::query_expr_resolve;
@@ -342,7 +342,7 @@ mod tests {
     fn column(name: &str, position: i16, data_type: Type, is_primary_key: bool) -> ColumnMetadata {
         ColumnMetadata {
             name: name.into(),
-            position,
+            position: ColumnPosition::from_raw(position),
             type_oid: TypeOid::from_type(&data_type),
             data_type: data_type.clone(),
             type_name: data_type.name().into(),

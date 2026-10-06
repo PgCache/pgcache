@@ -1,5 +1,6 @@
 use ecow::EcoString;
 use postgres_protocol::escape;
+use rootcause::Report;
 use tokio_postgres::Row;
 use tokio_postgres::types::Type;
 use tracing::{debug, error, info, instrument, warn};
@@ -7,7 +8,8 @@ use tracing::{debug, error, info, instrument, warn};
 use super::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::{
-    ColumnMetadata, ColumnStore, IndexMetadata, TableMetadata, cache_type_name_resolve,
+    ColumnMetadata, ColumnPosition, ColumnStore, IndexMetadata, TableMetadata,
+    cache_type_name_resolve,
 };
 use crate::oid::{Oid, TypeOid};
 use crate::result::error_chain_format;
@@ -125,10 +127,18 @@ impl WriterCore {
             let type_oid: TypeOid = row.get("type_oid");
             let type_info = self.column_type_resolve(type_oid).await?;
             let pg_position: i64 = row.get("position");
+            let column_name: String = row.get("column_name");
+            let position = ColumnPosition::from_attnum(pg_position).ok_or_else(|| {
+                Report::from(CacheError::ColumnPositionOutOfRange {
+                    position: pg_position,
+                    column_name: column_name.clone(),
+                    table_name: table.to_owned(),
+                })
+            })?;
 
             let column = ColumnMetadata {
-                name: row.get::<_, String>("column_name").into(),
-                position: i16::try_from(pg_position).expect("column position fits in i16"),
+                name: column_name.into(),
+                position,
                 type_oid,
                 data_type: type_info.data_type,
                 type_name: type_info.type_name,

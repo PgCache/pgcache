@@ -48,7 +48,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::ColumnMetadata;
+    use crate::catalog::{ColumnMetadata, ColumnPosition};
     use crate::oid::TypeOid;
     use crate::query::ast::{BinaryOp, LiteralValue};
     use crate::query::resolved::{
@@ -60,7 +60,7 @@ mod tests {
     fn test_resolved_select_node_replace_strips_group_by() {
         let col_meta = ColumnMetadata {
             name: "status".into(),
-            position: 1,
+            position: ColumnPosition::from_raw(1),
             type_oid: TypeOid::from_raw(25),
             data_type: Type::TEXT,
             type_name: "text".into(),

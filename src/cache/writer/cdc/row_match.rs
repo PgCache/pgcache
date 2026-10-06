@@ -223,16 +223,16 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore};
+    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::LiteralValue;
     use crate::query::cast::CastTarget;
 
     // Row layout: [id INT4 (PK), name TEXT, created_at TIMESTAMP].
     fn fixture_table() -> TableMetadata {
-        let column = |name: &str, position, data_type: Type, type_name: &str| ColumnMetadata {
+        let column = |name: &str, position: i16, data_type: Type, type_name: &str| ColumnMetadata {
             name: name.into(),
-            position,
+            position: ColumnPosition::from_raw(position),
             type_oid: TypeOid::from_type(&data_type),
             data_type,
             type_name: type_name.into(),

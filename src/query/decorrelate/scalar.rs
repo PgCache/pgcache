@@ -13,7 +13,7 @@ use super::{
     ScalarDecorrelateResult,
 };
 use crate::cache::SubqueryKind;
-use crate::catalog::ColumnMetadata;
+use crate::catalog::{ColumnMetadata, ColumnPosition};
 use crate::oid::TypeOid;
 use crate::query::ast::{BinaryOp, JoinType, SubLinkType, TableAlias};
 use crate::query::resolved::{
@@ -97,7 +97,7 @@ fn synthetic_column_node(
 }
 
 /// Synthetic column metadata for derived table columns (TEXT type, non-primary-key).
-fn synthetic_text_metadata(name: &str, position: i16) -> ColumnMetadata {
+fn synthetic_text_metadata(name: &str, position: ColumnPosition) -> ColumnMetadata {
     ColumnMetadata {
         name: EcoString::from(name),
         position,
@@ -227,7 +227,7 @@ pub(super) fn subquery_scalar_decorrelate(
     let scalar_column_ref = synthetic_column_node(
         &derived_alias,
         scalar_alias.clone(),
-        synthetic_text_metadata(scalar_alias.as_str(), 1),
+        synthetic_text_metadata(scalar_alias.as_str(), ColumnPosition::FIRST),
     );
 
     Ok(ScalarDecorrelateResult {

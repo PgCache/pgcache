@@ -524,7 +524,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::{
         BinaryOp, Deparse, JoinType, LiteralValue, QueryBody, query_expr_parse,
@@ -543,7 +543,7 @@ mod tests {
         };
         ColumnMetadata {
             name: name.into(),
-            position,
+            position: ColumnPosition::from_raw(position),
             type_oid,
             data_type,
             type_name: type_name.into(),

@@ -5,15 +5,16 @@
 use ecow::EcoString;
 use iddqd::BiHashMap;
 use postgres_types::Type;
+use rootcause::Report;
 
 use super::entry::query_expr_resolve_scoped;
 use super::join_using::MergedJoinColumn;
-use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::QueryExpr;
 use crate::query::resolved::{
-    ResolveResult, ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
-    ResolvedSelectColumns,
+    ResolveError, ResolveResult, ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr,
+    ResolvedScalarExpr, ResolvedSelectColumns,
 };
 
 /// A FROM-clause entry visible in scope. Entries are kept in FROM order,
@@ -189,8 +190,12 @@ impl<'a> ResolutionScope<'a> {
         &mut self,
         resolved_query: &ResolvedQueryExpr,
         alias: &str,
-    ) {
-        let columns = derived_table_columns_extract(resolved_query);
+    ) -> ResolveResult<()> {
+        let columns = derived_table_columns_extract(resolved_query).ok_or_else(|| {
+            Report::from(ResolveError::TooManyColumns {
+                alias: alias.to_owned(),
+            })
+        })?;
 
         let synthetic_metadata = TableMetadata {
             replica_identity_full: false,
@@ -206,6 +211,7 @@ impl<'a> ResolutionScope<'a> {
             metadata: synthetic_metadata,
             alias: alias.into(),
         });
+        Ok(())
     }
 
     /// Find all tables in scope that contain a given column (for unqualified column resolution).
@@ -248,18 +254,21 @@ impl<'a> ResolutionScope<'a> {
 /// - `SELECT *`: returns all columns from all tables in the inner query
 /// - `SELECT col1, col2`: returns column metadata for each, using aliases as names
 /// - `SELECT <none>`: returns empty (e.g., EXISTS subqueries)
-fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<ColumnMetadata> {
+/// - `None`: a column position beyond `i16::MAX`
+fn derived_table_columns_extract(
+    resolved_query: &ResolvedQueryExpr,
+) -> Option<Vec<ColumnMetadata>> {
     let select = match &resolved_query.body {
         ResolvedQueryBody::Select(select) => select,
         // Set operation output columns are defined by the leftmost SELECT
         ResolvedQueryBody::SetOp(set_op) => {
             return derived_table_columns_extract(&set_op.left);
         }
-        ResolvedQueryBody::Values(_) => return Vec::new(),
+        ResolvedQueryBody::Values(_) => return Some(Vec::new()),
     };
 
     match &select.columns {
-        ResolvedSelectColumns::None => Vec::new(),
+        ResolvedSelectColumns::None => Some(Vec::new()),
         ResolvedSelectColumns::Columns(cols) => cols
             .iter()
             .enumerate()
@@ -267,6 +276,9 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                 // Functions, literals, etc. without an alias have no stable
                 // output name — skip them.
                 let name = col.output_name()?.clone();
+                let Some(position) = ColumnPosition::from_index(i) else {
+                    return Some(None);
+                };
 
                 // Use column metadata from the source column if available,
                 // otherwise create a synthetic entry with TEXT type
@@ -281,7 +293,7 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
                     | ResolvedScalarExpr::Array(_)
                     | ResolvedScalarExpr::TypeCast { .. } => ColumnMetadata {
                         name: name.clone(),
-                        position: i16::try_from(i + 1).expect("column position fits in i16"),
+                        position,
                         type_oid: TypeOid::from_raw(25), // TEXT OID
                         data_type: Type::TEXT,
                         type_name: EcoString::from("text"),
@@ -292,11 +304,11 @@ fn derived_table_columns_extract(resolved_query: &ResolvedQueryExpr) -> Vec<Colu
 
                 // Override name with alias if provided (the column metadata
                 // from the source has the original name)
-                Some(ColumnMetadata {
+                Some(Some(ColumnMetadata {
                     name,
-                    position: i16::try_from(i + 1).expect("column position fits in i16"),
+                    position,
                     ..base_meta
-                })
+                }))
             })
             .collect(),
     }

@@ -384,7 +384,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::{BinaryOp, LiteralValue, MultiOp, SubLinkType, UnaryOp};
     use crate::query::predicate::CompiledPredicate;
@@ -402,7 +402,7 @@ mod tests {
         let (type_name, cache_type_name) = names;
         ColumnMetadata {
             name: name.into(),
-            position,
+            position: ColumnPosition::from_raw(position),
             type_oid: TypeOid::from_type(&data_type),
             data_type,
             type_name: type_name.into(),
@@ -1555,7 +1555,7 @@ mod tests {
         let mut cols: Vec<ColumnMetadata> = table.columns.iter().cloned().collect();
         cols.push(ColumnMetadata {
             name: "price".into(),
-            position: 4,
+            position: ColumnPosition::from_raw(4),
             type_oid: TypeOid::from_raw(701),
             data_type: Type::FLOAT8,
             type_name: "double precision".into(),

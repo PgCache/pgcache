@@ -12,7 +12,9 @@ use tokio_postgres::Error;
 use tracing::error;
 
 use crate::cache::messages::CdcValue;
-use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata, cache_type_name_resolve};
+use crate::catalog::{
+    ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata, cache_type_name_resolve,
+};
 use crate::oid::{Oid, TypeOid};
 use crate::pg::protocol::ByteString;
 
@@ -43,7 +45,7 @@ pub(super) fn parse_relation_to_table_metadata(relation_body: &RelationBody) -> 
         let column_metadata = ColumnMetadata {
             name: column.name().unwrap_or("unknown_column").into(),
             // PostgreSQL caps tables at 1600 columns.
-            position: i16::try_from(idx + 1).unwrap_or(i16::MAX),
+            position: ColumnPosition::from_index(idx).unwrap_or(ColumnPosition::MAX),
             type_oid,
             data_type,
             type_name: type_name.into(),

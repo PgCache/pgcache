@@ -823,7 +823,7 @@ mod point {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::pg::protocol::ByteString;
     use crate::query::constraint_index::point::{ColumnForms, row_value_forms};
@@ -838,7 +838,7 @@ mod point {
         let columns = ColumnStore::new([
             ColumnMetadata {
                 name: "id".into(),
-                position: 1,
+                position: ColumnPosition::from_raw(1),
                 type_oid: TypeOid::from_raw(23),
                 data_type: Type::INT4,
                 type_name: "integer".into(),
@@ -847,7 +847,7 @@ mod point {
             },
             ColumnMetadata {
                 name: "name".into(),
-                position: 2,
+                position: ColumnPosition::from_raw(2),
                 type_oid: TypeOid::from_raw(25),
                 data_type: Type::TEXT,
                 type_name: "text".into(),
@@ -856,7 +856,7 @@ mod point {
             },
             ColumnMetadata {
                 name: "active".into(),
-                position: 3,
+                position: ColumnPosition::from_raw(3),
                 type_oid: TypeOid::from_raw(16),
                 data_type: Type::BOOL,
                 type_name: "boolean".into(),

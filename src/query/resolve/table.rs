@@ -126,7 +126,7 @@ pub(super) fn table_source_resolve<'a>(
             let resolved_query = query_expr_resolve(&subquery.query, tables, search_path)?;
 
             // Add derived table to outer scope so outer columns can reference it
-            scope.derived_table_scope_add(&resolved_query, &alias.name);
+            scope.derived_table_scope_add(&resolved_query, &alias.name)?;
 
             Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
                 query: Box::new(resolved_query),
@@ -149,7 +149,7 @@ pub(super) fn table_source_resolve<'a>(
                 columns: cte_ref.column_aliases.clone(),
             };
 
-            scope.derived_table_scope_add(&resolved_query, alias_name);
+            scope.derived_table_scope_add(&resolved_query, alias_name)?;
 
             Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
                 query: Box::new(resolved_query),

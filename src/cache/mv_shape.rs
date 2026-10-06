@@ -218,7 +218,7 @@ pub(super) mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
     use crate::query::resolved::query_expr_resolve;
@@ -236,7 +236,7 @@ pub(super) mod tests {
             let is_pk = i == 0;
             ColumnMetadata {
                 name: (*c).into(),
-                position: i16::try_from(i + 1).expect("column position fits in i16"),
+                position: ColumnPosition::from_index(i).expect("column position in range"),
                 type_oid: TypeOid::from_raw(if is_pk { 23 } else { 25 }),
                 data_type: if is_pk { Type::INT4 } else { Type::TEXT },
                 type_name: if is_pk { "int4" } else { "text" }.into(),

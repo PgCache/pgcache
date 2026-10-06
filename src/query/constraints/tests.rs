@@ -6,7 +6,7 @@ use postgres_types::Type;
 use super::extract::analyze_query_constraints;
 use super::subsume::table_constraints_subsumed;
 use super::*;
-use crate::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{QueryBody, query_expr_parse};
 use crate::query::resolved::{ResolvedSelectNode, select_node_resolve};
@@ -25,7 +25,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
     let columns = ColumnStore::new([
         ColumnMetadata {
             name: "id".into(),
-            position: 1,
+            position: ColumnPosition::from_raw(1),
             type_oid: TypeOid::from_raw(23),
             data_type: Type::INT4,
             type_name: "int4".into(),
@@ -34,7 +34,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
         },
         ColumnMetadata {
             name: "name".into(),
-            position: 2,
+            position: ColumnPosition::from_raw(2),
             type_oid: TypeOid::from_raw(25),
             data_type: Type::TEXT,
             type_name: "text".into(),
@@ -617,7 +617,7 @@ fn test_transitive_propagation() {
         primary_key_columns: vec!["id".into()],
         columns: ColumnStore::new([ColumnMetadata {
             name: "id".into(),
-            position: 1,
+            position: ColumnPosition::from_raw(1),
             type_oid: TypeOid::from_raw(23),
             data_type: Type::INT4,
             type_name: "int4".into(),
