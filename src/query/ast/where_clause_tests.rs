@@ -10,6 +10,111 @@ fn where_clause_parse(sql: &str) -> Result<Option<WhereExpr>, AstError> {
     Ok(query_expr.where_clause().cloned())
 }
 
+fn col(name: &str) -> WhereExpr {
+    WhereExpr::Scalar(s_col(name))
+}
+
+fn qcol(table: &str, name: &str) -> WhereExpr {
+    WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+        table: Some(EcoString::from(table)),
+        column: EcoString::from(name),
+    }))
+}
+
+fn lit(value: LiteralValue) -> WhereExpr {
+    WhereExpr::Scalar(ScalarExpr::Literal(value))
+}
+
+fn text(value: &str) -> WhereExpr {
+    lit(LiteralValue::String(value.into()))
+}
+
+fn int(value: i64) -> WhereExpr {
+    lit(LiteralValue::Integer(value))
+}
+
+fn param(name: &str) -> WhereExpr {
+    lit(LiteralValue::Parameter(name.into()))
+}
+
+fn boolean(value: bool) -> WhereExpr {
+    lit(LiteralValue::Boolean(value))
+}
+
+fn null() -> WhereExpr {
+    lit(LiteralValue::Null)
+}
+
+fn cmp(op: BinaryOp, lexpr: WhereExpr, rexpr: WhereExpr) -> WhereExpr {
+    WhereExpr::Binary(BinaryExpr {
+        op,
+        lexpr: Box::new(lexpr),
+        rexpr: Box::new(rexpr),
+    })
+}
+
+fn and(lexpr: WhereExpr, rexpr: WhereExpr) -> WhereExpr {
+    cmp(BinaryOp::And, lexpr, rexpr)
+}
+
+fn or(lexpr: WhereExpr, rexpr: WhereExpr) -> WhereExpr {
+    cmp(BinaryOp::Or, lexpr, rexpr)
+}
+
+fn unary(op: UnaryOp, expr: WhereExpr) -> WhereExpr {
+    WhereExpr::Unary(UnaryExpr {
+        op,
+        expr: Box::new(expr),
+    })
+}
+
+fn not(expr: WhereExpr) -> WhereExpr {
+    unary(UnaryOp::Not, expr)
+}
+
+fn multi(op: MultiOp, exprs: Vec<WhereExpr>) -> WhereExpr {
+    WhereExpr::Multi(MultiExpr { op, exprs })
+}
+
+fn array(elements: Vec<ScalarExpr>) -> WhereExpr {
+    WhereExpr::Scalar(ScalarExpr::Array(elements))
+}
+
+fn s_col(name: &str) -> ScalarExpr {
+    ScalarExpr::Column(ColumnNode {
+        table: None,
+        column: EcoString::from(name),
+    })
+}
+
+fn s_int(value: i64) -> ScalarExpr {
+    ScalarExpr::Literal(LiteralValue::Integer(value))
+}
+
+fn s_text(value: &str) -> ScalarExpr {
+    ScalarExpr::Literal(LiteralValue::String(value.into()))
+}
+
+fn s_param(name: &str) -> ScalarExpr {
+    ScalarExpr::Literal(LiteralValue::Parameter(name.into()))
+}
+
+fn arith(op: ArithmeticOp, left: ScalarExpr, right: ScalarExpr) -> ScalarExpr {
+    ScalarExpr::Arithmetic(ArithmeticExpr {
+        left: Box::new(left),
+        op,
+        right: Box::new(right),
+    })
+}
+
+/// Each case's WHERE clause must parse to exactly the expected tree.
+fn where_cases_check(cases: Vec<(&str, &str, Option<WhereExpr>)>) {
+    for (label, sql, expected) in cases {
+        let actual = where_clause_parse(sql).unwrap_or_else(|e| panic!("{label}: {sql}: {e:?}"));
+        assert_eq!(actual, expected, "{label}: {sql}");
+    }
+}
+
 #[test]
 fn fingerprint_literals_differ() {
     let q1 = query_expr_parse("select id, str from test where str = 'hello'").unwrap();
@@ -39,1180 +144,6 @@ fn select_columns() {
     assert!(matches!(&cols[1].expr().unwrap(), ScalarExpr::Column(c) if c.column == "str"));
 }
 
-#[test]
-fn where_clause_simple_equality() {
-    let result = where_clause_parse("SELECT id, str FROM test WHERE str = 'hello'");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::Equal,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("str"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::String("hello".into()),
-        ))),
-    }));
-
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_integer_equality() {
-    let result = where_clause_parse("SELECT id FROM test WHERE id = 123");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::Equal,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("id"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::Integer(123),
-        ))),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_boolean_equality() {
-    let result = where_clause_parse("SELECT id FROM test WHERE active = true");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::Equal,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("active"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::Boolean(true),
-        ))),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_greater_than() {
-    let result = where_clause_parse("SELECT id FROM test WHERE cnt > 0");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::GreaterThan,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("cnt"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::Integer(0),
-        ))),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_and_operation() {
-    let result = where_clause_parse("SELECT id FROM test WHERE str = 'hello' AND id = 123");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::And,
-        lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("str"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::String("hello".into()),
-            ))),
-        })),
-        rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("id"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::Integer(123),
-            ))),
-        })),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_or_operation() {
-    let result = where_clause_parse("SELECT id FROM test WHERE str = 'hello' OR str = 'world'");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::Or,
-        lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("str"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::String("hello".into()),
-            ))),
-        })),
-        rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("str"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::String("world".into()),
-            ))),
-        })),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_not_operation() {
-    let result = where_clause_parse("SELECT id FROM test WHERE NOT str = 'hello'");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Unary(UnaryExpr {
-        op: UnaryOp::Not,
-        expr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("str"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::String("hello".into()),
-            ))),
-        })),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_qualified_column() {
-    let result = where_clause_parse("SELECT id FROM test WHERE test.str = 'hello'");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::Equal,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: Some(EcoString::from("test")),
-            column: EcoString::from("str"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::String("hello".into()),
-        ))),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_null_value() {
-    let result = where_clause_parse("SELECT id FROM test WHERE data = NULL");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::Equal,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("data"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Null))),
-    }));
-
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_no_where() {
-    let result = where_clause_parse("SELECT id FROM test");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    assert_eq!(where_clause, None);
-}
-
-#[test]
-fn where_clause_not_equal_with_exclamation() {
-    let result = where_clause_parse("SELECT id FROM test WHERE id != 123");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::NotEqual,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("id"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::Integer(123),
-        ))),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_not_equal_with_angle_brackets() {
-    let result = where_clause_parse("SELECT id FROM test WHERE id <> 123");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::NotEqual,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("id"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::Integer(123),
-        ))),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_less_than() {
-    let result = where_clause_parse("SELECT id FROM test WHERE id < 123");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::LessThan,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("id"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::Integer(123),
-        ))),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_less_than_or_equal() {
-    let result = where_clause_parse("SELECT id FROM test WHERE id <= 123");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::LessThanOrEqual,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("id"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::Integer(123),
-        ))),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_greater_than_or_equal() {
-    let result = where_clause_parse("SELECT id FROM test WHERE id >= 123");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::GreaterThanOrEqual,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("id"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::Integer(123),
-        ))),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_like() {
-    let result = where_clause_parse("SELECT id FROM test WHERE name LIKE 'test%'");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::Like);
-
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = binary.lexpr.as_ref() else {
-        panic!("expected Column on left");
-    };
-    assert_eq!(col.column, "name");
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(pattern))) =
-        binary.rexpr.as_ref()
-    else {
-        panic!("expected string pattern on right");
-    };
-    assert_eq!(pattern, "test%");
-}
-
-#[test]
-fn where_clause_chained_and_operation() {
-    let result = where_clause_parse(
-        "SELECT id FROM test WHERE name = 'john' AND age > 25 AND active = true",
-    );
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    // Should build a left-associative tree: ((name = 'john' AND age > 25) AND active = true)
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::And,
-        lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::And,
-            lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                    table: None,
-                    column: EcoString::from("name"),
-                }))),
-                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::String("john".into()),
-                ))),
-            })),
-            rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: BinaryOp::GreaterThan,
-                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                    table: None,
-                    column: EcoString::from("age"),
-                }))),
-                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::Integer(25),
-                ))),
-            })),
-        })),
-        rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("active"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::Boolean(true),
-            ))),
-        })),
-    }));
-
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_chained_or_operation() {
-    let result = where_clause_parse(
-        "SELECT id FROM test WHERE name = 'john' OR name = 'jane' OR name = 'bob'",
-    );
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    // Should build a left-associative tree: ((name = 'john' OR name = 'jane') OR name = 'bob')
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::Or,
-        lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Or,
-            lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                    table: None,
-                    column: EcoString::from("name"),
-                }))),
-                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::String("john".into()),
-                ))),
-            })),
-            rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-                op: BinaryOp::Equal,
-                lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                    table: None,
-                    column: EcoString::from("name"),
-                }))),
-                rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                    LiteralValue::String("jane".into()),
-                ))),
-            })),
-        })),
-        rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("name"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::String("bob".into()),
-            ))),
-        })),
-    }));
-
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_parameterized_query_single() {
-    let result = where_clause_parse("SELECT id FROM test WHERE id = $1");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::Equal,
-        lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-            table: None,
-            column: EcoString::from("id"),
-        }))),
-        rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-            LiteralValue::Parameter("$1".into()),
-        ))),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_parameterized_query_multiple() {
-    let result = where_clause_parse("SELECT id FROM test WHERE name = $1 AND age > $2");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::And,
-        lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("name"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::Parameter("$1".into()),
-            ))),
-        })),
-        rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::GreaterThan,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("age"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::Parameter("$2".into()),
-            ))),
-        })),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_parameterized_query_mixed_with_literals() {
-    let result = where_clause_parse("SELECT id FROM test WHERE name = $1 AND active = true");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap();
-
-    let expected = Some(WhereExpr::Binary(BinaryExpr {
-        op: BinaryOp::And,
-        lexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("name"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::Parameter("$1".into()),
-            ))),
-        })),
-        rexpr: Box::new(WhereExpr::Binary(BinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-                table: None,
-                column: EcoString::from("active"),
-            }))),
-            rexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Literal(
-                LiteralValue::Boolean(true),
-            ))),
-        })),
-    }));
-    assert_eq!(where_clause, expected);
-}
-
-#[test]
-fn where_clause_in_with_strings() {
-    let result =
-        where_clause_parse("SELECT * FROM t WHERE status IN ('active', 'pending', 'complete')");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr, got {:?}", where_clause);
-    };
-
-    assert_eq!(multi.op, MultiOp::In);
-    assert_eq!(multi.exprs.len(), 4); // column + 3 values
-
-    // First element should be the column
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = &multi.exprs[0] else {
-        panic!("expected Column");
-    };
-    assert_eq!(col.column, "status");
-
-    // Remaining elements should be string values
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(v1))) = &multi.exprs[1] else {
-        panic!("expected string value");
-    };
-    assert_eq!(v1, "active");
-}
-
-#[test]
-fn where_clause_not_in() {
-    let result = where_clause_parse("SELECT * FROM t WHERE id NOT IN (1, 2, 3)");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(multi.op, MultiOp::NotIn);
-    assert_eq!(multi.exprs.len(), 4); // column + 3 values
-}
-
-#[test]
-fn where_clause_in_with_integers() {
-    let result = where_clause_parse("SELECT * FROM t WHERE id IN (1, 2, 3)");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(multi.op, MultiOp::In);
-
-    // Check that values are integers
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(v1))) = &multi.exprs[1] else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*v1, 1);
-}
-
-#[test]
-fn where_clause_in_combined_with_and() {
-    let result = where_clause_parse(
-        "SELECT * FROM t WHERE tenant_id = 1 AND status IN ('active', 'pending')",
-    );
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    // Should be AND(tenant_id = 1, status IN (...))
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::And);
-
-    // Right side should be the IN clause
-    let WhereExpr::Multi(multi) = binary.rexpr.as_ref() else {
-        panic!("expected MultiExpr on right side");
-    };
-    assert_eq!(multi.op, MultiOp::In);
-}
-
-#[test]
-fn where_clause_is_null() {
-    let result = where_clause_parse("SELECT id FROM test WHERE deleted_at IS NULL");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Unary(unary) = where_clause else {
-        panic!("expected UnaryExpr");
-    };
-
-    assert_eq!(unary.op, UnaryOp::IsNull);
-
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
-        panic!("expected Column");
-    };
-    assert_eq!(col.column, "deleted_at");
-}
-
-#[test]
-fn where_clause_is_not_null() {
-    let result = where_clause_parse("SELECT id FROM test WHERE name IS NOT NULL");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Unary(unary) = where_clause else {
-        panic!("expected UnaryExpr");
-    };
-
-    assert_eq!(unary.op, UnaryOp::IsNotNull);
-
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
-        panic!("expected Column");
-    };
-    assert_eq!(col.column, "name");
-}
-
-#[test]
-fn where_clause_is_true() {
-    let result = where_clause_parse("SELECT id FROM test WHERE active IS TRUE");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Unary(unary) = where_clause else {
-        panic!("expected UnaryExpr");
-    };
-
-    assert_eq!(unary.op, UnaryOp::IsTrue);
-
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
-        panic!("expected Column");
-    };
-    assert_eq!(col.column, "active");
-}
-
-#[test]
-fn where_clause_is_false() {
-    let result = where_clause_parse("SELECT id FROM test WHERE active IS FALSE");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Unary(unary) = where_clause else {
-        panic!("expected UnaryExpr");
-    };
-
-    assert_eq!(unary.op, UnaryOp::IsFalse);
-
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
-        panic!("expected Column");
-    };
-    assert_eq!(col.column, "active");
-}
-
-#[test]
-fn where_clause_is_not_true() {
-    let result = where_clause_parse("SELECT id FROM test WHERE active IS NOT TRUE");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Unary(unary) = where_clause else {
-        panic!("expected UnaryExpr");
-    };
-
-    assert_eq!(unary.op, UnaryOp::IsNotTrue);
-
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
-        panic!("expected Column");
-    };
-    assert_eq!(col.column, "active");
-}
-
-#[test]
-fn where_clause_is_not_false() {
-    let result = where_clause_parse("SELECT id FROM test WHERE active IS NOT FALSE");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Unary(unary) = where_clause else {
-        panic!("expected UnaryExpr");
-    };
-
-    assert_eq!(unary.op, UnaryOp::IsNotFalse);
-
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = unary.expr.as_ref() else {
-        panic!("expected Column");
-    };
-    assert_eq!(col.column, "active");
-}
-
-#[test]
-fn where_clause_is_true_combined_with_and() {
-    let result = where_clause_parse("SELECT * FROM t WHERE id = 1 AND active IS TRUE");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::And);
-
-    let WhereExpr::Unary(unary) = binary.rexpr.as_ref() else {
-        panic!("expected UnaryExpr on right side");
-    };
-    assert_eq!(unary.op, UnaryOp::IsTrue);
-}
-
-#[test]
-fn where_clause_is_unknown_maps_to_is_null() {
-    let result = where_clause_parse("SELECT id FROM test WHERE active IS UNKNOWN");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Unary(unary) = where_clause else {
-        panic!("expected UnaryExpr");
-    };
-
-    // IS UNKNOWN is semantically identical to IS NULL
-    assert_eq!(unary.op, UnaryOp::IsNull);
-}
-
-#[test]
-fn where_clause_is_not_unknown_maps_to_is_not_null() {
-    let result = where_clause_parse("SELECT id FROM test WHERE active IS NOT UNKNOWN");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Unary(unary) = where_clause else {
-        panic!("expected UnaryExpr");
-    };
-
-    // IS NOT UNKNOWN is semantically identical to IS NOT NULL
-    assert_eq!(unary.op, UnaryOp::IsNotNull);
-}
-
-#[test]
-fn where_clause_is_null_combined_with_and() {
-    let result = where_clause_parse("SELECT * FROM t WHERE id = 1 AND deleted_at IS NULL");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    // Should be AND(id = 1, deleted_at IS NULL)
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::And);
-
-    // Right side should be IS NULL
-    let WhereExpr::Unary(unary) = binary.rexpr.as_ref() else {
-        panic!("expected UnaryExpr on right side");
-    };
-    assert_eq!(unary.op, UnaryOp::IsNull);
-}
-
-#[test]
-fn where_clause_between_integers() {
-    let result = where_clause_parse("SELECT * FROM t WHERE id BETWEEN 1 AND 10");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(multi.op, MultiOp::Between);
-    assert_eq!(multi.exprs.len(), 3);
-
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = &multi.exprs[0] else {
-        panic!("expected Column");
-    };
-    assert_eq!(col.column, "id");
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(low))) = &multi.exprs[1] else {
-        panic!("expected integer low bound");
-    };
-    assert_eq!(*low, 1);
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(high))) = &multi.exprs[2]
-    else {
-        panic!("expected integer high bound");
-    };
-    assert_eq!(*high, 10);
-}
-
-#[test]
-fn where_clause_not_between() {
-    let result = where_clause_parse("SELECT * FROM t WHERE price NOT BETWEEN 100 AND 200");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(multi.op, MultiOp::NotBetween);
-    assert_eq!(multi.exprs.len(), 3);
-}
-
-#[test]
-fn where_clause_between_with_parameters() {
-    let result = where_clause_parse("SELECT * FROM t WHERE created_at BETWEEN $1 AND $2");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(multi.op, MultiOp::Between);
-    assert_eq!(multi.exprs.len(), 3);
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Parameter(p1))) = &multi.exprs[1]
-    else {
-        panic!("expected parameter low bound");
-    };
-    assert_eq!(p1, "$1");
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Parameter(p2))) = &multi.exprs[2]
-    else {
-        panic!("expected parameter high bound");
-    };
-    assert_eq!(p2, "$2");
-}
-
-#[test]
-fn where_clause_between_combined_with_and() {
-    let result =
-        where_clause_parse("SELECT * FROM t WHERE tenant_id = 1 AND price BETWEEN 10 AND 50");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::And);
-
-    let WhereExpr::Multi(multi) = binary.rexpr.as_ref() else {
-        panic!("expected MultiExpr on right side");
-    };
-    assert_eq!(multi.op, MultiOp::Between);
-}
-
-#[test]
-fn where_clause_between_strings() {
-    let result = where_clause_parse("SELECT * FROM t WHERE name BETWEEN 'alice' AND 'charlie'");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(multi.op, MultiOp::Between);
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(low))) = &multi.exprs[1] else {
-        panic!("expected string low bound");
-    };
-    assert_eq!(low, "alice");
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::String(high))) = &multi.exprs[2] else {
-        panic!("expected string high bound");
-    };
-    assert_eq!(high, "charlie");
-}
-
-#[test]
-fn where_clause_between_symmetric() {
-    let result = where_clause_parse("SELECT * FROM t WHERE id BETWEEN SYMMETRIC 10 AND 1");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(multi.op, MultiOp::BetweenSymmetric);
-    assert_eq!(multi.exprs.len(), 3);
-
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = &multi.exprs[0] else {
-        panic!("expected Column");
-    };
-    assert_eq!(col.column, "id");
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(low))) = &multi.exprs[1] else {
-        panic!("expected integer low bound");
-    };
-    assert_eq!(*low, 10);
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(high))) = &multi.exprs[2]
-    else {
-        panic!("expected integer high bound");
-    };
-    assert_eq!(*high, 1);
-}
-
-#[test]
-fn where_clause_not_between_symmetric() {
-    let result = where_clause_parse("SELECT * FROM t WHERE id NOT BETWEEN SYMMETRIC 10 AND 1");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(multi.op, MultiOp::NotBetweenSymmetric);
-    assert_eq!(multi.exprs.len(), 3);
-}
-
-#[test]
-fn where_clause_any_with_array() {
-    let result = where_clause_parse("SELECT * FROM t WHERE id = ANY(ARRAY[1, 2, 3])");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(
-        multi.op,
-        MultiOp::Any {
-            comparison: BinaryOp::Equal
-        }
-    );
-    // [col, ARRAY[1, 2, 3]]
-    assert_eq!(multi.exprs.len(), 2);
-
-    let WhereExpr::Scalar(ScalarExpr::Column(col)) = &multi.exprs[0] else {
-        panic!("expected Column");
-    };
-    assert_eq!(col.column, "id");
-
-    let WhereExpr::Scalar(ScalarExpr::Array(elems)) = &multi.exprs[1] else {
-        panic!("expected Array");
-    };
-    assert_eq!(elems.len(), 3);
-
-    let ScalarExpr::Literal(LiteralValue::Integer(v1)) = &elems[0] else {
-        panic!("expected integer");
-    };
-    assert_eq!(*v1, 1);
-}
-
-#[test]
-fn where_clause_any_with_parameter() {
-    let result = where_clause_parse("SELECT * FROM t WHERE id = ANY($1)");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(
-        multi.op,
-        MultiOp::Any {
-            comparison: BinaryOp::Equal
-        }
-    );
-    // [col, $1] — parameter passed through as single value
-    assert_eq!(multi.exprs.len(), 2);
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Parameter(p))) = &multi.exprs[1] else {
-        panic!("expected parameter");
-    };
-    assert_eq!(p, "$1");
-}
-
-#[test]
-fn where_clause_all_with_array() {
-    let result = where_clause_parse("SELECT * FROM t WHERE score > ALL(ARRAY[80, 90])");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(
-        multi.op,
-        MultiOp::All {
-            comparison: BinaryOp::GreaterThan
-        }
-    );
-    // [col, ARRAY[80, 90]]
-    assert_eq!(multi.exprs.len(), 2);
-}
-
-#[test]
-fn where_clause_any_not_equal() {
-    let result = where_clause_parse("SELECT * FROM t WHERE status <> ANY(ARRAY['a', 'b'])");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Multi(multi) = where_clause else {
-        panic!("expected MultiExpr");
-    };
-
-    assert_eq!(
-        multi.op,
-        MultiOp::Any {
-            comparison: BinaryOp::NotEqual
-        }
-    );
-    // [col, ARRAY['a', 'b']]
-    assert_eq!(multi.exprs.len(), 2);
-}
-
-#[test]
-fn where_clause_any_combined_with_and() {
-    let result =
-        where_clause_parse("SELECT * FROM t WHERE tenant_id = 1 AND id = ANY(ARRAY[10, 20])");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::And);
-
-    let WhereExpr::Multi(multi) = binary.rexpr.as_ref() else {
-        panic!("expected MultiExpr on right side");
-    };
-    assert_eq!(
-        multi.op,
-        MultiOp::Any {
-            comparison: BinaryOp::Equal
-        }
-    );
-}
-
-#[test]
-fn where_clause_not_like() {
-    let result = where_clause_parse("SELECT * FROM t WHERE name NOT LIKE '%test%'");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::NotLike);
-}
-
-#[test]
-fn where_clause_ilike() {
-    let result = where_clause_parse("SELECT * FROM t WHERE name ILIKE '%test%'");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::ILike);
-}
-
-#[test]
-fn where_clause_not_ilike() {
-    let result = where_clause_parse("SELECT * FROM t WHERE name NOT ILIKE '%test%'");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::NotILike);
-}
-
-#[test]
-fn where_clause_like_with_parameter() {
-    let result = where_clause_parse("SELECT * FROM t WHERE name LIKE $1");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::Like);
-
-    let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Parameter(p))) = binary.rexpr.as_ref()
-    else {
-        panic!("expected parameter on right");
-    };
-    assert_eq!(p, "$1");
-}
-
-#[test]
-fn where_clause_like_combined_with_and() {
-    let result = where_clause_parse("SELECT * FROM t WHERE tenant_id = 1 AND name LIKE 'test%'");
-
-    assert!(result.is_ok());
-    let where_clause = result.unwrap().unwrap();
-
-    let WhereExpr::Binary(binary) = where_clause else {
-        panic!("expected BinaryExpr");
-    };
-
-    assert_eq!(binary.op, BinaryOp::And);
-
-    let WhereExpr::Binary(right) = binary.rexpr.as_ref() else {
-        panic!("expected BinaryExpr on right side");
-    };
-    assert_eq!(right.op, BinaryOp::Like);
-}
-
 // ------------------------------------------------------------------
 // Arithmetic in WHERE (PGC-118 layer 1)
 //
@@ -1232,81 +163,6 @@ fn where_clause_rhs(sql: &str) -> ScalarExpr {
         panic!("expected scalar RHS");
     };
     scalar
-}
-
-#[test]
-fn where_clause_arithmetic_with_column_left() {
-    let ScalarExpr::Arithmetic(arith) = where_clause_rhs("SELECT * FROM t WHERE x = a + 1") else {
-        panic!("expected arithmetic RHS");
-    };
-    assert_eq!(arith.op, ArithmeticOp::Add);
-    assert!(matches!(*arith.left, ScalarExpr::Column(ref c) if c.column == "a"));
-    assert!(matches!(
-        *arith.right,
-        ScalarExpr::Literal(LiteralValue::Integer(1))
-    ));
-}
-
-#[test]
-fn where_clause_arithmetic_modulo_with_parameter() {
-    let ScalarExpr::Arithmetic(arith) = where_clause_rhs("SELECT * FROM t WHERE x = $1 % 10")
-    else {
-        panic!("expected arithmetic RHS");
-    };
-    assert_eq!(arith.op, ArithmeticOp::Modulo);
-    assert!(matches!(
-        *arith.left,
-        ScalarExpr::Literal(LiteralValue::Parameter(_))
-    ));
-    assert!(matches!(
-        *arith.right,
-        ScalarExpr::Literal(LiteralValue::Integer(10))
-    ));
-}
-
-#[test]
-fn where_clause_arithmetic_all_ops() {
-    for (sql, expected_op) in [
-        ("SELECT * FROM t WHERE x = a + 2", ArithmeticOp::Add),
-        ("SELECT * FROM t WHERE x = a - 2", ArithmeticOp::Subtract),
-        ("SELECT * FROM t WHERE x = a * 2", ArithmeticOp::Multiply),
-        ("SELECT * FROM t WHERE x = a / 2", ArithmeticOp::Divide),
-        ("SELECT * FROM t WHERE x = a % 3", ArithmeticOp::Modulo),
-    ] {
-        let ScalarExpr::Arithmetic(arith) = where_clause_rhs(sql) else {
-            panic!("expected arithmetic RHS for {sql}");
-        };
-        assert_eq!(arith.op, expected_op, "{sql}");
-    }
-}
-
-#[test]
-fn where_clause_arithmetic_nested_with_parameter() {
-    // PGC-118 bench query shape, with a parameter to keep arithmetic observable.
-    let ScalarExpr::Arithmetic(outer) =
-        where_clause_rhs("SELECT * FROM t WHERE user_id = $1 % 10000 + 1")
-    else {
-        panic!("expected outer arithmetic");
-    };
-    assert_eq!(outer.op, ArithmeticOp::Add);
-    let ScalarExpr::Arithmetic(inner) = &*outer.left else {
-        panic!("expected inner arithmetic on left");
-    };
-    assert_eq!(inner.op, ArithmeticOp::Modulo);
-    assert!(matches!(
-        *outer.right,
-        ScalarExpr::Literal(LiteralValue::Integer(1))
-    ));
-}
-
-#[test]
-fn where_clause_arithmetic_two_columns() {
-    let ScalarExpr::Arithmetic(arith) = where_clause_rhs("SELECT * FROM t WHERE x = a + b") else {
-        panic!("expected arithmetic RHS");
-    };
-    assert_eq!(arith.op, ArithmeticOp::Add);
-    assert!(matches!(*arith.left, ScalarExpr::Column(ref c) if c.column == "a"));
-    assert!(matches!(*arith.right, ScalarExpr::Column(ref c) if c.column == "b"));
 }
 
 #[test]
@@ -1356,5 +212,165 @@ fn where_clause_typecast_deparse() {
             query_expr_fingerprint(&q2),
             "fingerprint mismatch after deparse round-trip\n  in:  {sql}\n  out: {buf}",
         );
+    }
+}
+
+#[test]
+fn test_where_comparison_cases() {
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+        ("=, text", "SELECT id, str FROM test WHERE str = 'hello'", Some(cmp(BinaryOp::Equal, col("str"), text("hello")))),
+        ("=, integer", "SELECT id FROM test WHERE id = 123", Some(cmp(BinaryOp::Equal, col("id"), int(123)))),
+        ("=, boolean", "SELECT id FROM test WHERE active = true", Some(cmp(BinaryOp::Equal, col("active"), boolean(true)))),
+        (">", "SELECT id FROM test WHERE cnt > 0", Some(cmp(BinaryOp::GreaterThan, col("cnt"), int(0)))),
+        ("!=", "SELECT id FROM test WHERE id != 123", Some(cmp(BinaryOp::NotEqual, col("id"), int(123)))),
+        ("<>", "SELECT id FROM test WHERE id <> 123", Some(cmp(BinaryOp::NotEqual, col("id"), int(123)))),
+        ("<", "SELECT id FROM test WHERE id < 123", Some(cmp(BinaryOp::LessThan, col("id"), int(123)))),
+        ("<=", "SELECT id FROM test WHERE id <= 123", Some(cmp(BinaryOp::LessThanOrEqual, col("id"), int(123)))),
+        (">=", "SELECT id FROM test WHERE id >= 123", Some(cmp(BinaryOp::GreaterThanOrEqual, col("id"), int(123)))),
+        ("qualified column", "SELECT id FROM test WHERE test.str = 'hello'", Some(cmp(BinaryOp::Equal, qcol("test", "str"), text("hello")))),
+        ("= NULL", "SELECT id FROM test WHERE data = NULL", Some(cmp(BinaryOp::Equal, col("data"), null()))),
+        ("no WHERE", "SELECT id FROM test", None),
+    ];
+    where_cases_check(cases);
+}
+
+#[test]
+fn test_where_logical_cases() {
+    // AND and OR chains associate to the left.
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+        ("AND", "SELECT id FROM test WHERE str = 'hello' AND id = 123", Some(and(cmp(BinaryOp::Equal, col("str"), text("hello")), cmp(BinaryOp::Equal, col("id"), int(123))))),
+        ("OR", "SELECT id FROM test WHERE str = 'hello' OR str = 'world'", Some(or(cmp(BinaryOp::Equal, col("str"), text("hello")), cmp(BinaryOp::Equal, col("str"), text("world"))))),
+        ("NOT", "SELECT id FROM test WHERE NOT str = 'hello'", Some(not(cmp(BinaryOp::Equal, col("str"), text("hello"))))),
+        ("chained AND (left-assoc)", "SELECT id FROM test WHERE name = 'john' AND age > 25 AND active = true", Some(and(and(cmp(BinaryOp::Equal, col("name"), text("john")), cmp(BinaryOp::GreaterThan, col("age"), int(25))), cmp(BinaryOp::Equal, col("active"), boolean(true))))),
+        ("chained OR (left-assoc)", "SELECT id FROM test WHERE name = 'john' OR name = 'jane' OR name = 'bob'", Some(or(or(cmp(BinaryOp::Equal, col("name"), text("john")), cmp(BinaryOp::Equal, col("name"), text("jane"))), cmp(BinaryOp::Equal, col("name"), text("bob"))))),
+    ];
+    where_cases_check(cases);
+}
+
+#[test]
+fn test_where_parameter_cases() {
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+        ("single", "SELECT id FROM test WHERE id = $1", Some(cmp(BinaryOp::Equal, col("id"), param("$1")))),
+        ("multiple", "SELECT id FROM test WHERE name = $1 AND age > $2", Some(and(cmp(BinaryOp::Equal, col("name"), param("$1")), cmp(BinaryOp::GreaterThan, col("age"), param("$2"))))),
+        ("mixed with literals", "SELECT id FROM test WHERE name = $1 AND active = true", Some(and(cmp(BinaryOp::Equal, col("name"), param("$1")), cmp(BinaryOp::Equal, col("active"), boolean(true))))),
+    ];
+    where_cases_check(cases);
+}
+
+#[test]
+fn test_where_in_list_cases() {
+    // The tested column first, then the list values.
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+        ("IN strings",       "SELECT * FROM t WHERE status IN ('active', 'pending', 'complete')",
+                             Some(multi(MultiOp::In, vec![col("status"), text("active"), text("pending"), text("complete")]))),
+        ("NOT IN",           "SELECT * FROM t WHERE id NOT IN (1, 2, 3)",
+                             Some(multi(MultiOp::NotIn, vec![col("id"), int(1), int(2), int(3)]))),
+        ("IN integers",      "SELECT * FROM t WHERE id IN (1, 2, 3)",
+                             Some(multi(MultiOp::In, vec![col("id"), int(1), int(2), int(3)]))),
+        ("IN under AND",     "SELECT * FROM t WHERE tenant_id = 1 AND status IN ('active', 'pending')",
+                             Some(and(cmp(BinaryOp::Equal, col("tenant_id"), int(1)), multi(MultiOp::In, vec![col("status"), text("active"), text("pending")])))),
+    ];
+    where_cases_check(cases);
+}
+
+#[test]
+fn test_where_is_test_cases() {
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+        ("IS NULL",                  "SELECT id FROM test WHERE deleted_at IS NULL",  Some(unary(UnaryOp::IsNull, col("deleted_at")))),
+        ("IS NOT NULL",              "SELECT id FROM test WHERE name IS NOT NULL",    Some(unary(UnaryOp::IsNotNull, col("name")))),
+        ("IS TRUE",                  "SELECT id FROM test WHERE active IS TRUE",      Some(unary(UnaryOp::IsTrue, col("active")))),
+        ("IS FALSE",                 "SELECT id FROM test WHERE active IS FALSE",     Some(unary(UnaryOp::IsFalse, col("active")))),
+        ("IS NOT TRUE",              "SELECT id FROM test WHERE active IS NOT TRUE",  Some(unary(UnaryOp::IsNotTrue, col("active")))),
+        ("IS NOT FALSE",             "SELECT id FROM test WHERE active IS NOT FALSE", Some(unary(UnaryOp::IsNotFalse, col("active")))),
+        ("IS UNKNOWN is IS NULL",    "SELECT id FROM test WHERE active IS UNKNOWN",     Some(unary(UnaryOp::IsNull, col("active")))),
+        ("IS NOT UNKNOWN is IS NOT NULL", "SELECT id FROM test WHERE active IS NOT UNKNOWN", Some(unary(UnaryOp::IsNotNull, col("active")))),
+        ("IS TRUE under AND",        "SELECT * FROM t WHERE id = 1 AND active IS TRUE",
+                                     Some(and(cmp(BinaryOp::Equal, col("id"), int(1)), unary(UnaryOp::IsTrue, col("active"))))),
+        ("IS NULL under AND",        "SELECT * FROM t WHERE id = 1 AND deleted_at IS NULL",
+                                     Some(and(cmp(BinaryOp::Equal, col("id"), int(1)), unary(UnaryOp::IsNull, col("deleted_at"))))),
+    ];
+    where_cases_check(cases);
+}
+
+#[test]
+fn test_where_between_cases() {
+    // The tested column, then the low and high bounds.
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+        ("integers",              "SELECT * FROM t WHERE id BETWEEN 1 AND 10",
+                                  Some(multi(MultiOp::Between, vec![col("id"), int(1), int(10)]))),
+        ("NOT BETWEEN",           "SELECT * FROM t WHERE price NOT BETWEEN 100 AND 200",
+                                  Some(multi(MultiOp::NotBetween, vec![col("price"), int(100), int(200)]))),
+        ("parameters",            "SELECT * FROM t WHERE created_at BETWEEN $1 AND $2",
+                                  Some(multi(MultiOp::Between, vec![col("created_at"), param("$1"), param("$2")]))),
+        ("under AND",             "SELECT * FROM t WHERE tenant_id = 1 AND price BETWEEN 10 AND 50",
+                                  Some(and(cmp(BinaryOp::Equal, col("tenant_id"), int(1)), multi(MultiOp::Between, vec![col("price"), int(10), int(50)])))),
+        ("strings",               "SELECT * FROM t WHERE name BETWEEN 'alice' AND 'charlie'",
+                                  Some(multi(MultiOp::Between, vec![col("name"), text("alice"), text("charlie")]))),
+        // SYMMETRIC keeps the bounds in written order; evaluation swaps them.
+        ("SYMMETRIC",             "SELECT * FROM t WHERE id BETWEEN SYMMETRIC 10 AND 1",
+                                  Some(multi(MultiOp::BetweenSymmetric, vec![col("id"), int(10), int(1)]))),
+        ("NOT BETWEEN SYMMETRIC", "SELECT * FROM t WHERE id NOT BETWEEN SYMMETRIC 10 AND 1",
+                                  Some(multi(MultiOp::NotBetweenSymmetric, vec![col("id"), int(10), int(1)]))),
+    ];
+    where_cases_check(cases);
+}
+
+#[test]
+fn test_where_any_all_cases() {
+    // The tested column, then the array (or array parameter).
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+        ("= ANY(ARRAY)",   "SELECT * FROM t WHERE id = ANY(ARRAY[1, 2, 3])",
+                           Some(multi(MultiOp::Any { comparison: BinaryOp::Equal }, vec![col("id"), array(vec![s_int(1), s_int(2), s_int(3)])]))),
+        ("= ANY($1)",      "SELECT * FROM t WHERE id = ANY($1)",
+                           Some(multi(MultiOp::Any { comparison: BinaryOp::Equal }, vec![col("id"), param("$1")]))),
+        ("> ALL(ARRAY)",   "SELECT * FROM t WHERE score > ALL(ARRAY[80, 90])",
+                           Some(multi(MultiOp::All { comparison: BinaryOp::GreaterThan }, vec![col("score"), array(vec![s_int(80), s_int(90)])]))),
+        ("<> ANY(ARRAY)",  "SELECT * FROM t WHERE status <> ANY(ARRAY['a', 'b'])",
+                           Some(multi(MultiOp::Any { comparison: BinaryOp::NotEqual }, vec![col("status"), array(vec![s_text("a"), s_text("b")])]))),
+        ("ANY under AND",  "SELECT * FROM t WHERE tenant_id = 1 AND id = ANY(ARRAY[10, 20])",
+                           Some(and(cmp(BinaryOp::Equal, col("tenant_id"), int(1)), multi(MultiOp::Any { comparison: BinaryOp::Equal }, vec![col("id"), array(vec![s_int(10), s_int(20)])])))),
+    ];
+    where_cases_check(cases);
+}
+
+#[test]
+fn test_where_like_cases() {
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+        ("LIKE",            "SELECT id FROM test WHERE name LIKE 'test%'",    Some(cmp(BinaryOp::Like, col("name"), text("test%")))),
+        ("NOT LIKE",        "SELECT * FROM t WHERE name NOT LIKE '%test%'",   Some(cmp(BinaryOp::NotLike, col("name"), text("%test%")))),
+        ("ILIKE",           "SELECT * FROM t WHERE name ILIKE '%test%'",      Some(cmp(BinaryOp::ILike, col("name"), text("%test%")))),
+        ("NOT ILIKE",       "SELECT * FROM t WHERE name NOT ILIKE '%test%'",  Some(cmp(BinaryOp::NotILike, col("name"), text("%test%")))),
+        ("LIKE $1",         "SELECT * FROM t WHERE name LIKE $1",             Some(cmp(BinaryOp::Like, col("name"), param("$1")))),
+        ("LIKE under AND",  "SELECT * FROM t WHERE tenant_id = 1 AND name LIKE 'test%'",
+                            Some(and(cmp(BinaryOp::Equal, col("tenant_id"), int(1)), cmp(BinaryOp::Like, col("name"), text("test%"))))),
+    ];
+    where_cases_check(cases);
+}
+
+#[test]
+fn test_where_arithmetic_rhs_cases() {
+    #[rustfmt::skip]
+    let cases: Vec<(&str, &str, ScalarExpr)> = vec![
+        ("column + literal",     "SELECT * FROM t WHERE x = a + 1",              arith(ArithmeticOp::Add, s_col("a"), s_int(1))),
+        ("-",                    "SELECT * FROM t WHERE x = a - 2",              arith(ArithmeticOp::Subtract, s_col("a"), s_int(2))),
+        ("*",                    "SELECT * FROM t WHERE x = a * 2",              arith(ArithmeticOp::Multiply, s_col("a"), s_int(2))),
+        ("/",                    "SELECT * FROM t WHERE x = a / 2",              arith(ArithmeticOp::Divide, s_col("a"), s_int(2))),
+        ("%",                    "SELECT * FROM t WHERE x = a % 3",              arith(ArithmeticOp::Modulo, s_col("a"), s_int(3))),
+        ("parameter % literal",  "SELECT * FROM t WHERE x = $1 % 10",            arith(ArithmeticOp::Modulo, s_param("$1"), s_int(10))),
+        // `%` binds tighter than `+`.
+        ("nested with parameter", "SELECT * FROM t WHERE user_id = $1 % 10000 + 1",
+                                  arith(ArithmeticOp::Add, arith(ArithmeticOp::Modulo, s_param("$1"), s_int(10000)), s_int(1))),
+        ("two columns",          "SELECT * FROM t WHERE x = a + b",              arith(ArithmeticOp::Add, s_col("a"), s_col("b"))),
+    ];
+    for (label, sql, expected) in cases {
+        assert_eq!(where_clause_rhs(sql), expected, "{label}: {sql}");
     }
 }
