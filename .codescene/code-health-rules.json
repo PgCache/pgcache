@@ -24,6 +24,10 @@
         {
           "name": "Low Cohesion",
           "weight": 0.0
+        },
+        {
+          "name": "Number of Functions in a Single Module",
+          "weight": 0.0
         }
       ],
       "content_filter": "test_code"
@@ -46,6 +50,10 @@
         },
         {
           "name": "Low Cohesion",
+          "weight": 0.0
+        },
+        {
+          "name": "Number of Functions in a Single Module",
           "weight": 0.0
         }
       ]
