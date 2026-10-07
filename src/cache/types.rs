@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use ecow::EcoString;
 use hdrhistogram::Histogram;
 use iddqd::{BiHashItem, BiHashMap, IdHashMap, bi_upcast};
+use rootcause::Report;
 
 use super::generation::Generation;
 use super::population_pool::PopulationPool;
@@ -17,7 +18,7 @@ use super::serve_pool_state::ServePool;
 use super::update_query::UpdateQueries;
 use crate::oid::Oid;
 use crate::{
-    cache::{memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
+    cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::TableMetadata,
     query::{
         Fingerprint, FingerprintDashMap, QueryShape, ast::QueryExpr, resolved::ResolvedQueryExpr,
@@ -187,7 +188,9 @@ pub struct QueryMetrics {
 }
 
 impl QueryMetrics {
-    pub fn new(registered_at_ns: Option<NonZeroU64>) -> Self {
+    /// `latency_template` is the empty histogram each query's
+    /// `cache_hit_latency` starts as (see [`CacheStateView::latency_template`]).
+    pub fn new(registered_at_ns: Option<NonZeroU64>, latency_template: &Histogram<u64>) -> Self {
         Self {
             hit_count: 0,
             miss_count: 0,
@@ -203,10 +206,7 @@ impl QueryMetrics {
             population_fetch_stage_ewma_ms: None,
             total_bytes_served: 0,
             population_row_count: 0,
-            // Auto-resizing (starts at a few hundred bytes, grows on record)
-            // rather than fixed-range — a fixed 1µs–60s bound pre-allocates
-            // ~20 KB per query, the dominant cost under high query cardinality.
-            cache_hit_latency: Histogram::new(2).expect("create auto-resizing histogram"),
+            cache_hit_latency: latency_template.clone(),
         }
     }
 }
@@ -279,6 +279,12 @@ pub struct CacheStateView {
     /// gate's forward attribution (PGC-440): a forward whose blocking bound is
     /// at or below it is waiting on apply/settle, above it on origin delivery.
     pub received_lsn: Arc<AtomicU64>,
+    /// Empty cache-hit latency histogram cloned into each query's metrics, so
+    /// the one fallible construction happens at startup. Auto-resizing (starts
+    /// at a few hundred bytes, grows on record) rather than fixed-range — a
+    /// fixed 1µs–60s bound pre-allocates ~20 KB per query, the dominant cost
+    /// under high query cardinality.
+    pub latency_template: Histogram<u64>,
 }
 
 impl std::fmt::Debug for CacheStateView {
@@ -293,8 +299,10 @@ impl std::fmt::Debug for CacheStateView {
 }
 
 impl CacheStateView {
-    pub fn new(dynamic: DynamicConfigHandle) -> Self {
-        Self {
+    pub fn new(dynamic: DynamicConfigHandle) -> CacheResult<Self> {
+        let latency_template =
+            Histogram::new(2).map_err(|_| Report::from(CacheError::LatencyHistogram))?;
+        Ok(Self {
             cached_queries: DashMap::default(),
             metrics: DashMap::default(),
             started_at: Instant::now(),
@@ -312,7 +320,8 @@ impl CacheStateView {
             settled_lsn: Arc::new(AtomicU64::new(0)),
             received_lsn: Arc::new(AtomicU64::new(0)),
             memo: ResultMemo::new(dynamic),
-        }
+            latency_template,
+        })
     }
 
     /// Whether dispatch should forward new queries to origin instead of

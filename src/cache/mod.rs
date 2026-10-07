@@ -94,7 +94,7 @@ pub use update_query::{
 };
 
 error_set! {
-    CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError
+    CacheError := WriteError || ReadError || DbError || ParseError || TableError || SendError || QueryResolutionError || SetupError
 
     ReadError := {
         IoError(io::Error),
@@ -140,6 +140,11 @@ error_set! {
 
     WriteError := {
         Write,
+    }
+
+    SetupError := {
+        #[display("Cache-hit latency histogram could not be created")]
+        LatencyHistogram,
     }
 
 

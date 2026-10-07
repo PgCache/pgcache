@@ -42,7 +42,7 @@ impl CacheDispatch {
             self.state_view
                 .metrics
                 .entry(pq.fingerprint)
-                .or_insert_with(|| QueryMetrics::new(now));
+                .or_insert_with(|| QueryMetrics::new(now, &self.state_view.latency_template));
 
             let (subsumption_tx, _subsumption_rx) = oneshot::channel();
             self.register_send(RegisterRequest {

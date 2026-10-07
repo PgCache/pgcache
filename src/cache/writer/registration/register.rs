@@ -182,7 +182,7 @@ impl WriterRegistration {
         core.state_view
             .metrics
             .entry(fingerprint)
-            .or_insert_with(|| QueryMetrics::new(now));
+            .or_insert_with(|| QueryMetrics::new(now, &core.state_view.latency_template));
         crate::metrics::handles()
             .reg
             .register_insert

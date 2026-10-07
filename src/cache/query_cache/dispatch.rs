@@ -533,7 +533,7 @@ impl CacheDispatch {
             self.state_view
                 .metrics
                 .entry(fingerprint)
-                .or_insert_with(|| QueryMetrics::new(now));
+                .or_insert_with(|| QueryMetrics::new(now, &self.state_view.latency_template));
             return Some(decision);
         }
 
