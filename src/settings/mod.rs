@@ -92,6 +92,27 @@ pub enum SslMode {
     VerifyFull,
 }
 
+/// How a TLS connection checks the server certificate. Only the encrypting
+/// [`SslMode`]s have one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsVerification {
+    /// `sslmode=require`: encrypt without verifying the certificate.
+    None,
+    /// `sslmode=verify-full`: verify the certificate against trusted CAs.
+    Full,
+}
+
+impl SslMode {
+    /// The certificate check for an encrypting mode; `None` for `Disable`.
+    pub fn tls_verification(self) -> Option<TlsVerification> {
+        match self {
+            SslMode::Disable => None,
+            SslMode::Require => Some(TlsVerification::None),
+            SslMode::VerifyFull => Some(TlsVerification::Full),
+        }
+    }
+}
+
 /// Error returned when parsing an invalid SSL mode string
 #[derive(Debug, Clone)]
 pub struct ParseSslModeError(String);

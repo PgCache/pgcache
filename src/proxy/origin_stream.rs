@@ -46,10 +46,10 @@ pub(super) async fn origin_connect(
     for addr in addrs {
         if let Ok(stream) = TcpStream::connect(addr).await {
             let _ = stream.set_nodelay(true);
-            return match ssl_mode {
-                SslMode::Disable => Ok(TlsStream::plain(stream)),
-                SslMode::Require | SslMode::VerifyFull => {
-                    let tls_stream = tls::pg_tls_connect(stream, ssl_mode, server_name)
+            return match ssl_mode.tls_verification() {
+                None => Ok(TlsStream::plain(stream)),
+                Some(verification) => {
+                    let tls_stream = tls::pg_tls_connect(stream, verification, server_name)
                         .await
                         .map_err(|e| {
                             Report::from(ConnectionError::TlsError(io::Error::other(

@@ -28,7 +28,7 @@ use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream as RustlsTlsStream;
 
 use crate::result::MapIntoReport;
-use crate::settings::SslMode;
+use crate::settings::TlsVerification;
 
 error_set! {
     /// Errors that can occur during TLS connection setup
@@ -167,7 +167,7 @@ const SSL_REQUEST: &[u8] = &[0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
 ///
 /// # Arguments
 /// * `stream` - Plain TCP connection to the PostgreSQL server
-/// * `ssl_mode` - TLS verification mode (Require = no verify, VerifyFull = verify)
+/// * `verification` - How the server certificate is checked
 /// * `server_name` - Hostname for TLS certificate verification
 ///
 /// # Returns
@@ -175,7 +175,7 @@ const SSL_REQUEST: &[u8] = &[0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f];
 /// * `Err(TlsError)` - If SSL not supported or TLS handshake fails
 pub async fn pg_tls_connect(
     mut stream: TcpStream,
-    ssl_mode: SslMode,
+    verification: TlsVerification,
     server_name: &str,
 ) -> TlsResult<RustlsTlsStream<TcpStream>> {
     tracing::debug!("pg_tls_connect: sending SSLRequest to {}", server_name);
@@ -199,10 +199,9 @@ pub async fn pg_tls_connect(
         b'S' => {
             // Server accepts SSL - proceed with TLS handshake
             tracing::debug!("pg_tls_connect: server accepts SSL, starting TLS handshake");
-            let config = match ssl_mode {
-                SslMode::Require => tls_config_no_verify_build(),
-                SslMode::VerifyFull => tls_config_verify_build(),
-                SslMode::Disable => unreachable!("pg_tls_connect called with SslMode::Disable"),
+            let config = match verification {
+                TlsVerification::None => tls_config_no_verify_build(),
+                TlsVerification::Full => tls_config_verify_build(),
             };
             let connector = TlsConnector::from(config);
             let server_name: ServerName<'_> = server_name
