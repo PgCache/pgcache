@@ -120,19 +120,16 @@ fn overlay_relation_drain(
     pool: &mut Vec<Vec<(usize, Option<ByteString>)>>,
     relation_oid: Oid,
 ) {
-    map.retain(|(r, _), entry| {
-        if *r != relation_oid {
-            return true;
-        }
-        if let OverlayEntry::Values(values) = entry
+    // `extract_if` removes only what the loop reaches, so the pool cap stays
+    // a condition, never a `break`.
+    for (_, entry) in map.extract_if(|(r, _), _| *r == relation_oid) {
+        if let OverlayEntry::Values(mut values) = entry
             && pool.len() < TOAST_OVERLAY_POOL_MAX
         {
-            let mut harvested = std::mem::take(values);
-            harvested.clear();
-            pool.push(harvested);
+            values.clear();
+            pool.push(values);
         }
-        false
-    });
+    }
 }
 
 /// Drain an overlay map, harvesting `Values` Vec allocations into the shared

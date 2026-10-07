@@ -165,15 +165,9 @@ impl CoalesceQueue {
         let mut expired = Vec::new();
         guard.retain(|_fingerprint, groups| {
             groups.retain(|_key, waiters| {
-                let mut kept = Vec::with_capacity(waiters.len());
-                for waiter in std::mem::take(waiters) {
-                    if waiter.timing.deadline_at.is_some_and(|d| d <= now) {
-                        expired.push(waiter);
-                    } else {
-                        kept.push(waiter);
-                    }
-                }
-                *waiters = kept;
+                expired.extend(
+                    waiters.extract_if(.., |w| w.timing.deadline_at.is_some_and(|d| d <= now)),
+                );
                 !waiters.is_empty()
             });
             !groups.is_empty()
