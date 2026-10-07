@@ -17,7 +17,6 @@ use crate::query::resolved::{
     ResolveError, ResolveResult, ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall,
     ResolvedJoinQual, ResolvedScalarExpr, ResolvedWhereExpr,
 };
-use crate::query::transform::where_expr_conjuncts_join;
 
 /// A `USING`/`NATURAL` join's merged output column. Postgres exposes
 /// the join column(s) once (not per side); for an outer join its value
@@ -124,71 +123,98 @@ pub(super) fn join_side_column_resolve(
     )
 }
 
-/// Resolve a `USING`/`NATURAL` join over `cols`: the verbatim
-/// qualifier (deparsed so Postgres merges the columns) plus its
+/// One `USING`/`NATURAL` column resolved on both join sides.
+struct UsingColumn {
+    /// `left = right`, this column's share of the join predicate.
+    conjunct: ResolvedWhereExpr,
+    merged: MergedJoinColumn,
+    /// The per-side `(qualifier, column)` pairs it consumes from `*` expansion.
+    consumed: [(EcoString, EcoString); 2],
+}
+
+fn using_column_resolve(
+    scope: &mut ResolutionScope<'_>,
+    ranges: JoinScopeRanges,
+    c: &EcoString,
+    outer: bool,
+) -> ResolveResult<UsingColumn> {
+    let unsupported = || Report::from(ResolveError::UnsupportedJoinQualifier);
+    let lq = join_side_qualifier(scope, ranges.left(), c).ok_or_else(unsupported)?;
+    let rq = join_side_qualifier(scope, ranges.right(), c).ok_or_else(unsupported)?;
+    let left_col = join_side_column_resolve(scope, &lq, c)?;
+    let right_col = join_side_column_resolve(scope, &rq, c)?;
+
+    let conjunct = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+        op: BinaryOp::Equal,
+        lexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(
+            left_col.clone(),
+        ))),
+        rexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(
+            right_col.clone(),
+        ))),
+    });
+
+    let expr = if outer {
+        ResolvedScalarExpr::Function(ResolvedFunctionCall {
+            name: EcoString::from("coalesce"),
+            args: vec![
+                ResolvedScalarExpr::Column(left_col),
+                ResolvedScalarExpr::Column(right_col),
+            ],
+            agg_star: false,
+            agg_distinct: false,
+            agg_order: Vec::new(),
+            agg_filter: None,
+            over: None,
+        })
+    } else {
+        ResolvedScalarExpr::Column(left_col)
+    };
+    Ok(UsingColumn {
+        conjunct,
+        merged: MergedJoinColumn {
+            name: c.clone(),
+            expr,
+            outer,
+        },
+        consumed: [(lq, c.clone()), (rq, c.clone())],
+    })
+}
+
+/// Resolve a `USING`/`NATURAL` join over its columns `first` and `rest`: the
+/// verbatim qualifier (deparsed so Postgres merges the columns) plus its
 /// equivalent equi-`predicate` for analysis, and the merged-column
 /// scope entries (merged value = the left column for an inner join,
 /// `COALESCE(left, right)` for an outer one) with the per-side
 /// `(qualifier, column)` pairs they consume from `*` expansion.
-/// `cols` is non-empty (the caller handles the no-common-column case).
 pub(super) fn join_using_resolve(
     scope: &mut ResolutionScope<'_>,
     ranges: JoinScopeRanges,
-    cols: &[EcoString],
+    (first, rest): (&EcoString, &[EcoString]),
     join_type: JoinType,
 ) -> ResolveResult<JoinUsingResolved> {
     let outer = join_type != JoinType::Inner;
-    let mut conjuncts: Vec<ResolvedWhereExpr> = Vec::with_capacity(cols.len());
-    let mut merged: Vec<MergedJoinColumn> = Vec::with_capacity(cols.len());
-    let mut consumed: Vec<(EcoString, EcoString)> = Vec::with_capacity(cols.len() * 2);
+    let mut merged: Vec<MergedJoinColumn> = Vec::with_capacity(1 + rest.len());
+    let mut consumed: Vec<(EcoString, EcoString)> = Vec::with_capacity(2 * (1 + rest.len()));
 
-    for c in cols {
-        let unsupported = || Report::from(ResolveError::UnsupportedJoinQualifier);
-        let lq = join_side_qualifier(scope, ranges.left(), c).ok_or_else(unsupported)?;
-        let rq = join_side_qualifier(scope, ranges.right(), c).ok_or_else(unsupported)?;
-        let left_col = join_side_column_resolve(scope, &lq, c)?;
-        let right_col = join_side_column_resolve(scope, &rq, c)?;
-
-        conjuncts.push(ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(
-                left_col.clone(),
-            ))),
-            rexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(
-                right_col.clone(),
-            ))),
-        }));
-
-        let expr = if outer {
-            ResolvedScalarExpr::Function(ResolvedFunctionCall {
-                name: EcoString::from("coalesce"),
-                args: vec![
-                    ResolvedScalarExpr::Column(left_col),
-                    ResolvedScalarExpr::Column(right_col),
-                ],
-                agg_star: false,
-                agg_distinct: false,
-                agg_order: Vec::new(),
-                agg_filter: None,
-                over: None,
-            })
-        } else {
-            ResolvedScalarExpr::Column(left_col)
-        };
-        merged.push(MergedJoinColumn {
-            name: c.clone(),
-            expr,
-            outer,
+    let first_column = using_column_resolve(scope, ranges, first, outer)?;
+    let mut predicate = first_column.conjunct;
+    merged.push(first_column.merged);
+    consumed.extend(first_column.consumed);
+    for c in rest {
+        let column = using_column_resolve(scope, ranges, c, outer)?;
+        predicate = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+            op: BinaryOp::And,
+            lexpr: Box::new(predicate),
+            rexpr: Box::new(column.conjunct),
         });
-        consumed.push((lq, c.clone()));
-        consumed.push((rq, c.clone()));
+        merged.push(column.merged);
+        consumed.extend(column.consumed);
     }
 
-    let predicate = where_expr_conjuncts_join(conjuncts)
-        .expect("USING/NATURAL resolves at least one join column");
     Ok((
         ResolvedJoinQual::Using {
-            columns: cols.to_vec(),
+            columns: std::iter::once(first).chain(rest).cloned().collect(),
             predicate,
         },
         merged,
@@ -207,14 +233,14 @@ pub(super) fn join_using_or_cross(
     cols: Vec<EcoString>,
     join_type: JoinType,
 ) -> ResolveResult<ResolvedJoinQual> {
-    if cols.is_empty() {
+    let Some(columns) = cols.split_first() else {
         return if join_type == JoinType::Inner {
             Ok(ResolvedJoinQual::Cross)
         } else {
             Err(Report::from(ResolveError::UnsupportedJoinQualifier))
         };
-    }
-    let (qual, merged, consumed) = join_using_resolve(scope, ranges, &cols, join_type)?;
+    };
+    let (qual, merged, consumed) = join_using_resolve(scope, ranges, columns, join_type)?;
     scope.merged_columns.extend(merged);
     scope.merged_consumed.extend(consumed);
     Ok(qual)
