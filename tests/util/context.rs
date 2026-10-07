@@ -210,7 +210,7 @@ impl TestContext {
     /// Create an additional client connection through the pgcache proxy.
     pub(crate) async fn proxy_client_connect(&self) -> Result<Client, Error> {
         let (client, connection) = Config::new()
-            .host("localhost")
+            .host("127.0.0.1")
             .port(self.cache_port)
             .user("postgres")
             .dbname("origin_test")

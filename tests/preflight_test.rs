@@ -7,17 +7,20 @@ use std::process::Command;
 use pgtemp::{PgTempDB, PgTempDBBuilder};
 use tokio_postgres::{Client, Config, NoTls};
 
+use crate::util::pgtemp_start;
+
 mod util;
 
 async fn origin_start(wal_level: &str) -> Result<(PgTempDB, Client), Error> {
-    let db = PgTempDBBuilder::new()
-        .with_dbname("preflight_test")
-        .with_config_param("wal_level", wal_level)
-        .with_config_param("log_destination", "stderr")
-        .with_config_param("logging_collector", "on")
-        .with_config_param("log_directory", "/tmp/")
-        .start_async()
-        .await;
+    let db = pgtemp_start(
+        PgTempDBBuilder::new()
+            .with_dbname("preflight_test")
+            .with_config_param("wal_level", wal_level)
+            .with_config_param("log_destination", "stderr")
+            .with_config_param("logging_collector", "on")
+            .with_config_param("log_directory", "/tmp/"),
+    )
+    .await?;
     let (client, connection) = Config::new()
         .host("127.0.0.1")
         .port(db.db_port())

@@ -117,52 +117,113 @@ pub(crate) struct TempDBs {
     pub cache: PgTempDB,
 }
 
-pub(crate) async fn start_databases() -> Result<(TempDBs, Client), Error> {
-    let db = PgTempDBBuilder::new()
-        .with_dbname("origin_test")
-        .with_config_param("wal_level", "logical")
-        .with_config_param("synchronous_commit", "on")
-        // Postgres inherits a *pipe* for stderr from pgtemp, and nothing drains
-        // it. Without the collector, backends log straight to that pipe; once
-        // its 16 KB buffer fills, a backend blocks inside `write()` in
-        // `EmitErrorReport` — mid-query, holding the client's response — until
-        // something frees space. The cache DB already runs a collector; origin
-        // did not, so any test that makes origin log heavily (e.g. an error per
-        // query) could stall a client for tens of seconds. Give origin its own
-        // syslogger so the pipe is always drained.
-        .with_config_param("log_destination", "stderr")
-        .with_config_param("logging_collector", "on")
-        .with_config_param("log_directory", "/tmp/")
-        .start_async()
-        .await;
+/// Attempts to start a test database on a fresh port before giving up.
+const PGTEMP_START_ATTEMPTS: usize = 5;
 
-    let db_cache = PgTempDBBuilder::new()
-        .with_dbname("cache_test")
-        .with_config_param("log_destination", "stderr")
-        .with_config_param("log_directory", "/tmp/")
-        .with_config_param("logging_collector", "on")
-        .with_config_param(
-            "shared_preload_libraries",
-            "pgcache_pgrx,pg_stat_statements",
-        )
-        .start_async()
-        .await;
+/// The one address test databases listen on and every client dials. pgtemp
+/// alone checks its port free on `::1` only, and PostgreSQL starts even when
+/// the `127.0.0.1` side is taken, so a `127.0.0.1` client could reach another
+/// test's socket instead (PGC-471).
+const TEST_DB_ADDR: &str = "127.0.0.1";
 
-    // Set up pgcache_pgrx extension on cache database
-    let (cache_client, cache_connection) = Config::new()
-        .host("localhost")
-        .port(db_cache.db_port())
-        .user(db_cache.db_user())
-        .dbname(db_cache.db_name())
+/// Start `builder`'s server listening only on [`TEST_DB_ADDR`], on a port
+/// checked free there, and prove the server answering on it is this one. A
+/// port taken between the check and PostgreSQL's bind fails the start (pgtemp
+/// panics) or the identity check; either retries on a fresh port.
+pub(crate) async fn pgtemp_start(builder: PgTempDBBuilder) -> Result<PgTempDB, Error> {
+    let mut last_error = Error::other("pgtemp start: no attempts made");
+    for _ in 0..PGTEMP_START_ATTEMPTS {
+        let port = find_available_port()?;
+        let attempt = builder
+            .clone()
+            .with_port(port)
+            .with_config_param("listen_addresses", TEST_DB_ADDR);
+        last_error = match tokio::task::spawn_blocking(move || attempt.start()).await {
+            Ok(db) => match pgtemp_identity_check(&db).await {
+                Ok(()) => return Ok(db),
+                Err(e) => e,
+            },
+            Err(e) => Error::other(format!("pgtemp start on port {port}: {e}")),
+        };
+    }
+    Err(last_error)
+}
+
+/// Whether the server on `db`'s port is `db` itself: its data directory must
+/// be the one pgtemp created.
+async fn pgtemp_identity_check(db: &PgTempDB) -> Result<(), Error> {
+    let client = test_db_connect(db).await?;
+    let row = client
+        .query_one("SELECT current_setting('data_directory')", &[])
+        .await
+        .map_err(Error::other)?;
+    let reported = std::fs::canonicalize(row.get::<_, String>(0))?;
+    let expected = std::fs::canonicalize(db.data_dir())?;
+    if reported == expected {
+        Ok(())
+    } else {
+        Err(Error::other(format!(
+            "port {} answered by {} instead of {}",
+            db.db_port(),
+            reported.display(),
+            expected.display()
+        )))
+    }
+}
+
+/// Connect to a test database on [`TEST_DB_ADDR`].
+pub(crate) async fn test_db_connect(db: &PgTempDB) -> Result<Client, Error> {
+    let (client, connection) = Config::new()
+        .host(TEST_DB_ADDR)
+        .port(db.db_port())
+        .user(db.db_user())
+        .dbname(db.db_name())
         .connect(NoTls)
         .await
         .map_err(Error::other)?;
-
     tokio::spawn(async move {
-        if let Err(e) = cache_connection.await {
-            eprintln!("cache connection error: {e}");
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
         }
     });
+    Ok(client)
+}
+
+pub(crate) async fn start_databases() -> Result<(TempDBs, Client), Error> {
+    let db = pgtemp_start(
+        PgTempDBBuilder::new()
+            .with_dbname("origin_test")
+            .with_config_param("wal_level", "logical")
+            .with_config_param("synchronous_commit", "on")
+            // Postgres inherits a *pipe* for stderr from pgtemp, and nothing drains
+            // it. Without the collector, backends log straight to that pipe; once
+            // its 16 KB buffer fills, a backend blocks inside `write()` in
+            // `EmitErrorReport` — mid-query, holding the client's response — until
+            // something frees space. The cache DB already runs a collector; origin
+            // did not, so any test that makes origin log heavily (e.g. an error per
+            // query) could stall a client for tens of seconds. Give origin its own
+            // syslogger so the pipe is always drained.
+            .with_config_param("log_destination", "stderr")
+            .with_config_param("logging_collector", "on")
+            .with_config_param("log_directory", "/tmp/"),
+    )
+    .await?;
+
+    let db_cache = pgtemp_start(
+        PgTempDBBuilder::new()
+            .with_dbname("cache_test")
+            .with_config_param("log_destination", "stderr")
+            .with_config_param("log_directory", "/tmp/")
+            .with_config_param("logging_collector", "on")
+            .with_config_param(
+                "shared_preload_libraries",
+                "pgcache_pgrx,pg_stat_statements",
+            ),
+    )
+    .await?;
+
+    // Set up pgcache_pgrx extension on cache database
+    let cache_client = test_db_connect(&db_cache).await?;
 
     cache_client
         .execute("CREATE EXTENSION pgcache_pgrx", &[])
@@ -170,20 +231,7 @@ pub(crate) async fn start_databases() -> Result<(TempDBs, Client), Error> {
         .map_err(Error::other)?;
 
     // Set up logical replication on origin
-    let (origin_client, origin_connection) = Config::new()
-        .host("localhost")
-        .port(db.db_port())
-        .user(db.db_user())
-        .dbname(db.db_name())
-        .connect(NoTls)
-        .await
-        .map_err(Error::other)?;
-
-    tokio::spawn(async move {
-        if let Err(e) = origin_connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
+    let origin_client = test_db_connect(&db).await?;
 
     // Publication and replication slot are created by pgcache's replication_provision().
     // The test only needs wal_level=logical on the origin (set in PgTempDBBuilder above).
@@ -295,7 +343,7 @@ fn pgcache_spawn_env(
 /// Connect a plain TCP client to pgcache.
 pub(crate) async fn pgcache_client_connect(listen_port: u16) -> Result<Client, Error> {
     let (client, connection) = Config::new()
-        .host("localhost")
+        .host("127.0.0.1")
         .port(listen_port)
         .user("postgres")
         .dbname("origin_test")
@@ -512,8 +560,10 @@ pub(crate) async fn connect_pgcache_tls(
     let tls_config = tls_config_with_cert(cert_path)?;
     let tls = MakeRustlsConnect::new(tls_config);
 
+    // The certificate names `localhost`; dial the address pgcache listens on.
     let (client, connection) = Config::new()
         .host("localhost")
+        .hostaddr(std::net::IpAddr::from([127, 0, 0, 1]))
         .port(listen_port)
         .user("postgres")
         .dbname("origin_test")
@@ -533,20 +583,5 @@ pub(crate) async fn connect_pgcache_tls(
 /// Connect directly to the cache database (bypassing pgcache proxy).
 /// Useful for verifying internal cache state like indexes.
 pub(crate) async fn connect_cache_db(dbs: &TempDBs) -> Result<Client, Error> {
-    let (client, connection) = Config::new()
-        .host("localhost")
-        .port(dbs.cache.db_port())
-        .user(dbs.cache.db_user())
-        .dbname(dbs.cache.db_name())
-        .connect(NoTls)
-        .await
-        .map_err(Error::other)?;
-
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("cache db connection error: {e}");
-        }
-    });
-
-    Ok(client)
+    test_db_connect(&dbs.cache).await
 }
