@@ -31,13 +31,12 @@ pub fn admin_server_spawn(
     status_tx: StatusSender,
     dynamic: DynamicConfigHandle,
 ) -> Result<(), std::io::Error> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     std::thread::Builder::new()
         .name("http".to_owned())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("admin server tokio runtime");
             rt.block_on(admin_server_run(
                 addr,
                 metrics,

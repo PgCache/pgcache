@@ -166,15 +166,12 @@ pub fn telemetry_spawn(
          See https://pgcache.com/docs/telemetry"
     );
 
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
     std::thread::Builder::new()
         .name("telemetry".to_owned())
-        .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("telemetry tokio runtime");
-            rt.block_on(telemetry_run(cancel, metrics_handle));
-        })?;
+        .spawn(move || rt.block_on(telemetry_run(cancel, metrics_handle)))?;
 
     Ok(())
 }
