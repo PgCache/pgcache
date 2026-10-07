@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use ecow::EcoString;
+use error_set::error_set;
 use postgres_replication::{
     LogicalReplicationStream,
     protocol::{
@@ -39,6 +40,20 @@ use decode::{
     parse_delete_row_data, parse_insert_row_data, parse_relation_to_table_metadata,
     parse_update_row_data,
 };
+
+error_set! {
+    /// Why the replication processor stopped on a message or the stream.
+    CdcError := {
+        PgError(Error),
+    } || CdcDecodeError
+
+    /// A replication message pgcache cannot decode. Unrecoverable: the cache
+    /// restarts rather than skip the change.
+    CdcDecodeError := {
+        #[display("binary tuple data on a text-format replication stream")]
+        BinaryTupleData,
+    }
+}
 
 /// Test-only CDC delivery delay (fault-injection feature, PGC-250 Slice B).
 /// Once a relation is tracked, sleeps before processing each replication
@@ -150,7 +165,7 @@ impl CdcProcessor {
     /// Starts the CDC replication stream and processes incoming messages.
     /// Uses tokio::select! for concurrent message processing and periodic keep-alives.
     /// Returns Ok(()) on graceful shutdown via cancellation token.
-    pub(super) async fn run(&mut self, cancel: CancellationToken) -> Result<(), Error> {
+    pub(super) async fn run(&mut self, cancel: CancellationToken) -> Result<(), CdcError> {
         // Start replication stream
         let slot = self.slot_name.as_str();
         let publ = self.publication_name.as_str();
@@ -187,19 +202,23 @@ impl CdcProcessor {
                     trace!("cdc stream result {msg_result:?}");
                     match msg_result {
                         Some(Ok(msg)) => {
-                            if let Err(e) = self.process_replication_message(msg, stream.as_mut()).await {
-                                error!(
-                                    "Error processing replication message: {}",
-                                    error_chain_format(&e),
-                                );
-                                // Continue processing despite errors
+                            match self.process_replication_message(msg, stream.as_mut()).await {
+                                Ok(()) => {}
+                                Err(CdcError::PgError(e)) => {
+                                    error!(
+                                        "Error processing replication message: {}",
+                                        error_chain_format(&e),
+                                    );
+                                    // Continue processing despite errors (PGC-472)
+                                }
+                                Err(e @ CdcError::BinaryTupleData) => return Err(e),
                             }
                             // Flush LSN progress to PostgreSQL periodically while processing
                             self.status_update_throttled(stream.as_mut()).await;
                         }
                         Some(Err(e)) => {
                             error!("Replication stream error: {}", error_chain_format(&e));
-                            return Err(e);
+                            return Err(e.into());
                         }
                         None => {
                             debug!("Replication stream ended");
@@ -421,7 +440,7 @@ impl CdcProcessor {
         &mut self,
         msg: ReplicationMessage<LogicalReplicationMessage>,
         stream: std::pin::Pin<&mut LogicalReplicationStream>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), CdcError> {
         match msg {
             ReplicationMessage::XLogData(xlog_data) => {
                 crate::metrics::handles().cdc.events_processed.increment(1);
@@ -447,7 +466,7 @@ impl CdcProcessor {
                 result
             }
             ReplicationMessage::PrimaryKeepAlive(keep_alive) => {
-                self.handle_keep_alive(&keep_alive, stream).await
+                Ok(self.handle_keep_alive(&keep_alive, stream).await?)
             }
             _ => {
                 error!("ReplicationMessage error: {:?}", &msg);
@@ -461,7 +480,7 @@ impl CdcProcessor {
     /// Forwards a `Begin` marker so the writer enters a source-transaction
     /// frame explicitly. The watermark does not advance here (only at
     /// `CommitMark`/`KeepAliveMark`); this is purely the frame delimiter.
-    async fn process_begin(&self, body: &BeginBody) -> Result<(), Error> {
+    async fn process_begin(&self, body: &BeginBody) -> Result<(), CdcError> {
         let xid = body.xid();
         if let Err(e) = self.cdc_tx.send(CdcCommand::Begin { xid }) {
             error!("Failed to forward begin (xid {xid}) to writer: {e:?}");
@@ -476,7 +495,7 @@ impl CdcProcessor {
     /// guaranteeing the watermark is transaction-aligned: by the time the
     /// writer processes the mark, every mutation enqueued earlier in this
     /// transaction has been applied (mpsc preserves order).
-    async fn process_commit(&self, body: &CommitBody) -> Result<(), Error> {
+    async fn process_commit(&self, body: &CommitBody) -> Result<(), CdcError> {
         let lsn = Lsn::from_raw(body.end_lsn());
         if let Err(e) = self.cdc_tx.send(CdcCommand::CommitMark { lsn }) {
             error!("Failed to forward commit mark (lsn {lsn}) to writer: {e:?}");
@@ -485,13 +504,13 @@ impl CdcProcessor {
     }
 
     /// Processes origin messages.
-    async fn process_origin(&self, _body: &OriginBody) -> Result<(), Error> {
+    async fn process_origin(&self, _body: &OriginBody) -> Result<(), CdcError> {
         // origin messages are not relevant to the cache
         Ok(())
     }
 
     /// Processes relation (table schema) messages.
-    async fn process_relation(&self, body: &RelationBody) -> Result<(), Error> {
+    async fn process_relation(&self, body: &RelationBody) -> Result<(), CdcError> {
         // Parse RelationBody into TableMetadata
         let table_metadata = parse_relation_to_table_metadata(body);
 
@@ -505,12 +524,12 @@ impl CdcProcessor {
     }
 
     /// Processes type definition messages.
-    async fn process_type(&self, _body: &TypeBody) -> Result<(), Error> {
+    async fn process_type(&self, _body: &TypeBody) -> Result<(), CdcError> {
         Ok(())
     }
 
     /// Processes insert messages with query-aware filtering.
-    async fn process_insert(&mut self, body: InsertBody) -> Result<(), Error> {
+    async fn process_insert(&mut self, body: InsertBody) -> Result<(), CdcError> {
         crate::metrics::handles().cdc.inserts.increment(1);
         let relation_oid = Oid::from_raw(body.rel_id());
 
@@ -535,7 +554,7 @@ impl CdcProcessor {
     }
 
     /// Processes update messages with query-aware filtering.
-    async fn process_update(&mut self, body: UpdateBody) -> Result<(), Error> {
+    async fn process_update(&mut self, body: UpdateBody) -> Result<(), CdcError> {
         crate::metrics::handles().cdc.updates.increment(1);
         let relation_oid = Oid::from_raw(body.rel_id());
 
@@ -561,7 +580,7 @@ impl CdcProcessor {
     }
 
     /// Processes delete messages with query-aware filtering.
-    async fn process_delete(&mut self, body: DeleteBody) -> Result<(), Error> {
+    async fn process_delete(&mut self, body: DeleteBody) -> Result<(), CdcError> {
         crate::metrics::handles().cdc.deletes.increment(1);
         let relation_oid = Oid::from_raw(body.rel_id());
 
@@ -586,7 +605,7 @@ impl CdcProcessor {
     }
 
     /// Processes truncate messages.
-    async fn process_truncate(&mut self, body: &TruncateBody) -> Result<(), Error> {
+    async fn process_truncate(&mut self, body: &TruncateBody) -> Result<(), CdcError> {
         let mut ids: Vec<Oid> = Vec::with_capacity(body.rel_ids().len());
         for &id in body.rel_ids() {
             let id = Oid::from_raw(id);

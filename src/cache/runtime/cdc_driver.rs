@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use rootcause::Report;
 use tokio::runtime::Builder;
 use tokio::sync::mpsc::UnboundedSender;
 #[cfg(feature = "fault-injection")]
@@ -12,7 +13,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-use crate::cache::cdc::{CdcProcessor, CdcProcessorHandles};
+use crate::cache::cdc::{CdcError, CdcProcessor, CdcProcessorHandles};
 use crate::cache::messages::CdcCommand;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::pg::Lsn;
@@ -135,10 +136,16 @@ pub(super) fn cdc_run(
             let saved_lsn = cdc.last_flushed_lsn();
             match &stream_result {
                 Ok(()) => warn!("CDC stream ended unexpectedly (last_flushed_lsn: {saved_lsn})"),
-                Err(e) => warn!(
+                Err(e @ CdcError::PgError(_)) => warn!(
                     "CDC stream error (last_flushed_lsn: {saved_lsn}): {}",
                     error_chain_format(e),
                 ),
+                // Resuming would skip or re-fail the undecodable change: restart
+                // the cache instead.
+                Err(e @ CdcError::BinaryTupleData) => {
+                    return Err(Report::from(CacheError::CdcFailure))
+                        .attach_loc(format!("CDC stream undecodable: {e}"));
+                }
             }
 
             // Forward all queries to origin while disconnected.

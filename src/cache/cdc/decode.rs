@@ -8,9 +8,9 @@ use ecow::EcoString;
 use postgres_replication::protocol::{
     DeleteBody, InsertBody, RelationBody, ReplicaIdentity, TupleData, UpdateBody,
 };
-use tokio_postgres::Error;
 use tracing::error;
 
+use super::CdcDecodeError;
 use crate::cache::messages::CdcValue;
 use crate::catalog::{
     ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata, cache_type_name_resolve,
@@ -72,17 +72,17 @@ pub(super) fn parse_relation_to_table_metadata(relation_body: &RelationBody) -> 
 }
 
 /// Parse row data from InsertBody into a Vec of column values indexed by position.
-pub(super) fn parse_insert_row_data(body: InsertBody) -> Result<Vec<CdcValue>, Error> {
-    Ok(tuple_data_parse(body.into_tuple().into_data()))
+pub(super) fn parse_insert_row_data(body: InsertBody) -> Result<Vec<CdcValue>, CdcDecodeError> {
+    tuple_data_parse(body.into_tuple().into_data())
 }
 
 /// Parse old and new row data from UpdateBody into Vecs of column values indexed by position.
 #[allow(clippy::type_complexity)]
 pub(super) fn parse_update_row_data(
     body: UpdateBody,
-) -> Result<(Vec<CdcValue>, Vec<CdcValue>), Error> {
+) -> Result<(Vec<CdcValue>, Vec<CdcValue>), CdcDecodeError> {
     let (key_tuple, old_tuple, new_tuple) = body.into_tuples();
-    let new_row_data = tuple_data_parse(new_tuple.into_data());
+    let new_row_data = tuple_data_parse(new_tuple.into_data())?;
 
     // 'K' (REPLICA IDENTITY DEFAULT, sent only on PK change) or 'O'
     // (REPLICA IDENTITY FULL, the complete old row on every update) —
@@ -91,13 +91,14 @@ pub(super) fn parse_update_row_data(
     let key_data = key_tuple
         .or(old_tuple)
         .map(|kt| tuple_data_parse(kt.into_data()))
+        .transpose()?
         .unwrap_or_default();
 
     Ok((key_data, new_row_data))
 }
 
 /// Parse row data from DeleteBody into a Vec of column values indexed by position.
-pub(super) fn parse_delete_row_data(body: DeleteBody) -> Result<Vec<CdcValue>, Error> {
+pub(super) fn parse_delete_row_data(body: DeleteBody) -> Result<Vec<CdcValue>, CdcDecodeError> {
     // DeleteBody contains either key_tuple (for tables with REPLICA IDENTITY USING INDEX)
     // or old_tuple (for tables with REPLICA IDENTITY FULL)
     let (key_tuple, old_tuple) = body.into_tuples();
@@ -107,7 +108,7 @@ pub(super) fn parse_delete_row_data(body: DeleteBody) -> Result<Vec<CdcValue>, E
         return Ok(Vec::new());
     };
 
-    Ok(tuple_data_parse(tuple.into_data()))
+    tuple_data_parse(tuple.into_data())
 }
 
 /// `tuple_data_parse` reuses the source Vec's allocation via the in-place
@@ -122,21 +123,23 @@ const _: () = assert!(
 /// Convert replication TupleData into column values, preserving the
 /// unchanged-toast marker distinctly from NULL (PGC-264). Consumes the Vec so
 /// the conversion is in place — no per-event allocation (see the layout
-/// assertion above).
-fn tuple_data_parse(columns: Vec<TupleData>) -> Vec<CdcValue> {
+/// assertion above; collecting through `Result` keeps the in-place path, which
+/// std does not guarantee, so a test pins it).
+fn tuple_data_parse(columns: Vec<TupleData>) -> Result<Vec<CdcValue>, CdcDecodeError> {
     columns
         .into_iter()
         .map(|col| match col {
-            TupleData::Null => CdcValue::Null,
-            TupleData::UnchangedToast => CdcValue::Toasted,
+            TupleData::Null => Ok(CdcValue::Null),
+            TupleData::UnchangedToast => Ok(CdcValue::Toasted),
             // Zero-copy: the value is a refcounted view of the replication
             // frame. PG sends valid UTF-8 in text format; an invalid sequence
             // falls back to a lossy copy rather than dropping the event.
-            TupleData::Text(data) => CdcValue::Text(
+            TupleData::Text(data) => Ok(CdcValue::Text(
                 ByteString::from_utf8(data.clone())
                     .unwrap_or_else(|_| ByteString::from(String::from_utf8_lossy(&data).as_ref())),
-            ),
-            TupleData::Binary(_) => unreachable!("pgcache uses text-format replication"),
+            )),
+            // pgcache never requests `binary` in START_REPLICATION.
+            TupleData::Binary(_) => Err(CdcDecodeError::BinaryTupleData),
         })
         .collect()
 }
@@ -153,12 +156,36 @@ mod tests {
             TupleData::Text("abc".as_bytes().into()),
         ];
         assert_eq!(
-            tuple_data_parse(columns),
+            tuple_data_parse(columns).expect("decode text tuple"),
             vec![
                 CdcValue::Null,
                 CdcValue::Toasted,
                 CdcValue::Text("abc".into()),
             ]
         );
+    }
+
+    #[test]
+    fn test_tuple_data_parse_rejects_binary() {
+        let columns = vec![TupleData::Null, TupleData::Binary("abc".as_bytes().into())];
+        assert!(matches!(
+            tuple_data_parse(columns),
+            Err(CdcDecodeError::BinaryTupleData)
+        ));
+    }
+
+    /// The conversion must reuse the replication frame's column Vec: std's
+    /// in-place collect is an unguaranteed optimization, so a toolchain change
+    /// that drops it fails here instead of adding a per-event allocation.
+    #[test]
+    fn test_tuple_data_parse_reuses_the_column_allocation() {
+        let columns = vec![
+            TupleData::Null,
+            TupleData::UnchangedToast,
+            TupleData::Text("abc".as_bytes().into()),
+        ];
+        let source = columns.as_ptr().cast::<u8>();
+        let values = tuple_data_parse(columns).expect("decode text tuple");
+        assert_eq!(values.as_ptr().cast::<u8>(), source);
     }
 }
