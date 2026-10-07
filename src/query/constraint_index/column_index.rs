@@ -180,9 +180,8 @@ impl<K: IdHashable + Copy> ColumnIndex<K> {
     fn insert(&mut self, fingerprint: K, range: &ColumnRange) {
         match placement(range) {
             Placement::Eq(key) => self.eq.entry(key).or_default().push(fingerprint),
-            Placement::InSet(set) => {
-                for v in set {
-                    let key = ValueKey::try_new(v).expect("InSet members are keyable");
+            Placement::InSet(keys) => {
+                for key in keys {
                     self.inset.entry(key).or_default().push(fingerprint);
                 }
             }
@@ -205,9 +204,8 @@ impl<K: IdHashable + Copy> ColumnIndex<K> {
     fn remove(&mut self, fingerprint: K, range: &ColumnRange) {
         match placement(range) {
             Placement::Eq(key) => map_vec_remove(&mut self.eq, &key, fingerprint),
-            Placement::InSet(set) => {
-                for v in set {
-                    let key = ValueKey::try_new(v).expect("InSet members are keyable");
+            Placement::InSet(keys) => {
+                for key in keys {
                     map_vec_remove(&mut self.inset, &key, fingerprint);
                 }
             }

@@ -1,8 +1,6 @@
 //! The canonical bucket key, and the classification that routes a
 //! `ColumnRange` to its sub-index.
 
-use std::collections::HashSet;
-
 use ecow::EcoString;
 use ordered_float::NotNan;
 
@@ -10,9 +8,10 @@ use crate::query::ast::LiteralValue;
 use crate::query::constraints::ColumnRange;
 
 /// Which `ColumnIndex` sub-structure a column range belongs in.
-pub(super) enum Placement<'a> {
+pub(super) enum Placement {
     Eq(ValueKey),
-    InSet(&'a HashSet<LiteralValue>),
+    /// Every member's key, in set iteration order.
+    InSet(Vec<ValueKey>),
     RangeLower(ValueKey),
     RangeUpper(ValueKey),
     /// Two-sided range with orderable bounds (PGC-189).
@@ -28,19 +27,17 @@ pub(super) enum Placement<'a> {
 /// bounds land in `range_both`; everything else — `Unknown`/`Empty`/
 /// `Unconstrained`, non-orderable bounds — routes to the linear `opaque`
 /// fallback.
-pub(super) fn placement(range: &ColumnRange) -> Placement<'_> {
+pub(super) fn placement(range: &ColumnRange) -> Placement {
     match range {
         ColumnRange::Equal(v) => ValueKey::try_new(v).map_or(Placement::Opaque, Placement::Eq),
         // All members must be keyable for the inverted `inset` index; one
         // unkeyable member routes the whole constraint to `opaque`
         // (deterministic, so insert and remove agree).
-        ColumnRange::InSet(set) => {
-            if set.iter().all(|v| ValueKey::try_new(v).is_some()) {
-                Placement::InSet(set)
-            } else {
-                Placement::Opaque
-            }
-        }
+        ColumnRange::InSet(set) => set
+            .iter()
+            .map(ValueKey::try_new)
+            .collect::<Option<Vec<_>>>()
+            .map_or(Placement::Opaque, Placement::InSet),
         ColumnRange::Range { lower, upper, .. } => match (lower, upper) {
             (Some(lb), None) => {
                 ValueKey::try_new(&lb.value).map_or(Placement::Opaque, Placement::RangeLower)
