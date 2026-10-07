@@ -353,6 +353,9 @@ impl<K: IdHashable + Copy> ColumnIndex<K> {
             self.extend_all(out);
             return;
         };
+        let (Some(min), Some(max)) = (keys.iter().min(), keys.iter().max()) else {
+            return;
+        };
         let mut iter = keys.iter();
         let Some(first) = iter.next() else {
             return;
@@ -381,8 +384,6 @@ impl<K: IdHashable + Copy> ColumnIndex<K> {
             out.extend(fps);
         }
         // Range parents must cover the closed interval [min, max] of the set.
-        let min = keys.iter().min().expect("set is non-empty");
-        let max = keys.iter().max().expect("set is non-empty");
         out.extend(self.range_lower.range(..=min.clone()).flat_map(|(_, f)| f));
         out.extend(self.range_upper.range(max.clone()..).flat_map(|(_, f)| f));
         self.extend_two_sided(min, max, out);

@@ -75,7 +75,7 @@ pub(super) fn classify(constraints: &[TableConstraint]) -> Classification {
         let values: Option<Vec<ValueKey>> = columns
             .columns()
             .iter()
-            .map(|c| ValueKey::try_new(&equality.remove(c).expect("equality maps every column")))
+            .map(|c| equality.remove(c).as_ref().and_then(ValueKey::try_new))
             .collect();
         match values {
             Some(values) => Classification::EqualityPure { columns, values },

@@ -166,11 +166,9 @@ fn is_canonical_date_prefix(date_bytes: &[u8; 10]) -> bool {
 /// Used by the classifier to gate `WHERE col::date = 'literal'` shapes
 /// against literals it knows how to compare lexicographically.
 pub fn is_canonical_date_literal(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() != 10 {
+    let Ok(chunk) = <&[u8; 10]>::try_from(s.as_bytes()) else {
         return false;
-    }
-    let chunk: &[u8; 10] = bytes.try_into().expect("len checked above");
+    };
     is_canonical_date_prefix(chunk)
 }
 

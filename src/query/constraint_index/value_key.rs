@@ -85,9 +85,7 @@ impl ValueKey {
             // Integers past 2^53 may share an f64 — see the type doc; only
             // over-returns, never drops a true match.
             #[allow(clippy::cast_precision_loss)]
-            LiteralValue::Integer(n) => Some(ValueKey::Num(
-                NotNan::new(*n as f64).expect("i64 as f64 is never NaN"),
-            )),
+            LiteralValue::Integer(n) => NotNan::new(*n as f64).ok().map(ValueKey::Num),
             LiteralValue::Float(f) => Some(ValueKey::Num(*f)),
             LiteralValue::String(s) | LiteralValue::StringWithCast(s, _) => {
                 Some(ValueKey::Str(s.clone()))

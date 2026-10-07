@@ -131,7 +131,9 @@ impl Buf for WriteQueue {
 
     fn advance(&mut self, mut cnt: usize) {
         while cnt > 0 {
-            let front = self.front_mut().expect("advance within queued bytes");
+            let Some(front) = self.front_mut() else {
+                break;
+            };
             let n = cnt.min(front.remaining());
             front.advance(n);
             cnt -= n;
@@ -139,6 +141,9 @@ impl Buf for WriteQueue {
                 self.pop_front();
             }
         }
+        // Writers advance by at most what they just wrote; past the end stops
+        // at empty rather than panicking.
+        debug_assert_eq!(cnt, 0, "advance past queued bytes");
     }
 
     fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
