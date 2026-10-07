@@ -42,13 +42,22 @@ use decode::{
 };
 
 error_set! {
-    /// Why the replication processor stopped on a message or the stream.
+    /// Why the replication processor stopped. A `PgError` is a stream or
+    /// connection failure, resumed by reconnecting; every other variant is
+    /// unrecoverable and restarts the cache. No failure skips a change.
     CdcError := {
         PgError(Error),
+    } || CdcEventError
+
+    /// A replication message the processor could not hand to the writer.
+    /// Unrecoverable: skipping it would leave the cache missing a change.
+    CdcEventError := {
+        /// The writer exited, so nothing can apply the change.
+        #[display("cache writer is gone")]
+        WriterGone,
     } || CdcDecodeError
 
-    /// A replication message pgcache cannot decode. Unrecoverable: the cache
-    /// restarts rather than skip the change.
+    /// A replication message pgcache cannot decode.
     CdcDecodeError := {
         #[display("binary tuple data on a text-format replication stream")]
         BinaryTupleData,
@@ -202,17 +211,7 @@ impl CdcProcessor {
                     trace!("cdc stream result {msg_result:?}");
                     match msg_result {
                         Some(Ok(msg)) => {
-                            match self.process_replication_message(msg, stream.as_mut()).await {
-                                Ok(()) => {}
-                                Err(CdcError::PgError(e)) => {
-                                    error!(
-                                        "Error processing replication message: {}",
-                                        error_chain_format(&e),
-                                    );
-                                    // Continue processing despite errors (PGC-472)
-                                }
-                                Err(e @ CdcError::BinaryTupleData) => return Err(e),
-                            }
+                            self.process_replication_message(msg, stream.as_mut()).await?;
                             // Flush LSN progress to PostgreSQL periodically while processing
                             self.status_update_throttled(stream.as_mut()).await;
                         }
@@ -395,7 +394,7 @@ impl CdcProcessor {
         &mut self,
         keep_alive: &PrimaryKeepAliveBody,
         stream: std::pin::Pin<&mut LogicalReplicationStream>,
-    ) -> Result<(), Error> {
+    ) -> Result<(), CdcError> {
         let reply_requested = keep_alive.reply() == 1;
         let wal_end = Lsn::from_raw(keep_alive.wal_end());
 
@@ -420,11 +419,8 @@ impl CdcProcessor {
 
             // Forward a keep-alive mark to the writer so its applied-LSN
             // watermark can advance during idle periods (no published-table
-            // transactions). Channel-send failure means the writer is gone;
-            // the next stream operation will surface that.
-            if let Err(e) = self.cdc_tx.send(CdcCommand::KeepAliveMark { lsn: wal_end }) {
-                error!("Failed to forward keep-alive mark to writer: {e:?}");
-            }
+            // transactions).
+            self.writer_send(CdcCommand::KeepAliveMark { lsn: wal_end })?;
         }
 
         if reply_requested {
@@ -457,16 +453,16 @@ impl CdcProcessor {
                     LogicalReplicationMessage::Truncate(body) => self.process_truncate(&body).await,
                     LogicalReplicationMessage::Message(_) | _ => {
                         debug!("unhandled replication message type");
-                        Ok(())
+                        Ok::<(), CdcEventError>(())
                     }
                 };
                 if result.is_ok() {
                     self.mark_lsn_decoded();
                 }
-                result
+                Ok(result?)
             }
             ReplicationMessage::PrimaryKeepAlive(keep_alive) => {
-                Ok(self.handle_keep_alive(&keep_alive, stream).await?)
+                self.handle_keep_alive(&keep_alive, stream).await
             }
             _ => {
                 error!("ReplicationMessage error: {:?}", &msg);
@@ -480,12 +476,8 @@ impl CdcProcessor {
     /// Forwards a `Begin` marker so the writer enters a source-transaction
     /// frame explicitly. The watermark does not advance here (only at
     /// `CommitMark`/`KeepAliveMark`); this is purely the frame delimiter.
-    async fn process_begin(&self, body: &BeginBody) -> Result<(), CdcError> {
-        let xid = body.xid();
-        if let Err(e) = self.cdc_tx.send(CdcCommand::Begin { xid }) {
-            error!("Failed to forward begin (xid {xid}) to writer: {e:?}");
-        }
-        Ok(())
+    async fn process_begin(&self, body: &BeginBody) -> Result<(), CdcEventError> {
+        self.writer_send(CdcCommand::Begin { xid: body.xid() })
     }
 
     /// Processes transaction commit messages.
@@ -495,41 +487,32 @@ impl CdcProcessor {
     /// guaranteeing the watermark is transaction-aligned: by the time the
     /// writer processes the mark, every mutation enqueued earlier in this
     /// transaction has been applied (mpsc preserves order).
-    async fn process_commit(&self, body: &CommitBody) -> Result<(), CdcError> {
-        let lsn = Lsn::from_raw(body.end_lsn());
-        if let Err(e) = self.cdc_tx.send(CdcCommand::CommitMark { lsn }) {
-            error!("Failed to forward commit mark (lsn {lsn}) to writer: {e:?}");
-        }
-        Ok(())
+    async fn process_commit(&self, body: &CommitBody) -> Result<(), CdcEventError> {
+        self.writer_send(CdcCommand::CommitMark {
+            lsn: Lsn::from_raw(body.end_lsn()),
+        })
     }
 
     /// Processes origin messages.
-    async fn process_origin(&self, _body: &OriginBody) -> Result<(), CdcError> {
+    async fn process_origin(&self, _body: &OriginBody) -> Result<(), CdcEventError> {
         // origin messages are not relevant to the cache
         Ok(())
     }
 
     /// Processes relation (table schema) messages.
-    async fn process_relation(&self, body: &RelationBody) -> Result<(), CdcError> {
-        // Parse RelationBody into TableMetadata
-        let table_metadata = parse_relation_to_table_metadata(body);
-
-        // Register table metadata in cache
-        if let Err(e) = self.cdc_tx.send(CdcCommand::TableRegister(table_metadata)) {
-            //todo, halt use of cache and fallback to proxy only mode
-            error!("Failed to register table from CDC: {e:?}");
-        }
-
-        Ok(())
+    async fn process_relation(&self, body: &RelationBody) -> Result<(), CdcEventError> {
+        self.writer_send(CdcCommand::TableRegister(parse_relation_to_table_metadata(
+            body,
+        )))
     }
 
     /// Processes type definition messages.
-    async fn process_type(&self, _body: &TypeBody) -> Result<(), CdcError> {
+    async fn process_type(&self, _body: &TypeBody) -> Result<(), CdcEventError> {
         Ok(())
     }
 
     /// Processes insert messages with query-aware filtering.
-    async fn process_insert(&mut self, body: InsertBody) -> Result<(), CdcError> {
+    async fn process_insert(&mut self, body: InsertBody) -> Result<(), CdcEventError> {
         crate::metrics::handles().cdc.inserts.increment(1);
         let relation_oid = Oid::from_raw(body.rel_id());
 
@@ -542,19 +525,14 @@ impl CdcProcessor {
         let row_data = parse_insert_row_data(body)?;
 
         // Let cache handle the insert with query-aware filtering
-        if let Err(e) = self.cdc_tx.send(CdcCommand::Insert {
+        self.writer_send(CdcCommand::Insert {
             relation_oid,
             row_data,
-        }) {
-            //todo, halt use of cache and fallback to proxy only mode
-            error!("Failed to handle INSERT for relation {relation_oid}: {e:?}");
-        }
-
-        Ok(())
+        })
     }
 
     /// Processes update messages with query-aware filtering.
-    async fn process_update(&mut self, body: UpdateBody) -> Result<(), CdcError> {
+    async fn process_update(&mut self, body: UpdateBody) -> Result<(), CdcEventError> {
         crate::metrics::handles().cdc.updates.increment(1);
         let relation_oid = Oid::from_raw(body.rel_id());
 
@@ -567,20 +545,15 @@ impl CdcProcessor {
         let (key_data, new_row_data) = parse_update_row_data(body)?;
 
         // Let cache handle the update with query-aware filtering
-        if let Err(e) = self.cdc_tx.send(CdcCommand::Update {
+        self.writer_send(CdcCommand::Update {
             relation_oid,
             key_data,
             row_data: new_row_data,
-        }) {
-            //todo, halt use of cache and fallback to proxy only mode
-            error!("Failed to handle UPDATE for relation {relation_oid}: {e:?}");
-        }
-
-        Ok(())
+        })
     }
 
     /// Processes delete messages with query-aware filtering.
-    async fn process_delete(&mut self, body: DeleteBody) -> Result<(), CdcError> {
+    async fn process_delete(&mut self, body: DeleteBody) -> Result<(), CdcEventError> {
         crate::metrics::handles().cdc.deletes.increment(1);
         let relation_oid = Oid::from_raw(body.rel_id());
 
@@ -593,19 +566,14 @@ impl CdcProcessor {
         let row_data = parse_delete_row_data(body)?;
 
         // Let cache handle the delete with query-aware filtering
-        if let Err(e) = self.cdc_tx.send(CdcCommand::Delete {
+        self.writer_send(CdcCommand::Delete {
             relation_oid,
             row_data,
-        }) {
-            //todo, halt use of cache and fallback to proxy only mode
-            error!("Failed to handle DELETE for relation {relation_oid}: {e:?}");
-        }
-
-        Ok(())
+        })
     }
 
     /// Processes truncate messages.
-    async fn process_truncate(&mut self, body: &TruncateBody) -> Result<(), CdcError> {
+    async fn process_truncate(&mut self, body: &TruncateBody) -> Result<(), CdcEventError> {
         let mut ids: Vec<Oid> = Vec::with_capacity(body.rel_ids().len());
         for &id in body.rel_ids() {
             let id = Oid::from_raw(id);
@@ -613,19 +581,44 @@ impl CdcProcessor {
                 ids.push(id);
             }
         }
-        if let Err(e) = self
-            .cdc_tx
-            .send(CdcCommand::Truncate { relation_oids: ids })
-        {
-            //todo, halt use of cache and fallback to proxy only mode
-            error!("Failed to handle truncate from CDC: {e:?}");
-        }
-        Ok(())
+        self.writer_send(CdcCommand::Truncate { relation_oids: ids })
+    }
+
+    fn writer_send(&self, command: CdcCommand) -> Result<(), CdcEventError> {
+        writer_command_send(&self.cdc_tx, command)
     }
 
     /// Check if there are any cached queries for a specific table by relation OID.
     /// Reads the shared active relations set maintained by the writer — no messaging needed.
     fn is_relation_active(&self, relation_oid: Oid) -> bool {
         self.active_relations.load().contains(&relation_oid)
+    }
+}
+
+/// Hand a command to the writer. Failing means the writer exited; the change
+/// is unappliable, so the stream must stop rather than skip it.
+fn writer_command_send(
+    cdc_tx: &UnboundedSender<CdcCommand>,
+    command: CdcCommand,
+) -> Result<(), CdcEventError> {
+    cdc_tx.send(command).map_err(|_| CdcEventError::WriterGone)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use super::*;
+
+    #[test]
+    fn test_writer_command_send_reports_a_gone_writer() {
+        let (cdc_tx, cdc_rx) = unbounded_channel();
+        let command = || CdcCommand::Begin { xid: 7 };
+        assert!(writer_command_send(&cdc_tx, command()).is_ok());
+        drop(cdc_rx);
+        assert!(matches!(
+            writer_command_send(&cdc_tx, command()),
+            Err(CdcEventError::WriterGone)
+        ));
     }
 }

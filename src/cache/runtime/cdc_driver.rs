@@ -140,11 +140,12 @@ pub(super) fn cdc_run(
                     "CDC stream error (last_flushed_lsn: {saved_lsn}): {}",
                     error_chain_format(e),
                 ),
-                // Resuming would skip or re-fail the undecodable change: restart
-                // the cache instead.
-                Err(e @ CdcError::BinaryTupleData) => {
+                // A change that cannot be applied (undecodable, or no writer to
+                // apply it): resuming would skip or re-fail it, so restart the
+                // cache instead.
+                Err(e @ (CdcError::BinaryTupleData | CdcError::WriterGone)) => {
                     return Err(Report::from(CacheError::CdcFailure))
-                        .attach_loc(format!("CDC stream undecodable: {e}"));
+                        .attach_loc(format!("CDC stream stopped: {e}"));
                 }
             }
 
