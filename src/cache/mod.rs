@@ -72,7 +72,9 @@ pub use generation::Generation;
 #[cfg(feature = "proxy")]
 pub use messages::{CacheMessage, CacheOutcome, CacheReply, DataStreamState, ProxyMessage};
 #[cfg(feature = "proxy")]
-pub use mv::{MvMeta, MvServe, MvState, mv_serve_sql_into, mv_state_initial, mv_table_name};
+pub use mv::{
+    MvMeta, MvServe, MvServePlan, MvState, mv_serve_sql_into, mv_state_initial, mv_table_name,
+};
 pub use mv_shape::{ShapeGate, shape_classify};
 #[cfg(feature = "proxy")]
 pub use query_cache::{CacheDispatchHandle, CacheDispatchPublisher, CacheDispatchUpdater};

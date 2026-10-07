@@ -121,7 +121,7 @@ pub fn mv_state_initial(gate: ShapeGate) -> MvState {
 
 /// All MV state for one cached query. Lives on `CachedQueryView`,
 /// written by the writer: registration sets `shape_gate`/`state`; MV
-/// build captures `output_columns` and flips `state` to `Fresh`.
+/// build installs `serve_plan` and flips `state` to `Fresh`.
 #[derive(Debug, Clone)]
 pub struct MvMeta {
     pub shape_gate: ShapeGate,
@@ -129,9 +129,9 @@ pub struct MvMeta {
     /// transitions go through `WriterCore::mv_state_write`, the dispatch side
     /// through `state_set`.
     state: MvState,
-    /// PostgreSQL's output column names, captured at first build and
-    /// reused across rebuilds. `None` until the MV has ever been built.
-    pub output_columns: Option<Arc<[EcoString]>>,
+    /// How a hit reads the MV, built when it first turned `Fresh` and reused
+    /// across rebuilds. `None` until the MV has ever been built.
+    pub serve_plan: Option<Arc<MvServePlan>>,
     /// LIMIT cap for the MV body — set for join shapes (top-N over the
     /// join), `None` otherwise. Dispatch falls through when an incoming
     /// variant needs more rows than the MV holds.
@@ -154,7 +154,7 @@ impl MvMeta {
         Self {
             shape_gate,
             state: mv_state_initial(shape_gate),
-            output_columns: None,
+            serve_plan: None,
             limit,
             fresh_at: None,
             wasted_builds: 0,
@@ -228,12 +228,23 @@ impl MvMeta {
     }
 }
 
-/// Serve-dispatch outcome. The `Mv` variant carries the column names
-/// pulled from the *same* locked view observation that saw `Fresh`, so
-/// "serve from MV without names" is unrepresentable past this point.
+/// Serve-dispatch outcome. The `Mv` variant carries the serve plan pulled
+/// from the *same* locked view observation that saw `Fresh`, so "serve from
+/// MV without a plan" is unrepresentable past this point.
 pub enum MvServe {
-    Mv(Arc<[EcoString]>),
+    Mv(Arc<MvServePlan>),
     SourceRow,
+}
+
+/// What an MV hit sends, rendered once when the MV first turns `Fresh`:
+/// everything but the per-request LIMIT.
+#[derive(Debug)]
+pub struct MvServePlan {
+    /// PostgreSQL's output column names, captured at first build and reused
+    /// across rebuilds.
+    pub output_columns: Arc<[EcoString]>,
+    /// `SELECT c0 AS …, … FROM <mv_table> [ORDER BY …]`.
+    sql: String,
 }
 
 /// Format the cache-DB table name for an MV keyed by fingerprint.
@@ -243,93 +254,82 @@ pub fn mv_table_name(fingerprint: Fingerprint) -> String {
     format!("pgcache_mv.q_{fingerprint}")
 }
 
-/// Build the serve-time SQL for reading from an MV table, into a caller-provided
-/// buffer (cleared first) so the serve path can reuse the connection's recycled
-/// `sql_buf` rather than allocating a fresh `String` per cache hit.
-///
-/// Shape: `SELECT * FROM <mv_table> [ORDER BY ...] [LIMIT ...]`.
-///
-/// Two ORDER BY strategies depending on body:
-///
-/// - **SELECT body** — emit **positional** (`ORDER BY 2 DESC`). The MV table's
-///   columns come from `CREATE TABLE AS` and don't match the source-qualified
-///   refs (`public.orders.status`, `count(orders.id)`) that resolved
-///   `order_by` carries — emitting the expression would reference tables not
-///   in the serve-time FROM clause.
-///
-/// - **SET OP body** — emit **direct deparse**. The resolver produces
-///   `Identifier(name)` for set-op ORDER BY (see `order_by_as_identifiers`),
-///   and those bare names match the MV column names (derived from the left
-///   branch's SELECT-list aliases by `CREATE TABLE AS` on a set op). So the
-///   naive deparse already works; no positional indirection needed.
-///
-/// In both cases the classifier (`shape_classify`) has already downgraded
-/// queries whose ORDER BY can't be served against the MV to `Skip`, so this
-/// function is called only on queries with viable ORDER BY.
-///
-/// Serve-time ORDER BY is essential even though population already applied it:
-/// `SELECT * FROM mv` returns rows in arbitrary physical order, so for user
-/// LIMIT < max_limit we need the re-sort to guarantee the correct top-M
-/// subset. No generation SET — MV tables are not `pgcache_pgrx`-tracked.
-pub fn mv_serve_sql_into(
-    sql: &mut String,
-    fingerprint: Fingerprint,
-    resolved: &ResolvedQueryExpr,
-    limit: Option<&LimitClause>,
-    output_columns: &[EcoString],
-) {
-    let table = mv_table_name(fingerprint);
-    sql.clear();
-    sql.reserve(16 + table.len() + output_columns.len() * 24);
-    // MV physical columns are positional (`c0..`) so duplicate output
-    // names (e.g. two `count`) are storable; alias them back here. Empty
-    // `output_columns` is a defensive fallback — a `Fresh` MV always has
-    // captured names (the worker logs this case).
-    sql.push_str("SELECT ");
-    if output_columns.is_empty() {
-        sql.push('*');
-    } else {
-        for (i, name) in output_columns.iter().enumerate() {
-            if i > 0 {
-                sql.push_str(", ");
+impl MvServePlan {
+    /// Render the MV read for `resolved`. Shape:
+    /// `SELECT c0 AS …, … FROM <mv_table> [ORDER BY …]`.
+    ///
+    /// MV physical columns are positional (`c0..`) so duplicate output names
+    /// (e.g. two `count`) are storable; alias them back here. Empty
+    /// `output_columns` falls back to `SELECT *`.
+    ///
+    /// Two ORDER BY strategies depending on body:
+    ///
+    /// - **SELECT body** — **positional** (`ORDER BY 2 DESC`), looking each
+    ///   expression up in the SELECT list.
+    /// - **SET OP body** — the expressions deparsed directly: the resolver
+    ///   produces `Identifier`s whose names match the MV table's columns.
+    ///
+    /// `None` when the ORDER BY cannot be expressed against the MV table: a
+    /// `VALUES` body, or an expression missing from the SELECT list.
+    pub fn new(
+        fingerprint: Fingerprint,
+        resolved: &ResolvedQueryExpr,
+        output_columns: Arc<[EcoString]>,
+    ) -> Option<Self> {
+        let table = mv_table_name(fingerprint);
+        let mut sql = String::with_capacity(16 + table.len() + output_columns.len() * 24);
+        sql.push_str("SELECT ");
+        if output_columns.is_empty() {
+            sql.push('*');
+        } else {
+            for (i, name) in output_columns.iter().enumerate() {
+                if i > 0 {
+                    sql.push_str(", ");
+                }
+                let _ = write!(sql, "c{i} AS {}", escape_identifier(name.as_str()));
             }
-            let _ = write!(sql, "c{i} AS {}", escape_identifier(name.as_str()));
         }
-    }
-    sql.push_str(" FROM ");
-    sql.push_str(&table);
+        sql.push_str(" FROM ");
+        sql.push_str(&table);
 
-    if !resolved.order_by.is_empty() {
-        match &resolved.body {
-            ResolvedQueryBody::Select(select) => {
-                mv_order_by_positional(sql, &resolved.order_by, &select.columns);
-            }
-            ResolvedQueryBody::SetOp(_) => {
-                mv_order_by_direct(sql, &resolved.order_by);
-            }
-            ResolvedQueryBody::Values(_) => {
-                unreachable!("MV fast path on Values body — classifier should have Skipped")
+        if !resolved.order_by.is_empty() {
+            match &resolved.body {
+                ResolvedQueryBody::Select(select) => {
+                    mv_order_by_positional(&mut sql, &resolved.order_by, &select.columns)?;
+                }
+                ResolvedQueryBody::SetOp(_) => mv_order_by_direct(&mut sql, &resolved.order_by),
+                ResolvedQueryBody::Values(_) => return None,
             }
         }
+        Some(Self {
+            output_columns,
+            sql,
+        })
     }
+}
+
+/// Build the serve-time SQL for an MV hit into a caller-provided buffer
+/// (cleared first) so the serve path can reuse the connection's recycled
+/// `sql_buf` rather than allocating a fresh `String` per cache hit.
+pub fn mv_serve_sql_into(sql: &mut String, plan: &MvServePlan, limit: Option<&LimitClause>) {
+    sql.clear();
+    sql.push_str(&plan.sql);
     if let Some(l) = limit {
         l.deparse(sql);
     }
 }
 
 /// Emit `ORDER BY N ASC|DESC, ...` by looking each expression's 1-based
-/// position up in the SELECT list. Classifier guarantees a position exists.
+/// position up in the SELECT list; `None` when one is missing.
 fn mv_order_by_positional(
     sql: &mut String,
     order_by: &[ResolvedOrderByClause],
     columns: &ResolvedSelectColumns,
-) {
+) -> Option<()> {
     sql.push_str(" ORDER BY");
     let mut sep = "";
     for o in order_by {
-        let pos = columns.columns_position_of(&o.expr).unwrap_or_else(|| {
-            unreachable!("ORDER BY expression not in SELECT list — classifier invariant");
-        });
+        let pos = columns.columns_position_of(&o.expr)?;
         let _ = write!(sql, "{sep} {pos}");
         match o.direction {
             OrderDirection::Asc => sql.push_str(" ASC"),
@@ -337,6 +337,7 @@ fn mv_order_by_positional(
         }
         sep = ",";
     }
+    Some(())
 }
 
 /// Emit `ORDER BY <expr> ASC|DESC, ...` by deparsing each expression directly.
@@ -545,28 +546,23 @@ mod tests {
     /// which keeps the ORDER BY / LIMIT assertions below orthogonal to the
     /// aliased-projection tests.
     fn build_serve_sql(sql: &str) -> String {
-        let mut out = String::new();
-        mv_serve_sql_into(
-            &mut out,
-            Fingerprint::from_raw(42),
-            &resolve_for_serve(sql),
-            None,
-            &[],
-        );
-        out
+        build_serve_sql_named(sql, &[])
     }
 
     fn build_serve_sql_named(sql: &str, names: &[&str]) -> String {
-        let names: Vec<EcoString> = names.iter().map(|n| EcoString::from(*n)).collect();
+        let names: Arc<[EcoString]> = names.iter().map(|n| EcoString::from(*n)).collect();
+        let plan = MvServePlan::new(Fingerprint::from_raw(42), &resolve_for_serve(sql), names)
+            .expect("ORDER BY expressible against the MV");
         let mut out = String::new();
-        mv_serve_sql_into(
-            &mut out,
-            Fingerprint::from_raw(42),
-            &resolve_for_serve(sql),
-            None,
-            &names,
-        );
+        mv_serve_sql_into(&mut out, &plan, None);
         out
+    }
+
+    #[test]
+    fn test_mv_serve_plan_rejects_order_by_outside_select_list() {
+        let resolved =
+            resolve_for_serve("SELECT status FROM orders GROUP BY status ORDER BY count(*)");
+        assert!(MvServePlan::new(Fingerprint::from_raw(42), &resolved, Arc::from([])).is_none());
     }
 
     #[test]

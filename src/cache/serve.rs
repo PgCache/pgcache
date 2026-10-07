@@ -210,16 +210,10 @@ async fn serve_query_send(
     include_describe: bool,
     binary_results: bool,
 ) -> CacheResult<PrepareOutcome> {
-    if let MvServe::Mv(cols) = &msg.mv {
+    if let MvServe::Mv(plan) = &msg.mv {
         // Render into the connection's recycled SQL buffer rather than a fresh
         // String.
-        mv_serve_sql_into(
-            &mut conn.sql_buf,
-            msg.fingerprint,
-            &msg.resolved,
-            msg.limit.as_ref(),
-            cols,
-        );
+        mv_serve_sql_into(&mut conn.sql_buf, plan, msg.limit.as_ref());
         conn.extended_query_unnamed_send(include_describe, binary_results)
             .await?;
         return Ok(PrepareOutcome {

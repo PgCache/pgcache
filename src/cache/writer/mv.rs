@@ -24,7 +24,7 @@ use super::mv_build::{MvBuildContext, mv_build_spawn};
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{MvBuildOutcome, QueryCommand},
-    mv::{MvState, mv_table_name},
+    mv::{MvServePlan, MvState, mv_table_name},
     types::CachedQueryState,
 };
 use crate::oid::Oid;
@@ -209,9 +209,29 @@ impl WriterCore {
                 }
 
                 if matches!(state, MvState::Building { .. }) {
-                    if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
-                        view.mv.output_columns = Some(output_columns);
-                        view.mv.fresh_mark(Instant::now());
+                    let installed =
+                        self.state_view
+                            .cached_queries
+                            .get_mut(&fingerprint)
+                            .map(|mut view| {
+                                let plan = view.resolved.as_deref().and_then(|resolved| {
+                                    MvServePlan::new(fingerprint, resolved, output_columns)
+                                });
+                                let installed = plan.is_some();
+                                if let Some(plan) = plan {
+                                    view.mv.serve_plan = Some(Arc::new(plan));
+                                    view.mv.fresh_mark(Instant::now());
+                                }
+                                installed
+                            });
+                    if installed == Some(false) {
+                        // The classifier admits only shapes whose ORDER BY the MV
+                        // can express; reaching here is a regression, not a
+                        // behavior change — serve from source rows for good.
+                        error!("mv build: {fingerprint} has no MV serve plan; marking ineligible");
+                        self.mv_table_drop(fingerprint).await;
+                        self.mv_state_write(fingerprint, MvState::Ineligible);
+                        return;
                     }
                     // →Fresh through the choke point: `Fresh` is dirtiable, so the
                     // index insert must accompany the state write (PGC-338).
@@ -278,7 +298,11 @@ impl WriterCore {
         // source-row population cap `view.max_limit`.
         let max_limit = view.mv.limit;
         let generation = view.generation;
-        let output_columns = view.mv.output_columns.as_ref().map(Arc::clone);
+        let output_columns = view
+            .mv
+            .serve_plan
+            .as_ref()
+            .map(|plan| Arc::clone(&plan.output_columns));
         drop(view);
 
         // Real source-row count from the origin population (set at ready-mark).

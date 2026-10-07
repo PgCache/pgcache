@@ -108,21 +108,16 @@ pub(crate) fn mv_serve_decide(
         // (and pays the `Instant::now()`); other states schedule nothing.
         let build_permitted =
             !matches!(state, MvState::Pending { .. }) || e.mv.build_permitted(Instant::now());
-        (
-            state,
-            e.mv.output_columns.clone(),
-            e.mv.limit,
-            build_permitted,
-        )
+        (state, e.mv.serve_plan.clone(), e.mv.limit, build_permitted)
     });
 
     match observed {
         None => MvDecision::Serve(MvServe::SourceRow),
-        Some((MvState::Fresh, Some(cols), mv_limit, _))
+        Some((MvState::Fresh, Some(plan), mv_limit, _))
             if limit_is_sufficient(mv_limit, rows_needed) =>
         {
             crate::metrics::handles().cache.mv_hits.increment(1);
-            MvDecision::Serve(MvServe::Mv(cols))
+            MvDecision::Serve(MvServe::Mv(plan))
         }
         Some((MvState::Fresh, Some(_), _, _)) => {
             crate::metrics::handles().cache.mv_fallthrough.increment(1);

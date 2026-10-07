@@ -95,8 +95,8 @@ fn explain_kind_for_view(
             // must not schedule an MV build or move serve metrics). A Fresh MV
             // with captured columns serves from the MV; everything else serves
             // from source rows.
-            let mv = match (mv.state(), mv.output_columns) {
-                (MvState::Fresh, Some(columns)) => MvServe::Mv(columns),
+            let mv = match (mv.state(), mv.serve_plan) {
+                (MvState::Fresh, Some(plan)) => MvServe::Mv(plan),
                 _ => MvServe::SourceRow,
             };
             ExplainKind::Run {
