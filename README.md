@@ -138,6 +138,15 @@ origin otherwise.
 > single `--upstream postgres://…` flag. The try script above runs this same image;
 > [Deploy → Docker](https://www.pgcache.com/docs/docker/) covers Compose, TLS, and production settings.
 
+## Talk to us
+
+Running pgcache against a real workload, or wondering whether it would pay off on yours? We'd like to hear from you.
+
+- **Free workload review.** 30 minutes with the founders. Bring your [Fit Analyzer](https://www.pgcache.com/fit) report or the hit rate from `try.sh status`, and we'll tell you what pgcache would serve and save, or say so if it isn't a fit. [Book a time](https://pgcache.com/review/readme).
+- **Pilots.** For teams taking it toward production: hands-on help getting it running, and before-and-after numbers for your team. [How pilots work](https://www.pgcache.com/register/pilot/).
+- **Wrote about pgcache, or found something odd?** Tell us, even if you're not sure it's a bug. We'll help you check and publish a write-up, link it from [our benchmarks page](https://www.pgcache.com/benchmarks/), and credit reports by name in the changelog.
+- **Questions.** [Discord](https://discord.gg/n4Mrr7DgB4), a GitHub issue, or philip@pgcache.com.
+
 ## How it works
 
 ```
