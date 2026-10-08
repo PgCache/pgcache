@@ -5,8 +5,9 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
+use ecow::EcoString;
 use tokio::sync::oneshot;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{CacheDispatch, QueryRequest};
 use crate::cache::Generation;
@@ -16,16 +17,41 @@ use crate::cache::mv_shape::ShapeGate;
 use crate::cache::query::limit_rows_needed;
 use crate::cache::types::{CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics};
 use crate::cache::{CacheError, CacheResult};
-use crate::query::Fingerprint;
+use crate::query::ast::query_expr_session_key;
+use crate::query::{Fingerprint, QueryKey};
 use crate::timing::duration_to_ns_u64;
+
+/// Pinned queries have no client session, so their bare table names resolve
+/// under this fixed path. A session on any other path reaches the same entry
+/// through the alias map once the writer has resolved its pair.
+fn pinned_search_path() -> Arc<[EcoString]> {
+    Arc::from([EcoString::from("public")])
+}
 
 impl CacheDispatch {
     /// Register pinned queries at startup by sending Register commands with `pinned: true`.
-    pub fn pinned_queries_register(&self, pinned: &[PinnedQuery]) -> CacheResult<()> {
+    pub async fn pinned_queries_register(&self, pinned: &[PinnedQuery]) -> CacheResult<()> {
+        let search_path = pinned_search_path();
         for pq in pinned {
+            let fingerprint = match query_expr_session_key(pq.cacheable_query.query(), &search_path)
+            {
+                QueryKey::Canonical(fingerprint) => fingerprint,
+                QueryKey::Session(session_key) => {
+                    match self
+                        .session_key_resolve(session_key, &pq.cacheable_query, &search_path)
+                        .await
+                    {
+                        Some(fingerprint) => fingerprint,
+                        None => {
+                            warn!("pinned query {session_key} does not resolve, skipping");
+                            continue;
+                        }
+                    }
+                }
+            };
             // Set Loading state in CacheStateView
             self.state_view.cached_queries.insert(
-                pq.fingerprint,
+                fingerprint,
                 CachedQueryView {
                     state: CachedQueryState::Loading,
                     generation: Generation::ZERO,
@@ -41,14 +67,14 @@ impl CacheDispatch {
             let now = NonZeroU64::new(duration_to_ns_u64(self.state_view.started_at.elapsed()));
             self.state_view
                 .metrics
-                .entry(pq.fingerprint)
+                .entry(fingerprint)
                 .or_insert_with(|| QueryMetrics::new(now, &self.state_view.latency_template));
 
             let (subsumption_tx, _subsumption_rx) = oneshot::channel();
             self.register_send(RegisterRequest {
-                fingerprint: pq.fingerprint,
+                fingerprint,
                 cacheable_query: Arc::clone(&pq.cacheable_query),
-                search_path: vec!["public".into()].into(),
+                search_path: Arc::clone(&search_path),
                 started_at: Instant::now(),
                 subsumption_tx,
                 admit_action: AdmitAction::Admit,

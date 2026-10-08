@@ -15,8 +15,8 @@ use crate::cache::query::CacheableQuery;
 use crate::cache::{CacheMessage, QueryParameters};
 use crate::pg::protocol::extended::parse_parameter_description;
 use crate::pg::protocol::session::{PreparedStatement, ResultFormats};
-use crate::query::Fingerprint;
-use crate::query::ast::query_expr_fingerprint;
+use crate::query::QueryKey;
+use crate::query::ast::query_expr_session_key;
 use crate::query::write::StatementEffects;
 
 /// Each Execute's effects snapshot, in batch order, for a forwarded buffer.
@@ -271,7 +271,8 @@ pub(super) struct ExtendedPending {
 pub(super) struct DispatchContext {
     pub(super) msg: CacheMessage,
     pub(super) pipeline: PipelineContext,
-    pub(super) fingerprint: Fingerprint,
+    /// Telemetry label for the slot: the query under the session's path.
+    pub(super) key: QueryKey,
     pub(super) lazy_parse: Option<EcoString>,
     pub(super) parse_statement: Option<EcoString>,
     pub(super) describe_statement: Option<EcoString>,
@@ -280,9 +281,14 @@ pub(super) struct DispatchContext {
 impl DispatchContext {
     /// Assemble a dispatch context from an entry and its cache candidate.
     /// `is_last` carries the single trailing `ReadyForQuery` for the batch.
-    pub(super) fn build(entry: ExecuteEntry, candidate: CacheCandidate, is_last: bool) -> Self {
+    pub(super) fn build(
+        entry: ExecuteEntry,
+        candidate: CacheCandidate,
+        is_last: bool,
+        search_path: &[EcoString],
+    ) -> Self {
         let prep = entry.prep;
-        let fingerprint = query_expr_fingerprint(candidate.cacheable_query.query());
+        let key = query_expr_session_key(candidate.cacheable_query.query(), search_path);
         let lazy_parse = (!prep.has_parse && candidate.lazy_parse_needed())
             .then(|| candidate.statement_name.clone());
         let pipeline = PipelineContext {
@@ -302,7 +308,7 @@ impl DispatchContext {
         Self {
             msg,
             pipeline,
-            fingerprint,
+            key,
             lazy_parse,
             // A cacheable (non-dirty) entry has at most one Parse / Describe('S').
             parse_statement: if prep.has_parse {

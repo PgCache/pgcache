@@ -12,7 +12,7 @@ use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::TableMetadata;
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::ast::{
-    AstError, QueryExpr, RawStatement, WhereParseError, query_expr_fingerprint,
+    AstError, QueryExpr, RawStatement, WhereParseError, query_expr_fingerprint_canonical,
     statement_convert_raw,
 };
 use pgcache_lib::query::constraints::{
@@ -305,7 +305,9 @@ pub fn statement_classify(
         user_max_limit
     };
     let has_limit = max_limit.is_some();
-    let fingerprint = query_expr_fingerprint(cacheable.query());
+    // Resolution above ran under `public` alone, so every bare name landed
+    // there; pgcache keys the same query identically (PGC-405).
+    let fingerprint = query_expr_fingerprint_canonical(cacheable.query(), |_| "public".into());
     let analysis = match query_admission_analyze(
         &resolved,
         fingerprint,

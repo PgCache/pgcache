@@ -57,7 +57,7 @@ use crate::{
         session::PreparedStatement,
     },
     proxy::egress::EgressQueue,
-    query::ast::query_expr_fingerprint,
+    query::ast::query_expr_session_key,
     settings::SslMode,
     telemetry::pg_version_set,
     timing::QueryTiming,
@@ -294,6 +294,7 @@ async fn handle_connection(
                             .then(|| {
                                 read_column_ranges(
                                     read_query,
+                                    &resolved_search_path,
                                     &state.dispatch_handle,
                                     &state.write_log,
                                 )
@@ -535,6 +536,7 @@ fn read_query_bound(msg: &CacheMessage) -> Option<QueryExpr> {
 
 fn read_column_ranges(
     query: &QueryExpr,
+    search_path: &[EcoString],
     dispatch_handle: &CacheDispatchHandle,
     write_log: &WriteLog,
 ) -> Option<HashMap<EcoString, ColumnRange>> {
@@ -542,8 +544,8 @@ fn read_column_ranges(
     if !write_log.table_has_row_predicate(table) {
         return None;
     }
-    let fingerprint = query_expr_fingerprint(query);
-    let resolved = dispatch_handle.cached_query_resolved(fingerprint)?;
+    let key = query_expr_session_key(query, search_path);
+    let resolved = dispatch_handle.cached_query_resolved(key)?;
     let select = resolved.as_select()?;
     let constraints = analyze_query_constraints(select);
     if !constraints.where_analysis_complete {
@@ -797,8 +799,12 @@ impl ConnectionState {
                 ProxyMode::Read
             }
             Ok(Action::CacheCheck(ast)) => {
-                let fingerprint = query_expr_fingerprint(ast.query());
-                self.telemetry.cache_timing_start(fingerprint);
+                let search_path = self
+                    .search_path_state
+                    .resolve()
+                    .unwrap_or_else(|| Arc::from([]));
+                let key = query_expr_session_key(ast.query(), &search_path);
+                self.telemetry.cache_timing_start(key);
                 self.extended.dispatch_is_extended = false;
                 self.egress.cache_push(CacheMessage::Query(msg.data, ast));
                 ProxyMode::OriginDrain

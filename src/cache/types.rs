@@ -378,6 +378,5 @@ pub struct CachedQueryView {
 
 /// A pre-validated pinned query, ready for registration.
 pub struct PinnedQuery {
-    pub fingerprint: Fingerprint,
     pub cacheable_query: Arc<CacheableQuery>,
 }

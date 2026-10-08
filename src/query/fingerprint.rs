@@ -95,6 +95,17 @@ pub enum QueryKey {
     Session(SessionKey),
 }
 
+impl QueryKey {
+    /// The underlying `u64`, for telemetry ids that only need a stable label
+    /// per query-and-path.
+    pub const fn raw(self) -> u64 {
+        match self {
+            Self::Canonical(fingerprint) => fingerprint.get(),
+            Self::Session(key) => key.get(),
+        }
+    }
+}
+
 /// `HashMap` keyed by `Fingerprint` with the passthrough [`IdHasher`](crate::id_hash::IdHasher):
 /// the key is already a hash, so a lookup doesn't recompute one.
 pub type FingerprintMap<V> = HashMap<Fingerprint, V, BuildIdHasher<Fingerprint>>;

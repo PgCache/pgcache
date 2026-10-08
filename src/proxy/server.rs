@@ -23,7 +23,7 @@ use crate::{
     },
     catalog::{FunctionVolatility, function_volatility_map_load},
     pg::{cdc::replication_cleanup, connect},
-    query::ast::{query_expr_convert_raw, query_expr_fingerprint},
+    query::ast::query_expr_convert_raw,
     settings::{Settings, SslMode},
     telemetry, tls,
 };
@@ -119,8 +119,6 @@ fn pinned_queries_validate(
                     return None;
                 }
             };
-            // Fingerprint before try_new takes ownership of query_expr.
-            let fingerprint = query_expr_fingerprint(&query_expr);
             let cacheable_query = match CacheableQuery::try_new(query_expr, func_volatility) {
                 Ok(cq) => cq,
                 Err(e) => {
@@ -128,9 +126,8 @@ fn pinned_queries_validate(
                     return None;
                 }
             };
-            info!("pinned query validated: {sql} (fingerprint: {fingerprint})");
+            info!("pinned query validated: {sql}");
             Some(PinnedQuery {
-                fingerprint,
                 cacheable_query: Arc::new(cacheable_query),
             })
         })
@@ -496,7 +493,6 @@ mod tests {
         ]));
         let result = pinned_queries_validate(&settings, &HashMap::new());
         assert_eq!(result.len(), 1);
-        assert_ne!(result[0].fingerprint.get(), 0);
     }
 
     #[test]
@@ -507,8 +503,10 @@ mod tests {
         ]));
         let result = pinned_queries_validate(&settings, &HashMap::new());
         assert_eq!(result.len(), 2);
-        // Different queries should have different fingerprints
-        assert_ne!(result[0].fingerprint, result[1].fingerprint);
+        assert_ne!(
+            result[0].cacheable_query.query(),
+            result[1].cacheable_query.query()
+        );
     }
 
     #[test]

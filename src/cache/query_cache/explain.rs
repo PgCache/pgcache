@@ -13,8 +13,8 @@ use crate::cache::reply::ReplySender;
 use crate::cache::types::{CachedQueryState, CachedQueryView};
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::proxy::{ClientSocket, ExplainSpec, ExplainTarget};
-use crate::query::Fingerprint;
-use crate::query::ast::{query_expr_convert_raw, query_expr_fingerprint};
+use crate::query::ast::{query_expr_convert_raw, query_expr_session_key};
+use crate::query::{Fingerprint, QueryKey};
 use crate::timing::QueryTiming;
 
 /// The client an explain response goes back to.
@@ -27,13 +27,18 @@ pub(super) struct ExplainClient {
 
 impl CacheDispatch {
     /// Route a `pgcache_explain(...)` request to the serve pool.
-    pub(super) fn explain_dispatch(&self, spec: ExplainSpec, client: ExplainClient) {
+    pub(super) fn explain_dispatch(
+        &self,
+        spec: ExplainSpec,
+        client: ExplainClient,
+        search_path: &[EcoString],
+    ) {
         let job = ExplainJob {
             client_socket: client.client_socket,
             reply_tx: client.reply_tx,
             timing: client.timing,
             transaction_status: client.transaction_status,
-            kind: self.explain_kind_build(spec),
+            kind: self.explain_kind_build(spec, search_path),
         };
         if self.serve_tx.send(ServeJob::Explain(job)).is_err() {
             // Serve channel closed (subsystem teardown): the leased socket drops
@@ -45,8 +50,8 @@ impl CacheDispatch {
     /// Resolve an [`ExplainSpec`] to the concrete work the serve pool should do:
     /// a [`ExplainKind::Run`] for a Ready cached query, or
     /// [`ExplainKind::Unavailable`] with a reason otherwise.
-    fn explain_kind_build(&self, spec: ExplainSpec) -> ExplainKind {
-        let fingerprint = match explain_fingerprint(&spec.target) {
+    fn explain_kind_build(&self, spec: ExplainSpec, search_path: &[EcoString]) -> ExplainKind {
+        let fingerprint = match self.explain_fingerprint(&spec.target, search_path) {
             Ok(fingerprint) => fingerprint,
             Err(unavailable) => return unavailable,
         };
@@ -64,13 +69,29 @@ impl CacheDispatch {
     }
 }
 
-/// The fingerprint an explain target names, or why it can't be resolved.
-fn explain_fingerprint(target: &ExplainTarget) -> Result<Fingerprint, ExplainKind> {
-    match target {
-        ExplainTarget::Fingerprint(value) => Ok(Fingerprint::from_raw(*value)),
-        ExplainTarget::Sql(sql) => explain_sql_fingerprint(sql).ok_or(ExplainKind::Unavailable {
-            message: "could not parse query for explain".into(),
-        }),
+impl CacheDispatch {
+    /// The fingerprint an explain target names, or why it can't be resolved.
+    /// Inline SQL is keyed the way dispatch keys it: under the session's
+    /// search_path, through the alias map when a table name is unqualified.
+    fn explain_fingerprint(
+        &self,
+        target: &ExplainTarget,
+        search_path: &[EcoString],
+    ) -> Result<Fingerprint, ExplainKind> {
+        match target {
+            ExplainTarget::Fingerprint(value) => Ok(Fingerprint::from_raw(*value)),
+            ExplainTarget::Sql(sql) => {
+                let key = explain_sql_key(sql, search_path).ok_or(ExplainKind::Unavailable {
+                    message: "could not parse query for explain".into(),
+                })?;
+                self.fingerprint_for_key(key)
+                    .ok_or(ExplainKind::Unavailable {
+                        message:
+                            "query not cached (no session has resolved it under this search_path)"
+                                .into(),
+                    })
+            }
+        }
     }
 }
 
@@ -121,12 +142,12 @@ fn explain_kind_for_view(
     }
 }
 
-/// Fingerprint the inline SQL of a `pgcache_explain('<sql>')` request, the same
-/// way registration keys it (raw-tree convert → `query_expr_fingerprint`), so the
+/// Key the inline SQL of a `pgcache_explain('<sql>')` request the same way
+/// dispatch keys it (raw-tree convert → `query_expr_session_key`), so the
 /// lookup hits the cached entry. `None` if the argument doesn't parse as a SELECT.
-fn explain_sql_fingerprint(sql: &str) -> Option<Fingerprint> {
+fn explain_sql_key(sql: &str, search_path: &[EcoString]) -> Option<QueryKey> {
     pg_query::parse_raw_scoped(sql, |tree| unsafe { query_expr_convert_raw(tree) })
         .ok()
         .and_then(Result::ok)
-        .map(|query| query_expr_fingerprint(&query))
+        .map(|query| query_expr_session_key(&query, search_path))
 }

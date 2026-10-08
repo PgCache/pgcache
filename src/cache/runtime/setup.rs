@@ -152,21 +152,22 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
     };
 
     // Remaining fallible setup; on error, tear down both threads and reap.
-    let dispatch = match handle
-        .block_on(CacheDispatch::new(
+    let dispatch = match handle.block_on(async {
+        let dispatch = CacheDispatch::new(
             settings,
             query_tx,
             serve_tx,
             Arc::clone(&state_view),
             cdc_connected,
-        ))
-        .attach_loc("creating query cache")
-        .and_then(|dispatch| {
-            dispatch
-                .pinned_queries_register(pinned)
-                .attach_loc("registering pinned queries")?;
-            Ok(dispatch)
-        }) {
+        )
+        .await
+        .attach_loc("creating query cache")?;
+        dispatch
+            .pinned_queries_register(pinned)
+            .await
+            .attach_loc("registering pinned queries")?;
+        Ok(dispatch)
+    }) {
         Ok(dispatch) => dispatch,
         Err(e) => {
             cache_cancel.cancel();
