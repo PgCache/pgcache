@@ -1,12 +1,10 @@
 use std::sync::Arc;
 
 use ecow::EcoString;
-use postgres_types::PgLsn;
 use tokio_util::bytes::BytesMut;
 use tracing::{debug, trace};
 
 use super::ConnectionState;
-use crate::pg::Lsn;
 use crate::pg::protocol::{
     backend::{PgBackendMessage, PgBackendMessageType, data_row_first_column},
     frontend::{PgFrontendMessage, simple_query_message_build},
@@ -24,13 +22,13 @@ fn query_message_sql(data: &BytesMut) -> Option<&str> {
     str::from_utf8(data.get(5..msg_len)?).ok()
 }
 
-/// State machine for intercepting origin responses that shouldn't reach the client.
-/// Only one intercept can be active at a time.
+/// State machine for stripping proxy-added parts out of a client request's
+/// own origin response. Only one intercept can be active at a time. Whole
+/// injected queries (probes) are not intercepts: their replies are ordered and
+/// swallowed by the egress queue's `Probe` slots (see `probe.rs`).
 pub(super) enum OriginIntercept {
     /// No intercept active — origin messages forwarded normally.
     None,
-    /// Intercepting SHOW search_path response (pre-PG18 fallback).
-    SearchPath,
     /// pgcache prepended a `Parse` ahead of the client's `Bind+Execute+Sync`
     /// because origin didn't know the statement name. Swallow the resulting
     /// `ParseComplete` (the client didn't ask for it) and let `BindComplete`
@@ -40,14 +38,6 @@ pub(super) enum OriginIntercept {
     /// Responses for the original statement are forwarded; the SHOW's response
     /// is stripped and parsed into `search_path_state`.
     TrailingShowSearchPath(TrailingShowState),
-    /// Read-after-write commit-LSN probe (PGC-124): an injected
-    /// `SELECT pg_current_wal_insert_lsn()` whose response is fully swallowed;
-    /// its LSN bounds each table's active tier holding writes up to
-    /// `stamp_seq` (a table with a later write is skipped and re-probed).
-    WalLsnProbe { stamp_seq: u64 },
-    /// Isolation-level discovery (PGC-387): an injected `SHOW
-    /// default_transaction_isolation` whose response is fully swallowed.
-    DefaultTransactionIsolation,
 }
 
 /// Sub-state for `OriginIntercept::TrailingShowSearchPath`.
@@ -139,24 +129,6 @@ impl ConnectionState {
         match &self.origin_intercept {
             OriginIntercept::None => false,
 
-            OriginIntercept::SearchPath => {
-                match msg.message_type {
-                    PgBackendMessageType::DataRows => {
-                        if let Some(value) = data_row_first_column(&msg.data) {
-                            debug!("received search_path from SHOW query: {}", value);
-                            self.search_path_state =
-                                SearchPathState::resolved(value, self.session_user.as_deref());
-                        }
-                    }
-                    PgBackendMessageType::ReadyForQuery => {
-                        debug!("search_path query complete");
-                        self.origin_intercept = OriginIntercept::None;
-                    }
-                    _ => {}
-                }
-                true
-            }
-
             OriginIntercept::LazyParseInline { statement_name } => {
                 let stmt_name = statement_name.clone();
                 match msg.message_type {
@@ -181,30 +153,6 @@ impl ConnectionState {
 
             &OriginIntercept::TrailingShowSearchPath(state) => {
                 self.trailing_show_search_path_handle(state, msg)
-            }
-
-            OriginIntercept::DefaultTransactionIsolation => {
-                if self.default_transaction_isolation_handle(msg) {
-                    self.origin_intercept = OriginIntercept::None;
-                }
-                true
-            }
-
-            &OriginIntercept::WalLsnProbe { stamp_seq } => {
-                match msg.message_type {
-                    PgBackendMessageType::DataRows => {
-                        if let Some(value) = data_row_first_column(&msg.data)
-                            && let Ok(lsn) = value.parse::<PgLsn>()
-                        {
-                            self.write_log.stamp(stamp_seq, Lsn::from(lsn));
-                        }
-                    }
-                    PgBackendMessageType::ReadyForQuery => {
-                        self.origin_intercept = OriginIntercept::None;
-                    }
-                    _ => {}
-                }
-                true
             }
         }
     }

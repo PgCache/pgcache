@@ -64,7 +64,7 @@ Monitor `ParameterStatus` messages from the origin database during startup and t
 On first `ReadyForQuery` after authentication, if `search_path` is still unknown:
 1. Inject `SHOW search_path;` query to origin
 2. Set `search_path_query_pending = true`
-3. Intercept response messages (RowDescription, DataRow, CommandComplete, ReadyForQuery)
+3. Swallow the response at the probe's ordered egress slot (ADR-055; originally an intercept state)
 4. Parse value from DataRow, store parsed search path
 5. Resume normal operation (messages are not forwarded to client)
 

@@ -25,6 +25,7 @@ mod describe_cache;
 mod describe_synth;
 mod extended;
 mod extended_buffer;
+mod probe;
 mod relay;
 mod search_path_intercept;
 mod telemetry;
@@ -109,8 +110,9 @@ pub(super) struct ConnectionState {
     /// TODO: Track SET ROLE queries to update effective user for permission checks
     session_user: Option<String>,
 
-    /// Intercepts origin responses that shouldn't reach the client (e.g., SHOW
-    /// search_path or proactive Parse+Sync). Only one intercept active at a time.
+    /// Strips proxy-added parts out of a client request's own origin response
+    /// (a lazy `Parse`, a piggybacked `SHOW search_path`). Only one active at
+    /// a time. Whole injected probes are ordered by `egress` instead.
     origin_intercept: OriginIntercept,
 
     /// Search path discovery state

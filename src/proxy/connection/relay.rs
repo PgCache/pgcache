@@ -51,7 +51,7 @@ use crate::{
             TransactionStatus, authentication_type, parameter_status_parse,
         },
         frontend::{
-            PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType, ProbeQuery,
+            PgFrontendMessage, PgFrontendMessageCodec, PgFrontendMessageType,
             startup_message_parameter,
         },
         session::PreparedStatement,
@@ -82,11 +82,6 @@ fn log_gate(last: &AtomicU64, window_secs: u64) -> bool {
 
 /// Window for the cache-down operator warnings, in seconds.
 const CACHE_DOWN_LOG_WINDOW_SECS: u64 = 5;
-
-/// Injected query that samples the origin's current WAL insert LSN — a safe
-/// upper bound on the commit LSN of every write forwarded before it, used to
-/// bound per-connection read-after-write log entries (PGC-124).
-const WAL_INSERT_LSN_PROBE: ProbeQuery = ProbeQuery::new("SELECT pg_current_wal_insert_lsn()");
 
 /// Gate state: cache died with a query in flight (client connection dropped).
 static CACHE_DEAD_INFLIGHT_LOG: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -853,6 +848,11 @@ impl ConnectionState {
             self.write_log.disable();
         }
 
+        // The handshake's responses are the first client-bound slot; opening
+        // it here (rather than lazily on the first byte back) keeps a request
+        // the client pipelines behind the startup ordered after it — and lets
+        // a probe injected at the startup ReadyForQuery see it in flight.
+        self.egress.origin_open();
         self.origin_write_buf.push_back(msg.data);
     }
 
@@ -862,8 +862,14 @@ impl ConnectionState {
     pub(super) fn handle_origin_message(&mut self, mut msg: PgBackendMessage) {
         trace!("net: origin→proxy {:?}", msg.message_type);
 
+        // A probe's reply, recognised by its position in origin's reply order,
+        // is consumed whole. Checked before the in-batch intercepts, which
+        // only ever apply to a client request's own response.
+        if self.egress.origin_reply_is_probe() {
+            self.probe_message_handle(&msg);
+            return;
+        }
         if self.origin_intercept_handle(&msg) {
-            self.intercept_ready_followup(&msg);
             return;
         }
 
@@ -901,22 +907,6 @@ impl ConnectionState {
             _ => {}
         }
         self.origin_message_relay(msg);
-    }
-
-    /// A message swallowed by an intercept (injected SHOW, lazy ParseComplete,
-    /// …) has no client egress slot, so its RFQ seals nothing. A completed
-    /// intercept's RFQ is still a quiescent point: chain the isolation probe /
-    /// commit-LSN probe now rather than waiting for client traffic. Only the
-    /// isolation probe chains (it is never injected while a block is open, so
-    /// it cannot fail-and-loop); a search_path SHOW retries at the next
-    /// client-visible RFQ.
-    fn intercept_ready_followup(&mut self, msg: &PgBackendMessage) {
-        if matches!(msg.message_type, PgBackendMessageType::ReadyForQuery)
-            && matches!(self.origin_intercept, OriginIntercept::None)
-        {
-            self.isolation_probe_inject();
-            self.write_log_maintain();
-        }
     }
 
     fn parameter_status_handle(&mut self, data: &BytesMut) {
@@ -961,11 +951,6 @@ impl ConnectionState {
         }
         self.search_path_just_piggyback_resolved = false;
         self.isolation_block_transition(previous_status);
-
-        // Re-sync any unknown session state (search_path on pre-PG18, the
-        // isolation default) with an injected SHOW. Skipped if another
-        // intercept is active — its completion chains the isolation probe.
-        self.session_discovery_inject();
     }
 
     /// Transaction ended: any SET (including SET LOCAL) within the txn
@@ -994,48 +979,10 @@ impl ConnectionState {
         self.egress.origin_append(msg.data.freeze());
         if was_rfq {
             self.egress.origin_seal();
-            // The current request's slot is now sealed, so the quiescence check
-            // inside `write_log_maintain` sees only genuinely in-flight work.
-            self.write_log_maintain();
+            // Re-sync unknown session state (search_path on pre-PG18, the
+            // isolation default) and bound pending writes (ADR-048).
+            self.probes_inject();
         }
-    }
-
-    /// Maintain the read-after-write log at a ReadyForQuery boundary (PGC-124):
-    /// drop writes the CDC apply watermark has passed, then — when idle
-    /// (post-commit) and the origin socket is quiescent — inject a commit-LSN
-    /// probe to bound the still-unstamped writes.
-    fn write_log_maintain(&mut self) {
-        if self.write_log.is_empty() {
-            return;
-        }
-        // Clear applied writes. Read the watermark through the current dispatch
-        // so a cache restart never surfaces a stale-high value.
-        if let Some(watermark) = self.dispatch_handle.settled_lsn() {
-            self.write_log.purge(watermark);
-        }
-        // Sample a commit-LSN bound for the unstamped writes, but only when
-        // idle ('I' — the writes have committed) and no origin response is in
-        // flight, so the probe's LSN is the next thing back and bounds exactly
-        // the writes recorded through `stamp_seq`. A write racing in after the
-        // sample is caught by `WriteLog::stamp`'s seq guard.
-        if self.write_log_probe_ready()
-            && let Some(stamp_seq) = self.write_log.stamp_seq()
-        {
-            self.origin_intercept = OriginIntercept::WalLsnProbe { stamp_seq };
-            self.origin_write_buf
-                .push_back(WAL_INSERT_LSN_PROBE.message());
-            crate::metrics::handles().raw.probes.increment(1);
-        }
-    }
-
-    /// Whether a commit-LSN probe may be injected now: the connection is idle
-    /// (post-commit) and nothing is in flight on the origin socket.
-    fn write_log_probe_ready(&self) -> bool {
-        let idle = matches!(self.proxy_mode, ProxyMode::Read) && !self.in_transaction();
-        let origin_quiet = matches!(self.origin_intercept, OriginIntercept::None)
-            && self.origin_write_buf.is_empty()
-            && self.egress.origin_all_sealed();
-        idle && origin_quiet
     }
 
     /// Handle the outcome of a cache reply (the leased socket has already been

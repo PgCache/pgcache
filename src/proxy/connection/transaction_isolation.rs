@@ -7,19 +7,21 @@
 //! forward. The effective level is invisible on the wire (neither
 //! `transaction_isolation` nor `default_transaction_isolation` is reported),
 //! so the proxy discovers the session default once with an injected `SHOW`
-//! (an origin intercept, like the pre-PG18 search_path probe) and tracks every
-//! statement that can change it from then on.
+//! (an ordered probe, see `probe.rs`) and tracks every statement that can
+//! change it from then on.
 //!
 //! A block's level is fixed when the block starts: PostgreSQL reads
 //! `default_transaction_isolation` at `BEGIN`, and a later change to the
 //! default applies to the *next* block. The proxy mirrors that by snapshotting
 //! its session state into a block-scoped state on the idle→in-block
 //! ReadyForQuery edge (a `BEGIN ... ISOLATION LEVEL` clause, forwarded
-//! earlier, takes precedence), and never probes while a block is open — a
-//! probe there would read the default, not the block. Explicit statements only
-//! ever tighten the tracked state; only the probe establishes READ COMMITTED,
-//! so a statement that failed at origin can never make the proxy serve
-//! wrongly. Unknown means forward, and unknown is transient: one round trip.
+//! earlier, takes precedence), and never probes while a block is open or a
+//! forwarded `BEGIN` is unacknowledged — a probe there would read the default,
+//! not the block (its own ReadyForQuery status is the final check). Explicit
+//! statements only ever tighten the tracked state; only the probe establishes
+//! READ COMMITTED, so a statement that failed at origin can never make the
+//! proxy serve wrongly. Unknown means forward, and unknown is transient: one
+//! round trip.
 //!
 //! Effects are applied when a statement is forwarded, which can run ahead of
 //! the ReadyForQuery that reports the block it lands in (pipelining). Block
@@ -32,18 +34,9 @@
 
 use tracing::debug;
 
-use super::{ConnectionState, OriginIntercept, SearchPathState};
-use crate::pg::protocol::{
-    backend::{PgBackendMessage, PgBackendMessageType, TransactionStatus, data_row_first_column},
-    frontend::ProbeQuery,
-};
+use super::ConnectionState;
+use crate::pg::protocol::backend::TransactionStatus;
 use crate::query::write::{IsolationEffect, IsolationLevel, StatementEffects, TransactionBoundary};
-
-/// Injected probe for the session default; its response is swallowed by
-/// [`OriginIntercept::DefaultTransactionIsolation`].
-const DEFAULT_TRANSACTION_ISOLATION_PROBE: ProbeQuery =
-    ProbeQuery::new("SHOW default_transaction_isolation;");
-const SEARCH_PATH_PROBE: ProbeQuery = ProbeQuery::new("SHOW search_path;");
 
 /// An isolation level as the proxy knows it — for the session default, and
 /// for the block currently open.
@@ -70,7 +63,7 @@ pub(super) enum TransactionForwardReason {
 impl ConnectionState {
     /// Whether the statement being forwarded lands inside a block: the status
     /// says so, or a forwarded `BEGIN` has not been acknowledged yet.
-    fn forwarding_into_block(&self) -> bool {
+    pub(super) fn forwarding_into_block(&self) -> bool {
         self.in_transaction() || self.begins_forwarded > 0
     }
 
@@ -166,69 +159,9 @@ impl ConnectionState {
         }
     }
 
-    /// No origin intercept is in flight.
-    fn origin_intercept_idle(&self) -> bool {
-        matches!(self.origin_intercept, OriginIntercept::None)
-    }
-
-    /// The session default is unknown and no block is open to hide it.
-    fn isolation_probe_needed(&self) -> bool {
-        self.session_isolation == IsolationState::Unknown && !self.in_transaction()
-    }
-
-    /// Inject the next pending session-discovery probe, if any, at a
-    /// client-visible ReadyForQuery: search_path first (pre-PG18 only), then
-    /// the isolation default. One intercept at a time.
-    pub(super) fn session_discovery_inject(&mut self) {
-        if !self.origin_intercept_idle() {
-            return;
-        }
-        if let SearchPathState::Unknown = self.search_path_state {
-            debug!("search_path unknown, sending SHOW search_path query");
-            self.origin_intercept = OriginIntercept::SearchPath;
-            // Injected query: its response is fully swallowed by the
-            // SearchPath intercept, so it gets no client egress slot.
-            self.origin_write_buf.push_back(SEARCH_PATH_PROBE.message());
-            return;
-        }
-        self.isolation_probe_inject();
-    }
-
-    /// Inject the isolation-default probe if it is unknown, no intercept is
-    /// active, and no block is open (inside one the probe would report the
-    /// default, not the block's level — and in a failed block it would just
-    /// error). Also the only probe chained onto another intercept's
-    /// completion: a probe that leaves the state unknown is not retried until
-    /// the next client-visible ReadyForQuery, so nothing can loop.
-    pub(super) fn isolation_probe_inject(&mut self) {
-        if !self.isolation_probe_needed() || !self.origin_intercept_idle() {
-            return;
-        }
-        debug!("default_transaction_isolation unknown, probing");
-        self.origin_intercept = OriginIntercept::DefaultTransactionIsolation;
-        self.origin_write_buf
-            .push_back(DEFAULT_TRANSACTION_ISOLATION_PROBE.message());
-        crate::metrics::handles().txn.isolation_probes.increment(1);
-    }
-
-    /// Consume one origin message under the isolation probe intercept. Returns
-    /// whether the intercept is complete (its ReadyForQuery arrived).
-    #[expect(clippy::wildcard_enum_match_arm)]
-    pub(super) fn default_transaction_isolation_handle(&mut self, msg: &PgBackendMessage) -> bool {
-        match msg.message_type {
-            PgBackendMessageType::DataRows => {
-                // Unreadable output stays Unknown (forward) rather than re-probe
-                // forever: the next client ReadyForQuery triggers a fresh probe.
-                if let Some(level) =
-                    data_row_first_column(&msg.data).and_then(IsolationLevel::parse)
-                {
-                    debug!(?level, "received default_transaction_isolation");
-                    self.session_isolation = IsolationState::Known(level);
-                }
-                false
-            }
-            PgBackendMessageType::ReadyForQuery => true,
-            _ => false,
-        }
+    /// The session default is unknown and no block is open (or about to be)
+    /// that would hide it.
+    pub(super) fn isolation_probe_needed(&self) -> bool {
+        self.session_isolation == IsolationState::Unknown && !self.forwarding_into_block()
     }
 }

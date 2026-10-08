@@ -47,10 +47,12 @@ read-after-write gate.
   block. Extended-protocol batches use the same per-slot gate.
 - **Isolation discovery: one probe plus statement tracking.** The session
   default is discovered once per connection by an injected `SHOW
-  default_transaction_isolation` (an origin intercept, sharing the search_path
-  probe's quiescent-ReadyForQuery injection point), and never while a block is
-  open — there it would report the default, not the block, and in a failed
-  block it would only error. Every statement that can change it is classified
+  default_transaction_isolation` (an ordered probe slot in the egress queue,
+  ADR-055; originally an origin intercept injected at a ReadyForQuery assumed
+  quiescent), and never while a block is open or a forwarded `BEGIN` is
+  unacknowledged — there it would report the default, not the block, and in a
+  failed block it would only error; the probe's own ReadyForQuery status is
+  the final check. Every statement that can change it is classified
   in the memoized cacheability analysis, bundled with its write class and
   transaction boundary as one `StatementEffects` value that every forward path
   applies through a single method: `BEGIN/START TRANSACTION ... ISOLATION
@@ -60,7 +62,7 @@ read-after-write gate.
   default; `RESET`, `RESET ALL`, `DISCARD ALL`, `SET ... TO DEFAULT`, `SET
   LOCAL`, an unreadable value, an unparseable statement, and any text
   mentioning `set_config` mark the default unknown. Unknown means forward, and
-  unknown is transient: the next quiescent ReadyForQuery re-probes. A mutation
+  unknown is transient: the next ReadyForQuery re-probes. A mutation
   inside a block flags a re-probe at block end, since a `SET` in a
   rolled-back block reverts and `SET LOCAL` always does.
 - **A block's level is fixed when it starts.** As PostgreSQL reads the default
@@ -152,8 +154,8 @@ read-after-write gate.
 ## Implementation Notes
 
 The gate and status plumbing live in the connection (`transaction_isolation.rs`
-holds the isolation state machine and probe intercept; the tri-state status and
-gate are in `relay.rs`); statement classification is in
+holds the isolation state machine, `probe.rs` the probe injection and reply
+application; the tri-state status and gate are in `relay.rs`); statement classification is in
 `query/ast/convert_raw/write.rs` and surfaces through `Action`. Metrics:
 `pgcache.txn.served`, `pgcache.txn.forwards{reason}`,
 `pgcache.txn.isolation_probes`. Integration coverage is

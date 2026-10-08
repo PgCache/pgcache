@@ -7,7 +7,9 @@ use std::io::Error;
 
 use tokio_postgres::SimpleQueryMessage;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta};
+use crate::util::{
+    TestContext, WireClient, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta,
+};
 
 mod util;
 
@@ -114,6 +116,53 @@ async fn test_commit_lsn_probe_fires_and_preserves_results() -> Result<(), Error
         delta.raw_probes
     );
 
+    Ok(())
+}
+
+/// A statement pipelined behind a write is in flight at the write's
+/// ReadyForQuery, where the commit-LSN probe is injected. The probe still
+/// fires, the pipelined statement gets its own response, and the write is
+/// bounded and cleared so a later read on the connection serves from cache.
+#[tokio::test]
+async fn test_commit_lsn_probe_with_pipelined_statement_behind_write() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[RAW_ON]).await?;
+    ctx.query("CREATE TABLE raw_pipe (id int primary key, v int)", &[])
+        .await?;
+    ctx.simple_query("INSERT INTO raw_pipe VALUES (1, 10)")
+        .await?;
+    ctx.cache_settle().await?;
+    register(&mut ctx, "SELECT v FROM raw_pipe WHERE id = 1").await?;
+
+    let mut client = WireClient::connect(ctx.cache_port).await?;
+    let before = ctx.metrics().await?;
+    client
+        .query_send("UPDATE raw_pipe SET v = 11 WHERE id = 1")
+        .await?;
+    client.query_send("SELECT 42 AS answer").await?;
+    let update = client.response_read().await?;
+    assert_eq!(update.command_tags(), ["UPDATE 1"]);
+    let select = client.response_read().await?;
+    assert_eq!(select.command_tags(), ["SELECT 1"]);
+    assert_eq!(select.first_value().as_deref(), Some("42"));
+
+    ctx.cache_settle().await?;
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert!(
+        delta.raw_probes >= 1,
+        "expected a commit-LSN probe behind the pipelined statement, got {}",
+        delta.raw_probes
+    );
+
+    // The write was bounded and has cleared: the read serves from cache with
+    // the committed value.
+    let before = ctx.metrics().await?;
+    let read = client.query("SELECT v FROM raw_pipe WHERE id = 1").await?;
+    assert_eq!(read.first_value().as_deref(), Some("11"));
+    let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "cleared write must not forward the read"
+    );
     Ok(())
 }
 
