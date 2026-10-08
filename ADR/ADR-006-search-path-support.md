@@ -13,8 +13,7 @@ Previously, pgcache hardcoded `"public"` as the default schema, which is incorre
 
 PostgreSQL's search path has specific semantics:
 - Comma-separated list of schema names
-- `$user` (unquoted) is a special token that expands to the current session user's username
-- `"$user"` (quoted) is a literal schema name, not the special token
+- `$user`, quoted or not, is a special token that expands to the current session user's username (PostgreSQL strips the quotes before matching it, which is how the default `"$user", public` works)
 - Unquoted identifiers are case-folded to lowercase
 - Quoted identifiers preserve case
 - PostgreSQL 18+ sends `search_path` via `ParameterStatus` messages during startup and on changes
@@ -38,8 +37,7 @@ pub struct SearchPath(pub Vec<SearchPathEntry>);
 ```
 
 The `SearchPath::parse()` method handles PostgreSQL's identifier quoting rules:
-- Unquoted `$user` → `SessionUser` variant
-- Quoted `"$user"` → `Schema("$user")` (literal)
+- `$user`, quoted or unquoted → `SessionUser` variant
 - Unquoted identifiers → lowercased schema name
 - Quoted identifiers → preserved case, unescaped `""` to `"`
 
@@ -83,6 +81,8 @@ A cached query's identity (`Fingerprint`) is the content hash of its AST plus, f
 
 A shared alias map (`SessionKey → Fingerprint`) on the cache state view joins the two. On an alias miss the dispatch sends `QueryCommand::Resolve`; the writer resolves each bare name against the catalog (memoized per path and name in `schema_resolutions`), records the alias, and replies with the fingerprint. This happens once per (query, path) pair process-wide; later requests, from any connection, read the alias. The writer is the only party that writes the map; aliases whose fingerprint has left both query maps are swept with the stale-entry cleanup, and dispatch treats an alias to a missing entry as an ordinary cold miss under that fingerprint.
 
+Unqualified function, type and operator names are not part of the key. The cache database holds no user objects, so a query can only be served with builtin semantics; the one way origin can differ for the same text is a path that lists `pg_catalog` after another schema, where a user object with a builtin's exact signature shadows it. Such a session forwards (`SearchPathState::BuiltinsShadowed`). A schema-qualified function call is cacheable only when the schema is `pg_catalog`; the qualifier stays on the AST and in the fingerprint.
+
 Keying on the resolved schema rather than on the path itself means two paths that resolve a query the same way share one entry, and pinned queries (resolved under `public` at startup) are reached by sessions on any path. Keying on the path alone was rejected: it duplicates every entry per distinct resolved path (the default `"$user", public` resolves differently per role) and leaves pinned entries unreachable from the default path. Resolution consults the origin catalog in path order; it must not short-circuit on an already-cached table in a later schema, because an earlier schema may shadow it.
 
 ### Cache Worker Execution
@@ -121,7 +121,6 @@ pub struct WorkerRequest {
 ### Not Implemented (Future Work)
 - `pg_catalog` and `pg_temp` implicit schema handling
 - Function-scoped search_path changes
-- Unqualified function, operator and type names also resolve through search_path and are not part of the key
 
 ## References
 - [PostgreSQL search_path documentation](https://www.postgresql.org/docs/current/ddl-schemas.html#DDL-SCHEMAS-PATH)

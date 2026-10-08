@@ -81,6 +81,22 @@ pub(super) enum SearchPathState {
     /// query), pre-expanded ($user → session_user) and shared: dispatching a
     /// cache query clones the Arc instead of collecting a fresh Vec per query.
     Resolved(Arc<[EcoString]>),
+
+    /// The resolved path lists `pg_catalog` after another schema. Only then
+    /// can a user function, type or operator with a builtin's exact signature
+    /// shadow the builtin on origin, while the cache DB (which has no user
+    /// objects) would run the builtin. Cacheable queries forward until the
+    /// path changes; the value is known, so nothing is re-probed.
+    BuiltinsShadowed,
+}
+
+/// `pg_catalog` is searched first unless listed explicitly, in which case it
+/// is searched at its listed position.
+fn builtins_shadowed(resolved: &[EcoString]) -> bool {
+    resolved
+        .iter()
+        .position(|schema| schema == "pg_catalog")
+        .is_some_and(|index| index > 0)
 }
 
 impl SearchPathState {
@@ -89,18 +105,30 @@ impl SearchPathState {
     /// final before any of the transitions into this state.
     pub(super) fn resolved(value: &str, session_user: Option<&str>) -> Self {
         let search_path = SearchPath::parse(value);
-        Self::Resolved(
-            search_path
-                .resolve(session_user)
-                .map(EcoString::from)
-                .collect(),
-        )
+        let resolved: Arc<[EcoString]> = search_path
+            .resolve(session_user)
+            .map(EcoString::from)
+            .collect();
+        if builtins_shadowed(&resolved) {
+            debug!("search_path lists pg_catalog after another schema; cacheable queries forward");
+            return Self::BuiltinsShadowed;
+        }
+        Self::Resolved(resolved)
+    }
+
+    /// Why a cacheable query is forwarded while this state has no path.
+    pub(super) fn forward_reason(&self) -> &'static str {
+        match self {
+            Self::Unknown => "search_path unknown",
+            Self::BuiltinsShadowed => "search_path lists pg_catalog after another schema",
+            Self::Resolved(_) => "search_path resolved",
+        }
     }
 
     /// The resolved search_path, if available.
     pub(super) fn resolve(&self) -> Option<Arc<[EcoString]>> {
         match self {
-            Self::Unknown => None,
+            Self::Unknown | Self::BuiltinsShadowed => None,
             Self::Resolved(search_path) => Some(Arc::clone(search_path)),
         }
     }
@@ -281,5 +309,48 @@ impl ConnectionState {
             debug!("search_path mutation detected in Parse");
             self.search_path_mark_unknown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolved_names(value: &str, session_user: Option<&str>) -> Option<Vec<String>> {
+        SearchPathState::resolved(value, session_user)
+            .resolve()
+            .map(|path| path.iter().map(ToString::to_string).collect())
+    }
+
+    #[test]
+    fn test_resolved_default_path_expands_user() {
+        assert_eq!(
+            resolved_names(r#""$user", public"#, Some("alice")),
+            Some(vec!["alice".to_owned(), "public".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test_resolved_pg_catalog_first_is_not_shadowed() {
+        assert_eq!(
+            resolved_names("pg_catalog, public", None),
+            Some(vec!["pg_catalog".to_owned(), "public".to_owned()])
+        );
+    }
+
+    #[test]
+    fn test_resolved_pg_catalog_after_another_schema_forwards() {
+        assert!(matches!(
+            SearchPathState::resolved("myschema, pg_catalog", None),
+            SearchPathState::BuiltinsShadowed
+        ));
+        assert_eq!(resolved_names("myschema, pg_catalog, public", None), None);
+        // `$user` expanding ahead of pg_catalog counts as another schema.
+        assert_eq!(resolved_names("$user, pg_catalog", Some("alice")), None);
+    }
+
+    #[test]
+    fn test_resolved_quoted_pg_catalog_is_the_same_schema() {
+        assert_eq!(resolved_names(r#"myschema, "pg_catalog""#, None), None);
     }
 }

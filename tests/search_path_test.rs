@@ -1,6 +1,6 @@
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
+use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta};
 
 mod util;
 
@@ -669,6 +669,72 @@ async fn test_search_path_qualified_query_shares_entry_across_paths() -> Result<
     ctx.simple_query("SET search_path TO qual_b").await?;
     let res = ctx.simple_query(sql).await?;
     assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A path that lists `pg_catalog` after another schema lets a user object
+/// shadow a builtin on origin, which the cache DB cannot reproduce. Such a
+/// session forwards; moving `pg_catalog` first restores caching.
+#[tokio::test]
+async fn test_search_path_pg_catalog_after_schema_forwards() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    config_table_create(&mut ctx, "late_cat", "from_late").await?;
+    let sql = "SELECT id, value FROM config WHERE id = 1";
+
+    ctx.simple_query("SET search_path TO late_cat, pg_catalog")
+        .await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_late")])?;
+    let after = ctx.metrics().await?;
+    let delta = metrics_delta(&m, &after);
+    assert_eq!(delta.queries_uncacheable, 1, "expected a forward");
+    assert_eq!(delta.queries_cacheable, 0, "must not be counted cacheable");
+
+    ctx.simple_query("SET search_path TO pg_catalog, late_cat")
+        .await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_late")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_late")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// The default path `"$user", public` spells the token quoted, and
+/// PostgreSQL still expands it, so a schema named after the role shadows
+/// `public`. The test role is `postgres`.
+#[tokio::test]
+async fn test_search_path_default_user_schema_precedes_public() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.origin_query(
+        "CREATE TABLE public.config (id integer primary key, value text)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "INSERT INTO public.config (id, value) VALUES (1, 'from_public')",
+        &[],
+    )
+    .await?;
+    config_table_create(&mut ctx, "postgres", "from_user").await?;
+    let sql = "SELECT id, value FROM config WHERE id = 1";
+
+    ctx.simple_query(r#"SET search_path TO "$user", public"#)
+        .await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_user")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_user")])?;
     let _m = assert_cache_hit(&mut ctx, m).await?;
 
     Ok(())

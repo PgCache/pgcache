@@ -238,7 +238,10 @@ async fn handle_connection(
                     Some(search_path) => search_path,
                     None if matches!(msg, CacheMessage::Explain(..)) => Arc::from([]),
                     None => {
-                        debug!("search_path unknown, forwarding to origin");
+                        debug!(
+                            "{}, forwarding to origin",
+                            state.search_path_state.forward_reason()
+                        );
                         crate::metrics::handles().query.uncacheable.increment(1);
                         state.cache_slot_forward_to_origin(msg);
                         continue;
