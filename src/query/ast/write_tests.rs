@@ -493,9 +493,6 @@ fn test_opaque_statements_are_connection_scope() {
     for sql in [
         // EXECUTE runs a prepared statement whose body may be DML.
         "EXECUTE p",
-        // EXPLAIN ANALYZE executes its argument.
-        "EXPLAIN ANALYZE INSERT INTO t (a) VALUES (1)",
-        "EXPLAIN SELECT 1",
         "CALL do_things()",
         "DO $$ BEGIN NULL; END $$",
         "CREATE TABLE t (a int)",
@@ -506,6 +503,43 @@ fn test_opaque_statements_are_connection_scope() {
             matches!(classify_write(sql), WriteClass::Connection),
             "for {sql:?}"
         );
+    }
+}
+
+/// PGC-374: `EXPLAIN ANALYZE` executes its argument, so it is a write of
+/// unknown scope. Any ANALYZE option not provably off counts as on.
+#[test]
+fn test_explain_analyze_is_connection_scope() {
+    for sql in [
+        "EXPLAIN ANALYZE INSERT INTO t (a) VALUES (1)",
+        "EXPLAIN ANALYZE SELECT 1",
+        "EXPLAIN (ANALYZE) DELETE FROM t",
+        "EXPLAIN (ANALYZE, BUFFERS) UPDATE t SET a = 1",
+        "EXPLAIN (analyze true) INSERT INTO t (a) VALUES (1)",
+        "EXPLAIN (ANALYZE on) INSERT INTO t (a) VALUES (1)",
+        "EXPLAIN (ANALYZE 1) INSERT INTO t (a) VALUES (1)",
+        "EXPLAIN (BUFFERS, ANALYZE) EXECUTE p",
+    ] {
+        assert!(
+            matches!(classify_write(sql), WriteClass::Connection),
+            "for {sql:?}"
+        );
+    }
+}
+
+/// PGC-374: a plain `EXPLAIN` only plans its argument, even a DML one.
+#[test]
+fn test_explain_without_analyze_is_read_only() {
+    for sql in [
+        "EXPLAIN SELECT 1",
+        "EXPLAIN INSERT INTO t (a) VALUES (1)",
+        "EXPLAIN (VERBOSE, FORMAT JSON) DELETE FROM t",
+        "EXPLAIN (ANALYZE false) INSERT INTO t (a) VALUES (1)",
+        "EXPLAIN (ANALYZE off) UPDATE t SET a = 1",
+        "EXPLAIN (ANALYZE 0) INSERT INTO t (a) VALUES (1)",
+        "EXPLAIN EXECUTE p",
+    ] {
+        assert_read_only(sql);
     }
 }
 

@@ -185,6 +185,7 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
                     _ => IsolationEffect::None,
                 },
             },
+            pg::NodeTag_T_ExplainStmt => explain_classify(cast::<pg::ExplainStmt>(stmt)),
             pg::NodeTag_T_VariableShowStmt
             | pg::NodeTag_T_DeallocateStmt
             | pg::NodeTag_T_ClosePortalStmt
@@ -194,9 +195,51 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
             | pg::NodeTag_T_UnlistenStmt
             | pg::NodeTag_T_NotifyStmt => read_only(None),
             // ExecuteStmt runs a SQL-level prepared statement whose body may be
-            // DML; ExplainStmt with ANALYZE executes its argument. Everything
-            // else (DDL, CALL, DO, unknown) is a potential write.
+            // DML. Everything else (DDL, CALL, DO, unknown) is a potential write.
             _ => Write(WriteClass::Connection),
+        }
+    }
+}
+
+/// `EXPLAIN` only plans its argument; `EXPLAIN ANALYZE` executes it (PGC-374).
+unsafe fn explain_classify(s: *const pg::ExplainStmt) -> NonSelectClass {
+    unsafe {
+        if explain_options_analyze((*s).options) {
+            NonSelectClass::Write(WriteClass::Connection)
+        } else {
+            read_only(None)
+        }
+    }
+}
+
+/// Whether an `EXPLAIN` option list turns ANALYZE on. An ANALYZE option whose
+/// value isn't provably false counts as on — the failure direction is "it ran".
+unsafe fn explain_options_analyze(options: *const pg::List) -> bool {
+    unsafe {
+        list_nodes(options).any(|node| {
+            node_tag(node) == pg::NodeTag_T_DefElem && {
+                let def = cast::<pg::DefElem>(node);
+                cstr((*def).defname).eq_ignore_ascii_case("analyze")
+                    && !option_value_is_false((*def).arg as NodePtr)
+            }
+        })
+    }
+}
+
+/// Whether an option value node is one `defGetBoolean` reads as false: the
+/// integer `0` or the strings `false` / `off`. A missing value means true.
+unsafe fn option_value_is_false(arg: NodePtr) -> bool {
+    unsafe {
+        if arg.is_null() {
+            return false;
+        }
+        match node_tag(arg) {
+            pg::NodeTag_T_Integer => (*cast::<pg::Integer>(arg)).ival == 0,
+            pg::NodeTag_T_String => {
+                let value = cstr((*cast::<pg::String>(arg)).sval);
+                value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
+            }
+            _ => false,
         }
     }
 }

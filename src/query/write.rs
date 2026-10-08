@@ -149,8 +149,8 @@ pub enum WriteClass {
     /// Target relation known, effect not row-enumerable (MERGE, degraded
     /// INSERT/DELETE/UPDATE forms, COPY FROM, TRUNCATE).
     Table(RelationRef),
-    /// Scope unknown: DDL, CALL, DO, EXECUTE, EXPLAIN, multi-statement, or
-    /// anything unrecognized.
+    /// Scope unknown: DDL, CALL, DO, EXECUTE, EXPLAIN ANALYZE, multi-statement,
+    /// or anything unrecognized.
     Connection,
     /// `PREPARE TRANSACTION`: the commit happens later, possibly from another
     /// session, so a commit-LSN bound sampled at this statement's
