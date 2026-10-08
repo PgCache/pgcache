@@ -20,8 +20,9 @@ impl SearchPath {
     /// Parse a search_path string from PostgreSQL.
     ///
     /// Handles:
-    /// - Unquoted `$user` -> `SessionUser`
-    /// - Quoted `"$user"` -> `Schema("$user")` (literal schema name)
+    /// - `$user`, quoted or not -> `SessionUser`. PostgreSQL strips the quotes
+    ///   before matching the token (`SplitIdentifierString` in namespace.c),
+    ///   which is why the default `"$user", public` works.
     /// - Regular identifiers -> `Schema(name)` (lowercased)
     /// - Double-quoted identifiers -> `Schema(name)` (preserves case)
     pub fn parse(s: &str) -> Self {
@@ -33,9 +34,12 @@ impl SearchPath {
                 if let Some(quoted) = entry.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
                     // Quoted identifier: preserve case, unescape double quotes
                     let unescaped = quoted.replace("\"\"", "\"");
-                    SearchPathEntry::Schema(unescaped)
+                    if unescaped == "$user" {
+                        SearchPathEntry::SessionUser
+                    } else {
+                        SearchPathEntry::Schema(unescaped)
+                    }
                 } else if entry == "$user" {
-                    // Unquoted $user is the special session user token
                     SearchPathEntry::SessionUser
                 } else {
                     // Unquoted identifier: lowercase
@@ -101,12 +105,13 @@ mod tests {
 
     #[test]
     fn test_parse_user_quoted() {
-        // Quoted "$user" is a literal schema name, not the special token
+        // The default search_path spells the token quoted; PG strips the
+        // quotes before matching it.
         let path = SearchPath::parse(r#""$user", public"#);
         assert_eq!(
             path.0,
             vec![
-                SearchPathEntry::Schema("$user".to_owned()),
+                SearchPathEntry::SessionUser,
                 SearchPathEntry::Schema("public".to_owned()),
             ]
         );
@@ -114,13 +119,12 @@ mod tests {
 
     #[test]
     fn test_parse_user_mixed() {
-        // First $user is unquoted (SessionUser), second is quoted (literal)
         let path = SearchPath::parse(r#"$user, "$user", public"#);
         assert_eq!(
             path.0,
             vec![
                 SearchPathEntry::SessionUser,
-                SearchPathEntry::Schema("$user".to_owned()),
+                SearchPathEntry::SessionUser,
                 SearchPathEntry::Schema("public".to_owned()),
             ]
         );
@@ -208,10 +212,9 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_quoted_user_not_expanded() {
-        // Quoted "$user" should stay as literal "$user", not expand to session user
+    fn test_resolve_quoted_user_expanded() {
         let path = SearchPath::parse(r#""$user", public"#);
         let resolved: Vec<&str> = path.resolve(Some("alice")).collect();
-        assert_eq!(resolved, vec!["$user", "public"]);
+        assert_eq!(resolved, vec!["alice", "public"]);
     }
 }
