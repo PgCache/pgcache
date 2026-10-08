@@ -14,6 +14,7 @@ pub mod update;
 pub mod write;
 
 pub use fingerprint::{
-    Fingerprint, FingerprintDashMap, FingerprintDashSet, FingerprintMap, FingerprintSet,
+    Fingerprint, FingerprintDashMap, FingerprintDashSet, FingerprintMap, FingerprintSet, QueryKey,
+    SessionKey, SessionKeyDashMap,
 };
 pub use shape::{QueryShape, ShapeKey, query_shape_derive};
