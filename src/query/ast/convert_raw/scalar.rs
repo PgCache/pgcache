@@ -170,13 +170,18 @@ unsafe fn typmods_render(typmods: *const pg::List, out: &mut String) -> Result<(
 
 unsafe fn func_call_convert(func_call: *const pg::FuncCall) -> Result<FunctionCall, AstError> {
     unsafe {
-        let name = list_nodes((*func_call).funcname)
-            .filter_map(|n| string_node_value(n))
-            .next_back()
-            .map(EcoString::from)
-            .ok_or_else(|| AstError::UnsupportedSelectFeature {
-                feature: "function with no name".to_owned(),
-            })?;
+        let mut parts = list_nodes((*func_call).funcname).filter_map(|n| string_node_value(n));
+        let (schema, name) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(name), None, None) => (None, EcoString::from(name)),
+            (Some(schema), Some(name), None) => {
+                (Some(EcoString::from(schema)), EcoString::from(name))
+            }
+            _ => {
+                return Err(AstError::UnsupportedSelectFeature {
+                    feature: "function name with zero or more than two parts".to_owned(),
+                });
+            }
+        };
 
         let agg_star = (*func_call).agg_star;
         let args = if agg_star {
@@ -198,10 +203,11 @@ unsafe fn func_call_convert(func_call: *const pg::FuncCall) -> Result<FunctionCa
 
         let over = match ((*func_call).over).is_null() {
             true => None,
-            false => Some(window_def_convert((*func_call).over)?),
+            false => Some(Box::new(window_def_convert((*func_call).over)?)),
         };
 
         Ok(FunctionCall {
+            schema,
             name,
             args,
             agg_star,
@@ -257,6 +263,7 @@ unsafe fn aexpr_nullif_convert(aexpr: *const pg::A_Expr) -> Result<FunctionCall,
 
 fn function_call_bare(name: EcoString, args: Vec<ScalarExpr>) -> FunctionCall {
     FunctionCall {
+        schema: None,
         name,
         args,
         agg_star: false,

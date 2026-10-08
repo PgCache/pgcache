@@ -106,6 +106,7 @@ pub enum PassthroughReason {
     UnsupportedFrom,
     UnsupportedSubquery,
     NonImmutableFunction,
+    SchemaQualifiedFunction,
     HasLimit,
     SystemCatalogReference,
     ResolutionFailed,
@@ -122,6 +123,7 @@ impl PassthroughReason {
             PassthroughReason::UnsupportedFrom => "unsupported FROM clause",
             PassthroughReason::UnsupportedSubquery => "unsupported subquery",
             PassthroughReason::NonImmutableFunction => "non-immutable function",
+            PassthroughReason::SchemaQualifiedFunction => "schema-qualified function",
             PassthroughReason::HasLimit => "LIMIT not cacheable here",
             PassthroughReason::SystemCatalogReference => "system catalog reference",
             PassthroughReason::ResolutionFailed => "column or table couldn't be resolved",
@@ -149,6 +151,10 @@ fn cacheability_reason(error: &CacheabilityError) -> (PassthroughReason, Option<
         ),
         CacheabilityError::NonImmutableFunction { function } => (
             PassthroughReason::NonImmutableFunction,
+            Some(function.to_string()),
+        ),
+        CacheabilityError::SchemaQualifiedFunction { function } => (
+            PassthroughReason::SchemaQualifiedFunction,
             Some(function.to_string()),
         ),
         CacheabilityError::HasLimit => (PassthroughReason::HasLimit, None),

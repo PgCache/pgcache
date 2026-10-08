@@ -133,7 +133,7 @@ pub(super) fn scalar_expr_window_refs_resolve(
             if let Some(over) = &mut func.over
                 && let Some(name) = over.ref_name.take()
             {
-                *over = defs
+                **over = defs
                     .get(&name)
                     .cloned()
                     .ok_or_else(|| AstError::UnsupportedFeature {

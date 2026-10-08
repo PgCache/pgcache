@@ -391,6 +391,13 @@ fn function_call_cacheable(
     ctx: ExprContext,
     fv: &FunctionVolatilityMap,
 ) -> Result<(), CacheabilityError> {
+    if let Some(schema) = &func.schema
+        && schema != "pg_catalog"
+    {
+        return Err(CacheabilityError::SchemaQualifiedFunction {
+            function: format!("{schema}.{}", func.name).into(),
+        });
+    }
     let function = func.name.to_lowercase();
     let is_immutable = matches!(
         fv.get(function.as_str()),
@@ -929,6 +936,26 @@ mod tests {
             result.is_ok(),
             "CASE with nested function calls should be cacheable: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_pg_catalog_qualified_function_cacheable() {
+        assert!(check_cacheable("SELECT id FROM users WHERE pg_catalog.lower(name) = 'x'").is_ok());
+        assert!(check_cacheable("SELECT pg_catalog.lower(name) FROM users").is_ok());
+    }
+
+    #[test]
+    fn test_other_schema_qualified_function_not_cacheable() {
+        for sql in [
+            "SELECT myschema.lower(name) FROM users",
+            "SELECT id FROM users WHERE myschema.lower(name) = 'x'",
+        ] {
+            let err = check_cacheable(sql).expect_err("schema-qualified function rejected");
+            assert!(
+                matches!(&err, CacheabilityError::SchemaQualifiedFunction { function } if function == "myschema.lower"),
+                "{sql}: {err}"
+            );
+        }
     }
 
     #[test]

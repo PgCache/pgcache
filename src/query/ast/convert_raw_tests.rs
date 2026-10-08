@@ -973,6 +973,7 @@ fn test_scalar_expr_nodes() {
 #[test]
 fn test_function_call_nodes() {
     let func = FunctionCall {
+        schema: None,
         name: EcoString::from("COUNT"),
         args: vec![ScalarExpr::Column(ColumnNode {
             table: None,
@@ -1348,6 +1349,7 @@ fn test_literal_in_select() {
 #[test]
 fn test_function_deparse_count_star() {
     let func = FunctionCall {
+        schema: None,
         name: EcoString::from("count"),
         args: vec![],
         agg_star: true,
@@ -1364,6 +1366,7 @@ fn test_function_deparse_count_star() {
 #[test]
 fn test_function_deparse_count_distinct() {
     let func = FunctionCall {
+        schema: None,
         name: EcoString::from("count"),
         args: vec![ScalarExpr::Column(ColumnNode {
             table: None,
@@ -1408,6 +1411,7 @@ fn test_case_has_subqueries() {
 #[test]
 fn test_window_function_deparse() {
     let func = FunctionCall {
+        schema: None,
         name: EcoString::from("sum"),
         args: vec![ScalarExpr::Column(ColumnNode {
             table: None,
@@ -1417,7 +1421,7 @@ fn test_window_function_deparse() {
         agg_distinct: false,
         agg_order: vec![],
         agg_filter: None,
-        over: Some(WindowSpec {
+        over: Some(Box::new(WindowSpec {
             partition_by: vec![ScalarExpr::Column(ColumnNode {
                 table: None,
                 column: EcoString::from("category"),
@@ -1432,7 +1436,7 @@ fn test_window_function_deparse() {
             }],
             frame: None,
             ref_name: None,
-        }),
+        })),
     };
     let mut buf = String::new();
     func.deparse(&mut buf);
@@ -1590,6 +1594,7 @@ fn test_filter_aggregate_distinct_predicates_roundtrip() {
 #[test]
 fn test_aggregate_order_by_deparse_roundtrip() {
     let func = FunctionCall {
+        schema: None,
         name: EcoString::from("string_agg"),
         args: vec![
             ScalarExpr::Column(ColumnNode {
@@ -3241,4 +3246,26 @@ fn test_select_nodes_branch_count_cases() {
             "{label}: {sql}"
         );
     }
+}
+
+#[test]
+fn test_function_schema_qualifier_is_kept() {
+    let func = only_function("SELECT pg_catalog.lower(name) FROM t");
+    assert_eq!(func.schema.as_deref(), Some("pg_catalog"));
+    assert_eq!(func.name, "lower");
+    let mut buf = String::new();
+    func.deparse(&mut buf);
+    assert!(buf.starts_with("pg_catalog.LOWER("), "{buf}");
+
+    let bare = only_function("SELECT lower(name) FROM t");
+    assert_eq!(bare.schema, None);
+    assert_ne!(
+        query_expr_fingerprint(&query_expr_parse("SELECT pg_catalog.lower(name) FROM t").unwrap()),
+        query_expr_fingerprint(&query_expr_parse("SELECT lower(name) FROM t").unwrap()),
+    );
+}
+
+#[test]
+fn test_function_three_part_name_unsupported() {
+    assert!(query_expr_parse("SELECT db.myschema.f(name) FROM t").is_err());
 }

@@ -8,13 +8,18 @@ use crate::query::ast::Deparse;
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct FunctionCall {
+    /// Schema qualifier as written. Only `pg_catalog` is cacheable: the cache
+    /// DB has no user functions.
+    pub schema: Option<EcoString>,
     pub name: EcoString,
     pub args: Vec<ScalarExpr>,
     pub agg_star: bool,                     // COUNT(*)
     pub agg_distinct: bool,                 // COUNT(DISTINCT col)
     pub agg_order: Vec<OrderByClause>, // ORDER BY inside aggregate: string_agg(x, ',' ORDER BY x). Vec (not SmallVec): OrderByClause is recursively reachable here, so inline storage would be infinitely sized.
     pub agg_filter: Option<Box<WhereExpr>>, // FILTER (WHERE ...) per-aggregate predicate
-    pub over: Option<WindowSpec>,      // Window function OVER clause
+    /// Window function OVER clause. Boxed: it is the largest field and only
+    /// window calls carry one, so the common call stays small in `ScalarExpr`.
+    pub over: Option<Box<WindowSpec>>,
 }
 
 impl AstNode for FunctionCall {
@@ -25,7 +30,7 @@ impl AstNode for FunctionCall {
         children_visit(&self.args, f)?;
         children_visit(&self.agg_order, f)?;
         children_visit(self.agg_filter.as_deref(), f)?;
-        children_visit(self.over.as_ref(), f)
+        children_visit(self.over.as_deref(), f)
     }
 }
 
@@ -41,6 +46,10 @@ impl FunctionCall {
 
 impl Deparse for FunctionCall {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        if let Some(schema) = &self.schema {
+            buf.push_str(schema);
+            buf.push('.');
+        }
         buf.push_str(&self.name.to_uppercase());
         buf.push('(');
         if self.agg_distinct {

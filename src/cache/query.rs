@@ -39,6 +39,10 @@ error_set! {
         NonImmutableFunction {
             function: EcoString,
         },
+        #[display("Schema-qualified function: {function}")]
+        SchemaQualifiedFunction {
+            function: EcoString,
+        },
         HasLimit,
         #[display("System catalog reference: {relation}")]
         SystemCatalogReference {
