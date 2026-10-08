@@ -21,10 +21,21 @@ use crate::{
     cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::TableMetadata,
     query::{
-        Fingerprint, FingerprintDashMap, QueryShape, ast::QueryExpr, resolved::ResolvedQueryExpr,
+        Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap, ast::QueryExpr,
+        resolved::ResolvedQueryExpr,
     },
     settings::{DynamicConfigHandle, Settings},
 };
+
+/// An alias-map entry: the canonical fingerprint a session key resolved to,
+/// stamped with the writer's sweep tick at insertion. The sweep spares an
+/// alias inserted since the previous sweep: its dispatch may not have
+/// inserted the entry under the fingerprint yet.
+#[derive(Debug, Clone, Copy)]
+pub struct Alias {
+    pub fingerprint: Fingerprint,
+    pub tick: u64,
+}
 
 /// Shared resolved query expression, wrapped in Arc to avoid deep cloning
 /// on every cache hit (the dispatch→serve path).
@@ -216,6 +227,13 @@ impl QueryMetrics {
 /// writes to another, eliminating the global RwLock bottleneck.
 pub struct CacheStateView {
     pub cached_queries: FingerprintDashMap<CachedQueryView>,
+    /// Session key → canonical fingerprint for every query with an
+    /// unqualified table name the writer has resolved under some search_path.
+    /// Written only by the writer (on `QueryCommand::Resolve`, and swept with
+    /// the stale-entry cleanup once the fingerprint is gone from both query
+    /// maps); dispatch only reads it. An alias whose target is missing is
+    /// dispatched as a cold miss under that fingerprint.
+    pub aliases: SessionKeyDashMap<Alias>,
     pub metrics: FingerprintDashMap<QueryMetrics>,
     pub started_at: Instant,
     /// Cache hits observed during the current GC interval. Incremented by the
@@ -291,6 +309,7 @@ impl std::fmt::Debug for CacheStateView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CacheStateView")
             .field("cached_queries", &self.cached_queries)
+            .field("aliases_len", &self.aliases.len())
             .field("metrics_len", &self.metrics.len())
             .field("started_at", &self.started_at)
             .field("memo_entries", &self.memo.len())
@@ -304,6 +323,7 @@ impl CacheStateView {
             Histogram::new(2).map_err(|_| Report::from(CacheError::LatencyHistogram))?;
         Ok(Self {
             cached_queries: DashMap::default(),
+            aliases: DashMap::default(),
             metrics: DashMap::default(),
             started_at: Instant::now(),
             hits_since_gc: AtomicU32::new(0),

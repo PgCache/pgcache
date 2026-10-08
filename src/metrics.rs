@@ -871,6 +871,7 @@ impl MvHandles {
 
 pub struct RegHandles {
     // Per-command handle latency, one cached handle per QueryCommand `cmd` label.
+    pub cmd_resolve: Histogram,
     pub cmd_register: Histogram,
     pub cmd_ready: Histogram,
     pub cmd_failed: Histogram,
@@ -922,6 +923,7 @@ impl RegHandles {
             QUERY_REGISTRATION_LATENCY_SECONDS,
         };
         Self {
+            cmd_resolve: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "resolve"),
             cmd_register: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "register"),
             cmd_ready: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "ready"),
             cmd_failed: metrics::histogram!(CACHE_WRITER_COMMAND_HANDLE_SECONDS, "cmd" => "failed"),

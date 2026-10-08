@@ -200,6 +200,15 @@ pub(super) struct WriterCore {
     /// re-allocated per probe (PGC-341/344). Depth ≤ the sets alive at once
     /// (2 in `handle_update`); balanced take/return keeps it there.
     candidate_scratch: Vec<FingerprintSet>,
+    /// Which schema each unqualified table name resolved to, per resolved
+    /// search_path. Filled from the origin catalog on first sight of a
+    /// (path, name) pair so later registrations under the same path skip the
+    /// catalog round trip. Never consults cache tables: a cache table in a
+    /// later schema says nothing about an earlier schema on the path.
+    pub(super) schema_resolutions: HashMap<Arc<[EcoString]>, HashMap<EcoString, EcoString>>,
+    /// Count of alias sweeps so far; stamps each alias at insertion so a sweep
+    /// can tell an alias inserted since the previous sweep from a stale one.
+    pub(super) alias_tick: u64,
     /// Buffered SQL for the in-progress frame's cache-table writes (PGC-228).
     /// Statements are appended here instead of executed eagerly; the whole
     /// `BEGIN; …; COMMIT` is flushed in one round-trip at `CommitMark` (or
@@ -451,6 +460,8 @@ impl WriterCore {
             frame_invalidations: HashSet::default(),
             frame_memo_evictions: HashSet::default(),
             candidate_scratch: Vec::new(),
+            schema_resolutions: HashMap::new(),
+            alias_tick: 0,
             frame_relation_oids: HashSet::new(),
             purge_pending: false,
             frame_buf: String::with_capacity(FRAME_BUF_CAPACITY),

@@ -16,7 +16,7 @@ use crate::cache::{
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::pg::protocol::session::ResultFormats;
-use crate::query::Fingerprint;
+use crate::query::{Fingerprint, SessionKey};
 
 /// Result of a subsumption check, sent from the writer back to the dispatch
 /// via a oneshot channel included in the Register command.
@@ -84,6 +84,26 @@ impl CacheMessage {
     }
 }
 
+/// Payload for `QueryCommand::Resolve`: a query whose table names are not all
+/// schema-qualified, seen under a resolved search_path the alias map has no
+/// entry for. The writer resolves each bare name against the catalog, records
+/// the alias, and replies with the canonical fingerprint.
+pub struct ResolveRequest {
+    pub session_key: SessionKey,
+    pub cacheable_query: Arc<CacheableQuery>,
+    pub search_path: Arc<[EcoString]>,
+    pub reply_tx: oneshot::Sender<ResolveResult>,
+}
+
+/// The writer's answer to a `Resolve`.
+pub enum ResolveResult {
+    /// The alias is recorded; dispatch continues under this fingerprint.
+    Resolved(Fingerprint),
+    /// A table name did not resolve on the path (or the catalog lookup
+    /// failed). The query is forwarded, as a failed registration is.
+    Unresolvable,
+}
+
 /// Payload for `QueryCommand::Register`.
 pub struct RegisterRequest {
     pub fingerprint: Fingerprint,
@@ -100,6 +120,10 @@ pub struct RegisterRequest {
 
 /// Commands for query registration lifecycle, sent to the writer thread
 pub enum QueryCommand {
+    /// Resolve a session key to its canonical fingerprint and record the
+    /// alias. Precedes `Register` for any query with an unqualified table name.
+    Resolve(ResolveRequest),
+
     /// Register a new query. The writer checks subsumption and responds
     /// via `subsumption_tx` before optionally dispatching population.
     Register(RegisterRequest),
@@ -152,6 +176,10 @@ pub enum QueryCommand {
 impl std::fmt::Debug for QueryCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Resolve(request) => f
+                .debug_struct("Resolve")
+                .field("session_key", &request.session_key)
+                .finish_non_exhaustive(),
             Self::Register(request) => f
                 .debug_struct("Register")
                 .field("fingerprint", &request.fingerprint)

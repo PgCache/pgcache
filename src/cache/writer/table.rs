@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use ecow::EcoString;
 use postgres_protocol::escape;
 use rootcause::Report;
@@ -333,18 +335,36 @@ impl WriterCore {
         Ok(indexes)
     }
 
+    /// The schema an unqualified table name resolves to under `search_path`:
+    /// the first schema on the path that holds a table of that name on origin,
+    /// memoized per (path, name) in `schema_resolutions`.
     #[instrument(skip_all)]
     pub(super) async fn schema_for_table_find(
+        &mut self,
+        table_name: &str,
+        search_path: &Arc<[EcoString]>,
+    ) -> CacheResult<EcoString> {
+        if let Some(schema) = self
+            .schema_resolutions
+            .get(search_path.as_ref())
+            .and_then(|by_name| by_name.get(table_name))
+        {
+            return Ok(schema.clone());
+        }
+        let schema = self.schema_for_table_query(table_name, search_path).await?;
+        self.schema_resolutions
+            .entry(Arc::clone(search_path))
+            .or_default()
+            .insert(EcoString::from(table_name), schema.clone());
+        Ok(schema)
+    }
+
+    async fn schema_for_table_query(
         &self,
         table_name: &str,
-        search_path: &[&str],
-    ) -> CacheResult<String> {
-        for schema in search_path {
-            if self.cache.tables.get2(&(*schema, table_name)).is_some() {
-                return Ok((*schema).to_owned());
-            }
-        }
-
+        search_path: &[EcoString],
+    ) -> CacheResult<EcoString> {
+        let search_path: Vec<&str> = search_path.iter().map(EcoString::as_str).collect();
         let sql = r"
             SELECT n.nspname
             FROM pg_class c
@@ -363,7 +383,7 @@ impl WriterCore {
             .map_into_report::<CacheError>()?;
 
         rows.first()
-            .map(|row| row.get::<_, String>(0))
+            .map(|row| EcoString::from(row.get::<_, &str>(0)))
             .ok_or_else(|| {
                 CacheError::UnknownTable {
                     oid: None,

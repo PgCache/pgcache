@@ -2,6 +2,7 @@
 //! and deparse it, classify its shape and limits, and register its per-table
 //! update queries.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,19 +21,19 @@ use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode};
+use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode, query_expr_fingerprint_canonical};
 use crate::query::query_shape_derive;
 use crate::query::resolved::{ResolvedQueryExpr, enum_order_dependence_check, query_expr_resolve};
 use crate::query::transform::predicate_pushdown_apply;
 
 /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
 async fn table_schema_resolve(
-    core: &WriterCore,
+    core: &mut WriterCore,
     table_node: &TableNode,
-    search_path: &[&str],
-) -> CacheResult<String> {
-    match table_node.schema.as_deref() {
-        Some(schema) => Ok(schema.to_owned()),
+    search_path: &Arc<[EcoString]>,
+) -> CacheResult<EcoString> {
+    match &table_node.schema {
+        Some(schema) => Ok(schema.clone()),
         None => {
             core.schema_for_table_find(table_node.name.as_str(), search_path)
                 .await
@@ -45,7 +46,7 @@ async fn table_schema_resolve(
 async fn cache_tables_ensure(
     core: &mut WriterCore,
     base_query: &QueryExpr,
-    search_path: &[&str],
+    search_path: &Arc<[EcoString]>,
 ) -> CacheResult<()> {
     for table_node in base_query.nodes::<TableNode>() {
         let table_name = table_node.name.as_str();
@@ -60,6 +61,34 @@ async fn cache_tables_ensure(
         }
     }
     Ok(())
+}
+
+/// The canonical fingerprint of a query under `search_path`: each unqualified
+/// table name is resolved against the catalog and folded into the identity.
+pub(super) async fn query_fingerprint_resolve(
+    core: &mut WriterCore,
+    query: &QueryExpr,
+    search_path: &Arc<[EcoString]>,
+) -> CacheResult<Fingerprint> {
+    let mut schema_by_name: HashMap<EcoString, EcoString> = HashMap::new();
+    for table_node in query.nodes::<TableNode>() {
+        if table_node.schema.is_some() || schema_by_name.contains_key(&table_node.name) {
+            continue;
+        }
+        let schema = core
+            .schema_for_table_find(table_node.name.as_str(), search_path)
+            .await
+            .attach_loc("resolving unqualified table for fingerprint")?;
+        schema_by_name.insert(table_node.name.clone(), schema);
+    }
+    Ok(query_expr_fingerprint_canonical(query, |table| {
+        let schema = schema_by_name.get(&table.name).cloned();
+        debug_assert!(
+            schema.is_some(),
+            "every unqualified table was resolved above"
+        );
+        schema.unwrap_or_default()
+    }))
 }
 
 /// Deparse once at registration. The output is a pure function of the
@@ -117,7 +146,7 @@ impl WriterRegistration {
         let search_path: Vec<&str> = request.search_path.iter().map(EcoString::as_str).collect();
         let (base_query, user_max_limit) = base_query_prepare(request.cacheable_query.query());
 
-        cache_tables_ensure(core, &base_query, &search_path).await?;
+        cache_tables_ensure(core, &base_query, &request.search_path).await?;
 
         let resolved: SharedResolved = Arc::new(
             query_expr_resolve(&base_query, &core.cache.tables, &search_path)

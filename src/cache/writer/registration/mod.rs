@@ -23,10 +23,10 @@ use super::population::{
     PopulationSpawnContext, population_dispatcher, population_worker_connect, population_worker_run,
 };
 use crate::cache::Generation;
-use crate::cache::messages::{QueryCommand, RegisterRequest};
+use crate::cache::messages::{QueryCommand, RegisterRequest, ResolveRequest, ResolveResult};
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::population_pool::PopulationPool;
-use crate::cache::types::{CachedQuery, SharedResolved};
+use crate::cache::types::{Alias, CachedQuery, SharedResolved};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::oid::Oid;
@@ -158,6 +158,7 @@ fn fault_mv_evict_on_build(_core: &WriterCore, _fingerprint: Fingerprint) -> boo
 fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
     let reg = &crate::metrics::handles().reg;
     match cmd {
+        QueryCommand::Resolve(_) => &reg.cmd_resolve,
         QueryCommand::Register(_) => &reg.cmd_register,
         QueryCommand::Merge(_) => &reg.cmd_ready,
         QueryCommand::Failed { .. } => &reg.cmd_failed,
@@ -178,7 +179,7 @@ fn command_histogram(cmd: &QueryCommand) -> &'static Histogram {
 /// `DecorrelateError`. A forwarded query still returns the correct result; a
 /// wrong cached result is caught by the result-diff path, and "should have
 /// cached" by routing assertions — neither relies on this error log.
-fn register_failure_log(fingerprint: Fingerprint, error: &CacheError) {
+fn register_failure_log(key: impl std::fmt::Display, error: &CacheError) {
     if matches!(
         error,
         CacheError::DecorrelateError(_)
@@ -186,15 +187,46 @@ fn register_failure_log(fingerprint: Fingerprint, error: &CacheError) {
             | CacheError::UnknownTable { .. }
     ) {
         debug!(
-            "query {fingerprint} forwarded (not cacheable): {}",
+            "query {key} forwarded (not cacheable): {}",
             error_chain_format(error),
         );
     } else {
         error!(
-            "query register failed for {fingerprint}: {}",
+            "query register failed for {key}: {}",
             error_chain_format(error),
         );
     }
+}
+
+/// Resolve a session key to its canonical fingerprint and record the alias.
+/// A name that does not resolve on the path is a routing outcome (the query
+/// forwards), logged like a failed registration.
+async fn resolve_command(core: &mut WriterCore, request: ResolveRequest) {
+    let session_key = request.session_key;
+    trace!("command query resolve {session_key}");
+    let result = match resolve::query_fingerprint_resolve(
+        core,
+        request.cacheable_query.query(),
+        &request.search_path,
+    )
+    .await
+    {
+        Ok(fingerprint) => {
+            core.state_view.aliases.insert(
+                session_key,
+                Alias {
+                    fingerprint,
+                    tick: core.alias_tick,
+                },
+            );
+            ResolveResult::Resolved(fingerprint)
+        }
+        Err(e) => {
+            register_failure_log(session_key, e.current_context());
+            ResolveResult::Unresolvable
+        }
+    };
+    let _ = request.reply_tx.send(result);
 }
 
 /// Owns the query registration / population path: consumes `QueryCommand`s
@@ -273,6 +305,7 @@ impl WriterRegistration {
         let histogram = command_histogram(&cmd);
         let handle_start = Instant::now();
         match cmd {
+            QueryCommand::Resolve(request) => resolve_command(core, request).await,
             QueryCommand::Register(request) => self.register_command(core, request).await,
             QueryCommand::Merge(merge) => {
                 // Queue the merge; the writer loop drains it once no CDC frame

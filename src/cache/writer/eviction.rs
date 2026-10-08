@@ -392,10 +392,22 @@ impl WriterCore {
                 CachedQueryState::Loading | CachedQueryState::Ready => true,
             });
 
-        // Remove metrics for fingerprints no longer in either map
+        // Remove metrics and aliases for fingerprints no longer in either map
         self.state_view.metrics.retain(|fp, _| {
             self.cache.cached_queries.contains_key1(fp)
                 || self.state_view.cached_queries.contains_key(fp)
+        });
+        // An alias inserted since the previous sweep is spared: its dispatch
+        // may still be between the Resolve reply and inserting the entry.
+        let current_tick = self.alias_tick;
+        self.alias_tick += 1;
+        self.state_view.aliases.retain(|_, alias| {
+            alias.tick >= current_tick
+                || self.cache.cached_queries.contains_key1(&alias.fingerprint)
+                || self
+                    .state_view
+                    .cached_queries
+                    .contains_key(&alias.fingerprint)
         });
     }
 
