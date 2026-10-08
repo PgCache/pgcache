@@ -147,3 +147,42 @@ async fn test_pgcache_explain_uncached_reports_status() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Inline SQL with a bare table name is keyed under the session's
+/// search_path, so `pgcache_explain('<sql>')` finds the entry a custom path
+/// registered (PGC-405).
+#[tokio::test]
+async fn test_pgcache_explain_by_sql_under_custom_search_path() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query("create schema explain_sp", &[]).await?;
+    ctx.query(
+        "create table explain_sp.items (id integer primary key, name text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into explain_sp.items (id, name) values (1, 'widget')",
+        &[],
+    )
+    .await?;
+    ctx.simple_query("set search_path to explain_sp").await?;
+
+    let query = "select id, name from items where name = 'widget'";
+    let m = ctx.metrics().await?;
+    ctx.simple_query(query).await?;
+    assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query(&format!("select pgcache_explain($q${query}$q$)"))
+        .await?;
+    let plan = query_plan_text(&res);
+    assert!(plan.contains("cost="), "not an EXPLAIN plan: {plan}");
+    assert!(
+        plan.contains("items"),
+        "plan does not scan the cached relation: {plan}"
+    );
+
+    Ok(())
+}

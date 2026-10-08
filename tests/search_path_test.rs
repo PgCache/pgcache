@@ -523,3 +523,153 @@ async fn test_search_path_join() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Create `<schema>.config (id, value)` with a single row `(1, <value>)`.
+async fn config_table_create(
+    ctx: &mut TestContext,
+    schema: &str,
+    value: &str,
+) -> Result<(), Error> {
+    ctx.origin_query(&format!("CREATE SCHEMA {schema}"), &[])
+        .await?;
+    ctx.origin_query(
+        &format!("CREATE TABLE {schema}.config (id integer primary key, value text)"),
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        &format!("INSERT INTO {schema}.config (id, value) VALUES (1, '{value}')"),
+        &[],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The same unqualified SQL under two search_paths names two different
+/// tables, so it must land on two cache entries. Served from one entry it
+/// would return the first schema's rows to the second session (PGC-405).
+#[tokio::test]
+async fn test_search_path_flip_serves_each_schema() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    config_table_create(&mut ctx, "flip_a", "from_a").await?;
+    config_table_create(&mut ctx, "flip_b", "from_b").await?;
+    let sql = "SELECT id, value FROM config WHERE id = 1";
+
+    ctx.simple_query("SET search_path TO flip_a").await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Same text, other schema: a miss that registers a second entry, never a
+    // hit on the first one.
+    ctx.simple_query("SET search_path TO flip_b").await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_b")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_b")])?;
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Back to the first schema: its entry is still there.
+    ctx.simple_query("SET search_path TO flip_a").await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// Two search_paths that resolve the table to the same schema share one
+/// cache entry: the second path's first request is served from the entry
+/// the first path populated (the alias is established by a writer resolve,
+/// not a registration).
+#[tokio::test]
+async fn test_search_path_equivalent_paths_share_entry() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    config_table_create(&mut ctx, "shared_a", "from_a").await?;
+    let sql = "SELECT id, value FROM config WHERE id = 1";
+
+    ctx.simple_query("SET search_path TO shared_a").await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    ctx.simple_query("SET search_path TO shared_a, public")
+        .await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A schema earlier on the path shadows a later one even when only the later
+/// one's table is already cached: resolution must consult the catalog, not
+/// the set of cache tables.
+#[tokio::test]
+async fn test_search_path_earlier_schema_shadows_cached_table() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.origin_query(
+        "CREATE TABLE public.config (id integer primary key, value text)",
+        &[],
+    )
+    .await?;
+    ctx.origin_query(
+        "INSERT INTO public.config (id, value) VALUES (1, 'from_public')",
+        &[],
+    )
+    .await?;
+    config_table_create(&mut ctx, "shadow_s", "from_s").await?;
+    let sql = "SELECT id, value FROM config WHERE id = 1";
+
+    ctx.simple_query("SET search_path TO public").await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_public")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    ctx.simple_query("SET search_path TO shadow_s, public")
+        .await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_s")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_s")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A schema-qualified query does not depend on search_path, so it keeps one
+/// entry across paths.
+#[tokio::test]
+async fn test_search_path_qualified_query_shares_entry_across_paths() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    config_table_create(&mut ctx, "qual_a", "from_a").await?;
+    config_table_create(&mut ctx, "qual_b", "from_b").await?;
+    let sql = "SELECT id, value FROM qual_a.config WHERE id = 1";
+
+    ctx.simple_query("SET search_path TO qual_a").await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    ctx.simple_query("SET search_path TO qual_b").await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("value", "from_a")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}

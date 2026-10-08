@@ -75,9 +75,15 @@ The resolved search path is:
 2. Used by `query_register()` for table resolution
 3. Used by `select_statement_resolve()` to find tables in the correct schemas
 
-When caching a query, the search path determines which schema each unqualified table reference belongs to. This resolved schema is then used for cache key generation, ensuring queries against the same table in different schemas are correctly differentiated.
+If the search path is unknown at cache time, the query is forwarded to the origin database rather than guessed at. This ensures correctness over availability.
 
-If the search path is unknown at cache time, the cache returns an error rather than guessing, forcing the query to be forwarded to the origin database. This ensures correctness over availability.
+### Cache Key
+
+A cached query's identity (`Fingerprint`) is the content hash of its AST plus, for every unqualified table name, the schema it resolved to. Only the writer can compute that, since resolution needs the catalog. The proxy therefore keys dispatch on a `SessionKey`: the AST hash folded with the session's resolved search_path, computed without the catalog. A fully qualified query needs no resolution, so its session key *is* its fingerprint (`QueryKey::Canonical`).
+
+A shared alias map (`SessionKey → Fingerprint`) on the cache state view joins the two. On an alias miss the dispatch sends `QueryCommand::Resolve`; the writer resolves each bare name against the catalog (memoized per path and name in `schema_resolutions`), records the alias, and replies with the fingerprint. This happens once per (query, path) pair process-wide; later requests, from any connection, read the alias. The writer is the only party that writes the map; aliases whose fingerprint has left both query maps are swept with the stale-entry cleanup, and dispatch treats an alias to a missing entry as an ordinary cold miss under that fingerprint.
+
+Keying on the resolved schema rather than on the path itself means two paths that resolve a query the same way share one entry, and pinned queries (resolved under `public` at startup) are reached by sessions on any path. Keying on the path alone was rejected: it duplicates every entry per distinct resolved path (the default `"$user", public` resolves differently per role) and leaves pinned entries unreachable from the default path. Resolution consults the origin catalog in path order; it must not short-circuit on an already-cached table in a later schema, because an earlier schema may shadow it.
 
 ### Cache Worker Execution
 
@@ -113,10 +119,9 @@ pub struct WorkerRequest {
 - Complexity in tracking query interception state
 
 ### Not Implemented (Future Work)
-- Tracking `SET search_path` commands mid-session for PostgreSQL < 18 (PG 18+ tracks via ParameterStatus)
 - `pg_catalog` and `pg_temp` implicit schema handling
 - Function-scoped search_path changes
-- `SET LOCAL` + transaction rollback handling
+- Unqualified function, operator and type names also resolve through search_path and are not part of the key
 
 ## References
 - [PostgreSQL search_path documentation](https://www.postgresql.org/docs/current/ddl-schemas.html#DDL-SCHEMAS-PATH)
