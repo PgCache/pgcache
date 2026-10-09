@@ -34,6 +34,9 @@ Anything else (IN lists, LIKE, subqueries, functions, joins) stays PgEval. The s
 - **Conservative classifier**: anything the Rust evaluator might mis-decide falls to PgEval, preserving PG as the correctness oracle. Expanding LocalEval coverage is a deliberate, testable change.
 - **Existing PG path untouched for unsupported shapes**: no behavior change for multi-table, aggregated, or complex-predicate queries.
 
+### Typed comparison (PGC-478, amendment)
+A `column op literal` comparison is decided by parsing both sides as the column's type (`query/typed_compare.rs`): integers and decimals as numbers, `date`, `timestamp` and `timestamptz` as values, text families as bytes. `is_simple_comparison` keeps a comparison local only when the literal parses as the type, so a spelling the parser does not handle (a month name, a zone-less `timestamptz` literal without a known session zone) falls to PgEval rather than to a byte comparison. Row text is parsed under the ISO `DateStyle` the replication session is pinned to (ADR-056).
+
 ## Consequences
 
 ### Positive

@@ -26,6 +26,9 @@ The hard constraint on the CDC side is asymmetric with the subsumption side: in 
 - **A second index instance, not a shared one, between subsumption and CDC.** Subsumption indexes only the single-table subsumption-eligible queries; CDC must see the full population including PgEval/multi-table queries. Rather than one index serving both with divergent membership rules, the reuse is at the *type* level — both are `ConstraintIndex<Fingerprint>` — while `subsumption` and `eval_index` hold different entry sets suited to their consumers.
 - **Sharing the probe across the three CDC consumers** collapses what were two-to-three full scans of one row into a single probe whose result is reused, which is the actual per-row cost reduction; narrowing each scan to the candidate set is the secondary win.
 
+### Typed keys (PGC-478, amendment)
+Entries are inserted and probed with each literal in its key form for the column's type (`table_constraints_keyed`): numbers, day counts and microsecond instants as `Num`, text normalised (`bpchar` trailing space, `uuid` case). The row's point-probe forms key the wire text the same way, so an entry keyed by `'2024-01-15 10:00'` is found by the wire text `2024-01-15 10:00:00`. A literal that does not parse as the column's type keys as `Null`, which places the entry in the opaque wildcard class: the probe over-returns, never misses.
+
 ## Consequences
 
 ### Positive
