@@ -103,10 +103,40 @@ enum TypedValue {
     Timestamp(DateTime),
     TimestampTz(Timestamp),
     Text(String),
+    /// `infinity` / `-infinity` of a date-time kind, `Infinity` / `-Infinity`
+    /// of a numeric one: beyond every finite value.
+    Infinite {
+        negative: bool,
+    },
+    /// Numeric `NaN`: above everything, equal only to itself, as at origin.
+    NaN,
 }
 
 impl TypedValue {
     fn cmp_same_kind(&self, other: &Self) -> Option<Ordering> {
+        match (self, other) {
+            (Self::NaN, Self::NaN) => return Some(Ordering::Equal),
+            (Self::NaN, _) => return Some(Ordering::Greater),
+            (_, Self::NaN) => return Some(Ordering::Less),
+            (Self::Infinite { negative: a }, Self::Infinite { negative: b }) => {
+                return Some(b.cmp(a));
+            }
+            (Self::Infinite { negative }, _) => {
+                return Some(if *negative {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                });
+            }
+            (_, Self::Infinite { negative }) => {
+                return Some(if *negative {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                });
+            }
+            _ => {}
+        }
         Some(match (self, other) {
             (Self::Integer(a), Self::Integer(b)) => a.cmp(b),
             (Self::Decimal(a), Self::Decimal(b)) => a.cmp(b),
@@ -374,7 +404,42 @@ impl TypedValue {
             #[allow(clippy::cast_precision_loss)]
             Self::TimestampTz(instant) => float(instant.as_microsecond() as f64),
             Self::Text(text) => Some(LiteralValue::String(text.into())),
+            Self::Infinite { negative } => float(if negative {
+                f64::NEG_INFINITY
+            } else {
+                f64::INFINITY
+            }),
+            // Above every finite key, like the positive infinity it shares a
+            // bucket with; the comparator tells them apart.
+            Self::NaN => float(f64::INFINITY),
         }
+    }
+}
+
+/// The out-of-range words PostgreSQL prints and accepts for `kind`.
+fn special_parse(kind: ValueKind, text: &str) -> Option<TypedValue> {
+    let word = text.trim().to_ascii_lowercase();
+    match kind {
+        ValueKind::Decimal => match word.as_str() {
+            "nan" => Some(TypedValue::NaN),
+            "infinity" | "+infinity" | "inf" | "+inf" => {
+                Some(TypedValue::Infinite { negative: false })
+            }
+            "-infinity" | "-inf" => Some(TypedValue::Infinite { negative: true }),
+            _ => None,
+        },
+        ValueKind::Date | ValueKind::Timestamp | ValueKind::TimestampTz => match word.as_str() {
+            "infinity" | "+infinity" => Some(TypedValue::Infinite { negative: false }),
+            "-infinity" => Some(TypedValue::Infinite { negative: true }),
+            _ => None,
+        },
+        ValueKind::Integer
+        | ValueKind::Bool
+        | ValueKind::Text
+        | ValueKind::Bpchar
+        | ValueKind::Uuid
+        | ValueKind::Enum
+        | ValueKind::Unsupported => None,
     }
 }
 
@@ -389,6 +454,13 @@ pub fn literal_canonical_text(
     text: &str,
     settings: &LiteralSettings,
 ) -> Option<String> {
+    if matches!(
+        kind,
+        ValueKind::Date | ValueKind::Timestamp | ValueKind::TimestampTz
+    ) && let Some(TypedValue::Infinite { negative }) = special_parse(kind, text)
+    {
+        return Some(if negative { "-infinity" } else { "infinity" }.to_owned());
+    }
     match kind {
         ValueKind::Date => {
             let (date, _, _) = datetime_split_ordered(text, settings.date_order)?;
@@ -479,7 +551,7 @@ fn datetime_split_ordered(
             DateOrder::YearMonthDay => (a, b, c),
         }
     };
-    let year: i16 = year.parse().ok()?;
+    let year = year_field_parse(year)?;
     let month: i8 = month.parse().ok()?;
     let day: i8 = day.parse().ok()?;
     let date = Date::new(year, month, day).ok()?;
@@ -496,6 +568,19 @@ fn datetime_split_ordered(
     };
     let time = time.trim_end();
     Some((date, (!time.is_empty()).then_some(time), offset))
+}
+
+/// A numeric year field; two digits follow PostgreSQL's rule: below 70 is
+/// 20xx, else 19xx.
+fn year_field_parse(field: &str) -> Option<i16> {
+    let year: i16 = field.parse().ok()?;
+    Some(if field.len() > 2 {
+        year
+    } else if year < 70 {
+        2000 + year
+    } else {
+        1900 + year
+    })
 }
 
 fn civil_parse_date(date: Date, time: Option<&str>) -> Option<DateTime> {
@@ -581,11 +666,18 @@ fn text_parse(kind: ValueKind, text: &str, zone: Option<&TimeZone>) -> Option<Ty
             // `'10.0'` against an integer column compares as numeric.
             Err(_) => Decimal::parse(text).map(TypedValue::Decimal),
         },
-        ValueKind::Decimal => Decimal::parse(text).map(TypedValue::Decimal),
+        ValueKind::Decimal => {
+            special_parse(kind, text).or_else(|| Decimal::parse(text).map(TypedValue::Decimal))
+        }
         ValueKind::Bool => bool_literal_parse(text).map(TypedValue::Bool),
-        ValueKind::Date => date_parse(text).map(TypedValue::Date),
-        ValueKind::Timestamp => timestamp_parse(text).map(TypedValue::Timestamp),
-        ValueKind::TimestampTz => timestamptz_parse(text, zone).map(TypedValue::TimestampTz),
+        ValueKind::Date => {
+            special_parse(kind, text).or_else(|| date_parse(text).map(TypedValue::Date))
+        }
+        ValueKind::Timestamp => {
+            special_parse(kind, text).or_else(|| timestamp_parse(text).map(TypedValue::Timestamp))
+        }
+        ValueKind::TimestampTz => special_parse(kind, text)
+            .or_else(|| timestamptz_parse(text, zone).map(TypedValue::TimestampTz)),
         ValueKind::Text => Some(TypedValue::Text(text.to_owned())),
         ValueKind::Bpchar => Some(TypedValue::Text(text.trim_end_matches(' ').to_owned())),
         ValueKind::Uuid => Some(TypedValue::Text(text.trim().to_ascii_lowercase())),
@@ -633,9 +725,34 @@ fn date_shape_ok(date: &str) -> bool {
             .all(u8::is_ascii_digit)
 }
 
+/// PostgreSQL prints a year before 1 AD with a ` BC` suffix, after any
+/// offset; 1 BC is year 0.
+fn bc_strip(text: &str) -> (&str, bool) {
+    let trimmed = text.trim_end();
+    match trimmed
+        .strip_suffix(" BC")
+        .or_else(|| trimmed.strip_suffix(" bc"))
+    {
+        Some(rest) => (rest, true),
+        None => (text, false),
+    }
+}
+
+fn date_bc_adjust(date: Date, bc: bool) -> Option<Date> {
+    if !bc {
+        return Some(date);
+    }
+    Date::new(1 - date.year(), date.month(), date.day()).ok()
+}
+
+fn civil_bc_adjust(civil: DateTime, bc: bool) -> Option<DateTime> {
+    Some(date_bc_adjust(civil.date(), bc)?.to_datetime(civil.time()))
+}
+
 fn date_parse(text: &str) -> Option<Date> {
+    let (text, bc) = bc_strip(text);
     let (date, _, _) = datetime_split(text)?;
-    date.parse().ok()
+    date_bc_adjust(date.parse().ok()?, bc)
 }
 
 /// `HH:MM[:SS[.ffffff]]` as a jiff civil time, via the ISO string form.
@@ -659,15 +776,17 @@ fn civil_parse(date: &str, time: Option<&str>) -> Option<DateTime> {
 fn timestamp_parse(text: &str) -> Option<DateTime> {
     // An offset on a `timestamp without time zone` input is ignored, as
     // PostgreSQL ignores it.
+    let (text, bc) = bc_strip(text);
     let (date, time, _) = datetime_split(text)?;
-    civil_parse(date, time)
+    civil_bc_adjust(civil_parse(date, time)?, bc)
 }
 
 /// A `timestamptz`: with an offset or `Z` it is an instant outright; without
 /// one it is a civil time in the session's zone.
 fn timestamptz_parse(text: &str, zone: Option<&TimeZone>) -> Option<Timestamp> {
+    let (text, bc) = bc_strip(text);
     let (date, time, offset) = datetime_split(text)?;
-    let civil = civil_parse(date, time)?;
+    let civil = civil_bc_adjust(civil_parse(date, time)?, bc)?;
     match offset {
         Some(offset) => {
             let offset = offset_parse(offset)?;
@@ -1032,5 +1151,87 @@ mod tests {
             Some(false)
         );
         assert_eq!(cmp(&Type::TEXT, text("a"), "b", NotEqual), Some(true));
+    }
+
+    /// Row text beyond the ISO shapes that the typed parsers must still
+    /// order: the infinities, `NaN`, and BC dates. `None` here drops a row
+    /// from a cached result it belongs to.
+    #[test]
+    fn test_infinite_nan_and_bc_row_text_compare() {
+        let bound = text("2024-06-01 00:00+00");
+        assert_eq!(
+            cmp(&Type::TIMESTAMPTZ, bound.clone(), "infinity", GreaterThan),
+            Some(true)
+        );
+        assert_eq!(
+            cmp(&Type::TIMESTAMPTZ, bound.clone(), "-infinity", LessThan),
+            Some(true)
+        );
+        assert_eq!(
+            cmp(&Type::TIMESTAMPTZ, bound.clone(), "-infinity", GreaterThan),
+            Some(false)
+        );
+        assert_eq!(
+            cmp(
+                &Type::TIMESTAMP,
+                text("2024-06-01"),
+                "infinity",
+                GreaterThan
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            cmp(&Type::DATE, text("infinity"), "infinity", Equal),
+            Some(true)
+        );
+        assert_eq!(
+            cmp(&Type::DATE, text("2024-06-01"), "0100-01-01 BC", LessThan),
+            Some(true)
+        );
+        assert_eq!(
+            cmp(
+                &Type::TIMESTAMPTZ,
+                bound,
+                "0100-01-01 00:00:00+00 BC",
+                LessThan
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            cmp(&Type::NUMERIC, text("5"), "NaN", GreaterThan),
+            Some(true)
+        );
+        assert_eq!(cmp(&Type::NUMERIC, text("NaN"), "NaN", Equal), Some(true));
+        assert_eq!(
+            cmp(&Type::NUMERIC, text("5"), "Infinity", GreaterThan),
+            Some(true)
+        );
+        assert_eq!(
+            cmp(&Type::NUMERIC, text("Infinity"), "NaN", GreaterThan),
+            Some(true)
+        );
+        assert_eq!(
+            cmp(&Type::FLOAT8, text("5"), "-Infinity", LessThan),
+            Some(true)
+        );
+        assert!(wire_text_index_key(ValueKind::TimestampTz, "infinity").is_some());
+        assert!(wire_text_index_key(ValueKind::Decimal, "NaN").is_some());
+        assert_eq!(
+            literal_canonical_text(ValueKind::Date, "Infinity", &LiteralSettings::default())
+                .as_deref(),
+            Some("infinity")
+        );
+    }
+
+    /// A two-digit year follows PostgreSQL's rule: below 70 is 20xx, else 19xx.
+    #[test]
+    fn test_two_digit_year_expands_as_postgres() {
+        let mdy = LiteralSettings::default();
+        let ymd = LiteralSettings::from_texts("UTC", "ISO, YMD", "postgres", "Default");
+        let canon =
+            |text: &str, s: &LiteralSettings| literal_canonical_text(ValueKind::Date, text, s);
+        assert_eq!(canon("01/02/24", &mdy).as_deref(), Some("2024-01-02"));
+        assert_eq!(canon("01/02/70", &mdy).as_deref(), Some("1970-01-02"));
+        assert_eq!(canon("24/01/02", &ymd).as_deref(), Some("2024-01-02"));
     }
 }

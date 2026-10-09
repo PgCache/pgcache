@@ -207,3 +207,74 @@ async fn test_uncanonicalisable_literal_serves_only_reference_sessions() -> Resu
     assert_eq!(delta.queries_cache_hit, 1, "served again on the reference");
     Ok(())
 }
+
+/// A two-digit year expands as PostgreSQL does (below 70 is 20xx), in the
+/// session's field order.
+#[tokio::test]
+async fn test_two_digit_year_follows_date_order() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query("create table days (id integer primary key, day date)", &[])
+        .await?;
+    ctx.query(
+        "insert into days values (1, '2024-01-02'), (2, '2024-02-01')",
+        &[],
+    )
+    .await?;
+    ctx.cache_settle().await?;
+    let sql = "select id from days where day = '01/02/24'";
+
+    ctx.simple_query("SET DateStyle = 'ISO, DMY'").await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
+
+/// A waiter coalesced onto a reference-only entry while it loads is gated
+/// like a direct hit: a session off the reference settings is forwarded,
+/// not handed the reference's rows.
+#[tokio::test]
+async fn test_coalesced_waiter_off_reference_forwards() -> Result<(), Error> {
+    // The population delay must end inside the waiter's 200ms cold coalesce
+    // deadline, or the waiter forwards on the deadline instead of draining.
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_POPULATION_DELAY_MS", "150")]).await?;
+    instants_table_create(&mut ctx).await?;
+    let sql = "select id from instants where at >= 'Jan 2 2024 10:00' order by id";
+
+    // What origin answers a Tokyo session.
+    ctx.origin_query("SET TimeZone = 'Asia/Tokyo'", &[]).await?;
+    let expected: Vec<String> = ctx
+        .origin_query(sql, &[])
+        .await?
+        .iter()
+        .map(|row| row.get::<_, i32>(0).to_string())
+        .collect();
+    ctx.origin_query("RESET TimeZone", &[]).await?;
+    assert_eq!(expected, ["2", "3"]);
+
+    let reference = ctx.proxy_client_connect().await?;
+    let tokyo = ctx.proxy_client_connect().await?;
+    tokyo
+        .simple_query("SET TimeZone = 'Asia/Tokyo'")
+        .await
+        .map_err(Error::other)?;
+
+    let before = ctx.metrics().await?;
+    let loader = tokio::spawn(async move { reference.simple_query(sql).await });
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let res = tokyo.simple_query(sql).await.map_err(Error::other)?;
+    loader.await.map_err(Error::other)?.map_err(Error::other)?;
+    assert_eq!(ids(&res)?, expected, "the Tokyo waiter must see Tokyo rows");
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(
+        delta.cache_coalesce_deadline_forward, 0,
+        "the waiter must reach the Ready drain, not the deadline"
+    );
+    assert_eq!(delta.cache_reference_only_forwards, 1);
+    Ok(())
+}

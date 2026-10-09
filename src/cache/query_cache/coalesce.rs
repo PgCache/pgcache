@@ -4,13 +4,36 @@ use std::time::Instant;
 use ecow::EcoString;
 use tracing::error;
 
-use super::{CacheDispatch, CoalescedClient};
+use super::{CacheDispatch, CoalescedClient, QueryRequest};
 use crate::cache::Generation;
 use crate::cache::messages::slices_concat;
 use crate::cache::query::{limit_is_sufficient, limit_rows_needed};
+use crate::cache::reference_settings::{self, ReferenceSettings};
 use crate::cache::types::SharedResolved;
 use crate::query::Fingerprint;
 use crate::result::error_chain_format;
+
+/// The gate a direct hit applies in `ready_hit`, for a reference-only entry:
+/// a waiter off the reference settings would read other rows at origin, so
+/// it is forwarded; the rest are returned to be served.
+fn waiters_on_reference(
+    waiters: Vec<QueryRequest>,
+    reference: &ReferenceSettings,
+) -> Vec<QueryRequest> {
+    let (on_reference, off_reference): (Vec<_>, Vec<_>) = waiters
+        .into_iter()
+        .partition(|w| *w.literal_settings == reference.literals);
+    if !off_reference.is_empty() {
+        crate::metrics::handles()
+            .cache
+            .reference_only_forward_total
+            .increment(off_reference.len() as u64);
+        for msg in off_reference {
+            let _ = msg.forward();
+        }
+    }
+    on_reference
+}
 
 impl CacheDispatch {
     /// Total number of requests waiting across all coalescing groups.
@@ -36,11 +59,13 @@ impl CacheDispatch {
         // The entry is Ready at drain time, so its propagated serve shape (if any)
         // is present; read it once for the whole drain rather than threading it
         // through the WriterNotify::Ready message.
-        let serve_shape = self
+        let (serve_shape, reference_only) = self
             .state_view
             .cached_queries
             .get(&fingerprint)
-            .and_then(|v| v.serve_shape.clone());
+            .map(|v| (v.serve_shape.clone(), v.reference_only))
+            .unwrap_or((None, false));
+        let reference = reference_only.then(reference_settings::current);
 
         let mut served = 0u64;
         for (_key, mut waiters) in groups {
@@ -50,6 +75,12 @@ impl CacheDispatch {
             let drain_started = Instant::now();
             for w in &mut waiters {
                 w.timing.drain_started_at = Some(drain_started);
+            }
+            if let Some(reference) = &reference {
+                waiters = waiters_on_reference(waiters, reference);
+                if waiters.is_empty() {
+                    continue;
+                }
             }
             let primary = waiters.remove(0);
 

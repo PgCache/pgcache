@@ -151,3 +151,36 @@ async fn test_date_literal_with_time_matches_updated_row() -> Result<(), Error> 
     let _ = assert_cache_hit(&mut ctx, m).await?;
     Ok(())
 }
+
+/// A row whose value is `infinity` belongs to an open-ended range predicate
+/// and must be applied in place like any other.
+#[tokio::test]
+async fn test_infinite_timestamptz_row_applies_under_cdc() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(
+        "create table contracts (id integer primary key, valid_to timestamptz)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "insert into contracts values (1, '2024-12-31 00:00:00+00')",
+        &[],
+    )
+    .await?;
+    let sql = "select id from contracts where valid_to > '2024-06-01 00:00:00+00' order by id";
+    warm(&mut ctx, sql).await?;
+
+    ctx.origin_query(
+        "insert into contracts values (2, 'infinity'), (3, '-infinity')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_apply_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_eq!(res.len(), 4, "the open-ended row joins the result");
+    assert_row_at(&res, 1, &[("id", "1")])?;
+    assert_row_at(&res, 2, &[("id", "2")])?;
+    let _ = assert_cache_hit(&mut ctx, m).await?;
+    Ok(())
+}
