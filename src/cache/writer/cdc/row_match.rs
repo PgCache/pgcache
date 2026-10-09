@@ -1,10 +1,13 @@
+use postgres_types::Type;
+
 use crate::cache::update_query::{ColumnChange, OrderByKey, RowChanges, UpdateQuery};
 use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::BinaryOp;
 use crate::query::cast::cast_target_coerce_text;
 use crate::query::constraints::{QueryConstraints, TableConstraint};
-use crate::query::evaluate::{literal_compare, where_value_compare_string};
+use crate::query::evaluate::literal_compare;
+use crate::query::typed_compare::typed_compare;
 
 /// Check that every WHERE constraint for `table_metadata` matches `row_data`.
 /// Returns true when there are no constraints for this table (full-scan
@@ -41,10 +44,13 @@ fn constraint_row_matches(
     else {
         return true;
     };
+    let Some(column_meta) = table_metadata.columns.get(constraint_column(constraint)) else {
+        return true;
+    };
     // NULL never matches comparison operators
-    row_value
-        .as_ref()
-        .is_some_and(|row_str| constraint_value_matches(constraint, row_str))
+    row_value.as_ref().is_some_and(|row_str| {
+        constraint_value_matches(constraint, &column_meta.data_type, row_str)
+    })
 }
 
 fn constraint_column(constraint: &TableConstraint) -> &str {
@@ -55,12 +61,17 @@ fn constraint_column(constraint: &TableConstraint) -> &str {
     }
 }
 
-fn constraint_value_matches(constraint: &TableConstraint, row_str: &str) -> bool {
+/// Every consumer of a constraint match invalidates, evicts or includes on a
+/// match, so a value the comparator cannot decide counts as matching: over-
+/// returning costs work, under-returning serves stale data (PGC-478).
+fn constraint_value_matches(constraint: &TableConstraint, data_type: &Type, row_str: &str) -> bool {
     match constraint {
-        TableConstraint::Comparison(_, op, val) => where_value_compare_string(val, row_str, *op),
+        TableConstraint::Comparison(_, op, val) => {
+            typed_compare(data_type, val, row_str, *op, None).unwrap_or(true)
+        }
         TableConstraint::AnyOf(_, values) => values
             .iter()
-            .any(|v| where_value_compare_string(v, row_str, BinaryOp::Equal)),
+            .any(|v| typed_compare(data_type, v, row_str, BinaryOp::Equal, None).unwrap_or(true)),
         // Coercion failure (e.g. `'abc'::int4`): the row would error at origin
         // and never match — safe to treat as non-matching here.
         TableConstraint::CastComparison(_, cast, op, val) => cast_target_coerce_text(cast, row_str)

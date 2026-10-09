@@ -7,15 +7,18 @@
 //! hoists it to registration: the column position, in-table flag, cast target,
 //! operator, and literal are resolved once into a flat node, leaving only the
 //! row-value lookup + compare per row. The comparison semantics are unchanged —
-//! leaves reuse `where_value_compare_string` / `cast_target_coerce_text` /
+//! leaves reuse `typed_compare` / `cast_target_coerce_text` /
 //! `literal_compare`, so a compiled predicate evaluates identically to
 //! `where_expr_evaluate` for the expression it was compiled from.
 
 use crate::pg::protocol::ByteString;
 use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
 use crate::query::cast::{CastTarget, canonicalize_comparison, cast_target_coerce_text};
-use crate::query::evaluate::{literal_compare, where_value_compare_string};
+use postgres_types::Type;
+
+use crate::query::evaluate::literal_compare;
 use crate::query::resolved::{ResolvedScalarExpr, ResolvedWhereExpr};
+use crate::query::typed_compare::typed_compare;
 
 /// Pre-canonicalized form of a LocalEval WHERE clause. Built once at registration
 /// from a `ResolvedWhereExpr`; evaluated per CDC row. A total mapping of every
@@ -39,6 +42,8 @@ pub enum CompiledPredicate {
     Compare {
         col: usize,
         in_table: bool,
+        /// The column's type, for the typed comparison of a bare literal.
+        data_type: Type,
         target: Option<CastTarget>,
         op: BinaryOp,
         value: LiteralValue,
@@ -72,6 +77,7 @@ impl CompiledPredicate {
                     Some((col, target, op, value)) => Self::Compare {
                         col: col.column_metadata.index(),
                         in_table: col.table.as_str() == table_name,
+                        data_type: col.column_metadata.data_type.clone(),
                         target: target.cloned(),
                         op,
                         value: value.clone(),
@@ -124,6 +130,7 @@ impl CompiledPredicate {
             Self::Compare {
                 col,
                 in_table,
+                data_type,
                 target,
                 op,
                 value,
@@ -143,7 +150,9 @@ impl CompiledPredicate {
                     Some(Some(bytes)) => {
                         let row_str = bytes.as_str();
                         match target {
-                            None => where_value_compare_string(value, row_str, *op),
+                            None => {
+                                typed_compare(data_type, value, row_str, *op, None).unwrap_or(false)
+                            }
                             Some(target) => match cast_target_coerce_text(target, row_str) {
                                 Some(coerced) => literal_compare(&coerced, *op, value),
                                 None => false,

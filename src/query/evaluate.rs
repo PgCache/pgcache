@@ -11,6 +11,7 @@ use crate::query::cast::{
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedScalarExpr, ResolvedWhereExpr,
 };
+use crate::query::typed_compare::{literal_locally_comparable, typed_compare};
 
 /// Recursively evaluate a resolved WHERE expression against a single row.
 ///
@@ -73,9 +74,14 @@ fn expr_comparison_evaluate(
     let row_value = column_row_value_get(column_ref, row_data, table_name);
 
     match (target, row_value) {
-        (None, ColumnRowValue::Present(row_value_str)) => {
-            where_value_compare_string(value, row_value_str, op)
-        }
+        (None, ColumnRowValue::Present(row_value_str)) => typed_compare(
+            &column_ref.column_metadata.data_type,
+            value,
+            row_value_str,
+            op,
+            None,
+        )
+        .unwrap_or(false),
         (Some(target), ColumnRowValue::Present(row_value_str)) => {
             let Some(coerced) = cast_target_coerce_text(target, row_value_str) else {
                 return false;
@@ -100,7 +106,7 @@ fn expr_comparison_evaluate(
 /// Boolean↔Boolean, Boolean↔string-of-bool (equality only). Other pairings
 /// return false.
 pub fn literal_compare(left: &LiteralValue, op: BinaryOp, right: &LiteralValue) -> bool {
-    // Boolean comparisons: equality only — matches `where_value_compare_string`
+    // Boolean comparisons: equality only — matches the typed row path's
     // semantics and ORM usage of `::bool`.
     if let Some((a, b)) = literal_pair_as_bool(left, right) {
         return match op {
@@ -127,7 +133,7 @@ pub fn literal_compare(left: &LiteralValue, op: BinaryOp, right: &LiteralValue) 
         // String↔String compares lexicographically. ISO 8601 dates
         // (`YYYY-MM-DD`) sort chronologically by bytes, so this serves the
         // `::date` coercion path; other String↔String comparisons happen on
-        // the row-text path (`where_value_compare_string`), not here.
+        // the row-text path (`typed_compare`), not here.
         (LiteralValue::String(a), LiteralValue::String(b)) => a.as_str().cmp(b.as_str()),
         (LiteralValue::String(a), LiteralValue::StringWithCast(b, _))
         | (LiteralValue::StringWithCast(a, _), LiteralValue::String(b)) => {
@@ -252,63 +258,6 @@ pub fn bool_wire_text_parse(text: &str) -> Option<bool> {
     }
 }
 
-/// Compare a string value from row data with a LiteralValue using the specified operator.
-pub fn where_value_compare_string(
-    filter_value: &LiteralValue,
-    row_value_str: &str,
-    op: BinaryOp,
-) -> bool {
-    match filter_value {
-        LiteralValue::String(filter_str) => {
-            ordering_satisfies_op(row_value_str.cmp(filter_str), op)
-        }
-        LiteralValue::StringWithCast(filter_str, _cast) => {
-            ordering_satisfies_op(row_value_str.cmp(filter_str), op)
-        }
-        LiteralValue::Integer(filter_int) => row_value_str
-            .parse::<i64>()
-            .is_ok_and(|row_int| ordering_satisfies_op(row_int.cmp(filter_int), op)),
-        LiteralValue::Float(filter_float) => {
-            float_text_compare(row_value_str, filter_float.into_inner(), op)
-        }
-        LiteralValue::Boolean(filter_bool) => bool_text_compare(row_value_str, *filter_bool, op),
-        LiteralValue::Null => false, // Row has non-NULL value, filter expects NULL
-        LiteralValue::NullWithCast(_) => false, // Row has non-NULL value, filter expects NULL
-        LiteralValue::Parameter(_) => false, // Parameters not supported in cache matching
-        // Array literals only appear via `MultiOp::Any` / `MultiOp::All`,
-        // which the evaluator handles at the WHERE-expr level — never here
-        // as a scalar comparison value.
-        LiteralValue::Array(_, _) => false,
-    }
-}
-
-/// A float filter against a row's text: equality within `f64::EPSILON`; an
-/// unparseable row never matches.
-fn float_text_compare(row_value_str: &str, filter: f64, op: BinaryOp) -> bool {
-    let Ok(row_float) = row_value_str.parse::<f64>() else {
-        return false;
-    };
-    match op {
-        BinaryOp::Equal => (row_float - filter).abs() < f64::EPSILON,
-        BinaryOp::NotEqual => (row_float - filter).abs() >= f64::EPSILON,
-        BinaryOp::LessThan => row_float < filter,
-        BinaryOp::LessThanOrEqual => row_float <= filter,
-        BinaryOp::GreaterThan => row_float > filter,
-        BinaryOp::GreaterThanOrEqual => row_float >= filter,
-        _ => false,
-    }
-}
-
-/// A boolean filter against a row's text: only `=` and `<>` are meaningful;
-/// an unparseable row never matches.
-fn bool_text_compare(row_value_str: &str, filter: bool, op: BinaryOp) -> bool {
-    match (bool_wire_text_parse(row_value_str), op) {
-        (Some(row_bool), BinaryOp::Equal) => row_bool == filter,
-        (Some(row_bool), BinaryOp::NotEqual) => row_bool != filter,
-        _ => false,
-    }
-}
-
 /// Returns true iff `where_expr_evaluate` can decide this expression against a
 /// single CDC row. Must stay in lockstep with the evaluator: any shape the
 /// evaluator falls through on (returning false unconditionally) is unsupported.
@@ -352,11 +301,13 @@ pub fn resolved_where_expr_supported(expr: &ResolvedWhereExpr) -> bool {
 /// `YYYY-MM-DD` form so lexicographic compare matches calendar order;
 /// other literal spellings (`'2024-1-5'`, etc.) fall through to PgEval.
 pub fn is_simple_comparison(binary_expr: &ResolvedBinaryExpr) -> bool {
-    let Some((col, target, _, literal)) = canonicalize_comparison(binary_expr) else {
+    let Some((col, target, op, literal)) = canonicalize_comparison(binary_expr) else {
         return false;
     };
     let Some(target) = target else {
-        return true;
+        // Bare `column op literal`: local only when the literal parses as the
+        // column's type (PGC-478); otherwise the cache database decides.
+        return literal_locally_comparable(&col.column_metadata.data_type, literal, op, None);
     };
     if !cast_target_is_coercion_supported(target, &col.column_metadata.data_type) {
         return false;
@@ -528,59 +479,6 @@ mod tests {
         literal: LiteralValue,
     ) -> ResolvedWhereExpr {
         binary_expr(op, col_expr(table, column), val_expr(literal))
-    }
-
-    // ------------------------------------------------------------------
-    // where_value_compare_string tests (shape-agnostic)
-    // ------------------------------------------------------------------
-
-    fn float(v: f64) -> LiteralValue {
-        LiteralValue::Float(NotNan::new(v).expect("test float is not NaN"))
-    }
-
-    #[test]
-    fn test_where_value_compare_string_cases() {
-        use BinaryOp::{Equal, GreaterThan, LessThan, NotEqual};
-        use LiteralValue::{Boolean, Integer, Null, Parameter};
-        // (label, filter literal, row text, op, expected)
-        #[rustfmt::skip]
-        let cases = [
-            ("string equal",                 text("hello"),           "hello",    Equal,       true),
-            ("string unequal",               text("hello"),           "world",    Equal,       false),
-            ("string not-equal",             text("hello"),           "world",    NotEqual,    true),
-            ("integer equal",                Integer(123),            "123",      Equal,       true),
-            ("integer unequal",              Integer(123),            "124",      Equal,       false),
-            ("integer vs unparseable row",   Integer(123),            "abc",      Equal,       false),
-            ("integer row below",            Integer(123),            "100",      LessThan,    true),
-            ("integer row above",            Integer(123),            "150",      GreaterThan, true),
-            ("float equal",                  float(123.45),           "123.45",   Equal,       true),
-            ("float unequal",                float(123.45),           "123.46",   Equal,       false),
-            ("float vs unparseable row",     float(123.45),           "invalid",  Equal,       false),
-            ("float row below",              float(123.45),           "100.0",    LessThan,    true),
-            ("float row above",              float(123.45),           "150.0",    GreaterThan, true),
-            ("bool true = 'true'",           Boolean(true),           "true",     Equal,       true),
-            ("bool true = 'false'",          Boolean(true),           "false",    Equal,       false),
-            ("bool true = 't'",              Boolean(true),           "t",        Equal,       true),
-            ("bool true = 'f'",              Boolean(true),           "f",        Equal,       false),
-            ("bool false = 'false'",         Boolean(false),          "false",    Equal,       true),
-            ("bool false = 'true'",          Boolean(false),          "true",     Equal,       false),
-            ("bool false = 'f'",             Boolean(false),          "f",        Equal,       true),
-            ("bool false = 't'",             Boolean(false),          "t",        Equal,       false),
-            ("bool true never matches '1'",  Boolean(true),           "1",        Equal,       false),
-            ("bool false never matches '0'", Boolean(false),          "0",        Equal,       false),
-            ("null filter vs 'anything'",    Null,                    "anything", Equal,       false),
-            ("null filter vs 'null'",        Null,                    "null",     Equal,       false),
-            ("null filter vs 'NULL'",        Null,                    "NULL",     Equal,       false),
-            ("parameter vs its own text",    Parameter("$1".into()),  "$1",       Equal,       false),
-            ("parameter vs 'anything'",      Parameter("$1".into()),  "anything", Equal,       false),
-        ];
-        for (label, filter, row_text, op, expected) in cases {
-            let actual = where_value_compare_string(&filter, row_text, op);
-            assert_eq!(
-                actual, expected,
-                "{label}: expected {expected}, got {actual} (row {row_text:?} {op:?} filter {filter:?})"
-            );
-        }
     }
 
     #[test]
@@ -1026,7 +924,7 @@ mod tests {
 
     // ------------------------------------------------------------------
     // Literal-LHS op-flip — `WHERE 5 < col` must evaluate the same as
-    // `WHERE col > 5`. Bug pre-dated PGC-149 in `where_value_compare_string`
+    // `WHERE col > 5`. Bug pre-dated PGC-149 in the row-text comparator
     // and was carried into the cast-coercion path; tests lock both.
     // ------------------------------------------------------------------
 

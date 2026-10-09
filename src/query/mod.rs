@@ -11,6 +11,7 @@ pub mod resolve;
 pub mod resolved;
 pub mod shape;
 pub mod transform;
+pub mod typed_compare;
 pub mod update;
 pub mod write;
 

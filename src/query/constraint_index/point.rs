@@ -49,7 +49,7 @@ type ClassKeys = SmallVec<[ColumnKeys; 2]>;
 ///
 /// An absent column, SQL NULL, or unchanged-TOAST yields `[Unknown]` — a
 /// wildcard that matches every entry constraining the column (conservative,
-/// never under-returns). The forms mirror `where_value_compare_string`'s row
+/// never under-returns). The forms mirror the row-text comparator's row
 /// interpretation, so the precise check downstream agrees.
 pub(crate) fn row_value_forms(
     table_metadata: &TableMetadata,
