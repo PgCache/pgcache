@@ -43,10 +43,13 @@ impl ConnectionState {
         if self
             .session_settings
             .probe_needed(self.forwarding_into_block())
-            && !self.egress.probe_pending(ProbeKind::SessionSettings)
+            && !self
+                .egress
+                .probe_pending(ProbeKind::SessionSettings { seq: 0 })
         {
             debug!("session settings unknown, probing");
-            self.probe_send(ProbeKind::SessionSettings, &SETTINGS_PROBE);
+            let seq = self.session_settings.probe_seq();
+            self.probe_send(ProbeKind::SessionSettings { seq }, &SETTINGS_PROBE);
             crate::metrics::handles().conn.settings_probes.increment(1);
         }
         self.commit_lsn_probe_inject();
@@ -113,9 +116,11 @@ impl ConnectionState {
     /// than looping.
     fn probe_apply(&mut self, result: ProbeResult, status: TransactionStatus) {
         match (result.kind, result.row) {
-            (ProbeKind::SessionSettings, Some(columns)) => {
+            (ProbeKind::SessionSettings { seq }, Some(columns)) => {
                 debug!(?status, "received session settings sample");
-                self.session_settings_update(|settings| settings.probe_apply(&columns, status));
+                self.session_settings_update(|settings| {
+                    settings.probe_apply(&columns, status, seq);
+                });
             }
             (ProbeKind::CommitLsn { stamp_seq }, Some(columns)) => {
                 if status != TransactionStatus::Idle {

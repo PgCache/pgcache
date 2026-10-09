@@ -17,6 +17,7 @@ use std::sync::Arc;
 use ecow::EcoString;
 use tracing::debug;
 
+use crate::cache::output_settings::OutputSettings;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::proxy::search_path::SearchPath;
 use crate::query::guc::Guc;
@@ -43,9 +44,15 @@ struct SettingState {
     /// The session value: what reads see outside a block, and inside one
     /// unless `block` overrides it.
     session: SettingValue,
+    /// The mutation sequence at which `session` last became unknown. A probe
+    /// injected before that point sampled origin before the mutation ran, so
+    /// its value must not fill this.
+    session_since: u64,
     /// `Some` while the open block may hold a different value (`SET LOCAL`,
     /// any `SET` inside the block). Dropped when the block ends.
     block: Option<SettingValue>,
+    /// As `session_since`, for `block`.
+    block_since: u64,
     /// A statement touched this setting inside the open block, so a
     /// `ROLLBACK TO SAVEPOINT` may have reverted the block value.
     touched_in_block: bool,
@@ -56,10 +63,23 @@ struct SettingState {
 impl SettingState {
     const UNKNOWN: SettingState = SettingState {
         session: SettingValue::Unknown,
+        session_since: 0,
         block: None,
+        block_since: 0,
         touched_in_block: false,
         reported: false,
     };
+
+    fn session_unknown_mark(&mut self, seq: u64) {
+        self.session = SettingValue::Unknown;
+        self.session_since = seq;
+    }
+
+    fn block_unknown_mark(&mut self, seq: u64) {
+        self.block = Some(SettingValue::Unknown);
+        self.block_since = seq;
+        self.touched_in_block = true;
+    }
 
     /// The value in force for a read in the given scope.
     fn effective(&self, in_block: bool) -> &SettingValue {
@@ -160,6 +180,9 @@ pub(crate) struct SessionSettings {
     /// The user from the startup message, the fallback for `$user` until
     /// `session_authorization` and `role` are known.
     startup_user: Option<EcoString>,
+    /// Counts mutations that mark values unknown. A probe carries the value at
+    /// its injection so its sample fills only values unknown since before it.
+    mutation_seq: u64,
     search_path: SearchPathState,
     isolation: IsolationState,
 }
@@ -169,9 +192,15 @@ impl SessionSettings {
         Self {
             states: [SettingState::UNKNOWN; Guc::ALL.len()],
             startup_user: None,
+            mutation_seq: 0,
             search_path: SearchPathState::Unknown,
             isolation: IsolationState::Unknown,
         }
+    }
+
+    /// The sequence a probe injected now should carry.
+    pub(crate) fn probe_seq(&self) -> u64 {
+        self.mutation_seq
     }
 
     // A discriminant is always below `Guc::ALL.len()` (pinned by a test in
@@ -222,6 +251,18 @@ impl SessionSettings {
         }
     }
 
+    /// The rendering settings in force for a read at this scope. The caller
+    /// has checked [`Self::serve_search_path`], so every value is known; an
+    /// unknown one (explain's path, which does not check) renders as empty.
+    pub(crate) fn output_settings(&self, in_block: bool) -> OutputSettings {
+        OutputSettings::from_values(|guc| {
+            self.effective(guc, in_block)
+                .known()
+                .map(EcoString::from)
+                .unwrap_or_default()
+        })
+    }
+
     /// Whether a probe at this scope would learn a value. Inside a block,
     /// settings whose in-block sample is meaningless are not waited on.
     pub(crate) fn probe_needed(&self, in_block: bool) -> bool {
@@ -251,10 +292,12 @@ impl SessionSettings {
     /// whether it lands inside a block (open, or a forwarded `BEGIN` not yet
     /// acknowledged).
     pub(crate) fn effect_apply(&mut self, effect: SettingsEffect, in_block: bool) {
+        self.mutation_seq += 1;
+        let seq = self.mutation_seq;
         if effect.block_revert {
             for state in &mut self.states {
                 if state.touched_in_block {
-                    state.block = Some(SettingValue::Unknown);
+                    state.block_unknown_mark(seq);
                 }
             }
         }
@@ -274,16 +317,15 @@ impl SessionSettings {
                 // No block value to track: a block-scoped change is invisible
                 // to reads, a session-scoped one is confirmed after the block.
                 if !effect.local {
-                    state.session = SettingValue::Unknown;
+                    state.session_unknown_mark(seq);
                 }
                 continue;
             }
             if effect.local || in_block {
-                state.block = Some(SettingValue::Unknown);
-                state.touched_in_block = true;
+                state.block_unknown_mark(seq);
             }
             if !effect.local {
-                state.session = SettingValue::Unknown;
+                state.session_unknown_mark(seq);
             }
         }
         self.views_rederive();
@@ -292,7 +334,9 @@ impl SessionSettings {
     /// Mark the session value of one setting unknown (an isolation effect
     /// the analyzer could not read).
     pub(crate) fn session_unknown_mark(&mut self, guc: Guc) {
-        self.state_mut(guc).session = SettingValue::Unknown;
+        self.mutation_seq += 1;
+        let seq = self.mutation_seq;
+        self.state_mut(guc).session_unknown_mark(seq);
         self.views_rederive();
     }
 
@@ -314,8 +358,16 @@ impl SessionSettings {
     }
 
     /// Apply a settings probe's row (one column per [`Guc::ALL`] entry) under
-    /// the status its `ReadyForQuery` carried.
-    pub(crate) fn probe_apply(&mut self, columns: &[Option<EcoString>], status: TransactionStatus) {
+    /// the status its `ReadyForQuery` carried. `seq` is the sequence the probe
+    /// was injected at: it fills only values that were unknown since before
+    /// then, never a known value and never one a later statement marked
+    /// (the sample predates that statement on origin).
+    pub(crate) fn probe_apply(
+        &mut self,
+        columns: &[Option<EcoString>],
+        status: TransactionStatus,
+        seq: u64,
+    ) {
         if status == TransactionStatus::Failed {
             debug!("settings probe answered in a failed block, discarding");
             return;
@@ -327,13 +379,18 @@ impl SessionSettings {
             };
             let state = self.state_mut(guc);
             if !in_block {
-                state.session = SettingValue::Known(value.clone());
+                // Idle: no block is open, so block values are moot.
                 state.block = None;
+                if state.session == SettingValue::Unknown && state.session_since <= seq {
+                    state.session = SettingValue::Known(value.clone());
+                }
             } else if !guc.block_sample_valid() {
                 continue;
-            } else if state.block.is_some() {
-                state.block = Some(SettingValue::Known(value.clone()));
-            } else if state.session == SettingValue::Unknown {
+            } else if let Some(block) = &state.block {
+                if *block == SettingValue::Unknown && state.block_since <= seq {
+                    state.block = Some(SettingValue::Known(value.clone()));
+                }
+            } else if state.session == SettingValue::Unknown && state.session_since <= seq {
                 state.session = SettingValue::Known(value.clone());
             }
         }
@@ -401,7 +458,7 @@ mod tests {
     fn all_known(status: TransactionStatus) -> SessionSettings {
         let mut settings = SessionSettings::new();
         settings.startup_user_set(Some("alice"));
-        settings.probe_apply(&sample("public"), status);
+        settings.probe_apply(&sample("public"), status, settings.probe_seq());
         settings
     }
 
@@ -446,7 +503,11 @@ mod tests {
             settings.serve_search_path(false),
             Err(SettingsForwardReason::SettingUnknown(Guc::SearchPath))
         );
-        settings.probe_apply(&sample("public"), TransactionStatus::Idle);
+        settings.probe_apply(
+            &sample("public"),
+            TransactionStatus::Idle,
+            settings.probe_seq(),
+        );
         assert!(!settings.probe_needed(false));
         assert_eq!(resolved(&settings), vec!["public"]);
         assert_eq!(
@@ -476,7 +537,11 @@ mod tests {
             settings.serve_search_path(false),
             Err(SettingsForwardReason::SettingUnknown(Guc::SearchPath))
         );
-        settings.probe_apply(&sample("myapp, public"), TransactionStatus::Idle);
+        settings.probe_apply(
+            &sample("myapp, public"),
+            TransactionStatus::Idle,
+            settings.probe_seq(),
+        );
         assert_eq!(resolved(&settings), vec!["myapp", "public"]);
     }
 
@@ -487,7 +552,11 @@ mod tests {
         // Session value untouched; the block needs a probe.
         assert!(settings.probe_needed(true));
         assert!(!settings.probe_needed(false));
-        settings.probe_apply(&sample("blockschema"), TransactionStatus::InTransaction);
+        settings.probe_apply(
+            &sample("blockschema"),
+            TransactionStatus::InTransaction,
+            settings.probe_seq(),
+        );
         assert_eq!(resolved(&settings), vec!["blockschema"]);
         assert!(settings.serve_search_path(true).is_ok());
         settings.block_exit();
@@ -500,7 +569,11 @@ mod tests {
         let mut settings = all_known(TransactionStatus::Idle);
         settings.effect_apply(SettingsEffect::guc(Guc::TimeZone, false), true);
         assert!(settings.probe_needed(true));
-        settings.probe_apply(&sample("public"), TransactionStatus::InTransaction);
+        settings.probe_apply(
+            &sample("public"),
+            TransactionStatus::InTransaction,
+            settings.probe_seq(),
+        );
         assert!(!settings.probe_needed(true));
         // Commit or rollback: the session value is still unknown until a
         // probe outside the block says.
@@ -510,7 +583,11 @@ mod tests {
             settings.serve_search_path(false),
             Err(SettingsForwardReason::SettingUnknown(Guc::TimeZone))
         );
-        settings.probe_apply(&sample("public"), TransactionStatus::Idle);
+        settings.probe_apply(
+            &sample("public"),
+            TransactionStatus::Idle,
+            settings.probe_seq(),
+        );
         assert!(!settings.probe_needed(false));
     }
 
@@ -526,7 +603,11 @@ mod tests {
     fn test_rollback_to_savepoint_reverts_touched_block_values() {
         let mut settings = all_known(TransactionStatus::Idle);
         settings.effect_apply(SettingsEffect::guc(Guc::TimeZone, true), true);
-        settings.probe_apply(&sample("public"), TransactionStatus::InTransaction);
+        settings.probe_apply(
+            &sample("public"),
+            TransactionStatus::InTransaction,
+            settings.probe_seq(),
+        );
         assert!(!settings.probe_needed(true));
         settings.effect_apply(SettingsEffect::BLOCK_REVERT, true);
         assert!(settings.probe_needed(true));
@@ -555,9 +636,17 @@ mod tests {
             true,
         );
         assert!(!settings.probe_needed(true));
-        settings.probe_apply(&sample("public"), TransactionStatus::InTransaction);
+        settings.probe_apply(
+            &sample("public"),
+            TransactionStatus::InTransaction,
+            settings.probe_seq(),
+        );
         assert_eq!(settings.isolation(), IsolationState::Unknown);
-        settings.probe_apply(&sample("public"), TransactionStatus::Idle);
+        settings.probe_apply(
+            &sample("public"),
+            TransactionStatus::Idle,
+            settings.probe_seq(),
+        );
         assert_eq!(
             settings.isolation(),
             IsolationState::Known(IsolationLevel::ReadCommitted)
@@ -569,10 +658,43 @@ mod tests {
         );
     }
 
+    /// A probe injected before a later SET sampled origin before that SET ran:
+    /// its value must not fill what the SET marked unknown.
+    #[test]
+    fn test_probe_fills_only_values_unknown_since_before_it() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.effect_apply(SettingsEffect::guc(Guc::ExtraFloatDigits, false), false);
+        let probe_seq = settings.probe_seq();
+        settings.effect_apply(SettingsEffect::guc(Guc::ByteaOutput, false), false);
+        let mut row = sample("public");
+        row[Guc::ByteaOutput as usize] = Some("hex".into());
+        settings.probe_apply(&row, TransactionStatus::Idle, probe_seq);
+        assert_eq!(
+            settings.effective(Guc::ExtraFloatDigits, false),
+            &SettingValue::Known("x".into())
+        );
+        assert_eq!(
+            settings.effective(Guc::ByteaOutput, false),
+            &SettingValue::Unknown
+        );
+        assert!(settings.probe_needed(false));
+        let mut row = sample("public");
+        row[Guc::ByteaOutput as usize] = Some("escape".into());
+        settings.probe_apply(&row, TransactionStatus::Idle, settings.probe_seq());
+        assert_eq!(
+            settings.effective(Guc::ByteaOutput, false),
+            &SettingValue::Known("escape".into())
+        );
+    }
+
     #[test]
     fn test_failed_block_sample_is_discarded() {
         let mut settings = SessionSettings::new();
-        settings.probe_apply(&sample("public"), TransactionStatus::Failed);
+        settings.probe_apply(
+            &sample("public"),
+            TransactionStatus::Failed,
+            settings.probe_seq(),
+        );
         assert!(settings.probe_needed(false));
     }
 
@@ -581,23 +703,35 @@ mod tests {
         let mut settings = all_known(TransactionStatus::Idle);
         settings.parameter_status(Guc::SearchPath, "$user, public");
         assert_eq!(resolved(&settings), vec!["alice", "public"]);
+        // `SET ROLE bob`: the role is unknown until the probe says.
+        settings.effect_apply(SettingsEffect::guc(Guc::Role, false), false);
         let mut row = sample("$user, public");
         row[Guc::Role as usize] = Some("bob".into());
-        settings.probe_apply(&row, TransactionStatus::Idle);
+        settings.probe_apply(&row, TransactionStatus::Idle, settings.probe_seq());
         assert_eq!(resolved(&settings), vec!["bob", "public"]);
     }
 
     #[test]
     fn test_pg_catalog_after_schema_forwards() {
         let mut settings = all_known(TransactionStatus::Idle);
-        settings.probe_apply(&sample("myschema, pg_catalog"), TransactionStatus::Idle);
+        settings.effect_apply(SettingsEffect::guc(Guc::SearchPath, false), false);
+        settings.probe_apply(
+            &sample("myschema, pg_catalog"),
+            TransactionStatus::Idle,
+            settings.probe_seq(),
+        );
         assert_eq!(settings.search_path(), &SearchPathState::BuiltinsShadowed);
         assert_eq!(
             settings.serve_search_path(false),
             Err(SettingsForwardReason::BuiltinsShadowed)
         );
         assert!(!settings.probe_needed(false), "the value is known");
-        settings.probe_apply(&sample("pg_catalog, myschema"), TransactionStatus::Idle);
+        settings.effect_apply(SettingsEffect::guc(Guc::SearchPath, false), false);
+        settings.probe_apply(
+            &sample("pg_catalog, myschema"),
+            TransactionStatus::Idle,
+            settings.probe_seq(),
+        );
         assert_eq!(resolved(&settings), vec!["pg_catalog", "myschema"]);
     }
 

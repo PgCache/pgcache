@@ -27,6 +27,10 @@ pub(crate) const TEXT_OID: TypeOid = TypeOid::from_raw(25);
 pub(crate) const SETGEN_STATEMENT_NAME: &[u8] = b"pgc_setgen";
 pub(crate) const SETGEN_SQL: &str = "SELECT set_config('mem.query_generation', $1, false)";
 
+/// Prepared statement (one per connection) that applies a client's rendering
+/// settings before a serve (PGC-287); its SQL is `output_settings::SETOUT_SQL`.
+pub(crate) const SETOUT_STATEMENT_NAME: &[u8] = b"pgc_setout";
+
 /// Build a PG startup message (protocol v3.0).
 ///
 /// Format: int32 len | int32 protocol_version(196608) | key\0value\0 pairs | \0

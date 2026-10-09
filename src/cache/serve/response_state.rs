@@ -1,7 +1,6 @@
 //! The serve response state machine: which cache-DB completion each step of a
 //! serve's pipeline expects, for the frames consumed rather than relayed.
 
-use crate::cache::mv::MvServe;
 use crate::pg::cache_connection::PrepareOutcome;
 use crate::pg::protocol::backend::PgBackendMessageType;
 
@@ -20,6 +19,13 @@ use crate::pg::protocol::backend::PgBackendMessageType;
 /// prefix and starts at `ParseComplete`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ServeResponseState {
+    /// Waiting for the rendering-settings statement's ParseComplete (first
+    /// application on this connection only)
+    SetOutParse,
+    /// Waiting for the rendering-settings statement's BindComplete
+    SetOutBind,
+    /// Consuming the rendering-settings one-row result
+    SetOutData,
     /// Waiting for the set_config statement's ParseComplete (first serve only)
     SetGenParse,
     /// Waiting for the set_config statement's BindComplete
@@ -41,17 +47,31 @@ pub(super) enum ServeResponseState {
 }
 
 impl ServeResponseState {
-    /// MV path: no set_config prefix, so start at the SELECT's ParseComplete.
-    /// Source-row path: consume the set_config response first — its Parse only
-    /// on the first serve of this connection, otherwise straight to its
-    /// BindComplete.
-    pub(super) fn initial(mv: &MvServe, prepare: &PrepareOutcome) -> Self {
-        if matches!(mv, MvServe::Mv(_)) {
-            Self::ParseComplete
-        } else if prepare.sent_setgen_parse {
-            Self::SetGenParse
+    /// The first completion to expect: the rendering settings' (Parse on their
+    /// first application on this connection, else Bind) when they were sent,
+    /// else whatever follows them — the generation stamp on the source-row
+    /// path, the SELECT on the MV path.
+    pub(super) fn initial(prepare: &PrepareOutcome) -> Self {
+        if prepare.sent_setout_parse {
+            Self::SetOutParse
+        } else if prepare.sent_setout {
+            Self::SetOutBind
         } else {
+            Self::after_setout(prepare)
+        }
+    }
+
+    /// The first completion after the rendering settings (or in their
+    /// absence): the generation stamp on the source-row path, else the SELECT.
+    fn after_setout(prepare: &PrepareOutcome) -> Self {
+        if prepare.sent_setgen_parse {
+            Self::SetGenParse
+        } else if prepare.sent_setgen {
             Self::SetGenBind
+        } else if prepare.sent_close {
+            Self::CloseComplete
+        } else {
+            Self::select_start(prepare)
         }
     }
 
@@ -64,6 +84,12 @@ impl ServeResponseState {
         include_describe: bool,
     ) -> Option<Self> {
         let next = match (self, message_type) {
+            (Self::SetOutParse, PgBackendMessageType::ParseComplete) => Self::SetOutBind,
+            (Self::SetOutBind, PgBackendMessageType::BindComplete) => Self::SetOutData,
+            (Self::SetOutData, PgBackendMessageType::DataRows) => Self::SetOutData,
+            (Self::SetOutData, PgBackendMessageType::CommandComplete) => {
+                Self::after_setout(prepare)
+            }
             (Self::SetGenParse, PgBackendMessageType::ParseComplete) => Self::SetGenBind,
             (Self::SetGenBind, PgBackendMessageType::BindComplete) => Self::SetGenData,
             // set_config returns one row; consume it without relaying.
@@ -106,7 +132,12 @@ impl ServeResponseState {
     fn in_set_config(self) -> bool {
         matches!(
             self,
-            Self::SetGenParse | Self::SetGenBind | Self::SetGenData
+            Self::SetOutParse
+                | Self::SetOutBind
+                | Self::SetOutData
+                | Self::SetGenParse
+                | Self::SetGenBind
+                | Self::SetGenData
         )
     }
 }
@@ -120,10 +151,73 @@ mod tests {
 
     fn prepare(sent_setgen_parse: bool, sent_parse: bool, sent_close: bool) -> PrepareOutcome {
         PrepareOutcome {
+            sent_setout: false,
+            sent_setout_parse: false,
+            sent_setgen: true,
             sent_setgen_parse,
             sent_parse,
             sent_close,
         }
+    }
+
+    /// PGC-287: the rendering-settings statement precedes everything; its
+    /// result is consumed on both the source-row and MV paths.
+    #[test]
+    fn test_advance_output_settings_precede_generation_and_mv_select() {
+        let source = PrepareOutcome {
+            sent_setout: true,
+            sent_setout_parse: true,
+            ..prepare(false, false, false)
+        };
+        let initial = ServeResponseState::initial(&source);
+        assert_eq!(initial, S::SetOutParse);
+        assert_eq!(
+            advance_through(
+                initial,
+                &[
+                    M::ParseComplete,
+                    M::BindComplete,
+                    M::DataRows,
+                    M::CommandComplete,
+                    M::BindComplete,
+                    M::DataRows,
+                    M::CommandComplete,
+                    M::BindComplete,
+                ],
+                &source,
+                false
+            ),
+            Some(S::DataRows)
+        );
+
+        let mv = PrepareOutcome {
+            sent_setout: true,
+            sent_setout_parse: false,
+            sent_setgen: false,
+            sent_setgen_parse: false,
+            sent_parse: true,
+            sent_close: false,
+        };
+        let initial = ServeResponseState::initial(&mv);
+        assert_eq!(initial, S::SetOutBind);
+        assert_eq!(
+            advance_through(
+                initial,
+                &[
+                    M::BindComplete,
+                    M::DataRows,
+                    M::CommandComplete,
+                    M::ParseComplete,
+                    M::BindComplete,
+                ],
+                &mv,
+                false
+            ),
+            Some(S::DataRows)
+        );
+        // No ReadyForQuery can end the serve while the settings result is
+        // still being consumed.
+        assert_eq!(S::SetOutData.advance(M::ReadyForQuery, &mv, false), None);
     }
 
     /// Feed `frames` through `advance` from `start`, returning the final state.
@@ -172,7 +266,7 @@ mod tests {
             ),
         ];
         for (prepare, include_describe, frames, start, end) in cases {
-            let initial = ServeResponseState::initial(&MvServe::SourceRow, &prepare);
+            let initial = ServeResponseState::initial(&prepare);
             assert_eq!(initial, start);
             assert_eq!(
                 advance_through(initial, frames, &prepare, include_describe),

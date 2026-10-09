@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::io;
 
+use ecow::EcoString;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_util::bytes::{BufMut, BytesMut};
@@ -12,10 +13,11 @@ use super::protocol::backend::{
     AUTHENTICATION_OK, PgBackendMessageCodec, PgBackendMessageType, data_rows_first_columns,
 };
 use super::protocol::frontend_encode::{
-    INT8_OID, SETGEN_SQL, SETGEN_STATEMENT_NAME, TEXT_OID, extended_query_build,
-    frontend_msg_append, startup_message_build, statement_name_bytes,
+    INT8_OID, SETGEN_SQL, SETGEN_STATEMENT_NAME, SETOUT_STATEMENT_NAME, TEXT_OID,
+    extended_query_build, frontend_msg_append, startup_message_build, statement_name_bytes,
 };
 use crate::cache::Generation;
+use crate::cache::output_settings::{OUTPUT_GUCS, OutputProfile, OutputSettings, SETOUT_SQL};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::query::ShapeKey;
 use crate::query::ast::LiteralValue;
@@ -77,6 +79,16 @@ impl PreparedStatements {
 /// What `pipelined_named_query_send` put on the wire, so the caller's response
 /// state machine knows which completion messages to expect.
 pub(crate) struct PrepareOutcome {
+    /// The rendering-settings statement was sent ahead of everything else
+    /// (expect its BindComplete, one DataRow and CommandComplete). Skipped when
+    /// the connection already runs under this client's settings (PGC-287).
+    pub sent_setout: bool,
+    /// A Parse for the rendering-settings statement was sent (expect a
+    /// ParseComplete before its BindComplete). First application per connection.
+    pub sent_setout_parse: bool,
+    /// The generation-stamp statement was sent (source-row serves; the MV path
+    /// has none).
+    pub sent_setgen: bool,
     /// A Parse for the `set_config` generation-stamp statement was sent (expect a
     /// ParseComplete before its BindComplete). First serve per connection only.
     pub sent_setgen_parse: bool,
@@ -108,6 +120,12 @@ pub(crate) struct CacheConnection {
     /// Whether the `pgc_setgen` generation-stamp statement has been Parsed on this
     /// connection yet (parsed once, then Bind+Execute'd per serve — PGC-235).
     pub(crate) setgen_parsed: bool,
+    /// Whether the `pgc_setout` rendering-settings statement has been Parsed
+    /// on this connection yet (PGC-287).
+    pub(crate) setout_parsed: bool,
+    /// The rendering settings this session currently runs under, so a serve
+    /// for a client on the same settings sends nothing to apply them.
+    pub(crate) applied_output: Option<OutputProfile>,
 }
 
 /// The non-read-half state of a [`CacheConnection`], held aside while its read
@@ -119,6 +137,8 @@ pub(crate) struct ParkedConnection {
     write_buf: BytesMut,
     prepared: PreparedStatements,
     setgen_parsed: bool,
+    setout_parsed: bool,
+    applied_output: Option<OutputProfile>,
 }
 
 impl CacheConnection {
@@ -142,6 +162,8 @@ impl CacheConnection {
                 write_buf: self.write_buf,
                 prepared: self.prepared,
                 setgen_parsed: self.setgen_parsed,
+                setout_parsed: self.setout_parsed,
+                applied_output: self.applied_output,
             },
         )
     }
@@ -161,6 +183,8 @@ impl CacheConnection {
             write_buf: parked.write_buf,
             prepared: parked.prepared,
             setgen_parsed: parked.setgen_parsed,
+            setout_parsed: parked.setout_parsed,
+            applied_output: parked.applied_output,
         }
     }
 
@@ -181,6 +205,8 @@ impl CacheConnection {
             write_buf: BytesMut::with_capacity(4096),
             prepared: PreparedStatements::new(),
             setgen_parsed: false,
+            setout_parsed: false,
+            applied_output: None,
         };
 
         // Send startup message
@@ -288,6 +314,7 @@ impl CacheConnection {
         &mut self,
         shape_key: ShapeKey,
         generation: Generation,
+        output: &OutputSettings,
         literals: &[LiteralValue],
         limit_text: Option<&str>,
         offset_text: Option<&str>,
@@ -305,6 +332,7 @@ impl CacheConnection {
         self.setgen_parsed = true;
 
         self.write_buf.clear();
+        let (sent_setout, sent_setout_parse) = self.output_settings_append(output)?;
 
         // Generation stamp: prepared `set_config(...)` (parse-on-first-use),
         // bound to the generation as text, no Describe — its one-row result is
@@ -358,10 +386,46 @@ impl CacheConnection {
             .map_into_report::<CacheError>()?;
 
         Ok(PrepareOutcome {
+            sent_setout,
+            sent_setout_parse,
+            sent_setgen: true,
             sent_setgen_parse: send_setgen_parse,
             sent_parse: send_parse,
             sent_close: close_victim.is_some(),
         })
+    }
+
+    /// Append the rendering-settings statement to `write_buf` unless the
+    /// session already runs under `output`'s values: a prepared
+    /// `set_config(…)` per setting (parse-on-first-use), bound as text, no
+    /// Describe, no Sync (shared with what follows). Returns what was sent.
+    fn output_settings_append(&mut self, output: &OutputSettings) -> CacheResult<(bool, bool)> {
+        let profile = output.profile();
+        if self.applied_output == Some(profile) {
+            return Ok((false, false));
+        }
+        let send_parse = !self.setout_parsed;
+        let values: [Option<&str>; OUTPUT_GUCS.len()] =
+            std::array::from_fn(|i| output.values().get(i).map(EcoString::as_str));
+        extended_query_build(
+            &mut self.write_buf,
+            SETOUT_STATEMENT_NAME,
+            SETOUT_SQL,
+            send_parse,
+            &[],
+            &[TEXT_OID; OUTPUT_GUCS.len()],
+            &values,
+            false, // no Describe
+            false, // text result (consumed)
+            false, // no Sync — shared with what follows
+        )?;
+        self.setout_parsed = true;
+        self.applied_output = Some(profile);
+        crate::metrics::handles()
+            .cache
+            .serve_settings_applied
+            .increment(1);
+        Ok((true, send_parse))
     }
 
     /// Extended-protocol serve with an *unnamed* statement and no parameters for
@@ -370,10 +434,12 @@ impl CacheConnection {
     /// Built into the recycled `write_buf`.
     pub(crate) async fn extended_query_unnamed_send(
         &mut self,
+        output: &OutputSettings,
         include_describe: bool,
         binary_results: bool,
-    ) -> CacheResult<()> {
+    ) -> CacheResult<PrepareOutcome> {
         self.write_buf.clear();
+        let (sent_setout, sent_setout_parse) = self.output_settings_append(output)?;
         extended_query_build(
             &mut self.write_buf,
             b"",
@@ -389,7 +455,15 @@ impl CacheConnection {
         self.stream
             .write_all(&self.write_buf)
             .await
-            .map_into_report::<CacheError>()
+            .map_into_report::<CacheError>()?;
+        Ok(PrepareOutcome {
+            sent_setout,
+            sent_setout_parse,
+            sent_setgen: false,
+            sent_setgen_parse: false,
+            sent_parse: true,
+            sent_close: false,
+        })
     }
 
     /// Reset the session `mem.query_generation` GUC to 0 (simple query, drained

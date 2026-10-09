@@ -106,6 +106,7 @@ fn memo_capture_begin(
         fingerprint: msg.fingerprint,
         binary,
         shape,
+        profile: msg.output_settings.profile(),
     };
     MemoCapture::begin(&state_view.memo, key, &oids)
 }
@@ -214,13 +215,9 @@ async fn serve_query_send(
         // Render into the connection's recycled SQL buffer rather than a fresh
         // String.
         mv_serve_sql_into(&mut conn.sql_buf, plan, msg.limit.as_ref());
-        conn.extended_query_unnamed_send(include_describe, binary_results)
-            .await?;
-        return Ok(PrepareOutcome {
-            sent_setgen_parse: false,
-            sent_parse: true,
-            sent_close: false,
-        });
+        return conn
+            .extended_query_unnamed_send(&msg.output_settings, include_describe, binary_results)
+            .await;
     }
 
     // Source-row serve via a shape-keyed prepared statement (PGC-294): the shape
@@ -266,6 +263,7 @@ async fn serve_query_send(
     conn.pipelined_named_query_send(
         shape.key,
         msg.generation,
+        &msg.output_settings,
         &shape.literals,
         limit_text,
         offset_text,
@@ -337,7 +335,7 @@ pub(super) async fn handle_cached_query(
     }
 
     let mut relay = Relay {
-        state: ServeResponseState::initial(&msg.mv, &prepare),
+        state: ServeResponseState::initial(&prepare),
         guard,
         broadcast,
         memo_capture,

@@ -363,6 +363,7 @@ async fn handle_connection(
                     client_socket: socket,
                     reply_tx,
                     search_path: resolved_search_path,
+                    output_settings: Arc::new(state.session_settings.output_settings(in_block)),
                     timing,
                     pipeline: state.extended.pipeline_take(),
                     transaction_status: state.transaction_status,

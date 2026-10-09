@@ -37,6 +37,8 @@ pub(crate) mod messages;
 pub(crate) mod mv;
 pub(crate) mod mv_shape;
 #[cfg(feature = "proxy")]
+pub(crate) mod output_settings;
+#[cfg(feature = "proxy")]
 mod population_pool;
 pub mod query;
 #[cfg(feature = "proxy")]

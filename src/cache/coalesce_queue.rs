@@ -3,6 +3,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::cache::messages::PipelineDescribe;
+use crate::cache::output_settings::OutputProfile;
 use crate::cache::query_cache::{QueryRequest, QueryType};
 use crate::cache::types::{CacheStateView, CachedQueryState};
 use crate::pg::protocol::backend::TransactionStatus;
@@ -66,6 +67,8 @@ pub(super) struct CoalesceKey {
     pipeline_describe: PipelineDescribe,
     result_formats: ResultFormats,
     limit: Option<LimitClause>,
+    /// Waiters rendered under different settings never share bytes (PGC-287).
+    profile: OutputProfile,
 }
 
 impl CoalesceKey {
@@ -84,6 +87,7 @@ impl CoalesceKey {
             pipeline_describe,
             result_formats: msg.result_formats.clone(),
             limit: msg.cacheable_query.query().limit.clone(),
+            profile: msg.output_settings.profile(),
         }
     }
 }

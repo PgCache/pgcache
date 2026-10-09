@@ -183,6 +183,9 @@ pub mod names {
     pub const CACHE_MEMO_HITS: &str = "pgcache.cache.memo_hits";
     /// Result snapshots stored into the memo by the capture path.
     pub const CACHE_MEMO_CAPTURES: &str = "pgcache.cache.memo_captures";
+    /// Serves that applied the client's rendering settings on the cache
+    /// connection (not skipped as already applied) (PGC-287).
+    pub const CACHE_SERVE_SETTINGS_APPLIED: &str = "pgcache.cache.serve_settings_applied";
     /// Memo entries dropped (CDC-evicted via stale seqlock, or budget-reclaimed).
     pub const CACHE_MEMO_EVICTIONS: &str = "pgcache.cache.memo_evictions";
     /// Current number of live memo entries.
@@ -653,6 +656,8 @@ pub struct CacheHandles {
     pub memo_hits: Counter,
     pub memo_captures: Counter,
     pub memo_evictions: Counter,
+    /// Rendering-settings applications on serve connections (PGC-287).
+    pub serve_settings_applied: Counter,
     pub memo_entries: Gauge,
     pub memo_bytes: Gauge,
     /// Incremented each time the supervisor rebuilds the cache subsystem.
@@ -702,7 +707,7 @@ impl CacheHandles {
             CACHE_RESTARTS_TOTAL, CACHE_RSS_BYTES, CACHE_SERVE_DESYNC_TOTAL,
             CACHE_SERVE_DIRTY_RETURN_TOTAL, CACHE_SERVE_POOL_BACKSTOP_GROWS,
             CACHE_SERVE_POOL_SCALE_DOWN, CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE,
-            CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
+            CACHE_SERVE_SETTINGS_APPLIED, CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
         };
         Self {
             lookup_latency: metrics::histogram!(CACHE_LOOKUP_LATENCY_SECONDS),
@@ -714,6 +719,7 @@ impl CacheHandles {
             coalesce_deadline_forward: metrics::counter!(CACHE_COALESCE_DEADLINE_FORWARD),
             memo_hits: metrics::counter!(CACHE_MEMO_HITS),
             memo_captures: metrics::counter!(CACHE_MEMO_CAPTURES),
+            serve_settings_applied: metrics::counter!(CACHE_SERVE_SETTINGS_APPLIED),
             memo_evictions: metrics::counter!(CACHE_MEMO_EVICTIONS),
             memo_entries: metrics::gauge!(CACHE_MEMO_ENTRIES),
             memo_bytes: metrics::gauge!(CACHE_MEMO_BYTES),

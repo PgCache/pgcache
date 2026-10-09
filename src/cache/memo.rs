@@ -55,6 +55,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 
+use crate::cache::output_settings::OutputProfile;
 use crate::oid::Oid;
 use crate::query::ast::{LimitClause, LiteralValue};
 use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
@@ -138,6 +139,8 @@ pub struct MemoKey {
     /// Result format negotiated at Bind: text (`false`) vs binary (`true`).
     pub binary: bool,
     pub shape: MemoShape,
+    /// The rendering settings the bytes were produced under (PGC-287).
+    pub profile: OutputProfile,
 }
 
 /// A captured result snapshot: client-ready core wire bytes plus the slot epochs
@@ -602,6 +605,7 @@ mod tests {
                 limit: None,
                 offset: None,
             },
+            profile: OutputProfile::default(),
         }
     }
 

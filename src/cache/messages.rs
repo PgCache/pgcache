@@ -4,6 +4,7 @@ use ecow::EcoString;
 use smallvec::SmallVec;
 use tokio_util::bytes::{Bytes, BytesMut};
 
+use super::output_settings::OutputSettings;
 use super::query::CacheableQuery;
 use super::query::QueryParameters;
 use super::reply::ReplySender;
@@ -176,6 +177,8 @@ pub struct ProxyMessage {
     pub reply_tx: ReplySender<CacheReply>,
     /// Resolved search_path for this connection (with $user expanded to session_user)
     pub search_path: Arc<[EcoString]>,
+    /// The client's rendering settings at this read's scope (PGC-287).
+    pub output_settings: Arc<OutputSettings>,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Pipeline context for atomic extended query dispatch.

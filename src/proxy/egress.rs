@@ -61,8 +61,10 @@ use tokio_util::bytes::Bytes;
 pub(super) enum ProbeKind {
     /// One `current_setting(…)` column per tracked session setting
     /// (PGC-287; covers the pre-PG18 search_path discovery of ADR-006 and the
-    /// isolation default of ADR-054).
-    SessionSettings,
+    /// isolation default of ADR-054). `seq` is the connection's mutation
+    /// sequence at injection: the sample fills only values unknown since
+    /// before it.
+    SessionSettings { seq: u64 },
     /// `SELECT pg_current_wal_insert_lsn()`: its LSN bounds the writes recorded
     /// through `stamp_seq` (ADR-048).
     CommitLsn { stamp_seq: u64 },
@@ -339,7 +341,7 @@ impl<C> EgressQueue<C> {
             matches!(
                 s,
                 EgressSlot::Probe {
-                    kind: ProbeKind::SessionSettings,
+                    kind: ProbeKind::SessionSettings { .. },
                     ..
                 }
             )
@@ -508,7 +510,7 @@ mod tests {
         // behind the probe flushes while the probe is still outstanding.
         let mut q = TestQueue::new();
         q.origin_open(); // R1
-        q.probe_push(ProbeKind::SessionSettings);
+        q.probe_push(ProbeKind::SessionSettings { seq: 0 });
         q.synth_push(Bytes::from_static(b"S"));
 
         q.origin_append(Bytes::from_static(b"r1"));
@@ -529,18 +531,18 @@ mod tests {
         // relayed; only then does the probe's reply get swallowed.
         let mut q = TestQueue::new();
         q.origin_open(); // R1
-        q.probe_push(ProbeKind::SessionSettings);
+        q.probe_push(ProbeKind::SessionSettings { seq: 0 });
         assert!(!q.origin_reply_is_probe());
-        assert!(q.probe_pending(ProbeKind::SessionSettings));
+        assert!(q.probe_pending(ProbeKind::SessionSettings { seq: 0 }));
 
         q.origin_append(Bytes::from_static(b"r1"));
         q.origin_seal();
         assert!(q.origin_reply_is_probe());
         q.probe_row(vec![Some("public".into()), None]);
         let done = q.probe_complete().expect("probe at origin head");
-        assert_eq!(done.kind, ProbeKind::SessionSettings);
+        assert_eq!(done.kind, ProbeKind::SessionSettings { seq: 0 });
         assert_eq!(done.row, Some(vec![Some("public".into()), None]));
-        assert!(!q.probe_pending(ProbeKind::SessionSettings));
+        assert!(!q.probe_pending(ProbeKind::SessionSettings { seq: 0 }));
         // R1's bytes are still owed to the client.
         assert_eq!(q.write_chunk(), b"r1");
         q.advance(2);
@@ -580,7 +582,7 @@ mod tests {
         // The settings probe resolves what the cache slot is keyed under, so
         // the slot dispatches only once the probe's reply is in.
         let mut q = TestQueue::new();
-        q.probe_push(ProbeKind::SessionSettings);
+        q.probe_push(ProbeKind::SessionSettings { seq: 0 });
         q.cache_push("q1");
         assert!(q.cache_dispatch().is_none());
         q.probe_row(vec![Some("public".into())]);
@@ -594,7 +596,7 @@ mod tests {
     fn test_probe_complete_only_at_origin_head() {
         let mut q = TestQueue::new();
         q.origin_open(); // R1 unsealed, ahead of the probe
-        q.probe_push(ProbeKind::SessionSettings);
+        q.probe_push(ProbeKind::SessionSettings { seq: 0 });
         assert!(q.probe_complete().is_none());
         q.origin_seal();
         assert!(q.probe_complete().is_some());

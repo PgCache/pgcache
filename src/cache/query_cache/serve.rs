@@ -129,6 +129,7 @@ impl CacheDispatch {
             fingerprint,
             binary,
             shape,
+            profile: msg.output_settings.profile(),
         };
         let hit = self.state_view.memo.get(&key)?;
         // A captured snapshot always carries a RowDescription; guard anyway so a
@@ -281,6 +282,7 @@ impl CacheDispatch {
             serve_shape,
             generation,
             mv,
+            output_settings: msg.output_settings,
             result_formats: msg.result_formats,
             client_socket: msg.client_socket,
             reply_tx: msg.reply_tx,

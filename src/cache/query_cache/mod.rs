@@ -9,6 +9,7 @@ use super::coalesce_queue::CoalesceQueue;
 use super::explain::ExplainJob;
 use super::messages::{CacheReply, MessageSlices, PipelineContext, PipelineDescribe, QueryCommand};
 use super::mv::MvServe;
+use super::output_settings::OutputSettings;
 use super::query::CacheableQuery;
 use super::reg_bucket::RegRateBucket;
 use super::reply::ReplySender;
@@ -55,6 +56,8 @@ pub struct QueryRequest {
     pub reply_tx: ReplySender<CacheReply>,
     /// Resolved search_path for schema resolution
     pub search_path: Arc<[EcoString]>,
+    /// The client's rendering settings at this read's scope (PGC-287).
+    pub output_settings: Arc<OutputSettings>,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Pipeline context from the proxy (None for simple queries and cold-path extended)
@@ -82,6 +85,9 @@ pub struct ServeRequest {
     /// Serve from the MV (carrying its aliased output column names) or
     /// from source rows. Decided on the dispatch path.
     pub mv: MvServe,
+    /// Applied on the serve connection before the SELECT so the cache DB
+    /// renders as origin would for this client (PGC-287).
+    pub output_settings: Arc<OutputSettings>,
     pub result_formats: ResultFormats,
     pub client_socket: ClientSocket,
     pub reply_tx: ReplySender<CacheReply>,
