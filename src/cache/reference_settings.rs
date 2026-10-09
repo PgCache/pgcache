@@ -107,14 +107,20 @@ impl ReferenceSettings {
             ))
     }
 
-    /// The statements that pin a session to the reference.
+    /// The statements that pin a session to the reference: the date-time
+    /// settings, and the locales a `money` or `to_char` text is rendered and
+    /// parsed under on either side of population and pgoutput.
     pub(crate) fn pin_sql(&self) -> String {
-        format!(
+        let mut sql = format!(
             "SET TimeZone = '{}'; SET DateStyle = 'ISO, {}'; SET IntervalStyle = '{}'",
             quote(&self.timezone),
             self.literals.date_order.as_str(),
             quote(&self.intervalstyle),
-        )
+        );
+        for (name, value) in LOCALE_GUCS.iter().zip(&self.locales) {
+            sql.push_str(&format!("; SET {name} = '{}'", quote(value)));
+        }
+        sql
     }
 
     /// Pin `client`'s session to the reference.
@@ -188,7 +194,8 @@ mod tests {
         assert_eq!(
             reference.pin_sql(),
             "SET TimeZone = 'America/New_York'; SET DateStyle = 'ISO, DMY'; \
-             SET IntervalStyle = 'sql_standard'"
+             SET IntervalStyle = 'sql_standard'; SET lc_monetary = 'C'; \
+             SET lc_numeric = 'C'; SET lc_time = 'C'"
         );
         let odd = ReferenceSettings {
             timezone: "it's".into(),

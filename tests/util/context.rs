@@ -11,7 +11,7 @@ use super::process::{
     PgCacheProcess, TempDBs, connect_pgcache, connect_pgcache_allowlist, connect_pgcache_args,
     connect_pgcache_clock, connect_pgcache_fault, connect_pgcache_pinned,
     connect_pgcache_pinned_fault, connect_pgcache_pinned_small_cache, connect_pgcache_small_cache,
-    start_databases,
+    start_databases, test_db_connect,
 };
 
 /// Test context combining all resources needed for integration tests.
@@ -50,6 +50,33 @@ impl TestContext {
             cache,
             origin,
         })
+    }
+
+    /// Set up a test context whose `before_start` closure runs against origin
+    /// before pgcache spawns, for state pgcache must see at startup (a role's
+    /// default settings, tables a pinned query needs).
+    pub(crate) async fn setup_before_start<F, Fut>(before_start: F) -> Result<Self, Error>
+    where
+        F: FnOnce(Client) -> Fut,
+        Fut: std::future::Future<Output = Result<Client, Error>>,
+    {
+        let (dbs, origin) = start_databases().await?;
+        let origin = before_start(origin).await?;
+        let (pgcache, cache_port, metrics_port, cache) = connect_pgcache(&dbs).await?;
+        Ok(Self {
+            dbs,
+            pgcache,
+            cache_port,
+            metrics_port,
+            cache,
+            origin,
+        })
+    }
+
+    /// A fresh direct connection to origin: a session started now, with the
+    /// role defaults in force now.
+    pub(crate) async fn origin_connect(&self) -> Result<Client, Error> {
+        test_db_connect(&self.dbs.origin).await
     }
 
     /// Set up a test context with extra pgcache CLI args (e.g.
