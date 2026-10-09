@@ -67,11 +67,11 @@ fn constraint_column(constraint: &TableConstraint) -> &str {
 fn constraint_value_matches(constraint: &TableConstraint, data_type: &Type, row_str: &str) -> bool {
     match constraint {
         TableConstraint::Comparison(_, op, val) => {
-            typed_compare(data_type, val, row_str, *op, None).unwrap_or(true)
+            typed_compare(data_type, val, row_str, *op).unwrap_or(true)
         }
         TableConstraint::AnyOf(_, values) => values
             .iter()
-            .any(|v| typed_compare(data_type, v, row_str, BinaryOp::Equal, None).unwrap_or(true)),
+            .any(|v| typed_compare(data_type, v, row_str, BinaryOp::Equal).unwrap_or(true)),
         // Coercion failure (e.g. `'abc'::int4`): the row would error at origin
         // and never match — safe to treat as non-matching here.
         TableConstraint::CastComparison(_, cast, op, val) => cast_target_coerce_text(cast, row_str)

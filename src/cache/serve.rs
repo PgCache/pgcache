@@ -17,7 +17,7 @@ use super::{
 };
 use crate::cache::messages::PipelineDescribe;
 use crate::oid::Oid;
-use crate::pg::cache_connection::{CacheConnection, PrepareOutcome};
+use crate::pg::cache_connection::{CacheConnection, NamedQuerySend, PrepareOutcome};
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG};
 use crate::query::ast::{AstNode, Deparse, LiteralValue};
@@ -260,16 +260,16 @@ async fn serve_query_send(
         &mut offset_itoa,
         &mut offset_other,
     );
-    conn.pipelined_named_query_send(
-        shape.key,
-        msg.generation,
-        &msg.output_settings,
-        &shape.literals,
+    conn.pipelined_named_query_send(NamedQuerySend {
+        shape_key: shape.key,
+        generation: msg.generation,
+        output: &msg.output_settings,
+        literals: &shape.literals,
         limit_text,
         offset_text,
         include_describe,
         binary_results,
-    )
+    })
     .await
 }
 

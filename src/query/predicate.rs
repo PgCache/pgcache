@@ -150,9 +150,7 @@ impl CompiledPredicate {
                     Some(Some(bytes)) => {
                         let row_str = bytes.as_str();
                         match target {
-                            None => {
-                                typed_compare(data_type, value, row_str, *op, None).unwrap_or(false)
-                            }
+                            None => typed_compare(data_type, value, row_str, *op).unwrap_or(false),
                             Some(target) => match cast_target_coerce_text(target, row_str) {
                                 Some(coerced) => literal_compare(&coerced, *op, value),
                                 None => false,

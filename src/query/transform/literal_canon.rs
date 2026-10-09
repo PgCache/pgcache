@@ -251,10 +251,13 @@ impl Pass<'_> {
     /// another is converted at population, and date ↔ timestamptz (or
     /// timestamp ↔ timestamptz) conversion uses the session zone.
     fn mixed_kinds_check(&mut self, column: Option<ValueKind>, literal: Option<ValueKind>) {
-        if let (Some(column), Some(literal)) = (column, literal)
-            && column != literal
-            && (column == ValueKind::TimestampTz || literal == ValueKind::TimestampTz)
-        {
+        let (Some(column), Some(literal)) = (column, literal) else {
+            return;
+        };
+        if column == literal {
+            return;
+        }
+        if column == ValueKind::TimestampTz || literal == ValueKind::TimestampTz {
             self.outcome.residual = true;
         }
     }

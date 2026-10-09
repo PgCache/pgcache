@@ -392,22 +392,31 @@ impl WriterCore {
                 CachedQueryState::Loading | CachedQueryState::Ready => true,
             });
 
-        // Remove metrics and aliases for fingerprints no longer in either map
-        self.state_view.metrics.retain(|fp, _| {
-            self.cache.cached_queries.contains_key1(fp)
-                || self.state_view.cached_queries.contains_key(fp)
-        });
-        // An alias inserted since the previous sweep is spared: its dispatch
-        // may still be between the Resolve reply and inserting the entry.
+        self.metrics_sweep();
+        self.aliases_sweep();
+    }
+
+    /// Whether `fingerprint` still names a cached query in either map.
+    fn fingerprint_live(&self, fingerprint: &Fingerprint) -> bool {
+        self.cache.cached_queries.contains_key1(fingerprint)
+            || self.state_view.cached_queries.contains_key(fingerprint)
+    }
+
+    /// Drop per-query metrics for fingerprints no longer in either map.
+    fn metrics_sweep(&self) {
+        self.state_view
+            .metrics
+            .retain(|fp, _| self.fingerprint_live(fp));
+    }
+
+    /// Drop aliases whose fingerprint is gone from both maps. An alias
+    /// inserted since the previous sweep is spared: its dispatch may still
+    /// be between the Resolve reply and inserting the entry.
+    fn aliases_sweep(&mut self) {
         let current_tick = self.alias_tick;
         self.alias_tick += 1;
         self.state_view.aliases.retain(|_, alias| {
-            alias.tick >= current_tick
-                || self.cache.cached_queries.contains_key1(&alias.fingerprint)
-                || self
-                    .state_view
-                    .cached_queries
-                    .contains_key(&alias.fingerprint)
+            alias.tick >= current_tick || self.fingerprint_live(&alias.fingerprint)
         });
     }
 

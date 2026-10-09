@@ -424,18 +424,27 @@ async fn writer_origin_connect(origin: &PgSettings) -> CacheResult<Client> {
     Ok(origin_client)
 }
 
+/// The writer's cache and origin sessions (the cache one pinned to the
+/// reference settings) and the cache volume's initial stats.
+async fn writer_resources_open(
+    settings: &Settings,
+) -> CacheResult<(Client, Client, InitialDiskStats)> {
+    let cache_client = pg::connect(&settings.cache, "writer cache")
+        .await
+        .map_into_report::<CacheError>()?;
+    reference_settings::pin(&cache_client, "writer cache").await?;
+    let origin_client = writer_origin_connect(&settings.origin).await?;
+    let disk = initial_disk_stats(&cache_client, settings).await;
+    Ok((cache_client, origin_client, disk))
+}
+
 impl WriterCore {
     pub(super) async fn new(
         settings: &Settings,
         shared: WriterShared,
         query_tx: UnboundedSender<QueryCommand>,
     ) -> CacheResult<Self> {
-        let cache_client = pg::connect(&settings.cache, "writer cache")
-            .await
-            .map_into_report::<CacheError>()?;
-        reference_settings::pin(&cache_client, "writer cache").await?;
-        let origin_client = writer_origin_connect(&settings.origin).await?;
-        let disk = initial_disk_stats(&cache_client, settings).await;
+        let (cache_client, origin_client, disk) = writer_resources_open(settings).await?;
         let WriterShared {
             state_view,
             active_relations,

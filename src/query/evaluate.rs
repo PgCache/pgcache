@@ -79,7 +79,6 @@ fn expr_comparison_evaluate(
             value,
             row_value_str,
             op,
-            None,
         )
         .unwrap_or(false),
         (Some(target), ColumnRowValue::Present(row_value_str)) => {
@@ -307,7 +306,7 @@ pub fn is_simple_comparison(binary_expr: &ResolvedBinaryExpr) -> bool {
     let Some(target) = target else {
         // Bare `column op literal`: local only when the literal parses as the
         // column's type (PGC-478); otherwise the cache database decides.
-        return literal_locally_comparable(&col.column_metadata.data_type, literal, op, None);
+        return literal_locally_comparable(&col.column_metadata.data_type, literal, op);
     };
     if !cast_target_is_coercion_supported(target, &col.column_metadata.data_type) {
         return false;

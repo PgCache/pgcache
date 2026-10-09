@@ -44,14 +44,10 @@ impl FunctionCall {
     }
 }
 
-impl Deparse for FunctionCall {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        if let Some(schema) = &self.schema {
-            buf.push_str(schema);
-            buf.push('.');
-        }
-        buf.push_str(&self.name.to_uppercase());
-        buf.push('(');
+impl FunctionCall {
+    /// Everything between the parentheses: `DISTINCT`, `*` or the arguments,
+    /// and an aggregate `ORDER BY`.
+    fn arguments_deparse(&self, buf: &mut String) {
         if self.agg_distinct {
             buf.push_str("DISTINCT ");
         }
@@ -74,6 +70,18 @@ impl Deparse for FunctionCall {
                 sep = ", ";
             }
         }
+    }
+}
+
+impl Deparse for FunctionCall {
+    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+        if let Some(schema) = &self.schema {
+            buf.push_str(schema);
+            buf.push('.');
+        }
+        buf.push_str(&self.name.to_uppercase());
+        buf.push('(');
+        self.arguments_deparse(buf);
         buf.push(')');
         if let Some(filter) = &self.agg_filter {
             buf.push_str(" FILTER (WHERE ");

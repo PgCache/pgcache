@@ -64,7 +64,7 @@ fn literal_keyed(kind: ValueKind, value: &LiteralValue) -> LiteralValue {
             if kind == ValueKind::Unsupported {
                 return value.clone();
             }
-            literal_index_key(kind, value, None).unwrap_or(LiteralValue::Null)
+            literal_index_key(kind, value).unwrap_or(LiteralValue::Null)
         }
     }
 }

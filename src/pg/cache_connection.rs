@@ -141,6 +141,20 @@ pub(crate) struct ParkedConnection {
     applied_output: Option<OutputProfile>,
 }
 
+/// One source-row serve: the prepared shape to execute and what to bind.
+pub(crate) struct NamedQuerySend<'a> {
+    pub(crate) shape_key: ShapeKey,
+    pub(crate) generation: Generation,
+    /// Applied before the SELECT so the cache DB renders as origin would.
+    pub(crate) output: &'a OutputSettings,
+    /// The shape's `$1..$k` literals.
+    pub(crate) literals: &'a [LiteralValue],
+    pub(crate) limit_text: Option<&'a str>,
+    pub(crate) offset_text: Option<&'a str>,
+    pub(crate) include_describe: bool,
+    pub(crate) binary_results: bool,
+}
+
 impl CacheConnection {
     /// Move the read half (`stream` + `codec`) into a `FramedRead`, reusing the
     /// recycled `read_buf`, and return it alongside the parked rest of the
@@ -309,59 +323,23 @@ impl CacheConnection {
     /// SELECT response. Returns a [`PrepareOutcome`] so the caller's response state
     /// machine knows which completion messages to expect. Built into the recycled
     /// `write_buf`, sent in one write.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn pipelined_named_query_send(
         &mut self,
-        shape_key: ShapeKey,
-        generation: Generation,
-        output: &OutputSettings,
-        literals: &[LiteralValue],
-        limit_text: Option<&str>,
-        offset_text: Option<&str>,
-        include_describe: bool,
-        binary_results: bool,
+        query: NamedQuerySend<'_>,
     ) -> CacheResult<PrepareOutcome> {
-        let send_parse = !self.prepared.contains(shape_key);
-        let name = statement_name_bytes(shape_key);
+        let send_parse = !self.prepared.contains(query.shape_key);
+        let name = statement_name_bytes(query.shape_key);
         let close_victim = if send_parse {
-            self.prepared.insert(shape_key)
+            self.prepared.insert(query.shape_key)
         } else {
             None
         };
-        let send_setgen_parse = !self.setgen_parsed;
-        self.setgen_parsed = true;
 
         self.write_buf.clear();
-        let (sent_setout, sent_setout_parse) = self.output_settings_append(output)?;
-
-        // Generation stamp: prepared `set_config(...)` (parse-on-first-use),
-        // bound to the generation as text, no Describe — its one-row result is
-        // consumed by the caller's state machine. No trailing Sync (shared).
-        let mut gen_buf = itoa::Buffer::new();
-        let gen_text = gen_buf.format(generation.get());
-        extended_query_build(
-            &mut self.write_buf,
-            SETGEN_STATEMENT_NAME,
-            SETGEN_SQL,
-            send_setgen_parse,
-            &[],
-            &[TEXT_OID],
-            &[Some(gen_text)],
-            false, // no Describe
-            false, // text result (consumed)
-            false, // no Sync — shared with the SELECT below
-        )?;
-
-        // Close the FIFO-evicted shape statement ahead of the SELECT so its
-        // CloseComplete precedes the SELECT response.
+        let (sent_setout, sent_setout_parse) = self.output_settings_append(query.output)?;
+        let sent_setgen_parse = self.generation_stamp_append(query.generation)?;
         if let Some(victim_key) = close_victim {
-            let victim_name = statement_name_bytes(victim_key);
-            frontend_msg_append(&mut self.write_buf, b'C', |b| {
-                b.put_u8(b'S'); // close a prepared statement
-                b.put_slice(&victim_name);
-                b.put_u8(0);
-                Ok(())
-            })?;
+            self.statement_close_append(victim_key)?;
         }
 
         // Params: the shape's `$1..$k` literals (rendered inline, OID 0 inferred)
@@ -372,11 +350,11 @@ impl CacheConnection {
             &name,
             &self.sql_buf,
             send_parse,
-            literals,
+            query.literals,
             &[INT8_OID, INT8_OID],
-            &[limit_text, offset_text],
-            include_describe,
-            binary_results,
+            &[query.limit_text, query.offset_text],
+            query.include_describe,
+            query.binary_results,
             true, // single trailing Sync for the whole pipeline
         )?;
 
@@ -389,9 +367,45 @@ impl CacheConnection {
             sent_setout,
             sent_setout_parse,
             sent_setgen: true,
-            sent_setgen_parse: send_setgen_parse,
+            sent_setgen_parse,
             sent_parse: send_parse,
             sent_close: close_victim.is_some(),
+        })
+    }
+
+    /// Append the generation stamp: prepared `set_config(...)`
+    /// (parse-on-first-use), bound to the generation as text, no Describe —
+    /// its one-row result is consumed by the caller's state machine. No
+    /// trailing Sync (shared). Returns whether the Parse was sent.
+    fn generation_stamp_append(&mut self, generation: Generation) -> CacheResult<bool> {
+        let send_setgen_parse = !self.setgen_parsed;
+        self.setgen_parsed = true;
+        let mut gen_buf = itoa::Buffer::new();
+        let gen_text = gen_buf.format(generation.get());
+        extended_query_build(
+            &mut self.write_buf,
+            SETGEN_STATEMENT_NAME,
+            SETGEN_SQL,
+            send_setgen_parse,
+            &[],
+            &[TEXT_OID],
+            &[Some(gen_text)],
+            false, // no Describe
+            false, // text result (consumed)
+            false, // no Sync — shared with the SELECT
+        )?;
+        Ok(send_setgen_parse)
+    }
+
+    /// Close a FIFO-evicted shape statement ahead of the SELECT so its
+    /// CloseComplete precedes the SELECT response.
+    fn statement_close_append(&mut self, victim_key: ShapeKey) -> CacheResult<()> {
+        let victim_name = statement_name_bytes(victim_key);
+        frontend_msg_append(&mut self.write_buf, b'C', |b| {
+            b.put_u8(b'S'); // close a prepared statement
+            b.put_slice(&victim_name);
+            b.put_u8(0);
+            Ok(())
         })
     }
 

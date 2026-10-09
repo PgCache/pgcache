@@ -11,9 +11,9 @@
 //! predicate PgEval at classification ([`literal_locally_comparable`] is the
 //! single gate the classifier asks), so evaluation never meets one.
 //!
-//! A `timestamptz` literal without an offset means "in the session's zone":
-//! it needs that zone to become an instant, which the caller supplies when it
-//! knows it (class 2's canonicalisation) and otherwise leaves to PgEval.
+//! A `timestamptz` literal without an offset is left to PgEval: class 2's
+//! canonicalisation rewrites one it can read into an instant with an explicit
+//! offset before any literal reaches this module.
 
 use std::cmp::Ordering;
 
@@ -23,7 +23,7 @@ use jiff::{Timestamp, Zoned};
 use ordered_float::NotNan;
 use postgres_types::{Kind, Type};
 
-use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::ast::{BinaryOp, Deparse, LiteralValue};
 use crate::query::cast::bool_literal_parse;
 use crate::query::literal_settings::{DateOrder, LiteralSettings};
 
@@ -175,14 +175,7 @@ impl Decimal {
     }
 
     fn parse(text: &str) -> Option<Self> {
-        let text = text.trim();
-        let (negative, rest) = if let Some(rest) = text.strip_prefix('-') {
-            (true, rest)
-        } else if let Some(rest) = text.strip_prefix('+') {
-            (false, rest)
-        } else {
-            (false, text)
-        };
+        let (negative, rest) = sign_split(text.trim());
         let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
             Some((mantissa, exponent)) => (mantissa, exponent.parse::<i32>().ok()?),
             None => (rest, 0),
@@ -191,17 +184,21 @@ impl Decimal {
         if int_part.is_empty() && frac_part.is_empty() {
             return None;
         }
-        if !int_part.bytes().all(|b| b.is_ascii_digit())
-            || !frac_part.bytes().all(|b| b.is_ascii_digit())
-        {
+        if !digits_only(int_part) || !digits_only(frac_part) {
             return None;
         }
-        let mut digits: Vec<u8> = int_part
+        let digits = int_part
             .bytes()
             .chain(frac_part.bytes())
             .map(|b| b - b'0')
             .collect();
-        let mut exponent = exponent - i32::try_from(frac_part.len()).ok()?;
+        let exponent = exponent - i32::try_from(frac_part.len()).ok()?;
+        Some(Self::normalised(negative, digits, exponent))
+    }
+
+    /// Strip leading and trailing zeros so equal values compare equal; zero
+    /// is unsigned with exponent 0.
+    fn normalised(negative: bool, mut digits: Vec<u8>, mut exponent: i32) -> Self {
         while digits.last() == Some(&0) {
             digits.pop();
             exponent += 1;
@@ -209,17 +206,26 @@ impl Decimal {
         let leading = digits.iter().take_while(|d| **d == 0).count();
         digits.drain(..leading);
         if digits.is_empty() {
-            return Some(Self {
+            return Self {
                 negative: false,
                 digits,
                 exponent: 0,
-            });
+            };
         }
-        Some(Self {
+        Self {
             negative,
             digits,
             exponent,
-        })
+        }
+    }
+
+    /// -1, 0 or 1: the order of signs, zero between.
+    fn sign(&self) -> i8 {
+        match (self.digits.is_empty(), self.negative) {
+            (true, _) => 0,
+            (false, true) => -1,
+            (false, false) => 1,
+        }
     }
 
     /// The nearest `f64`: exact for what fits, approximate beyond (an index
@@ -243,30 +249,9 @@ impl Decimal {
 
 impl Ord for Decimal {
     fn cmp(&self, other: &Self) -> Ordering {
-        match (self.digits.is_empty(), other.digits.is_empty()) {
-            (true, true) => return Ordering::Equal,
-            (true, false) => {
-                return if other.negative {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                };
-            }
-            (false, true) => {
-                return if self.negative {
-                    Ordering::Less
-                } else {
-                    Ordering::Greater
-                };
-            }
-            (false, false) => {}
-        }
-        if self.negative != other.negative {
-            return if self.negative {
-                Ordering::Less
-            } else {
-                Ordering::Greater
-            };
+        let by_sign = self.sign().cmp(&other.sign());
+        if by_sign != Ordering::Equal {
+            return by_sign;
         }
         let magnitude = self
             .magnitude()
@@ -280,6 +265,19 @@ impl Ord for Decimal {
     }
 }
 
+/// `(negative, rest)` for an optional leading sign.
+fn sign_split(text: &str) -> (bool, &str) {
+    if let Some(rest) = text.strip_prefix('-') {
+        (true, rest)
+    } else {
+        (false, text.strip_prefix('+').unwrap_or(text))
+    }
+}
+
+fn digits_only(text: &str) -> bool {
+    text.bytes().all(|b| b.is_ascii_digit())
+}
+
 impl PartialOrd for Decimal {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -288,14 +286,8 @@ impl PartialOrd for Decimal {
 
 /// Whether the classifier may keep `column op literal` local for a column of
 /// `ty`: the literal parses as that kind, and the operator is one the kind
-/// orders under. `zone` is the session zone for zone-less `timestamptz`
-/// literals; `None` leaves those to PgEval.
-pub fn literal_locally_comparable(
-    ty: &Type,
-    literal: &LiteralValue,
-    op: BinaryOp,
-    zone: Option<&TimeZone>,
-) -> bool {
+/// orders under.
+pub fn literal_locally_comparable(ty: &Type, literal: &LiteralValue, op: BinaryOp) -> bool {
     let kind = ValueKind::of_type(ty);
     if kind == ValueKind::Unsupported {
         return false;
@@ -312,7 +304,7 @@ pub fn literal_locally_comparable(
         | LiteralValue::StringWithCast(..)
         | LiteralValue::Integer(_)
         | LiteralValue::Float(_)
-        | LiteralValue::Boolean(_) => literal_parse(kind, literal, zone).is_some(),
+        | LiteralValue::Boolean(_) => literal_parse(kind, literal).is_some(),
     }
 }
 
@@ -324,7 +316,6 @@ pub fn typed_compare(
     literal: &LiteralValue,
     row_text: &str,
     op: BinaryOp,
-    zone: Option<&TimeZone>,
 ) -> Option<bool> {
     match literal {
         LiteralValue::Null | LiteralValue::NullWithCast(_) | LiteralValue::Parameter(_) => {
@@ -338,8 +329,8 @@ pub fn typed_compare(
         | LiteralValue::Boolean(_) => {}
     }
     let kind = ValueKind::of_type(ty);
-    let filter = literal_parse(kind, literal, zone)?;
-    let row = text_parse(kind, row_text, None)?;
+    let filter = literal_parse(kind, literal)?;
+    let row = text_parse(kind, row_text)?;
     let ordering = row.cmp_same_kind(&filter)?;
     Some(match op {
         BinaryOp::Equal => ordering == Ordering::Equal,
@@ -362,19 +353,15 @@ pub fn typed_compare(
 /// normalised, bools as `Boolean`. Numbers key as `ValueKey::Num` either way,
 /// so a literal and a row's wire text that mean the same value share one
 /// bucket. `None` when the literal does not parse as the kind.
-pub fn literal_index_key(
-    kind: ValueKind,
-    literal: &LiteralValue,
-    zone: Option<&TimeZone>,
-) -> Option<LiteralValue> {
-    literal_parse(kind, literal, zone).and_then(TypedValue::into_index_key)
+pub fn literal_index_key(kind: ValueKind, literal: &LiteralValue) -> Option<LiteralValue> {
+    literal_parse(kind, literal).and_then(TypedValue::into_index_key)
 }
 
 /// The index-key form of a row's wire text for a column of `kind`; the same
 /// mapping as [`literal_index_key`], so the point probe lands in the entry's
 /// bucket.
 pub fn wire_text_index_key(kind: ValueKind, text: &str) -> Option<LiteralValue> {
-    text_parse(kind, text, None).and_then(TypedValue::into_index_key)
+    text_parse(kind, text).and_then(TypedValue::into_index_key)
 }
 
 impl TypedValue {
@@ -532,14 +519,22 @@ fn datetime_split_ordered(
         Some(i) => text.split_at_checked(i)?,
         None => (text, ""),
     };
+    let date = numeric_date_parse(date_text, order)?;
+    if rest.is_empty() {
+        return Some((date, None, None));
+    }
+    let (time, offset) = time_offset_split(rest)?;
+    Some((date, time, offset))
+}
+
+/// A numeric date in the session's field order; a four-digit first field is
+/// year-first whatever the order, as in PostgreSQL.
+fn numeric_date_parse(date_text: &str, order: DateOrder) -> Option<Date> {
     let parts: Vec<&str> = date_text.split(['/', '.', '-']).collect();
     let [a, b, c] = parts.as_slice() else {
         return None;
     };
-    if !parts
-        .iter()
-        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-    {
+    if !parts.iter().all(|p| !p.is_empty() && digits_only(p)) {
         return None;
     }
     let (year, month, day) = if a.len() == 4 {
@@ -551,23 +546,12 @@ fn datetime_split_ordered(
             DateOrder::YearMonthDay => (a, b, c),
         }
     };
-    let year = year_field_parse(year)?;
-    let month: i8 = month.parse().ok()?;
-    let day: i8 = day.parse().ok()?;
-    let date = Date::new(year, month, day).ok()?;
-    if rest.is_empty() {
-        return Some((date, None, None));
-    }
-    let rest = rest.strip_prefix([' ', 'T'])?;
-    let (time, offset) = match rest.find(['+', '-', 'Z', 'z']) {
-        Some(i) => {
-            let (time, offset) = rest.split_at_checked(i)?;
-            (time, Some(offset))
-        }
-        None => (rest, None),
-    };
-    let time = time.trim_end();
-    Some((date, (!time.is_empty()).then_some(time), offset))
+    Date::new(
+        year_field_parse(year)?,
+        month.parse().ok()?,
+        day.parse().ok()?,
+    )
+    .ok()
 }
 
 /// A numeric year field; two digits follow PostgreSQL's rule: below 70 is
@@ -592,65 +576,29 @@ fn civil_parse_date(date: Date, time: Option<&str>) -> Option<DateTime> {
 
 /// Parse a predicate literal as `kind`. A typed literal (`'…'::type`) must
 /// name the same kind as the column.
-fn literal_parse(
-    kind: ValueKind,
-    literal: &LiteralValue,
-    zone: Option<&TimeZone>,
-) -> Option<TypedValue> {
+fn literal_parse(kind: ValueKind, literal: &LiteralValue) -> Option<TypedValue> {
     match literal {
-        LiteralValue::String(s) => text_parse(kind, s, zone),
+        LiteralValue::String(s) => text_parse(kind, s),
         LiteralValue::StringWithCast(s, cast) => {
             if ValueKind::of_cast_name(cast) != kind {
                 return None;
             }
-            text_parse(kind, s, zone)
+            text_parse(kind, s)
         }
-        LiteralValue::Integer(n) => match kind {
-            ValueKind::Integer => Some(TypedValue::Integer(i128::from(*n))),
-            ValueKind::Decimal => Decimal::parse(&n.to_string()).map(TypedValue::Decimal),
-            ValueKind::Bool => match n {
-                0 => Some(TypedValue::Bool(false)),
-                1 => Some(TypedValue::Bool(true)),
-                _ => None,
-            },
-            ValueKind::Date
-            | ValueKind::Timestamp
-            | ValueKind::TimestampTz
-            | ValueKind::Text
-            | ValueKind::Bpchar
-            | ValueKind::Uuid
-            | ValueKind::Enum
-            | ValueKind::Unsupported => None,
-        },
-        LiteralValue::Float(f) => match kind {
-            // An integer column against a fractional literal compares as
-            // numeric at origin; exact decimal does the same here.
-            ValueKind::Integer | ValueKind::Decimal => {
-                Decimal::parse(&format!("{}", f.into_inner())).map(TypedValue::Decimal)
+        // A bare number or boolean only ever meets a numeric or boolean
+        // column at origin; its text parses as that kind (an integer column
+        // against a fractional literal compares as numeric, as at origin).
+        LiteralValue::Integer(_) | LiteralValue::Float(_) | LiteralValue::Boolean(_) => {
+            if !matches!(
+                kind,
+                ValueKind::Integer | ValueKind::Decimal | ValueKind::Bool
+            ) {
+                return None;
             }
-            ValueKind::Bool
-            | ValueKind::Date
-            | ValueKind::Timestamp
-            | ValueKind::TimestampTz
-            | ValueKind::Text
-            | ValueKind::Bpchar
-            | ValueKind::Uuid
-            | ValueKind::Enum
-            | ValueKind::Unsupported => None,
-        },
-        LiteralValue::Boolean(b) => match kind {
-            ValueKind::Bool => Some(TypedValue::Bool(*b)),
-            ValueKind::Integer
-            | ValueKind::Decimal
-            | ValueKind::Date
-            | ValueKind::Timestamp
-            | ValueKind::TimestampTz
-            | ValueKind::Text
-            | ValueKind::Bpchar
-            | ValueKind::Uuid
-            | ValueKind::Enum
-            | ValueKind::Unsupported => None,
-        },
+            let mut text = String::new();
+            literal.deparse(&mut text);
+            text_parse(kind, &text)
+        }
         LiteralValue::Null
         | LiteralValue::NullWithCast(_)
         | LiteralValue::Parameter(_)
@@ -659,7 +607,7 @@ fn literal_parse(
 }
 
 /// Parse text (a literal's or a row's) as `kind`.
-fn text_parse(kind: ValueKind, text: &str, zone: Option<&TimeZone>) -> Option<TypedValue> {
+fn text_parse(kind: ValueKind, text: &str) -> Option<TypedValue> {
     match kind {
         ValueKind::Integer => match text.trim().parse::<i128>() {
             Ok(n) => Some(TypedValue::Integer(n)),
@@ -677,7 +625,7 @@ fn text_parse(kind: ValueKind, text: &str, zone: Option<&TimeZone>) -> Option<Ty
             special_parse(kind, text).or_else(|| timestamp_parse(text).map(TypedValue::Timestamp))
         }
         ValueKind::TimestampTz => special_parse(kind, text)
-            .or_else(|| timestamptz_parse(text, zone).map(TypedValue::TimestampTz)),
+            .or_else(|| timestamptz_parse(text).map(TypedValue::TimestampTz)),
         ValueKind::Text => Some(TypedValue::Text(text.to_owned())),
         ValueKind::Bpchar => Some(TypedValue::Text(text.trim_end_matches(' ').to_owned())),
         ValueKind::Uuid => Some(TypedValue::Text(text.trim().to_ascii_lowercase())),
@@ -698,6 +646,13 @@ fn datetime_split(text: &str) -> Option<(&str, Option<&str>, Option<&str>)> {
     if rest.is_empty() {
         return Some((date, None, None));
     }
+    let (time, offset) = time_offset_split(rest)?;
+    Some((date, time, offset))
+}
+
+/// The `{ |T}[HH:MM[:SS[.ffffff]]][±HH[:MM[:SS]] | Z]` tail after a date as
+/// `(time, offset)`; `None` for any other shape, a bare separator included.
+fn time_offset_split(rest: &str) -> Option<(Option<&str>, Option<&str>)> {
     let rest = rest.strip_prefix([' ', 'T'])?;
     let (time, offset) = match rest.find(['+', '-', 'Z', 'z']) {
         Some(i) => {
@@ -710,7 +665,7 @@ fn datetime_split(text: &str) -> Option<(&str, Option<&str>, Option<&str>)> {
     if time.is_empty() && offset.is_none() {
         return None;
     }
-    Some((date, (!time.is_empty()).then_some(time), offset))
+    Some(((!time.is_empty()).then_some(time), offset))
 }
 
 fn date_shape_ok(date: &str) -> bool {
@@ -781,22 +736,18 @@ fn timestamp_parse(text: &str) -> Option<DateTime> {
     civil_bc_adjust(civil_parse(date, time)?, bc)
 }
 
-/// A `timestamptz`: with an offset or `Z` it is an instant outright; without
-/// one it is a civil time in the session's zone.
-fn timestamptz_parse(text: &str, zone: Option<&TimeZone>) -> Option<Timestamp> {
+/// A `timestamptz`: an instant, so the text needs an offset or `Z`; without
+/// one it is a civil time in some session's zone, which this module does not
+/// know (see the module doc).
+fn timestamptz_parse(text: &str) -> Option<Timestamp> {
     let (text, bc) = bc_strip(text);
     let (date, time, offset) = datetime_split(text)?;
     let civil = civil_bc_adjust(civil_parse(date, time)?, bc)?;
-    match offset {
-        Some(offset) => {
-            let offset = offset_parse(offset)?;
-            civil
-                .to_zoned(TimeZone::fixed(offset))
-                .ok()
-                .map(|z: Zoned| z.timestamp())
-        }
-        None => civil.to_zoned(zone?.clone()).ok().map(|z| z.timestamp()),
-    }
+    let offset = offset_parse(offset?)?;
+    civil
+        .to_zoned(TimeZone::fixed(offset))
+        .ok()
+        .map(|z: Zoned| z.timestamp())
 }
 
 /// `Z`, `±HH`, `±HHMM`, `±HH:MM`, `±HH:MM:SS` as a fixed offset.
@@ -804,34 +755,32 @@ fn offset_parse(text: &str) -> Option<jiff::tz::Offset> {
     if matches!(text, "Z" | "z") {
         return Some(jiff::tz::Offset::UTC);
     }
-    let (sign, rest) = text
-        .strip_prefix('+')
-        .map(|rest| (1i32, rest))
-        .or_else(|| text.strip_prefix('-').map(|rest| (-1i32, rest)))?;
-    let parts: Vec<&str> = if rest.contains(':') {
-        rest.split(':').collect()
-    } else {
-        match rest.len() {
-            2 => vec![rest],
-            4 => {
-                let (hours, minutes) = rest.split_at_checked(2)?;
-                vec![hours, minutes]
-            }
-            _ => return None,
-        }
+    let (sign, rest) = match sign_split(text) {
+        (true, rest) => (-1i32, rest),
+        (false, rest) if rest.len() < text.len() => (1i32, rest),
+        (false, _) => return None,
     };
-    if parts.is_empty() || parts.len() > 3 {
+    let parts: Vec<&str> = match (rest.contains(':'), rest.len()) {
+        (true, _) => rest.split(':').collect(),
+        (false, 2) => vec![rest],
+        (false, 4) => {
+            let (hours, minutes) = rest.split_at_checked(2)?;
+            vec![hours, minutes]
+        }
+        (false, _) => return None,
+    };
+    if parts.len() > 3 {
         return None;
     }
     let mut seconds = 0i32;
     for (part, scale) in parts.iter().zip([3600, 60, 1]) {
-        if part.len() != 2 {
-            return None;
-        }
-        let n: i32 = part.parse().ok()?;
-        seconds += n * scale;
+        seconds += two_digits_parse(part)? * scale;
     }
     jiff::tz::Offset::from_seconds(sign * seconds).ok()
+}
+
+fn two_digits_parse(part: &str) -> Option<i32> {
+    (part.len() == 2).then(|| part.parse().ok()).flatten()
 }
 
 #[cfg(test)]
@@ -844,7 +793,7 @@ mod tests {
     }
 
     fn cmp(ty: &Type, literal: LiteralValue, row: &str, op: BinaryOp) -> Option<bool> {
-        typed_compare(ty, &literal, row, op, None)
+        typed_compare(ty, &literal, row, op)
     }
 
     #[test]
@@ -863,8 +812,7 @@ mod tests {
         assert!(!literal_locally_comparable(
             &Type::INT4,
             &text("abc"),
-            Equal,
-            None
+            Equal
         ));
     }
 
@@ -992,7 +940,8 @@ mod tests {
             ),
             Some(true)
         );
-        // Zone-less literal: needs the session zone.
+        // Zone-less literal: not an instant without the session zone, which
+        // canonicalisation supplies before a literal reaches here.
         assert_eq!(
             cmp(
                 &Type::TIMESTAMPTZ,
@@ -1005,26 +954,18 @@ mod tests {
         assert!(!literal_locally_comparable(
             &Type::TIMESTAMPTZ,
             &text("2024-01-15"),
-            Equal,
-            None
+            Equal
         ));
-        let tokyo = TimeZone::get("Asia/Tokyo").expect("tzdb bundled");
+        // Canonicalised under Asia/Tokyo, the same literal is an instant.
         assert_eq!(
-            typed_compare(
+            cmp(
                 &Type::TIMESTAMPTZ,
-                &text("2024-01-15 10:00"),
+                text("2024-01-15 01:00:00+00"),
                 "2024-01-15 01:00:00+00",
-                Equal,
-                Some(&tokyo)
+                Equal
             ),
             Some(true)
         );
-        assert!(literal_locally_comparable(
-            &Type::TIMESTAMPTZ,
-            &text("2024-01-15"),
-            Equal,
-            Some(&tokyo)
-        ));
     }
 
     #[test]
@@ -1127,8 +1068,7 @@ mod tests {
         assert!(!literal_locally_comparable(
             &Type::JSONB,
             &text("{}"),
-            Equal,
-            None
+            Equal
         ));
         assert_eq!(cmp(&Type::JSONB, text("{}"), "{}", Equal), None);
         assert_eq!(
@@ -1138,8 +1078,7 @@ mod tests {
         assert!(literal_locally_comparable(
             &Type::INT4,
             &LiteralValue::Null,
-            Equal,
-            None
+            Equal
         ));
         assert_eq!(
             cmp(
