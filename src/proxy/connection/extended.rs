@@ -206,10 +206,7 @@ impl ConnectionState {
             Ok(Action::Forward(
                 ForwardReason::UnsupportedStatement | ForwardReason::Invalid,
                 effects,
-            )) => {
-                self.search_path_parse_inspect(sql);
-                (StatementType::NonSelect, effects)
-            }
+            )) => (StatementType::NonSelect, effects),
             // pg_query failed but origin may still parse it (parser version
             // skew): any Execute of this statement could be a write, so record
             // conservatively at connection scope — the same failure direction

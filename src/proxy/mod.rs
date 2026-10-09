@@ -7,6 +7,7 @@ mod origin_stream;
 mod query;
 pub mod search_path;
 mod server;
+mod session_settings;
 mod tls_stream;
 
 pub use cache_sender::{StatusSender, StatusSenderUpdater};

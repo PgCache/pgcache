@@ -32,21 +32,11 @@
 //! that changes the default under a live session, and a `SET` executed from
 //! inside a function body.
 
-use tracing::debug;
-
 use super::ConnectionState;
 use crate::pg::protocol::backend::TransactionStatus;
+use crate::proxy::session_settings::{IsolationState, SessionSettings};
+use crate::query::guc::Guc;
 use crate::query::write::{IsolationEffect, IsolationLevel, StatementEffects, TransactionBoundary};
-
-/// An isolation level as the proxy knows it — for the session default, and
-/// for the block currently open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum IsolationState {
-    /// Not yet probed, or invalidated by a mutation. In-transaction reads
-    /// forward while a block is in this state.
-    Unknown,
-    Known(IsolationLevel),
-}
 
 /// Why an in-transaction cacheable read was forwarded instead of served.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,12 +67,16 @@ impl ConnectionState {
             IsolationEffect::None => {}
             IsolationEffect::Transaction(level) => self.transaction_isolation_apply(level, begins),
             IsolationEffect::SessionDefault(IsolationLevel::ReadCommitted)
-            | IsolationEffect::SessionUnknown => {
-                self.session_isolation_set(IsolationState::Unknown)
+            | IsolationEffect::SessionUnknown => self.session_settings_update(|settings| {
+                settings.session_unknown_mark(Guc::DefaultTransactionIsolation);
+            }),
+            // Inside a block the new default may yet roll back: leave it
+            // unknown (the settings effect already did) for the probe after
+            // the block to confirm.
+            IsolationEffect::SessionDefault(level) if !self.forwarding_into_block() => {
+                self.session_settings_update(|settings| settings.isolation_known_set(level))
             }
-            IsolationEffect::SessionDefault(level) => {
-                self.session_isolation_set(IsolationState::Known(level));
-            }
+            IsolationEffect::SessionDefault(_) => {}
         }
         if begins {
             self.begins_forwarded = self.begins_forwarded.saturating_add(1);
@@ -104,13 +98,6 @@ impl ConnectionState {
             // PostgreSQL ignores it with a warning.
             self.block_isolation = IsolationState::Known(level);
         }
-    }
-
-    /// A session-default change. Inside a block it may revert (rollback, `SET
-    /// LOCAL`), so the block's end re-probes.
-    fn session_isolation_set(&mut self, state: IsolationState) {
-        self.session_isolation = state;
-        self.isolation_mutated_in_block |= self.forwarding_into_block();
     }
 
     /// Whether a cacheable read may be served from cache given the current
@@ -145,23 +132,16 @@ impl ConnectionState {
     fn block_enter(&mut self) {
         self.block_isolation = match self.pending_block_isolation.take() {
             Some(level) => IsolationState::Known(level),
-            None => self.session_isolation,
+            None => self.session_settings.isolation(),
         };
         self.begins_forwarded = self.begins_forwarded.saturating_sub(1);
     }
 
+    /// The block ended: its level is gone, and so are the block-scoped
+    /// settings; a session default changed inside the block was marked
+    /// unknown when its `SET` was forwarded, so the next probe re-reads it.
     fn block_exit(&mut self) {
         self.block_isolation = IsolationState::Unknown;
-        if self.isolation_mutated_in_block {
-            self.isolation_mutated_in_block = false;
-            debug!("txn ended after an isolation mutation, marking default unknown");
-            self.session_isolation = IsolationState::Unknown;
-        }
-    }
-
-    /// The session default is unknown and no block is open (or about to be)
-    /// that would hide it.
-    pub(super) fn isolation_probe_needed(&self) -> bool {
-        self.session_isolation == IsolationState::Unknown && !self.forwarding_into_block()
+        self.session_settings_update(SessionSettings::block_exit);
     }
 }

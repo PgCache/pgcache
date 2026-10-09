@@ -1,33 +1,33 @@
 //! Origin probes: queries the proxy injects on a connection's origin socket
 //! for its own bookkeeping, whose responses are swallowed rather than relayed.
 //!
-//! Three probes exist — `SHOW search_path` (pre-PG18, ADR-006), `SHOW
-//! default_transaction_isolation` (ADR-054) and `SELECT
-//! pg_current_wal_insert_lsn()` (ADR-048). Each takes a `Probe` slot in the
-//! egress queue at its position in origin's reply order, so its reply is
-//! recognised by position however many client requests are in flight around
-//! it (see `proxy::egress`). No probe needs a quiescent socket: it is injected
-//! at any origin `ReadyForQuery`, client-visible or a probe's own, and the
-//! conditions are purely state-based. A probe that must not run inside a
-//! transaction block is skipped while one is open or a forwarded `BEGIN` is
-//! unacknowledged, and its own `ReadyForQuery` status is the final check:
-//! anything but idle discards the sample.
+//! Two probes exist — the session-settings sample (PGC-287: one
+//! `current_setting` column per tracked setting, covering the pre-PG18
+//! search_path discovery of ADR-006 and the isolation default of ADR-054) and
+//! `SELECT pg_current_wal_insert_lsn()` (ADR-048). Each takes a `Probe` slot
+//! in the egress queue at its position in origin's reply order, so its reply
+//! is recognised by position however many client requests are in flight
+//! around it (see `proxy::egress`). No probe needs a quiescent socket: it is
+//! injected at any origin `ReadyForQuery`, client-visible or a probe's own,
+//! and the conditions are purely state-based. The settings probe runs inside
+//! blocks too — a `SET LOCAL` value is what an in-block read must honour —
+//! and its own `ReadyForQuery` status scopes the sample. The commit-LSN probe
+//! must not run inside a block and is skipped while one is open or a
+//! forwarded `BEGIN` is unacknowledged; its status is the final check.
 
 use postgres_types::PgLsn;
 use tracing::debug;
 
-use super::{ConnectionState, IsolationState, SearchPathState};
+use super::ConnectionState;
 use crate::pg::Lsn;
 use crate::pg::protocol::{
-    backend::{PgBackendMessage, PgBackendMessageType, TransactionStatus, data_row_first_column},
+    backend::{PgBackendMessage, PgBackendMessageType, TransactionStatus, data_row_columns},
     frontend::ProbeQuery,
 };
 use crate::proxy::egress::{ProbeKind, ProbeResult};
-use crate::query::write::IsolationLevel;
+use crate::proxy::session_settings::SETTINGS_PROBE_SQL;
 
-const SEARCH_PATH_PROBE: ProbeQuery = ProbeQuery::new("SHOW search_path;");
-const DEFAULT_TRANSACTION_ISOLATION_PROBE: ProbeQuery =
-    ProbeQuery::new("SHOW default_transaction_isolation;");
+const SETTINGS_PROBE: ProbeQuery = ProbeQuery::new(SETTINGS_PROBE_SQL);
 const WAL_INSERT_LSN_PROBE: ProbeQuery = ProbeQuery::new("SELECT pg_current_wal_insert_lsn()");
 
 impl ConnectionState {
@@ -40,20 +40,14 @@ impl ConnectionState {
         if self.flush_describe_pending || self.extended.group_origin_forwarded {
             return;
         }
-        if matches!(self.search_path_state, SearchPathState::Unknown)
-            && !self.egress.probe_pending(ProbeKind::SearchPath)
+        if self
+            .session_settings
+            .probe_needed(self.forwarding_into_block())
+            && !self.egress.probe_pending(ProbeKind::SessionSettings)
         {
-            debug!("search_path unknown, probing");
-            self.probe_send(ProbeKind::SearchPath, &SEARCH_PATH_PROBE);
-        }
-        if self.isolation_probe_needed() && !self.egress.probe_pending(ProbeKind::IsolationDefault)
-        {
-            debug!("default_transaction_isolation unknown, probing");
-            self.probe_send(
-                ProbeKind::IsolationDefault,
-                &DEFAULT_TRANSACTION_ISOLATION_PROBE,
-            );
-            crate::metrics::handles().txn.isolation_probes.increment(1);
+            debug!("session settings unknown, probing");
+            self.probe_send(ProbeKind::SessionSettings, &SETTINGS_PROBE);
+            crate::metrics::handles().conn.settings_probes.increment(1);
         }
         self.commit_lsn_probe_inject();
     }
@@ -98,8 +92,9 @@ impl ConnectionState {
     pub(super) fn probe_message_handle(&mut self, msg: &PgBackendMessage) {
         match msg.message_type {
             PgBackendMessageType::DataRows => {
-                if let Some(value) = data_row_first_column(&msg.data) {
-                    self.egress.probe_row(value.into());
+                if let Some(columns) = data_row_columns(&msg.data) {
+                    self.egress
+                        .probe_row(columns.into_iter().map(|c| c.map(Into::into)).collect());
                 }
             }
             PgBackendMessageType::ReadyForQuery => {
@@ -118,27 +113,18 @@ impl ConnectionState {
     /// than looping.
     fn probe_apply(&mut self, result: ProbeResult, status: TransactionStatus) {
         match (result.kind, result.row) {
-            (ProbeKind::SearchPath, Some(value)) => {
-                debug!("received search_path from SHOW query: {}", value);
-                self.search_path_state =
-                    SearchPathState::resolved(&value, self.session_user.as_deref());
+            (ProbeKind::SessionSettings, Some(columns)) => {
+                debug!(?status, "received session settings sample");
+                self.session_settings_update(|settings| settings.probe_apply(&columns, status));
             }
-            (ProbeKind::IsolationDefault, Some(value)) => {
-                if status != TransactionStatus::Idle {
-                    debug!("isolation probe answered inside a block, discarding");
-                    return;
-                }
-                if let Some(level) = IsolationLevel::parse(&value) {
-                    debug!(?level, "received default_transaction_isolation");
-                    self.session_isolation = IsolationState::Known(level);
-                }
-            }
-            (ProbeKind::CommitLsn { stamp_seq }, Some(value)) => {
+            (ProbeKind::CommitLsn { stamp_seq }, Some(columns)) => {
                 if status != TransactionStatus::Idle {
                     debug!("commit-LSN probe answered inside a block, discarding");
                     return;
                 }
-                if let Ok(lsn) = value.parse::<PgLsn>() {
+                if let Some(Some(value)) = columns.first()
+                    && let Ok(lsn) = value.parse::<PgLsn>()
+                {
                     self.write_log.stamp(stamp_seq, Lsn::from(lsn));
                 }
             }

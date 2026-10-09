@@ -113,6 +113,13 @@ impl Guc {
     pub const fn block_sample_valid(self) -> bool {
         !matches!(self, Guc::DefaultTransactionIsolation)
     }
+
+    /// Whether a cacheable read depends on the setting's value. The isolation
+    /// default does not: a block's level is fixed when it starts (ADR-054)
+    /// and gated separately, and outside a block the default is irrelevant.
+    pub const fn gates_reads(self) -> bool {
+        !matches!(self, Guc::DefaultTransactionIsolation)
+    }
 }
 
 impl fmt::Display for Guc {

@@ -190,7 +190,7 @@ async fn test_strict_isolation_forwards_read_committed_serves() -> Result<(), Er
     ctx.simple_query("BEGIN").await?;
     ctx.simple_query(READ_ONE).await?;
     let delta = metrics_delta(&before, &ctx.metrics_after_outcomes(&before, 1).await?);
-    assert!(delta.txn_isolation_probes >= 1, "expected a re-probe");
+    assert!(delta.conn_settings_probes >= 1, "expected a re-probe");
     assert_eq!(delta.queries_cache_hit, 1, "READ COMMITTED serves again");
     assert_eq!(delta.txn_served, 1);
     ctx.simple_query("COMMIT").await?;
@@ -245,7 +245,7 @@ async fn test_set_local_isolation_rediscovered_after_commit() -> Result<(), Erro
     ctx.simple_query(READ_ONE).await?;
     let delta = metrics_delta(&before, &ctx.metrics().await?);
     assert_eq!(delta.txn_served, 1, "the open block stays READ COMMITTED");
-    assert_eq!(delta.txn_isolation_probes, 0, "no probe inside a block");
+    assert_eq!(delta.conn_settings_probes, 0, "no probe inside a block");
     // The txn-end re-probe is injected at COMMIT's ReadyForQuery.
     let before = ctx.metrics().await?;
     ctx.simple_query("COMMIT").await?;
@@ -253,7 +253,7 @@ async fn test_set_local_isolation_rediscovered_after_commit() -> Result<(), Erro
     ctx.simple_query(READ_ONE).await?;
     let delta = metrics_delta(&before, &ctx.metrics().await?);
     assert!(
-        delta.txn_isolation_probes >= 1,
+        delta.conn_settings_probes >= 1,
         "expected a txn-end re-probe"
     );
     assert_eq!(delta.txn_served, 1, "default reverted to READ COMMITTED");
@@ -360,7 +360,7 @@ async fn test_session_default_change_inside_block_keeps_block_level() -> Result<
     client.simple_query(READ_ONE).await.map_err(Error::other)?;
     let delta = metrics_delta(&before, &ctx.metrics().await?);
     assert!(
-        delta.txn_isolation_probes >= 1,
+        delta.conn_settings_probes >= 1,
         "default re-probed at block end"
     );
     assert_eq!(delta.txn_served, 1, "the next block starts READ COMMITTED");
@@ -437,7 +437,7 @@ async fn test_pipelined_begin_set_default_rollback_reprobes() -> Result<(), Erro
     assert_eq!(read.data_row_count(), 1);
     let delta = metrics_delta(&before, &ctx.metrics().await?);
     assert!(
-        delta.txn_isolation_probes >= 1,
+        delta.conn_settings_probes >= 1,
         "default re-probed after rollback"
     );
     assert_eq!(
@@ -463,15 +463,15 @@ async fn test_failed_block_does_not_probe_repeatedly() -> Result<(), Error> {
     let before = ctx.metrics().await?;
     tokio::time::sleep(std::time::Duration::from_millis(700)).await;
     let delta = metrics_delta(&before, &ctx.metrics().await?);
-    assert_eq!(delta.txn_isolation_probes, 0, "no probe inside a block");
+    assert_eq!(delta.conn_settings_probes, 0, "no probe inside a block");
 
     ctx.simple_query("ROLLBACK").await?;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let delta = metrics_delta(&before, &ctx.metrics().await?);
     assert!(
-        delta.txn_isolation_probes <= 1,
+        delta.conn_settings_probes <= 1,
         "one probe after the block ends, got {}",
-        delta.txn_isolation_probes
+        delta.conn_settings_probes
     );
     Ok(())
 }

@@ -144,9 +144,9 @@ async fn test_isolation_reprobe_with_pipelined_statement_behind_it() -> Result<(
     assert_eq!(next.first_value().as_deref(), Some("7"));
     let delta = metrics_delta(&before, &ctx.metrics().await?);
     assert!(
-        delta.txn_isolation_probes >= 1,
+        delta.conn_settings_probes >= 1,
         "expected a re-probe after SET default_transaction_isolation, got {}",
-        delta.txn_isolation_probes
+        delta.conn_settings_probes
     );
     Ok(())
 }

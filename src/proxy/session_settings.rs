@@ -1,0 +1,619 @@
+//! Per-connection tracking of the session settings that can change what a
+//! cached query means (PGC-287): their values as the proxy knows them, in
+//! session and transaction-block scope, and the views dispatch reads from
+//! them (the resolved search_path, the isolation default).
+//!
+//! Values arrive three ways. Origin reports some settings by `ParameterStatus`
+//! on every change; once a setting has been reported this way, statements that
+//! touch it are not tracked (origin will say). The rest are sampled by one
+//! probe (`SELECT current_setting(…)` over every tracked setting, one column
+//! each in [`Guc::ALL`] order) whenever something is unknown; the probe's own
+//! `ReadyForQuery` status says whether the sample is the session's value or
+//! the open block's. In between, the analyzer's [`SettingsEffect`] of each
+//! forwarded statement marks what it may have changed, in which scope.
+
+use std::sync::Arc;
+
+use ecow::EcoString;
+use tracing::debug;
+
+use crate::pg::protocol::backend::TransactionStatus;
+use crate::proxy::search_path::SearchPath;
+use crate::query::guc::Guc;
+use crate::query::write::{IsolationLevel, SettingsEffect};
+
+/// A setting's value as the proxy knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SettingValue {
+    Unknown,
+    Known(EcoString),
+}
+
+impl SettingValue {
+    fn known(&self) -> Option<&str> {
+        match self {
+            Self::Known(value) => Some(value),
+            Self::Unknown => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SettingState {
+    /// The session value: what reads see outside a block, and inside one
+    /// unless `block` overrides it.
+    session: SettingValue,
+    /// `Some` while the open block may hold a different value (`SET LOCAL`,
+    /// any `SET` inside the block). Dropped when the block ends.
+    block: Option<SettingValue>,
+    /// A statement touched this setting inside the open block, so a
+    /// `ROLLBACK TO SAVEPOINT` may have reverted the block value.
+    touched_in_block: bool,
+    /// Origin reports this setting by `ParameterStatus` on every change.
+    reported: bool,
+}
+
+impl SettingState {
+    const UNKNOWN: SettingState = SettingState {
+        session: SettingValue::Unknown,
+        block: None,
+        touched_in_block: false,
+        reported: false,
+    };
+
+    /// The value in force for a read in the given scope.
+    fn effective(&self, in_block: bool) -> &SettingValue {
+        match (&self.block, in_block) {
+            (Some(block), true) => block,
+            _ => &self.session,
+        }
+    }
+
+    /// Whether a probe would learn something at this scope: an unknown block
+    /// override, or an unknown session value a block does not hide.
+    fn unknown_at(&self, in_block: bool) -> bool {
+        match (&self.block, in_block) {
+            (Some(block), true) => *block == SettingValue::Unknown,
+            (Some(_), false) | (None, _) => self.session == SettingValue::Unknown,
+        }
+    }
+}
+
+/// The resolved search_path dispatch keys on (ADR-006).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SearchPathState {
+    /// No authoritative value yet.
+    Unknown,
+    /// Resolved, `$user` expanded, shared: dispatching a cache query clones
+    /// the `Arc` instead of collecting a fresh `Vec` per query.
+    Resolved(Arc<[EcoString]>),
+    /// The path lists `pg_catalog` after another schema. Only then can a user
+    /// function, type or operator with a builtin's exact signature shadow the
+    /// builtin on origin, while the cache DB (which has no user objects) would
+    /// run the builtin. Cacheable queries forward until the path changes.
+    BuiltinsShadowed,
+}
+
+/// `pg_catalog` is searched first unless listed explicitly, in which case it
+/// is searched at its listed position.
+fn builtins_shadowed(resolved: &[EcoString]) -> bool {
+    resolved
+        .iter()
+        .position(|schema| schema == "pg_catalog")
+        .is_some_and(|index| index > 0)
+}
+
+impl SearchPathState {
+    /// Build the resolved state from a raw search_path value, expanding
+    /// `$user` to the effective user name.
+    pub(crate) fn resolved(value: &str, user: Option<&str>) -> Self {
+        let search_path = SearchPath::parse(value);
+        let resolved: Arc<[EcoString]> = search_path.resolve(user).map(EcoString::from).collect();
+        if builtins_shadowed(&resolved) {
+            debug!("search_path lists pg_catalog after another schema; cacheable queries forward");
+            return Self::BuiltinsShadowed;
+        }
+        Self::Resolved(resolved)
+    }
+
+    /// The resolved search_path, if available.
+    pub(crate) fn resolve(&self) -> Option<Arc<[EcoString]>> {
+        match self {
+            Self::Unknown | Self::BuiltinsShadowed => None,
+            Self::Resolved(search_path) => Some(Arc::clone(search_path)),
+        }
+    }
+}
+
+/// The session's `default_transaction_isolation` as the proxy knows it
+/// (ADR-054).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IsolationState {
+    Unknown,
+    Known(IsolationLevel),
+}
+
+/// Why a cacheable read cannot be keyed right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsForwardReason {
+    /// Some tracked setting has no known value at the read's scope.
+    SettingUnknown(Guc),
+    /// The effective search_path lists `pg_catalog` after another schema.
+    BuiltinsShadowed,
+}
+
+impl SettingsForwardReason {
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::SettingUnknown(Guc::SearchPath) => "search_path unknown",
+            Self::SettingUnknown(_) => "session setting unknown",
+            Self::BuiltinsShadowed => "search_path lists pg_catalog after another schema",
+        }
+    }
+}
+
+/// Every tracked setting of one client session, plus the views derived from
+/// them. Pure: the connection applies protocol events to it and reads back.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionSettings {
+    states: [SettingState; Guc::ALL.len()],
+    /// The user from the startup message, the fallback for `$user` until
+    /// `session_authorization` and `role` are known.
+    startup_user: Option<EcoString>,
+    search_path: SearchPathState,
+    isolation: IsolationState,
+}
+
+impl SessionSettings {
+    pub(crate) fn new() -> Self {
+        Self {
+            states: [SettingState::UNKNOWN; Guc::ALL.len()],
+            startup_user: None,
+            search_path: SearchPathState::Unknown,
+            isolation: IsolationState::Unknown,
+        }
+    }
+
+    // A discriminant is always below `Guc::ALL.len()` (pinned by a test in
+    // `query::guc`), so these cannot go out of bounds.
+    #[expect(clippy::indexing_slicing)]
+    fn state(&self, guc: Guc) -> &SettingState {
+        &self.states[guc as usize]
+    }
+
+    #[expect(clippy::indexing_slicing)]
+    fn state_mut(&mut self, guc: Guc) -> &mut SettingState {
+        &mut self.states[guc as usize]
+    }
+
+    /// The effective search_path view (the open block's if it has one).
+    pub(crate) fn search_path(&self) -> &SearchPathState {
+        &self.search_path
+    }
+
+    /// The session's isolation default.
+    pub(crate) fn isolation(&self) -> IsolationState {
+        self.isolation
+    }
+
+    /// The value in force for a read at this scope.
+    pub(crate) fn effective(&self, guc: Guc, in_block: bool) -> &SettingValue {
+        self.state(guc).effective(in_block)
+    }
+
+    /// The search_path a cacheable read is keyed under, or why it forwards:
+    /// every tracked setting must be known at the read's scope, and the path
+    /// must not shadow builtins.
+    pub(crate) fn serve_search_path(
+        &self,
+        in_block: bool,
+    ) -> Result<Arc<[EcoString]>, SettingsForwardReason> {
+        if let Some(guc) = Guc::ALL
+            .into_iter()
+            .filter(|guc| guc.gates_reads())
+            .find(|guc| self.effective(*guc, in_block) == &SettingValue::Unknown)
+        {
+            return Err(SettingsForwardReason::SettingUnknown(guc));
+        }
+        match &self.search_path {
+            SearchPathState::Resolved(path) => Ok(Arc::clone(path)),
+            SearchPathState::BuiltinsShadowed => Err(SettingsForwardReason::BuiltinsShadowed),
+            SearchPathState::Unknown => Err(SettingsForwardReason::SettingUnknown(Guc::SearchPath)),
+        }
+    }
+
+    /// Whether a probe at this scope would learn a value. Inside a block,
+    /// settings whose in-block sample is meaningless are not waited on.
+    pub(crate) fn probe_needed(&self, in_block: bool) -> bool {
+        Guc::ALL.into_iter().any(|guc| {
+            (!in_block || guc.block_sample_valid()) && self.state(guc).unknown_at(in_block)
+        })
+    }
+
+    /// The startup message's user: the `$user` fallback.
+    pub(crate) fn startup_user_set(&mut self, user: Option<&str>) {
+        self.startup_user = user.map(EcoString::from);
+        self.views_rederive();
+    }
+
+    /// Origin reported a setting's current value. The session value is final
+    /// (origin re-reports a reverting `SET LOCAL` at block end), and from now
+    /// on statements touching it are left to origin.
+    pub(crate) fn parameter_status(&mut self, guc: Guc, value: &str) {
+        let state = self.state_mut(guc);
+        state.session = SettingValue::Known(value.into());
+        state.block = None;
+        state.reported = true;
+        self.views_rederive();
+    }
+
+    /// A statement that may change settings was forwarded. `in_block` is
+    /// whether it lands inside a block (open, or a forwarded `BEGIN` not yet
+    /// acknowledged).
+    pub(crate) fn effect_apply(&mut self, effect: SettingsEffect, in_block: bool) {
+        if effect.block_revert {
+            for state in &mut self.states {
+                if state.touched_in_block {
+                    state.block = Some(SettingValue::Unknown);
+                }
+            }
+        }
+        if effect.is_none() {
+            self.views_rederive();
+            return;
+        }
+        for guc in Guc::ALL {
+            if !effect.all && !effect.touched.contains(guc) {
+                continue;
+            }
+            let state = self.state_mut(guc);
+            if state.reported {
+                continue;
+            }
+            if !guc.block_sample_valid() {
+                // No block value to track: a block-scoped change is invisible
+                // to reads, a session-scoped one is confirmed after the block.
+                if !effect.local {
+                    state.session = SettingValue::Unknown;
+                }
+                continue;
+            }
+            if effect.local || in_block {
+                state.block = Some(SettingValue::Unknown);
+                state.touched_in_block = true;
+            }
+            if !effect.local {
+                state.session = SettingValue::Unknown;
+            }
+        }
+        self.views_rederive();
+    }
+
+    /// Mark the session value of one setting unknown (an isolation effect
+    /// the analyzer could not read).
+    pub(crate) fn session_unknown_mark(&mut self, guc: Guc) {
+        self.state_mut(guc).session = SettingValue::Unknown;
+        self.views_rederive();
+    }
+
+    /// The session isolation default as a parsed `SET` established it.
+    pub(crate) fn isolation_known_set(&mut self, level: IsolationLevel) {
+        self.state_mut(Guc::DefaultTransactionIsolation).session =
+            SettingValue::Known(isolation_setting_text(level).into());
+        self.views_rederive();
+    }
+
+    /// The open block ended: block values are gone, and session values were
+    /// already marked unknown by any session-scoped change made inside it.
+    pub(crate) fn block_exit(&mut self) {
+        for state in &mut self.states {
+            state.block = None;
+            state.touched_in_block = false;
+        }
+        self.views_rederive();
+    }
+
+    /// Apply a settings probe's row (one column per [`Guc::ALL`] entry) under
+    /// the status its `ReadyForQuery` carried.
+    pub(crate) fn probe_apply(&mut self, columns: &[Option<EcoString>], status: TransactionStatus) {
+        if status == TransactionStatus::Failed {
+            debug!("settings probe answered in a failed block, discarding");
+            return;
+        }
+        let in_block = status == TransactionStatus::InTransaction;
+        for (guc, column) in Guc::ALL.into_iter().zip(columns) {
+            let Some(value) = column else {
+                continue;
+            };
+            let state = self.state_mut(guc);
+            if !in_block {
+                state.session = SettingValue::Known(value.clone());
+                state.block = None;
+            } else if !guc.block_sample_valid() {
+                continue;
+            } else if state.block.is_some() {
+                state.block = Some(SettingValue::Known(value.clone()));
+            } else if state.session == SettingValue::Unknown {
+                state.session = SettingValue::Known(value.clone());
+            }
+        }
+        self.views_rederive();
+    }
+
+    /// The user `$user` expands to: the current role when one is set, else the
+    /// session authorization, else the startup user.
+    fn user_for_search_path(&self) -> Option<&str> {
+        if let Some(role) = self.state(Guc::Role).session.known()
+            && !role.eq_ignore_ascii_case("none")
+        {
+            return Some(role);
+        }
+        self.state(Guc::SessionAuthorization)
+            .session
+            .known()
+            .or(self.startup_user.as_deref())
+    }
+
+    fn views_rederive(&mut self) {
+        let in_block_value = self.state(Guc::SearchPath).block.as_ref();
+        let effective = in_block_value.unwrap_or(&self.state(Guc::SearchPath).session);
+        let search_path = match effective {
+            SettingValue::Known(value) => {
+                SearchPathState::resolved(value, self.user_for_search_path())
+            }
+            SettingValue::Unknown => SearchPathState::Unknown,
+        };
+        if search_path != self.search_path {
+            self.search_path = search_path;
+        }
+        self.isolation = match self.state(Guc::DefaultTransactionIsolation).session.known() {
+            Some(value) => match IsolationLevel::parse(value) {
+                Some(level) => IsolationState::Known(level),
+                None => IsolationState::Unknown,
+            },
+            None => IsolationState::Unknown,
+        };
+    }
+}
+
+/// The level as `SHOW default_transaction_isolation` prints it.
+fn isolation_setting_text(level: IsolationLevel) -> &'static str {
+    match level {
+        IsolationLevel::ReadCommitted => "read committed",
+        IsolationLevel::RepeatableRead => "repeatable read",
+        IsolationLevel::Serializable => "serializable",
+    }
+}
+
+/// The settings probe: one `current_setting` column per [`Guc::ALL`] entry,
+/// in order. `missing_ok` so an unset custom setting yields NULL rather than
+/// an error. A literal so it is a `&'static str` for [`ProbeQuery`]; the unit
+/// test pins it to the enum.
+pub(crate) const SETTINGS_PROBE_SQL: &str = "SELECT current_setting('search_path',true),current_setting('timezone',true),current_setting('datestyle',true),current_setting('intervalstyle',true),current_setting('standard_conforming_strings',true),current_setting('backslash_quote',true),current_setting('transform_null_equals',true),current_setting('array_nulls',true),current_setting('default_text_search_config',true),current_setting('gin_fuzzy_search_limit',true),current_setting('timezone_abbreviations',true),current_setting('extra_float_digits',true),current_setting('bytea_output',true),current_setting('client_encoding',true),current_setting('lc_monetary',true),current_setting('lc_numeric',true),current_setting('lc_time',true),current_setting('xmlbinary',true),current_setting('xmloption',true),current_setting('role',true),current_setting('session_authorization',true),current_setting('row_security',true),current_setting('default_transaction_isolation',true)";
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::wildcard_enum_match_arm)]
+
+    use super::*;
+    use crate::query::guc::GucSet;
+
+    fn all_known(status: TransactionStatus) -> SessionSettings {
+        let mut settings = SessionSettings::new();
+        settings.startup_user_set(Some("alice"));
+        settings.probe_apply(&sample("public"), status);
+        settings
+    }
+
+    /// A probe row with `search_path` set and every other setting a plain value.
+    fn sample(search_path: &str) -> Vec<Option<EcoString>> {
+        Guc::ALL
+            .into_iter()
+            .map(|guc| match guc {
+                Guc::SearchPath => Some(search_path.into()),
+                Guc::Role => Some("none".into()),
+                Guc::SessionAuthorization => Some("alice".into()),
+                Guc::DefaultTransactionIsolation => Some("read committed".into()),
+                _ => Some("x".into()),
+            })
+            .collect()
+    }
+
+    fn resolved(settings: &SessionSettings) -> Vec<String> {
+        settings
+            .search_path()
+            .resolve()
+            .expect("resolved search_path")
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn test_probe_sql_matches_guc_order() {
+        let columns: Vec<String> = Guc::ALL
+            .into_iter()
+            .map(|guc| format!("current_setting('{}',true)", guc.name()))
+            .collect();
+        assert_eq!(SETTINGS_PROBE_SQL, format!("SELECT {}", columns.join(",")));
+    }
+
+    #[test]
+    fn test_new_connection_forwards_until_probed() {
+        let mut settings = SessionSettings::new();
+        assert!(settings.probe_needed(false));
+        assert_eq!(
+            settings.serve_search_path(false),
+            Err(SettingsForwardReason::SettingUnknown(Guc::SearchPath))
+        );
+        settings.probe_apply(&sample("public"), TransactionStatus::Idle);
+        assert!(!settings.probe_needed(false));
+        assert_eq!(resolved(&settings), vec!["public"]);
+        assert_eq!(
+            settings.isolation(),
+            IsolationState::Known(IsolationLevel::ReadCommitted)
+        );
+    }
+
+    #[test]
+    fn test_parameter_status_sets_and_marks_reported() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.parameter_status(Guc::SearchPath, r#""$user", public"#);
+        assert_eq!(resolved(&settings), vec!["alice", "public"]);
+        // Reported: a later SET is left to origin, nothing becomes unknown.
+        settings.effect_apply(SettingsEffect::guc(Guc::SearchPath, false), false);
+        assert!(!settings.probe_needed(false));
+        assert_eq!(resolved(&settings), vec!["alice", "public"]);
+    }
+
+    #[test]
+    fn test_set_marks_unknown_and_probe_restores() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.effect_apply(SettingsEffect::guc(Guc::SearchPath, false), false);
+        assert!(settings.probe_needed(false));
+        assert_eq!(settings.search_path(), &SearchPathState::Unknown);
+        assert_eq!(
+            settings.serve_search_path(false),
+            Err(SettingsForwardReason::SettingUnknown(Guc::SearchPath))
+        );
+        settings.probe_apply(&sample("myapp, public"), TransactionStatus::Idle);
+        assert_eq!(resolved(&settings), vec!["myapp", "public"]);
+    }
+
+    #[test]
+    fn test_set_local_scopes_to_block_and_reverts_at_exit() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.effect_apply(SettingsEffect::guc(Guc::SearchPath, true), true);
+        // Session value untouched; the block needs a probe.
+        assert!(settings.probe_needed(true));
+        assert!(!settings.probe_needed(false));
+        settings.probe_apply(&sample("blockschema"), TransactionStatus::InTransaction);
+        assert_eq!(resolved(&settings), vec!["blockschema"]);
+        assert!(settings.serve_search_path(true).is_ok());
+        settings.block_exit();
+        assert_eq!(resolved(&settings), vec!["public"]);
+        assert!(!settings.probe_needed(false));
+    }
+
+    #[test]
+    fn test_set_inside_block_marks_both_scopes() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.effect_apply(SettingsEffect::guc(Guc::TimeZone, false), true);
+        assert!(settings.probe_needed(true));
+        settings.probe_apply(&sample("public"), TransactionStatus::InTransaction);
+        assert!(!settings.probe_needed(true));
+        // Commit or rollback: the session value is still unknown until a
+        // probe outside the block says.
+        settings.block_exit();
+        assert!(settings.probe_needed(false));
+        assert_eq!(
+            settings.serve_search_path(false),
+            Err(SettingsForwardReason::SettingUnknown(Guc::TimeZone))
+        );
+        settings.probe_apply(&sample("public"), TransactionStatus::Idle);
+        assert!(!settings.probe_needed(false));
+    }
+
+    #[test]
+    fn test_untouched_block_needs_no_probe_at_exit() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.block_exit();
+        assert!(!settings.probe_needed(false));
+        assert!(settings.serve_search_path(false).is_ok());
+    }
+
+    #[test]
+    fn test_rollback_to_savepoint_reverts_touched_block_values() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.effect_apply(SettingsEffect::guc(Guc::TimeZone, true), true);
+        settings.probe_apply(&sample("public"), TransactionStatus::InTransaction);
+        assert!(!settings.probe_needed(true));
+        settings.effect_apply(SettingsEffect::BLOCK_REVERT, true);
+        assert!(settings.probe_needed(true));
+        assert_eq!(
+            settings.effective(Guc::TimeZone, true),
+            &SettingValue::Unknown
+        );
+        assert_eq!(
+            settings.effective(Guc::SearchPath, true),
+            &SettingValue::Known("public".into())
+        );
+    }
+
+    #[test]
+    fn test_isolation_default_not_sampled_inside_a_block() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.session_unknown_mark(Guc::DefaultTransactionIsolation);
+        assert!(!settings.probe_needed(true), "cannot be learned in a block");
+        assert!(settings.probe_needed(false));
+        // It never gates a read: the block's level is fixed at BEGIN.
+        assert!(settings.serve_search_path(true).is_ok());
+        assert!(settings.serve_search_path(false).is_ok());
+        // A block-scoped change to it is invisible to reads.
+        settings.effect_apply(
+            SettingsEffect::guc(Guc::DefaultTransactionIsolation, true),
+            true,
+        );
+        assert!(!settings.probe_needed(true));
+        settings.probe_apply(&sample("public"), TransactionStatus::InTransaction);
+        assert_eq!(settings.isolation(), IsolationState::Unknown);
+        settings.probe_apply(&sample("public"), TransactionStatus::Idle);
+        assert_eq!(
+            settings.isolation(),
+            IsolationState::Known(IsolationLevel::ReadCommitted)
+        );
+        settings.isolation_known_set(IsolationLevel::Serializable);
+        assert_eq!(
+            settings.isolation(),
+            IsolationState::Known(IsolationLevel::Serializable)
+        );
+    }
+
+    #[test]
+    fn test_failed_block_sample_is_discarded() {
+        let mut settings = SessionSettings::new();
+        settings.probe_apply(&sample("public"), TransactionStatus::Failed);
+        assert!(settings.probe_needed(false));
+    }
+
+    #[test]
+    fn test_role_drives_user_expansion() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.parameter_status(Guc::SearchPath, "$user, public");
+        assert_eq!(resolved(&settings), vec!["alice", "public"]);
+        let mut row = sample("$user, public");
+        row[Guc::Role as usize] = Some("bob".into());
+        settings.probe_apply(&row, TransactionStatus::Idle);
+        assert_eq!(resolved(&settings), vec!["bob", "public"]);
+    }
+
+    #[test]
+    fn test_pg_catalog_after_schema_forwards() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.probe_apply(&sample("myschema, pg_catalog"), TransactionStatus::Idle);
+        assert_eq!(settings.search_path(), &SearchPathState::BuiltinsShadowed);
+        assert_eq!(
+            settings.serve_search_path(false),
+            Err(SettingsForwardReason::BuiltinsShadowed)
+        );
+        assert!(!settings.probe_needed(false), "the value is known");
+        settings.probe_apply(&sample("pg_catalog, myschema"), TransactionStatus::Idle);
+        assert_eq!(resolved(&settings), vec!["pg_catalog", "myschema"]);
+    }
+
+    #[test]
+    fn test_reset_all_marks_every_unreported_setting() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.parameter_status(Guc::ClientEncoding, "UTF8");
+        settings.effect_apply(SettingsEffect::all(), false);
+        assert_eq!(
+            settings.effective(Guc::ClientEncoding, false),
+            &SettingValue::Known("UTF8".into())
+        );
+        assert_eq!(
+            settings.effective(Guc::TimeZone, false),
+            &SettingValue::Unknown
+        );
+        let _ = GucSet::EMPTY;
+    }
+}

@@ -4,9 +4,9 @@ use tokio_util::{
     codec::Decoder,
 };
 
-use super::{
-    PgConnectionState, PgMessage, PgMessageType, ProtocolError, ProtocolResult, message_length,
-};
+use super::{PgConnectionState, PgMessage, PgMessageType, ProtocolError};
+#[cfg(test)]
+use super::{ProtocolResult, message_length};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PgFrontendMessageType {
@@ -113,6 +113,7 @@ impl ProbeQuery {
 /// Build a simple query message for sending to the backend.
 ///
 /// Message format: 'Q' | int32 len | string query (null-terminated)
+#[cfg(test)]
 pub(crate) fn simple_query_message_build(query: &str) -> ProtocolResult<BytesMut> {
     // Length includes: 4 bytes for length field + query bytes + 1 null terminator
     let len = message_length(4 + query.len() + 1)?;

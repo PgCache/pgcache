@@ -25,21 +25,22 @@ mod describe_cache;
 mod describe_synth;
 mod extended;
 mod extended_buffer;
+mod origin_intercept;
 mod probe;
 mod relay;
-mod search_path_intercept;
 mod telemetry;
 mod transaction_isolation;
 mod write_log;
 
 use super::origin_stream::{OriginReadHalf, OriginWriteHalf, origin_connect};
+use crate::proxy::session_settings::{IsolationState, SessionSettings};
 use describe_cache::{DESCRIBE_CACHE_CAPACITY, DescribeCacheEntry, DescribeKey};
 use extended_buffer::ExtendedPending;
+use origin_intercept::OriginIntercept;
 pub use relay::connection_task;
 use relay::forward_lazy_parse_install;
-use search_path_intercept::{OriginIntercept, SearchPathState};
 use telemetry::QueryTelemetry;
-use transaction_isolation::{IsolationState, TransactionForwardReason};
+use transaction_isolation::TransactionForwardReason;
 use write_log::{RawDecision, RawForwardCause, RawForwardReason, WriteLog, forward_cause};
 
 /// Manages state for a single client connection.
@@ -69,10 +70,6 @@ pub(super) struct ConnectionState {
     /// `Failed`) may be cache-served inside a block (PGC-387).
     transaction_status: TransactionStatus,
 
-    /// The session's `default_transaction_isolation`, probed once and tracked
-    /// through the statements that can change it (PGC-387).
-    session_isolation: IsolationState,
-
     /// The open block's isolation level, fixed on the idle→in-block edge from
     /// `pending_block_isolation` or the session default; tightened by `SET
     /// TRANSACTION`. Meaningless outside a block.
@@ -85,10 +82,6 @@ pub(super) struct ConnectionState {
     /// Forwarded `BEGIN`s whose idle→in-block ReadyForQuery has not arrived:
     /// a following pipelined statement already belongs to that block.
     begins_forwarded: u32,
-
-    /// The session default was changed inside a block, so it must be re-probed
-    /// once the block ends (a `SET` can revert with the block).
-    isolation_mutated_in_block: bool,
 
     /// A cache serve was abandoned mid-response inside a block: the connection
     /// closes once the serve returns so origin rolls the block back.
@@ -106,33 +99,14 @@ pub(super) struct ConnectionState {
     /// Extended protocol: portals (bound statements) by name
     portals: HashMap<EcoString, Portal>,
 
-    /// PostgreSQL session user from startup message
-    /// TODO: Track SET ROLE queries to update effective user for permission checks
-    session_user: Option<String>,
-
     /// Strips proxy-added parts out of a client request's own origin response
-    /// (a lazy `Parse`, a piggybacked `SHOW search_path`). Only one active at
-    /// a time. Whole injected probes are ordered by `egress` instead.
+    /// (a lazy `Parse`). Only one active at a time. Whole injected probes are
+    /// ordered by `egress` instead.
     origin_intercept: OriginIntercept,
 
-    /// Search path discovery state
-    search_path_state: SearchPathState,
-
-    /// Set when the TrailingShowSearchPath piggyback intercept resolves
-    /// search_path within the current origin message batch. Cleared when the
-    /// RFQ for that batch is processed. Used to suppress the txn-end dirty
-    /// marker so piggyback on COMMIT/ROLLBACK doesn't immediately clobber the
-    /// freshly-resolved value.
-    search_path_just_piggyback_resolved: bool,
-
-    /// Set on the first `ParameterStatus("search_path", ...)` message we
-    /// receive. This signals that the origin treats search_path as a
-    /// GUC_REPORT parameter and will emit ParameterStatus on every change
-    /// (PG18+ behavior). Once known, the proxy skips its defensive SHOW
-    /// machinery — mutation detection, piggyback rewrite, and txn-end dirty
-    /// marking — since ParameterStatus keeps state in sync automatically and
-    /// the redundant SHOW would just burn a round trip.
-    search_path_auto_reported: bool,
+    /// The tracked session settings and the views dispatch reads from them:
+    /// the resolved search_path and the isolation default (PGC-287).
+    session_settings: SessionSettings,
 
     /// Query timing instrumentation
     telemetry: QueryTelemetry,

@@ -300,6 +300,26 @@ pub(crate) fn authentication_type(data: &BytesMut) -> Option<i32> {
 /// Message format: 'D' | int32 len | int16 column_count | (int32 col_len | bytes col_data)*
 ///
 /// Returns `None` if the message is malformed or the column is NULL.
+/// Every column of the first `DataRow` in `data` (a batch may hold several);
+/// `None` for a NULL column. `None` overall if the frame is malformed.
+pub(crate) fn data_row_columns(data: &[u8]) -> Option<Vec<Option<&str>>> {
+    let count = u16::from_be_bytes(data.get(5..7)?.try_into().ok()?);
+    let mut columns = Vec::with_capacity(usize::from(count));
+    let mut at = 7usize;
+    for _ in 0..count {
+        let len = i32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?);
+        at += 4;
+        if len < 0 {
+            columns.push(None);
+            continue;
+        }
+        let len = usize::try_from(len).ok()?;
+        columns.push(Some(std::str::from_utf8(data.get(at..at + len)?).ok()?));
+        at += len;
+    }
+    Some(columns)
+}
+
 pub(crate) fn data_row_first_column(data: &[u8]) -> Option<&str> {
     // Skip tag ('D') and length (4 bytes) and column count (2 bytes)
     let payload = data.get(7..)?;
@@ -464,5 +484,28 @@ mod tests {
         let mut out = Vec::new();
         data_rows_first_columns(&blob, &mut out);
         assert_eq!(out, vec!["only line".to_owned()]);
+    }
+    #[test]
+    fn test_data_row_columns_reads_every_column_and_null() {
+        // tag 'D', len, 3 columns: "ab", NULL, "" (empty but not null)
+        let mut frame = vec![b'D'];
+        let body: Vec<u8> = [
+            &3u16.to_be_bytes()[..],
+            &2i32.to_be_bytes()[..],
+            b"ab",
+            &(-1i32).to_be_bytes()[..],
+            &0i32.to_be_bytes()[..],
+        ]
+        .concat();
+        let len = i32::try_from(body.len() + 4).expect("frame length fits");
+        frame.extend_from_slice(&len.to_be_bytes());
+        frame.extend_from_slice(&body);
+        assert_eq!(
+            data_row_columns(&frame),
+            Some(vec![Some("ab"), None, Some("")])
+        );
+        assert_eq!(data_row_first_column(&frame), Some("ab"));
+        // Truncated frame: no partial answer.
+        assert_eq!(data_row_columns(&frame[..frame.len() - 1]), None);
     }
 }

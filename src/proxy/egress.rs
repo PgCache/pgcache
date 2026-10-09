@@ -59,14 +59,17 @@ use tokio_util::bytes::Bytes;
 /// response is swallowed at its `Probe` slot and applied by the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProbeKind {
-    /// `SHOW search_path` — pre-PG18 discovery (ADR-006).
-    SearchPath,
-    /// `SHOW default_transaction_isolation` (ADR-054).
-    IsolationDefault,
+    /// One `current_setting(…)` column per tracked session setting
+    /// (PGC-287; covers the pre-PG18 search_path discovery of ADR-006 and the
+    /// isolation default of ADR-054).
+    SessionSettings,
     /// `SELECT pg_current_wal_insert_lsn()`: its LSN bounds the writes recorded
     /// through `stamp_seq` (ADR-048).
     CommitLsn { stamp_seq: u64 },
 }
+
+/// The columns of a probe's one `DataRow`; `None` is SQL NULL.
+pub(super) type ProbeRow = Vec<Option<EcoString>>;
 
 impl ProbeKind {
     fn same_kind(self, other: Self) -> bool {
@@ -74,12 +77,12 @@ impl ProbeKind {
     }
 }
 
-/// A probe whose `ReadyForQuery` arrived: what it was, and the first column of
-/// its one `DataRow` (`None` if the probe errored or returned nothing).
+/// A probe whose `ReadyForQuery` arrived: what it was, and the columns of its
+/// one `DataRow` (`None` if the probe errored or returned nothing).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ProbeResult {
     pub(super) kind: ProbeKind,
-    pub(super) row: Option<EcoString>,
+    pub(super) row: Option<ProbeRow>,
 }
 
 /// One pending client-bound response, in receive order. Generic over the cache
@@ -100,7 +103,7 @@ enum EgressSlot<C> {
     /// for the client.
     Probe {
         kind: ProbeKind,
-        row: Option<EcoString>,
+        row: Option<ProbeRow>,
     },
 }
 
@@ -160,11 +163,11 @@ impl<C> EgressQueue<C> {
         matches!(self.origin_reply_slot(), Some(EgressSlot::Probe { .. }))
     }
 
-    /// Record the probe reply's first column. No-op if the next reply is not a
+    /// Record the probe reply's row. No-op if the next reply is not a
     /// probe's.
-    pub(super) fn probe_row(&mut self, value: EcoString) {
+    pub(super) fn probe_row(&mut self, columns: ProbeRow) {
         if let Some(EgressSlot::Probe { row, .. }) = self.origin_reply_slot() {
-            *row = Some(value);
+            *row = Some(columns);
         }
     }
 
@@ -326,9 +329,24 @@ impl<C> EgressQueue<C> {
 
     /// Transition the head `Cache` slot into the serving state and take its
     /// message for dispatch to the worker. Returns `None` if the head is not a
-    /// pending cache slot.
+    /// pending cache slot, or while a session-settings probe is still
+    /// outstanding ahead of it: that probe is what makes the slot keyable, and
+    /// it is one round trip away (a commit-LSN probe decides nothing for the
+    /// slot, so it never holds one back).
     pub(super) fn cache_dispatch(&mut self) -> Option<C> {
-        match self.client_head_mut() {
+        let head = self.client_head()?;
+        if self.slots.iter().take(head).any(|s| {
+            matches!(
+                s,
+                EgressSlot::Probe {
+                    kind: ProbeKind::SessionSettings,
+                    ..
+                }
+            )
+        }) {
+            return None;
+        }
+        match self.slots.get_mut(head) {
             Some(EgressSlot::Cache { msg, serving }) if !*serving => {
                 *serving = true;
                 msg.take()
@@ -490,7 +508,7 @@ mod tests {
         // behind the probe flushes while the probe is still outstanding.
         let mut q = TestQueue::new();
         q.origin_open(); // R1
-        q.probe_push(ProbeKind::SearchPath);
+        q.probe_push(ProbeKind::SessionSettings);
         q.synth_push(Bytes::from_static(b"S"));
 
         q.origin_append(Bytes::from_static(b"r1"));
@@ -511,18 +529,18 @@ mod tests {
         // relayed; only then does the probe's reply get swallowed.
         let mut q = TestQueue::new();
         q.origin_open(); // R1
-        q.probe_push(ProbeKind::IsolationDefault);
+        q.probe_push(ProbeKind::SessionSettings);
         assert!(!q.origin_reply_is_probe());
-        assert!(q.probe_pending(ProbeKind::IsolationDefault));
+        assert!(q.probe_pending(ProbeKind::SessionSettings));
 
         q.origin_append(Bytes::from_static(b"r1"));
         q.origin_seal();
         assert!(q.origin_reply_is_probe());
-        q.probe_row("read committed".into());
+        q.probe_row(vec![Some("public".into()), None]);
         let done = q.probe_complete().expect("probe at origin head");
-        assert_eq!(done.kind, ProbeKind::IsolationDefault);
-        assert_eq!(done.row.as_deref(), Some("read committed"));
-        assert!(!q.probe_pending(ProbeKind::IsolationDefault));
+        assert_eq!(done.kind, ProbeKind::SessionSettings);
+        assert_eq!(done.row, Some(vec![Some("public".into()), None]));
+        assert!(!q.probe_pending(ProbeKind::SessionSettings));
         // R1's bytes are still owed to the client.
         assert_eq!(q.write_chunk(), b"r1");
         q.advance(2);
@@ -545,7 +563,7 @@ mod tests {
         q.cache_to_origin();
         // Probe reply first (it was written to origin first).
         assert!(q.origin_reply_is_probe());
-        q.probe_row("0/1".into());
+        q.probe_row(vec![Some("0/1".into())]);
         let done = q.probe_complete().expect("probe at origin head");
         assert_eq!(done.kind, ProbeKind::CommitLsn { stamp_seq: 7 });
         // Then the forwarded query's reply.
@@ -558,10 +576,25 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_waits_for_a_settings_probe_ahead_of_it() {
+        // The settings probe resolves what the cache slot is keyed under, so
+        // the slot dispatches only once the probe's reply is in.
+        let mut q = TestQueue::new();
+        q.probe_push(ProbeKind::SessionSettings);
+        q.cache_push("q1");
+        assert!(q.cache_dispatch().is_none());
+        q.probe_row(vec![Some("public".into())]);
+        assert!(q.probe_complete().is_some());
+        assert_eq!(q.cache_dispatch(), Some("q1"));
+        q.cache_done();
+        assert!(q.is_empty());
+    }
+
+    #[test]
     fn test_probe_complete_only_at_origin_head() {
         let mut q = TestQueue::new();
         q.origin_open(); // R1 unsealed, ahead of the probe
-        q.probe_push(ProbeKind::SearchPath);
+        q.probe_push(ProbeKind::SessionSettings);
         assert!(q.probe_complete().is_none());
         q.origin_seal();
         assert!(q.probe_complete().is_some());

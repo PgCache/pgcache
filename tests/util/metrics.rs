@@ -68,7 +68,7 @@ pub(crate) struct MetricsSnapshot {
     pub txn_forward_isolation_unknown: u64,
     pub txn_forward_isolation_strict: u64,
     pub txn_forward_pending_write: u64,
-    pub txn_isolation_probes: u64,
+    pub conn_settings_probes: u64,
 }
 
 /// Fetch metrics via HTTP from the Prometheus endpoint.
@@ -114,7 +114,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut txn_forward_isolation_unknown = 0u64;
     let mut txn_forward_isolation_strict = 0u64;
     let mut txn_forward_pending_write = 0u64;
-    let mut txn_isolation_probes = 0u64;
+    let mut conn_settings_probes = 0u64;
     let mut queries_invalid = 0u64;
     let mut queries_cache_hit = 0u64;
     let mut queries_cache_miss = 0u64;
@@ -181,7 +181,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_txn_forwards{reason=\"pending_write\"}" => {
                     txn_forward_pending_write = value;
                 }
-                "pgcache_txn_isolation_probes" => txn_isolation_probes = value,
+                "pgcache_conn_settings_probes" => conn_settings_probes = value,
                 "pgcache_queries_invalid" => queries_invalid = value,
                 "pgcache_queries_cache_hit" => queries_cache_hit = value,
                 "pgcache_queries_cache_miss" => queries_cache_miss = value,
@@ -292,7 +292,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         txn_forward_isolation_unknown,
         txn_forward_isolation_strict,
         txn_forward_pending_write,
-        txn_isolation_probes,
+        conn_settings_probes,
     })
 }
 
@@ -363,7 +363,7 @@ pub(crate) fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -
             - before.txn_forward_isolation_strict,
         txn_forward_pending_write: after.txn_forward_pending_write
             - before.txn_forward_pending_write,
-        txn_isolation_probes: after.txn_isolation_probes - before.txn_isolation_probes,
+        conn_settings_probes: after.conn_settings_probes - before.conn_settings_probes,
         // Rates are cumulative averages, not meaningful for deltas
         cache_hit_rate: 0.0,
         cacheability_rate: 0.0,

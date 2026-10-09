@@ -90,8 +90,6 @@ pub mod names {
     /// isolation_unknown | isolation_strict | pending_write (the block's own
     /// uncommitted writes intersect the read).
     pub const TXN_FORWARDS: &str = "pgcache.txn.forwards";
-    /// `SHOW default_transaction_isolation` probes injected on origin sockets.
-    pub const TXN_ISOLATION_PROBES: &str = "pgcache.txn.isolation_probes";
 
     // Histogram metrics (latency in seconds per Prometheus convention)
     /// End-to-end latency for cache hits: client message received → response written to client.
@@ -309,6 +307,8 @@ pub mod names {
     pub const PROTOCOL_DESCRIBE_CACHE_EVICTIONS: &str = "pgcache.protocol.describe_cache.evictions";
     pub const PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS: &str =
         "pgcache.protocol.describe_cache.invalidations";
+    /// Session-settings probes injected on origin connections (PGC-287).
+    pub const CONN_SETTINGS_PROBES: &str = "pgcache.conn.settings_probes";
     /// Bind+Execute forwards where pgcache prepended a lazy `Parse` because
     /// origin didn't yet know the statement.
     pub const PROTOCOL_LAZY_PARSE_FORWARDED: &str = "pgcache.protocol.lazy_parse_forwarded";
@@ -445,19 +445,17 @@ pub struct TxnHandles {
     pub forward_isolation_unknown: Counter,
     pub forward_isolation_strict: Counter,
     pub forward_pending_write: Counter,
-    pub isolation_probes: Counter,
 }
 
 impl TxnHandles {
     fn build() -> Self {
-        use names::{TXN_FORWARDS, TXN_ISOLATION_PROBES, TXN_SERVED};
+        use names::{TXN_FORWARDS, TXN_SERVED};
         Self {
             served: metrics::counter!(TXN_SERVED),
             forward_failed: metrics::counter!(TXN_FORWARDS, "reason" => "failed"),
             forward_isolation_unknown: metrics::counter!(TXN_FORWARDS, "reason" => "isolation_unknown"),
             forward_isolation_strict: metrics::counter!(TXN_FORWARDS, "reason" => "isolation_strict"),
             forward_pending_write: metrics::counter!(TXN_FORWARDS, "reason" => "pending_write"),
-            isolation_probes: metrics::counter!(TXN_ISOLATION_PROBES),
         }
     }
 }
@@ -527,6 +525,8 @@ pub struct ConnHandles {
     pub describe_misses: Counter,
     pub describe_evictions: Counter,
     pub describe_invalidations: Counter,
+    /// Session-settings probes injected on origin connections (PGC-287).
+    pub settings_probes: Counter,
     pub lazy_parse_forwarded: Counter,
     pub close_local: Counter,
 }
@@ -534,11 +534,11 @@ pub struct ConnHandles {
 impl ConnHandles {
     fn build() -> Self {
         use names::{
-            CACHEABILITY_ENTRIES, CONNECTIONS_ACTIVE, CONNECTIONS_ERRORS, CONNECTIONS_TOTAL,
-            PROTOCOL_CLOSE_LOCAL, PROTOCOL_DESCRIBE_CACHE_EVICTIONS, PROTOCOL_DESCRIBE_CACHE_HITS,
-            PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS, PROTOCOL_DESCRIBE_CACHE_MISSES,
-            PROTOCOL_EXTENDED_QUERIES, PROTOCOL_LAZY_PARSE_FORWARDED, PROTOCOL_PREPARED_STATEMENTS,
-            PROTOCOL_SIMPLE_QUERIES,
+            CACHEABILITY_ENTRIES, CONN_SETTINGS_PROBES, CONNECTIONS_ACTIVE, CONNECTIONS_ERRORS,
+            CONNECTIONS_TOTAL, PROTOCOL_CLOSE_LOCAL, PROTOCOL_DESCRIBE_CACHE_EVICTIONS,
+            PROTOCOL_DESCRIBE_CACHE_HITS, PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS,
+            PROTOCOL_DESCRIBE_CACHE_MISSES, PROTOCOL_EXTENDED_QUERIES,
+            PROTOCOL_LAZY_PARSE_FORWARDED, PROTOCOL_PREPARED_STATEMENTS, PROTOCOL_SIMPLE_QUERIES,
         };
         Self {
             total: metrics::counter!(CONNECTIONS_TOTAL),
@@ -552,6 +552,7 @@ impl ConnHandles {
             describe_misses: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_MISSES),
             describe_evictions: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_EVICTIONS),
             describe_invalidations: metrics::counter!(PROTOCOL_DESCRIBE_CACHE_INVALIDATIONS),
+            settings_probes: metrics::counter!(CONN_SETTINGS_PROBES),
             lazy_parse_forwarded: metrics::counter!(PROTOCOL_LAZY_PARSE_FORWARDED),
             close_local: metrics::counter!(PROTOCOL_CLOSE_LOCAL),
         }

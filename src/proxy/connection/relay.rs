@@ -25,17 +25,18 @@ use tracing::{debug, error, instrument, trace, warn};
 use super::{
     ConnectionState, DESCRIBE_CACHE_CAPACITY, ExtendedPending, IsolationState, OriginIntercept,
     OriginReadHalf, OriginWriteHalf, QueryTelemetry, RawDecision, RawForwardCause,
-    RawForwardReason, SearchPathState, TransactionForwardReason, WriteLog, forward_cause,
-    origin_connect,
+    RawForwardReason, TransactionForwardReason, WriteLog, forward_cause, origin_connect,
 };
 use crate::catalog::FunctionVolatility;
 use crate::proxy::CacheabilityStore;
 use crate::proxy::ParseError;
 use crate::proxy::client_stream::{ClientSocket, ClientStream, OwnedClientReadHalf};
 use crate::proxy::query::{Action, CacheabilityCache, ForwardReason, handle_query};
+use crate::proxy::session_settings::SessionSettings;
 use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
+use crate::query::guc::Guc;
 use crate::query::transform::query_expr_parameters_replace;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
@@ -234,14 +235,13 @@ async fn handle_connection(
                 // except `pgcache_explain`, which resolves against the cached
                 // query's stored form and doesn't use the client's search_path,
                 // so dispatch it even on the first (unresolved) statement (PGC-345).
-                let resolved_search_path = match state.search_path_state.resolve() {
-                    Some(search_path) => search_path,
-                    None if matches!(msg, CacheMessage::Explain(..)) => Arc::from([]),
-                    None => {
-                        debug!(
-                            "{}, forwarding to origin",
-                            state.search_path_state.forward_reason()
-                        );
+                let in_block = state.in_transaction();
+                let resolved_search_path = match state.session_settings.serve_search_path(in_block)
+                {
+                    Ok(search_path) => search_path,
+                    Err(_) if matches!(msg, CacheMessage::Explain(..)) => Arc::from([]),
+                    Err(reason) => {
+                        debug!("{}, forwarding to origin", reason.describe());
                         crate::metrics::handles().query.uncacheable.increment(1);
                         state.cache_slot_forward_to_origin(msg);
                         continue;
@@ -626,21 +626,16 @@ impl ConnectionState {
             flush_describe_pending: false,
             cacheability_cache: CacheabilityCache::new(cacheability_store),
             transaction_status: TransactionStatus::Idle,
-            session_isolation: IsolationState::Unknown,
             block_isolation: IsolationState::Unknown,
             pending_block_isolation: None,
             begins_forwarded: 0,
-            isolation_mutated_in_block: false,
             close_requested: false,
             proxy_mode: ProxyMode::Read,
             proxy_status: ProxyStatus::Normal,
             prepared_statements: HashMap::new(),
             portals: HashMap::new(),
-            session_user: None,
             origin_intercept: OriginIntercept::None,
-            search_path_state: SearchPathState::Unknown,
-            search_path_just_piggyback_resolved: false,
-            search_path_auto_reported: false,
+            session_settings: SessionSettings::new(),
             telemetry: QueryTelemetry::new(),
             func_volatility,
             extended: ExtendedPending::new(),
@@ -659,7 +654,26 @@ impl ConnectionState {
         if let Some(class) = &effects.write {
             self.write_log.record(class);
         }
+        let in_block = self.forwarding_into_block();
+        let settings = effects.settings;
+        self.session_settings_update(|state| state.effect_apply(settings, in_block));
         self.isolation_effects_apply(effects);
+    }
+
+    /// Mutate the session settings; a change to the effective search_path
+    /// clears the describe cache, whose RowDescription column types depend on
+    /// how unqualified names resolve.
+    pub(super) fn session_settings_update(&mut self, update: impl FnOnce(&mut SessionSettings)) {
+        let before = self.session_settings.search_path().clone();
+        update(&mut self.session_settings);
+        if self.session_settings.search_path() != &before && !self.describe_cache.is_empty() {
+            let n = self.describe_cache.len();
+            self.describe_cache.clear();
+            crate::metrics::handles()
+                .conn
+                .describe_invalidations
+                .increment(n as u64);
+        }
     }
 
     /// Analyze a statement forwarded without a cache decision (failed block,
@@ -759,13 +773,11 @@ impl ConnectionState {
 
     /// Handle a simple-protocol `Query`: route it to the cache, explain it, or
     /// forward it to origin, recording its effects on the way.
-    async fn simple_query_handle(&mut self, mut msg: PgFrontendMessage) {
+    async fn simple_query_handle(&mut self, msg: PgFrontendMessage) {
         let m = crate::metrics::handles();
         m.query.total.increment(1);
         m.conn.simple_queries.increment(1);
         self.telemetry.query_receive();
-
-        self.search_path_inspect_query(&mut msg);
 
         if self.cache_dispatch_possible() {
             let analyzed = handle_query(
@@ -803,7 +815,8 @@ impl ConnectionState {
             }
             Ok(Action::CacheCheck(ast)) => {
                 let search_path = self
-                    .search_path_state
+                    .session_settings
+                    .search_path()
                     .resolve()
                     .unwrap_or_else(|| Arc::from([]));
                 let key = query_expr_session_key(ast.query(), &search_path);
@@ -840,7 +853,8 @@ impl ConnectionState {
     /// Handle the client's `StartupMessage`: note the session user, and
     /// disable caching for a database other than the one the cache mirrors.
     fn startup_handle(&mut self, msg: PgFrontendMessage) {
-        self.session_user = startup_message_parameter(&msg.data, "user").map(String::from);
+        let user = startup_message_parameter(&msg.data, "user");
+        self.session_settings_update(|settings| settings.startup_user_set(user));
 
         // The cache is connected to a specific database and cannot serve queries
         // for other databases.
@@ -922,21 +936,15 @@ impl ConnectionState {
         let Some((name, value)) = parameter_status_parse(data) else {
             return;
         };
-        match name {
-            "search_path" => {
-                // PG18+ reports search_path as a GUC_REPORT parameter, emitting
-                // this message on every change (including startup, SET, DISCARD
-                // ALL, and SET LOCAL reverts at transaction end). First arrival
-                // tells us we can skip the defensive SHOW machinery.
-                debug!("received search_path from ParameterStatus: {}", value);
-                self.search_path_state =
-                    SearchPathState::resolved(value, self.session_user.as_deref());
-                self.search_path_auto_reported = true;
-            }
-            "server_version" => {
-                pg_version_set(value.to_owned());
-            }
-            _ => {}
+        if name == "server_version" {
+            pg_version_set(value.to_owned());
+        }
+        // Origin reports a tracked setting on every change (startup, SET,
+        // DISCARD ALL, a SET LOCAL reverting at block end); from the first
+        // report on, that setting is never probed or marked unknown again.
+        if let Some(guc) = Guc::parse(name) {
+            debug!("received {guc} from ParameterStatus");
+            self.session_settings_update(|settings| settings.parameter_status(guc, value));
         }
     }
 
@@ -944,7 +952,6 @@ impl ConnectionState {
     /// a block, 'E' failed block) and everything that hangs off a block ending.
     fn ready_for_query_handle(&mut self, data: &BytesMut) {
         let previous_status = self.transaction_status;
-        let was_in_transaction = self.in_transaction();
         self.transaction_status = TransactionStatus::from_ready_for_query(data);
 
         self.telemetry.origin_complete();
@@ -954,25 +961,7 @@ impl ConnectionState {
             self.portals.retain(|name, _| !name.is_empty());
         }
 
-        if self.search_path_reset_needed(was_in_transaction) {
-            debug!("txn ended, marking search_path unknown");
-            self.search_path_mark_unknown();
-        }
-        self.search_path_just_piggyback_resolved = false;
         self.isolation_block_transition(previous_status);
-    }
-
-    /// Transaction ended: any SET (including SET LOCAL) within the txn
-    /// reverts, so the cached search_path may no longer match. Skipped on
-    /// PG18+: ParameterStatus already arrived earlier in this same batch with
-    /// the post-txn value. Also skipped if a piggyback intercept in this batch
-    /// has already resolved search_path — marking unknown would clobber that
-    /// fresh value.
-    fn search_path_reset_needed(&self, was_in_transaction: bool) -> bool {
-        let txn_ended = was_in_transaction && !self.in_transaction();
-        let already_known =
-            self.search_path_just_piggyback_resolved || self.search_path_auto_reported;
-        txn_ended && !already_known
     }
 
     /// Relay an origin message to the client's egress queue. ReadyForQuery

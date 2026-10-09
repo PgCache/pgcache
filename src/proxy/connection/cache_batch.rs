@@ -48,7 +48,8 @@ impl ConnectionState {
     pub(super) fn cache_batch_dispatch(&mut self, entries: SmallVec<[ExecuteEntry; 1]>) {
         // Unknown search_path forwards at dispatch; the key is then only a label.
         let search_path = self
-            .search_path_state
+            .session_settings
+            .search_path()
             .resolve()
             .unwrap_or_else(|| Arc::from([]));
         // Common case: a single Parse/Bind/Describe/Execute. Begin it directly

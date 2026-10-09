@@ -1,11 +1,8 @@
-//! search_path handling, split by safety profile.
-//!
-//! * [`mutations`] — unsafe FFI classification of search_path-mutating
-//!   statements over a raw pg_query parse tree.
-//! * [`value`] — the pure, safe `SearchPath` value: parse and resolve.
+//! The parsed `search_path` value: pure, safe string parsing and resolution.
+//! Which statements change it is the analyzer's business
+//! (`SettingsEffect`), and the per-connection state lives in
+//! `proxy::session_settings`.
 
-mod mutations;
 mod value;
 
-pub use mutations::{MutationKind, SearchPathMutations, search_path_mutations_raw};
 pub use value::{SearchPath, SearchPathEntry};
