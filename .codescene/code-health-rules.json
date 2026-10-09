@@ -6,6 +6,10 @@
         {
           "name": "function_lines_of_code_warning",
           "value": 150
+        },
+        {
+          "name": "file_lines_of_code_for_warning",
+          "value": 3000
         }
       ],
       "rules": [
@@ -55,6 +59,12 @@
         {
           "name": "Number of Functions in a Single Module",
           "weight": 0.0
+        }
+      ],
+      "thresholds": [
+        {
+          "name": "file_lines_of_code_for_warning",
+          "value": 3000
         }
       ]
     }

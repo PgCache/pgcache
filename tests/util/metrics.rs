@@ -10,7 +10,7 @@ use super::context::TestContext;
 
 /// Point-in-time snapshot of metrics for test assertions.
 /// Populated by parsing metrics from the Prometheus HTTP endpoint.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct MetricsSnapshot {
     pub queries_total: u64,
     pub queries_cacheable: u64,
@@ -97,291 +97,133 @@ pub(crate) async fn metrics_http_get(port: u16) -> Result<MetricsSnapshot, Error
     metrics_prometheus_parse(&response)
 }
 
+/// A sample's Prometheus name and the snapshot field it fills.
+struct Sample {
+    name: &'static str,
+    field: fn(&mut MetricsSnapshot) -> &mut u64,
+}
+
+macro_rules! samples {
+    ($($name:literal => $field:ident,)*) => {
+        &[$(Sample { name: $name, field: |snapshot| &mut snapshot.$field },)*]
+    };
+}
+
+/// Every sample the snapshot records, by its exported name.
+const SAMPLES: &[Sample] = samples! {
+    "pgcache_queries_total" => queries_total,
+    "pgcache_queries_cacheable" => queries_cacheable,
+    "pgcache_queries_uncacheable" => queries_uncacheable,
+    "pgcache_queries_unsupported" => queries_unsupported,
+    "pgcache_raw_writes_recorded" => raw_writes_recorded,
+    "pgcache_raw_probes" => raw_probes,
+    "pgcache_raw_serve_disjoint_insert" => raw_serve_disjoint_insert,
+    "pgcache_raw_serve_disjoint_delete" => raw_serve_disjoint_delete,
+    "pgcache_raw_serve_disjoint_update" => raw_serve_disjoint_update,
+    "pgcache_cache_cdc_toast_repairs" => cache_cdc_toast_repairs,
+    "pgcache_cache_cdc_toast_fallbacks" => cache_cdc_toast_fallbacks,
+    "pgcache_cache_cdc_toast_stale_aborts" => cache_cdc_toast_stale_aborts,
+    "pgcache_txn_served" => txn_served,
+    "pgcache_txn_forwards{reason=\"failed\"}" => txn_forward_failed,
+    "pgcache_txn_forwards{reason=\"isolation_unknown\"}" => txn_forward_isolation_unknown,
+    "pgcache_txn_forwards{reason=\"isolation_strict\"}" => txn_forward_isolation_strict,
+    "pgcache_txn_forwards{reason=\"pending_write\"}" => txn_forward_pending_write,
+    "pgcache_conn_settings_probes" => conn_settings_probes,
+    "pgcache_queries_invalid" => queries_invalid,
+    "pgcache_queries_cache_hit" => queries_cache_hit,
+    "pgcache_queries_cache_miss" => queries_cache_miss,
+    "pgcache_queries_cache_error" => queries_cache_error,
+    "pgcache_queries_allowlist_skipped" => queries_allowlist_skipped,
+    "pgcache_cache_subsumptions" => cache_subsumptions,
+    "pgcache_cache_invalidations" => cache_invalidations,
+    "pgcache_cache_readmissions" => cache_readmissions,
+    "pgcache_cache_coalesce_served" => cache_coalesce_served,
+    "pgcache_cache_coalesce_deadline_forward_total" => cache_coalesce_deadline_forward,
+    "pgcache_cache_coalesce_waiting" => cache_coalesce_waiting,
+    "pgcache_cache_restarts_total" => cache_restarts_total,
+    "pgcache_cache_pool_replenished" => cache_pool_replenished,
+    "pgcache_cache_serve_desync_total" => cache_serve_desync_total,
+    "pgcache_cache_mv_hits" => cache_mv_hits,
+    "pgcache_cache_mv_fallthrough" => cache_mv_fallthrough,
+    "pgcache_cache_mv_builds_suppressed" => cache_mv_builds_suppressed,
+    "pgcache_cache_mv_rebuilds" => cache_mv_rebuilds,
+    "pgcache_cache_mv_skipped_rebuilds" => cache_mv_skipped_rebuilds,
+    "pgcache_cache_mv_dirty_truncates" => cache_mv_dirty_truncates,
+    "pgcache_cache_memo_hits" => cache_memo_hits,
+    "pgcache_cache_memo_captures" => cache_memo_captures,
+    "pgcache_cache_serve_settings_applied" => cache_serve_settings_applied,
+    "pgcache_cache_reference_only_forward_total" => cache_reference_only_forwards,
+    "pgcache_cache_memo_evictions" => cache_memo_evictions,
+    "pgcache_cache_cdc_local_eval_hits" => cache_cdc_local_eval_hits,
+    "pgcache_cache_cdc_pg_eval_hits" => cache_cdc_pg_eval_hits,
+    "pgcache_protocol_describe_cache_hits" => protocol_describe_cache_hits,
+    "pgcache_protocol_describe_cache_misses" => protocol_describe_cache_misses,
+    "pgcache_protocol_lazy_parse_forwarded" => protocol_lazy_parse_forwarded,
+    "pgcache_protocol_close_local" => protocol_close_local,
+};
+
 /// Parse Prometheus text format into MetricsSnapshot.
 fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
-    let mut queries_total = 0u64;
-    let mut queries_cacheable = 0u64;
-    let mut queries_uncacheable = 0u64;
-    let mut queries_unsupported = 0u64;
-    let mut raw_writes_recorded = 0u64;
-    let mut raw_probes = 0u64;
-    let mut raw_serve_disjoint_insert = 0u64;
-    let mut raw_serve_disjoint_delete = 0u64;
-    let mut raw_serve_disjoint_update = 0u64;
-    let mut cache_cdc_toast_repairs = 0u64;
-    let mut cache_cdc_toast_fallbacks = 0u64;
-    let mut cache_cdc_toast_stale_aborts = 0u64;
-    let mut txn_served = 0u64;
-    let mut txn_forward_failed = 0u64;
-    let mut txn_forward_isolation_unknown = 0u64;
-    let mut txn_forward_isolation_strict = 0u64;
-    let mut txn_forward_pending_write = 0u64;
-    let mut conn_settings_probes = 0u64;
-    let mut queries_invalid = 0u64;
-    let mut queries_cache_hit = 0u64;
-    let mut queries_cache_miss = 0u64;
-    let mut queries_cache_error = 0u64;
-    let mut queries_allowlist_skipped = 0u64;
-    let mut cache_subsumptions = 0u64;
-    let mut cache_invalidations = 0u64;
-    let mut cache_readmissions = 0u64;
-    let mut cache_coalesce_served = 0u64;
-    let mut cache_coalesce_deadline_forward = 0u64;
-    let mut cache_coalesce_waiting = 0u64;
-    let mut cache_restarts_total = 0u64;
-    let mut cache_pool_replenished = 0u64;
-    let mut cache_serve_desync_total = 0u64;
-    let mut cache_mv_hits = 0u64;
-    let mut cache_mv_fallthrough = 0u64;
-    let mut cache_mv_builds_suppressed = 0u64;
-    let mut cache_mv_rebuilds = 0u64;
-    let mut cache_mv_skipped_rebuilds = 0u64;
-    let mut cache_mv_dirty_truncates = 0u64;
-    let mut cache_memo_hits = 0u64;
-    let mut cache_memo_captures = 0u64;
-    let mut cache_serve_settings_applied = 0u64;
-    let mut cache_reference_only_forwards = 0u64;
-    let mut cache_memo_evictions = 0u64;
-    let mut cache_cdc_local_eval_hits = 0u64;
-    let mut cache_cdc_pg_eval_hits = 0u64;
-    let mut protocol_describe_cache_hits = 0u64;
-    let mut protocol_describe_cache_misses = 0u64;
-    let mut protocol_lazy_parse_forwarded = 0u64;
-    let mut protocol_close_local = 0u64;
-
+    let mut snapshot = MetricsSnapshot::default();
     for line in response.lines() {
-        // Skip comments and empty lines
-        if line.starts_with('#') || line.is_empty() {
+        let Some((name, value)) = sample_parse(line) else {
             continue;
-        }
-
-        // Parse "metric_name value" format
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let name = parts[0];
-            let value: u64 = parts[1].parse().unwrap_or(0);
-
-            match name {
-                "pgcache_queries_total" => queries_total = value,
-                "pgcache_queries_cacheable" => queries_cacheable = value,
-                "pgcache_queries_uncacheable" => queries_uncacheable = value,
-                "pgcache_queries_unsupported" => queries_unsupported = value,
-                "pgcache_raw_writes_recorded" => raw_writes_recorded = value,
-                "pgcache_raw_probes" => raw_probes = value,
-                "pgcache_raw_serve_disjoint_insert" => raw_serve_disjoint_insert = value,
-                "pgcache_raw_serve_disjoint_delete" => raw_serve_disjoint_delete = value,
-                "pgcache_raw_serve_disjoint_update" => raw_serve_disjoint_update = value,
-                "pgcache_cache_cdc_toast_repairs" => cache_cdc_toast_repairs = value,
-                "pgcache_cache_cdc_toast_fallbacks" => cache_cdc_toast_fallbacks = value,
-                "pgcache_cache_cdc_toast_stale_aborts" => cache_cdc_toast_stale_aborts = value,
-                "pgcache_txn_served" => txn_served = value,
-                "pgcache_txn_forwards{reason=\"failed\"}" => txn_forward_failed = value,
-                "pgcache_txn_forwards{reason=\"isolation_unknown\"}" => {
-                    txn_forward_isolation_unknown = value;
-                }
-                "pgcache_txn_forwards{reason=\"isolation_strict\"}" => {
-                    txn_forward_isolation_strict = value;
-                }
-                "pgcache_txn_forwards{reason=\"pending_write\"}" => {
-                    txn_forward_pending_write = value;
-                }
-                "pgcache_conn_settings_probes" => conn_settings_probes = value,
-                "pgcache_queries_invalid" => queries_invalid = value,
-                "pgcache_queries_cache_hit" => queries_cache_hit = value,
-                "pgcache_queries_cache_miss" => queries_cache_miss = value,
-                "pgcache_queries_cache_error" => queries_cache_error = value,
-                "pgcache_queries_allowlist_skipped" => queries_allowlist_skipped = value,
-                "pgcache_cache_subsumptions" => cache_subsumptions = value,
-                "pgcache_cache_invalidations" => cache_invalidations = value,
-                "pgcache_cache_readmissions" => cache_readmissions = value,
-                "pgcache_cache_coalesce_served" => cache_coalesce_served = value,
-                "pgcache_cache_coalesce_deadline_forward_total" => {
-                    cache_coalesce_deadline_forward = value;
-                }
-                // Gauge: printed as "0", "1", or "1.0" — take the integer part.
-                "pgcache_cache_coalesce_waiting" => {
-                    cache_coalesce_waiting = parts[1]
-                        .split('.')
-                        .next()
-                        .and_then(|whole| whole.parse::<u64>().ok())
-                        .unwrap_or(0);
-                }
-                "pgcache_cache_restarts_total" => cache_restarts_total = value,
-                "pgcache_cache_pool_replenished" => cache_pool_replenished = value,
-                "pgcache_cache_serve_desync_total" => cache_serve_desync_total = value,
-                "pgcache_cache_mv_hits" => cache_mv_hits = value,
-                "pgcache_cache_mv_fallthrough" => cache_mv_fallthrough = value,
-                "pgcache_cache_mv_builds_suppressed" => cache_mv_builds_suppressed = value,
-                "pgcache_cache_mv_rebuilds" => cache_mv_rebuilds = value,
-                "pgcache_cache_mv_skipped_rebuilds" => cache_mv_skipped_rebuilds = value,
-                "pgcache_cache_mv_dirty_truncates" => cache_mv_dirty_truncates = value,
-                "pgcache_cache_memo_hits" => cache_memo_hits = value,
-                "pgcache_cache_memo_captures" => cache_memo_captures = value,
-                "pgcache_cache_serve_settings_applied" => cache_serve_settings_applied = value,
-                "pgcache_cache_reference_only_forward_total" => {
-                    cache_reference_only_forwards = value
-                }
-                "pgcache_cache_memo_evictions" => cache_memo_evictions = value,
-                "pgcache_cache_cdc_local_eval_hits" => cache_cdc_local_eval_hits = value,
-                "pgcache_cache_cdc_pg_eval_hits" => cache_cdc_pg_eval_hits = value,
-                "pgcache_protocol_describe_cache_hits" => protocol_describe_cache_hits = value,
-                "pgcache_protocol_describe_cache_misses" => protocol_describe_cache_misses = value,
-                "pgcache_protocol_lazy_parse_forwarded" => protocol_lazy_parse_forwarded = value,
-                "pgcache_protocol_close_local" => protocol_close_local = value,
-                _ => {}
-            }
+        };
+        if let Some(sample) = SAMPLES.iter().find(|sample| sample.name == name) {
+            *(sample.field)(&mut snapshot) = value;
         }
     }
+    snapshot.rates_derive();
+    Ok(snapshot)
+}
 
-    // Test telemetry rates; query counts in tests never approach 2^53.
-    #[allow(clippy::cast_precision_loss)]
-    let cache_hit_rate = if queries_cacheable > 0 {
-        (queries_cache_hit as f64 / queries_cacheable as f64) * 100.0
-    } else {
-        0.0
-    };
+/// `name value` from one exposition line; `None` for comments, blank lines
+/// and anything else. A gauge prints as `0`, `1` or `1.0`: the integer part
+/// is the value.
+fn sample_parse(line: &str) -> Option<(&str, u64)> {
+    if line.starts_with('#') {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let name = parts.next()?;
+    let whole = parts.next()?.split('.').next().unwrap_or_default();
+    Some((name, whole.parse().unwrap_or(0)))
+}
 
-    let queries_select = queries_total
-        .saturating_sub(queries_unsupported)
-        .saturating_sub(queries_invalid);
-    #[allow(clippy::cast_precision_loss)]
-    let cacheability_rate = if queries_select > 0 {
-        (queries_cacheable as f64 / queries_select as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    Ok(MetricsSnapshot {
-        queries_total,
-        queries_cacheable,
-        queries_uncacheable,
-        queries_unsupported,
-        queries_invalid,
-        queries_cache_hit,
-        queries_cache_miss,
-        queries_cache_error,
-        queries_allowlist_skipped,
-        cache_subsumptions,
-        cache_invalidations,
-        cache_readmissions,
-        cache_coalesce_served,
-        cache_coalesce_deadline_forward,
-        cache_coalesce_waiting,
-        cache_restarts_total,
-        cache_pool_replenished,
-        cache_serve_desync_total,
-        cache_mv_hits,
-        cache_mv_fallthrough,
-        cache_mv_builds_suppressed,
-        cache_mv_rebuilds,
-        cache_mv_skipped_rebuilds,
-        cache_mv_dirty_truncates,
-        cache_memo_hits,
-        cache_memo_captures,
-        cache_serve_settings_applied,
-        cache_reference_only_forwards,
-        cache_memo_evictions,
-        cache_cdc_local_eval_hits,
-        cache_cdc_pg_eval_hits,
-        protocol_describe_cache_hits,
-        protocol_describe_cache_misses,
-        protocol_lazy_parse_forwarded,
-        protocol_close_local,
-        cache_hit_rate,
-        cacheability_rate,
-        raw_writes_recorded,
-        raw_probes,
-        raw_serve_disjoint_insert,
-        raw_serve_disjoint_delete,
-        raw_serve_disjoint_update,
-        cache_cdc_toast_repairs,
-        cache_cdc_toast_fallbacks,
-        cache_cdc_toast_stale_aborts,
-        txn_served,
-        txn_forward_failed,
-        txn_forward_isolation_unknown,
-        txn_forward_isolation_strict,
-        txn_forward_pending_write,
-        conn_settings_probes,
-    })
+impl MetricsSnapshot {
+    /// The hit and cacheability rates from the counts.
+    fn rates_derive(&mut self) {
+        // Test telemetry rates; query counts in tests never approach 2^53.
+        #[allow(clippy::cast_precision_loss)]
+        if self.queries_cacheable > 0 {
+            self.cache_hit_rate =
+                (self.queries_cache_hit as f64 / self.queries_cacheable as f64) * 100.0;
+        }
+        let queries_select = self
+            .queries_total
+            .saturating_sub(self.queries_unsupported)
+            .saturating_sub(self.queries_invalid);
+        #[allow(clippy::cast_precision_loss)]
+        if queries_select > 0 {
+            self.cacheability_rate =
+                (self.queries_cacheable as f64 / queries_select as f64) * 100.0;
+        }
+    }
 }
 
 /// Calculate metrics delta between two snapshots.
 /// Useful for asserting metrics within a consolidated test where metrics accumulate.
 pub(crate) fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -> MetricsSnapshot {
-    MetricsSnapshot {
-        queries_total: after.queries_total - before.queries_total,
-        queries_cacheable: after.queries_cacheable - before.queries_cacheable,
-        queries_uncacheable: after.queries_uncacheable - before.queries_uncacheable,
-        queries_unsupported: after.queries_unsupported - before.queries_unsupported,
-        queries_invalid: after.queries_invalid - before.queries_invalid,
-        queries_cache_hit: after.queries_cache_hit - before.queries_cache_hit,
-        queries_cache_miss: after.queries_cache_miss - before.queries_cache_miss,
-        queries_cache_error: after.queries_cache_error - before.queries_cache_error,
-        queries_allowlist_skipped: after.queries_allowlist_skipped
-            - before.queries_allowlist_skipped,
-        cache_subsumptions: after.cache_subsumptions - before.cache_subsumptions,
-        cache_invalidations: after.cache_invalidations - before.cache_invalidations,
-        cache_readmissions: after.cache_readmissions - before.cache_readmissions,
-        cache_coalesce_served: after.cache_coalesce_served - before.cache_coalesce_served,
-        cache_coalesce_deadline_forward: after.cache_coalesce_deadline_forward
-            - before.cache_coalesce_deadline_forward,
-        // Gauge, not a counter: carry the current value rather than a delta.
-        cache_coalesce_waiting: after.cache_coalesce_waiting,
-        cache_restarts_total: after.cache_restarts_total - before.cache_restarts_total,
-        cache_pool_replenished: after.cache_pool_replenished - before.cache_pool_replenished,
-        cache_serve_desync_total: after.cache_serve_desync_total - before.cache_serve_desync_total,
-        cache_mv_hits: after.cache_mv_hits - before.cache_mv_hits,
-        cache_mv_fallthrough: after.cache_mv_fallthrough - before.cache_mv_fallthrough,
-        cache_mv_builds_suppressed: after.cache_mv_builds_suppressed
-            - before.cache_mv_builds_suppressed,
-        cache_mv_rebuilds: after.cache_mv_rebuilds - before.cache_mv_rebuilds,
-        cache_mv_skipped_rebuilds: after.cache_mv_skipped_rebuilds
-            - before.cache_mv_skipped_rebuilds,
-        cache_mv_dirty_truncates: after.cache_mv_dirty_truncates - before.cache_mv_dirty_truncates,
-        cache_memo_hits: after.cache_memo_hits - before.cache_memo_hits,
-        cache_memo_captures: after.cache_memo_captures - before.cache_memo_captures,
-        cache_serve_settings_applied: after.cache_serve_settings_applied
-            - before.cache_serve_settings_applied,
-        cache_reference_only_forwards: after.cache_reference_only_forwards
-            - before.cache_reference_only_forwards,
-        cache_memo_evictions: after.cache_memo_evictions - before.cache_memo_evictions,
-        cache_cdc_local_eval_hits: after.cache_cdc_local_eval_hits
-            - before.cache_cdc_local_eval_hits,
-        cache_cdc_pg_eval_hits: after.cache_cdc_pg_eval_hits - before.cache_cdc_pg_eval_hits,
-        protocol_describe_cache_hits: after.protocol_describe_cache_hits
-            - before.protocol_describe_cache_hits,
-        protocol_describe_cache_misses: after.protocol_describe_cache_misses
-            - before.protocol_describe_cache_misses,
-        protocol_lazy_parse_forwarded: after.protocol_lazy_parse_forwarded
-            - before.protocol_lazy_parse_forwarded,
-        protocol_close_local: after.protocol_close_local - before.protocol_close_local,
-        raw_writes_recorded: after.raw_writes_recorded - before.raw_writes_recorded,
-        raw_probes: after.raw_probes - before.raw_probes,
-        raw_serve_disjoint_insert: after.raw_serve_disjoint_insert
-            - before.raw_serve_disjoint_insert,
-        raw_serve_disjoint_delete: after.raw_serve_disjoint_delete
-            - before.raw_serve_disjoint_delete,
-        raw_serve_disjoint_update: after.raw_serve_disjoint_update
-            - before.raw_serve_disjoint_update,
-        cache_cdc_toast_repairs: after.cache_cdc_toast_repairs - before.cache_cdc_toast_repairs,
-        cache_cdc_toast_fallbacks: after.cache_cdc_toast_fallbacks
-            - before.cache_cdc_toast_fallbacks,
-        cache_cdc_toast_stale_aborts: after.cache_cdc_toast_stale_aborts
-            - before.cache_cdc_toast_stale_aborts,
-        txn_served: after.txn_served - before.txn_served,
-        txn_forward_failed: after.txn_forward_failed - before.txn_forward_failed,
-        txn_forward_isolation_unknown: after.txn_forward_isolation_unknown
-            - before.txn_forward_isolation_unknown,
-        txn_forward_isolation_strict: after.txn_forward_isolation_strict
-            - before.txn_forward_isolation_strict,
-        txn_forward_pending_write: after.txn_forward_pending_write
-            - before.txn_forward_pending_write,
-        conn_settings_probes: after.conn_settings_probes - before.conn_settings_probes,
-        // Rates are cumulative averages, not meaningful for deltas
-        cache_hit_rate: 0.0,
-        cacheability_rate: 0.0,
+    let mut before = before.clone();
+    let mut after = after.clone();
+    let mut delta = MetricsSnapshot::default();
+    for sample in SAMPLES {
+        *(sample.field)(&mut delta) = *(sample.field)(&mut after) - *(sample.field)(&mut before);
     }
+    // Gauge, not a counter: carry the current value rather than a delta.
+    delta.cache_coalesce_waiting = after.cache_coalesce_waiting;
+    // Rates are cumulative averages, not meaningful for deltas: left at zero.
+    delta
 }
 
 /// How long [`metrics_after_outcomes`] waits for outcomes to be recorded.
