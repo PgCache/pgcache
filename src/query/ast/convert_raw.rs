@@ -13,7 +13,7 @@ use pg_query::pg_nodes as pg;
 use super::raw::{NodePtr, cast, list_nodes, node_tag, node_tag_name, sublink_type_name};
 use super::{AstError, CteDefinition, NullOrder, OrderDirection, QueryExpr, SubLinkType};
 use crate::query::transform::query_expr_constant_fold;
-use crate::query::write::{IsolationEffect, TransactionBoundary, WriteClass};
+use crate::query::write::{IsolationEffect, SettingsEffect, TransactionBoundary, WriteClass};
 
 mod from;
 mod scalar;
@@ -64,6 +64,8 @@ pub enum RawStatement {
         transaction: Option<TransactionBoundary>,
         /// Effect on the session's isolation-level state (PGC-387).
         isolation: IsolationEffect,
+        /// Tracked session settings the statement may change (PGC-287).
+        settings: SettingsEffect,
     },
 }
 
@@ -97,9 +99,11 @@ pub unsafe fn statement_convert_raw(tree_root: *const c_void) -> Result<RawState
                 write::NonSelectClass::ReadOnly {
                     transaction,
                     isolation,
+                    settings,
                 } => RawStatement::ReadOnlyUtility {
                     transaction,
                     isolation,
+                    settings,
                 },
             },
         })

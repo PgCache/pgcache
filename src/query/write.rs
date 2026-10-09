@@ -9,6 +9,7 @@ use ecow::EcoString;
 use smallvec::SmallVec;
 
 use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::guc::{Guc, GucSet};
 
 /// Classification-time cap on extracted `INSERT ... VALUES` rows: a larger
 /// statement degrades to [`WriteClass::Table`] rather than pay per-cell
@@ -79,6 +80,75 @@ pub enum IsolationEffect {
     SessionUnknown,
 }
 
+/// Which tracked session settings a forwarded statement may change (PGC-287).
+/// Produced by the analyzer and applied by the connection's session-settings
+/// state when the statement is forwarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SettingsEffect {
+    /// Settings the statement names: `SET x`, `RESET x`, `set_config('x', …)`.
+    pub touched: GucSet,
+    /// Every tracked setting may have changed: `RESET ALL`, `DISCARD ALL`, a
+    /// `set_config` whose name is not a literal, or an unclassifiable statement.
+    pub all: bool,
+    /// Transaction-scoped (`SET LOCAL`, `set_config(…, true)`): the change
+    /// reverts when the block ends.
+    pub local: bool,
+    /// `ROLLBACK TO SAVEPOINT`: any setting changed inside the open block may
+    /// have reverted to its value at the savepoint.
+    pub block_revert: bool,
+}
+
+impl SettingsEffect {
+    pub const NONE: SettingsEffect = SettingsEffect {
+        touched: GucSet::EMPTY,
+        all: false,
+        local: false,
+        block_revert: false,
+    };
+
+    pub const BLOCK_REVERT: SettingsEffect = SettingsEffect {
+        block_revert: true,
+        ..SettingsEffect::NONE
+    };
+
+    pub const fn guc(guc: Guc, local: bool) -> Self {
+        SettingsEffect {
+            touched: GucSet::single(guc),
+            all: false,
+            local,
+            block_revert: false,
+        }
+    }
+
+    pub const fn all() -> Self {
+        SettingsEffect {
+            touched: GucSet::all(),
+            all: true,
+            local: false,
+            block_revert: false,
+        }
+    }
+
+    pub const fn is_none(self) -> bool {
+        self.touched.is_empty() && !self.all
+    }
+
+    /// Both effects at once. Session scope wins over transaction scope: a
+    /// session-scoped change inside a block marks the block too.
+    pub const fn union(self, other: Self) -> Self {
+        SettingsEffect {
+            touched: self.touched.union(other.touched),
+            all: self.all || other.all,
+            local: match (self.is_none(), other.is_none()) {
+                (true, _) => other.local,
+                (_, true) => self.local,
+                (false, false) => self.local && other.local,
+            },
+            block_revert: self.block_revert || other.block_revert,
+        }
+    }
+}
+
 /// Everything a forwarded statement does to the proxy's per-connection state,
 /// bundled so every forward path (simple query, extended Sync, extended Flush,
 /// forward-without-cache-decision) applies it the same way.
@@ -91,6 +161,8 @@ pub struct StatementEffects {
     pub isolation: IsolationEffect,
     /// Transaction-control boundary, for block-scoped isolation bookkeeping.
     pub transaction: Option<TransactionBoundary>,
+    /// Tracked session settings the statement may change (PGC-287).
+    pub settings: SettingsEffect,
 }
 
 impl StatementEffects {
@@ -99,6 +171,7 @@ impl StatementEffects {
             write: None,
             isolation,
             transaction,
+            settings: SettingsEffect::NONE,
         }
     }
 
@@ -107,7 +180,13 @@ impl StatementEffects {
             write: Some(class),
             isolation,
             transaction: None,
+            settings: SettingsEffect::NONE,
         }
+    }
+
+    pub fn with_settings(mut self, settings: SettingsEffect) -> Self {
+        self.settings = self.settings.union(settings);
+        self
     }
 
     /// A statement the proxy could not classify (parse failure, unresolvable
@@ -118,6 +197,7 @@ impl StatementEffects {
             write: Some(WriteClass::Connection),
             isolation: IsolationEffect::SessionUnknown,
             transaction: None,
+            settings: SettingsEffect::all(),
         }
     }
 }

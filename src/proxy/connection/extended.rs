@@ -285,6 +285,7 @@ impl ConnectionState {
                 .map(|class| write_class_bind(class, portal, stmt)),
             isolation: stmt.effects.isolation,
             transaction: stmt.effects.transaction,
+            settings: stmt.effects.settings,
         }
     }
 

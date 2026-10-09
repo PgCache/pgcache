@@ -12,9 +12,11 @@ use pg_query::pg_nodes as pg;
 use super::where_clause::{const_value_extract, param_ref_extract, where_expr_convert};
 use crate::query::ast::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
 use crate::query::ast::{BinaryExpr, BinaryOp, LiteralValue, ScalarExpr, WhereExpr};
+use crate::query::guc::Guc;
 use crate::query::write::{
     DeleteStatement, INSERT_MAX_ROWS, InsertRow, InsertStatement, IsolationEffect, IsolationLevel,
-    RelationRef, SetAssignment, TransactionBoundary, UpdateStatement, WriteClass, WriteComparison,
+    RelationRef, SetAssignment, SettingsEffect, TransactionBoundary, UpdateStatement, WriteClass,
+    WriteComparison,
 };
 
 /// Classification of a non-SELECT root statement.
@@ -27,14 +29,43 @@ pub(super) enum NonSelectClass {
     ReadOnly {
         transaction: Option<TransactionBoundary>,
         isolation: IsolationEffect,
+        settings: SettingsEffect,
     },
 }
 
-/// A read-only classification with no isolation effect.
+/// A read-only classification with no isolation or settings effect.
 fn read_only(transaction: Option<TransactionBoundary>) -> NonSelectClass {
     NonSelectClass::ReadOnly {
         transaction,
         isolation: IsolationEffect::None,
+        settings: SettingsEffect::NONE,
+    }
+}
+
+/// Which tracked settings a `SET` / `RESET` statement may change (PGC-287).
+/// pg_query normalises the spelling variants (`SET TIME ZONE`, `SET NAMES`,
+/// `SET SCHEMA`, `SET ROLE`, `SET SESSION AUTHORIZATION`) to the GUC name.
+unsafe fn variable_set_settings_effect(s: *const pg::VariableSetStmt) -> SettingsEffect {
+    unsafe {
+        let kind = (*s).kind;
+        if kind == pg::VariableSetKind_VAR_RESET_ALL {
+            return SettingsEffect::all();
+        }
+        let name = cstr((*s).name);
+        if kind == pg::VariableSetKind_VAR_SET_MULTI {
+            // `SET SESSION CHARACTERISTICS AS TRANSACTION …` sets the session
+            // transaction defaults; `SET TRANSACTION …` is block-scoped and
+            // tracked by the isolation effect alone.
+            return if name.eq_ignore_ascii_case("SESSION CHARACTERISTICS") {
+                SettingsEffect::guc(Guc::DefaultTransactionIsolation, false)
+            } else {
+                SettingsEffect::NONE
+            };
+        }
+        match Guc::parse(name) {
+            Some(guc) => SettingsEffect::guc(guc, (*s).is_local),
+            None => SettingsEffect::NONE,
+        }
     }
 }
 
@@ -174,17 +205,31 @@ pub(super) unsafe fn non_select_classify(stmt: NodePtr) -> NonSelectClass {
             pg::NodeTag_T_TransactionStmt => {
                 transaction_classify(cast::<pg::TransactionStmt>(stmt))
             }
-            pg::NodeTag_T_VariableSetStmt => ReadOnly {
-                transaction: None,
-                isolation: variable_set_isolation_effect(cast::<pg::VariableSetStmt>(stmt)),
-            },
-            pg::NodeTag_T_DiscardStmt => ReadOnly {
-                transaction: None,
-                isolation: match (*cast::<pg::DiscardStmt>(stmt)).target {
-                    pg::DiscardMode_DISCARD_ALL => IsolationEffect::SessionUnknown,
-                    _ => IsolationEffect::None,
-                },
-            },
+            pg::NodeTag_T_VariableSetStmt => {
+                let s = cast::<pg::VariableSetStmt>(stmt);
+                ReadOnly {
+                    transaction: None,
+                    isolation: variable_set_isolation_effect(s),
+                    settings: variable_set_settings_effect(s),
+                }
+            }
+            pg::NodeTag_T_DiscardStmt => {
+                let discard_all =
+                    (*cast::<pg::DiscardStmt>(stmt)).target == pg::DiscardMode_DISCARD_ALL;
+                ReadOnly {
+                    transaction: None,
+                    isolation: if discard_all {
+                        IsolationEffect::SessionUnknown
+                    } else {
+                        IsolationEffect::None
+                    },
+                    settings: if discard_all {
+                        SettingsEffect::all()
+                    } else {
+                        SettingsEffect::NONE
+                    },
+                }
+            }
             pg::NodeTag_T_ExplainStmt => explain_classify(cast::<pg::ExplainStmt>(stmt)),
             pg::NodeTag_T_VariableShowStmt
             | pg::NodeTag_T_DeallocateStmt
@@ -276,6 +321,7 @@ unsafe fn transaction_classify(s: *const pg::TransactionStmt) -> NonSelectClass 
                 NonSelectClass::ReadOnly {
                     transaction: Some(TransactionBoundary::Begin),
                     isolation: begin_isolation_effect((*s).options),
+                    settings: SettingsEffect::NONE,
                 }
             }
             // AND CHAIN immediately re-enters a transaction.
@@ -286,8 +332,12 @@ unsafe fn transaction_classify(s: *const pg::TransactionStmt) -> NonSelectClass 
                 TransactionBoundary::End
             })),
             pg::TransactionStmtKind_TRANS_STMT_SAVEPOINT
-            | pg::TransactionStmtKind_TRANS_STMT_RELEASE
-            | pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO => read_only(None),
+            | pg::TransactionStmtKind_TRANS_STMT_RELEASE => read_only(None),
+            pg::TransactionStmtKind_TRANS_STMT_ROLLBACK_TO => NonSelectClass::ReadOnly {
+                transaction: None,
+                isolation: IsolationEffect::None,
+                settings: SettingsEffect::BLOCK_REVERT,
+            },
             // PREPARE TRANSACTION commits later, possibly from another
             // session — the entry must never be LSN-stamped.
             pg::TransactionStmtKind_TRANS_STMT_PREPARE => {

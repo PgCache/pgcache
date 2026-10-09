@@ -16,10 +16,11 @@ use crate::{
     catalog::FunctionVolatility,
     id_hash::{BuildIdHasher, impl_id_hashable},
     query::ast::{
-        AstError, FunctionCall, LiteralValue, QueryBody, QueryExpr, RawStatement, ScalarExpr,
-        SelectColumn, SelectColumns, SelectNode, statement_convert_raw,
+        AstError, AstNode, FunctionCall, LiteralValue, QueryBody, QueryExpr, RawStatement,
+        ScalarExpr, SelectColumn, SelectColumns, SelectNode, statement_convert_raw,
     },
-    query::write::{IsolationEffect, StatementEffects, WriteClass},
+    query::guc::Guc,
+    query::write::{IsolationEffect, SettingsEffect, StatementEffects, WriteClass},
 };
 
 /// Name of the pseudo-function the proxy intercepts to explain a cached query
@@ -315,6 +316,37 @@ fn sql_mentions_set_config(sql: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }
 
+/// The settings effect of the `set_config` calls in a converted statement:
+/// each call with a literal name touches that setting (an untracked name is
+/// not an effect), scoped by a literal `is_local`; a call whose name is not a
+/// literal may change anything. The caller only asks when the text mentions
+/// `set_config`, so finding no call means it hides somewhere the converter
+/// does not model and the answer is likewise everything.
+fn set_config_calls_effect(query: &QueryExpr) -> SettingsEffect {
+    let mut effect = SettingsEffect::NONE;
+    let mut calls = 0usize;
+    for call in query.nodes::<FunctionCall>() {
+        if !call.name.eq_ignore_ascii_case("set_config") {
+            continue;
+        }
+        calls += 1;
+        let Some(ScalarExpr::Literal(LiteralValue::String(name))) = call.args.first() else {
+            return SettingsEffect::all();
+        };
+        let local = matches!(
+            call.args.get(2),
+            Some(ScalarExpr::Literal(LiteralValue::Boolean(true)))
+        );
+        if let Some(guc) = Guc::parse(name.as_str()) {
+            effect = effect.union(SettingsEffect::guc(guc, local));
+        }
+    }
+    if calls == 0 {
+        return SettingsEffect::all();
+    }
+    effect
+}
+
 /// Extract the SQL text from a simple-query (`Q`) frame: tag (1) + length (4) +
 /// the null-terminated query string. Returns `None` on a malformed frame or
 /// non-UTF-8 body.
@@ -364,17 +396,28 @@ pub(super) fn analyze(
     // `set_config('default_transaction_isolation', ...)` can hide in any
     // forwarded statement (a SELECT, a DO block, a CALL); a text scan is the
     // conservative catch-all, and a false positive only costs a re-probe.
-    let isolation = if sql_mentions_set_config(sql) {
+    let mentions_set_config = sql_mentions_set_config(sql);
+    let isolation = if mentions_set_config {
         IsolationEffect::SessionUnknown
     } else {
         IsolationEffect::None
     };
+    // Same scan for the tracked session settings (PGC-287); a converted SELECT
+    // narrows it to the settings its literal `set_config` names below.
+    let mut settings = if mentions_set_config {
+        SettingsEffect::all()
+    } else {
+        SettingsEffect::NONE
+    };
 
-    let action = match convert_result {
+    let mut action = match convert_result {
         Ok(RawStatement::Select {
             converted: Ok(query),
             ..
         }) => {
+            if mentions_set_config {
+                settings = set_config_calls_effect(&query);
+            }
             // `SELECT pgcache_explain(...)` is intercepted before cacheability
             // classification (it would otherwise be an uncacheable unknown
             // function) and routed to the cache to explain a cached plan.
@@ -435,6 +478,7 @@ pub(super) fn analyze(
         Ok(RawStatement::ReadOnlyUtility {
             transaction,
             isolation: statement_isolation,
+            settings: statement_settings,
         }) => Action::Forward(
             ForwardReason::UnsupportedStatement,
             // Only a whitelisted utility carries a parsed effect; the
@@ -447,7 +491,8 @@ pub(super) fn analyze(
                     statement_isolation
                 },
                 transaction,
-            ),
+            )
+            .with_settings(statement_settings),
         ),
         Err(ast_error) => {
             let reason = ast_error_forward_reason(&ast_error);
@@ -460,6 +505,9 @@ pub(super) fn analyze(
             Action::Forward(reason, effects)
         }
     };
+    if let Action::Forward(_, effects) = &mut action {
+        effects.settings = effects.settings.union(settings);
+    }
 
     // Don't memoize writes: DML text is almost always unique (fresh literals
     // per statement), so a write entry would rarely be re-hit, and its class
@@ -718,6 +766,50 @@ mod tests {
                 discriminant_name(&other)
             ),
         }
+    }
+
+    fn settings_of(sql: &str) -> SettingsEffect {
+        match analyze_fresh(sql, &HashMap::new()) {
+            Action::Forward(_, effects) => effects.settings,
+            _ => panic!("expected a forward for {sql:?}"),
+        }
+    }
+
+    /// PGC-287: a literal `set_config` names the setting it changes and its
+    /// scope; anything less certain may change every tracked setting.
+    #[test]
+    fn test_analyze_settings_effect_of_set_config() {
+        assert_eq!(
+            settings_of("SELECT set_config('timezone', 'UTC', true)"),
+            SettingsEffect::guc(Guc::TimeZone, true)
+        );
+        assert_eq!(
+            settings_of(
+                "SELECT set_config('search_path', 'a', false), set_config('role', 'r', false)"
+            ),
+            SettingsEffect::guc(Guc::SearchPath, false)
+                .union(SettingsEffect::guc(Guc::Role, false))
+        );
+        // Untracked names are no effect; a non-literal name may be anything.
+        assert_eq!(
+            settings_of("SELECT set_config('request.jwt.claims', '{}', true)"),
+            SettingsEffect::NONE
+        );
+        assert_eq!(
+            settings_of("SELECT set_config($1, 'x', false)"),
+            SettingsEffect::all()
+        );
+        // Hidden from the converter: the text scan's answer stands.
+        assert_eq!(
+            settings_of("DO $$ BEGIN PERFORM SET_CONFIG('x', 'y', false); END $$"),
+            SettingsEffect::all()
+        );
+        assert_eq!(settings_of("SELECT now()"), SettingsEffect::NONE);
+        assert_eq!(
+            settings_of("SET LOCAL search_path = a"),
+            SettingsEffect::guc(Guc::SearchPath, true)
+        );
+        assert!(StatementEffects::unknown().settings.all);
     }
 
     /// PGC-387: a `set_config()` call anywhere in a forwarded statement

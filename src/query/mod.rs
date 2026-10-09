@@ -5,6 +5,7 @@ pub mod constraints;
 pub mod decorrelate;
 pub mod evaluate;
 pub mod fingerprint;
+pub mod guc;
 pub mod predicate;
 pub mod resolve;
 pub mod resolved;

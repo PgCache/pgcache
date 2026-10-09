@@ -5,11 +5,12 @@
 use ecow::EcoString;
 
 use crate::query::ast::*;
+use crate::query::guc::Guc;
 use crate::query::write::IsolationEffect::{SessionDefault, SessionUnknown, Transaction};
 use crate::query::write::IsolationLevel::{ReadCommitted, RepeatableRead, Serializable};
 use crate::query::write::{
     DeleteStatement, INSERT_MAX_ROWS, InsertStatement, IsolationEffect, RelationRef,
-    TransactionBoundary, UpdateStatement, WriteClass,
+    SettingsEffect, TransactionBoundary, UpdateStatement, WriteClass,
 };
 
 /// Classify one SQL statement through the public entry point.
@@ -58,6 +59,94 @@ fn isolation_of(sql: &str) -> IsolationEffect {
         Ok(RawStatement::ReadOnlyUtility { isolation, .. }) => isolation,
         other => panic!("expected ReadOnlyUtility for {sql:?}, got {other:?}"),
     }
+}
+
+fn settings_of(sql: &str) -> SettingsEffect {
+    match classify(sql) {
+        Ok(RawStatement::ReadOnlyUtility { settings, .. }) => settings,
+        other => panic!("expected ReadOnlyUtility for {sql:?}, got {other:?}"),
+    }
+}
+
+/// PGC-287: `SET` / `RESET` / `DISCARD` report which tracked settings they
+/// may change, and whether the change is block-scoped.
+#[test]
+fn test_settings_effect_of_set_statements() {
+    assert_eq!(
+        settings_of("SET search_path TO myapp, public"),
+        SettingsEffect::guc(Guc::SearchPath, false)
+    );
+    assert_eq!(
+        settings_of("SET LOCAL search_path = myapp"),
+        SettingsEffect::guc(Guc::SearchPath, true)
+    );
+    assert_eq!(
+        settings_of("SET SESSION TimeZone = 'UTC'"),
+        SettingsEffect::guc(Guc::TimeZone, false)
+    );
+    assert_eq!(
+        settings_of("SET TIME ZONE 'Europe/Paris'"),
+        SettingsEffect::guc(Guc::TimeZone, false)
+    );
+    assert_eq!(
+        settings_of("SET NAMES 'UTF8'"),
+        SettingsEffect::guc(Guc::ClientEncoding, false)
+    );
+    assert_eq!(
+        settings_of("SET SCHEMA 'myapp'"),
+        SettingsEffect::guc(Guc::SearchPath, false)
+    );
+    assert_eq!(
+        settings_of("SET ROLE reader"),
+        SettingsEffect::guc(Guc::Role, false)
+    );
+    assert_eq!(
+        settings_of("SET SESSION AUTHORIZATION alice"),
+        SettingsEffect::guc(Guc::SessionAuthorization, false)
+    );
+    assert_eq!(
+        settings_of("SET search_path TO DEFAULT"),
+        SettingsEffect::guc(Guc::SearchPath, false)
+    );
+    assert_eq!(
+        settings_of("RESET timezone"),
+        SettingsEffect::guc(Guc::TimeZone, false)
+    );
+    assert_eq!(
+        settings_of("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+        SettingsEffect::guc(Guc::DefaultTransactionIsolation, false)
+    );
+    // Block-scoped isolation is the isolation effect's business.
+    assert_eq!(
+        settings_of("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+        SettingsEffect::NONE
+    );
+    assert_eq!(settings_of("SET work_mem = '64MB'"), SettingsEffect::NONE);
+}
+
+#[test]
+fn test_settings_effect_of_reset_all_and_discard() {
+    assert_eq!(settings_of("RESET ALL"), SettingsEffect::all());
+    assert_eq!(settings_of("DISCARD ALL"), SettingsEffect::all());
+    assert_eq!(settings_of("DISCARD TEMP"), SettingsEffect::NONE);
+    assert_eq!(settings_of("DISCARD PLANS"), SettingsEffect::NONE);
+    assert_eq!(settings_of("BEGIN"), SettingsEffect::NONE);
+    assert_eq!(settings_of("COMMIT"), SettingsEffect::NONE);
+    assert_eq!(
+        settings_of("ROLLBACK TO SAVEPOINT sp"),
+        SettingsEffect::BLOCK_REVERT
+    );
+    assert_eq!(settings_of("SAVEPOINT sp"), SettingsEffect::NONE);
+}
+
+#[test]
+fn test_settings_effect_union_scopes() {
+    let local = SettingsEffect::guc(Guc::TimeZone, true);
+    let session = SettingsEffect::guc(Guc::Role, false);
+    assert!(local.union(local).local);
+    assert!(!local.union(session).local);
+    assert_eq!(SettingsEffect::NONE.union(local), local);
+    assert!(local.union(SettingsEffect::all()).all);
 }
 
 /// PGC-387: transaction-control and SET statements report their effect on the
