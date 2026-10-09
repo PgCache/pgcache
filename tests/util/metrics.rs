@@ -42,6 +42,7 @@ pub(crate) struct MetricsSnapshot {
     pub cache_memo_hits: u64,
     pub cache_memo_captures: u64,
     pub cache_serve_settings_applied: u64,
+    pub cache_reference_only_forwards: u64,
     pub cache_memo_evictions: u64,
     pub cache_cdc_local_eval_hits: u64,
     pub cache_cdc_pg_eval_hits: u64,
@@ -139,6 +140,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
     let mut cache_memo_hits = 0u64;
     let mut cache_memo_captures = 0u64;
     let mut cache_serve_settings_applied = 0u64;
+    let mut cache_reference_only_forwards = 0u64;
     let mut cache_memo_evictions = 0u64;
     let mut cache_cdc_local_eval_hits = 0u64;
     let mut cache_cdc_pg_eval_hits = 0u64;
@@ -216,6 +218,9 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
                 "pgcache_cache_memo_hits" => cache_memo_hits = value,
                 "pgcache_cache_memo_captures" => cache_memo_captures = value,
                 "pgcache_cache_serve_settings_applied" => cache_serve_settings_applied = value,
+                "pgcache_cache_reference_only_forward_total" => {
+                    cache_reference_only_forwards = value
+                }
                 "pgcache_cache_memo_evictions" => cache_memo_evictions = value,
                 "pgcache_cache_cdc_local_eval_hits" => cache_cdc_local_eval_hits = value,
                 "pgcache_cache_cdc_pg_eval_hits" => cache_cdc_pg_eval_hits = value,
@@ -274,6 +279,7 @@ fn metrics_prometheus_parse(response: &str) -> Result<MetricsSnapshot, Error> {
         cache_memo_hits,
         cache_memo_captures,
         cache_serve_settings_applied,
+        cache_reference_only_forwards,
         cache_memo_evictions,
         cache_cdc_local_eval_hits,
         cache_cdc_pg_eval_hits,
@@ -337,6 +343,8 @@ pub(crate) fn metrics_delta(before: &MetricsSnapshot, after: &MetricsSnapshot) -
         cache_memo_captures: after.cache_memo_captures - before.cache_memo_captures,
         cache_serve_settings_applied: after.cache_serve_settings_applied
             - before.cache_serve_settings_applied,
+        cache_reference_only_forwards: after.cache_reference_only_forwards
+            - before.cache_reference_only_forwards,
         cache_memo_evictions: after.cache_memo_evictions - before.cache_memo_evictions,
         cache_cdc_local_eval_hits: after.cache_cdc_local_eval_hits
             - before.cache_cdc_local_eval_hits,
