@@ -19,7 +19,7 @@ use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::ClientSocket;
 use crate::query::ast::LimitClause;
-use crate::query::literal_settings::LiteralSettings;
+use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, QueryShape};
 use crate::settings::DynamicConfigHandle;
 use crate::timing::QueryTiming;
@@ -55,12 +55,11 @@ pub struct QueryRequest {
     pub result_formats: ResultFormats,
     pub client_socket: ClientSocket,
     pub reply_tx: ReplySender<CacheReply>,
-    /// Resolved search_path for schema resolution
-    pub search_path: Arc<[EcoString]>,
+    /// What the read is keyed under: the resolved search_path and the
+    /// literal settings at this read's scope.
+    pub keying: Arc<KeyingSettings>,
     /// The client's rendering settings at this read's scope (PGC-287).
     pub output_settings: Arc<OutputSettings>,
-    /// The client's literal-semantics settings at this read's scope (PGC-287).
-    pub literal_settings: Arc<LiteralSettings>,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Pipeline context from the proxy (None for simple queries and cold-path extended)

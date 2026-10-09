@@ -21,6 +21,7 @@ use crate::cache::output_settings::OutputSettings;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::proxy::search_path::SearchPath;
 use crate::query::guc::Guc;
+use crate::query::keying_settings::KeyingSettings;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::write::{IsolationLevel, SettingsEffect};
 
@@ -59,27 +60,89 @@ struct SettingState {
     touched_in_block: bool,
     /// Origin reports this setting by `ParameterStatus` on every change.
     reported: bool,
+    /// Whether the setting has a block value to track: an in-block sample is
+    /// meaningful and a block-scoped change is visible to reads
+    /// ([`Guc::block_sample_valid`]).
+    block_sample_valid: bool,
 }
 
 impl SettingState {
-    const UNKNOWN: SettingState = SettingState {
-        session: SettingValue::Unknown,
-        session_since: 0,
-        block: None,
-        block_since: 0,
-        touched_in_block: false,
-        reported: false,
-    };
+    fn for_guc(guc: Guc) -> Self {
+        Self {
+            session: SettingValue::Unknown,
+            session_since: 0,
+            block: None,
+            block_since: 0,
+            touched_in_block: false,
+            reported: false,
+            block_sample_valid: guc.block_sample_valid(),
+        }
+    }
 
     fn session_unknown_mark(&mut self, seq: u64) {
         self.session = SettingValue::Unknown;
         self.session_since = seq;
     }
 
+    /// No block value to track means nothing to mark: a block-scoped change
+    /// is invisible to reads, a session-scoped one is confirmed after the
+    /// block.
     fn block_unknown_mark(&mut self, seq: u64) {
+        if !self.block_sample_valid {
+            return;
+        }
         self.block = Some(SettingValue::Unknown);
         self.block_since = seq;
         self.touched_in_block = true;
+    }
+
+    /// How a forwarded statement's change to this setting lands: a reported
+    /// setting is left to origin's `ParameterStatus`; otherwise the block
+    /// mark (a block-scoped change, or any change inside a block), the
+    /// session mark (a session-scoped change), or both.
+    fn effect_mark(&mut self, local: bool, in_block: bool, seq: u64) {
+        if self.reported {
+            return;
+        }
+        if local || in_block {
+            self.block_unknown_mark(seq);
+        }
+        if !local {
+            self.session_unknown_mark(seq);
+        }
+    }
+
+    /// Fill the session value from a sample taken at `seq`, if it was
+    /// unknown since before then.
+    fn session_fill(&mut self, value: &EcoString, seq: u64) {
+        if self.session == SettingValue::Unknown && self.session_since <= seq {
+            self.session = SettingValue::Known(value.clone());
+        }
+    }
+
+    /// A sample taken with no block open. A block mark made after the probe
+    /// was injected belongs to a block the sample predates, so it stays.
+    fn idle_sample_apply(&mut self, value: &EcoString, seq: u64) {
+        if self.block_since <= seq {
+            self.block = None;
+        }
+        self.session_fill(value, seq);
+    }
+
+    /// A sample taken inside a block: it fills the block override when one
+    /// is marked unknown, else the session value the block inherits. Nothing
+    /// for a setting whose in-block sample is meaningless.
+    fn block_sample_apply(&mut self, value: &EcoString, seq: u64) {
+        if !self.block_sample_valid {
+            return;
+        }
+        match &self.block {
+            Some(SettingValue::Unknown) if self.block_since <= seq => {
+                self.block = Some(SettingValue::Known(value.clone()));
+            }
+            Some(_) => {}
+            None => self.session_fill(value, seq),
+        }
     }
 
     /// The value in force for a read in the given scope.
@@ -228,7 +291,7 @@ pub(crate) struct SessionSettings {
 impl SessionSettings {
     pub(crate) fn new() -> Self {
         Self {
-            states: [SettingState::UNKNOWN; Guc::ALL.len()],
+            states: Guc::ALL.map(SettingState::for_guc),
             startup_user: None,
             mutation_seq: 0,
             search_path: SearchPathState::Unknown,
@@ -268,13 +331,29 @@ impl SessionSettings {
         self.state(guc).effective(in_block)
     }
 
-    /// The search_path a cacheable read is keyed under, or why it forwards:
+    /// The settings a cacheable read is keyed under, or why it forwards:
     /// every tracked setting must be known at the read's scope, and the path
     /// must not shadow builtins.
-    pub(crate) fn serve_search_path(
+    pub(crate) fn serve_keying(
         &self,
         in_block: bool,
-    ) -> Result<Arc<[EcoString]>, SettingsForwardReason> {
+    ) -> Result<KeyingSettings, SettingsForwardReason> {
+        Ok(KeyingSettings {
+            search_path: self.serve_search_path(in_block)?,
+            literals: self.literal_settings(in_block),
+        })
+    }
+
+    /// Keying settings for a key that is only a label (telemetry, a batch
+    /// context): an unknown search_path reads as empty rather than forwarding.
+    pub(crate) fn keying_label(&self, in_block: bool) -> KeyingSettings {
+        KeyingSettings {
+            search_path: self.search_path.resolve().unwrap_or_else(|| Arc::from([])),
+            literals: self.literal_settings(in_block),
+        }
+    }
+
+    fn serve_search_path(&self, in_block: bool) -> Result<Arc<[EcoString]>, SettingsForwardReason> {
         if let Some(guc) = Guc::ALL
             .into_iter()
             .filter(|guc| guc.gates_reads())
@@ -304,7 +383,7 @@ impl SessionSettings {
     }
 
     /// The rendering settings in force for a read at this scope. The caller
-    /// has checked [`Self::serve_search_path`], so every value is known; an
+    /// has checked [`Self::serve_keying`], so every value is known; an
     /// unknown one (explain's path, which does not check) renders as empty.
     pub(crate) fn output_settings(&self, in_block: bool) -> OutputSettings {
         OutputSettings::from_values(|guc| {
@@ -316,8 +395,8 @@ impl SessionSettings {
     }
 
     /// The literal-semantics settings in force for a read at this scope; the
-    /// caller has checked [`Self::serve_search_path`], so every value is known.
-    pub(crate) fn literal_settings(&self, in_block: bool) -> LiteralSettings {
+    /// caller has checked [`Self::serve_keying`], so every value is known.
+    fn literal_settings(&self, in_block: bool) -> LiteralSettings {
         let value = |guc: Guc| self.effective(guc, in_block).known().unwrap_or_default();
         LiteralSettings::from_texts(
             value(Guc::TimeZone),
@@ -359,40 +438,28 @@ impl SessionSettings {
         self.mutation_seq += 1;
         let seq = self.mutation_seq;
         if effect.block_revert {
-            for state in &mut self.states {
-                if state.touched_in_block {
-                    state.block_unknown_mark(seq);
-                }
-            }
+            self.block_touched_revert(seq);
         }
         if effect.inert_at(in_block) {
             self.views_rederive();
             return;
         }
         for guc in Guc::ALL {
-            if !effect.all && !effect.touched.contains(guc) {
-                continue;
-            }
-            let state = self.state_mut(guc);
-            if state.reported {
-                continue;
-            }
-            if !guc.block_sample_valid() {
-                // No block value to track: a block-scoped change is invisible
-                // to reads, a session-scoped one is confirmed after the block.
-                if !effect.local {
-                    state.session_unknown_mark(seq);
-                }
-                continue;
-            }
-            if effect.local || in_block {
-                state.block_unknown_mark(seq);
-            }
-            if !effect.local {
-                state.session_unknown_mark(seq);
+            if effect.touches(guc) {
+                self.state_mut(guc).effect_mark(effect.local, in_block, seq);
             }
         }
         self.views_rederive();
+    }
+
+    /// A `ROLLBACK TO SAVEPOINT` may have reverted every block value a
+    /// statement touched inside the block.
+    fn block_touched_revert(&mut self, seq: u64) {
+        for state in &mut self.states {
+            if state.touched_in_block {
+                state.block_unknown_mark(seq);
+            }
+        }
     }
 
     /// Mark the session value of one setting unknown (an isolation effect
@@ -442,24 +509,10 @@ impl SessionSettings {
                 continue;
             };
             let state = self.state_mut(guc);
-            if !in_block {
-                // Idle: no block was open when origin sampled. A block mark
-                // made after the probe was injected belongs to a block the
-                // sample predates, so it stays.
-                if state.block_since <= seq {
-                    state.block = None;
-                }
-                if state.session == SettingValue::Unknown && state.session_since <= seq {
-                    state.session = SettingValue::Known(value.clone());
-                }
-            } else if !guc.block_sample_valid() {
-                continue;
-            } else if let Some(block) = &state.block {
-                if *block == SettingValue::Unknown && state.block_since <= seq {
-                    state.block = Some(SettingValue::Known(value.clone()));
-                }
-            } else if state.session == SettingValue::Unknown && state.session_since <= seq {
-                state.session = SettingValue::Known(value.clone());
+            if in_block {
+                state.block_sample_apply(value, seq);
+            } else {
+                state.idle_sample_apply(value, seq);
             }
         }
         self.views_rederive();

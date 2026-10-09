@@ -14,7 +14,7 @@ use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::{ClientSocket, ExplainSpec};
 use crate::query::Fingerprint;
-use crate::query::literal_settings::LiteralSettings;
+use crate::query::keying_settings::KeyingSettings;
 use crate::timing::QueryTiming;
 
 pub(crate) use super::serve_decision::AdmitAction;
@@ -176,12 +176,11 @@ pub struct ProxyMessage {
     /// Socket for sending response data directly to the client
     pub client_socket: ClientSocket,
     pub reply_tx: ReplySender<CacheReply>,
-    /// Resolved search_path for this connection (with $user expanded to session_user)
-    pub search_path: Arc<[EcoString]>,
+    /// What the read is keyed under: the resolved search_path and the
+    /// literal settings at this read's scope.
+    pub keying: Arc<KeyingSettings>,
     /// The client's rendering settings at this read's scope (PGC-287).
     pub output_settings: Arc<OutputSettings>,
-    /// The client's literal-semantics settings at this read's scope (PGC-287).
-    pub literal_settings: Arc<LiteralSettings>,
     /// Per-query timing data
     pub timing: QueryTiming,
     /// Pipeline context for atomic extended query dispatch.

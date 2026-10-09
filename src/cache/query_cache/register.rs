@@ -19,7 +19,7 @@ use crate::cache::reference_settings;
 use crate::cache::types::{CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics};
 use crate::cache::{CacheError, CacheResult};
 use crate::query::Fingerprint;
-use crate::query::ast::query_expr_session_key;
+use crate::query::keying_settings::KeyingSettings;
 use crate::timing::duration_to_ns_u64;
 
 /// Pinned queries have no client session, so their bare table names resolve
@@ -32,20 +32,16 @@ fn pinned_search_path() -> Arc<[EcoString]> {
 impl CacheDispatch {
     /// Register pinned queries at startup by sending Register commands with `pinned: true`.
     pub async fn pinned_queries_register(&self, pinned: &[PinnedQuery]) -> CacheResult<()> {
-        let search_path = pinned_search_path();
         // Pinned queries have no session: their literals mean what the
         // reference makes of them.
-        let literal_settings = Arc::new(reference_settings::current().literals.clone());
+        let keying = Arc::new(KeyingSettings {
+            search_path: pinned_search_path(),
+            literals: reference_settings::current().literals.clone(),
+        });
         for pq in pinned {
-            let session_key =
-                query_expr_session_key(pq.cacheable_query.query(), &search_path, &literal_settings);
+            let session_key = keying.session_key(pq.cacheable_query.query());
             let fingerprint = match self
-                .session_key_resolve(
-                    session_key,
-                    &pq.cacheable_query,
-                    &search_path,
-                    &literal_settings,
-                )
+                .session_key_resolve(session_key, &pq.cacheable_query, &keying)
                 .await
             {
                 Some(fingerprint) => fingerprint,
@@ -80,8 +76,7 @@ impl CacheDispatch {
             self.register_send(RegisterRequest {
                 fingerprint,
                 cacheable_query: Arc::clone(&pq.cacheable_query),
-                search_path: Arc::clone(&search_path),
-                literal_settings: Arc::clone(&literal_settings),
+                keying: Arc::clone(&keying),
                 started_at: Instant::now(),
                 subsumption_tx,
                 admit_action: AdmitAction::Admit,
@@ -112,8 +107,7 @@ impl CacheDispatch {
         let request = RegisterRequest {
             fingerprint,
             cacheable_query: Arc::clone(&msg.cacheable_query),
-            search_path: Arc::clone(&msg.search_path),
-            literal_settings: Arc::clone(&msg.literal_settings),
+            keying: Arc::clone(&msg.keying),
             started_at: Instant::now(),
             subsumption_tx,
             admit_action,

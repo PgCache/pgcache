@@ -16,8 +16,7 @@ use crate::cache::{CacheMessage, QueryParameters};
 use crate::pg::protocol::extended::parse_parameter_description;
 use crate::pg::protocol::session::{PreparedStatement, ResultFormats};
 use crate::query::SessionKey;
-use crate::query::ast::query_expr_session_key;
-use crate::query::literal_settings::LiteralSettings;
+use crate::query::keying_settings::KeyingSettings;
 use crate::query::write::StatementEffects;
 
 /// Each Execute's effects snapshot, in batch order, for a forwarded buffer.
@@ -286,15 +285,10 @@ impl DispatchContext {
         entry: ExecuteEntry,
         candidate: CacheCandidate,
         is_last: bool,
-        search_path: &[EcoString],
-        literal_settings: &LiteralSettings,
+        keying: &KeyingSettings,
     ) -> Self {
         let prep = entry.prep;
-        let key = query_expr_session_key(
-            candidate.cacheable_query.query(),
-            search_path,
-            literal_settings,
-        );
+        let key = keying.session_key(candidate.cacheable_query.query());
         let lazy_parse = (!prep.has_parse && candidate.lazy_parse_needed())
             .then(|| candidate.statement_name.clone());
         let pipeline = PipelineContext {

@@ -210,8 +210,7 @@ async fn resolve_command(core: &mut WriterCore, request: ResolveRequest) {
     let result = match resolve::query_fingerprint_resolve(
         core,
         request.cacheable_query.query(),
-        &request.search_path,
-        &request.literal_settings,
+        &request.keying,
     )
     .await
     {

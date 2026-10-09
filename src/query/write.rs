@@ -129,6 +129,11 @@ impl SettingsEffect {
         }
     }
 
+    /// Whether the statement may change `guc`.
+    pub fn touches(&self, guc: Guc) -> bool {
+        self.all || self.touched.contains(guc)
+    }
+
     /// Whether the statement leaves every tracked value as it was: it names
     /// no setting, or it is block-scoped outside a block, which changes
     /// nothing at origin (a warning).

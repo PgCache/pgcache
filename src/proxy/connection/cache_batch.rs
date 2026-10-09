@@ -3,7 +3,6 @@
 //! run on a miss.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 
 use smallvec::SmallVec;
 use tokio_util::bytes::BytesMut;
@@ -47,14 +46,7 @@ impl ConnectionState {
     /// candidate and the list is non-empty).
     pub(super) fn cache_batch_dispatch(&mut self, entries: SmallVec<[ExecuteEntry; 1]>) {
         // Unknown search_path forwards at dispatch; the key is then only a label.
-        let search_path = self
-            .session_settings
-            .search_path()
-            .resolve()
-            .unwrap_or_else(|| Arc::from([]));
-        let literal_settings = self
-            .session_settings
-            .literal_settings(self.in_transaction());
+        let keying = self.session_settings.keying_label(self.in_transaction());
         // Common case: a single Parse/Bind/Describe/Execute. Begin it directly
         // without allocating a batch queue (the trailing-most slots empty).
         if entries.len() == 1 {
@@ -62,13 +54,7 @@ impl ConnectionState {
                 && let Some(candidate) = entry.candidate.take()
             {
                 self.extended.batch.clear();
-                self.cache_slot_begin(DispatchContext::build(
-                    entry,
-                    candidate,
-                    true,
-                    &search_path,
-                    &literal_settings,
-                ));
+                self.cache_slot_begin(DispatchContext::build(entry, candidate, true, &keying));
                 self.proxy_mode = ProxyMode::OriginDrain;
             }
             return;
@@ -81,13 +67,7 @@ impl ConnectionState {
             let Some(candidate) = entry.candidate.take() else {
                 continue;
             };
-            contexts.push_back(DispatchContext::build(
-                entry,
-                candidate,
-                i == last,
-                &search_path,
-                &literal_settings,
-            ));
+            contexts.push_back(DispatchContext::build(entry, candidate, i == last, &keying));
         }
         if let Some(first) = contexts.pop_front() {
             self.extended.batch = contexts;

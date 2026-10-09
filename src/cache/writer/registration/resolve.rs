@@ -22,7 +22,7 @@ use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode};
 use crate::query::constraint_index::table_constraints_keyed;
-use crate::query::literal_settings::LiteralSettings;
+use crate::query::keying_settings::KeyingSettings;
 use crate::query::query_shape_derive;
 use crate::query::resolved::{
     ResolvedQueryExpr, enum_order_dependence_check, query_expr_resolve, resolved_query_fingerprint,
@@ -67,35 +67,34 @@ async fn cache_tables_ensure(
     Ok(())
 }
 
-/// The fingerprint of a query under `search_path` and `literal_settings`:
-/// the hash of its resolved form (schema-qualified tables, canonical
-/// literals). Ensures the cache tables exist and resolves exactly as
-/// registration does, so the two agree.
+/// The fingerprint of a query under the session's keying settings: the hash
+/// of its resolved form (schema-qualified tables, canonical literals).
+/// Ensures the cache tables exist and resolves exactly as registration
+/// does, so the two agree.
 pub(super) async fn query_fingerprint_resolve(
     core: &mut WriterCore,
     query: &QueryExpr,
-    search_path: &Arc<[EcoString]>,
-    literal_settings: &LiteralSettings,
+    keying: &KeyingSettings,
 ) -> CacheResult<Fingerprint> {
     let (base_query, _) = base_query_prepare(query);
-    cache_tables_ensure(core, &base_query, search_path).await?;
-    let (resolved, _) = query_resolve_canonical(core, &base_query, search_path, literal_settings)
+    cache_tables_ensure(core, &base_query, &keying.search_path).await?;
+    let (resolved, _) = query_resolve_canonical(core, &base_query, keying)
         .attach_loc("resolving query expression for its fingerprint")?;
     Ok(resolved_query_fingerprint(&resolved))
 }
 
-/// Resolve `base_query` and canonicalise its date-time literals under the
-/// registering session's settings; the result is the identity-bearing form.
+/// Resolve `base_query` on the session's search_path and canonicalise its
+/// date-time literals under the session's settings; the result is the
+/// identity-bearing form.
 fn query_resolve_canonical(
     core: &WriterCore,
     base_query: &QueryExpr,
-    search_path: &Arc<[EcoString]>,
-    literal_settings: &LiteralSettings,
+    keying: &KeyingSettings,
 ) -> CacheResult<(ResolvedQueryExpr, LiteralCanonOutcome)> {
-    let path: Vec<&str> = search_path.iter().map(EcoString::as_str).collect();
+    let path: Vec<&str> = keying.search_path.iter().map(EcoString::as_str).collect();
     let mut resolved = query_expr_resolve(base_query, &core.cache.tables, &path)
         .map_err(|e| e.context_transform(CacheError::from))?;
-    let outcome = resolved_literals_canonicalise(&mut resolved, literal_settings);
+    let outcome = resolved_literals_canonicalise(&mut resolved, &keying.literals);
     Ok((resolved, outcome))
 }
 
@@ -153,15 +152,10 @@ impl WriterRegistration {
     ) -> CacheResult<QueryResolution> {
         let (base_query, user_max_limit) = base_query_prepare(request.cacheable_query.query());
 
-        cache_tables_ensure(core, &base_query, &request.search_path).await?;
+        cache_tables_ensure(core, &base_query, &request.keying.search_path).await?;
 
-        let (resolved, literals) = query_resolve_canonical(
-            core,
-            &base_query,
-            &request.search_path,
-            &request.literal_settings,
-        )
-        .attach_loc("resolving query expression")?;
+        let (resolved, literals) = query_resolve_canonical(core, &base_query, &request.keying)
+            .attach_loc("resolving query expression")?;
         // The identity dispatch resolved this pair to must be the one this
         // resolution produces (before the pushdown transform).
         debug_assert_eq!(

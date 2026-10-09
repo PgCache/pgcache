@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use dashmap::Entry;
-use ecow::EcoString;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio_util::bytes::BytesMut;
@@ -31,8 +30,7 @@ use crate::cache::types::{
 use crate::cache::{CacheError, CacheResult, fast_path};
 use crate::pg::Lsn;
 use crate::proxy::ClientSocket;
-use crate::query::ast::query_expr_session_key;
-use crate::query::literal_settings::LiteralSettings;
+use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, SessionKey};
 use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, DynamicConfig, Settings};
@@ -146,22 +144,21 @@ impl CacheDispatch {
     }
 
     /// Ask the writer which fingerprint a session key resolves to under the
-    /// request's search_path. One round trip per (query, path) pair process
-    /// wide: the writer records the alias, so later requests find it in
-    /// `fingerprint_for_key`. `None` when the query does not resolve (forward).
+    /// request's keying settings. One round trip per (query, settings) pair
+    /// process wide: the writer records the alias, so later requests find it
+    /// in `fingerprint_for_key`. `None` when the query does not resolve
+    /// (forward).
     pub(super) async fn session_key_resolve(
         &self,
         session_key: SessionKey,
         cacheable_query: &Arc<CacheableQuery>,
-        search_path: &Arc<[EcoString]>,
-        literal_settings: &Arc<LiteralSettings>,
+        keying: &Arc<KeyingSettings>,
     ) -> Option<Fingerprint> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let request = ResolveRequest {
             session_key,
             cacheable_query: Arc::clone(cacheable_query),
-            search_path: Arc::clone(search_path),
-            literal_settings: Arc::clone(literal_settings),
+            keying: Arc::clone(keying),
             reply_tx,
         };
         if self.query_tx.send(QueryCommand::Resolve(request)).is_err() {
@@ -224,9 +221,8 @@ impl CacheDispatch {
             message,
             client_socket,
             reply_tx,
-            search_path,
+            keying,
             output_settings,
-            literal_settings,
             timing,
             pipeline,
             transaction_status,
@@ -243,8 +239,7 @@ impl CacheDispatch {
                     timing,
                     transaction_status,
                 },
-                &search_path,
-                &literal_settings,
+                &keying,
             );
             return;
         }
@@ -270,9 +265,8 @@ impl CacheDispatch {
                     result_formats: query_data.result_formats,
                     client_socket,
                     reply_tx,
-                    search_path,
+                    keying,
                     output_settings,
-                    literal_settings,
                     timing,
                     pipeline,
                     transaction_status,
@@ -302,48 +296,8 @@ impl CacheDispatch {
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub async fn query_dispatch(&mut self, mut msg: QueryRequest) -> CacheResult<()> {
         let cfg = self.dynamic.load();
-        if !fast_path::query_allowlist_check(
-            &cfg.allowed_tables_parsed,
-            msg.cacheable_query.query(),
-        ) {
-            crate::metrics::handles()
-                .query
-                .allowlist_skipped
-                .increment(1);
+        let Some(fingerprint) = self.identity_resolve(&msg, &cfg).await else {
             return msg.forward();
-        }
-
-        // Identity: through the alias map, or — once per (query, path) pair —
-        // by asking the writer to resolve the query. A brand-new pair under
-        // throttle forwards before resolving, as a brand-new entry would.
-        let session_key = query_expr_session_key(
-            msg.cacheable_query.query(),
-            &msg.search_path,
-            &msg.literal_settings,
-        );
-        let fingerprint = match self.fingerprint_for_key(session_key) {
-            Some(fingerprint) => fingerprint,
-            None if self.state_view.throttled() => {
-                crate::metrics::handles()
-                    .cache
-                    .registration_throttled_total
-                    .increment(1);
-                return msg.forward();
-            }
-            None => {
-                match self
-                    .session_key_resolve(
-                        session_key,
-                        &msg.cacheable_query,
-                        &msg.search_path,
-                        &msg.literal_settings,
-                    )
-                    .await
-                {
-                    Some(fingerprint) => fingerprint,
-                    None => return msg.forward(),
-                }
-            }
         };
         let target = self.dispatch_target(fingerprint, &msg.cacheable_query, &cfg);
         trace!("{fingerprint}");
@@ -424,6 +378,41 @@ impl CacheDispatch {
         }
     }
 
+    /// The identity of an admissible request: through the alias map, or —
+    /// once per (query, keying settings) pair — by asking the writer to
+    /// resolve the query. `None` forwards: a table outside the allowlist, a
+    /// brand-new pair under throttle (before resolving, as a brand-new entry
+    /// would), or a query that does not resolve.
+    async fn identity_resolve(
+        &self,
+        msg: &QueryRequest,
+        cfg: &DynamicConfig,
+    ) -> Option<Fingerprint> {
+        if !fast_path::query_allowlist_check(
+            &cfg.allowed_tables_parsed,
+            msg.cacheable_query.query(),
+        ) {
+            crate::metrics::handles()
+                .query
+                .allowlist_skipped
+                .increment(1);
+            return None;
+        }
+        let session_key = msg.keying.session_key(msg.cacheable_query.query());
+        if let Some(fingerprint) = self.fingerprint_for_key(session_key) {
+            return Some(fingerprint);
+        }
+        if self.state_view.throttled() {
+            crate::metrics::handles()
+                .cache
+                .registration_throttled_total
+                .increment(1);
+            return None;
+        }
+        self.session_key_resolve(session_key, &msg.cacheable_query, &msg.keying)
+            .await
+    }
+
     /// The dispatch's fingerprint and decision inputs.
     fn dispatch_target(
         &self,
@@ -488,7 +477,7 @@ impl CacheDispatch {
         // A literal the writer could not canonicalise means what the
         // reference settings make of it; a session on other settings would
         // read different rows from origin.
-        if *reference_only && *msg.literal_settings != reference_settings::current().literals {
+        if *reference_only && msg.keying.literals != reference_settings::current().literals {
             crate::metrics::handles()
                 .cache
                 .reference_only_forward_total

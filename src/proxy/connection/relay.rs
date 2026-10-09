@@ -37,7 +37,7 @@ use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
 use crate::query::guc::Guc;
-use crate::query::literal_settings::LiteralSettings;
+use crate::query::keying_settings::KeyingSettings;
 use crate::query::transform::query_expr_parameters_replace;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
@@ -59,7 +59,6 @@ use crate::{
         session::PreparedStatement,
     },
     proxy::egress::EgressQueue,
-    query::ast::query_expr_session_key,
     settings::SslMode,
     telemetry::pg_version_set,
     timing::QueryTiming,
@@ -237,10 +236,11 @@ async fn handle_connection(
                 // query's stored form and doesn't use the client's search_path,
                 // so dispatch it even on the first (unresolved) statement (PGC-345).
                 let in_block = state.in_transaction();
-                let resolved_search_path = match state.session_settings.serve_search_path(in_block)
-                {
-                    Ok(search_path) => search_path,
-                    Err(_) if matches!(msg, CacheMessage::Explain(..)) => Arc::from([]),
+                let keying = match state.session_settings.serve_keying(in_block) {
+                    Ok(keying) => Arc::new(keying),
+                    Err(_) if matches!(msg, CacheMessage::Explain(..)) => {
+                        Arc::new(state.session_settings.keying_label(in_block))
+                    }
                     Err(reason) => {
                         debug!("{}, forwarding to origin", reason.describe());
                         crate::metrics::handles().query.uncacheable.increment(1);
@@ -248,8 +248,6 @@ async fn handle_connection(
                         continue;
                     }
                 };
-
-                let literal_settings = Arc::new(state.session_settings.literal_settings(in_block));
                 crate::metrics::handles().query.cacheable.increment(1);
 
                 // Transaction gate (PGC-387): inside a block, serve only when the
@@ -299,8 +297,7 @@ async fn handle_connection(
                             .then(|| {
                                 read_column_ranges(
                                     read_query,
-                                    &resolved_search_path,
-                                    &literal_settings,
+                                    &keying,
                                     &state.dispatch_handle,
                                     &state.write_log,
                                 )
@@ -365,9 +362,8 @@ async fn handle_connection(
                     message: msg,
                     client_socket: socket,
                     reply_tx,
-                    search_path: resolved_search_path,
+                    keying,
                     output_settings: Arc::new(state.session_settings.output_settings(in_block)),
-                    literal_settings,
                     timing,
                     pipeline: state.extended.pipeline_take(),
                     transaction_status: state.transaction_status,
@@ -544,8 +540,7 @@ fn read_query_bound(msg: &CacheMessage) -> Option<QueryExpr> {
 
 fn read_column_ranges(
     query: &QueryExpr,
-    search_path: &[EcoString],
-    literal_settings: &LiteralSettings,
+    keying: &KeyingSettings,
     dispatch_handle: &CacheDispatchHandle,
     write_log: &WriteLog,
 ) -> Option<HashMap<EcoString, ColumnRange>> {
@@ -553,7 +548,7 @@ fn read_column_ranges(
     if !write_log.table_has_row_predicate(table) {
         return None;
     }
-    let key = query_expr_session_key(query, search_path, literal_settings);
+    let key = keying.session_key(query);
     let resolved = dispatch_handle.cached_query_resolved(key)?;
     let select = resolved.as_select()?;
     let constraints = analyze_query_constraints(select);
@@ -820,16 +815,9 @@ impl ConnectionState {
                 ProxyMode::Read
             }
             Ok(Action::CacheCheck(ast)) => {
-                let search_path = self
-                    .session_settings
-                    .search_path()
-                    .resolve()
-                    .unwrap_or_else(|| Arc::from([]));
-                let literal_settings = self
-                    .session_settings
-                    .literal_settings(self.in_transaction());
-                let key = query_expr_session_key(ast.query(), &search_path, &literal_settings);
-                self.telemetry.cache_timing_start(key);
+                let keying = self.session_settings.keying_label(self.in_transaction());
+                self.telemetry
+                    .cache_timing_start(keying.session_key(ast.query()));
                 self.extended.dispatch_is_extended = false;
                 self.egress.cache_push(CacheMessage::Query(msg.data, ast));
                 ProxyMode::OriginDrain

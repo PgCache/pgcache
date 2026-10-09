@@ -22,7 +22,7 @@ fn waiters_on_reference(
 ) -> Vec<QueryRequest> {
     let (on_reference, off_reference): (Vec<_>, Vec<_>) = waiters
         .into_iter()
-        .partition(|w| *w.literal_settings == reference.literals);
+        .partition(|w| w.keying.literals == reference.literals);
     if !off_reference.is_empty() {
         crate::metrics::handles()
             .cache
