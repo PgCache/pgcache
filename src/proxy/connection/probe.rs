@@ -40,19 +40,31 @@ impl ConnectionState {
         if self.flush_describe_pending || self.extended.group_origin_forwarded {
             return;
         }
-        if self
-            .session_settings
-            .probe_needed(self.forwarding_into_block())
-            && !self
-                .egress
-                .probe_pending(ProbeKind::SessionSettings { seq: 0 })
-        {
+        if self.settings_probe_wanted() {
             debug!("session settings unknown, probing");
             let seq = self.session_settings.probe_seq();
             self.probe_send(ProbeKind::SessionSettings { seq }, &SETTINGS_PROBE);
             crate::metrics::handles().conn.settings_probes.increment(1);
         }
         self.commit_lsn_probe_inject();
+    }
+
+    /// Whether a settings probe would learn something now and none is in
+    /// flight. A failed block rejects the probe like any statement, and its
+    /// sample would be discarded: wait for the block to end.
+    fn settings_probe_wanted(&self) -> bool {
+        if self.transaction_status == TransactionStatus::Failed {
+            return false;
+        }
+        if !self
+            .session_settings
+            .probe_needed(self.forwarding_into_block())
+        {
+            return false;
+        }
+        !self
+            .egress
+            .probe_pending(ProbeKind::SessionSettings { seq: 0 })
     }
 
     /// Maintain the read-after-write log (ADR-048): drop writes the CDC

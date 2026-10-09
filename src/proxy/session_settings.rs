@@ -365,7 +365,7 @@ impl SessionSettings {
                 }
             }
         }
-        if effect.is_none() {
+        if effect.inert_at(in_block) {
             self.views_rederive();
             return;
         }
@@ -443,8 +443,12 @@ impl SessionSettings {
             };
             let state = self.state_mut(guc);
             if !in_block {
-                // Idle: no block is open, so block values are moot.
-                state.block = None;
+                // Idle: no block was open when origin sampled. A block mark
+                // made after the probe was injected belongs to a block the
+                // sample predates, so it stays.
+                if state.block_since <= seq {
+                    state.block = None;
+                }
                 if state.session == SettingValue::Unknown && state.session_since <= seq {
                     state.session = SettingValue::Known(value.clone());
                 }
@@ -462,17 +466,19 @@ impl SessionSettings {
     }
 
     /// The user `$user` expands to: the current role when one is set, else the
-    /// session authorization, else the startup user.
+    /// session authorization, else the startup user. Each at the value in
+    /// force: the open block's override when it has one.
     fn user_for_search_path(&self) -> Option<&str> {
-        if let Some(role) = self.state(Guc::Role).session.known()
+        let in_force = |guc: Guc| {
+            let state = self.state(guc);
+            state.block.as_ref().unwrap_or(&state.session).known()
+        };
+        if let Some(role) = in_force(Guc::Role)
             && !role.eq_ignore_ascii_case("none")
         {
             return Some(role);
         }
-        self.state(Guc::SessionAuthorization)
-            .session
-            .known()
-            .or(self.startup_user.as_deref())
+        in_force(Guc::SessionAuthorization).or(self.startup_user.as_deref())
     }
 
     fn views_rederive(&mut self) {
@@ -844,5 +850,54 @@ mod tests {
             &SettingValue::Unknown
         );
         let _ = GucSet::EMPTY;
+    }
+
+    /// An idle sample answers a probe injected before a `SET LOCAL` was
+    /// forwarded: it says nothing about the block the `SET LOCAL` opened, so
+    /// the block mark stays.
+    #[test]
+    fn test_idle_sample_keeps_a_block_mark_made_after_injection() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        let seq = settings.probe_seq();
+        settings.effect_apply(SettingsEffect::guc(Guc::ByteaOutput, true), true);
+        settings.probe_apply(&sample("public"), TransactionStatus::Idle, seq);
+        assert!(
+            settings.probe_needed(true),
+            "the block value is still unknown"
+        );
+        assert_eq!(
+            settings.effective(Guc::ByteaOutput, true),
+            &SettingValue::Unknown
+        );
+    }
+
+    /// `SET LOCAL` outside a block changes nothing at origin (a warning), so
+    /// it must not leave a block mark that no probe would ever clear.
+    #[test]
+    fn test_local_set_outside_a_block_changes_nothing() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        settings.effect_apply(SettingsEffect::guc(Guc::SearchPath, true), false);
+        assert_eq!(resolved(&settings), vec!["public"]);
+        assert!(!settings.probe_needed(false));
+        assert!(settings.serve_search_path(false).is_ok());
+    }
+
+    /// `$user` follows the role in force for the read: a `SET LOCAL ROLE`
+    /// inside the block, once the in-block probe has read it.
+    #[test]
+    fn test_user_expands_from_the_block_role() {
+        let mut settings = SessionSettings::new();
+        settings.startup_user_set(Some("alice"));
+        let path = r#""$user", public"#;
+        settings.probe_apply(&sample(path), TransactionStatus::Idle, settings.probe_seq());
+        assert_eq!(resolved(&settings), vec!["alice", "public"]);
+        settings.effect_apply(SettingsEffect::guc(Guc::Role, true), true);
+        assert!(settings.probe_needed(true));
+        let mut row = sample(path);
+        row[Guc::Role as usize] = Some("bob".into());
+        settings.probe_apply(&row, TransactionStatus::InTransaction, settings.probe_seq());
+        assert_eq!(resolved(&settings), vec!["bob", "public"]);
+        settings.block_exit();
+        assert_eq!(resolved(&settings), vec!["alice", "public"]);
     }
 }

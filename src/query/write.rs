@@ -129,6 +129,13 @@ impl SettingsEffect {
         }
     }
 
+    /// Whether the statement leaves every tracked value as it was: it names
+    /// no setting, or it is block-scoped outside a block, which changes
+    /// nothing at origin (a warning).
+    pub fn inert_at(&self, in_block: bool) -> bool {
+        self.is_none() || (self.local && !in_block)
+    }
+
     pub const fn is_none(self) -> bool {
         self.touched.is_empty() && !self.all
     }
