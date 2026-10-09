@@ -19,6 +19,7 @@ use super::stream::population_task;
 use super::{PopulationConnections, PopulationOutcome, PopulationSpawnContext, PopulationWork};
 use crate::cache::messages::{PopulationMerge, QueryCommand};
 use crate::cache::population_pool::{POPULATION_PARK_EXPIRY, PopulationPool};
+use crate::cache::reference_settings;
 use crate::cache::writer::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::oid::Oid;
@@ -110,6 +111,7 @@ async fn population_cache_connect(settings: &PgSettings, id: usize) -> CacheResu
         .batch_execute("SET client_min_messages = warning")
         .await
         .map_into_report::<CacheError>()?;
+    reference_settings::pin(&cache_conn, "population cache").await?;
     Ok(cache_conn)
 }
 
@@ -125,6 +127,7 @@ pub(crate) async fn population_worker_connect(
     let origin = pg::connect(&ctx.origin_settings, &format!("population origin {id}"))
         .await
         .map_into_report::<CacheError>()?;
+    reference_settings::pin(&origin, "population origin").await?;
     Ok(PopulationConnections { origin, cache })
 }
 
@@ -298,10 +301,19 @@ impl PopulationWorker {
         }
         let id = self.id;
         match pg::connect(&self.origin_settings, &format!("population origin {id}")).await {
-            Ok(c) => {
-                self.connections.origin = c;
-                true
-            }
+            Ok(c) => match reference_settings::pin(&c, "population origin").await {
+                Ok(()) => {
+                    self.connections.origin = c;
+                    true
+                }
+                Err(e) => {
+                    error!(
+                        "population worker {id}: origin session pin failed: {}",
+                        error_chain_format(e.current_context())
+                    );
+                    false
+                }
+            },
             Err(e) => {
                 error!("population worker {id}: origin reconnect failed: {e}");
                 false

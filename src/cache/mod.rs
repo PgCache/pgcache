@@ -44,6 +44,8 @@ pub mod query;
 #[cfg(feature = "proxy")]
 mod query_cache;
 #[cfg(feature = "proxy")]
+pub(crate) mod reference_settings;
+#[cfg(feature = "proxy")]
 mod reg_bucket;
 #[cfg(feature = "proxy")]
 mod reg_gate;

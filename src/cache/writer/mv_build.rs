@@ -24,6 +24,7 @@ use tokio_stream::StreamExt;
 use tracing::{error, trace};
 
 use crate::cache::Generation;
+use crate::cache::reference_settings;
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{MvBuildOutcome, QueryCommand},
@@ -191,7 +192,19 @@ async fn mv_build_run(pool: &MvBuildPool, ctx: &MvBuildContext) -> MvBuildOutcom
     let client = match slot.content.take() {
         Some(c) if !c.is_closed() => c,
         _ => match pg::connect(&pool.settings, "mv build").await {
-            Ok(c) => c,
+            Ok(c) => match reference_settings::pin(&c, "mv build").await {
+                Ok(()) => c,
+                Err(e) => {
+                    error!(
+                        "mv build session pin failed for {}: {}",
+                        ctx.fingerprint,
+                        error_chain_format(e.current_context())
+                    );
+                    return MvBuildOutcome::Failed {
+                        has_table: ctx.has_table,
+                    };
+                }
+            },
             Err(e) => {
                 error!("mv build connect failed for {}: {e}", ctx.fingerprint);
                 return MvBuildOutcome::Failed {

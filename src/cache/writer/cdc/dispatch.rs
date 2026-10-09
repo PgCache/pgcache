@@ -13,6 +13,7 @@ use tracing::trace;
 use super::segment_eval::PreparedEvalKey;
 use super::{BATCH_FRAMES_MAX, PREPARED_EVAL_CACHE_CAPACITY, SQL_BUFFER_CAPACITY, WriterCdc};
 use crate::cache::messages::{CdcCommand, CdcValue};
+use crate::cache::reference_settings;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, ToastState};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
@@ -383,10 +384,12 @@ impl WriterCdc {
         let cache_eval_conn = pg::connect(&settings.cache, "cache eval")
             .await
             .map_into_report::<CacheError>()?;
+        reference_settings::pin(&cache_eval_conn, "cache eval").await?;
 
         let cdc_write_conn = pg::connect(&settings.cache, "cdc write")
             .await
             .map_into_report::<CacheError>()?;
+        reference_settings::pin(&cdc_write_conn, "cdc write").await?;
 
         #[cfg(feature = "fault-injection")]
         fault::init();

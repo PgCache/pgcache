@@ -16,6 +16,7 @@ use super::merge_queue::MergeQueue;
 use super::mv_build::MvBuildPool;
 use super::staging::{PopulationDeletedKeys, StagingPool};
 use crate::cache::Generation;
+use crate::cache::reference_settings;
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{QueryCommand, WriterNotify},
@@ -419,6 +420,7 @@ async fn writer_origin_connect(origin: &PgSettings) -> CacheResult<Client> {
         .await
         .map_into_report::<CacheError>()
         .attach_loc("setting synchronous_commit on writer origin")?;
+    reference_settings::pin(&origin_client, "writer origin").await?;
     Ok(origin_client)
 }
 
@@ -431,6 +433,7 @@ impl WriterCore {
         let cache_client = pg::connect(&settings.cache, "writer cache")
             .await
             .map_into_report::<CacheError>()?;
+        reference_settings::pin(&cache_client, "writer cache").await?;
         let origin_client = writer_origin_connect(&settings.origin).await?;
         let disk = initial_disk_stats(&cache_client, settings).await;
         let WriterShared {

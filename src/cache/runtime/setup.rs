@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, unbounded_channel};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, info, instrument};
 
 use super::cdc_driver::cdc_run;
 use super::memory_monitor::{memory_monitor, shared_buffers_bytes_query};
@@ -17,12 +17,14 @@ use super::serve_pool::{serve_loop, serve_pool_bounds, serve_pool_controller};
 use crate::cache::cdc::CdcProcessorHandles;
 use crate::cache::messages::WriterNotify;
 use crate::cache::query_cache::CacheDispatch;
+use crate::cache::reference_settings::{self, ReferenceSettings};
 use crate::cache::types::{ActiveRelations, CacheStateView};
 use crate::cache::writer::{WriterChannels, WriterShared, writer_run};
 use crate::cache::{
     CacheDispatchPublisher, CacheError, CacheResult, MapIntoReport, PinnedQuery, ReportExt,
     StatusRequest,
 };
+use crate::pg;
 use crate::pg::cdc::replication_provision;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
@@ -64,6 +66,22 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
         .attach_loc("provisioning replication on origin")?;
 
     cache_database_reset(settings).attach_loc("resetting cache database")?;
+
+    // The literal-semantics settings every pgcache session is pinned to:
+    // origin's defaults for the role pgcache connects as (PGC-287 class 2).
+    let reference = handle
+        .block_on(async {
+            let client = pg::connect(&settings.origin, "reference settings")
+                .await
+                .map_into_report::<CacheError>()?;
+            ReferenceSettings::probe(&client).await
+        })
+        .attach_loc("reading the reference session settings from origin")?;
+    info!(
+        "reference session settings: TimeZone={} DateStyle=ISO,{} IntervalStyle={}",
+        reference.timezone, reference.datestyle_order, reference.intervalstyle
+    );
+    reference_settings::install(reference);
 
     let state_view = Arc::new(CacheStateView::new(settings.dynamic.clone())?);
     let active_relations: ActiveRelations =
