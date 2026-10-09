@@ -14,6 +14,7 @@ use crate::pg::protocol::ByteString;
 use crate::query::ast::LiteralValue;
 use crate::query::constraints::ColumnRange;
 use crate::query::evaluate::bool_wire_text_parse;
+use crate::query::typed_compare::{ValueKind, wire_text_index_key};
 
 /// Per-column candidate forms a CDC row value can take: the literal string plus
 /// optional float/bool reinterpretations. A fixed array (one slot per form) so
@@ -63,19 +64,47 @@ pub(crate) fn row_value_forms(
         return [Some(ColumnRange::Unknown), None, None];
     };
     let text = bytes.as_str();
+    let kind = ValueKind::of_type(&meta.data_type);
     // One slot per reinterpretation. A fourth would not fit `[_; 3]` — a
     // deliberate compile-time gate on growing the inline capacity.
-    let float = text
-        .parse::<f64>()
-        .ok()
-        .and_then(|x| NotNan::new(x).ok())
-        .map(|n| ColumnRange::Equal(LiteralValue::Float(n)));
+    //
+    // The typed slot is the column kind's key form (PGC-478): a number, a
+    // day count or an instant in microseconds, matching how
+    // `table_constraints_keyed` keyed the entry's literal. An untyped column
+    // keeps the lexical float reinterpretation.
+    let typed = match kind {
+        ValueKind::Integer
+        | ValueKind::Decimal
+        | ValueKind::Date
+        | ValueKind::Timestamp
+        | ValueKind::TimestampTz => wire_text_index_key(kind, text).map(ColumnRange::Equal),
+        ValueKind::Bool
+        | ValueKind::Text
+        | ValueKind::Bpchar
+        | ValueKind::Uuid
+        | ValueKind::Enum
+        | ValueKind::Unsupported => text
+            .parse::<f64>()
+            .ok()
+            .and_then(|x| NotNan::new(x).ok())
+            .map(|n| ColumnRange::Equal(LiteralValue::Float(n))),
+    };
+    let lexical = match kind {
+        ValueKind::Bpchar | ValueKind::Uuid => {
+            wire_text_index_key(kind, text).unwrap_or_else(|| LiteralValue::String(text.into()))
+        }
+        ValueKind::Integer
+        | ValueKind::Decimal
+        | ValueKind::Bool
+        | ValueKind::Date
+        | ValueKind::Timestamp
+        | ValueKind::TimestampTz
+        | ValueKind::Text
+        | ValueKind::Enum
+        | ValueKind::Unsupported => LiteralValue::String(text.into()),
+    };
     let boolean = bool_wire_text_parse(text).map(|b| ColumnRange::Equal(LiteralValue::Boolean(b)));
-    [
-        Some(ColumnRange::Equal(LiteralValue::String(text.into()))),
-        float,
-        boolean,
-    ]
+    [Some(ColumnRange::Equal(lexical)), typed, boolean]
 }
 
 /// Cartesian product of per-column key sets, for the point-probe equality

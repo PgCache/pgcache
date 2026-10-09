@@ -14,6 +14,7 @@ use crate::cache::messages::PopulationMerge;
 use crate::cache::writer::core::{QueryServing, WriterCore};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
+use crate::query::constraint_index::table_constraints_keyed;
 use crate::timing::{duration_to_ns_u64, duration_to_us_u64};
 
 /// Update the `has_limit` bit on the query's update queries. Limited queries
@@ -26,7 +27,8 @@ fn subsumption_limit_reindex(
     has_limit: bool,
 ) {
     for oid in relation_oids {
-        let table_name = core.cache.tables.get1(oid).map(|t| t.name.clone());
+        let table = core.cache.tables.get1(oid);
+        let table_name = table.map(|t| t.name.clone());
         let Some(mut queries) = core.cache.update_queries.get_mut(oid) else {
             continue;
         };
@@ -52,7 +54,8 @@ fn subsumption_limit_reindex(
                     .unwrap_or_default()
             });
         if let Some(tcs) = constraints {
-            queries.subsumption.insert(fingerprint, &tcs);
+            let keyed = table.map_or_else(|| tcs.clone(), |t| table_constraints_keyed(&tcs, t));
+            queries.subsumption.insert(fingerprint, &keyed);
         }
     }
 }

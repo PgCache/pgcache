@@ -22,6 +22,7 @@ use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode, query_expr_fingerprint_canonical};
+use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::query_shape_derive;
 use crate::query::resolved::{ResolvedQueryExpr, enum_order_dependence_check, query_expr_resolve};
 use crate::query::transform::predicate_pushdown_apply;
@@ -218,6 +219,14 @@ impl WriterRegistration {
         let mut relation_oids = Vec::new();
         for admission in analysis.tables {
             let relation_oid = admission.relation_oid;
+            // Index under each literal's key form for its column's type, so
+            // the row probe and the region probe match on value (PGC-478).
+            let keyed = core
+                .cache
+                .tables
+                .get1(&relation_oid)
+                .map(|table| table_constraints_keyed(&admission.index_constraints, table))
+                .unwrap_or_else(|| admission.index_constraints.clone());
             let mut queries = core
                 .cache
                 .update_queries
@@ -225,13 +234,9 @@ impl WriterRegistration {
                 .or_insert_with(|| UpdateQueries::new(relation_oid));
             queries.query_insert(admission.update_query);
             if admission.subsumer_eligible {
-                queries
-                    .subsumption
-                    .insert(fingerprint, &admission.index_constraints);
+                queries.subsumption.insert(fingerprint, &keyed);
             }
-            queries
-                .eval_index
-                .insert(fingerprint, &admission.index_constraints);
+            queries.eval_index.insert(fingerprint, &keyed);
             relation_oids.push(relation_oid);
         }
         Ok(relation_oids)

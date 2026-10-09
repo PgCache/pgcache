@@ -20,6 +20,7 @@ use std::cmp::Ordering;
 use jiff::civil::{Date, DateTime};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
+use ordered_float::NotNan;
 use postgres_types::{Kind, Type};
 
 use crate::query::ast::{BinaryOp, LiteralValue};
@@ -190,6 +191,19 @@ impl Decimal {
         })
     }
 
+    /// The nearest `f64`: exact for what fits, approximate beyond (an index
+    /// key may over-return; the precise comparison stays exact).
+    fn to_f64(&self) -> f64 {
+        let digits: String = self.digits.iter().map(|d| char::from(b'0' + d)).collect();
+        let text = format!(
+            "{}{}e{}",
+            if self.negative { "-" } else { "" },
+            if digits.is_empty() { "0" } else { &digits },
+            self.exponent
+        );
+        text.parse().unwrap_or(0.0)
+    }
+
     /// Position of the most significant digit relative to the point.
     fn magnitude(&self) -> i64 {
         i64::try_from(self.digits.len()).unwrap_or(i64::MAX) + i64::from(self.exponent)
@@ -310,6 +324,57 @@ pub fn typed_compare(
         | BinaryOp::NotLike
         | BinaryOp::NotILike => return None,
     })
+}
+
+/// The index-key form of a literal for a column of `kind` (PGC-478):
+/// integers and decimals as numbers, days and microseconds as `Float`, text
+/// normalised, bools as `Boolean`. Numbers key as `ValueKey::Num` either way,
+/// so a literal and a row's wire text that mean the same value share one
+/// bucket. `None` when the literal does not parse as the kind.
+pub fn literal_index_key(
+    kind: ValueKind,
+    literal: &LiteralValue,
+    zone: Option<&TimeZone>,
+) -> Option<LiteralValue> {
+    literal_parse(kind, literal, zone).and_then(TypedValue::into_index_key)
+}
+
+/// The index-key form of a row's wire text for a column of `kind`; the same
+/// mapping as [`literal_index_key`], so the point probe lands in the entry's
+/// bucket.
+pub fn wire_text_index_key(kind: ValueKind, text: &str) -> Option<LiteralValue> {
+    text_parse(kind, text, None).and_then(TypedValue::into_index_key)
+}
+
+impl TypedValue {
+    /// Unix epoch as a civil date, the origin of the day count key.
+    const EPOCH_DATE: Date = Date::constant(1970, 1, 1);
+
+    fn into_index_key(self) -> Option<LiteralValue> {
+        let float = |x: f64| NotNan::new(x).ok().map(LiteralValue::Float);
+        match self {
+            // Every number keys as `Float` so an entry's literal and a row's
+            // text share one `ValueKey::Num` bucket whatever their spelling;
+            // past 2^53 the key is approximate, which can only over-return.
+            #[allow(clippy::cast_precision_loss)]
+            Self::Integer(n) => float(n as f64),
+            Self::Decimal(decimal) => float(decimal.to_f64()),
+            Self::Bool(b) => Some(LiteralValue::Boolean(b)),
+            Self::Date(date) => float(f64::from(date.since(Self::EPOCH_DATE).ok()?.get_days())),
+            #[allow(clippy::cast_precision_loss)]
+            Self::Timestamp(civil) => {
+                let micros = civil
+                    .to_zoned(TimeZone::UTC)
+                    .ok()?
+                    .timestamp()
+                    .as_microsecond();
+                float(micros as f64)
+            }
+            #[allow(clippy::cast_precision_loss)]
+            Self::TimestampTz(instant) => float(instant.as_microsecond() as f64),
+            Self::Text(text) => Some(LiteralValue::String(text.into())),
+        }
+    }
 }
 
 /// Parse a predicate literal as `kind`. A typed literal (`'…'::type`) must

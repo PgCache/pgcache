@@ -938,6 +938,71 @@ mod point {
         assert!(none.is_empty());
     }
 
+    /// `[id int4 (pk), at timestamp, price numeric, day date]` — row layout
+    /// `[id, at, price, day]`.
+    fn typed_table() -> TableMetadata {
+        let column = |name: &str, position: i16, data_type: Type, type_name: &str| ColumnMetadata {
+            name: name.into(),
+            position: ColumnPosition::from_raw(position),
+            type_oid: TypeOid::from_type(&data_type),
+            data_type,
+            type_name: type_name.into(),
+            cache_type_name: type_name.into(),
+            is_primary_key: position == 1,
+        };
+        TableMetadata {
+            replica_identity_full: false,
+            name: "typed".into(),
+            schema: "public".into(),
+            relation_oid: Oid::from_raw(777),
+            primary_key_columns: vec!["id".into()],
+            columns: ColumnStore::new([
+                column("id", 1, Type::INT4, "int4"),
+                column("at", 2, Type::TIMESTAMP, "timestamp"),
+                column("price", 3, Type::NUMERIC, "numeric"),
+                column("day", 4, Type::DATE, "date"),
+            ]),
+            indexes: Vec::new(),
+        }
+    }
+
+    /// PGC-478: entries keyed by their literal's typed form are found by a row
+    /// whose wire text spells the same value differently; an unparseable
+    /// literal is routed to the wildcard class and still returned.
+    #[test]
+    fn test_point_probe_matches_typed_literals_across_spellings() {
+        let t = typed_table();
+        let mut idx = ConstraintIndex::<Fingerprint>::new();
+        let keyed = |cs: &[TableConstraint]| table_constraints_keyed(cs, &t);
+        idx.insert(fp(1), &keyed(&[eq("at", text("2024-01-15 10:00"))]));
+        idx.insert(fp(2), &keyed(&[eq("price", text("10.500"))]));
+        idx.insert(fp(3), &keyed(&[gt("day", text("2024-01-10 00:00"))]));
+        idx.insert(fp(4), &keyed(&[eq("at", text("Jan 15 2024"))]));
+        idx.insert(fp(5), &keyed(&[eq("at", text("2024-01-16 10:00"))]));
+
+        let row = [
+            bs("1"),
+            bs("2024-01-15 10:00:00"),
+            bs("10.5"),
+            bs("2024-01-15"),
+        ];
+        let found = idx.candidates_point(|c| row_value_forms(&t, &row, c));
+        assert!(found.contains(&fp(1)), "timestamp without seconds");
+        assert!(found.contains(&fp(2)), "numeric with trailing zeros");
+        assert!(found.contains(&fp(3)), "date range bound with a time part");
+        assert!(found.contains(&fp(4)), "unparseable literal is a wildcard");
+        assert!(
+            !found.contains(&fp(5)),
+            "a different instant is not returned"
+        );
+
+        // The region probe keys the new query's literal the same way.
+        let region = idx.candidates(&keyed(&[eq("at", text("2024-01-15T10:00:00"))]));
+        assert!(region.contains(&fp(1)));
+        assert!(region.contains(&fp(4)));
+        assert!(!region.contains(&fp(5)));
+    }
+
     // `row_value_forms`: every keyable interpretation of the wire text.
 
     fn has_str_form(forms: &ColumnForms, s: &str) -> bool {

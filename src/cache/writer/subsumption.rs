@@ -18,6 +18,7 @@ use crate::cache::admission::{SubsumerCandidate, SubsumerSource, subsumption_cov
 use crate::cache::types::{Cache, SharedResolved};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::oid::Oid;
+use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::{TableConstraint, analyze_query_constraints};
 use crate::result::error_chain_format;
 use crate::timing::duration_to_ns_u64;
@@ -34,6 +35,12 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
         relation_oid: Oid,
         table_constraints: &[TableConstraint],
     ) -> impl Iterator<Item = SubsumerCandidate<'_>> {
+        // Probe with the new query's constraints in their key forms, the way
+        // the index was built (PGC-478).
+        let keyed = self.cache.tables.get1(&relation_oid).map_or_else(
+            || table_constraints.to_vec(),
+            |t| table_constraints_keyed(table_constraints, t),
+        );
         self.cache
             .update_queries
             .get(&relation_oid)
@@ -44,7 +51,7 @@ impl SubsumerSource for WriterSubsumerSource<'_> {
                 // `subsumption_covered`.
                 update_queries
                     .subsumption
-                    .candidates(table_constraints)
+                    .candidates(&keyed)
                     .into_iter()
                     .filter_map(move |fingerprint| {
                         let update_query = update_queries.queries.get(&fingerprint)?;
