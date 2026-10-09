@@ -160,6 +160,9 @@ pub(crate) enum SettingsForwardReason {
     SettingUnknown(Guc),
     /// The effective search_path lists `pg_catalog` after another schema.
     BuiltinsShadowed,
+    /// A setting changes how origin parses the statement itself, so the
+    /// proxy's parse (and the cache's) would not match origin's.
+    ParsingIncompatible(Guc),
 }
 
 impl SettingsForwardReason {
@@ -168,7 +171,41 @@ impl SettingsForwardReason {
             Self::SettingUnknown(Guc::SearchPath) => "search_path unknown",
             Self::SettingUnknown(_) => "session setting unknown",
             Self::BuiltinsShadowed => "search_path lists pg_catalog after another schema",
+            Self::ParsingIncompatible(_) => "session setting changes statement parsing",
         }
+    }
+}
+
+/// Settings whose non-default value changes what a statement means in a way
+/// the proxy's parser does not model: `standard_conforming_strings` off
+/// (pg_query parses as if on), `transform_null_equals` on (`= NULL` becomes
+/// `IS NULL`), `array_nulls` off (`'NULL'` array elements are strings) and a
+/// non-zero `gin_fuzzy_search_limit` (GIN results become a random sample).
+fn parsing_incompatible(guc: Guc, value: &str) -> bool {
+    let is = |expected: &str| value.trim().eq_ignore_ascii_case(expected);
+    match guc {
+        Guc::StandardConformingStrings | Guc::ArrayNulls => !is("on"),
+        Guc::TransformNullEquals => is("on"),
+        Guc::GinFuzzySearchLimit => !is("0"),
+        Guc::SearchPath
+        | Guc::TimeZone
+        | Guc::DateStyle
+        | Guc::IntervalStyle
+        | Guc::BackslashQuote
+        | Guc::DefaultTextSearchConfig
+        | Guc::TimezoneAbbreviations
+        | Guc::ExtraFloatDigits
+        | Guc::ByteaOutput
+        | Guc::ClientEncoding
+        | Guc::LcMonetary
+        | Guc::LcNumeric
+        | Guc::LcTime
+        | Guc::XmlBinary
+        | Guc::XmlOption
+        | Guc::Role
+        | Guc::SessionAuthorization
+        | Guc::RowSecurity
+        | Guc::DefaultTransactionIsolation => false,
     }
 }
 
@@ -243,6 +280,20 @@ impl SessionSettings {
             .find(|guc| self.effective(*guc, in_block) == &SettingValue::Unknown)
         {
             return Err(SettingsForwardReason::SettingUnknown(guc));
+        }
+        if let Some(guc) = [
+            Guc::StandardConformingStrings,
+            Guc::TransformNullEquals,
+            Guc::ArrayNulls,
+            Guc::GinFuzzySearchLimit,
+        ]
+        .into_iter()
+        .find(|guc| {
+            self.effective(*guc, in_block)
+                .known()
+                .is_some_and(|value| parsing_incompatible(*guc, value))
+        }) {
+            return Err(SettingsForwardReason::ParsingIncompatible(guc));
         }
         match &self.search_path {
             SearchPathState::Resolved(path) => Ok(Arc::clone(path)),
@@ -471,6 +522,9 @@ mod tests {
                 Guc::Role => Some("none".into()),
                 Guc::SessionAuthorization => Some("alice".into()),
                 Guc::DefaultTransactionIsolation => Some("read committed".into()),
+                Guc::StandardConformingStrings | Guc::ArrayNulls => Some("on".into()),
+                Guc::TransformNullEquals => Some("off".into()),
+                Guc::GinFuzzySearchLimit => Some("0".into()),
                 _ => Some("x".into()),
             })
             .collect()
@@ -685,6 +739,34 @@ mod tests {
             settings.effective(Guc::ByteaOutput, false),
             &SettingValue::Known("escape".into())
         );
+    }
+
+    /// Settings that change parsing forward the session while set.
+    #[test]
+    fn test_parsing_incompatible_settings_forward() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        assert!(settings.serve_search_path(false).is_ok());
+        for (guc, bad, good) in [
+            (Guc::StandardConformingStrings, "off", "on"),
+            (Guc::TransformNullEquals, "on", "off"),
+            (Guc::ArrayNulls, "off", "on"),
+            (Guc::GinFuzzySearchLimit, "100", "0"),
+        ] {
+            settings.effect_apply(SettingsEffect::guc(guc, false), false);
+            let mut row = sample("public");
+            row[guc as usize] = Some(bad.into());
+            settings.probe_apply(&row, TransactionStatus::Idle, settings.probe_seq());
+            assert_eq!(
+                settings.serve_search_path(false),
+                Err(SettingsForwardReason::ParsingIncompatible(guc)),
+                "{guc}={bad}"
+            );
+            settings.effect_apply(SettingsEffect::guc(guc, false), false);
+            let mut row = sample("public");
+            row[guc as usize] = Some(good.into());
+            settings.probe_apply(&row, TransactionStatus::Idle, settings.probe_seq());
+            assert!(settings.serve_search_path(false).is_ok(), "{guc}={good}");
+        }
     }
 
     #[test]

@@ -156,3 +156,35 @@ async fn test_pipelined_set_search_path_then_read() -> Result<(), Error> {
     }
     Ok(())
 }
+
+/// A setting that changes how origin parses statements forwards the session
+/// while it is set (`standard_conforming_strings` off: pg_query parses as if
+/// on), and caching resumes once it is reset.
+#[tokio::test]
+async fn test_parsing_incompatible_setting_forwards_until_reset() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    ctx.query(TABLE_SQL, &[]).await?;
+    ctx.simple_query(SEED_SQL).await?;
+    ctx.cache_settle().await?;
+    register(&mut ctx, READ_ONE).await?;
+
+    ctx.simple_query("SET standard_conforming_strings = off")
+        .await?;
+    let before = ctx.metrics().await?;
+    let res = ctx.simple_query(READ_ONE).await?;
+    assert_row_at(&res, 1, &[("v", "10")])?;
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(
+        delta.queries_uncacheable, 1,
+        "forwarded while parsing differs"
+    );
+    assert_eq!(delta.queries_cache_hit, 0);
+
+    ctx.simple_query("RESET standard_conforming_strings")
+        .await?;
+    let before = ctx.metrics().await?;
+    let _ = ctx.simple_query(READ_ONE).await?;
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(delta.queries_cache_hit, 1, "served again once reset");
+    Ok(())
+}
