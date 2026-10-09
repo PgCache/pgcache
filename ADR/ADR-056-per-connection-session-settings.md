@@ -1,0 +1,43 @@
+# ADR-056: Per-Connection Session Settings
+
+## Status
+Accepted
+
+## Context
+
+A cached result is only valid for a client whose session settings match the ones it was computed under: `search_path` decides which table a bare name is, `TimeZone` and `DateStyle` decide what a literal means and how a timestamp is rendered, `role` decides which rows a policy exposes. Before this decision the proxy tracked two settings, each with its own machinery: `search_path` through a raw-tree classifier, a piggybacked `SET …; SHOW search_path` rewrite of the client's own query and an unconditional re-probe at every transaction end before PostgreSQL 18 (ADR-006), and `default_transaction_isolation` through the statement analyzer's effects and a block-scoped state (ADR-054). Nothing else was tracked, so PGC-287's other classes had nowhere to land, and the two trackers duplicated mutation detection, block handling and probing.
+
+Alternatives were a third tracker beside the two (rejected: the ticket asks for one mechanism), and deriving the search_path view lazily on each read (rejected: the hot path clones a precomputed `Arc` and should keep doing so).
+
+## Decision
+
+- **One state per connection.** `SessionSettings` holds every tracked setting (a fixed `Guc` enum: name resolution, literal semantics, text rendering, identity, and the isolation default) with a session value and an optional block value, each known or unknown. The resolved search_path and the isolation default are views derived from it when it changes; the block-level isolation logic of ADR-054 stays and reads the session default from the view.
+- **One classifier.** The statement analyzer's `StatementEffects` gains a settings effect: which settings a statement may change, whether the change is block-scoped (`SET LOCAL`, `set_config(…, true)`), whether it may be anything (`RESET ALL`, `DISCARD ALL`, a `set_config` whose name is not a literal), and whether a `ROLLBACK TO SAVEPOINT` may have reverted block values. It is memoised with the verdict and applied by the single forward-effects method. The search_path classifier, both inspect hooks and the piggyback intercept are gone.
+- **One probe.** `ProbeKind::SessionSettings` samples every tracked setting in one `current_setting(…)` row, as an ordered egress slot (ADR-055). It is injected at any origin ReadyForQuery when something is unknown at the read's scope and none is pending, inside blocks included: the probe's own status byte scopes the sample as session or block state, a failed-block sample is discarded, and the isolation default is taken only from an idle sample since PostgreSQL reads it at `BEGIN`.
+- **Reported settings are origin's.** A setting origin has reported by `ParameterStatus` (always for `client_encoding`, `DateStyle`, `TimeZone` and friends; `search_path` from PostgreSQL 18) is updated from each report and never marked unknown by a statement.
+- **Scope follows the statement, not the block end.** A session-scoped `SET` marks the session value unknown at forward time, inside a block or not; a block-scoped one marks only the block value. Block exit drops block values. A block that touched nothing needs no probe when it ends.
+- **Unknown forwards.** A cacheable read is keyed only when every tracked setting is known at its scope and the search_path does not shadow builtins (ADR-006). Values are tracked here; what each class of setting does to keying and serving is decided by the later PGC-287 slices.
+
+## Rationale
+
+- **Correctness needs the whole list.** Each class of setting has its own handling rule, but every one of them needs the same tracking: a value per scope, invalidation by statement, recovery by report or probe.
+- **The analyzer already sees every statement.** Classifying settings where write class and isolation are classified gives one memoised pass and one apply point, instead of a second raw-tree walk per statement.
+- **Slot probes remove the reason for the piggyback.** With no quiescence condition and no starvation (ADR-055), a lazy probe after a `SET` costs the same single round trip as rewriting the client's query, under both protocols.
+- **Transaction-end re-discovery was a proxy for scope.** Marking at forward time, in the scope the statement names, makes the block end a no-op for untouched settings (PGC-216).
+
+## Consequences
+
+### Positive
+- `SET LOCAL` and `set_config(…, true)` are tracked for in-block serving (ADR-054).
+- `$user` expands against the current role and session authorization rather than the startup user.
+- One probe per fresh connection instead of two before PostgreSQL 18; none after a transaction that changed nothing.
+- No query rewriting on the client's connection; the only remaining intercept strips a lazy `Parse`.
+
+### Negative
+- Every fresh connection waits one probe round trip before its first cacheable read is keyed, on PostgreSQL 18 too (its reported settings do not cover the unreported ones).
+- `txn.isolation_probes` is replaced by `conn.settings_probes`.
+- The tracked list is fixed; custom settings read by policies (`app.*`, `request.jwt.claims`) are the class 4 slice's extension of it.
+- A `SET` executed inside a function body, and a `postgresql.conf` reload under a live session, remain unobservable (as in ADR-054).
+
+## Implementation Notes
+`proxy/session_settings.rs` is the pure state and its derived views; `proxy/connection/probe.rs` injects and applies the probe; `query/guc.rs` is the tracked list and the probe column order; the settings effect lives in `query/write.rs` and is produced in `query/ast/convert_raw/write.rs` and `proxy/query.rs`. Supersedes ADR-006's acquisition strategy and amends ADR-054's isolation discovery; ADR-006's keying and resolution sections stand.

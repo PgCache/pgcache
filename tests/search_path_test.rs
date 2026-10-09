@@ -259,11 +259,11 @@ async fn test_search_path_cache_invalidation() -> Result<(), Error> {
     Ok(())
 }
 
-/// Smoke test: mid-connection `SET search_path` via simple-query goes
-/// through the piggyback path (Query message rewritten to
-/// `SET ...; SHOW search_path`, SHOW response stripped before the client
-/// sees it). The client should see a normal SET response and subsequent
-/// queries must continue to work against the new schema.
+/// Smoke test: a mid-connection `SET search_path` via simple-query marks the
+/// path unknown; the settings probe injected at the SET's ReadyForQuery
+/// re-reads it before the next cacheable query is keyed (on PG18 the
+/// ParameterStatus does the same without a probe). The client sees a normal
+/// SET response and subsequent queries work against the new schema.
 #[tokio::test]
 async fn test_search_path_dynamic_simple_query() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;
@@ -298,9 +298,8 @@ async fn test_search_path_dynamic_simple_query() -> Result<(), Error> {
         .await?;
     assert_row_at(&res, 1, &[("id", "1"), ("label", "widget_one")])?;
 
-    // Phase 2: SET is rewritten to `SET ...; SHOW search_path` on the wire.
-    // The client's API call must not see the SHOW response. Then the B-only
-    // table must still resolve successfully against origin.
+    // Phase 2: the SET's response reaches the client unchanged, and the
+    // B-only table resolves against the re-read path.
     ctx.simple_query("SET search_path TO dyn_simple_b").await?;
     let res = ctx
         .simple_query("SELECT id, label FROM gadgets WHERE id = 1")
@@ -311,8 +310,7 @@ async fn test_search_path_dynamic_simple_query() -> Result<(), Error> {
 }
 
 /// Same smoke test but the `SET search_path` goes through the extended
-/// protocol (tokio-postgres `query`), which takes the lazy re-SHOW path
-/// instead of piggyback.
+/// protocol (tokio-postgres `query`).
 #[tokio::test]
 async fn test_search_path_dynamic_extended_protocol() -> Result<(), Error> {
     let mut ctx = TestContext::setup().await?;

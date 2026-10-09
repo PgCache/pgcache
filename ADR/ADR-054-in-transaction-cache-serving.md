@@ -62,9 +62,10 @@ read-after-write gate.
   default; `RESET`, `RESET ALL`, `DISCARD ALL`, `SET ... TO DEFAULT`, `SET
   LOCAL`, an unreadable value, an unparseable statement, and any text
   mentioning `set_config` mark the default unknown. Unknown means forward, and
-  unknown is transient: the next ReadyForQuery re-probes. A mutation
-  inside a block flags a re-probe at block end, since a `SET` in a
-  rolled-back block reverts and `SET LOCAL` always does.
+  unknown is transient: the next ReadyForQuery re-probes. *(ADR-056: the
+  default is now one column of the session-settings probe, whose in-block
+  sample is ignored for it; a session-scoped `SET` inside a block marks the
+  default unknown at forward time, so the block end itself re-probes nothing.)*
 - **A block's level is fixed when it starts.** As PostgreSQL reads the default
   at `BEGIN`, the proxy snapshots its session state into a block-scoped state
   on the idle→in-block ReadyForQuery edge (a forwarded `BEGIN` clause takes
@@ -129,8 +130,8 @@ read-after-write gate.
 
 ### Negative
 
-- One `SHOW default_transaction_isolation` round trip per connection at
-  connect, and one after each isolation mutation.
+- One probe round trip per connection at connect (the session-settings probe,
+  ADR-056), and one after each isolation mutation.
 - A block that explicitly asks for READ COMMITTED under a stricter session
   default is forwarded wholesale (the clause is not trusted).
 - A mid-response serve failure inside a block drops the client connection

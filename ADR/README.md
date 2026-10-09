@@ -13,7 +13,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 
 ## Proxy & PostgreSQL protocol
 - [ADR-005](ADR-005-extended-query-protocol-support.md) — Extended query protocol (Parse/Bind/Execute) with parse-time cacheability
-- [ADR-006](ADR-006-search-path-support.md) — Per-connection `search_path` tracking for schema resolution
+- [ADR-006](ADR-006-search-path-support.md) — Per-connection `search_path` tracking for schema resolution *(acquisition superseded by ADR-056; keying stands)*
 - [ADR-008](ADR-008-origin-tls-support.md) — Origin TLS (rustls + SSLRequest negotiation)
 - [ADR-009](ADR-009-client-tls-support.md) — Client TLS (shared `ServerConnection` across threads)
 - [ADR-025](ADR-025-cache-connection-hot-path.md) — CacheConnection hot path: zero-copy frame forwarding, no `tokio_postgres`
@@ -23,6 +23,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-051](ADR-051-raw-tier-merge-newest.md) — RaW tier saturation folds into the newest tier; depth cap 8 *(amends ADR-048's tier queues)*
 - [ADR-054](ADR-054-in-transaction-cache-serving.md) — In-transaction cache serving at READ COMMITTED: per-slot transaction gate, isolation discovery (probe + statement tracking), ReadyForQuery status plumbing *(extends ADR-048; probe injection amended by ADR-055)*
 - [ADR-055](ADR-055-probes-as-ordered-egress-slots.md) — Probe replies as ordered egress slots: position in origin's reply order replaces intercept + quiescence for all three probes *(amends ADR-006, ADR-048, ADR-054)*
+- [ADR-056](ADR-056-per-connection-session-settings.md) — Per-connection session settings: one tracked-GUC state, one analyzer effect, one batched probe scoped by its status byte *(supersedes ADR-006's acquisition; amends ADR-054)*
 
 ## Query parsing, analysis & transformation
 - [ADR-002](ADR-002-resolved-ast.md) — Resolved AST: fully schema-qualified query form for analysis

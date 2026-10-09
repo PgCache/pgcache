@@ -1,7 +1,7 @@
 # ADR-006: Search Path Support for Schema Resolution
 
 ## Status
-Accepted
+Accepted. The acquisition strategy (ParameterStatus, fallback `SHOW`, piggyback) is superseded by ADR-056; the parsing rules and the Cache Key section stand.
 
 ## Context
 
