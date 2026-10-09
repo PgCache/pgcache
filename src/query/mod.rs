@@ -6,6 +6,7 @@ pub mod decorrelate;
 pub mod evaluate;
 pub mod fingerprint;
 pub mod guc;
+pub mod literal_settings;
 pub mod predicate;
 pub mod resolve;
 pub mod resolved;

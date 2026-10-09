@@ -74,6 +74,8 @@ pub struct CachedQuery {
     pub invalidated: bool,
     /// Pinned queries are protected from eviction and auto-readmitted after CDC invalidation.
     pub pinned: bool,
+    /// Mirrored into `CachedQueryView.reference_only`.
+    pub reference_only: bool,
 }
 
 impl BiHashItem for CachedQuery {
@@ -369,6 +371,10 @@ pub struct CachedQueryView {
     pub serve_shape: Option<QueryShape>,
     /// Maximum rows cached for this fingerprint (None = all rows)
     pub max_limit: Option<u64>,
+    /// A date-time literal was left as written at registration, so the
+    /// entry holds what the reference settings make of it; serve only to a
+    /// session on the same settings (PGC-287).
+    pub reference_only: bool,
     /// CLOCK reference bit — set by dispatch on cache hit, read/cleared by writer during eviction
     pub referenced: bool,
     /// MV shape classification, runtime state, and captured output column

@@ -37,6 +37,7 @@ use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
 use crate::query::guc::Guc;
+use crate::query::literal_settings::LiteralSettings;
 use crate::query::transform::query_expr_parameters_replace;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
@@ -248,6 +249,7 @@ async fn handle_connection(
                     }
                 };
 
+                let literal_settings = Arc::new(state.session_settings.literal_settings(in_block));
                 crate::metrics::handles().query.cacheable.increment(1);
 
                 // Transaction gate (PGC-387): inside a block, serve only when the
@@ -298,6 +300,7 @@ async fn handle_connection(
                                 read_column_ranges(
                                     read_query,
                                     &resolved_search_path,
+                                    &literal_settings,
                                     &state.dispatch_handle,
                                     &state.write_log,
                                 )
@@ -364,6 +367,7 @@ async fn handle_connection(
                     reply_tx,
                     search_path: resolved_search_path,
                     output_settings: Arc::new(state.session_settings.output_settings(in_block)),
+                    literal_settings,
                     timing,
                     pipeline: state.extended.pipeline_take(),
                     transaction_status: state.transaction_status,
@@ -541,6 +545,7 @@ fn read_query_bound(msg: &CacheMessage) -> Option<QueryExpr> {
 fn read_column_ranges(
     query: &QueryExpr,
     search_path: &[EcoString],
+    literal_settings: &LiteralSettings,
     dispatch_handle: &CacheDispatchHandle,
     write_log: &WriteLog,
 ) -> Option<HashMap<EcoString, ColumnRange>> {
@@ -548,7 +553,7 @@ fn read_column_ranges(
     if !write_log.table_has_row_predicate(table) {
         return None;
     }
-    let key = query_expr_session_key(query, search_path);
+    let key = query_expr_session_key(query, search_path, literal_settings);
     let resolved = dispatch_handle.cached_query_resolved(key)?;
     let select = resolved.as_select()?;
     let constraints = analyze_query_constraints(select);
@@ -820,7 +825,10 @@ impl ConnectionState {
                     .search_path()
                     .resolve()
                     .unwrap_or_else(|| Arc::from([]));
-                let key = query_expr_session_key(ast.query(), &search_path);
+                let literal_settings = self
+                    .session_settings
+                    .literal_settings(self.in_transaction());
+                let key = query_expr_session_key(ast.query(), &search_path, &literal_settings);
                 self.telemetry.cache_timing_start(key);
                 self.extended.dispatch_is_extended = false;
                 self.egress.cache_push(CacheMessage::Query(msg.data, ast));

@@ -21,6 +21,7 @@ use crate::cache::messages::{
 use crate::cache::mv::MvMeta;
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::query::{CacheableQuery, limit_rows_needed};
+use crate::cache::reference_settings;
 use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;
 use crate::cache::serve_decision::{DecisionInput, EntrySnapshot, ServeDecision, serve_decide};
@@ -31,6 +32,7 @@ use crate::cache::{CacheError, CacheResult, fast_path};
 use crate::pg::Lsn;
 use crate::proxy::ClientSocket;
 use crate::query::ast::query_expr_session_key;
+use crate::query::literal_settings::LiteralSettings;
 use crate::query::{Fingerprint, SessionKey};
 use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, DynamicConfig, Settings};
@@ -152,12 +154,14 @@ impl CacheDispatch {
         session_key: SessionKey,
         cacheable_query: &Arc<CacheableQuery>,
         search_path: &Arc<[EcoString]>,
+        literal_settings: &Arc<LiteralSettings>,
     ) -> Option<Fingerprint> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let request = ResolveRequest {
             session_key,
             cacheable_query: Arc::clone(cacheable_query),
             search_path: Arc::clone(search_path),
+            literal_settings: Arc::clone(literal_settings),
             reply_tx,
         };
         if self.query_tx.send(QueryCommand::Resolve(request)).is_err() {
@@ -222,6 +226,7 @@ impl CacheDispatch {
             reply_tx,
             search_path,
             output_settings,
+            literal_settings,
             timing,
             pipeline,
             transaction_status,
@@ -239,6 +244,7 @@ impl CacheDispatch {
                     transaction_status,
                 },
                 &search_path,
+                &literal_settings,
             );
             return;
         }
@@ -266,6 +272,7 @@ impl CacheDispatch {
                     reply_tx,
                     search_path,
                     output_settings,
+                    literal_settings,
                     timing,
                     pipeline,
                     transaction_status,
@@ -309,7 +316,11 @@ impl CacheDispatch {
         // Identity: through the alias map, or — once per (query, path) pair —
         // by asking the writer to resolve the query. A brand-new pair under
         // throttle forwards before resolving, as a brand-new entry would.
-        let session_key = query_expr_session_key(msg.cacheable_query.query(), &msg.search_path);
+        let session_key = query_expr_session_key(
+            msg.cacheable_query.query(),
+            &msg.search_path,
+            &msg.literal_settings,
+        );
         let fingerprint = match self.fingerprint_for_key(session_key) {
             Some(fingerprint) => fingerprint,
             None if self.state_view.throttled() => {
@@ -321,7 +332,12 @@ impl CacheDispatch {
             }
             None => {
                 match self
-                    .session_key_resolve(session_key, &msg.cacheable_query, &msg.search_path)
+                    .session_key_resolve(
+                        session_key,
+                        &msg.cacheable_query,
+                        &msg.search_path,
+                        &msg.literal_settings,
+                    )
                     .await
                 {
                     Some(fingerprint) => fingerprint,
@@ -459,6 +475,7 @@ impl CacheDispatch {
             resolved: Some(resolved),
             deparsed_sql: Some(deparsed_sql),
             serve_shape,
+            reference_only,
             ..
         }) = entry
         else {
@@ -468,6 +485,16 @@ impl CacheDispatch {
             debug!("ready entry without resolved form, forwarding {fingerprint}");
             return msg.forward();
         };
+        // A literal the writer could not canonicalise means what the
+        // reference settings make of it; a session on other settings would
+        // read different rows from origin.
+        if *reference_only && *msg.literal_settings != reference_settings::current().literals {
+            crate::metrics::handles()
+                .cache
+                .reference_only_forward_total
+                .increment(1);
+            return msg.forward();
+        }
         self.metrics_hit_record(fingerprint);
         self.clock_reference_set(target.input.cache_policy, &fingerprint);
         self.hit_serve(
@@ -596,6 +623,7 @@ impl CacheDispatch {
                         deparsed_sql: None,
                         serve_shape: None,
                         max_limit: None,
+                        reference_only: false,
                         referenced: false,
                         // Writer fills this in after resolution/classification.
                         mv: MvMeta::new(ShapeGate::Skip, None),

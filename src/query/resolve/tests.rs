@@ -10,6 +10,7 @@ use crate::query::ast::{
     AstNode, BinaryOp, Deparse, JoinType, LiteralValue, OrderDirection, SelectNode, SubLinkType,
 };
 use crate::query::ast::{query_expr_parse, query_expr_session_key};
+use crate::query::literal_settings::LiteralSettings;
 use crate::query::resolved::resolved_query_fingerprint;
 use crate::query::resolved::{
     ResolveError, ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode,
@@ -1889,7 +1890,8 @@ fn test_resolved_query_fingerprint_identity() {
         bare.get(),
         query_expr_session_key(
             &query_expr_parse("SELECT id FROM users WHERE id = 1").expect("parse"),
-            &["public".into()]
+            &["public".into()],
+            &LiteralSettings::default()
         )
         .get()
     );

@@ -21,6 +21,7 @@ use crate::cache::output_settings::OutputSettings;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::proxy::search_path::SearchPath;
 use crate::query::guc::Guc;
+use crate::query::literal_settings::LiteralSettings;
 use crate::query::write::{IsolationLevel, SettingsEffect};
 
 /// A setting's value as the proxy knows it.
@@ -312,6 +313,18 @@ impl SessionSettings {
                 .map(EcoString::from)
                 .unwrap_or_default()
         })
+    }
+
+    /// The literal-semantics settings in force for a read at this scope; the
+    /// caller has checked [`Self::serve_search_path`], so every value is known.
+    pub(crate) fn literal_settings(&self, in_block: bool) -> LiteralSettings {
+        let value = |guc: Guc| self.effective(guc, in_block).known().unwrap_or_default();
+        LiteralSettings::from_texts(
+            value(Guc::TimeZone),
+            value(Guc::DateStyle),
+            value(Guc::IntervalStyle),
+            value(Guc::TimezoneAbbreviations),
+        )
     }
 
     /// Whether a probe at this scope would learn a value. Inside a block,

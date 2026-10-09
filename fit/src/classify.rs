@@ -17,8 +17,10 @@ use pgcache_lib::query::ast::{
 use pgcache_lib::query::constraints::{
     QueryConstraints, TableConstraint, analyze_query_constraints,
 };
+use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::resolve::query_expr_resolve;
 use pgcache_lib::query::resolved::resolved_query_fingerprint;
+use pgcache_lib::query::transform::resolved_literals_canonicalise;
 use pgcache_lib::query::transform::{predicate_pushdown_apply, query_expr_parameters_replace};
 use pgcache_lib::query::write::{TransactionBoundary, WriteClass};
 use pgcache_lib::query::{Fingerprint, ShapeKey, query_shape_derive};
@@ -295,15 +297,16 @@ pub fn statement_classify(
     // forcing unbounded population, exactly as in query_resolve.
     let (base_query, user_max_limit) = base_query_prepare(cacheable.query());
 
-    let Ok(resolved) = query_expr_resolve(&base_query, catalog, &["public"]) else {
+    let Ok(mut resolved) = query_expr_resolve(&base_query, catalog, &["public"]) else {
         return Verdict::Passthrough {
             reason: PassthroughReason::ResolutionFailed,
             detail: None,
             cte_write: None,
         };
     };
-    // The identity is the resolved form before the pushdown transform, as
-    // pgcache computes it.
+    // The identity is the resolved form, literals canonicalised under the
+    // default settings, before the pushdown transform — as pgcache computes it.
+    resolved_literals_canonicalise(&mut resolved, &LiteralSettings::default());
     let fingerprint = resolved_query_fingerprint(&resolved);
     let resolved = predicate_pushdown_apply(resolved);
     let shape_gate = shape_gate_classify(&resolved, &builtins.aggregates);

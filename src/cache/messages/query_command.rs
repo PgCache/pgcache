@@ -16,6 +16,7 @@ use crate::cache::{
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::pg::protocol::session::ResultFormats;
+use crate::query::literal_settings::LiteralSettings;
 use crate::query::{Fingerprint, SessionKey};
 
 /// Result of a subsumption check, sent from the writer back to the dispatch
@@ -92,6 +93,9 @@ pub struct ResolveRequest {
     pub session_key: SessionKey,
     pub cacheable_query: Arc<CacheableQuery>,
     pub search_path: Arc<[EcoString]>,
+    /// The registering session's literal-semantics settings, which the
+    /// writer canonicalises the query's date-time literals under.
+    pub literal_settings: Arc<LiteralSettings>,
     pub reply_tx: oneshot::Sender<ResolveResult>,
 }
 
@@ -109,6 +113,7 @@ pub struct RegisterRequest {
     pub fingerprint: Fingerprint,
     pub cacheable_query: Arc<CacheableQuery>,
     pub search_path: Arc<[EcoString]>,
+    pub literal_settings: Arc<LiteralSettings>,
     pub started_at: Instant,
     /// Writer sends subsumption result back so the dispatch can route the held request.
     pub subsumption_tx: oneshot::Sender<SubsumptionResult>,

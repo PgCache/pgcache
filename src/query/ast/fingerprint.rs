@@ -3,7 +3,8 @@ use std::hash::{Hash, Hasher};
 
 use ecow::EcoString;
 
-use super::{QueryExpr, SelectNode};
+use super::{AstNode, LiteralValue, QueryExpr, SelectNode};
+use crate::query::literal_settings::LiteralSettings;
 use crate::query::{Fingerprint, SessionKey};
 
 /// Domain tag mixed into a session key after the AST so it never shares a
@@ -38,13 +39,31 @@ pub fn query_expr_fingerprint(query: &QueryExpr) -> Fingerprint {
     Fingerprint::from_raw(query_expr_hasher(query).finish())
 }
 
-/// The proxy's key for a query under the session's resolved search_path. The
-/// alias map maps it to the fingerprint the writer resolved the pair to.
-pub fn query_expr_session_key(query: &QueryExpr, search_path: &[EcoString]) -> SessionKey {
+/// The proxy's key for a query under the session's resolved search_path and,
+/// when the query has a string literal whose meaning they could change, its
+/// literal settings. The alias map maps it to the fingerprint the writer
+/// resolved the triple to.
+pub fn query_expr_session_key(
+    query: &QueryExpr,
+    search_path: &[EcoString],
+    literals: &LiteralSettings,
+) -> SessionKey {
     let mut hasher = query_expr_hasher(query);
     hasher.write_u8(DOMAIN_SESSION);
     search_path.hash(&mut hasher);
+    if query_expr_has_string_literal(query) {
+        literals.hash(&mut hasher);
+    }
     SessionKey::from_raw(hasher.finish())
+}
+
+fn query_expr_has_string_literal(query: &QueryExpr) -> bool {
+    query.nodes::<LiteralValue>().any(|literal| {
+        matches!(
+            literal,
+            LiteralValue::String(_) | LiteralValue::StringWithCast(..)
+        )
+    })
 }
 
 #[cfg(test)]
@@ -61,7 +80,23 @@ mod tests {
     }
 
     fn session_key(sql: &str, search_path: &[&str]) -> SessionKey {
-        query_expr_session_key(&parse(sql), &path(search_path))
+        query_expr_session_key(&parse(sql), &path(search_path), &LiteralSettings::default())
+    }
+
+    #[test]
+    fn test_session_key_folds_literal_settings_only_with_a_string_literal() {
+        let tokyo = LiteralSettings::from_texts("Asia/Tokyo", "ISO, MDY", "postgres", "Default");
+        let utc = LiteralSettings::default();
+        let numeric = parse("SELECT id FROM users WHERE id = 1");
+        assert_eq!(
+            query_expr_session_key(&numeric, &path(&["public"]), &tokyo),
+            query_expr_session_key(&numeric, &path(&["public"]), &utc)
+        );
+        let text = parse("SELECT id FROM users WHERE created_at > '2024-01-01'");
+        assert_ne!(
+            query_expr_session_key(&text, &path(&["public"]), &tokyo),
+            query_expr_session_key(&text, &path(&["public"]), &utc)
+        );
     }
 
     #[test]
@@ -96,7 +131,7 @@ mod tests {
     fn test_session_key_never_equals_the_plain_fingerprint() {
         let query = parse("SELECT id FROM users WHERE id = 1");
         assert_ne!(
-            query_expr_session_key(&query, &path(&[])).get(),
+            query_expr_session_key(&query, &path(&[]), &LiteralSettings::default()).get(),
             query_expr_fingerprint(&query).get()
         );
     }

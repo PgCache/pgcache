@@ -25,6 +25,7 @@ use postgres_types::{Kind, Type};
 
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::bool_literal_parse;
+use crate::query::literal_settings::{DateOrder, LiteralSettings};
 
 /// How a column's values compare, derived from its type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +77,7 @@ impl ValueKind {
 
     /// The kind a literal's cast names (`'…'::timestamptz`), from the
     /// canonical type name the converter stores on the literal.
-    fn of_cast_name(name: &str) -> Self {
+    pub(crate) fn of_cast_name(name: &str) -> Self {
         match name {
             "int2" | "int4" | "int8" | "oid" => Self::Integer,
             "numeric" | "float4" | "float8" => Self::Decimal,
@@ -374,6 +375,133 @@ impl TypedValue {
             Self::TimestampTz(instant) => float(instant.as_microsecond() as f64),
             Self::Text(text) => Some(LiteralValue::String(text.into())),
         }
+    }
+}
+
+/// The canonical spelling of a date-time literal for a column of `kind`
+/// under the session's settings: ISO date, ISO date-time, or an instant with
+/// an explicit `+00` offset — unambiguous under any session. `None` when the
+/// text is not a spelling this parser handles (a month name, `infinity`, a
+/// zone-less `timestamptz` under an unknown zone), or `kind` is not a
+/// date-time kind.
+pub fn literal_canonical_text(
+    kind: ValueKind,
+    text: &str,
+    settings: &LiteralSettings,
+) -> Option<String> {
+    match kind {
+        ValueKind::Date => {
+            let (date, _, _) = datetime_split_ordered(text, settings.date_order)?;
+            Some(date.to_string())
+        }
+        ValueKind::Timestamp => {
+            let (date, time, _) = datetime_split_ordered(text, settings.date_order)?;
+            let civil = civil_parse_date(date, time)?;
+            Some(civil_text(civil))
+        }
+        ValueKind::TimestampTz => {
+            let (date, time, offset) = datetime_split_ordered(text, settings.date_order)?;
+            let civil = civil_parse_date(date, time)?;
+            let instant = match offset {
+                Some(offset) => civil
+                    .to_zoned(TimeZone::fixed(offset_parse(offset)?))
+                    .ok()?
+                    .timestamp(),
+                None => civil.to_zoned(settings.zone()?).ok()?.timestamp(),
+            };
+            Some(format!(
+                "{}+00",
+                civil_text(instant.to_zoned(TimeZone::UTC).datetime())
+            ))
+        }
+        ValueKind::Integer
+        | ValueKind::Decimal
+        | ValueKind::Bool
+        | ValueKind::Text
+        | ValueKind::Bpchar
+        | ValueKind::Uuid
+        | ValueKind::Enum
+        | ValueKind::Unsupported => None,
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]` as PostgreSQL prints a `timestamp`.
+fn civil_text(civil: DateTime) -> String {
+    let base = format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        civil.year(),
+        civil.month(),
+        civil.day(),
+        civil.hour(),
+        civil.minute(),
+        civil.second()
+    );
+    let micros = civil.subsec_nanosecond() / 1000;
+    if micros == 0 {
+        base
+    } else {
+        format!("{base}.{}", format!("{micros:06}").trim_end_matches('0'))
+    }
+}
+
+/// Like [`datetime_split`], also accepting a numeric date in the session's
+/// field order (`01/15/2024`, `15.01.2024`, `15-01-2024`); a four-digit first
+/// field is year-first whatever the order, as in PostgreSQL. The date part
+/// is returned normalised to `YYYY-MM-DD`.
+fn datetime_split_ordered(
+    text: &str,
+    order: DateOrder,
+) -> Option<(Date, Option<&str>, Option<&str>)> {
+    if let Some((date, time, offset)) = datetime_split(text) {
+        return Some((date.parse().ok()?, time, offset));
+    }
+    let text = text.trim();
+    let (date_text, rest) = match text.find([' ', 'T']) {
+        Some(i) => text.split_at_checked(i)?,
+        None => (text, ""),
+    };
+    let parts: Vec<&str> = date_text.split(['/', '.', '-']).collect();
+    let [a, b, c] = parts.as_slice() else {
+        return None;
+    };
+    if !parts
+        .iter()
+        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let (year, month, day) = if a.len() == 4 {
+        (a, b, c)
+    } else {
+        match order {
+            DateOrder::MonthDayYear => (c, a, b),
+            DateOrder::DayMonthYear => (c, b, a),
+            DateOrder::YearMonthDay => (a, b, c),
+        }
+    };
+    let year: i16 = year.parse().ok()?;
+    let month: i8 = month.parse().ok()?;
+    let day: i8 = day.parse().ok()?;
+    let date = Date::new(year, month, day).ok()?;
+    if rest.is_empty() {
+        return Some((date, None, None));
+    }
+    let rest = rest.strip_prefix([' ', 'T'])?;
+    let (time, offset) = match rest.find(['+', '-', 'Z', 'z']) {
+        Some(i) => {
+            let (time, offset) = rest.split_at_checked(i)?;
+            (time, Some(offset))
+        }
+        None => (rest, None),
+    };
+    let time = time.trim_end();
+    Some((date, (!time.is_empty()).then_some(time), offset))
+}
+
+fn civil_parse_date(date: Date, time: Option<&str>) -> Option<DateTime> {
+    match time {
+        Some(time) => Some(date.to_datetime(time_parse(time)?)),
+        None => Some(date.to_datetime(jiff::civil::Time::midnight())),
     }
 }
 
@@ -821,6 +949,58 @@ mod tests {
             cmp(&Type::BOOL, LiteralValue::Integer(0), "f", Equal),
             Some(true)
         );
+    }
+
+    #[test]
+    fn test_canonical_text_under_settings() {
+        let mdy = LiteralSettings::from_texts("Asia/Tokyo", "ISO, MDY", "postgres", "Default");
+        let dmy = LiteralSettings::from_texts("UTC", "ISO, DMY", "postgres", "Default");
+        let canon = |kind, text: &str, s: &LiteralSettings| literal_canonical_text(kind, text, s);
+        assert_eq!(
+            canon(ValueKind::Date, "01/02/2024", &mdy).as_deref(),
+            Some("2024-01-02")
+        );
+        assert_eq!(
+            canon(ValueKind::Date, "01/02/2024", &dmy).as_deref(),
+            Some("2024-02-01")
+        );
+        assert_eq!(
+            canon(ValueKind::Date, "2024-01-02", &dmy).as_deref(),
+            Some("2024-01-02")
+        );
+        assert_eq!(
+            canon(ValueKind::Date, "2024/01/02", &dmy).as_deref(),
+            Some("2024-01-02")
+        );
+        assert_eq!(canon(ValueKind::Date, "Jan 2 2024", &mdy), None);
+        assert_eq!(
+            canon(ValueKind::Timestamp, "2024-01-02 10:00", &mdy).as_deref(),
+            Some("2024-01-02 10:00:00")
+        );
+        assert_eq!(
+            canon(ValueKind::Timestamp, "2024-01-02T10:00:00.250", &mdy).as_deref(),
+            Some("2024-01-02 10:00:00.25")
+        );
+        // Zone-less timestamptz: the session zone decides the instant.
+        assert_eq!(
+            canon(ValueKind::TimestampTz, "2024-01-02 10:00", &mdy).as_deref(),
+            Some("2024-01-02 01:00:00+00")
+        );
+        assert_eq!(
+            canon(ValueKind::TimestampTz, "2024-01-02 10:00+05:30", &dmy).as_deref(),
+            Some("2024-01-02 04:30:00+00")
+        );
+        let unknown =
+            LiteralSettings::from_texts("Nowhere/Land", "ISO, MDY", "postgres", "Default");
+        assert_eq!(
+            canon(ValueKind::TimestampTz, "2024-01-02 10:00", &unknown),
+            None
+        );
+        assert_eq!(
+            canon(ValueKind::TimestampTz, "2024-01-02 10:00Z", &unknown).as_deref(),
+            Some("2024-01-02 10:00:00+00")
+        );
+        assert_eq!(canon(ValueKind::Integer, "1", &mdy), None);
     }
 
     #[test]

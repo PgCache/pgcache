@@ -264,6 +264,10 @@ pub mod names {
     /// Queries forwarded to origin (not registered) due to memory-pressure throttling.
     pub const CACHE_REGISTRATION_THROTTLED_TOTAL: &str =
         "pgcache.cache.registration_throttled_total";
+    /// Hits on an entry holding a reference-only literal, forwarded because
+    /// the session's literal settings differ from the reference (PGC-287).
+    pub const CACHE_REFERENCE_ONLY_FORWARD_TOTAL: &str =
+        "pgcache.cache.reference_only_forward_total";
     /// Max registered queries that fit the memory budget (0 = uncapped) (PGC-251).
     pub const CACHE_QUERY_COUNT_CAP: &str = "pgcache.cache.query_count_cap";
     /// Measured per-query memory footprint, EWMA-smoothed bytes (PGC-251).
@@ -675,6 +679,7 @@ pub struct CacheHandles {
     pub marginal_bytes_per_query: Gauge,
     pub registration_throttled: Gauge,
     pub registration_throttled_total: Counter,
+    pub reference_only_forward_total: Counter,
     /// Serve-pool liveness observability (PGC-278).
     pub serves_in_flight: Gauge,
     pub pool_available: Gauge,
@@ -701,13 +706,14 @@ impl CacheHandles {
             CACHE_MEMO_CAPTURES, CACHE_MEMO_ENTRIES, CACHE_MEMO_EVICTIONS, CACHE_MEMO_HITS,
             CACHE_MEMORY_BUDGET_BYTES, CACHE_MEMORY_USED_BYTES, CACHE_MV_BUILDS_SUPPRESSED,
             CACHE_MV_FALLTHROUGH, CACHE_MV_HITS, CACHE_POOL_AVAILABLE, CACHE_POOL_RECYCLED,
-            CACHE_POOL_REPLENISHED, CACHE_QUERY_COUNT_CAP, CACHE_REG_GATE_BTLBW,
-            CACHE_REG_GATE_DRAIN_RATE, CACHE_REG_GATE_LOADING, CACHE_REG_GATE_QUEUE_MIN,
-            CACHE_REG_GATE_RATE, CACHE_REGISTRATION_THROTTLED, CACHE_REGISTRATION_THROTTLED_TOTAL,
-            CACHE_RESTARTS_TOTAL, CACHE_RSS_BYTES, CACHE_SERVE_DESYNC_TOTAL,
-            CACHE_SERVE_DIRTY_RETURN_TOTAL, CACHE_SERVE_POOL_BACKSTOP_GROWS,
-            CACHE_SERVE_POOL_SCALE_DOWN, CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE,
-            CACHE_SERVE_SETTINGS_APPLIED, CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
+            CACHE_POOL_REPLENISHED, CACHE_QUERY_COUNT_CAP, CACHE_REFERENCE_ONLY_FORWARD_TOTAL,
+            CACHE_REG_GATE_BTLBW, CACHE_REG_GATE_DRAIN_RATE, CACHE_REG_GATE_LOADING,
+            CACHE_REG_GATE_QUEUE_MIN, CACHE_REG_GATE_RATE, CACHE_REGISTRATION_THROTTLED,
+            CACHE_REGISTRATION_THROTTLED_TOTAL, CACHE_RESTARTS_TOTAL, CACHE_RSS_BYTES,
+            CACHE_SERVE_DESYNC_TOTAL, CACHE_SERVE_DIRTY_RETURN_TOTAL,
+            CACHE_SERVE_POOL_BACKSTOP_GROWS, CACHE_SERVE_POOL_SCALE_DOWN,
+            CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE, CACHE_SERVE_SETTINGS_APPLIED,
+            CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
         };
         Self {
             lookup_latency: metrics::histogram!(CACHE_LOOKUP_LATENCY_SECONDS),
@@ -733,6 +739,7 @@ impl CacheHandles {
             marginal_bytes_per_query: metrics::gauge!(CACHE_MARGINAL_BYTES_PER_QUERY),
             registration_throttled: metrics::gauge!(CACHE_REGISTRATION_THROTTLED),
             registration_throttled_total: metrics::counter!(CACHE_REGISTRATION_THROTTLED_TOTAL),
+            reference_only_forward_total: metrics::counter!(CACHE_REFERENCE_ONLY_FORWARD_TOTAL),
             serves_in_flight: metrics::gauge!(CACHE_SERVES_IN_FLIGHT),
             pool_available: metrics::gauge!(CACHE_POOL_AVAILABLE),
             serve_pool_size: metrics::gauge!(CACHE_SERVE_POOL_SIZE),

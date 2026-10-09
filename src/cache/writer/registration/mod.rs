@@ -79,6 +79,8 @@ pub(super) struct QueryResolution {
     /// MV body applies the user's LIMIT over the source-row cache);
     /// `None` for other reducers, whose results are already collapsed.
     pub(super) mv_limit: Option<u64>,
+    /// See `CachedQuery.reference_only`.
+    pub(super) reference_only: bool,
     /// MV shape gate. Also gates `max_limit`: reducer shapes force
     /// `max_limit = None` so source-row population isn't truncated in a way
     /// that would break re-evaluation (aggregates, GROUP BY, DISTINCT,
@@ -130,6 +132,7 @@ pub(super) fn cached_query_insert(
         registration_started_at: Some(identity.started_at),
         invalidated: false,
         pinned: identity.pinned,
+        reference_only: resolution.reference_only,
     });
     (generation, changed)
 }
@@ -208,6 +211,7 @@ async fn resolve_command(core: &mut WriterCore, request: ResolveRequest) {
         core,
         request.cacheable_query.query(),
         &request.search_path,
+        &request.literal_settings,
     )
     .await
     {

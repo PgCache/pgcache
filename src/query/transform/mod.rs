@@ -1,4 +1,5 @@
 mod constant_fold;
+mod literal_canon;
 mod parameters;
 mod pushdown;
 mod select_node;
@@ -35,6 +36,7 @@ error_set! {
 pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
 pub use constant_fold::query_expr_constant_fold;
+pub use literal_canon::{LiteralCanonOutcome, resolved_literals_canonicalise};
 #[cfg(feature = "proxy")]
 pub(crate) use parameters::{
     delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,

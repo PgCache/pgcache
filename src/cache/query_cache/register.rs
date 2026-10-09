@@ -15,6 +15,7 @@ use crate::cache::messages::{AdmitAction, QueryCommand, RegisterRequest, Subsump
 use crate::cache::mv::MvMeta;
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::query::limit_rows_needed;
+use crate::cache::reference_settings;
 use crate::cache::types::{CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics};
 use crate::cache::{CacheError, CacheResult};
 use crate::query::Fingerprint;
@@ -32,10 +33,19 @@ impl CacheDispatch {
     /// Register pinned queries at startup by sending Register commands with `pinned: true`.
     pub async fn pinned_queries_register(&self, pinned: &[PinnedQuery]) -> CacheResult<()> {
         let search_path = pinned_search_path();
+        // Pinned queries have no session: their literals mean what the
+        // reference makes of them.
+        let literal_settings = Arc::new(reference_settings::current().literals.clone());
         for pq in pinned {
-            let session_key = query_expr_session_key(pq.cacheable_query.query(), &search_path);
+            let session_key =
+                query_expr_session_key(pq.cacheable_query.query(), &search_path, &literal_settings);
             let fingerprint = match self
-                .session_key_resolve(session_key, &pq.cacheable_query, &search_path)
+                .session_key_resolve(
+                    session_key,
+                    &pq.cacheable_query,
+                    &search_path,
+                    &literal_settings,
+                )
                 .await
             {
                 Some(fingerprint) => fingerprint,
@@ -54,6 +64,7 @@ impl CacheDispatch {
                     deparsed_sql: None,
                     serve_shape: None,
                     max_limit: None,
+                    reference_only: false,
                     referenced: false,
                     // Writer fills this in after resolution/classification.
                     mv: MvMeta::new(ShapeGate::Skip, None),
@@ -70,6 +81,7 @@ impl CacheDispatch {
                 fingerprint,
                 cacheable_query: Arc::clone(&pq.cacheable_query),
                 search_path: Arc::clone(&search_path),
+                literal_settings: Arc::clone(&literal_settings),
                 started_at: Instant::now(),
                 subsumption_tx,
                 admit_action: AdmitAction::Admit,
@@ -101,6 +113,7 @@ impl CacheDispatch {
             fingerprint,
             cacheable_query: Arc::clone(&msg.cacheable_query),
             search_path: Arc::clone(&msg.search_path),
+            literal_settings: Arc::clone(&msg.literal_settings),
             started_at: Instant::now(),
             subsumption_tx,
             admit_action,

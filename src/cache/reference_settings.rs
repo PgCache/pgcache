@@ -14,6 +14,7 @@ use ecow::EcoString;
 use tokio_postgres::Client;
 
 use super::{CacheError, CacheResult, MapIntoReport, ReportExt};
+use crate::query::literal_settings::LiteralSettings;
 
 /// Origin's defaults for the literal-semantics settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,15 +23,14 @@ pub(crate) struct ReferenceSettings {
     /// The input order half of `DateStyle` (`MDY`, `DMY`, `YMD`).
     pub(crate) datestyle_order: EcoString,
     pub(crate) intervalstyle: EcoString,
+    /// The same values as a literal-settings profile, for comparison with a
+    /// session's when an entry can only be served under the reference.
+    pub(crate) literals: LiteralSettings,
 }
 
 impl Default for ReferenceSettings {
     fn default() -> Self {
-        Self {
-            timezone: "UTC".into(),
-            datestyle_order: "MDY".into(),
-            intervalstyle: "postgres".into(),
-        }
+        Self::new("UTC", "ISO, MDY", "postgres", "Default")
     }
 }
 
@@ -45,12 +45,26 @@ impl ReferenceSettings {
                 .attach_loc("reading a reference session setting")?;
             Ok(row.get::<_, String>(0))
         };
-        let datestyle = show("DateStyle").await?;
-        Ok(Self {
-            timezone: show("TimeZone").await?.into(),
-            datestyle_order: datestyle_order(&datestyle).into(),
-            intervalstyle: show("IntervalStyle").await?.into(),
-        })
+        Ok(Self::new(
+            &show("TimeZone").await?,
+            &show("DateStyle").await?,
+            &show("IntervalStyle").await?,
+            &show("timezone_abbreviations").await?,
+        ))
+    }
+
+    fn new(timezone: &str, datestyle: &str, intervalstyle: &str, abbreviations: &str) -> Self {
+        Self {
+            timezone: timezone.into(),
+            datestyle_order: datestyle_order(datestyle).into(),
+            intervalstyle: intervalstyle.into(),
+            literals: LiteralSettings::from_texts(
+                timezone,
+                datestyle,
+                intervalstyle,
+                abbreviations,
+            ),
+        }
     }
 
     /// The statements that pin a session to the reference.
@@ -122,11 +136,8 @@ mod tests {
 
     #[test]
     fn test_pin_sql_forces_iso_output_and_quotes_values() {
-        let reference = ReferenceSettings {
-            timezone: "America/New_York".into(),
-            datestyle_order: "DMY".into(),
-            intervalstyle: "sql_standard".into(),
-        };
+        let reference =
+            ReferenceSettings::new("America/New_York", "ISO, DMY", "sql_standard", "Default");
         assert_eq!(
             reference.pin_sql(),
             "SET TimeZone = 'America/New_York'; SET DateStyle = 'ISO, DMY'; \

@@ -52,6 +52,9 @@ impl ConnectionState {
             .search_path()
             .resolve()
             .unwrap_or_else(|| Arc::from([]));
+        let literal_settings = self
+            .session_settings
+            .literal_settings(self.in_transaction());
         // Common case: a single Parse/Bind/Describe/Execute. Begin it directly
         // without allocating a batch queue (the trailing-most slots empty).
         if entries.len() == 1 {
@@ -59,7 +62,13 @@ impl ConnectionState {
                 && let Some(candidate) = entry.candidate.take()
             {
                 self.extended.batch.clear();
-                self.cache_slot_begin(DispatchContext::build(entry, candidate, true, &search_path));
+                self.cache_slot_begin(DispatchContext::build(
+                    entry,
+                    candidate,
+                    true,
+                    &search_path,
+                    &literal_settings,
+                ));
                 self.proxy_mode = ProxyMode::OriginDrain;
             }
             return;
@@ -77,6 +86,7 @@ impl ConnectionState {
                 candidate,
                 i == last,
                 &search_path,
+                &literal_settings,
             ));
         }
         if let Some(first) = contexts.pop_front() {

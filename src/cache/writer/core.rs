@@ -592,11 +592,9 @@ impl WriterCore {
         // The serve shape mirrors `CachedQuery.serve_shape`; the cached query is
         // already inserted at every transition, so read it from there rather
         // than thread it through every transition caller (PGC-294).
-        let serve_shape = self
-            .cache
-            .cached_queries
-            .get1(&fingerprint)
-            .map(|q| q.serve_shape.clone());
+        let cached = self.cache.cached_queries.get1(&fingerprint);
+        let serve_shape = cached.map(|q| q.serve_shape.clone());
+        let reference_only = cached.is_some_and(|q| q.reference_only);
         self.state_view
             .cached_queries
             .entry(fingerprint)
@@ -607,6 +605,7 @@ impl WriterCore {
                 v.deparsed_sql = Some(serving.deparsed_sql.clone());
                 v.serve_shape = serve_shape.clone();
                 v.max_limit = serving.max_limit;
+                v.reference_only = reference_only;
                 v.referenced = false;
             })
             .or_insert_with(|| CachedQueryView {
@@ -616,6 +615,7 @@ impl WriterCore {
                 deparsed_sql: Some(serving.deparsed_sql.clone()),
                 serve_shape,
                 max_limit: serving.max_limit,
+                reference_only,
                 referenced: false,
                 mv: MvMeta::new(ShapeGate::Skip, None),
             });
