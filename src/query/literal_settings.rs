@@ -19,6 +19,15 @@ pub enum DateOrder {
 }
 
 impl DateOrder {
+    /// The spelling `SET DateStyle` takes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MonthDayYear => "MDY",
+            Self::DayMonthYear => "DMY",
+            Self::YearMonthDay => "YMD",
+        }
+    }
+
     /// The order half of a `DateStyle` value (`ISO, DMY` → day first); MDY
     /// when the value names none, as PostgreSQL defaults it.
     pub fn from_datestyle(value: &str) -> Self {

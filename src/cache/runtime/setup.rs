@@ -69,17 +69,29 @@ pub(super) fn cache_setup<'scope, 'env: 'scope, 'settings: 'scope>(
 
     // The literal-semantics settings every pgcache session is pinned to:
     // origin's defaults for the role pgcache connects as (PGC-287 class 2).
-    let reference = handle
-        .block_on(async {
-            let client = pg::connect(&settings.origin, "reference settings")
-                .await
-                .map_into_report::<CacheError>()?;
-            ReferenceSettings::probe(&client).await
-        })
-        .attach_loc("reading the reference session settings from origin")?;
+    let reference: CacheResult<ReferenceSettings> = handle.block_on(async {
+        let client = pg::connect(&settings.origin, "reference settings")
+            .await
+            .map_into_report::<CacheError>()?;
+        let reference = ReferenceSettings::probe(&client)
+            .await
+            .attach_loc("reading the reference session settings from origin")?;
+        let cache_client = pg::connect(&settings.cache, "reference locales")
+            .await
+            .map_into_report::<CacheError>()?;
+        reference.locales_check(&cache_client).await?;
+        Ok(reference)
+    });
+    let reference = reference.attach_loc("establishing the reference session settings")?;
     info!(
-        "reference session settings: TimeZone={} DateStyle=ISO,{} IntervalStyle={}",
-        reference.timezone, reference.datestyle_order, reference.intervalstyle
+        "reference session settings: TimeZone={} DateStyle=ISO,{} IntervalStyle={} \
+         lc_monetary={} lc_numeric={} lc_time={}",
+        reference.timezone,
+        reference.literals.date_order.as_str(),
+        reference.intervalstyle,
+        reference.locales[0],
+        reference.locales[1],
+        reference.locales[2]
     );
     reference_settings::install(reference);
 

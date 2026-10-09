@@ -40,7 +40,7 @@ Alternatives were a third tracker beside the two (rejected: the ticket asks for 
 ### Negative
 - Every fresh connection waits one probe round trip before its first cacheable read is keyed, on PostgreSQL 18 too (its reported settings do not cover the unreported ones).
 - `txn.isolation_probes` is replaced by `conn.settings_probes`.
-- A client's `lc_monetary`, `lc_numeric` or `lc_time` must name a locale the cache cluster's host has; otherwise applying them fails on the cache DB and the hit forwards (the serve-pool error path), every time.
+- Origin's default `lc_monetary`, `lc_numeric` and `lc_time` are checked on the cache DB at setup: a cache host without them could never serve a hit, so the generation refuses to start and names the locale to install. A client that sets a locale of its own that the cache host lacks still forwards every hit through the serve-pool error path (PGC-477).
 - A client on different rendering settings from the ones a memo was captured under misses that memo and takes the serve pool; a binary-format client does too, since a query can still compute settings-dependent text.
 - A session on literal settings other than origin's defaults forwards every hit on a reference-only entry, and every digit-bearing string literal in a blind position (`lpad(x, 5, '0')`) makes its entry reference-only; the pass is conservative where it cannot see a type.
 - The writer resolves a query twice on its first appearance under a (path, settings) pair: once to answer `Resolve`, once to register. Fingerprints are not persistent, so changing what they hash costs nothing across restarts.

@@ -11,11 +11,11 @@
 //! `literal_compare`, so a compiled predicate evaluates identically to
 //! `where_expr_evaluate` for the expression it was compiled from.
 
+use postgres_types::Type;
+
 use crate::pg::protocol::ByteString;
 use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
 use crate::query::cast::{CastTarget, canonicalize_comparison, cast_target_coerce_text};
-use postgres_types::Type;
-
 use crate::query::evaluate::literal_compare;
 use crate::query::resolved::{ResolvedScalarExpr, ResolvedWhereExpr};
 use crate::query::typed_compare::typed_compare;
