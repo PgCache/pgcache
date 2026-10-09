@@ -15,7 +15,7 @@ use crate::cache::query::CacheableQuery;
 use crate::cache::{CacheMessage, QueryParameters};
 use crate::pg::protocol::extended::parse_parameter_description;
 use crate::pg::protocol::session::{PreparedStatement, ResultFormats};
-use crate::query::QueryKey;
+use crate::query::SessionKey;
 use crate::query::ast::query_expr_session_key;
 use crate::query::write::StatementEffects;
 
@@ -272,7 +272,7 @@ pub(super) struct DispatchContext {
     pub(super) msg: CacheMessage,
     pub(super) pipeline: PipelineContext,
     /// Telemetry label for the slot: the query under the session's path.
-    pub(super) key: QueryKey,
+    pub(super) key: SessionKey,
     pub(super) lazy_parse: Option<EcoString>,
     pub(super) parse_statement: Option<EcoString>,
     pub(super) describe_statement: Option<EcoString>,

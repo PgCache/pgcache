@@ -31,7 +31,7 @@ use crate::cache::{CacheError, CacheResult, fast_path};
 use crate::pg::Lsn;
 use crate::proxy::ClientSocket;
 use crate::query::ast::query_expr_session_key;
-use crate::query::{Fingerprint, QueryKey, SessionKey};
+use crate::query::{Fingerprint, SessionKey};
 use crate::result::error_chain_format;
 use crate::settings::{CachePolicy, DynamicConfig, Settings};
 use crate::timing::{QueryTiming, duration_to_ns_u64};
@@ -126,7 +126,7 @@ impl CacheDispatch {
     /// node the writer produced at registration. `None` for unregistered or
     /// still-loading queries, or a session key with no alias yet (the gate
     /// then forwards conservatively).
-    pub fn cached_query_resolved(&self, key: QueryKey) -> Option<SharedResolved> {
+    pub fn cached_query_resolved(&self, key: SessionKey) -> Option<SharedResolved> {
         let fingerprint = self.fingerprint_for_key(key)?;
         let view = self.state_view.cached_queries.get(&fingerprint)?;
         matches!(view.state, CachedQueryState::Ready)
@@ -134,17 +134,13 @@ impl CacheDispatch {
             .flatten()
     }
 
-    /// The fingerprint a query key names: the key itself when canonical, else
-    /// the alias map's answer. `None` is an alias miss.
-    pub(super) fn fingerprint_for_key(&self, key: QueryKey) -> Option<Fingerprint> {
-        match key {
-            QueryKey::Canonical(fingerprint) => Some(fingerprint),
-            QueryKey::Session(session_key) => self
-                .state_view
-                .aliases
-                .get(&session_key)
-                .map(|alias| alias.fingerprint),
-        }
+    /// The fingerprint the alias map has for a session key; `None` is an
+    /// alias miss.
+    pub(super) fn fingerprint_for_key(&self, key: SessionKey) -> Option<Fingerprint> {
+        self.state_view
+            .aliases
+            .get(&key)
+            .map(|alias| alias.fingerprint)
     }
 
     /// Ask the writer which fingerprint a session key resolves to under the
@@ -310,32 +306,28 @@ impl CacheDispatch {
             return msg.forward();
         }
 
-        // Identity: canonical outright, through the alias map, or — once per
-        // (query, path) pair — by asking the writer to resolve the bare table
-        // names. A brand-new pair under throttle forwards before resolving, as
-        // a brand-new entry would.
-        let key = query_expr_session_key(msg.cacheable_query.query(), &msg.search_path);
-        let fingerprint = match key {
-            QueryKey::Canonical(fingerprint) => fingerprint,
-            QueryKey::Session(session_key) => match self.fingerprint_for_key(key) {
-                Some(fingerprint) => fingerprint,
-                None if self.state_view.throttled() => {
-                    crate::metrics::handles()
-                        .cache
-                        .registration_throttled_total
-                        .increment(1);
-                    return msg.forward();
+        // Identity: through the alias map, or — once per (query, path) pair —
+        // by asking the writer to resolve the query. A brand-new pair under
+        // throttle forwards before resolving, as a brand-new entry would.
+        let session_key = query_expr_session_key(msg.cacheable_query.query(), &msg.search_path);
+        let fingerprint = match self.fingerprint_for_key(session_key) {
+            Some(fingerprint) => fingerprint,
+            None if self.state_view.throttled() => {
+                crate::metrics::handles()
+                    .cache
+                    .registration_throttled_total
+                    .increment(1);
+                return msg.forward();
+            }
+            None => {
+                match self
+                    .session_key_resolve(session_key, &msg.cacheable_query, &msg.search_path)
+                    .await
+                {
+                    Some(fingerprint) => fingerprint,
+                    None => return msg.forward(),
                 }
-                None => {
-                    match self
-                        .session_key_resolve(session_key, &msg.cacheable_query, &msg.search_path)
-                        .await
-                    {
-                        Some(fingerprint) => fingerprint,
-                        None => return msg.forward(),
-                    }
-                }
-            },
+            }
         };
         let target = self.dispatch_target(fingerprint, &msg.cacheable_query, &cfg);
         trace!("{fingerprint}");

@@ -2,7 +2,6 @@
 //! and deparse it, classify its shape and limits, and register its per-table
 //! update queries.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,10 +20,12 @@ use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode, query_expr_fingerprint_canonical};
+use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode};
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::query_shape_derive;
-use crate::query::resolved::{ResolvedQueryExpr, enum_order_dependence_check, query_expr_resolve};
+use crate::query::resolved::{
+    ResolvedQueryExpr, enum_order_dependence_check, query_expr_resolve, resolved_query_fingerprint,
+};
 use crate::query::transform::predicate_pushdown_apply;
 
 /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
@@ -64,32 +65,21 @@ async fn cache_tables_ensure(
     Ok(())
 }
 
-/// The canonical fingerprint of a query under `search_path`: each unqualified
-/// table name is resolved against the catalog and folded into the identity.
+/// The fingerprint of a query under `search_path`: the hash of its resolved
+/// form (schema-qualified tables, canonical literals). Ensures the cache
+/// tables exist and resolves exactly as registration does, so the two agree.
 pub(super) async fn query_fingerprint_resolve(
     core: &mut WriterCore,
     query: &QueryExpr,
     search_path: &Arc<[EcoString]>,
 ) -> CacheResult<Fingerprint> {
-    let mut schema_by_name: HashMap<EcoString, EcoString> = HashMap::new();
-    for table_node in query.nodes::<TableNode>() {
-        if table_node.schema.is_some() || schema_by_name.contains_key(&table_node.name) {
-            continue;
-        }
-        let schema = core
-            .schema_for_table_find(table_node.name.as_str(), search_path)
-            .await
-            .attach_loc("resolving unqualified table for fingerprint")?;
-        schema_by_name.insert(table_node.name.clone(), schema);
-    }
-    Ok(query_expr_fingerprint_canonical(query, |table| {
-        let schema = schema_by_name.get(&table.name).cloned();
-        debug_assert!(
-            schema.is_some(),
-            "every unqualified table was resolved above"
-        );
-        schema.unwrap_or_default()
-    }))
+    let (base_query, _) = base_query_prepare(query);
+    cache_tables_ensure(core, &base_query, search_path).await?;
+    let path: Vec<&str> = search_path.iter().map(EcoString::as_str).collect();
+    let resolved = query_expr_resolve(&base_query, &core.cache.tables, &path)
+        .map_err(|e| e.context_transform(CacheError::from))
+        .attach_loc("resolving query expression for its fingerprint")?;
+    Ok(resolved_query_fingerprint(&resolved))
 }
 
 /// Deparse once at registration. The output is a pure function of the
@@ -149,12 +139,17 @@ impl WriterRegistration {
 
         cache_tables_ensure(core, &base_query, &request.search_path).await?;
 
-        let resolved: SharedResolved = Arc::new(
-            query_expr_resolve(&base_query, &core.cache.tables, &search_path)
-                .map_err(|e| e.context_transform(CacheError::from))
-                .attach_loc("resolving query expression")
-                .map(predicate_pushdown_apply)?,
+        let resolved = query_expr_resolve(&base_query, &core.cache.tables, &search_path)
+            .map_err(|e| e.context_transform(CacheError::from))
+            .attach_loc("resolving query expression")?;
+        // The identity dispatch resolved this pair to must be the one this
+        // resolution produces (before the pushdown transform).
+        debug_assert_eq!(
+            resolved_query_fingerprint(&resolved),
+            request.fingerprint,
+            "registration resolved to a different fingerprint than the alias"
         );
+        let resolved: SharedResolved = Arc::new(predicate_pushdown_apply(resolved));
 
         enum_order_dependence_check(&resolved)
             .map_err(|e| e.context_transform(CacheError::from))

@@ -5,6 +5,7 @@ use rootcause::Report;
 use crate::cache::SubqueryKind;
 use crate::catalog::ColumnMetadata;
 use crate::oid::Oid;
+use crate::query::Fingerprint;
 use crate::query::ast::{
     ArithmeticOp, BinaryOp, FrameExclusion, FrameMode, JoinType, LiteralValue, MultiOp, NullOrder,
     OrderDirection, SetOpType, SubLinkType, TableAlias, UnaryOp, ValuesClause,
@@ -60,7 +61,7 @@ error_set! {
 pub type ResolveResult<T> = Result<T, Report<ResolveError>>;
 
 /// Resolved table reference with complete metadata
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ResolvedTableNode {
     /// Full schema name (resolved from 'public' default if needed)
     pub schema: EcoString,
@@ -115,14 +116,14 @@ impl std::hash::Hash for ResolvedColumnNode {
 }
 
 /// Resolved unary expression
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedUnaryExpr {
     pub op: UnaryOp,
     pub expr: Box<ResolvedWhereExpr>,
 }
 
 /// Resolved binary expression
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedBinaryExpr {
     pub op: BinaryOp,
     pub lexpr: Box<ResolvedWhereExpr>,
@@ -130,7 +131,7 @@ pub struct ResolvedBinaryExpr {
 }
 
 /// Resolved multi-operand expression
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedMultiExpr {
     pub op: MultiOp,
     pub exprs: Vec<ResolvedWhereExpr>,
@@ -138,7 +139,7 @@ pub struct ResolvedMultiExpr {
 
 /// Resolved WHERE expression with fully qualified references.
 /// Scalar leaves are wrapped in `Scalar(ResolvedScalarExpr)`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ResolvedWhereExpr {
     /// Scalar leaf — literal, column, function call, arithmetic, array,
     /// scalar subquery, etc.
@@ -163,7 +164,7 @@ pub enum ResolvedWhereExpr {
 }
 
 /// Resolved arithmetic expression: `left op right`
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedArithmeticExpr {
     pub left: Box<ResolvedScalarExpr>,
     pub op: ArithmeticOp,
@@ -173,7 +174,7 @@ pub struct ResolvedArithmeticExpr {
 /// Resolved scalar expression — mirror of AST `ScalarExpr`. Appears in
 /// SELECT columns, function args, arithmetic operands, ARRAY elements,
 /// CASE arms, TypeCast inner, scalar subqueries, and WHERE leaves.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ResolvedScalarExpr {
     Column(ResolvedColumnNode),
     /// Unqualified column name used in set-op ORDER BY, which references
@@ -195,7 +196,7 @@ pub enum ResolvedScalarExpr {
 }
 
 /// Resolved function call — mirrors `query::ast::FunctionCall`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedFunctionCall {
     pub name: EcoString,
     pub args: Vec<ResolvedScalarExpr>,
@@ -207,7 +208,7 @@ pub struct ResolvedFunctionCall {
 }
 
 /// Resolved window specification for OVER clause
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedWindowSpec {
     /// PARTITION BY columns
     pub partition_by: Vec<ResolvedScalarExpr>,
@@ -219,7 +220,7 @@ pub struct ResolvedWindowSpec {
 
 /// Resolved window frame — mirrors `ast::WindowFrame`. `mode`/`exclusion` are
 /// the shared AST enums (no expressions to resolve).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedWindowFrame {
     pub mode: FrameMode,
     pub start: ResolvedFrameBound,
@@ -228,7 +229,7 @@ pub struct ResolvedWindowFrame {
 }
 
 /// Resolved frame bound — mirrors `ast::FrameBound`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ResolvedFrameBound {
     UnboundedPreceding,
     OffsetPreceding(Box<ResolvedScalarExpr>),
@@ -238,7 +239,7 @@ pub enum ResolvedFrameBound {
 }
 
 /// Resolved CASE expression
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedCaseExpr {
     /// For simple CASE, the expression being tested
     pub arg: Option<Box<ResolvedScalarExpr>>,
@@ -249,7 +250,7 @@ pub struct ResolvedCaseExpr {
 }
 
 /// Resolved CASE WHEN clause
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedCaseWhen {
     /// The condition (for searched CASE) or value (for simple CASE)
     pub condition: ResolvedWhereExpr,
@@ -258,14 +259,14 @@ pub struct ResolvedCaseWhen {
 }
 
 /// Resolved SELECT column with optional alias
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedSelectColumn {
     pub expr: ResolvedScalarExpr,
     pub alias: Option<EcoString>,
 }
 
 /// Resolved SELECT columns list
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ResolvedSelectColumns {
     /// No columns (empty SELECT)
     None,
@@ -274,7 +275,7 @@ pub enum ResolvedSelectColumns {
 }
 
 /// Resolved table source
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ResolvedTableSource {
     /// Direct table reference
     Table(ResolvedTableNode),
@@ -285,7 +286,7 @@ pub enum ResolvedTableSource {
 }
 
 /// Resolved subquery table source
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedTableSubqueryNode {
     pub query: Box<ResolvedQueryExpr>,
     pub alias: TableAlias,
@@ -297,7 +298,7 @@ pub struct ResolvedTableSubqueryNode {
 
 /// A resolved join's qualifier — mutually exclusive in SQL, so one
 /// enum rather than fields that could encode impossible states.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ResolvedJoinQual {
     /// `JOIN … ON <expr>`
     On(ResolvedWhereExpr),
@@ -315,7 +316,7 @@ pub enum ResolvedJoinQual {
 }
 
 /// Resolved JOIN node
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedJoinNode {
     pub join_type: JoinType,
     pub left: ResolvedTableSource,
@@ -324,7 +325,7 @@ pub struct ResolvedJoinNode {
 }
 
 /// Resolved ORDER BY clause
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedOrderByClause {
     pub expr: ResolvedScalarExpr,
     pub direction: OrderDirection,
@@ -332,7 +333,7 @@ pub struct ResolvedOrderByClause {
 }
 
 /// Resolved LIMIT clause
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedLimitClause {
     pub count: Option<LiteralValue>,
     pub offset: Option<LiteralValue>,
@@ -343,7 +344,7 @@ pub struct ResolvedLimitClause {
 // ============================================================================
 
 /// Resolved core SELECT (without ORDER BY/LIMIT - those go on ResolvedQueryExpr)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedSelectNode {
     pub distinct: bool,
     pub columns: ResolvedSelectColumns,
@@ -367,7 +368,7 @@ impl Default for ResolvedSelectNode {
 }
 
 /// Resolved set operation node
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedSetOpNode {
     pub op: SetOpType,
     pub all: bool,
@@ -376,7 +377,7 @@ pub struct ResolvedSetOpNode {
 }
 
 /// The body of a resolved query - SELECT, VALUES, or set operation
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub enum ResolvedQueryBody {
     Select(Box<ResolvedSelectNode>),
     Values(ValuesClause), // No resolution needed for literals
@@ -384,7 +385,7 @@ pub enum ResolvedQueryBody {
 }
 
 /// A complete resolved query expression with optional ordering/limiting
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ResolvedQueryExpr {
     pub body: ResolvedQueryBody,
     pub order_by: Vec<ResolvedOrderByClause>,
@@ -403,3 +404,21 @@ impl Default for ResolvedQueryExpr {
 
 // Re-export public resolution functions so existing imports continue to work
 pub use super::resolve::{query_expr_resolve, select_node_resolve};
+
+/// The cache identity of a resolved query (PGC-287 class 2): a hash of the
+/// resolved body and ORDER BY, which carry each table's schema and each
+/// literal in canonical form, so two spellings of one query under any
+/// search_path or session settings share an entry. LIMIT/OFFSET are
+/// excluded as they are from the unresolved fingerprint.
+pub fn resolved_query_fingerprint(resolved: &ResolvedQueryExpr) -> Fingerprint {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hasher.write_u8(RESOLVED_FINGERPRINT_DOMAIN);
+    resolved.body.hash(&mut hasher);
+    resolved.order_by.hash(&mut hasher);
+    Fingerprint::from_raw(hasher.finish())
+}
+
+/// Keeps a resolved fingerprint from ever colliding with a session key
+/// built from the same text.
+const RESOLVED_FINGERPRINT_DOMAIN: u8 = 3;

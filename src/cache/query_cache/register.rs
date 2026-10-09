@@ -17,8 +17,8 @@ use crate::cache::mv_shape::ShapeGate;
 use crate::cache::query::limit_rows_needed;
 use crate::cache::types::{CachedQueryState, CachedQueryView, PinnedQuery, QueryMetrics};
 use crate::cache::{CacheError, CacheResult};
+use crate::query::Fingerprint;
 use crate::query::ast::query_expr_session_key;
-use crate::query::{Fingerprint, QueryKey};
 use crate::timing::duration_to_ns_u64;
 
 /// Pinned queries have no client session, so their bare table names resolve
@@ -33,20 +33,15 @@ impl CacheDispatch {
     pub async fn pinned_queries_register(&self, pinned: &[PinnedQuery]) -> CacheResult<()> {
         let search_path = pinned_search_path();
         for pq in pinned {
-            let fingerprint = match query_expr_session_key(pq.cacheable_query.query(), &search_path)
+            let session_key = query_expr_session_key(pq.cacheable_query.query(), &search_path);
+            let fingerprint = match self
+                .session_key_resolve(session_key, &pq.cacheable_query, &search_path)
+                .await
             {
-                QueryKey::Canonical(fingerprint) => fingerprint,
-                QueryKey::Session(session_key) => {
-                    match self
-                        .session_key_resolve(session_key, &pq.cacheable_query, &search_path)
-                        .await
-                    {
-                        Some(fingerprint) => fingerprint,
-                        None => {
-                            warn!("pinned query {session_key} does not resolve, skipping");
-                            continue;
-                        }
-                    }
+                Some(fingerprint) => fingerprint,
+                None => {
+                    warn!("pinned query {session_key} does not resolve, skipping");
+                    continue;
                 }
             };
             // Set Loading state in CacheStateView

@@ -1,7 +1,7 @@
 use std::time::Instant;
 
 use crate::{
-    query::QueryKey,
+    query::SessionKey,
     timing::{QueryId, QueryTiming, timing_record},
 };
 
@@ -48,8 +48,8 @@ impl QueryTelemetry {
     }
 
     /// Create cache timing for a cacheable query.
-    pub(super) fn cache_timing_start(&mut self, key: QueryKey) {
-        let query_id = QueryId::new(key.raw());
+    pub(super) fn cache_timing_start(&mut self, key: SessionKey) {
+        let query_id = QueryId::new(key.get());
         let received_at = self.client_received_at.unwrap_or_else(Instant::now);
         let mut timing = QueryTiming::new(query_id, received_at);
         timing.parsed_at = Some(Instant::now());

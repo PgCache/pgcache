@@ -7,12 +7,10 @@ use serde::{Deserialize, Serialize};
 use crate::id_hash::{BuildIdHasher, impl_id_hashable};
 
 /// A query fingerprint: the cache's identity for a cached query and the key of
-/// every per-query map. For a fully schema-qualified query it is the content
-/// hash of the `QueryExpr` (excluding LIMIT/OFFSET) from
-/// [`query_expr_fingerprint`](super::ast::query_expr_fingerprint); for a query
-/// with unqualified table names it also folds in the schema each one resolved
-/// to ([`query_expr_fingerprint_canonical`](super::ast::query_expr_fingerprint_canonical)),
-/// which only the writer can compute. The proxy reaches it from a
+/// every per-query map. It is the hash of the *resolved* query
+/// ([`resolved_query_fingerprint`](super::resolved::resolved_query_fingerprint)):
+/// schema-qualified tables and canonical literals, excluding LIMIT/OFFSET.
+/// Only the writer can compute it; the proxy reaches it from a
 /// [`SessionKey`] through the alias map.
 ///
 /// A newtype over `u64` for type safety — fingerprints share `u64`'s layout
@@ -51,12 +49,11 @@ impl fmt::Display for Fingerprint {
     }
 }
 
-/// The proxy-side key for a query whose table names are not all
-/// schema-qualified: the content hash of the unresolved `QueryExpr` folded with
-/// the session's resolved search_path. Two sessions that send the same text
-/// under the same resolved path share one session key; the alias map
-/// (`SessionKey` → [`Fingerprint`]) says which cached query that pair resolved
-/// to. Only ever produced by
+/// The proxy-side key for a query: the content hash of the unresolved
+/// `QueryExpr` folded with the session's resolved search_path. Two sessions
+/// that send the same text under the same resolved path share one session
+/// key; the alias map (`SessionKey` → [`Fingerprint`]) says which cached
+/// query that pair resolved to. Only ever produced by
 /// [`query_expr_session_key`](super::ast::query_expr_session_key).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -80,29 +77,6 @@ impl SessionKey {
 impl fmt::Display for SessionKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
-    }
-}
-
-/// What the proxy knows about a query's cache identity before the writer has
-/// resolved it. A fully qualified query needs no resolution, so its session
-/// key *is* its fingerprint and dispatch skips the alias map.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QueryKey {
-    /// Every table name carries a schema: the fingerprint is final.
-    Canonical(Fingerprint),
-    /// At least one table name resolves through search_path: the fingerprint
-    /// is reached through the alias map, or established by a writer resolve.
-    Session(SessionKey),
-}
-
-impl QueryKey {
-    /// The underlying `u64`, for telemetry ids that only need a stable label
-    /// per query-and-path.
-    pub const fn raw(self) -> u64 {
-        match self {
-            Self::Canonical(fingerprint) => fingerprint.get(),
-            Self::Session(key) => key.get(),
-        }
     }
 }
 

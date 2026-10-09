@@ -12,13 +12,13 @@ use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::TableMetadata;
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::ast::{
-    AstError, QueryExpr, RawStatement, WhereParseError, query_expr_fingerprint_canonical,
-    statement_convert_raw,
+    AstError, QueryExpr, RawStatement, WhereParseError, statement_convert_raw,
 };
 use pgcache_lib::query::constraints::{
     QueryConstraints, TableConstraint, analyze_query_constraints,
 };
 use pgcache_lib::query::resolve::query_expr_resolve;
+use pgcache_lib::query::resolved::resolved_query_fingerprint;
 use pgcache_lib::query::transform::{predicate_pushdown_apply, query_expr_parameters_replace};
 use pgcache_lib::query::write::{TransactionBoundary, WriteClass};
 use pgcache_lib::query::{Fingerprint, ShapeKey, query_shape_derive};
@@ -295,15 +295,17 @@ pub fn statement_classify(
     // forcing unbounded population, exactly as in query_resolve.
     let (base_query, user_max_limit) = base_query_prepare(cacheable.query());
 
-    let Ok(resolved) =
-        query_expr_resolve(&base_query, catalog, &["public"]).map(predicate_pushdown_apply)
-    else {
+    let Ok(resolved) = query_expr_resolve(&base_query, catalog, &["public"]) else {
         return Verdict::Passthrough {
             reason: PassthroughReason::ResolutionFailed,
             detail: None,
             cte_write: None,
         };
     };
+    // The identity is the resolved form before the pushdown transform, as
+    // pgcache computes it.
+    let fingerprint = resolved_query_fingerprint(&resolved);
+    let resolved = predicate_pushdown_apply(resolved);
     let shape_gate = shape_gate_classify(&resolved, &builtins.aggregates);
     let max_limit = if shape_gate.is_reducer() {
         None
@@ -311,9 +313,6 @@ pub fn statement_classify(
         user_max_limit
     };
     let has_limit = max_limit.is_some();
-    // Resolution above ran under `public` alone, so every bare name landed
-    // there; pgcache keys the same query identically (PGC-405).
-    let fingerprint = query_expr_fingerprint_canonical(cacheable.query(), |_| "public".into());
     let analysis = match query_admission_analyze(
         &resolved,
         fingerprint,

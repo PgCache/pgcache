@@ -14,7 +14,7 @@ use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 /// The kind of subquery context a table was found in.
 /// Determines invalidation behavior based on whether the subquery's
 /// result set growing or shrinking affects the outer query.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash)]
 pub enum SubqueryKind {
     /// IN, EXISTS, FROM subquery, CTE.
     /// Set growth → outer result grows → invalidate.

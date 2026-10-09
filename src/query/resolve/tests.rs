@@ -9,6 +9,8 @@ use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{
     AstNode, BinaryOp, Deparse, JoinType, LiteralValue, OrderDirection, SelectNode, SubLinkType,
 };
+use crate::query::ast::{query_expr_parse, query_expr_session_key};
+use crate::query::resolved::resolved_query_fingerprint;
 use crate::query::resolved::{
     ResolveError, ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode,
     ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
@@ -1858,4 +1860,37 @@ fn test_having_aggregate_decorations_resolve_cases() {
             "{label}: HAVING aggregate of {sql} resolved to {func:?}"
         );
     }
+}
+
+/// PGC-287 class 2: the cache identity is the resolved query's hash, so a
+/// bare and a qualified spelling of one table share it, LIMIT does not
+/// enter it, and a different table does.
+#[test]
+fn test_resolved_query_fingerprint_identity() {
+    let tables = catalog(&["users", "orders"]);
+    let fingerprint = |sql: &str| {
+        let query = query_expr_parse(sql).expect("parse");
+        resolved_query_fingerprint(
+            &query_expr_resolve(&query, &tables, &["public"]).expect("resolve"),
+        )
+    };
+    let bare = fingerprint("SELECT id FROM users WHERE id = 1");
+    assert_eq!(
+        bare,
+        fingerprint("SELECT id FROM public.users WHERE id = 1")
+    );
+    assert_eq!(
+        bare,
+        fingerprint("SELECT id FROM users WHERE id = 1 LIMIT 5")
+    );
+    assert_ne!(bare, fingerprint("SELECT id FROM orders WHERE id = 1"));
+    assert_ne!(bare, fingerprint("SELECT id FROM users WHERE id = 2"));
+    assert_ne!(
+        bare.get(),
+        query_expr_session_key(
+            &query_expr_parse("SELECT id FROM users WHERE id = 1").expect("parse"),
+            &["public".into()]
+        )
+        .get()
+    );
 }

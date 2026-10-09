@@ -14,7 +14,7 @@ use crate::cache::types::{CachedQueryState, CachedQueryView};
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::proxy::{ClientSocket, ExplainSpec, ExplainTarget};
 use crate::query::ast::{query_expr_convert_raw, query_expr_session_key};
-use crate::query::{Fingerprint, QueryKey};
+use crate::query::{Fingerprint, SessionKey};
 use crate::timing::QueryTiming;
 
 /// The client an explain response goes back to.
@@ -145,7 +145,7 @@ fn explain_kind_for_view(
 /// Key the inline SQL of a `pgcache_explain('<sql>')` request the same way
 /// dispatch keys it (raw-tree convert → `query_expr_session_key`), so the
 /// lookup hits the cached entry. `None` if the argument doesn't parse as a SELECT.
-fn explain_sql_key(sql: &str, search_path: &[EcoString]) -> Option<QueryKey> {
+fn explain_sql_key(sql: &str, search_path: &[EcoString]) -> Option<SessionKey> {
     pg_query::parse_raw_scoped(sql, |tree| unsafe { query_expr_convert_raw(tree) })
         .ok()
         .and_then(Result::ok)
