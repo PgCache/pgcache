@@ -317,35 +317,70 @@ pub fn typed_compare(
     row_text: &str,
     op: BinaryOp,
 ) -> Option<bool> {
-    match literal {
-        LiteralValue::Null | LiteralValue::NullWithCast(_) | LiteralValue::Parameter(_) => {
-            return Some(false);
-        }
-        LiteralValue::Array(..) => return None,
-        LiteralValue::String(_)
-        | LiteralValue::StringWithCast(..)
-        | LiteralValue::Integer(_)
-        | LiteralValue::Float(_)
-        | LiteralValue::Boolean(_) => {}
+    TypedLiteral::new(ty, literal).row_compare(row_text, op)
+}
+
+/// A comparison's literal parsed once for its column's kind, so a predicate
+/// evaluated per CDC row parses only the row's text ([`Self::row_compare`]).
+#[derive(Debug, Clone)]
+pub struct TypedLiteral {
+    kind: ValueKind,
+    parsed: LiteralParse,
+}
+
+#[derive(Debug, Clone)]
+enum LiteralParse {
+    /// NULL or a parameter: a present row value never matches it.
+    Never,
+    /// A literal the comparator cannot decide for the kind.
+    Undecidable,
+    Value(TypedValue),
+}
+
+impl TypedLiteral {
+    pub fn new(ty: &Type, literal: &LiteralValue) -> Self {
+        let kind = ValueKind::of_type(ty);
+        let parsed = match literal {
+            LiteralValue::Null | LiteralValue::NullWithCast(_) | LiteralValue::Parameter(_) => {
+                LiteralParse::Never
+            }
+            LiteralValue::Array(..) => LiteralParse::Undecidable,
+            LiteralValue::String(_)
+            | LiteralValue::StringWithCast(..)
+            | LiteralValue::Integer(_)
+            | LiteralValue::Float(_)
+            | LiteralValue::Boolean(_) => {
+                literal_parse(kind, literal).map_or(LiteralParse::Undecidable, LiteralParse::Value)
+            }
+        };
+        Self { kind, parsed }
     }
-    let kind = ValueKind::of_type(ty);
-    let filter = literal_parse(kind, literal)?;
-    let row = text_parse(kind, row_text)?;
-    let ordering = row.cmp_same_kind(&filter)?;
-    Some(match op {
-        BinaryOp::Equal => ordering == Ordering::Equal,
-        BinaryOp::NotEqual => ordering != Ordering::Equal,
-        BinaryOp::LessThan => ordering == Ordering::Less,
-        BinaryOp::LessThanOrEqual => ordering != Ordering::Greater,
-        BinaryOp::GreaterThan => ordering == Ordering::Greater,
-        BinaryOp::GreaterThanOrEqual => ordering != Ordering::Less,
-        BinaryOp::And
-        | BinaryOp::Or
-        | BinaryOp::Like
-        | BinaryOp::ILike
-        | BinaryOp::NotLike
-        | BinaryOp::NotILike => return None,
-    })
+
+    /// `row_text op literal` for a present (non-NULL) row value; `None` when
+    /// the comparison is undecidable (the caller picks the conservative side).
+    pub fn row_compare(&self, row_text: &str, op: BinaryOp) -> Option<bool> {
+        let filter = match &self.parsed {
+            LiteralParse::Never => return Some(false),
+            LiteralParse::Undecidable => return None,
+            LiteralParse::Value(value) => value,
+        };
+        let row = text_parse(self.kind, row_text)?;
+        let ordering = row.cmp_same_kind(filter)?;
+        Some(match op {
+            BinaryOp::Equal => ordering == Ordering::Equal,
+            BinaryOp::NotEqual => ordering != Ordering::Equal,
+            BinaryOp::LessThan => ordering == Ordering::Less,
+            BinaryOp::LessThanOrEqual => ordering != Ordering::Greater,
+            BinaryOp::GreaterThan => ordering == Ordering::Greater,
+            BinaryOp::GreaterThanOrEqual => ordering != Ordering::Less,
+            BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Like
+            | BinaryOp::ILike
+            | BinaryOp::NotLike
+            | BinaryOp::NotILike => return None,
+        })
+    }
 }
 
 /// The index-key form of a literal for a column of `kind` (PGC-478):
@@ -588,6 +623,10 @@ fn literal_parse(kind: ValueKind, literal: &LiteralValue) -> Option<TypedValue> 
         // A bare number or boolean only ever meets a numeric or boolean
         // column at origin; its text parses as that kind (an integer column
         // against a fractional literal compares as numeric, as at origin).
+        LiteralValue::Integer(n) if matches!(kind, ValueKind::Integer | ValueKind::Decimal) => {
+            Some(TypedValue::Integer(i128::from(*n)))
+        }
+        LiteralValue::Boolean(b) if kind == ValueKind::Bool => Some(TypedValue::Bool(*b)),
         LiteralValue::Integer(_) | LiteralValue::Float(_) | LiteralValue::Boolean(_) => {
             if !matches!(
                 kind,
@@ -787,6 +826,54 @@ fn two_digits_parse(part: &str) -> Option<i32> {
 mod tests {
     use super::*;
     use crate::query::ast::BinaryOp::{Equal, GreaterThan, LessThan, NotEqual};
+
+    /// The pre-parsed literal decides exactly as the one-shot comparator for
+    /// every literal shape, including the undecidable and never-matching ones.
+    #[test]
+    fn test_typed_literal_matches_one_shot_compare() {
+        let cases: &[(Type, LiteralValue, &str, BinaryOp)] = &[
+            (Type::INT4, LiteralValue::Integer(10), "10", Equal),
+            (Type::INT4, LiteralValue::String("10.0".into()), "10", Equal),
+            (Type::NUMERIC, LiteralValue::Integer(10), "10.50", LessThan),
+            (
+                Type::NUMERIC,
+                LiteralValue::Float(NotNan::new(1.5).expect("finite")),
+                "1.50",
+                Equal,
+            ),
+            (Type::BOOL, LiteralValue::Boolean(true), "t", Equal),
+            (Type::BOOL, LiteralValue::Integer(1), "t", Equal),
+            (
+                Type::TIMESTAMP,
+                LiteralValue::String("2024-01-15 10:00".into()),
+                "2024-01-15 10:00:00",
+                Equal,
+            ),
+            (
+                Type::TEXT,
+                LiteralValue::String("b".into()),
+                "a",
+                GreaterThan,
+            ),
+            (Type::TEXT, LiteralValue::Integer(1), "1", Equal),
+            (Type::INT4, LiteralValue::Null, "1", Equal),
+            (
+                Type::INT4,
+                LiteralValue::Parameter("$1".into()),
+                "1",
+                NotEqual,
+            ),
+            (Type::INT4, LiteralValue::String("abc".into()), "1", Equal),
+            (Type::INT4, LiteralValue::Integer(1), "1", BinaryOp::Like),
+        ];
+        for (ty, literal, row, op) in cases {
+            assert_eq!(
+                TypedLiteral::new(ty, literal).row_compare(row, *op),
+                typed_compare(ty, literal, row, *op),
+                "{ty:?} {literal:?} {row} {op:?}"
+            );
+        }
+    }
 
     fn text(s: &str) -> LiteralValue {
         LiteralValue::String(s.into())
