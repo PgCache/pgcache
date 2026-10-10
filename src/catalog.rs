@@ -16,7 +16,7 @@ use tokio_postgres::{Client, Error};
 
 use crate::cache::CacheError;
 use crate::oid::{Oid, TypeOid};
-use crate::query::ast::{ColumnNode, ScalarExpr, SelectColumn, SelectColumns, TableAlias};
+use crate::query::ast::{ColumnNode, NodeId, ScalarExpr, SelectColumn, SelectColumns, TableAlias};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
 };
@@ -141,6 +141,7 @@ impl TableMetadata {
             .iter()
             .map(|c| SelectColumn::Expr {
                 expr: ScalarExpr::Column(ColumnNode {
+                    id: NodeId::PENDING,
                     table: if let Some(alias) = alias {
                         Some(alias.name.clone())
                     } else {

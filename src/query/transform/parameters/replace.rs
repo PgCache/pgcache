@@ -5,9 +5,9 @@ use rootcause::Report;
 
 use super::parameter_to_literal;
 use crate::cache::QueryParameters;
-use crate::query::ast::{LiteralValue, QueryExpr, ScalarExpr, SelectNode};
+use crate::query::ast::{LiteralValue, QueryExpr, ScalarExpr, SelectNode, query_expr_finalize};
 use crate::query::transform::walk::{QueryWalkerMut, query_expr_walk_mut, select_node_walk_mut};
-use crate::query::transform::{AstTransformError, AstTransformResult};
+use crate::query::transform::{AstTransformError, AstTransformResult, query_expr_constant_fold};
 
 pub fn query_expr_parameters_replace(
     query_expr: &QueryExpr,
@@ -19,7 +19,8 @@ pub fn query_expr_parameters_replace(
 
     // Bind-time substitution can newly expose pure-literal arithmetic that the
     // convert-time fold couldn't reach (e.g. `$1 % 10 + 1` once $1 is bound).
-    crate::query::transform::query_expr_constant_fold(&mut new_query);
+    query_expr_constant_fold(&mut new_query);
+    query_expr_finalize(&mut new_query);
 
     Ok(new_query)
 }

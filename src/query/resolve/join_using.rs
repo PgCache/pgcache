@@ -12,7 +12,7 @@ use rootcause::Report;
 
 use super::column::column_resolve;
 use super::scope::ResolutionScope;
-use crate::query::ast::{BinaryOp, ColumnNode, JoinType};
+use crate::query::ast::{BinaryOp, ColumnNode, JoinType, NodeId};
 use crate::query::resolved::{
     ResolveError, ResolveResult, ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall,
     ResolvedJoinQual, ResolvedScalarExpr, ResolvedWhereExpr,
@@ -116,6 +116,7 @@ pub(super) fn join_side_column_resolve(
 ) -> ResolveResult<ResolvedColumnNode> {
     column_resolve(
         &ColumnNode {
+            id: NodeId::PENDING,
             table: Some(qual.clone()),
             column: column.clone(),
         },

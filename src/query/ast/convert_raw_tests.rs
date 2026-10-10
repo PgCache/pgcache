@@ -331,6 +331,7 @@ fn test_query_expr_select_subquery() {
         columns[0],
         SelectColumn::Expr {
             expr: ScalarExpr::Column(ColumnNode {
+                id: NodeId::PENDING,
                 table: Some(EcoString::from("invoice")),
                 column: EcoString::from("id")
             }),
@@ -425,6 +426,7 @@ fn test_table_node_deparse() {
 
     // Simple table
     TableNode {
+        id: NodeId::PENDING,
         schema: None,
         name: EcoString::from("users"),
         alias: None,
@@ -435,6 +437,7 @@ fn test_table_node_deparse() {
 
     // Qualified table with alias
     TableNode {
+        id: NodeId::PENDING,
         schema: Some(EcoString::from("public")),
         name: EcoString::from("users"),
         alias: Some(TableAlias {
@@ -448,6 +451,7 @@ fn test_table_node_deparse() {
 
     // table requires quoting
     TableNode {
+        id: NodeId::PENDING,
         schema: Some(EcoString::from("public")),
         name: EcoString::from("userAccount"),
         alias: Some(TableAlias {
@@ -465,6 +469,7 @@ fn test_column_ref_deparse() {
 
     // Simple column
     ColumnNode {
+        id: NodeId::PENDING,
         table: None,
         column: EcoString::from("id"),
     }
@@ -474,6 +479,7 @@ fn test_column_ref_deparse() {
 
     // Qualified column
     ColumnNode {
+        id: NodeId::PENDING,
         table: Some(EcoString::from("users")),
         column: EcoString::from("name"),
     }
@@ -483,6 +489,7 @@ fn test_column_ref_deparse() {
 
     // table and column require quoting
     ColumnNode {
+        id: NodeId::PENDING,
         table: Some(EcoString::from("Users")),
         column: EcoString::from("firstName"),
     }
@@ -497,6 +504,7 @@ fn test_select_column_alias_deparse() {
     // Simple column
     SelectColumn::Expr {
         expr: ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("id"),
         }),
@@ -509,6 +517,7 @@ fn test_select_column_alias_deparse() {
     // Qualified column
     SelectColumn::Expr {
         expr: ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: Some(EcoString::from("users")),
             column: EcoString::from("name"),
         }),
@@ -521,6 +530,7 @@ fn test_select_column_alias_deparse() {
     // alias requires quoting
     SelectColumn::Expr {
         expr: ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("id"),
         }),
@@ -619,8 +629,10 @@ fn test_binary_expr_deparse() {
 
     // Simple equality: id = 1
     let expr = BinaryExpr {
+        id: NodeId::PENDING,
         op: BinaryOp::Equal,
         lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("id"),
         }))),
@@ -635,8 +647,10 @@ fn test_binary_expr_deparse() {
 
     // Complex expression: users.name = 'john'
     let expr = BinaryExpr {
+        id: NodeId::PENDING,
         op: BinaryOp::Equal,
         lexpr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: Some(EcoString::from("users")),
             column: EcoString::from("name"),
         }))),
@@ -655,8 +669,10 @@ fn test_unary_expr_deparse() {
 
     // NOT active (prefix operator)
     let expr = UnaryExpr {
+        id: NodeId::PENDING,
         op: UnaryOp::Not,
         expr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("active"),
         }))),
@@ -668,8 +684,10 @@ fn test_unary_expr_deparse() {
 
     // deleted_at IS NULL (postfix operator)
     let expr = UnaryExpr {
+        id: NodeId::PENDING,
         op: UnaryOp::IsNull,
         expr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("deleted_at"),
         }))),
@@ -681,8 +699,10 @@ fn test_unary_expr_deparse() {
 
     // name IS NOT NULL (postfix operator)
     let expr = UnaryExpr {
+        id: NodeId::PENDING,
         op: UnaryOp::IsNotNull,
         expr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("name"),
         }))),
@@ -694,8 +714,10 @@ fn test_unary_expr_deparse() {
 
     // active IS TRUE (postfix operator)
     let expr = UnaryExpr {
+        id: NodeId::PENDING,
         op: UnaryOp::IsTrue,
         expr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("active"),
         }))),
@@ -707,8 +729,10 @@ fn test_unary_expr_deparse() {
 
     // active IS NOT FALSE (postfix operator)
     let expr = UnaryExpr {
+        id: NodeId::PENDING,
         op: UnaryOp::IsNotFalse,
         expr: Box::new(WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("active"),
         }))),
@@ -973,9 +997,11 @@ fn test_scalar_expr_nodes() {
 #[test]
 fn test_function_call_nodes() {
     let func = FunctionCall {
+        id: NodeId::PENDING,
         schema: None,
         name: EcoString::from("COUNT"),
         args: vec![ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("id"),
         })],
@@ -1060,9 +1086,11 @@ fn test_binary_expr_nodes() {
 fn test_multi_expr_nodes() {
     // Test MultiExpr::nodes() with a manually constructed MultiExpr
     let multi = MultiExpr {
+        id: NodeId::PENDING,
         op: MultiOp::In,
         exprs: vec![
             WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+                id: NodeId::PENDING,
                 table: None,
                 column: EcoString::from("id"),
             })),
@@ -1349,6 +1377,7 @@ fn test_literal_in_select() {
 #[test]
 fn test_function_deparse_count_star() {
     let func = FunctionCall {
+        id: NodeId::PENDING,
         schema: None,
         name: EcoString::from("count"),
         args: vec![],
@@ -1366,9 +1395,11 @@ fn test_function_deparse_count_star() {
 #[test]
 fn test_function_deparse_count_distinct() {
     let func = FunctionCall {
+        id: NodeId::PENDING,
         schema: None,
         name: EcoString::from("count"),
         args: vec![ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("status"),
         })],
@@ -1411,9 +1442,11 @@ fn test_case_has_subqueries() {
 #[test]
 fn test_window_function_deparse() {
     let func = FunctionCall {
+        id: NodeId::PENDING,
         schema: None,
         name: EcoString::from("sum"),
         args: vec![ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("amount"),
         })],
@@ -1422,12 +1455,16 @@ fn test_window_function_deparse() {
         agg_order: vec![],
         agg_filter: None,
         over: Some(Box::new(WindowSpec {
+            id: NodeId::PENDING,
             partition_by: vec![ScalarExpr::Column(ColumnNode {
+                id: NodeId::PENDING,
                 table: None,
                 column: EcoString::from("category"),
             })],
             order_by: vec![OrderByClause {
+                id: NodeId::PENDING,
                 expr: ScalarExpr::Column(ColumnNode {
+                    id: NodeId::PENDING,
                     table: None,
                     column: EcoString::from("date"),
                 }),
@@ -1594,10 +1631,12 @@ fn test_filter_aggregate_distinct_predicates_roundtrip() {
 #[test]
 fn test_aggregate_order_by_deparse_roundtrip() {
     let func = FunctionCall {
+        id: NodeId::PENDING,
         schema: None,
         name: EcoString::from("string_agg"),
         args: vec![
             ScalarExpr::Column(ColumnNode {
+                id: NodeId::PENDING,
                 table: None,
                 column: EcoString::from("name"),
             }),
@@ -1606,7 +1645,9 @@ fn test_aggregate_order_by_deparse_roundtrip() {
         agg_star: false,
         agg_distinct: false,
         agg_order: vec![OrderByClause {
+            id: NodeId::PENDING,
             expr: ScalarExpr::Column(ColumnNode {
+                id: NodeId::PENDING,
                 table: None,
                 column: EcoString::from("name"),
             }),
@@ -1699,7 +1740,9 @@ fn test_arithmetic_divide() {
 #[test]
 fn test_arithmetic_deparse() {
     let arith = ArithmeticExpr {
+        id: NodeId::PENDING,
         left: Box::new(ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from("amount"),
         })),
@@ -1856,7 +1899,13 @@ fn test_query_expr_select_star() {
         panic!("Expected Columns");
     };
     assert_eq!(cols.len(), 1);
-    assert!(matches!(&cols[0], SelectColumn::Star(None)));
+    assert!(matches!(
+        &cols[0],
+        SelectColumn::Star(StarNode {
+            qualifier: None,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -1865,7 +1914,13 @@ fn test_query_expr_select_star_with_column() {
     let [star, column] = select_columns(&select) else {
         panic!("expected two columns");
     };
-    assert!(matches!(star, SelectColumn::Star(None)));
+    assert!(matches!(
+        star,
+        SelectColumn::Star(StarNode {
+            qualifier: None,
+            ..
+        })
+    ));
     assert!(matches!(column.expr(), Some(ScalarExpr::Column(c)) if c.column == "col"));
 }
 
@@ -1875,7 +1930,7 @@ fn test_query_expr_select_qualified_star() {
     let [star, column] = select_columns(&select) else {
         panic!("expected two columns");
     };
-    assert!(matches!(star, SelectColumn::Star(Some(t)) if t == "t1"));
+    assert!(matches!(star, SelectColumn::Star(StarNode { qualifier: Some(t), .. }) if t == "t1"));
     assert!(matches!(column.expr(),
         Some(ScalarExpr::Column(c)) if c.column == "col" && c.table.as_deref() == Some("t2")));
 }
@@ -3161,6 +3216,7 @@ fn test_multi_expr_deparse_cases() {
     ];
     for (label, op, column, values, expected) in cases {
         let mut exprs = vec![WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+            id: NodeId::PENDING,
             table: None,
             column: EcoString::from(column),
         }))];
@@ -3169,7 +3225,15 @@ fn test_multi_expr_deparse_cases() {
                 .into_iter()
                 .map(|v| WhereExpr::Scalar(ScalarExpr::Literal(v))),
         );
-        assert_eq!(deparsed_node(&MultiExpr { op, exprs }), expected, "{label}");
+        assert_eq!(
+            deparsed_node(&MultiExpr {
+                id: NodeId::PENDING,
+                op,
+                exprs
+            }),
+            expected,
+            "{label}"
+        );
     }
 }
 

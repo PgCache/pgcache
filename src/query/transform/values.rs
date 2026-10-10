@@ -7,7 +7,7 @@ use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::{
-    Deparse, LiteralValue, TableAlias, ValuesClause, emit_escaped_string_literal,
+    Deparse, LiteralValue, NodeId, TableAlias, ValuesClause, emit_escaped_string_literal,
 };
 use crate::query::resolved::{
     ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
@@ -206,7 +206,10 @@ pub fn resolved_select_node_table_replace_with_values(
 
     *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
         query: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::Values(ValuesClause { rows: vec![values] }),
+            body: ResolvedQueryBody::Values(ValuesClause {
+                id: NodeId::PENDING,
+                rows: vec![values],
+            }),
             order_by: vec![],
             limit: None,
         }),
@@ -265,6 +268,7 @@ impl PgEvalTemplate {
         *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
             query: Box::new(ResolvedQueryExpr {
                 body: ResolvedQueryBody::Values(ValuesClause {
+                    id: NodeId::PENDING,
                     rows: vec![vec![LiteralValue::String(EcoString::from(
                         PG_EVAL_SENTINEL,
                     ))]],
@@ -390,7 +394,10 @@ pub fn resolved_select_node_table_replace_with_values_batch(
 
     *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
         query: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::Values(ValuesClause { rows: value_rows }),
+            body: ResolvedQueryBody::Values(ValuesClause {
+                id: NodeId::PENDING,
+                rows: value_rows,
+            }),
             order_by: vec![],
             limit: None,
         }),

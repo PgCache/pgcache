@@ -16,6 +16,7 @@ fn col(name: &str) -> WhereExpr {
 
 fn qcol(table: &str, name: &str) -> WhereExpr {
     WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
+        id: NodeId::PENDING,
         table: Some(EcoString::from(table)),
         column: EcoString::from(name),
     }))
@@ -47,6 +48,7 @@ fn null() -> WhereExpr {
 
 fn cmp(op: BinaryOp, lexpr: WhereExpr, rexpr: WhereExpr) -> WhereExpr {
     WhereExpr::Binary(BinaryExpr {
+        id: NodeId::PENDING,
         op,
         lexpr: Box::new(lexpr),
         rexpr: Box::new(rexpr),
@@ -63,6 +65,7 @@ fn or(lexpr: WhereExpr, rexpr: WhereExpr) -> WhereExpr {
 
 fn unary(op: UnaryOp, expr: WhereExpr) -> WhereExpr {
     WhereExpr::Unary(UnaryExpr {
+        id: NodeId::PENDING,
         op,
         expr: Box::new(expr),
     })
@@ -73,7 +76,11 @@ fn not(expr: WhereExpr) -> WhereExpr {
 }
 
 fn multi(op: MultiOp, exprs: Vec<WhereExpr>) -> WhereExpr {
-    WhereExpr::Multi(MultiExpr { op, exprs })
+    WhereExpr::Multi(MultiExpr {
+        id: NodeId::PENDING,
+        op,
+        exprs,
+    })
 }
 
 fn array(elements: Vec<ScalarExpr>) -> WhereExpr {
@@ -82,6 +89,7 @@ fn array(elements: Vec<ScalarExpr>) -> WhereExpr {
 
 fn s_col(name: &str) -> ScalarExpr {
     ScalarExpr::Column(ColumnNode {
+        id: NodeId::PENDING,
         table: None,
         column: EcoString::from(name),
     })
@@ -101,6 +109,7 @@ fn s_param(name: &str) -> ScalarExpr {
 
 fn arith(op: ArithmeticOp, left: ScalarExpr, right: ScalarExpr) -> ScalarExpr {
     ScalarExpr::Arithmetic(ArithmeticExpr {
+        id: NodeId::PENDING,
         left: Box::new(left),
         op,
         right: Box::new(right),

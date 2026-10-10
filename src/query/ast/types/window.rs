@@ -3,11 +3,12 @@ use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
-use super::{AstNode, OrderByClause, ScalarExpr, WhereExpr, children_visit};
-use crate::query::ast::Deparse;
+use super::{AstNode, OrderByClause, ScalarExpr, WhereExpr, children_finalize, children_visit};
+use crate::query::ast::{Deparse, NodeId, NodePositions};
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct FunctionCall {
+    pub id: NodeId,
     /// Schema qualifier as written. Only `pg_catalog` is cacheable: the cache
     /// DB has no user functions.
     pub schema: Option<EcoString>,
@@ -31,6 +32,17 @@ impl AstNode for FunctionCall {
         children_visit(&self.agg_order, f)?;
         children_visit(self.agg_filter.as_deref(), f)?;
         children_visit(self.over.as_deref(), f)
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        children_finalize(&mut self.args, positions);
+        children_finalize(&mut self.agg_order, positions);
+        children_finalize(self.agg_filter.as_deref_mut(), positions);
+        children_finalize(self.over.as_deref_mut(), positions);
     }
 }
 
@@ -99,6 +111,7 @@ impl Deparse for FunctionCall {
 /// Window specification for OVER clause: OVER (PARTITION BY ... ORDER BY ...)
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct WindowSpec {
+    pub id: NodeId,
     /// PARTITION BY columns
     pub partition_by: Vec<ScalarExpr>,
     /// ORDER BY clauses. Vec (not SmallVec): recursively reachable, see `agg_order`.
@@ -123,6 +136,16 @@ impl AstNode for WindowSpec {
         children_visit(&self.order_by, f)?;
         children_visit(self.frame.as_ref(), f)
     }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        children_finalize(&mut self.partition_by, positions);
+        children_finalize(&mut self.order_by, positions);
+        children_finalize(self.frame.as_mut(), positions);
+    }
 }
 
 impl WindowSpec {
@@ -143,6 +166,7 @@ impl WindowSpec {
 /// round-trips as `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct WindowFrame {
+    pub id: NodeId,
     pub mode: FrameMode,
     pub start: FrameBound,
     pub end: FrameBound,
@@ -155,6 +179,14 @@ impl AstNode for WindowFrame {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         children_visit([&self.start, &self.end], f)
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        children_finalize([&mut self.start, &mut self.end], positions);
     }
 }
 
@@ -223,6 +255,17 @@ impl AstNode for FrameBound {
             | FrameBound::UnboundedFollowing => {}
         }
         ControlFlow::Continue(())
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        match self {
+            FrameBound::OffsetPreceding(e) | FrameBound::OffsetFollowing(e) => {
+                e.finalize(positions);
+            }
+            FrameBound::UnboundedPreceding
+            | FrameBound::CurrentRow
+            | FrameBound::UnboundedFollowing => {}
+        }
     }
 }
 

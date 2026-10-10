@@ -6,9 +6,9 @@ use ordered_float::NotNan;
 use postgres_protocol::escape;
 use strum_macros::AsRefStr;
 
-use super::{AstNode, FunctionCall, QueryExpr, SelectNode, children_visit};
+use super::{AstNode, FunctionCall, QueryExpr, SelectNode, children_finalize, children_visit};
 use crate::cache::{SubqueryKind, UpdateQuerySource};
-use crate::query::ast::Deparse;
+use crate::query::ast::{Deparse, NodeId, NodePositions};
 use crate::query::cast::{CastTarget, cast_target_deparse};
 
 // Core literal value types that can appear in SQL expressions.
@@ -223,11 +223,16 @@ fn array_element_text_push_quoted(s: &str, out: &mut String) {
 // Column reference (potentially qualified: table.column)
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ColumnNode {
+    pub id: NodeId,
     pub table: Option<EcoString>,
     pub column: EcoString,
 }
 
-impl AstNode for ColumnNode {}
+impl AstNode for ColumnNode {
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+}
 
 impl Deparse for ColumnNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
@@ -385,6 +390,7 @@ impl Deparse for MultiOp {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct UnaryExpr {
+    pub id: NodeId,
     pub op: UnaryOp,
     pub expr: Box<WhereExpr>,
 }
@@ -396,6 +402,14 @@ impl AstNode for UnaryExpr {
     ) -> ControlFlow<B> {
         self.expr.try_for_each_node(f)?;
         ControlFlow::Continue(())
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        self.expr.finalize(positions);
     }
 }
 
@@ -439,6 +453,7 @@ impl Deparse for UnaryExpr {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct BinaryExpr {
+    pub id: NodeId,
     pub op: BinaryOp,
     pub lexpr: Box<WhereExpr>, // left expression
     pub rexpr: Box<WhereExpr>, // right expression
@@ -450,6 +465,14 @@ impl AstNode for BinaryExpr {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         children_visit([&*self.lexpr, &*self.rexpr], f)
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        children_finalize([&mut *self.lexpr, &mut *self.rexpr], positions);
     }
 }
 
@@ -495,6 +518,7 @@ impl Deparse for BinaryExpr {
 // Multi-operand expressions (for IN, BETWEEN, etc.)
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct MultiExpr {
+    pub id: NodeId,
     pub op: MultiOp,
     pub exprs: Vec<WhereExpr>,
 }
@@ -505,6 +529,14 @@ impl AstNode for MultiExpr {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         children_visit(&self.exprs, f)
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        children_finalize(&mut self.exprs, positions);
     }
 }
 
@@ -599,6 +631,23 @@ impl AstNode for WhereExpr {
             }
         }
         ControlFlow::Continue(())
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        match self {
+            WhereExpr::Scalar(scalar) => scalar.finalize(positions),
+            WhereExpr::Unary(unary) => unary.finalize(positions),
+            WhereExpr::Binary(binary) => binary.finalize(positions),
+            WhereExpr::Multi(multi) => multi.finalize(positions),
+            WhereExpr::Subquery {
+                query, test_expr, ..
+            } => {
+                query.finalize(positions);
+                if let Some(e) = test_expr {
+                    e.finalize(positions);
+                }
+            }
+        }
     }
 }
 
@@ -756,6 +805,7 @@ pub enum ArithmeticOp {
 /// Arithmetic expression: `left op right` (e.g., `amount * -1`)
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ArithmeticExpr {
+    pub id: NodeId,
     pub left: Box<ScalarExpr>,
     pub op: ArithmeticOp,
     pub right: Box<ScalarExpr>,
@@ -767,6 +817,14 @@ impl AstNode for ArithmeticExpr {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         children_visit([&*self.left, &*self.right], f)
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        children_finalize([&mut *self.left, &mut *self.right], positions);
     }
 }
 
@@ -828,6 +886,19 @@ impl AstNode for ScalarExpr {
             ScalarExpr::TypeCast { expr, .. } => expr.try_for_each_node(f)?,
         }
         ControlFlow::Continue(())
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        match self {
+            ScalarExpr::Column(col) => col.finalize(positions),
+            ScalarExpr::Function(func) => func.finalize(positions),
+            ScalarExpr::Literal(lit) => lit.finalize(positions),
+            ScalarExpr::Case(case) => case.finalize(positions),
+            ScalarExpr::Arithmetic(arith) => arith.finalize(positions),
+            ScalarExpr::Subquery(query) => query.finalize(positions),
+            ScalarExpr::Array(elems) => children_finalize(elems, positions),
+            ScalarExpr::TypeCast { expr, .. } => expr.finalize(positions),
+        }
     }
 }
 
@@ -941,6 +1012,7 @@ impl Deparse for ScalarExpr {
 /// CASE expression: CASE [arg] WHEN condition THEN result [...] [ELSE default] END
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct CaseExpr {
+    pub id: NodeId,
     /// For simple CASE (CASE expr WHEN val...), holds the expression being tested.
     /// None for searched CASE (CASE WHEN condition...).
     pub arg: Option<Box<ScalarExpr>>,
@@ -958,6 +1030,16 @@ impl AstNode for CaseExpr {
         children_visit(self.arg.as_deref(), f)?;
         children_visit(&self.whens, f)?;
         children_visit(self.default.as_deref(), f)
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        children_finalize(self.arg.as_deref_mut(), positions);
+        children_finalize(&mut self.whens, positions);
+        children_finalize(self.default.as_deref_mut(), positions);
     }
 }
 
@@ -995,6 +1077,7 @@ impl Deparse for CaseExpr {
 /// A single WHEN clause in a CASE expression
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct CaseWhen {
+    pub id: NodeId,
     /// The condition (for searched CASE) or value (for simple CASE)
     pub condition: WhereExpr,
     /// The result if condition is true/matches
@@ -1008,6 +1091,15 @@ impl AstNode for CaseWhen {
     ) -> ControlFlow<B> {
         self.condition.try_for_each_node(f)?;
         self.result.try_for_each_node(f)
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        self.condition.finalize(positions);
+        self.result.finalize(positions);
     }
 }
 

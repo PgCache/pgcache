@@ -3,9 +3,12 @@ use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
-use super::{AstNode, CteMaterialization, QueryExpr, SelectNode, WhereExpr, children_visit};
+use super::{
+    AstNode, CteMaterialization, QueryExpr, SelectNode, WhereExpr, children_finalize,
+    children_visit,
+};
 use crate::cache::{SubqueryKind, UpdateQuerySource};
-use crate::query::ast::Deparse;
+use crate::query::ast::{Deparse, NodeId, NodePositions};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableAlias {
@@ -46,6 +49,7 @@ pub enum TableSource {
 /// external context.
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct CteRefNode {
+    pub id: NodeId,
     pub cte_name: EcoString,
     pub query: Box<QueryExpr>,
     pub column_aliases: Vec<EcoString>,
@@ -65,6 +69,15 @@ impl AstNode for TableSource {
             TableSource::CteRef(cte_ref) => cte_ref.try_for_each_node(f)?,
         }
         ControlFlow::Continue(())
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        match self {
+            TableSource::Table(table) => table.finalize(positions),
+            TableSource::Subquery(sub) => sub.finalize(positions),
+            TableSource::Join(join) => join.finalize(positions),
+            TableSource::CteRef(cte_ref) => cte_ref.finalize(positions),
+        }
     }
 }
 
@@ -151,12 +164,17 @@ impl Deparse for TableSource {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableNode {
+    pub id: NodeId,
     pub schema: Option<EcoString>,
     pub name: EcoString,
     pub alias: Option<TableAlias>,
 }
 
-impl AstNode for TableNode {}
+impl AstNode for TableNode {
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+}
 
 impl Deparse for TableNode {
     fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
@@ -179,6 +197,7 @@ impl Deparse for TableNode {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct TableSubqueryNode {
+    pub id: NodeId,
     pub lateral: bool,
     pub query: Box<QueryExpr>,
     pub alias: Option<TableAlias>,
@@ -191,6 +210,14 @@ impl AstNode for TableSubqueryNode {
     ) -> ControlFlow<B> {
         self.query.try_for_each_node(f)?;
         ControlFlow::Continue(())
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        self.query.finalize(positions);
     }
 }
 
@@ -221,6 +248,14 @@ impl AstNode for CteRefNode {
     ) -> ControlFlow<B> {
         self.query.try_for_each_node(f)?;
         ControlFlow::Continue(())
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        self.query.finalize(positions);
     }
 }
 
@@ -257,6 +292,7 @@ pub enum JoinQual {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct JoinNode {
+    pub id: NodeId,
     pub join_type: JoinType,
     pub left: Box<TableSource>,
     pub right: Box<TableSource>,
@@ -273,6 +309,17 @@ impl AstNode for JoinNode {
             c.try_for_each_node(f)?;
         }
         ControlFlow::Continue(())
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        children_finalize([&mut *self.left, &mut *self.right], positions);
+        if let JoinQual::On(c) = &mut self.qual {
+            c.finalize(positions);
+        }
     }
 }
 

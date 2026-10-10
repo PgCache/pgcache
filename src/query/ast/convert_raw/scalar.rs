@@ -14,7 +14,8 @@ use crate::query::ast::raw::{
     string_node_value,
 };
 use crate::query::ast::{
-    ArithmeticExpr, ArithmeticOp, AstError, CaseExpr, CaseWhen, Deparse, FunctionCall, ScalarExpr,
+    ArithmeticExpr, ArithmeticOp, AstError, CaseExpr, CaseWhen, Deparse, FunctionCall, NodeId,
+    ScalarExpr,
 };
 use crate::query::cast::cast_target_from_canonical;
 
@@ -207,6 +208,7 @@ unsafe fn func_call_convert(func_call: *const pg::FuncCall) -> Result<FunctionCa
         };
 
         Ok(FunctionCall {
+            id: NodeId::PENDING,
             schema,
             name,
             args,
@@ -263,6 +265,7 @@ unsafe fn aexpr_nullif_convert(aexpr: *const pg::A_Expr) -> Result<FunctionCall,
 
 fn function_call_bare(name: EcoString, args: Vec<ScalarExpr>) -> FunctionCall {
     FunctionCall {
+        id: NodeId::PENDING,
         schema: None,
         name,
         args,
@@ -292,6 +295,7 @@ pub(super) unsafe fn aexpr_arithmetic_convert(
         let left = scalar_expr_convert((*aexpr).lexpr)?;
         let right = scalar_expr_convert((*aexpr).rexpr)?;
         Ok(ArithmeticExpr {
+            id: NodeId::PENDING,
             left: Box::new(left),
             op,
             right: Box::new(right),
@@ -352,6 +356,7 @@ unsafe fn case_expr_convert(case_expr: *const pg::CaseExpr) -> Result<CaseExpr, 
         };
 
         Ok(CaseExpr {
+            id: NodeId::PENDING,
             arg,
             whens,
             default,
@@ -384,6 +389,10 @@ unsafe fn case_when_convert(node: NodePtr) -> Result<CaseWhen, AstError> {
         }
         let result = scalar_expr_convert(res)?;
 
-        Ok(CaseWhen { condition, result })
+        Ok(CaseWhen {
+            id: NodeId::PENDING,
+            condition,
+            result,
+        })
     }
 }

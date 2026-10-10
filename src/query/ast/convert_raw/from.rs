@@ -11,7 +11,7 @@ use crate::query::ast::raw::{
     NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag, node_tag_name, string_node_value,
 };
 use crate::query::ast::{
-    AstError, CteRefNode, JoinNode, JoinQual, JoinType, TableAlias, TableNode, TableSource,
+    AstError, CteRefNode, JoinNode, JoinQual, JoinType, NodeId, TableAlias, TableNode, TableSource,
     TableSubqueryNode,
 };
 
@@ -83,6 +83,7 @@ unsafe fn join_expr_convert(
         };
 
         Ok(TableSource::Join(JoinNode {
+            id: NodeId::PENDING,
             join_type: join_type_map((*join_expr).jointype)?,
             left: Box::new(left_table),
             right: Box::new(right_table),
@@ -124,6 +125,7 @@ unsafe fn table_node_convert(
             && let Some(cte_def) = ctx.cte_find(&name)
         {
             return Ok(TableSource::CteRef(CteRefNode {
+                id: NodeId::PENDING,
                 cte_name: name,
                 query: Box::new(cte_def.query.clone()),
                 column_aliases: cte_def.column_aliases.clone(),
@@ -133,6 +135,7 @@ unsafe fn table_node_convert(
         }
 
         Ok(TableSource::Table(TableNode {
+            id: NodeId::PENDING,
             schema,
             name,
             alias,
@@ -164,6 +167,7 @@ unsafe fn table_subquery_node_convert(
         };
 
         Ok(TableSource::Subquery(TableSubqueryNode {
+            id: NodeId::PENDING,
             lateral: (*range_subselect).lateral,
             query: Box::new(query),
             alias,

@@ -18,8 +18,8 @@ use crate::query::ast::raw::{
     NodePtr, aexpr_kind_name, cast, cstr, list_is_empty, list_nodes, node_tag, string_node_value,
 };
 use crate::query::ast::{
-    AstError, BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, ScalarExpr,
-    SubLinkType, UnaryExpr, UnaryOp, WhereExpr, WhereParseError,
+    AstError, BinaryExpr, BinaryOp, ColumnNode, LiteralValue, MultiExpr, MultiOp, NodeId,
+    ScalarExpr, SubLinkType, UnaryExpr, UnaryOp, WhereExpr, WhereParseError,
 };
 
 // ---------- Literal / column / param extraction ----------
@@ -78,7 +78,11 @@ pub(super) unsafe fn column_ref_extract(
         }
 
         let column = column.ok_or(WhereParseError::InvalidColumnRef)?;
-        Ok(ColumnNode { table, column })
+        Ok(ColumnNode {
+            id: NodeId::PENDING,
+            table,
+            column,
+        })
     }
 }
 
@@ -219,6 +223,7 @@ pub(super) unsafe fn null_test_convert(
             }
         };
         Ok(WhereExpr::Unary(UnaryExpr {
+            id: NodeId::PENDING,
             op,
             expr: Box::new(where_expr_convert(arg)?),
         }))
@@ -247,6 +252,7 @@ pub(super) unsafe fn boolean_test_convert(
             }
         };
         Ok(WhereExpr::Unary(UnaryExpr {
+            id: NodeId::PENDING,
             op,
             expr: Box::new(where_expr_convert(arg)?),
         }))
@@ -305,6 +311,7 @@ unsafe fn binary_convert(
     unsafe {
         let (lexpr, rexpr) = a_expr_operands(expr)?;
         Ok(WhereExpr::Binary(BinaryExpr {
+            id: NodeId::PENDING,
             op,
             lexpr: Box::new(where_expr_convert(lexpr)?),
             rexpr: Box::new(where_expr_convert(rexpr)?),
@@ -340,7 +347,11 @@ unsafe fn a_expr_in_convert(expr: *const pg::A_Expr) -> Result<WhereExpr, WhereP
         let values = in_list_extract(rexpr)?;
         let mut exprs = vec![left_expr];
         exprs.extend(values);
-        Ok(WhereExpr::Multi(MultiExpr { op, exprs }))
+        Ok(WhereExpr::Multi(MultiExpr {
+            id: NodeId::PENDING,
+            op,
+            exprs,
+        }))
     }
 }
 
@@ -353,6 +364,7 @@ unsafe fn a_expr_between_convert(
         let left_expr = where_expr_convert(lexpr)?;
         let (low, high) = between_bounds_extract(rexpr)?;
         Ok(WhereExpr::Multi(MultiExpr {
+            id: NodeId::PENDING,
             op,
             exprs: vec![left_expr, low, high],
         }))
@@ -368,6 +380,7 @@ unsafe fn a_expr_any_all_convert(
         let left_expr = where_expr_convert(lexpr)?;
         let right_expr = any_all_rexpr_convert(rexpr)?;
         Ok(WhereExpr::Multi(MultiExpr {
+            id: NodeId::PENDING,
             op,
             exprs: vec![left_expr, right_expr],
         }))
@@ -489,12 +502,14 @@ pub(super) unsafe fn bool_expr_convert(
                     });
                 };
                 let mut result = WhereExpr::Binary(BinaryExpr {
+                    id: NodeId::PENDING,
                     op,
                     lexpr: Box::new(where_expr_convert(*first)?),
                     rexpr: Box::new(where_expr_convert(*second)?),
                 });
                 for arg in rest {
                     result = WhereExpr::Binary(BinaryExpr {
+                        id: NodeId::PENDING,
                         op,
                         lexpr: Box::new(result),
                         rexpr: Box::new(where_expr_convert(*arg)?),
@@ -509,6 +524,7 @@ pub(super) unsafe fn bool_expr_convert(
                     });
                 };
                 Ok(WhereExpr::Unary(UnaryExpr {
+                    id: NodeId::PENDING,
                     op: UnaryOp::Not,
                     expr: Box::new(where_expr_convert(*arg)?),
                 }))

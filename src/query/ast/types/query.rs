@@ -6,10 +6,10 @@ use smallvec::SmallVec;
 
 use super::{
     AstNode, ColumnNode, LiteralValue, ScalarExpr, TableNode, TableSource, WhereExpr,
-    children_visit,
+    children_finalize, children_visit,
 };
 use crate::cache::UpdateQuerySource;
-use crate::query::ast::{Deparse, clause_deparse, separated_deparse};
+use crate::query::ast::{Deparse, NodeId, NodePositions, clause_deparse, separated_deparse};
 
 // ============================================================================
 // New Query Type Hierarchy (for UNION/INTERSECT/EXCEPT support)
@@ -35,9 +35,19 @@ impl Deparse for SetOpType {
 }
 
 /// VALUES clause with typed rows - represents `VALUES (1, 'a'), (2, 'b')`
-#[derive(Debug, Clone, PartialEq, Hash, Default)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct ValuesClause {
+    pub id: NodeId,
     pub rows: Vec<Vec<LiteralValue>>,
+}
+
+impl Default for ValuesClause {
+    fn default() -> Self {
+        Self {
+            id: NodeId::PENDING,
+            rows: Vec::new(),
+        }
+    }
 }
 
 impl AstNode for ValuesClause {
@@ -49,6 +59,16 @@ impl AstNode for ValuesClause {
             children_visit(row, f)?;
         }
         ControlFlow::Continue(())
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        for row in &mut self.rows {
+            children_finalize(row, positions);
+        }
     }
 }
 
@@ -81,6 +101,7 @@ impl Deparse for ValuesClause {
 /// Core SELECT without ORDER BY/LIMIT (those go on the parent query)
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SelectNode {
+    pub id: NodeId,
     pub distinct: bool,
     pub columns: SelectColumns,
     pub from: SmallVec<[TableSource; 1]>,
@@ -92,6 +113,7 @@ pub struct SelectNode {
 impl Default for SelectNode {
     fn default() -> Self {
         Self {
+            id: NodeId::PENDING,
             distinct: false,
             columns: SelectColumns::None,
             from: SmallVec::new(),
@@ -112,6 +134,18 @@ impl AstNode for SelectNode {
         children_visit(self.where_clause.as_ref(), f)?;
         children_visit(&self.group_by, f)?;
         children_visit(self.having.as_ref(), f)
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        self.columns.finalize(positions);
+        children_finalize(&mut self.from, positions);
+        children_finalize(self.where_clause.as_mut(), positions);
+        children_finalize(&mut self.group_by, positions);
+        children_finalize(self.having.as_mut(), positions);
     }
 }
 
@@ -187,6 +221,7 @@ impl Deparse for SelectNode {
 /// Set operation node: `left UNION/INTERSECT/EXCEPT [ALL] right`
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct SetOpNode {
+    pub id: NodeId,
     pub op: SetOpType,
     pub all: bool,
     pub left: Box<QueryExpr>,
@@ -199,6 +234,14 @@ impl AstNode for SetOpNode {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         children_visit([&*self.left, &*self.right], f)
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        children_finalize([&mut *self.left, &mut *self.right], positions);
     }
 }
 
@@ -242,6 +285,14 @@ impl AstNode for QueryBody {
         }
         ControlFlow::Continue(())
     }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        match self {
+            QueryBody::Select(select) => select.finalize(positions),
+            QueryBody::Values(values) => values.finalize(positions),
+            QueryBody::SetOp(set_op) => set_op.finalize(positions),
+        }
+    }
 }
 
 impl QueryBody {
@@ -274,6 +325,7 @@ impl Deparse for QueryBody {
 /// ORDER BY and LIMIT apply to the entire query expression.
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct QueryExpr {
+    pub id: NodeId,
     pub ctes: Vec<CteDefinition>,
     pub body: QueryBody,
     pub order_by: SmallVec<[OrderByClause; 1]>,
@@ -283,6 +335,7 @@ pub struct QueryExpr {
 impl Default for QueryExpr {
     fn default() -> Self {
         Self {
+            id: NodeId::PENDING,
             ctes: Vec::new(),
             body: QueryBody::Values(ValuesClause::default()),
             order_by: SmallVec::new(),
@@ -321,6 +374,18 @@ impl AstNode for QueryExpr {
         }
         self.body.try_for_each_node(f)?;
         children_visit(&self.order_by, f)
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        for c in &mut self.ctes {
+            c.query.finalize(positions);
+        }
+        self.body.finalize(positions);
+        children_finalize(&mut self.order_by, positions);
     }
 }
 
@@ -494,6 +559,13 @@ impl AstNode for SelectColumns {
         }
         ControlFlow::Continue(())
     }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        match self {
+            SelectColumns::None => {}
+            SelectColumns::Columns(columns) => children_finalize(columns, positions),
+        }
+    }
 }
 
 impl SelectColumns {
@@ -539,7 +611,21 @@ pub enum SelectColumn {
         alias: Option<EcoString>,
     },
     /// `*` or `<qualifier>.*`. Cannot be aliased.
-    Star(Option<EcoString>),
+    Star(StarNode),
+}
+
+/// `*` or `<qualifier>.*` in a select list. A node of its own so resolution
+/// can bind the expansion to it (ADR-057).
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct StarNode {
+    pub id: NodeId,
+    pub qualifier: Option<EcoString>,
+}
+
+impl AstNode for StarNode {
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
 }
 
 impl SelectColumn {
@@ -574,9 +660,16 @@ impl AstNode for SelectColumn {
     ) -> ControlFlow<B> {
         match self {
             SelectColumn::Expr { expr, .. } => expr.try_for_each_node(f)?,
-            SelectColumn::Star(_) => {}
+            SelectColumn::Star(star) => star.try_for_each_node(f)?,
         }
         ControlFlow::Continue(())
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        match self {
+            SelectColumn::Expr { expr, .. } => expr.finalize(positions),
+            SelectColumn::Star(star) => star.finalize(positions),
+        }
     }
 }
 
@@ -591,8 +684,8 @@ impl Deparse for SelectColumn {
                     alias.deparse(buf);
                 }
             }
-            SelectColumn::Star(qualifier) => {
-                if let Some(table) = qualifier {
+            SelectColumn::Star(star) => {
+                if let Some(table) = &star.qualifier {
                     buf.push_str(table);
                     buf.push('.');
                 }
@@ -605,6 +698,7 @@ impl Deparse for SelectColumn {
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct OrderByClause {
+    pub id: NodeId,
     pub expr: ScalarExpr,
     pub direction: OrderDirection,
     pub null_order: NullOrder,
@@ -617,6 +711,14 @@ impl AstNode for OrderByClause {
     ) -> ControlFlow<B> {
         self.expr.try_for_each_node(f)?;
         ControlFlow::Continue(())
+    }
+
+    fn id_set(&mut self, id: NodeId) {
+        self.id = id;
+    }
+
+    fn children_finalize(&mut self, positions: &mut NodePositions) {
+        self.expr.finalize(positions);
     }
 }
 

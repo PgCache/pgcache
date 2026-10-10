@@ -1,7 +1,9 @@
 mod convert_raw;
 #[cfg(test)]
 mod convert_raw_tests;
+mod finalize;
 mod fingerprint;
+mod node_id;
 pub(crate) mod raw;
 mod types;
 #[cfg(test)]
@@ -122,5 +124,7 @@ impl Deparse for EcoString {
 #[cfg(test)]
 pub(crate) use convert_raw::query_expr_parse;
 pub use convert_raw::{RawStatement, query_expr_convert_raw, statement_convert_raw};
+pub use finalize::query_expr_finalize;
 pub use fingerprint::*;
+pub use node_id::{NodeId, NodePositions};
 pub use types::*;

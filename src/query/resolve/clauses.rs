@@ -30,8 +30,8 @@ pub(super) fn select_columns_resolve(
     let mut resolved_cols = Vec::new();
     for col in cols {
         match col {
-            SelectColumn::Star(qualifier) => {
-                star_expand(qualifier.as_deref(), scope, &mut resolved_cols);
+            SelectColumn::Star(star) => {
+                star_expand(star.qualifier.as_deref(), scope, &mut resolved_cols);
             }
             SelectColumn::Expr { expr, alias } => {
                 let resolved_expr = scalar_expr_resolve(expr, scope)?;

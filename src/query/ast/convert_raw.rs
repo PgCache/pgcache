@@ -11,7 +11,9 @@ use std::os::raw::c_void;
 use pg_query::pg_nodes as pg;
 
 use super::raw::{NodePtr, cast, list_nodes, node_tag, node_tag_name, sublink_type_name};
-use super::{AstError, CteDefinition, NullOrder, OrderDirection, QueryExpr, SubLinkType};
+use super::{
+    AstError, CteDefinition, NullOrder, OrderDirection, QueryExpr, SubLinkType, query_expr_finalize,
+};
 use crate::query::transform::query_expr_constant_fold;
 use crate::query::write::{IsolationEffect, SettingsEffect, TransactionBoundary, WriteClass};
 
@@ -133,6 +135,7 @@ unsafe fn select_root_convert(select: *const pg::SelectStmt) -> Result<QueryExpr
         let mut query = select_stmt_to_query_expr(select)?;
         window_refs_assert_resolved(&query)?;
         query_expr_constant_fold(&mut query);
+        query_expr_finalize(&mut query);
         Ok(query)
     }
 }

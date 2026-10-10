@@ -11,8 +11,8 @@ use super::scalar::scalar_expr_convert;
 use super::{null_order_map, order_dir_map};
 use crate::query::ast::raw::{NodePtr, cast, cstr, list_nodes, node_tag, node_tag_name};
 use crate::query::ast::{
-    AstError, AstNode, FrameBound, FrameExclusion, FrameMode, OrderByClause, QueryExpr, ScalarExpr,
-    SelectColumn, SelectColumns, WindowFrame, WindowSpec,
+    AstError, AstNode, FrameBound, FrameExclusion, FrameMode, NodeId, OrderByClause, QueryExpr,
+    ScalarExpr, SelectColumn, SelectColumns, WindowFrame, WindowSpec,
 };
 
 // Window `frameOptions` bitmask from PostgreSQL `parsenodes.h`. libpg_query
@@ -44,6 +44,7 @@ pub(super) unsafe fn window_def_convert(
         let name = cstr((*win_def).name);
         if !name.is_empty() {
             return Ok(WindowSpec {
+                id: NodeId::PENDING,
                 partition_by: Vec::new(),
                 order_by: Vec::new(),
                 frame: None,
@@ -73,6 +74,7 @@ pub(super) unsafe fn window_spec_from_clauses(
         let order_by = window_order_by_convert((*win_def).orderClause)?.into_vec();
         let frame = window_frame_convert(win_def)?;
         Ok(WindowSpec {
+            id: NodeId::PENDING,
             partition_by,
             order_by,
             frame,
@@ -238,6 +240,7 @@ pub(super) unsafe fn window_frame_convert(
             FrameExclusion::NoOthers
         };
         Ok(Some(WindowFrame {
+            id: NodeId::PENDING,
             mode,
             start,
             end,
@@ -311,6 +314,7 @@ pub(super) unsafe fn sort_by_to_order_clause(
         let direction = order_dir_map((*sort_by).sortby_dir)?;
         let null_order = null_order_map((*sort_by).sortby_nulls)?;
         Ok(OrderByClause {
+            id: NodeId::PENDING,
             expr,
             direction,
             null_order,

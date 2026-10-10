@@ -16,9 +16,9 @@ use crate::query::ast::raw::{
     NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag, node_tag_name, string_node_value,
 };
 use crate::query::ast::{
-    AstError, ColumnNode, CteDefinition, CteMaterialization, LimitClause, LiteralValue,
+    AstError, ColumnNode, CteDefinition, CteMaterialization, LimitClause, LiteralValue, NodeId,
     OrderByClause, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode, SetOpNode,
-    SetOpType, ValuesClause,
+    SetOpType, StarNode, ValuesClause,
 };
 
 unsafe fn with_clause_extract(
@@ -114,6 +114,7 @@ pub(super) unsafe fn select_stmt_to_query_expr_with_ctx(
         let body = query_body_convert(select_stmt, &ctx)?;
 
         Ok(QueryExpr {
+            id: NodeId::PENDING,
             ctes,
             body,
             order_by,
@@ -131,7 +132,10 @@ unsafe fn query_body_convert(
         match (*select_stmt).op {
             pg::SetOperation_SETOP_NONE if !list_is_empty((*select_stmt).valuesLists) => {
                 let rows = value_list_convert((*select_stmt).valuesLists)?;
-                Ok(QueryBody::Values(ValuesClause { rows }))
+                Ok(QueryBody::Values(ValuesClause {
+                    id: NodeId::PENDING,
+                    rows,
+                }))
             }
             pg::SetOperation_SETOP_NONE => {
                 let select_node = select_stmt_to_select_node(select_stmt, ctx)?;
@@ -167,6 +171,7 @@ unsafe fn set_op_convert(
         let right = select_stmt_to_query_expr_with_ctx(rarg, ctx)?;
 
         Ok(QueryBody::SetOp(SetOpNode {
+            id: NodeId::PENDING,
             op,
             all: (*select_stmt).all,
             left: Box::new(left),
@@ -195,6 +200,7 @@ unsafe fn select_stmt_to_select_node(
         };
 
         Ok(SelectNode {
+            id: NodeId::PENDING,
             distinct: !list_is_empty((*select_stmt).distinctClause),
             columns,
             from,
@@ -280,10 +286,18 @@ unsafe fn star_column(column_ref: *const pg::ColumnRef) -> Result<Option<SelectC
     unsafe {
         let fields: SmallVec<[_; 4]> = list_nodes((*column_ref).fields).collect();
         match fields.as_slice() {
-            [star] if node_tag(*star) == pg::NodeTag_T_A_Star => Ok(Some(SelectColumn::Star(None))),
+            [star] if node_tag(*star) == pg::NodeTag_T_A_Star => {
+                Ok(Some(SelectColumn::Star(StarNode {
+                    id: NodeId::PENDING,
+                    qualifier: None,
+                })))
+            }
             [.., qualifier, star] if node_tag(*star) == pg::NodeTag_T_A_Star => {
                 let table = string_node_value(*qualifier).ok_or(AstError::InvalidTableRef)?;
-                Ok(Some(SelectColumn::Star(Some(EcoString::from(table)))))
+                Ok(Some(SelectColumn::Star(StarNode {
+                    id: NodeId::PENDING,
+                    qualifier: Some(EcoString::from(table)),
+                })))
             }
             _ => Ok(None),
         }
