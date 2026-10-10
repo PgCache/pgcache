@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::borrow::Cow;
 use std::ops::ControlFlow;
 
 use ecow::EcoString;
@@ -8,7 +9,7 @@ use super::{
     children_visit,
 };
 use crate::cache::{SubqueryKind, UpdateQuerySource};
-use crate::query::ast::{Deparse, NodeId, NodePositions};
+use crate::query::ast::{Clause, Deparse, DeparseContext, DeparseWith, NodeId, NodePositions};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableAlias {
@@ -151,13 +152,13 @@ impl TableSource {
     }
 }
 
-impl Deparse for TableSource {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for TableSource {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         match self {
-            TableSource::Table(table) => table.deparse(buf),
-            TableSource::Subquery(subquery) => subquery.deparse(buf),
-            TableSource::Join(join) => join.deparse(buf),
-            TableSource::CteRef(cte_ref) => cte_ref.deparse(buf),
+            TableSource::Table(table) => table.deparse_with(cx, buf),
+            TableSource::Subquery(subquery) => subquery.deparse_with(cx, buf),
+            TableSource::Join(join) => join.deparse_with(cx, buf),
+            TableSource::CteRef(cte_ref) => cte_ref.deparse_with(cx, buf),
         }
     }
 }
@@ -176,22 +177,25 @@ impl AstNode for TableNode {
     }
 }
 
-impl Deparse for TableNode {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        buf.push(' ');
+impl TableNode {
+    /// `schema.name` as written.
+    pub(crate) fn name_deparse_plain(&self, buf: &mut String) {
         if let Some(schema) = &self.schema {
             schema.deparse(buf);
             buf.push('.');
         }
-
         self.name.deparse(buf);
+    }
+}
 
+impl DeparseWith for TableNode {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        buf.push(' ');
+        cx.table_name_deparse(self, buf);
         if let Some(alias) = &self.alias {
             buf.push(' ');
             alias.deparse(buf);
         }
-
-        buf
     }
 }
 
@@ -221,23 +225,21 @@ impl AstNode for TableSubqueryNode {
     }
 }
 
-impl Deparse for TableSubqueryNode {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for TableSubqueryNode {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         buf.push(' ');
         if self.lateral {
             buf.push_str("LATERAL ");
         }
 
         buf.push('(');
-        self.query.deparse(buf);
+        self.query.deparse_with(cx, buf);
         buf.push(')');
 
         if let Some(alias) = &self.alias {
             buf.push(' ');
             alias.deparse(buf);
         }
-
-        buf
     }
 }
 
@@ -259,8 +261,9 @@ impl AstNode for CteRefNode {
     }
 }
 
-impl Deparse for CteRefNode {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl CteRefNode {
+    /// ` cte_name alias` as written.
+    pub(crate) fn deparse_plain(&self, buf: &mut String) {
         buf.push(' ');
         self.cte_name.deparse(buf);
 
@@ -268,8 +271,12 @@ impl Deparse for CteRefNode {
             buf.push(' ');
             alias.deparse(buf);
         }
+    }
+}
 
-        buf
+impl DeparseWith for CteRefNode {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        cx.cte_ref_deparse(self, buf);
     }
 }
 
@@ -323,10 +330,18 @@ impl AstNode for JoinNode {
     }
 }
 
-impl Deparse for JoinNode {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        self.left.deparse(buf);
-        match &self.qual {
+impl DeparseWith for JoinNode {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        self.left.deparse_with(cx, buf);
+        let qual: Cow<'_, JoinQual> = match &self.qual {
+            JoinQual::Natural => match cx.natural_join_columns(self) {
+                Some(columns) if columns.is_empty() => Cow::Owned(JoinQual::Cross),
+                Some(columns) => Cow::Owned(JoinQual::Using(columns)),
+                None => Cow::Borrowed(&self.qual),
+            },
+            JoinQual::On(_) | JoinQual::Using(_) | JoinQual::Cross => Cow::Borrowed(&self.qual),
+        };
+        match &*qual {
             // CROSS JOIN is always inner; the keyword carries the semantics.
             JoinQual::Cross => buf.push_str(" CROSS JOIN"),
             JoinQual::Natural => {
@@ -337,11 +352,13 @@ impl Deparse for JoinNode {
                 buf.push_str(self.join_type.join_keyword());
             }
         }
-        self.right.deparse(buf);
-        match &self.qual {
+        self.right.deparse_with(cx, buf);
+        match &*qual {
             JoinQual::On(condition) => {
+                cx.clause_enter(Clause::JoinOn);
                 buf.push_str(" ON ");
-                condition.deparse(buf);
+                condition.deparse_with(cx, buf);
+                cx.clause_leave(Clause::JoinOn);
             }
             JoinQual::Using(cols) => {
                 buf.push_str(" USING (");
@@ -355,7 +372,6 @@ impl Deparse for JoinNode {
             }
             JoinQual::Natural | JoinQual::Cross => {}
         }
-        buf
     }
 }
 

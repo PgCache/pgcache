@@ -8,7 +8,9 @@ use strum_macros::AsRefStr;
 
 use super::{AstNode, FunctionCall, QueryExpr, SelectNode, children_finalize, children_visit};
 use crate::cache::{SubqueryKind, UpdateQuerySource};
-use crate::query::ast::{Deparse, NodeId, NodePositions};
+use crate::query::ast::{
+    Deparse, DeparseContext, DeparseWith, NodeId, NodePositions, parenthesized_deparse_with,
+};
 use crate::query::cast::{CastTarget, cast_target_deparse};
 
 // Core literal value types that can appear in SQL expressions.
@@ -234,15 +236,20 @@ impl AstNode for ColumnNode {
     }
 }
 
-impl Deparse for ColumnNode {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl ColumnNode {
+    /// `table.column` as written.
+    pub(crate) fn deparse_plain(&self, buf: &mut String) {
         if let Some(table) = &self.table {
             table.deparse(buf);
             buf.push('.');
         }
         self.column.deparse(buf);
+    }
+}
 
-        buf
+impl DeparseWith for ColumnNode {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        cx.column_deparse(self, buf);
     }
 }
 
@@ -413,8 +420,8 @@ impl AstNode for UnaryExpr {
     }
 }
 
-impl Deparse for UnaryExpr {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for UnaryExpr {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         match self.op {
             UnaryOp::IsNull
             | UnaryOp::IsNotNull
@@ -423,7 +430,7 @@ impl Deparse for UnaryExpr {
             | UnaryOp::IsFalse
             | UnaryOp::IsNotFalse => {
                 // Postfix operators: expr IS NULL, expr IS TRUE, etc.
-                self.expr.deparse(buf);
+                self.expr.deparse_with(cx, buf);
                 buf.push(' ');
                 self.op.deparse(buf);
             }
@@ -438,16 +445,9 @@ impl Deparse for UnaryExpr {
                 );
                 self.op.deparse(buf);
                 buf.push(' ');
-                if needs_parens {
-                    buf.push('(');
-                }
-                self.expr.deparse(buf);
-                if needs_parens {
-                    buf.push(')');
-                }
+                parenthesized_deparse_with(cx, buf, self.expr.as_ref(), needs_parens);
             }
         }
-        buf
     }
 }
 
@@ -489,29 +489,15 @@ impl BinaryExpr {
     }
 }
 
-impl Deparse for BinaryExpr {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        if self.child_needs_parens(&self.lexpr) {
-            buf.push('(');
-            self.lexpr.deparse(buf);
-            buf.push(')');
-        } else {
-            self.lexpr.deparse(buf);
-        }
-
+impl DeparseWith for BinaryExpr {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        let left_parens = self.child_needs_parens(&self.lexpr);
+        let right_parens = self.child_needs_parens(&self.rexpr);
+        parenthesized_deparse_with(cx, buf, self.lexpr.as_ref(), left_parens);
         buf.push(' ');
         self.op.deparse(buf);
         buf.push(' ');
-
-        if self.child_needs_parens(&self.rexpr) {
-            buf.push('(');
-            self.rexpr.deparse(buf);
-            buf.push(')');
-        } else {
-            self.rexpr.deparse(buf);
-        }
-
-        buf
+        parenthesized_deparse_with(cx, buf, self.rexpr.as_ref(), right_parens);
     }
 }
 
@@ -540,16 +526,16 @@ impl AstNode for MultiExpr {
     }
 }
 
-impl Deparse for MultiExpr {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for MultiExpr {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         // MultiExpr format: [column, value1, value2, ...]
         // Output: column IN (value1, value2, ...) or column NOT IN (...)
         let [first, rest @ ..] = self.exprs.as_slice() else {
-            return buf;
+            return;
         };
 
         // First expression is the column/left side
-        first.deparse(buf);
+        first.deparse_with(cx, buf);
 
         match self.op {
             MultiOp::In => buf.push_str(" IN ("),
@@ -565,10 +551,10 @@ impl Deparse for MultiExpr {
                 let mut sep = "";
                 for expr in rest {
                     buf.push_str(sep);
-                    expr.deparse(buf);
+                    expr.deparse_with(cx, buf);
                     sep = " AND ";
                 }
-                return buf;
+                return;
             }
             MultiOp::Any { .. } | MultiOp::All { .. } => {
                 buf.push(' ');
@@ -581,11 +567,10 @@ impl Deparse for MultiExpr {
         let mut sep = "";
         for expr in rest {
             buf.push_str(sep);
-            expr.deparse(buf);
+            expr.deparse_with(cx, buf);
             sep = ", ";
         }
         buf.push(')');
-        buf
     }
 }
 
@@ -723,67 +708,39 @@ impl WhereExpr {
     }
 }
 
-impl Deparse for WhereExpr {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for WhereExpr {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         match self {
-            WhereExpr::Scalar(scalar) => {
-                scalar.deparse(buf);
-            }
-            WhereExpr::Unary(expr) => {
-                expr.deparse(buf);
-            }
-            WhereExpr::Binary(expr) => {
-                expr.deparse(buf);
-            }
-            WhereExpr::Multi(expr) => {
-                expr.deparse(buf);
-            }
+            WhereExpr::Scalar(scalar) => scalar.deparse_with(cx, buf),
+            WhereExpr::Unary(expr) => expr.deparse_with(cx, buf),
+            WhereExpr::Binary(expr) => expr.deparse_with(cx, buf),
+            WhereExpr::Multi(expr) => expr.deparse_with(cx, buf),
             WhereExpr::Subquery {
                 query,
                 sublink_type,
                 test_expr,
-            } => match sublink_type {
-                SubLinkType::Exists => {
-                    buf.push_str("EXISTS (");
-                    query.deparse(buf);
-                    buf.push(')');
-                }
-                SubLinkType::Any => {
+            } => {
+                let opener = match (sublink_type, test_expr) {
+                    (SubLinkType::Exists, _) => "EXISTS (",
                     // IN is a special case of ANY
-                    if let Some(test) = test_expr {
-                        test.deparse(buf);
-                        buf.push_str(" IN (");
-                        query.deparse(buf);
-                        buf.push(')');
-                    } else {
-                        buf.push('(');
-                        query.deparse(buf);
-                        buf.push(')');
+                    (SubLinkType::Any, Some(test)) => {
+                        test.deparse_with(cx, buf);
+                        " IN ("
                     }
-                }
-                SubLinkType::All => {
-                    if let Some(test) = test_expr {
-                        test.deparse(buf);
-                        buf.push_str(" <> ALL (");
-                        query.deparse(buf);
-                        buf.push(')');
-                    } else {
-                        buf.push_str("ALL (");
-                        query.deparse(buf);
-                        buf.push(')');
+                    (SubLinkType::All, Some(test)) => {
+                        test.deparse_with(cx, buf);
+                        " <> ALL ("
                     }
-                }
-                SubLinkType::Expr => {
-                    // Scalar subquery in a predicate position (rare; usually
-                    // routed through Scalar). Bare parenthesized query.
-                    buf.push('(');
-                    query.deparse(buf);
-                    buf.push(')');
-                }
-            },
+                    (SubLinkType::All, None) => "ALL (",
+                    // A scalar subquery in predicate position, or ANY
+                    // without a test expression: bare parenthesized query.
+                    (SubLinkType::Any | SubLinkType::Expr, _) => "(",
+                };
+                buf.push_str(opener);
+                query.deparse_with(cx, buf);
+                buf.push(')');
+            }
         }
-
-        buf
     }
 }
 
@@ -834,16 +791,15 @@ impl ArithmeticExpr {
     }
 }
 
-impl Deparse for ArithmeticExpr {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for ArithmeticExpr {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         buf.push('(');
-        self.left.deparse(buf);
+        self.left.deparse_with(cx, buf);
         buf.push(' ');
         buf.push_str(self.op.as_ref());
         buf.push(' ');
-        self.right.deparse(buf);
+        self.right.deparse_with(cx, buf);
         buf.push(')');
-        buf
     }
 }
 
@@ -973,37 +929,34 @@ impl ScalarExpr {
     }
 }
 
-impl Deparse for ScalarExpr {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for ScalarExpr {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         match self {
-            ScalarExpr::Column(col) => col.deparse(buf),
-            ScalarExpr::Function(func) => func.deparse(buf),
-            ScalarExpr::Literal(lit) => lit.deparse(buf),
-            ScalarExpr::Case(case) => case.deparse(buf),
-            ScalarExpr::Arithmetic(arith) => arith.deparse(buf),
+            ScalarExpr::Column(col) => col.deparse_with(cx, buf),
+            ScalarExpr::Function(func) => func.deparse_with(cx, buf),
+            ScalarExpr::Literal(lit) => cx.literal_deparse(lit, buf),
+            ScalarExpr::Case(case) => case.deparse_with(cx, buf),
+            ScalarExpr::Arithmetic(arith) => arith.deparse_with(cx, buf),
             ScalarExpr::Subquery(select) => {
                 buf.push('(');
-                select.deparse(buf);
+                select.deparse_with(cx, buf);
                 buf.push(')');
-                buf
             }
             ScalarExpr::Array(elems) => {
                 buf.push_str("ARRAY[");
                 let mut sep = "";
                 for elem in elems {
                     buf.push_str(sep);
-                    elem.deparse(buf);
+                    elem.deparse_with(cx, buf);
                     sep = ", ";
                 }
                 buf.push(']');
-                buf
             }
             ScalarExpr::TypeCast { expr, target } => {
                 buf.push('(');
-                expr.deparse(buf);
+                expr.deparse_with(cx, buf);
                 buf.push_str(")::");
                 buf.push_str(cast_target_deparse(target));
-                buf
             }
         }
     }
@@ -1052,25 +1005,24 @@ impl CaseExpr {
     }
 }
 
-impl Deparse for CaseExpr {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for CaseExpr {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         buf.push_str("CASE");
         if let Some(arg) = &self.arg {
             buf.push(' ');
-            arg.deparse(buf);
+            arg.deparse_with(cx, buf);
         }
         for when in &self.whens {
             buf.push_str(" WHEN ");
-            when.condition.deparse(buf);
+            when.condition.deparse_with(cx, buf);
             buf.push_str(" THEN ");
-            when.result.deparse(buf);
+            when.result.deparse_with(cx, buf);
         }
         if let Some(default) = &self.default {
             buf.push_str(" ELSE ");
-            default.deparse(buf);
+            default.deparse_with(cx, buf);
         }
         buf.push_str(" END");
-        buf
     }
 }
 

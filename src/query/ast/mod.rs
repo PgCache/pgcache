@@ -1,6 +1,7 @@
 mod convert_raw;
 #[cfg(test)]
 mod convert_raw_tests;
+mod deparse;
 mod finalize;
 mod fingerprint;
 mod node_id;
@@ -11,10 +12,7 @@ mod where_clause_tests;
 #[cfg(test)]
 mod write_tests;
 
-use ecow::EcoString;
 use error_set::error_set;
-
-use crate::pg::{identifier_needs_quotes, identifier_quote_into};
 
 error_set! {
     AstError := {
@@ -64,66 +62,15 @@ error_set! {
     }
 }
 
-pub trait Deparse {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String;
-}
-
-/// Deparse `items` with `separator` between them.
-pub(crate) fn separated_deparse<T: Deparse>(buf: &mut String, items: &[T], separator: &str) {
-    for (i, item) in items.iter().enumerate() {
-        if i > 0 {
-            buf.push_str(separator);
-        }
-        item.deparse(buf);
-    }
-}
-
-/// `keyword` then `expr`, when present.
-pub(crate) fn clause_deparse(buf: &mut String, keyword: &str, expr: Option<&impl Deparse>) {
-    if let Some(expr) = expr {
-        buf.push_str(keyword);
-        expr.deparse(buf);
-    }
-}
-
-/// Deparse `item`, wrapped in parentheses when `parens` (precedence needs it).
-pub(crate) fn parenthesized_deparse(buf: &mut String, item: &impl Deparse, parens: bool) {
-    if parens {
-        buf.push('(');
-    }
-    item.deparse(buf);
-    if parens {
-        buf.push(')');
-    }
-}
-
-impl Deparse for String {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        self.as_str().deparse(buf)
-    }
-}
-
-impl Deparse for &str {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        match identifier_needs_quotes(self) {
-            true => identifier_quote_into(self, buf),
-            false => buf.push_str(self),
-        };
-
-        buf
-    }
-}
-
-impl Deparse for EcoString {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        self.as_str().deparse(buf)
-    }
-}
-
 // Re-export everything public from submodules
 #[cfg(test)]
 pub(crate) use convert_raw::query_expr_parse;
 pub use convert_raw::{RawStatement, query_expr_convert_raw, statement_convert_raw};
+pub use deparse::{Clause, Deparse, DeparseContext, DeparseWith, Plain};
+pub(crate) use deparse::{
+    clause_deparse, clause_deparse_with, parenthesized_deparse, parenthesized_deparse_with,
+    separated_deparse, separated_deparse_with,
+};
 pub use finalize::query_expr_finalize;
 pub use fingerprint::*;
 pub use node_id::{NodeId, NodePositions};

@@ -4,7 +4,7 @@ use std::ops::ControlFlow;
 use ecow::EcoString;
 
 use super::{AstNode, OrderByClause, ScalarExpr, WhereExpr, children_finalize, children_visit};
-use crate::query::ast::{Deparse, NodeId, NodePositions};
+use crate::query::ast::{Deparse, DeparseContext, DeparseWith, NodeId, NodePositions};
 
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct FunctionCall {
@@ -57,9 +57,18 @@ impl FunctionCall {
 }
 
 impl FunctionCall {
+    /// `schema.NAME` as written, the name upper-cased.
+    pub(crate) fn name_deparse_plain(&self, buf: &mut String) {
+        if let Some(schema) = &self.schema {
+            buf.push_str(schema);
+            buf.push('.');
+        }
+        buf.push_str(&self.name.to_uppercase());
+    }
+
     /// Everything between the parentheses: `DISTINCT`, `*` or the arguments,
     /// and an aggregate `ORDER BY`.
-    fn arguments_deparse(&self, buf: &mut String) {
+    fn arguments_deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         if self.agg_distinct {
             buf.push_str("DISTINCT ");
         }
@@ -69,7 +78,7 @@ impl FunctionCall {
             let mut sep = "";
             for arg in &self.args {
                 buf.push_str(sep);
-                arg.deparse(buf);
+                arg.deparse_with(cx, buf);
                 sep = ", ";
             }
         }
@@ -78,33 +87,28 @@ impl FunctionCall {
             let mut sep = "";
             for clause in &self.agg_order {
                 buf.push_str(sep);
-                clause.deparse(buf);
+                clause.deparse_with(cx, buf);
                 sep = ", ";
             }
         }
     }
 }
 
-impl Deparse for FunctionCall {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        if let Some(schema) = &self.schema {
-            buf.push_str(schema);
-            buf.push('.');
-        }
-        buf.push_str(&self.name.to_uppercase());
+impl DeparseWith for FunctionCall {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        cx.function_name_deparse(self, buf);
         buf.push('(');
-        self.arguments_deparse(buf);
+        self.arguments_deparse_with(cx, buf);
         buf.push(')');
         if let Some(filter) = &self.agg_filter {
             buf.push_str(" FILTER (WHERE ");
-            filter.deparse(buf);
+            filter.deparse_with(cx, buf);
             buf.push(')');
         }
         if let Some(over) = &self.over {
             buf.push_str(" OVER ");
-            over.deparse(buf);
+            over.deparse_with(cx, buf);
         }
-        buf
     }
 }
 
@@ -190,15 +194,14 @@ impl AstNode for WindowFrame {
     }
 }
 
-impl Deparse for WindowFrame {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for WindowFrame {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         self.mode.deparse(buf);
         buf.push_str(" BETWEEN ");
-        self.start.deparse(buf);
+        self.start.deparse_with(cx, buf);
         buf.push_str(" AND ");
-        self.end.deparse(buf);
+        self.end.deparse_with(cx, buf);
         self.exclusion.deparse(buf);
-        buf
     }
 }
 
@@ -269,22 +272,21 @@ impl AstNode for FrameBound {
     }
 }
 
-impl Deparse for FrameBound {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for FrameBound {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         match self {
             FrameBound::UnboundedPreceding => buf.push_str("UNBOUNDED PRECEDING"),
             FrameBound::CurrentRow => buf.push_str("CURRENT ROW"),
             FrameBound::UnboundedFollowing => buf.push_str("UNBOUNDED FOLLOWING"),
             FrameBound::OffsetPreceding(e) => {
-                e.deparse(buf);
+                e.deparse_with(cx, buf);
                 buf.push_str(" PRECEDING");
             }
             FrameBound::OffsetFollowing(e) => {
-                e.deparse(buf);
+                e.deparse_with(cx, buf);
                 buf.push_str(" FOLLOWING");
             }
         }
-        buf
     }
 }
 
@@ -309,15 +311,15 @@ impl Deparse for FrameExclusion {
     }
 }
 
-impl Deparse for WindowSpec {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for WindowSpec {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         buf.push('(');
         if !self.partition_by.is_empty() {
             buf.push_str("PARTITION BY ");
             let mut sep = "";
             for col in &self.partition_by {
                 buf.push_str(sep);
-                col.deparse(buf);
+                col.deparse_with(cx, buf);
                 sep = ", ";
             }
         }
@@ -329,7 +331,7 @@ impl Deparse for WindowSpec {
             let mut sep = "";
             for clause in &self.order_by {
                 buf.push_str(sep);
-                clause.deparse(buf);
+                clause.deparse_with(cx, buf);
                 sep = ", ";
             }
         }
@@ -337,9 +339,8 @@ impl Deparse for WindowSpec {
             if !self.partition_by.is_empty() || !self.order_by.is_empty() {
                 buf.push(' ');
             }
-            frame.deparse(buf);
+            frame.deparse_with(cx, buf);
         }
         buf.push(')');
-        buf
     }
 }

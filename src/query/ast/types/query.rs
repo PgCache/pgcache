@@ -9,7 +9,10 @@ use super::{
     children_finalize, children_visit,
 };
 use crate::cache::UpdateQuerySource;
-use crate::query::ast::{Deparse, NodeId, NodePositions, clause_deparse, separated_deparse};
+use crate::query::ast::{
+    Clause, Deparse, DeparseContext, DeparseWith, NodeId, NodePositions, clause_deparse_with,
+    separated_deparse, separated_deparse_with,
+};
 
 // ============================================================================
 // New Query Type Hierarchy (for UNION/INTERSECT/EXCEPT support)
@@ -78,8 +81,9 @@ impl ValuesClause {
     }
 }
 
-impl Deparse for ValuesClause {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for ValuesClause {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        cx.clause_enter(Clause::Values);
         buf.push_str("VALUES ");
         let mut row_sep = "";
         buf.push('(');
@@ -88,13 +92,13 @@ impl Deparse for ValuesClause {
             let mut sep = "";
             for value in row {
                 buf.push_str(sep);
-                value.deparse(buf);
+                cx.literal_deparse(value, buf);
                 sep = ", ";
             }
             row_sep = "), (";
         }
         buf.push(')');
-        buf
+        cx.clause_leave(Clause::Values);
     }
 }
 
@@ -197,24 +201,35 @@ impl SelectNode {
     }
 }
 
-impl Deparse for SelectNode {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for SelectNode {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         buf.push_str("SELECT");
         if self.distinct {
             buf.push_str(" DISTINCT");
         }
-        self.columns.deparse(buf);
+        cx.clause_enter(Clause::SelectList);
+        self.columns.deparse_with(cx, buf);
+        cx.clause_leave(Clause::SelectList);
         if !self.from.is_empty() {
+            cx.clause_enter(Clause::From);
             buf.push_str(" FROM");
-            separated_deparse(buf, &self.from, ",");
+            separated_deparse_with(cx, buf, &self.from, ",");
+            cx.clause_leave(Clause::From);
         }
-        clause_deparse(buf, " WHERE ", self.where_clause.as_ref());
+        clause_deparse_with(
+            cx,
+            buf,
+            Clause::Where,
+            " WHERE ",
+            self.where_clause.as_ref(),
+        );
         if !self.group_by.is_empty() {
+            cx.clause_enter(Clause::GroupBy);
             buf.push_str(" GROUP BY ");
-            separated_deparse(buf, &self.group_by, ", ");
+            separated_deparse_with(cx, buf, &self.group_by, ", ");
+            cx.clause_leave(Clause::GroupBy);
         }
-        clause_deparse(buf, " HAVING ", self.having.as_ref());
-        buf
+        clause_deparse_with(cx, buf, Clause::Having, " HAVING ", self.having.as_ref());
     }
 }
 
@@ -251,17 +266,16 @@ impl SetOpNode {
     }
 }
 
-impl Deparse for SetOpNode {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        self.left.deparse(buf);
+impl DeparseWith for SetOpNode {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        self.left.deparse_with(cx, buf);
         buf.push(' ');
         self.op.deparse(buf);
         if self.all {
             buf.push_str(" ALL");
         }
         buf.push(' ');
-        self.right.deparse(buf);
-        buf
+        self.right.deparse_with(cx, buf);
     }
 }
 
@@ -305,12 +319,12 @@ impl QueryBody {
     }
 }
 
-impl Deparse for QueryBody {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for QueryBody {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         match self {
-            QueryBody::Select(select) => select.deparse(buf),
-            QueryBody::Values(values) => values.deparse(buf),
-            QueryBody::SetOp(set_op) => set_op.deparse(buf),
+            QueryBody::Select(select) => select.deparse_with(cx, buf),
+            QueryBody::Values(values) => values.deparse_with(cx, buf),
+            QueryBody::SetOp(set_op) => set_op.deparse_with(cx, buf),
         }
     }
 }
@@ -500,27 +514,32 @@ impl QueryExpr {
     }
 }
 
-impl Deparse for QueryExpr {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        if !self.ctes.is_empty() {
+impl DeparseWith for QueryExpr {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        if !self.ctes.is_empty() && cx.with_clause_renders() {
+            cx.clause_enter(Clause::With);
             buf.push_str("WITH ");
-            separated_deparse(buf, &self.ctes, ", ");
+            separated_deparse_with(cx, buf, &self.ctes, ", ");
             buf.push(' ');
+            cx.clause_leave(Clause::With);
         }
-        self.body.deparse(buf);
+        self.body.deparse_with(cx, buf);
         if !self.order_by.is_empty() {
+            cx.clause_enter(Clause::OrderBy);
             buf.push_str(" ORDER BY ");
-            separated_deparse(buf, &self.order_by, ", ");
+            separated_deparse_with(cx, buf, &self.order_by, ", ");
+            cx.clause_leave(Clause::OrderBy);
         }
         if let Some(limit) = &self.limit {
-            limit.deparse(buf);
+            cx.clause_enter(Clause::Limit);
+            limit.deparse_with(cx, buf);
+            cx.clause_leave(Clause::Limit);
         }
-        buf
     }
 }
 
-impl Deparse for CteDefinition {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for CteDefinition {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         self.name.deparse(buf);
         if !self.column_aliases.is_empty() {
             buf.push('(');
@@ -534,9 +553,8 @@ impl Deparse for CteDefinition {
             CteMaterialization::NotMaterialized => buf.push_str("NOT MATERIALIZED "),
         }
         buf.push('(');
-        self.query.deparse(buf);
+        self.query.deparse_with(cx, buf);
         buf.push(')');
-        buf
     }
 }
 
@@ -585,21 +603,19 @@ impl SelectColumns {
     }
 }
 
-impl Deparse for SelectColumns {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for SelectColumns {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         match self {
             SelectColumns::None => buf.push(' '),
             SelectColumns::Columns(cols) => {
                 let mut sep = "";
                 for col in cols {
                     buf.push_str(sep);
-                    col.deparse(buf);
+                    col.deparse_with(cx, buf);
                     sep = ",";
                 }
             }
         };
-
-        buf
     }
 }
 
@@ -625,6 +641,17 @@ pub struct StarNode {
 impl AstNode for StarNode {
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
+    }
+}
+
+impl StarNode {
+    /// `*` or `qualifier.*` as written.
+    pub(crate) fn deparse_plain(&self, buf: &mut String) {
+        if let Some(table) = &self.qualifier {
+            buf.push_str(table);
+            buf.push('.');
+        }
+        buf.push('*');
     }
 }
 
@@ -673,26 +700,19 @@ impl AstNode for SelectColumn {
     }
 }
 
-impl Deparse for SelectColumn {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for SelectColumn {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         buf.push(' ');
         match self {
             SelectColumn::Expr { expr, alias } => {
-                expr.deparse(buf);
+                expr.deparse_with(cx, buf);
                 if let Some(alias) = alias {
                     buf.push_str(" AS ");
                     alias.deparse(buf);
                 }
             }
-            SelectColumn::Star(star) => {
-                if let Some(table) = &star.qualifier {
-                    buf.push_str(table);
-                    buf.push('.');
-                }
-                buf.push('*');
-            }
+            SelectColumn::Star(star) => cx.star_deparse(star, buf),
         }
-        buf
     }
 }
 
@@ -722,13 +742,12 @@ impl AstNode for OrderByClause {
     }
 }
 
-impl Deparse for OrderByClause {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
-        self.expr.deparse(buf);
+impl DeparseWith for OrderByClause {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        self.expr.deparse_with(cx, buf);
         buf.push(' ');
         self.direction.deparse(buf);
         self.null_order.deparse(buf);
-        buf
     }
 }
 
@@ -778,16 +797,15 @@ pub struct LimitClause {
     pub offset: Option<LiteralValue>,
 }
 
-impl Deparse for LimitClause {
-    fn deparse<'b>(&self, buf: &'b mut String) -> &'b mut String {
+impl DeparseWith for LimitClause {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         if let Some(count) = &self.count {
             buf.push_str(" LIMIT ");
-            count.deparse(buf);
+            cx.literal_deparse(count, buf);
         }
         if let Some(offset) = &self.offset {
             buf.push_str(" OFFSET ");
-            offset.deparse(buf);
+            cx.literal_deparse(offset, buf);
         }
-        buf
     }
 }
