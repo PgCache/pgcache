@@ -45,8 +45,6 @@ impl ConnectionState {
     /// Caller guarantees [`Self::cache_batch_eligible`] (every entry has a
     /// candidate and the list is non-empty).
     pub(super) fn cache_batch_dispatch(&mut self, entries: SmallVec<[ExecuteEntry; 1]>) {
-        // Unknown search_path forwards at dispatch; the key is then only a label.
-        let keying = self.session_settings.keying_label(self.in_transaction());
         // Common case: a single Parse/Bind/Describe/Execute. Begin it directly
         // without allocating a batch queue (the trailing-most slots empty).
         if entries.len() == 1 {
@@ -54,7 +52,7 @@ impl ConnectionState {
                 && let Some(candidate) = entry.candidate.take()
             {
                 self.extended.batch.clear();
-                self.cache_slot_begin(DispatchContext::build(entry, candidate, true, &keying));
+                self.cache_slot_begin(DispatchContext::build(entry, candidate, true));
                 self.proxy_mode = ProxyMode::OriginDrain;
             }
             return;
@@ -67,7 +65,7 @@ impl ConnectionState {
             let Some(candidate) = entry.candidate.take() else {
                 continue;
             };
-            contexts.push_back(DispatchContext::build(entry, candidate, i == last, &keying));
+            contexts.push_back(DispatchContext::build(entry, candidate, i == last));
         }
         if let Some(first) = contexts.pop_front() {
             self.extended.batch = contexts;
@@ -80,7 +78,7 @@ impl ConnectionState {
     /// timing, install pipeline + forward-fallback state, and push the egress
     /// Cache slot.
     pub(super) fn cache_slot_begin(&mut self, ctx: DispatchContext) {
-        self.telemetry.cache_timing_start(ctx.key);
+        self.telemetry.cache_timing_start();
         self.extended.dispatch_is_extended = true;
         self.extended.pipeline_context = Some(ctx.pipeline);
         // Reset the awaited-response queues to just this slot's statement(s);

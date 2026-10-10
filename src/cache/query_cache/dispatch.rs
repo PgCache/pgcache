@@ -222,6 +222,7 @@ impl CacheDispatch {
             client_socket,
             reply_tx,
             keying,
+            session_key,
             output_settings,
             timing,
             pipeline,
@@ -266,6 +267,7 @@ impl CacheDispatch {
                     client_socket,
                     reply_tx,
                     keying,
+                    session_key,
                     output_settings,
                     timing,
                     pipeline,
@@ -398,7 +400,9 @@ impl CacheDispatch {
                 .increment(1);
             return None;
         }
-        let session_key = msg.keying.session_key(msg.cacheable_query.query());
+        let session_key = msg
+            .session_key
+            .unwrap_or_else(|| msg.keying.session_key(msg.cacheable_query.query()));
         if let Some(fingerprint) = self.fingerprint_for_key(session_key) {
             return Some(fingerprint);
         }

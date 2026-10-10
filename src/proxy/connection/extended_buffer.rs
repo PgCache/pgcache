@@ -15,8 +15,6 @@ use crate::cache::query::CacheableQuery;
 use crate::cache::{CacheMessage, QueryParameters};
 use crate::pg::protocol::extended::parse_parameter_description;
 use crate::pg::protocol::session::{PreparedStatement, ResultFormats};
-use crate::query::SessionKey;
-use crate::query::keying_settings::KeyingSettings;
 use crate::query::write::StatementEffects;
 
 /// Each Execute's effects snapshot, in batch order, for a forwarded buffer.
@@ -271,8 +269,6 @@ pub(super) struct ExtendedPending {
 pub(super) struct DispatchContext {
     pub(super) msg: CacheMessage,
     pub(super) pipeline: PipelineContext,
-    /// Telemetry label for the slot: the query under the session's path.
-    pub(super) key: SessionKey,
     pub(super) lazy_parse: Option<EcoString>,
     pub(super) parse_statement: Option<EcoString>,
     pub(super) describe_statement: Option<EcoString>,
@@ -281,14 +277,8 @@ pub(super) struct DispatchContext {
 impl DispatchContext {
     /// Assemble a dispatch context from an entry and its cache candidate.
     /// `is_last` carries the single trailing `ReadyForQuery` for the batch.
-    pub(super) fn build(
-        entry: ExecuteEntry,
-        candidate: CacheCandidate,
-        is_last: bool,
-        keying: &KeyingSettings,
-    ) -> Self {
+    pub(super) fn build(entry: ExecuteEntry, candidate: CacheCandidate, is_last: bool) -> Self {
         let prep = entry.prep;
-        let key = keying.session_key(candidate.cacheable_query.query());
         let lazy_parse = (!prep.has_parse && candidate.lazy_parse_needed())
             .then(|| candidate.statement_name.clone());
         let pipeline = PipelineContext {
@@ -308,7 +298,6 @@ impl DispatchContext {
         Self {
             msg,
             pipeline,
-            key,
             lazy_parse,
             // A cacheable (non-dirty) entry has at most one Parse / Describe('S').
             parse_statement: if prep.has_parse {

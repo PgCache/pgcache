@@ -20,7 +20,7 @@ use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::ClientSocket;
 use crate::query::ast::LimitClause;
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::{Fingerprint, QueryShape};
+use crate::query::{Fingerprint, QueryShape, SessionKey};
 use crate::settings::DynamicConfigHandle;
 use crate::timing::QueryTiming;
 
@@ -58,6 +58,8 @@ pub struct QueryRequest {
     /// What the read is keyed under: the resolved search_path and the
     /// literal settings at this read's scope.
     pub keying: Arc<KeyingSettings>,
+    /// The read's session key when the proxy hashed it at the slot.
+    pub session_key: Option<SessionKey>,
     /// The client's rendering settings at this read's scope (PGC-287).
     pub output_settings: Arc<OutputSettings>,
     /// Per-query timing data

@@ -13,8 +13,8 @@ use crate::cache::Generation;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::{ClientSocket, ExplainSpec};
-use crate::query::Fingerprint;
 use crate::query::keying_settings::KeyingSettings;
+use crate::query::{Fingerprint, SessionKey};
 use crate::timing::QueryTiming;
 
 pub(crate) use super::serve_decision::AdmitAction;
@@ -179,6 +179,9 @@ pub struct ProxyMessage {
     /// What the read is keyed under: the resolved search_path and the
     /// literal settings at this read's scope.
     pub keying: Arc<KeyingSettings>,
+    /// The read's session key when the proxy could hash it once at the slot
+    /// (`None` for a parameterized read with binds, keyed after substitution).
+    pub session_key: Option<SessionKey>,
     /// The client's rendering settings at this read's scope (PGC-287).
     pub output_settings: Arc<OutputSettings>,
     /// Per-query timing data

@@ -48,10 +48,11 @@ impl QueryTelemetry {
     }
 
     /// Create cache timing for a cacheable query.
-    pub(super) fn cache_timing_start(&mut self, key: SessionKey) {
-        let query_id = QueryId::new(key.get());
+    pub(super) fn cache_timing_start(&mut self) {
+        // The id's fingerprint is the session key, hashed once at the cache
+        // slot and stamped by `cache_timing_dispatch`.
         let received_at = self.client_received_at.unwrap_or_else(Instant::now);
-        let mut timing = QueryTiming::new(query_id, received_at);
+        let mut timing = QueryTiming::new(QueryId::new(0), received_at);
         timing.parsed_at = Some(Instant::now());
         self.cache_timing = Some(timing);
     }
@@ -98,11 +99,14 @@ impl QueryTelemetry {
 
     /// Take the cache timing for dispatch to the cache pipeline.
     /// Sets dispatched_at before returning.
-    pub(super) fn cache_timing_dispatch(&mut self) -> QueryTiming {
+    pub(super) fn cache_timing_dispatch(&mut self, key: Option<SessionKey>) -> QueryTiming {
         let mut t = self
             .cache_timing
             .take()
             .unwrap_or_else(|| QueryTiming::new(QueryId::new(0), Instant::now()));
+        if let Some(key) = key {
+            t.query_id.fingerprint = key.get();
+        }
         t.dispatched_at = Some(Instant::now());
         t
     }

@@ -34,6 +34,7 @@ use crate::proxy::client_stream::{ClientSocket, ClientStream, OwnedClientReadHal
 use crate::proxy::query::{Action, CacheabilityCache, ForwardReason, handle_query};
 use crate::proxy::session_settings::SessionSettings;
 use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
+use crate::query::SessionKey;
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
 use crate::query::guc::Guc;
@@ -250,6 +251,17 @@ async fn handle_connection(
                     }
                 };
                 crate::metrics::handles().query.cacheable.increment(1);
+                // Hashed once here for the gate, the timing id and dispatch. A
+                // parameterized read with binds is keyed after substitution.
+                let session_key = match &msg {
+                    CacheMessage::Query(_, cq) => Some(keying.session_key(cq.query())),
+                    CacheMessage::QueryParameterized(_, cq, parameters, _)
+                        if parameters.is_empty() =>
+                    {
+                        Some(keying.session_key(cq.query()))
+                    }
+                    CacheMessage::QueryParameterized(..) | CacheMessage::Explain(..) => None,
+                };
 
                 // Transaction gate (PGC-387): inside a block, serve only when the
                 // block is healthy and READ COMMITTED. Checked here, not at
@@ -297,6 +309,7 @@ async fn handle_connection(
                         let shape = has_pred.then(|| {
                             read_shape(
                                 read_query,
+                                session_key,
                                 &keying,
                                 &state.dispatch_handle,
                                 &state.write_log,
@@ -361,7 +374,7 @@ async fn handle_connection(
                 }
 
                 let reply_tx = reply_slot.sender();
-                let timing = state.telemetry.cache_timing_dispatch();
+                let timing = state.telemetry.cache_timing_dispatch(session_key);
 
                 // Lease the owned write half to the worker for this query.
                 let proxy_msg = ProxyMessage {
@@ -369,6 +382,7 @@ async fn handle_connection(
                     client_socket: socket,
                     reply_tx,
                     keying,
+                    session_key,
                     output_settings: state.session_settings.output_settings(in_block),
                     timing,
                     pipeline: state.extended.pipeline_take(),
@@ -556,6 +570,7 @@ struct ReadShape {
 
 fn read_shape(
     query: &QueryExpr,
+    session_key: Option<SessionKey>,
     keying: &KeyingSettings,
     dispatch_handle: &CacheDispatchHandle,
     write_log: &WriteLog,
@@ -570,7 +585,7 @@ fn read_shape(
     if !pending {
         return none;
     }
-    let key = keying.session_key(query);
+    let key = session_key.unwrap_or_else(|| keying.session_key(query));
     let Some(resolved) = dispatch_handle.cached_query_resolved(key) else {
         return none;
     };
@@ -843,9 +858,7 @@ impl ConnectionState {
                 ProxyMode::Read
             }
             Ok(Action::CacheCheck(ast)) => {
-                let keying = self.session_settings.keying_label(self.in_transaction());
-                self.telemetry
-                    .cache_timing_start(keying.session_key(ast.query()));
+                self.telemetry.cache_timing_start();
                 self.extended.dispatch_is_extended = false;
                 self.egress.cache_push(CacheMessage::Query(msg.data, ast));
                 ProxyMode::OriginDrain
