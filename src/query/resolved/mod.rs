@@ -13,6 +13,7 @@ use crate::query::ast::{
 use crate::query::cast::CastTarget;
 
 mod analysis;
+pub use analysis::{ColumnsByTable, resolved_query_columns_by_table};
 mod deparse;
 mod enum_gate;
 mod subquery_collect;

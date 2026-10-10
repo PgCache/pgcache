@@ -38,6 +38,7 @@ use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
 use crate::query::guc::Guc;
 use crate::query::keying_settings::KeyingSettings;
+use crate::query::resolved::{ColumnsByTable, resolved_query_columns_by_table};
 use crate::query::transform::query_expr_parameters_replace;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
@@ -280,11 +281,11 @@ async fn handle_connection(
                         state.write_log.purge(watermark);
                     }
                     if let Some(cq) = msg.cacheable_query() {
-                        // Derive the read's per-column ranges only when a pending
+                        // Derive the read's shape only when a pending
                         // INSERT/DELETE/UPDATE could benefit from row-level
                         // disjointness (PGC-369/381/382); an opaque/connection
-                        // write ignores them, and `read_column_ranges` self-limits
-                        // to reads whose table actually has such a pending write.
+                        // write ignores it, and `read_shape` self-limits to
+                        // reads of a table that actually has such a pending write.
                         let has_pred = state.write_log.has_row_predicates();
                         // Under the extended protocol the read still carries `$n`
                         // placeholders here; substitute the bind values so the
@@ -293,18 +294,23 @@ async fn handle_connection(
                         // row predicate is pending.
                         let bound = has_pred.then(|| read_query_bound(&msg)).flatten();
                         let read_query = bound.as_ref().unwrap_or_else(|| cq.query());
-                        let read_ranges = has_pred
-                            .then(|| {
-                                read_column_ranges(
-                                    read_query,
-                                    &keying,
-                                    &state.dispatch_handle,
-                                    &state.write_log,
-                                )
-                            })
-                            .flatten();
+                        let shape = has_pred.then(|| {
+                            read_shape(
+                                read_query,
+                                &keying,
+                                &state.dispatch_handle,
+                                &state.write_log,
+                            )
+                        });
+                        let (read_ranges, read_columns) =
+                            shape.as_ref().map_or((None, None), |shape| {
+                                (shape.ranges.as_ref(), shape.columns.as_ref())
+                            });
                         let m = crate::metrics::handles();
-                        match state.write_log.decide(read_query, read_ranges.as_ref()) {
+                        match state
+                            .write_log
+                            .decide(read_query, read_ranges, read_columns)
+                        {
                             RawDecision::Forward(reason, blocker) => {
                                 // Inside a block the intersecting write is the
                                 // block's own uncommitted one (never stamped until
@@ -538,24 +544,46 @@ fn read_query_bound(msg: &CacheMessage) -> Option<QueryExpr> {
     query_expr_parameters_replace(cq.query(), parameters).ok()
 }
 
-fn read_column_ranges(
+/// What the read-after-write gate can prove with: the read's per-column
+/// ranges on its single table (`None` for a join or other multi-table shape),
+/// and the columns it references per table. Both come from the read's
+/// registered resolved form, so an unregistered read yields neither and
+/// forwards conservatively.
+struct ReadShape {
+    ranges: Option<HashMap<EcoString, ColumnRange>>,
+    columns: Option<ColumnsByTable>,
+}
+
+fn read_shape(
     query: &QueryExpr,
     keying: &KeyingSettings,
     dispatch_handle: &CacheDispatchHandle,
     write_log: &WriteLog,
-) -> Option<HashMap<EcoString, ColumnRange>> {
-    let table = single_table(query)?;
-    if !write_log.table_has_row_predicate(table) {
-        return None;
+) -> ReadShape {
+    let none = ReadShape {
+        ranges: None,
+        columns: None,
+    };
+    let pending = query
+        .nodes::<TableNode>()
+        .any(|table| write_log.table_has_row_predicate(table));
+    if !pending {
+        return none;
     }
     let key = keying.session_key(query);
-    let resolved = dispatch_handle.cached_query_resolved(key)?;
-    let select = resolved.as_select()?;
-    let constraints = analyze_query_constraints(select);
-    if !constraints.where_analysis_complete {
-        return None;
+    let Some(resolved) = dispatch_handle.cached_query_resolved(key) else {
+        return none;
+    };
+    let ranges = single_table(query).and_then(|table| {
+        let constraints = analyze_query_constraints(resolved.as_select()?);
+        constraints
+            .where_analysis_complete
+            .then(|| table_column_ranges(&constraints, &table.name))
+    });
+    ReadShape {
+        ranges,
+        columns: Some(resolved_query_columns_by_table(&resolved)),
     }
-    Some(table_column_ranges(&constraints, &table.name))
 }
 
 /// The single table a read references, or `None` if it references zero or more

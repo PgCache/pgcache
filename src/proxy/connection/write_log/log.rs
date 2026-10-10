@@ -1,14 +1,15 @@
 //! The [`WriteLog`]: recording forwarded writes, stamping commit-LSN bounds,
 //! purging on the settled watermark, and the per-read gate verdict.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
 use super::aggregate::{
     MERGED_PREDICATE_CAP, TableAggregate, UPDATE_DELETE_PREDICATE_CAP, equality_tuple_build,
-    merged_tuples_disjoint, merged_updates_disjoint, update_predicate_build, update_tuple_build,
+    merged_tuples_disjoint, merged_updates_disjoint, set_unreferenced, update_predicate_build,
+    update_tuple_build,
 };
 use super::tiers::{ConnectionTiers, TableTiers};
 use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
@@ -17,6 +18,7 @@ use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{
     ColumnRange, column_ranges_disjoint, column_ranges_from_comparisons,
 };
+use crate::query::resolved::ColumnsByTable;
 use crate::query::write::{RelationRef, WriteClass};
 
 /// The schema variants of one table name with pending writes. Keyed by bare
@@ -259,6 +261,7 @@ impl WriteLog {
         &self,
         query: &QueryExpr,
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+        read_columns: Option<&ColumnsByTable>,
     ) -> RawDecision {
         // A connection-scoped pending write (unknown table) poisons every read.
         if !self.connection.is_empty() {
@@ -271,8 +274,12 @@ impl WriteLog {
         // blocking table suffices for attribution (PGC-440).
         let mut kinds = DisjointKinds::default();
         let blocked = query.try_for_each_node::<TableNode, RawBlocker>(&mut |table| match self
-            .table_intersects(table, read_ranges, &mut kinds)
-        {
+            .table_intersects(
+                table,
+                read_ranges,
+                read_columns.and_then(|columns| columns.get(&table.name)),
+                &mut kinds,
+            ) {
             Some(blocker) => ControlFlow::Break(blocker),
             None => ControlFlow::Continue(()),
         });
@@ -294,6 +301,7 @@ impl WriteLog {
         &self,
         table: &TableNode,
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+        read_columns: Option<&HashSet<EcoString>>,
         kinds: &mut DisjointKinds,
     ) -> Option<RawBlocker> {
         let bucket = self.tables.get(&table.name)?;
@@ -303,7 +311,7 @@ impl WriteLog {
                 continue;
             }
             for (bound, agg) in tiers.aggregates_bounded() {
-                if Self::aggregate_intersects(agg, read_ranges, kinds) {
+                if Self::aggregate_intersects(agg, read_ranges, read_columns, kinds) {
                     let tier = bound.map_or(RawBlocker::Unstamped, RawBlocker::Stamped);
                     blocker = Some(blocker.map_or(tier, |prior| prior.merge(tier)));
                 }
@@ -315,10 +323,12 @@ impl WriteLog {
     /// Whether the read intersects one tier aggregate's pending writes. An
     /// opaque write always intersects; pending INSERTs/DELETEs/UPDATEs
     /// intersect unless the read is provably disjoint from every one (the
-    /// proven-disjoint kinds fold into `kinds`).
+    /// proven-disjoint kinds fold into `kinds`), or, for an UPDATE, never
+    /// references a column it assigns.
     fn aggregate_intersects(
         agg: &TableAggregate,
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+        read_columns: Option<&HashSet<EcoString>>,
         kinds: &mut DisjointKinds,
     ) -> bool {
         if agg.opaque {
@@ -347,21 +357,21 @@ impl WriteLog {
             }
         }
         if !agg.merged_updates.is_empty() {
-            if read_ranges
-                .is_some_and(|ranges| merged_updates_disjoint(&agg.merged_updates, ranges))
-            {
+            if merged_updates_disjoint(&agg.merged_updates, read_ranges, read_columns) {
                 kinds.update = true;
             } else {
                 return true;
             }
         }
         for update in &agg.updates {
-            // Serveable only if the read touches neither the updated rows
-            // (WHERE) nor their post-update image (grow).
-            let disjoint = read_ranges.is_some_and(|ranges| {
-                column_ranges_disjoint(ranges, &update.where_ranges)
-                    && column_ranges_disjoint(ranges, &update.image_ranges)
-            });
+            // Serveable if the read never looks at an assigned column, or
+            // touches neither the updated rows (WHERE) nor their post-update
+            // image (grow).
+            let disjoint = set_unreferenced(&update.set_columns, read_columns)
+                || read_ranges.is_some_and(|ranges| {
+                    column_ranges_disjoint(ranges, &update.where_ranges)
+                        && column_ranges_disjoint(ranges, &update.image_ranges)
+                });
             if disjoint {
                 kinds.update = true;
             } else {

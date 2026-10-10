@@ -1,15 +1,37 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
 use super::{
-    ResolvedJoinNode, ResolvedJoinQual, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
-    ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableNode,
-    ResolvedTableSource, ResolvedWhereExpr,
+    ResolvedColumnNode, ResolvedJoinNode, ResolvedJoinQual, ResolvedQueryBody, ResolvedQueryExpr,
+    ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode,
+    ResolvedTableNode, ResolvedTableSource, ResolvedWhereExpr,
 };
 use crate::query::ast::AstNode;
 use crate::query::ast::BinaryOp;
+
+/// The columns a query references, per table name. Every referenced table has
+/// an entry, possibly empty (`SELECT count(*) FROM t`); two tables of one
+/// name in different schemas share an entry, which only over-approximates.
+pub type ColumnsByTable = HashMap<EcoString, HashSet<EcoString>>;
+
+/// Which columns of each table a resolved query reads anywhere: select list,
+/// predicates, join conditions (a USING join through its equi-join
+/// predicate), grouping, ordering and subqueries. Stars are already expanded.
+pub fn resolved_query_columns_by_table(query: &ResolvedQueryExpr) -> ColumnsByTable {
+    let mut columns: ColumnsByTable = HashMap::new();
+    for table in query.nodes::<ResolvedTableNode>() {
+        columns.entry(table.name.clone()).or_default();
+    }
+    for column in query.nodes::<ResolvedColumnNode>() {
+        columns
+            .entry(column.table.clone())
+            .or_default()
+            .insert(column.column.clone());
+    }
+    columns
+}
 
 impl ResolvedWhereExpr {
     /// Compute the maximum subquery nesting depth in this WHERE expression.

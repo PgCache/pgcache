@@ -2,7 +2,7 @@
 //! insert rows, shape-grouped equality tuples, per-statement range maps),
 //! their caps, and the disjointness checks the gate runs against them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ecow::EcoString;
@@ -87,6 +87,21 @@ pub(crate) struct TableAggregate {
 pub(crate) struct UpdatePredicate {
     pub(super) where_ranges: HashMap<EcoString, ColumnRange>,
     pub(super) image_ranges: HashMap<EcoString, ColumnRange>,
+    /// The columns the UPDATE assigns, for the unreferenced-column rule
+    /// ([`set_unreferenced`]).
+    pub(super) set_columns: Box<[EcoString]>,
+}
+
+/// Whether an UPDATE assigning `set_columns` cannot change a read that
+/// references only `read_columns` of the table: an UPDATE neither adds nor
+/// removes rows, so a read that never looks at an assigned column sees the
+/// same result whatever rows the UPDATE matched. `None` (columns unknown)
+/// proves nothing.
+pub(super) fn set_unreferenced(
+    set_columns: &[EcoString],
+    read_columns: Option<&HashSet<EcoString>>,
+) -> bool {
+    read_columns.is_some_and(|read| set_columns.iter().all(|column| !read.contains(column)))
 }
 
 /// Row-enumerable INSERTs pending against one table, stored column-major
@@ -332,23 +347,30 @@ pub(super) fn update_tuple_build(
     Some(((where_columns, set_columns), (where_values, set_values)))
 }
 
-/// Whether the read is provably disjoint from every merged UPDATE — from both
-/// the WHERE tuple (the rows it touches) and the post-update image (the WHERE
+/// Whether the read is provably unaffected by every merged UPDATE: a shape
+/// assigning only columns the read never references cannot change it
+/// ([`set_unreferenced`]); otherwise the read must be disjoint from both the
+/// WHERE tuple (the rows it touches) and the post-update image (the WHERE
 /// values with SET overrides applied; an unknown SET value constrains
 /// nothing). The tuple-level equivalent of checking [`UpdatePredicate`]'s two
 /// range maps.
 pub(super) fn merged_updates_disjoint(
     merged: &MergedUpdates,
-    read_ranges: &HashMap<EcoString, ColumnRange>,
+    read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
+    read_columns: Option<&HashSet<EcoString>>,
 ) -> bool {
-    // An unsatisfiable read matches no row at all.
-    if read_ranges
-        .values()
-        .any(|range| matches!(range, ColumnRange::Empty))
-    {
-        return true;
-    }
+    let unsatisfiable = read_ranges.is_some_and(|ranges| {
+        ranges
+            .values()
+            .any(|range| matches!(range, ColumnRange::Empty))
+    });
     merged.iter().all(|((where_columns, set_columns), tuples)| {
+        if set_unreferenced(set_columns, read_columns) || unsatisfiable {
+            return true;
+        }
+        let Some(read_ranges) = read_ranges else {
+            return false;
+        };
         // Resolve the shape's columns against the read once.
         let where_constrained: SmallVec<[(usize, &ColumnRange); 2]> = where_columns
             .iter()
@@ -481,5 +503,10 @@ pub(super) fn update_predicate_build(update: &UpdateStatement) -> UpdatePredicat
     UpdatePredicate {
         where_ranges,
         image_ranges,
+        set_columns: update
+            .set
+            .iter()
+            .map(|(column, _)| column.clone())
+            .collect(),
     }
 }

@@ -1011,3 +1011,49 @@ async fn test_gate_conversion_failed_select_records_connection_scope() -> Result
     );
     Ok(())
 }
+
+/// An UPDATE that sets only columns a join read never references cannot
+/// change that read's result, so the read serves from cache during lag
+/// instead of forwarding; one that sets a referenced column still forwards.
+#[tokio::test]
+async fn test_gate_update_of_unreferenced_column_serves_join_read() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&RAW_LAG).await?;
+    ctx.query(
+        "CREATE TABLE ua (id int primary key, bid int, note text)",
+        &[],
+    )
+    .await?;
+    ctx.query("CREATE TABLE ub (id int primary key, label text)", &[])
+        .await?;
+    ctx.query("INSERT INTO ua VALUES (1, 10, 'n')", &[]).await?;
+    ctx.query("INSERT INTO ub VALUES (10, 'x')", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "SELECT ua.id, ub.label FROM ua JOIN ub ON ua.bid = ub.id WHERE ua.id = 1";
+    register(&mut ctx, q).await?;
+
+    // `note` is not referenced by the read: served from cache under lag.
+    ctx.simple_query("UPDATE ua SET note = 'changed' WHERE id = 1")
+        .await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "x")])?;
+    let delta = metrics_delta(&m, &ctx.metrics_after_outcomes(&m, 1).await?);
+    assert_eq!(
+        delta.queries_cache_hit, 1,
+        "update of an unreferenced column must not forward the read"
+    );
+    assert!(
+        delta.raw_serve_disjoint_update >= 1,
+        "served under the update-precision path"
+    );
+
+    // `label` is referenced: forwarded, and sees the new value (a stale hit
+    // would still return 'x').
+    ctx.simple_query("UPDATE ub SET label = 'y' WHERE id = 10")
+        .await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("label", "y")])?;
+
+    Ok(())
+}
