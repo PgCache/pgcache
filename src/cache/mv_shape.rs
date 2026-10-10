@@ -218,7 +218,7 @@ pub(super) mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
     use crate::query::resolved::query_expr_resolve;
@@ -255,18 +255,12 @@ pub(super) mod tests {
         }
     }
 
-    pub(crate) fn test_tables() -> BiHashMap<TableMetadata> {
+    pub(crate) fn test_tables() -> Catalog {
         let mut t = BiHashMap::new();
-        t.insert_overwrite(test_table(
-            "orders",
-            Oid::from_raw(1),
-            &["id", "status", "total"],
-        ));
-        t.insert_overwrite(test_table(
-            "users",
-            Oid::from_raw(2),
-            &["id", "name", "email"],
-        ));
+        t.insert_overwrite(
+            test_table("orders", Oid::from_raw(1), &["id", "status", "total"]).into(),
+        );
+        t.insert_overwrite(test_table("users", Oid::from_raw(2), &["id", "name", "email"]).into());
         t
     }
 

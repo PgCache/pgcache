@@ -4,7 +4,6 @@
 use std::collections::HashSet;
 
 use ecow::EcoString;
-use iddqd::BiHashMap;
 
 use super::update_classify::{
     limit_order_keys_collect, limit_window_columns_collect, pg_batchable_classify,
@@ -15,7 +14,7 @@ use crate::cache::mv_shape::{ShapeGate, shape_classify};
 use crate::cache::query::limit_rows_needed;
 use crate::cache::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
 use crate::cache::{CacheError, CacheResult};
-use crate::catalog::TableMetadata;
+use crate::catalog::Catalog;
 use crate::query::Fingerprint;
 use crate::query::ast::{AstNode, QueryBody, QueryExpr};
 use crate::query::constraints::analyze_query_constraints;
@@ -80,7 +79,7 @@ pub fn query_admission_analyze(
     fingerprint: Fingerprint,
     has_limit: bool,
     aggregate_functions: &HashSet<EcoString>,
-    tables: &BiHashMap<TableMetadata>,
+    tables: &Catalog,
     depth: AdmissionDepth,
 ) -> CacheResult<AdmissionAnalysis> {
     let decorrelated = query_expr_decorrelate(resolved, aggregate_functions)

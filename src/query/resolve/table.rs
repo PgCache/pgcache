@@ -1,8 +1,9 @@
 //! Resolve a FROM entry: catalog lookup for a table reference, and the
 //! recursive walk over tables, joins and derived tables.
 
+use std::sync::Arc;
+
 use ecow::EcoString;
-use iddqd::BiHashMap;
 use rootcause::Report;
 
 use super::bindings::TableSlot;
@@ -11,7 +12,7 @@ use super::expr::where_expr_resolve;
 use super::join_using::{JoinScopeRanges, join_natural_common_columns, join_using_or_cross};
 use super::scope::ResolutionScope;
 use crate::cache::SubqueryKind;
-use crate::catalog::TableMetadata;
+use crate::catalog::{Catalog, CatalogTable};
 use crate::query::ast::{JoinQual, TableAlias, TableNode, TableSource};
 use crate::query::resolved::{
     ResolveError, ResolveResult, ResolvedJoinNode, ResolvedJoinQual, ResolvedTableNode,
@@ -24,9 +25,9 @@ use crate::query::resolved::{
 /// Otherwise, search through the search_path schemas in order.
 pub(super) fn table_metadata_find<'map, 'node: 'map>(
     table_node: &'node TableNode,
-    tables: &'map BiHashMap<TableMetadata>,
+    tables: &'map Catalog,
     search_path: &[&'map str],
-) -> Option<&'map TableMetadata> {
+) -> Option<&'map CatalogTable> {
     let table_name = table_node.name.as_str();
 
     // If table has explicit schema, use it directly
@@ -48,7 +49,7 @@ pub(super) fn table_metadata_find<'map, 'node: 'map>(
 /// Resolve a table source (table, join, or subquery)
 pub(super) fn table_source_resolve<'a>(
     source: &'a TableSource,
-    tables: &'a BiHashMap<TableMetadata>,
+    tables: &'a Catalog,
     scope: &mut ResolutionScope<'a>,
     search_path: &[&'a str],
 ) -> ResolveResult<ResolvedTableSource> {
@@ -65,9 +66,7 @@ pub(super) fn table_source_resolve<'a>(
             let slot = scope.bindings.slot_push(
                 table_node.id,
                 TableSlot::Base {
-                    relation_oid: table_metadata.relation_oid,
-                    schema: table_metadata.schema.clone(),
-                    name: table_metadata.name.clone(),
+                    table: Arc::clone(table_metadata.shared()),
                     alias: table_node.alias.as_ref().map(|a| a.name.clone()),
                 },
             );

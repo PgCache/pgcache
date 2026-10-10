@@ -85,12 +85,11 @@ pub(super) fn column_lookup(
         // Fall back to outer scope (correlated reference)
         if let Some(outer) = scope.outer_table_scope_find(table_qualifier) {
             let column_metadata = outer
-                .metadata
+                .table
                 .columns
                 .get(column_name.as_str())
-                .ok_or_else(|| column_not_found(&outer.metadata.name, column_name))?;
-            let resolved =
-                column_resolved(&outer.metadata, outer.alias.as_deref(), column_metadata);
+                .ok_or_else(|| column_not_found(&outer.table.name, column_name))?;
+            let resolved = column_resolved(&outer.table, outer.alias.as_deref(), column_metadata);
             let binding = column_binding(outer.slot, column_metadata);
             scope.outer_refs.push(resolved.clone());
             return Ok(ColumnLookup::Column {
@@ -131,14 +130,14 @@ pub(super) fn column_lookup(
             // Fall back to outer scope (correlated reference)
             let outer_match = scope.outer_tables.iter().find_map(|outer| {
                 outer
-                    .metadata
+                    .table
                     .columns
                     .get(column_name.as_str())
                     .map(|col_meta| (outer, col_meta))
             });
             if let Some((outer, column_metadata)) = outer_match {
                 let resolved =
-                    column_resolved(&outer.metadata, outer.alias.as_deref(), column_metadata);
+                    column_resolved(&outer.table, outer.alias.as_deref(), column_metadata);
                 let binding = column_binding(outer.slot, column_metadata);
                 scope.outer_refs.push(resolved.clone());
                 return Ok(ColumnLookup::Column {
@@ -178,7 +177,6 @@ fn column_binding(slot: SlotId, column_metadata: &ColumnMetadata) -> ColumnBindi
     ColumnBinding {
         slot,
         position: column_metadata.position,
-        data_type: column_metadata.data_type.clone(),
     }
 }
 

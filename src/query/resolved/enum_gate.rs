@@ -321,7 +321,7 @@ mod tests {
     use postgres_types::{Kind, Type};
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
     use crate::query::resolved::query_expr_resolve;
@@ -356,7 +356,7 @@ mod tests {
 
     /// alerts(id int4 pk, sev severity, note text, dsev domain-over-enum,
     /// yr domain-over-int)
-    fn tables() -> BiHashMap<TableMetadata> {
+    fn tables() -> Catalog {
         let domain_over_enum = Type::new(
             "sevdom".to_owned(),
             90002,
@@ -370,21 +370,24 @@ mod tests {
             "public".to_owned(),
         );
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(TableMetadata {
-            replica_identity_full: false,
-            relation_oid: Oid::from_raw(5001),
-            name: "alerts".into(),
-            schema: "public".into(),
-            primary_key_columns: vec!["id".into()],
-            columns: ColumnStore::new([
-                column("id", 1, Type::INT4, true),
-                column("sev", 2, severity_type(), false),
-                column("note", 3, Type::TEXT, false),
-                column("dsev", 4, domain_over_enum, false),
-                column("yr", 5, domain_over_int, false),
-            ]),
-            indexes: Vec::new(),
-        });
+        tables.insert_overwrite(
+            TableMetadata {
+                replica_identity_full: false,
+                relation_oid: Oid::from_raw(5001),
+                name: "alerts".into(),
+                schema: "public".into(),
+                primary_key_columns: vec!["id".into()],
+                columns: ColumnStore::new([
+                    column("id", 1, Type::INT4, true),
+                    column("sev", 2, severity_type(), false),
+                    column("note", 3, Type::TEXT, false),
+                    column("dsev", 4, domain_over_enum, false),
+                    column("yr", 5, domain_over_int, false),
+                ]),
+                indexes: Vec::new(),
+            }
+            .into(),
+        );
         tables
     }
 

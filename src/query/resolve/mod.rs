@@ -21,7 +21,7 @@ mod table;
 mod tests;
 
 pub use bindings::{
-    Bindings, ColumnBinding, ColumnTarget, DerivedColumn, MergedColumnBinding, MergedId,
-    ResolvedQuery, SlotId, StarItem, TableSlot,
+    Bindings, ColumnBinding, ColumnTarget, MergedColumnBinding, MergedId, ResolvedQuery, SlotId,
+    StarItem, TableSlot,
 };
 pub use entry::{query_expr_resolve, query_expr_resolve_bound, select_node_resolve};

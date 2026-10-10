@@ -162,9 +162,12 @@ impl WriterCore {
         }
         // A relation evicted mid-population has no cache table to merge into;
         // its staging rows are discarded in chunks like the rest.
-        let plan = step
-            .population
-            .and_then(|_| self.cache.tables.get1(&relation_oid).map(MergePlan::build));
+        let plan = step.population.and_then(|_| {
+            self.cache
+                .tables
+                .get1(&relation_oid)
+                .map(|t| MergePlan::build(t))
+        });
         if let (Some(plan), Some(population)) = (&plan, step.population)
             && self
                 .merge_toast_stale_hit(&target, plan, population)

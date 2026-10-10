@@ -604,7 +604,10 @@ fn fallback_columns<'t>(
         ToastState::Pending(positions) => {
             debug_assert!(false, "pending toast survived the repair pre-pass");
             error!(relation_oid = %relation_oid, "unrepaired toasted update at decide time");
-            let columns = toasted_column_names(core.cache.tables.get1(&relation_oid), positions);
+            let columns = toasted_column_names(
+                core.cache.tables.get1(&relation_oid).map(|t| &**t),
+                positions,
+            );
             (Cow::Owned(columns), "cdc replay unrepaired toasted update")
         }
         ToastState::Complete => (Cow::Borrowed(&[]), "cdc replay update toast fallback"),

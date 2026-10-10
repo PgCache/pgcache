@@ -138,7 +138,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::{QueryBody, query_expr_parse};
     use crate::query::resolved::select_node_resolve;
@@ -170,7 +170,7 @@ mod tests {
     }
 
     /// Parse SQL and resolve the SELECT node using the given tables.
-    fn resolve_select(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedSelectNode {
+    fn resolve_select(sql: &str, tables: &Catalog) -> ResolvedSelectNode {
         let query_expr = query_expr_parse(sql).expect("convert");
         let select = match query_expr.body {
             QueryBody::Select(s) => s,
@@ -187,19 +187,21 @@ mod tests {
 
     /// Create standard test tables for terminality tests:
     /// a(id, name, status), b(id, a_id, name, status, val, x), c(id, b_id, val, x)
-    fn terminality_test_tables() -> BiHashMap<TableMetadata> {
+    fn terminality_test_tables() -> Catalog {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table("a", Oid::from_raw(1), &["id", "name", "status"]));
-        tables.insert_overwrite(test_table(
-            "b",
-            Oid::from_raw(2),
-            &["id", "a_id", "name", "status", "val", "x"],
-        ));
-        tables.insert_overwrite(test_table(
-            "c",
-            Oid::from_raw(3),
-            &["id", "b_id", "val", "x"],
-        ));
+        tables
+            .insert_overwrite(test_table("a", Oid::from_raw(1), &["id", "name", "status"]).into());
+        tables.insert_overwrite(
+            test_table(
+                "b",
+                Oid::from_raw(2),
+                &["id", "a_id", "name", "status", "val", "x"],
+            )
+            .into(),
+        );
+        tables.insert_overwrite(
+            test_table("c", Oid::from_raw(3), &["id", "b_id", "val", "x"]).into(),
+        );
         tables
     }
 
@@ -320,7 +322,7 @@ mod tests {
     #[test]
     fn test_no_join_no_optional() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table("users", Oid::from_raw(1), &["id", "name"]));
+        tables.insert_overwrite(test_table("users", Oid::from_raw(1), &["id", "name"]).into());
         let select = resolve_select("SELECT * FROM users WHERE id = 1", &tables);
         let (terminal, non_terminal) = outer_join_optional_tables(&select);
         assert!(terminal.is_empty());

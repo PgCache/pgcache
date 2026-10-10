@@ -75,7 +75,7 @@ mod tests {
     use super::*;
     use crate::cache::SubqueryKind;
     use crate::cache::query::CacheableQuery;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::{Deparse, query_expr_parse};
     use crate::query::resolved::query_expr_resolve;
@@ -113,97 +113,104 @@ mod tests {
     }
 
     /// Build a comprehensive table catalog covering all tables used in tests.
-    fn test_tables() -> BiHashMap<TableMetadata> {
+    fn test_tables() -> Catalog {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(test_table(
-            "a",
-            Oid::from_raw(1),
-            &["id", "name", "val", "tenant_id", "status"],
-        ));
-        tables.insert_overwrite(test_table(
-            "b",
-            Oid::from_raw(2),
-            &[
-                "id",
-                "name",
-                "a_id",
-                "x",
-                "val",
-                "b_id",
-                "user_id",
-                "tenant_id",
-                "status",
-            ],
-        ));
-        tables.insert_overwrite(test_table(
-            "c",
-            Oid::from_raw(3),
-            &["id", "x", "b_id", "val", "tenant_id"],
-        ));
-        tables.insert_overwrite(test_table("d", Oid::from_raw(4), &["id"]));
-        tables.insert_overwrite(test_table(
-            "users",
-            Oid::from_raw(10),
-            &[
-                "id",
-                "name",
-                "email",
-                "user_id",
-                "status",
-                "active",
-                "uuid",
-                "age",
-                "tenant_id",
-            ],
-        ));
-        tables.insert_overwrite(test_table("location", Oid::from_raw(11), &["user_id"]));
-        tables.insert_overwrite(test_table(
-            "orders",
-            Oid::from_raw(12),
-            &["id", "user_id", "total", "product_id"],
-        ));
-        tables.insert_overwrite(test_table(
-            "admins",
-            Oid::from_raw(13),
-            &["id", "tenant_id"],
-        ));
-        tables.insert_overwrite(test_table(
-            "active_users",
-            Oid::from_raw(14),
-            &["id", "user_id"],
-        ));
-        tables.insert_overwrite(test_table(
-            "banned_users",
-            Oid::from_raw(15),
-            &["id", "user_id"],
-        ));
-        tables.insert_overwrite(test_table(
-            "products",
-            Oid::from_raw(16),
-            &["id", "store_id", "name", "category_id"],
-        ));
-        tables.insert_overwrite(test_table(
-            "stores",
-            Oid::from_raw(17),
-            &["id", "region_id"],
-        ));
-        tables.insert_overwrite(test_table("regions", Oid::from_raw(18), &["id", "name"]));
-        tables.insert_overwrite(test_table(
-            "excluded_regions",
-            Oid::from_raw(19),
-            &["id", "region_id"],
-        ));
-        tables.insert_overwrite(test_table("categories", Oid::from_raw(20), &["id", "name"]));
-        tables.insert_overwrite(test_table(
-            "excluded_categories",
-            Oid::from_raw(21),
-            &["id"],
-        ));
-        tables.insert_overwrite(test_table(
-            "blacklist",
-            Oid::from_raw(22),
-            &["id", "product_id", "category_id"],
-        ));
+        tables.insert_overwrite(
+            test_table(
+                "a",
+                Oid::from_raw(1),
+                &["id", "name", "val", "tenant_id", "status"],
+            )
+            .into(),
+        );
+        tables.insert_overwrite(
+            test_table(
+                "b",
+                Oid::from_raw(2),
+                &[
+                    "id",
+                    "name",
+                    "a_id",
+                    "x",
+                    "val",
+                    "b_id",
+                    "user_id",
+                    "tenant_id",
+                    "status",
+                ],
+            )
+            .into(),
+        );
+        tables.insert_overwrite(
+            test_table(
+                "c",
+                Oid::from_raw(3),
+                &["id", "x", "b_id", "val", "tenant_id"],
+            )
+            .into(),
+        );
+        tables.insert_overwrite(test_table("d", Oid::from_raw(4), &["id"]).into());
+        tables.insert_overwrite(
+            test_table(
+                "users",
+                Oid::from_raw(10),
+                &[
+                    "id",
+                    "name",
+                    "email",
+                    "user_id",
+                    "status",
+                    "active",
+                    "uuid",
+                    "age",
+                    "tenant_id",
+                ],
+            )
+            .into(),
+        );
+        tables.insert_overwrite(test_table("location", Oid::from_raw(11), &["user_id"]).into());
+        tables.insert_overwrite(
+            test_table(
+                "orders",
+                Oid::from_raw(12),
+                &["id", "user_id", "total", "product_id"],
+            )
+            .into(),
+        );
+        tables
+            .insert_overwrite(test_table("admins", Oid::from_raw(13), &["id", "tenant_id"]).into());
+        tables.insert_overwrite(
+            test_table("active_users", Oid::from_raw(14), &["id", "user_id"]).into(),
+        );
+        tables.insert_overwrite(
+            test_table("banned_users", Oid::from_raw(15), &["id", "user_id"]).into(),
+        );
+        tables.insert_overwrite(
+            test_table(
+                "products",
+                Oid::from_raw(16),
+                &["id", "store_id", "name", "category_id"],
+            )
+            .into(),
+        );
+        tables
+            .insert_overwrite(test_table("stores", Oid::from_raw(17), &["id", "region_id"]).into());
+        tables.insert_overwrite(test_table("regions", Oid::from_raw(18), &["id", "name"]).into());
+        tables.insert_overwrite(
+            test_table("excluded_regions", Oid::from_raw(19), &["id", "region_id"]).into(),
+        );
+        tables
+            .insert_overwrite(test_table("categories", Oid::from_raw(20), &["id", "name"]).into());
+        tables
+            .insert_overwrite(test_table("excluded_categories", Oid::from_raw(21), &["id"]).into());
+        tables.insert_overwrite(
+            test_table(
+                "blacklist",
+                Oid::from_raw(22),
+                &["id", "product_id", "category_id"],
+            )
+            .into(),
+        );
         tables
     }
 

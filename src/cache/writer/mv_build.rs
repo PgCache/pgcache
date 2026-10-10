@@ -579,7 +579,7 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::{
         AstNode, ColumnNode, FunctionCall, QueryExpr, SelectNode, SetOpNode, SetOpType, TableNode,
@@ -611,18 +611,12 @@ mod tests {
         }
     }
 
-    fn test_tables() -> BiHashMap<TableMetadata> {
+    fn test_tables() -> Catalog {
         let mut t = BiHashMap::new();
-        t.insert_overwrite(test_table(
-            "orders",
-            Oid::from_raw(1),
-            &["id", "status", "total"],
-        ));
-        t.insert_overwrite(test_table(
-            "users",
-            Oid::from_raw(2),
-            &["id", "name", "email"],
-        ));
+        t.insert_overwrite(
+            test_table("orders", Oid::from_raw(1), &["id", "status", "total"]).into(),
+        );
+        t.insert_overwrite(test_table("users", Oid::from_raw(2), &["id", "name", "email"]).into());
         t
     }
 

@@ -126,11 +126,12 @@ pub(super) async fn population_task(
 }
 
 fn table_metadata_find<'a>(
-    table_metadata: &'a [TableMetadata],
+    table_metadata: &'a [Arc<TableMetadata>],
     table_node: &ResolvedTableNode,
 ) -> CacheResult<&'a TableMetadata> {
     table_metadata
         .iter()
+        .map(|t| &**t)
         .find(|t| t.relation_oid == table_node.relation_oid)
         .ok_or_else(|| {
             CacheError::UnknownTable {

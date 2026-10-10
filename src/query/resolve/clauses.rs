@@ -107,7 +107,6 @@ fn entry_columns_expand(
         items.push(StarItem::Column(ColumnBinding {
             slot: entry.slot(),
             position: column_metadata.position,
-            data_type: column_metadata.data_type.clone(),
         }));
     }
 }

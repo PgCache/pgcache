@@ -19,7 +19,7 @@ use super::update_query::UpdateQueries;
 use crate::oid::Oid;
 use crate::{
     cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
-    catalog::TableMetadata,
+    catalog::Catalog,
     query::{
         Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap,
         ast::QueryExpr,
@@ -107,7 +107,7 @@ impl BiHashItem for CachedQuery {
 /// Main cache data structure containing all cached state
 #[derive(Debug)]
 pub struct Cache {
-    pub tables: BiHashMap<TableMetadata>,
+    pub tables: Catalog,
     pub update_queries: IdHashMap<UpdateQueries>,
     pub cached_queries: BiHashMap<CachedQuery>,
     /// Monotonically increasing generation counter (starts at 1)

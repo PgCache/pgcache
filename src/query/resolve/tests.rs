@@ -8,7 +8,7 @@ use postgres_types::Type;
 
 use super::scope::derived_table_columns_extract;
 use super::*;
-use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{
     ArithmeticExpr, AstNode, BinaryExpr, BinaryOp, CaseExpr, ColumnNode, CteRefNode, Deparse,
@@ -37,13 +37,13 @@ fn parse_select_node(sql: &str) -> SelectNode {
 }
 
 /// Parse SQL and resolve to ResolvedSelectNode
-fn resolve_sql(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedSelectNode {
+fn resolve_sql(sql: &str, tables: &Catalog) -> ResolvedSelectNode {
     let node = parse_select_node(sql);
     select_node_resolve(&node, tables, &["public"]).expect("resolve")
 }
 
 /// Parse SQL and resolve to ResolvedQueryExpr (for ORDER BY/LIMIT tests)
-fn resolve_query(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedQueryExpr {
+fn resolve_query(sql: &str, tables: &Catalog) -> ResolvedQueryExpr {
     use crate::query::ast::query_expr_parse;
     let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
     query_expr_resolve(&query_expr, tables, &["public"]).expect("resolve")
@@ -138,23 +138,21 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
 
 /// A catalog of `test_table_metadata` tables (`id int4`, `name text`), with
 /// relation OIDs from 1001 in order.
-fn catalog(names: &[&str]) -> BiHashMap<TableMetadata> {
+fn catalog(names: &[&str]) -> Catalog {
     let mut tables = BiHashMap::new();
     for (oid, name) in (1001..).zip(names) {
-        tables.insert_overwrite(test_table_metadata(name, Oid::from_raw(oid)));
+        tables.insert_overwrite(test_table_metadata(name, Oid::from_raw(oid)).into());
     }
     tables
 }
 
 /// A catalog of all-text tables given as (name, columns), OIDs from 1001.
-fn catalog_with_columns(specs: &[(&str, &[&str])]) -> BiHashMap<TableMetadata> {
+fn catalog_with_columns(specs: &[(&str, &[&str])]) -> Catalog {
     let mut tables = BiHashMap::new();
     for (oid, (name, columns)) in (1001..).zip(specs) {
-        tables.insert_overwrite(test_table_metadata_with_columns(
-            name,
-            Oid::from_raw(oid),
-            columns,
-        ));
+        tables.insert_overwrite(
+            test_table_metadata_with_columns(name, Oid::from_raw(oid), columns).into(),
+        );
     }
     tables
 }
@@ -530,16 +528,12 @@ fn test_select_star_single_derived() {
 #[test]
 fn test_select_star_derived_using_multi_column() {
     let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "t1",
-        Oid::from_raw(1001),
-        &["id", "name", "x"],
-    ));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "t2",
-        Oid::from_raw(1002),
-        &["id", "name", "y"],
-    ));
+    tables.insert_overwrite(
+        test_table_metadata_with_columns("t1", Oid::from_raw(1001), &["id", "name", "x"]).into(),
+    );
+    tables.insert_overwrite(
+        test_table_metadata_with_columns("t2", Oid::from_raw(1002), &["id", "name", "y"]).into(),
+    );
 
     let resolved = resolve_sql(
         "SELECT * FROM (SELECT id, name, x FROM t1) a \
@@ -1415,21 +1409,30 @@ fn test_direct_table_nodes_excludes_where_subquery() {
 #[test]
 fn test_direct_table_nodes_with_join_and_subquery() {
     let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "items",
-        Oid::from_raw(1001),
-        &["id", "name", "category_id"],
-    ));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "inventory",
-        Oid::from_raw(1002),
-        &["id", "item_id", "quantity"],
-    ));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "categories",
-        Oid::from_raw(1003),
-        &["id", "name", "active"],
-    ));
+    tables.insert_overwrite(
+        test_table_metadata_with_columns(
+            "items",
+            Oid::from_raw(1001),
+            &["id", "name", "category_id"],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        test_table_metadata_with_columns(
+            "inventory",
+            Oid::from_raw(1002),
+            &["id", "item_id", "quantity"],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        test_table_metadata_with_columns(
+            "categories",
+            Oid::from_raw(1003),
+            &["id", "name", "active"],
+        )
+        .into(),
+    );
 
     let resolved = resolve_sql(
         "SELECT i.name FROM items i \
@@ -1486,21 +1489,18 @@ fn test_direct_table_nodes_derived_table() {
 fn test_doubly_nested_correlated_subquery() {
     // Grandchild subquery references the grandparent scope
     let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "departments",
-        Oid::from_raw(1001),
-        &["id", "name"],
-    ));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "employees",
-        Oid::from_raw(1002),
-        &["id", "dept_id"],
-    ));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "projects",
-        Oid::from_raw(1003),
-        &["id", "employee_id"],
-    ));
+    tables.insert_overwrite(
+        test_table_metadata_with_columns("departments", Oid::from_raw(1001), &["id", "name"])
+            .into(),
+    );
+    tables.insert_overwrite(
+        test_table_metadata_with_columns("employees", Oid::from_raw(1002), &["id", "dept_id"])
+            .into(),
+    );
+    tables.insert_overwrite(
+        test_table_metadata_with_columns("projects", Oid::from_raw(1003), &["id", "employee_id"])
+            .into(),
+    );
 
     // departments d → employees e (correlated on d.id) → projects (correlated on e.id)
     let node = parse_select_node(
@@ -1535,16 +1535,12 @@ fn test_doubly_nested_correlated_subquery() {
 fn test_unqualified_column_not_in_any_scope() {
     // `nonexistent` doesn't exist in any table — should remain ColumnNotFound
     let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "users",
-        Oid::from_raw(1001),
-        &["id", "name"],
-    ));
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "orders",
-        Oid::from_raw(1002),
-        &["id", "total"],
-    ));
+    tables.insert_overwrite(
+        test_table_metadata_with_columns("users", Oid::from_raw(1001), &["id", "name"]).into(),
+    );
+    tables.insert_overwrite(
+        test_table_metadata_with_columns("orders", Oid::from_raw(1002), &["id", "total"]).into(),
+    );
 
     let node = parse_select_node(
         "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE nonexistent = 1)",
@@ -1815,11 +1811,9 @@ fn star_column_assert(col: &ResolvedSelectColumn, expected: StarColumn, context:
 fn test_select_star_mixed_derived_cases() {
     use StarColumn::{Base, Derived, Merged};
     let mut tables = catalog(&["users"]);
-    tables.insert_overwrite(test_table_metadata_with_columns(
-        "orders",
-        Oid::from_raw(1002),
-        &["id", "total"],
-    ));
+    tables.insert_overwrite(
+        test_table_metadata_with_columns("orders", Oid::from_raw(1002), &["id", "total"]).into(),
+    );
     // Unqualified `*` emits the merged USING column first, then each side's
     // remaining columns in FROM order; qualified `o.*` is that side verbatim.
     #[rustfmt::skip]
@@ -1914,7 +1908,7 @@ type ColumnRef = (EcoString, EcoString, EcoString, ColumnPosition, Type);
 /// A derived table's alias and its `(name, type)` output columns.
 type DerivedShape = (EcoString, Vec<(EcoString, Type)>);
 
-fn binding_catalog() -> BiHashMap<TableMetadata> {
+fn binding_catalog() -> Catalog {
     catalog_with_columns(&[
         ("users", &["id", "name", "dept_id"]),
         ("departments", &["id", "name", "manager_id"]),
@@ -1961,57 +1955,27 @@ fn resolved_column_refs(resolved: &ResolvedQueryExpr) -> Vec<ColumnRef> {
         .collect()
 }
 
-fn binding_ref(
-    bindings: &Bindings,
-    catalog: &BiHashMap<TableMetadata>,
-    binding: &ColumnBinding,
-) -> ColumnRef {
-    match bindings.slot(binding.slot).expect("slot of a bound column") {
-        TableSlot::Base { schema, name, .. } => {
-            let table = catalog
-                .get2(&(schema.as_str(), name.as_str()))
-                .expect("bound table in catalog");
-            let column = table
-                .columns
-                .iter()
-                .find(|c| c.position == binding.position)
-                .expect("column at bound position");
-            (
-                schema.clone(),
-                name.clone(),
-                column.name.clone(),
-                binding.position,
-                binding.data_type.clone(),
-            )
-        }
-        TableSlot::Derived { alias, columns, .. } => {
-            let (_, column) = columns
-                .iter()
-                .enumerate()
-                .find(|(i, _)| ColumnPosition::from_index(*i) == Some(binding.position))
-                .expect("derived column at bound position");
-            (
-                EcoString::new(),
-                alias.clone(),
-                column.name.clone(),
-                binding.position,
-                column.data_type.clone(),
-            )
-        }
-    }
+fn binding_ref(bindings: &Bindings, binding: &ColumnBinding) -> ColumnRef {
+    let slot = bindings.slot(binding.slot).expect("slot of a bound column");
+    let table = slot.table();
+    let column = bindings
+        .binding_column(binding)
+        .expect("column at bound position");
+    (
+        table.schema.clone(),
+        table.name.clone(),
+        column.name.clone(),
+        binding.position,
+        column.data_type.clone(),
+    )
 }
 
 /// The references a merged column stands for, in the resolved tree's order:
 /// the left column, plus the right one under `COALESCE` for an outer join.
-fn merged_refs(
-    bindings: &Bindings,
-    catalog: &BiHashMap<TableMetadata>,
-    merged: &MergedColumnBinding,
-    out: &mut Vec<ColumnRef>,
-) {
-    out.push(binding_ref(bindings, catalog, &merged.left));
+fn merged_refs(bindings: &Bindings, merged: &MergedColumnBinding, out: &mut Vec<ColumnRef>) {
+    out.push(binding_ref(bindings, &merged.left));
     if merged.outer {
-        out.push(binding_ref(bindings, catalog, &merged.right));
+        out.push(binding_ref(bindings, &merged.right));
     }
 }
 
@@ -2070,11 +2034,7 @@ fn outside_cte_definitions(ranges: &[(usize, usize)], id: NodeId) -> bool {
 /// Every column reference the plain tree stands for through its bindings, in
 /// the resolved tree's pre-order: column nodes and star expansions at their
 /// own position, a `USING`/`NATURAL` join's equi-predicate after its inputs.
-fn bound_column_refs(
-    query: &QueryExpr,
-    bindings: &Bindings,
-    catalog: &BiHashMap<TableMetadata>,
-) -> Vec<ColumnRef> {
+fn bound_column_refs(query: &QueryExpr, bindings: &Bindings) -> Vec<ColumnRef> {
     let ranges = cte_definition_ranges(query);
     let mut keyed: Vec<((usize, u8, usize), ColumnRef)> = Vec::new();
     let mut keyed_push = |key: (usize, u8), refs: Vec<ColumnRef>| {
@@ -2091,10 +2051,10 @@ fn bound_column_refs(
             .unwrap_or_else(|| panic!("unbound column node {column:?}"));
         let mut refs = Vec::new();
         match target {
-            ColumnTarget::Column(binding) => refs.push(binding_ref(bindings, catalog, binding)),
+            ColumnTarget::Column(binding) => refs.push(binding_ref(bindings, binding)),
             ColumnTarget::Merged(id) => {
                 let merged = bindings.merged(*id).expect("merged column");
-                merged_refs(bindings, catalog, merged, &mut refs);
+                merged_refs(bindings, merged, &mut refs);
             }
             ColumnTarget::Output => {}
         }
@@ -2107,10 +2067,10 @@ fn bound_column_refs(
         let mut refs = Vec::new();
         for item in bindings.star(star).expect("star bound") {
             match item {
-                StarItem::Column(binding) => refs.push(binding_ref(bindings, catalog, binding)),
+                StarItem::Column(binding) => refs.push(binding_ref(bindings, binding)),
                 StarItem::Merged(id) => {
                     let merged = bindings.merged(*id).expect("merged column");
-                    merged_refs(bindings, catalog, merged, &mut refs);
+                    merged_refs(bindings, merged, &mut refs);
                 }
             }
         }
@@ -2129,8 +2089,8 @@ fn bound_column_refs(
             .iter()
             .filter(|m| m.join.index() == join.id.index())
         {
-            refs.push(binding_ref(bindings, catalog, &merged.left));
-            refs.push(binding_ref(bindings, catalog, &merged.right));
+            refs.push(binding_ref(bindings, &merged.left));
+            refs.push(binding_ref(bindings, &merged.right));
         }
         keyed_push((subtree_last_position(join, join.id), 1), refs);
     }
@@ -2141,10 +2101,7 @@ fn bound_column_refs(
         .collect()
 }
 
-fn resolve_bound(
-    sql: &str,
-    catalog: &BiHashMap<TableMetadata>,
-) -> (QueryExpr, ResolvedQueryExpr, Bindings) {
+fn resolve_bound(sql: &str, catalog: &Catalog) -> (QueryExpr, ResolvedQueryExpr, Bindings) {
     let query = query_expr_parse(sql).expect("parse");
     let (resolved, bindings) =
         query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
@@ -2157,7 +2114,7 @@ fn test_bindings_match_resolved_tree_column_references() {
     for sql in BINDING_CORPUS {
         let (query, resolved, bindings) = resolve_bound(sql, &catalog);
         assert_eq!(
-            bound_column_refs(&query, &bindings, &catalog),
+            bound_column_refs(&query, &bindings),
             resolved_column_refs(&resolved),
             "column references for {sql}"
         );
@@ -2188,12 +2145,12 @@ fn test_bindings_match_resolved_tree_table_sources() {
             .map(|table| {
                 let slot = bindings.source(table.id).expect("table source bound");
                 match bindings.slot(slot).expect("slot") {
-                    TableSlot::Base {
-                        relation_oid,
-                        schema,
-                        name,
-                        alias,
-                    } => (schema.clone(), name.clone(), alias.clone(), *relation_oid),
+                    TableSlot::Base { table, alias } => (
+                        table.schema.clone(),
+                        table.name.clone(),
+                        alias.clone(),
+                        table.relation_oid,
+                    ),
                     TableSlot::Derived { .. } => panic!("table node bound to a derived slot"),
                 }
             })
@@ -2216,9 +2173,10 @@ fn test_bindings_match_resolved_tree_table_sources() {
         let derived_shape = |id: NodeId| {
             let slot = bindings.source(id).expect("derived source bound");
             match bindings.slot(slot).expect("slot") {
-                TableSlot::Derived { alias, columns, .. } => (
-                    alias.clone(),
-                    columns
+                TableSlot::Derived { table, .. } => (
+                    table.name.clone(),
+                    table
+                        .columns
                         .iter()
                         .map(|c| (c.name.clone(), c.data_type.clone()))
                         .collect::<Vec<_>>(),
@@ -2277,7 +2235,7 @@ fn test_bindings_correlated_columns_match_outer_refs() {
                 let Some(ColumnTarget::Column(binding)) = bindings.column_by_id(*id) else {
                     panic!("correlated node without a column binding");
                 };
-                let (_, table, column, _, _) = binding_ref(&bindings, &catalog, binding);
+                let (_, table, column, _, _) = binding_ref(&bindings, binding);
                 (table, column)
             })
             .collect();

@@ -4,7 +4,7 @@ use iddqd::BiHashMap;
 use postgres_types::Type;
 
 use super::*;
-use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{Deparse, JoinType, UnaryOp, query_expr_parse};
 use crate::query::resolved::{
@@ -39,43 +39,58 @@ fn test_table(name: &str, relation_oid: Oid, column_names: &[&str]) -> TableMeta
     }
 }
 
-fn test_tables() -> BiHashMap<TableMetadata> {
+fn test_tables() -> Catalog {
     let mut tables = BiHashMap::new();
-    tables.insert_overwrite(test_table(
-        "employees",
-        Oid::from_raw(1),
-        &["id", "name", "dept_id", "status", "manager_id"],
-    ));
-    tables.insert_overwrite(test_table(
-        "orders",
-        Oid::from_raw(2),
-        &["id", "emp_id", "status", "total", "customer_id"],
-    ));
-    tables.insert_overwrite(test_table(
-        "departments",
-        Oid::from_raw(3),
-        &["id", "name", "location", "budget"],
-    ));
-    tables.insert_overwrite(test_table(
-        "customers",
-        Oid::from_raw(4),
-        &["id", "name", "region", "emp_id"],
-    ));
-    tables.insert_overwrite(test_table(
-        "users",
-        Oid::from_raw(5),
-        &["id", "name", "email", "status"],
-    ));
-    tables.insert_overwrite(test_table(
-        "active_users",
-        Oid::from_raw(6),
-        &["id", "user_id"],
-    ));
-    tables.insert_overwrite(test_table(
-        "projects",
-        Oid::from_raw(7),
-        &["id", "name", "dept_id", "status"],
-    ));
+    tables.insert_overwrite(
+        test_table(
+            "employees",
+            Oid::from_raw(1),
+            &["id", "name", "dept_id", "status", "manager_id"],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        test_table(
+            "orders",
+            Oid::from_raw(2),
+            &["id", "emp_id", "status", "total", "customer_id"],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        test_table(
+            "departments",
+            Oid::from_raw(3),
+            &["id", "name", "location", "budget"],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        test_table(
+            "customers",
+            Oid::from_raw(4),
+            &["id", "name", "region", "emp_id"],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        test_table(
+            "users",
+            Oid::from_raw(5),
+            &["id", "name", "email", "status"],
+        )
+        .into(),
+    );
+    tables
+        .insert_overwrite(test_table("active_users", Oid::from_raw(6), &["id", "user_id"]).into());
+    tables.insert_overwrite(
+        test_table(
+            "projects",
+            Oid::from_raw(7),
+            &["id", "name", "dept_id", "status"],
+        )
+        .into(),
+    );
     tables
 }
 
@@ -97,10 +112,7 @@ fn test_aggregate_functions() -> HashSet<EcoString> {
 }
 
 /// Parse SQL → resolve → decorrelate → return outcome.
-fn resolve_and_decorrelate(
-    sql: &str,
-    tables: &BiHashMap<TableMetadata>,
-) -> DecorrelateResult<DecorrelateOutcome> {
+fn resolve_and_decorrelate(sql: &str, tables: &Catalog) -> DecorrelateResult<DecorrelateOutcome> {
     let ast = query_expr_parse(sql).expect("convert to AST");
     let resolved = query_expr_resolve(&ast, tables, &["public"]).expect("resolve query");
     query_expr_decorrelate(&resolved, &test_aggregate_functions())

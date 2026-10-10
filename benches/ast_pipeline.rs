@@ -30,7 +30,7 @@ use ecow::EcoString;
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
-use pgcache_lib::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use pgcache_lib::oid::{Oid, TypeOid};
 use pgcache_lib::pg::ByteString;
 use pgcache_lib::query::ast::{
@@ -124,100 +124,121 @@ fn table(oid: u32, name: &str, primary_key: &str, columns: Vec<ColumnMetadata>) 
     }
 }
 
-fn catalog() -> BiHashMap<TableMetadata> {
+fn catalog() -> Catalog {
     let mut tables = BiHashMap::new();
-    tables.insert_overwrite(table(
-        1001,
-        "actor",
-        "actor_id",
-        vec![
-            column("actor_id", 0, Type::INT4, true),
-            column("first_name", 1, Type::TEXT, false),
-            column("last_name", 2, Type::TEXT, false),
-            column("last_update", 3, Type::TIMESTAMPTZ, false),
-        ],
-    ));
-    tables.insert_overwrite(table(
-        1002,
-        "film",
-        "film_id",
-        vec![
-            column("film_id", 0, Type::INT4, true),
-            column("title", 1, Type::TEXT, false),
-            column("description", 2, Type::TEXT, false),
-            column("release_year", 3, Type::INT4, false),
-            column("language_id", 4, Type::INT4, false),
-            column("original_language_id", 5, Type::INT4, false),
-            column("rental_duration", 6, Type::INT2, false),
-            column("rental_rate", 7, Type::NUMERIC, false),
-            column("length", 8, Type::INT2, false),
-            column("replacement_cost", 9, Type::NUMERIC, false),
-            column("rating", 10, Type::TEXT, false),
-            column("last_update", 11, Type::TIMESTAMPTZ, false),
-            column("special_features", 12, Type::TEXT_ARRAY, false),
-            column("fulltext", 13, Type::TEXT, false),
-        ],
-    ));
-    tables.insert_overwrite(table(
-        1003,
-        "film_actor",
-        "actor_id",
-        vec![
-            column("actor_id", 0, Type::INT4, true),
-            column("film_id", 1, Type::INT4, true),
-            column("last_update", 2, Type::TIMESTAMPTZ, false),
-        ],
-    ));
-    tables.insert_overwrite(table(
-        1004,
-        "category",
-        "category_id",
-        vec![
-            column("category_id", 0, Type::INT4, true),
-            column("name", 1, Type::TEXT, false),
-            column("last_update", 2, Type::TIMESTAMPTZ, false),
-        ],
-    ));
-    tables.insert_overwrite(table(
-        1005,
-        "film_category",
-        "film_id",
-        vec![
-            column("film_id", 0, Type::INT4, true),
-            column("category_id", 1, Type::INT4, true),
-            column("last_update", 2, Type::TIMESTAMPTZ, false),
-        ],
-    ));
-    tables.insert_overwrite(table(
-        1006,
-        "payment",
-        "payment_id",
-        vec![
-            column("payment_id", 0, Type::INT4, true),
-            column("customer_id", 1, Type::INT4, false),
-            column("staff_id", 2, Type::INT4, false),
-            column("rental_id", 3, Type::INT4, false),
-            column("amount", 4, Type::NUMERIC, false),
-            column("payment_date", 5, Type::TIMESTAMPTZ, false),
-        ],
-    ));
-    tables.insert_overwrite(table(
-        1007,
-        "customer",
-        "customer_id",
-        vec![
-            column("customer_id", 0, Type::INT4, true),
-            column("store_id", 1, Type::INT4, false),
-            column("first_name", 2, Type::TEXT, false),
-            column("last_name", 3, Type::TEXT, false),
-            column("email", 4, Type::TEXT, false),
-            column("address_id", 5, Type::INT4, false),
-            column("activebool", 6, Type::BOOL, false),
-            column("create_date", 7, Type::DATE, false),
-            column("last_update", 8, Type::TIMESTAMPTZ, false),
-            column("active", 9, Type::INT4, false),
-        ],
-    ));
+    tables.insert_overwrite(
+        table(
+            1001,
+            "actor",
+            "actor_id",
+            vec![
+                column("actor_id", 0, Type::INT4, true),
+                column("first_name", 1, Type::TEXT, false),
+                column("last_name", 2, Type::TEXT, false),
+                column("last_update", 3, Type::TIMESTAMPTZ, false),
+            ],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        table(
+            1002,
+            "film",
+            "film_id",
+            vec![
+                column("film_id", 0, Type::INT4, true),
+                column("title", 1, Type::TEXT, false),
+                column("description", 2, Type::TEXT, false),
+                column("release_year", 3, Type::INT4, false),
+                column("language_id", 4, Type::INT4, false),
+                column("original_language_id", 5, Type::INT4, false),
+                column("rental_duration", 6, Type::INT2, false),
+                column("rental_rate", 7, Type::NUMERIC, false),
+                column("length", 8, Type::INT2, false),
+                column("replacement_cost", 9, Type::NUMERIC, false),
+                column("rating", 10, Type::TEXT, false),
+                column("last_update", 11, Type::TIMESTAMPTZ, false),
+                column("special_features", 12, Type::TEXT_ARRAY, false),
+                column("fulltext", 13, Type::TEXT, false),
+            ],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        table(
+            1003,
+            "film_actor",
+            "actor_id",
+            vec![
+                column("actor_id", 0, Type::INT4, true),
+                column("film_id", 1, Type::INT4, true),
+                column("last_update", 2, Type::TIMESTAMPTZ, false),
+            ],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        table(
+            1004,
+            "category",
+            "category_id",
+            vec![
+                column("category_id", 0, Type::INT4, true),
+                column("name", 1, Type::TEXT, false),
+                column("last_update", 2, Type::TIMESTAMPTZ, false),
+            ],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        table(
+            1005,
+            "film_category",
+            "film_id",
+            vec![
+                column("film_id", 0, Type::INT4, true),
+                column("category_id", 1, Type::INT4, true),
+                column("last_update", 2, Type::TIMESTAMPTZ, false),
+            ],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        table(
+            1006,
+            "payment",
+            "payment_id",
+            vec![
+                column("payment_id", 0, Type::INT4, true),
+                column("customer_id", 1, Type::INT4, false),
+                column("staff_id", 2, Type::INT4, false),
+                column("rental_id", 3, Type::INT4, false),
+                column("amount", 4, Type::NUMERIC, false),
+                column("payment_date", 5, Type::TIMESTAMPTZ, false),
+            ],
+        )
+        .into(),
+    );
+    tables.insert_overwrite(
+        table(
+            1007,
+            "customer",
+            "customer_id",
+            vec![
+                column("customer_id", 0, Type::INT4, true),
+                column("store_id", 1, Type::INT4, false),
+                column("first_name", 2, Type::TEXT, false),
+                column("last_name", 3, Type::TEXT, false),
+                column("email", 4, Type::TEXT, false),
+                column("address_id", 5, Type::INT4, false),
+                column("activebool", 6, Type::BOOL, false),
+                column("create_date", 7, Type::DATE, false),
+                column("last_update", 8, Type::TIMESTAMPTZ, false),
+                column("active", 9, Type::INT4, false),
+            ],
+        )
+        .into(),
+    );
     tables
 }
 
@@ -343,14 +364,11 @@ fn parse(sql: &str) -> QueryExpr {
         .expect("the fixture SQL converts")
 }
 
-fn resolve(query: &QueryExpr, catalog: &BiHashMap<TableMetadata>) -> ResolvedQueryExpr {
+fn resolve(query: &QueryExpr, catalog: &Catalog) -> ResolvedQueryExpr {
     query_expr_resolve(query, catalog, &["public"]).expect("the fixture SQL resolves")
 }
 
-fn resolve_bound(
-    query: &QueryExpr,
-    catalog: &BiHashMap<TableMetadata>,
-) -> (ResolvedQueryExpr, Bindings) {
+fn resolve_bound(query: &QueryExpr, catalog: &Catalog) -> (ResolvedQueryExpr, Bindings) {
     query_expr_resolve_bound(query, catalog, &["public"]).expect("the fixture SQL resolves")
 }
 
@@ -447,7 +465,7 @@ fn sizes_report() {
     }
 }
 
-fn allocations_report(shapes: &[Shape], catalog: &BiHashMap<TableMetadata>) {
+fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
     let settings = LiteralSettings::default();
     let search_path: [EcoString; 1] = ["public".into()];
     println!("\n== allocations per stage (count / bytes)");

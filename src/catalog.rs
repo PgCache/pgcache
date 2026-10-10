@@ -7,9 +7,11 @@
 use std::collections::HashMap;
 #[cfg(feature = "proxy")]
 use std::collections::HashSet;
+use std::ops::Deref;
+use std::sync::Arc;
 
 use ecow::EcoString;
-use iddqd::{BiHashItem, bi_upcast};
+use iddqd::{BiHashItem, BiHashMap, bi_upcast};
 use postgres_types::{Kind, Type};
 #[cfg(feature = "proxy")]
 use tokio_postgres::{Client, Error};
@@ -50,6 +52,18 @@ impl ColumnStore {
     pub fn get(&self, name: &str) -> Option<&ColumnMetadata> {
         let &idx = self.by_name.get(name)?;
         self.sorted.get(idx)
+    }
+
+    /// Look up a column by its position.
+    pub fn by_position(&self, position: ColumnPosition) -> Option<&ColumnMetadata> {
+        self.sorted
+            .get(position.index())
+            .filter(|column| column.position == position)
+            .or_else(|| {
+                self.sorted
+                    .iter()
+                    .find(|column| column.position == position)
+            })
     }
 
     /// Iterate columns in position order.
@@ -189,7 +203,33 @@ impl TableMetadata {
     }
 }
 
-impl BiHashItem for TableMetadata {
+/// A catalog entry shared by every resolution that references it (ADR-057):
+/// a cached query keeps the metadata it was resolved against after a refresh
+/// replaces the entry, as it kept copies before.
+#[derive(Debug, Clone)]
+pub struct CatalogTable(Arc<TableMetadata>);
+
+impl CatalogTable {
+    pub fn shared(&self) -> &Arc<TableMetadata> {
+        &self.0
+    }
+}
+
+impl Deref for CatalogTable {
+    type Target = TableMetadata;
+
+    fn deref(&self) -> &TableMetadata {
+        &self.0
+    }
+}
+
+impl From<TableMetadata> for CatalogTable {
+    fn from(table: TableMetadata) -> Self {
+        Self(Arc::new(table))
+    }
+}
+
+impl BiHashItem for CatalogTable {
     type K1<'a> = Oid;
     type K2<'a> = (&'a str, &'a str);
 
@@ -203,6 +243,9 @@ impl BiHashItem for TableMetadata {
 
     bi_upcast!();
 }
+
+/// The tables the cache tracks, by relation oid and by `(schema, name)`.
+pub type Catalog = BiHashMap<CatalogTable>;
 
 /// A user column's 1-based position (PostgreSQL `attnum`), always in
 /// `1..=i16::MAX`, so its 0-based slice index cannot underflow.

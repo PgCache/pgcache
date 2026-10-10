@@ -46,7 +46,7 @@ mod resolve;
 pub(crate) struct PopulationWork {
     pub fingerprint: Fingerprint,
     pub generation: Generation,
-    pub table_metadata: Vec<TableMetadata>,
+    pub table_metadata: Vec<Arc<TableMetadata>>,
     /// SELECT branches extracted from the query at registration time.
     /// For simple SELECT queries, this contains one branch.
     /// For set operations (UNION/INTERSECT/EXCEPT), contains all branches.

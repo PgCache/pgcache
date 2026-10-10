@@ -282,7 +282,7 @@ mod classify_tests {
 
     use super::*;
     use crate::cache::query::CacheableQuery;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_expr_parse;
     use crate::query::resolved::query_expr_resolve;
@@ -311,7 +311,7 @@ mod classify_tests {
         }
     }
 
-    fn resolve(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedQueryExpr {
+    fn resolve(sql: &str, tables: &Catalog) -> ResolvedQueryExpr {
         let query_expr = query_expr_parse(sql).expect("convert");
         let cacheable = CacheableQuery::try_new(query_expr, &HashMap::new()).expect("cacheable");
         query_expr_resolve(cacheable.query(), tables, &["public"]).expect("resolve")
@@ -319,11 +319,9 @@ mod classify_tests {
 
     fn classify_single_table(sql: &str) -> UpdateEvalStrategy {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(make_table(
-            "t",
-            Oid::from_raw(1),
-            &["id", "name", "status", "age"],
-        ));
+        tables.insert_overwrite(
+            make_table("t", Oid::from_raw(1), &["id", "name", "status", "age"]).into(),
+        );
         let resolved = resolve(sql, &tables);
         update_eval_strategy_classify(&resolved, UpdateQuerySource::FromClause)
     }
@@ -380,8 +378,8 @@ mod classify_tests {
     #[test]
     fn test_multi_table_is_pg_eval() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(make_table("a", Oid::from_raw(1), &["id", "bid"]));
-        tables.insert_overwrite(make_table("b", Oid::from_raw(2), &["id", "name"]));
+        tables.insert_overwrite(make_table("a", Oid::from_raw(1), &["id", "bid"]).into());
+        tables.insert_overwrite(make_table("b", Oid::from_raw(2), &["id", "name"]).into());
         let resolved = resolve("SELECT * FROM a JOIN b ON a.bid = b.id", &tables);
         assert_eq!(
             update_eval_strategy_classify(&resolved, UpdateQuerySource::FromClause),
@@ -394,7 +392,7 @@ mod classify_tests {
         use crate::cache::SubqueryKind;
         let resolved = resolve("SELECT * FROM t WHERE id = 5", &{
             let mut tables = BiHashMap::new();
-            tables.insert_overwrite(make_table("t", Oid::from_raw(1), &["id", "name"]));
+            tables.insert_overwrite(make_table("t", Oid::from_raw(1), &["id", "name"]).into());
             tables
         });
         // Same query, but classified as a subquery-sourced update query
@@ -413,11 +411,9 @@ mod classify_tests {
     #[test]
     fn test_predicate_columns_where_collected_select_list_excluded() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(make_table(
-            "t",
-            Oid::from_raw(1),
-            &["id", "name", "status", "age"],
-        ));
+        tables.insert_overwrite(
+            make_table("t", Oid::from_raw(1), &["id", "name", "status", "age"]).into(),
+        );
         let resolved = resolve(
             "SELECT name FROM t WHERE status = 'a' AND age > 'x'",
             &tables,
@@ -435,8 +431,10 @@ mod classify_tests {
     #[test]
     fn test_predicate_columns_join_columns_collected_per_table() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(make_table("t", Oid::from_raw(1), &["id", "name", "status"]));
-        tables.insert_overwrite(make_table("u", Oid::from_raw(2), &["id", "t_id", "region"]));
+        tables
+            .insert_overwrite(make_table("t", Oid::from_raw(1), &["id", "name", "status"]).into());
+        tables
+            .insert_overwrite(make_table("u", Oid::from_raw(2), &["id", "t_id", "region"]).into());
         let resolved = resolve(
             "SELECT t.name FROM t JOIN u ON u.t_id = t.id WHERE u.region = 'x'",
             &tables,
@@ -453,11 +451,9 @@ mod classify_tests {
     #[test]
     fn test_predicate_columns_group_by_and_having_collected() {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(make_table(
-            "t",
-            Oid::from_raw(1),
-            &["id", "name", "status", "age"],
-        ));
+        tables.insert_overwrite(
+            make_table("t", Oid::from_raw(1), &["id", "name", "status", "age"]).into(),
+        );
         let resolved = resolve(
             "SELECT status, count(id) FROM t GROUP BY status HAVING count(age) > 1",
             &tables,

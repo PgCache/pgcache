@@ -580,7 +580,7 @@ impl WriterCore {
         self.cache_table_create_from_metadata(&table_metadata)
             .await?;
 
-        self.cache.tables.insert_overwrite(table_metadata);
+        self.cache.tables.insert_overwrite(table_metadata.into());
 
         Ok(())
     }

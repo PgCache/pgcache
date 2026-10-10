@@ -61,7 +61,7 @@ async fn cache_tables_ensure(
             .contains_key2(&(schema.as_str(), table_name))
         {
             let table = core.cache_table_create(Some(&schema), table_name).await?;
-            core.cache.tables.insert_overwrite(table);
+            core.cache.tables.insert_overwrite(table.into());
         }
     }
     Ok(())

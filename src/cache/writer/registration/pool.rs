@@ -2,6 +2,7 @@
 //! building / dispatching population work onto the shared queue.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::task::spawn_local;
@@ -127,9 +128,9 @@ impl WriterRegistration {
             .into_iter()
             .collect();
 
-        let table_metadata: Vec<TableMetadata> = branch_relation_oids
+        let table_metadata: Vec<Arc<TableMetadata>> = branch_relation_oids
             .iter()
-            .filter_map(|oid| core.cache.tables.get1(oid).cloned())
+            .filter_map(|oid| core.cache.tables.get1(oid).map(|t| Arc::clone(t.shared())))
             .collect();
 
         PopulationWork {

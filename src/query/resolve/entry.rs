@@ -1,8 +1,6 @@
 //! The public entry points: resolve a parsed `QueryExpr` / `SelectNode`
 //! against the catalog, plus the scoped variant used for subquery bodies.
 
-use iddqd::BiHashMap;
-
 use super::bindings::{Bindings, BindingsBuilder};
 use super::clauses::{
     group_by_resolve, having_resolve, limit_resolve, order_by_as_identifiers, order_by_resolve,
@@ -11,7 +9,7 @@ use super::clauses::{
 use super::expr::where_expr_resolve;
 use super::scope::{OuterTable, ResolutionScope};
 use super::table::table_source_resolve;
-use crate::catalog::TableMetadata;
+use crate::catalog::Catalog;
 use crate::query::ast::{QueryBody, QueryExpr, SelectNode};
 use crate::query::resolved::{
     ResolveResult, ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectNode,
@@ -21,7 +19,7 @@ use crate::query::resolved::{
 /// Resolve a QueryExpr to a ResolvedQueryExpr
 pub fn query_expr_resolve(
     query: &QueryExpr,
-    tables: &BiHashMap<TableMetadata>,
+    tables: &Catalog,
     search_path: &[&str],
 ) -> ResolveResult<ResolvedQueryExpr> {
     query_expr_resolve_bound(query, tables, search_path).map(|(resolved, _)| resolved)
@@ -31,7 +29,7 @@ pub fn query_expr_resolve(
 /// tree's bindings (ADR-057); both describe the same resolution.
 pub fn query_expr_resolve_bound(
     query: &QueryExpr,
-    tables: &BiHashMap<TableMetadata>,
+    tables: &Catalog,
     search_path: &[&str],
 ) -> ResolveResult<(ResolvedQueryExpr, Bindings)> {
     let mut bindings = BindingsBuilder::default();
@@ -43,7 +41,7 @@ pub fn query_expr_resolve_bound(
 /// Resolve a SelectNode to a ResolvedSelectNode
 pub fn select_node_resolve(
     select: &SelectNode,
-    tables: &BiHashMap<TableMetadata>,
+    tables: &Catalog,
     search_path: &[&str],
 ) -> ResolveResult<ResolvedSelectNode> {
     let mut bindings = BindingsBuilder::default();
@@ -58,7 +56,7 @@ pub fn select_node_resolve(
 /// correlated subquery resolution).
 pub(super) fn select_node_resolve_scoped<'a>(
     select: &'a SelectNode,
-    tables: &'a BiHashMap<TableMetadata>,
+    tables: &'a Catalog,
     scope: &mut ResolutionScope<'a>,
     search_path: &[&'a str],
 ) -> ResolveResult<ResolvedSelectNode> {
@@ -100,7 +98,7 @@ pub(super) fn select_node_resolve_scoped<'a>(
 /// outer column references found within it.
 pub(super) fn query_expr_resolve_scoped<'a>(
     query: &'a QueryExpr,
-    catalog_tables: &'a BiHashMap<TableMetadata>,
+    catalog_tables: &'a Catalog,
     search_path: &[&'a str],
     outer_tables: Vec<OuterTable>,
     bindings: &'a mut BindingsBuilder,

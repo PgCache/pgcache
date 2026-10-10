@@ -131,7 +131,7 @@ impl WriterCdc {
         core: &WriterCore,
         oids: impl Iterator<Item = Oid>,
     ) -> Option<String> {
-        truncate_sql(oids.filter_map(|oid| core.cache.tables.get1(&oid)))
+        truncate_sql(oids.filter_map(|oid| core.cache.tables.get1(&oid).map(|t| &**t)))
     }
 
     /// Build one chunk's combined predicate `SELECT` into `pg_eval_buf`, the

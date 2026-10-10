@@ -626,7 +626,7 @@ impl WriterCdc {
         let repaired = chain.source(&slot).is_some_and(|values| {
             toasted_values_apply(values, pending_positions(update.toast), update.new_row_data)
         });
-        let table_metadata = core.cache.tables.get1(&update.relation_oid);
+        let table_metadata = core.cache.tables.get1(&update.relation_oid).map(|t| &**t);
         let pk_changed = table_metadata.is_some_and(|t| update.pk_changed(t));
         if repaired {
             crate::metrics::handles().cdc.toast_repairs.increment(1);
@@ -654,7 +654,7 @@ impl WriterCdc {
     /// (to-be-deleted) row in the overlay.
     fn toast_fallback_mark(core: &mut WriterCore, update: PendingUpdate<'_>) {
         let toasted_columns = toasted_column_names(
-            core.cache.tables.get1(&update.relation_oid),
+            core.cache.tables.get1(&update.relation_oid).map(|t| &**t),
             pending_positions(update.toast),
         );
         // The fallback handler deletes the row; later in-batch repairs must

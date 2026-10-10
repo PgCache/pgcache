@@ -2,15 +2,18 @@
 //! join columns are visible while resolving a query, plus the derived-table
 //! column extraction that feeds it.
 
+use std::sync::Arc;
+
 use ecow::EcoString;
-use iddqd::BiHashMap;
 use postgres_types::Type;
 use rootcause::Report;
 
-use super::bindings::{BindingsBuilder, DerivedColumn, SlotId, TableSlot};
+use super::bindings::{BindingsBuilder, SlotId, TableSlot};
 use super::entry::query_expr_resolve_scoped;
 use super::join_using::MergedJoinColumn;
-use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+use crate::catalog::{
+    Catalog, CatalogTable, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata,
+};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{NodeId, QueryExpr};
 use crate::query::resolved::{
@@ -24,14 +27,14 @@ use crate::query::resolved::{
 pub(super) enum ScopeEntry<'a> {
     /// Catalog (base) table with optional alias.
     Base {
-        metadata: &'a TableMetadata,
+        table: &'a CatalogTable,
         alias: Option<&'a str>,
         slot: SlotId,
     },
-    /// Derived table (FROM subquery) with owned synthetic metadata whose
-    /// columns are determined by the subquery's output.
+    /// Derived table (FROM subquery) with synthetic metadata whose columns
+    /// are determined by the subquery's output, shared with its slot.
     Derived {
-        metadata: TableMetadata,
+        table: Arc<TableMetadata>,
         alias: EcoString,
         slot: SlotId,
     },
@@ -40,8 +43,15 @@ pub(super) enum ScopeEntry<'a> {
 impl ScopeEntry<'_> {
     pub(super) fn metadata(&self) -> &TableMetadata {
         match self {
-            ScopeEntry::Base { metadata, .. } => metadata,
-            ScopeEntry::Derived { metadata, .. } => metadata,
+            ScopeEntry::Base { table, .. } => table,
+            ScopeEntry::Derived { table, .. } => table,
+        }
+    }
+
+    fn shared(&self) -> Arc<TableMetadata> {
+        match self {
+            ScopeEntry::Base { table, .. } => Arc::clone(table.shared()),
+            ScopeEntry::Derived { table, .. } => Arc::clone(table),
         }
     }
 
@@ -76,8 +86,8 @@ impl ScopeEntry<'_> {
 /// A table of an enclosing scope, snapshotted for correlated lookups.
 #[derive(Debug, Clone)]
 pub(super) struct OuterTable {
-    pub(super) metadata: TableMetadata,
-    pub(super) alias: Option<String>,
+    pub(super) table: Arc<TableMetadata>,
+    pub(super) alias: Option<EcoString>,
     pub(super) slot: SlotId,
 }
 
@@ -87,7 +97,7 @@ pub(super) struct ResolutionScope<'a> {
     /// Base and derived tables visible in this scope, in FROM order.
     pub(super) entries: Vec<ScopeEntry<'a>>,
     /// Catalog of all known tables (for subquery resolution)
-    pub(super) catalog_tables: &'a BiHashMap<TableMetadata>,
+    pub(super) catalog_tables: &'a Catalog,
     /// Search path for schema resolution
     pub(super) search_path: Vec<&'a str>,
     /// Owned snapshot of ancestor scope tables for correlated reference fallback.
@@ -108,7 +118,7 @@ pub(super) struct ResolutionScope<'a> {
 
 impl<'a> ResolutionScope<'a> {
     pub(super) fn new(
-        catalog_tables: &'a BiHashMap<TableMetadata>,
+        catalog_tables: &'a Catalog,
         search_path: &[&'a str],
         bindings: &'a mut BindingsBuilder,
     ) -> Self {
@@ -120,7 +130,7 @@ impl<'a> ResolutionScope<'a> {
     /// `outer_tables` is an owned snapshot of the ancestor scopes' tables, used as
     /// fallback when column resolution fails in this scope (correlated references).
     pub(super) fn new_with_outer(
-        catalog_tables: &'a BiHashMap<TableMetadata>,
+        catalog_tables: &'a Catalog,
         search_path: &[&'a str],
         outer_tables: Vec<OuterTable>,
         bindings: &'a mut BindingsBuilder,
@@ -144,8 +154,8 @@ impl<'a> ResolutionScope<'a> {
             .entries
             .iter()
             .map(|entry| OuterTable {
-                metadata: entry.metadata().clone(),
-                alias: entry.alias().map(str::to_owned),
+                table: entry.shared(),
+                alias: entry.alias().map(EcoString::from),
                 slot: entry.slot(),
             })
             .collect();
@@ -158,22 +168,18 @@ impl<'a> ResolutionScope<'a> {
     pub(super) fn outer_table_scope_find(&self, name: &str) -> Option<&OuterTable> {
         self.outer_tables.iter().find(|outer| match &outer.alias {
             Some(alias) => alias == name,
-            None => outer.metadata.name == name,
+            None => outer.table.name == name,
         })
     }
 
     /// Add a table to the scope
     pub(super) fn table_scope_add(
         &mut self,
-        metadata: &'a TableMetadata,
+        table: &'a CatalogTable,
         alias: Option<&'a str>,
         slot: SlotId,
     ) {
-        self.entries.push(ScopeEntry::Base {
-            metadata,
-            alias,
-            slot,
-        });
+        self.entries.push(ScopeEntry::Base { table, alias, slot });
     }
 
     /// A `USING`/`NATURAL` merged join column by (output) name.
@@ -190,9 +196,9 @@ impl<'a> ResolutionScope<'a> {
         // the original table name, which must not resolve to the base
         // entry's still-aliased occurrence).
         self.entries.iter().find(|entry| match entry {
-            ScopeEntry::Base {
-                metadata, alias, ..
-            } => alias.map_or(metadata.name == name, |a| a == name),
+            ScopeEntry::Base { table, alias, .. } => {
+                alias.map_or(table.name == name, |a| a == name)
+            }
             ScopeEntry::Derived { alias, .. } => alias == name,
         })
     }
@@ -215,22 +221,7 @@ impl<'a> ResolutionScope<'a> {
             })
         })?;
 
-        let slot = self.bindings.slot_push(
-            node,
-            TableSlot::Derived {
-                node,
-                alias: alias.into(),
-                columns: columns
-                    .iter()
-                    .map(|column| DerivedColumn {
-                        name: column.name.clone(),
-                        data_type: column.data_type.clone(),
-                    })
-                    .collect(),
-            },
-        );
-
-        let synthetic_metadata = TableMetadata {
+        let table = Arc::new(TableMetadata {
             replica_identity_full: false,
             relation_oid: Oid::from_raw(0),
             name: alias.into(),
@@ -238,10 +229,17 @@ impl<'a> ResolutionScope<'a> {
             primary_key_columns: Vec::new(),
             columns: ColumnStore::new(columns),
             indexes: Vec::new(),
-        };
+        });
+        let slot = self.bindings.slot_push(
+            node,
+            TableSlot::Derived {
+                node,
+                table: Arc::clone(&table),
+            },
+        );
 
         self.entries.push(ScopeEntry::Derived {
-            metadata: synthetic_metadata,
+            table,
             alias: alias.into(),
             slot,
         });

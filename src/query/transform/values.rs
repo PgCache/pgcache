@@ -626,12 +626,15 @@ mod tests {
             ("j1_pk", "int4"),
         ];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("j1_tbl", Oid::from_raw(5001), cols));
-        tables.insert_overwrite(table_metadata(
-            "j2_tbl",
-            Oid::from_raw(5002),
-            &[("i", "int4"), ("k", "int4"), ("j2_pk", "int4")],
-        ));
+        tables.insert_overwrite(table_metadata("j1_tbl", Oid::from_raw(5001), cols).into());
+        tables.insert_overwrite(
+            table_metadata(
+                "j2_tbl",
+                Oid::from_raw(5002),
+                &[("i", "int4"), ("k", "int4"), ("j2_pk", "int4")],
+            )
+            .into(),
+        );
         let j1 = table_metadata("j1_tbl", Oid::from_raw(5001), cols);
         let row = vec![
             Some("1".into()),
@@ -669,7 +672,7 @@ mod tests {
     fn test_group_by_having_uses_subquery_alias() {
         let cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), cols));
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), cols).into());
         let onek = table_metadata("onek", Oid::from_raw(6001), cols);
         let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
 
@@ -716,8 +719,8 @@ mod tests {
         let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
         let dept_cols = &[("k", "int4"), ("v", "int4")];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols));
-        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols));
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols).into());
+        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols).into());
         let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
         let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
 
@@ -749,8 +752,8 @@ mod tests {
         let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
         let dept_cols = &[("k", "int4"), ("v", "int4")];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols));
-        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols));
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols).into());
+        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols).into());
         let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
         let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
 
@@ -782,9 +785,9 @@ mod tests {
         let dept_cols = &[("k", "int4"), ("v", "int4")];
         let emp_cols = &[("k", "int4"), ("w", "int4")];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols));
-        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols));
-        tables.insert_overwrite(table_metadata("emp", Oid::from_raw(6003), emp_cols));
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols).into());
+        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols).into());
+        tables.insert_overwrite(table_metadata("emp", Oid::from_raw(6003), emp_cols).into());
         let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
         let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
 
@@ -820,7 +823,7 @@ mod tests {
     fn test_inner_occurrence_under_own_alias_not_clobbered() {
         let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols));
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols).into());
         let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
         let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
 
@@ -852,7 +855,7 @@ mod tests {
     fn test_same_alias_shadowing_refuses_rewrite() {
         let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols));
+        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols).into());
         let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
         let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
 
@@ -889,8 +892,8 @@ mod tests {
         ];
         let cols2 = &[("i", "int4"), ("k", "int4"), ("j2_pk", "int4")];
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("j1_tbl", Oid::from_raw(5001), cols1));
-        tables.insert_overwrite(table_metadata("j2_tbl", Oid::from_raw(5002), cols2));
+        tables.insert_overwrite(table_metadata("j1_tbl", Oid::from_raw(5001), cols1).into());
+        tables.insert_overwrite(table_metadata("j2_tbl", Oid::from_raw(5002), cols2).into());
 
         let resolve = |sql: &str| {
             let qe = query_expr_parse(sql).expect("convert");
@@ -1287,7 +1290,7 @@ mod tests {
         rows: &[Vec<Option<ByteString>>],
     ) {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata.clone());
+        tables.insert_overwrite(table_metadata.clone().into());
         let qe = query_expr_parse(sql).expect("parse");
         let QueryBody::Select(node) = qe.body else {
             panic!("expected SELECT");
@@ -1355,7 +1358,7 @@ mod tests {
             panic!("expected SELECT");
         };
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(onek.clone());
+        tables.insert_overwrite(onek.clone().into());
         let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
         let template = PgEvalTemplate::build(&resolved, &onek).expect("template builds");
 

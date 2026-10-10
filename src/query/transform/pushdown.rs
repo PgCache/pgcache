@@ -378,7 +378,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::{LiteralValue, query_expr_parse};
     use crate::query::resolved::query_expr_resolve;
@@ -414,7 +414,7 @@ mod tests {
         }
     }
 
-    fn resolve_and_pushdown(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedQueryExpr {
+    fn resolve_and_pushdown(sql: &str, tables: &Catalog) -> ResolvedQueryExpr {
         let ast = query_expr_parse(sql).expect("convert to AST");
         let resolved = query_expr_resolve(&ast, tables, &["public"]).expect("resolve query");
         predicate_pushdown_apply(resolved)
@@ -422,14 +422,12 @@ mod tests {
 
     /// A catalog of text-column tables, given as (name, columns), with relation
     /// OIDs from 1001 in order.
-    fn tables(specs: &[(&str, &[&str])]) -> BiHashMap<TableMetadata> {
+    fn tables(specs: &[(&str, &[&str])]) -> Catalog {
         let mut tables = BiHashMap::new();
         for (oid, (name, columns)) in (1001..).zip(specs) {
-            tables.insert_overwrite(test_table_metadata_with_columns(
-                name,
-                Oid::from_raw(oid),
-                columns,
-            ));
+            tables.insert_overwrite(
+                test_table_metadata_with_columns(name, Oid::from_raw(oid), columns).into(),
+            );
         }
         tables
     }
@@ -485,7 +483,7 @@ mod tests {
         )
     }
 
-    fn assert_outer_where_kept(sql: &str, tables: &BiHashMap<TableMetadata>, reason: &str) {
+    fn assert_outer_where_kept(sql: &str, tables: &Catalog, reason: &str) {
         let result = resolve_and_pushdown(sql, tables);
         assert!(as_select(&result).where_clause.is_some(), "{reason}");
     }

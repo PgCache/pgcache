@@ -6,13 +6,13 @@ use postgres_types::Type;
 use super::extract::analyze_query_constraints;
 use super::subsume::table_constraints_subsumed;
 use super::*;
-use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{QueryBody, query_expr_parse};
 use crate::query::resolved::{ResolvedSelectNode, select_node_resolve};
 
 // Helper function to parse SQL and resolve to ResolvedSelectNode
-fn resolve_sql(sql: &str, tables: &BiHashMap<TableMetadata>) -> ResolvedSelectNode {
+fn resolve_sql(sql: &str, tables: &Catalog) -> ResolvedSelectNode {
     let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
     let QueryBody::Select(node) = query_expr.body else {
         panic!("expected SELECT");
@@ -55,15 +55,15 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
 }
 
 /// A catalog of `test_table_metadata` tables, OIDs from 1001 in order.
-fn catalog(names: &[&str]) -> BiHashMap<TableMetadata> {
+fn catalog(names: &[&str]) -> Catalog {
     let mut tables = BiHashMap::new();
     for (oid, name) in (1001..).zip(names) {
-        tables.insert_overwrite(test_table_metadata(name, Oid::from_raw(oid)));
+        tables.insert_overwrite(test_table_metadata(name, Oid::from_raw(oid)).into());
     }
     tables
 }
 
-fn constraints_of(sql: &str, tables: &BiHashMap<TableMetadata>) -> QueryConstraints {
+fn constraints_of(sql: &str, tables: &Catalog) -> QueryConstraints {
     analyze_query_constraints(&resolve_sql(sql, tables))
 }
 
@@ -609,23 +609,26 @@ fn test_join_propagation() {
 fn test_transitive_propagation() {
     let mut tables = catalog(&["a", "b"]);
 
-    tables.insert_overwrite(TableMetadata {
-        replica_identity_full: false,
-        relation_oid: Oid::from_raw(1003),
-        name: "c".into(),
-        schema: "public".into(),
-        primary_key_columns: vec!["id".into()],
-        columns: ColumnStore::new([ColumnMetadata {
-            name: "id".into(),
-            position: ColumnPosition::from_raw(1),
-            type_oid: TypeOid::from_raw(23),
-            data_type: Type::INT4,
-            type_name: "int4".into(),
-            cache_type_name: "int4".into(),
-            is_primary_key: true,
-        }]),
-        indexes: Vec::new(),
-    });
+    tables.insert_overwrite(
+        TableMetadata {
+            replica_identity_full: false,
+            relation_oid: Oid::from_raw(1003),
+            name: "c".into(),
+            schema: "public".into(),
+            primary_key_columns: vec!["id".into()],
+            columns: ColumnStore::new([ColumnMetadata {
+                name: "id".into(),
+                position: ColumnPosition::from_raw(1),
+                type_oid: TypeOid::from_raw(23),
+                data_type: Type::INT4,
+                type_name: "int4".into(),
+                cache_type_name: "int4".into(),
+                is_primary_key: true,
+            }]),
+            indexes: Vec::new(),
+        }
+        .into(),
+    );
 
     let sql = "SELECT * FROM (a JOIN b ON a.id = b.id) JOIN c ON b.id = c.id WHERE a.id = 1";
     let resolved = resolve_sql(sql, &tables);

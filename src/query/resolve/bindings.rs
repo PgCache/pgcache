@@ -4,10 +4,8 @@
 use std::sync::Arc;
 
 use ecow::EcoString;
-use postgres_types::Type;
 
-use crate::catalog::ColumnPosition;
-use crate::oid::Oid;
+use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::query::ast::{ColumnNode, NodeId, QueryExpr, StarNode};
 
 /// Index of a table source in [`Bindings::slots`].
@@ -30,38 +28,47 @@ impl MergedId {
     }
 }
 
-/// One FROM entry of the whole tree, subqueries included.
+/// One FROM entry of the whole tree, subqueries included. Both variants
+/// share their metadata with the catalog or the resolver that built it, so a
+/// binding is a slot and a position and nothing is copied per reference.
 #[derive(Debug, Clone)]
 pub enum TableSlot {
-    /// A catalog table. The next slice replaces the names with a shared
-    /// `Arc<TableMetadata>`.
+    /// A catalog table.
     Base {
-        relation_oid: Oid,
-        schema: EcoString,
-        name: EcoString,
+        table: Arc<TableMetadata>,
         alias: Option<EcoString>,
     },
-    /// A FROM subquery or CTE reference, with its output columns in order.
+    /// A FROM subquery or CTE reference; `table` is the synthetic metadata
+    /// the resolver derives from its output list (name = alias, oid 0).
     Derived {
         node: NodeId,
-        alias: EcoString,
-        columns: Vec<DerivedColumn>,
+        table: Arc<TableMetadata>,
     },
 }
 
-#[derive(Debug, Clone)]
-pub struct DerivedColumn {
-    pub name: EcoString,
-    pub data_type: Type,
+impl TableSlot {
+    pub fn table(&self) -> &TableMetadata {
+        match self {
+            TableSlot::Base { table, .. } | TableSlot::Derived { table, .. } => table,
+        }
+    }
+
+    /// The name a reference qualifies this slot by: the alias, else the
+    /// table name (a derived table's synthetic name is its alias).
+    pub fn qualifier(&self) -> &str {
+        match self {
+            TableSlot::Base { table, alias } => alias.as_deref().unwrap_or(table.name.as_str()),
+            TableSlot::Derived { table, .. } => table.name.as_str(),
+        }
+    }
 }
 
-/// A column reference's resolution: which slot, which column of it, and the
-/// type the comparator and index keys need.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// A column reference's resolution: which slot and which column of it. Name
+/// and type live once, on the slot's table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ColumnBinding {
     pub slot: SlotId,
     pub position: ColumnPosition,
-    pub data_type: Type,
 }
 
 /// What a [`ColumnNode`] stands for once resolved.
@@ -117,6 +124,31 @@ fn by_node<T>(entries: &[(NodeId, T)], id: NodeId) -> Option<&T> {
 impl Bindings {
     pub fn column(&self, node: &ColumnNode) -> Option<&ColumnTarget> {
         self.column_by_id(node.id)
+    }
+
+    /// The catalog column a binding names.
+    pub fn binding_column(&self, binding: &ColumnBinding) -> Option<&ColumnMetadata> {
+        self.slot(binding.slot)?
+            .table()
+            .columns
+            .by_position(binding.position)
+    }
+
+    /// The catalog column a `Column`-bound node names; `None` for a merged
+    /// or output reference.
+    pub fn column_metadata(&self, node: &ColumnNode) -> Option<&ColumnMetadata> {
+        match self.column(node)? {
+            ColumnTarget::Column(binding) => self.binding_column(binding),
+            ColumnTarget::Merged(_) | ColumnTarget::Output => None,
+        }
+    }
+
+    /// The slot a `Column`-bound node refers into.
+    pub fn column_slot(&self, node: &ColumnNode) -> Option<&TableSlot> {
+        match self.column(node)? {
+            ColumnTarget::Column(binding) => self.slot(binding.slot),
+            ColumnTarget::Merged(_) | ColumnTarget::Output => None,
+        }
     }
 
     pub fn column_by_id(&self, id: NodeId) -> Option<&ColumnTarget> {

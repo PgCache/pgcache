@@ -113,7 +113,7 @@ mod tests {
 
     fn resolve(sql: &str) -> ResolvedQueryExpr {
         let mut tables = BiHashMap::new();
-        tables.insert_overwrite(users_table());
+        tables.insert_overwrite(users_table().into());
         let query_expr = query_expr_parse(sql).expect("parse");
         query_expr_resolve(&query_expr, &tables, &["public"]).expect("resolve")
     }
