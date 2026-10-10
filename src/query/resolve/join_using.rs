@@ -10,7 +10,8 @@
 use ecow::EcoString;
 use rootcause::Report;
 
-use super::column::column_resolve;
+use super::bindings::{ColumnBinding, MergedColumnBinding, MergedId};
+use super::column::{ColumnLookup, column_lookup};
 use super::scope::ResolutionScope;
 use crate::query::ast::{BinaryOp, ColumnNode, JoinType, NodeId};
 use crate::query::resolved::{
@@ -32,6 +33,8 @@ pub(super) struct MergedJoinColumn {
     /// Outer join: merged value is `COALESCE`, not a plain column — so
     /// an unqualified GROUP BY on it is unsupported (forwarded).
     pub(super) outer: bool,
+    /// The same column in the bindings.
+    pub(super) merged: MergedId,
 }
 
 /// Scope index ranges delimiting each side of a join, into
@@ -108,20 +111,25 @@ pub(super) fn join_natural_common_columns(
     out
 }
 
-/// Resolve `qual.column = c` against the join scope.
+/// Resolve `qual.column = c` against the join scope. The reference is
+/// synthesized, not a node of the tree, so it is looked up without binding.
 pub(super) fn join_side_column_resolve(
     scope: &mut ResolutionScope<'_>,
     qual: &EcoString,
     column: &EcoString,
-) -> ResolveResult<ResolvedColumnNode> {
-    column_resolve(
-        &ColumnNode {
-            id: NodeId::PENDING,
-            table: Some(qual.clone()),
-            column: column.clone(),
-        },
-        scope,
-    )
+) -> ResolveResult<(ResolvedColumnNode, ColumnBinding)> {
+    let reference = ColumnNode {
+        id: NodeId::PENDING,
+        table: Some(qual.clone()),
+        column: column.clone(),
+    };
+    match column_lookup(&reference, scope)? {
+        ColumnLookup::Column {
+            resolved, binding, ..
+        } => Ok((resolved, binding)),
+        // Qualified lookups never reach a merged column; forward if one does.
+        ColumnLookup::Merged { .. } => Err(Report::from(ResolveError::UnsupportedJoinQualifier)),
+    }
 }
 
 /// One `USING`/`NATURAL` column resolved on both join sides.
@@ -138,12 +146,20 @@ fn using_column_resolve(
     ranges: JoinScopeRanges,
     c: &EcoString,
     outer: bool,
+    join: NodeId,
 ) -> ResolveResult<UsingColumn> {
     let unsupported = || Report::from(ResolveError::UnsupportedJoinQualifier);
     let lq = join_side_qualifier(scope, ranges.left(), c).ok_or_else(unsupported)?;
     let rq = join_side_qualifier(scope, ranges.right(), c).ok_or_else(unsupported)?;
-    let left_col = join_side_column_resolve(scope, &lq, c)?;
-    let right_col = join_side_column_resolve(scope, &rq, c)?;
+    let (left_col, left_binding) = join_side_column_resolve(scope, &lq, c)?;
+    let (right_col, right_binding) = join_side_column_resolve(scope, &rq, c)?;
+    let merged = scope.bindings.merged_push(MergedColumnBinding {
+        join,
+        name: c.clone(),
+        left: left_binding,
+        right: right_binding,
+        outer,
+    });
 
     let conjunct = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
         op: BinaryOp::Equal,
@@ -177,6 +193,7 @@ fn using_column_resolve(
             name: c.clone(),
             expr,
             outer,
+            merged,
         },
         consumed: [(lq, c.clone()), (rq, c.clone())],
     })
@@ -193,17 +210,18 @@ pub(super) fn join_using_resolve(
     ranges: JoinScopeRanges,
     (first, rest): (&EcoString, &[EcoString]),
     join_type: JoinType,
+    join: NodeId,
 ) -> ResolveResult<JoinUsingResolved> {
     let outer = join_type != JoinType::Inner;
     let mut merged: Vec<MergedJoinColumn> = Vec::with_capacity(1 + rest.len());
     let mut consumed: Vec<(EcoString, EcoString)> = Vec::with_capacity(2 * (1 + rest.len()));
 
-    let first_column = using_column_resolve(scope, ranges, first, outer)?;
+    let first_column = using_column_resolve(scope, ranges, first, outer, join)?;
     let mut predicate = first_column.conjunct;
     merged.push(first_column.merged);
     consumed.extend(first_column.consumed);
     for c in rest {
-        let column = using_column_resolve(scope, ranges, c, outer)?;
+        let column = using_column_resolve(scope, ranges, c, outer, join)?;
         predicate = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
             op: BinaryOp::And,
             lexpr: Box::new(predicate),
@@ -233,6 +251,7 @@ pub(super) fn join_using_or_cross(
     ranges: JoinScopeRanges,
     cols: Vec<EcoString>,
     join_type: JoinType,
+    join: NodeId,
 ) -> ResolveResult<ResolvedJoinQual> {
     let Some(columns) = cols.split_first() else {
         return if join_type == JoinType::Inner {
@@ -241,7 +260,7 @@ pub(super) fn join_using_or_cross(
             Err(Report::from(ResolveError::UnsupportedJoinQualifier))
         };
     };
-    let (qual, merged, consumed) = join_using_resolve(scope, ranges, columns, join_type)?;
+    let (qual, merged, consumed) = join_using_resolve(scope, ranges, columns, join_type, join)?;
     scope.merged_columns.extend(merged);
     scope.merged_consumed.extend(consumed);
     Ok(qual)

@@ -1,6 +1,7 @@
 //! Resolve expressions: WHERE predicates, scalar expressions, and the window
 //! specifications / frames that hang off a window function call.
 
+use super::bindings::ColumnTarget;
 use super::clauses::order_by_resolve;
 use super::column::column_resolve;
 use super::scope::ResolutionScope;
@@ -85,10 +86,13 @@ pub(super) fn scalar_expr_resolve(
             // not an ambiguous per-side lookup. Qualified `t.c` still
             // reaches the base table.
             if col.table.is_none()
-                && let Some(expr) = scope
+                && let Some((expr, merged)) = scope
                     .merged_column_find(col.column.as_str())
-                    .map(|m| m.expr.clone())
+                    .map(|m| (m.expr.clone(), m.merged))
             {
+                scope
+                    .bindings
+                    .column_bind(col.id, ColumnTarget::Merged(merged), false);
                 return Ok(expr);
             }
             let resolved = column_resolve(col, scope)?;

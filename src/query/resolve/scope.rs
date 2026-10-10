@@ -7,11 +7,12 @@ use iddqd::BiHashMap;
 use postgres_types::Type;
 use rootcause::Report;
 
+use super::bindings::{BindingsBuilder, DerivedColumn, SlotId, TableSlot};
 use super::entry::query_expr_resolve_scoped;
 use super::join_using::MergedJoinColumn;
 use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
-use crate::query::ast::QueryExpr;
+use crate::query::ast::{NodeId, QueryExpr};
 use crate::query::resolved::{
     ResolveError, ResolveResult, ResolvedColumnNode, ResolvedQueryBody, ResolvedQueryExpr,
     ResolvedScalarExpr, ResolvedSelectColumns,
@@ -25,12 +26,14 @@ pub(super) enum ScopeEntry<'a> {
     Base {
         metadata: &'a TableMetadata,
         alias: Option<&'a str>,
+        slot: SlotId,
     },
     /// Derived table (FROM subquery) with owned synthetic metadata whose
     /// columns are determined by the subquery's output.
     Derived {
         metadata: TableMetadata,
         alias: EcoString,
+        slot: SlotId,
     },
 }
 
@@ -49,6 +52,13 @@ impl ScopeEntry<'_> {
         }
     }
 
+    /// The binding slot this entry was given when it entered scope.
+    pub(super) fn slot(&self) -> SlotId {
+        match self {
+            ScopeEntry::Base { slot, .. } | ScopeEntry::Derived { slot, .. } => *slot,
+        }
+    }
+
     /// The scope key a column of this entry is qualified by: the alias,
     /// else the table name. Matches the `merged_consumed` key convention.
     pub(super) fn qualifier_key(&self) -> &str {
@@ -63,6 +73,14 @@ impl ScopeEntry<'_> {
     }
 }
 
+/// A table of an enclosing scope, snapshotted for correlated lookups.
+#[derive(Debug, Clone)]
+pub(super) struct OuterTable {
+    pub(super) metadata: TableMetadata,
+    pub(super) alias: Option<String>,
+    pub(super) slot: SlotId,
+}
+
 /// Resolution scope tracking available tables and their aliases.
 #[derive(Debug)]
 pub(super) struct ResolutionScope<'a> {
@@ -75,31 +93,26 @@ pub(super) struct ResolutionScope<'a> {
     /// Owned snapshot of ancestor scope tables for correlated reference fallback.
     /// Populated when this scope was created for a WHERE/SELECT subquery body.
     /// Empty at top level.
-    pub(super) outer_tables: Vec<(TableMetadata, Option<String>)>,
+    pub(super) outer_tables: Vec<OuterTable>,
     /// Correlated column references found during resolution of this scope's expressions.
-    /// Populated by `column_resolve` when it falls back to `outer_tables`.
+    /// Populated by `column_lookup` when it falls back to `outer_tables`.
     pub(super) outer_refs: Vec<ResolvedColumnNode>,
     /// `USING`/`NATURAL` merged join columns, in `*`-expansion order.
     pub(super) merged_columns: Vec<MergedJoinColumn>,
     /// `(scope-key, column)` pairs consumed into a merge — skipped by
     /// unqualified `*` (the single merged column replaces them).
     pub(super) merged_consumed: Vec<(EcoString, EcoString)>,
+    /// Bindings of the whole tree, shared with every nested scope.
+    pub(super) bindings: &'a mut BindingsBuilder,
 }
 
 impl<'a> ResolutionScope<'a> {
     pub(super) fn new(
         catalog_tables: &'a BiHashMap<TableMetadata>,
         search_path: &[&'a str],
+        bindings: &'a mut BindingsBuilder,
     ) -> Self {
-        Self {
-            entries: Vec::new(),
-            catalog_tables,
-            search_path: search_path.to_vec(),
-            outer_tables: Vec::new(),
-            outer_refs: Vec::new(),
-            merged_columns: Vec::new(),
-            merged_consumed: Vec::new(),
-        }
+        Self::new_with_outer(catalog_tables, search_path, Vec::new(), bindings)
     }
 
     /// Create a scope for resolving an inner subquery body.
@@ -109,7 +122,8 @@ impl<'a> ResolutionScope<'a> {
     pub(super) fn new_with_outer(
         catalog_tables: &'a BiHashMap<TableMetadata>,
         search_path: &[&'a str],
-        outer_tables: Vec<(TableMetadata, Option<String>)>,
+        outer_tables: Vec<OuterTable>,
+        bindings: &'a mut BindingsBuilder,
     ) -> Self {
         Self {
             entries: Vec::new(),
@@ -119,16 +133,21 @@ impl<'a> ResolutionScope<'a> {
             outer_refs: Vec::new(),
             merged_columns: Vec::new(),
             merged_consumed: Vec::new(),
+            bindings,
         }
     }
 
     /// Snapshot the current scope's tables (including derived and outer) for passing
     /// to a child subquery scope. The child needs access to all ancestor tables.
-    pub(super) fn scope_tables_snapshot(&self) -> Vec<(TableMetadata, Option<String>)> {
-        let mut snapshot: Vec<(TableMetadata, Option<String>)> = self
+    pub(super) fn scope_tables_snapshot(&self) -> Vec<OuterTable> {
+        let mut snapshot: Vec<OuterTable> = self
             .entries
             .iter()
-            .map(|entry| (entry.metadata().clone(), entry.alias().map(str::to_owned)))
+            .map(|entry| OuterTable {
+                metadata: entry.metadata().clone(),
+                alias: entry.alias().map(str::to_owned),
+                slot: entry.slot(),
+            })
             .collect();
         // Include ancestors so nested correlation can reach any level
         snapshot.extend(self.outer_tables.iter().cloned());
@@ -136,25 +155,25 @@ impl<'a> ResolutionScope<'a> {
     }
 
     /// Find a table in the outer scope by name or alias.
-    pub(super) fn outer_table_scope_find(
-        &self,
-        name: &str,
-    ) -> Option<(&TableMetadata, Option<&str>)> {
-        self.outer_tables
-            .iter()
-            .find(|(meta, alias)| {
-                if let Some(alias_name) = alias {
-                    alias_name == name
-                } else {
-                    meta.name == name
-                }
-            })
-            .map(|(meta, alias)| (meta, alias.as_deref()))
+    pub(super) fn outer_table_scope_find(&self, name: &str) -> Option<&OuterTable> {
+        self.outer_tables.iter().find(|outer| match &outer.alias {
+            Some(alias) => alias == name,
+            None => outer.metadata.name == name,
+        })
     }
 
     /// Add a table to the scope
-    pub(super) fn table_scope_add(&mut self, metadata: &'a TableMetadata, alias: Option<&'a str>) {
-        self.entries.push(ScopeEntry::Base { metadata, alias });
+    pub(super) fn table_scope_add(
+        &mut self,
+        metadata: &'a TableMetadata,
+        alias: Option<&'a str>,
+        slot: SlotId,
+    ) {
+        self.entries.push(ScopeEntry::Base {
+            metadata,
+            alias,
+            slot,
+        });
     }
 
     /// A `USING`/`NATURAL` merged join column by (output) name.
@@ -162,26 +181,24 @@ impl<'a> ResolutionScope<'a> {
         self.merged_columns.iter().find(|m| m.name == name)
     }
 
-    /// Find table metadata by name or alias.
+    /// Find the scope entry a qualifier names.
     /// Checks both catalog tables and derived tables (FROM subqueries).
-    pub(super) fn table_scope_find(&self, name: &str) -> Option<(&TableMetadata, Option<&str>)> {
+    pub(super) fn table_scope_find(&self, name: &str) -> Option<&ScopeEntry<'a>> {
         // Alias-EXCLUSIVE matching, unlike `qualifier_matches`: an aliased
         // table is not referencable by its underlying name (and the VALUES
         // transform relies on this — it aliases a replacement subquery with
         // the original table name, which must not resolve to the base
         // entry's still-aliased occurrence).
-        self.entries
-            .iter()
-            .find(|entry| match entry {
-                ScopeEntry::Base { metadata, alias } => {
-                    alias.map_or(metadata.name == name, |a| a == name)
-                }
-                ScopeEntry::Derived { alias, .. } => alias == name,
-            })
-            .map(|entry| (entry.metadata(), entry.alias()))
+        self.entries.iter().find(|entry| match entry {
+            ScopeEntry::Base {
+                metadata, alias, ..
+            } => alias.map_or(metadata.name == name, |a| a == name),
+            ScopeEntry::Derived { alias, .. } => alias == name,
+        })
     }
 
-    /// Add a derived table (FROM subquery) to the scope.
+    /// Add a derived table (FROM subquery or CTE reference at `node`) to the
+    /// scope.
     ///
     /// Extracts output columns from the resolved inner query and creates synthetic
     /// `TableMetadata` so the outer query can resolve column references against
@@ -190,12 +207,28 @@ impl<'a> ResolutionScope<'a> {
         &mut self,
         resolved_query: &ResolvedQueryExpr,
         alias: &str,
+        node: NodeId,
     ) -> ResolveResult<()> {
         let columns = derived_table_columns_extract(resolved_query).ok_or_else(|| {
             Report::from(ResolveError::TooManyColumns {
                 alias: alias.to_owned(),
             })
         })?;
+
+        let slot = self.bindings.slot_push(
+            node,
+            TableSlot::Derived {
+                node,
+                alias: alias.into(),
+                columns: columns
+                    .iter()
+                    .map(|column| DerivedColumn {
+                        name: column.name.clone(),
+                        data_type: column.data_type.clone(),
+                    })
+                    .collect(),
+            },
+        );
 
         let synthetic_metadata = TableMetadata {
             replica_identity_full: false,
@@ -210,6 +243,7 @@ impl<'a> ResolutionScope<'a> {
         self.entries.push(ScopeEntry::Derived {
             metadata: synthetic_metadata,
             alias: alias.into(),
+            slot,
         });
         Ok(())
     }
@@ -218,12 +252,12 @@ impl<'a> ResolutionScope<'a> {
     pub(super) fn column_matches_find<'b>(
         &'b self,
         column: &str,
-    ) -> Vec<(&'b TableMetadata, Option<&'b str>, &'b ColumnMetadata)> {
+    ) -> Vec<(&'b ScopeEntry<'a>, &'b ColumnMetadata)> {
         let mut matches = Vec::new();
 
         for entry in &self.entries {
             if let Some(col_meta) = entry.metadata().columns.get(column) {
-                matches.push((entry.metadata(), entry.alias(), col_meta));
+                matches.push((entry, col_meta));
             }
         }
 
@@ -236,14 +270,16 @@ impl<'a> ResolutionScope<'a> {
     /// are allowed. Outer column references are resolved against `outer_tables` and
     /// collected; they appear as normal `Column` nodes in the resolved inner query.
     pub(super) fn subquery_resolve(
-        &self,
+        &mut self,
         query: &QueryExpr,
     ) -> ResolveResult<(ResolvedQueryExpr, Vec<ResolvedColumnNode>)> {
+        let outer_tables = self.scope_tables_snapshot();
         query_expr_resolve_scoped(
             query,
             self.catalog_tables,
             &self.search_path,
-            self.scope_tables_snapshot(),
+            outer_tables,
+            &mut *self.bindings,
         )
     }
 }
@@ -255,7 +291,7 @@ impl<'a> ResolutionScope<'a> {
 /// - `SELECT col1, col2`: returns column metadata for each, using aliases as names
 /// - `SELECT <none>`: returns empty (e.g., EXISTS subqueries)
 /// - `None`: a column position beyond `i16::MAX`
-fn derived_table_columns_extract(
+pub(super) fn derived_table_columns_extract(
     resolved_query: &ResolvedQueryExpr,
 ) -> Option<Vec<ColumnMetadata>> {
     let select = match &resolved_query.body {

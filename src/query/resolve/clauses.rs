@@ -3,12 +3,13 @@
 
 use ecow::EcoString;
 
+use super::bindings::{BindingsBuilder, ColumnBinding, ColumnTarget, StarItem};
 use super::column::column_resolve;
 use super::expr::{scalar_expr_resolve, where_expr_resolve};
 use super::scope::{ResolutionScope, ScopeEntry};
 use crate::query::ast::{
     ColumnNode, LimitClause, LiteralValue, OrderByClause, ScalarExpr, SelectColumn, SelectColumns,
-    WhereExpr,
+    StarNode, WhereExpr,
 };
 use crate::query::resolved::{
     ResolveResult, ResolvedArithmeticExpr, ResolvedColumnNode, ResolvedFunctionCall,
@@ -31,7 +32,7 @@ pub(super) fn select_columns_resolve(
     for col in cols {
         match col {
             SelectColumn::Star(star) => {
-                star_expand(star.qualifier.as_deref(), scope, &mut resolved_cols);
+                star_expand(star, scope, &mut resolved_cols);
             }
             SelectColumn::Expr { expr, alias } => {
                 let resolved_expr = scalar_expr_resolve(expr, scope)?;
@@ -52,21 +53,30 @@ pub(super) fn select_columns_resolve(
 /// columns. Qualified `t.*` is that table's columns verbatim (join column
 /// included).
 fn star_expand(
-    qualifier: Option<&str>,
-    scope: &ResolutionScope<'_>,
+    star: &StarNode,
+    scope: &mut ResolutionScope<'_>,
     out: &mut Vec<ResolvedSelectColumn>,
 ) {
+    let qualifier = star.qualifier.as_deref();
+    let mut items = Vec::new();
     if qualifier.is_none() {
         out.extend(scope.merged_columns.iter().map(|m| ResolvedSelectColumn {
             expr: m.expr.clone(),
             alias: Some(m.name.clone()),
         }));
+        items.extend(
+            scope
+                .merged_columns
+                .iter()
+                .map(|m| StarItem::Merged(m.merged)),
+        );
     }
     for entry in &scope.entries {
         if qualifier.is_none_or(|q| entry.qualifier_matches(q)) {
-            entry_columns_expand(entry, qualifier.is_none(), scope, out);
+            entry_columns_expand(entry, qualifier.is_none(), scope, out, &mut items);
         }
     }
+    scope.bindings.star_bind(star.id, items);
 }
 
 /// One table's columns for `*`. Under unqualified `*`, columns merged into a
@@ -76,6 +86,7 @@ fn entry_columns_expand(
     unqualified: bool,
     scope: &ResolutionScope<'_>,
     out: &mut Vec<ResolvedSelectColumn>,
+    items: &mut Vec<StarItem>,
 ) {
     let table_metadata = entry.metadata();
     let key = entry.qualifier_key();
@@ -93,6 +104,11 @@ fn entry_columns_expand(
             }),
             alias: None,
         });
+        items.push(StarItem::Column(ColumnBinding {
+            slot: entry.slot(),
+            position: column_metadata.position,
+            data_type: column_metadata.data_type.clone(),
+        }));
     }
 }
 
@@ -117,7 +133,12 @@ pub(super) fn order_by_resolve(
     let mut resolved = Vec::with_capacity(order_by.len());
     for clause in order_by {
         let resolved_expr = match order_by_alias_match(&clause.expr, select_columns) {
-            Some(ident) => ident,
+            Some((col, ident)) => {
+                scope
+                    .bindings
+                    .column_bind(col.id, ColumnTarget::Output, false);
+                ident
+            }
             None => scalar_expr_resolve(&clause.expr, scope)?,
         };
         resolved.push(ResolvedOrderByClause {
@@ -130,11 +151,11 @@ pub(super) fn order_by_resolve(
 }
 
 /// If `clause_expr` is an unqualified column reference whose name matches a
-/// SELECT-list output name, return it as an `Identifier`.
-pub(super) fn order_by_alias_match(
-    clause_expr: &ScalarExpr,
+/// SELECT-list output name, return it with its `Identifier` form.
+pub(super) fn order_by_alias_match<'e>(
+    clause_expr: &'e ScalarExpr,
     select_columns: Option<&ResolvedSelectColumns>,
-) -> Option<ResolvedScalarExpr> {
+) -> Option<(&'e ColumnNode, ResolvedScalarExpr)> {
     let ScalarExpr::Column(col) = clause_expr else {
         return None;
     };
@@ -142,16 +163,19 @@ pub(super) fn order_by_alias_match(
         return None;
     }
     select_columns?.position_by_output_name(col.column.as_str())?;
-    Some(ResolvedScalarExpr::Identifier(col.column.clone()))
+    Some((col, ResolvedScalarExpr::Identifier(col.column.clone())))
 }
 
 /// Convert ORDER BY clauses to use unqualified Identifier expressions.
 /// Used for set operations where ORDER BY references output columns by name.
-pub(super) fn order_by_as_identifiers(order_by: &[OrderByClause]) -> Vec<ResolvedOrderByClause> {
+pub(super) fn order_by_as_identifiers(
+    order_by: &[OrderByClause],
+    bindings: &mut BindingsBuilder,
+) -> Vec<ResolvedOrderByClause> {
     order_by
         .iter()
         .map(|clause| {
-            let expr = scalar_expr_to_identifier(&clause.expr);
+            let expr = scalar_expr_to_identifier(&clause.expr, bindings);
             ResolvedOrderByClause {
                 expr,
                 direction: clause.direction.clone(),
@@ -163,13 +187,23 @@ pub(super) fn order_by_as_identifiers(order_by: &[OrderByClause]) -> Vec<Resolve
 
 /// Convert a ScalarExpr to a ResolvedScalarExpr using unqualified Identifier for columns.
 /// Used for ORDER BY in set operations where columns reference output names, not table columns.
-pub(super) fn scalar_expr_to_identifier(expr: &ScalarExpr) -> ResolvedScalarExpr {
+pub(super) fn scalar_expr_to_identifier(
+    expr: &ScalarExpr,
+    bindings: &mut BindingsBuilder,
+) -> ResolvedScalarExpr {
     match expr {
-        ScalarExpr::Column(col) => ResolvedScalarExpr::Identifier(col.column.as_str().into()),
+        ScalarExpr::Column(col) => {
+            bindings.column_bind(col.id, ColumnTarget::Output, false);
+            ResolvedScalarExpr::Identifier(col.column.as_str().into())
+        }
         ScalarExpr::Literal(lit) => ResolvedScalarExpr::Literal(lit.clone()),
         ScalarExpr::Function(func) => ResolvedScalarExpr::Function(ResolvedFunctionCall {
             name: func.name.as_str().into(),
-            args: func.args.iter().map(scalar_expr_to_identifier).collect(),
+            args: func
+                .args
+                .iter()
+                .map(|arg| scalar_expr_to_identifier(arg, bindings))
+                .collect(),
             agg_star: func.agg_star,
             agg_distinct: func.agg_distinct,
             // Set-op ORDER BY references output column names only;
@@ -183,15 +217,18 @@ pub(super) fn scalar_expr_to_identifier(expr: &ScalarExpr) -> ResolvedScalarExpr
             ResolvedScalarExpr::Literal(LiteralValue::Null)
         }
         ScalarExpr::Arithmetic(arith) => ResolvedScalarExpr::Arithmetic(ResolvedArithmeticExpr {
-            left: Box::new(scalar_expr_to_identifier(&arith.left)),
+            left: Box::new(scalar_expr_to_identifier(&arith.left, bindings)),
             op: arith.op,
-            right: Box::new(scalar_expr_to_identifier(&arith.right)),
+            right: Box::new(scalar_expr_to_identifier(&arith.right, bindings)),
         }),
-        ScalarExpr::Array(elems) => {
-            ResolvedScalarExpr::Array(elems.iter().map(scalar_expr_to_identifier).collect())
-        }
+        ScalarExpr::Array(elems) => ResolvedScalarExpr::Array(
+            elems
+                .iter()
+                .map(|elem| scalar_expr_to_identifier(elem, bindings))
+                .collect(),
+        ),
         ScalarExpr::TypeCast { expr, target } => ResolvedScalarExpr::TypeCast {
-            expr: Box::new(scalar_expr_to_identifier(expr)),
+            expr: Box::new(scalar_expr_to_identifier(expr, bindings)),
             target: target.clone(),
         },
     }

@@ -21,6 +21,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::mem::size_of;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
@@ -39,7 +40,10 @@ use pgcache_lib::query::ast::{
 };
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::predicate::CompiledPredicate;
-use pgcache_lib::query::resolve::query_expr_resolve;
+use pgcache_lib::query::resolve::{
+    Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot, query_expr_resolve,
+    query_expr_resolve_bound,
+};
 use pgcache_lib::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode,
     ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
@@ -343,6 +347,13 @@ fn resolve(query: &QueryExpr, catalog: &BiHashMap<TableMetadata>) -> ResolvedQue
     query_expr_resolve(query, catalog, &["public"]).expect("the fixture SQL resolves")
 }
 
+fn resolve_bound(
+    query: &QueryExpr,
+    catalog: &BiHashMap<TableMetadata>,
+) -> (ResolvedQueryExpr, Bindings) {
+    query_expr_resolve_bound(query, catalog, &["public"]).expect("the fixture SQL resolves")
+}
+
 fn canonicalise(resolved: &ResolvedQueryExpr, settings: &LiteralSettings) -> ResolvedQueryExpr {
     let mut canonical = resolved.clone();
     let _ = resolved_literals_canonicalise(&mut canonical, settings);
@@ -422,6 +433,18 @@ fn sizes_report() {
         "TableMetadata",
         size_of::<TableMetadata>()
     );
+    println!("\n== bindings (bytes)");
+    let bindings: [(&str, usize); 6] = [
+        ("ResolvedQuery", size_of::<ResolvedQuery>()),
+        ("Bindings", size_of::<Bindings>()),
+        ("TableSlot", size_of::<TableSlot>()),
+        ("ColumnBinding", size_of::<ColumnBinding>()),
+        ("ColumnTarget", size_of::<ColumnTarget>()),
+        ("StarItem", size_of::<StarItem>()),
+    ];
+    for (name, size) in bindings {
+        println!("{name:<28}{size:>8}");
+    }
 }
 
 fn allocations_report(shapes: &[Shape], catalog: &BiHashMap<TableMetadata>) {
@@ -429,13 +452,15 @@ fn allocations_report(shapes: &[Shape], catalog: &BiHashMap<TableMetadata>) {
     let search_path: [EcoString; 1] = ["public".into()];
     println!("\n== allocations per stage (count / bytes)");
     println!(
-        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
         "query",
         "convert",
         "plain_clone",
         "session_key",
         "resolve",
         "resolved_clone",
+        "bindings",
+        "bound_clone",
         "canonicalise",
         "fingerprint",
         "deparse",
@@ -449,6 +474,10 @@ fn allocations_report(shapes: &[Shape], catalog: &BiHashMap<TableMetadata>) {
         let (resolved, resolve_n, resolve_b) = allocations_count(|| resolve(&query, catalog));
         let (_, resolved_clone_n, resolved_clone_b) =
             allocations_count(|| black_box(resolved.clone()));
+        let ((_, bindings), bound_n, bound_b) =
+            allocations_count(|| resolve_bound(&query, catalog));
+        let bound = ResolvedQuery::new(Arc::new(query.clone()), bindings);
+        let (_, bound_clone_n, bound_clone_b) = allocations_count(|| black_box(bound.clone()));
         let (canonical, canon_n, canon_b) =
             allocations_count(|| canonicalise(&resolved, &settings));
         let (_, fingerprint_n, fingerprint_b) =
@@ -458,13 +487,18 @@ fn allocations_report(shapes: &[Shape], catalog: &BiHashMap<TableMetadata>) {
             allocations_count(|| predicate_compile(&canonical, shape.predicate_table));
         let cell = |n: usize, b: usize| format!("{n}/{b}");
         println!(
-            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
             shape.name,
             cell(convert_n, convert_b),
             cell(plain_clone_n, plain_clone_b),
             cell(key_n, key_b),
             cell(resolve_n, resolve_b),
             cell(resolved_clone_n, resolved_clone_b),
+            cell(
+                bound_n.saturating_sub(resolve_n),
+                bound_b.saturating_sub(resolve_b)
+            ),
+            cell(bound_clone_n, bound_clone_b),
             cell(
                 canon_n - resolved_clone_n,
                 canon_b.saturating_sub(resolved_clone_b)
@@ -475,7 +509,8 @@ fn allocations_report(shapes: &[Shape], catalog: &BiHashMap<TableMetadata>) {
         );
     }
     println!(
-        "(canonicalise excludes the clone it starts from; convert excludes pg_query's C-side parse)\n"
+        "(canonicalise excludes the clone it starts from; bindings is the bound resolve's cost \
+         over resolve; convert excludes pg_query's C-side parse)\n"
     );
 }
 
@@ -496,6 +531,8 @@ fn bench_pipeline(c: &mut Criterion) {
     for shape in &shapes {
         let query = parse(&shape.sql);
         let resolved = resolve(&query, &catalog);
+        let (_, bindings) = resolve_bound(&query, &catalog);
+        let bound = ResolvedQuery::new(Arc::new(query.clone()), bindings);
         let canonical = canonicalise(&resolved, &settings);
         let predicate = predicate_compile(&canonical, shape.predicate_table);
         let row = row_build(shape.row);
@@ -527,6 +564,20 @@ fn bench_pipeline(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("resolved_clone", shape.name),
             &resolved,
+            |b, r| {
+                b.iter(|| black_box(r.clone()));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("resolve_bound", shape.name),
+            &query,
+            |b, q| {
+                b.iter(|| black_box(resolve_bound(q, &catalog)));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("bound_clone", shape.name),
+            &bound,
             |b, r| {
                 b.iter(|| black_box(r.clone()));
             },

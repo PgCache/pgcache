@@ -1,13 +1,20 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
+use std::sync::Arc;
+
+use ecow::EcoString;
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
+use super::scope::derived_table_columns_extract;
 use super::*;
 use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{
-    AstNode, BinaryOp, Deparse, JoinType, LiteralValue, OrderDirection, SelectNode, SubLinkType,
+    ArithmeticExpr, AstNode, BinaryExpr, BinaryOp, CaseExpr, ColumnNode, CteRefNode, Deparse,
+    FunctionCall, JoinNode, JoinQual, JoinType, LiteralValue, MultiExpr, NodeId, OrderByClause,
+    OrderDirection, QueryExpr, SelectNode, SetOpNode, StarNode, SubLinkType, TableNode,
+    TableSubqueryNode, UnaryExpr, ValuesClause,
 };
 use crate::query::ast::{query_expr_parse, query_expr_session_key};
 use crate::query::literal_settings::LiteralSettings;
@@ -16,7 +23,7 @@ use crate::query::resolved::{
     ResolveError, ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode,
     ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
     ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode,
-    ResolvedTableSource, ResolvedWhereExpr,
+    ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedWhereExpr,
 };
 
 /// Parse SQL and return a SelectNode (for tests using new types)
@@ -1895,4 +1902,406 @@ fn test_resolved_query_fingerprint_identity() {
         )
         .get()
     );
+}
+
+// ============================================================================
+// Bindings beside the resolved tree (ADR-057, PGC-481 slice 1)
+// ============================================================================
+
+/// `(schema, table, column, position, type)` of one column reference.
+type ColumnRef = (EcoString, EcoString, EcoString, ColumnPosition, Type);
+
+/// A derived table's alias and its `(name, type)` output columns.
+type DerivedShape = (EcoString, Vec<(EcoString, Type)>);
+
+fn binding_catalog() -> BiHashMap<TableMetadata> {
+    catalog_with_columns(&[
+        ("users", &["id", "name", "dept_id"]),
+        ("departments", &["id", "name", "manager_id"]),
+        ("orders", &["id", "user_id", "amount"]),
+        ("items", &["id", "order_id", "sku"]),
+    ])
+}
+
+const BINDING_CORPUS: &[&str] = &[
+    "SELECT u.id, name FROM users u WHERE dept_id = 'x'",
+    "SELECT u.id, d.name AS dname FROM users u JOIN departments d ON u.dept_id = d.id \
+     WHERE d.name = 'a' ORDER BY dname, u.id DESC",
+    "SELECT * FROM users JOIN departments USING (id)",
+    "SELECT * FROM users LEFT JOIN departments USING (id) WHERE id = '1'",
+    "SELECT id, count(*) FROM users JOIN departments USING (id) GROUP BY id",
+    "SELECT * FROM users NATURAL JOIN departments",
+    "SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM users u WHERE u.dept_id = d.id)",
+    "SELECT v.total, v.uid FROM (SELECT user_id AS uid, amount AS total FROM orders) v \
+     WHERE v.total = '5'",
+    "WITH big AS (SELECT id, amount FROM orders WHERE amount = '9') \
+     SELECT big.id FROM big JOIN items ON items.order_id = big.id",
+    "SELECT id FROM users UNION SELECT id FROM departments ORDER BY id",
+    "SELECT name, count(*) FROM users GROUP BY name HAVING count(*) > 1 ORDER BY count(*) DESC",
+    "SELECT u.name, (SELECT max(o.amount) FROM orders o WHERE o.user_id = u.id) FROM users u \
+     WHERE u.id IN (SELECT user_id FROM orders WHERE amount = '1')",
+    "SELECT u.* FROM users u JOIN departments d ON d.id = u.dept_id \
+     WHERE d.id = ANY(ARRAY['1', '2']) AND u.name LIKE 'a%'",
+    "SELECT CASE WHEN amount = '0' THEN sku ELSE order_id END FROM orders o \
+     JOIN items i ON i.order_id = o.id ORDER BY i.sku NULLS FIRST",
+];
+
+fn resolved_column_refs(resolved: &ResolvedQueryExpr) -> Vec<ColumnRef> {
+    resolved
+        .nodes::<ResolvedColumnNode>()
+        .map(|c| {
+            (
+                c.schema.clone(),
+                c.table.clone(),
+                c.column.clone(),
+                c.column_metadata.position,
+                c.column_metadata.data_type.clone(),
+            )
+        })
+        .collect()
+}
+
+fn binding_ref(
+    bindings: &Bindings,
+    catalog: &BiHashMap<TableMetadata>,
+    binding: &ColumnBinding,
+) -> ColumnRef {
+    match bindings.slot(binding.slot).expect("slot of a bound column") {
+        TableSlot::Base { schema, name, .. } => {
+            let table = catalog
+                .get2(&(schema.as_str(), name.as_str()))
+                .expect("bound table in catalog");
+            let column = table
+                .columns
+                .iter()
+                .find(|c| c.position == binding.position)
+                .expect("column at bound position");
+            (
+                schema.clone(),
+                name.clone(),
+                column.name.clone(),
+                binding.position,
+                binding.data_type.clone(),
+            )
+        }
+        TableSlot::Derived { alias, columns, .. } => {
+            let (_, column) = columns
+                .iter()
+                .enumerate()
+                .find(|(i, _)| ColumnPosition::from_index(*i) == Some(binding.position))
+                .expect("derived column at bound position");
+            (
+                EcoString::new(),
+                alias.clone(),
+                column.name.clone(),
+                binding.position,
+                column.data_type.clone(),
+            )
+        }
+    }
+}
+
+/// The references a merged column stands for, in the resolved tree's order:
+/// the left column, plus the right one under `COALESCE` for an outer join.
+fn merged_refs(
+    bindings: &Bindings,
+    catalog: &BiHashMap<TableMetadata>,
+    merged: &MergedColumnBinding,
+    out: &mut Vec<ColumnRef>,
+) {
+    out.push(binding_ref(bindings, catalog, &merged.left));
+    if merged.outer {
+        out.push(binding_ref(bindings, catalog, &merged.right));
+    }
+}
+
+/// The largest stored id under `root`; every node after the subtree has a
+/// larger id, so `(this, 1)` sorts between the subtree and what follows.
+fn subtree_last_position<R: AstNode>(root: &R, root_id: NodeId) -> usize {
+    fn bump<R: AstNode, T: AstNode>(root: &R, id_of: fn(&T) -> NodeId, last: &mut usize) {
+        for node in root.nodes::<T>() {
+            *last = (*last).max(id_of(node).index());
+        }
+    }
+    let mut last = root_id.index();
+    bump::<R, QueryExpr>(root, |n| n.id, &mut last);
+    bump::<R, SelectNode>(root, |n| n.id, &mut last);
+    bump::<R, SetOpNode>(root, |n| n.id, &mut last);
+    bump::<R, ValuesClause>(root, |n| n.id, &mut last);
+    bump::<R, OrderByClause>(root, |n| n.id, &mut last);
+    bump::<R, StarNode>(root, |n| n.id, &mut last);
+    bump::<R, TableNode>(root, |n| n.id, &mut last);
+    bump::<R, TableSubqueryNode>(root, |n| n.id, &mut last);
+    bump::<R, CteRefNode>(root, |n| n.id, &mut last);
+    bump::<R, JoinNode>(root, |n| n.id, &mut last);
+    bump::<R, ColumnNode>(root, |n| n.id, &mut last);
+    bump::<R, UnaryExpr>(root, |n| n.id, &mut last);
+    bump::<R, BinaryExpr>(root, |n| n.id, &mut last);
+    bump::<R, MultiExpr>(root, |n| n.id, &mut last);
+    bump::<R, ArithmeticExpr>(root, |n| n.id, &mut last);
+    bump::<R, CaseExpr>(root, |n| n.id, &mut last);
+    bump::<R, FunctionCall>(root, |n| n.id, &mut last);
+    last
+}
+
+/// Id ranges of CTE definition bodies. The resolver resolves the copy each
+/// `CteRefNode` embeds, never the definition, so the resolved tree has no
+/// counterpart for nodes in these ranges.
+fn cte_definition_ranges(query: &QueryExpr) -> Vec<(usize, usize)> {
+    query
+        .nodes::<QueryExpr>()
+        .flat_map(|q| {
+            q.ctes.iter().map(|cte| {
+                (
+                    cte.query.id.index(),
+                    subtree_last_position(&cte.query, cte.query.id),
+                )
+            })
+        })
+        .collect()
+}
+
+fn outside_cte_definitions(ranges: &[(usize, usize)], id: NodeId) -> bool {
+    !ranges
+        .iter()
+        .any(|(start, last)| (*start..=*last).contains(&id.index()))
+}
+
+/// Every column reference the plain tree stands for through its bindings, in
+/// the resolved tree's pre-order: column nodes and star expansions at their
+/// own position, a `USING`/`NATURAL` join's equi-predicate after its inputs.
+fn bound_column_refs(
+    query: &QueryExpr,
+    bindings: &Bindings,
+    catalog: &BiHashMap<TableMetadata>,
+) -> Vec<ColumnRef> {
+    let ranges = cte_definition_ranges(query);
+    let mut keyed: Vec<((usize, u8, usize), ColumnRef)> = Vec::new();
+    let mut keyed_push = |key: (usize, u8), refs: Vec<ColumnRef>| {
+        for (k, column_ref) in refs.into_iter().enumerate() {
+            keyed.push(((key.0, key.1, k), column_ref));
+        }
+    };
+    for column in query
+        .nodes::<ColumnNode>()
+        .filter(|c| outside_cte_definitions(&ranges, c.id))
+    {
+        let target = bindings
+            .column(column)
+            .unwrap_or_else(|| panic!("unbound column node {column:?}"));
+        let mut refs = Vec::new();
+        match target {
+            ColumnTarget::Column(binding) => refs.push(binding_ref(bindings, catalog, binding)),
+            ColumnTarget::Merged(id) => {
+                let merged = bindings.merged(*id).expect("merged column");
+                merged_refs(bindings, catalog, merged, &mut refs);
+            }
+            ColumnTarget::Output => {}
+        }
+        keyed_push((column.id.index(), 0), refs);
+    }
+    for star in query
+        .nodes::<StarNode>()
+        .filter(|s| outside_cte_definitions(&ranges, s.id))
+    {
+        let mut refs = Vec::new();
+        for item in bindings.star(star).expect("star bound") {
+            match item {
+                StarItem::Column(binding) => refs.push(binding_ref(bindings, catalog, binding)),
+                StarItem::Merged(id) => {
+                    let merged = bindings.merged(*id).expect("merged column");
+                    merged_refs(bindings, catalog, merged, &mut refs);
+                }
+            }
+        }
+        keyed_push((star.id.index(), 0), refs);
+    }
+    for join in query
+        .nodes::<JoinNode>()
+        .filter(|j| outside_cte_definitions(&ranges, j.id))
+    {
+        if !matches!(join.qual, JoinQual::Using(_) | JoinQual::Natural) {
+            continue;
+        }
+        let mut refs = Vec::new();
+        for merged in bindings
+            .merged_columns()
+            .iter()
+            .filter(|m| m.join.index() == join.id.index())
+        {
+            refs.push(binding_ref(bindings, catalog, &merged.left));
+            refs.push(binding_ref(bindings, catalog, &merged.right));
+        }
+        keyed_push((subtree_last_position(join, join.id), 1), refs);
+    }
+    keyed.sort_by_key(|(key, _)| *key);
+    keyed
+        .into_iter()
+        .map(|(_, column_ref)| column_ref)
+        .collect()
+}
+
+fn resolve_bound(
+    sql: &str,
+    catalog: &BiHashMap<TableMetadata>,
+) -> (QueryExpr, ResolvedQueryExpr, Bindings) {
+    let query = query_expr_parse(sql).expect("parse");
+    let (resolved, bindings) =
+        query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
+    (query, resolved, bindings)
+}
+
+#[test]
+fn test_bindings_match_resolved_tree_column_references() {
+    let catalog = binding_catalog();
+    for sql in BINDING_CORPUS {
+        let (query, resolved, bindings) = resolve_bound(sql, &catalog);
+        assert_eq!(
+            bound_column_refs(&query, &bindings, &catalog),
+            resolved_column_refs(&resolved),
+            "column references for {sql}"
+        );
+    }
+}
+
+#[test]
+fn test_bindings_match_resolved_tree_table_sources() {
+    let catalog = binding_catalog();
+    for sql in BINDING_CORPUS {
+        let (query, resolved, bindings) = resolve_bound(sql, &catalog);
+        let ranges = cte_definition_ranges(&query);
+
+        let expected_tables: Vec<_> = resolved
+            .nodes::<ResolvedTableNode>()
+            .map(|t| {
+                (
+                    t.schema.clone(),
+                    t.name.clone(),
+                    t.alias.clone(),
+                    t.relation_oid,
+                )
+            })
+            .collect();
+        let bound_tables: Vec<_> = query
+            .nodes::<TableNode>()
+            .filter(|t| outside_cte_definitions(&ranges, t.id))
+            .map(|table| {
+                let slot = bindings.source(table.id).expect("table source bound");
+                match bindings.slot(slot).expect("slot") {
+                    TableSlot::Base {
+                        relation_oid,
+                        schema,
+                        name,
+                        alias,
+                    } => (schema.clone(), name.clone(), alias.clone(), *relation_oid),
+                    TableSlot::Derived { .. } => panic!("table node bound to a derived slot"),
+                }
+            })
+            .collect();
+        assert_eq!(bound_tables, expected_tables, "table slots for {sql}");
+
+        let expected_derived: Vec<DerivedShape> = resolved
+            .nodes::<ResolvedTableSubqueryNode>()
+            .map(|sub| {
+                let columns = derived_table_columns_extract(&sub.query).expect("derived columns");
+                (
+                    sub.alias.name.clone(),
+                    columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.data_type.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
+        let derived_shape = |id: NodeId| {
+            let slot = bindings.source(id).expect("derived source bound");
+            match bindings.slot(slot).expect("slot") {
+                TableSlot::Derived { alias, columns, .. } => (
+                    alias.clone(),
+                    columns
+                        .iter()
+                        .map(|c| (c.name.clone(), c.data_type.clone()))
+                        .collect::<Vec<_>>(),
+                ),
+                TableSlot::Base { .. } => panic!("derived node bound to a base slot"),
+            }
+        };
+        let mut bound_derived: Vec<(usize, DerivedShape)> = query
+            .nodes::<TableSubqueryNode>()
+            .filter(|s| outside_cte_definitions(&ranges, s.id))
+            .map(|sub| (sub.id.index(), derived_shape(sub.id)))
+            .chain(
+                query
+                    .nodes::<CteRefNode>()
+                    .filter(|c| outside_cte_definitions(&ranges, c.id))
+                    .map(|cte| (cte.id.index(), derived_shape(cte.id))),
+            )
+            .collect();
+        bound_derived.sort_by_key(|(position, _)| *position);
+        let bound_derived: Vec<_> = bound_derived.into_iter().map(|(_, shape)| shape).collect();
+        assert_eq!(bound_derived, expected_derived, "derived slots for {sql}");
+    }
+}
+
+#[test]
+fn test_bindings_correlated_columns_match_outer_refs() {
+    let catalog = binding_catalog();
+    for sql in BINDING_CORPUS {
+        let (query, resolved, bindings) = resolve_bound(sql, &catalog);
+
+        let mut expected: Vec<(EcoString, EcoString)> = Vec::new();
+        for expr in resolved.nodes::<ResolvedWhereExpr>() {
+            if let ResolvedWhereExpr::Subquery { outer_refs, .. } = expr {
+                expected.extend(
+                    outer_refs
+                        .iter()
+                        .map(|c| (c.table.clone(), c.column.clone())),
+                );
+            }
+        }
+        for expr in resolved.nodes::<ResolvedScalarExpr>() {
+            if let ResolvedScalarExpr::Subquery(_, outer_refs) = expr {
+                expected.extend(
+                    outer_refs
+                        .iter()
+                        .map(|c| (c.table.clone(), c.column.clone())),
+                );
+            }
+        }
+        expected.sort();
+
+        let mut bound: Vec<(EcoString, EcoString)> = bindings
+            .correlated()
+            .iter()
+            .map(|id| {
+                let Some(ColumnTarget::Column(binding)) = bindings.column_by_id(*id) else {
+                    panic!("correlated node without a column binding");
+                };
+                let (_, table, column, _, _) = binding_ref(&bindings, &catalog, binding);
+                (table, column)
+            })
+            .collect();
+        bound.sort();
+        assert_eq!(bound, expected, "correlated references for {sql}");
+        let correlated_nodes = query
+            .nodes::<ColumnNode>()
+            .filter(|c| bindings.is_correlated(c))
+            .count();
+        assert_eq!(correlated_nodes, bound.len(), "is_correlated for {sql}");
+    }
+}
+
+#[test]
+fn test_resolved_query_clone_shares_the_tree() {
+    let catalog = binding_catalog();
+    let (query, _, bindings) = resolve_bound(BINDING_CORPUS[1], &catalog);
+    let resolved = ResolvedQuery::new(Arc::new(query), bindings);
+    let copy = resolved.clone();
+    assert!(std::ptr::eq(resolved.tree(), copy.tree()));
+    let first_column = copy.tree().nodes::<ColumnNode>().next().expect("a column");
+    assert!(matches!(
+        copy.column(first_column),
+        Some(ColumnTarget::Column(_))
+    ));
+    assert_eq!(copy.bindings().slots().len(), 2);
 }

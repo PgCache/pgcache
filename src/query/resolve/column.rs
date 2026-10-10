@@ -4,66 +4,100 @@
 use ecow::EcoString;
 use rootcause::Report;
 
+use super::bindings::{ColumnBinding, ColumnTarget, MergedId, SlotId};
 use super::scope::ResolutionScope;
+use crate::catalog::{ColumnMetadata, TableMetadata};
 use crate::query::ast::ColumnNode;
 use crate::query::resolved::{ResolveError, ResolveResult, ResolvedColumnNode, ResolvedScalarExpr};
 
-/// Resolve a column reference to a resolved column node.
+/// What a column name denotes in scope: the resolved node the resolved tree
+/// carries, and the binding the plain tree records for it.
+pub(super) enum ColumnLookup {
+    Column {
+        resolved: ResolvedColumnNode,
+        binding: ColumnBinding,
+        correlated: bool,
+    },
+    /// An inner join's `USING`/`NATURAL` merged column, which is exactly its
+    /// left column.
+    Merged {
+        resolved: ResolvedColumnNode,
+        merged: MergedId,
+    },
+}
+
+/// Resolve a column reference to a resolved column node, recording its
+/// binding against the node.
+pub(super) fn column_resolve(
+    column_node: &ColumnNode,
+    scope: &mut ResolutionScope<'_>,
+) -> ResolveResult<ResolvedColumnNode> {
+    match column_lookup(column_node, scope)? {
+        ColumnLookup::Column {
+            resolved,
+            binding,
+            correlated,
+        } => {
+            scope
+                .bindings
+                .column_bind(column_node.id, ColumnTarget::Column(binding), correlated);
+            Ok(resolved)
+        }
+        ColumnLookup::Merged { resolved, merged } => {
+            scope
+                .bindings
+                .column_bind(column_node.id, ColumnTarget::Merged(merged), false);
+            Ok(resolved)
+        }
+    }
+}
+
+/// Look a column reference up without recording a binding, for callers
+/// resolving a synthesized reference rather than a node of the tree.
 ///
 /// When the column cannot be found in the inner scope and the scope has
 /// `outer_tables` set (i.e. we are inside a subquery body), the outer tables
 /// are tried as a fallback. On a successful outer-table match the resolved node
 /// is recorded in `scope.outer_refs` — marking this as a correlated reference —
 /// and returned as a normal column node so the inner query remains fully resolved.
-pub(super) fn column_resolve(
+pub(super) fn column_lookup(
     column_node: &ColumnNode,
     scope: &mut ResolutionScope<'_>,
-) -> ResolveResult<ResolvedColumnNode> {
+) -> ResolveResult<ColumnLookup> {
     let column_name = &column_node.column;
 
     // Table-qualified reference (e.g. `o.id`)
     if let Some(table_qualifier) = &column_node.table {
         // Try inner scope first
-        if let Some((table_metadata, alias)) = scope.table_scope_find(table_qualifier) {
+        if let Some(entry) = scope.table_scope_find(table_qualifier) {
+            let table_metadata = entry.metadata();
             let column_metadata = table_metadata
                 .columns
                 .get(column_name.as_str())
-                .ok_or_else(|| {
-                    Report::from(ResolveError::ColumnNotFound {
-                        table: table_metadata.name.to_string(),
-                        column: column_name.to_string(),
-                    })
-                })?;
-            return Ok(ResolvedColumnNode {
-                schema: table_metadata.schema.clone(),
-                table: table_metadata.name.clone(),
-                table_alias: alias.map(EcoString::from),
-                column: column_metadata.name.clone(),
-                column_metadata: column_metadata.clone(),
+                .ok_or_else(|| column_not_found(&table_metadata.name, column_name))?;
+            return Ok(ColumnLookup::Column {
+                resolved: column_resolved(table_metadata, entry.alias(), column_metadata),
+                binding: column_binding(entry.slot(), column_metadata),
+                correlated: false,
             });
         }
 
         // Fall back to outer scope (correlated reference)
-        if let Some((outer_meta, outer_alias)) = scope.outer_table_scope_find(table_qualifier) {
-            let column_metadata =
-                outer_meta
-                    .columns
-                    .get(column_name.as_str())
-                    .ok_or_else(|| {
-                        Report::from(ResolveError::ColumnNotFound {
-                            table: outer_meta.name.to_string(),
-                            column: column_name.to_string(),
-                        })
-                    })?;
-            let resolved = ResolvedColumnNode {
-                schema: outer_meta.schema.clone(),
-                table: outer_meta.name.clone(),
-                table_alias: outer_alias.map(EcoString::from),
-                column: column_metadata.name.clone(),
-                column_metadata: column_metadata.clone(),
-            };
+        if let Some(outer) = scope.outer_table_scope_find(table_qualifier) {
+            let column_metadata = outer
+                .metadata
+                .columns
+                .get(column_name.as_str())
+                .ok_or_else(|| column_not_found(&outer.metadata.name, column_name))?;
+            let resolved =
+                column_resolved(&outer.metadata, outer.alias.as_deref(), column_metadata);
+            let binding = column_binding(outer.slot, column_metadata);
             scope.outer_refs.push(resolved.clone());
-            return Ok(resolved);
+            return Ok(ColumnLookup::Column {
+                resolved,
+                binding,
+                correlated: true,
+            });
         }
 
         return Err(Report::from(ResolveError::TableNotFound {
@@ -82,7 +116,10 @@ pub(super) fn column_resolve(
         if !merged.outer
             && let ResolvedScalarExpr::Column(c) = &merged.expr
         {
-            return Ok(c.clone());
+            return Ok(ColumnLookup::Merged {
+                resolved: c.clone(),
+                merged: merged.merged,
+            });
         }
         return Err(Report::from(ResolveError::UnsupportedJoinQualifier));
     }
@@ -92,36 +129,62 @@ pub(super) fn column_resolve(
     match matches.as_slice() {
         [] => {
             // Fall back to outer scope (correlated reference)
-            let outer_match = scope.outer_tables.iter().find_map(|(meta, alias)| {
-                meta.columns
+            let outer_match = scope.outer_tables.iter().find_map(|outer| {
+                outer
+                    .metadata
+                    .columns
                     .get(column_name.as_str())
-                    .map(|col_meta| (meta, alias.as_deref(), col_meta))
+                    .map(|col_meta| (outer, col_meta))
             });
-            if let Some((outer_meta, outer_alias, col_meta)) = outer_match {
-                let resolved = ResolvedColumnNode {
-                    schema: outer_meta.schema.clone(),
-                    table: outer_meta.name.clone(),
-                    table_alias: outer_alias.map(EcoString::from),
-                    column: col_meta.name.clone(),
-                    column_metadata: col_meta.clone(),
-                };
+            if let Some((outer, column_metadata)) = outer_match {
+                let resolved =
+                    column_resolved(&outer.metadata, outer.alias.as_deref(), column_metadata);
+                let binding = column_binding(outer.slot, column_metadata);
                 scope.outer_refs.push(resolved.clone());
-                return Ok(resolved);
+                return Ok(ColumnLookup::Column {
+                    resolved,
+                    binding,
+                    correlated: true,
+                });
             }
-            Err(Report::from(ResolveError::ColumnNotFound {
-                table: "<unknown>".to_owned(),
-                column: column_name.to_string(),
-            }))
+            Err(column_not_found("<unknown>", column_name))
         }
-        [(table_metadata, alias, column_metadata)] => Ok(ResolvedColumnNode {
-            schema: table_metadata.schema.clone(),
-            table: table_metadata.name.clone(),
-            table_alias: alias.map(EcoString::from),
-            column: column_metadata.name.clone(),
-            column_metadata: (*column_metadata).clone(),
+        [(entry, column_metadata)] => Ok(ColumnLookup::Column {
+            resolved: column_resolved(entry.metadata(), entry.alias(), column_metadata),
+            binding: column_binding(entry.slot(), column_metadata),
+            correlated: false,
         }),
         _ => Err(Report::from(ResolveError::AmbiguousColumn {
             column: column_name.to_string(),
         })),
     }
+}
+
+fn column_resolved(
+    table_metadata: &TableMetadata,
+    alias: Option<&str>,
+    column_metadata: &ColumnMetadata,
+) -> ResolvedColumnNode {
+    ResolvedColumnNode {
+        schema: table_metadata.schema.clone(),
+        table: table_metadata.name.clone(),
+        table_alias: alias.map(EcoString::from),
+        column: column_metadata.name.clone(),
+        column_metadata: column_metadata.clone(),
+    }
+}
+
+fn column_binding(slot: SlotId, column_metadata: &ColumnMetadata) -> ColumnBinding {
+    ColumnBinding {
+        slot,
+        position: column_metadata.position,
+        data_type: column_metadata.data_type.clone(),
+    }
+}
+
+fn column_not_found(table: &str, column: &str) -> Report<ResolveError> {
+    Report::from(ResolveError::ColumnNotFound {
+        table: table.to_owned(),
+        column: column.to_owned(),
+    })
 }

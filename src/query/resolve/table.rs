@@ -5,7 +5,8 @@ use ecow::EcoString;
 use iddqd::BiHashMap;
 use rootcause::Report;
 
-use super::entry::query_expr_resolve;
+use super::bindings::TableSlot;
+use super::entry::query_expr_resolve_scoped;
 use super::expr::where_expr_resolve;
 use super::join_using::{JoinScopeRanges, join_natural_common_columns, join_using_or_cross};
 use super::scope::ResolutionScope;
@@ -61,9 +62,19 @@ pub(super) fn table_source_resolve<'a>(
                     })
                 })?;
 
+            let slot = scope.bindings.slot_push(
+                table_node.id,
+                TableSlot::Base {
+                    relation_oid: table_metadata.relation_oid,
+                    schema: table_metadata.schema.clone(),
+                    name: table_metadata.name.clone(),
+                    alias: table_node.alias.as_ref().map(|a| a.name.clone()),
+                },
+            );
             scope.table_scope_add(
                 table_metadata,
                 table_node.alias.as_ref().map(|a| a.name.as_str()),
+                slot,
             );
 
             let resolved = ResolvedTableNode {
@@ -99,10 +110,12 @@ pub(super) fn table_source_resolve<'a>(
             let qual = match &join_node.qual {
                 JoinQual::On(cond) => ResolvedJoinQual::On(where_expr_resolve(cond, scope)?),
                 JoinQual::Cross => ResolvedJoinQual::Cross,
-                JoinQual::Using(cols) => join_using_or_cross(scope, ranges, cols.clone(), jt)?,
+                JoinQual::Using(cols) => {
+                    join_using_or_cross(scope, ranges, cols.clone(), jt, join_node.id)?
+                }
                 JoinQual::Natural => {
                     let cols = join_natural_common_columns(scope, ranges);
-                    join_using_or_cross(scope, ranges, cols, jt)?
+                    join_using_or_cross(scope, ranges, cols, jt, join_node.id)?
                 }
             };
 
@@ -123,10 +136,16 @@ pub(super) fn table_source_resolve<'a>(
 
             // FROM-clause subqueries use a fresh scope — LATERAL (which would require access
             // to the outer scope) is not supported and produces TableNotFound if attempted.
-            let resolved_query = query_expr_resolve(&subquery.query, tables, search_path)?;
+            let (resolved_query, _) = query_expr_resolve_scoped(
+                &subquery.query,
+                tables,
+                search_path,
+                Vec::new(),
+                &mut *scope.bindings,
+            )?;
 
             // Add derived table to outer scope so outer columns can reference it
-            scope.derived_table_scope_add(&resolved_query, &alias.name)?;
+            scope.derived_table_scope_add(&resolved_query, &alias.name, subquery.id)?;
 
             Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
                 query: Box::new(resolved_query),
@@ -142,14 +161,20 @@ pub(super) fn table_source_resolve<'a>(
                 .unwrap_or(&cte_ref.cte_name);
 
             // CTE bodies use a fresh scope (non-correlated)
-            let resolved_query = query_expr_resolve(&cte_ref.query, tables, search_path)?;
+            let (resolved_query, _) = query_expr_resolve_scoped(
+                &cte_ref.query,
+                tables,
+                search_path,
+                Vec::new(),
+                &mut *scope.bindings,
+            )?;
 
             let alias = TableAlias {
                 name: EcoString::from(alias_name),
                 columns: cte_ref.column_aliases.clone(),
             };
 
-            scope.derived_table_scope_add(&resolved_query, alias_name)?;
+            scope.derived_table_scope_add(&resolved_query, alias_name, cte_ref.id)?;
 
             Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
                 query: Box::new(resolved_query),
