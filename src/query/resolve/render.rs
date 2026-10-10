@@ -294,6 +294,12 @@ struct Output {
 }
 
 impl ResolvedQuery {
+    /// The context that renders this query's nodes as the cache serves
+    /// them, for a caller composing its own SQL around parts of the tree.
+    pub fn deparse_context(&self) -> impl DeparseContext + '_ {
+        Bound::text(self.bindings())
+    }
+
     /// The SQL the cache serves for this query, appended to `buf`.
     pub fn sql_into(&self, buf: &mut String) {
         self.tree()

@@ -30,15 +30,15 @@ use crate::cache::{
     messages::{MvBuildOutcome, QueryCommand},
     mv::mv_table_name,
     mv_shape::ShapeGate,
-    types::SharedResolved,
+    types::SharedResolvedQuery,
 };
 use crate::pg;
 use crate::query::Fingerprint;
-use crate::query::ast::{Deparse, LiteralValue, SetOpType};
-use crate::query::resolved::{
-    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
-    ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode,
+use crate::query::ast::{
+    Clause, DeparseContext, DeparseWith, QueryBody, QueryExpr, clause_deparse_with,
+    separated_deparse_with,
 };
+use crate::query::resolve::ResolvedQuery;
 use crate::result::error_chain_format;
 use crate::settings::PgSettings;
 
@@ -59,7 +59,7 @@ pub(super) struct MvBuildContext {
     /// LIMIT cap for the MV body (joins only).
     pub max_limit: Option<u64>,
     pub generation: Generation,
-    pub resolved: SharedResolved,
+    pub bound: SharedResolvedQuery,
     /// Captured by a previous build; `None` means describe before building.
     pub output_columns: Option<Arc<[EcoString]>>,
     /// Real source-row count from the origin population, when the query
@@ -322,10 +322,10 @@ async fn mv_build_execute(client: &Client, ctx: &MvBuildContext) -> MvBuildOutco
 }
 
 /// PostgreSQL's output column names for the query, captured by describing
-/// `<resolved> LIMIT 0` (same query as source-row serve).
+/// `<serve sql> LIMIT 0` (same query as source-row serve).
 async fn mv_output_columns(client: &Client, ctx: &MvBuildContext) -> CacheResult<Arc<[EcoString]>> {
     let mut sql = String::with_capacity(256);
-    ctx.resolved.deparse(&mut sql);
+    ctx.bound.sql_into(&mut sql);
     sql.push_str(" LIMIT 0");
 
     let stream = client
@@ -419,47 +419,43 @@ async fn mv_result_count(client: &Client, ctx: &MvBuildContext) -> CacheResult<u
 ///   result. This keeps the gate measuring reduction for UNION/INTERSECT/EXCEPT
 ///   the way it does for an aggregate's pre-grouping rows (PGC-329).
 /// - **VALUES**: the literal rows themselves.
-fn mv_gate_input_query(resolved: &ResolvedQueryExpr) -> ResolvedQueryExpr {
-    let body = match &resolved.body {
-        ResolvedQueryBody::Select(select) => {
+fn mv_gate_input_sql_into<C: DeparseContext>(query: &QueryExpr, cx: &mut C, buf: &mut String) {
+    match &query.body {
+        QueryBody::Select(select) => {
             // Constant projection, no DISTINCT: counts scanned rows (including
             // join fan-out) — the work the query does.
-            ResolvedQueryBody::Select(Box::new(ResolvedSelectNode {
-                distinct: false,
-                columns: ResolvedSelectColumns::Columns(vec![ResolvedSelectColumn {
-                    expr: ResolvedScalarExpr::Literal(LiteralValue::Integer(1)),
-                    alias: None,
-                }]),
-                from: select.from.clone(),
-                where_clause: select.where_clause.clone(),
-                group_by: vec![],
-                having: None,
-            }))
+            buf.push_str("SELECT 1");
+            if !select.from.is_empty() {
+                cx.clause_enter(Clause::From);
+                buf.push_str(" FROM");
+                separated_deparse_with(cx, buf, &select.from, ",");
+                cx.clause_leave(Clause::From);
+            }
+            clause_deparse_with(
+                cx,
+                buf,
+                Clause::Where,
+                " WHERE ",
+                select.where_clause.as_ref(),
+            );
         }
         // `UNION ALL` (not the original op) so no branch rows are deduped or
         // dropped — the denominator is the total input the set-op scans.
-        ResolvedQueryBody::SetOp(setop) => ResolvedQueryBody::SetOp(ResolvedSetOpNode {
-            op: SetOpType::Union,
-            all: true,
-            left: Box::new(mv_gate_input_query(&setop.left)),
-            right: Box::new(mv_gate_input_query(&setop.right)),
-        }),
-        ResolvedQueryBody::Values(_) => resolved.body.clone(),
-    };
-    ResolvedQueryExpr {
-        body,
-        order_by: vec![],
-        limit: None,
+        QueryBody::SetOp(set_op) => {
+            mv_gate_input_sql_into(&set_op.left, cx, buf);
+            buf.push_str(" UNION ALL ");
+            mv_gate_input_sql_into(&set_op.right, cx, buf);
+        }
+        QueryBody::Values(values) => values.deparse_with(cx, buf),
     }
 }
 
 /// SQL for the Measure-gate denominator: `count(*)` over the source query's
-/// input rows (see `mv_gate_input_query`).
-fn mv_source_count_sql(resolved: &ResolvedQueryExpr) -> String {
-    let inner = mv_gate_input_query(resolved);
+/// input rows (see `mv_gate_input_sql_into`).
+fn mv_source_count_sql(bound: &ResolvedQuery) -> String {
     let mut sql = String::with_capacity(256);
     sql.push_str("SELECT count(*) FROM (");
-    inner.deparse(&mut sql);
+    mv_gate_input_sql_into(bound.tree(), &mut bound.deparse_context(), &mut sql);
     sql.push_str(") _mv_gate_denom");
     sql
 }
@@ -467,7 +463,7 @@ fn mv_source_count_sql(resolved: &ResolvedQueryExpr) -> String {
 /// Denominator of the Measure size gate: the source query's predicate-scoped
 /// input row count (see `mv_source_count_sql`).
 async fn mv_source_rows_count(client: &Client, ctx: &MvBuildContext) -> CacheResult<u64> {
-    let sql = mv_source_count_sql(&ctx.resolved);
+    let sql = mv_source_count_sql(&ctx.bound);
     let row = client
         .query_one(&sql, &[])
         .await
@@ -476,12 +472,12 @@ async fn mv_source_rows_count(client: &Client, ctx: &MvBuildContext) -> CacheRes
     Ok(u64::try_from(row.get::<_, i64>(0)).unwrap_or(0))
 }
 
-/// Append the resolved query body (including any ORDER BY) and the MV's
+/// Append the query's serve SQL (including any ORDER BY) and the MV's
 /// `max_limit` cap. Used anywhere we need the SELECT body that would populate
 /// the MV table.
 fn mv_body_append(buf: &mut String, ctx: &MvBuildContext) {
     use std::fmt::Write;
-    ctx.resolved.deparse(buf);
+    ctx.bound.sql_into(buf);
     if let Some(limit) = ctx.max_limit {
         let _ = write!(buf, " LIMIT {limit}");
     }
@@ -540,7 +536,7 @@ fn mv_columns_list(arity: usize) -> String {
     s
 }
 
-/// `SELECT count(*) FROM (<deparsed resolved> LIMIT max_limit) _mv_gate_src`.
+/// `SELECT count(*) FROM (<serve sql> LIMIT max_limit) _mv_gate_src`.
 /// The LIMIT keeps the gate consistent with what would be stored — an MV capped
 /// at `max_limit` can never have more than `max_limit` rows, so counting past
 /// the cap would make the ratio over-report.
@@ -582,10 +578,10 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::{
-        AstNode, ColumnNode, FunctionCall, QueryExpr, SelectNode, SetOpNode, SetOpType, TableNode,
+        AstNode, ColumnNode, FunctionCall, SelectNode, SetOpNode, SetOpType, TableNode,
         query_expr_parse,
     };
-    use crate::query::resolved::query_expr_resolve;
+    use crate::query::resolve::query_expr_resolve_bound;
 
     fn test_table(name: &str, oid: Oid, cols: &[&str]) -> TableMetadata {
         let columns = ColumnStore::new(cols.iter().enumerate().map(|(i, c)| {
@@ -623,10 +619,10 @@ mod tests {
     /// Build the Measure-gate denominator for `sql` and re-parse it into an AST
     /// so tests assert on nodes, not raw text.
     fn denom_ast(sql: &str) -> QueryExpr {
-        let ast = query_expr_parse(sql).expect("parse source");
-        let resolved =
-            query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve source");
-        let denom = mv_source_count_sql(&resolved);
+        let ast = Arc::new(query_expr_parse(sql).expect("parse source"));
+        let (_, bindings) =
+            query_expr_resolve_bound(&ast, &test_tables(), &["public"]).expect("resolve source");
+        let denom = mv_source_count_sql(&ResolvedQuery::new(ast, bindings));
         query_expr_parse(&denom).expect("denominator SQL re-parses")
     }
 

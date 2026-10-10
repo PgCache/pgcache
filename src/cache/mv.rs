@@ -18,12 +18,10 @@ use postgres_protocol::escape::escape_identifier;
 use super::mv_shape::ShapeGate;
 use crate::query::Fingerprint;
 use crate::query::ast::{
-    Deparse, LimitClause, OrderDirection, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
-    SelectColumns, TableSource,
+    Deparse, LimitClause, OrderByClause, OrderDirection, QueryBody, QueryExpr, ScalarExpr,
+    SelectColumn, SelectColumns, SelectNode, TableSource,
 };
-use crate::query::resolved::{
-    ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumns,
-};
+use crate::query::resolve::ResolvedQuery;
 
 /// Runtime state of the materialized result for a cached query.
 ///
@@ -258,7 +256,7 @@ pub fn mv_table_name(fingerprint: Fingerprint) -> String {
 }
 
 impl MvServePlan {
-    /// Render the MV read for `resolved`. Shape:
+    /// Render the MV read for `bound`. Shape:
     /// `SELECT c0 AS …, … FROM <mv_table> [ORDER BY …]`.
     ///
     /// MV physical columns are positional (`c0..`) so duplicate output names
@@ -269,14 +267,14 @@ impl MvServePlan {
     ///
     /// - **SELECT body** — **positional** (`ORDER BY 2 DESC`), looking each
     ///   expression up in the SELECT list.
-    /// - **SET OP body** — the expressions deparsed directly: the resolver
-    ///   produces `Identifier`s whose names match the MV table's columns.
+    /// - **SET OP body** — the expressions rendered directly: a set-op
+    ///   ORDER BY names output columns, which the MV table's columns match.
     ///
     /// `None` when the ORDER BY cannot be expressed against the MV table: a
     /// `VALUES` body, or an expression missing from the SELECT list.
     pub fn new(
         fingerprint: Fingerprint,
-        resolved: &ResolvedQueryExpr,
+        bound: &ResolvedQuery,
         output_columns: Arc<[EcoString]>,
     ) -> Option<Self> {
         let table = mv_table_name(fingerprint);
@@ -295,13 +293,14 @@ impl MvServePlan {
         sql.push_str(" FROM ");
         sql.push_str(&table);
 
-        if !resolved.order_by.is_empty() {
-            match &resolved.body {
-                ResolvedQueryBody::Select(select) => {
-                    mv_order_by_positional(&mut sql, &resolved.order_by, &select.columns)?;
+        let tree = bound.tree();
+        if !tree.order_by.is_empty() {
+            match &tree.body {
+                QueryBody::Select(select) => {
+                    mv_order_by_positional(&mut sql, bound, select, &tree.order_by)?;
                 }
-                ResolvedQueryBody::SetOp(_) => mv_order_by_direct(&mut sql, &resolved.order_by),
-                ResolvedQueryBody::Values(_) => return None,
+                QueryBody::SetOp(_) => mv_order_by_direct(&mut sql, bound, &tree.order_by),
+                QueryBody::Values(_) => return None,
             }
         }
         Some(Self {
@@ -326,13 +325,14 @@ pub fn mv_serve_sql_into(sql: &mut String, plan: &MvServePlan, limit: Option<&Li
 /// position up in the SELECT list; `None` when one is missing.
 fn mv_order_by_positional(
     sql: &mut String,
-    order_by: &[ResolvedOrderByClause],
-    columns: &ResolvedSelectColumns,
+    bound: &ResolvedQuery,
+    select: &SelectNode,
+    order_by: &[OrderByClause],
 ) -> Option<()> {
     sql.push_str(" ORDER BY");
     let mut sep = "";
     for o in order_by {
-        let pos = columns.columns_position_of(&o.expr)?;
+        let pos = bound.order_by_position(select, o)?;
         let _ = write!(sql, "{sep} {pos}");
         match o.direction {
             OrderDirection::Asc => sql.push_str(" ASC"),
@@ -343,16 +343,16 @@ fn mv_order_by_positional(
     Some(())
 }
 
-/// Emit `ORDER BY <expr> ASC|DESC, ...` by deparsing each expression directly.
-/// Used for set-op MVs where the resolver produces `Identifier` expressions
-/// whose bare names match the MV table's column names.
-fn mv_order_by_direct(sql: &mut String, order_by: &[ResolvedOrderByClause]) {
+/// Emit `ORDER BY <expr> ASC|DESC, ...` by rendering each item directly.
+/// Used for set-op MVs, whose ORDER BY names output columns: bare names
+/// that match the MV table's column names.
+fn mv_order_by_direct(sql: &mut String, bound: &ResolvedQuery, order_by: &[OrderByClause]) {
     sql.push_str(" ORDER BY");
     let mut sep = "";
     for o in order_by {
         sql.push_str(sep);
         sql.push(' ');
-        o.deparse(sql);
+        bound.order_by_into(o, sql);
         sep = ",";
     }
 }
@@ -421,7 +421,7 @@ mod tests {
     use super::*;
     use crate::cache::mv_shape::tests::test_tables;
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolved::query_expr_resolve;
+    use crate::query::resolve::query_expr_resolve_bound;
 
     #[test]
     fn test_mv_table_name_format() {
@@ -580,9 +580,11 @@ mod tests {
 
     // ==================== mv_serve_sql positional ORDER BY ====================
 
-    fn resolve_for_serve(sql: &str) -> ResolvedQueryExpr {
-        let ast = query_expr_parse(sql).expect("convert to AST");
-        query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve query")
+    fn resolve_for_serve(sql: &str) -> ResolvedQuery {
+        let ast = Arc::new(query_expr_parse(sql).expect("convert to AST"));
+        let (_, bindings) =
+            query_expr_resolve_bound(&ast, &test_tables(), &["public"]).expect("resolve query");
+        ResolvedQuery::new(ast, bindings)
     }
 
     /// Empty `output_columns` exercises the positional `SELECT *` fallback,
