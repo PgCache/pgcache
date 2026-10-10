@@ -65,11 +65,8 @@ pub(crate) struct PopulationWork {
 /// Intermediate result from resolving a query before subsumption check or population.
 pub(super) struct QueryResolution {
     pub(super) resolved: SharedResolved,
-    /// Deparsed SQL body of `resolved`. Computed once here and reused on the
-    /// serving hot path; see `CachedQuery.deparsed_sql`.
-    pub(super) deparsed_sql: EcoString,
-    /// Parameterized serve shape of `resolved` (PGC-294), computed alongside
-    /// `deparsed_sql`; see `CachedQuery.serve_shape`.
+    /// Parameterized serve shape of `bound` (PGC-294); see
+    /// `CachedQuery.serve_shape`.
     pub(super) serve_shape: QueryShape,
     pub(super) relation_oids: Vec<Oid>,
     /// The canonical plain tree with its bindings (ADR-057).
@@ -125,7 +122,6 @@ pub(super) fn cached_query_insert(
         relation_oids: resolution.relation_oids,
         bound: resolution.bound,
         resolved: resolution.resolved,
-        deparsed_sql: resolution.deparsed_sql,
         serve_shape: resolution.serve_shape,
         max_limit: resolution.max_limit,
         cached_bytes: 0,

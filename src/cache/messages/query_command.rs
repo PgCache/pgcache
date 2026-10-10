@@ -9,13 +9,14 @@ use tokio_util::bytes::BytesMut;
 
 use crate::cache::Generation;
 use crate::cache::serve_decision::AdmitAction;
-use crate::cache::types::SharedResolved;
+use crate::cache::types::SharedResolvedQuery;
 use crate::cache::{
     CacheError, CacheMessage, Report, query::CacheableQuery, query_cache::QueryType,
 };
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::pg::protocol::session::ResultFormats;
+use crate::query::QueryShape;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, SessionKey};
 
@@ -25,8 +26,8 @@ pub enum SubsumptionResult {
     /// Data already in cache. State is Ready, serve immediately.
     Subsumed {
         generation: Generation,
-        resolved: SharedResolved,
-        deparsed_sql: EcoString,
+        bound: SharedResolvedQuery,
+        serve_shape: QueryShape,
     },
     /// Not subsumed. Forward to origin; population dispatched if admit_action was Admit.
     NotSubsumed,

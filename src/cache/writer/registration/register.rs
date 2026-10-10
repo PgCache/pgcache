@@ -127,10 +127,10 @@ impl WriterRegistration {
             .register_subsume
             .record(subsume_start.elapsed().as_secs_f64());
         Ok(match subsume_result {
-            Some((generation, resolved, deparsed_sql)) => SubsumptionResult::Subsumed {
+            Some((generation, bound, serve_shape)) => SubsumptionResult::Subsumed {
                 generation,
-                resolved,
-                deparsed_sql,
+                bound,
+                serve_shape,
             },
             None => SubsumptionResult::NotSubsumed,
         })

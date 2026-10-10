@@ -1,6 +1,5 @@
 use std::time::Instant;
 
-use ecow::EcoString;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::error::SendError;
 use tokio_util::bytes::{Buf, Bytes};
@@ -13,7 +12,7 @@ use crate::cache::fast_path::{self, MvDecision};
 use crate::cache::memo::{MemoHit, MemoKey, MemoShape};
 use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe, slices_concat};
 use crate::cache::mv::MvServe;
-use crate::cache::types::SharedResolved;
+use crate::cache::types::SharedResolvedQuery;
 use crate::cache::write_queue::WriteQueue;
 use crate::cache::{CacheError, CacheResult};
 use crate::pg::protocol::backend::TransactionStatus;
@@ -46,14 +45,12 @@ impl CacheDispatch {
     /// (format, shape), otherwise a pool serve (from the MV table or source
     /// rows, decided here). Scoped to the single-request Ready path: coalesced
     /// groups and subsumption serves dispatch to the serve pool directly.
-    #[allow(clippy::too_many_arguments)]
     pub(super) async fn hit_serve(
         &self,
         fingerprint: Fingerprint,
         msg: QueryRequest,
-        resolved: SharedResolved,
-        deparsed_sql: EcoString,
-        serve_shape: Option<QueryShape>,
+        bound: SharedResolvedQuery,
+        serve_shape: QueryShape,
         generation: Generation,
         rows_needed: Option<u64>,
     ) -> CacheResult<()> {
@@ -63,38 +60,19 @@ impl CacheDispatch {
         // No memo: hand off to the serve pool. `mv_dispatch_decide` picks the MV fast
         // path vs source-row fallthrough and, on a dirty MV, schedules a rebuild.
         let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
-        self.pool_serve(
-            fingerprint,
-            msg,
-            resolved,
-            deparsed_sql,
-            serve_shape,
-            generation,
-            mv,
-        )
+        self.pool_serve(fingerprint, msg, bound, serve_shape, generation, mv)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn pool_serve(
         &self,
         fingerprint: Fingerprint,
         msg: QueryRequest,
-        resolved: SharedResolved,
-        deparsed_sql: EcoString,
-        serve_shape: Option<QueryShape>,
+        bound: SharedResolvedQuery,
+        serve_shape: QueryShape,
         generation: Generation,
         mv: MvServe,
     ) -> CacheResult<()> {
-        self.pool_serve_coalesced(
-            fingerprint,
-            msg,
-            resolved,
-            deparsed_sql,
-            serve_shape,
-            generation,
-            mv,
-            vec![],
-        )
+        self.pool_serve_coalesced(fingerprint, msg, bound, serve_shape, generation, mv, vec![])
     }
 
     /// Build a plan to serve this Ready hit from an in-process memo, or `None`
@@ -244,9 +222,8 @@ impl CacheDispatch {
         &self,
         fingerprint: Fingerprint,
         msg: QueryRequest,
-        resolved: SharedResolved,
-        deparsed_sql: EcoString,
-        serve_shape: Option<QueryShape>,
+        bound: SharedResolvedQuery,
+        serve_shape: QueryShape,
         generation: Generation,
         mv: MvServe,
         coalesced: Vec<CoalescedClient>,
@@ -277,8 +254,7 @@ impl CacheDispatch {
             fingerprint,
             query_type: msg.query_type,
             data: msg.data,
-            resolved,
-            deparsed_sql,
+            bound,
             serve_shape,
             generation,
             mv,

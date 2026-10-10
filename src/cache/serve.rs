@@ -16,13 +16,10 @@ use super::{
     write_queue::WriteQueue,
 };
 use crate::cache::messages::PipelineDescribe;
-use crate::oid::Oid;
 use crate::pg::cache_connection::{CacheConnection, NamedQuerySend, PrepareOutcome};
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG};
-use crate::query::ast::{AstNode, Deparse, LiteralValue};
-use crate::query::query_shape_derive;
-use crate::query::resolved::ResolvedTableNode;
+use crate::query::ast::{Deparse, LiteralValue};
 
 mod coalesce;
 mod relay;
@@ -88,17 +85,11 @@ fn memo_capture_begin(
         return None;
     }
     let shape = MemoShape::from_limit(&msg.limit)?;
-    // Every relation the query *reads*, via the AST walk — deliberately broader
-    // than the precomputed `CachedQuery.relation_oids` (which excludes subquery
-    // tables): a change to any read relation, subqueries included, must evict the
-    // snapshot, so this set must not be narrowed to that field.
-    let mut oids: Vec<Oid> = msg
-        .resolved
-        .nodes::<ResolvedTableNode>()
-        .map(|t| t.relation_oid)
-        .collect();
-    oids.sort_unstable();
-    oids.dedup();
+    // Every relation the query *reads* — deliberately broader than the
+    // precomputed `CachedQuery.relation_oids` (which excludes subquery
+    // tables): a change to any read relation, subqueries included, must evict
+    // the snapshot, so this set must not be narrowed to that field.
+    let oids = msg.bound.relation_oids();
     if oids.is_empty() {
         return None;
     }
@@ -224,16 +215,7 @@ async fn serve_query_send(
     // SQL carries `$1..$k` placeholders for its literals, so a single plan is
     // shared by every query of this shape regardless of literal values (collapsing
     // the per-literal plan explosion that drove relcache-invalidation storms).
-    // Most hits carry a precomputed shape; subsumed serves have none and derive it
-    // from the resolved query here (cold path).
-    let derived_shape;
-    let shape = match &msg.serve_shape {
-        Some(shape) => shape,
-        None => {
-            derived_shape = query_shape_derive(msg.resolved.as_ref());
-            &derived_shape
-        }
-    };
+    let shape = &msg.serve_shape;
 
     // Shape body, then the trailing `LIMIT $(k+1) OFFSET $(k+2)` placeholders.
     conn.sql_buf.clear();

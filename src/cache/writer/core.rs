@@ -31,7 +31,7 @@ use crate::oid::Oid;
 use crate::pg;
 use crate::pg::Lsn;
 use crate::pg::protocol::ByteString;
-use crate::query::{Fingerprint, FingerprintSet};
+use crate::query::{Fingerprint, FingerprintSet, QueryShape};
 use crate::settings::{PgSettings, Settings};
 
 /// Deterministic fault injection for the restart supervisor: kill the writer on
@@ -121,7 +121,7 @@ pub(super) struct QueryServing {
     pub(super) generation: Generation,
     pub(super) resolved: SharedResolved,
     pub(super) bound: SharedResolvedQuery,
-    pub(super) deparsed_sql: EcoString,
+    pub(super) serve_shape: QueryShape,
     pub(super) max_limit: Option<u64>,
 }
 
@@ -600,12 +600,11 @@ impl WriterCore {
         state: CachedQueryState,
         serving: &QueryServing,
     ) {
-        // The serve shape mirrors `CachedQuery.serve_shape`; the cached query is
-        // already inserted at every transition, so read it from there rather
-        // than thread it through every transition caller (PGC-294).
-        let cached = self.cache.cached_queries.get1(&fingerprint);
-        let serve_shape = cached.map(|q| q.serve_shape.clone());
-        let reference_only = cached.is_some_and(|q| q.reference_only);
+        let reference_only = self
+            .cache
+            .cached_queries
+            .get1(&fingerprint)
+            .is_some_and(|q| q.reference_only);
         let read_columns = Arc::new(serving.bound.columns_by_table());
         self.state_view
             .cached_queries
@@ -616,8 +615,7 @@ impl WriterCore {
                 v.resolved = Some(Arc::clone(&serving.resolved));
                 v.bound = Some(Arc::clone(&serving.bound));
                 v.read_columns = Some(Arc::clone(&read_columns));
-                v.deparsed_sql = Some(serving.deparsed_sql.clone());
-                v.serve_shape = serve_shape.clone();
+                v.serve_shape = Some(serving.serve_shape.clone());
                 v.max_limit = serving.max_limit;
                 v.reference_only = reference_only;
                 v.referenced = false;
@@ -628,8 +626,7 @@ impl WriterCore {
                 resolved: Some(Arc::clone(&serving.resolved)),
                 bound: Some(Arc::clone(&serving.bound)),
                 read_columns: Some(read_columns),
-                deparsed_sql: Some(serving.deparsed_sql.clone()),
-                serve_shape,
+                serve_shape: Some(serving.serve_shape.clone()),
                 max_limit: serving.max_limit,
                 reference_only,
                 referenced: false,
@@ -653,16 +650,16 @@ impl WriterCore {
         self.state_view_write(fingerprint, CachedQueryState::Ready, &serving);
         let QueryServing {
             generation,
-            resolved,
-            deparsed_sql,
+            bound,
+            serve_shape,
             max_limit,
             ..
         } = serving;
         let _ = self.notify_tx.send(WriterNotify::Ready {
             fingerprint,
             generation,
-            resolved,
-            deparsed_sql,
+            bound,
+            serve_shape,
             max_limit,
         });
     }

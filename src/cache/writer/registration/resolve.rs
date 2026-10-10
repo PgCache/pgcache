@@ -1,6 +1,6 @@
 //! Registration phase 1: ensure the query's tables exist in the cache, resolve
-//! and deparse it, classify its shape and limits, and register its per-table
-//! update queries.
+//! it, render its serve shape, classify its shape and limits, and register
+//! its per-table update queries.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -20,12 +20,12 @@ use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode};
+use crate::query::QueryShape;
+use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::query_shape_derive;
 use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
-use crate::query::resolved::{ResolvedQueryExpr, resolved_query_fingerprint};
+use crate::query::resolved::ResolvedQueryExpr;
 use crate::query::transform::predicate_pushdown_apply;
 use crate::query::transform::{
     LiteralCanonOutcome, query_literals_canonicalise, resolved_literals_canonicalise,
@@ -69,9 +69,9 @@ async fn cache_tables_ensure(
 }
 
 /// The fingerprint of a query under the session's keying settings: the hash
-/// of its resolved form (schema-qualified tables, canonical literals).
-/// Ensures the cache tables exist and resolves exactly as registration
-/// does, so the two agree.
+/// of its serve SQL (schema-qualified tables, canonical literals). Ensures
+/// the cache tables exist and resolves exactly as registration does, so the
+/// two agree.
 pub(super) async fn query_fingerprint_resolve(
     core: &mut WriterCore,
     query: &QueryExpr,
@@ -81,13 +81,13 @@ pub(super) async fn query_fingerprint_resolve(
     cache_tables_ensure(core, &base_query, &keying.search_path).await?;
     let resolution = query_resolve_canonical(core, base_query, keying)
         .attach_loc("resolving query expression for its fingerprint")?;
-    Ok(resolved_query_fingerprint(&resolution.resolved))
+    Ok(resolution.bound.fingerprint())
 }
 
 /// The identity-bearing form of a query in both representations.
 struct CanonicalResolution {
-    /// Canonical resolved tree: the fingerprint, deparse and rewrite source
-    /// until those move onto `bound`.
+    /// Canonical resolved tree: the rewrite and analysis source until those
+    /// move onto `bound`.
     resolved: ResolvedQueryExpr,
     /// The canonical plain tree with its bindings (ADR-057).
     bound: SharedResolvedQuery,
@@ -119,19 +119,17 @@ fn query_resolve_canonical(
     })
 }
 
-/// Deparse once at registration. The output is a pure function of the
-/// resolved AST, so every cache hit can splice it in instead of re-running
-/// the deparse traversal.
-fn resolved_deparse(resolved: &ResolvedQueryExpr) -> EcoString {
-    let deparse_start = Instant::now();
-    let mut buf = String::with_capacity(256);
-    resolved.deparse(&mut buf);
-    let deparsed_sql: EcoString = buf.into();
+/// Render the serve shape once at registration (PGC-294): the per-shape
+/// serve statement and its binds, which every cache hit splices in instead
+/// of re-rendering the tree.
+fn serve_shape_render(bound: &ResolvedQuery) -> QueryShape {
+    let render_start = Instant::now();
+    let shape = bound.shape();
     crate::metrics::handles()
         .reg
         .resolve_deparse
-        .record(deparse_start.elapsed().as_secs_f64());
-    deparsed_sql
+        .record(render_start.elapsed().as_secs_f64());
+    shape
 }
 
 /// `(max_limit, mv_limit)` for a resolved query.
@@ -182,9 +180,9 @@ impl WriterRegistration {
         } = query_resolve_canonical(core, base_query, &request.keying)
             .attach_loc("resolving query expression")?;
         // The identity dispatch resolved this pair to must be the one this
-        // resolution produces (before the pushdown transform).
+        // resolution produces.
         debug_assert_eq!(
-            resolved_query_fingerprint(&resolved),
+            bound.fingerprint(),
             request.fingerprint,
             "registration resolved to a different fingerprint than the alias"
         );
@@ -195,11 +193,7 @@ impl WriterRegistration {
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("enum order-dependence gate")?;
 
-        let deparsed_sql = resolved_deparse(&resolved);
-
-        // Parameterized shape (PGC-294): the per-shape serve statement + binds,
-        // derived from the same resolved AST. Additive to the fingerprint.
-        let serve_shape = query_shape_derive(&resolved);
+        let serve_shape = serve_shape_render(&bound);
 
         // Classify the shape once here; `query_register` and MV setup both reuse
         // the result via `QueryResolution.shape_gate` to avoid re-running
@@ -221,7 +215,6 @@ impl WriterRegistration {
 
         Ok(QueryResolution {
             resolved,
-            deparsed_sql,
             serve_shape,
             relation_oids,
             bound,

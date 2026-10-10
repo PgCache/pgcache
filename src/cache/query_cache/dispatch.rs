@@ -469,17 +469,16 @@ impl CacheDispatch {
         let fingerprint = target.fingerprint;
         let Some(CachedQueryView {
             generation,
-            resolved: Some(resolved),
-            deparsed_sql: Some(deparsed_sql),
-            serve_shape,
+            bound: Some(bound),
+            serve_shape: Some(serve_shape),
             reference_only,
             ..
         }) = entry
         else {
-            // The writer publishes the resolved form together with Ready;
-            // serve from origin rather than guess if not.
-            debug_assert!(false, "Ready entry without resolved form {fingerprint}");
-            debug!("ready entry without resolved form, forwarding {fingerprint}");
+            // The writer publishes the bound query and its shape together
+            // with Ready; serve from origin rather than guess if not.
+            debug_assert!(false, "Ready entry without a serve shape {fingerprint}");
+            debug!("ready entry without a serve shape, forwarding {fingerprint}");
             return msg.forward();
         };
         // A literal the writer could not canonicalise means what the
@@ -497,8 +496,7 @@ impl CacheDispatch {
         self.hit_serve(
             fingerprint,
             msg,
-            Arc::clone(resolved),
-            deparsed_sql.clone(),
+            Arc::clone(bound),
             serve_shape.clone(),
             *generation,
             target.input.rows_needed,
@@ -619,7 +617,6 @@ impl CacheDispatch {
                         resolved: None,
                         bound: None,
                         read_columns: None,
-                        deparsed_sql: None,
                         serve_shape: None,
                         max_limit: None,
                         reference_only: false,

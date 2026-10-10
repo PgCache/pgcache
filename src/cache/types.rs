@@ -6,7 +6,6 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use ecow::EcoString;
 use hdrhistogram::Histogram;
 use iddqd::{BiHashItem, BiHashMap, IdHashMap, bi_upcast};
 use rootcause::Report;
@@ -57,15 +56,11 @@ pub struct CachedQuery {
     pub relation_oids: Vec<Oid>,
     pub bound: SharedResolvedQuery,
     pub resolved: SharedResolved,
-    /// Deparsed SQL body of the resolved query. Computed once at registration
-    /// and reused on every non-MV cache hit to avoid per-request AST traversal.
-    /// Excludes LIMIT (which varies per request) and the `SET mem.query_generation`
-    /// prefix.
-    pub deparsed_sql: EcoString,
-    /// Parameterized serve shape (PGC-294): `deparsed_sql` with literals replaced
-    /// by `$N` placeholders, plus its key and the bound literals. Built alongside
-    /// the (unchanged) fingerprint; lets the serve path share one prepared
-    /// statement per shape across all fingerprints that differ only in literals.
+    /// Parameterized serve shape (PGC-294): the serve SQL of `bound` with its
+    /// predicate literals replaced by `$N` placeholders, plus its key and the
+    /// literals to bind. Computed once at registration; lets the serve path
+    /// share one prepared statement per shape across all fingerprints that
+    /// differ only in literals.
     pub serve_shape: QueryShape,
     /// Maximum rows cached for this fingerprint.
     /// `None` = all rows cached (query seen without LIMIT, or OFFSET-only).
@@ -381,9 +376,6 @@ pub struct CachedQueryView {
     /// The columns `resolved` reads per table, for the read-after-write gate;
     /// set with `resolved`.
     pub read_columns: Option<Arc<ColumnsByTable>>,
-    /// Precomputed deparsed SQL body (mirrors `CachedQuery.deparsed_sql`).
-    /// None while Loading; Some once the view transitions to Ready.
-    pub deparsed_sql: Option<EcoString>,
     /// Parameterized serve shape (mirrors `CachedQuery.serve_shape`, PGC-294).
     /// None while Loading; Some once the view transitions to Ready.
     pub serve_shape: Option<QueryShape>,

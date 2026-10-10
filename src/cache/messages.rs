@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use ecow::EcoString;
 use smallvec::SmallVec;
 use tokio_util::bytes::{Bytes, BytesMut};
 
@@ -8,11 +7,12 @@ use super::output_settings::OutputSettings;
 use super::query::CacheableQuery;
 use super::query::QueryParameters;
 use super::reply::ReplySender;
-use super::types::SharedResolved;
+use super::types::SharedResolvedQuery;
 use crate::cache::Generation;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::{ClientSocket, ExplainSpec};
+use crate::query::QueryShape;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, SessionKey};
 use crate::timing::QueryTiming;
@@ -34,8 +34,8 @@ pub(crate) enum WriterNotify {
     Ready {
         fingerprint: Fingerprint,
         generation: Generation,
-        resolved: SharedResolved,
-        deparsed_sql: EcoString,
+        bound: SharedResolvedQuery,
+        serve_shape: QueryShape,
         max_limit: Option<u64>,
     },
     /// Population failed.

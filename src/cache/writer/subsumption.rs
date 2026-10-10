@@ -6,7 +6,6 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
-use ecow::EcoString;
 use tracing::{debug, error};
 
 use super::core::{QueryServing, WriterCore};
@@ -15,9 +14,10 @@ use super::registration::{
 };
 use crate::cache::Generation;
 use crate::cache::admission::{SubsumerCandidate, SubsumerSource, subsumption_covered};
-use crate::cache::types::{Cache, SharedResolved};
+use crate::cache::types::{Cache, SharedResolvedQuery};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::oid::Oid;
+use crate::query::QueryShape;
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::{TableConstraint, analyze_query_constraints};
 use crate::result::error_chain_format;
@@ -106,19 +106,22 @@ impl WriterRegistration {
     }
 
     /// Handle a subsumed query: assign generation, stamp rows in cache DB, mark Ready.
-    /// Returns (generation, resolved) on success. Falls back to None if cache DB execution fails.
+    /// Returns what it serves on success. Falls back to None if cache DB execution fails.
     pub(super) async fn query_subsume(
         &self,
         core: &mut WriterCore,
         identity: RegistrationIdentity,
         resolution: QueryResolution,
-    ) -> CacheResult<Option<(Generation, SharedResolved, EcoString)>> {
+    ) -> CacheResult<Option<(Generation, SharedResolvedQuery, QueryShape)>> {
         let subsume_start = Instant::now();
         let fingerprint = identity.fingerprint;
         let resolved = Arc::clone(&resolution.resolved);
         let bound = Arc::clone(&resolution.bound);
-        let deparsed_sql = resolution.deparsed_sql.clone();
+        let serve_shape = resolution.serve_shape.clone();
         let max_limit = resolution.max_limit;
+        // Running the query under the new generation stamps the rows it
+        // reads, which the subsumer already holds.
+        let stamp_sql = bound.sql();
 
         let (generation, relations_changed) = cached_query_insert(core, identity, resolution);
 
@@ -143,7 +146,7 @@ impl WriterRegistration {
 
         let cache_exec_result = core
             .db_cache
-            .batch_execute(deparsed_sql.as_str())
+            .batch_execute(&stamp_sql)
             .await
             .map_into_report::<CacheError>();
 
@@ -165,9 +168,9 @@ impl WriterRegistration {
             fingerprint,
             QueryServing {
                 generation,
-                resolved: Arc::clone(&resolved),
-                bound,
-                deparsed_sql: deparsed_sql.clone(),
+                resolved,
+                bound: Arc::clone(&bound),
+                serve_shape: serve_shape.clone(),
                 max_limit,
             },
         );
@@ -191,6 +194,6 @@ impl WriterRegistration {
             .record(subsume_start.elapsed().as_secs_f64());
 
         debug!("query subsumed {fingerprint}");
-        Ok(Some((generation, resolved, deparsed_sql)))
+        Ok(Some((generation, bound, serve_shape)))
     }
 }

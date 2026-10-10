@@ -283,8 +283,8 @@ async fn coalesce_drain(
             }
             notify = notify_rx.recv() => {
                 match notify {
-                    Some(WriterNotify::Ready { fingerprint, generation, resolved, deparsed_sql, max_limit }) => {
-                        dispatch.waiting_drain_ready(fingerprint, generation, resolved, deparsed_sql, max_limit);
+                    Some(WriterNotify::Ready { fingerprint, generation, bound, serve_shape, max_limit }) => {
+                        dispatch.waiting_drain_ready(fingerprint, generation, bound, serve_shape, max_limit);
                     }
                     Some(WriterNotify::Failed { fingerprint }) => {
                         dispatch.waiting_drain_failed(fingerprint);

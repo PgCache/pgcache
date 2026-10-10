@@ -59,7 +59,6 @@ impl CacheDispatch {
                     resolved: None,
                     bound: None,
                     read_columns: None,
-                    deparsed_sql: None,
                     serve_shape: None,
                     max_limit: None,
                     reference_only: false,
@@ -126,8 +125,8 @@ impl CacheDispatch {
         match subsumption_rx.await {
             Ok(SubsumptionResult::Subsumed {
                 generation,
-                resolved,
-                deparsed_sql,
+                bound,
+                serve_shape,
             }) => {
                 self.metrics_hit_record(fingerprint);
                 // Subsumed queries have mv_state = MeasurePending (see Future Work:
@@ -135,15 +134,7 @@ impl CacheDispatch {
                 // false and the serve goes through the fallthrough path.
                 let rows_needed = limit_rows_needed(&msg.cacheable_query.query().limit);
                 let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
-                self.pool_serve(
-                    fingerprint,
-                    msg,
-                    resolved,
-                    deparsed_sql,
-                    None,
-                    generation,
-                    mv,
-                )
+                self.pool_serve(fingerprint, msg, bound, serve_shape, generation, mv)
             }
             Ok(SubsumptionResult::NotSubsumed) | Err(_) => {
                 self.metrics_miss_record(fingerprint);

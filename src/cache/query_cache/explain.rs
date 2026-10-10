@@ -97,7 +97,7 @@ impl CacheDispatch {
 }
 
 /// The explain work for a cached query in `view`'s state: only a Ready query
-/// with a resolved form can run.
+/// with a serve shape can run.
 fn explain_kind_for_view(
     fingerprint: Fingerprint,
     view: CachedQueryView,
@@ -105,13 +105,12 @@ fn explain_kind_for_view(
 ) -> ExplainKind {
     let CachedQueryView {
         state,
-        resolved,
         serve_shape,
         mv,
         ..
     } = view;
-    match (state, resolved) {
-        (CachedQueryState::Ready, Some(resolved)) => {
+    match (state, serve_shape) {
+        (CachedQueryState::Ready, Some(serve_shape)) => {
             // Read-only backend decision: reflect what would serve now without
             // the serve-path `mv_dispatch_decide` side effects (a diagnostic
             // must not schedule an MV build or move serve metrics). A Fresh MV
@@ -125,7 +124,6 @@ fn explain_kind_for_view(
                 fingerprint,
                 mv,
                 serve_shape,
-                resolved,
                 options,
             }
         }

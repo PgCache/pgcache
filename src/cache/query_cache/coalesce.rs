@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use ecow::EcoString;
 use tracing::error;
 
 use super::{CacheDispatch, CoalescedClient, QueryRequest};
@@ -9,7 +8,7 @@ use crate::cache::Generation;
 use crate::cache::messages::slices_concat;
 use crate::cache::query::{limit_is_sufficient, limit_rows_needed};
 use crate::cache::reference_settings::{self, ReferenceSettings};
-use crate::cache::types::SharedResolved;
+use crate::cache::types::SharedResolvedQuery;
 use crate::query::Fingerprint;
 use crate::query::QueryShape;
 use crate::result::error_chain_format;
@@ -18,9 +17,8 @@ use crate::result::error_chain_format;
 struct DrainServing {
     fingerprint: Fingerprint,
     generation: Generation,
-    resolved: SharedResolved,
-    deparsed_sql: EcoString,
-    serve_shape: Option<QueryShape>,
+    bound: SharedResolvedQuery,
+    serve_shape: QueryShape,
     max_limit: Option<u64>,
     /// `Some` for a reference-only entry: the settings a waiter must be on.
     reference: Option<Arc<ReferenceSettings>>,
@@ -64,28 +62,23 @@ impl CacheDispatch {
         &self,
         fingerprint: Fingerprint,
         generation: Generation,
-        resolved: SharedResolved,
-        deparsed_sql: EcoString,
+        bound: SharedResolvedQuery,
+        serve_shape: QueryShape,
         max_limit: Option<u64>,
     ) {
         let Some(groups) = self.waiting.drain(fingerprint) else {
             return;
         };
 
-        // The entry is Ready at drain time, so its propagated serve shape (if any)
-        // is present; read it once for the whole drain rather than threading it
-        // through the WriterNotify::Ready message.
-        let (serve_shape, reference_only) = self
+        let reference_only = self
             .state_view
             .cached_queries
             .get(&fingerprint)
-            .map(|v| (v.serve_shape.clone(), v.reference_only))
-            .unwrap_or((None, false));
+            .is_some_and(|v| v.reference_only);
         let serving = DrainServing {
             fingerprint,
             generation,
-            resolved,
-            deparsed_sql,
+            bound,
             serve_shape,
             max_limit,
             reference: reference_only.then(reference_settings::current),
@@ -161,8 +154,7 @@ impl CacheDispatch {
         if let Err(e) = self.pool_serve_coalesced(
             serving.fingerprint,
             primary,
-            Arc::clone(&serving.resolved),
-            serving.deparsed_sql.clone(),
+            Arc::clone(&serving.bound),
             serving.serve_shape.clone(),
             serving.generation,
             mv,

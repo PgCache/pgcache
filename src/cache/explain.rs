@@ -17,7 +17,7 @@ use crate::cache::messages::{CacheOutcome, CacheReply};
 use crate::cache::mv::{MvServe, mv_table_name};
 use crate::cache::reply::ReplySender;
 use crate::cache::runtime::serve_pool::ConnectionGuard;
-use crate::cache::types::{CacheStateView, SharedResolved};
+use crate::cache::types::CacheStateView;
 use crate::pg::cache_connection::{CacheConnection, ExplainOutcome};
 use crate::pg::protocol::ProtocolResult;
 use crate::pg::protocol::backend::TransactionStatus;
@@ -26,8 +26,7 @@ use crate::pg::protocol::encode::{
     row_description_text_encode,
 };
 use crate::proxy::ClientSocket;
-use crate::query::resolved::ResolvedQueryExpr;
-use crate::query::{Fingerprint, QueryShape, query_shape_derive};
+use crate::query::{Fingerprint, QueryShape};
 use crate::timing::QueryTiming;
 
 /// A unit of explain work routed through the serve pool, carrying the leased
@@ -47,9 +46,8 @@ pub enum ExplainKind {
     Run {
         fingerprint: Fingerprint,
         mv: MvServe,
-        /// Source-row shape (`None` falls back to deriving one from `resolved`).
-        serve_shape: Option<QueryShape>,
-        resolved: SharedResolved,
+        /// The source-row shape the query serves by.
+        serve_shape: QueryShape,
         /// Verbatim EXPLAIN option list (may be empty).
         options: EcoString,
     },
@@ -85,20 +83,13 @@ pub(super) async fn handle_explain_request(
             fingerprint,
             mv,
             serve_shape,
-            resolved,
             options,
         } => {
             // Source-row queries can also serve from the in-process response
             // memo (ADR-036); report whether a live entry currently exists.
             let memoized = state_view.memo.fingerprint_memoized(fingerprint);
-            let (explain_sql, literals, notices) = explain_sql_build(
-                fingerprint,
-                &mv,
-                serve_shape.as_ref(),
-                &resolved,
-                &options,
-                memoized,
-            );
+            let (explain_sql, literals, notices) =
+                explain_sql_build(fingerprint, &mv, &serve_shape, &options, memoized);
             match guard.conn.take() {
                 None => explain_response_encode(
                     &[],
@@ -168,8 +159,7 @@ pub(super) async fn handle_explain_request(
 fn explain_sql_build(
     fingerprint: Fingerprint,
     mv: &MvServe,
-    serve_shape: Option<&QueryShape>,
-    resolved: &ResolvedQueryExpr,
+    serve_shape: &QueryShape,
     options: &str,
     memoized: bool,
 ) -> (String, Vec<crate::query::ast::LiteralValue>, Vec<String>) {
@@ -179,13 +169,8 @@ fn explain_sql_build(
     // bound constants are exactly the caller's. The only fidelity gap is plan
     // caching: this is a fresh custom plan for those constants, whereas a
     // long-lived worker statement may have switched to a generic plan.
-    let (shape_sql, literals) = match serve_shape {
-        Some(shape) => (shape.sql.to_string(), shape.literals.clone()),
-        None => {
-            let derived = query_shape_derive(resolved);
-            (derived.sql.to_string(), derived.literals)
-        }
-    };
+    let shape_sql = serve_shape.sql.to_string();
+    let literals = serve_shape.literals.clone();
 
     let mut notices = vec![format!("pgcache_explain: fingerprint={fingerprint}")];
     match mv {

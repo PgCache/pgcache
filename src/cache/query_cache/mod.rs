@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use ecow::EcoString;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::bytes::{Bytes, BytesMut};
 
@@ -13,7 +12,7 @@ use super::output_settings::OutputSettings;
 use super::query::CacheableQuery;
 use super::reg_bucket::RegRateBucket;
 use super::reply::ReplySender;
-use super::types::{CacheStateView, SharedResolved};
+use super::types::{CacheStateView, SharedResolvedQuery};
 use crate::cache::Generation;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
@@ -71,19 +70,15 @@ pub struct QueryRequest {
 }
 
 /// Request sent to cache serve for executing cached queries.
-/// Contains the resolved AST with schema-qualified table names.
 pub struct ServeRequest {
     pub fingerprint: Fingerprint,
     pub query_type: QueryType,
     pub data: BytesMut,
-    pub resolved: SharedResolved,
-    /// Precomputed deparsed SQL body of `resolved`. Spliced into the SET +
-    /// body + LIMIT wire string the serve pool sends to the cache DB.
-    pub deparsed_sql: EcoString,
-    /// Parameterized serve shape (literal-free SQL + ordered literal values).
-    /// `Some` for source-row serves (the shape-keyed prepared-statement path);
-    /// `None` for MV-backed serves, which keep the `deparsed_sql` path (PGC-294).
-    pub serve_shape: Option<QueryShape>,
+    /// The query as registered: what the serve reads, for the memo.
+    pub bound: SharedResolvedQuery,
+    /// Parameterized serve shape (literal-free SQL + ordered literal values):
+    /// the shape-keyed prepared statement a source-row serve runs (PGC-294).
+    pub serve_shape: QueryShape,
     /// Generation number for row tracking in pgcache_pgrx extension
     pub generation: Generation,
     /// Serve from the MV (carrying its aliased output column names) or
