@@ -560,6 +560,8 @@ fn literal_settings_sensitive(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
@@ -567,7 +569,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::{AstNode, Deparse, query_expr_parse};
-    use crate::query::resolve::{query_expr_resolve, query_expr_resolve_bound};
+    use crate::query::resolve::{ResolvedQuery, query_expr_resolve, query_expr_resolve_bound};
 
     fn events() -> Catalog {
         let column = |name: &str, position: i16, ty: Type| ColumnMetadata {
@@ -660,6 +662,24 @@ mod tests {
         "SELECT count(*) FILTER (WHERE day > '01/02/2024') FROM events HAVING \
          max(at) > '2024-01-02 10:00'",
     ];
+
+    /// The canonicalised plain tree renders, bound, as the canonicalised
+    /// resolved tree deparses.
+    #[test]
+    fn test_bound_sql_matches_resolved_deparse_after_canonicalisation() {
+        let settings = tokyo_dmy();
+        for sql in EQUIVALENCE_CORPUS {
+            let mut query = query_expr_parse(sql).expect("parse");
+            let (mut resolved, bindings) =
+                query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
+            resolved_literals_canonicalise(&mut resolved, &settings);
+            query_literals_canonicalise(&mut query, &bindings, &settings);
+            let bound = ResolvedQuery::new(Arc::new(query), bindings);
+            let mut expected = String::new();
+            resolved.deparse(&mut expected);
+            assert_eq!(bound.sql(), expected, "{sql}");
+        }
+    }
 
     /// The plain pass and the resolved pass rewrite the same literals to the
     /// same text and reach the same verdict.

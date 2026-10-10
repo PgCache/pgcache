@@ -17,6 +17,7 @@ mod entry;
 mod enum_gate;
 mod expr;
 mod join_using;
+mod render;
 mod scope;
 mod table;
 #[cfg(test)]

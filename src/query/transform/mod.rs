@@ -39,6 +39,7 @@ pub use constant_fold::query_expr_constant_fold;
 pub use literal_canon::{
     LiteralCanonOutcome, query_literals_canonicalise, resolved_literals_canonicalise,
 };
+pub(crate) use parameters::literal_is_parameterizable;
 #[cfg(feature = "proxy")]
 pub(crate) use parameters::{
     delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,

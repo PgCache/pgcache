@@ -427,7 +427,7 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::query_expr_parse;
+    use crate::query::ast::{Deparse, query_expr_parse};
     use crate::query::resolve::query_expr_resolve_bound;
     use crate::query::resolved::enum_order_dependence_check;
 
@@ -511,6 +511,20 @@ mod tests {
             .into(),
         );
         tables
+    }
+
+    /// Enum and domain columns render the same bound as resolved.
+    #[test]
+    fn test_bound_sql_matches_resolved_deparse() {
+        for (sql, _) in CORPUS {
+            let query = query_expr_parse(sql).expect("parse");
+            let (resolved, bindings) =
+                query_expr_resolve_bound(&query, &tables(), &["public"]).expect("resolve");
+            let bound = ResolvedQuery::new(Arc::new(query), bindings);
+            let mut expected = String::new();
+            resolved.deparse(&mut expected);
+            assert_eq!(bound.sql(), expected, "{sql}");
+        }
     }
 
     /// The verdict of both gates on one query: "allowed", or the rejection

@@ -470,7 +470,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
     let search_path: [EcoString; 1] = ["public".into()];
     println!("\n== allocations per stage (count / bytes)");
     println!(
-        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
         "query",
         "convert",
         "plain_clone",
@@ -482,6 +482,9 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         "canonicalise",
         "fingerprint",
         "deparse",
+        "bound_fp",
+        "bound_render",
+        "bound_shape",
         "pred_compile"
     );
     for shape in shapes {
@@ -501,11 +504,14 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         let (_, fingerprint_n, fingerprint_b) =
             allocations_count(|| resolved_query_fingerprint(&canonical));
         let (_, deparse_n, deparse_b) = allocations_count(|| deparse(&canonical));
+        let (_, bound_fp_n, bound_fp_b) = allocations_count(|| bound.fingerprint());
+        let (_, bound_render_n, bound_render_b) = allocations_count(|| bound.sql());
+        let (_, bound_shape_n, bound_shape_b) = allocations_count(|| bound.shape());
         let (_, compile_n, compile_b) =
             allocations_count(|| predicate_compile(&canonical, shape.predicate_table));
         let cell = |n: usize, b: usize| format!("{n}/{b}");
         println!(
-            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
             shape.name,
             cell(convert_n, convert_b),
             cell(plain_clone_n, plain_clone_b),
@@ -523,6 +529,9 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
             ),
             cell(fingerprint_n, fingerprint_b),
             cell(deparse_n, deparse_b),
+            cell(bound_fp_n, bound_fp_b),
+            cell(bound_render_n, bound_render_b),
+            cell(bound_shape_n, bound_shape_b),
             cell(compile_n, compile_b),
         );
     }
@@ -619,6 +628,27 @@ fn bench_pipeline(c: &mut Criterion) {
             &canonical,
             |b, r| {
                 b.iter(|| black_box(deparse(r)));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("bound_fingerprint", shape.name),
+            &bound,
+            |b, r| {
+                b.iter(|| black_box(r.fingerprint()));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("bound_render", shape.name),
+            &bound,
+            |b, r| {
+                b.iter(|| black_box(r.sql()));
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("bound_shape", shape.name),
+            &bound,
+            |b, r| {
+                b.iter(|| black_box(r.shape()));
             },
         );
         group.bench_with_input(

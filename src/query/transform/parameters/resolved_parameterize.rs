@@ -45,7 +45,7 @@ use crate::query::resolved::{
 /// Keeping cast/array literals inline means two queries differing only in such a
 /// literal get distinct shapes — accepted minor proliferation for those rarer
 /// forms in exchange for never binding a value at the wrong type.
-fn literal_is_parameterizable(literal: &LiteralValue) -> bool {
+pub(crate) fn literal_is_parameterizable(literal: &LiteralValue) -> bool {
     match literal {
         LiteralValue::String(_)
         | LiteralValue::Integer(_)

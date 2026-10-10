@@ -14,6 +14,7 @@ use crate::cache::QueryParameter;
 use crate::query::ast::LiteralValue;
 
 pub use replace::{query_expr_parameters_replace, select_node_parameters_replace};
+pub(crate) use resolved_parameterize::literal_is_parameterizable;
 pub use resolved_parameterize::resolved_query_expr_parameterize;
 #[cfg(feature = "proxy")]
 pub(crate) use write_parameterize::{

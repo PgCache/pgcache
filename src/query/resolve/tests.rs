@@ -147,7 +147,7 @@ fn catalog(names: &[&str]) -> Catalog {
 }
 
 /// A catalog of all-text tables given as (name, columns), OIDs from 1001.
-fn catalog_with_columns(specs: &[(&str, &[&str])]) -> Catalog {
+pub(super) fn catalog_with_columns(specs: &[(&str, &[&str])]) -> Catalog {
     let mut tables = BiHashMap::new();
     for (oid, (name, columns)) in (1001..).zip(specs) {
         tables.insert_overwrite(
@@ -1908,7 +1908,7 @@ type ColumnRef = (EcoString, EcoString, EcoString, ColumnPosition, Type);
 /// A derived table's alias and its `(name, type)` output columns.
 type DerivedShape = (EcoString, Vec<(EcoString, Type)>);
 
-fn binding_catalog() -> Catalog {
+pub(super) fn binding_catalog() -> Catalog {
     catalog_with_columns(&[
         ("users", &["id", "name", "dept_id"]),
         ("departments", &["id", "name", "manager_id"]),
@@ -1917,7 +1917,7 @@ fn binding_catalog() -> Catalog {
     ])
 }
 
-const BINDING_CORPUS: &[&str] = &[
+pub(super) const BINDING_CORPUS: &[&str] = &[
     "SELECT u.id, name FROM users u WHERE dept_id = 'x'",
     "SELECT u.id, d.name AS dname FROM users u JOIN departments d ON u.dept_id = d.id \
      WHERE d.name = 'a' ORDER BY dname, u.id DESC",

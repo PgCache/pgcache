@@ -514,8 +514,10 @@ impl QueryExpr {
     }
 }
 
-impl DeparseWith for QueryExpr {
-    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+impl QueryExpr {
+    /// The query without its LIMIT/OFFSET: what identifies it (see
+    /// `query_expr_hasher`).
+    pub(crate) fn unlimited_deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
         if !self.ctes.is_empty() && cx.with_clause_renders() {
             cx.clause_enter(Clause::With);
             buf.push_str("WITH ");
@@ -530,6 +532,12 @@ impl DeparseWith for QueryExpr {
             separated_deparse_with(cx, buf, &self.order_by, ", ");
             cx.clause_leave(Clause::OrderBy);
         }
+    }
+}
+
+impl DeparseWith for QueryExpr {
+    fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
+        self.unlimited_deparse_with(cx, buf);
         if let Some(limit) = &self.limit {
             cx.clause_enter(Clause::Limit);
             limit.deparse_with(cx, buf);
@@ -610,9 +618,15 @@ impl DeparseWith for SelectColumns {
             SelectColumns::Columns(cols) => {
                 let mut sep = "";
                 for col in cols {
+                    let start = buf.len();
                     buf.push_str(sep);
                     col.deparse_with(cx, buf);
-                    sep = ",";
+                    // A star that expands to nothing leaves no column behind.
+                    if buf.len() == start + sep.len() + 1 {
+                        buf.truncate(start);
+                    } else {
+                        sep = ",";
+                    }
                 }
             }
         };
