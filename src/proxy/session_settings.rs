@@ -486,18 +486,20 @@ impl SessionSettings {
     /// whether it lands inside a block (open, or a forwarded `BEGIN` not yet
     /// acknowledged).
     pub(crate) fn effect_apply(&mut self, effect: SettingsEffect, in_block: bool) {
+        let inert = effect.inert_at(in_block);
+        if inert && !effect.block_revert {
+            return;
+        }
         self.mutation_seq += 1;
         let seq = self.mutation_seq;
         if effect.block_revert {
             self.block_touched_revert(seq);
         }
-        if effect.inert_at(in_block) {
-            self.views_rederive();
-            return;
-        }
-        for guc in Guc::ALL {
-            if effect.touches(guc) {
-                self.state_mut(guc).effect_mark(effect.local, in_block, seq);
+        if !inert {
+            for guc in Guc::ALL {
+                if effect.touches(guc) {
+                    self.state_mut(guc).effect_mark(effect.local, in_block, seq);
+                }
             }
         }
         self.views_rederive();
@@ -636,6 +638,21 @@ mod tests {
         settings.startup_user_set(Some("alice"));
         settings.probe_apply(&sample("public"), status, settings.probe_seq());
         settings
+    }
+
+    /// A forwarded statement that touches no setting (every plain write)
+    /// leaves the views and the probe sequence alone.
+    #[test]
+    fn test_inert_effect_leaves_views_and_sequence_untouched() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        let keying = settings.serve_keying(false).expect("every setting known");
+        let seq = settings.probe_seq();
+        settings.effect_apply(SettingsEffect::default(), false);
+        assert!(Arc::ptr_eq(
+            &keying,
+            &settings.serve_keying(false).expect("every setting known")
+        ));
+        assert_eq!(settings.probe_seq(), seq);
     }
 
     /// A read dispatches with the views built at the last change: the same
