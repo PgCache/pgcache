@@ -202,6 +202,10 @@ regex-lite = "0.1.9"
 name = "subsumption_index"
 harness = false
 
+[[bench]]
+name = "ast_pipeline"
+harness = false
+
 [patch.crates-io]
 # Local path while pg_query changes accumulate (bindgen allowlist); push the
 # fork and restore the git patch when the churn settles.
