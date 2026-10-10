@@ -12,7 +12,7 @@ use crate::cache::admission::{
     AdmissionDepth, base_query_prepare, query_admission_analyze, shape_gate_classify,
 };
 use crate::cache::messages::RegisterRequest;
-use crate::cache::mv::{resolved_has_join, resolved_has_window};
+use crate::cache::mv::{query_has_join, query_has_window};
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::types::{SharedResolved, SharedResolvedQuery};
 use crate::cache::update_query::UpdateQueries;
@@ -25,9 +25,7 @@ use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::query_shape_derive;
 use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
-use crate::query::resolved::{
-    ResolvedQueryExpr, enum_order_dependence_check, resolved_query_fingerprint,
-};
+use crate::query::resolved::{ResolvedQueryExpr, resolved_query_fingerprint};
 use crate::query::transform::predicate_pushdown_apply;
 use crate::query::transform::{
     LiteralCanonOutcome, query_literals_canonicalise, resolved_literals_canonicalise,
@@ -148,7 +146,7 @@ fn resolved_deparse(resolved: &ResolvedQueryExpr) -> EcoString {
 /// window functions — a windowed MV must store the full result because the
 /// window depends on the whole partition.
 fn resolution_limits(
-    resolved: &ResolvedQueryExpr,
+    query: &QueryExpr,
     shape_gate: ShapeGate,
     user_max_limit: Option<u64>,
 ) -> (Option<u64>, Option<u64>) {
@@ -157,7 +155,7 @@ fn resolution_limits(
     } else {
         user_max_limit
     };
-    let mv_limit = if resolved_has_join(resolved) && !resolved_has_window(resolved) {
+    let mv_limit = if query_has_join(query) && !query_has_window(query) {
         user_max_limit
     } else {
         None
@@ -192,7 +190,8 @@ impl WriterRegistration {
         );
         let resolved: SharedResolved = Arc::new(predicate_pushdown_apply(resolved));
 
-        enum_order_dependence_check(&resolved)
+        bound
+            .enum_order_dependence_check()
             .map_err(|e| e.context_transform(CacheError::from))
             .attach_loc("enum order-dependence gate")?;
 
@@ -206,7 +205,7 @@ impl WriterRegistration {
         // the result via `QueryResolution.shape_gate` to avoid re-running
         // decorrelation + classification.
         let shape_gate = shape_gate_classify(&resolved, &self.aggregate_functions);
-        let (max_limit, mv_limit) = resolution_limits(&resolved, shape_gate, user_max_limit);
+        let (max_limit, mv_limit) = resolution_limits(bound.tree(), shape_gate, user_max_limit);
 
         let uq_start = Instant::now();
         let relation_oids = self.update_queries_register(

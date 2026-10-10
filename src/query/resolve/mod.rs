@@ -9,10 +9,12 @@
 //! * [`join_using`] — the `USING`/`NATURAL` merged-column cluster.
 //! * [`entry`] — the public entry points.
 
+mod analysis;
 mod bindings;
 mod clauses;
 mod column;
 mod entry;
+mod enum_gate;
 mod expr;
 mod join_using;
 mod scope;

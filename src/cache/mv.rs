@@ -15,9 +15,12 @@ use std::time::{Duration, Instant};
 use ecow::EcoString;
 use postgres_protocol::escape::escape_identifier;
 
-use super::mv_shape::{ShapeGate, columns_any, scalar_expr_has_window, select_has_join};
+use super::mv_shape::ShapeGate;
 use crate::query::Fingerprint;
-use crate::query::ast::{Deparse, LimitClause, OrderDirection};
+use crate::query::ast::{
+    Deparse, LimitClause, OrderDirection, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
+    SelectColumns, TableSource,
+};
 use crate::query::resolved::{
     ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumns,
 };
@@ -356,20 +359,60 @@ fn mv_order_by_direct(sql: &mut String, order_by: &[ResolvedOrderByClause]) {
 
 /// Top-level body is a SELECT with a join. Only joins get an MV LIMIT
 /// cap; other reducers collapse the input regardless.
-pub(crate) fn resolved_has_join(resolved: &ResolvedQueryExpr) -> bool {
-    match &resolved.body {
-        ResolvedQueryBody::Select(s) => select_has_join(s),
-        ResolvedQueryBody::SetOp(_) | ResolvedQueryBody::Values(_) => false,
+pub(crate) fn query_has_join(query: &QueryExpr) -> bool {
+    match &query.body {
+        QueryBody::Select(select) => {
+            select.from.len() > 1
+                || select
+                    .from
+                    .iter()
+                    .any(|source| matches!(source, TableSource::Join(_)))
+        }
+        QueryBody::SetOp(_) | QueryBody::Values(_) => false,
     }
 }
 
-/// Top-level SELECT projects a window function. A window MV must store the whole
-/// result (the window depends on the full partition), so it's excluded from the
-/// join top-N `mv_limit` cap even when it also contains a join.
-pub(crate) fn resolved_has_window(resolved: &ResolvedQueryExpr) -> bool {
-    match &resolved.body {
-        ResolvedQueryBody::Select(s) => columns_any(&s.columns, &scalar_expr_has_window),
-        ResolvedQueryBody::SetOp(_) | ResolvedQueryBody::Values(_) => false,
+/// Top-level SELECT projects a window function. A window MV must store the
+/// whole result (the window depends on the full partition), so it's excluded
+/// from the join top-N `mv_limit` cap even when it also contains a join.
+pub(crate) fn query_has_window(query: &QueryExpr) -> bool {
+    let QueryBody::Select(select) = &query.body else {
+        return false;
+    };
+    let SelectColumns::Columns(columns) = &select.columns else {
+        return false;
+    };
+    columns.iter().any(|column| match column {
+        SelectColumn::Expr { expr, .. } => scalar_has_window(expr),
+        SelectColumn::Star(_) => false,
+    })
+}
+
+/// A window function call anywhere in the expression, descending through
+/// function arguments, CASE branches and arithmetic operands but not into
+/// scalar subqueries.
+fn scalar_has_window(expr: &ScalarExpr) -> bool {
+    match expr {
+        ScalarExpr::Function(function) => {
+            function.over.is_some() || function.args.iter().any(scalar_has_window)
+        }
+        ScalarExpr::Case(case) => {
+            case.arg.as_ref().is_some_and(|arg| scalar_has_window(arg))
+                || case
+                    .whens
+                    .iter()
+                    .any(|when| scalar_has_window(&when.result))
+                || case
+                    .default
+                    .as_ref()
+                    .is_some_and(|default| scalar_has_window(default))
+        }
+        ScalarExpr::Arithmetic(arithmetic) => {
+            scalar_has_window(&arithmetic.left) || scalar_has_window(&arithmetic.right)
+        }
+        ScalarExpr::Array(elems) => elems.iter().any(scalar_has_window),
+        ScalarExpr::TypeCast { expr, .. } => scalar_has_window(expr),
+        ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Subquery(_) => false,
     }
 }
 

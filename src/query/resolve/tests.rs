@@ -18,13 +18,13 @@ use crate::query::ast::{
 };
 use crate::query::ast::{query_expr_parse, query_expr_session_key};
 use crate::query::literal_settings::LiteralSettings;
-use crate::query::resolved::resolved_query_fingerprint;
 use crate::query::resolved::{
     ResolveError, ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode,
     ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
     ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode,
     ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedWhereExpr,
 };
+use crate::query::resolved::{resolved_query_columns_by_table, resolved_query_fingerprint};
 
 /// Parse SQL and return a SelectNode (for tests using new types)
 fn parse_select_node(sql: &str) -> SelectNode {
@@ -2246,6 +2246,22 @@ fn test_bindings_correlated_columns_match_outer_refs() {
             .filter(|c| bindings.is_correlated(c))
             .count();
         assert_eq!(correlated_nodes, bound.len(), "is_correlated for {sql}");
+    }
+}
+
+/// The gate's per-table column sets read through bindings equal the
+/// resolved tree's.
+#[test]
+fn test_bound_columns_by_table_match_resolved() {
+    let catalog = binding_catalog();
+    for sql in BINDING_CORPUS {
+        let (query, resolved, bindings) = resolve_bound(sql, &catalog);
+        let bound = ResolvedQuery::new(Arc::new(query), bindings);
+        assert_eq!(
+            bound.columns_by_table(),
+            resolved_query_columns_by_table(&resolved),
+            "columns by table for {sql}"
+        );
     }
 }
 

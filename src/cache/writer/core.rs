@@ -31,7 +31,6 @@ use crate::oid::Oid;
 use crate::pg;
 use crate::pg::Lsn;
 use crate::pg::protocol::ByteString;
-use crate::query::resolved::resolved_query_columns_by_table;
 use crate::query::{Fingerprint, FingerprintSet};
 use crate::settings::{PgSettings, Settings};
 
@@ -607,7 +606,7 @@ impl WriterCore {
         let cached = self.cache.cached_queries.get1(&fingerprint);
         let serve_shape = cached.map(|q| q.serve_shape.clone());
         let reference_only = cached.is_some_and(|q| q.reference_only);
-        let read_columns = Arc::new(resolved_query_columns_by_table(&serving.resolved));
+        let read_columns = Arc::new(serving.bound.columns_by_table());
         self.state_view
             .cached_queries
             .entry(fingerprint)
