@@ -39,7 +39,7 @@ use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{ColumnRange, analyze_query_constraints, table_column_ranges};
 use crate::query::guc::Guc;
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::resolved::{ColumnsByTable, resolved_query_columns_by_table};
+use crate::query::resolved::ColumnsByTable;
 use crate::query::transform::query_expr_parameters_replace;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
@@ -317,7 +317,7 @@ async fn handle_connection(
                         });
                         let (read_ranges, read_columns) =
                             shape.as_ref().map_or((None, None), |shape| {
-                                (shape.ranges.as_ref(), shape.columns.as_ref())
+                                (shape.ranges.as_ref(), shape.columns.as_deref())
                             });
                         let m = crate::metrics::handles();
                         match state
@@ -565,7 +565,7 @@ fn read_query_bound(msg: &CacheMessage) -> Option<QueryExpr> {
 /// forwards conservatively.
 struct ReadShape {
     ranges: Option<HashMap<EcoString, ColumnRange>>,
-    columns: Option<ColumnsByTable>,
+    columns: Option<Arc<ColumnsByTable>>,
 }
 
 fn read_shape(
@@ -586,18 +586,18 @@ fn read_shape(
         return none;
     }
     let key = session_key.unwrap_or_else(|| keying.session_key(query));
-    let Some(resolved) = dispatch_handle.cached_query_resolved(key) else {
+    let Some(form) = dispatch_handle.cached_query_read_form(key) else {
         return none;
     };
     let ranges = single_table(query).and_then(|table| {
-        let constraints = analyze_query_constraints(resolved.as_select()?);
+        let constraints = analyze_query_constraints(form.resolved.as_select()?);
         constraints
             .where_analysis_complete
             .then(|| table_column_ranges(&constraints, &table.name))
     });
     ReadShape {
         ranges,
-        columns: Some(resolved_query_columns_by_table(&resolved)),
+        columns: Some(form.columns),
     }
 }
 

@@ -1,7 +1,7 @@
 use tokio::sync::watch;
 
 use super::CacheDispatch;
-use crate::cache::types::SharedResolved;
+use crate::cache::types::CachedReadForm;
 use crate::pg::Lsn;
 use crate::query::SessionKey;
 
@@ -39,11 +39,11 @@ impl CacheDispatchHandle {
     /// The resolved form of a registered query in the current generation, for the
     /// read-after-write gate's row-level INSERT check (PGC-124). Reads through the
     /// watch without cloning the whole dispatch.
-    pub fn cached_query_resolved(&self, key: SessionKey) -> Option<SharedResolved> {
+    pub fn cached_query_read_form(&self, key: SessionKey) -> Option<CachedReadForm> {
         self.rx
             .borrow()
             .as_ref()
-            .and_then(|d| d.cached_query_resolved(key))
+            .and_then(|d| d.cached_query_read_form(key))
     }
 }
 

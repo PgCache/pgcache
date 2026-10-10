@@ -30,6 +30,7 @@ use crate::oid::Oid;
 use crate::pg;
 use crate::pg::Lsn;
 use crate::pg::protocol::ByteString;
+use crate::query::resolved::resolved_query_columns_by_table;
 use crate::query::{Fingerprint, FingerprintSet};
 use crate::settings::{PgSettings, Settings};
 
@@ -604,6 +605,7 @@ impl WriterCore {
         let cached = self.cache.cached_queries.get1(&fingerprint);
         let serve_shape = cached.map(|q| q.serve_shape.clone());
         let reference_only = cached.is_some_and(|q| q.reference_only);
+        let read_columns = Arc::new(resolved_query_columns_by_table(&serving.resolved));
         self.state_view
             .cached_queries
             .entry(fingerprint)
@@ -611,6 +613,7 @@ impl WriterCore {
                 v.state = state;
                 v.generation = serving.generation;
                 v.resolved = Some(Arc::clone(&serving.resolved));
+                v.read_columns = Some(Arc::clone(&read_columns));
                 v.deparsed_sql = Some(serving.deparsed_sql.clone());
                 v.serve_shape = serve_shape.clone();
                 v.max_limit = serving.max_limit;
@@ -621,6 +624,7 @@ impl WriterCore {
                 state,
                 generation: serving.generation,
                 resolved: Some(Arc::clone(&serving.resolved)),
+                read_columns: Some(read_columns),
                 deparsed_sql: Some(serving.deparsed_sql.clone()),
                 serve_shape,
                 max_limit: serving.max_limit,

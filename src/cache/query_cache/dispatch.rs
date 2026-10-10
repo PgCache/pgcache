@@ -25,7 +25,7 @@ use crate::cache::reg_bucket::RegRateBucket;
 use crate::cache::reply::ReplySender;
 use crate::cache::serve_decision::{DecisionInput, EntrySnapshot, ServeDecision, serve_decide};
 use crate::cache::types::{
-    CacheStateView, CachedQueryState, CachedQueryView, QueryMetrics, SharedResolved,
+    CacheStateView, CachedQueryState, CachedQueryView, CachedReadForm, QueryMetrics,
 };
 use crate::cache::{CacheError, CacheResult, fast_path};
 use crate::pg::Lsn;
@@ -126,12 +126,16 @@ impl CacheDispatch {
     /// node the writer produced at registration. `None` for unregistered or
     /// still-loading queries, or a session key with no alias yet (the gate
     /// then forwards conservatively).
-    pub fn cached_query_resolved(&self, key: SessionKey) -> Option<SharedResolved> {
+    pub fn cached_query_read_form(&self, key: SessionKey) -> Option<CachedReadForm> {
         let fingerprint = self.fingerprint_for_key(key)?;
         let view = self.state_view.cached_queries.get(&fingerprint)?;
-        matches!(view.state, CachedQueryState::Ready)
-            .then(|| view.resolved.clone())
-            .flatten()
+        if !matches!(view.state, CachedQueryState::Ready) {
+            return None;
+        }
+        Some(CachedReadForm {
+            resolved: view.resolved.clone()?,
+            columns: view.read_columns.clone()?,
+        })
     }
 
     /// The fingerprint the alias map has for a session key; `None` is an
@@ -613,6 +617,7 @@ impl CacheDispatch {
                         state: transition.new,
                         generation: Generation::ZERO,
                         resolved: None,
+                        read_columns: None,
                         deparsed_sql: None,
                         serve_shape: None,
                         max_limit: None,

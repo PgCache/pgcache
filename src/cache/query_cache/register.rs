@@ -57,6 +57,7 @@ impl CacheDispatch {
                     state: CachedQueryState::Loading,
                     generation: Generation::ZERO,
                     resolved: None,
+                    read_columns: None,
                     deparsed_sql: None,
                     serve_shape: None,
                     max_limit: None,

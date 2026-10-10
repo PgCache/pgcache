@@ -21,8 +21,9 @@ use crate::{
     cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::TableMetadata,
     query::{
-        Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap, ast::QueryExpr,
-        resolved::ResolvedQueryExpr,
+        Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap,
+        ast::QueryExpr,
+        resolved::{ColumnsByTable, ResolvedQueryExpr},
     },
     settings::{DynamicConfigHandle, Settings},
 };
@@ -355,6 +356,14 @@ impl CacheStateView {
     }
 }
 
+/// A Ready cached query's registered form as the read-after-write gate
+/// reasons about it.
+#[derive(Debug, Clone)]
+pub struct CachedReadForm {
+    pub resolved: SharedResolved,
+    pub columns: Arc<ColumnsByTable>,
+}
+
 /// Lightweight view of a cached query for dispatch lookups.
 #[derive(Debug, Clone)]
 pub struct CachedQueryView {
@@ -363,6 +372,9 @@ pub struct CachedQueryView {
     pub generation: Generation,
     /// Resolved query (None for Loading placeholder before writer resolves)
     pub resolved: Option<SharedResolved>,
+    /// The columns `resolved` reads per table, for the read-after-write gate;
+    /// set with `resolved`.
+    pub read_columns: Option<Arc<ColumnsByTable>>,
     /// Precomputed deparsed SQL body (mirrors `CachedQuery.deparsed_sql`).
     /// None while Loading; Some once the view transitions to Ready.
     pub deparsed_sql: Option<EcoString>,
