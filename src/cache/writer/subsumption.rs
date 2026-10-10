@@ -116,6 +116,7 @@ impl WriterRegistration {
         let subsume_start = Instant::now();
         let fingerprint = identity.fingerprint;
         let resolved = Arc::clone(&resolution.resolved);
+        let bound = Arc::clone(&resolution.bound);
         let deparsed_sql = resolution.deparsed_sql.clone();
         let max_limit = resolution.max_limit;
 
@@ -165,6 +166,7 @@ impl WriterRegistration {
             QueryServing {
                 generation,
                 resolved: Arc::clone(&resolved),
+                bound,
                 deparsed_sql: deparsed_sql.clone(),
                 max_limit,
             },

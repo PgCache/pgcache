@@ -26,11 +26,10 @@ use crate::cache::Generation;
 use crate::cache::messages::{QueryCommand, RegisterRequest, ResolveRequest, ResolveResult};
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::population_pool::PopulationPool;
-use crate::cache::types::{Alias, CachedQuery, SharedResolved};
+use crate::cache::types::{Alias, CachedQuery, SharedResolved, SharedResolvedQuery};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::oid::Oid;
-use crate::query::ast::QueryExpr;
 use crate::query::resolved::ResolvedSelectNode;
 use crate::query::{Fingerprint, QueryShape};
 use crate::result::error_chain_format;
@@ -73,7 +72,8 @@ pub(super) struct QueryResolution {
     /// `deparsed_sql`; see `CachedQuery.serve_shape`.
     pub(super) serve_shape: QueryShape,
     pub(super) relation_oids: Vec<Oid>,
-    pub(super) base_query: QueryExpr,
+    /// The canonical plain tree with its bindings (ADR-057).
+    pub(super) bound: SharedResolvedQuery,
     pub(super) max_limit: Option<u64>,
     /// MV cap, separate from `max_limit`. Set for join shapes only (the
     /// MV body applies the user's LIMIT over the source-row cache);
@@ -123,7 +123,7 @@ pub(super) fn cached_query_insert(
         fingerprint: identity.fingerprint,
         generation,
         relation_oids: resolution.relation_oids,
-        query: resolution.base_query,
+        bound: resolution.bound,
         resolved: resolution.resolved,
         deparsed_sql: resolution.deparsed_sql,
         serve_shape: resolution.serve_shape,

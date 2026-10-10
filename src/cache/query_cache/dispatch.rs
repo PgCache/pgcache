@@ -617,6 +617,7 @@ impl CacheDispatch {
                         state: transition.new,
                         generation: Generation::ZERO,
                         resolved: None,
+                        bound: None,
                         read_columns: None,
                         deparsed_sql: None,
                         serve_shape: None,

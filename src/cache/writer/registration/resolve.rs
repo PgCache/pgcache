@@ -14,7 +14,7 @@ use crate::cache::admission::{
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{resolved_has_join, resolved_has_window};
 use crate::cache::mv_shape::ShapeGate;
-use crate::cache::types::SharedResolved;
+use crate::cache::types::{SharedResolved, SharedResolvedQuery};
 use crate::cache::update_query::UpdateQueries;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
@@ -24,11 +24,14 @@ use crate::query::ast::{AstNode, Deparse, QueryExpr, TableNode};
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::query_shape_derive;
+use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
 use crate::query::resolved::{
-    ResolvedQueryExpr, enum_order_dependence_check, query_expr_resolve, resolved_query_fingerprint,
+    ResolvedQueryExpr, enum_order_dependence_check, resolved_query_fingerprint,
 };
 use crate::query::transform::predicate_pushdown_apply;
-use crate::query::transform::{LiteralCanonOutcome, resolved_literals_canonicalise};
+use crate::query::transform::{
+    LiteralCanonOutcome, query_literals_canonicalise, resolved_literals_canonicalise,
+};
 
 /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
 async fn table_schema_resolve(
@@ -78,24 +81,44 @@ pub(super) async fn query_fingerprint_resolve(
 ) -> CacheResult<Fingerprint> {
     let (base_query, _) = base_query_prepare(query);
     cache_tables_ensure(core, &base_query, &keying.search_path).await?;
-    let (resolved, _) = query_resolve_canonical(core, &base_query, keying)
+    let resolution = query_resolve_canonical(core, base_query, keying)
         .attach_loc("resolving query expression for its fingerprint")?;
-    Ok(resolved_query_fingerprint(&resolved))
+    Ok(resolved_query_fingerprint(&resolution.resolved))
+}
+
+/// The identity-bearing form of a query in both representations.
+struct CanonicalResolution {
+    /// Canonical resolved tree: the fingerprint, deparse and rewrite source
+    /// until those move onto `bound`.
+    resolved: ResolvedQueryExpr,
+    /// The canonical plain tree with its bindings (ADR-057).
+    bound: SharedResolvedQuery,
+    literals: LiteralCanonOutcome,
 }
 
 /// Resolve `base_query` on the session's search_path and canonicalise its
-/// date-time literals under the session's settings; the result is the
-/// identity-bearing form.
+/// date-time literals under the session's settings. `base_query` is the
+/// caller's own copy; it is canonicalised in place and becomes the shared
+/// tree.
 fn query_resolve_canonical(
     core: &WriterCore,
-    base_query: &QueryExpr,
+    mut base_query: QueryExpr,
     keying: &KeyingSettings,
-) -> CacheResult<(ResolvedQueryExpr, LiteralCanonOutcome)> {
+) -> CacheResult<CanonicalResolution> {
     let path: Vec<&str> = keying.search_path.iter().map(EcoString::as_str).collect();
-    let mut resolved = query_expr_resolve(base_query, &core.cache.tables, &path)
+    let (mut resolved, bindings) = query_expr_resolve_bound(&base_query, &core.cache.tables, &path)
         .map_err(|e| e.context_transform(CacheError::from))?;
-    let outcome = resolved_literals_canonicalise(&mut resolved, &keying.literals);
-    Ok((resolved, outcome))
+    let literals = query_literals_canonicalise(&mut base_query, &bindings, &keying.literals);
+    let resolved_literals = resolved_literals_canonicalise(&mut resolved, &keying.literals);
+    debug_assert_eq!(
+        literals, resolved_literals,
+        "plain and resolved canonicalisation disagree"
+    );
+    Ok(CanonicalResolution {
+        resolved,
+        bound: Arc::new(ResolvedQuery::new(Arc::new(base_query), bindings)),
+        literals,
+    })
 }
 
 /// Deparse once at registration. The output is a pure function of the
@@ -154,7 +177,11 @@ impl WriterRegistration {
 
         cache_tables_ensure(core, &base_query, &request.keying.search_path).await?;
 
-        let (resolved, literals) = query_resolve_canonical(core, &base_query, &request.keying)
+        let CanonicalResolution {
+            resolved,
+            bound,
+            literals,
+        } = query_resolve_canonical(core, base_query, &request.keying)
             .attach_loc("resolving query expression")?;
         // The identity dispatch resolved this pair to must be the one this
         // resolution produces (before the pushdown transform).
@@ -198,7 +225,7 @@ impl WriterRegistration {
             deparsed_sql,
             serve_shape,
             relation_oids,
-            base_query,
+            bound,
             max_limit,
             mv_limit,
             shape_gate,

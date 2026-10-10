@@ -22,7 +22,7 @@ use crate::{
     catalog::Catalog,
     query::{
         Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap,
-        ast::QueryExpr,
+        resolve::ResolvedQuery,
         resolved::{ColumnsByTable, ResolvedQueryExpr},
     },
     settings::{DynamicConfigHandle, Settings},
@@ -42,6 +42,10 @@ pub struct Alias {
 /// on every cache hit (the dispatch→serve path).
 pub(super) type SharedResolved = Arc<ResolvedQueryExpr>;
 
+/// The canonical plain tree with its bindings (ADR-057), shared like
+/// `SharedResolved`; the serve and analysis paths move onto it slice by slice.
+pub(super) type SharedResolvedQuery = Arc<ResolvedQuery>;
+
 pub(super) use super::serve_decision::CachedQueryState;
 
 /// A cached query with its metadata and state
@@ -51,7 +55,7 @@ pub struct CachedQuery {
     /// Generation number assigned when query was registered (monotonically increasing)
     pub generation: Generation,
     pub relation_oids: Vec<Oid>,
-    pub query: QueryExpr,
+    pub bound: SharedResolvedQuery,
     pub resolved: SharedResolved,
     /// Deparsed SQL body of the resolved query. Computed once at registration
     /// and reused on every non-MV cache hit to avoid per-request AST traversal.
@@ -372,6 +376,8 @@ pub struct CachedQueryView {
     pub generation: Generation,
     /// Resolved query (None for Loading placeholder before writer resolves)
     pub resolved: Option<SharedResolved>,
+    /// The same resolution as a plain tree with bindings; set with `resolved`.
+    pub bound: Option<SharedResolvedQuery>,
     /// The columns `resolved` reads per table, for the read-after-write gate;
     /// set with `resolved`.
     pub read_columns: Option<Arc<ColumnsByTable>>,

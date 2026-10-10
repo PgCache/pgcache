@@ -86,6 +86,7 @@ impl WriterRegistration {
         let serving = QueryServing {
             generation: new_generation,
             resolved: Arc::clone(&cached.resolved),
+            bound: Arc::clone(&cached.bound),
             deparsed_sql: cached.deparsed_sql.clone(),
             max_limit: cached.max_limit,
         };
@@ -127,6 +128,7 @@ impl WriterRegistration {
                 let serving = QueryServing {
                     generation: query.generation,
                     resolved: Arc::clone(&query.resolved),
+                    bound: Arc::clone(&query.bound),
                     deparsed_sql: query.deparsed_sql.clone(),
                     max_limit: query.max_limit,
                 };
@@ -212,6 +214,7 @@ impl WriterRegistration {
 
         // Collect data needed before mutating
         let resolved = Arc::clone(&cached_query.resolved);
+        let bound = Arc::clone(&cached_query.bound);
         let deparsed_sql = cached_query.deparsed_sql.clone();
         let relation_oids = cached_query.relation_oids.clone();
         let old_generation = cached_query.generation;
@@ -232,6 +235,7 @@ impl WriterRegistration {
         let serving = QueryServing {
             generation: new_generation,
             resolved,
+            bound,
             deparsed_sql,
             max_limit: new_max_limit,
         };

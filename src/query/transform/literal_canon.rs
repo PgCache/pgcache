@@ -10,9 +10,13 @@
 //! meaning, is left as written and reported, so the entry is served only to
 //! sessions on the reference settings it will be populated under.
 
-use crate::query::ast::{LiteralValue, ValuesClause};
+use crate::query::ast::{
+    CaseExpr, FunctionCall, JoinQual, LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
+    SelectColumns, SelectNode, TableSource, ValuesClause, WhereExpr,
+};
 use crate::query::cast::{CastTarget, cast_target_from_canonical};
 use crate::query::literal_settings::LiteralSettings;
+use crate::query::resolve::{Bindings, ColumnTarget};
 use crate::query::resolved::{
     ResolvedCaseExpr, ResolvedFunctionCall, ResolvedJoinQual, ResolvedQueryBody, ResolvedQueryExpr,
     ResolvedScalarExpr, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource,
@@ -39,6 +43,215 @@ pub fn resolved_literals_canonicalise(
     };
     pass.query(resolved);
     pass.outcome
+}
+
+/// Canonicalise every date-time literal of a finalized plain tree under
+/// `settings`, reading column types through `bindings` (ADR-057). Values
+/// change, structure does not, so the tree's ids stay valid. CTE definition
+/// bodies are skipped: the resolver binds only the copy each reference
+/// embeds, and that copy is canonicalised in its place.
+pub fn query_literals_canonicalise(
+    query: &mut QueryExpr,
+    bindings: &Bindings,
+    settings: &LiteralSettings,
+) -> LiteralCanonOutcome {
+    let mut pass = BoundPass {
+        bindings,
+        literals: Pass {
+            settings,
+            outcome: LiteralCanonOutcome::default(),
+        },
+    };
+    pass.query(query);
+    pass.literals.outcome
+}
+
+/// The plain-tree walk; literal handling is shared with the resolved walk.
+struct BoundPass<'a> {
+    bindings: &'a Bindings,
+    literals: Pass<'a>,
+}
+
+impl BoundPass<'_> {
+    fn query(&mut self, query: &mut QueryExpr) {
+        match &mut query.body {
+            QueryBody::Select(select) => self.select(select),
+            QueryBody::SetOp(set_op) => {
+                self.query(&mut set_op.left);
+                self.query(&mut set_op.right);
+            }
+            QueryBody::Values(values) => self.literals.values(values),
+        }
+        for clause in &mut query.order_by {
+            self.scalar(&mut clause.expr, None);
+        }
+    }
+
+    fn select(&mut self, select: &mut SelectNode) {
+        for source in &mut select.from {
+            self.source(source);
+        }
+        if let Some(where_clause) = &mut select.where_clause {
+            self.where_expr(where_clause);
+        }
+        if let Some(having) = &mut select.having {
+            self.where_expr(having);
+        }
+        if let SelectColumns::Columns(columns) = &mut select.columns {
+            for column in columns {
+                if let SelectColumn::Expr { expr, .. } = column {
+                    self.scalar(expr, None);
+                }
+            }
+        }
+    }
+
+    fn source(&mut self, source: &mut TableSource) {
+        match source {
+            TableSource::Table(_) => {}
+            TableSource::Subquery(subquery) => self.query(&mut subquery.query),
+            TableSource::CteRef(cte_ref) => self.query(&mut cte_ref.query),
+            TableSource::Join(join) => {
+                self.source(&mut join.left);
+                self.source(&mut join.right);
+                if let JoinQual::On(on) = &mut join.qual {
+                    self.where_expr(on);
+                }
+            }
+        }
+    }
+
+    fn where_expr(&mut self, expr: &mut WhereExpr) {
+        match expr {
+            WhereExpr::Scalar(scalar) => self.scalar(scalar, None),
+            WhereExpr::Unary(unary) => self.where_expr(&mut unary.expr),
+            WhereExpr::Binary(binary) => {
+                let kind = self
+                    .column_kind(&binary.lexpr)
+                    .or_else(|| self.column_kind(&binary.rexpr));
+                self.operand(&mut binary.lexpr, kind);
+                self.operand(&mut binary.rexpr, kind);
+            }
+            WhereExpr::Multi(multi) => {
+                let kind = multi
+                    .exprs
+                    .first()
+                    .and_then(|first| self.column_kind(first));
+                for (i, member) in multi.exprs.iter_mut().enumerate() {
+                    self.operand(member, kind.filter(|_| i > 0));
+                }
+            }
+            WhereExpr::Subquery {
+                query, test_expr, ..
+            } => {
+                if let Some(test) = test_expr {
+                    self.scalar(test, None);
+                }
+                self.query(query);
+            }
+        }
+    }
+
+    fn operand(&mut self, side: &mut WhereExpr, kind: Option<ValueKind>) {
+        if let WhereExpr::Scalar(scalar) = side {
+            self.scalar(scalar, kind);
+        } else {
+            self.where_expr(side);
+        }
+    }
+
+    fn scalar(&mut self, expr: &mut ScalarExpr, kind: Option<ValueKind>) {
+        match expr {
+            ScalarExpr::Literal(literal) => self.literals.literal(literal, kind),
+            ScalarExpr::TypeCast {
+                expr: inner,
+                target,
+            } => {
+                let cast = cast_kind(target);
+                if let ScalarExpr::Literal(literal) = inner.as_mut() {
+                    self.literals.literal(literal, cast);
+                    self.literals.mixed_kinds_check(kind, cast);
+                } else {
+                    self.scalar(inner, None);
+                }
+            }
+            ScalarExpr::Array(elems) => {
+                for elem in elems {
+                    self.scalar(elem, kind);
+                }
+            }
+            ScalarExpr::Function(function) => self.function(function),
+            ScalarExpr::Case(case) => self.case(case),
+            ScalarExpr::Arithmetic(arith) => {
+                self.scalar(&mut arith.left, None);
+                self.scalar(&mut arith.right, None);
+            }
+            ScalarExpr::Subquery(query) => self.query(query),
+            ScalarExpr::Column(_) => {}
+        }
+    }
+
+    fn function(&mut self, function: &mut FunctionCall) {
+        for arg in &mut function.args {
+            self.scalar(arg, None);
+        }
+        if let Some(filter) = &mut function.agg_filter {
+            self.where_expr(filter);
+        }
+        for clause in &mut function.agg_order {
+            self.scalar(&mut clause.expr, None);
+        }
+    }
+
+    fn case(&mut self, case: &mut CaseExpr) {
+        if let Some(arg) = &mut case.arg {
+            self.scalar(arg, None);
+        }
+        for when in &mut case.whens {
+            self.where_expr(&mut when.condition);
+            self.scalar(&mut when.result, None);
+        }
+        if let Some(default) = &mut case.default {
+            self.scalar(default, None);
+        }
+    }
+
+    /// The kind of the column a comparison side names, looking through a
+    /// cast; an inner join's merged column has its left column's kind.
+    fn column_kind(&self, side: &WhereExpr) -> Option<ValueKind> {
+        let WhereExpr::Scalar(scalar) = side else {
+            return None;
+        };
+        self.scalar_column_kind(scalar)
+    }
+
+    fn scalar_column_kind(&self, scalar: &ScalarExpr) -> Option<ValueKind> {
+        match scalar {
+            ScalarExpr::Column(column) => {
+                let metadata = match self.bindings.column(column)? {
+                    ColumnTarget::Column(binding) => self.bindings.binding_column(binding)?,
+                    ColumnTarget::Merged(id) => {
+                        let merged = self.bindings.merged(*id)?;
+                        if merged.outer {
+                            return None;
+                        }
+                        self.bindings.binding_column(&merged.left)?
+                    }
+                    ColumnTarget::Output => return None,
+                };
+                Some(ValueKind::of_type(&metadata.data_type))
+            }
+            ScalarExpr::TypeCast { expr, target } => {
+                cast_kind(target).or_else(|| self.scalar_column_kind(expr))
+            }
+            ScalarExpr::Literal(_)
+            | ScalarExpr::Function(_)
+            | ScalarExpr::Case(_)
+            | ScalarExpr::Arithmetic(_)
+            | ScalarExpr::Subquery(_)
+            | ScalarExpr::Array(_) => None,
+        }
+    }
 }
 
 struct Pass<'a> {
@@ -353,9 +566,8 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::Deparse;
-    use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve;
+    use crate::query::ast::{AstNode, Deparse, query_expr_parse};
+    use crate::query::resolve::{query_expr_resolve, query_expr_resolve_bound};
 
     fn events() -> Catalog {
         let column = |name: &str, position: i16, ty: Type| ColumnMetadata {
@@ -397,6 +609,71 @@ mod tests {
         let mut sql = String::new();
         resolved.deparse(&mut sql);
         (sql, outcome)
+    }
+
+    /// Both passes over one query: the plain tree's literals in pre-order
+    /// and its outcome, against the resolved tree's.
+    fn canon_both(
+        sql: &str,
+        settings: &LiteralSettings,
+    ) -> (
+        (Vec<LiteralValue>, LiteralCanonOutcome),
+        (Vec<LiteralValue>, LiteralCanonOutcome),
+    ) {
+        let mut query = query_expr_parse(sql).expect("parse");
+        let (mut resolved, bindings) =
+            query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
+        let resolved_outcome = resolved_literals_canonicalise(&mut resolved, settings);
+        let plain_outcome = query_literals_canonicalise(&mut query, &bindings, settings);
+        let resolved_literals = resolved.nodes::<LiteralValue>().cloned().collect();
+        let plain_literals = query.nodes::<LiteralValue>().cloned().collect();
+        (
+            (plain_literals, plain_outcome),
+            (resolved_literals, resolved_outcome),
+        )
+    }
+
+    const EQUIVALENCE_CORPUS: &[&str] = &[
+        "SELECT id FROM events WHERE day = '01/02/2024' AND at > '2024-01-02 10:00' \
+         AND local_at < '2024-01-02 10:00+05'",
+        "SELECT id FROM events WHERE day IN ('01/02/2024', '02/03/2024') \
+         OR day = ANY (ARRAY['03/04/2024']) OR day BETWEEN '04/05/2024' AND '05/06/2024' \
+         OR local_at = '06/07/2024 08:00'::timestamp",
+        "SELECT id FROM events WHERE day = 'Jan 2 2024'",
+        "SELECT id FROM events WHERE at > to_timestamp('2024-01-02', 'YYYY-MM-DD')",
+        "SELECT id FROM events WHERE span > '1 day'",
+        "SELECT id FROM events WHERE label = lower('now')",
+        "SELECT id FROM events WHERE day = '2024-01-02 10:00'::timestamptz",
+        "SELECT id FROM events WHERE label = '2024-01-02' AND lower(label) = 'bob' \
+         AND id = '7'::int4 AND label = 'order-42'::text",
+        "SELECT id FROM events WHERE label = '{\"a\": 1}'::jsonb::text",
+        "SELECT id FROM events e WHERE EXISTS (SELECT 1 FROM events x \
+         WHERE x.day = '01/02/2024' AND x.id = e.id) ORDER BY CASE WHEN day > '02/03/2024' \
+         THEN 1 ELSE 2 END",
+        "SELECT day FROM events a JOIN events b USING (day) WHERE day = '01/02/2024'",
+        "SELECT day FROM events a LEFT JOIN events b USING (day) WHERE day = '01/02/2024'",
+        "SELECT v.d FROM (SELECT day AS d FROM events WHERE at > '2024-01-02 10:00') v \
+         WHERE v.d = '01/02/2024'",
+        "SELECT * FROM (VALUES ('01/02/2024', 1)) v",
+        "SELECT id FROM events WHERE day = '01/02/2024' UNION SELECT id FROM events \
+         WHERE at > '2024-01-02 10:00' ORDER BY id",
+        "SELECT count(*) FILTER (WHERE day > '01/02/2024') FROM events HAVING \
+         max(at) > '2024-01-02 10:00'",
+    ];
+
+    /// The plain pass and the resolved pass rewrite the same literals to the
+    /// same text and reach the same verdict.
+    #[test]
+    fn test_plain_pass_matches_resolved_pass() {
+        for settings in [
+            tokyo_dmy(),
+            LiteralSettings::from_texts("Nowhere/Land", "ISO, MDY", "postgres", "Default"),
+        ] {
+            for sql in EQUIVALENCE_CORPUS {
+                let (plain, resolved) = canon_both(sql, &settings);
+                assert_eq!(plain, resolved, "{sql}");
+            }
+        }
     }
 
     fn tokyo_dmy() -> LiteralSettings {

@@ -24,6 +24,7 @@ use crate::cache::{
     mv_shape::ShapeGate,
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
+        SharedResolvedQuery,
     },
 };
 use crate::oid::Oid;
@@ -120,6 +121,7 @@ pub(crate) struct WriterShared {
 pub(super) struct QueryServing {
     pub(super) generation: Generation,
     pub(super) resolved: SharedResolved,
+    pub(super) bound: SharedResolvedQuery,
     pub(super) deparsed_sql: EcoString,
     pub(super) max_limit: Option<u64>,
 }
@@ -613,6 +615,7 @@ impl WriterCore {
                 v.state = state;
                 v.generation = serving.generation;
                 v.resolved = Some(Arc::clone(&serving.resolved));
+                v.bound = Some(Arc::clone(&serving.bound));
                 v.read_columns = Some(Arc::clone(&read_columns));
                 v.deparsed_sql = Some(serving.deparsed_sql.clone());
                 v.serve_shape = serve_shape.clone();
@@ -624,6 +627,7 @@ impl WriterCore {
                 state,
                 generation: serving.generation,
                 resolved: Some(Arc::clone(&serving.resolved)),
+                bound: Some(Arc::clone(&serving.bound)),
                 read_columns: Some(read_columns),
                 deparsed_sql: Some(serving.deparsed_sql.clone()),
                 serve_shape,
@@ -653,6 +657,7 @@ impl WriterCore {
             resolved,
             deparsed_sql,
             max_limit,
+            ..
         } = serving;
         let _ = self.notify_tx.send(WriterNotify::Ready {
             fingerprint,
