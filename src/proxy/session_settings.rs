@@ -286,17 +286,53 @@ pub(crate) struct SessionSettings {
     mutation_seq: u64,
     search_path: SearchPathState,
     isolation: IsolationState,
+    /// The read-scope views for a read outside a block and for one inside,
+    /// rebuilt only when a value changes ([`Self::views_rederive`]) so a read
+    /// costs two `Arc` clones, not a settings parse and eleven string clones.
+    idle: ScopeViews,
+    block: ScopeViews,
+}
+
+/// What a read at one scope dispatches with, derived from the values in
+/// force there.
+#[derive(Debug, Clone)]
+struct ScopeViews {
+    keying: Result<Arc<KeyingSettings>, SettingsForwardReason>,
+    label: Arc<KeyingSettings>,
+    output: Arc<OutputSettings>,
+}
+
+impl ScopeViews {
+    fn unknown() -> Self {
+        let label = Arc::new(KeyingSettings {
+            search_path: Arc::from([]),
+            literals: LiteralSettings::default(),
+        });
+        Self {
+            keying: Err(SettingsForwardReason::SettingUnknown(Guc::SearchPath)),
+            label,
+            output: Arc::new(OutputSettings::default()),
+        }
+    }
 }
 
 impl SessionSettings {
     pub(crate) fn new() -> Self {
-        Self {
+        let mut settings = Self {
             states: Guc::ALL.map(SettingState::for_guc),
             startup_user: None,
             mutation_seq: 0,
             search_path: SearchPathState::Unknown,
             isolation: IsolationState::Unknown,
-        }
+            idle: ScopeViews::unknown(),
+            block: ScopeViews::unknown(),
+        };
+        settings.views_rederive();
+        settings
+    }
+
+    fn scope(&self, in_block: bool) -> &ScopeViews {
+        if in_block { &self.block } else { &self.idle }
     }
 
     /// The sequence a probe injected now should carry.
@@ -337,19 +373,37 @@ impl SessionSettings {
     pub(crate) fn serve_keying(
         &self,
         in_block: bool,
-    ) -> Result<KeyingSettings, SettingsForwardReason> {
-        Ok(KeyingSettings {
-            search_path: self.serve_search_path(in_block)?,
-            literals: self.literal_settings(in_block),
-        })
+    ) -> Result<Arc<KeyingSettings>, SettingsForwardReason> {
+        self.scope(in_block).keying.clone()
     }
 
     /// Keying settings for a key that is only a label (telemetry, a batch
     /// context): an unknown search_path reads as empty rather than forwarding.
-    pub(crate) fn keying_label(&self, in_block: bool) -> KeyingSettings {
-        KeyingSettings {
-            search_path: self.search_path.resolve().unwrap_or_else(|| Arc::from([])),
-            literals: self.literal_settings(in_block),
+    pub(crate) fn keying_label(&self, in_block: bool) -> Arc<KeyingSettings> {
+        Arc::clone(&self.scope(in_block).label)
+    }
+
+    /// The rendering settings in force for a read at this scope. The caller
+    /// has checked [`Self::serve_keying`], so every value is known; an
+    /// unknown one (explain's path, which does not check) renders as empty.
+    pub(crate) fn output_settings(&self, in_block: bool) -> Arc<OutputSettings> {
+        Arc::clone(&self.scope(in_block).output)
+    }
+
+    fn scope_views_build(&self, in_block: bool) -> ScopeViews {
+        let literals = self.literal_settings(in_block);
+        ScopeViews {
+            keying: self.serve_search_path(in_block).map(|search_path| {
+                Arc::new(KeyingSettings {
+                    search_path,
+                    literals: literals.clone(),
+                })
+            }),
+            label: Arc::new(KeyingSettings {
+                search_path: self.search_path.resolve().unwrap_or_else(|| Arc::from([])),
+                literals,
+            }),
+            output: Arc::new(self.output_settings_build(in_block)),
         }
     }
 
@@ -382,10 +436,7 @@ impl SessionSettings {
         }
     }
 
-    /// The rendering settings in force for a read at this scope. The caller
-    /// has checked [`Self::serve_keying`], so every value is known; an
-    /// unknown one (explain's path, which does not check) renders as empty.
-    pub(crate) fn output_settings(&self, in_block: bool) -> OutputSettings {
+    fn output_settings_build(&self, in_block: bool) -> OutputSettings {
         OutputSettings::from_values(|guc| {
             self.effective(guc, in_block)
                 .known()
@@ -553,6 +604,8 @@ impl SessionSettings {
             },
             None => IsolationState::Unknown,
         };
+        self.idle = self.scope_views_build(false);
+        self.block = self.scope_views_build(true);
     }
 }
 
@@ -583,6 +636,26 @@ mod tests {
         settings.startup_user_set(Some("alice"));
         settings.probe_apply(&sample("public"), status, settings.probe_seq());
         settings
+    }
+
+    /// A read dispatches with the views built at the last change: the same
+    /// `Arc`s until a value changes, fresh ones reflecting the change after.
+    #[test]
+    fn test_scope_views_are_shared_until_a_value_changes() {
+        let mut settings = all_known(TransactionStatus::Idle);
+        let keying = settings.serve_keying(false).expect("every setting known");
+        let output = settings.output_settings(false);
+        assert!(Arc::ptr_eq(
+            &keying,
+            &settings.serve_keying(false).expect("every setting known")
+        ));
+        assert!(Arc::ptr_eq(&output, &settings.output_settings(false)));
+
+        settings.parameter_status(Guc::TimeZone, "Asia/Tokyo");
+        let changed = settings.serve_keying(false).expect("every setting known");
+        assert!(!Arc::ptr_eq(&keying, &changed));
+        assert_eq!(changed.literals.timezone, "Asia/Tokyo");
+        assert_ne!(settings.output_settings(false).profile(), output.profile());
     }
 
     /// A probe row with `search_path` set and every other setting a plain value.

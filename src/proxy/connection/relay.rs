@@ -238,9 +238,9 @@ async fn handle_connection(
                 // so dispatch it even on the first (unresolved) statement (PGC-345).
                 let in_block = state.in_transaction();
                 let keying = match state.session_settings.serve_keying(in_block) {
-                    Ok(keying) => Arc::new(keying),
+                    Ok(keying) => keying,
                     Err(_) if matches!(msg, CacheMessage::Explain(..)) => {
-                        Arc::new(state.session_settings.keying_label(in_block))
+                        state.session_settings.keying_label(in_block)
                     }
                     Err(reason) => {
                         debug!("{}, forwarding to origin", reason.describe());
@@ -369,7 +369,7 @@ async fn handle_connection(
                     client_socket: socket,
                     reply_tx,
                     keying,
-                    output_settings: Arc::new(state.session_settings.output_settings(in_block)),
+                    output_settings: state.session_settings.output_settings(in_block),
                     timing,
                     pipeline: state.extended.pipeline_take(),
                     transaction_status: state.transaction_status,

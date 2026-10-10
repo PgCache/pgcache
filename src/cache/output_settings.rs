@@ -30,9 +30,16 @@ pub(crate) const OUTPUT_GUCS: [Guc; 11] = [
 pub(crate) const SETOUT_SQL: &str = "SELECT set_config('timezone',$1,false),set_config('datestyle',$2,false),set_config('intervalstyle',$3,false),set_config('extra_float_digits',$4,false),set_config('bytea_output',$5,false),set_config('client_encoding',$6,false),set_config('lc_monetary',$7,false),set_config('lc_numeric',$8,false),set_config('lc_time',$9,false),set_config('xmlbinary',$10,false),set_config('xmloption',$11,false)";
 
 /// A client's rendering settings as the proxy knows them at dispatch.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputSettings {
     values: [EcoString; OUTPUT_GUCS.len()],
+    profile: OutputProfile,
+}
+
+impl Default for OutputSettings {
+    fn default() -> Self {
+        Self::from_values(|_| EcoString::new())
+    }
 }
 
 /// The hash of an [`OutputSettings`]. Every value counts whatever the result
@@ -46,8 +53,12 @@ pub struct OutputProfile(u64);
 impl OutputSettings {
     /// Build from a lookup of each rendering setting's value.
     pub fn from_values(mut value_of: impl FnMut(Guc) -> EcoString) -> Self {
+        let values = OUTPUT_GUCS.map(&mut value_of);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        values.hash(&mut hasher);
         Self {
-            values: OUTPUT_GUCS.map(&mut value_of),
+            values,
+            profile: OutputProfile(hasher.finish()),
         }
     }
 
@@ -59,9 +70,7 @@ impl OutputSettings {
     /// The profile a result rendered under these settings carries, and what
     /// a serve connection remembers having applied.
     pub fn profile(&self) -> OutputProfile {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.values.hash(&mut hasher);
-        OutputProfile(hasher.finish())
+        self.profile
     }
 }
 
