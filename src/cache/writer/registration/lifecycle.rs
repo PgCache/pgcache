@@ -94,6 +94,7 @@ impl WriterRegistration {
         cached.invalidated = false;
         cached.cached_bytes = 0;
         cached.registration_started_at = Some(started_at);
+        let population = Arc::clone(&cached.population);
         // Refcount unchanged — readmit reuses the existing relation_oids set.
         core.cache.cached_queries.insert_overwrite(cached);
 
@@ -104,7 +105,7 @@ impl WriterRegistration {
             PopulationTarget {
                 fingerprint,
                 generation: serving.generation,
-                bound: &serving.bound,
+                population: &population,
                 max_limit: serving.max_limit,
             },
         )?;
@@ -212,6 +213,7 @@ impl WriterRegistration {
 
         // Collect data needed before mutating
         let bound = Arc::clone(&cached_query.bound);
+        let population = Arc::clone(&cached_query.population);
         let serve_shape = Arc::clone(&cached_query.serve_shape);
         let relation_oids = cached_query.relation_oids.clone();
         let old_generation = cached_query.generation;
@@ -242,7 +244,7 @@ impl WriterRegistration {
             PopulationTarget {
                 fingerprint,
                 generation: serving.generation,
-                bound: &serving.bound,
+                population: &population,
                 max_limit: serving.max_limit,
             },
         )?;

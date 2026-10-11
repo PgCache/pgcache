@@ -187,10 +187,12 @@ impl WriterRegistration {
             .resolve_update_queries_register
             .record(uq_start.elapsed().as_secs_f64());
 
+        let population = decorrelated.unwrap_or_else(|| Arc::clone(&bound));
         Ok(QueryResolution {
             serve_shape,
             relation_oids,
             bound,
+            population,
             max_limit,
             mv_limit,
             shape_gate,

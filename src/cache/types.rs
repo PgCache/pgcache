@@ -54,6 +54,9 @@ pub struct CachedQuery {
     pub generation: Generation,
     pub relation_oids: Vec<Oid>,
     pub bound: SharedResolvedQuery,
+    /// The tree population reads: the decorrelated form of `bound`, or
+    /// `bound` itself when nothing was correlated.
+    pub population: SharedResolvedQuery,
     /// Parameterized serve shape (PGC-294): the serve SQL of `bound` with its
     /// predicate literals replaced by `$N` placeholders, plus its key and the
     /// literals to bind. Computed once at registration; lets the serve path

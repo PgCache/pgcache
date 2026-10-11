@@ -69,6 +69,8 @@ pub(super) struct QueryResolution {
     pub(super) relation_oids: Vec<Oid>,
     /// The canonical plain tree with its bindings (ADR-057).
     pub(super) bound: SharedResolvedQuery,
+    /// See `CachedQuery.population`.
+    pub(super) population: SharedResolvedQuery,
     pub(super) max_limit: Option<u64>,
     /// MV cap, separate from `max_limit`. Set for join shapes only (the
     /// MV body applies the user's LIMIT over the source-row cache);
@@ -99,7 +101,8 @@ pub(super) struct RegistrationIdentity {
 struct PopulationTarget<'a> {
     fingerprint: Fingerprint,
     generation: Generation,
-    bound: &'a SharedResolvedQuery,
+    /// See `CachedQuery.population`.
+    population: &'a SharedResolvedQuery,
     max_limit: Option<u64>,
 }
 
@@ -119,6 +122,7 @@ pub(super) fn cached_query_insert(
         generation,
         relation_oids: resolution.relation_oids,
         bound: resolution.bound,
+        population: resolution.population,
         serve_shape: resolution.serve_shape,
         max_limit: resolution.max_limit,
         cached_bytes: 0,

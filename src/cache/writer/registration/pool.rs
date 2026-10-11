@@ -16,7 +16,6 @@ use crate::cache::writer::population::{
 };
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
-use crate::query::decorrelate::query_decorrelate;
 use crate::result::error_chain_format;
 
 impl WriterRegistration {
@@ -91,19 +90,14 @@ impl WriterRegistration {
         self.populate_work_dispatch(core, work)
     }
 
-    /// Build population work for a query: decorrelate it so correlated
-    /// subqueries are merged into JOINs (the query as registered when it has
-    /// none), and collect the metadata of every table it reads.
+    /// Build population work for a query: the tree registration decorrelated
+    /// for it, and the metadata of every table it reads.
     fn population_work_build(
         &self,
         core: &WriterCore,
         target: PopulationTarget<'_>,
     ) -> PopulationWork {
-        let population: SharedResolvedQuery =
-            match query_decorrelate(target.bound, &self.aggregate_functions) {
-                Ok(Some(decorrelated)) => Arc::new(decorrelated),
-                Ok(None) | Err(_) => Arc::clone(target.bound),
-            };
+        let population: SharedResolvedQuery = Arc::clone(target.population);
         let table_metadata: Vec<Arc<TableMetadata>> = population
             .relation_oids()
             .iter()
