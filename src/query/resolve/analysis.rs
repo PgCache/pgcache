@@ -3,8 +3,12 @@
 
 use std::collections::HashMap;
 
+use ecow::EcoString;
+
 use super::bindings::{ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot};
-use crate::query::ast::{AstNode, ColumnNode, StarNode};
+use crate::query::ast::{
+    AstNode, ColumnNode, QueryBody, QueryExpr, SelectColumn, SelectColumns, StarNode,
+};
 use crate::query::resolved::ColumnsByTable;
 
 impl ResolvedQuery {
@@ -41,6 +45,40 @@ impl ResolvedQuery {
             self.column_add(&mut columns, &merged.right);
         }
         columns
+    }
+
+    /// The output names of `query`, one per output position with stars
+    /// expanded: an alias, else the column name of a column reference, else
+    /// nothing. A set operation's outputs are its leftmost branch's.
+    pub fn output_names(&self, query: &QueryExpr) -> Vec<Option<EcoString>> {
+        let select = match &query.body {
+            QueryBody::Select(select) => select,
+            QueryBody::SetOp(set_op) => return self.output_names(&set_op.left),
+            QueryBody::Values(_) => return Vec::new(),
+        };
+        let SelectColumns::Columns(columns) = &select.columns else {
+            return Vec::new();
+        };
+        let bindings = self.bindings();
+        let mut names = Vec::with_capacity(columns.len());
+        for column in columns {
+            match column {
+                SelectColumn::Expr { expr, alias } => {
+                    names.push(alias.clone().or_else(|| self.column_output_name(expr)));
+                }
+                SelectColumn::Star(star) => {
+                    for item in bindings.star(star).unwrap_or(&[]) {
+                        names.push(match item {
+                            StarItem::Column(binding) => {
+                                bindings.binding_column(binding).map(|c| c.name.clone())
+                            }
+                            StarItem::Merged(id) => bindings.merged(*id).map(|m| m.name.clone()),
+                        });
+                    }
+                }
+            }
+        }
+        names
     }
 
     fn column_add(&self, columns: &mut ColumnsByTable, binding: &ColumnBinding) {

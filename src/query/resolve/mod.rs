@@ -23,6 +23,7 @@ mod table;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use bindings::BindingsBuilder;
 pub use bindings::{
     Bindings, ColumnBinding, ColumnTarget, MergedColumnBinding, MergedId, ResolvedQuery, SlotId,
     StarItem, TableSlot,

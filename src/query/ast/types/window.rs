@@ -34,6 +34,10 @@ impl AstNode for FunctionCall {
         children_visit(self.over.as_deref(), f)
     }
 
+    fn id(&self) -> NodeId {
+        self.id
+    }
+
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -141,6 +145,10 @@ impl AstNode for WindowSpec {
         children_visit(self.frame.as_ref(), f)
     }
 
+    fn id(&self) -> NodeId {
+        self.id
+    }
+
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -183,6 +191,10 @@ impl AstNode for WindowFrame {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         children_visit([&self.start, &self.end], f)
+    }
+
+    fn id(&self) -> NodeId {
+        self.id
     }
 
     fn id_set(&mut self, id: NodeId) {

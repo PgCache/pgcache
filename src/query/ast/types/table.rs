@@ -172,6 +172,10 @@ pub struct TableNode {
 }
 
 impl AstNode for TableNode {
+    fn id(&self) -> NodeId {
+        self.id
+    }
+
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -216,6 +220,10 @@ impl AstNode for TableSubqueryNode {
         ControlFlow::Continue(())
     }
 
+    fn id(&self) -> NodeId {
+        self.id
+    }
+
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -250,6 +258,10 @@ impl AstNode for CteRefNode {
     ) -> ControlFlow<B> {
         self.query.try_for_each_node(f)?;
         ControlFlow::Continue(())
+    }
+
+    fn id(&self) -> NodeId {
+        self.id
     }
 
     fn id_set(&mut self, id: NodeId) {
@@ -316,6 +328,10 @@ impl AstNode for JoinNode {
             c.try_for_each_node(f)?;
         }
         ControlFlow::Continue(())
+    }
+
+    fn id(&self) -> NodeId {
+        self.id
     }
 
     fn id_set(&mut self, id: NodeId) {

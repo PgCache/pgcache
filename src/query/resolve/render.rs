@@ -429,7 +429,7 @@ impl ResolvedQuery {
     /// The name PostgreSQL gives an unaliased output: the column name of a
     /// column reference (a merged outer-join column is `coalesce`, which has
     /// none); nothing for any other expression.
-    fn column_output_name(&self, expr: &ScalarExpr) -> Option<EcoString> {
+    pub(crate) fn column_output_name(&self, expr: &ScalarExpr) -> Option<EcoString> {
         let ScalarExpr::Column(column) = expr else {
             return None;
         };

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ecow::EcoString;
 
 use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
-use crate::query::ast::{ColumnNode, NodeId, QueryExpr, StarNode};
+use crate::query::ast::{ColumnNode, IdRemap, NodeId, QueryExpr, StarNode};
 
 /// Index of a table source in [`Bindings::slots`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -191,10 +191,11 @@ impl Bindings {
     }
 }
 
-/// Accumulates bindings while the resolver walks the tree; emission order is
-/// the resolver's, so [`BindingsBuilder::finish`] sorts by node id.
+/// Accumulates bindings while the resolver walks the tree, or while a
+/// rewrite binds what it added to a remapped copy; emission order is the
+/// caller's, so [`BindingsBuilder::finish`] sorts by node id.
 #[derive(Debug, Default)]
-pub(super) struct BindingsBuilder {
+pub(crate) struct BindingsBuilder {
     bindings: Bindings,
 }
 
@@ -204,31 +205,72 @@ fn narrow(index: usize) -> u32 {
 }
 
 impl BindingsBuilder {
-    pub(super) fn slot_push(&mut self, source: NodeId, slot: TableSlot) -> SlotId {
+    /// The bindings of a tree a rewrite built from pieces of `source`'s,
+    /// carried to the pieces' new positions (ADR-057): a node kept in
+    /// several places binds in each, a node the rewrite dropped binds
+    /// nowhere. Slots are kept as they are, so what the rewrite added binds
+    /// into them by slot and position.
+    pub(crate) fn from_remapped(source: &Bindings, remap: &IdRemap) -> Self {
+        let mut bindings = Bindings {
+            slots: source.slots.clone(),
+            ..Bindings::default()
+        };
+        for (node, slot) in &source.sources {
+            bindings
+                .sources
+                .extend(remap.new_ids(*node).map(|new| (new, *slot)));
+        }
+        for (node, target) in &source.columns {
+            bindings
+                .columns
+                .extend(remap.new_ids(*node).map(|new| (new, target.clone())));
+        }
+        for (node, items) in &source.stars {
+            bindings
+                .stars
+                .extend(remap.new_ids(*node).map(|new| (new, items.clone())));
+        }
+        // A merged column keeps its index, which column and star bindings
+        // name; one whose join the rewrite dropped is simply never reached.
+        bindings.merged = source
+            .merged
+            .iter()
+            .map(|merged| MergedColumnBinding {
+                join: remap.new_id(merged.join).unwrap_or(merged.join),
+                ..merged.clone()
+            })
+            .collect();
+        for node in &source.correlated {
+            bindings.correlated.extend(remap.new_ids(*node));
+        }
+        Self { bindings }
+    }
+
+    pub(crate) fn slot_push(&mut self, source: NodeId, slot: TableSlot) -> SlotId {
         let id = SlotId(narrow(self.bindings.slots.len()));
         self.bindings.slots.push(slot);
         self.bindings.sources.push((source, id));
         id
     }
 
-    pub(super) fn column_bind(&mut self, node: NodeId, target: ColumnTarget, correlated: bool) {
+    pub(crate) fn column_bind(&mut self, node: NodeId, target: ColumnTarget, correlated: bool) {
         self.bindings.columns.push((node, target));
         if correlated {
             self.bindings.correlated.push(node);
         }
     }
 
-    pub(super) fn star_bind(&mut self, node: NodeId, items: Vec<StarItem>) {
+    pub(crate) fn star_bind(&mut self, node: NodeId, items: Vec<StarItem>) {
         self.bindings.stars.push((node, items));
     }
 
-    pub(super) fn merged_push(&mut self, merged: MergedColumnBinding) -> MergedId {
+    pub(crate) fn merged_push(&mut self, merged: MergedColumnBinding) -> MergedId {
         let id = MergedId(narrow(self.bindings.merged.len()));
         self.bindings.merged.push(merged);
         id
     }
 
-    pub(super) fn finish(self) -> Bindings {
+    pub(crate) fn finish(self) -> Bindings {
         let mut bindings = self.bindings;
         bindings.sources.sort_by_key(|(node, _)| node.index());
         bindings.columns.sort_by_key(|(node, _)| node.index());
@@ -246,6 +288,72 @@ impl BindingsBuilder {
             "bindings keyed by a pending or repeated node id"
         );
         bindings
+    }
+}
+
+#[cfg(test)]
+impl Bindings {
+    /// One line per binding, naming slots by content rather than index, so
+    /// two resolutions of one tree compare equal whatever order their
+    /// slots were made in.
+    pub(crate) fn describe(&self) -> Vec<String> {
+        let slot_text = |id: SlotId| match self.slot(id) {
+            Some(TableSlot::Base { table, alias }) => {
+                let alias = alias
+                    .as_ref()
+                    .map(|a| format!(" AS {a}"))
+                    .unwrap_or_default();
+                format!("{}.{}{alias}", table.schema, table.name)
+            }
+            Some(TableSlot::Derived { table, .. }) => {
+                let columns: Vec<String> = table
+                    .columns
+                    .iter()
+                    .map(|c| format!("{}:{}", c.name, c.type_name))
+                    .collect();
+                format!("derived {}({})", table.name, columns.join(", "))
+            }
+            None => "?".to_owned(),
+        };
+        let binding_text =
+            |b: &ColumnBinding| format!("{}#{}", slot_text(b.slot), b.position.index());
+        let merged_text = |id: MergedId| match self.merged(id) {
+            Some(m) => format!(
+                "merged {} join {} {} = {} outer={}",
+                m.name,
+                m.join.index(),
+                binding_text(&m.left),
+                binding_text(&m.right),
+                m.outer
+            ),
+            None => "merged ?".to_owned(),
+        };
+        let mut lines = Vec::new();
+        for (node, slot) in &self.sources {
+            lines.push(format!("source {} -> {}", node.index(), slot_text(*slot)));
+        }
+        for (node, target) in &self.columns {
+            let target = match target {
+                ColumnTarget::Column(b) => binding_text(b),
+                ColumnTarget::Merged(id) => merged_text(*id),
+                ColumnTarget::Output => "output".to_owned(),
+            };
+            lines.push(format!("column {} -> {target}", node.index()));
+        }
+        for (node, items) in &self.stars {
+            let items: Vec<String> = items
+                .iter()
+                .map(|item| match item {
+                    StarItem::Column(b) => binding_text(b),
+                    StarItem::Merged(id) => merged_text(*id),
+                })
+                .collect();
+            lines.push(format!("star {} -> [{}]", node.index(), items.join(", ")));
+        }
+        for node in &self.correlated {
+            lines.push(format!("correlated {}", node.index()));
+        }
+        lines
     }
 }
 

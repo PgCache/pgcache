@@ -64,6 +64,10 @@ impl AstNode for ValuesClause {
         ControlFlow::Continue(())
     }
 
+    fn id(&self) -> NodeId {
+        self.id
+    }
+
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -138,6 +142,10 @@ impl AstNode for SelectNode {
         children_visit(self.where_clause.as_ref(), f)?;
         children_visit(&self.group_by, f)?;
         children_visit(self.having.as_ref(), f)
+    }
+
+    fn id(&self) -> NodeId {
+        self.id
     }
 
     fn id_set(&mut self, id: NodeId) {
@@ -249,6 +257,10 @@ impl AstNode for SetOpNode {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         children_visit([&*self.left, &*self.right], f)
+    }
+
+    fn id(&self) -> NodeId {
+        self.id
     }
 
     fn id_set(&mut self, id: NodeId) {
@@ -388,6 +400,10 @@ impl AstNode for QueryExpr {
         }
         self.body.try_for_each_node(f)?;
         children_visit(&self.order_by, f)
+    }
+
+    fn id(&self) -> NodeId {
+        self.id
     }
 
     fn id_set(&mut self, id: NodeId) {
@@ -653,6 +669,10 @@ pub struct StarNode {
 }
 
 impl AstNode for StarNode {
+    fn id(&self) -> NodeId {
+        self.id
+    }
+
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -745,6 +765,10 @@ impl AstNode for OrderByClause {
     ) -> ControlFlow<B> {
         self.expr.try_for_each_node(f)?;
         ControlFlow::Continue(())
+    }
+
+    fn id(&self) -> NodeId {
+        self.id
     }
 
     fn id_set(&mut self, id: NodeId) {

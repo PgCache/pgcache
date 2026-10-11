@@ -24,9 +24,9 @@ use crate::query::QueryShape;
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+use crate::query::resolve::{ResolvedQuery, query_expr_resolve, query_expr_resolve_bound};
 use crate::query::resolved::ResolvedQueryExpr;
-use crate::query::transform::predicate_pushdown_apply;
+use crate::query::transform::query_predicate_pushdown;
 use crate::query::transform::{
     LiteralCanonOutcome, query_literals_canonicalise, resolved_literals_canonicalise,
 };
@@ -186,7 +186,24 @@ impl WriterRegistration {
             request.fingerprint,
             "registration resolved to a different fingerprint than the alias"
         );
-        let resolved: SharedResolved = Arc::new(predicate_pushdown_apply(resolved));
+        // Pushdown (ADR-012) happens on the bound query; the resolved tree
+        // its remaining consumers read is the pushed-down tree resolved.
+        let (bound, resolved) = match query_predicate_pushdown(&bound) {
+            Some(pushed) => {
+                let path: Vec<&str> = request
+                    .keying
+                    .search_path
+                    .iter()
+                    .map(EcoString::as_str)
+                    .collect();
+                let resolved = query_expr_resolve(pushed.tree(), &core.cache.tables, &path)
+                    .map_err(|e| e.context_transform(CacheError::from))
+                    .attach_loc("resolving the pushed-down query")?;
+                (Arc::new(pushed), resolved)
+            }
+            None => (bound, resolved),
+        };
+        let resolved: SharedResolved = Arc::new(resolved);
 
         bound
             .enum_order_dependence_check()

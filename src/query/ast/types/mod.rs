@@ -46,11 +46,18 @@ pub(crate) fn children_finalize<'a, T: AstNode + 'a>(
 /// [`AstNode::children_finalize`], which must cover exactly the children
 /// `try_for_each_child` covers, in the same order.
 pub trait AstNode: Any + Sized {
-    /// Stamp this node's pre-order position, then every descendant's.
+    /// Stamp this node's pre-order position, then every descendant's. A
+    /// node that already carries an id is being refinalized: the pair is
+    /// recorded so side tables keyed on the old id can follow it.
     fn finalize(&mut self, positions: &mut NodePositions) {
-        let id = positions.take();
+        let id = positions.stamp(self.id());
         self.id_set(id);
         self.children_finalize(positions);
+    }
+
+    /// This node's id. Types without an `id` field are never positioned.
+    fn id(&self) -> NodeId {
+        NodeId::PENDING
     }
 
     /// Store this node's id. Types without an `id` field keep the default.

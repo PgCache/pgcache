@@ -231,6 +231,10 @@ pub struct ColumnNode {
 }
 
 impl AstNode for ColumnNode {
+    fn id(&self) -> NodeId {
+        self.id
+    }
+
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -411,6 +415,10 @@ impl AstNode for UnaryExpr {
         ControlFlow::Continue(())
     }
 
+    fn id(&self) -> NodeId {
+        self.id
+    }
+
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -467,6 +475,10 @@ impl AstNode for BinaryExpr {
         children_visit([&*self.lexpr, &*self.rexpr], f)
     }
 
+    fn id(&self) -> NodeId {
+        self.id
+    }
+
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -515,6 +527,10 @@ impl AstNode for MultiExpr {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         children_visit(&self.exprs, f)
+    }
+
+    fn id(&self) -> NodeId {
+        self.id
     }
 
     fn id_set(&mut self, id: NodeId) {
@@ -637,6 +653,36 @@ impl AstNode for WhereExpr {
 }
 
 impl WhereExpr {
+    /// The AND-conjuncts of a predicate: `a AND b AND c` is `[a, b, c]`,
+    /// anything else is itself.
+    pub fn conjuncts(self) -> Vec<WhereExpr> {
+        match self {
+            WhereExpr::Binary(binary) if binary.op == BinaryOp::And => {
+                let mut conjuncts = binary.lexpr.conjuncts();
+                conjuncts.extend(binary.rexpr.conjuncts());
+                conjuncts
+            }
+            other @ (WhereExpr::Scalar(_)
+            | WhereExpr::Unary(_)
+            | WhereExpr::Binary(_)
+            | WhereExpr::Multi(_)
+            | WhereExpr::Subquery { .. }) => vec![other],
+        }
+    }
+
+    /// `conjuncts` rejoined with AND, left-nested; `None` for no conjuncts.
+    /// The AND nodes are new, so they carry no id.
+    pub fn conjuncts_join(conjuncts: Vec<WhereExpr>) -> Option<WhereExpr> {
+        conjuncts.into_iter().reduce(|left, right| {
+            WhereExpr::Binary(BinaryExpr {
+                id: NodeId::PENDING,
+                op: BinaryOp::And,
+                lexpr: Box::new(left),
+                rexpr: Box::new(right),
+            })
+        })
+    }
+
     pub fn has_subqueries(&self) -> bool {
         match self {
             WhereExpr::Scalar(scalar) => scalar.has_subqueries(),
@@ -774,6 +820,10 @@ impl AstNode for ArithmeticExpr {
         f: &mut impl FnMut(&'a N) -> ControlFlow<B>,
     ) -> ControlFlow<B> {
         children_visit([&*self.left, &*self.right], f)
+    }
+
+    fn id(&self) -> NodeId {
+        self.id
     }
 
     fn id_set(&mut self, id: NodeId) {
@@ -985,6 +1035,10 @@ impl AstNode for CaseExpr {
         children_visit(self.default.as_deref(), f)
     }
 
+    fn id(&self) -> NodeId {
+        self.id
+    }
+
     fn id_set(&mut self, id: NodeId) {
         self.id = id;
     }
@@ -1043,6 +1097,10 @@ impl AstNode for CaseWhen {
     ) -> ControlFlow<B> {
         self.condition.try_for_each_node(f)?;
         self.result.try_for_each_node(f)
+    }
+
+    fn id(&self) -> NodeId {
+        self.id
     }
 
     fn id_set(&mut self, id: NodeId) {
