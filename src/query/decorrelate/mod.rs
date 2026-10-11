@@ -8,6 +8,7 @@ use crate::query::resolved::{
     ResolvedColumnNode, ResolvedQueryExpr, ResolvedTableSource, ResolvedWhereExpr,
 };
 
+mod bound;
 mod driver;
 mod exists;
 mod in_subquery;
@@ -17,6 +18,7 @@ mod scalar;
 #[cfg(test)]
 mod tests;
 
+pub use bound::query_decorrelate;
 pub use driver::query_expr_decorrelate;
 
 error_set! {

@@ -3,13 +3,14 @@
 //! decorrelation, constraint analysis against the synthesized catalog).
 
 use ecow::EcoString;
-use iddqd::BiHashMap;
 use pgcache_lib::cache::admission::{
-    AdmissionDepth, base_query_prepare, query_admission_analyze, shape_gate_classify,
+    AdmissionDepth, CanonicalResolution, base_query_prepare, query_admission_analyze,
+    query_decorrelate_resolve, query_pushdown_resolve, query_resolve_canonical,
+    shape_gate_classify,
 };
 use pgcache_lib::cache::query::limit_rows_needed;
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
-use pgcache_lib::catalog::TableMetadata;
+use pgcache_lib::catalog::Catalog;
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::ast::{
     AstError, QueryExpr, RawStatement, WhereParseError, statement_convert_raw,
@@ -18,12 +19,9 @@ use pgcache_lib::query::constraints::{
     QueryConstraints, TableConstraint, analyze_query_constraints,
 };
 use pgcache_lib::query::literal_settings::LiteralSettings;
-use pgcache_lib::query::resolve::query_expr_resolve;
-use pgcache_lib::query::resolved::resolved_query_fingerprint;
-use pgcache_lib::query::transform::resolved_literals_canonicalise;
-use pgcache_lib::query::transform::{predicate_pushdown_apply, query_expr_parameters_replace};
+use pgcache_lib::query::transform::query_expr_parameters_replace;
 use pgcache_lib::query::write::{TransactionBoundary, WriteClass};
-use pgcache_lib::query::{Fingerprint, ShapeKey, query_shape_derive};
+use pgcache_lib::query::{Fingerprint, ShapeKey};
 
 use crate::input::{TraceStatement, query_parameters_infer};
 use crate::volatility::BuiltinFunctions;
@@ -248,7 +246,7 @@ pub enum Verdict {
 
 pub fn statement_classify(
     parsed: &ParsedStatement,
-    catalog: &BiHashMap<TableMetadata>,
+    catalog: &Catalog,
     builtins: &BuiltinFunctions,
 ) -> Verdict {
     let expr = match &parsed.outcome {
@@ -297,19 +295,44 @@ pub fn statement_classify(
     // forcing unbounded population, exactly as in query_resolve.
     let (base_query, user_max_limit) = base_query_prepare(cacheable.query());
 
-    let Ok(mut resolved) = query_expr_resolve(&base_query, catalog, &["public"]) else {
+    // The identity is the bound query's serve SQL, literals canonicalised
+    // under the default settings, before the pushdown transform — as
+    // pgcache computes it.
+    let Ok(CanonicalResolution {
+        resolved, bound, ..
+    }) = query_resolve_canonical(
+        base_query,
+        catalog,
+        &["public"],
+        &LiteralSettings::default(),
+    )
+    else {
         return Verdict::Passthrough {
             reason: PassthroughReason::ResolutionFailed,
             detail: None,
             cte_write: None,
         };
     };
-    // The identity is the resolved form, literals canonicalised under the
-    // default settings, before the pushdown transform — as pgcache computes it.
-    resolved_literals_canonicalise(&mut resolved, &LiteralSettings::default());
-    let fingerprint = resolved_query_fingerprint(&resolved);
-    let resolved = predicate_pushdown_apply(resolved);
-    let shape_gate = shape_gate_classify(&resolved, &builtins.aggregates);
+    let fingerprint = bound.fingerprint();
+    let Ok((bound, resolved)) = query_pushdown_resolve(bound, resolved, catalog, &["public"])
+    else {
+        return Verdict::Passthrough {
+            reason: PassthroughReason::ResolutionFailed,
+            detail: None,
+            cte_write: None,
+        };
+    };
+    let Ok(decorrelated) =
+        query_decorrelate_resolve(&bound, &builtins.aggregates, catalog, &["public"])
+    else {
+        return Verdict::Passthrough {
+            reason: PassthroughReason::DecorrelationFailed,
+            detail: None,
+            cte_write: None,
+        };
+    };
+    let decorrelated_resolved = decorrelated.as_ref().map(|(_, resolved)| resolved);
+    let shape_gate = shape_gate_classify(&resolved, decorrelated_resolved, &builtins.aggregates);
     let max_limit = if shape_gate.is_reducer() {
         None
     } else {
@@ -318,6 +341,7 @@ pub fn statement_classify(
     let has_limit = max_limit.is_some();
     let analysis = match query_admission_analyze(
         &resolved,
+        decorrelated_resolved,
         fingerprint,
         has_limit,
         &builtins.aggregates,
@@ -356,7 +380,7 @@ pub fn statement_classify(
 
     Verdict::Cacheable(Box::new(CacheableAnalysis {
         fingerprint,
-        shape_key: query_shape_derive(&resolved).key,
+        shape_key: bound.shape().key,
         relations,
         has_limit,
         rows_needed: limit_rows_needed(&cacheable.query().limit),

@@ -149,7 +149,7 @@ pub(super) fn table_source_resolve<'a>(
             Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
                 query: Box::new(resolved_query),
                 alias: alias.clone(),
-                subquery_kind: SubqueryKind::Inclusion,
+                subquery_kind: subquery.kind,
             }))
         }
         TableSource::CteRef(cte_ref) => {

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 use iddqd::BiHashMap;
-use pgcache_lib::catalog::{ColumnMetadata, ColumnStore, TableMetadata};
+use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use pgcache_lib::oid::{Oid, TypeOid};
 use pgcache_lib::query::ast::{
     AstNode, ColumnNode, JoinQual, LiteralValue, OrderByClause, QueryBody, QueryExpr, ScalarExpr,
@@ -33,7 +33,7 @@ pub struct SynthesisStats {
 }
 
 pub struct SynthCatalog {
-    pub tables: BiHashMap<TableMetadata>,
+    pub tables: Catalog,
     pub stats: SynthesisStats,
 }
 
@@ -397,7 +397,7 @@ impl Synthesizer {
     }
 
     fn finish(self) -> SynthCatalog {
-        let mut tables = BiHashMap::new();
+        let mut tables: Catalog = BiHashMap::new();
         let mut stats = SynthesisStats {
             tables: self.order.len(),
             heuristic_attributions: self.heuristic_attributions,
@@ -442,7 +442,7 @@ impl Synthesizer {
                 };
                 ColumnMetadata {
                     name: name.clone(),
-                    position: i16::try_from(i + 1).unwrap_or(i16::MAX),
+                    position: ColumnPosition::from_index(i).unwrap_or(ColumnPosition::FIRST),
                     type_oid: TypeOid::from_type(&data_type),
                     data_type,
                     type_name: type_name.into(),
@@ -451,15 +451,18 @@ impl Synthesizer {
                 }
             }));
 
-            tables.insert_overwrite(TableMetadata {
-                replica_identity_full: false,
-                relation_oid: Oid::from_raw(100_000 + u32::try_from(index).unwrap_or(0)),
-                name: key.1.clone(),
-                schema: key.0.clone(),
-                primary_key_columns: vec![primary_key],
-                columns,
-                indexes: Vec::new(),
-            });
+            tables.insert_overwrite(
+                TableMetadata {
+                    replica_identity_full: false,
+                    relation_oid: Oid::from_raw(100_000 + u32::try_from(index).unwrap_or(0)),
+                    name: key.1.clone(),
+                    schema: key.0.clone(),
+                    primary_key_columns: vec![primary_key],
+                    columns,
+                    indexes: Vec::new(),
+                }
+                .into(),
+            );
         }
 
         SynthCatalog { tables, stats }

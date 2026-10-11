@@ -246,6 +246,14 @@ impl BindingsBuilder {
         Self { bindings }
     }
 
+    /// A column reference a rewrite moved into the scope it was correlated
+    /// with is no longer correlated.
+    pub(crate) fn correlated_remove(&mut self, node: NodeId) {
+        self.bindings
+            .correlated
+            .retain(|candidate| candidate.index() != node.index());
+    }
+
     pub(crate) fn slot_push(&mut self, source: NodeId, slot: TableSlot) -> SlotId {
         let id = SlotId(narrow(self.bindings.slots.len()));
         self.bindings.slots.push(slot);

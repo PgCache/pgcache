@@ -2,6 +2,7 @@
 //! registration path (PGC-391) so pgcache-fit runs the identical analysis.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use ecow::EcoString;
 
@@ -18,10 +19,15 @@ use crate::catalog::Catalog;
 use crate::query::Fingerprint;
 use crate::query::ast::{AstNode, QueryBody, QueryExpr};
 use crate::query::constraints::analyze_query_constraints;
-use crate::query::decorrelate::query_expr_decorrelate;
+use crate::query::decorrelate::query_decorrelate;
+use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
-use crate::query::resolved::{ResolvedQueryExpr, ResolvedTableNode};
-use crate::query::transform::PgEvalTemplate;
+use crate::query::resolve::{ResolvedQuery, query_expr_resolve, query_expr_resolve_bound};
+use crate::query::resolved::{ResolveResult, ResolvedQueryExpr, ResolvedTableNode};
+use crate::query::transform::{
+    LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
+    resolved_literals_canonicalise,
+};
 use crate::query::update::query_table_update_queries;
 use crate::result::ReportExt;
 
@@ -49,47 +55,104 @@ pub fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
     (base_query, max_limit)
 }
 
-/// Classify a resolved query's shape for MV eligibility. Runs decorrelation
-/// first so the classification matches what first-population / rebuild will
-/// actually see (correlated subqueries get rewritten to JOIN + DISTINCT,
-/// which affects classification). Falls back to the original resolved form
-/// if decorrelation fails.
-///
-/// NOTE: `population_work_build` and `query_admission_analyze` also decorrelate
-/// the same resolved query. Factoring these callers onto a single
-/// decorrelation pass is a worthwhile follow-up but out of scope for v1.
-pub fn shape_gate_classify(
-    resolved: &ResolvedQueryExpr,
-    aggregate_functions: &HashSet<EcoString>,
-) -> ShapeGate {
-    let decorrelated = query_expr_decorrelate(resolved, aggregate_functions).ok();
-    let query: &ResolvedQueryExpr = match &decorrelated {
-        Some(d) if d.transformed => &d.resolved,
-        _ => resolved,
-    };
-    shape_classify(query, aggregate_functions)
+/// The identity-bearing form of a query in both representations.
+pub struct CanonicalResolution {
+    /// Canonical resolved tree: the analysis source until those analyses
+    /// move onto `bound`.
+    pub resolved: ResolvedQueryExpr,
+    /// The canonical plain tree with its bindings (ADR-057).
+    pub bound: Arc<ResolvedQuery>,
+    pub literals: LiteralCanonOutcome,
 }
 
-/// Decorrelate the resolved query and derive one [`TableAdmission`] per
-/// update query: the built [`UpdateQuery`], its constraints, and the
-/// subsumer-eligibility gates. Pure — the caller stores (writer) or
-/// simulates (fit) the results.
+/// Resolve `base_query` on `search_path` and canonicalise its date-time
+/// literals under `settings`. `base_query` is the caller's own copy; it is
+/// canonicalised in place and becomes the shared tree.
+pub fn query_resolve_canonical(
+    mut base_query: QueryExpr,
+    tables: &Catalog,
+    search_path: &[&str],
+    settings: &LiteralSettings,
+) -> ResolveResult<CanonicalResolution> {
+    let (mut resolved, bindings) = query_expr_resolve_bound(&base_query, tables, search_path)?;
+    let literals = query_literals_canonicalise(&mut base_query, &bindings, settings);
+    let resolved_literals = resolved_literals_canonicalise(&mut resolved, settings);
+    debug_assert_eq!(
+        literals, resolved_literals,
+        "plain and resolved canonicalisation disagree"
+    );
+    Ok(CanonicalResolution {
+        resolved,
+        bound: Arc::new(ResolvedQuery::new(Arc::new(base_query), bindings)),
+        literals,
+    })
+}
+
+/// Predicate pushdown (ADR-012) on the bound query, with the pushed-down
+/// tree resolved for the analyses still on the resolved tree. Both come
+/// back as they were when nothing moves.
+pub fn query_pushdown_resolve(
+    bound: Arc<ResolvedQuery>,
+    resolved: ResolvedQueryExpr,
+    tables: &Catalog,
+    search_path: &[&str],
+) -> ResolveResult<(Arc<ResolvedQuery>, ResolvedQueryExpr)> {
+    match query_predicate_pushdown(&bound) {
+        Some(pushed) => {
+            let resolved = query_expr_resolve(pushed.tree(), tables, search_path)?;
+            Ok((Arc::new(pushed), resolved))
+        }
+        None => Ok((bound, resolved)),
+    }
+}
+
+/// Decorrelation (ADR-014 to ADR-017) on the bound query, with the
+/// rewritten tree resolved likewise; `None` when there is nothing to
+/// decorrelate. Runs once at registration for the shape gate, admission
+/// and population alike.
+pub fn query_decorrelate_resolve(
+    bound: &ResolvedQuery,
+    aggregate_functions: &HashSet<EcoString>,
+    tables: &Catalog,
+    search_path: &[&str],
+) -> CacheResult<Option<(ResolvedQuery, ResolvedQueryExpr)>> {
+    let Some(decorrelated) = query_decorrelate(bound, aggregate_functions)
+        .map_err(|e| e.context_transform(CacheError::from))
+        .attach_loc("decorrelating correlated subqueries")?
+    else {
+        return Ok(None);
+    };
+    let resolved = query_expr_resolve(decorrelated.tree(), tables, search_path)
+        .map_err(|e| e.context_transform(CacheError::from))
+        .attach_loc("resolving the decorrelated query")?;
+    Ok(Some((decorrelated, resolved)))
+}
+
+/// Classify a query's shape for MV eligibility on its decorrelated form
+/// when it has one, so the shape classified is the shape population and
+/// rebuild see.
+pub fn shape_gate_classify(
+    resolved: &ResolvedQueryExpr,
+    decorrelated: Option<&ResolvedQueryExpr>,
+    aggregate_functions: &HashSet<EcoString>,
+) -> ShapeGate {
+    shape_classify(decorrelated.unwrap_or(resolved), aggregate_functions)
+}
+
+/// Derive one [`TableAdmission`] per update query of `resolved`, or of
+/// `decorrelated` when the query had correlated subqueries: the built
+/// [`UpdateQuery`], its constraints, and the subsumer-eligibility gates.
+/// Pure — the caller stores (writer) or simulates (fit) the results.
 pub fn query_admission_analyze(
     resolved: &ResolvedQueryExpr,
+    decorrelated: Option<&ResolvedQueryExpr>,
     fingerprint: Fingerprint,
     has_limit: bool,
     aggregate_functions: &HashSet<EcoString>,
     tables: &Catalog,
     depth: AdmissionDepth,
 ) -> CacheResult<AdmissionAnalysis> {
-    let decorrelated = query_expr_decorrelate(resolved, aggregate_functions)
-        .map_err(|e| e.context_transform(CacheError::from))
-        .attach_loc("decorrelating correlated subqueries")?;
-    let update_source = if decorrelated.transformed {
-        &decorrelated.resolved
-    } else {
-        resolved
-    };
+    let update_source = decorrelated.unwrap_or(resolved);
 
     let mut admissions = Vec::new();
     for (table_node, update_resolved, source) in query_table_update_queries(update_source) {
@@ -208,7 +271,7 @@ pub fn query_admission_analyze(
     }
 
     Ok(AdmissionAnalysis {
-        transformed: decorrelated.transformed,
+        transformed: decorrelated.is_some(),
         tables: admissions,
     })
 }

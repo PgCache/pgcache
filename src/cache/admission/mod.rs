@@ -16,7 +16,9 @@ mod subsume;
 mod update_classify;
 
 pub use analyze::{
-    AdmissionDepth, base_query_prepare, query_admission_analyze, shape_gate_classify,
+    AdmissionDepth, CanonicalResolution, base_query_prepare, query_admission_analyze,
+    query_decorrelate_resolve, query_pushdown_resolve, query_resolve_canonical,
+    shape_gate_classify,
 };
 pub use subsume::subsumption_covered;
 

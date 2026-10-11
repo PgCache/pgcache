@@ -118,10 +118,11 @@ impl TableSource {
         match self {
             TableSource::Table(_) => {}
             TableSource::Subquery(sub) => {
-                let kind = if negated {
-                    SubqueryKind::Exclusion
-                } else {
-                    SubqueryKind::Inclusion
+                let kind = match (sub.kind, negated) {
+                    (SubqueryKind::Scalar, _) => SubqueryKind::Scalar,
+                    (SubqueryKind::Inclusion, true) => SubqueryKind::Exclusion,
+                    (SubqueryKind::Exclusion, true) => SubqueryKind::Inclusion,
+                    (kind, false) => kind,
                 };
                 sub.query.select_nodes_collect(
                     branches,
@@ -209,6 +210,11 @@ pub struct TableSubqueryNode {
     pub lateral: bool,
     pub query: Box<QueryExpr>,
     pub alias: Option<TableAlias>,
+    /// What the derived table stands for in CDC terms: a FROM subquery as
+    /// written is `Inclusion`; decorrelation marks the derived table it
+    /// makes from a scalar subquery `Scalar`, so any change to it still
+    /// invalidates.
+    pub kind: SubqueryKind,
 }
 
 impl AstNode for TableSubqueryNode {

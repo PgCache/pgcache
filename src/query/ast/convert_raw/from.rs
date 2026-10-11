@@ -7,6 +7,7 @@ use smallvec::SmallVec;
 use super::ParseContext;
 use super::select::select_stmt_to_query_expr_with_ctx;
 use super::where_clause::where_expr_convert;
+use crate::cache::SubqueryKind;
 use crate::query::ast::raw::{
     NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag, node_tag_name, string_node_value,
 };
@@ -171,6 +172,7 @@ unsafe fn table_subquery_node_convert(
             lateral: (*range_subselect).lateral,
             query: Box::new(query),
             alias,
+            kind: SubqueryKind::Inclusion,
         }))
     }
 }

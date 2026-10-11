@@ -9,12 +9,14 @@ use ecow::EcoString;
 
 use super::{QueryResolution, WriterRegistration};
 use crate::cache::admission::{
-    AdmissionDepth, base_query_prepare, query_admission_analyze, shape_gate_classify,
+    AdmissionDepth, CanonicalResolution, base_query_prepare, query_admission_analyze,
+    query_decorrelate_resolve, query_pushdown_resolve, query_resolve_canonical,
+    shape_gate_classify,
 };
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
 use crate::cache::mv_shape::ShapeGate;
-use crate::cache::types::{SharedResolved, SharedResolvedQuery};
+use crate::cache::types::SharedResolved;
 use crate::cache::update_query::UpdateQueries;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
@@ -24,12 +26,8 @@ use crate::query::QueryShape;
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::resolve::{ResolvedQuery, query_expr_resolve, query_expr_resolve_bound};
+use crate::query::resolve::ResolvedQuery;
 use crate::query::resolved::ResolvedQueryExpr;
-use crate::query::transform::query_predicate_pushdown;
-use crate::query::transform::{
-    LiteralCanonOutcome, query_literals_canonicalise, resolved_literals_canonicalise,
-};
 
 /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
 async fn table_schema_resolve(
@@ -79,44 +77,16 @@ pub(super) async fn query_fingerprint_resolve(
 ) -> CacheResult<Fingerprint> {
     let (base_query, _) = base_query_prepare(query);
     cache_tables_ensure(core, &base_query, &keying.search_path).await?;
-    let resolution = query_resolve_canonical(core, base_query, keying)
-        .attach_loc("resolving query expression for its fingerprint")?;
+    let path = search_path(keying);
+    let resolution =
+        query_resolve_canonical(base_query, &core.cache.tables, &path, &keying.literals)
+            .map_err(|e| e.context_transform(CacheError::from))
+            .attach_loc("resolving query expression for its fingerprint")?;
     Ok(resolution.bound.fingerprint())
 }
 
-/// The identity-bearing form of a query in both representations.
-struct CanonicalResolution {
-    /// Canonical resolved tree: the rewrite and analysis source until those
-    /// move onto `bound`.
-    resolved: ResolvedQueryExpr,
-    /// The canonical plain tree with its bindings (ADR-057).
-    bound: SharedResolvedQuery,
-    literals: LiteralCanonOutcome,
-}
-
-/// Resolve `base_query` on the session's search_path and canonicalise its
-/// date-time literals under the session's settings. `base_query` is the
-/// caller's own copy; it is canonicalised in place and becomes the shared
-/// tree.
-fn query_resolve_canonical(
-    core: &WriterCore,
-    mut base_query: QueryExpr,
-    keying: &KeyingSettings,
-) -> CacheResult<CanonicalResolution> {
-    let path: Vec<&str> = keying.search_path.iter().map(EcoString::as_str).collect();
-    let (mut resolved, bindings) = query_expr_resolve_bound(&base_query, &core.cache.tables, &path)
-        .map_err(|e| e.context_transform(CacheError::from))?;
-    let literals = query_literals_canonicalise(&mut base_query, &bindings, &keying.literals);
-    let resolved_literals = resolved_literals_canonicalise(&mut resolved, &keying.literals);
-    debug_assert_eq!(
-        literals, resolved_literals,
-        "plain and resolved canonicalisation disagree"
-    );
-    Ok(CanonicalResolution {
-        resolved,
-        bound: Arc::new(ResolvedQuery::new(Arc::new(base_query), bindings)),
-        literals,
-    })
+fn search_path(keying: &KeyingSettings) -> Vec<&str> {
+    keying.search_path.iter().map(EcoString::as_str).collect()
 }
 
 /// Render the serve shape once at registration (PGC-294): the per-shape
@@ -173,12 +143,19 @@ impl WriterRegistration {
 
         cache_tables_ensure(core, &base_query, &request.keying.search_path).await?;
 
+        let path = search_path(&request.keying);
         let CanonicalResolution {
             resolved,
             bound,
             literals,
-        } = query_resolve_canonical(core, base_query, &request.keying)
-            .attach_loc("resolving query expression")?;
+        } = query_resolve_canonical(
+            base_query,
+            &core.cache.tables,
+            &path,
+            &request.keying.literals,
+        )
+        .map_err(|e| e.context_transform(CacheError::from))
+        .attach_loc("resolving query expression")?;
         // The identity dispatch resolved this pair to must be the one this
         // resolution produces.
         debug_assert_eq!(
@@ -186,23 +163,9 @@ impl WriterRegistration {
             request.fingerprint,
             "registration resolved to a different fingerprint than the alias"
         );
-        // Pushdown (ADR-012) happens on the bound query; the resolved tree
-        // its remaining consumers read is the pushed-down tree resolved.
-        let (bound, resolved) = match query_predicate_pushdown(&bound) {
-            Some(pushed) => {
-                let path: Vec<&str> = request
-                    .keying
-                    .search_path
-                    .iter()
-                    .map(EcoString::as_str)
-                    .collect();
-                let resolved = query_expr_resolve(pushed.tree(), &core.cache.tables, &path)
-                    .map_err(|e| e.context_transform(CacheError::from))
-                    .attach_loc("resolving the pushed-down query")?;
-                (Arc::new(pushed), resolved)
-            }
-            None => (bound, resolved),
-        };
+        let (bound, resolved) = query_pushdown_resolve(bound, resolved, &core.cache.tables, &path)
+            .map_err(|e| e.context_transform(CacheError::from))
+            .attach_loc("resolving the pushed-down query")?;
         let resolved: SharedResolved = Arc::new(resolved);
 
         bound
@@ -212,10 +175,17 @@ impl WriterRegistration {
 
         let serve_shape = serve_shape_render(&bound);
 
-        // Classify the shape once here; `query_register` and MV setup both reuse
-        // the result via `QueryResolution.shape_gate` to avoid re-running
-        // decorrelation + classification.
-        let shape_gate = shape_gate_classify(&resolved, &self.aggregate_functions);
+        // Decorrelate once; the shape gate and admission read the result,
+        // and `query_register` / MV setup reuse `shape_gate`.
+        let decorrelated = query_decorrelate_resolve(
+            &bound,
+            &self.aggregate_functions,
+            &core.cache.tables,
+            &path,
+        )?;
+        let decorrelated_resolved = decorrelated.as_ref().map(|(_, resolved)| resolved);
+        let shape_gate =
+            shape_gate_classify(&resolved, decorrelated_resolved, &self.aggregate_functions);
         let (max_limit, mv_limit) = resolution_limits(bound.tree(), shape_gate, user_max_limit);
 
         let uq_start = Instant::now();
@@ -223,6 +193,7 @@ impl WriterRegistration {
             core,
             request.fingerprint,
             &resolved,
+            decorrelated_resolved,
             max_limit.is_some(),
         )?;
         crate::metrics::handles()
@@ -251,10 +222,12 @@ impl WriterRegistration {
         core: &mut WriterCore,
         fingerprint: Fingerprint,
         resolved: &SharedResolved,
+        decorrelated: Option<&ResolvedQueryExpr>,
         has_limit: bool,
     ) -> CacheResult<Vec<Oid>> {
         let analysis = query_admission_analyze(
             resolved,
+            decorrelated,
             fingerprint,
             has_limit,
             &self.aggregate_functions,
