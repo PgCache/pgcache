@@ -4,9 +4,9 @@
 
 use ecow::EcoString;
 use pgcache_lib::cache::admission::{
-    AdmissionDepth, CanonicalResolution, base_query_prepare, query_admission_analyze,
-    query_decorrelate_resolve, query_pushdown_resolve, query_resolve_canonical,
-    shape_gate_classify,
+    AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare,
+    query_admission_analyze, query_decorrelate_resolve, query_pushdown_resolve,
+    query_resolve_canonical, shape_gate_classify,
 };
 use pgcache_lib::cache::query::limit_rows_needed;
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
@@ -331,8 +331,11 @@ pub fn statement_classify(
             cte_write: None,
         };
     };
-    let decorrelated_resolved = decorrelated.as_ref().map(|(_, resolved)| resolved);
-    let shape_gate = shape_gate_classify(&resolved, decorrelated_resolved, &builtins.aggregates);
+    let shape_gate = shape_gate_classify(
+        &resolved,
+        decorrelated.as_ref().map(|(_, resolved)| resolved),
+        &builtins.aggregates,
+    );
     let max_limit = if shape_gate.is_reducer() {
         None
     } else {
@@ -340,8 +343,11 @@ pub fn statement_classify(
     };
     let has_limit = max_limit.is_some();
     let analysis = match query_admission_analyze(
-        &resolved,
-        decorrelated_resolved,
+        AdmissionQuery {
+            resolved: &resolved,
+            bound: &bound,
+            decorrelated: decorrelated.as_ref(),
+        },
         fingerprint,
         has_limit,
         &builtins.aggregates,

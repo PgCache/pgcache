@@ -5,7 +5,10 @@ use std::collections::HashSet;
 
 use ecow::EcoString;
 
-use crate::query::ast::{AstNode, JoinType};
+use crate::query::ast::{
+    AstNode, ColumnNode, JoinNode, JoinQual, JoinType, SelectNode, TableSource, WhereExpr,
+};
+use crate::query::resolve::{ColumnTarget, ResolvedQuery};
 use crate::query::resolved::{
     ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectNode, ResolvedTableSource,
     ResolvedWhereExpr,
@@ -51,6 +54,117 @@ pub fn outer_join_optional_tables(
 
     let terminal = all_optional.difference(&non_terminal).cloned().collect();
     (terminal, non_terminal)
+}
+
+/// [`outer_join_optional_tables`] on a branch of a bound query: the same
+/// sets, read from the bindings.
+pub fn outer_join_optional_tables_bound(
+    bound: &ResolvedQuery,
+    select: &SelectNode,
+) -> (HashSet<EcoString>, HashSet<EcoString>) {
+    let [TableSource::Join(join)] = select.from.as_slice() else {
+        return (HashSet::new(), HashSet::new());
+    };
+    let mut non_terminal_refs = HashSet::new();
+    if let Some(where_clause) = &select.where_clause {
+        column_table_refs_collect(bound, where_clause, &mut non_terminal_refs);
+    }
+    let mut all_optional = HashSet::new();
+    let mut non_terminal = HashSet::new();
+    join_terminality_walk(
+        bound,
+        join,
+        &non_terminal_refs,
+        &mut all_optional,
+        &mut non_terminal,
+    );
+    let terminal = all_optional.difference(&non_terminal).cloned().collect();
+    (terminal, non_terminal)
+}
+
+/// The tables the column references of a predicate are bound to, a merged
+/// column counting for its left column.
+fn column_table_refs_collect(
+    bound: &ResolvedQuery,
+    expr: &WhereExpr,
+    tables: &mut HashSet<EcoString>,
+) {
+    let bindings = bound.bindings();
+    for column in expr.nodes::<ColumnNode>() {
+        let binding = match bindings.column(column) {
+            Some(ColumnTarget::Column(binding)) => Some(*binding),
+            Some(ColumnTarget::Merged(id)) => bindings.merged(*id).map(|merged| merged.left),
+            Some(ColumnTarget::Output) | None => None,
+        };
+        if let Some(slot) = binding.and_then(|binding| bindings.slot(binding.slot)) {
+            tables.insert(slot.table().name.clone());
+        }
+    }
+}
+
+/// The table names of a FROM subtree, through joins but not into derived
+/// tables.
+fn source_table_names_collect(source: &TableSource, names: &mut HashSet<EcoString>) {
+    match source {
+        TableSource::Table(table) => {
+            names.insert(table.name.clone());
+        }
+        TableSource::Join(join) => {
+            source_table_names_collect(&join.left, names);
+            source_table_names_collect(&join.right, names);
+        }
+        TableSource::Subquery(_) | TableSource::CteRef(_) => {}
+    }
+}
+
+/// [`resolved_join_terminality_walk`] on a bound join: a `USING`/`NATURAL`
+/// join's condition refers to both sides of each merged column.
+fn join_terminality_walk(
+    bound: &ResolvedQuery,
+    join: &JoinNode,
+    non_terminal_refs: &HashSet<EcoString>,
+    all_optional: &mut HashSet<EcoString>,
+    non_terminal: &mut HashSet<EcoString>,
+) {
+    let optional_side = match join.join_type {
+        JoinType::Left => Some(&join.right),
+        JoinType::Right => Some(&join.left),
+        JoinType::Inner | JoinType::Full => None,
+    };
+    if let Some(optional_side) = optional_side {
+        let mut optional_tables = HashSet::new();
+        source_table_names_collect(optional_side, &mut optional_tables);
+        for table in optional_tables {
+            if non_terminal_refs.contains(&table) {
+                non_terminal.insert(table.clone());
+            }
+            all_optional.insert(table);
+        }
+    }
+    let mut child_refs = non_terminal_refs.clone();
+    match &join.qual {
+        JoinQual::On(condition) => column_table_refs_collect(bound, condition, &mut child_refs),
+        JoinQual::Using(_) | JoinQual::Natural => {
+            let bindings = bound.bindings();
+            for merged in bindings
+                .merged_columns()
+                .iter()
+                .filter(|merged| merged.join.index() == join.id.index())
+            {
+                for binding in [&merged.left, &merged.right] {
+                    if let Some(slot) = bindings.slot(binding.slot) {
+                        child_refs.insert(slot.table().name.clone());
+                    }
+                }
+            }
+        }
+        JoinQual::Cross => {}
+    }
+    for side in [&*join.left, &*join.right] {
+        if let TableSource::Join(nested) = side {
+            join_terminality_walk(bound, nested, &child_refs, all_optional, non_terminal);
+        }
+    }
 }
 
 /// Collect real table names from all column references in a resolved WHERE expression.

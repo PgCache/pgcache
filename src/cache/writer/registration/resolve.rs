@@ -9,9 +9,9 @@ use ecow::EcoString;
 
 use super::{QueryResolution, WriterRegistration};
 use crate::cache::admission::{
-    AdmissionDepth, CanonicalResolution, base_query_prepare, query_admission_analyze,
-    query_decorrelate_resolve, query_pushdown_resolve, query_resolve_canonical,
-    shape_gate_classify,
+    AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare,
+    query_admission_analyze, query_decorrelate_resolve, query_pushdown_resolve,
+    query_resolve_canonical, shape_gate_classify,
 };
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
@@ -183,9 +183,11 @@ impl WriterRegistration {
             &core.cache.tables,
             &path,
         )?;
-        let decorrelated_resolved = decorrelated.as_ref().map(|(_, resolved)| resolved);
-        let shape_gate =
-            shape_gate_classify(&resolved, decorrelated_resolved, &self.aggregate_functions);
+        let shape_gate = shape_gate_classify(
+            &resolved,
+            decorrelated.as_ref().map(|(_, resolved)| resolved),
+            &self.aggregate_functions,
+        );
         let (max_limit, mv_limit) = resolution_limits(bound.tree(), shape_gate, user_max_limit);
 
         let uq_start = Instant::now();
@@ -193,7 +195,8 @@ impl WriterRegistration {
             core,
             request.fingerprint,
             &resolved,
-            decorrelated_resolved,
+            &bound,
+            decorrelated.as_ref(),
             max_limit.is_some(),
         )?;
         crate::metrics::handles()
@@ -222,12 +225,16 @@ impl WriterRegistration {
         core: &mut WriterCore,
         fingerprint: Fingerprint,
         resolved: &SharedResolved,
-        decorrelated: Option<&ResolvedQueryExpr>,
+        bound: &ResolvedQuery,
+        decorrelated: Option<&(ResolvedQuery, ResolvedQueryExpr)>,
         has_limit: bool,
     ) -> CacheResult<Vec<Oid>> {
         let analysis = query_admission_analyze(
-            resolved,
-            decorrelated,
+            AdmissionQuery {
+                resolved,
+                bound,
+                decorrelated,
+            },
             fingerprint,
             has_limit,
             &self.aggregate_functions,

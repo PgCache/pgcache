@@ -28,7 +28,7 @@ use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
     resolved_literals_canonicalise,
 };
-use crate::query::update::query_table_update_queries;
+use crate::query::update::{query_table_update_queries, query_table_update_queries_bound};
 use crate::result::ReportExt;
 
 /// How much of each [`TableAdmission`] to build. The writer needs the full
@@ -139,23 +139,52 @@ pub fn shape_gate_classify(
     shape_classify(decorrelated.unwrap_or(resolved), aggregate_functions)
 }
 
-/// Derive one [`TableAdmission`] per update query of `resolved`, or of
-/// `decorrelated` when the query had correlated subqueries: the built
+/// The query as admission reads it: as registered in both representations,
+/// and decorrelated when it had correlated subqueries.
+pub struct AdmissionQuery<'a> {
+    pub resolved: &'a ResolvedQueryExpr,
+    pub bound: &'a ResolvedQuery,
+    pub decorrelated: Option<&'a (ResolvedQuery, ResolvedQueryExpr)>,
+}
+
+/// Derive one [`TableAdmission`] per update query of the query, or of its
+/// decorrelated form when it had correlated subqueries: the built
 /// [`UpdateQuery`], its constraints, and the subsumer-eligibility gates.
 /// Pure — the caller stores (writer) or simulates (fit) the results.
 pub fn query_admission_analyze(
-    resolved: &ResolvedQueryExpr,
-    decorrelated: Option<&ResolvedQueryExpr>,
+    query: AdmissionQuery<'_>,
     fingerprint: Fingerprint,
     has_limit: bool,
     aggregate_functions: &HashSet<EcoString>,
     tables: &Catalog,
     depth: AdmissionDepth,
 ) -> CacheResult<AdmissionAnalysis> {
-    let update_source = decorrelated.unwrap_or(resolved);
+    let AdmissionQuery {
+        resolved,
+        bound,
+        decorrelated,
+    } = query;
+    let (bound_source, update_source) = match decorrelated {
+        Some((bound, resolved)) => (bound, resolved),
+        None => (bound, resolved),
+    };
+    let bound_updates = query_table_update_queries_bound(bound_source);
+    debug_assert_eq!(
+        bound_updates.len(),
+        query_table_update_queries(update_source).len(),
+        "the bound and resolved derivations disagree on the update queries"
+    );
 
     let mut admissions = Vec::new();
-    for (table_node, update_resolved, source) in query_table_update_queries(update_source) {
+    for ((table_node, update_resolved, source), bound_update) in
+        query_table_update_queries(update_source)
+            .into_iter()
+            .zip(bound_updates)
+    {
+        debug_assert!(
+            table_node.name == bound_update.table.name && source == bound_update.source,
+            "the bound and resolved derivations disagree on an update query"
+        );
         let relation_oid = table_node.relation_oid;
         let constraints = update_resolved
             .as_select()
@@ -212,6 +241,7 @@ pub fn query_admission_analyze(
         let mut update_query = UpdateQuery {
             fingerprint,
             resolved: update_resolved,
+            bound: bound_update.bound,
             source,
             constraints,
             has_limit,

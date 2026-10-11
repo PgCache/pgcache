@@ -7,6 +7,7 @@ use crate::oid::Oid;
 use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::QueryConstraints;
 use crate::query::predicate::CompiledPredicate;
+use crate::query::resolve::ResolvedQuery;
 use crate::query::resolved::ResolvedQueryExpr;
 use crate::query::transform::PgEvalTemplate;
 use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
@@ -100,6 +101,9 @@ pub struct UpdateQuery {
     pub fingerprint: Fingerprint,
     /// Resolved AST query
     pub resolved: ResolvedQueryExpr,
+    /// The same query bound (ADR-057); the CDC paths move onto it slice by
+    /// slice.
+    pub bound: ResolvedQuery,
     /// Whether this table was found directly in FROM or inside a subquery
     pub source: UpdateQuerySource,
     /// WHERE clause constraints for CDC invalidation filtering

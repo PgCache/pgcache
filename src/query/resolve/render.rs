@@ -17,8 +17,8 @@ use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::{
     Clause, ColumnNode, CteRefNode, Deparse, DeparseContext, DeparseWith, FunctionCall, JoinNode,
-    LiteralValue, OrderByClause, ScalarExpr, SelectColumn, SelectColumns, SelectNode, StarNode,
-    TableNode, separated_deparse,
+    LiteralValue, NodeId, OrderByClause, ScalarExpr, SelectColumn, SelectColumns, SelectNode,
+    StarNode, TableNode, separated_deparse,
 };
 use crate::query::shape::{QueryShape, ShapeKey};
 use crate::query::transform::literal_is_parameterizable;
@@ -298,6 +298,29 @@ impl ResolvedQuery {
     /// them, for a caller composing its own SQL around parts of the tree.
     pub fn deparse_context(&self) -> impl DeparseContext + '_ {
         Bound::text(self.bindings())
+    }
+
+    /// Every column of the table a FROM entry names, as the cache serves
+    /// them: ` q.c1, q.c2, …` with the entry's qualifier. Nothing for a
+    /// derived table or an unbound entry.
+    pub fn source_columns_into(&self, source: NodeId, buf: &mut String) {
+        let bindings = self.bindings();
+        let Some(slot) = bindings.source(source).and_then(|slot| bindings.slot(slot)) else {
+            debug_assert!(false, "FROM entry without a slot");
+            return;
+        };
+        let TableSlot::Base { table, .. } = slot else {
+            return;
+        };
+        let mut sep = "";
+        for column in table.columns.iter() {
+            buf.push_str(sep);
+            buf.push(' ');
+            Bound::slot_name_deparse(slot, buf);
+            buf.push('.');
+            column.name.deparse(buf);
+            sep = ",";
+        }
     }
 
     /// The SQL the cache serves for this query, appended to `buf`.

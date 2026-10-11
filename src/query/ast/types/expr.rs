@@ -752,6 +752,23 @@ impl WhereExpr {
             }
         }
     }
+
+    /// Like `subquery_nodes_collect` but every collected subquery is
+    /// `SubqueryKind::Scalar` whatever its sublink type: its truth value
+    /// feeds an enclosing scalar (aggregate FILTER, CASE WHEN condition),
+    /// so shrink-skip rules are unsound (PGC-107).
+    pub(crate) fn subquery_nodes_collect_as_scalar<'a>(
+        &'a self,
+        branches: &mut Vec<(&'a SelectNode, UpdateQuerySource)>,
+    ) {
+        let start = branches.len();
+        self.subquery_nodes_collect(branches, false);
+        for (_, source) in branches.iter_mut().skip(start) {
+            if let UpdateQuerySource::Subquery(kind) = source {
+                *kind = SubqueryKind::Scalar;
+            }
+        }
+    }
 }
 
 impl DeparseWith for WhereExpr {
@@ -936,7 +953,7 @@ impl ScalarExpr {
                     clause.expr.subquery_nodes_collect(branches);
                 }
                 if let Some(filter) = &func.agg_filter {
-                    filter.subquery_nodes_collect(branches, false);
+                    filter.subquery_nodes_collect_as_scalar(branches);
                 }
                 if let Some(over) = &func.over {
                     for col in &over.partition_by {
@@ -952,7 +969,7 @@ impl ScalarExpr {
                     arg.subquery_nodes_collect(branches);
                 }
                 for when in &case.whens {
-                    when.condition.subquery_nodes_collect(branches, false);
+                    when.condition.subquery_nodes_collect_as_scalar(branches);
                     when.result.subquery_nodes_collect(branches);
                 }
                 if let Some(default) = &case.default {

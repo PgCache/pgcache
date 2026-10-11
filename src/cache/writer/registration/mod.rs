@@ -30,7 +30,6 @@ use crate::cache::types::{Alias, CachedQuery, SharedResolved, SharedResolvedQuer
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::oid::Oid;
-use crate::query::resolved::ResolvedSelectNode;
 use crate::query::{Fingerprint, QueryShape};
 use crate::result::error_chain_format;
 use crate::settings::Settings;
@@ -46,10 +45,10 @@ pub(crate) struct PopulationWork {
     pub fingerprint: Fingerprint,
     pub generation: Generation,
     pub table_metadata: Vec<Arc<TableMetadata>>,
-    /// SELECT branches extracted from the query at registration time.
-    /// For simple SELECT queries, this contains one branch.
-    /// For set operations (UNION/INTERSECT/EXCEPT), contains all branches.
-    pub branches: Vec<ResolvedSelectNode>,
+    /// The query population reads: the registered query, decorrelated. Each
+    /// of its SELECT branches (one for a plain SELECT, one per set-operation
+    /// branch and per subquery) is populated table by table.
+    pub population: SharedResolvedQuery,
     /// Maximum rows to fetch during population. `None` = fetch all rows.
     pub max_limit: Option<u64>,
     /// Staging table per relation, checked out from the pool at dispatch
@@ -101,7 +100,7 @@ pub(super) struct RegistrationIdentity {
 struct PopulationTarget<'a> {
     fingerprint: Fingerprint,
     generation: Generation,
-    resolved: &'a SharedResolved,
+    bound: &'a SharedResolvedQuery,
     max_limit: Option<u64>,
 }
 

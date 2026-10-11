@@ -13,7 +13,7 @@ use super::{
 };
 use crate::cache::CacheResult;
 use crate::cache::messages::{AdmitAction, RegisterRequest, SubsumptionResult};
-use crate::cache::types::{QueryMetrics, SharedResolved};
+use crate::cache::types::{QueryMetrics, SharedResolvedQuery};
 use crate::cache::writer::core::WriterCore;
 use crate::query::Fingerprint;
 use crate::timing::duration_to_ns_u64;
@@ -22,7 +22,7 @@ use crate::timing::duration_to_ns_u64;
 /// rows fails on the cache DB.
 struct SubsumptionFallback {
     fingerprint: Fingerprint,
-    resolved: SharedResolved,
+    bound: SharedResolvedQuery,
     max_limit: Option<u64>,
 }
 
@@ -85,7 +85,7 @@ impl WriterRegistration {
             // Phase 3a: Subsume — stamp rows, mark Ready
             let fallback = SubsumptionFallback {
                 fingerprint,
-                resolved: Arc::clone(&resolution.resolved),
+                bound: Arc::clone(&resolution.bound),
                 max_limit: resolution.max_limit,
             };
             let result = self.query_subsume_timed(core, identity, resolution).await?;
@@ -155,7 +155,7 @@ impl WriterRegistration {
                 PopulationTarget {
                     fingerprint,
                     generation,
-                    resolved: &fallback.resolved,
+                    bound: &fallback.bound,
                     max_limit: fallback.max_limit,
                 },
             )?;
@@ -173,7 +173,7 @@ impl WriterRegistration {
         resolution: QueryResolution,
     ) -> CacheResult<()> {
         let fingerprint = identity.fingerprint;
-        let resolved = Arc::clone(&resolution.resolved);
+        let bound = Arc::clone(&resolution.bound);
         let max_limit = resolution.max_limit;
 
         let insert_start = Instant::now();
@@ -203,7 +203,7 @@ impl WriterRegistration {
             PopulationTarget {
                 fingerprint,
                 generation,
-                resolved: &resolved,
+                bound: &bound,
                 max_limit,
             },
         )?;

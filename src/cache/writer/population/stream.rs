@@ -25,9 +25,10 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::Lsn;
-use crate::query::ast::Deparse;
-use crate::query::resolved::{ResolvedSelectNode, ResolvedTableNode};
-use crate::query::transform::resolved_select_node_replace;
+use crate::query::ast::{
+    Clause, DeparseContext, SelectNode, TableNode, clause_deparse_with, separated_deparse_with,
+};
+use crate::query::resolve::ResolvedQuery;
 
 /// Number of rows to batch per INSERT statement sent to the cache database.
 const POPULATION_INSERT_BATCH_SIZE: usize = 200;
@@ -90,15 +91,15 @@ pub(super) async fn population_task(
     let mut reset: HashSet<Oid> = HashSet::new();
     let mut staged: Vec<(Oid, EcoString)> = Vec::new();
 
-    for branch in &work.branches {
+    for (branch, _) in work.population.tree().select_nodes_with_source() {
         for table_node in branch.direct_table_nodes() {
-            let table = table_metadata_find(&work.table_metadata, table_node)?;
+            let table = table_metadata_find(&work.table_metadata, &work.population, table_node)?;
             let (staging, needs_create) = staging_table_find(&work.staging, table)?;
             let fresh = reset.insert(table.relation_oid);
             if fresh && needs_create {
                 staging_table_create(&connections.cache, table, &staging).await?;
             }
-            let sql = population_select_build(table, table_node, branch, work.max_limit);
+            let sql = population_select_build(&work.population, table_node, branch, work.max_limit);
             let (bytes, rows) = population_stream(connections, &sql, table, &staging).await?;
             cached_bytes += bytes;
             row_count += rows;
@@ -127,15 +128,24 @@ pub(super) async fn population_task(
 
 fn table_metadata_find<'a>(
     table_metadata: &'a [Arc<TableMetadata>],
-    table_node: &ResolvedTableNode,
+    population: &ResolvedQuery,
+    table_node: &TableNode,
 ) -> CacheResult<&'a TableMetadata> {
-    table_metadata
-        .iter()
-        .map(|t| &**t)
-        .find(|t| t.relation_oid == table_node.relation_oid)
+    let bindings = population.bindings();
+    let relation_oid = bindings
+        .source(table_node.id)
+        .and_then(|slot| bindings.slot(slot))
+        .map(|slot| slot.table().relation_oid);
+    relation_oid
+        .and_then(|oid| {
+            table_metadata
+                .iter()
+                .map(|t| &**t)
+                .find(|t| t.relation_oid == oid)
+        })
         .ok_or_else(|| {
             CacheError::UnknownTable {
-                oid: Some(table_node.relation_oid),
+                oid: relation_oid,
                 name: Some(table_node.name.to_string()),
             }
             .into()
@@ -181,18 +191,33 @@ async fn staging_table_create(
         .map_into_report::<CacheError>()
 }
 
-/// The origin SELECT for one table of a branch: the branch with its select
-/// list replaced by the table's columns, capped at the query's max limit.
+/// The origin SELECT for one table of a branch: the branch's FROM and WHERE
+/// with the table's columns as the select list, capped at the query's max
+/// limit. DISTINCT folds join fan-out; GROUP BY and HAVING are dropped
+/// because the cache holds raw rows and aggregates at retrieval.
 fn population_select_build(
-    table: &TableMetadata,
-    table_node: &ResolvedTableNode,
-    branch: &ResolvedSelectNode,
+    population: &ResolvedQuery,
+    table_node: &TableNode,
+    branch: &SelectNode,
     max_limit: Option<u64>,
 ) -> String {
-    let select_columns = table.resolved_select_columns(table_node.alias.as_deref());
-    let new_ast = resolved_select_node_replace(branch, select_columns);
     let mut buf = String::with_capacity(1024);
-    new_ast.deparse(&mut buf);
+    let mut cx = population.deparse_context();
+    buf.push_str("SELECT DISTINCT");
+    population.source_columns_into(table_node.id, &mut buf);
+    if !branch.from.is_empty() {
+        cx.clause_enter(Clause::From);
+        buf.push_str(" FROM");
+        separated_deparse_with(&mut cx, &mut buf, &branch.from, ",");
+        cx.clause_leave(Clause::From);
+    }
+    clause_deparse_with(
+        &mut cx,
+        &mut buf,
+        Clause::Where,
+        " WHERE ",
+        branch.where_clause.as_ref(),
+    );
     if let Some(limit) = max_limit {
         write!(buf, " LIMIT {limit}").ok();
     }
@@ -621,5 +646,105 @@ mod tests {
         let (pk, tuple, _) = escaped_tuple_build(3, &[0, 2], |idx| values[idx]);
         assert_eq!(tuple, "('ab','cd','ef')");
         assert_eq!(pk, vec!["'ab'".to_owned(), "'ef'".to_owned()]);
+    }
+
+    // ==================== population select ====================
+
+    fn population_catalog() -> crate::catalog::Catalog {
+        use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+        use crate::oid::TypeOid;
+        use postgres_types::Type;
+        let mut tables = iddqd::BiHashMap::new();
+        for (name, oid, columns) in [
+            ("users", 1u32, &["id", "name"][..]),
+            ("orders", 2, &["id", "user_id", "total"][..]),
+        ] {
+            let store =
+                ColumnStore::new(
+                    columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, column)| ColumnMetadata {
+                            name: (*column).into(),
+                            position: ColumnPosition::from_index(i)
+                                .expect("column position in range"),
+                            type_oid: TypeOid::from_raw(23),
+                            data_type: Type::INT4,
+                            type_name: "int4".into(),
+                            cache_type_name: "int4".into(),
+                            is_primary_key: i == 0,
+                        }),
+                );
+            tables.insert_overwrite(
+                TableMetadata {
+                    replica_identity_full: false,
+                    relation_oid: Oid::from_raw(oid),
+                    name: name.into(),
+                    schema: "public".into(),
+                    primary_key_columns: vec![columns[0].into()],
+                    columns: store,
+                    indexes: Vec::new(),
+                }
+                .into(),
+            );
+        }
+        tables
+    }
+
+    /// Every (branch, table) population select of `sql`, in population order.
+    fn population_selects(sql: &str, max_limit: Option<u64>) -> Vec<String> {
+        use crate::query::ast::query_expr_parse;
+        use crate::query::resolve::query_expr_resolve_bound;
+        let catalog = population_catalog();
+        let query = Arc::new(query_expr_parse(sql).expect("parse"));
+        let (_, bindings) =
+            query_expr_resolve_bound(&query, &catalog, &["public"]).expect("resolve");
+        let population = ResolvedQuery::new(query, bindings);
+        let mut selects = Vec::new();
+        for (branch, _) in population.tree().select_nodes_with_source() {
+            for table_node in branch.direct_table_nodes() {
+                selects.push(population_select_build(
+                    &population,
+                    table_node,
+                    branch,
+                    max_limit,
+                ));
+            }
+        }
+        selects
+    }
+
+    /// Each table of a branch is fetched with the branch's FROM and WHERE,
+    /// DISTINCT, without its grouping, ordering or projection.
+    #[test]
+    fn test_population_select_cases() {
+        #[rustfmt::skip]
+        let cases: [(&str, &str, Option<u64>, &[&str]); 5] = [
+            ("single table", "SELECT name FROM users WHERE id = 1 ORDER BY name", Some(5), &[
+                "SELECT DISTINCT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1 LIMIT 5",
+            ]),
+            ("aliased join", "SELECT u.name, o.total FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > 2", None, &[
+                "SELECT DISTINCT u.id, u.name FROM public.users u JOIN public.orders o ON o.user_id = u.id WHERE o.total > 2",
+                "SELECT DISTINCT o.id, o.user_id, o.total FROM public.users u JOIN public.orders o ON o.user_id = u.id WHERE o.total > 2",
+            ]),
+            ("grouping dropped", "SELECT user_id, count(*) FROM orders GROUP BY user_id HAVING count(*) > 1", None, &[
+                "SELECT DISTINCT public.orders.id, public.orders.user_id, public.orders.total FROM public.orders",
+            ]),
+            ("set operation", "SELECT id FROM users WHERE id = 1 UNION SELECT user_id FROM orders WHERE total = 2", None, &[
+                "SELECT DISTINCT public.users.id, public.users.name FROM public.users WHERE public.users.id = 1",
+                "SELECT DISTINCT public.orders.id, public.orders.user_id, public.orders.total FROM public.orders WHERE public.orders.total = 2",
+            ]),
+            ("subquery branch", "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total = 3)", None, &[
+                "SELECT DISTINCT public.users.id, public.users.name FROM public.users WHERE public.users.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.total = 3)",
+                "SELECT DISTINCT public.orders.id, public.orders.user_id, public.orders.total FROM public.orders WHERE public.orders.total = 3",
+            ]),
+        ];
+        for (label, sql, max_limit, expected) in cases {
+            assert_eq!(
+                population_selects(sql, max_limit),
+                expected,
+                "{label}: {sql}"
+            );
+        }
     }
 }

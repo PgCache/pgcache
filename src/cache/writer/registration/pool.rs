@@ -1,7 +1,6 @@
 //! Population workers: elastic scale-up toward the controller's target, and
 //! building / dispatching population work onto the shared queue.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -10,16 +9,14 @@ use tracing::error;
 
 use super::{PopulationTarget, PopulationWork, WriterRegistration};
 use crate::cache::CacheResult;
-use crate::cache::types::SharedResolved;
+use crate::cache::types::SharedResolvedQuery;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::population::{
     POPULATION_SPAWN_COOLDOWN, population_worker_connect, population_worker_run,
 };
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
-use crate::query::ast::AstNode;
-use crate::query::decorrelate::query_expr_decorrelate;
-use crate::query::resolved::{ResolvedQueryExpr, ResolvedSelectNode, ResolvedTableNode};
+use crate::query::decorrelate::query_decorrelate;
 use crate::result::error_chain_format;
 
 impl WriterRegistration {
@@ -94,41 +91,21 @@ impl WriterRegistration {
         self.populate_work_dispatch(core, work)
     }
 
-    /// Build population work for a query, handling decorrelation and branch extraction.
-    ///
-    /// Decorrelates the resolved AST so correlated subqueries are merged into JOINs,
-    /// then extracts SELECT branches, collects table metadata, and builds PopulationWork.
+    /// Build population work for a query: decorrelate it so correlated
+    /// subqueries are merged into JOINs (the query as registered when it has
+    /// none), and collect the metadata of every table it reads.
     fn population_work_build(
         &self,
         core: &WriterCore,
         target: PopulationTarget<'_>,
     ) -> PopulationWork {
-        let resolved: &SharedResolved = target.resolved;
-        let population_resolved = query_expr_decorrelate(resolved, &self.aggregate_functions)
-            .map(|d| {
-                if d.transformed {
-                    d.resolved
-                } else {
-                    ResolvedQueryExpr::clone(resolved)
-                }
-            })
-            .unwrap_or_else(|_| ResolvedQueryExpr::clone(resolved));
-
-        let branches: Vec<ResolvedSelectNode> = population_resolved
-            .select_nodes()
-            .into_iter()
-            .cloned()
-            .collect();
-
-        let branch_relation_oids: Vec<Oid> = branches
-            .iter()
-            .flat_map(|branch: &ResolvedSelectNode| branch.nodes::<ResolvedTableNode>())
-            .map(|tn| tn.relation_oid)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        let table_metadata: Vec<Arc<TableMetadata>> = branch_relation_oids
+        let population: SharedResolvedQuery =
+            match query_decorrelate(target.bound, &self.aggregate_functions) {
+                Ok(Some(decorrelated)) => Arc::new(decorrelated),
+                Ok(None) | Err(_) => Arc::clone(target.bound),
+            };
+        let table_metadata: Vec<Arc<TableMetadata>> = population
+            .relation_oids()
             .iter()
             .filter_map(|oid| core.cache.tables.get1(oid).map(|t| Arc::clone(t.shared())))
             .collect();
@@ -137,7 +114,7 @@ impl WriterRegistration {
             fingerprint: target.fingerprint,
             generation: target.generation,
             table_metadata,
-            branches,
+            population,
             max_limit: target.max_limit,
             // Filled in at dispatch from the staging pool (needs `&mut core`).
             staging: Vec::new(),

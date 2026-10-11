@@ -105,7 +105,7 @@ impl WriterRegistration {
             PopulationTarget {
                 fingerprint,
                 generation: serving.generation,
-                resolved: &serving.resolved,
+                bound: &serving.bound,
                 max_limit: serving.max_limit,
             },
         )?;
@@ -246,7 +246,7 @@ impl WriterRegistration {
             PopulationTarget {
                 fingerprint,
                 generation: serving.generation,
-                resolved: &serving.resolved,
+                bound: &serving.bound,
                 max_limit: serving.max_limit,
             },
         )?;
