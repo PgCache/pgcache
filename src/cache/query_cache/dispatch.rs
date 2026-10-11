@@ -497,7 +497,7 @@ impl CacheDispatch {
             fingerprint,
             msg,
             Arc::clone(bound),
-            serve_shape.clone(),
+            Arc::clone(serve_shape),
             *generation,
             target.input.rows_needed,
         )

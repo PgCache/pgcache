@@ -24,14 +24,14 @@ use crate::cache::{
     mv_shape::ShapeGate,
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView,
-        SharedResolvedQuery,
+        SharedQueryShape, SharedResolvedQuery,
     },
 };
 use crate::oid::Oid;
 use crate::pg;
 use crate::pg::Lsn;
 use crate::pg::protocol::ByteString;
-use crate::query::{Fingerprint, FingerprintSet, QueryShape};
+use crate::query::{Fingerprint, FingerprintSet};
 use crate::settings::{PgSettings, Settings};
 
 /// Deterministic fault injection for the restart supervisor: kill the writer on
@@ -120,7 +120,7 @@ pub(crate) struct WriterShared {
 pub(super) struct QueryServing {
     pub(super) generation: Generation,
     pub(super) bound: SharedResolvedQuery,
-    pub(super) serve_shape: QueryShape,
+    pub(super) serve_shape: SharedQueryShape,
     pub(super) max_limit: Option<u64>,
 }
 
@@ -613,7 +613,7 @@ impl WriterCore {
                 v.generation = serving.generation;
                 v.bound = Some(Arc::clone(&serving.bound));
                 v.read_columns = Some(Arc::clone(&read_columns));
-                v.serve_shape = Some(serving.serve_shape.clone());
+                v.serve_shape = Some(Arc::clone(&serving.serve_shape));
                 v.max_limit = serving.max_limit;
                 v.reference_only = reference_only;
                 v.referenced = false;
@@ -623,7 +623,7 @@ impl WriterCore {
                 generation: serving.generation,
                 bound: Some(Arc::clone(&serving.bound)),
                 read_columns: Some(read_columns),
-                serve_shape: Some(serving.serve_shape.clone()),
+                serve_shape: Some(Arc::clone(&serving.serve_shape)),
                 max_limit: serving.max_limit,
                 reference_only,
                 referenced: false,

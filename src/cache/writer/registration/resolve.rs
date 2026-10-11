@@ -16,12 +16,12 @@ use crate::cache::admission::{
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
 use crate::cache::mv_shape::ShapeGate;
+use crate::cache::types::SharedQueryShape;
 use crate::cache::update_query::UpdateQueries;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::QueryShape;
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::keying_settings::KeyingSettings;
@@ -90,9 +90,9 @@ fn search_path(keying: &KeyingSettings) -> Vec<&str> {
 /// Render the serve shape once at registration (PGC-294): the per-shape
 /// serve statement and its binds, which every cache hit splices in instead
 /// of re-rendering the tree.
-fn serve_shape_render(bound: &ResolvedQuery) -> QueryShape {
+fn serve_shape_render(bound: &ResolvedQuery) -> SharedQueryShape {
     let render_start = Instant::now();
-    let shape = bound.shape();
+    let shape = Arc::new(bound.shape());
     crate::metrics::handles()
         .reg
         .resolve_deparse

@@ -40,6 +40,10 @@ pub struct Alias {
 /// hit never deep-clones it (the dispatch→serve path).
 pub(super) type SharedResolvedQuery = Arc<ResolvedQuery>;
 
+/// The serve shape, shared between the cached query, its view and every
+/// hit so serving allocates nothing for it.
+pub(super) type SharedQueryShape = Arc<QueryShape>;
+
 pub(super) use super::serve_decision::CachedQueryState;
 
 /// A cached query with its metadata and state
@@ -55,7 +59,7 @@ pub struct CachedQuery {
     /// literals to bind. Computed once at registration; lets the serve path
     /// share one prepared statement per shape across all fingerprints that
     /// differ only in literals.
-    pub serve_shape: QueryShape,
+    pub serve_shape: SharedQueryShape,
     /// Maximum rows cached for this fingerprint.
     /// `None` = all rows cached (query seen without LIMIT, or OFFSET-only).
     /// `Some(n)` = up to `n` rows cached (max LIMIT+OFFSET across all variants seen).
@@ -370,7 +374,7 @@ pub struct CachedQueryView {
     pub read_columns: Option<Arc<ColumnsByTable>>,
     /// Parameterized serve shape (mirrors `CachedQuery.serve_shape`, PGC-294).
     /// None while Loading; Some once the view transitions to Ready.
-    pub serve_shape: Option<QueryShape>,
+    pub serve_shape: Option<SharedQueryShape>,
     /// Maximum rows cached for this fingerprint (None = all rows)
     pub max_limit: Option<u64>,
     /// A date-time literal was left as written at registration, so the

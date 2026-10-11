@@ -14,10 +14,9 @@ use super::registration::{
 };
 use crate::cache::Generation;
 use crate::cache::admission::{SubsumerCandidate, SubsumerSource, subsumption_covered};
-use crate::cache::types::{Cache, SharedResolvedQuery};
+use crate::cache::types::{Cache, SharedQueryShape, SharedResolvedQuery};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::oid::Oid;
-use crate::query::QueryShape;
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::constraints::{TableConstraint, query_constraints_analyze};
 use crate::result::error_chain_format;
@@ -112,11 +111,11 @@ impl WriterRegistration {
         core: &mut WriterCore,
         identity: RegistrationIdentity,
         resolution: QueryResolution,
-    ) -> CacheResult<Option<(Generation, SharedResolvedQuery, QueryShape)>> {
+    ) -> CacheResult<Option<(Generation, SharedResolvedQuery, SharedQueryShape)>> {
         let subsume_start = Instant::now();
         let fingerprint = identity.fingerprint;
         let bound = Arc::clone(&resolution.bound);
-        let serve_shape = resolution.serve_shape.clone();
+        let serve_shape = Arc::clone(&resolution.serve_shape);
         let max_limit = resolution.max_limit;
         // Running the query under the new generation stamps the rows it
         // reads, which the subsumer already holds.
@@ -168,7 +167,7 @@ impl WriterRegistration {
             QueryServing {
                 generation,
                 bound: Arc::clone(&bound),
-                serve_shape: serve_shape.clone(),
+                serve_shape: Arc::clone(&serve_shape),
                 max_limit,
             },
         );

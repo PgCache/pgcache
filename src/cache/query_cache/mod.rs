@@ -12,14 +12,14 @@ use super::output_settings::OutputSettings;
 use super::query::CacheableQuery;
 use super::reg_bucket::RegRateBucket;
 use super::reply::ReplySender;
-use super::types::{CacheStateView, SharedResolvedQuery};
+use super::types::{CacheStateView, SharedQueryShape, SharedResolvedQuery};
 use crate::cache::Generation;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::ClientSocket;
 use crate::query::ast::LimitClause;
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::{Fingerprint, QueryShape, SessionKey};
+use crate::query::{Fingerprint, SessionKey};
 use crate::settings::DynamicConfigHandle;
 use crate::timing::QueryTiming;
 
@@ -78,7 +78,7 @@ pub struct ServeRequest {
     pub bound: SharedResolvedQuery,
     /// Parameterized serve shape (literal-free SQL + ordered literal values):
     /// the shape-keyed prepared statement a source-row serve runs (PGC-294).
-    pub serve_shape: QueryShape,
+    pub serve_shape: SharedQueryShape,
     /// Generation number for row tracking in pgcache_pgrx extension
     pub generation: Generation,
     /// Serve from the MV (carrying its aliased output column names) or

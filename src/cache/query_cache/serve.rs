@@ -12,12 +12,12 @@ use crate::cache::fast_path::{self, MvDecision};
 use crate::cache::memo::{MemoHit, MemoKey, MemoShape};
 use crate::cache::messages::{CacheOutcome, CacheReply, PipelineDescribe, slices_concat};
 use crate::cache::mv::MvServe;
-use crate::cache::types::SharedResolvedQuery;
+use crate::cache::types::{SharedQueryShape, SharedResolvedQuery};
 use crate::cache::write_queue::WriteQueue;
 use crate::cache::{CacheError, CacheResult};
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::encode::{BIND_COMPLETE_MSG, PARSE_COMPLETE_MSG};
-use crate::query::{Fingerprint, QueryShape};
+use crate::query::Fingerprint;
 
 /// A pre-checked plan to serve a request from an in-process memo snapshot: the
 /// matched snapshot plus which envelope frames to regenerate around its core.
@@ -50,7 +50,7 @@ impl CacheDispatch {
         fingerprint: Fingerprint,
         msg: QueryRequest,
         bound: SharedResolvedQuery,
-        serve_shape: QueryShape,
+        serve_shape: SharedQueryShape,
         generation: Generation,
         rows_needed: Option<u64>,
     ) -> CacheResult<()> {
@@ -68,7 +68,7 @@ impl CacheDispatch {
         fingerprint: Fingerprint,
         msg: QueryRequest,
         bound: SharedResolvedQuery,
-        serve_shape: QueryShape,
+        serve_shape: SharedQueryShape,
         generation: Generation,
         mv: MvServe,
     ) -> CacheResult<()> {
@@ -223,7 +223,7 @@ impl CacheDispatch {
         fingerprint: Fingerprint,
         msg: QueryRequest,
         bound: SharedResolvedQuery,
-        serve_shape: QueryShape,
+        serve_shape: SharedQueryShape,
         generation: Generation,
         mv: MvServe,
         coalesced: Vec<CoalescedClient>,

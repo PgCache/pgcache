@@ -8,9 +8,8 @@ use crate::cache::Generation;
 use crate::cache::messages::slices_concat;
 use crate::cache::query::{limit_is_sufficient, limit_rows_needed};
 use crate::cache::reference_settings::{self, ReferenceSettings};
-use crate::cache::types::SharedResolvedQuery;
+use crate::cache::types::{SharedQueryShape, SharedResolvedQuery};
 use crate::query::Fingerprint;
-use crate::query::QueryShape;
 use crate::result::error_chain_format;
 
 /// What a Ready entry serves its drained waiters, read once per drain.
@@ -18,7 +17,7 @@ struct DrainServing {
     fingerprint: Fingerprint,
     generation: Generation,
     bound: SharedResolvedQuery,
-    serve_shape: QueryShape,
+    serve_shape: SharedQueryShape,
     max_limit: Option<u64>,
     /// `Some` for a reference-only entry: the settings a waiter must be on.
     reference: Option<Arc<ReferenceSettings>>,
@@ -63,7 +62,7 @@ impl CacheDispatch {
         fingerprint: Fingerprint,
         generation: Generation,
         bound: SharedResolvedQuery,
-        serve_shape: QueryShape,
+        serve_shape: SharedQueryShape,
         max_limit: Option<u64>,
     ) {
         let Some(groups) = self.waiting.drain(fingerprint) else {
@@ -155,7 +154,7 @@ impl CacheDispatch {
             serving.fingerprint,
             primary,
             Arc::clone(&serving.bound),
-            serving.serve_shape.clone(),
+            Arc::clone(&serving.serve_shape),
             serving.generation,
             mv,
             coalesced,

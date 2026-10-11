@@ -86,7 +86,7 @@ impl WriterRegistration {
         let serving = QueryServing {
             generation: new_generation,
             bound: Arc::clone(&cached.bound),
-            serve_shape: cached.serve_shape.clone(),
+            serve_shape: Arc::clone(&cached.serve_shape),
             max_limit: cached.max_limit,
         };
 
@@ -127,7 +127,7 @@ impl WriterRegistration {
                 let serving = QueryServing {
                     generation: query.generation,
                     bound: Arc::clone(&query.bound),
-                    serve_shape: query.serve_shape.clone(),
+                    serve_shape: Arc::clone(&query.serve_shape),
                     max_limit: query.max_limit,
                 };
                 (serving, started_at)
@@ -212,7 +212,7 @@ impl WriterRegistration {
 
         // Collect data needed before mutating
         let bound = Arc::clone(&cached_query.bound);
-        let serve_shape = cached_query.serve_shape.clone();
+        let serve_shape = Arc::clone(&cached_query.serve_shape);
         let relation_oids = cached_query.relation_oids.clone();
         let old_generation = cached_query.generation;
 

@@ -26,11 +26,11 @@ use crate::cache::Generation;
 use crate::cache::messages::{QueryCommand, RegisterRequest, ResolveRequest, ResolveResult};
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::population_pool::PopulationPool;
-use crate::cache::types::{Alias, CachedQuery, SharedResolvedQuery};
+use crate::cache::types::{Alias, CachedQuery, SharedQueryShape, SharedResolvedQuery};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::oid::Oid;
-use crate::query::{Fingerprint, QueryShape};
+use crate::query::Fingerprint;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
 
@@ -65,7 +65,7 @@ pub(crate) struct PopulationWork {
 pub(super) struct QueryResolution {
     /// Parameterized serve shape of `bound` (PGC-294); see
     /// `CachedQuery.serve_shape`.
-    pub(super) serve_shape: QueryShape,
+    pub(super) serve_shape: SharedQueryShape,
     pub(super) relation_oids: Vec<Oid>,
     /// The canonical plain tree with its bindings (ADR-057).
     pub(super) bound: SharedResolvedQuery,

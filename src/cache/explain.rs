@@ -17,7 +17,7 @@ use crate::cache::messages::{CacheOutcome, CacheReply};
 use crate::cache::mv::{MvServe, mv_table_name};
 use crate::cache::reply::ReplySender;
 use crate::cache::runtime::serve_pool::ConnectionGuard;
-use crate::cache::types::CacheStateView;
+use crate::cache::types::{CacheStateView, SharedQueryShape};
 use crate::pg::cache_connection::{CacheConnection, ExplainOutcome};
 use crate::pg::protocol::ProtocolResult;
 use crate::pg::protocol::backend::TransactionStatus;
@@ -47,7 +47,7 @@ pub enum ExplainKind {
         fingerprint: Fingerprint,
         mv: MvServe,
         /// The source-row shape the query serves by.
-        serve_shape: QueryShape,
+        serve_shape: SharedQueryShape,
         /// Verbatim EXPLAIN option list (may be empty).
         options: EcoString,
     },

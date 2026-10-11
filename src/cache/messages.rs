@@ -7,12 +7,11 @@ use super::output_settings::OutputSettings;
 use super::query::CacheableQuery;
 use super::query::QueryParameters;
 use super::reply::ReplySender;
-use super::types::SharedResolvedQuery;
+use super::types::{SharedQueryShape, SharedResolvedQuery};
 use crate::cache::Generation;
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::pg::protocol::session::ResultFormats;
 use crate::proxy::{ClientSocket, ExplainSpec};
-use crate::query::QueryShape;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, SessionKey};
 use crate::timing::QueryTiming;
@@ -35,7 +34,7 @@ pub(crate) enum WriterNotify {
         fingerprint: Fingerprint,
         generation: Generation,
         bound: SharedResolvedQuery,
-        serve_shape: QueryShape,
+        serve_shape: SharedQueryShape,
         max_limit: Option<u64>,
     },
     /// Population failed.
