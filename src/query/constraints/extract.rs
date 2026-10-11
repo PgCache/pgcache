@@ -69,7 +69,7 @@ impl ConstraintCollector {
             match target {
                 None => {
                     self.constraints.insert(ColumnConstraint::Comparison {
-                        column: col.clone(),
+                        column: col.into(),
                         op,
                         value: val.clone(),
                     });
@@ -78,7 +78,7 @@ impl ConstraintCollector {
                     if cast_target_is_coercion_supported(cast, &col.column_metadata.data_type) =>
                 {
                     self.constraints.insert(ColumnConstraint::CastComparison {
-                        column: col.clone(),
+                        column: col.into(),
                         cast: cast.clone(),
                         op,
                         value: val.clone(),
@@ -95,8 +95,8 @@ impl ConstraintCollector {
         ) && binary.op == BinaryOp::Equal
         {
             self.equivalences.insert(ColumnEquivalence {
-                left: left.clone(),
-                right: right.clone(),
+                left: left.into(),
+                right: right.into(),
             });
             return;
         }
@@ -179,12 +179,12 @@ fn between_constraints_extract(
     };
 
     constraints.insert(ColumnConstraint::Comparison {
-        column: col.clone(),
+        column: col.into(),
         op: BinaryOp::GreaterThanOrEqual,
         value: low.clone(),
     });
     constraints.insert(ColumnConstraint::Comparison {
-        column: col.clone(),
+        column: col.into(),
         op: BinaryOp::LessThanOrEqual,
         value: high.clone(),
     });
@@ -219,7 +219,7 @@ fn in_constraints_extract(
     literal_values.dedup();
 
     constraints.insert(ColumnConstraint::InSet {
-        column: col.clone(),
+        column: col.into(),
         values: literal_values,
     });
 }
@@ -286,7 +286,7 @@ fn any_eq_array_constraints_extract(
     literal_values.dedup();
 
     constraints.insert(ColumnConstraint::InSet {
-        column: col.clone(),
+        column: col.into(),
         values: literal_values,
     });
 }
@@ -310,7 +310,7 @@ fn not_in_constraints_extract(
             return;
         }
         constraints.insert(ColumnConstraint::Comparison {
-            column: col.clone(),
+            column: col.into(),
             op: BinaryOp::NotEqual,
             value: v.clone(),
         });
@@ -402,13 +402,18 @@ impl ColumnConstraint {
 /// so outer constraints (e.g., `AND tenant_id = 1`) are still correctly extracted
 /// even when subqueries are present.
 pub fn analyze_query_constraints(resolved: &ResolvedSelectNode) -> QueryConstraints {
-    // Step 1: Collect all constraint information (constraints + equivalences)
     let (constraints, equivalences, where_analysis_complete) = collect_query_constraints(resolved);
+    query_constraints_build(constraints, equivalences, where_analysis_complete)
+}
 
-    // Step 2: Propagate constraints through equivalences
+/// The constraints of a query from what its predicates imply: propagated
+/// through the equivalences, then organised by table.
+pub(super) fn query_constraints_build(
+    constraints: HashSet<ColumnConstraint>,
+    equivalences: HashSet<ColumnEquivalence>,
+    where_analysis_complete: bool,
+) -> QueryConstraints {
     let column_constraints = propagate_constraints(constraints, &equivalences);
-
-    // Step 3: Organize by table for quick lookup
     let mut table_constraints: HashMap<EcoString, Vec<TableConstraint>> = HashMap::new();
     for constraint in &column_constraints {
         let tc = match constraint {

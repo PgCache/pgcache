@@ -17,10 +17,12 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
-use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::ast::{BinaryOp, ColumnNode, LiteralValue};
 use crate::query::cast::CastTarget;
+use crate::query::resolve::{ResolvedQuery, TableSlot};
 use crate::query::resolved::ResolvedColumnNode;
 
+mod bound;
 mod extract;
 mod range;
 #[cfg(feature = "proxy")]
@@ -29,6 +31,7 @@ mod subsume;
 #[cfg(test)]
 mod tests;
 
+pub use bound::query_constraints_analyze;
 pub use extract::analyze_query_constraints;
 pub use subsume::table_constraints_subsumed;
 
@@ -39,19 +42,82 @@ pub(crate) use range_overlap::{
     table_column_ranges,
 };
 
+/// The column a constraint is on: its table as the query names it. The
+/// alias is how the query spells it and no part of its identity, so a
+/// constraint propagates across an equivalence whatever the spelling.
+#[derive(Debug, Clone)]
+pub struct ConstraintColumn {
+    pub schema: EcoString,
+    pub table: EcoString,
+    pub alias: Option<EcoString>,
+    pub column: EcoString,
+}
+
+impl PartialEq for ConstraintColumn {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema == other.schema && self.table == other.table && self.column == other.column
+    }
+}
+
+impl Eq for ConstraintColumn {}
+
+impl std::hash::Hash for ConstraintColumn {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.schema.hash(state);
+        self.table.hash(state);
+        self.column.hash(state);
+    }
+}
+
+impl From<&ResolvedColumnNode> for ConstraintColumn {
+    fn from(node: &ResolvedColumnNode) -> Self {
+        Self {
+            schema: node.schema.clone(),
+            table: node.table.clone(),
+            alias: node.table_alias.clone(),
+            column: node.column.clone(),
+        }
+    }
+}
+
+impl ConstraintColumn {
+    /// The column a bound reference stands for; `None` for an outer-join
+    /// merged column or an output name.
+    pub fn of(bound: &ResolvedQuery, node: &ColumnNode) -> Option<Self> {
+        let bindings = bound.bindings();
+        let binding = bound.column_binding(node)?;
+        let column = bindings.binding_column(&binding)?.name.clone();
+        Some(match bindings.slot(binding.slot)? {
+            TableSlot::Base { table, alias } => Self {
+                schema: table.schema.clone(),
+                table: table.name.clone(),
+                alias: alias.clone(),
+                column,
+            },
+            // A derived table is named by its alias and has no schema.
+            TableSlot::Derived { table, .. } => Self {
+                schema: EcoString::new(),
+                table: table.name.clone(),
+                alias: Some(table.name.clone()),
+                column,
+            },
+        })
+    }
+}
+
 /// A column constraint extracted from WHERE/JOIN conditions
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ColumnConstraint {
     /// Single comparison: column op value
     Comparison {
-        column: ResolvedColumnNode,
+        column: ConstraintColumn,
         op: BinaryOp,
         value: LiteralValue,
     },
     /// Set membership: column IN (v1, v2, ...)
     /// Values are sorted for deterministic Hash/Eq.
     InSet {
-        column: ResolvedColumnNode,
+        column: ConstraintColumn,
         values: Vec<LiteralValue>,
     },
     /// Comparison through a non-identity cast: `column::cast op value`.
@@ -59,7 +125,7 @@ pub enum ColumnConstraint {
     /// must bucket these separately from bare `Comparison` constraints
     /// on the same column.
     CastComparison {
-        column: ResolvedColumnNode,
+        column: ConstraintColumn,
         cast: CastTarget,
         op: BinaryOp,
         value: LiteralValue,
@@ -67,7 +133,7 @@ pub enum ColumnConstraint {
 }
 
 impl ColumnConstraint {
-    pub fn column(&self) -> &ResolvedColumnNode {
+    pub fn column(&self) -> &ConstraintColumn {
         match self {
             ColumnConstraint::Comparison { column, .. }
             | ColumnConstraint::InSet { column, .. }
@@ -79,15 +145,15 @@ impl ColumnConstraint {
 /// An equivalence between two columns
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ColumnEquivalence {
-    pub left: ResolvedColumnNode,
-    pub right: ResolvedColumnNode,
+    pub left: ConstraintColumn,
+    pub right: ConstraintColumn,
 }
 
 impl ColumnEquivalence {
     /// Returns true if this equivalence represents a join condition:
     /// columns from different tables, or same table with different aliases (self-join)
     pub fn is_join(&self) -> bool {
-        self.left.table != self.right.table || self.left.table_alias != self.right.table_alias
+        self.left.table != self.right.table || self.left.alias != self.right.alias
     }
 }
 

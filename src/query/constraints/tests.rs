@@ -9,6 +9,7 @@ use super::*;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{QueryBody, query_expr_parse};
+use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
 use crate::query::resolved::{ResolvedSelectNode, select_node_resolve};
 
 // Helper function to parse SQL and resolve to ResolvedSelectNode
@@ -63,8 +64,46 @@ fn catalog(names: &[&str]) -> Catalog {
     tables
 }
 
+/// The constraints of `sql`, as the bound analysis reads them; every call
+/// also checks them against the resolved analysis, which stays as the
+/// oracle until the resolved tree goes.
 fn constraints_of(sql: &str, tables: &Catalog) -> QueryConstraints {
-    analyze_query_constraints(&resolve_sql(sql, tables))
+    let expected = analyze_query_constraints(&resolve_sql(sql, tables));
+    let query = std::sync::Arc::new(query_expr_parse(sql).expect("convert to QueryExpr"));
+    let (_, bindings) =
+        query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve bound");
+    let bound = ResolvedQuery::new(query, bindings);
+    let actual = query_constraints_analyze(&bound, bound.select().expect("a SELECT"));
+    assert_constraints_equal(&actual, &expected, sql);
+    actual
+}
+
+/// Equal sets of column constraints and equivalences, the same per-table
+/// constraints in any order, and the same completeness.
+fn assert_constraints_equal(actual: &QueryConstraints, expected: &QueryConstraints, sql: &str) {
+    assert_eq!(
+        actual.column_constraints, expected.column_constraints,
+        "{sql}"
+    );
+    assert_eq!(actual.equivalences, expected.equivalences, "{sql}");
+    assert_eq!(
+        actual.where_analysis_complete, expected.where_analysis_complete,
+        "{sql}"
+    );
+    let by_table = |constraints: &QueryConstraints| -> Vec<(EcoString, Vec<String>)> {
+        let mut tables: Vec<(EcoString, Vec<String>)> = constraints
+            .table_constraints
+            .iter()
+            .map(|(table, constraints)| {
+                let mut texts: Vec<String> = constraints.iter().map(|c| format!("{c:?}")).collect();
+                texts.sort();
+                (table.clone(), texts)
+            })
+            .collect();
+        tables.sort();
+        tables
+    };
+    assert_eq!(by_table(actual), by_table(expected), "{sql}");
 }
 
 /// Whether any constraint on `table` satisfies `matches`.
@@ -1063,4 +1102,23 @@ fn test_cast_comparison_does_not_propagate_through_equivalence() {
         &cmp("users2", "name", BinaryOp::Equal, int(5)),
         &CastTarget::Int4
     ));
+}
+
+/// Shapes the other tests leave out, where the bound analysis must read
+/// through merged columns and derived tables as the resolved one did.
+#[test]
+fn test_bound_analysis_matches_resolved_on_join_shapes() {
+    let tables = catalog(&["users", "orders", "items"]);
+    for sql in [
+        "SELECT * FROM users JOIN orders USING (id) WHERE id = 1 AND users.name = 'a'",
+        "SELECT * FROM users u LEFT JOIN orders o USING (id) WHERE u.name = 'a'",
+        "SELECT * FROM users NATURAL JOIN orders WHERE id > 2",
+        "SELECT * FROM users u JOIN orders o ON u.id = o.id JOIN items i ON i.id = o.id WHERE u.id IN (1, 2)",
+        "SELECT v.id FROM (SELECT id, name FROM users WHERE name = 'x') v WHERE v.id = 3",
+        "SELECT u.id FROM users u WHERE u.id = 1 AND u.name::text = 'a' AND u.id::int8 > 0",
+        "SELECT u.id FROM users u WHERE u.id BETWEEN SYMMETRIC 9 AND 1 AND u.name NOT IN ('a', 'b')",
+        "SELECT u.id FROM users u WHERE u.id = ANY (ARRAY[3, 1, 2]) OR u.name = 'z'",
+    ] {
+        let _ = constraints_of(sql, &tables);
+    }
 }

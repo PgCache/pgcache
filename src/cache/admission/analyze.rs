@@ -18,7 +18,7 @@ use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::query::Fingerprint;
 use crate::query::ast::{AstNode, QueryBody, QueryExpr};
-use crate::query::constraints::analyze_query_constraints;
+use crate::query::constraints::query_constraints_analyze;
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
@@ -186,9 +186,10 @@ pub fn query_admission_analyze(
             "the bound and resolved derivations disagree on an update query"
         );
         let relation_oid = table_node.relation_oid;
-        let constraints = update_resolved
-            .as_select()
-            .map(analyze_query_constraints)
+        let constraints = bound_update
+            .bound
+            .select()
+            .map(|select| query_constraints_analyze(&bound_update.bound, select))
             .unwrap_or_default();
         let eval_strategy = update_eval_strategy_classify(&update_resolved, source);
         let pg_batchable = depth == AdmissionDepth::Full

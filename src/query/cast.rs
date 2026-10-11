@@ -20,7 +20,9 @@
 use ecow::EcoString;
 use postgres_types::Type;
 
+use crate::query::ast::{BinaryExpr, ColumnNode, ScalarExpr, WhereExpr};
 use crate::query::ast::{BinaryOp, LiteralValue};
+use crate::query::resolve::ResolvedQuery;
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedScalarExpr, ResolvedWhereExpr,
 };
@@ -191,6 +193,79 @@ pub fn bool_literal_parse(s: &str) -> Option<bool> {
         if trimmed.eq_ignore_ascii_case(spelling) {
             return Some(false);
         }
+    }
+    None
+}
+
+/// [`resolved_strip_identity_cast`] on the bound query.
+pub fn identity_cast_strip<'a>(bound: &ResolvedQuery, expr: &'a ScalarExpr) -> &'a ScalarExpr {
+    let ScalarExpr::TypeCast {
+        expr: inner,
+        target,
+    } = expr
+    else {
+        return expr;
+    };
+    let ScalarExpr::Column(column) = inner.as_ref() else {
+        return expr;
+    };
+    match bound.column_type(column) {
+        Some(base) if cast_target_is_identity_on(target, base) => inner.as_ref(),
+        Some(_) | None => expr,
+    }
+}
+
+/// [`resolved_where_scalar_leaf`] on the bound query.
+pub fn where_scalar_leaf<'a>(bound: &ResolvedQuery, expr: &'a WhereExpr) -> Option<&'a ScalarExpr> {
+    if let WhereExpr::Scalar(scalar) = expr {
+        Some(identity_cast_strip(bound, scalar))
+    } else {
+        None
+    }
+}
+
+/// [`canonicalize_comparison`] on the bound query: `(column, cast target,
+/// op with the column on the left, literal)`.
+pub fn comparison_canonicalize<'a>(
+    bound: &ResolvedQuery,
+    binary: &'a BinaryExpr,
+) -> Option<(
+    &'a ColumnNode,
+    Option<&'a CastTarget>,
+    BinaryOp,
+    &'a LiteralValue,
+)> {
+    let lleaf = where_scalar_leaf(bound, &binary.lexpr);
+    let rleaf = where_scalar_leaf(bound, &binary.rexpr);
+    let column_target = |scalar: &'a ScalarExpr| match scalar {
+        ScalarExpr::Column(column) => Some((column, None)),
+        ScalarExpr::TypeCast { expr, target } => match expr.as_ref() {
+            ScalarExpr::Column(column) => Some((column, Some(target))),
+            ScalarExpr::Function(_)
+            | ScalarExpr::Literal(_)
+            | ScalarExpr::Case(_)
+            | ScalarExpr::Arithmetic(_)
+            | ScalarExpr::Subquery(_)
+            | ScalarExpr::Array(_)
+            | ScalarExpr::TypeCast { .. } => None,
+        },
+        ScalarExpr::Function(_)
+        | ScalarExpr::Literal(_)
+        | ScalarExpr::Case(_)
+        | ScalarExpr::Arithmetic(_)
+        | ScalarExpr::Subquery(_)
+        | ScalarExpr::Array(_) => None,
+    };
+    if let (Some(left), Some(ScalarExpr::Literal(value))) = (lleaf, rleaf)
+        && let Some((column, target)) = column_target(left)
+    {
+        return Some((column, target, binary.op, value));
+    }
+    if let (Some(ScalarExpr::Literal(value)), Some(right)) = (lleaf, rleaf)
+        && let Some((column, target)) = column_target(right)
+    {
+        let flipped = binary.op.op_flip()?;
+        return Some((column, target, flipped, value));
     }
     None
 }

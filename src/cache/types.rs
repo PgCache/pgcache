@@ -359,7 +359,7 @@ impl CacheStateView {
 /// reasons about it.
 #[derive(Debug, Clone)]
 pub struct CachedReadForm {
-    pub resolved: SharedResolved,
+    pub bound: SharedResolvedQuery,
     pub columns: Arc<ColumnsByTable>,
 }
 

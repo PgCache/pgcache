@@ -4,14 +4,46 @@
 use std::collections::HashMap;
 
 use ecow::EcoString;
+use postgres_types::Type;
 
 use super::bindings::{ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot};
 use crate::query::ast::{
-    AstNode, ColumnNode, QueryBody, QueryExpr, SelectColumn, SelectColumns, StarNode,
+    AstNode, ColumnNode, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode, StarNode,
 };
 use crate::query::resolved::ColumnsByTable;
 
 impl ResolvedQuery {
+    /// The top-level SELECT, when the body is one.
+    pub fn select(&self) -> Option<&SelectNode> {
+        match &self.tree().body {
+            QueryBody::Select(select) => Some(select),
+            QueryBody::SetOp(_) | QueryBody::Values(_) => None,
+        }
+    }
+
+    /// The catalog column a reference stands for: its own, or the left
+    /// column of an inner-join merged column (which is exactly that
+    /// column); nothing for an outer-join merged column or an output name.
+    pub fn column_binding(&self, node: &ColumnNode) -> Option<ColumnBinding> {
+        match self.column(node)? {
+            ColumnTarget::Column(binding) => Some(*binding),
+            ColumnTarget::Merged(id) => self
+                .bindings()
+                .merged(*id)
+                .filter(|merged| !merged.outer)
+                .map(|merged| merged.left),
+            ColumnTarget::Output => None,
+        }
+    }
+
+    /// The type of the column a reference stands for.
+    pub fn column_type(&self, node: &ColumnNode) -> Option<&Type> {
+        let binding = self.column_binding(node)?;
+        self.bindings()
+            .binding_column(&binding)
+            .map(|column| &column.data_type)
+    }
+
     /// Which columns of each table the query reads anywhere: select list,
     /// predicates, join conditions (a `USING`/`NATURAL` join through both
     /// sides of each merged column), grouping, ordering and subqueries, with
