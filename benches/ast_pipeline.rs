@@ -1,7 +1,7 @@
 //! AST pipeline benchmarks (PGC-480 follow-up): what each stage of the query
 //! pipeline costs on representative shapes, measured three ways in one run.
 //!
-//! * **Node sizes** (`size_of`) of the plain and resolved tree types: a fat
+//! * **Node sizes** (`size_of`) of the tree's node types: a fat
 //!   enum shows up here before any restructuring.
 //! * **Allocations per stage per query**, counted by a wrapping global
 //!   allocator and printed once before criterion starts. Deterministic, so it
@@ -19,6 +19,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::HashSet;
 use std::hint::black_box;
 use std::mem::size_of;
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use ecow::EcoString;
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
+use pgcache_lib::cache::admission::{AdmissionDepth, AdmissionQuery, query_admission_analyze};
 use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use pgcache_lib::oid::{Oid, TypeOid};
 use pgcache_lib::pg::ByteString;
@@ -45,6 +47,7 @@ use pgcache_lib::query::resolve::{
     query_expr_resolve_bound,
 };
 use pgcache_lib::query::transform::query_literals_canonicalise;
+use pgcache_lib::query::update::query_table_update_queries_bound;
 
 // ---------------------------------------------------------------------------
 // Counting allocator
@@ -445,7 +448,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
     let search_path: [EcoString; 1] = ["public".into()];
     println!("\n== allocations per stage (count / bytes)");
     println!(
-        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
         "query",
         "convert",
         "plain_clone",
@@ -456,7 +459,9 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         "fingerprint",
         "render",
         "shape",
-        "pred_compile"
+        "pred_compile",
+        "update_queries",
+        "admission"
     );
     for shape in shapes {
         let (query, convert_n, convert_b) = allocations_count(|| parse(&shape.sql));
@@ -474,9 +479,26 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
             allocations_count(|| predicate_compile(&bound, shape.predicate_table));
         let (_, bindings_clone_n, bindings_clone_b) =
             allocations_count(|| black_box(bindings.clone()));
+        let aggregates = HashSet::new();
+        let (_, update_n, update_b) =
+            allocations_count(|| black_box(query_table_update_queries_bound(&bound)));
+        let fingerprint = bound.fingerprint();
+        let (_, admission_n, admission_b) = allocations_count(|| {
+            black_box(query_admission_analyze(
+                AdmissionQuery {
+                    bound: &bound,
+                    decorrelated: None,
+                },
+                fingerprint,
+                false,
+                &aggregates,
+                catalog,
+                AdmissionDepth::Full,
+            ))
+        });
         let cell = |n: usize, b: usize| format!("{n}/{b}");
         println!(
-            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
             shape.name,
             cell(convert_n, convert_b),
             cell(plain_clone_n, plain_clone_b),
@@ -491,6 +513,8 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
             cell(render_n, render_b),
             cell(shape_n, shape_b),
             cell(compile_n, compile_b),
+            cell(update_n, update_b),
+            cell(admission_n, admission_b),
         );
     }
     println!(
