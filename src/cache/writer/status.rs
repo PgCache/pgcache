@@ -10,7 +10,6 @@ use crate::cache::status::{
 };
 use crate::cache::types::{CachedQuery, CachedQueryState, QueryMetrics};
 use crate::pg::Lsn;
-use crate::query::ast::Deparse;
 
 impl WriterCore {
     /// Update cache state gauges with current values.
@@ -154,7 +153,7 @@ impl WriterCore {
     fn query_status_data(&self, q: &CachedQuery) -> QueryStatusData {
         let cache = &self.cache;
         let mut sql_preview = String::with_capacity(128);
-        Deparse::deparse(&*q.resolved, &mut sql_preview);
+        q.bound.sql_into(&mut sql_preview);
         sql_preview.truncate(200);
 
         let tables: Vec<String> = q

@@ -3,24 +3,28 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::cache::UpdateQuerySource;
-use crate::cache::query::{outer_join_optional_tables, outer_join_optional_tables_bound};
 #[cfg(test)]
+use crate::cache::query::outer_join_optional_tables;
+use crate::cache::query::outer_join_optional_tables_bound;
 use crate::oid::Oid;
 use crate::query::ast::{
     LiteralValue, NodeId, QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns,
     SelectNode, TableNode, query_expr_refinalize,
 };
 use crate::query::resolve::{BindingsBuilder, ResolvedQuery};
+#[cfg(test)]
 use crate::query::resolved::{
     ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
     ResolvedSelectColumns, ResolvedTableNode,
 };
+#[cfg(test)]
 use crate::query::transform::resolved_select_node_update_replace;
 
 /// One table's update query: the branch it sits in with the select list
 /// replaced by `true`, as a query of its own.
 pub struct TableUpdateQuery<'a> {
     pub table: &'a TableNode,
+    pub relation_oid: Oid,
     pub bound: ResolvedQuery,
     pub source: UpdateQuerySource,
 }
@@ -33,6 +37,15 @@ pub fn query_table_update_queries_bound(bound: &ResolvedQuery) -> Vec<TableUpdat
     for (branch, source) in bound.tree().select_nodes_with_source() {
         let (terminal, non_terminal) = outer_join_optional_tables_bound(bound, branch);
         for table in branch.direct_table_nodes() {
+            let relation_oid = bound
+                .bindings()
+                .source(table.id)
+                .and_then(|slot| bound.bindings().slot(slot))
+                .map(|slot| slot.table().relation_oid);
+            let Some(relation_oid) = relation_oid else {
+                debug_assert!(false, "a direct table of a resolved query has a slot");
+                continue;
+            };
             let mut tree = QueryExpr {
                 id: NodeId::PENDING,
                 ctes: Vec::new(),
@@ -62,6 +75,7 @@ pub fn query_table_update_queries_bound(bound: &ResolvedQuery) -> Vec<TableUpdat
             };
             result.push(TableUpdateQuery {
                 table,
+                relation_oid,
                 bound: ResolvedQuery::new(Arc::new(tree), bindings),
                 source: effective_source,
             });
@@ -80,7 +94,8 @@ pub fn query_table_update_queries_bound(bound: &ResolvedQuery) -> Vec<TableUpdat
 ///
 /// This approach ensures that CDC handling only checks if a changed row matches the
 /// specific branch conditions, not the entire set operation structure.
-pub fn query_table_update_queries(
+#[cfg(test)]
+pub(crate) fn query_table_update_queries(
     resolved: &ResolvedQueryExpr,
 ) -> Vec<(&ResolvedTableNode, ResolvedQueryExpr, UpdateQuerySource)> {
     let mut result = Vec::new();

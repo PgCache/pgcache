@@ -19,9 +19,6 @@ use tokio_postgres::{Client, Error};
 use crate::cache::CacheError;
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{ColumnNode, NodeId, ScalarExpr, SelectColumn, SelectColumns, TableAlias};
-use crate::query::resolved::{
-    ResolvedColumnNode, ResolvedScalarExpr, ResolvedSelectColumn, ResolvedSelectColumns,
-};
 
 /// Column storage: sorted by position with O(1) name lookups.
 ///
@@ -177,29 +174,6 @@ impl TableMetadata {
             .collect();
 
         SelectColumns::Columns(columns)
-    }
-
-    /// Generate resolved SELECT columns for all columns in this table.
-    ///
-    /// Creates `ResolvedSelectColumns::Columns` with fully qualified column references.
-    /// If a table_alias is provided, columns will use that alias for deparsing.
-    pub fn resolved_select_columns(&self, table_alias: Option<&str>) -> ResolvedSelectColumns {
-        let columns = self
-            .columns
-            .iter()
-            .map(|c| ResolvedSelectColumn {
-                expr: ResolvedScalarExpr::Column(ResolvedColumnNode {
-                    schema: self.schema.clone(),
-                    table: self.name.clone(),
-                    table_alias: table_alias.map(EcoString::from),
-                    column: c.name.clone(),
-                    column_metadata: c.clone(),
-                }),
-                alias: None,
-            })
-            .collect();
-
-        ResolvedSelectColumns::Columns(columns)
     }
 }
 

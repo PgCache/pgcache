@@ -614,7 +614,6 @@ impl CacheDispatch {
                     slot.insert(CachedQueryView {
                         state: transition.new,
                         generation: Generation::ZERO,
-                        resolved: None,
                         bound: None,
                         read_columns: None,
                         serve_shape: None,

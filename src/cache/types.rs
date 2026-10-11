@@ -20,9 +20,8 @@ use crate::{
     cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::Catalog,
     query::{
-        Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap,
-        resolve::ResolvedQuery,
-        resolved::{ColumnsByTable, ResolvedQueryExpr},
+        Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap, resolve::ResolvedQuery,
+        resolved::ColumnsByTable,
     },
     settings::{DynamicConfigHandle, Settings},
 };
@@ -37,12 +36,8 @@ pub struct Alias {
     pub tick: u64,
 }
 
-/// Shared resolved query expression, wrapped in Arc to avoid deep cloning
-/// on every cache hit (the dispatch→serve path).
-pub(super) type SharedResolved = Arc<ResolvedQueryExpr>;
-
-/// The canonical plain tree with its bindings (ADR-057), shared like
-/// `SharedResolved`; the serve and analysis paths move onto it slice by slice.
+/// The canonical plain tree with its bindings (ADR-057), shared so a cache
+/// hit never deep-clones it (the dispatch→serve path).
 pub(super) type SharedResolvedQuery = Arc<ResolvedQuery>;
 
 pub(super) use super::serve_decision::CachedQueryState;
@@ -55,7 +50,6 @@ pub struct CachedQuery {
     pub generation: Generation,
     pub relation_oids: Vec<Oid>,
     pub bound: SharedResolvedQuery,
-    pub resolved: SharedResolved,
     /// Parameterized serve shape (PGC-294): the serve SQL of `bound` with its
     /// predicate literals replaced by `$N` placeholders, plus its key and the
     /// literals to bind. Computed once at registration; lets the serve path
@@ -369,12 +363,10 @@ pub struct CachedQueryView {
     pub state: CachedQueryState,
     /// Generation number (0 for Loading placeholder before writer assigns real value)
     pub generation: Generation,
-    /// Resolved query (None for Loading placeholder before writer resolves)
-    pub resolved: Option<SharedResolved>,
-    /// The same resolution as a plain tree with bindings; set with `resolved`.
+    /// The bound query (None for Loading placeholder before writer resolves)
     pub bound: Option<SharedResolvedQuery>,
-    /// The columns `resolved` reads per table, for the read-after-write gate;
-    /// set with `resolved`.
+    /// The columns `bound` reads per table, for the read-after-write gate;
+    /// set with `bound`.
     pub read_columns: Option<Arc<ColumnsByTable>>,
     /// Parameterized serve shape (mirrors `CachedQuery.serve_shape`, PGC-294).
     /// None while Loading; Some once the view transitions to Ready.

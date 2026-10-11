@@ -5,8 +5,8 @@
 use ecow::EcoString;
 use pgcache_lib::cache::admission::{
     AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare,
-    query_admission_analyze, query_decorrelate_resolve, query_pushdown_resolve,
-    query_resolve_canonical, shape_gate_classify,
+    query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
+    shape_gate_classify,
 };
 use pgcache_lib::cache::query::limit_rows_needed;
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
@@ -298,15 +298,12 @@ pub fn statement_classify(
     // The identity is the bound query's serve SQL, literals canonicalised
     // under the default settings, before the pushdown transform — as
     // pgcache computes it.
-    let Ok(CanonicalResolution {
-        resolved, bound, ..
-    }) = query_resolve_canonical(
+    let Ok(CanonicalResolution { bound, .. }) = query_resolve_canonical(
         base_query,
         catalog,
         &["public"],
         &LiteralSettings::default(),
-    )
-    else {
+    ) else {
         return Verdict::Passthrough {
             reason: PassthroughReason::ResolutionFailed,
             detail: None,
@@ -314,28 +311,15 @@ pub fn statement_classify(
         };
     };
     let fingerprint = bound.fingerprint();
-    let Ok((bound, resolved)) = query_pushdown_resolve(bound, resolved, catalog, &["public"])
-    else {
-        return Verdict::Passthrough {
-            reason: PassthroughReason::ResolutionFailed,
-            detail: None,
-            cte_write: None,
-        };
-    };
-    let Ok(decorrelated) =
-        query_decorrelate_resolve(&bound, &builtins.aggregates, catalog, &["public"])
-    else {
+    let bound = query_pushdown(bound);
+    let Ok(decorrelated) = query_decorrelate_checked(&bound, &builtins.aggregates) else {
         return Verdict::Passthrough {
             reason: PassthroughReason::DecorrelationFailed,
             detail: None,
             cte_write: None,
         };
     };
-    let shape_gate = shape_gate_classify(
-        &bound,
-        decorrelated.as_ref().map(|(bound, _)| bound),
-        &builtins.aggregates,
-    );
+    let shape_gate = shape_gate_classify(&bound, decorrelated.as_ref(), &builtins.aggregates);
     let max_limit = if shape_gate.is_reducer() {
         None
     } else {
@@ -344,7 +328,6 @@ pub fn statement_classify(
     let has_limit = max_limit.is_some();
     let analysis = match query_admission_analyze(
         AdmissionQuery {
-            resolved: &resolved,
             bound: &bound,
             decorrelated: decorrelated.as_ref(),
         },

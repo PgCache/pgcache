@@ -8,7 +8,6 @@ use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::QueryConstraints;
 use crate::query::predicate::CompiledPredicate;
 use crate::query::resolve::ResolvedQuery;
-use crate::query::resolved::ResolvedQueryExpr;
 use crate::query::transform::PgEvalTemplate;
 use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 
@@ -99,10 +98,7 @@ pub enum UpdateQuerySource {
 pub struct UpdateQuery {
     /// Fingerprint of cached query that generated this update query
     pub fingerprint: Fingerprint,
-    /// Resolved AST query
-    pub resolved: ResolvedQueryExpr,
-    /// The same query bound (ADR-057); the CDC paths move onto it slice by
-    /// slice.
+    /// The update query, bound (ADR-057).
     pub bound: ResolvedQuery,
     /// Whether this table was found directly in FROM or inside a subquery
     pub source: UpdateQuerySource,

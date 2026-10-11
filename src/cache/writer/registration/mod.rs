@@ -26,7 +26,7 @@ use crate::cache::Generation;
 use crate::cache::messages::{QueryCommand, RegisterRequest, ResolveRequest, ResolveResult};
 use crate::cache::mv_shape::ShapeGate;
 use crate::cache::population_pool::PopulationPool;
-use crate::cache::types::{Alias, CachedQuery, SharedResolved, SharedResolvedQuery};
+use crate::cache::types::{Alias, CachedQuery, SharedResolvedQuery};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::{TableMetadata, aggregate_functions_load};
 use crate::oid::Oid;
@@ -63,7 +63,6 @@ pub(crate) struct PopulationWork {
 
 /// Intermediate result from resolving a query before subsumption check or population.
 pub(super) struct QueryResolution {
-    pub(super) resolved: SharedResolved,
     /// Parameterized serve shape of `bound` (PGC-294); see
     /// `CachedQuery.serve_shape`.
     pub(super) serve_shape: QueryShape,
@@ -120,7 +119,6 @@ pub(super) fn cached_query_insert(
         generation,
         relation_oids: resolution.relation_oids,
         bound: resolution.bound,
-        resolved: resolution.resolved,
         serve_shape: resolution.serve_shape,
         max_limit: resolution.max_limit,
         cached_bytes: 0,

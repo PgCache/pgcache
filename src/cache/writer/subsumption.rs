@@ -115,7 +115,6 @@ impl WriterRegistration {
     ) -> CacheResult<Option<(Generation, SharedResolvedQuery, QueryShape)>> {
         let subsume_start = Instant::now();
         let fingerprint = identity.fingerprint;
-        let resolved = Arc::clone(&resolution.resolved);
         let bound = Arc::clone(&resolution.bound);
         let serve_shape = resolution.serve_shape.clone();
         let max_limit = resolution.max_limit;
@@ -168,7 +167,6 @@ impl WriterRegistration {
             fingerprint,
             QueryServing {
                 generation,
-                resolved,
                 bound: Arc::clone(&bound),
                 serve_shape: serve_shape.clone(),
                 max_limit,

@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use tracing::{debug, error, trace, warn};
@@ -11,7 +10,6 @@ use crate::cache::memo::SlotKey;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, types::CachedQueryState};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::Deparse;
 use crate::result::error_chain_format;
 use crate::settings::CachePolicy;
 
@@ -295,7 +293,7 @@ impl WriterCore {
         };
 
         let old_generation = query.generation;
-        let resolved = Arc::clone(&query.resolved);
+        let sql = query.bound.sql();
 
         // 1. Assign new generation (insert before removing old — keeps old gen valid for re-stamp)
         let new_generation = self.cache.generation_allocate();
@@ -309,8 +307,6 @@ impl WriterCore {
 
         // 3. Re-execute query against cache DB (discard results).
         //    The CustomScan tracker side-effect updates dshash from old_gen to new_gen.
-        let mut sql = String::with_capacity(512);
-        Deparse::deparse(&*resolved, &mut sql);
         self.db_cache
             .batch_execute(&sql)
             .await

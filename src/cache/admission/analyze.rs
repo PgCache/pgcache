@@ -17,18 +17,17 @@ use crate::cache::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySou
 use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::query::Fingerprint;
-use crate::query::ast::{AstNode, QueryBody, QueryExpr};
+use crate::query::ast::{QueryBody, QueryExpr};
 use crate::query::constraints::query_constraints_analyze;
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
-use crate::query::resolve::{ResolvedQuery, query_expr_resolve, query_expr_resolve_bound};
-use crate::query::resolved::{ResolveResult, ResolvedQueryExpr, ResolvedTableNode};
+use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+use crate::query::resolved::ResolveResult;
 use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
-    resolved_literals_canonicalise,
 };
-use crate::query::update::{query_table_update_queries, query_table_update_queries_bound};
+use crate::query::update::query_table_update_queries_bound;
 use crate::result::ReportExt;
 
 /// How much of each [`TableAdmission`] to build. The writer needs the full
@@ -55,11 +54,8 @@ pub fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
     (base_query, max_limit)
 }
 
-/// The identity-bearing form of a query in both representations.
+/// The identity-bearing form of a query.
 pub struct CanonicalResolution {
-    /// Canonical resolved tree: the analysis source until those analyses
-    /// move onto `bound`.
-    pub resolved: ResolvedQueryExpr,
     /// The canonical plain tree with its bindings (ADR-057).
     pub bound: Arc<ResolvedQuery>,
     pub literals: LiteralCanonOutcome,
@@ -74,58 +70,33 @@ pub fn query_resolve_canonical(
     search_path: &[&str],
     settings: &LiteralSettings,
 ) -> ResolveResult<CanonicalResolution> {
-    let (mut resolved, bindings) = query_expr_resolve_bound(&base_query, tables, search_path)?;
+    let (_, bindings) = query_expr_resolve_bound(&base_query, tables, search_path)?;
     let literals = query_literals_canonicalise(&mut base_query, &bindings, settings);
-    let resolved_literals = resolved_literals_canonicalise(&mut resolved, settings);
-    debug_assert_eq!(
-        literals, resolved_literals,
-        "plain and resolved canonicalisation disagree"
-    );
     Ok(CanonicalResolution {
-        resolved,
         bound: Arc::new(ResolvedQuery::new(Arc::new(base_query), bindings)),
         literals,
     })
 }
 
-/// Predicate pushdown (ADR-012) on the bound query, with the pushed-down
-/// tree resolved for the analyses still on the resolved tree. Both come
-/// back as they were when nothing moves.
-pub fn query_pushdown_resolve(
-    bound: Arc<ResolvedQuery>,
-    resolved: ResolvedQueryExpr,
-    tables: &Catalog,
-    search_path: &[&str],
-) -> ResolveResult<(Arc<ResolvedQuery>, ResolvedQueryExpr)> {
+/// Predicate pushdown (ADR-012) on the bound query; the query comes back as
+/// it was when nothing moves.
+pub fn query_pushdown(bound: Arc<ResolvedQuery>) -> Arc<ResolvedQuery> {
     match query_predicate_pushdown(&bound) {
-        Some(pushed) => {
-            let resolved = query_expr_resolve(pushed.tree(), tables, search_path)?;
-            Ok((Arc::new(pushed), resolved))
-        }
-        None => Ok((bound, resolved)),
+        Some(pushed) => Arc::new(pushed),
+        None => bound,
     }
 }
 
-/// Decorrelation (ADR-014 to ADR-017) on the bound query, with the
-/// rewritten tree resolved likewise; `None` when there is nothing to
-/// decorrelate. Runs once at registration for the shape gate, admission
-/// and population alike.
-pub fn query_decorrelate_resolve(
+/// Decorrelation (ADR-014 to ADR-017) on the bound query; `None` when there
+/// is nothing to decorrelate. Runs once at registration for the shape gate,
+/// admission and population alike.
+pub fn query_decorrelate_checked(
     bound: &ResolvedQuery,
     aggregate_functions: &HashSet<EcoString>,
-    tables: &Catalog,
-    search_path: &[&str],
-) -> CacheResult<Option<(ResolvedQuery, ResolvedQueryExpr)>> {
-    let Some(decorrelated) = query_decorrelate(bound, aggregate_functions)
+) -> CacheResult<Option<ResolvedQuery>> {
+    query_decorrelate(bound, aggregate_functions)
         .map_err(|e| e.context_transform(CacheError::from))
-        .attach_loc("decorrelating correlated subqueries")?
-    else {
-        return Ok(None);
-    };
-    let resolved = query_expr_resolve(decorrelated.tree(), tables, search_path)
-        .map_err(|e| e.context_transform(CacheError::from))
-        .attach_loc("resolving the decorrelated query")?;
-    Ok(Some((decorrelated, resolved)))
+        .attach_loc("decorrelating correlated subqueries")
 }
 
 /// Classify a query's shape for MV eligibility on its decorrelated form
@@ -139,12 +110,11 @@ pub fn shape_gate_classify(
     shape_classify(decorrelated.unwrap_or(bound), aggregate_functions)
 }
 
-/// The query as admission reads it: as registered in both representations,
-/// and decorrelated when it had correlated subqueries.
+/// The query as admission reads it: as registered, and decorrelated when
+/// it had correlated subqueries.
 pub struct AdmissionQuery<'a> {
-    pub resolved: &'a ResolvedQueryExpr,
     pub bound: &'a ResolvedQuery,
-    pub decorrelated: Option<&'a (ResolvedQuery, ResolvedQueryExpr)>,
+    pub decorrelated: Option<&'a ResolvedQuery>,
 }
 
 /// Derive one [`TableAdmission`] per update query of the query, or of its
@@ -160,38 +130,21 @@ pub fn query_admission_analyze(
     depth: AdmissionDepth,
 ) -> CacheResult<AdmissionAnalysis> {
     let AdmissionQuery {
-        resolved,
         bound,
         decorrelated,
     } = query;
-    let (bound_source, update_source) = match decorrelated {
-        Some((bound, resolved)) => (bound, resolved),
-        None => (bound, resolved),
-    };
-    let bound_updates = query_table_update_queries_bound(bound_source);
-    debug_assert_eq!(
-        bound_updates.len(),
-        query_table_update_queries(update_source).len(),
-        "the bound and resolved derivations disagree on the update queries"
-    );
+    let update_source = decorrelated.unwrap_or(bound);
 
     let mut admissions = Vec::new();
-    for ((table_node, update_resolved, source), bound_update) in
-        query_table_update_queries(update_source)
-            .into_iter()
-            .zip(bound_updates)
-    {
-        debug_assert!(
-            table_node.name == bound_update.table.name && source == bound_update.source,
-            "the bound and resolved derivations disagree on an update query"
-        );
-        let relation_oid = table_node.relation_oid;
-        let constraints = bound_update
-            .bound
-            .select()
-            .map(|select| query_constraints_analyze(&bound_update.bound, select))
-            .unwrap_or_default();
+    for bound_update in query_table_update_queries_bound(update_source) {
+        let table_node = bound_update.table;
+        let source = bound_update.source;
+        let relation_oid = bound_update.relation_oid;
         let update_bound = &bound_update.bound;
+        let constraints = update_bound
+            .select()
+            .map(|select| query_constraints_analyze(update_bound, select))
+            .unwrap_or_default();
         let eval_strategy = update_eval_strategy_classify(update_bound, source);
         let pg_batchable = depth == AdmissionDepth::Full
             && eval_strategy == UpdateEvalStrategy::PgEval
@@ -239,7 +192,6 @@ pub fn query_admission_analyze(
         let table_name = table_node.name.clone();
         let mut update_query = UpdateQuery {
             fingerprint,
-            resolved: update_resolved,
             bound: bound_update.bound,
             source,
             constraints,
@@ -268,12 +220,7 @@ pub fn query_admission_analyze(
         // Index it as *unconstrained* — the broadest candidate class — and
         // keep it out of subsumption, where "no constraints" means the
         // opposite (the parent loaded every row).
-        let self_joined = update_query
-            .resolved
-            .nodes::<ResolvedTableNode>()
-            .filter(|t| t.relation_oid == relation_oid)
-            .count()
-            > 1;
+        let self_joined = update_query.bound.relation_occurrences(relation_oid) > 1;
         let index_constraints = if self_joined {
             Vec::new()
         } else {

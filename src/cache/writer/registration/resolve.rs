@@ -10,13 +10,12 @@ use ecow::EcoString;
 use super::{QueryResolution, WriterRegistration};
 use crate::cache::admission::{
     AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare,
-    query_admission_analyze, query_decorrelate_resolve, query_pushdown_resolve,
-    query_resolve_canonical, shape_gate_classify,
+    query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
+    shape_gate_classify,
 };
 use crate::cache::messages::RegisterRequest;
 use crate::cache::mv::{query_has_join, query_has_window};
 use crate::cache::mv_shape::ShapeGate;
-use crate::cache::types::SharedResolved;
 use crate::cache::update_query::UpdateQueries;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
@@ -27,7 +26,6 @@ use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::ResolvedQuery;
-use crate::query::resolved::ResolvedQueryExpr;
 
 /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
 async fn table_schema_resolve(
@@ -144,11 +142,7 @@ impl WriterRegistration {
         cache_tables_ensure(core, &base_query, &request.keying.search_path).await?;
 
         let path = search_path(&request.keying);
-        let CanonicalResolution {
-            resolved,
-            bound,
-            literals,
-        } = query_resolve_canonical(
+        let CanonicalResolution { bound, literals } = query_resolve_canonical(
             base_query,
             &core.cache.tables,
             &path,
@@ -163,10 +157,7 @@ impl WriterRegistration {
             request.fingerprint,
             "registration resolved to a different fingerprint than the alias"
         );
-        let (bound, resolved) = query_pushdown_resolve(bound, resolved, &core.cache.tables, &path)
-            .map_err(|e| e.context_transform(CacheError::from))
-            .attach_loc("resolving the pushed-down query")?;
-        let resolved: SharedResolved = Arc::new(resolved);
+        let bound = query_pushdown(bound);
 
         bound
             .enum_order_dependence_check()
@@ -177,24 +168,15 @@ impl WriterRegistration {
 
         // Decorrelate once; the shape gate and admission read the result,
         // and `query_register` / MV setup reuse `shape_gate`.
-        let decorrelated = query_decorrelate_resolve(
-            &bound,
-            &self.aggregate_functions,
-            &core.cache.tables,
-            &path,
-        )?;
-        let shape_gate = shape_gate_classify(
-            &bound,
-            decorrelated.as_ref().map(|(bound, _)| bound),
-            &self.aggregate_functions,
-        );
+        let decorrelated = query_decorrelate_checked(&bound, &self.aggregate_functions)?;
+        let shape_gate =
+            shape_gate_classify(&bound, decorrelated.as_ref(), &self.aggregate_functions);
         let (max_limit, mv_limit) = resolution_limits(bound.tree(), shape_gate, user_max_limit);
 
         let uq_start = Instant::now();
         let relation_oids = self.update_queries_register(
             core,
             request.fingerprint,
-            &resolved,
             &bound,
             decorrelated.as_ref(),
             max_limit.is_some(),
@@ -205,7 +187,6 @@ impl WriterRegistration {
             .record(uq_start.elapsed().as_secs_f64());
 
         Ok(QueryResolution {
-            resolved,
             serve_shape,
             relation_oids,
             bound,
@@ -224,14 +205,12 @@ impl WriterRegistration {
         &self,
         core: &mut WriterCore,
         fingerprint: Fingerprint,
-        resolved: &SharedResolved,
         bound: &ResolvedQuery,
-        decorrelated: Option<&(ResolvedQuery, ResolvedQueryExpr)>,
+        decorrelated: Option<&ResolvedQuery>,
         has_limit: bool,
     ) -> CacheResult<Vec<Oid>> {
         let analysis = query_admission_analyze(
             AdmissionQuery {
-                resolved,
                 bound,
                 decorrelated,
             },

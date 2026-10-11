@@ -23,7 +23,7 @@ use crate::cache::{
     mv::MvMeta,
     mv_shape::ShapeGate,
     types::{
-        ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView, SharedResolved,
+        ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView,
         SharedResolvedQuery,
     },
 };
@@ -119,7 +119,6 @@ pub(crate) struct WriterShared {
 /// on every Loading / Ready transition and sent with the Ready notify.
 pub(super) struct QueryServing {
     pub(super) generation: Generation,
-    pub(super) resolved: SharedResolved,
     pub(super) bound: SharedResolvedQuery,
     pub(super) serve_shape: QueryShape,
     pub(super) max_limit: Option<u64>,
@@ -612,7 +611,6 @@ impl WriterCore {
             .and_modify(|v| {
                 v.state = state;
                 v.generation = serving.generation;
-                v.resolved = Some(Arc::clone(&serving.resolved));
                 v.bound = Some(Arc::clone(&serving.bound));
                 v.read_columns = Some(Arc::clone(&read_columns));
                 v.serve_shape = Some(serving.serve_shape.clone());
@@ -623,7 +621,6 @@ impl WriterCore {
             .or_insert_with(|| CachedQueryView {
                 state,
                 generation: serving.generation,
-                resolved: Some(Arc::clone(&serving.resolved)),
                 bound: Some(Arc::clone(&serving.bound)),
                 read_columns: Some(read_columns),
                 serve_shape: Some(serving.serve_shape.clone()),

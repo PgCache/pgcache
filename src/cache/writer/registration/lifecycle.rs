@@ -85,7 +85,6 @@ impl WriterRegistration {
 
         let serving = QueryServing {
             generation: new_generation,
-            resolved: Arc::clone(&cached.resolved),
             bound: Arc::clone(&cached.bound),
             serve_shape: cached.serve_shape.clone(),
             max_limit: cached.max_limit,
@@ -127,7 +126,6 @@ impl WriterRegistration {
                 let started_at = query.registration_started_at.take();
                 let serving = QueryServing {
                     generation: query.generation,
-                    resolved: Arc::clone(&query.resolved),
                     bound: Arc::clone(&query.bound),
                     serve_shape: query.serve_shape.clone(),
                     max_limit: query.max_limit,
@@ -213,7 +211,6 @@ impl WriterRegistration {
         core.mv_dirty_mark(fingerprint);
 
         // Collect data needed before mutating
-        let resolved = Arc::clone(&cached_query.resolved);
         let bound = Arc::clone(&cached_query.bound);
         let serve_shape = cached_query.serve_shape.clone();
         let relation_oids = cached_query.relation_oids.clone();
@@ -234,7 +231,6 @@ impl WriterRegistration {
 
         let serving = QueryServing {
             generation: new_generation,
-            resolved,
             bound,
             serve_shape,
             max_limit: new_max_limit,

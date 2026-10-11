@@ -56,7 +56,6 @@ impl CacheDispatch {
                 CachedQueryView {
                     state: CachedQueryState::Loading,
                     generation: Generation::ZERO,
-                    resolved: None,
                     bound: None,
                     read_columns: None,
                     serve_shape: None,
