@@ -1,35 +1,24 @@
-use std::sync::Arc;
-
-use smallvec::SmallVec;
-
 use crate::cache::UpdateQuerySource;
 use crate::cache::query::outer_join_optional_tables;
 use crate::oid::Oid;
-use crate::query::ast::{
-    LiteralValue, NodeId, QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns,
-    SelectNode, TableNode, query_expr_refinalize,
-};
-use crate::query::resolve::{BindingsBuilder, ResolvedQuery};
+use crate::query::ast::TableNode;
+use crate::query::resolve::{QueryBranch, ResolvedQuery};
 
-/// One table's update query: the branch it sits in with the select list
-/// replaced by `true`, as a query of its own.
+/// One table's update query: the branch it sits in, as a query of its own.
 pub struct TableUpdateQuery<'a> {
     pub table: &'a TableNode,
     pub relation_oid: Oid,
-    pub bound: ResolvedQuery,
+    pub branch: QueryBranch<'a>,
     pub source: UpdateQuerySource,
 }
 
-/// One update query per direct table of each branch: the branch with its
-/// select list replaced by `true` and no ORDER BY or LIMIT, as the query CDC
-/// evaluates a changed row against. The branch's FROM, WHERE, GROUP BY and
-/// HAVING keep their nodes, so their bindings follow through the refinalize
-/// remap (ADR-057).
+/// One update query per direct table of each branch of `bound`.
 pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery<'_>> {
     let mut result = Vec::new();
-    for (branch, source) in bound.tree().select_nodes_with_source() {
-        let (terminal, non_terminal) = outer_join_optional_tables(bound, branch);
-        for table in branch.direct_table_nodes() {
+    for (select, source) in bound.tree().select_nodes_with_source() {
+        let (terminal, non_terminal) = outer_join_optional_tables(bound, select);
+        let branch = QueryBranch { bound, select };
+        for table in select.direct_table_nodes() {
             let relation_oid = bound
                 .bindings()
                 .source(table.id)
@@ -39,22 +28,6 @@ pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery
                 debug_assert!(false, "a direct table of a resolved query has a slot");
                 continue;
             };
-            let mut tree = QueryExpr {
-                id: NodeId::PENDING,
-                ctes: Vec::new(),
-                body: QueryBody::Select(Box::new(SelectNode {
-                    id: NodeId::PENDING,
-                    columns: SelectColumns::Columns(vec![SelectColumn::Expr {
-                        expr: ScalarExpr::Literal(LiteralValue::Boolean(true)),
-                        alias: None,
-                    }]),
-                    ..branch.clone()
-                })),
-                order_by: SmallVec::new(),
-                limit: None,
-            };
-            let remap = query_expr_refinalize(&mut tree);
-            let bindings = BindingsBuilder::from_remapped(bound.bindings(), &remap).finish();
             let effective_source = if source == UpdateQuerySource::FromClause {
                 if non_terminal.contains(table.name.as_str()) {
                     UpdateQuerySource::OuterJoinOptional
@@ -69,7 +42,7 @@ pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery
             result.push(TableUpdateQuery {
                 table,
                 relation_oid,
-                bound: ResolvedQuery::new(Arc::new(tree), bindings),
+                branch,
                 source: effective_source,
             });
         }
@@ -83,6 +56,7 @@ mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use iddqd::BiHashMap;
     use postgres_types::Type;
@@ -242,7 +216,7 @@ mod tests {
             .map(|update| {
                 (
                     update.table.name.to_string(),
-                    update.bound.sql(),
+                    update.branch.sql(),
                     update.source,
                 )
             })
@@ -771,70 +745,5 @@ mod tests {
             UpdateQuerySource::FromClause,
             "c is not on optional side"
         );
-    }
-
-    /// Every query the resolved derivation's tests exercise, plus subqueries
-    /// whose truth feeds a scalar (PGC-107).
-    const BOUND_CORPUS: &[&str] = &[
-        "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM b WHERE b.a_id = 1)) FROM a",
-        "SELECT count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM b WHERE b.a_id = 1)) FROM a",
-        "SELECT CASE WHEN EXISTS (SELECT 1 FROM b WHERE b.a_id = 1) THEN 1 ELSE 0 END FROM a",
-        "SELECT CASE WHEN id IN (SELECT a_id FROM b) THEN 1 ELSE (SELECT count(*) FROM c) END FROM a",
-        "SELECT id, name, email FROM users WHERE id = 1",
-        "SELECT id, name, email FROM users JOIN location ON location.user_id = users.user_id WHERE users.user_id = 1",
-        "SELECT * FROM users JOIN location ON location.user_id = users.user_id JOIN orders ON orders.user_id = users.user_id WHERE users.user_id = 1",
-        "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id JOIN d ON c.id = d.id WHERE a.id = 1",
-        "SELECT id FROM users WHERE tenant_id = 1 UNION SELECT id FROM admins WHERE tenant_id = 1",
-        "SELECT id FROM a WHERE tenant_id = 1 UNION SELECT id FROM b WHERE tenant_id = 1 UNION SELECT id FROM c WHERE tenant_id = 1",
-        "SELECT a.id FROM a JOIN b ON a.id = b.a_id WHERE a.tenant_id = 1 UNION SELECT id FROM c WHERE tenant_id = 1",
-        "WITH active_users AS (SELECT id, name FROM users WHERE status = 'active') SELECT active_users.id, orders.total FROM active_users JOIN orders ON orders.user_id = active_users.id",
-        "SELECT id FROM users WHERE id = 1",
-        "SELECT a.id FROM users a JOIN orders b ON a.id = b.user_id WHERE a.id = 1",
-        "SELECT * FROM users WHERE id IN (SELECT user_id FROM active_users)",
-        "SELECT * FROM users WHERE id NOT IN (SELECT user_id FROM banned_users)",
-        "WITH active AS (SELECT id FROM users WHERE active = true) SELECT * FROM active",
-        "SELECT * FROM (SELECT id FROM users WHERE id = 1) sub",
-        "SELECT name FROM products WHERE store_id IN ( SELECT id FROM stores WHERE region_id IN ( SELECT id FROM regions WHERE name = 'East' ) )",
-        "SELECT name FROM products WHERE store_id IN ( SELECT id FROM stores WHERE region_id NOT IN ( SELECT region_id FROM excluded_regions ) )",
-        "SELECT name FROM products WHERE id NOT IN ( SELECT product_id FROM blacklist WHERE category_id IN ( SELECT id FROM categories WHERE name = 'Restricted' ) )",
-        "SELECT name FROM products WHERE id NOT IN ( SELECT product_id FROM blacklist WHERE category_id NOT IN ( SELECT id FROM excluded_categories ) )",
-        "SELECT a.id, b.name FROM a LEFT JOIN b ON a.id = b.a_id WHERE a.id = 1",
-        "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id WHERE b.status = 'active'",
-        "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id LEFT JOIN c ON b.x = c.x WHERE a.id = 1",
-        "SELECT * FROM a JOIN b ON a.id = b.a_id LEFT JOIN c ON b.id = c.b_id WHERE a.id = 1",
-        "SELECT * FROM a LEFT JOIN b ON a.id = b.a_id JOIN c ON b.val = c.val WHERE a.id = 1",
-    ];
-
-    fn bound(sql: &str, tables: &Catalog) -> ResolvedQuery {
-        let cacheable = parse_cacheable(sql);
-        let query = Arc::new(cacheable.query().clone());
-        let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve");
-        ResolvedQuery::new(query, bindings)
-    }
-
-    /// An update query's remapped bindings are the ones the resolver makes
-    /// for it as a query of its own, wherever it is one (a correlated
-    /// subquery branch is not).
-    #[test]
-    fn test_bound_update_query_bindings_match_resolver() {
-        let tables = test_tables();
-        for sql in BOUND_CORPUS {
-            for update in query_table_update_queries(&bound(sql, &tables)) {
-                match query_expr_resolve(update.bound.tree(), &tables, &["public"]) {
-                    Ok(expected) => {
-                        assert_eq!(
-                            update.bound.bindings().describe(),
-                            expected.describe(),
-                            "{sql}"
-                        );
-                    }
-                    Err(e) => assert_ne!(
-                        update.source,
-                        UpdateQuerySource::FromClause,
-                        "{sql}: a FROM-clause update query resolves on its own: {e:?}"
-                    ),
-                }
-            }
-        }
     }
 }

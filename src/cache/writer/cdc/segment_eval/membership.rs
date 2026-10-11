@@ -235,8 +235,12 @@ impl WriterCdc {
         }
         crate::metrics::handles().cdc.prepared_misses.increment(1);
         self.pg_eval_buf.clear();
-        membership_unnest_into(&mut self.pg_eval_buf, &update_query.bound, table_metadata)
-            .map_err(|e| e.context_transform(CacheError::from))?;
+        membership_unnest_into(
+            &mut self.pg_eval_buf,
+            update_query.branch()?,
+            table_metadata,
+        )
+        .map_err(|e| e.context_transform(CacheError::from))?;
         let statement = self
             .cache_eval_conn
             .prepare(&self.pg_eval_buf)
@@ -342,7 +346,7 @@ impl WriterCdc {
                 #[allow(clippy::cast_possible_wrap)]
                 membership_batch_into(
                     &mut self.pg_eval_buf,
-                    &update_query.bound,
+                    update_query.branch()?,
                     table_metadata,
                     &chunk_rows,
                     ordinal as i64,

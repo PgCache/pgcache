@@ -1,13 +1,17 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use ecow::EcoString;
 use iddqd::{IdHashItem, id_upcast};
+use rootcause::Report;
 
+use crate::cache::{CacheError, CacheResult};
 use crate::oid::Oid;
+use crate::query::ast::NodeId;
 use crate::query::constraint_index::ConstraintIndex;
 use crate::query::constraints::QueryConstraints;
 use crate::query::predicate::CompiledPredicate;
-use crate::query::resolve::ResolvedQuery;
+use crate::query::resolve::{QueryBranch, ResolvedQuery};
 use crate::query::transform::PgEvalTemplate;
 use crate::query::{Fingerprint, FingerprintMap, FingerprintSet};
 
@@ -98,8 +102,11 @@ pub enum UpdateQuerySource {
 pub struct UpdateQuery {
     /// Fingerprint of cached query that generated this update query
     pub fingerprint: Fingerprint,
-    /// The update query, bound (ADR-057).
-    pub bound: ResolvedQuery,
+    /// The query the update query is a branch of: the cached query, or its
+    /// decorrelated form. Every update query derived from it shares it.
+    pub bound: Arc<ResolvedQuery>,
+    /// The branch the table sits in, by node id (ADR-057).
+    pub branch: NodeId,
     /// Whether this table was found directly in FROM or inside a subquery
     pub source: UpdateQuerySource,
     /// WHERE clause constraints for CDC invalidation filtering
@@ -139,9 +146,8 @@ pub struct UpdateQuery {
     /// makes every eval verdict for this query untrustworthy, forcing
     /// invalidation (PGC-264).
     pub predicate_columns: HashSet<EcoString>,
-    /// Precomputed `is_single_table()` of the update query. Cached because
-    /// the CDC invalidation checks consult it per row per query, and the
-    /// underlying `QueryExpr::is_single_table` walks the tree.
+    /// `QueryBranch::is_single_table` of the branch, kept because the CDC
+    /// invalidation checks consult it per row per query and it walks the tree.
     pub is_single_table: bool,
     /// Pre-canonicalized WHERE clause for the LocalEval membership probe
     /// (`update_query_matches_locally`), built once at registration so the per
@@ -153,11 +159,19 @@ pub struct UpdateQuery {
     /// query with its CDC'd table replaced by a `VALUES` subquery, deparsed once
     /// so the per-row check renders only the row literals instead of cloning and
     /// re-deparsing the whole AST. `None` for LocalEval queries or shapes the
-    /// template builder can't handle (the per-row clone-and-deparse still works).
+    /// template builder can't handle (the per-row deparse still works).
     pub pg_eval_template: Option<PgEvalTemplate>,
 }
 
 impl UpdateQuery {
+    /// The branch CDC evaluates a changed row against.
+    pub fn branch(&self) -> CacheResult<QueryBranch<'_>> {
+        QueryBranch::find(&self.bound, self.branch).ok_or_else(|| {
+            debug_assert!(false, "an update query names a branch of its query");
+            Report::from(CacheError::InvalidQuery)
+        })
+    }
+
     /// Whether a CDC UPDATE (`operation = Upsert`) for this query could ever
     /// invalidate it: the static upper bound of `row_cached_invalidation_check`
     /// ∪ `row_uncached_invalidation_check` over all possible row values. This is

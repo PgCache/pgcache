@@ -15,6 +15,7 @@ use rootcause::Report;
 
 mod analysis;
 mod bindings;
+mod branch;
 mod clauses;
 mod column;
 mod entry;
@@ -73,5 +74,6 @@ pub use bindings::{
     Bindings, ColumnBinding, ColumnTarget, MergedColumnBinding, MergedId, ResolvedQuery, SlotId,
     StarItem, TableSlot,
 };
+pub use branch::QueryBranch;
 pub use entry::query_expr_resolve;
 pub use render::SourceOverride;

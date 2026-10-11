@@ -485,10 +485,11 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
             allocations_count(|| black_box(bindings.clone()));
         let (_, update_n, update_b) =
             allocations_count(|| black_box(query_table_update_queries(&bound)));
+        let shared = Arc::new(bound.clone());
         let (admission, admission_n, admission_b) = allocations_count(|| {
             query_admission_analyze(
                 AdmissionQuery {
-                    bound: &bound,
+                    bound: &shared,
                     decorrelated: None,
                 },
                 fingerprint,

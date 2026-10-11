@@ -2,6 +2,8 @@
 //! Stage A (syntactic cacheability, no catalog) and Stage B (resolution,
 //! decorrelation, constraint analysis against the synthesized catalog).
 
+use std::sync::Arc;
+
 use ecow::EcoString;
 use pgcache_lib::cache::admission::{
     AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare,
@@ -319,7 +321,8 @@ pub fn statement_classify(
             cte_write: None,
         };
     };
-    let shape_gate = shape_gate_classify(&bound, decorrelated.as_ref(), &builtins.aggregates);
+    let decorrelated = decorrelated.map(Arc::new);
+    let shape_gate = shape_gate_classify(&bound, decorrelated.as_deref(), &builtins.aggregates);
     let max_limit = if shape_gate.is_reducer() {
         None
     } else {

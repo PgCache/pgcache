@@ -33,7 +33,7 @@ use crate::result::ReportExt;
 /// How much of each [`TableAdmission`] to build. The writer needs the full
 /// [`UpdateQuery`] including its CDC-eval caches; offline analysis
 /// (pgcache-fit) keeps only the decision fields, so the caches — a per-table
-/// AST clone + deparse among them — are skipped.
+/// deparse among them — are skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmissionDepth {
     Full,
@@ -113,8 +113,8 @@ pub fn shape_gate_classify(
 /// The query as admission reads it: as registered, and decorrelated when
 /// it had correlated subqueries.
 pub struct AdmissionQuery<'a> {
-    pub bound: &'a ResolvedQuery,
-    pub decorrelated: Option<&'a ResolvedQuery>,
+    pub bound: &'a Arc<ResolvedQuery>,
+    pub decorrelated: Option<&'a Arc<ResolvedQuery>>,
 }
 
 /// Derive one [`TableAdmission`] per update query of the query, or of its
@@ -140,27 +140,23 @@ pub fn query_admission_analyze(
         let table_node = bound_update.table;
         let source = bound_update.source;
         let relation_oid = bound_update.relation_oid;
-        let update_bound = &bound_update.bound;
-        let constraints = update_bound
-            .select()
-            .map(|select| query_constraints_analyze(update_bound, select))
-            .unwrap_or_default();
-        let eval_strategy = update_eval_strategy_classify(update_bound, source);
+        let branch = bound_update.branch;
+        let constraints = query_constraints_analyze(update_source, branch.select);
+        let eval_strategy = update_eval_strategy_classify(branch, source);
         let pg_batchable = depth == AdmissionDepth::Full
             && eval_strategy == UpdateEvalStrategy::PgEval
-            && pg_batchable_classify(update_bound, relation_oid, aggregate_functions);
-        // Walk the parent query — the update query has ORDER BY stripped.
+            && pg_batchable_classify(branch, relation_oid, aggregate_functions);
+        // Walk the whole query: the branch has no ORDER BY.
         let limit_window_columns = if has_limit {
             limit_window_columns_collect(bound, table_node.name.as_str())
         } else {
             HashSet::new()
         };
-        // Walk the update query: it is the tree CDC eval actually runs.
-        let predicate_columns = predicate_columns_collect(update_bound, table_node.name.as_str());
-        let is_single_table = update_bound.tree().is_single_table();
+        let predicate_columns = predicate_columns_collect(branch, table_node.name.as_str());
+        let is_single_table = branch.is_single_table();
         // Direction-aware window spec (PGC-334) — the shapes the cached-path
         // window check can reason about. Walks the parent query like
-        // `limit_window_columns` (ORDER BY is stripped from the update query).
+        // `limit_window_columns` (the branch has no ORDER BY).
         let order_by_keys =
             (has_limit && is_single_table && matches!(source, UpdateQuerySource::FromClause))
                 .then(|| limit_order_keys_collect(bound, table_node.name.as_str()))
@@ -170,21 +166,22 @@ pub fn query_admission_analyze(
         // consult this, so skip building it.
         let compiled_where =
             if depth == AdmissionDepth::Full && eval_strategy == UpdateEvalStrategy::LocalEval {
-                update_bound
-                    .select()
-                    .and_then(|s| s.where_clause.as_ref())
-                    .map(|w| CompiledPredicate::compile(update_bound, w, table_node.name.as_str()))
+                branch
+                    .select
+                    .where_clause
+                    .as_ref()
+                    .map(|w| CompiledPredicate::compile(update_source, w, table_node.name.as_str()))
             } else {
                 None
             };
         // Precompute the PgEval membership template so the per-row check
-        // skips the resolved-AST clone + deparse (PGC-343). Only PgEval uses
+        // skips the per-row deparse (PGC-343). Only PgEval uses
         // it; needs the relation's TableMetadata.
         let pg_eval_template =
             if depth == AdmissionDepth::Full && eval_strategy == UpdateEvalStrategy::PgEval {
-                tables.get1(&relation_oid).and_then(|table_metadata| {
-                    PgEvalTemplate::build(&bound_update.bound, table_metadata)
-                })
+                tables
+                    .get1(&relation_oid)
+                    .and_then(|table_metadata| PgEvalTemplate::build(branch, table_metadata))
             } else {
                 None
             };
@@ -192,7 +189,8 @@ pub fn query_admission_analyze(
         let table_name = table_node.name.clone();
         let mut update_query = UpdateQuery {
             fingerprint,
-            bound: bound_update.bound,
+            bound: Arc::clone(update_source),
+            branch: branch.select.id,
             source,
             constraints,
             has_limit,

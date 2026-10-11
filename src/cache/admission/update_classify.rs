@@ -14,7 +14,7 @@ use crate::query::ast::{
     ScalarExpr, SelectColumn, SelectColumns, SelectNode,
 };
 use crate::query::evaluate::where_expr_supported;
-use crate::query::resolve::{ColumnBinding, ColumnTarget, ResolvedQuery};
+use crate::query::resolve::{ColumnBinding, ColumnTarget, QueryBranch, ResolvedQuery};
 
 /// Conservative classifier: rejects anything the Rust evaluator can't decide
 /// from a single CDC row. GROUP BY / HAVING are rejected because row-level
@@ -22,15 +22,13 @@ use crate::query::resolve::{ColumnBinding, ColumnTarget, ResolvedQuery};
 /// are rejected because their CDC semantics (subquery membership, outer join
 /// null-padding cascade) aren't expressible as a row-level predicate.
 pub(super) fn update_eval_strategy_classify(
-    bound: &ResolvedQuery,
+    branch: QueryBranch<'_>,
     source: UpdateQuerySource,
 ) -> UpdateEvalStrategy {
     if source != UpdateQuerySource::FromClause {
         return UpdateEvalStrategy::PgEval;
     }
-    let Some(select) = bound.select() else {
-        return UpdateEvalStrategy::PgEval;
-    };
+    let select = branch.select;
     if !select.is_single_table() {
         return UpdateEvalStrategy::PgEval;
     }
@@ -40,7 +38,7 @@ pub(super) fn update_eval_strategy_classify(
     let Some(where_expr) = &select.where_clause else {
         return UpdateEvalStrategy::LocalEval;
     };
-    if where_expr_supported(bound, where_expr) {
+    if where_expr_supported(branch.bound, where_expr) {
         UpdateEvalStrategy::LocalEval
     } else {
         UpdateEvalStrategy::PgEval
@@ -60,17 +58,15 @@ pub(super) fn update_eval_strategy_classify(
 /// single-occurrence substitution is not a complete membership test
 /// (PGC-256), and batching pre-evaluates unfiltered.
 pub(super) fn pg_batchable_classify(
-    bound: &ResolvedQuery,
+    branch: QueryBranch<'_>,
     relation_oid: Oid,
     aggregate_functions: &HashSet<EcoString>,
 ) -> bool {
-    let Some(select) = bound.select() else {
-        return false;
-    };
+    let select = branch.select;
     if !select.group_by.is_empty() || select.having.is_some() {
         return false;
     }
-    if bound.relation_occurrences(relation_oid) > 1 {
+    if branch.bound.relation_occurrences(relation_oid) > 1 {
         return false;
     }
     match &select.columns {
@@ -279,15 +275,11 @@ fn order_key_build(column: &EcoString, clause: &OrderByClause) -> OrderByKey {
 /// direction), GROUP BY, and HAVING. The outer SELECT list is excluded: it
 /// never feeds a membership or invalidation verdict (PGC-264).
 pub(super) fn predicate_columns_collect(
-    bound: &ResolvedQuery,
+    branch: QueryBranch<'_>,
     table_name: &str,
 ) -> HashSet<EcoString> {
-    let mut cols = ReferencedColumns::new(bound, table_name);
-    let Some(select) = bound.select() else {
-        // Not a plain select (set-op branch): over-collect every reference.
-        cols.add_refs(bound.tree());
-        return cols.columns;
-    };
+    let mut cols = ReferencedColumns::new(branch.bound, table_name);
+    let select = branch.select;
     for source in &select.from {
         cols.add_refs(source);
     }
@@ -350,13 +342,20 @@ mod classify_tests {
         ResolvedQuery::new(query, bindings)
     }
 
+    fn branch(bound: &ResolvedQuery) -> QueryBranch<'_> {
+        QueryBranch {
+            bound,
+            select: bound.select().expect("a select"),
+        }
+    }
+
     fn classify_single_table(sql: &str) -> UpdateEvalStrategy {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(
             make_table("t", Oid::from_raw(1), &["id", "name", "status", "age"]).into(),
         );
         let bound = resolve(sql, &tables);
-        update_eval_strategy_classify(&bound, UpdateQuerySource::FromClause)
+        update_eval_strategy_classify(branch(&bound), UpdateQuerySource::FromClause)
     }
 
     #[test]
@@ -415,7 +414,7 @@ mod classify_tests {
         tables.insert_overwrite(make_table("b", Oid::from_raw(2), &["id", "name"]).into());
         let bound = resolve("SELECT * FROM a JOIN b ON a.bid = b.id", &tables);
         assert_eq!(
-            update_eval_strategy_classify(&bound, UpdateQuerySource::FromClause),
+            update_eval_strategy_classify(branch(&bound), UpdateQuerySource::FromClause),
             UpdateEvalStrategy::PgEval
         );
     }
@@ -431,7 +430,7 @@ mod classify_tests {
         // Same query, but classified as a subquery-sourced update query
         assert_eq!(
             update_eval_strategy_classify(
-                &bound,
+                branch(&bound),
                 UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
             ),
             UpdateEvalStrategy::PgEval
@@ -451,7 +450,7 @@ mod classify_tests {
             "SELECT name FROM t WHERE status = 'a' AND age > 'x'",
             &tables,
         );
-        let cols = predicate_columns_collect(&bound, "t");
+        let cols = predicate_columns_collect(branch(&bound), "t");
         assert!(cols.contains("status"));
         assert!(cols.contains("age"));
         assert!(
@@ -472,10 +471,10 @@ mod classify_tests {
             "SELECT t.name FROM t JOIN u ON u.t_id = t.id WHERE u.region = 'x'",
             &tables,
         );
-        let t_cols = predicate_columns_collect(&bound, "t");
+        let t_cols = predicate_columns_collect(branch(&bound), "t");
         assert!(t_cols.contains("id"), "join column collected");
         assert!(!t_cols.contains("name"));
-        let u_cols = predicate_columns_collect(&bound, "u");
+        let u_cols = predicate_columns_collect(branch(&bound), "u");
         assert!(u_cols.contains("t_id"));
         assert!(u_cols.contains("region"));
         assert!(!u_cols.contains("id"));
@@ -491,7 +490,7 @@ mod classify_tests {
             "SELECT status, count(id) FROM t GROUP BY status HAVING count(age) > 1",
             &tables,
         );
-        let cols = predicate_columns_collect(&bound, "t");
+        let cols = predicate_columns_collect(branch(&bound), "t");
         assert!(cols.contains("status"), "GROUP BY column collected");
         assert!(cols.contains("age"), "HAVING column collected");
         assert!(

@@ -184,17 +184,7 @@ pub(super) fn update_query_matches_locally(
 ) -> bool {
     // `compiled_where` is built from this query's WHERE at registration (PGC-339).
     match &update_query.compiled_where {
-        None => {
-            // `None` must mean "LocalEval SELECT with no WHERE", never a non-SELECT
-            // shape: the old code returned `false` for a non-SELECT, and the
-            // classifier only assigns LocalEval to SELECTs. Guard that invariant so
-            // a future classifier change can't silently make every row match here.
-            debug_assert!(
-                update_query.bound.select().is_some(),
-                "LocalEval query must be a SELECT; classifier/compiled_where invariant broken"
-            );
-            true
-        }
+        None => true,
         Some(predicate) => predicate.eval(row_data),
     }
 }

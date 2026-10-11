@@ -252,7 +252,7 @@ impl WriterCdc {
         if pg_eval_template_render(buf, update_query, row_data) {
             return Ok(());
         }
-        membership_values_all_into(buf, &update_query.bound, table_metadata, row_data)
+        membership_values_all_into(buf, update_query.branch()?, table_metadata, row_data)
             .map_err(|e| e.context_transform(CacheError::from))
     }
 

@@ -168,9 +168,10 @@ impl WriterRegistration {
 
         // Decorrelate once; the shape gate and admission read the result,
         // and `query_register` / MV setup reuse `shape_gate`.
-        let decorrelated = query_decorrelate_checked(&bound, &self.aggregate_functions)?;
+        let decorrelated =
+            query_decorrelate_checked(&bound, &self.aggregate_functions)?.map(Arc::new);
         let shape_gate =
-            shape_gate_classify(&bound, decorrelated.as_ref(), &self.aggregate_functions);
+            shape_gate_classify(&bound, decorrelated.as_deref(), &self.aggregate_functions);
         let (max_limit, mv_limit) = resolution_limits(bound.tree(), shape_gate, user_max_limit);
 
         let uq_start = Instant::now();
@@ -205,8 +206,8 @@ impl WriterRegistration {
         &self,
         core: &mut WriterCore,
         fingerprint: Fingerprint,
-        bound: &ResolvedQuery,
-        decorrelated: Option<&ResolvedQuery>,
+        bound: &Arc<ResolvedQuery>,
+        decorrelated: Option<&Arc<ResolvedQuery>>,
         has_limit: bool,
     ) -> CacheResult<Vec<Oid>> {
         let analysis = query_admission_analyze(

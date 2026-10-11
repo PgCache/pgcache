@@ -2,6 +2,7 @@
 //! bindings, with no resolved hierarchy in between.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 
 use ecow::EcoString;
 use postgres_types::Type;
@@ -10,7 +11,8 @@ use super::bindings::{ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, Tabl
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::query::ast::{
-    AstNode, ColumnNode, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode, StarNode,
+    AstNode, ColumnNode, NodeId, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode,
+    StarNode,
 };
 
 /// The columns a query reads from each table, by table name.
@@ -22,6 +24,23 @@ impl ResolvedQuery {
         match &self.tree().body {
             QueryBody::Select(select) => Some(select),
             QueryBody::SetOp(_) | QueryBody::Values(_) => None,
+        }
+    }
+
+    /// The SELECT node with `id`, anywhere in the tree.
+    pub fn select_node(&self, id: NodeId) -> Option<&SelectNode> {
+        let found = self
+            .tree()
+            .try_for_each_node::<SelectNode, &SelectNode>(&mut |select| {
+                if select.id.index() == id.index() {
+                    ControlFlow::Break(select)
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+        match found {
+            ControlFlow::Break(select) => Some(select),
+            ControlFlow::Continue(()) => None,
         }
     }
 
