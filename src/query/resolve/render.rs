@@ -543,7 +543,7 @@ mod tests {
     use crate::catalog::Catalog;
     use crate::query::ast::{query_expr_parse, query_expr_session_key};
     use crate::query::literal_settings::LiteralSettings;
-    use crate::query::resolve::query_expr_resolve_bound;
+    use crate::query::resolve::query_expr_resolve;
     use crate::query::resolve::tests::{BINDING_CORPUS, binding_catalog, catalog_with_columns};
 
     /// Shapes the binding corpus leaves out: stars over outer and `NATURAL`
@@ -584,7 +584,7 @@ mod tests {
 
     fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
         let query = query_expr_parse(sql).expect("parse");
-        let bindings = query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
         ResolvedQuery::new(Arc::new(query), bindings)
     }
 

@@ -427,7 +427,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve_bound;
+    use crate::query::resolve::query_expr_resolve;
 
     fn column_metadata(name: &str, index: usize, type_name: &str) -> ColumnMetadata {
         let (type_oid, data_type) = match type_name {
@@ -472,7 +472,7 @@ mod tests {
 
     fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
         let query = Arc::new(query_expr_parse(sql).expect("parse"));
-        let bindings = query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 

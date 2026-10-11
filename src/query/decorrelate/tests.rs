@@ -15,7 +15,7 @@ use crate::query::ast::{
     Deparse, JoinNode, JoinQual, JoinType, QueryBody, QueryExpr, SelectColumn, SelectColumns,
     SelectNode, TableSource, TableSubqueryNode, UnaryOp, WhereExpr, query_expr_parse,
 };
-use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
 
 /// Create test table metadata with given column names.
 /// First column is the primary key (INT4), rest are TEXT.
@@ -125,7 +125,7 @@ struct Outcome {
 /// Parse SQL → bind → decorrelate.
 fn resolve_and_decorrelate(sql: &str, tables: &Catalog) -> DecorrelateResult<Outcome> {
     let query = Arc::new(query_expr_parse(sql).expect("convert to AST"));
-    let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve query");
+    let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve query");
     let bound = ResolvedQuery::new(query, bindings);
     Ok(
         match query_decorrelate(&bound, &test_aggregate_functions())? {

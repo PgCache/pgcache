@@ -581,7 +581,7 @@ mod tests {
         AstNode, ColumnNode, FunctionCall, SelectNode, SetOpNode, SetOpType, TableNode,
         query_expr_parse,
     };
-    use crate::query::resolve::query_expr_resolve_bound;
+    use crate::query::resolve::query_expr_resolve;
 
     fn test_table(name: &str, oid: Oid, cols: &[&str]) -> TableMetadata {
         let columns = ColumnStore::new(cols.iter().enumerate().map(|(i, c)| {
@@ -621,7 +621,7 @@ mod tests {
     fn denom_ast(sql: &str) -> QueryExpr {
         let ast = Arc::new(query_expr_parse(sql).expect("parse source"));
         let bindings =
-            query_expr_resolve_bound(&ast, &test_tables(), &["public"]).expect("resolve source");
+            query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve source");
         let denom = mv_source_count_sql(&ResolvedQuery::new(ast, bindings));
         query_expr_parse(&denom).expect("denominator SQL re-parses")
     }

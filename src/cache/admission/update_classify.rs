@@ -316,7 +316,7 @@ mod classify_tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+    use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
 
     fn make_table(name: &str, oid: Oid, columns: &[&str]) -> TableMetadata {
         let cols = ColumnStore::new(columns.iter().enumerate().map(|(i, c)| {
@@ -346,7 +346,7 @@ mod classify_tests {
         let query_expr = query_expr_parse(sql).expect("convert");
         let cacheable = CacheableQuery::try_new(query_expr, &HashMap::new()).expect("cacheable");
         let query = std::sync::Arc::new(cacheable.query().clone());
-        let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 

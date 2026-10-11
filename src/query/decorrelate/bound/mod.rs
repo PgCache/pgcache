@@ -541,7 +541,7 @@ mod tests {
     use crate::catalog::Catalog;
     use crate::oid::TypeOid;
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve_bound;
+    use crate::query::resolve::query_expr_resolve;
 
     fn test_table(name: &str, relation_oid: u32, column_names: &[&str]) -> TableMetadata {
         let columns = ColumnStore::new(column_names.iter().enumerate().map(|(i, column)| {
@@ -689,7 +689,7 @@ mod tests {
 
     fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
         let query = Arc::new(query_expr_parse(sql).expect("parse"));
-        let bindings = query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 
@@ -703,7 +703,7 @@ mod tests {
             let Ok(Some(rewritten)) = query_decorrelate(&bound(sql, &catalog), &aggregates) else {
                 continue;
             };
-            let expected = query_expr_resolve_bound(rewritten.tree(), &catalog, &["public"])
+            let expected = query_expr_resolve(rewritten.tree(), &catalog, &["public"])
                 .unwrap_or_else(|e| panic!("{sql}: the rewritten tree resolves: {e:?}"));
             assert_eq!(
                 rewritten.bindings().describe(),

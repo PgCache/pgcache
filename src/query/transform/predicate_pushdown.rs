@@ -373,7 +373,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve_bound;
+    use crate::query::resolve::query_expr_resolve;
 
     /// A catalog of text-column tables, given as (name, columns), with
     /// relation OIDs from 1001 in order.
@@ -503,7 +503,7 @@ mod tests {
 
     fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
         let query = Arc::new(query_expr_parse(sql).expect("parse"));
-        let bindings = query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 
@@ -519,7 +519,7 @@ mod tests {
             let Some(pushed) = pushed else {
                 continue;
             };
-            let expected = query_expr_resolve_bound(pushed.tree(), &catalog, &["public"])
+            let expected = query_expr_resolve(pushed.tree(), &catalog, &["public"])
                 .expect("the pushed-down tree resolves");
             assert_eq!(pushed.bindings().describe(), expected.describe(), "{sql}");
         }

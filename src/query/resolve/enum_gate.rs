@@ -428,7 +428,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve_bound;
+    use crate::query::resolve::query_expr_resolve;
 
     fn severity_type() -> Type {
         Type::new(
@@ -516,7 +516,7 @@ mod tests {
     /// displayed.
     fn verdict(sql: &str) -> String {
         let query = query_expr_parse(sql).expect("parse");
-        let bindings = query_expr_resolve_bound(&query, &tables(), &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, &tables(), &["public"]).expect("resolve");
         match ResolvedQuery::new(Arc::new(query), bindings).enum_order_dependence_check() {
             Ok(()) => "allowed".to_owned(),
             Err(e) => e.into_current_context().to_string(),

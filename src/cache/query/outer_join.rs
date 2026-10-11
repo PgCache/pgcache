@@ -12,7 +12,7 @@ use crate::query::resolve::{ColumnTarget, ResolvedQuery};
 
 /// [`outer_join_optional_tables`] on a branch of a bound query: the same
 /// sets, read from the bindings.
-pub fn outer_join_optional_tables_bound(
+pub fn outer_join_optional_tables(
     bound: &ResolvedQuery,
     select: &SelectNode,
 ) -> (HashSet<EcoString>, HashSet<EcoString>) {
@@ -135,7 +135,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+    use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
 
     /// Create test table metadata with given column names.
     /// First column is the primary key (INT4), rest are TEXT.
@@ -166,7 +166,7 @@ mod tests {
     /// Parse and bind SQL over the given tables.
     fn bind(sql: &str, tables: &Catalog) -> ResolvedQuery {
         let query = Arc::new(query_expr_parse(sql).expect("convert"));
-        let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 
@@ -174,7 +174,7 @@ mod tests {
     /// terminality tables.
     fn terminality(sql: &str) -> (HashSet<EcoString>, HashSet<EcoString>) {
         let bound = bind(sql, &terminality_test_tables());
-        outer_join_optional_tables_bound(&bound, bound.select().expect("a SELECT"))
+        outer_join_optional_tables(&bound, bound.select().expect("a SELECT"))
     }
 
     /// Create standard test tables for terminality tests:
@@ -317,7 +317,7 @@ mod tests {
         tables.insert_overwrite(test_table("users", Oid::from_raw(1), &["id", "name"]).into());
         let bound = bind("SELECT * FROM users WHERE id = 1", &tables);
         let (terminal, non_terminal) =
-            outer_join_optional_tables_bound(&bound, bound.select().expect("a SELECT"));
+            outer_join_optional_tables(&bound, bound.select().expect("a SELECT"));
         assert!(terminal.is_empty());
         assert!(non_terminal.is_empty());
     }

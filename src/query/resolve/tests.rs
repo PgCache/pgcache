@@ -113,14 +113,14 @@ pub(super) fn catalog_with_columns(specs: &[(&str, &[&str])]) -> Catalog {
 /// Parse and bind `sql` over `tables`.
 fn bound(sql: &str, tables: &Catalog) -> ResolvedQuery {
     let query = Arc::new(query_expr_parse(sql).expect("convert to QueryExpr"));
-    let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+    let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve");
     ResolvedQuery::new(query, bindings)
 }
 
 /// The error binding `sql` over `tables` ends in.
 fn bind_error(sql: &str, tables: &Catalog) -> ResolveError {
     let query = query_expr_parse(sql).expect("convert to QueryExpr");
-    match query_expr_resolve_bound(&query, tables, &["public"]) {
+    match query_expr_resolve(&query, tables, &["public"]) {
         Ok(_) => panic!("expected {sql} not to resolve"),
         Err(e) => e.into_current_context(),
     }

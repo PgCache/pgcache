@@ -694,10 +694,10 @@ mod tests {
     /// Every (branch, table) population select of `sql`, in population order.
     fn population_selects(sql: &str, max_limit: Option<u64>) -> Vec<String> {
         use crate::query::ast::query_expr_parse;
-        use crate::query::resolve::query_expr_resolve_bound;
+        use crate::query::resolve::query_expr_resolve;
         let catalog = population_catalog();
         let query = Arc::new(query_expr_parse(sql).expect("parse"));
-        let bindings = query_expr_resolve_bound(&query, &catalog, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, &catalog, &["public"]).expect("resolve");
         let population = ResolvedQuery::new(query, bindings);
         let mut selects = Vec::new();
         for (branch, _) in population.tree().select_nodes_with_source() {

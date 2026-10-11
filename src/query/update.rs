@@ -3,7 +3,7 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::cache::UpdateQuerySource;
-use crate::cache::query::outer_join_optional_tables_bound;
+use crate::cache::query::outer_join_optional_tables;
 use crate::oid::Oid;
 use crate::query::ast::{
     LiteralValue, NodeId, QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns,
@@ -20,13 +20,15 @@ pub struct TableUpdateQuery<'a> {
     pub source: UpdateQuerySource,
 }
 
-/// [`query_table_update_queries`] on the bound query. The branch's FROM,
-/// WHERE, GROUP BY and HAVING keep their nodes, so their bindings follow
-/// through the refinalize remap (ADR-057).
-pub fn query_table_update_queries_bound(bound: &ResolvedQuery) -> Vec<TableUpdateQuery<'_>> {
+/// One update query per direct table of each branch: the branch with its
+/// select list replaced by `true` and no ORDER BY or LIMIT, as the query CDC
+/// evaluates a changed row against. The branch's FROM, WHERE, GROUP BY and
+/// HAVING keep their nodes, so their bindings follow through the refinalize
+/// remap (ADR-057).
+pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery<'_>> {
     let mut result = Vec::new();
     for (branch, source) in bound.tree().select_nodes_with_source() {
-        let (terminal, non_terminal) = outer_join_optional_tables_bound(bound, branch);
+        let (terminal, non_terminal) = outer_join_optional_tables(bound, branch);
         for table in branch.direct_table_nodes() {
             let relation_oid = bound
                 .bindings()
@@ -91,7 +93,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve_bound;
+    use crate::query::resolve::query_expr_resolve;
 
     /// Helper to parse SQL and return a CacheableQuery
     fn parse_cacheable(sql: &str) -> CacheableQuery {
@@ -233,9 +235,9 @@ mod tests {
         let tables = test_tables();
         let cacheable = parse_cacheable(sql);
         let query = Arc::new(cacheable.query().clone());
-        let bindings = query_expr_resolve_bound(&query, &tables, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, &tables, &["public"]).expect("resolve");
         let bound = ResolvedQuery::new(query, bindings);
-        query_table_update_queries_bound(&bound)
+        query_table_update_queries(&bound)
             .into_iter()
             .map(|update| {
                 (
@@ -806,7 +808,7 @@ mod tests {
     fn bound(sql: &str, tables: &Catalog) -> ResolvedQuery {
         let cacheable = parse_cacheable(sql);
         let query = Arc::new(cacheable.query().clone());
-        let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 
@@ -817,8 +819,8 @@ mod tests {
     fn test_bound_update_query_bindings_match_resolver() {
         let tables = test_tables();
         for sql in BOUND_CORPUS {
-            for update in query_table_update_queries_bound(&bound(sql, &tables)) {
-                match query_expr_resolve_bound(update.bound.tree(), &tables, &["public"]) {
+            for update in query_table_update_queries(&bound(sql, &tables)) {
+                match query_expr_resolve(update.bound.tree(), &tables, &["public"]) {
                     Ok(expected) => {
                         assert_eq!(
                             update.bound.bindings().describe(),

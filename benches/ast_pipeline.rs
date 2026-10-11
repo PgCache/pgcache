@@ -43,11 +43,10 @@ use pgcache_lib::query::ast::{
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::predicate::CompiledPredicate;
 use pgcache_lib::query::resolve::{
-    Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot,
-    query_expr_resolve_bound,
+    Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot, query_expr_resolve,
 };
 use pgcache_lib::query::transform::query_literals_canonicalise;
-use pgcache_lib::query::update::query_table_update_queries_bound;
+use pgcache_lib::query::update::query_table_update_queries;
 
 // ---------------------------------------------------------------------------
 // Counting allocator
@@ -362,7 +361,7 @@ fn parse(sql: &str) -> QueryExpr {
 }
 
 fn resolve_bound(query: &QueryExpr, catalog: &Catalog) -> Bindings {
-    query_expr_resolve_bound(query, catalog, &["public"]).expect("the fixture SQL resolves")
+    query_expr_resolve(query, catalog, &["public"]).expect("the fixture SQL resolves")
 }
 
 /// The bound query of `query` with its literals canonicalised, as
@@ -446,6 +445,11 @@ fn sizes_report() {
 fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
     let settings = LiteralSettings::default();
     let search_path: [EcoString; 1] = ["public".into()];
+    // The aggregates the writer loads from `pg_proc` that the fixtures use.
+    let aggregates: HashSet<EcoString> = ["count", "sum", "avg", "min", "max"]
+        .into_iter()
+        .map(EcoString::from)
+        .collect();
     println!("\n== allocations per stage (count / bytes)");
     println!(
         "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
@@ -472,30 +476,30 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         let (bound, canon_n, canon_b) =
             allocations_count(|| canonicalise(&query, &bindings, &settings));
         let (_, bound_clone_n, bound_clone_b) = allocations_count(|| black_box(bound.clone()));
-        let (_, fingerprint_n, fingerprint_b) = allocations_count(|| bound.fingerprint());
+        let (fingerprint, fingerprint_n, fingerprint_b) = allocations_count(|| bound.fingerprint());
         let (_, render_n, render_b) = allocations_count(|| bound.sql());
         let (_, shape_n, shape_b) = allocations_count(|| bound.shape());
         let (_, compile_n, compile_b) =
             allocations_count(|| predicate_compile(&bound, shape.predicate_table));
         let (_, bindings_clone_n, bindings_clone_b) =
             allocations_count(|| black_box(bindings.clone()));
-        let aggregates = HashSet::new();
         let (_, update_n, update_b) =
-            allocations_count(|| black_box(query_table_update_queries_bound(&bound)));
-        let fingerprint = bound.fingerprint();
-        let (_, admission_n, admission_b) = allocations_count(|| {
-            black_box(query_admission_analyze(
+            allocations_count(|| black_box(query_table_update_queries(&bound)));
+        let (admission, admission_n, admission_b) = allocations_count(|| {
+            query_admission_analyze(
                 AdmissionQuery {
                     bound: &bound,
                     decorrelated: None,
                 },
                 fingerprint,
-                false,
+                bound.tree().limit.is_some(),
                 &aggregates,
                 catalog,
                 AdmissionDepth::Full,
-            ))
+            )
         });
+        let admission = admission.expect("the fixture SQL is admitted");
+        black_box(admission.tables.len());
         let cell = |n: usize, b: usize| format!("{n}/{b}");
         println!(
             "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",

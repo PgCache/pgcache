@@ -196,7 +196,7 @@ mod tests {
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
     use crate::query::evaluate::where_expr_supported;
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+    use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
 
     // ------------------------------------------------------------------
     // Row evaluation. Each predicate is parsed and bound as the writer
@@ -267,7 +267,7 @@ mod tests {
     fn fixture_bound(sql: &str) -> ResolvedQuery {
         let query = Arc::new(query_expr_parse(sql).expect("parse"));
         let bindings =
-            query_expr_resolve_bound(&query, &fixture_catalog(), &["public"]).expect("resolve");
+            query_expr_resolve(&query, &fixture_catalog(), &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 

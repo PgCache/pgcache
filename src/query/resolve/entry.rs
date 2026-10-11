@@ -14,7 +14,7 @@ use crate::query::resolve::ResolveResult;
 
 /// Bind every table and column reference of a finalized `query` to the
 /// catalog (ADR-057).
-pub fn query_expr_resolve_bound(
+pub fn query_expr_resolve(
     query: &QueryExpr,
     tables: &Catalog,
     search_path: &[&str],

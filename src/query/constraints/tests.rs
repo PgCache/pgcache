@@ -8,7 +8,7 @@ use super::*;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::query_expr_parse;
-use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
 
 // Helper function to create test table metadata
 fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
@@ -56,7 +56,7 @@ fn catalog(names: &[&str]) -> Catalog {
 /// Parse and bind `sql` over `tables`.
 fn resolve_sql(sql: &str, tables: &Catalog) -> ResolvedQuery {
     let query = std::sync::Arc::new(query_expr_parse(sql).expect("convert to QueryExpr"));
-    let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve bound");
+    let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve bound");
     ResolvedQuery::new(query, bindings)
 }
 

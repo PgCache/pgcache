@@ -73,5 +73,5 @@ pub use bindings::{
     Bindings, ColumnBinding, ColumnTarget, MergedColumnBinding, MergedId, ResolvedQuery, SlotId,
     StarItem, TableSlot,
 };
-pub use entry::query_expr_resolve_bound;
+pub use entry::query_expr_resolve;
 pub use render::SourceOverride;

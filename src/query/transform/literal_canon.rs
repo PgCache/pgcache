@@ -387,7 +387,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+    use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
 
     fn events() -> Catalog {
         let column = |name: &str, position: i16, ty: Type| ColumnMetadata {
@@ -424,7 +424,7 @@ mod tests {
 
     fn canon(sql: &str, settings: &LiteralSettings) -> (String, LiteralCanonOutcome) {
         let mut query = query_expr_parse(sql).expect("parse");
-        let bindings = query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
+        let bindings = query_expr_resolve(&query, &events(), &["public"]).expect("resolve");
         let outcome = query_literals_canonicalise(&mut query, &bindings, settings);
         let bound = ResolvedQuery::new(Arc::new(query), bindings);
         (bound.sql(), outcome)

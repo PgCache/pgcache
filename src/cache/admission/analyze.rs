@@ -23,11 +23,11 @@ use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
 use crate::query::resolve::ResolveResult;
-use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
 use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
 };
-use crate::query::update::query_table_update_queries_bound;
+use crate::query::update::query_table_update_queries;
 use crate::result::ReportExt;
 
 /// How much of each [`TableAdmission`] to build. The writer needs the full
@@ -70,7 +70,7 @@ pub fn query_resolve_canonical(
     search_path: &[&str],
     settings: &LiteralSettings,
 ) -> ResolveResult<CanonicalResolution> {
-    let bindings = query_expr_resolve_bound(&base_query, tables, search_path)?;
+    let bindings = query_expr_resolve(&base_query, tables, search_path)?;
     let literals = query_literals_canonicalise(&mut base_query, &bindings, settings);
     Ok(CanonicalResolution {
         bound: Arc::new(ResolvedQuery::new(Arc::new(base_query), bindings)),
@@ -136,7 +136,7 @@ pub fn query_admission_analyze(
     let update_source = decorrelated.unwrap_or(bound);
 
     let mut admissions = Vec::new();
-    for bound_update in query_table_update_queries_bound(update_source) {
+    for bound_update in query_table_update_queries(update_source) {
         let table_node = bound_update.table;
         let source = bound_update.source;
         let relation_oid = bound_update.relation_oid;

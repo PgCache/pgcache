@@ -393,7 +393,7 @@ mod tests {
     use super::*;
     use crate::cache::mv_shape::tests::test_tables;
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve_bound;
+    use crate::query::resolve::query_expr_resolve;
 
     #[test]
     fn test_mv_table_name_format() {
@@ -555,7 +555,7 @@ mod tests {
     fn resolve_for_serve(sql: &str) -> ResolvedQuery {
         let ast = Arc::new(query_expr_parse(sql).expect("convert to AST"));
         let bindings =
-            query_expr_resolve_bound(&ast, &test_tables(), &["public"]).expect("resolve query");
+            query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve query");
         ResolvedQuery::new(ast, bindings)
     }
 
