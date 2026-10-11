@@ -23,9 +23,6 @@ use postgres_types::Type;
 use crate::query::ast::{BinaryExpr, ColumnNode, ScalarExpr, WhereExpr};
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::resolve::ResolvedQuery;
-use crate::query::resolved::{
-    ResolvedBinaryExpr, ResolvedColumnNode, ResolvedScalarExpr, ResolvedWhereExpr,
-};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CastTarget {
@@ -266,83 +263,6 @@ pub fn comparison_canonicalize<'a>(
     {
         let flipped = binary.op.op_flip()?;
         return Some((column, target, flipped, value));
-    }
-    None
-}
-
-/// Strip a `TypeCast { Column, target }` wrapper when the cast is an
-/// identity coercion on that column's type. Other shapes pass through.
-/// Shared by evaluator, classifier, and constraints extractor so they apply
-/// the same whitelist.
-pub fn resolved_strip_identity_cast(expr: &ResolvedScalarExpr) -> &ResolvedScalarExpr {
-    let ResolvedScalarExpr::TypeCast {
-        expr: inner,
-        target,
-    } = expr
-    else {
-        return expr;
-    };
-    let ResolvedScalarExpr::Column(col) = inner.as_ref() else {
-        return expr;
-    };
-    if cast_target_is_identity_on(target, &col.column_metadata.data_type) {
-        inner.as_ref()
-    } else {
-        expr
-    }
-}
-
-/// Unwrap a `ResolvedWhereExpr::Scalar(...)` and strip an identity TypeCast,
-/// so callers can pattern-match on a bare Column/Literal leaf even when the
-/// source SQL was `col::text op '...'`. Returns `None` for non-Scalar shapes.
-pub fn resolved_where_scalar_leaf(expr: &ResolvedWhereExpr) -> Option<&ResolvedScalarExpr> {
-    if let ResolvedWhereExpr::Scalar(scalar) = expr {
-        Some(resolved_strip_identity_cast(scalar))
-    } else {
-        None
-    }
-}
-
-/// Canonicalize a binary comparison into column-LHS form:
-/// `(column, optional cast target, op-with-column-on-LHS, literal)`. Identity
-/// casts have already been stripped by `resolved_where_scalar_leaf`, so a
-/// present `Some(target)` means a real coercion is required at evaluation
-/// time. When the literal was on the LHS of the SQL (`5 < col`), the returned
-/// `op` is flipped via `BinaryOp::op_flip` so downstream comparison logic can
-/// always assume `column op literal`.
-pub fn canonicalize_comparison<'a>(
-    binary: &'a ResolvedBinaryExpr,
-) -> Option<(
-    &'a ResolvedColumnNode,
-    Option<&'a CastTarget>,
-    BinaryOp,
-    &'a LiteralValue,
-)> {
-    let lleaf = resolved_where_scalar_leaf(&binary.lexpr);
-    let rleaf = resolved_where_scalar_leaf(&binary.rexpr);
-
-    let column_target = |scalar: &'a ResolvedScalarExpr| match scalar {
-        ResolvedScalarExpr::Column(col) => Some((col, None)),
-        ResolvedScalarExpr::TypeCast { expr, target } => {
-            if let ResolvedScalarExpr::Column(col) = expr.as_ref() {
-                Some((col, Some(target)))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-
-    if let (Some(left), Some(ResolvedScalarExpr::Literal(val))) = (lleaf, rleaf)
-        && let Some((col, target)) = column_target(left)
-    {
-        return Some((col, target, binary.op, val));
-    }
-    if let (Some(ResolvedScalarExpr::Literal(val)), Some(right)) = (lleaf, rleaf)
-        && let Some((col, target)) = column_target(right)
-    {
-        let flipped = binary.op.op_flip()?;
-        return Some((col, target, flipped, val));
     }
     None
 }

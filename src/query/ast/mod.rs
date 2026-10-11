@@ -68,8 +68,7 @@ pub(crate) use convert_raw::query_expr_parse;
 pub use convert_raw::{RawStatement, query_expr_convert_raw, statement_convert_raw};
 pub use deparse::{Clause, Deparse, DeparseContext, DeparseWith, Plain};
 pub(crate) use deparse::{
-    clause_deparse, clause_deparse_with, parenthesized_deparse, parenthesized_deparse_with,
-    separated_deparse, separated_deparse_with,
+    clause_deparse_with, parenthesized_deparse_with, separated_deparse, separated_deparse_with,
 };
 pub use finalize::{query_expr_finalize, query_expr_refinalize};
 pub use fingerprint::*;

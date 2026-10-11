@@ -8,7 +8,7 @@ use super::scope::{OutputColumn, ResolutionScope, ScopeEntry};
 use crate::query::ast::{
     ColumnNode, OrderByClause, ScalarExpr, SelectColumn, SelectColumns, StarNode,
 };
-use crate::query::resolved::ResolveResult;
+use crate::query::resolve::ResolveResult;
 
 /// Bind the SELECT list, returning its output columns. A star (`*` or
 /// `t1.*`) stands for all columns of the matching tables in scope.

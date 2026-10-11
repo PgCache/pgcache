@@ -8,7 +8,7 @@ use super::clauses::order_by_resolve;
 use super::column::{ColumnLookup, column_resolve};
 use super::scope::ResolutionScope;
 use crate::query::ast::{FrameBound, ScalarExpr, WhereExpr, WindowFrame, WindowSpec};
-use crate::query::resolved::ResolveResult;
+use crate::query::resolve::ResolveResult;
 
 /// What a SELECT-list expression contributes to its output column: the name
 /// a bare column reference gives it, and the catalog column it carries

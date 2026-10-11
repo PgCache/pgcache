@@ -540,10 +540,8 @@ mod tests {
     use super::*;
     use crate::catalog::Catalog;
     use crate::oid::TypeOid;
-    use crate::query::ast::{Deparse, query_expr_parse};
-    use crate::query::decorrelate::query_expr_decorrelate;
+    use crate::query::ast::query_expr_parse;
     use crate::query::resolve::query_expr_resolve_bound;
-    use crate::query::resolved::query_expr_resolve;
 
     fn test_table(name: &str, relation_oid: u32, column_names: &[&str]) -> TableMetadata {
         let columns = ColumnStore::new(column_names.iter().enumerate().map(|(i, column)| {
@@ -693,60 +691,6 @@ mod tests {
         let query = Arc::new(query_expr_parse(sql).expect("parse"));
         let bindings = query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
-    }
-
-    fn resolved_sql(resolved: &crate::query::resolved::ResolvedQueryExpr) -> String {
-        let mut sql = String::new();
-        resolved.deparse(&mut sql);
-        sql
-    }
-
-    /// The bound rewrite accepts, rejects (for the same reason) and renders
-    /// exactly as the resolved one.
-    #[test]
-    fn test_bound_decorrelation_matches_resolved_decorrelation() {
-        let catalog = test_tables();
-        let aggregates = aggregates();
-        for sql in corpus() {
-            let query = query_expr_parse(sql).expect("parse");
-            let resolved = query_expr_resolve(&query, &catalog, &["public"]).expect("resolve");
-            let expected = query_expr_decorrelate(&resolved, &aggregates);
-            let before = bound(sql, &catalog);
-            let actual = query_decorrelate(&before, &aggregates);
-            match (expected, actual) {
-                (Err(expected), Err(actual)) => assert_eq!(
-                    actual.current_context().to_string(),
-                    expected.current_context().to_string(),
-                    "{sql}"
-                ),
-                (Ok(expected), Ok(actual)) => {
-                    assert_eq!(actual.is_some(), expected.transformed, "{sql}");
-                    if let Some(actual) = actual {
-                        assert_eq!(actual.sql(), resolved_sql(&expected.resolved), "{sql}");
-                        // The derived table a scalar subquery becomes keeps
-                        // meaning "any change invalidates".
-                        let expected_sources: Vec<_> = expected
-                            .resolved
-                            .select_nodes_with_source()
-                            .into_iter()
-                            .map(|(_, source)| source)
-                            .collect();
-                        let actual_sources: Vec<_> = actual
-                            .tree()
-                            .select_nodes_with_source()
-                            .into_iter()
-                            .map(|(_, source)| source)
-                            .collect();
-                        assert_eq!(actual_sources, expected_sources, "{sql}");
-                    }
-                }
-                (expected, actual) => panic!(
-                    "{sql}: resolved {:?} but bound {:?}",
-                    expected.map(|o| o.transformed),
-                    actual.map(|o| o.is_some())
-                ),
-            }
-        }
     }
 
     /// The remapped bindings are the ones the resolver makes for the

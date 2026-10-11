@@ -12,7 +12,7 @@ use super::join_using::{JoinScopeRanges, join_natural_common_columns, join_using
 use super::scope::ResolutionScope;
 use crate::catalog::{Catalog, CatalogTable};
 use crate::query::ast::{JoinQual, TableNode, TableSource};
-use crate::query::resolved::{ResolveError, ResolveResult};
+use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// Find table metadata for a table reference.
 ///

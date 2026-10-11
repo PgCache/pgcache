@@ -11,7 +11,7 @@ use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
 use crate::pg::Lsn;
 use crate::query::ast::{BinaryOp, LiteralValue, QueryExpr};
 use crate::query::constraints::ColumnRange;
-use crate::query::resolved::ColumnsByTable;
+use crate::query::resolve::ColumnsByTable;
 use crate::query::write::{
     DeleteStatement, InsertRow, InsertStatement, RelationRef, UpdateStatement, WriteClass,
 };

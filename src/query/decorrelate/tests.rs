@@ -1,6 +1,9 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
+use std::collections::HashSet;
 use std::sync::Arc;
+
+use ecow::EcoString;
 
 use iddqd::BiHashMap;
 use postgres_types::Type;

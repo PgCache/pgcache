@@ -28,7 +28,7 @@ use crate::query::ast::{
     MultiExpr, MultiOp, OrderByClause, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
     SelectColumns, SelectNode, TableSource, WhereExpr,
 };
-use crate::query::resolved::{ResolveError, ResolveResult};
+use crate::query::resolve::{ResolveError, ResolveResult};
 
 impl ResolvedQuery {
     /// Check for order-dependent enum usage. `Err` carries the first
@@ -427,10 +427,8 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::{Deparse, query_expr_parse};
+    use crate::query::ast::query_expr_parse;
     use crate::query::resolve::query_expr_resolve_bound;
-    use crate::query::resolved::enum_order_dependence_check;
-    use crate::query::resolved::query_expr_resolve;
 
     fn severity_type() -> Type {
         Type::new(
@@ -514,36 +512,15 @@ mod tests {
         tables
     }
 
-    /// Enum and domain columns render the same bound as resolved.
-    #[test]
-    fn test_bound_sql_matches_resolved_deparse() {
-        for (sql, _) in CORPUS {
-            let query = query_expr_parse(sql).expect("parse");
-            let resolved = query_expr_resolve(&query, &tables(), &["public"]).expect("resolve");
-            let bindings =
-                query_expr_resolve_bound(&query, &tables(), &["public"]).expect("resolve");
-            let bound = ResolvedQuery::new(Arc::new(query), bindings);
-            let mut expected = String::new();
-            resolved.deparse(&mut expected);
-            assert_eq!(bound.sql(), expected, "{sql}");
-        }
-    }
-
-    /// The verdict of both gates on one query: "allowed", or the rejection
-    /// as displayed.
-    fn verdicts(sql: &str) -> (String, String) {
+    /// The gate's verdict on one query: "allowed", or the rejection as
+    /// displayed.
+    fn verdict(sql: &str) -> String {
         let query = query_expr_parse(sql).expect("parse");
-        let resolved = query_expr_resolve(&query, &tables(), &["public"]).expect("resolve");
         let bindings = query_expr_resolve_bound(&query, &tables(), &["public"]).expect("resolve");
-        let bound = ResolvedQuery::new(Arc::new(query), bindings);
-        let display = |result: ResolveResult<()>| match result {
+        match ResolvedQuery::new(Arc::new(query), bindings).enum_order_dependence_check() {
             Ok(()) => "allowed".to_owned(),
             Err(e) => e.into_current_context().to_string(),
-        };
-        (
-            display(bound.enum_order_dependence_check()),
-            display(enum_order_dependence_check(&resolved)),
-        )
+        }
     }
 
     const CORPUS: &[(&str, bool)] = &[
@@ -640,14 +617,15 @@ mod tests {
         ),
     ];
 
-    /// The bound gate and the resolved gate agree on every verdict, and the
-    /// verdict is the expected one.
     #[test]
-    fn test_bound_gate_matches_resolved_gate() {
+    fn test_gate_verdict_cases() {
         for (sql, rejected) in CORPUS {
-            let (bound, resolved) = verdicts(sql);
-            assert_eq!(bound, resolved, "verdicts differ for {sql}");
-            assert_eq!(bound != "allowed", *rejected, "verdict for {sql}: {bound}");
+            let verdict = verdict(sql);
+            assert_eq!(
+                verdict != "allowed",
+                *rejected,
+                "verdict for {sql}: {verdict}"
+            );
         }
     }
 }

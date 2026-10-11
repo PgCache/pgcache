@@ -3,8 +3,6 @@ use std::sync::Arc;
 use smallvec::SmallVec;
 
 use crate::cache::UpdateQuerySource;
-#[cfg(test)]
-use crate::cache::query::outer_join_optional_tables;
 use crate::cache::query::outer_join_optional_tables_bound;
 use crate::oid::Oid;
 use crate::query::ast::{
@@ -12,13 +10,6 @@ use crate::query::ast::{
     SelectNode, TableNode, query_expr_refinalize,
 };
 use crate::query::resolve::{BindingsBuilder, ResolvedQuery};
-#[cfg(test)]
-use crate::query::resolved::{
-    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
-    ResolvedSelectColumns, ResolvedTableNode,
-};
-#[cfg(test)]
-use crate::query::transform::resolved_select_node_update_replace;
 
 /// One table's update query: the branch it sits in with the select list
 /// replaced by `true`, as a query of its own.
@@ -84,61 +75,6 @@ pub fn query_table_update_queries_bound(bound: &ResolvedQuery) -> Vec<TableUpdat
     result
 }
 
-/// Generate queries used to check if a DML statement applies to a given table.
-/// Returns one update query per (table, branch) pair, operating entirely in the
-/// resolved AST domain.
-///
-/// For simple SELECT queries, each table gets one update query derived from that SELECT.
-/// For set operations (UNION/INTERSECT/EXCEPT), each table gets an update query derived
-/// from just the branch that contains it (not the full set operation).
-///
-/// This approach ensures that CDC handling only checks if a changed row matches the
-/// specific branch conditions, not the entire set operation structure.
-#[cfg(test)]
-pub(crate) fn query_table_update_queries(
-    resolved: &ResolvedQueryExpr,
-) -> Vec<(&ResolvedTableNode, ResolvedQueryExpr, UpdateQuerySource)> {
-    let mut result = Vec::new();
-
-    let select_true = ResolvedSelectColumns::Columns(vec![ResolvedSelectColumn {
-        expr: ResolvedScalarExpr::Literal(LiteralValue::Boolean(true)),
-        alias: None,
-    }]);
-
-    for (branch, source) in resolved.select_nodes_with_source() {
-        let (terminal, non_terminal) = outer_join_optional_tables(branch);
-
-        // For each direct table in this branch (not inside subqueries).
-        // Tables inside subqueries are handled by their own inner branch.
-        for table in branch.direct_table_nodes() {
-            // Create update query from just this branch (not full query)
-            let update_select = resolved_select_node_update_replace(branch, select_true.clone());
-            let update_query = ResolvedQueryExpr {
-                body: ResolvedQueryBody::Select(Box::new(update_select)),
-                order_by: vec![],
-                limit: None,
-            };
-
-            // Outer join optional-side tables need specialized CDC handling.
-            let effective_source = if source == UpdateQuerySource::FromClause {
-                if non_terminal.contains(table.name.as_str()) {
-                    UpdateQuerySource::OuterJoinOptional
-                } else if terminal.contains(table.name.as_str()) {
-                    UpdateQuerySource::OuterJoinTerminal
-                } else {
-                    source
-                }
-            } else {
-                source
-            };
-
-            result.push((table, update_query, effective_source));
-        }
-    }
-
-    result
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -154,9 +90,8 @@ mod tests {
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
-    use crate::query::ast::{Deparse, query_expr_parse};
+    use crate::query::ast::query_expr_parse;
     use crate::query::resolve::query_expr_resolve_bound;
-    use crate::query::resolved::query_expr_resolve;
 
     /// Helper to parse SQL and return a CacheableQuery
     fn parse_cacheable(sql: &str) -> CacheableQuery {
@@ -873,29 +808,6 @@ mod tests {
         let query = Arc::new(cacheable.query().clone());
         let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
-    }
-
-    /// The bound derivation yields the same tables, sources and rendered
-    /// update queries as the resolved one.
-    #[test]
-    fn test_bound_update_queries_match_resolved() {
-        let tables = test_tables();
-        for sql in BOUND_CORPUS {
-            let cacheable = parse_cacheable(sql);
-            let resolved =
-                query_expr_resolve(cacheable.query(), &tables, &["public"]).expect("resolve");
-            let expected = query_table_update_queries(&resolved);
-            let bound = bound(sql, &tables);
-            let actual = query_table_update_queries_bound(&bound);
-            assert_eq!(actual.len(), expected.len(), "{sql}");
-            for ((table, resolved, source), update) in expected.iter().zip(&actual) {
-                assert_eq!(update.table.name, table.name, "{sql}");
-                assert_eq!(update.source, *source, "{sql}");
-                let mut expected_sql = String::new();
-                resolved.deparse(&mut expected_sql);
-                assert_eq!(update.bound.sql(), expected_sql, "{sql}");
-            }
-        }
     }
 
     /// An update query's remapped bindings are the ones the resolver makes

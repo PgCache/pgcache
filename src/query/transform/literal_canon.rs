@@ -17,11 +17,6 @@ use crate::query::ast::{
 use crate::query::cast::{CastTarget, cast_target_from_canonical};
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::resolve::{Bindings, ColumnTarget};
-use crate::query::resolved::{
-    ResolvedCaseExpr, ResolvedFunctionCall, ResolvedJoinQual, ResolvedQueryBody, ResolvedQueryExpr,
-    ResolvedScalarExpr, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource,
-    ResolvedWhereExpr,
-};
 use crate::query::typed_compare::{ValueKind, literal_canonical_text};
 
 /// What the pass found.
@@ -30,19 +25,6 @@ pub struct LiteralCanonOutcome {
     /// A literal was left as written whose meaning the populating session's
     /// settings decide.
     pub residual: bool,
-}
-
-/// Canonicalise every date-time literal of `resolved` under `settings`.
-pub fn resolved_literals_canonicalise(
-    resolved: &mut ResolvedQueryExpr,
-    settings: &LiteralSettings,
-) -> LiteralCanonOutcome {
-    let mut pass = Pass {
-        settings,
-        outcome: LiteralCanonOutcome::default(),
-    };
-    pass.query(resolved);
-    pass.outcome
 }
 
 /// Canonicalise every date-time literal of a finalized plain tree under
@@ -260,149 +242,11 @@ struct Pass<'a> {
 }
 
 impl Pass<'_> {
-    fn query(&mut self, query: &mut ResolvedQueryExpr) {
-        match &mut query.body {
-            ResolvedQueryBody::Select(select) => self.select(select),
-            ResolvedQueryBody::SetOp(set_op) => {
-                self.query(&mut set_op.left);
-                self.query(&mut set_op.right);
-            }
-            ResolvedQueryBody::Values(values) => self.values(values),
-        }
-        for clause in &mut query.order_by {
-            self.scalar(&mut clause.expr, None);
-        }
-    }
-
-    fn select(&mut self, select: &mut ResolvedSelectNode) {
-        for source in &mut select.from {
-            self.source(source);
-        }
-        if let Some(where_clause) = &mut select.where_clause {
-            self.where_expr(where_clause);
-        }
-        if let Some(having) = &mut select.having {
-            self.where_expr(having);
-        }
-        if let ResolvedSelectColumns::Columns(columns) = &mut select.columns {
-            for column in columns {
-                self.scalar(&mut column.expr, None);
-            }
-        }
-    }
-
     fn values(&mut self, values: &mut ValuesClause) {
         for row in &mut values.rows {
             for literal in row {
                 self.literal(literal, None);
             }
-        }
-    }
-
-    fn source(&mut self, source: &mut ResolvedTableSource) {
-        match source {
-            ResolvedTableSource::Table(_) => {}
-            ResolvedTableSource::Subquery(subquery) => self.query(&mut subquery.query),
-            ResolvedTableSource::Join(join) => {
-                self.source(&mut join.left);
-                self.source(&mut join.right);
-                if let ResolvedJoinQual::On(on) = &mut join.qual {
-                    self.where_expr(on);
-                }
-            }
-        }
-    }
-
-    fn where_expr(&mut self, expr: &mut ResolvedWhereExpr) {
-        match expr {
-            ResolvedWhereExpr::Scalar(scalar) => self.scalar(scalar, None),
-            ResolvedWhereExpr::Unary(unary) => self.where_expr(&mut unary.expr),
-            ResolvedWhereExpr::Binary(binary) => {
-                let kind = column_kind(&binary.lexpr).or_else(|| column_kind(&binary.rexpr));
-                self.operand(&mut binary.lexpr, kind);
-                self.operand(&mut binary.rexpr, kind);
-            }
-            ResolvedWhereExpr::Multi(multi) => {
-                let kind = multi.exprs.first().and_then(column_kind);
-                for (i, member) in multi.exprs.iter_mut().enumerate() {
-                    self.operand(member, kind.filter(|_| i > 0));
-                }
-            }
-            ResolvedWhereExpr::Subquery {
-                query, test_expr, ..
-            } => {
-                if let Some(test) = test_expr {
-                    self.scalar(test, None);
-                }
-                self.query(query);
-            }
-        }
-    }
-
-    /// One side of a comparison against a column of `kind` (when known).
-    fn operand(&mut self, side: &mut ResolvedWhereExpr, kind: Option<ValueKind>) {
-        if let ResolvedWhereExpr::Scalar(scalar) = side {
-            self.scalar(scalar, kind);
-        } else {
-            self.where_expr(side);
-        }
-    }
-
-    /// `kind` is the type the enclosing comparison gives a literal here.
-    fn scalar(&mut self, expr: &mut ResolvedScalarExpr, kind: Option<ValueKind>) {
-        match expr {
-            ResolvedScalarExpr::Literal(literal) => self.literal(literal, kind),
-            ResolvedScalarExpr::TypeCast {
-                expr: inner,
-                target,
-            } => {
-                let cast = cast_kind(target);
-                if let ResolvedScalarExpr::Literal(literal) = inner.as_mut() {
-                    self.literal(literal, cast);
-                    self.mixed_kinds_check(kind, cast);
-                } else {
-                    self.scalar(inner, None);
-                }
-            }
-            // An array under `= ANY (...)` takes the column's kind per element.
-            ResolvedScalarExpr::Array(elems) => {
-                for elem in elems {
-                    self.scalar(elem, kind);
-                }
-            }
-            ResolvedScalarExpr::Function(function) => self.function(function),
-            ResolvedScalarExpr::Case(case) => self.case(case),
-            ResolvedScalarExpr::Arithmetic(arith) => {
-                self.scalar(&mut arith.left, None);
-                self.scalar(&mut arith.right, None);
-            }
-            ResolvedScalarExpr::Subquery(query, _) => self.query(query),
-            ResolvedScalarExpr::Column(_) | ResolvedScalarExpr::Identifier(_) => {}
-        }
-    }
-
-    fn function(&mut self, function: &mut ResolvedFunctionCall) {
-        for arg in &mut function.args {
-            self.scalar(arg, None);
-        }
-        if let Some(filter) = &mut function.agg_filter {
-            self.where_expr(filter);
-        }
-        for clause in &mut function.agg_order {
-            self.scalar(&mut clause.expr, None);
-        }
-    }
-
-    fn case(&mut self, case: &mut ResolvedCaseExpr) {
-        if let Some(arg) = &mut case.arg {
-            self.scalar(arg, None);
-        }
-        for when in &mut case.whens {
-            self.where_expr(&mut when.condition);
-            self.scalar(&mut when.result, None);
-        }
-        if let Some(default) = &mut case.default {
-            self.scalar(default, None);
         }
     }
 
@@ -476,32 +320,6 @@ impl Pass<'_> {
     }
 }
 
-/// The kind of the column a comparison side names, looking through a cast.
-fn column_kind(side: &ResolvedWhereExpr) -> Option<ValueKind> {
-    let ResolvedWhereExpr::Scalar(scalar) = side else {
-        return None;
-    };
-    scalar_column_kind(scalar)
-}
-
-fn scalar_column_kind(scalar: &ResolvedScalarExpr) -> Option<ValueKind> {
-    match scalar {
-        ResolvedScalarExpr::Column(column) => {
-            Some(ValueKind::of_type(&column.column_metadata.data_type))
-        }
-        ResolvedScalarExpr::TypeCast { expr, target } => {
-            cast_kind(target).or_else(|| scalar_column_kind(expr))
-        }
-        ResolvedScalarExpr::Identifier(_)
-        | ResolvedScalarExpr::Literal(_)
-        | ResolvedScalarExpr::Function(_)
-        | ResolvedScalarExpr::Case(_)
-        | ResolvedScalarExpr::Arithmetic(_)
-        | ResolvedScalarExpr::Subquery(..)
-        | ResolvedScalarExpr::Array(_) => None,
-    }
-}
-
 /// The kind a cast target names. A type whose text input no tracked setting
 /// changes reads as `Text`, so a literal cast to it is never residual.
 fn cast_kind(target: &CastTarget) -> Option<ValueKind> {
@@ -568,9 +386,8 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::{AstNode, Deparse, query_expr_parse};
+    use crate::query::ast::query_expr_parse;
     use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
-    use crate::query::resolved::query_expr_resolve;
 
     fn events() -> Catalog {
         let column = |name: &str, position: i16, ty: Type| ColumnMetadata {
@@ -611,90 +428,6 @@ mod tests {
         let outcome = query_literals_canonicalise(&mut query, &bindings, settings);
         let bound = ResolvedQuery::new(Arc::new(query), bindings);
         (bound.sql(), outcome)
-    }
-
-    /// Both passes over one query: the plain tree's literals in pre-order
-    /// and its outcome, against the resolved tree's.
-    fn canon_both(
-        sql: &str,
-        settings: &LiteralSettings,
-    ) -> (
-        (Vec<LiteralValue>, LiteralCanonOutcome),
-        (Vec<LiteralValue>, LiteralCanonOutcome),
-    ) {
-        let mut query = query_expr_parse(sql).expect("parse");
-        let mut resolved = query_expr_resolve(&query, &events(), &["public"]).expect("resolve");
-        let bindings = query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
-        let resolved_outcome = resolved_literals_canonicalise(&mut resolved, settings);
-        let plain_outcome = query_literals_canonicalise(&mut query, &bindings, settings);
-        let resolved_literals = resolved.nodes::<LiteralValue>().cloned().collect();
-        let plain_literals = query.nodes::<LiteralValue>().cloned().collect();
-        (
-            (plain_literals, plain_outcome),
-            (resolved_literals, resolved_outcome),
-        )
-    }
-
-    const EQUIVALENCE_CORPUS: &[&str] = &[
-        "SELECT id FROM events WHERE day = '01/02/2024' AND at > '2024-01-02 10:00' \
-         AND local_at < '2024-01-02 10:00+05'",
-        "SELECT id FROM events WHERE day IN ('01/02/2024', '02/03/2024') \
-         OR day = ANY (ARRAY['03/04/2024']) OR day BETWEEN '04/05/2024' AND '05/06/2024' \
-         OR local_at = '06/07/2024 08:00'::timestamp",
-        "SELECT id FROM events WHERE day = 'Jan 2 2024'",
-        "SELECT id FROM events WHERE at > to_timestamp('2024-01-02', 'YYYY-MM-DD')",
-        "SELECT id FROM events WHERE span > '1 day'",
-        "SELECT id FROM events WHERE label = lower('now')",
-        "SELECT id FROM events WHERE day = '2024-01-02 10:00'::timestamptz",
-        "SELECT id FROM events WHERE label = '2024-01-02' AND lower(label) = 'bob' \
-         AND id = '7'::int4 AND label = 'order-42'::text",
-        "SELECT id FROM events WHERE label = '{\"a\": 1}'::jsonb::text",
-        "SELECT id FROM events e WHERE EXISTS (SELECT 1 FROM events x \
-         WHERE x.day = '01/02/2024' AND x.id = e.id) ORDER BY CASE WHEN day > '02/03/2024' \
-         THEN 1 ELSE 2 END",
-        "SELECT day FROM events a JOIN events b USING (day) WHERE day = '01/02/2024'",
-        "SELECT day FROM events a LEFT JOIN events b USING (day) WHERE day = '01/02/2024'",
-        "SELECT v.d FROM (SELECT day AS d FROM events WHERE at > '2024-01-02 10:00') v \
-         WHERE v.d = '01/02/2024'",
-        "SELECT * FROM (VALUES ('01/02/2024', 1)) v",
-        "SELECT id FROM events WHERE day = '01/02/2024' UNION SELECT id FROM events \
-         WHERE at > '2024-01-02 10:00' ORDER BY id",
-        "SELECT count(*) FILTER (WHERE day > '01/02/2024') FROM events HAVING \
-         max(at) > '2024-01-02 10:00'",
-    ];
-
-    /// The canonicalised plain tree renders, bound, as the canonicalised
-    /// resolved tree deparses.
-    #[test]
-    fn test_bound_sql_matches_resolved_deparse_after_canonicalisation() {
-        let settings = tokyo_dmy();
-        for sql in EQUIVALENCE_CORPUS {
-            let mut query = query_expr_parse(sql).expect("parse");
-            let mut resolved = query_expr_resolve(&query, &events(), &["public"]).expect("resolve");
-            let bindings =
-                query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
-            resolved_literals_canonicalise(&mut resolved, &settings);
-            query_literals_canonicalise(&mut query, &bindings, &settings);
-            let bound = ResolvedQuery::new(Arc::new(query), bindings);
-            let mut expected = String::new();
-            resolved.deparse(&mut expected);
-            assert_eq!(bound.sql(), expected, "{sql}");
-        }
-    }
-
-    /// The plain pass and the resolved pass rewrite the same literals to the
-    /// same text and reach the same verdict.
-    #[test]
-    fn test_plain_pass_matches_resolved_pass() {
-        for settings in [
-            tokyo_dmy(),
-            LiteralSettings::from_texts("Nowhere/Land", "ISO, MDY", "postgres", "Default"),
-        ] {
-            for sql in EQUIVALENCE_CORPUS {
-                let (plain, resolved) = canon_both(sql, &settings);
-                assert_eq!(plain, resolved, "{sql}");
-            }
-        }
     }
 
     fn tokyo_dmy() -> LiteralSettings {

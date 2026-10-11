@@ -372,11 +372,8 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::{Deparse, query_expr_parse};
+    use crate::query::ast::query_expr_parse;
     use crate::query::resolve::query_expr_resolve_bound;
-    use crate::query::resolved::ResolvedQueryExpr;
-    use crate::query::resolved::query_expr_resolve;
-    use crate::query::transform::predicate_pushdown_apply;
 
     /// A catalog of text-column tables, given as (name, columns), with
     /// relation OIDs from 1001 in order.
@@ -510,41 +507,16 @@ mod tests {
         ResolvedQuery::new(query, bindings)
     }
 
-    fn resolved_pushed(sql: &str, catalog: &Catalog) -> ResolvedQueryExpr {
-        let query = query_expr_parse(sql).expect("parse");
-        let resolved = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
-        predicate_pushdown_apply(resolved)
-    }
-
-    fn resolved_sql(resolved: &ResolvedQueryExpr) -> String {
-        let mut sql = String::new();
-        resolved.deparse(&mut sql);
-        sql
-    }
-
-    #[test]
-    fn test_bound_pushdown_renders_as_resolved_pushdown() {
-        let catalog = two_tables();
-        for (sql, moves) in CORPUS {
-            let before = bound(sql, &catalog);
-            let pushed = query_predicate_pushdown(&before);
-            assert_eq!(pushed.is_some(), *moves, "{sql}");
-            let rendered = pushed.as_ref().unwrap_or(&before).sql();
-            assert_eq!(
-                rendered,
-                resolved_sql(&resolved_pushed(sql, &catalog)),
-                "{sql}"
-            );
-        }
-    }
-
-    /// The remapped bindings are the ones the resolver would make for the
-    /// rewritten tree.
+    /// Every corpus query moves its predicate or keeps it as expected, and
+    /// a moved predicate's remapped bindings are the ones the resolver
+    /// would make for the rewritten tree.
     #[test]
     fn test_bound_pushdown_bindings_match_resolver() {
         let catalog = two_tables();
-        for (sql, _) in CORPUS {
-            let Some(pushed) = query_predicate_pushdown(&bound(sql, &catalog)) else {
+        for (sql, moves) in CORPUS {
+            let pushed = query_predicate_pushdown(&bound(sql, &catalog));
+            assert_eq!(pushed.is_some(), *moves, "{sql}");
+            let Some(pushed) = pushed else {
                 continue;
             };
             let expected = query_expr_resolve_bound(pushed.tree(), &catalog, &["public"])

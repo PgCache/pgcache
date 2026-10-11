@@ -7,7 +7,7 @@ use super::bindings::{ColumnBinding, ColumnTarget, MergedId, SlotId};
 use super::scope::ResolutionScope;
 use crate::catalog::ColumnMetadata;
 use crate::query::ast::ColumnNode;
-use crate::query::resolved::{ResolveError, ResolveResult};
+use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// What a column name denotes in scope.
 pub(super) enum ColumnLookup {

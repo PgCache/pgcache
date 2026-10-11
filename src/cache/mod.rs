@@ -7,7 +7,7 @@ use tokio_postgres::Error;
 
 use crate::oid::{Oid, TypeOid};
 use crate::query::{
-    decorrelate::DecorrelateError, resolved::ResolveError, transform::AstTransformError,
+    decorrelate::DecorrelateError, resolve::ResolveError, transform::AstTransformError,
 };
 
 /// Result type with location-tracking error reports.

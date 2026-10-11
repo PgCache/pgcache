@@ -44,12 +44,6 @@ use pgcache_lib::query::resolve::{
     Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot,
     query_expr_resolve_bound,
 };
-use pgcache_lib::query::resolved::{
-    ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode,
-    ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
-    ResolvedSelectColumn, ResolvedSelectNode, ResolvedTableNode, ResolvedTableSource,
-    ResolvedWhereExpr,
-};
 use pgcache_lib::query::transform::query_literals_canonicalise;
 
 // ---------------------------------------------------------------------------
@@ -402,7 +396,6 @@ fn row_build(row: &[Option<&str>]) -> Vec<Option<ByteString>> {
 
 fn sizes_report() {
     println!("\n== node sizes (bytes)");
-    println!("{:<28}{:>8}    {:<28}{:>8}", "plain", "", "resolved", "");
     let plain: [(&str, usize); 15] = [
         ("QueryExpr", size_of::<QueryExpr>()),
         ("QueryBody", size_of::<QueryBody>()),
@@ -420,33 +413,19 @@ fn sizes_report() {
         ("OrderByClause", size_of::<OrderByClause>()),
         ("CteDefinition", size_of::<CteDefinition>()),
     ];
-    let resolved: [(&str, usize); 15] = [
-        ("ResolvedQueryExpr", size_of::<ResolvedQueryExpr>()),
-        ("ResolvedQueryBody", size_of::<ResolvedQueryBody>()),
-        ("ResolvedSelectNode", size_of::<ResolvedSelectNode>()),
-        ("ResolvedSelectColumn", size_of::<ResolvedSelectColumn>()),
-        ("ResolvedTableSource", size_of::<ResolvedTableSource>()),
-        ("ResolvedTableNode", size_of::<ResolvedTableNode>()),
-        ("ResolvedJoinNode", size_of::<ResolvedJoinNode>()),
-        ("ResolvedScalarExpr", size_of::<ResolvedScalarExpr>()),
-        ("ResolvedWhereExpr", size_of::<ResolvedWhereExpr>()),
-        ("ResolvedBinaryExpr", size_of::<ResolvedBinaryExpr>()),
-        ("ResolvedColumnNode", size_of::<ResolvedColumnNode>()),
-        ("ColumnMetadata", size_of::<ColumnMetadata>()),
-        ("ResolvedFunctionCall", size_of::<ResolvedFunctionCall>()),
-        ("ResolvedOrderByClause", size_of::<ResolvedOrderByClause>()),
-        ("Type", size_of::<Type>()),
-    ];
-    for ((plain_name, plain_size), (resolved_name, resolved_size)) in plain.iter().zip(&resolved) {
-        println!("{plain_name:<28}{plain_size:>8}    {resolved_name:<28}{resolved_size:>8}");
+    for (name, size) in plain {
+        println!("{name:<28}{size:>8}");
     }
-    println!(
-        "{:<28}{:>8}    {:<28}{:>8}",
-        "EcoString",
-        size_of::<EcoString>(),
-        "TableMetadata",
-        size_of::<TableMetadata>()
-    );
+    println!("\n== metadata (bytes)");
+    let metadata: [(&str, usize); 4] = [
+        ("EcoString", size_of::<EcoString>()),
+        ("Type", size_of::<Type>()),
+        ("ColumnMetadata", size_of::<ColumnMetadata>()),
+        ("TableMetadata", size_of::<TableMetadata>()),
+    ];
+    for (name, size) in metadata {
+        println!("{name:<28}{size:>8}");
+    }
     println!("\n== bindings (bytes)");
     let bindings: [(&str, usize); 6] = [
         ("ResolvedQuery", size_of::<ResolvedQuery>()),

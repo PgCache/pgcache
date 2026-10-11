@@ -39,7 +39,7 @@ use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{ColumnRange, query_constraints_analyze, table_column_ranges};
 use crate::query::guc::Guc;
 use crate::query::keying_settings::KeyingSettings;
-use crate::query::resolved::ColumnsByTable;
+use crate::query::resolve::ColumnsByTable;
 use crate::query::transform::query_expr_parameters_replace;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;

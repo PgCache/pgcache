@@ -20,8 +20,8 @@ use crate::{
     cache::{CacheError, CacheResult, memo::ResultMemo, mv::MvMeta, query::CacheableQuery},
     catalog::Catalog,
     query::{
-        Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap, resolve::ResolvedQuery,
-        resolved::ColumnsByTable,
+        Fingerprint, FingerprintDashMap, QueryShape, SessionKeyDashMap,
+        resolve::{ColumnsByTable, ResolvedQuery},
     },
     settings::{DynamicConfigHandle, Settings},
 };

@@ -22,8 +22,8 @@ use crate::query::constraints::query_constraints_analyze;
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
+use crate::query::resolve::ResolveResult;
 use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
-use crate::query::resolved::ResolveResult;
 use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
 };

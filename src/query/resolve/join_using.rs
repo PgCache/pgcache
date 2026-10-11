@@ -13,7 +13,7 @@ use super::bindings::{ColumnBinding, MergedColumnBinding, MergedId};
 use super::column::{ColumnLookup, column_lookup};
 use super::scope::ResolutionScope;
 use crate::query::ast::{ColumnNode, JoinType, NodeId};
-use crate::query::resolved::{ResolveError, ResolveResult};
+use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// A `USING`/`NATURAL` join's merged output column. Postgres exposes the
 /// join column(s) once (not per side); for an outer join its value is

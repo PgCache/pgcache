@@ -10,7 +10,6 @@ pub mod keying_settings;
 pub mod literal_settings;
 pub mod predicate;
 pub mod resolve;
-pub mod resolved;
 pub mod shape;
 pub mod transform;
 pub mod typed_compare;
@@ -21,4 +20,4 @@ pub use fingerprint::{
     Fingerprint, FingerprintDashMap, FingerprintDashSet, FingerprintMap, FingerprintSet,
     SessionKey, SessionKeyDashMap,
 };
-pub use shape::{QueryShape, ShapeKey, query_shape_derive};
+pub use shape::{QueryShape, ShapeKey};

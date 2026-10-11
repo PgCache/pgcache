@@ -545,9 +545,6 @@ mod tests {
     use crate::query::literal_settings::LiteralSettings;
     use crate::query::resolve::query_expr_resolve_bound;
     use crate::query::resolve::tests::{BINDING_CORPUS, binding_catalog, catalog_with_columns};
-    use crate::query::resolved::query_expr_resolve;
-    use crate::query::resolved::{ResolvedQueryExpr, resolved_query_fingerprint};
-    use crate::query::shape::query_shape_derive;
 
     /// Shapes the binding corpus leaves out: stars over outer and `NATURAL`
     /// joins, qualified stars, aliased and chained CTE references, set-op
@@ -585,75 +582,10 @@ mod tests {
         BINDING_CORPUS.iter().chain(RENDER_CORPUS).copied()
     }
 
-    fn resolve_both(sql: &str, catalog: &Catalog) -> (ResolvedQuery, ResolvedQueryExpr) {
-        let query = query_expr_parse(sql).expect("parse");
-        let resolved = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
-        let bindings = query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
-        (ResolvedQuery::new(Arc::new(query), bindings), resolved)
-    }
-
     fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
-        resolve_both(sql, catalog).0
-    }
-
-    fn resolved_sql(resolved: &ResolvedQueryExpr) -> String {
-        let mut sql = String::new();
-        resolved.deparse(&mut sql);
-        sql
-    }
-
-    #[test]
-    fn test_bound_sql_matches_resolved_deparse() {
-        let catalog = binding_catalog();
-        for sql in corpus() {
-            let (bound, resolved) = resolve_both(sql, &catalog);
-            assert_eq!(bound.sql(), resolved_sql(&resolved), "{sql}");
-        }
-    }
-
-    #[test]
-    fn test_bound_shape_matches_resolved_shape() {
-        let catalog = binding_catalog();
-        for sql in corpus() {
-            let (bound, resolved) = resolve_both(sql, &catalog);
-            let shape = bound.shape();
-            let expected = query_shape_derive(&resolved);
-            assert_eq!(shape.sql, expected.sql, "{sql}");
-            assert_eq!(shape.literals, expected.literals, "{sql}");
-            assert_eq!(shape.key, expected.key, "{sql}");
-        }
-    }
-
-    /// Two corpus queries share a bound fingerprint exactly when they share
-    /// a resolved one.
-    #[test]
-    fn test_bound_fingerprint_classes_match_resolved() {
-        let catalog = binding_catalog();
-        let spellings = [
-            "SELECT id FROM public.users WHERE id = 1 LIMIT 5",
-            "SELECT users.id FROM users WHERE users.id = 1",
-            "SELECT id FROM users WHERE id = 1",
-        ];
-        let fingerprints: Vec<(&str, Fingerprint, Fingerprint)> = corpus()
-            .chain(spellings)
-            .map(|sql| {
-                let (bound, resolved) = resolve_both(sql, &catalog);
-                (
-                    sql,
-                    bound.fingerprint(),
-                    resolved_query_fingerprint(&resolved),
-                )
-            })
-            .collect();
-        for (left, left_bound, left_resolved) in &fingerprints {
-            for (right, right_bound, right_resolved) in &fingerprints {
-                assert_eq!(
-                    left_bound == right_bound,
-                    left_resolved == right_resolved,
-                    "{left} vs {right}"
-                );
-            }
-        }
+        let query = query_expr_parse(sql).expect("parse");
+        let bindings = query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
+        ResolvedQuery::new(Arc::new(query), bindings)
     }
 
     /// PGC-287 class 2: a bare and a qualified spelling of one table share
@@ -680,11 +612,7 @@ mod tests {
     fn test_bound_fingerprint_shares_no_value_with_other_domains() {
         let catalog = binding_catalog();
         let sql = "SELECT id FROM users WHERE id = 1";
-        let (bound, resolved) = resolve_both(sql, &catalog);
-        assert_ne!(
-            bound.fingerprint().get(),
-            resolved_query_fingerprint(&resolved).get()
-        );
+        let bound = bound(sql, &catalog);
         assert_ne!(
             bound.fingerprint().get(),
             query_expr_session_key(

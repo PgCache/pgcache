@@ -10,7 +10,7 @@ use super::scope::{OuterTable, OutputColumn, ResolutionScope};
 use super::table::table_source_resolve;
 use crate::catalog::Catalog;
 use crate::query::ast::{QueryBody, QueryExpr, SelectNode};
-use crate::query::resolved::ResolveResult;
+use crate::query::resolve::ResolveResult;
 
 /// Bind every table and column reference of a finalized `query` to the
 /// catalog (ADR-057).

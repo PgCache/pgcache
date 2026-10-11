@@ -18,7 +18,7 @@ use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraints::{
     ColumnRange, column_ranges_disjoint, column_ranges_from_comparisons,
 };
-use crate::query::resolved::ColumnsByTable;
+use crate::query::resolve::ColumnsByTable;
 use crate::query::write::{RelationRef, WriteClass};
 
 /// The schema variants of one table name with pending writes. Keyed by bare

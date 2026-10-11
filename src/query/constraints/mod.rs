@@ -20,10 +20,8 @@ use ecow::EcoString;
 use crate::query::ast::{BinaryOp, ColumnNode, LiteralValue};
 use crate::query::cast::CastTarget;
 use crate::query::resolve::{ResolvedQuery, TableSlot};
-use crate::query::resolved::ResolvedColumnNode;
 
 mod bound;
-mod extract;
 mod range;
 #[cfg(feature = "proxy")]
 mod range_overlap;
@@ -32,7 +30,6 @@ mod subsume;
 mod tests;
 
 pub use bound::query_constraints_analyze;
-pub use extract::analyze_query_constraints;
 pub use subsume::table_constraints_subsumed;
 
 pub(crate) use range::{ColumnRange, column_range_build};
@@ -66,17 +63,6 @@ impl std::hash::Hash for ConstraintColumn {
         self.schema.hash(state);
         self.table.hash(state);
         self.column.hash(state);
-    }
-}
-
-impl From<&ResolvedColumnNode> for ConstraintColumn {
-    fn from(node: &ResolvedColumnNode) -> Self {
-        Self {
-            schema: node.schema.clone(),
-            table: node.table.clone(),
-            alias: node.table_alias.clone(),
-            column: node.column.clone(),
-        }
     }
 }
 

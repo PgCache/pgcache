@@ -9,52 +9,6 @@ use crate::query::ast::{
     AstNode, ColumnNode, JoinNode, JoinQual, JoinType, SelectNode, TableSource, WhereExpr,
 };
 use crate::query::resolve::{ColumnTarget, ResolvedQuery};
-use crate::query::resolved::{
-    ResolvedColumnNode, ResolvedJoinNode, ResolvedSelectNode, ResolvedTableSource,
-    ResolvedWhereExpr,
-};
-
-/// Categorizes optional-side tables in outer joins as terminal or non-terminal.
-///
-/// - **Terminal**: columns don't appear in WHERE or other join conditions.
-///   CDC INSERT/DELETE handled in place — the preserved side already has the row,
-///   changes here only affect NULL-padded columns.
-/// - **Non-terminal**: columns appear in WHERE or other join conditions.
-///   CDC events trigger full query invalidation (conservative but correct).
-///
-/// Uses the resolved AST where column references carry the real table name
-/// (not aliases), eliminating alias ambiguity.
-pub fn outer_join_optional_tables(
-    select: &ResolvedSelectNode,
-) -> (HashSet<EcoString>, HashSet<EcoString>) {
-    let join = match select.from.as_slice() {
-        [ResolvedTableSource::Join(join)] => join,
-        _ => return (HashSet::new(), HashSet::new()),
-    };
-
-    // Pass 1: collect real table names from WHERE clause column references.
-    // GROUP BY, HAVING, and SELECT list are excluded — population queries strip
-    // GROUP BY/HAVING, and all three are re-evaluated at retrieval time against
-    // cached rows.
-    let mut non_terminal_refs = HashSet::new();
-    if let Some(where_clause) = &select.where_clause {
-        resolved_column_table_refs_collect(where_clause, &mut non_terminal_refs);
-    }
-
-    // Pass 2: walk the join tree, collecting all optional-side tables and
-    // identifying which are non-terminal
-    let mut all_optional = HashSet::new();
-    let mut non_terminal = HashSet::new();
-    resolved_join_terminality_walk(
-        join,
-        &non_terminal_refs,
-        &mut all_optional,
-        &mut non_terminal,
-    );
-
-    let terminal = all_optional.difference(&non_terminal).cloned().collect();
-    (terminal, non_terminal)
-}
 
 /// [`outer_join_optional_tables`] on a branch of a bound query: the same
 /// sets, read from the bindings.
@@ -164,83 +118,6 @@ fn join_terminality_walk(
         if let TableSource::Join(nested) = side {
             join_terminality_walk(bound, nested, &child_refs, all_optional, non_terminal);
         }
-    }
-}
-
-/// Collect real table names from all column references in a resolved WHERE expression.
-fn resolved_column_table_refs_collect(expr: &ResolvedWhereExpr, tables: &mut HashSet<EcoString>) {
-    for col in expr.nodes::<ResolvedColumnNode>() {
-        tables.insert(col.table.clone());
-    }
-}
-
-/// Collect the real table names from all table nodes in a resolved table source subtree.
-/// Traverses JOINs but not subqueries.
-fn resolved_source_table_names_collect(
-    source: &ResolvedTableSource,
-    names: &mut HashSet<EcoString>,
-) {
-    match source {
-        ResolvedTableSource::Table(table) => {
-            names.insert(table.name.clone());
-        }
-        ResolvedTableSource::Join(join) => {
-            resolved_source_table_names_collect(&join.left, names);
-            resolved_source_table_names_collect(&join.right, names);
-        }
-        ResolvedTableSource::Subquery(_) => {}
-    }
-}
-
-/// Recursive walk of the resolved join tree to collect optional-side tables
-/// and identify which are non-terminal.
-///
-/// `non_terminal_refs` accumulates: WHERE column table refs + ancestor join
-/// condition column table refs. At each outer join, the optional side's tables
-/// are checked against this set.
-///
-/// The current join's own ON condition is NOT in `non_terminal_refs` during the
-/// check — it's only merged before recursing into children. This correctly
-/// excludes a join's own condition from the terminal definition.
-fn resolved_join_terminality_walk(
-    join: &ResolvedJoinNode,
-    non_terminal_refs: &HashSet<EcoString>,
-    all_optional: &mut HashSet<EcoString>,
-    non_terminal: &mut HashSet<EcoString>,
-) {
-    if let Some(optional_side) = optional_side(join) {
-        let mut optional_tables = HashSet::new();
-        resolved_source_table_names_collect(optional_side, &mut optional_tables);
-        for table in optional_tables {
-            if non_terminal_refs.contains(&table) {
-                non_terminal.insert(table.clone());
-            }
-            all_optional.insert(table);
-        }
-    }
-
-    // Before recursing, merge this join's condition refs so children see them
-    // as "ancestor join conditions"
-    let mut child_refs = non_terminal_refs.clone();
-    if let Some(condition) = join.predicate() {
-        resolved_column_table_refs_collect(condition, &mut child_refs);
-    }
-
-    // Recurse into nested joins
-    for side in [&join.left, &join.right] {
-        if let ResolvedTableSource::Join(nested) = side {
-            resolved_join_terminality_walk(nested, &child_refs, all_optional, non_terminal);
-        }
-    }
-}
-
-/// The side of an outer join whose rows may be NULL-padded; none for INNER,
-/// and FULL is rejected before this analysis runs.
-fn optional_side(join: &ResolvedJoinNode) -> Option<&ResolvedTableSource> {
-    match join.join_type {
-        JoinType::Left => Some(&join.right),
-        JoinType::Right => Some(&join.left),
-        JoinType::Inner | JoinType::Full => None,
     }
 }
 

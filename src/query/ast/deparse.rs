@@ -118,14 +118,6 @@ pub(crate) fn separated_deparse_with<C: DeparseContext, T: DeparseWith>(
     }
 }
 
-/// `keyword` then `expr`, when present.
-pub(crate) fn clause_deparse(buf: &mut String, keyword: &str, expr: Option<&impl Deparse>) {
-    if let Some(expr) = expr {
-        buf.push_str(keyword);
-        expr.deparse(buf);
-    }
-}
-
 /// `keyword` then `expr`, when present, reported to the context as `clause`.
 pub(crate) fn clause_deparse_with<C: DeparseContext, T: DeparseWith>(
     cx: &mut C,
@@ -142,18 +134,8 @@ pub(crate) fn clause_deparse_with<C: DeparseContext, T: DeparseWith>(
     }
 }
 
-/// Deparse `item`, wrapped in parentheses when `parens` (precedence needs it).
-pub(crate) fn parenthesized_deparse(buf: &mut String, item: &impl Deparse, parens: bool) {
-    if parens {
-        buf.push('(');
-    }
-    item.deparse(buf);
-    if parens {
-        buf.push(')');
-    }
-}
-
-/// [`parenthesized_deparse`] under a context.
+/// Deparse `item` under a context, wrapped in parentheses when `parens`
+/// (precedence needs it).
 pub(crate) fn parenthesized_deparse_with<C: DeparseContext, T: DeparseWith>(
     cx: &mut C,
     buf: &mut String,

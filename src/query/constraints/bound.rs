@@ -1,15 +1,17 @@
-//! [`analyze_query_constraints`](super::extract::analyze_query_constraints)
-//! on the bound query: the column constraints and equivalences a SELECT's
-//! predicates imply, read from the plain tree and its bindings.
+//! The column constraints and equivalences a SELECT's predicates imply,
+//! read from the plain tree and its bindings.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use super::extract::query_constraints_build;
+use ecow::EcoString;
+
 use super::range::{
     literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
 };
-use super::{ColumnConstraint, ColumnEquivalence, ConstraintColumn, QueryConstraints};
+use super::{
+    ColumnConstraint, ColumnEquivalence, ConstraintColumn, QueryConstraints, TableConstraint,
+};
 use crate::query::ast::{
     BinaryExpr, BinaryOp, JoinQual, LiteralValue, MultiExpr, MultiOp, ScalarExpr, SelectNode,
     TableSource, WhereExpr,
@@ -316,4 +318,101 @@ fn constraint_column_of_binding(
             column,
         },
     })
+}
+
+/// Propagate constraints through column equivalences using fixpoint iteration
+pub(super) fn propagate_constraints(
+    mut constraints: HashSet<ColumnConstraint>,
+    equivalences: &HashSet<ColumnEquivalence>,
+) -> HashSet<ColumnConstraint> {
+    // Fixpoint iteration: propagate until no changes
+    loop {
+        let new_constraints: Vec<ColumnConstraint> = equivalences
+            .iter()
+            .flat_map(|equiv| {
+                constraints
+                    .iter()
+                    .filter_map(move |constraint| constraint.across(equiv))
+            })
+            .collect();
+        let mut changed = false;
+        for constraint in new_constraints {
+            changed |= constraints.insert(constraint);
+        }
+        if !changed {
+            return constraints;
+        }
+    }
+}
+
+impl ColumnConstraint {
+    /// This constraint copied onto the other column of `equiv`, when it
+    /// constrains one of them.
+    fn across(&self, equiv: &ColumnEquivalence) -> Option<ColumnConstraint> {
+        let other = if *self.column() == equiv.left {
+            &equiv.right
+        } else if *self.column() == equiv.right {
+            &equiv.left
+        } else {
+            return None;
+        };
+        match self {
+            ColumnConstraint::Comparison { op, value, .. } => Some(ColumnConstraint::Comparison {
+                column: other.clone(),
+                op: *op,
+                value: value.clone(),
+            }),
+            ColumnConstraint::InSet { values, .. } => Some(ColumnConstraint::InSet {
+                column: other.clone(),
+                values: values.clone(),
+            }),
+            // CastComparison doesn't propagate — `val::int = 5 AND val = other_val`
+            // does NOT imply `other_val::int = 5` unless we also know
+            // `other_val` is cast-compatible. Conservative skip.
+            ColumnConstraint::CastComparison { .. } => None,
+        }
+    }
+}
+
+/// The constraints of a query from what its predicates imply: propagated
+/// through the equivalences, then organised by table.
+fn query_constraints_build(
+    constraints: HashSet<ColumnConstraint>,
+    equivalences: HashSet<ColumnEquivalence>,
+    where_analysis_complete: bool,
+) -> QueryConstraints {
+    let column_constraints = propagate_constraints(constraints, &equivalences);
+    let mut table_constraints: HashMap<EcoString, Vec<TableConstraint>> = HashMap::new();
+    for constraint in &column_constraints {
+        let tc = match constraint {
+            ColumnConstraint::Comparison {
+                column, op, value, ..
+            } => TableConstraint::Comparison(column.column.clone(), *op, value.clone()),
+            ColumnConstraint::InSet { column, values, .. } => {
+                TableConstraint::AnyOf(column.column.clone(), values.clone())
+            }
+            ColumnConstraint::CastComparison {
+                column,
+                cast,
+                op,
+                value,
+            } => TableConstraint::CastComparison(
+                column.column.clone(),
+                cast.clone(),
+                *op,
+                value.clone(),
+            ),
+        };
+        table_constraints
+            .entry(constraint.column().table.clone())
+            .or_default()
+            .push(tc);
+    }
+
+    QueryConstraints {
+        column_constraints,
+        equivalences,
+        table_constraints,
+        where_analysis_complete,
+    }
 }

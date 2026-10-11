@@ -16,7 +16,7 @@ use crate::catalog::{
 };
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{NodeId, QueryExpr};
-use crate::query::resolved::{ResolveError, ResolveResult};
+use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// A FROM-clause entry visible in scope. Entries are kept in FROM order,
 /// which `*` expansion must follow (PostgreSQL expands `*` in FROM order).

@@ -1,7 +1,7 @@
 //! Whole-query facts read from a [`ResolvedQuery`]: the tree plus its
 //! bindings, with no resolved hierarchy in between.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 use postgres_types::Type;
@@ -12,7 +12,9 @@ use crate::oid::Oid;
 use crate::query::ast::{
     AstNode, ColumnNode, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode, StarNode,
 };
-use crate::query::resolved::ColumnsByTable;
+
+/// The columns a query reads from each table, by table name.
+pub type ColumnsByTable = HashMap<EcoString, HashSet<EcoString>>;
 
 impl ResolvedQuery {
     /// The top-level SELECT, when the body is one.
