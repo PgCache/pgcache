@@ -1,17 +1,18 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
+use std::sync::Arc;
+
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
 use super::*;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
-use crate::query::ast::{Deparse, JoinType, UnaryOp, query_expr_parse};
-use crate::query::resolved::{
-    ResolvedJoinNode, ResolvedQueryBody, ResolvedQueryExpr, ResolvedSelectColumns,
-    ResolvedSelectNode, ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedWhereExpr,
-    query_expr_resolve,
+use crate::query::ast::{
+    Deparse, JoinNode, JoinQual, JoinType, QueryBody, QueryExpr, SelectColumn, SelectColumns,
+    SelectNode, TableSource, TableSubqueryNode, UnaryOp, WhereExpr, query_expr_parse,
 };
+use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
 
 /// Create test table metadata with given column names.
 /// First column is the primary key (INT4), rest are TEXT.
@@ -111,16 +112,36 @@ fn test_aggregate_functions() -> HashSet<EcoString> {
     .collect()
 }
 
-/// Parse SQL → resolve → decorrelate → return outcome.
-fn resolve_and_decorrelate(sql: &str, tables: &Catalog) -> DecorrelateResult<DecorrelateOutcome> {
-    let ast = query_expr_parse(sql).expect("convert to AST");
-    let resolved = query_expr_resolve(&ast, tables, &["public"]).expect("resolve query");
-    query_expr_decorrelate(&resolved, &test_aggregate_functions())
+/// A decorrelation outcome: the query as rewritten, or as it was when
+/// nothing in it was correlated.
+struct Outcome {
+    query: ResolvedQuery,
+    transformed: bool,
 }
 
-fn as_select(query: &ResolvedQueryExpr) -> &ResolvedSelectNode {
+/// Parse SQL → bind → decorrelate.
+fn resolve_and_decorrelate(sql: &str, tables: &Catalog) -> DecorrelateResult<Outcome> {
+    let query = Arc::new(query_expr_parse(sql).expect("convert to AST"));
+    let (_, bindings) =
+        query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve query");
+    let bound = ResolvedQuery::new(query, bindings);
+    Ok(
+        match query_decorrelate(&bound, &test_aggregate_functions())? {
+            Some(rewritten) => Outcome {
+                query: rewritten,
+                transformed: true,
+            },
+            None => Outcome {
+                query: bound,
+                transformed: false,
+            },
+        },
+    )
+}
+
+fn as_select(query: &QueryExpr) -> &SelectNode {
     match &query.body {
-        ResolvedQueryBody::Select(s) => s,
+        QueryBody::Select(s) => s,
         _ => panic!("expected Select"),
     }
 }
@@ -129,10 +150,10 @@ fn as_select(query: &ResolvedQueryExpr) -> &ResolvedSelectNode {
 
 /// Every FROM source in pre-order: each top-level source, and a join's
 /// sides after the join itself. Derived-table bodies are not entered.
-fn from_sources(select: &ResolvedSelectNode) -> Vec<&ResolvedTableSource> {
-    fn collect<'a>(source: &'a ResolvedTableSource, out: &mut Vec<&'a ResolvedTableSource>) {
+fn from_sources(select: &SelectNode) -> Vec<&TableSource> {
+    fn collect<'a>(source: &'a TableSource, out: &mut Vec<&'a TableSource>) {
         out.push(source);
-        if let ResolvedTableSource::Join(join) = source {
+        if let TableSource::Join(join) = source {
             collect(&join.left, out);
             collect(&join.right, out);
         }
@@ -145,111 +166,124 @@ fn from_sources(select: &ResolvedSelectNode) -> Vec<&ResolvedTableSource> {
 }
 
 /// Flatten all JoinNodes from the FROM clause.
-fn select_joins(select: &ResolvedSelectNode) -> Vec<&ResolvedJoinNode> {
+fn select_joins(select: &SelectNode) -> Vec<&JoinNode> {
     from_sources(select)
         .into_iter()
         .filter_map(|source| match source {
-            ResolvedTableSource::Join(join) => Some(join.as_ref()),
+            TableSource::Join(join) => Some(join),
             _ => None,
         })
         .collect()
 }
 
 /// All table names in the FROM clause (through joins, not into subqueries).
-fn from_table_names(select: &ResolvedSelectNode) -> Vec<&str> {
+fn from_table_names(select: &SelectNode) -> Vec<&str> {
     from_sources(select)
         .into_iter()
         .filter_map(|source| match source {
-            ResolvedTableSource::Table(t) => Some(t.name.as_str()),
+            TableSource::Table(t) => Some(t.name.as_str()),
             _ => None,
         })
         .collect()
 }
 
 /// The derived tables (FROM subqueries) of the FROM clause.
-fn derived_tables(select: &ResolvedSelectNode) -> Vec<&ResolvedTableSubqueryNode> {
+fn derived_tables(select: &SelectNode) -> Vec<&TableSubqueryNode> {
     from_sources(select)
         .into_iter()
         .filter_map(|source| match source {
-            ResolvedTableSource::Subquery(sub) => Some(sub),
+            TableSource::Subquery(sub) => Some(sub),
             _ => None,
         })
         .collect()
 }
 
 /// Aliases of the derived tables in the FROM clause.
-fn from_derived_aliases(select: &ResolvedSelectNode) -> Vec<&str> {
+fn from_derived_aliases(select: &SelectNode) -> Vec<&str> {
     derived_tables(select)
         .into_iter()
-        .map(|sub| sub.alias.name.as_str())
+        .filter_map(|sub| sub.alias.as_ref().map(|alias| alias.name.as_str()))
         .collect()
 }
 
 /// Scalar column aliases from derived table SELECT lists (e.g. `_ds1` in
 /// `(SELECT count(*) AS _ds1 ...) AS _dc1`).
-fn derived_scalar_aliases(select: &ResolvedSelectNode) -> Vec<&str> {
+fn derived_scalar_aliases(select: &SelectNode) -> Vec<&str> {
     derived_tables(select)
         .into_iter()
         .filter_map(|sub| match &sub.query.body {
-            ResolvedQueryBody::Select(inner) => match &inner.columns {
-                ResolvedSelectColumns::Columns(cols) => Some(cols),
-                ResolvedSelectColumns::None => None,
+            QueryBody::Select(inner) => match &inner.columns {
+                SelectColumns::Columns(cols) => Some(cols),
+                SelectColumns::None => None,
             },
             _ => None,
         })
         .flatten()
-        .filter_map(|col| col.alias.as_deref())
+        .filter_map(|col| match col {
+            SelectColumn::Expr {
+                alias: Some(alias), ..
+            } => Some(alias.as_str()),
+            _ => None,
+        })
         .collect()
 }
 
 /// Whether any derived table has a non-empty GROUP BY.
-fn derived_has_group_by(select: &ResolvedSelectNode) -> bool {
-    derived_tables(select).into_iter().any(|sub| {
-        matches!(&sub.query.body, ResolvedQueryBody::Select(inner) if !inner.group_by.is_empty())
-    })
+fn derived_has_group_by(select: &SelectNode) -> bool {
+    derived_tables(select).into_iter().any(
+        |sub| matches!(&sub.query.body, QueryBody::Select(inner) if !inner.group_by.is_empty()),
+    )
 }
 
 /// Whether `matches` holds anywhere in a WHERE expression, looking through
 /// NOT/IS, AND/OR and multi-operand expressions but not into subquery bodies.
-fn where_any(expr: &Option<ResolvedWhereExpr>, matches: fn(&ResolvedWhereExpr) -> bool) -> bool {
-    fn walk(expr: &ResolvedWhereExpr, matches: fn(&ResolvedWhereExpr) -> bool) -> bool {
+fn where_any(expr: &Option<WhereExpr>, matches: fn(&WhereExpr) -> bool) -> bool {
+    fn walk(expr: &WhereExpr, matches: fn(&WhereExpr) -> bool) -> bool {
         matches(expr)
             || match expr {
-                ResolvedWhereExpr::Unary(u) => walk(&u.expr, matches),
-                ResolvedWhereExpr::Binary(b) => walk(&b.lexpr, matches) || walk(&b.rexpr, matches),
-                ResolvedWhereExpr::Multi(m) => m.exprs.iter().any(|e| walk(e, matches)),
+                WhereExpr::Unary(u) => walk(&u.expr, matches),
+                WhereExpr::Binary(b) => walk(&b.lexpr, matches) || walk(&b.rexpr, matches),
+                WhereExpr::Multi(m) => m.exprs.iter().any(|e| walk(e, matches)),
                 _ => false,
             }
     }
     expr.as_ref().is_some_and(|e| walk(e, matches))
 }
 
-fn where_has_subquery(expr: &Option<ResolvedWhereExpr>) -> bool {
-    where_any(expr, |e| matches!(e, ResolvedWhereExpr::Subquery { .. }))
+fn where_has_subquery(expr: &Option<WhereExpr>) -> bool {
+    where_any(expr, |e| matches!(e, WhereExpr::Subquery { .. }))
 }
 
-fn where_has_is_null(expr: &Option<ResolvedWhereExpr>) -> bool {
+fn where_has_is_null(expr: &Option<WhereExpr>) -> bool {
     where_any(
         expr,
-        |e| matches!(e, ResolvedWhereExpr::Unary(u) if u.op == UnaryOp::IsNull),
+        |e| matches!(e, WhereExpr::Unary(u) if u.op == UnaryOp::IsNull),
     )
 }
 
 /// Decorrelate `sql` over the test catalog; the result as returned.
-fn decorrelate(sql: &str) -> DecorrelateResult<DecorrelateOutcome> {
+fn decorrelate(sql: &str) -> DecorrelateResult<Outcome> {
     resolve_and_decorrelate(sql, &test_tables())
 }
 
 /// Decorrelate `sql`, which must succeed with a rewrite, and return the
 /// rewritten SELECT.
-fn decorrelated(sql: &str) -> ResolvedSelectNode {
+fn decorrelated(sql: &str) -> SelectNode {
     let outcome = decorrelate(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
     assert!(outcome.transformed, "expected a rewrite of {sql}");
-    as_select(&outcome.resolved).clone()
+    as_select(outcome.query.tree()).clone()
 }
 
-/// Deparse a single WHERE expression for targeted predicate checks.
-fn deparse_expr(expr: &ResolvedWhereExpr) -> String {
+fn join_on(join: &JoinNode) -> &WhereExpr {
+    let JoinQual::On(on) = &join.qual else {
+        panic!("expected an ON join, got {:?}", join.qual);
+    };
+    on
+}
+
+/// Deparse a single WHERE expression, as written, for targeted predicate
+/// checks.
+fn deparse_expr(expr: &WhereExpr) -> String {
     let mut buf = String::new();
     expr.deparse(&mut buf);
     buf
@@ -275,7 +309,7 @@ fn test_exists_single_correlation() {
     assert_eq!(joins[0].join_type, JoinType::Inner);
     assert!(select.distinct);
 
-    let on = deparse_expr(joins[0].predicate().unwrap());
+    let on = deparse_expr(join_on(joins[0]));
     assert!(on.contains("o.emp_id = e.id"), "correlation in ON: {on}");
 }
 
@@ -292,7 +326,7 @@ fn test_exists_multiple_correlation_predicates() {
     );
     let joins = select_joins(&select);
     assert_eq!(joins.len(), 1);
-    let on = deparse_expr(joins[0].predicate().unwrap());
+    let on = deparse_expr(join_on(joins[0]));
     assert!(on.contains("o.emp_id = e.id"), "first correlation: {on}");
     assert!(
         on.contains("o.status = e.status"),
@@ -383,7 +417,7 @@ fn test_exists_sets_distinct() {
     )
     .unwrap();
 
-    let select = as_select(&outcome.resolved);
+    let select = as_select(outcome.query.tree());
     assert!(select.distinct, "EXISTS decorrelation should set DISTINCT");
 }
 
@@ -418,7 +452,7 @@ fn test_not_exists_residual_in_on_clause() {
     let joins = select_joins(&select);
     assert_eq!(joins.len(), 1);
     assert_eq!(joins[0].join_type, JoinType::Left);
-    let on = deparse_expr(joins[0].predicate().unwrap());
+    let on = deparse_expr(join_on(joins[0]));
     assert!(on.contains("e.dept_id = d.id"), "correlation in ON: {on}");
     assert!(on.contains("e.status = 'active'"), "residual in ON: {on}");
     assert!(where_has_is_null(&select.where_clause));
@@ -434,7 +468,7 @@ fn test_not_exists_adds_is_null_check() {
     )
     .unwrap();
 
-    let select = as_select(&outcome.resolved);
+    let select = as_select(outcome.query.tree());
     assert!(
         where_has_is_null(&select.where_clause),
         "should have IS NULL in WHERE"
@@ -779,8 +813,8 @@ fn test_scalar_setop_unique_aliases() {
 
     assert!(outcome.transformed);
     // Extract both branches from the SetOp
-    let set_op = match &outcome.resolved.body {
-        ResolvedQueryBody::SetOp(s) => s,
+    let set_op = match &outcome.query.tree().body {
+        QueryBody::SetOp(s) => s,
         _ => panic!("expected SetOp"),
     };
     let left = as_select(&set_op.left);
@@ -821,7 +855,7 @@ fn test_in_single_correlation() {
     assert_eq!(joins.len(), 1);
     assert_eq!(joins[0].join_type, JoinType::Inner);
     assert!(select.distinct);
-    let on = deparse_expr(joins[0].predicate().unwrap());
+    let on = deparse_expr(join_on(joins[0]));
     assert!(on.contains("e.dept_id = d.id"), "IN predicate in ON: {on}");
     assert!(on.contains("d.name = e.name"), "correlation in ON: {on}");
 }
@@ -874,7 +908,7 @@ fn test_in_sets_distinct() {
     )
     .unwrap();
 
-    let select = as_select(&outcome.resolved);
+    let select = as_select(outcome.query.tree());
     assert!(select.distinct, "IN decorrelation should set DISTINCT");
 }
 
@@ -925,7 +959,7 @@ fn test_not_in_single_correlation() {
     assert_eq!(joins.len(), 1);
     assert_eq!(joins[0].join_type, JoinType::Left);
     assert!(where_has_is_null(&select.where_clause));
-    let on = deparse_expr(joins[0].predicate().unwrap());
+    let on = deparse_expr(join_on(joins[0]));
     assert!(on.contains("e.dept_id = d.id"), "IN predicate in ON: {on}");
     assert!(on.contains("d.name = e.name"), "correlation in ON: {on}");
 }
@@ -942,7 +976,7 @@ fn test_not_in_all_syntax() {
     .unwrap();
 
     assert!(outcome.transformed);
-    let select = as_select(&outcome.resolved);
+    let select = as_select(outcome.query.tree());
     let joins = select_joins(select);
     assert!(
         joins.iter().any(|j| j.join_type == JoinType::Left),
@@ -965,7 +999,7 @@ fn test_not_in_with_residual_in_on_clause() {
     assert_eq!(joins.len(), 1);
     assert_eq!(joins[0].join_type, JoinType::Left);
     // Residual should be in ON clause (not outer WHERE) for LEFT JOIN semantics
-    let on = deparse_expr(joins[0].predicate().unwrap());
+    let on = deparse_expr(join_on(joins[0]));
     assert!(
         on.contains("d.location = 'NYC'"),
         "residual in ON clause: {on}"
@@ -1004,7 +1038,7 @@ fn test_not_in_does_not_set_distinct() {
     )
     .unwrap();
 
-    let select = as_select(&outcome.resolved);
+    let select = as_select(outcome.query.tree());
     assert!(
         !select.distinct,
         "NOT IN decorrelation should NOT set DISTINCT"
@@ -1059,7 +1093,7 @@ fn test_non_correlated_not_in_unchanged() {
     .unwrap();
 
     assert!(!outcome.transformed);
-    let select = as_select(&outcome.resolved);
+    let select = as_select(outcome.query.tree());
     assert!(
         where_has_subquery(&select.where_clause),
         "non-correlated NOT IN should remain"
@@ -1106,7 +1140,7 @@ fn test_unchanged_cases() {
             !outcome.transformed,
             "{label}: should be left unchanged: {sql}"
         );
-        let select = as_select(&outcome.resolved);
+        let select = as_select(outcome.query.tree());
         assert_eq!(
             where_has_subquery(&select.where_clause),
             subquery_remains,

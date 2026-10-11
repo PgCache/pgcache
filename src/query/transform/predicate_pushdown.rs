@@ -585,4 +585,51 @@ mod tests {
              WHERE public.t1.b = 'x') sub"
         );
     }
+
+    /// Where a predicate lands: every branch of a pushable derived table,
+    /// AND-ed onto a branch's own WHERE with its columns restated per
+    /// branch; shapes whose result it would change keep the outer WHERE.
+    #[test]
+    fn test_pushdown_render_cases() {
+        let ab_ab = tables(&[("t1", &["a", "b"]), ("t2", &["a", "b"])]);
+        let ab_cd = tables(&[("t1", &["a", "b"]), ("t2", &["c", "d"])]);
+        let ab = tables(&[("t1", &["a", "b"])]);
+        #[rustfmt::skip]
+        let pushed: [(&str, &Catalog, &str, &str); 7] = [
+            ("both UNION branches",       &ab_ab, "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'",
+             "SELECT sub.a, sub.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.a = 'x' UNION ALL SELECT public.t2.a, public.t2.b FROM public.t2 WHERE public.t2.a = 'x') sub"),
+            ("columns remapped by position", &ab_cd, "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT c, d FROM t2) sub WHERE sub.a = 'x'",
+             "SELECT sub.a, sub.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.a = 'x' UNION ALL SELECT public.t2.c, public.t2.d FROM public.t2 WHERE public.t2.c = 'x') sub"),
+            ("existing WHERE AND-ed",     &ab_ab, "SELECT * FROM (SELECT a, b FROM t1 WHERE b = 'y' UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'",
+             "SELECT sub.a, sub.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.b = 'y' AND public.t1.a = 'x' UNION ALL SELECT public.t2.a, public.t2.b FROM public.t2 WHERE public.t2.a = 'x') sub"),
+            ("every conjunct",            &ab_ab, "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x' AND sub.b = 'y'",
+             "SELECT sub.a, sub.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.a = 'x' AND public.t1.b = 'y' UNION ALL SELECT public.t2.a, public.t2.b FROM public.t2 WHERE public.t2.a = 'x' AND public.t2.b = 'y') sub"),
+            ("plain derived table",       &ab,    "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a = 'x'",
+             "SELECT sub.a, sub.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.a = 'x') sub"),
+            ("literal columns beside",    &ab_ab, "SELECT * FROM (SELECT a, 'CONST' AS label, NULL AS extra FROM t1 UNION ALL SELECT a, 'OTHER' AS label, NULL AS extra FROM t2) sub WHERE sub.a = 'x'",
+             "SELECT sub.a, sub.label, sub.extra FROM (SELECT public.t1.a, 'CONST' AS label, NULL AS extra FROM public.t1 WHERE public.t1.a = 'x' UNION ALL SELECT public.t2.a, 'OTHER' AS label, NULL AS extra FROM public.t2 WHERE public.t2.a = 'x') sub"),
+            ("set-op branches recurse",   &ab_ab, "SELECT * FROM (SELECT a, b FROM t1) sub1 WHERE sub1.a = 'x' UNION ALL SELECT * FROM (SELECT a, b FROM t2) sub2 WHERE sub2.a = 'y'",
+             "SELECT sub1.a, sub1.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.a = 'x') sub1 UNION ALL SELECT sub2.a, sub2.b FROM (SELECT public.t2.a, public.t2.b FROM public.t2 WHERE public.t2.a = 'y') sub2"),
+        ];
+        for (label, catalog, sql, expected) in pushed {
+            let result = query_predicate_pushdown(&bound(sql, catalog))
+                .unwrap_or_else(|| panic!("{label}: expected a pushdown of {sql}"));
+            assert_eq!(result.sql(), expected, "{label}");
+        }
+        #[rustfmt::skip]
+        let kept: [(&str, &Catalog, &str); 6] = [
+            ("literal output column", &ab,    "SELECT * FROM (SELECT a, 42 AS val FROM t1) sub WHERE sub.val = 99"),
+            ("GROUP BY",              &ab,    "SELECT * FROM (SELECT a, count(b) AS cnt FROM t1 GROUP BY a) sub WHERE sub.a = 'x'"),
+            ("window function",       &ab,    "SELECT * FROM (SELECT a, row_number() OVER (ORDER BY b) AS rn FROM t1) sub WHERE sub.a = 'x'"),
+            ("no derived table",      &ab,    "SELECT a, b FROM t1 WHERE a = 'x'"),
+            ("subquery predicate",    &ab_ab, "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a IN (SELECT a FROM t2)"),
+            ("LIMIT in the branch",   &ab,    "SELECT * FROM (SELECT a, b FROM t1 LIMIT 10) sub WHERE sub.a = 'x'"),
+        ];
+        for (label, catalog, sql) in kept {
+            assert!(
+                query_predicate_pushdown(&bound(sql, catalog)).is_none(),
+                "{label}: {sql} keeps its WHERE"
+            );
+        }
+    }
 }

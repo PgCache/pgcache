@@ -248,14 +248,16 @@ fn optional_side(join: &ResolvedJoinNode) -> Option<&ResolvedTableSource> {
 mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
+    use std::sync::Arc;
+
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::{QueryBody, query_expr_parse};
-    use crate::query::resolved::select_node_resolve;
+    use crate::query::ast::query_expr_parse;
+    use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
 
     /// Create test table metadata with given column names.
     /// First column is the primary key (INT4), rest are TEXT.
@@ -283,20 +285,18 @@ mod tests {
         }
     }
 
-    /// Parse SQL and resolve the SELECT node using the given tables.
-    fn resolve_select(sql: &str, tables: &Catalog) -> ResolvedSelectNode {
-        let query_expr = query_expr_parse(sql).expect("convert");
-        let select = match query_expr.body {
-            QueryBody::Select(s) => s,
-            _ => panic!("expected SELECT"),
-        };
-        select_node_resolve(&select, tables, &["public"]).expect("resolve")
+    /// Parse and bind SQL over the given tables.
+    fn bind(sql: &str, tables: &Catalog) -> ResolvedQuery {
+        let query = Arc::new(query_expr_parse(sql).expect("convert"));
+        let (_, bindings) = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+        ResolvedQuery::new(query, bindings)
     }
 
     /// Terminal and non-terminal optional tables of `sql` over the standard
     /// terminality tables.
     fn terminality(sql: &str) -> (HashSet<EcoString>, HashSet<EcoString>) {
-        outer_join_optional_tables(&resolve_select(sql, &terminality_test_tables()))
+        let bound = bind(sql, &terminality_test_tables());
+        outer_join_optional_tables_bound(&bound, bound.select().expect("a SELECT"))
     }
 
     /// Create standard test tables for terminality tests:
@@ -437,8 +437,9 @@ mod tests {
     fn test_no_join_no_optional() {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(test_table("users", Oid::from_raw(1), &["id", "name"]).into());
-        let select = resolve_select("SELECT * FROM users WHERE id = 1", &tables);
-        let (terminal, non_terminal) = outer_join_optional_tables(&select);
+        let bound = bind("SELECT * FROM users WHERE id = 1", &tables);
+        let (terminal, non_terminal) =
+            outer_join_optional_tables_bound(&bound, bound.select().expect("a SELECT"));
         assert!(terminal.is_empty());
         assert!(non_terminal.is_empty());
     }

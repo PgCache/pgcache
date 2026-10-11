@@ -569,7 +569,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::{AstNode, Deparse, query_expr_parse};
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve, query_expr_resolve_bound};
+    use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
 
     fn events() -> Catalog {
         let column = |name: &str, position: i16, ty: Type| ColumnMetadata {
@@ -605,12 +605,12 @@ mod tests {
     }
 
     fn canon(sql: &str, settings: &LiteralSettings) -> (String, LiteralCanonOutcome) {
-        let query = query_expr_parse(sql).expect("parse");
-        let mut resolved = query_expr_resolve(&query, &events(), &["public"]).expect("resolve");
-        let outcome = resolved_literals_canonicalise(&mut resolved, settings);
-        let mut sql = String::new();
-        resolved.deparse(&mut sql);
-        (sql, outcome)
+        let mut query = query_expr_parse(sql).expect("parse");
+        let (_, bindings) =
+            query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
+        let outcome = query_literals_canonicalise(&mut query, &bindings, settings);
+        let bound = ResolvedQuery::new(Arc::new(query), bindings);
+        (bound.sql(), outcome)
     }
 
     /// Both passes over one query: the plain tree's literals in pre-order

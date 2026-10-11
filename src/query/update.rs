@@ -292,15 +292,24 @@ mod tests {
         tables
     }
 
-    /// Parse SQL, resolve, and call query_table_update_queries.
-    fn update_queries(sql: &str) -> Vec<(String, ResolvedQueryExpr, UpdateQuerySource)> {
+    /// Parse SQL, bind it, and derive the update queries as
+    /// `(table, update SQL, source)`.
+    fn update_queries(sql: &str) -> Vec<(String, String, UpdateQuerySource)> {
         let tables = test_tables();
         let cacheable = parse_cacheable(sql);
-        let resolved =
-            query_expr_resolve(cacheable.query(), &tables, &["public"]).expect("resolve");
-        query_table_update_queries(&resolved)
+        let query = Arc::new(cacheable.query().clone());
+        let (_, bindings) =
+            query_expr_resolve_bound(&query, &tables, &["public"]).expect("resolve");
+        let bound = ResolvedQuery::new(query, bindings);
+        query_table_update_queries_bound(&bound)
             .into_iter()
-            .map(|(t, q, s)| (t.name.to_string(), q, s))
+            .map(|update| {
+                (
+                    update.table.name.to_string(),
+                    update.bound.sql(),
+                    update.source,
+                )
+            })
             .collect()
     }
 
@@ -310,11 +319,8 @@ mod tests {
 
         assert_eq!(result.len(), 1);
 
-        let mut buf = String::new();
-        let new_sql = result[0].1.deparse(&mut buf);
-
         assert_eq!(
-            new_sql,
+            result[0].1,
             "SELECT true FROM public.users WHERE public.users.id = 1"
         );
     }
@@ -331,13 +337,8 @@ mod tests {
 
         let expected = "SELECT true FROM public.users JOIN public.location ON public.location.user_id = public.users.user_id WHERE public.users.user_id = 1";
 
-        let mut update1 = String::new();
-        result[0].1.deparse(&mut update1);
-        assert_eq!(update1, expected);
-
-        let mut update2 = String::new();
-        result[1].1.deparse(&mut update2);
-        assert_eq!(update2, expected);
+        assert_eq!(result[0].1, expected);
+        assert_eq!(result[1].1, expected);
     }
 
     #[test]
@@ -352,8 +353,7 @@ mod tests {
         assert_eq!(result.len(), 3, "Should have 3 update queries for 3 tables");
 
         // All three queries should produce the same SQL (the full join query with SELECT true)
-        let mut update1 = String::new();
-        result[0].1.deparse(&mut update1);
+        let update1 = &result[0].1;
         assert!(update1.contains("SELECT true"));
         assert!(update1.contains("JOIN"));
 
@@ -406,9 +406,7 @@ mod tests {
         assert!(table_names.contains(&"admins"));
 
         // Update queries should be branch-specific (no UNION)
-        for (table_name, query, _) in &result {
-            let mut sql = String::new();
-            query.deparse(&mut sql);
+        for (table_name, sql, _) in &result {
             assert!(
                 !sql.contains("UNION"),
                 "Update query for {table_name} should NOT contain UNION: {sql}",
@@ -440,9 +438,7 @@ mod tests {
         assert!(table_names.contains(&"c"));
 
         // Verify each update query is branch-specific (no UNION)
-        for (table_name, query, _) in &result {
-            let mut sql = String::new();
-            query.deparse(&mut sql);
+        for (table_name, sql, _) in &result {
             assert!(
                 !sql.contains("UNION"),
                 "Update query for {table_name} should NOT contain UNION: {sql}",
@@ -886,12 +882,15 @@ mod tests {
     fn test_bound_update_queries_match_resolved() {
         let tables = test_tables();
         for sql in BOUND_CORPUS {
-            let expected = update_queries(sql);
+            let cacheable = parse_cacheable(sql);
+            let resolved =
+                query_expr_resolve(cacheable.query(), &tables, &["public"]).expect("resolve");
+            let expected = query_table_update_queries(&resolved);
             let bound = bound(sql, &tables);
             let actual = query_table_update_queries_bound(&bound);
             assert_eq!(actual.len(), expected.len(), "{sql}");
-            for ((name, resolved, source), update) in expected.iter().zip(&actual) {
-                assert_eq!(update.table.name.as_str(), name, "{sql}");
+            for ((table, resolved, source), update) in expected.iter().zip(&actual) {
+                assert_eq!(update.table.name, table.name, "{sql}");
                 assert_eq!(update.source, *source, "{sql}");
                 let mut expected_sql = String::new();
                 resolved.deparse(&mut expected_sql);
