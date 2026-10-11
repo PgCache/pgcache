@@ -11,8 +11,7 @@ use crate::oid::Oid;
 use crate::pg::identifier_quote_into;
 use crate::pg::protocol::ByteString;
 use crate::query::Fingerprint;
-use crate::query::ast::Deparse;
-use crate::query::transform::resolved_select_node_table_replace_with_values_all;
+use crate::query::transform::membership_values_all_into;
 use crate::result::error_chain_format;
 
 /// Append `items` to `buf` separated by `sep`, each rendered by `render`.
@@ -253,22 +252,8 @@ impl WriterCdc {
         if pg_eval_template_render(buf, update_query, row_data) {
             return Ok(());
         }
-        let resolved_select = update_query
-            .resolved
-            .as_select()
-            .ok_or(CacheError::InvalidQuery)?;
-        let value_selects = resolved_select_node_table_replace_with_values_all(
-            resolved_select,
-            table_metadata,
-            row_data,
-        )
-        .map_err(|e| e.context_transform(CacheError::from))?;
-        separated_into(buf, " OR ", &value_selects, |buf, value_select| {
-            buf.push_str("EXISTS (");
-            Deparse::deparse(value_select, buf);
-            buf.push(')');
-        });
-        Ok(())
+        membership_values_all_into(buf, &update_query.bound, table_metadata, row_data)
+            .map_err(|e| e.context_transform(CacheError::from))
     }
 
     /// Append an unconditional upsert for `row_data` into `buf` —

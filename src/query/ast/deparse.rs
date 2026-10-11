@@ -43,9 +43,9 @@ pub enum Clause {
 /// What the walk asks its context at each reference. Every hook defaults
 /// to the node as written.
 pub trait DeparseContext: Sized {
-    /// `schema.name` of a table reference; the walk adds the alias.
-    fn table_name_deparse(&mut self, node: &TableNode, buf: &mut String) {
-        node.name_deparse_plain(buf);
+    /// A table reference in FROM, with its leading space and alias.
+    fn table_deparse(&mut self, node: &TableNode, buf: &mut String) {
+        node.deparse_plain(buf);
     }
 
     fn column_deparse(&mut self, node: &ColumnNode, buf: &mut String) {

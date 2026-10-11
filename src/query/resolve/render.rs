@@ -11,7 +11,8 @@ use std::hash::{Hash, Hasher};
 use ecow::EcoString;
 
 use super::bindings::{
-    Bindings, ColumnBinding, ColumnTarget, MergedColumnBinding, ResolvedQuery, StarItem, TableSlot,
+    Bindings, ColumnBinding, ColumnTarget, MergedColumnBinding, ResolvedQuery, SlotId, StarItem,
+    TableSlot,
 };
 use crate::oid::Oid;
 use crate::query::Fingerprint;
@@ -41,10 +42,23 @@ enum Mode {
     },
 }
 
+/// A FROM entry something else stands in for: the entry renders as
+/// `(<source>) alias(columns)` and every column bound to its slot as
+/// `alias.column`, so a CDC row can take a relation's place in its query.
+pub struct SourceOverride<'a> {
+    pub slot: SlotId,
+    pub alias: &'a str,
+    /// The derived table's text, without its parentheses.
+    pub source: &'a str,
+    /// The alias column list; empty when the source names its own columns.
+    pub columns: &'a [EcoString],
+}
+
 /// The context that renders a bound tree.
 struct Bound<'a> {
     bindings: &'a Bindings,
     mode: Mode,
+    source: Option<&'a SourceOverride<'a>>,
 }
 
 impl<'a> Bound<'a> {
@@ -52,6 +66,7 @@ impl<'a> Bound<'a> {
         Self {
             bindings,
             mode: Mode::Text,
+            source: None,
         }
     }
 
@@ -63,7 +78,21 @@ impl<'a> Bound<'a> {
                 predicate_depth: 0,
                 projection_depth: 0,
             },
+            source: None,
         }
+    }
+
+    fn with_source(bindings: &'a Bindings, source: &'a SourceOverride<'a>) -> Self {
+        Self {
+            bindings,
+            mode: Mode::Text,
+            source: Some(source),
+        }
+    }
+
+    /// The override for `slot`, when one stands in for it.
+    fn source_override(&self, slot: SlotId) -> Option<&'a SourceOverride<'a>> {
+        self.source.filter(|source| source.slot == slot)
     }
 
     fn slot_name_deparse(slot: &TableSlot, buf: &mut String) {
@@ -94,7 +123,12 @@ impl<'a> Bound<'a> {
             debug_assert!(false, "column binding without a slot or column");
             return;
         };
-        Self::slot_name_deparse(slot, buf);
+        match self.source_override(binding.slot) {
+            Some(source) => {
+                source.alias.deparse(buf);
+            }
+            None => Self::slot_name_deparse(slot, buf),
+        }
         buf.push('.');
         column.name.deparse(buf);
     }
@@ -136,21 +170,36 @@ impl<'a> Bound<'a> {
 }
 
 impl DeparseContext for Bound<'_> {
-    fn table_name_deparse(&mut self, node: &TableNode, buf: &mut String) {
-        match self
-            .bindings
-            .source(node.id)
-            .and_then(|slot| self.bindings.slot(slot))
-        {
+    fn table_deparse(&mut self, node: &TableNode, buf: &mut String) {
+        let Some(slot) = self.bindings.source(node.id) else {
+            debug_assert!(false, "table reference without a slot");
+            node.deparse_plain(buf);
+            return;
+        };
+        if let Some(source) = self.source_override(slot) {
+            buf.push_str(" (");
+            buf.push_str(source.source);
+            buf.push_str(") ");
+            source.alias.deparse(buf);
+            if !source.columns.is_empty() {
+                buf.push('(');
+                separated_deparse(buf, source.columns, ", ");
+                buf.push(')');
+            }
+            return;
+        }
+        match self.bindings.slot(slot) {
             Some(slot) => {
                 let table = slot.table();
+                buf.push(' ');
                 table.schema.deparse(buf);
                 buf.push('.');
                 table.name.deparse(buf);
+                node.alias_deparse(buf);
             }
             None => {
                 debug_assert!(false, "table reference without a slot");
-                node.name_deparse_plain(buf);
+                node.deparse_plain(buf);
             }
         }
     }
@@ -298,6 +347,21 @@ impl ResolvedQuery {
     /// them, for a caller composing its own SQL around parts of the tree.
     pub fn deparse_context(&self) -> impl DeparseContext + '_ {
         Bound::text(self.bindings())
+    }
+
+    /// [`ResolvedQuery::deparse_context`] with `source` standing in for one
+    /// FROM entry.
+    pub fn deparse_context_with_source<'a>(
+        &'a self,
+        source: &'a SourceOverride<'a>,
+    ) -> impl DeparseContext + 'a {
+        Bound::with_source(self.bindings(), source)
+    }
+
+    /// The serve SQL with `source` standing in for one FROM entry.
+    pub fn sql_with_source_into(&self, source: &SourceOverride<'_>, buf: &mut String) {
+        self.tree()
+            .deparse_with(&mut Bound::with_source(self.bindings(), source), buf);
     }
 
     /// Every column of the table a FROM entry names, as the cache serves

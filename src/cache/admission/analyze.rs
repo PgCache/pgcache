@@ -228,10 +228,8 @@ pub fn query_admission_analyze(
         // it; needs the relation's TableMetadata.
         let pg_eval_template =
             if depth == AdmissionDepth::Full && eval_strategy == UpdateEvalStrategy::PgEval {
-                update_resolved.as_select().and_then(|select| {
-                    tables
-                        .get1(&relation_oid)
-                        .and_then(|table_metadata| PgEvalTemplate::build(select, table_metadata))
+                tables.get1(&relation_oid).and_then(|table_metadata| {
+                    PgEvalTemplate::build(&bound_update.bound, table_metadata)
                 })
             } else {
                 None

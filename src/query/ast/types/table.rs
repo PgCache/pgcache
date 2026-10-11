@@ -183,24 +183,29 @@ impl AstNode for TableNode {
 }
 
 impl TableNode {
-    /// `schema.name` as written.
-    pub(crate) fn name_deparse_plain(&self, buf: &mut String) {
+    /// ` schema.name alias` as written.
+    pub(crate) fn deparse_plain(&self, buf: &mut String) {
+        buf.push(' ');
         if let Some(schema) = &self.schema {
             schema.deparse(buf);
             buf.push('.');
         }
         self.name.deparse(buf);
+        self.alias_deparse(buf);
+    }
+
+    /// ` alias`, when the reference carries one.
+    pub(crate) fn alias_deparse(&self, buf: &mut String) {
+        if let Some(alias) = &self.alias {
+            buf.push(' ');
+            alias.deparse(buf);
+        }
     }
 }
 
 impl DeparseWith for TableNode {
     fn deparse_with<C: DeparseContext>(&self, cx: &mut C, buf: &mut String) {
-        buf.push(' ');
-        cx.table_name_deparse(self, buf);
-        if let Some(alias) = &self.alias {
-            buf.push(' ');
-            alias.deparse(buf);
-        }
+        cx.table_deparse(self, buf);
     }
 }
 

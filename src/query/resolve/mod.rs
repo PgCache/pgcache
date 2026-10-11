@@ -29,3 +29,4 @@ pub use bindings::{
     StarItem, TableSlot,
 };
 pub use entry::{query_expr_resolve, query_expr_resolve_bound, select_node_resolve};
+pub use render::SourceOverride;

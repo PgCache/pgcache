@@ -19,11 +19,7 @@ use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
 use crate::query::Fingerprint;
-use crate::query::ast::Deparse;
-use crate::query::transform::{
-    resolved_select_node_table_replace_with_unnest,
-    resolved_select_node_table_replace_with_values_batch,
-};
+use crate::query::transform::{membership_batch_into, membership_unnest_into};
 use crate::result::error_chain_format;
 
 /// One membership-eval row: `(event index, row image)`.
@@ -238,14 +234,9 @@ impl WriterCdc {
             return Ok(statement.clone());
         }
         crate::metrics::handles().cdc.prepared_misses.increment(1);
-        let select = update_query
-            .resolved
-            .as_select()
-            .ok_or(CacheError::InvalidQuery)?;
-        let unnest_select = resolved_select_node_table_replace_with_unnest(select, table_metadata)
-            .map_err(|e| e.context_transform(CacheError::from))?;
         self.pg_eval_buf.clear();
-        Deparse::deparse(&unnest_select, &mut self.pg_eval_buf);
+        membership_unnest_into(&mut self.pg_eval_buf, &update_query.bound, table_metadata)
+            .map_err(|e| e.context_transform(CacheError::from))?;
         let statement = self
             .cache_eval_conn
             .prepare(&self.pg_eval_buf)
@@ -347,20 +338,16 @@ impl WriterCdc {
                 if ordinal > 0 {
                     self.pg_eval_buf.push_str(" UNION ALL ");
                 }
-                let select = update_query
-                    .resolved
-                    .as_select()
-                    .ok_or(CacheError::InvalidQuery)?;
                 // Ordinal is bounded by PG_EVAL_CHUNK (32): never wraps.
                 #[allow(clippy::cast_possible_wrap)]
-                let batch_select = resolved_select_node_table_replace_with_values_batch(
-                    select,
+                membership_batch_into(
+                    &mut self.pg_eval_buf,
+                    &update_query.bound,
                     table_metadata,
                     &chunk_rows,
                     ordinal as i64,
                 )
                 .map_err(|e| e.context_transform(CacheError::from))?;
-                Deparse::deparse(&batch_select, &mut self.pg_eval_buf);
             }
 
             let msgs = match self.cache_eval_conn.simple_query(&self.pg_eval_buf).await {

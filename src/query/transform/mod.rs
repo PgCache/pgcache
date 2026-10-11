@@ -26,8 +26,6 @@ error_set! {
         InvalidParameterValue { message: String },
         #[display("Unsupported binary format for OID {oid}")]
         UnsupportedBinaryFormat { oid: TypeOid },
-        #[display("Table {table} is re-opened under the same alias in a subquery")]
-        ShadowedTable { table: EcoString },
         #[display("Table {table} occurs more than once (self-join); a single-occurrence substitution is not a complete membership test")]
         MultipleOccurrences { table: EcoString },
     }
@@ -53,8 +51,7 @@ pub use pushdown::predicate_pushdown_apply;
 pub(crate) use pushdown::{where_expr_conjuncts_join, where_expr_conjuncts_split};
 pub use select_node::resolved_select_node_update_replace;
 pub use values::{
-    BATCH_IDX_COLUMN, PgEvalTemplate, TableOccurrence,
-    resolved_select_node_table_replace_with_unnest, resolved_select_node_table_replace_with_values,
-    resolved_select_node_table_replace_with_values_all,
-    resolved_select_node_table_replace_with_values_batch, table_occurrences_find,
+    BATCH_IDX_COLUMN, PgEvalTemplate, TableOccurrence, membership_batch_into,
+    membership_unnest_into, membership_values_all_into, membership_values_into,
+    table_occurrences_find,
 };

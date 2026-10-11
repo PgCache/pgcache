@@ -1,66 +1,60 @@
+//! CDC membership SQL: the query with the changed relation's FROM entry
+//! standing in for a `VALUES` row (or rows, or `unnest` parameters), so the
+//! cache DB answers whether the row belongs to the query's result. The entry
+//! and every reference bound to it render by a [`SourceOverride`] on the
+//! bound query; nothing is cloned or rewritten per row.
+
+use std::fmt::Write;
+
 use ecow::EcoString;
 use rootcause::Report;
 
 use super::{AstTransformError, AstTransformResult};
-use crate::cache::SubqueryKind;
 use crate::catalog::TableMetadata;
-use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
 use crate::query::ast::{
-    Deparse, LiteralValue, NodeId, TableAlias, ValuesClause, emit_escaped_string_literal,
+    Clause, Deparse, DeparseContext, LiteralValue, QueryBody, SelectNode, clause_deparse_with,
+    emit_escaped_string_literal, separated_deparse_with,
 };
-use crate::query::resolved::{
-    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
-    ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableSource, ResolvedTableSubqueryNode,
-};
-
-mod alias_rewrite;
-
-use alias_rewrite::resolved_select_node_alias_rewrite;
+use crate::query::resolve::{ResolvedQuery, SlotId, SourceOverride, TableSlot};
 
 /// Synthetic leading column carrying each batched row's ordinal through the
 /// membership query (PGC-241). Prefixed to avoid colliding with real columns.
 pub const BATCH_IDX_COLUMN: &str = "__pgc_idx";
 
-/// The FROM occurrence of the table being replaced by `VALUES`.
+/// A FROM occurrence of the relation being replaced: its slot is its
+/// identity, so a self-join's arms never clobber each other (PGC-256), and
+/// its qualifier (explicit alias, else the table name) names the stand-in.
+#[derive(Debug)]
 pub struct TableOccurrence {
-    /// `Some` iff the FROM entry carried an explicit alias. This is the
-    /// occurrence's *identity*: under a self-join the other occurrences share
-    /// `(schema, table)` and differ only here, so the rewrite keys on it to
-    /// avoid clobbering their references (PGC-256).
-    explicit_alias: Option<EcoString>,
-    /// Explicit alias, else the table name — what the `VALUES` subquery is
-    /// named, and what the rewritten references are qualified by.
-    effective_alias: EcoString,
+    slot: SlotId,
+    alias: EcoString,
 }
 
-/// Every FROM occurrence of `table_metadata`'s relation. A self-join yields one
-/// per arm; they are distinguished by their explicit alias (PGC-256).
+/// Every top-level FROM occurrence of `table_metadata`'s relation. A
+/// self-join yields one per arm.
 pub fn table_occurrences_find(
-    resolved: &ResolvedSelectNode,
+    bound: &ResolvedQuery,
     table_metadata: &TableMetadata,
 ) -> AstTransformResult<Vec<TableOccurrence>> {
+    let bindings = bound.bindings();
+    let Some(select) = top_select(bound) else {
+        return Err(Report::from(AstTransformError::MissingTable));
+    };
     let mut occurrences = Vec::new();
-    let mut frontier: Vec<&ResolvedTableSource> = resolved.from.iter().collect();
-    while let Some(cur) = frontier.pop() {
-        match cur {
-            ResolvedTableSource::Join(join) => {
-                frontier.push(&join.left);
-                frontier.push(&join.right);
-            }
-            ResolvedTableSource::Table(table)
-                if table.relation_oid == table_metadata.relation_oid =>
-            {
-                let explicit_alias = table.alias.as_deref().map(EcoString::from);
-                let effective_alias = explicit_alias
-                    .clone()
-                    .unwrap_or_else(|| EcoString::from(table_metadata.name.as_str()));
-                occurrences.push(TableOccurrence {
-                    explicit_alias,
-                    effective_alias,
-                });
-            }
-            ResolvedTableSource::Table(_) | ResolvedTableSource::Subquery(_) => (),
+    for table in select.direct_table_nodes() {
+        let Some(slot) = bindings.source(table.id) else {
+            continue;
+        };
+        if let Some(TableSlot::Base {
+            table: metadata, ..
+        }) = bindings.slot(slot)
+            && metadata.relation_oid == table_metadata.relation_oid
+        {
+            occurrences.push(TableOccurrence {
+                slot,
+                alias: EcoString::from(bindings.slot(slot).map_or("", |s| s.qualifier())),
+            });
         }
     }
     if occurrences.is_empty() {
@@ -70,56 +64,37 @@ pub fn table_occurrences_find(
 }
 
 /// The relation's sole FROM occurrence. Errors when it appears more than once —
-/// the callers that use this (the batch/unnest transforms and the prepared
+/// the callers that use this (the batch/unnest forms and the prepared
 /// `PgEvalTemplate`) all substitute a single occurrence, which is only a
 /// complete membership test when there *is* only one (PGC-256).
 fn table_occurrence_single(
-    resolved: &ResolvedSelectNode,
+    bound: &ResolvedQuery,
     table_metadata: &TableMetadata,
 ) -> AstTransformResult<TableOccurrence> {
-    let mut occurrences = table_occurrences_find(resolved, table_metadata)?;
+    let mut occurrences = table_occurrences_find(bound, table_metadata)?;
     if occurrences.len() > 1 {
         return Err(AstTransformError::MultipleOccurrences {
             table: EcoString::from(table_metadata.name.as_str()),
         }
         .into());
     }
-    Ok(occurrences.remove(0))
+    occurrences
+        .pop()
+        .ok_or_else(|| Report::from(AstTransformError::MissingTable))
 }
 
-/// Find the table source for `occurrence` in the FROM tree, mutably, for
-/// replacement. Matches on the occurrence's explicit alias, so a self-join
-/// replaces the intended arm rather than whichever one is found first.
-fn table_source_find_mut<'a>(
-    resolved: &'a mut ResolvedSelectNode,
-    relation_oid: Oid,
-    occurrence: &TableOccurrence,
-) -> AstTransformResult<&'a mut ResolvedTableSource> {
-    let mut frontier: Vec<&mut ResolvedTableSource> = resolved.from.iter_mut().collect();
-    let mut source_node: Option<&mut ResolvedTableSource> = None;
-    while let Some(cur) = frontier.pop() {
-        match cur {
-            ResolvedTableSource::Join(join) => {
-                frontier.push(&mut join.left);
-                frontier.push(&mut join.right);
-            }
-            ResolvedTableSource::Table(table)
-                if table.relation_oid == relation_oid
-                    && table.alias.as_deref() == occurrence.explicit_alias.as_deref() =>
-            {
-                source_node = Some(cur);
-                break;
-            }
-            ResolvedTableSource::Table(_) | ResolvedTableSource::Subquery(_) => (),
-        }
+/// The query's top-level SELECT; a membership query is never a set operation.
+fn top_select(bound: &ResolvedQuery) -> Option<&SelectNode> {
+    match &bound.tree().body {
+        QueryBody::Select(select) => Some(select),
+        QueryBody::SetOp(_) | QueryBody::Values(_) => None,
     }
-    source_node.ok_or_else(|| Report::from(AstTransformError::MissingTable))
 }
 
-/// One VALUES row's literals for `row_data`, in `table_metadata` column order,
-/// with per-column casts (NULLs carry the column type). Emits one literal per
-/// column position present in `row_data`; [`values_column_names`] yields the
-/// matching alias columns.
+/// One VALUES row's literals for `row_data`, in `table_metadata` column
+/// order, with per-column casts (NULLs carry the column type). Emits one
+/// literal per column position present in `row_data`;
+/// [`values_column_names`] yields the matching alias columns.
 fn values_row_build(
     table_metadata: &TableMetadata,
     row_data: &[Option<ByteString>],
@@ -152,87 +127,77 @@ fn values_column_names(
         .collect()
 }
 
-/// One membership-test query per FROM occurrence of `table_metadata`'s relation.
-///
-/// A row belongs to the query's result if it can stand in for **any** occurrence,
-/// so the caller must combine these disjunctively (`EXISTS(a) OR EXISTS(b)`).
-/// Testing a single arm of a self-join under-approximates membership and evicts
-/// rows the other arm still needs (PGC-256).
-pub fn resolved_select_node_table_replace_with_values_all(
-    resolved: &ResolvedSelectNode,
-    table_metadata: &TableMetadata,
-    row_data: &[Option<ByteString>],
-) -> AstTransformResult<Vec<ResolvedSelectNode>> {
-    table_occurrences_find(resolved, table_metadata)?
-        .iter()
-        .map(|occurrence| {
-            resolved_select_node_table_replace_with_values(
-                resolved,
-                table_metadata,
-                row_data,
-                occurrence,
-            )
-        })
-        .collect()
+/// `VALUES (…), (…)` over `rows`.
+fn values_source(rows: &[Vec<LiteralValue>]) -> String {
+    let mut source = String::with_capacity(64);
+    source.push_str("VALUES ");
+    let mut row_sep = "";
+    for row in rows {
+        source.push_str(row_sep);
+        source.push('(');
+        let mut sep = "";
+        for value in row {
+            source.push_str(sep);
+            value.deparse(&mut source);
+            sep = ", ";
+        }
+        source.push(')');
+        row_sep = ", ";
+    }
+    source
 }
 
-/// Replace one FROM occurrence of `table_metadata` with a single-row `VALUES`
-/// (the CDC row), aliased as that occurrence, so the query can be evaluated as
-/// an `EXISTS(...)` membership test for that row *standing in for that arm*.
-/// References belonging to the occurrence are rewritten to the alias; the other
-/// arms keep pointing at their real table entries.
-pub fn resolved_select_node_table_replace_with_values(
-    resolved: &ResolvedSelectNode,
+/// `EXISTS (…)` per FROM occurrence of the relation, OR'd: a row belongs to
+/// the result if it can stand in for **any** occurrence, so testing one arm
+/// of a self-join under-approximates membership (PGC-256).
+pub fn membership_values_all_into(
+    buf: &mut String,
+    bound: &ResolvedQuery,
+    table_metadata: &TableMetadata,
+    row_data: &[Option<ByteString>],
+) -> AstTransformResult<()> {
+    let mut sep = "";
+    for occurrence in table_occurrences_find(bound, table_metadata)? {
+        buf.push_str(sep);
+        buf.push_str("EXISTS (");
+        membership_values_into(buf, bound, table_metadata, row_data, &occurrence);
+        buf.push(')');
+        sep = " OR ";
+    }
+    Ok(())
+}
+
+/// The query with `occurrence` standing in for the single-row `VALUES` of
+/// `row_data`, aliased as that occurrence.
+pub fn membership_values_into(
+    buf: &mut String,
+    bound: &ResolvedQuery,
     table_metadata: &TableMetadata,
     row_data: &[Option<ByteString>],
     occurrence: &TableOccurrence,
-) -> AstTransformResult<ResolvedSelectNode> {
-    let mut resolved_new = resolved.clone();
-
-    // Update all column references for this occurrence to use the alias
-    resolved_select_node_alias_rewrite(
-        &mut resolved_new,
-        &table_metadata.schema,
-        &table_metadata.name,
-        occurrence,
-    )?;
-
-    let source_node =
-        table_source_find_mut(&mut resolved_new, table_metadata.relation_oid, occurrence)?;
-
-    // Build VALUES clause from row_data and collect column names
-    let column_names = values_column_names(table_metadata, row_data);
-    let values = values_row_build(table_metadata, row_data);
-
-    *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
-        query: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::Values(ValuesClause {
-                id: NodeId::PENDING,
-                rows: vec![values],
-            }),
-            order_by: vec![],
-            limit: None,
-        }),
-        alias: TableAlias {
-            name: occurrence.effective_alias.clone(),
-            columns: column_names,
+) {
+    let source = values_source(&[values_row_build(table_metadata, row_data)]);
+    let columns = values_column_names(table_metadata, row_data);
+    bound.sql_with_source_into(
+        &SourceOverride {
+            slot: occurrence.slot,
+            alias: &occurrence.alias,
+            source: &source,
+            columns: &columns,
         },
-        subquery_kind: SubqueryKind::Inclusion,
-    });
-
-    Ok(resolved_new)
+        buf,
+    );
 }
 
-/// Marker literal injected into the template's `VALUES` row so the deparsed SQL
-/// can be split into the fixed prefix/suffix around the per-row literals. Chosen
-/// to be unique and escape-free, so it deparses to a plain `'…'` literal.
+/// Marker literal rendered into the template's `VALUES` row so the SQL can
+/// be split into the fixed prefix/suffix around the per-row literals. Chosen
+/// to be unique and escape-free, so it renders as a plain `'…'` literal.
 const PG_EVAL_SENTINEL: &str = "__pgc_values_sentinel__";
 
-/// Precomputed deparse of a PgEval membership query with the CDC'd table already
-/// replaced by a `VALUES` subquery, split so only the per-row literals remain to
-/// render (PGC-343). Built once at registration; the hot path writes
-/// `prefix` + the row's literals + `suffix` into the reused eval buffer, skipping
-/// the per-row `resolved.clone()` + alias-walk + deparse.
+/// A PgEval membership query rendered once with the CDC'd relation already
+/// standing in as a `VALUES` row, split so only the per-row literals remain
+/// to render (PGC-343). The hot path writes `prefix` + the row's literals +
+/// `suffix` into the reused eval buffer.
 #[derive(Debug, Clone)]
 pub struct PgEvalTemplate {
     prefix: EcoString,
@@ -245,46 +210,28 @@ pub struct PgEvalTemplate {
 
 impl PgEvalTemplate {
     /// Build the template for one PgEval query over `table_metadata`, or `None`
-    /// if the query shape isn't a substitutable select or the sentinel split is
-    /// ambiguous — the caller then falls back to the per-row clone-and-deparse.
-    pub fn build(resolved: &ResolvedSelectNode, table_metadata: &TableMetadata) -> Option<Self> {
-        let mut template = resolved.clone();
-        let occurrence = table_occurrence_single(&template, table_metadata).ok()?;
-        resolved_select_node_alias_rewrite(
-            &mut template,
-            &table_metadata.schema,
-            &table_metadata.name,
-            &occurrence,
-        )
-        .ok()?;
-        let source_node =
-            table_source_find_mut(&mut template, table_metadata.relation_oid, &occurrence).ok()?;
-
-        let column_names: Vec<EcoString> = table_metadata
+    /// if the relation does not occur exactly once or the sentinel split is
+    /// ambiguous — the caller then falls back to the per-row render.
+    pub fn build(bound: &ResolvedQuery, table_metadata: &TableMetadata) -> Option<Self> {
+        let occurrence = table_occurrence_single(bound, table_metadata).ok()?;
+        let columns: Vec<EcoString> = table_metadata
             .columns
             .iter()
             .map(|c| EcoString::from(c.name.as_str()))
             .collect();
-        *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
-            query: Box::new(ResolvedQueryExpr {
-                body: ResolvedQueryBody::Values(ValuesClause {
-                    id: NodeId::PENDING,
-                    rows: vec![vec![LiteralValue::String(EcoString::from(
-                        PG_EVAL_SENTINEL,
-                    ))]],
-                }),
-                order_by: vec![],
-                limit: None,
-            }),
-            alias: TableAlias {
-                name: occurrence.effective_alias.clone(),
-                columns: column_names,
-            },
-            subquery_kind: SubqueryKind::Inclusion,
-        });
-
+        let source = values_source(&[vec![LiteralValue::String(EcoString::from(
+            PG_EVAL_SENTINEL,
+        ))]]);
         let mut sql = String::new();
-        Deparse::deparse(&template, &mut sql);
+        bound.sql_with_source_into(
+            &SourceOverride {
+                slot: occurrence.slot,
+                alias: &occurrence.alias,
+                source: &source,
+                columns: &columns,
+            },
+            &mut sql,
+        );
 
         let mut needle = String::new();
         emit_escaped_string_literal(PG_EVAL_SENTINEL, &mut needle);
@@ -292,7 +239,6 @@ impl PgEvalTemplate {
             return None;
         }
         let (prefix, suffix) = sql.split_once(needle.as_str())?;
-
         Some(Self {
             prefix: EcoString::from(prefix),
             suffix: EcoString::from(suffix),
@@ -304,10 +250,10 @@ impl PgEvalTemplate {
         })
     }
 
-    /// Render this query's membership SELECT for `row_data` into `buf`, matching
-    /// `resolved_select_node_table_replace_with_values` + deparse byte-for-byte.
-    /// Returns `false` without touching `buf` when `row_data` doesn't cover every
-    /// column (a short/partial CDC row), so the caller falls back.
+    /// Render this query's membership SELECT for `row_data` into `buf`,
+    /// matching [`membership_values_into`] byte for byte. Returns `false`
+    /// without touching `buf` when `row_data` doesn't cover every column (a
+    /// short/partial CDC row), so the caller falls back.
     pub fn render_into(&self, buf: &mut String, row_data: &[Option<ByteString>]) -> bool {
         // Every column must be present before any write, so a short row falls
         // back cleanly (no partial output left in `buf`).
@@ -323,7 +269,7 @@ impl PgEvalTemplate {
         for (idx, type_name) in &self.columns {
             buf.push_str(sep);
             // Mirror `values_row_build`'s `StringWithCast` / `NullWithCast`
-            // deparse. `Some(_)` is guaranteed by the guard above; a missing
+            // rendering. `Some(_)` is guaranteed by the guard above; a missing
             // slot renders `NULL` rather than panicking.
             match row_data.get(*idx).and_then(Option::as_ref) {
                 Some(value) => {
@@ -343,41 +289,77 @@ impl PgEvalTemplate {
     }
 }
 
-/// Multi-row variant of [`resolved_select_node_table_replace_with_values`]
-/// for batched membership evaluation (PGC-241): the table source becomes a
-/// K-row `VALUES` where each row is prefixed with its ordinal in a synthetic
-/// [`BATCH_IDX_COLUMN`], and the projection is replaced with
-/// `SELECT <ord>, <BATCH_IDX_COLUMN>` so a `UNION ALL` of per-query arms
-/// returns the matching `(query ordinal, row index)` pairs in one statement.
+/// `SELECT <projection>` over the top-level SELECT's FROM, WHERE, GROUP BY
+/// and HAVING with `occurrence` standing in for `source`.
+fn membership_select_into(
+    buf: &mut String,
+    bound: &ResolvedQuery,
+    occurrence: &TableOccurrence,
+    source: &str,
+    columns: &[EcoString],
+    projection: &str,
+) -> AstTransformResult<()> {
+    let select = top_select(bound).ok_or_else(|| Report::from(AstTransformError::MissingTable))?;
+    let override_ = SourceOverride {
+        slot: occurrence.slot,
+        alias: &occurrence.alias,
+        source,
+        columns,
+    };
+    let mut cx = bound.deparse_context_with_source(&override_);
+    buf.push_str("SELECT ");
+    buf.push_str(projection);
+    if !select.from.is_empty() {
+        cx.clause_enter(Clause::From);
+        buf.push_str(" FROM");
+        separated_deparse_with(&mut cx, buf, &select.from, ",");
+        cx.clause_leave(Clause::From);
+    }
+    clause_deparse_with(
+        &mut cx,
+        buf,
+        Clause::Where,
+        " WHERE ",
+        select.where_clause.as_ref(),
+    );
+    if !select.group_by.is_empty() {
+        cx.clause_enter(Clause::GroupBy);
+        buf.push_str(" GROUP BY ");
+        separated_deparse_with(&mut cx, buf, &select.group_by, ", ");
+        cx.clause_leave(Clause::GroupBy);
+    }
+    clause_deparse_with(
+        &mut cx,
+        buf,
+        Clause::Having,
+        " HAVING ",
+        select.having.as_ref(),
+    );
+    Ok(())
+}
+
+/// Multi-row membership for batched evaluation (PGC-241): the relation's sole
+/// occurrence becomes a K-row `VALUES`, each row prefixed with its ordinal in
+/// a synthetic [`BATCH_IDX_COLUMN`], projected as `<query ordinal>,
+/// <BATCH_IDX_COLUMN>` so a `UNION ALL` of per-query arms returns the
+/// matching `(query ordinal, row index)` pairs in one statement.
 ///
 /// Only valid for queries whose membership is per-row independent
 /// (`UpdateQuery::pg_batchable`): each VALUES row joins/filters independently,
 /// so projecting the surviving indexes is exactly the per-row `EXISTS` answer.
-pub fn resolved_select_node_table_replace_with_values_batch(
-    resolved: &ResolvedSelectNode,
+pub fn membership_batch_into(
+    buf: &mut String,
+    bound: &ResolvedQuery,
     table_metadata: &TableMetadata,
     rows: &[&[Option<ByteString>]],
     query_ordinal: i64,
-) -> AstTransformResult<ResolvedSelectNode> {
-    let mut resolved_new = resolved.clone();
-
-    let occurrence = table_occurrence_single(&resolved_new, table_metadata)?;
-
-    resolved_select_node_alias_rewrite(
-        &mut resolved_new,
-        &table_metadata.schema,
-        &table_metadata.name,
-        &occurrence,
-    )?;
-
-    let source_node =
-        table_source_find_mut(&mut resolved_new, table_metadata.relation_oid, &occurrence)?;
-
+) -> AstTransformResult<()> {
+    let occurrence = table_occurrence_single(bound, table_metadata)?;
     // Batch rows are uniform full-width (the caller filters odd-arity rows
     // out), so the alias columns are the relation's full column list.
-    let mut column_names: Vec<EcoString> = Vec::with_capacity(table_metadata.columns.len() + 1);
-    column_names.push(EcoString::from(BATCH_IDX_COLUMN));
-    column_names.extend(
+    let mut columns: Vec<EcoString> = Vec::with_capacity(table_metadata.columns.len() + 1);
+    columns.push(EcoString::from(BATCH_IDX_COLUMN));
+    columns.extend(
         table_metadata
             .columns
             .iter()
@@ -391,44 +373,13 @@ pub fn resolved_select_node_table_replace_with_values_batch(
         values.extend(values_row_build(table_metadata, row_data));
         value_rows.push(values);
     }
-
-    *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
-        query: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::Values(ValuesClause {
-                id: NodeId::PENDING,
-                rows: value_rows,
-            }),
-            order_by: vec![],
-            limit: None,
-        }),
-        alias: TableAlias {
-            name: occurrence.effective_alias.clone(),
-            columns: column_names,
-        },
-        subquery_kind: SubqueryKind::Inclusion,
-    });
-
-    // Replace the projection with `(query ordinal, row index)`: membership for
-    // a batchable query is "which VALUES rows survive the joins/filters", and
-    // the ordinal tags this arm's hits within a UNION ALL chunk. The original
-    // projection carries no membership semantics for batchable shapes (no
-    // aggregates / GROUP BY / HAVING by classification).
-    resolved_new.columns = ResolvedSelectColumns::Columns(vec![
-        ResolvedSelectColumn {
-            expr: ResolvedScalarExpr::Literal(LiteralValue::Integer(query_ordinal)),
-            alias: None,
-        },
-        ResolvedSelectColumn {
-            expr: ResolvedScalarExpr::Identifier(EcoString::from(BATCH_IDX_COLUMN)),
-            alias: None,
-        },
-    ]);
-
-    Ok(resolved_new)
+    let source = values_source(&value_rows);
+    let projection = format!("{query_ordinal}, {BATCH_IDX_COLUMN}");
+    membership_select_into(buf, bound, &occurrence, &source, &columns, &projection)
 }
 
-/// Prepared-statement variant of the batch transform (PGC-241 stage 4): the
-/// table source becomes a from-less subselect of `unnest()` calls over array
+/// Prepared-statement membership (PGC-241 stage 4): the relation's sole
+/// occurrence becomes a from-less subselect of `unnest()` calls over array
 /// parameters, so the SQL shape is fixed regardless of row count and the
 /// statement can be prepared once per query and reused across frames:
 ///
@@ -443,930 +394,360 @@ pub fn resolved_select_node_table_replace_with_values_batch(
 /// happens server-side exactly as the inlined literals' casts do. Multiple
 /// set-returning `unnest`s in a select list expand in lockstep for equal-length
 /// arrays. The projection is the surviving row ordinals.
-///
-/// The resolved AST has no FROM-function node, so the `unnest` expressions ride
-/// in [`LiteralValue::Parameter`], which deparses verbatim.
-pub fn resolved_select_node_table_replace_with_unnest(
-    resolved: &ResolvedSelectNode,
+pub fn membership_unnest_into(
+    buf: &mut String,
+    bound: &ResolvedQuery,
     table_metadata: &TableMetadata,
-) -> AstTransformResult<ResolvedSelectNode> {
-    let mut resolved_new = resolved.clone();
-
-    let occurrence = table_occurrence_single(&resolved_new, table_metadata)?;
-
-    resolved_select_node_alias_rewrite(
-        &mut resolved_new,
-        &table_metadata.schema,
-        &table_metadata.name,
-        &occurrence,
-    )?;
-
-    let source_node =
-        table_source_find_mut(&mut resolved_new, table_metadata.relation_oid, &occurrence)?;
-
-    let mut unnest_columns = Vec::with_capacity(table_metadata.columns.len() + 1);
-    unnest_columns.push(ResolvedSelectColumn {
-        expr: ResolvedScalarExpr::Literal(LiteralValue::Parameter(EcoString::from(
-            "unnest($1::int4[])",
-        ))),
-        alias: Some(EcoString::from(BATCH_IDX_COLUMN)),
-    });
+) -> AstTransformResult<()> {
+    let occurrence = table_occurrence_single(bound, table_metadata)?;
+    let mut source = String::with_capacity(64 + table_metadata.columns.len() * 32);
+    let _ = write!(source, "SELECT unnest($1::int4[]) AS {BATCH_IDX_COLUMN}");
     for (i, column_meta) in table_metadata.columns.iter().enumerate() {
-        unnest_columns.push(ResolvedSelectColumn {
-            expr: ResolvedScalarExpr::Literal(LiteralValue::Parameter(EcoString::from(format!(
-                "unnest(${}::text[])::{}",
-                i + 2,
-                column_meta.type_name
-            )))),
-            alias: Some(EcoString::from(column_meta.name.as_str())),
-        });
+        let _ = write!(
+            source,
+            ", unnest(${}::text[])::{} AS ",
+            i + 2,
+            column_meta.type_name
+        );
+        column_meta.name.deparse(&mut source);
     }
-
-    *source_node = ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
-        query: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::Select(Box::new(ResolvedSelectNode {
-                columns: ResolvedSelectColumns::Columns(unnest_columns),
-                ..Default::default()
-            })),
-            order_by: vec![],
-            limit: None,
-        }),
-        // Column names flow from the inner select aliases; a bare table alias
-        // keeps refs like `<alias>.<col>` resolving.
-        alias: TableAlias {
-            name: occurrence.effective_alias.clone(),
-            columns: vec![],
-        },
-        subquery_kind: SubqueryKind::Inclusion,
-    });
-
-    resolved_new.columns = ResolvedSelectColumns::Columns(vec![ResolvedSelectColumn {
-        expr: ResolvedScalarExpr::Identifier(EcoString::from(BATCH_IDX_COLUMN)),
-        alias: None,
-    }]);
-
-    Ok(resolved_new)
+    // Column names flow from the inner select's aliases; a bare table alias
+    // keeps references like `<alias>.<col>` resolving.
+    membership_select_into(buf, bound, &occurrence, &source, &[], BATCH_IDX_COLUMN)
 }
 
 #[cfg(test)]
 mod tests {
-    /// Substitute the relation's sole FROM occurrence. Every test below uses a
-    /// query where the table appears once; self-join coverage lives in the
-    /// `cache_test` integration suite.
-    fn replace_single(
-        resolved: &ResolvedSelectNode,
-        table_metadata: &TableMetadata,
-        row_data: &[Option<ByteString>],
-    ) -> AstTransformResult<ResolvedSelectNode> {
-        let occurrence = table_occurrence_single(resolved, table_metadata)?;
-        resolved_select_node_table_replace_with_values(
-            resolved,
-            table_metadata,
-            row_data,
-            &occurrence,
-        )
-    }
+    use std::sync::Arc;
 
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
-    use crate::oid::TypeOid;
-    use crate::query::ast::{
-        BinaryOp, Deparse, JoinType, LiteralValue, QueryBody, query_expr_parse,
-    };
-    use crate::query::resolve::select_node_resolve;
-    use crate::query::resolved::{
-        ResolvedBinaryExpr, ResolvedColumnNode, ResolvedJoinNode, ResolvedJoinQual,
-        ResolvedSelectColumn, ResolvedTableNode, ResolvedTableSource, ResolvedWhereExpr,
-    };
-    use crate::query::transform::AstTransformError;
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore};
+    use crate::oid::{Oid, TypeOid};
+    use crate::query::ast::query_expr_parse;
+    use crate::query::resolve::query_expr_resolve_bound;
 
-    fn column_metadata(name: &str, position: i16, type_name: &str) -> ColumnMetadata {
+    fn column_metadata(name: &str, index: usize, type_name: &str) -> ColumnMetadata {
         let (type_oid, data_type) = match type_name {
             "int4" => (TypeOid::from_type(&Type::INT4), Type::INT4),
             _ => (TypeOid::from_type(&Type::TEXT), Type::TEXT),
         };
         ColumnMetadata {
             name: name.into(),
-            position: ColumnPosition::from_raw(position),
+            position: ColumnPosition::from_index(index).expect("column position in range"),
             type_oid,
             data_type,
             type_name: type_name.into(),
             cache_type_name: type_name.into(),
-            is_primary_key: position == 1,
+            is_primary_key: index == 0,
         }
     }
 
-    fn table_metadata(name: &str, oid: Oid, cols: &[(&str, &str)]) -> TableMetadata {
-        let columns =
-            ColumnStore::new(cols.iter().enumerate().map(|(i, &(col_name, type_name))| {
-                column_metadata(
-                    col_name,
-                    i16::try_from(i + 1).expect("column position fits in i16"),
-                    type_name,
-                )
-            }));
+    fn table_metadata(name: &str, oid: u32, cols: &[(&str, &str)]) -> TableMetadata {
+        let columns = ColumnStore::new(
+            cols.iter()
+                .enumerate()
+                .map(|(i, (name, type_name))| column_metadata(name, i, type_name)),
+        );
         TableMetadata {
             replica_identity_full: false,
-            relation_oid: oid,
+            relation_oid: Oid::from_raw(oid),
             name: name.into(),
             schema: "public".into(),
-            primary_key_columns: vec![cols.first().expect("at least one column").0.into()],
+            primary_key_columns: vec![cols[0].0.into()],
             columns,
             indexes: Vec::new(),
         }
     }
 
-    fn resolved_table(name: &str, oid: Oid, alias: Option<&str>) -> ResolvedTableSource {
-        ResolvedTableSource::Table(ResolvedTableNode {
-            schema: "public".into(),
-            name: name.into(),
-            alias: alias.map(|a| a.into()),
-            relation_oid: oid,
-        })
-    }
-
-    fn resolved_column(table: &str, column: &str, col_meta: ColumnMetadata) -> ResolvedColumnNode {
-        ResolvedColumnNode {
-            schema: "public".into(),
-            table: table.into(),
-            table_alias: None,
-            column: column.into(),
-            column_metadata: col_meta,
+    fn catalog(tables: &[&TableMetadata]) -> Catalog {
+        let mut catalog = BiHashMap::new();
+        for table in tables {
+            catalog.insert_overwrite((*table).clone().into());
         }
+        catalog
     }
 
-    /// Build a minimal SELECT node: `SELECT columns FROM table_source WHERE where_clause`
-    fn select_node(
-        from: Vec<ResolvedTableSource>,
-        columns: ResolvedSelectColumns,
-        where_clause: Option<ResolvedWhereExpr>,
-    ) -> ResolvedSelectNode {
-        ResolvedSelectNode {
-            from,
-            columns,
-            where_clause,
-            ..Default::default()
-        }
+    fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
+        let query = Arc::new(query_expr_parse(sql).expect("parse"));
+        let (_, bindings) =
+            query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
+        ResolvedQuery::new(query, bindings)
     }
 
-    /// PGC-139: when a join's CDC'd table is swapped for a VALUES
-    /// subquery, refs to it in the JOIN ON condition must use the
-    /// subquery alias. A surviving schema-qualified `public.j1_tbl.col`
-    /// dangles against the aliased FROM entry and Postgres rejects it
-    /// with "invalid reference to FROM-clause entry".
+    fn row(values: &[Option<&str>]) -> Vec<Option<ByteString>> {
+        values.iter().map(|v| v.map(Into::into)).collect()
+    }
+
+    /// The single-occurrence membership SQL for `row_data`.
+    fn membership(
+        sql: &str,
+        table: &TableMetadata,
+        catalog: &Catalog,
+        row_data: &[Option<ByteString>],
+    ) -> String {
+        let bound = bound(sql, catalog);
+        let occurrence = table_occurrence_single(&bound, table).expect("one occurrence");
+        let mut buf = String::new();
+        membership_values_into(&mut buf, &bound, table, row_data, &occurrence);
+        buf
+    }
+
+    fn users() -> TableMetadata {
+        table_metadata("users", 100, &[("id", "int4"), ("name", "text")])
+    }
+
     #[test]
-    fn test_join_on_condition_uses_subquery_alias() {
-        let cols = &[
-            ("i", "int4"),
-            ("j", "int4"),
-            ("t", "text"),
-            ("j1_pk", "int4"),
-        ];
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("j1_tbl", Oid::from_raw(5001), cols).into());
-        tables.insert_overwrite(
-            table_metadata(
-                "j2_tbl",
-                Oid::from_raw(5002),
-                &[("i", "int4"), ("k", "int4"), ("j2_pk", "int4")],
-            )
-            .into(),
+    fn test_table_stands_in_as_values_with_casts_and_alias_columns() {
+        let users = users();
+        let catalog = catalog(&[&users]);
+        assert_eq!(
+            membership(
+                "SELECT name FROM users WHERE id = 1",
+                &users,
+                &catalog,
+                &row(&[Some("42"), Some("alice")])
+            ),
+            "SELECT users.name FROM (VALUES ('42'::int4, 'alice'::text)) users(id, name) WHERE users.id = 1"
         );
-        let j1 = table_metadata("j1_tbl", Oid::from_raw(5001), cols);
-        let row = vec![
-            Some("1".into()),
-            Some("4".into()),
-            Some("one".into()),
-            Some("1".into()),
-        ];
-
-        let qe = query_expr_parse("SELECT * FROM j1_tbl JOIN j2_tbl ON (j1_tbl.i = j2_tbl.i)")
-            .expect("convert");
-        let QueryBody::Select(node) = qe.body else {
-            panic!("expected SELECT");
-        };
-        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = replace_single(&resolved, &j1, &row).expect("replace");
-        let mut sql = String::new();
-        Deparse::deparse(&replaced, &mut sql);
-
-        assert!(
-            sql.contains("ON j1_tbl.i = "),
-            "ON condition must reference the subquery alias; got: {sql}"
+        // NULLs keep their column's cast; a short row only names the columns it has.
+        assert_eq!(
+            membership(
+                "SELECT name FROM users",
+                &users,
+                &catalog,
+                &row(&[Some("1"), None])
+            ),
+            "SELECT users.name FROM (VALUES ('1'::int4, NULL::text)) users(id, name)"
         );
-        assert!(
-            !sql.contains("public.j1_tbl"),
-            "no dangling schema-qualified ref to the replaced table; got: {sql}"
+        assert_eq!(
+            membership(
+                "SELECT u.name FROM users u WHERE u.id = 1",
+                &users,
+                &catalog,
+                &row(&[Some("1")])
+            ),
+            "SELECT u.name FROM (VALUES ('1'::int4)) u(id) WHERE u.id = 1"
         );
     }
 
-    /// PGC-145: GROUP BY / HAVING refs to the CDC'd table must also use
-    /// the VALUES-subquery alias (same omission class as PGC-139). A
-    /// surviving `public.onek.col` in GROUP BY/HAVING dangles against
-    /// the aliased FROM entry → "invalid reference to FROM-clause
-    /// entry" → writer crash on insert.
+    /// PGC-139 / PGC-145: references in JOIN ON, GROUP BY and HAVING follow
+    /// the stand-in's alias like the select list and WHERE do; a surviving
+    /// `public.table.col` would dangle against the aliased entry.
     #[test]
-    fn test_group_by_having_uses_subquery_alias() {
-        let cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), cols).into());
-        let onek = table_metadata("onek", Oid::from_raw(6001), cols);
-        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
-
-        let qe = query_expr_parse(
-            "SELECT ten, count(*) FILTER (WHERE odd = 1) AS c FROM onek \
-             GROUP BY ten HAVING count(*) > 0",
-        )
-        .expect("convert");
-        let QueryBody::Select(node) = qe.body else {
-            panic!("expected SELECT");
-        };
-        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = replace_single(&resolved, &onek, &row).expect("replace");
-        let mut sql = String::new();
-        Deparse::deparse(&replaced, &mut sql);
-
-        assert!(
-            sql.contains("GROUP BY onek.ten"),
-            "GROUP BY must reference the subquery alias; got: {sql}"
+    fn test_every_clause_references_the_stand_in() {
+        let j1 = table_metadata("j1_tbl", 5001, &[("i", "int4"), ("j", "int4")]);
+        let j2 = table_metadata("j2_tbl", 5002, &[("i", "int4"), ("k", "int4")]);
+        let catalog = catalog(&[&j1, &j2]);
+        let sql = membership(
+            "SELECT j1_tbl.j, count(*) FILTER (WHERE j2_tbl.k = 1) AS c FROM j1_tbl \
+             JOIN j2_tbl ON j1_tbl.i = j2_tbl.i WHERE j1_tbl.j > 0 GROUP BY j1_tbl.j HAVING count(*) > 0",
+            &j1,
+            &catalog,
+            &row(&[Some("1"), Some("4")]),
         );
-        assert!(
-            !sql.contains("public.onek"),
-            "no dangling schema-qualified ref to the replaced table; got: {sql}"
+        assert_eq!(
+            sql,
+            "SELECT j1_tbl.j, count(*) FILTER (WHERE public.j2_tbl.k = 1) AS c FROM \
+             (VALUES ('1'::int4, '4'::int4)) j1_tbl(i, j) JOIN public.j2_tbl ON j1_tbl.i = public.j2_tbl.i \
+             WHERE j1_tbl.j > 0 GROUP BY j1_tbl.j HAVING count(*) > 0"
         );
     }
 
-    // ==================== Nested-subquery scope characterization ====================
-    //
-    // The replaced table is always a *top-level* FROM entry, so references to
-    // it inside a nested subquery are correlated outer-references. The current
-    // alias rewrite is asymmetric by depth: the top-level handler covers
-    // WHERE/columns/GROUP BY/HAVING/JOIN-ON, but the nested-subquery handler
-    // covers only WHERE/columns/ORDER BY. The three tests below pin that
-    // asymmetry; the GROUP BY/HAVING/JOIN-ON gaps are the PGC-139/145 failure
-    // class one scope deeper, deferred to PGC-322 (the resolution there must
-    // also weigh that a name-based rewrite can mis-touch a shadowing inner
-    // instance of the same table). When PGC-322 lands, the two "gap" tests
-    // flip from `contains` to `!contains` deliberately.
-
-    /// CURRENT behavior: a correlated reference to the CDC'd table inside a
-    /// nested subquery's WHERE *is* rewritten to the VALUES-subquery alias.
+    /// A correlated reference to the stand-in inside a nested subquery
+    /// follows it too, wherever it sits; an inner occurrence of the same
+    /// table, under its own alias or even the same one, keeps its own
+    /// binding (PGC-256).
     #[test]
-    fn test_nested_subquery_where_correlated_ref_rewritten() {
-        let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
-        let dept_cols = &[("k", "int4"), ("v", "int4")];
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols).into());
-        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols).into());
-        let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
-        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
-
-        let qe = query_expr_parse(
-            "SELECT unique1 FROM onek WHERE EXISTS \
-             (SELECT 1 FROM dept WHERE dept.k = onek.ten)",
-        )
-        .expect("convert");
-        let QueryBody::Select(node) = qe.body else {
-            panic!("expected SELECT");
-        };
-        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = replace_single(&resolved, &onek, &row).expect("replace");
-        let mut sql = String::new();
-        Deparse::deparse(&replaced, &mut sql);
-
-        assert!(
-            !sql.contains("public.onek"),
-            "nested WHERE correlated ref must be aliased; got: {sql}"
+    fn test_nested_references_follow_their_binding() {
+        let onek = table_metadata("onek", 6001, &[("unique1", "int4"), ("ten", "int4")]);
+        let catalog = catalog(&[&onek]);
+        let r = row(&[Some("1"), Some("7")]);
+        assert_eq!(
+            membership(
+                "SELECT unique1 FROM onek WHERE EXISTS (SELECT 1 FROM onek o2 WHERE o2.ten = onek.ten)",
+                &onek,
+                &catalog,
+                &r
+            ),
+            "SELECT onek.unique1 FROM (VALUES ('1'::int4, '7'::int4)) onek(unique1, ten) \
+             WHERE EXISTS (SELECT 1 FROM public.onek o2 WHERE o2.ten = onek.ten)"
+        );
+        assert_eq!(
+            membership(
+                "SELECT unique1 FROM onek WHERE EXISTS (SELECT 1 FROM onek WHERE onek.ten = 3)",
+                &onek,
+                &catalog,
+                &r
+            ),
+            "SELECT onek.unique1 FROM (VALUES ('1'::int4, '7'::int4)) onek(unique1, ten) \
+             WHERE EXISTS (SELECT 1 FROM public.onek WHERE public.onek.ten = 3)"
+        );
+        assert_eq!(
+            membership(
+                "SELECT unique1 FROM onek WHERE EXISTS (SELECT 1 FROM onek o2 GROUP BY o2.ten HAVING max(o2.ten) = onek.ten)",
+                &onek,
+                &catalog,
+                &r
+            ),
+            "SELECT onek.unique1 FROM (VALUES ('1'::int4, '7'::int4)) onek(unique1, ten) \
+             WHERE EXISTS (SELECT 1 FROM public.onek o2 GROUP BY o2.ten HAVING max(o2.ten) = onek.ten)"
         );
     }
 
-    /// A correlated reference to the CDC'd table inside a nested subquery's
-    /// HAVING is rewritten to the VALUES alias. The nested-subquery handler
-    /// used to skip HAVING, leaving `public.onek.ten` dangling against the
-    /// aliased FROM entry (PGC-317, same omission class as PGC-145).
+    /// `USING` and `NATURAL` render verbatim around the stand-in, whose alias
+    /// columns carry the join column (PGC-142).
     #[test]
-    fn test_nested_subquery_having_correlated_ref_rewritten() {
-        let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
-        let dept_cols = &[("k", "int4"), ("v", "int4")];
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols).into());
-        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols).into());
-        let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
-        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
-
-        let qe = query_expr_parse(
-            "SELECT unique1 FROM onek WHERE EXISTS \
-             (SELECT 1 FROM dept GROUP BY dept.k HAVING count(*) > onek.ten)",
-        )
-        .expect("convert");
-        let QueryBody::Select(node) = qe.body else {
-            panic!("expected SELECT");
-        };
-        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = replace_single(&resolved, &onek, &row).expect("replace");
-        let mut sql = String::new();
-        Deparse::deparse(&replaced, &mut sql);
-
-        assert!(
-            !sql.contains("public.onek"),
-            "nested HAVING correlated ref must be aliased; got: {sql}"
+    fn test_using_join_keeps_its_qualifier() {
+        let j1 = table_metadata("j1_tbl", 5001, &[("i", "int4"), ("j", "int4")]);
+        let j2 = table_metadata("j2_tbl", 5002, &[("i", "int4"), ("k", "int4")]);
+        let catalog = catalog(&[&j1, &j2]);
+        assert_eq!(
+            membership(
+                "SELECT j FROM j1_tbl JOIN j2_tbl USING (i)",
+                &j1,
+                &catalog,
+                &row(&[Some("1"), Some("4")])
+            ),
+            "SELECT j1_tbl.j FROM (VALUES ('1'::int4, '4'::int4)) j1_tbl(i, j) JOIN public.j2_tbl USING (i)"
+        );
+        assert_eq!(
+            membership(
+                "SELECT * FROM j1_tbl NATURAL JOIN j2_tbl",
+                &j1,
+                &catalog,
+                &row(&[Some("1"), Some("4")])
+            ),
+            "SELECT j1_tbl.i AS i, j1_tbl.j, public.j2_tbl.k FROM (VALUES ('1'::int4, '4'::int4)) j1_tbl(i, j) JOIN public.j2_tbl USING (i)"
         );
     }
 
-    /// A correlated reference to the CDC'd table inside a nested subquery's
-    /// inner JOIN-ON is rewritten to the VALUES alias; the subquery's own
-    /// tables keep their schema qualification (PGC-317).
     #[test]
-    fn test_nested_subquery_join_on_correlated_ref_rewritten() {
-        let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
-        let dept_cols = &[("k", "int4"), ("v", "int4")];
-        let emp_cols = &[("k", "int4"), ("w", "int4")];
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols).into());
-        tables.insert_overwrite(table_metadata("dept", Oid::from_raw(6002), dept_cols).into());
-        tables.insert_overwrite(table_metadata("emp", Oid::from_raw(6003), emp_cols).into());
-        let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
-        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
-
-        let qe = query_expr_parse(
-            "SELECT unique1 FROM onek WHERE EXISTS \
-             (SELECT 1 FROM dept JOIN emp ON emp.k = onek.ten)",
-        )
-        .expect("convert");
-        let QueryBody::Select(node) = qe.body else {
-            panic!("expected SELECT");
-        };
-        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = replace_single(&resolved, &onek, &row).expect("replace");
-        let mut sql = String::new();
-        Deparse::deparse(&replaced, &mut sql);
-
-        assert!(
-            !sql.contains("public.onek"),
-            "nested JOIN-ON correlated ref must be aliased; got: {sql}"
+    fn test_self_join_tests_every_arm() {
+        let users = users();
+        let catalog = catalog(&[&users]);
+        let bound = bound(
+            "SELECT a.name FROM users a JOIN users b ON a.id = b.id",
+            &catalog,
         );
-        assert!(
-            sql.contains("public.dept") && sql.contains("public.emp"),
-            "the subquery's own tables must keep schema qualification; got: {sql}"
+        let mut buf = String::new();
+        membership_values_all_into(&mut buf, &bound, &users, &row(&[Some("1"), Some("x")]))
+            .expect("render");
+        assert_eq!(
+            buf,
+            "EXISTS (SELECT a.name FROM (VALUES ('1'::int4, 'x'::text)) a(id, name) JOIN public.users b ON a.id = b.id) \
+             OR EXISTS (SELECT a.name FROM public.users a JOIN (VALUES ('1'::int4, 'x'::text)) b(id, name) ON a.id = b.id)"
         );
     }
 
-    /// A subquery that re-opens the CDC'd table under its own alias is a
-    /// distinct occurrence: its references must survive untouched, while the
-    /// correlated reference to the outer occurrence is aliased. Matching on
-    /// bare `(schema, table)` clobbered both, collapsing the correlation into
-    /// the tautology `onek.ten = onek.ten` (PGC-256).
     #[test]
-    fn test_inner_occurrence_under_own_alias_not_clobbered() {
-        let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols).into());
-        let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
-        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
-
-        let qe = query_expr_parse(
-            "SELECT unique1 FROM onek WHERE EXISTS \
-             (SELECT 1 FROM onek o2 WHERE o2.ten = onek.ten)",
-        )
-        .expect("convert");
-        let QueryBody::Select(node) = qe.body else {
-            panic!("expected SELECT");
-        };
-        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let replaced = replace_single(&resolved, &onek, &row).expect("replace");
-        let mut sql = String::new();
-        Deparse::deparse(&replaced, &mut sql);
-
-        assert!(
-            sql.contains("o2.ten = onek.ten"),
-            "inner occurrence must keep its own alias, outer must be rewritten; got: {sql}"
+    fn test_batch_rows_carry_their_ordinal_and_projection() {
+        let users = users();
+        let catalog = catalog(&[&users]);
+        let bound = bound("SELECT name FROM users WHERE id > 0", &catalog);
+        let row_a = row(&[Some("1"), Some("a")]);
+        let row_b = row(&[Some("2"), None]);
+        let rows: Vec<&[Option<ByteString>]> = vec![&row_a, &row_b];
+        let mut buf = String::new();
+        membership_batch_into(&mut buf, &bound, &users, &rows, 7).expect("render");
+        assert_eq!(
+            buf,
+            "SELECT 7, __pgc_idx FROM (VALUES (0, '1'::int4, 'a'::text), (1, '2'::int4, NULL::text)) \
+             users(__pgc_idx, id, name) WHERE users.id > 0"
         );
     }
 
-    /// When a subquery re-opens the CDC'd table under the *same* alias, its
-    /// references are indistinguishable from correlated references to the outer
-    /// occurrence. The rewrite refuses rather than emit a silently-wrong
-    /// membership predicate; CDC then invalidates instead of mis-applying
-    /// (PGC-256).
     #[test]
-    fn test_same_alias_shadowing_refuses_rewrite() {
-        let onek_cols = &[("unique1", "int4"), ("ten", "int4"), ("odd", "int4")];
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("onek", Oid::from_raw(6001), onek_cols).into());
-        let onek = table_metadata("onek", Oid::from_raw(6001), onek_cols);
-        let row = vec![Some("1".into()), Some("7".into()), Some("1".into())];
+    fn test_unnest_shape_is_fixed_across_row_counts() {
+        let users = users();
+        let catalog = catalog(&[&users]);
+        let bound = bound("SELECT name FROM users u WHERE u.id > 0", &catalog);
+        let mut buf = String::new();
+        membership_unnest_into(&mut buf, &bound, &users).expect("render");
+        assert_eq!(
+            buf,
+            "SELECT __pgc_idx FROM (SELECT unnest($1::int4[]) AS __pgc_idx, unnest($2::text[])::int4 AS id, \
+             unnest($3::text[])::text AS name) u WHERE u.id > 0"
+        );
+    }
 
-        let qe = query_expr_parse(
-            "SELECT unique1 FROM onek WHERE EXISTS \
-             (SELECT 1 FROM onek WHERE onek.ten = 3)",
-        )
-        .expect("convert");
-        let QueryBody::Select(node) = qe.body else {
-            panic!("expected SELECT");
-        };
-        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-
-        let err = replace_single(&resolved, &onek, &row)
-            .expect_err("refuse the rewrite under same-alias shadowing");
+    #[test]
+    fn test_missing_or_repeated_occurrences_are_errors() {
+        let users = users();
+        let other = table_metadata("other", 101, &[("id", "int4")]);
+        let catalog = catalog(&[&users, &other]);
+        let bound = bound(
+            "SELECT a.name FROM users a JOIN users b ON a.id = b.id",
+            &catalog,
+        );
         assert!(matches!(
-            err.current_context(),
-            AstTransformError::ShadowedTable { .. }
+            table_occurrence_single(&bound, &users)
+                .expect_err("two arms")
+                .current_context(),
+            AstTransformError::MultipleOccurrences { .. }
+        ));
+        assert!(matches!(
+            table_occurrences_find(&bound, &other)
+                .expect_err("absent")
+                .current_context(),
+            AstTransformError::MissingTable
         ));
     }
 
-    /// USING/NATURAL deparse **verbatim** (so Postgres performs the
-    /// column merge — matching origin's `SELECT *` width / unqualified
-    /// refs), while carrying a synthesized equi-`predicate` for
-    /// freshness analysis. CROSS deparses `CROSS JOIN` with no
-    /// predicate. (PGC-142)
+    /// PGC-343: the template's prefix/suffix render byte-identical to the
+    /// per-row render it replaces, including NULLs and escaping.
     #[test]
-    fn test_join_qual_using_natural_preserved_with_predicate() {
-        let cols1 = &[
-            ("i", "int4"),
-            ("j", "int4"),
-            ("t", "text"),
-            ("j1_pk", "int4"),
-        ];
-        let cols2 = &[("i", "int4"), ("k", "int4"), ("j2_pk", "int4")];
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata("j1_tbl", Oid::from_raw(5001), cols1).into());
-        tables.insert_overwrite(table_metadata("j2_tbl", Oid::from_raw(5002), cols2).into());
-
-        let resolve = |sql: &str| {
-            let qe = query_expr_parse(sql).expect("convert");
-            let QueryBody::Select(node) = qe.body else {
-                panic!("expected SELECT");
-            };
-            select_node_resolve(&node, &tables, &["public"]).expect("resolve")
-        };
-        let deparsed = |n: &ResolvedSelectNode| {
-            let mut s = String::new();
-            Deparse::deparse(n, &mut s);
-            s
-        };
-        let join_qual = |n: &ResolvedSelectNode| match n.from.first() {
-            Some(ResolvedTableSource::Join(j)) => j.clone(),
-            _ => panic!("expected a join in FROM"),
-        };
-
-        // CROSS → `CROSS JOIN`, no predicate.
-        let cross = resolve("SELECT * FROM j1_tbl CROSS JOIN j2_tbl");
-        let cross_sql = deparsed(&cross);
-        assert!(
-            cross_sql.contains(" CROSS JOIN public.j2_tbl") && !cross_sql.contains(" ON "),
-            "CROSS must deparse as CROSS JOIN with no ON; got: {cross_sql}"
-        );
-        assert!(
-            join_qual(&cross).predicate().is_none(),
-            "CROSS has no analysis predicate"
-        );
-
-        // USING (i) → emitted verbatim (NOT rewritten to ON), with a
-        // synthesized equi-predicate for analysis.
-        let using = resolve("SELECT * FROM j1_tbl JOIN j2_tbl USING (i)");
-        let using_sql = deparsed(&using);
-        assert!(
-            using_sql.contains(" JOIN public.j2_tbl USING (i)") && !using_sql.contains(" ON "),
-            "USING must deparse verbatim, not as ON; got: {using_sql}"
-        );
-        assert!(
-            join_qual(&using).predicate().is_some(),
-            "USING must carry an equi-predicate for analysis"
-        );
-
-        // NATURAL (common column: i) → resolved to `USING (i)`.
-        let natural = deparsed(&resolve("SELECT * FROM j1_tbl NATURAL JOIN j2_tbl"));
-        assert!(
-            natural.contains(" JOIN public.j2_tbl USING (i)") && !natural.contains(" ON "),
-            "NATURAL must resolve to USING over common columns; got: {natural}"
-        );
-
-        // Outer + USING keeps the outer keyword and the USING clause.
-        let left = deparsed(&resolve("SELECT * FROM j1_tbl LEFT JOIN j2_tbl USING (i)"));
-        assert!(
-            left.contains(" LEFT JOIN public.j2_tbl USING (i)"),
-            "LEFT JOIN USING must deparse verbatim; got: {left}"
-        );
-    }
-
-    // ==================== Happy Path Tests ====================
-
-    #[test]
-    fn test_simple_table_replaced_with_values() {
-        let meta = table_metadata(
-            "users",
-            Oid::from_raw(100),
-            &[("id", "int4"), ("name", "text")],
-        );
-        let node = select_node(
-            vec![resolved_table("users", Oid::from_raw(100), None)],
-            ResolvedSelectColumns::None,
-            None,
-        );
-        let row = vec![Some("42".into()), Some("alice".into())];
-
-        let result = replace_single(&node, &meta, &row).expect("replace");
-
-        // The FROM source should now be a subquery with VALUES
-        let from = result.from.first().expect("at least one FROM source");
-        let subquery = match from {
-            ResolvedTableSource::Subquery(sq) => sq,
-            ResolvedTableSource::Table(_) | ResolvedTableSource::Join(_) => {
-                panic!("expected Subquery, got: {from:?}")
-            }
-        };
-
-        // Alias should use the table name since no explicit alias was set
-        assert_eq!(subquery.alias.name, "users");
-        assert_eq!(subquery.alias.columns, vec!["id", "name"]);
-
-        // VALUES should contain the row data with type casts
-        let mut buf = String::new();
-        result.deparse(&mut buf);
-        assert!(
-            buf.contains("VALUES ('42'::int4, 'alice'::text)"),
-            "should contain VALUES with casts: {buf}"
-        );
-        assert!(
-            buf.contains("users(id, name)"),
-            "should contain alias with column names: {buf}"
-        );
-    }
-
-    #[test]
-    fn test_null_values_produce_null_with_cast() {
-        let meta = table_metadata(
-            "users",
-            Oid::from_raw(100),
-            &[("id", "int4"), ("name", "text")],
-        );
-        let node = select_node(
-            vec![resolved_table("users", Oid::from_raw(100), None)],
-            ResolvedSelectColumns::None,
-            None,
-        );
-        let row = vec![Some("1".into()), None];
-
-        let result = replace_single(&node, &meta, &row).expect("replace");
-
-        let mut buf = String::new();
-        result.deparse(&mut buf);
-        assert!(
-            buf.contains("'1'::int4, NULL::text"),
-            "NULL column should produce NULL::type: {buf}"
-        );
-    }
-
-    #[test]
-    fn test_unnest_replace_shape() {
-        let meta = table_metadata(
-            "users",
-            Oid::from_raw(100),
-            &[("id", "int4"), ("name", "text")],
-        );
-        let node = select_node(
-            vec![resolved_table("users", Oid::from_raw(100), Some("u"))],
-            ResolvedSelectColumns::None,
-            None,
-        );
-
-        let result =
-            resolved_select_node_table_replace_with_unnest(&node, &meta).expect("unnest replace");
-
-        let mut sql = String::new();
-        result.deparse(&mut sql);
-        assert!(
-            sql.contains(&format!("unnest($1::int4[]) AS {BATCH_IDX_COLUMN}")),
-            "idx param first: {sql}"
-        );
-        assert!(
-            sql.contains("unnest($2::text[])::int4 AS id"),
-            "column param with element cast: {sql}"
-        );
-        assert!(
-            sql.contains("unnest($3::text[])::text AS name"),
-            "params follow column order: {sql}"
-        );
-        assert!(
-            sql.contains(&format!("SELECT {BATCH_IDX_COLUMN} FROM")),
-            "projection is the surviving ordinals: {sql}"
-        );
-    }
-
-    #[test]
-    fn test_batch_values_rows_idx_and_projection() {
-        let meta = table_metadata(
-            "users",
-            Oid::from_raw(100),
-            &[("id", "int4"), ("name", "text")],
-        );
-        let node = select_node(
-            vec![resolved_table("users", Oid::from_raw(100), None)],
-            ResolvedSelectColumns::None,
-            None,
-        );
-        let row_a = vec![Some("1".into()), Some("a".into())];
-        let row_b = vec![Some("2".into()), None];
-        let rows: Vec<&[Option<ByteString>]> = vec![&row_a, &row_b];
-
-        let result = resolved_select_node_table_replace_with_values_batch(&node, &meta, &rows, 7)
-            .expect("batch replace");
-
-        let mut buf = String::new();
-        result.deparse(&mut buf);
-        // Each VALUES row is prefixed with its ordinal; NULLs keep their cast.
-        assert!(
-            buf.contains("0, '1'::int4, 'a'::text"),
-            "first row carries idx 0: {buf}"
-        );
-        assert!(
-            buf.contains("1, '2'::int4, NULL::text"),
-            "second row carries idx 1 with NULL cast: {buf}"
-        );
-        // The alias column list leads with the synthetic idx column.
-        assert!(
-            buf.contains(&format!("({BATCH_IDX_COLUMN}, id, name)")),
-            "alias columns lead with idx: {buf}"
-        );
-        // Projection is the (query ordinal, row idx) pair.
-        assert!(
-            buf.contains(&format!("SELECT 7, {BATCH_IDX_COLUMN}")),
-            "projection is (ordinal, idx): {buf}"
-        );
-    }
-
-    #[test]
-    fn test_explicit_alias_preserved() {
-        let meta = table_metadata("users", Oid::from_raw(100), &[("id", "int4")]);
-        let node = select_node(
-            vec![resolved_table("users", Oid::from_raw(100), Some("u"))],
-            ResolvedSelectColumns::None,
-            None,
-        );
-        let row = vec![Some("1".into())];
-
-        let result = replace_single(&node, &meta, &row).expect("replace");
-
-        let from = result.from.first().expect("at least one FROM source");
-        let subquery = match from {
-            ResolvedTableSource::Subquery(sq) => sq,
-            ResolvedTableSource::Table(_) | ResolvedTableSource::Join(_) => {
-                panic!("expected Subquery, got: {from:?}")
-            }
-        };
-        assert_eq!(subquery.alias.name, "u", "should preserve explicit alias");
-    }
-
-    // ==================== Error Tests ====================
-
-    #[test]
-    fn test_empty_from_returns_missing_table() {
-        let meta = table_metadata("users", Oid::from_raw(100), &[("id", "int4")]);
-        let node = select_node(vec![], ResolvedSelectColumns::None, None);
-        let row = vec![Some("1".into())];
-
-        let err = replace_single(&node, &meta, &row)
-            .map_err(|e| e.into_current_context())
-            .expect_err("should fail");
-
-        assert!(
-            matches!(err, AstTransformError::MissingTable),
-            "expected MissingTable, got: {err:?}"
-        );
-    }
-
-    #[test]
-    fn test_non_matching_oid_returns_missing_table() {
-        let meta = table_metadata("users", Oid::from_raw(100), &[("id", "int4")]);
-        // FROM has a table with OID 999, but metadata says OID 100
-        let node = select_node(
-            vec![resolved_table("users", Oid::from_raw(999), None)],
-            ResolvedSelectColumns::None,
-            None,
-        );
-        let row = vec![Some("1".into())];
-
-        let err = replace_single(&node, &meta, &row)
-            .map_err(|e| e.into_current_context())
-            .expect_err("should fail");
-
-        assert!(
-            matches!(err, AstTransformError::MissingTable),
-            "expected MissingTable, got: {err:?}"
-        );
-    }
-
-    // ==================== Column Alias Update Tests ====================
-
-    #[test]
-    fn test_where_column_alias_updated() {
-        let id_meta = column_metadata("id", 1, "int4");
-        let where_clause = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
-            op: BinaryOp::Equal,
-            lexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(
-                resolved_column("users", "id", id_meta),
-            ))),
-            rexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Literal(
-                LiteralValue::Integer(42),
-            ))),
-        });
-
-        let meta = table_metadata(
-            "users",
-            Oid::from_raw(100),
-            &[("id", "int4"), ("name", "text")],
-        );
-        let node = select_node(
-            vec![resolved_table("users", Oid::from_raw(100), None)],
-            ResolvedSelectColumns::None,
-            Some(where_clause),
-        );
-        let row = vec![Some("42".into()), Some("alice".into())];
-
-        let result = replace_single(&node, &meta, &row).expect("replace");
-
-        // After replacement, column references to public.users should have table_alias set
-        let mut buf = String::new();
-        result.deparse(&mut buf);
-        // With alias set, column deparses as "users.id" instead of "public.users.id"
-        assert!(
-            buf.contains("WHERE users.id = 42"),
-            "column should use alias after replacement: {buf}"
-        );
-    }
-
-    #[test]
-    fn test_select_column_alias_updated() {
-        let id_meta = column_metadata("id", 1, "int4");
-        let columns = ResolvedSelectColumns::Columns(vec![ResolvedSelectColumn {
-            expr: ResolvedScalarExpr::Column(resolved_column("users", "id", id_meta)),
-            alias: None,
-        }]);
-
-        let meta = table_metadata("users", Oid::from_raw(100), &[("id", "int4")]);
-        let node = select_node(
-            vec![resolved_table("users", Oid::from_raw(100), None)],
-            columns,
-            None,
-        );
-        let row = vec![Some("42".into())];
-
-        let result = replace_single(&node, &meta, &row).expect("replace");
-
-        let mut buf = String::new();
-        result.deparse(&mut buf);
-        // SELECT column should deparse with alias
-        assert!(
-            buf.contains("SELECT users.id"),
-            "select column should use alias: {buf}"
-        );
-        assert!(
-            !buf.contains("public.users.id"),
-            "should not have schema-qualified reference: {buf}"
-        );
-    }
-
-    // ==================== JOIN Tests ====================
-
-    #[test]
-    fn test_table_inside_join_replaced() {
-        let meta = table_metadata(
-            "orders",
-            Oid::from_raw(200),
-            &[("id", "int4"), ("total", "text")],
-        );
-
-        let join = ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
-            join_type: JoinType::Inner,
-            left: resolved_table("users", Oid::from_raw(100), None),
-            right: resolved_table("orders", Oid::from_raw(200), None),
-            qual: ResolvedJoinQual::Cross,
-        }));
-
-        let node = select_node(vec![join], ResolvedSelectColumns::None, None);
-        let row = vec![Some("7".into()), Some("99.50".into())];
-
-        let result = replace_single(&node, &meta, &row).expect("replace");
-
-        // The JOIN's right side should now be a subquery
-        let from = result.from.first().expect("at least one FROM source");
-        let join_node = match from {
-            ResolvedTableSource::Join(j) => j,
-            ResolvedTableSource::Table(_) | ResolvedTableSource::Subquery(_) => {
-                panic!("expected Join, got: {from:?}")
-            }
-        };
-
-        // Left side should remain a table
-        assert!(
-            matches!(&join_node.left, ResolvedTableSource::Table(t) if t.name == "users"),
-            "left side should still be the users table"
-        );
-
-        // Right side should be replaced with VALUES subquery
-        let subquery = match &join_node.right {
-            ResolvedTableSource::Subquery(sq) => sq,
-            ResolvedTableSource::Table(_) | ResolvedTableSource::Join(_) => {
-                panic!(
-                    "expected right side to be Subquery, got: {:?}",
-                    join_node.right
-                )
-            }
-        };
-        assert_eq!(subquery.alias.name, "orders");
-        assert_eq!(subquery.alias.columns, vec!["id", "total"]);
-    }
-
-    /// PGC-343: the precomputed `PgEvalTemplate` fast path must produce SQL
-    /// byte-identical to the clone-and-deparse oracle
-    /// (`resolved_select_node_table_replace_with_values` + `Deparse`), since it
-    /// feeds the PgEval membership check that gates invalidate-or-not.
-    fn assert_template_matches_oracle(
-        sql: &str,
-        table_metadata: &TableMetadata,
-        rows: &[Vec<Option<ByteString>>],
-    ) {
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(table_metadata.clone().into());
-        let qe = query_expr_parse(sql).expect("parse");
-        let QueryBody::Select(node) = qe.body else {
-            panic!("expected SELECT");
-        };
-        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let template = PgEvalTemplate::build(&resolved, table_metadata)
-            .expect("template builds for this shape");
-
-        for row in rows {
-            let oracle_select =
-                replace_single(&resolved, table_metadata, row).expect("oracle replace");
-            let mut oracle = String::new();
-            Deparse::deparse(&oracle_select, &mut oracle);
-
-            let mut fast = String::new();
-            assert!(
-                template.render_into(&mut fast, row),
-                "full row should take the fast path: {row:?}"
-            );
-            assert_eq!(
-                fast, oracle,
-                "template SQL diverged from oracle for row {row:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_pg_eval_template_matches_oracle_across_shapes() {
+    fn test_pg_eval_template_matches_per_row_render() {
         let onek = table_metadata(
             "onek",
-            Oid::from_raw(7001),
+            7001,
             &[("id", "int4"), ("ten", "int4"), ("name", "text")],
         );
-        let rows = vec![
-            vec![Some("1".into()), Some("7".into()), Some("alice".into())],
-            // NULL in a text column (NullWithCast path) + a value needing escaping.
-            vec![Some("2".into()), None, Some("o'brien".into())],
-            vec![Some("3".into()), Some("0".into()), Some("".into())],
+        let catalog = catalog(&[&onek]);
+        let rows = [
+            row(&[Some("1"), Some("7"), Some("alice")]),
+            row(&[Some("2"), None, Some("o'brien")]),
+            row(&[Some("3"), Some("0"), Some("")]),
         ];
-
-        // single-table WHERE, GROUP BY/HAVING, and a self-referential predicate —
-        // the shapes PgEval membership actually sees.
-        assert_template_matches_oracle("SELECT * FROM onek WHERE ten = 7", &onek, &rows);
-        assert_template_matches_oracle(
+        for sql in [
+            "SELECT * FROM onek WHERE ten = 7",
             "SELECT id FROM onek WHERE name = 'x' AND ten > 3",
-            &onek,
-            &rows,
-        );
-        assert_template_matches_oracle(
             "SELECT ten, count(*) AS c FROM onek GROUP BY ten HAVING count(*) > 0",
-            &onek,
-            &rows,
-        );
+        ] {
+            let bound = bound(sql, &catalog);
+            let template = PgEvalTemplate::build(&bound, &onek).expect("template builds");
+            for r in &rows {
+                let occurrence = table_occurrence_single(&bound, &onek).expect("one occurrence");
+                let mut expected = String::new();
+                membership_values_into(&mut expected, &bound, &onek, r, &occurrence);
+                let mut fast = String::new();
+                assert!(
+                    template.render_into(&mut fast, r),
+                    "{sql}: full row takes the fast path"
+                );
+                assert_eq!(fast, expected, "{sql}");
+            }
+        }
     }
 
     #[test]
     fn test_pg_eval_template_declines_short_row() {
         let onek = table_metadata(
             "onek",
-            Oid::from_raw(7002),
+            7002,
             &[("id", "int4"), ("ten", "int4"), ("name", "text")],
         );
-        let qe = query_expr_parse("SELECT * FROM onek WHERE ten = 7").expect("parse");
-        let QueryBody::Select(node) = qe.body else {
-            panic!("expected SELECT");
-        };
-        let mut tables = BiHashMap::new();
-        tables.insert_overwrite(onek.clone().into());
-        let resolved = select_node_resolve(&node, &tables, &["public"]).expect("resolve");
-        let template = PgEvalTemplate::build(&resolved, &onek).expect("template builds");
-
-        // Row missing the trailing column → decline, leaving buf untouched so the
-        // caller falls back to the clone-and-deparse path.
-        let short: Vec<Option<ByteString>> = vec![Some("1".into()), Some("7".into())];
-        let mut buf = String::from("PRE");
-        assert!(!template.render_into(&mut buf, &short));
-        assert_eq!(buf, "PRE", "declined render must not write into buf");
+        let catalog = catalog(&[&onek]);
+        let template =
+            PgEvalTemplate::build(&bound("SELECT * FROM onek WHERE ten = 7", &catalog), &onek)
+                .expect("template builds");
+        let mut buf = String::from("EXISTS (");
+        assert!(!template.render_into(&mut buf, &row(&[Some("1"), Some("7")])));
+        assert_eq!(
+            buf, "EXISTS (",
+            "a declined render leaves the buffer as it was"
+        );
     }
 }
