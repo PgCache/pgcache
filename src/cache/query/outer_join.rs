@@ -71,8 +71,9 @@ fn source_table_names_collect(source: &TableSource, names: &mut HashSet<EcoStrin
     }
 }
 
-/// [`resolved_join_terminality_walk`] on a bound join: a `USING`/`NATURAL`
-/// join's condition refers to both sides of each merged column.
+/// Walk a join tree classifying each outer join's optional side as terminal
+/// or non-terminal; a `USING`/`NATURAL` join's condition refers to both
+/// sides of each merged column.
 fn join_terminality_walk(
     bound: &ResolvedQuery,
     join: &JoinNode,
@@ -277,7 +278,7 @@ mod tests {
     #[test]
     fn test_terminal_with_alias() {
         // Aliased table on optional side, terminal.
-        // Resolved AST resolves alias "t" back to real table name "b".
+        // The bindings name the real table "b" behind the alias "t".
         let (terminal, non_terminal) =
             terminality("SELECT a.id, t.name FROM a LEFT JOIN b t ON a.id = t.a_id WHERE a.id = 1");
         assert!(non_terminal.is_empty(), "no non-terminal: {non_terminal:?}");
@@ -290,7 +291,7 @@ mod tests {
     #[test]
     fn test_non_terminal_with_alias() {
         // Aliased table on optional side, non-terminal (alias used in WHERE).
-        // Resolved AST uses real table name "b" (not alias "t").
+        // The bindings name the real table "b", not the alias "t".
         let (terminal, non_terminal) =
             terminality("SELECT * FROM a LEFT JOIN b t ON a.id = t.a_id WHERE t.status = 'active'");
         assert!(

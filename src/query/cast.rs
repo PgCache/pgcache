@@ -194,7 +194,8 @@ pub fn bool_literal_parse(s: &str) -> Option<bool> {
     None
 }
 
-/// [`resolved_strip_identity_cast`] on the bound query.
+/// `expr` without an identity cast: `column::text` on a text column is the
+/// column itself. Any other cast, or a cast of a non-column, is kept.
 pub fn identity_cast_strip<'a>(bound: &ResolvedQuery, expr: &'a ScalarExpr) -> &'a ScalarExpr {
     let ScalarExpr::TypeCast {
         expr: inner,
@@ -212,7 +213,7 @@ pub fn identity_cast_strip<'a>(bound: &ResolvedQuery, expr: &'a ScalarExpr) -> &
     }
 }
 
-/// [`resolved_where_scalar_leaf`] on the bound query.
+/// The scalar a `WhereExpr::Scalar` holds, without an identity cast.
 pub fn where_scalar_leaf<'a>(bound: &ResolvedQuery, expr: &'a WhereExpr) -> Option<&'a ScalarExpr> {
     if let WhereExpr::Scalar(scalar) = expr {
         Some(identity_cast_strip(bound, scalar))

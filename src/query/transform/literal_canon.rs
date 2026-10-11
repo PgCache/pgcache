@@ -1,6 +1,6 @@
-//! Canonicalise the date-time literals of a resolved query under the session
-//! settings they were written in (PGC-287 class 2), so the resolved form —
-//! and the identity, population, serve and CDC evaluation derived from it —
+//! Canonicalise the date-time literals of a bound query under the session
+//! settings they were written in (PGC-287 class 2), so the bound form — and
+//! the identity, population, serve and CDC evaluation derived from it —
 //! means the same rows whatever session registered it.
 //!
 //! A literal is rewritten where its type is known: compared to a column, a

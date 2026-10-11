@@ -1,6 +1,6 @@
 # ADR-002: Resolved AST for Query Analysis
 
-**Status**: Accepted
+**Status**: Superseded by [ADR-057](ADR-057-query-tree-with-side-table-bindings.md): the resolved hierarchy is gone; resolution is a side table of bindings on the one plain tree.
 **Date**: 2025-10-10
 
 ## Context

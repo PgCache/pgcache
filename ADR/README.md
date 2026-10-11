@@ -26,7 +26,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-056](ADR-056-per-connection-session-settings.md) — Per-connection session settings: one tracked-GUC state, one analyzer effect, one batched probe scoped by its status byte *(supersedes ADR-006's acquisition; amends ADR-054)*
 
 ## Query parsing, analysis & transformation
-- [ADR-002](ADR-002-resolved-ast.md) — Resolved AST: fully schema-qualified query form for analysis *(parallel hierarchy to be superseded by ADR-057)*
+- [ADR-002](ADR-002-resolved-ast.md) — Resolved AST: fully schema-qualified query form for analysis *(superseded by ADR-057)*
 - [ADR-003](ADR-003-constant-propagation.md) — Constant propagation through column equivalences for constraint analysis
 - [ADR-011](ADR-011-set-operation-support.md) — Set operations (UNION/INTERSECT/EXCEPT): per-branch populate, whole-query invalidate
 - [ADR-012](ADR-012-predicate-pushdown.md) — Predicate pushdown into FROM subqueries
@@ -40,7 +40,7 @@ Conventions: files are `ADR-XXX-brief-title.md` with the next sequential number;
 - [ADR-029](ADR-029-subsumption-complex-bucket-index.md) — Subsumption complex-bucket per-column index
 - [ADR-030](ADR-030-subsumption-two-sided-range-index.md) — Subsumption two-sided (BETWEEN-style) range index
 - [ADR-037](ADR-037-constraint-containment-index.md) — Generalized constraint-containment index *(generalizes ADR-024/029/030; shared with the CDC matcher)*
-- [ADR-057](ADR-057-query-tree-with-side-table-bindings.md) — One immutable query tree with resolution as a side table keyed by pre-order `NodeId`; structural results of resolution as annotations; arena as the named second round *(supersedes ADR-002's parallel hierarchy once landed)*
+- [ADR-057](ADR-057-query-tree-with-side-table-bindings.md) — One immutable query tree with resolution as a side table keyed by pre-order `NodeId`; structural results of resolution as annotations; arena as the named second round *(supersedes ADR-002's parallel hierarchy)*
 
 ## Caching tiers & serving
 - [ADR-010](ADR-010-population-worker-pool.md) — Persistent population worker pool *(amended by ADR-050)*

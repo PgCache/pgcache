@@ -1,5 +1,5 @@
 //! What resolution adds to a finalized tree (ADR-057): a side table keyed by
-//! node id, built beside the resolved tree while the two coexist.
+//! node id, which with the shared tree is the bound query.
 
 use std::sync::Arc;
 

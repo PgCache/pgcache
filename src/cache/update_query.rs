@@ -139,13 +139,13 @@ pub struct UpdateQuery {
     /// makes every eval verdict for this query untrustworthy, forcing
     /// invalidation (PGC-264).
     pub predicate_columns: HashSet<EcoString>,
-    /// Precomputed `resolved.is_single_table()`. Cached because the CDC
-    /// invalidation checks consult it per row per query, and the underlying
-    /// `ResolvedQueryExpr::is_single_table` walks the AST.
+    /// Precomputed `is_single_table()` of the update query. Cached because
+    /// the CDC invalidation checks consult it per row per query, and the
+    /// underlying `QueryExpr::is_single_table` walks the tree.
     pub is_single_table: bool,
     /// Pre-canonicalized WHERE clause for the LocalEval membership probe
     /// (`update_query_matches_locally`), built once at registration so the per
-    /// row CDC path skips re-destructuring the resolved AST (PGC-339). `None`
+    /// row CDC path skips re-destructuring the tree (PGC-339). `None`
     /// means either no WHERE clause (unconditional match) or a non-LocalEval
     /// query (never consulted — `eval_strategy != LocalEval`).
     pub compiled_where: Option<CompiledPredicate>,

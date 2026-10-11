@@ -842,7 +842,7 @@ fn test_identifier_quoting_render_cases() {
 }
 
 // ============================================================================
-// Bindings beside the resolved tree (ADR-057, PGC-481 slice 1)
+// The binding corpus (ADR-057)
 // ============================================================================
 
 pub(super) fn binding_catalog() -> Catalog {

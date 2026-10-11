@@ -10,7 +10,6 @@ use crate::oid::{Oid, TypeOid};
 use crate::query::ast::query_expr_parse;
 use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
 
-// Helper function to parse SQL and resolve to ResolvedSelectNode
 // Helper function to create test table metadata
 fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
     let columns = ColumnStore::new([

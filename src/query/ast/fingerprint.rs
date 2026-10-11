@@ -32,9 +32,8 @@ fn query_expr_hasher(query: &QueryExpr) -> DefaultHasher {
 }
 
 /// The content fingerprint of a `QueryExpr` as written. Not a cache identity
-/// (that is the resolved query's, see
-/// [`resolved_query_fingerprint`](crate::query::resolved::resolved_query_fingerprint));
-/// used where only the text's own identity matters, such as tests.
+/// (that is the bound query's, `ResolvedQuery::fingerprint`); used where
+/// only the text's own identity matters, such as tests.
 pub fn query_expr_fingerprint(query: &QueryExpr) -> Fingerprint {
     Fingerprint::from_raw(query_expr_hasher(query).finish())
 }

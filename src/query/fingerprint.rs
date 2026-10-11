@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::id_hash::{BuildIdHasher, impl_id_hashable};
 
 /// A query fingerprint: the cache's identity for a cached query and the key of
-/// every per-query map. It is the hash of the *resolved* query
-/// ([`resolved_query_fingerprint`](super::resolved::resolved_query_fingerprint)):
-/// schema-qualified tables and canonical literals, excluding LIMIT/OFFSET.
+/// every per-query map. It is the hash of the *bound* query's serve text
+/// (`ResolvedQuery::fingerprint`): schema-qualified tables and canonical
+/// literals, excluding LIMIT/OFFSET.
 /// Only the writer can compute it; the proxy reaches it from a
 /// [`SessionKey`] through the alias map.
 ///
