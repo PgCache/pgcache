@@ -132,11 +132,11 @@ pub fn query_decorrelate_resolve(
 /// when it has one, so the shape classified is the shape population and
 /// rebuild see.
 pub fn shape_gate_classify(
-    resolved: &ResolvedQueryExpr,
-    decorrelated: Option<&ResolvedQueryExpr>,
+    bound: &ResolvedQuery,
+    decorrelated: Option<&ResolvedQuery>,
     aggregate_functions: &HashSet<EcoString>,
 ) -> ShapeGate {
-    shape_classify(decorrelated.unwrap_or(resolved), aggregate_functions)
+    shape_classify(decorrelated.unwrap_or(bound), aggregate_functions)
 }
 
 /// The query as admission reads it: as registered in both representations,
@@ -191,36 +191,36 @@ pub fn query_admission_analyze(
             .select()
             .map(|select| query_constraints_analyze(&bound_update.bound, select))
             .unwrap_or_default();
-        let eval_strategy = update_eval_strategy_classify(&update_resolved, source);
+        let update_bound = &bound_update.bound;
+        let eval_strategy = update_eval_strategy_classify(update_bound, source);
         let pg_batchable = depth == AdmissionDepth::Full
             && eval_strategy == UpdateEvalStrategy::PgEval
-            && pg_batchable_classify(&update_resolved, relation_oid, aggregate_functions);
-        // Walk the parent `resolved` — `update_resolved` has ORDER BY stripped.
+            && pg_batchable_classify(update_bound, relation_oid, aggregate_functions);
+        // Walk the parent query — the update query has ORDER BY stripped.
         let limit_window_columns = if has_limit {
-            limit_window_columns_collect(resolved, table_node.name.as_str())
+            limit_window_columns_collect(bound, table_node.name.as_str())
         } else {
             HashSet::new()
         };
-        // Walk `update_resolved`: it is the AST CDC eval actually runs.
-        let predicate_columns =
-            predicate_columns_collect(&update_resolved, table_node.name.as_str());
-        let is_single_table = update_resolved.is_single_table();
+        // Walk the update query: it is the tree CDC eval actually runs.
+        let predicate_columns = predicate_columns_collect(update_bound, table_node.name.as_str());
+        let is_single_table = update_bound.tree().is_single_table();
         // Direction-aware window spec (PGC-334) — the shapes the cached-path
-        // window check can reason about. Walks the parent `resolved` like
-        // `limit_window_columns` (ORDER BY is stripped from `update_resolved`).
+        // window check can reason about. Walks the parent query like
+        // `limit_window_columns` (ORDER BY is stripped from the update query).
         let order_by_keys =
             (has_limit && is_single_table && matches!(source, UpdateQuerySource::FromClause))
-                .then(|| limit_order_keys_collect(resolved, table_node.name.as_str()))
+                .then(|| limit_order_keys_collect(bound, table_node.name.as_str()))
                 .flatten();
         // Compile the LocalEval WHERE once so the per-row CDC membership probe
-        // doesn't re-destructure the resolved AST (PGC-339). PgEval queries
-        // never consult this, so skip building it.
+        // doesn't re-destructure the tree (PGC-339). PgEval queries never
+        // consult this, so skip building it.
         let compiled_where =
             if depth == AdmissionDepth::Full && eval_strategy == UpdateEvalStrategy::LocalEval {
-                update_resolved
-                    .as_select()
+                update_bound
+                    .select()
                     .and_then(|s| s.where_clause.as_ref())
-                    .map(|w| CompiledPredicate::compile(w, table_node.name.as_str()))
+                    .map(|w| CompiledPredicate::compile(update_bound, w, table_node.name.as_str()))
             } else {
                 None
             };

@@ -384,9 +384,9 @@ fn deparse(resolved: &ResolvedQueryExpr) -> String {
     sql
 }
 
-fn predicate_compile(resolved: &ResolvedQueryExpr, table: &str) -> Option<CompiledPredicate> {
-    let where_clause = resolved.as_select()?.where_clause.as_ref()?;
-    Some(CompiledPredicate::compile(where_clause, table))
+fn predicate_compile(bound: &ResolvedQuery, table: &str) -> Option<CompiledPredicate> {
+    let where_clause = bound.select()?.where_clause.as_ref()?;
+    Some(CompiledPredicate::compile(bound, where_clause, table))
 }
 
 fn row_build(row: &[Option<&str>]) -> Vec<Option<ByteString>> {
@@ -508,7 +508,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         let (_, bound_render_n, bound_render_b) = allocations_count(|| bound.sql());
         let (_, bound_shape_n, bound_shape_b) = allocations_count(|| bound.shape());
         let (_, compile_n, compile_b) =
-            allocations_count(|| predicate_compile(&canonical, shape.predicate_table));
+            allocations_count(|| predicate_compile(&bound, shape.predicate_table));
         let cell = |n: usize, b: usize| format!("{n}/{b}");
         println!(
             "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
@@ -561,7 +561,7 @@ fn bench_pipeline(c: &mut Criterion) {
         let (_, bindings) = resolve_bound(&query, &catalog);
         let bound = ResolvedQuery::new(Arc::new(query.clone()), bindings);
         let canonical = canonicalise(&resolved, &settings);
-        let predicate = predicate_compile(&canonical, shape.predicate_table);
+        let predicate = predicate_compile(&bound, shape.predicate_table);
         let row = row_build(shape.row);
 
         group.bench_with_input(
@@ -653,7 +653,7 @@ fn bench_pipeline(c: &mut Criterion) {
         );
         group.bench_with_input(
             BenchmarkId::new("predicate_compile", shape.name),
-            &canonical,
+            &bound,
             |b, r| {
                 b.iter(|| black_box(predicate_compile(r, shape.predicate_table)));
             },

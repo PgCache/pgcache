@@ -1,5 +1,6 @@
-//! Classify a registered query's WHERE clause and columns: can CDC evaluate it
-//! in Rust, can it be batched, and which columns does its predicate touch.
+//! Registration-time classifiers over an update query and the query it
+//! came from: how CDC evaluates its WHERE, whether rows batch, and which
+//! columns define a LIMIT window.
 
 use std::collections::HashSet;
 use std::ops::ControlFlow;
@@ -8,28 +9,26 @@ use ecow::EcoString;
 
 use crate::cache::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuerySource};
 use crate::oid::Oid;
-use crate::query::ast::{AstNode, NullOrder, OrderDirection};
-use crate::query::evaluate::resolved_where_expr_supported;
-use crate::query::resolved::{
-    ResolvedColumnNode, ResolvedOrderByClause, ResolvedQueryExpr, ResolvedScalarExpr,
-    ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableNode,
+use crate::query::ast::{
+    AstNode, ColumnNode, JoinNode, JoinQual, NullOrder, OrderByClause, OrderDirection, QueryExpr,
+    ScalarExpr, SelectColumn, SelectColumns, SelectNode,
 };
+use crate::query::evaluate::where_expr_supported;
+use crate::query::resolve::{ColumnBinding, ColumnTarget, ResolvedQuery};
 
-/// Decide whether CDC can evaluate this update query's WHERE in Rust.
-///
 /// Conservative classifier: rejects anything the Rust evaluator can't decide
 /// from a single CDC row. GROUP BY / HAVING are rejected because row-level
 /// matching doesn't capture post-aggregation filtering. Non-FromClause sources
 /// are rejected because their CDC semantics (subquery membership, outer join
 /// null-padding cascade) aren't expressible as a row-level predicate.
 pub(super) fn update_eval_strategy_classify(
-    resolved: &ResolvedQueryExpr,
+    bound: &ResolvedQuery,
     source: UpdateQuerySource,
 ) -> UpdateEvalStrategy {
     if source != UpdateQuerySource::FromClause {
         return UpdateEvalStrategy::PgEval;
     }
-    let Some(select) = resolved.as_select() else {
+    let Some(select) = bound.select() else {
         return UpdateEvalStrategy::PgEval;
     };
     if !select.is_single_table() {
@@ -41,7 +40,7 @@ pub(super) fn update_eval_strategy_classify(
     let Some(where_expr) = &select.where_clause else {
         return UpdateEvalStrategy::LocalEval;
     };
-    if resolved_where_expr_supported(where_expr) {
+    if where_expr_supported(bound, where_expr) {
         UpdateEvalStrategy::LocalEval
     } else {
         UpdateEvalStrategy::PgEval
@@ -55,85 +54,115 @@ pub(super) fn update_eval_strategy_classify(
 /// multi-row VALUES is equivalent iff each row's answer is independent of the
 /// others. GROUP BY / HAVING / SELECT-list aggregates evaluate against the
 /// substituted rows as a set, so they must stay on the per-row path. (LIMIT and
-/// ORDER BY never reach the predicate — `cache_predicate_into` deparses the
-/// select node only — and aggregates can't appear in WHERE.)
+/// ORDER BY never reach the predicate, and aggregates can't appear in WHERE.)
 ///
-/// Relations appearing more than once (self-joins) are excluded: the VALUES
-/// transform's alias rewrite clobbers every occurrence's references to one
-/// alias, which can forward-reference a later FROM entry — invalid SQL. The
-/// per-row path has the same defect but only reaches it on paths the decide
-/// pass usually skips; batching pre-evaluates unfiltered, so it must not pick
-/// these up (PGC-256 tracks the underlying transform defect).
+/// Relations appearing more than once (self-joins) are excluded: a
+/// single-occurrence substitution is not a complete membership test
+/// (PGC-256), and batching pre-evaluates unfiltered.
 pub(super) fn pg_batchable_classify(
-    resolved: &ResolvedQueryExpr,
+    bound: &ResolvedQuery,
     relation_oid: Oid,
     aggregate_functions: &HashSet<EcoString>,
 ) -> bool {
-    let Some(select) = resolved.as_select() else {
+    let Some(select) = bound.select() else {
         return false;
     };
     if !select.group_by.is_empty() || select.having.is_some() {
         return false;
     }
-    if resolved
-        .nodes::<ResolvedTableNode>()
-        .filter(|t| t.relation_oid == relation_oid)
-        .count()
-        > 1
-    {
+    if bound.relation_occurrences(relation_oid) > 1 {
         return false;
     }
     match &select.columns {
-        ResolvedSelectColumns::None => true,
-        ResolvedSelectColumns::Columns(cols) => cols
-            .iter()
-            .all(|c| !c.expr.has_aggregate(aggregate_functions)),
+        SelectColumns::None => true,
+        SelectColumns::Columns(columns) => columns.iter().all(|column| match column {
+            SelectColumn::Expr { expr, .. } => !expr.has_aggregate(aggregate_functions),
+            SelectColumn::Star(_) => true,
+        }),
     }
 }
 
 /// Column names of one table, collected from column references anywhere
 /// under the nodes added.
-struct TableColumns<'t> {
-    table: &'t str,
+struct ReferencedColumns<'a> {
+    bound: &'a ResolvedQuery,
+    table: &'a str,
     columns: HashSet<EcoString>,
 }
 
-impl<'t> TableColumns<'t> {
-    fn new(table: &'t str) -> Self {
+impl<'a> ReferencedColumns<'a> {
+    fn new(bound: &'a ResolvedQuery, table: &'a str) -> Self {
         Self {
+            bound,
             table,
             columns: HashSet::new(),
         }
     }
 
-    fn add(&mut self, column: &ResolvedColumnNode) {
-        if column.table.as_str() == self.table {
-            self.columns.insert(column.column.clone());
+    fn add(&mut self, column: &ColumnNode) {
+        if let Some(binding) = self.bound.column_binding(column) {
+            self.add_binding(&binding);
         }
     }
 
-    /// Every column reference under `node` (zero-allocation walk).
+    fn add_binding(&mut self, binding: &ColumnBinding) {
+        let bindings = self.bound.bindings();
+        if let (Some(slot), Some(column)) = (
+            bindings.slot(binding.slot),
+            bindings.binding_column(binding),
+        ) && slot.table().name.as_str() == self.table
+        {
+            self.columns.insert(column.name.clone());
+        }
+    }
+
+    /// Every column reference under `node` (zero-allocation walk), plus
+    /// both sides of each column a USING or NATURAL join under it merges:
+    /// the tree names those without a column reference.
     fn add_refs<N: AstNode>(&mut self, node: &N) {
-        let _ = node.try_for_each_node::<ResolvedColumnNode, ()>(&mut |column| {
+        let _ = node.try_for_each_node::<ColumnNode, ()>(&mut |column| {
             self.add(column);
+            ControlFlow::Continue(())
+        });
+        let _ = node.try_for_each_node::<JoinNode, ()>(&mut |join| {
+            if matches!(join.qual, JoinQual::Using(_) | JoinQual::Natural) {
+                for merged in self.bound.bindings().merged_columns() {
+                    if merged.join.index() == join.id.index() {
+                        self.add_binding(&merged.left);
+                        self.add_binding(&merged.right);
+                    }
+                }
+            }
             ControlFlow::Continue(())
         });
     }
 }
 
 /// The SELECT-list expressions an `ORDER BY alias` names (output-name match).
-fn select_alias_exprs<'s>(
-    select: &'s ResolvedSelectNode,
+fn alias_exprs<'s>(
+    bound: &'s ResolvedQuery,
+    select: &'s SelectNode,
     name: &'s EcoString,
-) -> impl Iterator<Item = &'s ResolvedScalarExpr> {
-    let columns: &[ResolvedSelectColumn] = match &select.columns {
-        ResolvedSelectColumns::Columns(columns) => columns,
-        ResolvedSelectColumns::None => &[],
+) -> impl Iterator<Item = &'s ScalarExpr> {
+    let columns: &[SelectColumn] = match &select.columns {
+        SelectColumns::Columns(columns) => columns,
+        SelectColumns::None => &[],
     };
-    columns
-        .iter()
-        .filter(move |column| column.output_name() == Some(name))
-        .map(|column| &column.expr)
+    columns.iter().filter_map(move |column| match column {
+        SelectColumn::Expr { expr, alias } => {
+            let output = alias.clone().or_else(|| bound.column_output_name(expr));
+            (output.as_ref() == Some(name)).then_some(expr)
+        }
+        SelectColumn::Star(_) => None,
+    })
+}
+
+/// The output an ORDER BY item names, when it names one.
+fn order_by_output<'s>(bound: &ResolvedQuery, clause: &'s OrderByClause) -> Option<&'s EcoString> {
+    let ScalarExpr::Column(column) = &clause.expr else {
+        return None;
+    };
+    matches!(bound.column(column), Some(ColumnTarget::Output)).then_some(&column.column)
 }
 
 /// Collect column names on `table_name` that participate in the parent
@@ -148,19 +177,20 @@ fn select_alias_exprs<'s>(
 /// reference and naturally produces no entries here. Those shapes are
 /// Measure queries that already use PgEval/MV invalidation paths.
 pub(super) fn limit_window_columns_collect(
-    resolved: &ResolvedQueryExpr,
+    bound: &ResolvedQuery,
     table_name: &str,
 ) -> HashSet<EcoString> {
-    let mut cols = TableColumns::new(table_name);
-    let select = resolved.as_select();
-    for clause in &resolved.order_by {
+    let mut cols = ReferencedColumns::new(bound, table_name);
+    let query: &QueryExpr = bound.tree();
+    let select = bound.select();
+    for clause in &query.order_by {
         cols.add_refs(&clause.expr);
-        // Aliased `ORDER BY value` resolves to `Identifier`; chase it through
-        // the SELECT-list to recover the underlying base-table column refs.
-        if let ResolvedScalarExpr::Identifier(name) = &clause.expr
+        // Aliased `ORDER BY value` names an output; chase it through the
+        // SELECT list to recover the underlying base-table column refs.
+        if let Some(name) = order_by_output(bound, clause)
             && let Some(select) = select
         {
-            for expr in select_alias_exprs(select, name) {
+            for expr in alias_exprs(bound, select, name) {
                 cols.add_refs(expr);
             }
         }
@@ -183,43 +213,44 @@ pub(super) fn limit_window_columns_collect(
 /// a bare-column SELECT alias. Anything else returns `None` and the window
 /// check stays direction-blind (always invalidates).
 pub(super) fn limit_order_keys_collect(
-    resolved: &ResolvedQueryExpr,
+    bound: &ResolvedQuery,
     table_name: &str,
 ) -> Option<Box<[OrderByKey]>> {
-    let select = resolved.as_select()?;
-    if !row_level_window(resolved, select) {
+    let select = bound.select()?;
+    let query: &QueryExpr = bound.tree();
+    if !window_is_row_level(query, select) {
         return None;
     }
-    let mut keys = Vec::with_capacity(resolved.order_by.len());
-    for clause in &resolved.order_by {
-        let column = order_key_column(&clause.expr, select)?;
-        if column.table.as_str() != table_name {
+    let mut keys = Vec::with_capacity(query.order_by.len());
+    for clause in &query.order_by {
+        let column = order_key(bound, clause, select)?;
+        if bound.column_table(column)?.name.as_str() != table_name {
             return None;
         }
-        keys.push(order_by_key(column, clause));
+        keys.push(order_key_build(bound.column_name(column)?, clause));
     }
     Some(keys.into())
 }
 
 /// A window whose rows are the SELECT's own rows: ordered, and no DISTINCT,
 /// GROUP BY or HAVING reshaping them.
-fn row_level_window(resolved: &ResolvedQueryExpr, select: &ResolvedSelectNode) -> bool {
+fn window_is_row_level(query: &QueryExpr, select: &SelectNode) -> bool {
     let reshaped = select.distinct || !select.group_by.is_empty() || select.having.is_some();
-    !reshaped && !resolved.order_by.is_empty()
+    !reshaped && !query.order_by.is_empty()
 }
 
 /// The plain column an ORDER BY key sorts by: the key itself, or the bare
 /// column an `ORDER BY alias` names.
-fn order_key_column<'s>(
-    expr: &'s ResolvedScalarExpr,
-    select: &'s ResolvedSelectNode,
-) -> Option<&'s ResolvedColumnNode> {
-    let target = if let ResolvedScalarExpr::Identifier(name) = expr {
-        select_alias_exprs(select, name).next()?
-    } else {
-        expr
+fn order_key<'s>(
+    bound: &'s ResolvedQuery,
+    clause: &'s OrderByClause,
+    select: &'s SelectNode,
+) -> Option<&'s ColumnNode> {
+    let target = match order_by_output(bound, clause) {
+        Some(name) => alias_exprs(bound, select, name).next()?,
+        None => &clause.expr,
     };
-    if let ResolvedScalarExpr::Column(column) = target {
+    if let ScalarExpr::Column(column) = target {
         Some(column)
     } else {
         None
@@ -228,7 +259,7 @@ fn order_key_column<'s>(
 
 /// `Default` null ordering resolves per PG semantics — NULLs sort larger than
 /// every value, so ASC → last, DESC → first.
-fn order_by_key(column: &ResolvedColumnNode, clause: &ResolvedOrderByClause) -> OrderByKey {
+fn order_key_build(column: &EcoString, clause: &OrderByClause) -> OrderByKey {
     let descending = matches!(clause.direction, OrderDirection::Desc);
     let nulls_first = match clause.null_order {
         NullOrder::NullsFirst => true,
@@ -236,7 +267,7 @@ fn order_by_key(column: &ResolvedColumnNode, clause: &ResolvedOrderByClause) -> 
         NullOrder::Default => descending,
     };
     OrderByKey {
-        column: column.column.clone(),
+        column: column.clone(),
         descending,
         nulls_first,
     }
@@ -248,13 +279,13 @@ fn order_by_key(column: &ResolvedColumnNode, clause: &ResolvedOrderByClause) -> 
 /// direction), GROUP BY, and HAVING. The outer SELECT list is excluded: it
 /// never feeds a membership or invalidation verdict (PGC-264).
 pub(super) fn predicate_columns_collect(
-    resolved: &ResolvedQueryExpr,
+    bound: &ResolvedQuery,
     table_name: &str,
 ) -> HashSet<EcoString> {
-    let mut cols = TableColumns::new(table_name);
-    let Some(select) = resolved.as_select() else {
+    let mut cols = ReferencedColumns::new(bound, table_name);
+    let Some(select) = bound.select() else {
         // Not a plain select (set-op branch): over-collect every reference.
-        cols.add_refs(resolved);
+        cols.add_refs(bound.tree());
         return cols.columns;
     };
     for source in &select.from {
@@ -273,6 +304,281 @@ pub(super) fn predicate_columns_collect(
 }
 
 #[cfg(test)]
+mod resolved {
+    //! The resolved classifiers: the oracle the bound ones are checked
+    //! against until the resolved tree goes.
+
+    use std::collections::HashSet;
+    use std::ops::ControlFlow;
+
+    use ecow::EcoString;
+
+    use crate::cache::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuerySource};
+    use crate::oid::Oid;
+    use crate::query::ast::{AstNode, NullOrder, OrderDirection};
+    use crate::query::evaluate::resolved_where_expr_supported;
+    use crate::query::resolved::{
+        ResolvedColumnNode, ResolvedOrderByClause, ResolvedQueryExpr, ResolvedScalarExpr,
+        ResolvedSelectColumn, ResolvedSelectColumns, ResolvedSelectNode, ResolvedTableNode,
+    };
+
+    /// Conservative classifier: rejects anything the Rust evaluator can't decide
+    /// from a single CDC row. GROUP BY / HAVING are rejected because row-level
+    /// matching doesn't capture post-aggregation filtering. Non-FromClause sources
+    /// are rejected because their CDC semantics (subquery membership, outer join
+    /// null-padding cascade) aren't expressible as a row-level predicate.
+    pub(super) fn update_eval_strategy_classify_resolved(
+        resolved: &ResolvedQueryExpr,
+        source: UpdateQuerySource,
+    ) -> UpdateEvalStrategy {
+        if source != UpdateQuerySource::FromClause {
+            return UpdateEvalStrategy::PgEval;
+        }
+        let Some(select) = resolved.as_select() else {
+            return UpdateEvalStrategy::PgEval;
+        };
+        if !select.is_single_table() {
+            return UpdateEvalStrategy::PgEval;
+        }
+        if !select.group_by.is_empty() || select.having.is_some() {
+            return UpdateEvalStrategy::PgEval;
+        }
+        let Some(where_expr) = &select.where_clause else {
+            return UpdateEvalStrategy::LocalEval;
+        };
+        if resolved_where_expr_supported(where_expr) {
+            UpdateEvalStrategy::LocalEval
+        } else {
+            UpdateEvalStrategy::PgEval
+        }
+    }
+
+    /// Whether a PgEval query's membership predicate stays per-row correct when
+    /// evaluated for many CDC rows in one multi-row VALUES statement (PGC-241).
+    ///
+    /// Per-row membership substitutes the changed table with *only that row*; a
+    /// multi-row VALUES is equivalent iff each row's answer is independent of the
+    /// others. GROUP BY / HAVING / SELECT-list aggregates evaluate against the
+    /// substituted rows as a set, so they must stay on the per-row path. (LIMIT and
+    /// ORDER BY never reach the predicate — `cache_predicate_into` deparses the
+    /// select node only — and aggregates can't appear in WHERE.)
+    ///
+    /// Relations appearing more than once (self-joins) are excluded: the VALUES
+    /// transform's alias rewrite clobbers every occurrence's references to one
+    /// alias, which can forward-reference a later FROM entry — invalid SQL. The
+    /// per-row path has the same defect but only reaches it on paths the decide
+    /// pass usually skips; batching pre-evaluates unfiltered, so it must not pick
+    /// these up (PGC-256 tracks the underlying transform defect).
+    pub(super) fn pg_batchable_classify_resolved(
+        resolved: &ResolvedQueryExpr,
+        relation_oid: Oid,
+        aggregate_functions: &HashSet<EcoString>,
+    ) -> bool {
+        let Some(select) = resolved.as_select() else {
+            return false;
+        };
+        if !select.group_by.is_empty() || select.having.is_some() {
+            return false;
+        }
+        if resolved
+            .nodes::<ResolvedTableNode>()
+            .filter(|t| t.relation_oid == relation_oid)
+            .count()
+            > 1
+        {
+            return false;
+        }
+        match &select.columns {
+            ResolvedSelectColumns::None => true,
+            ResolvedSelectColumns::Columns(cols) => cols
+                .iter()
+                .all(|c| !c.expr.has_aggregate(aggregate_functions)),
+        }
+    }
+
+    /// Column names of one table, collected from column references anywhere
+    /// under the nodes added.
+    struct TableColumns<'t> {
+        table: &'t str,
+        columns: HashSet<EcoString>,
+    }
+
+    impl<'t> TableColumns<'t> {
+        fn new(table: &'t str) -> Self {
+            Self {
+                table,
+                columns: HashSet::new(),
+            }
+        }
+
+        fn add(&mut self, column: &ResolvedColumnNode) {
+            if column.table.as_str() == self.table {
+                self.columns.insert(column.column.clone());
+            }
+        }
+
+        /// Every column reference under `node` (zero-allocation walk).
+        fn add_refs<N: AstNode>(&mut self, node: &N) {
+            let _ = node.try_for_each_node::<ResolvedColumnNode, ()>(&mut |column| {
+                self.add(column);
+                ControlFlow::Continue(())
+            });
+        }
+    }
+
+    /// The SELECT-list expressions an `ORDER BY alias` names (output-name match).
+    fn select_alias_exprs<'s>(
+        select: &'s ResolvedSelectNode,
+        name: &'s EcoString,
+    ) -> impl Iterator<Item = &'s ResolvedScalarExpr> {
+        let columns: &[ResolvedSelectColumn] = match &select.columns {
+            ResolvedSelectColumns::Columns(columns) => columns,
+            ResolvedSelectColumns::None => &[],
+        };
+        columns
+            .iter()
+            .filter(move |column| column.output_name() == Some(name))
+            .map(|column| &column.expr)
+    }
+
+    /// Collect column names on `table_name` that participate in the parent
+    /// query's LIMIT-window definition: top-level ORDER BY, WHERE, and HAVING.
+    ///
+    /// PGC-94: used by row_cached_invalidation_check to decide whether a CDC
+    /// UPDATE on a cached row may shift the window such that an untracked
+    /// row needs to fill the gap. Returns an empty set when the query has
+    /// no window-defining references on this table.
+    ///
+    /// Aliased ORDER BY (`ORDER BY count(*) DESC LIMIT 10`) carries no table
+    /// reference and naturally produces no entries here. Those shapes are
+    /// Measure queries that already use PgEval/MV invalidation paths.
+    pub(super) fn limit_window_columns_collect_resolved(
+        resolved: &ResolvedQueryExpr,
+        table_name: &str,
+    ) -> HashSet<EcoString> {
+        let mut cols = TableColumns::new(table_name);
+        let select = resolved.as_select();
+        for clause in &resolved.order_by {
+            cols.add_refs(&clause.expr);
+            // Aliased `ORDER BY value` resolves to `Identifier`; chase it through
+            // the SELECT-list to recover the underlying base-table column refs.
+            if let ResolvedScalarExpr::Identifier(name) = &clause.expr
+                && let Some(select) = select
+            {
+                for expr in select_alias_exprs(select, name) {
+                    cols.add_refs(expr);
+                }
+            }
+        }
+        if let Some(select) = select {
+            if let Some(where_expr) = &select.where_clause {
+                cols.add_refs(where_expr);
+            }
+            if let Some(having) = &select.having {
+                cols.add_refs(having);
+            }
+        }
+        cols.columns
+    }
+
+    /// The ORDER BY key spec for direction-aware window invalidation (PGC-334):
+    /// `Some` only when the parent query is a plain SELECT (no set-op, GROUP BY,
+    /// HAVING, or DISTINCT — their windows aren't row-level) and every key
+    /// resolves to exactly one plain column of `table_name`, directly or through
+    /// a bare-column SELECT alias. Anything else returns `None` and the window
+    /// check stays direction-blind (always invalidates).
+    pub(super) fn limit_order_keys_collect_resolved(
+        resolved: &ResolvedQueryExpr,
+        table_name: &str,
+    ) -> Option<Box<[OrderByKey]>> {
+        let select = resolved.as_select()?;
+        if !row_level_window(resolved, select) {
+            return None;
+        }
+        let mut keys = Vec::with_capacity(resolved.order_by.len());
+        for clause in &resolved.order_by {
+            let column = order_key_column(&clause.expr, select)?;
+            if column.table.as_str() != table_name {
+                return None;
+            }
+            keys.push(order_by_key(column, clause));
+        }
+        Some(keys.into())
+    }
+
+    /// A window whose rows are the SELECT's own rows: ordered, and no DISTINCT,
+    /// GROUP BY or HAVING reshaping them.
+    fn row_level_window(resolved: &ResolvedQueryExpr, select: &ResolvedSelectNode) -> bool {
+        let reshaped = select.distinct || !select.group_by.is_empty() || select.having.is_some();
+        !reshaped && !resolved.order_by.is_empty()
+    }
+
+    /// The plain column an ORDER BY key sorts by: the key itself, or the bare
+    /// column an `ORDER BY alias` names.
+    fn order_key_column<'s>(
+        expr: &'s ResolvedScalarExpr,
+        select: &'s ResolvedSelectNode,
+    ) -> Option<&'s ResolvedColumnNode> {
+        let target = if let ResolvedScalarExpr::Identifier(name) = expr {
+            select_alias_exprs(select, name).next()?
+        } else {
+            expr
+        };
+        if let ResolvedScalarExpr::Column(column) = target {
+            Some(column)
+        } else {
+            None
+        }
+    }
+
+    /// `Default` null ordering resolves per PG semantics — NULLs sort larger than
+    /// every value, so ASC → last, DESC → first.
+    fn order_by_key(column: &ResolvedColumnNode, clause: &ResolvedOrderByClause) -> OrderByKey {
+        let descending = matches!(clause.direction, OrderDirection::Desc);
+        let nulls_first = match clause.null_order {
+            NullOrder::NullsFirst => true,
+            NullOrder::NullsLast => false,
+            NullOrder::Default => descending,
+        };
+        OrderByKey {
+            column: column.column.clone(),
+            descending,
+            nulls_first,
+        }
+    }
+
+    /// Collect column names on `table_name` whose values CDC eval reads for this
+    /// update query: WHERE, from-source join predicates (including any nested
+    /// subquery internals — over-collection errs toward invalidation, the safe
+    /// direction), GROUP BY, and HAVING. The outer SELECT list is excluded: it
+    /// never feeds a membership or invalidation verdict (PGC-264).
+    pub(super) fn predicate_columns_collect_resolved(
+        resolved: &ResolvedQueryExpr,
+        table_name: &str,
+    ) -> HashSet<EcoString> {
+        let mut cols = TableColumns::new(table_name);
+        let Some(select) = resolved.as_select() else {
+            // Not a plain select (set-op branch): over-collect every reference.
+            cols.add_refs(resolved);
+            return cols.columns;
+        };
+        for source in &select.from {
+            cols.add_refs(source);
+        }
+        if let Some(where_expr) = &select.where_clause {
+            cols.add_refs(where_expr);
+        }
+        for column in &select.group_by {
+            cols.add(column);
+        }
+        if let Some(having) = &select.having {
+            cols.add_refs(having);
+        }
+        cols.columns
+    }
+}
+
+#[cfg(test)]
 mod classify_tests {
 
     use std::collections::HashMap;
@@ -280,11 +586,14 @@ mod classify_tests {
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
+    use super::resolved::*;
     use super::*;
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_expr_parse;
+    use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+    use crate::query::resolved::ResolvedQueryExpr;
     use crate::query::resolved::query_expr_resolve;
 
     fn make_table(name: &str, oid: Oid, columns: &[&str]) -> TableMetadata {
@@ -311,7 +620,15 @@ mod classify_tests {
         }
     }
 
-    fn resolve(sql: &str, tables: &Catalog) -> ResolvedQueryExpr {
+    fn resolve(sql: &str, tables: &Catalog) -> ResolvedQuery {
+        let query_expr = query_expr_parse(sql).expect("convert");
+        let cacheable = CacheableQuery::try_new(query_expr, &HashMap::new()).expect("cacheable");
+        let query = std::sync::Arc::new(cacheable.query().clone());
+        let (_, bindings) = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+        ResolvedQuery::new(query, bindings)
+    }
+
+    fn resolve_oracle(sql: &str, tables: &Catalog) -> ResolvedQueryExpr {
         let query_expr = query_expr_parse(sql).expect("convert");
         let cacheable = CacheableQuery::try_new(query_expr, &HashMap::new()).expect("cacheable");
         query_expr_resolve(cacheable.query(), tables, &["public"]).expect("resolve")
@@ -322,8 +639,8 @@ mod classify_tests {
         tables.insert_overwrite(
             make_table("t", Oid::from_raw(1), &["id", "name", "status", "age"]).into(),
         );
-        let resolved = resolve(sql, &tables);
-        update_eval_strategy_classify(&resolved, UpdateQuerySource::FromClause)
+        let bound = resolve(sql, &tables);
+        update_eval_strategy_classify(&bound, UpdateQuerySource::FromClause)
     }
 
     #[test]
@@ -380,9 +697,9 @@ mod classify_tests {
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(make_table("a", Oid::from_raw(1), &["id", "bid"]).into());
         tables.insert_overwrite(make_table("b", Oid::from_raw(2), &["id", "name"]).into());
-        let resolved = resolve("SELECT * FROM a JOIN b ON a.bid = b.id", &tables);
+        let bound = resolve("SELECT * FROM a JOIN b ON a.bid = b.id", &tables);
         assert_eq!(
-            update_eval_strategy_classify(&resolved, UpdateQuerySource::FromClause),
+            update_eval_strategy_classify(&bound, UpdateQuerySource::FromClause),
             UpdateEvalStrategy::PgEval
         );
     }
@@ -390,7 +707,7 @@ mod classify_tests {
     #[test]
     fn test_non_fromclause_source_is_pg_eval() {
         use crate::cache::SubqueryKind;
-        let resolved = resolve("SELECT * FROM t WHERE id = 5", &{
+        let bound = resolve("SELECT * FROM t WHERE id = 5", &{
             let mut tables = BiHashMap::new();
             tables.insert_overwrite(make_table("t", Oid::from_raw(1), &["id", "name"]).into());
             tables
@@ -398,7 +715,7 @@ mod classify_tests {
         // Same query, but classified as a subquery-sourced update query
         assert_eq!(
             update_eval_strategy_classify(
-                &resolved,
+                &bound,
                 UpdateQuerySource::Subquery(SubqueryKind::Inclusion),
             ),
             UpdateEvalStrategy::PgEval
@@ -414,11 +731,11 @@ mod classify_tests {
         tables.insert_overwrite(
             make_table("t", Oid::from_raw(1), &["id", "name", "status", "age"]).into(),
         );
-        let resolved = resolve(
+        let bound = resolve(
             "SELECT name FROM t WHERE status = 'a' AND age > 'x'",
             &tables,
         );
-        let cols = predicate_columns_collect(&resolved, "t");
+        let cols = predicate_columns_collect(&bound, "t");
         assert!(cols.contains("status"));
         assert!(cols.contains("age"));
         assert!(
@@ -435,14 +752,14 @@ mod classify_tests {
             .insert_overwrite(make_table("t", Oid::from_raw(1), &["id", "name", "status"]).into());
         tables
             .insert_overwrite(make_table("u", Oid::from_raw(2), &["id", "t_id", "region"]).into());
-        let resolved = resolve(
+        let bound = resolve(
             "SELECT t.name FROM t JOIN u ON u.t_id = t.id WHERE u.region = 'x'",
             &tables,
         );
-        let t_cols = predicate_columns_collect(&resolved, "t");
+        let t_cols = predicate_columns_collect(&bound, "t");
         assert!(t_cols.contains("id"), "join column collected");
         assert!(!t_cols.contains("name"));
-        let u_cols = predicate_columns_collect(&resolved, "u");
+        let u_cols = predicate_columns_collect(&bound, "u");
         assert!(u_cols.contains("t_id"));
         assert!(u_cols.contains("region"));
         assert!(!u_cols.contains("id"));
@@ -454,16 +771,90 @@ mod classify_tests {
         tables.insert_overwrite(
             make_table("t", Oid::from_raw(1), &["id", "name", "status", "age"]).into(),
         );
-        let resolved = resolve(
+        let bound = resolve(
             "SELECT status, count(id) FROM t GROUP BY status HAVING count(age) > 1",
             &tables,
         );
-        let cols = predicate_columns_collect(&resolved, "t");
+        let cols = predicate_columns_collect(&bound, "t");
         assert!(cols.contains("status"), "GROUP BY column collected");
         assert!(cols.contains("age"), "HAVING column collected");
         assert!(
             !cols.contains("id"),
             "aggregate arg only in the SELECT list must be excluded"
         );
+    }
+
+    /// Every classifier agrees with its resolved form over the shapes the
+    /// cached path meets: single tables, joins, set operations, aliased and
+    /// aggregate ordering, casts, and subqueries.
+    #[test]
+    fn test_bound_classifiers_match_resolved() {
+        let tables = {
+            let mut t = BiHashMap::new();
+            t.insert_overwrite(
+                make_table("t", Oid::from_raw(1), &["id", "name", "status", "bid"]).into(),
+            );
+            t.insert_overwrite(make_table("b", Oid::from_raw(2), &["id", "name", "kind"]).into());
+            t
+        };
+        let aggregates: HashSet<EcoString> =
+            ["count", "max"].into_iter().map(EcoString::from).collect();
+        #[rustfmt::skip]
+        let corpus = [
+            "SELECT * FROM t WHERE id = 1",
+            "SELECT * FROM t WHERE id = 1 AND name = 'x' OR status = 'y'",
+            "SELECT * FROM t WHERE id IN (1, 2)",
+            "SELECT * FROM t WHERE name LIKE 'a%'",
+            "SELECT * FROM t WHERE name::text = 'a' AND status::date = '2024-01-01'",
+            "SELECT * FROM t WHERE id::int8 > 5 AND 'z' < name",
+            "SELECT status, count(*) FROM t GROUP BY status HAVING count(*) > 1",
+            "SELECT * FROM t JOIN b ON t.bid = b.id WHERE b.kind = 'k' ORDER BY t.name LIMIT 5",
+            "SELECT t.id, t.name AS label FROM t ORDER BY label DESC NULLS LAST LIMIT 3",
+            "SELECT t.id FROM t ORDER BY name, id DESC LIMIT 3",
+            "SELECT DISTINCT t.id FROM t ORDER BY t.id LIMIT 3",
+            "SELECT t.id FROM t WHERE t.id = 1 UNION SELECT b.id FROM b WHERE b.kind = 'k' ORDER BY id",
+            "SELECT t.id FROM t WHERE EXISTS (SELECT 1 FROM b WHERE b.id = t.bid AND b.kind = 'k')",
+            "SELECT t.id FROM t JOIN b USING (id) WHERE id = 3 ORDER BY id LIMIT 2",
+            "SELECT t1.id FROM t t1 JOIN t t2 ON t1.bid = t2.id WHERE t1.name = 'a'",
+            "SELECT max(t.id) AS top FROM t ORDER BY top LIMIT 1",
+        ];
+        for sql in corpus {
+            let bound = resolve(sql, &tables);
+            let oracle = resolve_oracle(sql, &tables);
+            for source in [
+                UpdateQuerySource::FromClause,
+                UpdateQuerySource::OuterJoinOptional,
+            ] {
+                assert_eq!(
+                    update_eval_strategy_classify(&bound, source),
+                    update_eval_strategy_classify_resolved(&oracle, source),
+                    "{sql}"
+                );
+            }
+            for oid in [Oid::from_raw(1), Oid::from_raw(2)] {
+                assert_eq!(
+                    pg_batchable_classify(&bound, oid, &aggregates),
+                    pg_batchable_classify_resolved(&oracle, oid, &aggregates),
+                    "{sql}"
+                );
+            }
+            for table in ["t", "b"] {
+                assert_eq!(
+                    limit_window_columns_collect(&bound, table),
+                    limit_window_columns_collect_resolved(&oracle, table),
+                    "{sql}"
+                );
+                assert_eq!(
+                    limit_order_keys_collect(&bound, table),
+                    limit_order_keys_collect_resolved(&oracle, table),
+                    "{sql}"
+                );
+                assert_eq!(
+                    predicate_columns_collect(&bound, table),
+                    predicate_columns_collect_resolved(&oracle, table),
+                    "{sql}"
+                );
+            }
+        }
     }
 }

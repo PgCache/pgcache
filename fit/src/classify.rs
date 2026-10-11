@@ -332,8 +332,8 @@ pub fn statement_classify(
         };
     };
     let shape_gate = shape_gate_classify(
-        &resolved,
-        decorrelated.as_ref().map(|(_, resolved)| resolved),
+        &bound,
+        decorrelated.as_ref().map(|(bound, _)| bound),
         &builtins.aggregates,
     );
     let max_limit = if shape_gate.is_reducer() {

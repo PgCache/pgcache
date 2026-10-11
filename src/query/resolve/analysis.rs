@@ -7,6 +7,8 @@ use ecow::EcoString;
 use postgres_types::Type;
 
 use super::bindings::{ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot};
+use crate::catalog::TableMetadata;
+use crate::oid::Oid;
 use crate::query::ast::{
     AstNode, ColumnNode, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode, StarNode,
 };
@@ -34,6 +36,28 @@ impl ResolvedQuery {
                 .map(|merged| merged.left),
             ColumnTarget::Output => None,
         }
+    }
+
+    /// The table of the column a reference stands for (a derived table's
+    /// synthetic metadata is named by its alias).
+    pub fn column_table(&self, node: &ColumnNode) -> Option<&TableMetadata> {
+        let binding = self.column_binding(node)?;
+        self.bindings().slot(binding.slot).map(TableSlot::table)
+    }
+
+    /// The name of the column a reference stands for.
+    pub fn column_name(&self, node: &ColumnNode) -> Option<&EcoString> {
+        let binding = self.column_binding(node)?;
+        self.bindings().binding_column(&binding).map(|c| &c.name)
+    }
+
+    /// How many FROM entries name the relation `relation_oid`, at any depth.
+    pub fn relation_occurrences(&self, relation_oid: Oid) -> usize {
+        self.bindings()
+            .slots()
+            .iter()
+            .filter(|slot| matches!(slot, TableSlot::Base { table, .. } if table.relation_oid == relation_oid))
+            .count()
     }
 
     /// The type of the column a reference stands for.

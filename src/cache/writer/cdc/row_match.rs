@@ -190,7 +190,7 @@ pub(super) fn update_query_matches_locally(
             // classifier only assigns LocalEval to SELECTs. Guard that invariant so
             // a future classifier change can't silently make every row match here.
             debug_assert!(
-                update_query.resolved.as_select().is_some(),
+                update_query.bound.select().is_some(),
                 "LocalEval query must be a SELECT; classifier/compiled_where invariant broken"
             );
             true

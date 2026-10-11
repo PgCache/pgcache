@@ -3,11 +3,13 @@
 #[cfg(test)]
 use crate::oid::Oid;
 use crate::pg::protocol::ByteString;
+use crate::query::ast::{BinaryExpr, ScalarExpr, WhereExpr};
 use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
 use crate::query::cast::{
     CastTarget, canonicalize_comparison, cast_target_coerce_text,
-    cast_target_is_coercion_supported, is_canonical_date_literal,
+    cast_target_is_coercion_supported, comparison_canonicalize, is_canonical_date_literal,
 };
+use crate::query::resolve::ResolvedQuery;
 use crate::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedScalarExpr, ResolvedWhereExpr,
 };
@@ -255,6 +257,51 @@ pub fn bool_wire_text_parse(text: &str) -> Option<bool> {
         "f" | "false" => Some(false),
         _ => None,
     }
+}
+
+/// [`resolved_where_expr_supported`] on the bound query: whether the compiled
+/// predicate can decide `expr` against a single CDC row.
+pub fn where_expr_supported(bound: &ResolvedQuery, expr: &WhereExpr) -> bool {
+    match expr {
+        WhereExpr::Scalar(scalar) => {
+            matches!(scalar, ScalarExpr::Column(_) | ScalarExpr::Literal(_))
+        }
+        WhereExpr::Binary(binary) => match binary.op {
+            BinaryOp::And | BinaryOp::Or => {
+                where_expr_supported(bound, &binary.lexpr)
+                    && where_expr_supported(bound, &binary.rexpr)
+            }
+            BinaryOp::Equal
+            | BinaryOp::NotEqual
+            | BinaryOp::LessThan
+            | BinaryOp::LessThanOrEqual
+            | BinaryOp::GreaterThan
+            | BinaryOp::GreaterThanOrEqual => comparison_is_simple(bound, binary),
+            BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => false,
+        },
+        WhereExpr::Unary(unary) => where_expr_supported(bound, &unary.expr),
+        WhereExpr::Multi(_) | WhereExpr::Subquery { .. } => false,
+    }
+}
+
+/// [`is_simple_comparison`] on the bound query.
+pub fn comparison_is_simple(bound: &ResolvedQuery, binary: &BinaryExpr) -> bool {
+    let Some((column, target, op, literal)) = comparison_canonicalize(bound, binary) else {
+        return false;
+    };
+    let Some(base) = bound.column_type(column) else {
+        return false;
+    };
+    let Some(target) = target else {
+        return literal_locally_comparable(base, literal, op);
+    };
+    if !cast_target_is_coercion_supported(target, base) {
+        return false;
+    }
+    if *target == CastTarget::Date {
+        return literal_is_canonical_date(literal);
+    }
+    true
 }
 
 /// Returns true iff `where_expr_evaluate` can decide this expression against a
@@ -1659,7 +1706,7 @@ mod tests {
     }
 
     fn assert_compiled_matches_oracle(expr: &ResolvedWhereExpr) {
-        let compiled = CompiledPredicate::compile(expr, TABLE);
+        let compiled = CompiledPredicate::compile_resolved(expr, TABLE);
         for row in diff_rows() {
             assert_eq!(
                 compiled.eval(&row),

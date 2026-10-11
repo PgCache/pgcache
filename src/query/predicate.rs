@@ -12,10 +12,16 @@
 //! `where_expr_evaluate` for the expression it was compiled from.
 
 use crate::pg::protocol::ByteString;
-use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
-use crate::query::cast::{CastTarget, canonicalize_comparison, cast_target_coerce_text};
+use crate::query::ast::{BinaryOp, LiteralValue, ScalarExpr, UnaryOp, WhereExpr};
+#[cfg(test)]
+use crate::query::cast::canonicalize_comparison;
+use crate::query::cast::{CastTarget, cast_target_coerce_text, comparison_canonicalize};
 use crate::query::evaluate::literal_compare;
-use crate::query::resolved::{ResolvedScalarExpr, ResolvedWhereExpr};
+use crate::query::resolve::ResolvedQuery;
+#[cfg(test)]
+use crate::query::resolved::ResolvedScalarExpr;
+#[cfg(test)]
+use crate::query::resolved::ResolvedWhereExpr;
 use crate::query::typed_compare::TypedLiteral;
 
 /// Pre-canonicalized form of a LocalEval WHERE clause. Built once at registration
@@ -54,18 +60,77 @@ pub enum CompiledPredicate {
 }
 
 impl CompiledPredicate {
-    /// Compile a resolved WHERE expression for rows of `table_name`. Total —
+    /// Compile a WHERE expression of `bound` for rows of `table_name`. Total —
     /// every input maps to a node.
-    pub fn compile(expr: &ResolvedWhereExpr, table_name: &str) -> Self {
+    pub fn compile(bound: &ResolvedQuery, expr: &WhereExpr, table_name: &str) -> Self {
+        match expr {
+            WhereExpr::Binary(b) => match b.op {
+                BinaryOp::And => Self::And(
+                    Box::new(Self::compile(bound, &b.lexpr, table_name)),
+                    Box::new(Self::compile(bound, &b.rexpr, table_name)),
+                ),
+                BinaryOp::Or => Self::Or(
+                    Box::new(Self::compile(bound, &b.lexpr, table_name)),
+                    Box::new(Self::compile(bound, &b.rexpr, table_name)),
+                ),
+                BinaryOp::Equal
+                | BinaryOp::NotEqual
+                | BinaryOp::LessThan
+                | BinaryOp::LessThanOrEqual
+                | BinaryOp::GreaterThan
+                | BinaryOp::GreaterThanOrEqual => {
+                    let compare = comparison_canonicalize(bound, b).and_then(
+                        |(column, target, op, value)| {
+                            let binding = bound.column_binding(column)?;
+                            let table = bound.column_table(column)?;
+                            let data_type = bound.column_type(column)?;
+                            Some(Self::Compare {
+                                col: binding.position.index(),
+                                in_table: table.name.as_str() == table_name,
+                                target: target.cloned(),
+                                op,
+                                value: value.clone(),
+                                literal: TypedLiteral::new(data_type, value),
+                            })
+                        },
+                    );
+                    compare.unwrap_or(Self::ConstFalse)
+                }
+                BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => {
+                    Self::ConstFalse
+                }
+            },
+            WhereExpr::Unary(u) => match u.op {
+                UnaryOp::Not => Self::Not(Box::new(Self::compile(bound, &u.expr, table_name))),
+                op @ (UnaryOp::IsNull
+                | UnaryOp::IsNotNull
+                | UnaryOp::IsTrue
+                | UnaryOp::IsNotTrue
+                | UnaryOp::IsFalse
+                | UnaryOp::IsNotFalse) => Self::NullCheck {
+                    op,
+                    col: column_position(bound, &u.expr, table_name),
+                },
+            },
+            WhereExpr::Scalar(_) | WhereExpr::Multi(_) | WhereExpr::Subquery { .. } => {
+                Self::ConstFalse
+            }
+        }
+    }
+
+    /// [`CompiledPredicate::compile`] from the resolved tree; the oracle its
+    /// tests compare against until the resolved tree goes.
+    #[cfg(test)]
+    pub fn compile_resolved(expr: &ResolvedWhereExpr, table_name: &str) -> Self {
         match expr {
             ResolvedWhereExpr::Binary(b) => match b.op {
                 BinaryOp::And => Self::And(
-                    Box::new(Self::compile(&b.lexpr, table_name)),
-                    Box::new(Self::compile(&b.rexpr, table_name)),
+                    Box::new(Self::compile_resolved(&b.lexpr, table_name)),
+                    Box::new(Self::compile_resolved(&b.rexpr, table_name)),
                 ),
                 BinaryOp::Or => Self::Or(
-                    Box::new(Self::compile(&b.lexpr, table_name)),
-                    Box::new(Self::compile(&b.rexpr, table_name)),
+                    Box::new(Self::compile_resolved(&b.lexpr, table_name)),
+                    Box::new(Self::compile_resolved(&b.rexpr, table_name)),
                 ),
                 BinaryOp::Equal
                 | BinaryOp::NotEqual
@@ -88,7 +153,7 @@ impl CompiledPredicate {
                 }
             },
             ResolvedWhereExpr::Unary(u) => match u.op {
-                UnaryOp::Not => Self::Not(Box::new(Self::compile(&u.expr, table_name))),
+                UnaryOp::Not => Self::Not(Box::new(Self::compile_resolved(&u.expr, table_name))),
                 op @ (UnaryOp::IsNull
                 | UnaryOp::IsNotNull
                 | UnaryOp::IsTrue
@@ -166,6 +231,19 @@ impl CompiledPredicate {
 /// Row position of `expr` when it is an in-table bare column reference, matching
 /// the value `unary_expr_evaluate` reads for IS NULL/TRUE/FALSE checks: `None`
 /// for any non-column inner, or a column belonging to another table.
+fn column_position(bound: &ResolvedQuery, expr: &WhereExpr, table_name: &str) -> Option<usize> {
+    let WhereExpr::Scalar(ScalarExpr::Column(column)) = expr else {
+        return None;
+    };
+    let table = bound.column_table(column)?;
+    if table.name.as_str() != table_name {
+        return None;
+    }
+    Some(bound.column_binding(column)?.position.index())
+}
+
+/// [`column_position`] on the resolved tree.
+#[cfg(test)]
 fn column_position_in_table(expr: &ResolvedWhereExpr, table_name: &str) -> Option<usize> {
     if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = expr
         && col.table.as_str() == table_name
@@ -173,5 +251,99 @@ fn column_position_in_table(expr: &ResolvedWhereExpr, table_name: &str) -> Optio
         Some(col.column_metadata.index())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use iddqd::BiHashMap;
+    use postgres_types::Type;
+
+    use super::*;
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::oid::{Oid, TypeOid};
+    use crate::query::ast::query_expr_parse;
+    use crate::query::resolve::query_expr_resolve_bound;
+
+    fn catalog() -> Catalog {
+        let column = |name: &str, index: usize, ty: Type| ColumnMetadata {
+            name: name.into(),
+            position: ColumnPosition::from_index(index).expect("position"),
+            type_oid: TypeOid::from_type(&ty),
+            type_name: ty.name().into(),
+            cache_type_name: ty.name().into(),
+            data_type: ty,
+            is_primary_key: index == 0,
+        };
+        let mut tables = BiHashMap::new();
+        for (name, oid) in [("t", 1u32), ("b", 2)] {
+            tables.insert_overwrite(
+                TableMetadata {
+                    replica_identity_full: false,
+                    relation_oid: Oid::from_raw(oid),
+                    name: name.into(),
+                    schema: "public".into(),
+                    primary_key_columns: vec!["id".into()],
+                    columns: ColumnStore::new([
+                        column("id", 0, Type::INT4),
+                        column("name", 1, Type::TEXT),
+                        column("flag", 2, Type::BOOL),
+                        column("day", 3, Type::DATE),
+                    ]),
+                    indexes: Vec::new(),
+                }
+                .into(),
+            );
+        }
+        tables
+    }
+
+    /// The bound compilation is the resolved one, node for node, over every
+    /// shape the evaluator accepts or rejects.
+    #[test]
+    fn test_bound_compile_matches_resolved() {
+        let catalog = catalog();
+        #[rustfmt::skip]
+        let corpus = [
+            "SELECT id FROM t WHERE id = 1",
+            "SELECT id FROM t WHERE 5 < id AND name <> 'x' OR flag IS TRUE",
+            "SELECT id FROM t WHERE NOT (id = 1 AND name IS NOT NULL)",
+            "SELECT id FROM t WHERE name::text = 'a' AND id::int8 = 3 AND day::date = '2024-01-01'",
+            "SELECT id FROM t WHERE id IN (1, 2) OR name LIKE 'a%'",
+            "SELECT id FROM t WHERE id = (SELECT max(id) FROM b)",
+            "SELECT t.id FROM t JOIN b ON t.id = b.id WHERE b.name = 'z' AND t.flag IS FALSE",
+            "SELECT id FROM t JOIN b USING (id) WHERE id = 7 AND t.name = 'q'",
+            "SELECT id FROM t WHERE id = NULL AND flag = true AND name = 1",
+        ];
+        for sql in corpus {
+            let query = Arc::new(query_expr_parse(sql).expect("parse"));
+            let (resolved, bindings) =
+                query_expr_resolve_bound(&query, &catalog, &["public"]).expect("resolve");
+            let bound = crate::query::resolve::ResolvedQuery::new(query, bindings);
+            let (Some(select), Some(resolved_select)) = (bound.select(), resolved.as_select())
+            else {
+                panic!("{sql}: a SELECT");
+            };
+            let (Some(where_clause), Some(resolved_where)) =
+                (&select.where_clause, &resolved_select.where_clause)
+            else {
+                panic!("{sql}: a WHERE");
+            };
+            for table in ["t", "b"] {
+                assert_eq!(
+                    format!(
+                        "{:?}",
+                        CompiledPredicate::compile(&bound, where_clause, table)
+                    ),
+                    format!(
+                        "{:?}",
+                        CompiledPredicate::compile_resolved(resolved_where, table)
+                    ),
+                    "{sql} for {table}"
+                );
+            }
+        }
     }
 }

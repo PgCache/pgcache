@@ -3,8 +3,6 @@
 //! grouped by the keys when the scalar aggregates; the outer reference
 //! becomes `_dcN._dsN`.
 
-use std::collections::HashSet;
-
 use ecow::EcoString;
 use postgres_types::Type;
 use smallvec::SmallVec;
@@ -31,40 +29,6 @@ struct ScalarJoin {
     derived: TableSource,
     condition: WhereExpr,
     scalar: ColumnNode,
-}
-
-/// Whether a scalar expression calls an aggregate, looking through CASE
-/// arms, arithmetic, arrays and casts but not into subqueries.
-fn scalar_has_aggregate(expr: &ScalarExpr, aggregates: &HashSet<EcoString>) -> bool {
-    match expr {
-        ScalarExpr::Function(func) => {
-            aggregates.contains(func.name.as_str())
-                || func
-                    .args
-                    .iter()
-                    .any(|a| scalar_has_aggregate(a, aggregates))
-        }
-        ScalarExpr::Case(case) => {
-            case.arg
-                .as_ref()
-                .is_some_and(|a| scalar_has_aggregate(a, aggregates))
-                || case
-                    .whens
-                    .iter()
-                    .any(|w| scalar_has_aggregate(&w.result, aggregates))
-                || case
-                    .default
-                    .as_ref()
-                    .is_some_and(|d| scalar_has_aggregate(d, aggregates))
-        }
-        ScalarExpr::Arithmetic(arithmetic) => {
-            scalar_has_aggregate(&arithmetic.left, aggregates)
-                || scalar_has_aggregate(&arithmetic.right, aggregates)
-        }
-        ScalarExpr::Array(elements) => elements.iter().any(|e| scalar_has_aggregate(e, aggregates)),
-        ScalarExpr::TypeCast { expr, .. } => scalar_has_aggregate(expr, aggregates),
-        ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Subquery(_) => false,
-    }
 }
 
 /// The binding an inner correlation column refers to: its own, or the left
@@ -102,7 +66,7 @@ fn subquery_scalar_decorrelate(
         .where_clause
         .as_ref()
         .ok_or_else(|| rejected("scalar subquery has no WHERE clause"))?;
-    let has_aggregate = scalar_has_aggregate(scalar, state.aggregate_functions);
+    let has_aggregate = scalar.has_aggregate(state.aggregate_functions);
     if !has_aggregate && query.limit.is_some() {
         return Err(rejected("non-aggregate scalar subquery with LIMIT"));
     }

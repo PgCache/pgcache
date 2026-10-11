@@ -1,4 +1,5 @@
 use std::any::Any;
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 
 use ecow::EcoString;
@@ -992,6 +993,61 @@ impl ScalarExpr {
             ScalarExpr::TypeCast { expr, .. } => {
                 expr.subquery_nodes_collect(branches);
             }
+        }
+    }
+}
+
+impl ScalarExpr {
+    /// Whether the expression calls one of `aggregates`, looking through
+    /// function arguments, CASE arms, arithmetic, arrays and casts but not
+    /// into subqueries (an aggregate inside one does not aggregate here).
+    pub fn has_aggregate(&self, aggregates: &HashSet<EcoString>) -> bool {
+        match self {
+            ScalarExpr::Function(func) => {
+                aggregates.contains(func.name.as_str())
+                    || func.args.iter().any(|a| a.has_aggregate(aggregates))
+            }
+            ScalarExpr::Case(case) => {
+                case.arg
+                    .as_ref()
+                    .is_some_and(|a| a.has_aggregate(aggregates))
+                    || case
+                        .whens
+                        .iter()
+                        .any(|w| w.result.has_aggregate(aggregates))
+                    || case
+                        .default
+                        .as_ref()
+                        .is_some_and(|d| d.has_aggregate(aggregates))
+            }
+            ScalarExpr::Arithmetic(arithmetic) => {
+                arithmetic.left.has_aggregate(aggregates)
+                    || arithmetic.right.has_aggregate(aggregates)
+            }
+            ScalarExpr::Array(elements) => elements.iter().any(|e| e.has_aggregate(aggregates)),
+            ScalarExpr::TypeCast { expr, .. } => expr.has_aggregate(aggregates),
+            ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Subquery(_) => false,
+        }
+    }
+
+    /// Whether the expression holds a window function call (`OVER`),
+    /// looking through the same forms as [`ScalarExpr::has_aggregate`].
+    pub fn has_window(&self) -> bool {
+        match self {
+            ScalarExpr::Function(func) => {
+                func.over.is_some() || func.args.iter().any(ScalarExpr::has_window)
+            }
+            ScalarExpr::Case(case) => {
+                case.arg.as_ref().is_some_and(|a| a.has_window())
+                    || case.whens.iter().any(|w| w.result.has_window())
+                    || case.default.as_ref().is_some_and(|d| d.has_window())
+            }
+            ScalarExpr::Arithmetic(arithmetic) => {
+                arithmetic.left.has_window() || arithmetic.right.has_window()
+            }
+            ScalarExpr::Array(elements) => elements.iter().any(ScalarExpr::has_window),
+            ScalarExpr::TypeCast { expr, .. } => expr.has_window(),
+            ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Subquery(_) => false,
         }
     }
 }

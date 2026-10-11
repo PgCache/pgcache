@@ -184,8 +184,8 @@ impl WriterRegistration {
             &path,
         )?;
         let shape_gate = shape_gate_classify(
-            &resolved,
-            decorrelated.as_ref().map(|(_, resolved)| resolved),
+            &bound,
+            decorrelated.as_ref().map(|(bound, _)| bound),
             &self.aggregate_functions,
         );
         let (max_limit, mv_limit) = resolution_limits(bound.tree(), shape_gate, user_max_limit);

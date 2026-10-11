@@ -18,8 +18,8 @@ use postgres_protocol::escape::escape_identifier;
 use super::mv_shape::ShapeGate;
 use crate::query::Fingerprint;
 use crate::query::ast::{
-    Deparse, LimitClause, OrderByClause, OrderDirection, QueryBody, QueryExpr, ScalarExpr,
-    SelectColumn, SelectColumns, SelectNode, TableSource,
+    Deparse, LimitClause, OrderByClause, OrderDirection, QueryBody, QueryExpr, SelectColumn,
+    SelectColumns, SelectNode, TableSource,
 };
 use crate::query::resolve::ResolvedQuery;
 
@@ -383,37 +383,9 @@ pub(crate) fn query_has_window(query: &QueryExpr) -> bool {
         return false;
     };
     columns.iter().any(|column| match column {
-        SelectColumn::Expr { expr, .. } => scalar_has_window(expr),
+        SelectColumn::Expr { expr, .. } => expr.has_window(),
         SelectColumn::Star(_) => false,
     })
-}
-
-/// A window function call anywhere in the expression, descending through
-/// function arguments, CASE branches and arithmetic operands but not into
-/// scalar subqueries.
-fn scalar_has_window(expr: &ScalarExpr) -> bool {
-    match expr {
-        ScalarExpr::Function(function) => {
-            function.over.is_some() || function.args.iter().any(scalar_has_window)
-        }
-        ScalarExpr::Case(case) => {
-            case.arg.as_ref().is_some_and(|arg| scalar_has_window(arg))
-                || case
-                    .whens
-                    .iter()
-                    .any(|when| scalar_has_window(&when.result))
-                || case
-                    .default
-                    .as_ref()
-                    .is_some_and(|default| scalar_has_window(default))
-        }
-        ScalarExpr::Arithmetic(arithmetic) => {
-            scalar_has_window(&arithmetic.left) || scalar_has_window(&arithmetic.right)
-        }
-        ScalarExpr::Array(elems) => elems.iter().any(scalar_has_window),
-        ScalarExpr::TypeCast { expr, .. } => scalar_has_window(expr),
-        ScalarExpr::Column(_) | ScalarExpr::Literal(_) | ScalarExpr::Subquery(_) => false,
-    }
 }
 
 #[cfg(test)]
