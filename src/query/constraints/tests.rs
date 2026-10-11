@@ -1122,3 +1122,25 @@ fn test_bound_analysis_matches_resolved_on_join_shapes() {
         let _ = constraints_of(sql, &tables);
     }
 }
+
+/// Two spellings of one column through different aliases are the same
+/// constraint column, by equality and by hash.
+#[test]
+fn test_constraint_column_identity_ignores_alias() {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let column = |alias: &str| ConstraintColumn {
+        schema: "public".into(),
+        table: "users".into(),
+        alias: Some(alias.into()),
+        column: "id".into(),
+    };
+    let (u, u2) = (column("u"), column("u2"));
+    assert_eq!(u, u2);
+    let hash = |c: &ConstraintColumn| {
+        let mut hasher = DefaultHasher::new();
+        c.hash(&mut hasher);
+        hasher.finish()
+    };
+    assert_eq!(hash(&u), hash(&u2));
+}

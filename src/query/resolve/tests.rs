@@ -11,98 +11,22 @@ use super::*;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{
-    ArithmeticExpr, AstNode, BinaryExpr, BinaryOp, CaseExpr, ColumnNode, CteRefNode, Deparse,
-    FunctionCall, JoinNode, JoinQual, JoinType, LiteralValue, MultiExpr, NodeId, OrderByClause,
-    OrderDirection, QueryExpr, SelectNode, SetOpNode, StarNode, SubLinkType, TableNode,
-    TableSubqueryNode, UnaryExpr, ValuesClause,
+    ArithmeticExpr, AstNode, BinaryExpr, BinaryOp, CaseExpr, ColumnNode, CteRefNode, FunctionCall,
+    JoinNode, JoinQual, JoinType, LiteralValue, MultiExpr, NodeId, OrderByClause, OrderDirection,
+    QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns, SelectNode, SetOpNode, StarNode,
+    SubLinkType, TableNode, TableSource, TableSubqueryNode, UnaryExpr, ValuesClause, WhereExpr,
+    query_expr_parse,
 };
-use crate::query::ast::{query_expr_parse, query_expr_session_key};
-use crate::query::literal_settings::LiteralSettings;
 use crate::query::resolved::{
-    ResolveError, ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode,
-    ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedSelectColumn,
-    ResolvedSelectColumns, ResolvedSelectNode, ResolvedSetOpNode, ResolvedTableNode,
-    ResolvedTableSource, ResolvedTableSubqueryNode, ResolvedWhereExpr,
+    ResolveError, ResolvedColumnNode, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedTableNode,
+    ResolvedTableSubqueryNode, ResolvedWhereExpr, resolved_query_columns_by_table,
 };
-use crate::query::resolved::{resolved_query_columns_by_table, resolved_query_fingerprint};
 
-/// Parse SQL and return a SelectNode (for tests using new types)
-fn parse_select_node(sql: &str) -> SelectNode {
-    use crate::query::ast::{QueryBody, query_expr_parse};
-    let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
-    match query_expr.body {
-        QueryBody::Select(node) => *node,
-        _ => panic!("expected SELECT"),
-    }
-}
+// ============================================================================
+// Catalogs
+// ============================================================================
 
-/// Parse SQL and resolve to ResolvedSelectNode
-fn resolve_sql(sql: &str, tables: &Catalog) -> ResolvedSelectNode {
-    let node = parse_select_node(sql);
-    select_node_resolve(&node, tables, &["public"]).expect("resolve")
-}
-
-/// Parse SQL and resolve to ResolvedQueryExpr (for ORDER BY/LIMIT tests)
-fn resolve_query(sql: &str, tables: &Catalog) -> ResolvedQueryExpr {
-    use crate::query::ast::query_expr_parse;
-    let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
-    query_expr_resolve(&query_expr, tables, &["public"]).expect("resolve")
-}
-
-#[test]
-fn test_resolved_table_node_construction() {
-    let table_node = ResolvedTableNode {
-        schema: "public".into(),
-        name: "users".into(),
-        alias: Some("u".into()),
-        relation_oid: Oid::from_raw(12345),
-    };
-
-    assert_eq!(table_node.schema, "public");
-    assert_eq!(table_node.name, "users");
-    assert_eq!(table_node.alias.as_deref(), Some("u"));
-    assert_eq!(table_node.relation_oid.get(), 12345);
-}
-
-#[test]
-fn test_resolved_column_node_construction() {
-    let col_node = ResolvedColumnNode {
-        schema: "public".into(),
-        table: "users".into(),
-        table_alias: Some("u".into()),
-        column: "id".into(),
-        column_metadata: ColumnMetadata {
-            name: "id".into(),
-            position: ColumnPosition::from_raw(1),
-            type_oid: TypeOid::from_raw(23),
-            data_type: Type::INT4,
-            type_name: "int4".into(),
-            cache_type_name: "int4".into(),
-            is_primary_key: true,
-        },
-    };
-
-    assert_eq!(col_node.schema, "public");
-    assert_eq!(col_node.table, "users");
-    assert_eq!(col_node.table_alias.as_deref(), Some("u"));
-    assert_eq!(col_node.column, "id");
-    assert_eq!(col_node.column_metadata.type_name, "int4");
-    assert_eq!(col_node.column_metadata.position, ColumnPosition::FIRST);
-    assert!(col_node.column_metadata.is_primary_key);
-}
-
-#[test]
-fn test_resolved_select_node_default() {
-    let node = ResolvedSelectNode::default();
-    assert!(matches!(node.columns, ResolvedSelectColumns::None));
-    assert!(node.from.is_empty());
-    assert!(node.where_clause.is_none());
-    assert!(node.group_by.is_empty());
-    assert!(node.having.is_none());
-    assert!(!node.distinct);
-}
-
-// Helper function to create test table metadata
+/// `name(id int4, name text)` with `id` the key.
 fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
     let columns = ColumnStore::new([
         ColumnMetadata {
@@ -146,125 +70,6 @@ fn catalog(names: &[&str]) -> Catalog {
     tables
 }
 
-/// A catalog of all-text tables given as (name, columns), OIDs from 1001.
-pub(super) fn catalog_with_columns(specs: &[(&str, &[&str])]) -> Catalog {
-    let mut tables = BiHashMap::new();
-    for (oid, (name, columns)) in (1001..).zip(specs) {
-        tables.insert_overwrite(
-            test_table_metadata_with_columns(name, Oid::from_raw(oid), columns).into(),
-        );
-    }
-    tables
-}
-
-fn only_join(resolved: &ResolvedSelectNode) -> &ResolvedJoinNode {
-    match resolved.from.as_slice() {
-        [ResolvedTableSource::Join(join)] => join,
-        other => panic!("expected a single join source, got {other:?}"),
-    }
-}
-
-fn as_table(source: &ResolvedTableSource) -> &ResolvedTableNode {
-    let ResolvedTableSource::Table(table) = source else {
-        panic!("expected a table source, got {source:?}");
-    };
-    table
-}
-
-fn as_binary(expr: &ResolvedWhereExpr) -> &ResolvedBinaryExpr {
-    let ResolvedWhereExpr::Binary(binary) = expr else {
-        panic!("expected a binary expression, got {expr:?}");
-    };
-    binary
-}
-
-fn as_column(expr: &ResolvedWhereExpr) -> &ResolvedColumnNode {
-    let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(column)) = expr else {
-        panic!("expected a column, got {expr:?}");
-    };
-    column
-}
-
-fn column_ref(expr: &ResolvedWhereExpr) -> (&str, &str) {
-    let column = as_column(expr);
-    (column.table.as_str(), column.column.as_str())
-}
-
-/// The outer references of the first subquery: the WHERE predicate's, or the
-/// first SELECT-list scalar subquery's.
-fn subquery_outer_refs(resolved: &ResolvedSelectNode) -> Vec<(&str, &str)> {
-    let refs = match &resolved.where_clause {
-        Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) => outer_refs,
-        _ => {
-            let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-                panic!("expected a subquery in WHERE or the SELECT list");
-            };
-            cols.iter()
-                .find_map(|col| match &col.expr {
-                    ResolvedScalarExpr::Subquery(_, outer_refs) => Some(outer_refs),
-                    _ => None,
-                })
-                .expect("a SELECT-list subquery")
-        }
-    };
-    refs.iter()
-        .map(|c| (c.table.as_str(), c.column.as_str()))
-        .collect()
-}
-
-fn deparsed(node: &impl Deparse) -> String {
-    let mut buf = String::new();
-    node.deparse(&mut buf);
-    buf
-}
-
-#[test]
-fn test_table_and_column_resolve_cases() {
-    let tables = catalog(&["users"]);
-    // (label, SQL, expected FROM alias, WHERE lhs column, its type name if checked)
-    #[rustfmt::skip]
-    let cases = [
-        ("bare table, qualified column",   "SELECT * FROM users WHERE users.id = 1",          None,      "id",   Some("int4")),
-        ("aliased table, aliased column",  "SELECT * FROM users u WHERE u.name = 'john'",     Some("u"), "name", Some("text")),
-        ("bare table, unqualified column", "SELECT * FROM users WHERE id = 1",                None,      "id",   None),
-    ];
-    for (label, sql, alias, column, type_name) in cases {
-        let resolved = resolve_sql(sql, &tables);
-        let [ResolvedTableSource::Table(table)] = resolved.from.as_slice() else {
-            panic!("{label}: expected a single table source in {sql:?}");
-        };
-        let actual = (
-            table.schema.as_str(),
-            table.name.as_str(),
-            table.alias.as_deref(),
-            table.relation_oid.get(),
-        );
-        assert_eq!(
-            actual,
-            ("public", "users", alias, 1001),
-            "{label}: table of {sql:?}"
-        );
-        let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.where_clause else {
-            panic!("{label}: expected a binary WHERE in {sql:?}");
-        };
-        let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*binary.lexpr else {
-            panic!("{label}: expected a column on the left of the WHERE in {sql:?}");
-        };
-        let actual = (col.schema.as_str(), col.table.as_str(), col.column.as_str());
-        assert_eq!(
-            actual,
-            ("public", "users", column),
-            "{label}: WHERE column of {sql:?}"
-        );
-        if let Some(type_name) = type_name {
-            assert_eq!(
-                col.column_metadata.type_name, type_name,
-                "{label}: column type of {sql:?}"
-            );
-        }
-    }
-}
-
 /// Create test table metadata with custom column names (all text type, first is PK).
 fn test_table_metadata_with_columns(
     name: &str,
@@ -297,1348 +102,704 @@ fn test_table_metadata_with_columns(
     }
 }
 
-#[test]
-fn test_table_resolve_not_found() {
-    let tables = BiHashMap::new();
-    let node = parse_select_node("SELECT * FROM users");
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    assert!(matches!(
-        result.map_err(|e| e.into_current_context()),
-        Err(ResolveError::TableNotFound { .. })
-    ));
+/// A catalog of all-text tables given as (name, columns), OIDs from 1001.
+pub(super) fn catalog_with_columns(specs: &[(&str, &[&str])]) -> Catalog {
+    let mut tables = BiHashMap::new();
+    for (oid, (name, columns)) in (1001..).zip(specs) {
+        tables.insert_overwrite(
+            test_table_metadata_with_columns(name, Oid::from_raw(oid), columns).into(),
+        );
+    }
+    tables
 }
 
-#[test]
-fn test_column_resolve_ambiguous() {
-    let tables = catalog(&["users", "orders"]);
+// ============================================================================
+// Binding helpers
+// ============================================================================
 
-    // Both tables have 'id' column, unqualified reference is ambiguous
-    let node = parse_select_node("SELECT * FROM users, orders WHERE id = 1");
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    assert!(matches!(
-        result.map_err(|e| e.into_current_context()),
-        Err(ResolveError::AmbiguousColumn { .. })
-    ));
+/// Parse and bind `sql` over `tables`.
+fn bound(sql: &str, tables: &Catalog) -> ResolvedQuery {
+    let query = Arc::new(query_expr_parse(sql).expect("convert to QueryExpr"));
+    let (_, bindings) = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+    ResolvedQuery::new(query, bindings)
 }
 
+/// The error binding `sql` over `tables` ends in.
+fn bind_error(sql: &str, tables: &Catalog) -> ResolveError {
+    let query = query_expr_parse(sql).expect("convert to QueryExpr");
+    match query_expr_resolve_bound(&query, tables, &["public"]) {
+        Ok(_) => panic!("expected {sql} not to resolve"),
+        Err(e) => e.into_current_context(),
+    }
+}
+
+fn select_of(bound: &ResolvedQuery) -> &SelectNode {
+    bound.select().expect("a SELECT")
+}
+
+/// `(table, column)` a column reference is bound to.
+fn column_ref(bound: &ResolvedQuery, column: &ColumnNode) -> (String, String) {
+    let table = bound.column_table(column).expect("a bound column");
+    let name = bound.column_name(column).expect("a bound column");
+    (table.name.to_string(), name.to_string())
+}
+
+fn as_binary(expr: &WhereExpr) -> &BinaryExpr {
+    let WhereExpr::Binary(binary) = expr else {
+        panic!("expected a binary expression, got {expr:?}");
+    };
+    binary
+}
+
+fn as_column(expr: &WhereExpr) -> &ColumnNode {
+    let WhereExpr::Scalar(ScalarExpr::Column(column)) = expr else {
+        panic!("expected a column, got {expr:?}");
+    };
+    column
+}
+
+fn only_join(select: &SelectNode) -> &JoinNode {
+    match select.from.as_slice() {
+        [TableSource::Join(join)] => join,
+        other => panic!("expected a single join source, got {other:?}"),
+    }
+}
+
+fn as_table(source: &TableSource) -> &TableNode {
+    let TableSource::Table(table) = source else {
+        panic!("expected a table source, got {source:?}");
+    };
+    table
+}
+
+fn join_on(join: &JoinNode) -> &WhereExpr {
+    let JoinQual::On(on) = &join.qual else {
+        panic!("expected an ON join, got {:?}", join.qual);
+    };
+    on
+}
+
+/// The base slot a table node is bound to: `(schema, table, alias, oid)`.
+fn table_slot(bound: &ResolvedQuery, table: &TableNode) -> (String, String, Option<String>, u32) {
+    let slot = bound.bindings().source(table.id).expect("table bound");
+    match bound.bindings().slot(slot).expect("slot") {
+        TableSlot::Base { table, alias } => (
+            table.schema.to_string(),
+            table.name.to_string(),
+            alias.as_ref().map(ToString::to_string),
+            table.relation_oid.get(),
+        ),
+        TableSlot::Derived { .. } => panic!("table node bound to a derived slot"),
+    }
+}
+
+/// `(table, column)` of every correlated reference, in tree order.
+fn correlated_refs(bound: &ResolvedQuery) -> Vec<(String, String)> {
+    let bindings = bound.bindings();
+    bindings
+        .correlated()
+        .iter()
+        .map(|id| {
+            let Some(ColumnTarget::Column(binding)) = bindings.column_by_id(*id) else {
+                panic!("correlated node without a column binding");
+            };
+            let slot = bindings.slot(binding.slot).expect("slot");
+            let column = bindings.binding_column(binding).expect("column");
+            (slot.table().name.to_string(), column.name.to_string())
+        })
+        .collect()
+}
+
+fn pair(table: &str, column: &str) -> (String, String) {
+    (table.to_owned(), column.to_owned())
+}
+
+// ============================================================================
+// Tables and columns
+// ============================================================================
+
 #[test]
-fn test_select_star_expansion() {
+fn test_table_and_column_bind_cases() {
     let tables = catalog(&["users"]);
-
-    let resolved = resolve_sql("SELECT * FROM users", &tables);
-
-    // Check that SELECT * was expanded to all columns
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("Expected Columns");
-    };
-    assert_eq!(cols.len(), 2);
-    let ResolvedScalarExpr::Column(col) = &cols[0].expr else {
-        panic!("Expected column expression");
-    };
-    assert_eq!(col.column, "id");
-    assert_eq!(col.table, "users");
-    let ResolvedScalarExpr::Column(col) = &cols[1].expr else {
-        panic!("Expected column expression");
-    };
-    assert_eq!(col.column, "name");
-    assert_eq!(col.table, "users");
-}
-
-#[test]
-fn test_select_specific_columns() {
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_sql("SELECT id, name FROM users", &tables);
-
-    // Check that specific columns were resolved
-    if let ResolvedSelectColumns::Columns(cols) = &resolved.columns {
-        assert_eq!(cols.len(), 2);
-
-        if let ResolvedScalarExpr::Column(col) = &cols[0].expr {
-            assert_eq!(col.column, "id");
-            assert_eq!(col.table, "users");
-        } else {
-            panic!("Expected column expression");
+    // (label, SQL, expected FROM alias, WHERE lhs column, its type name if checked)
+    #[rustfmt::skip]
+    let cases = [
+        ("bare table, qualified column",   "SELECT * FROM users WHERE users.id = 1",          None,      "id",   Some("int4")),
+        ("aliased table, aliased column",  "SELECT * FROM users u WHERE u.name = 'john'",     Some("u"), "name", Some("text")),
+        ("bare table, unqualified column", "SELECT * FROM users WHERE id = 1",                None,      "id",   None),
+    ];
+    for (label, sql, alias, column, type_name) in cases {
+        let query = bound(sql, &tables);
+        let select = select_of(&query);
+        let [TableSource::Table(table)] = select.from.as_slice() else {
+            panic!("{label}: expected a single table source in {sql:?}");
+        };
+        assert_eq!(
+            table_slot(&query, table),
+            ("public".into(), "users".into(), alias.map(Into::into), 1001),
+            "{label}: table of {sql:?}"
+        );
+        let binary = as_binary(select.where_clause.as_ref().expect("WHERE"));
+        let col = as_column(&binary.lexpr);
+        assert_eq!(
+            column_ref(&query, col),
+            pair("users", column),
+            "{label}: WHERE column of {sql:?}"
+        );
+        if let Some(type_name) = type_name {
+            assert_eq!(
+                query.column_type(col).expect("column type").name(),
+                type_name,
+                "{label}: column type of {sql:?}"
+            );
         }
-
-        if let ResolvedScalarExpr::Column(col) = &cols[1].expr {
-            assert_eq!(col.column, "name");
-            assert_eq!(col.table, "users");
-        } else {
-            panic!("Expected column expression");
-        }
-    } else {
-        panic!("Expected Columns");
     }
 }
 
 #[test]
-fn test_select_star_with_column() {
-    let tables = catalog(&["users"]);
+fn test_bind_error_cases() {
+    assert!(matches!(
+        bind_error("SELECT * FROM users", &BiHashMap::new()),
+        ResolveError::TableNotFound { .. }
+    ));
+    // Both tables have `id`: an unqualified reference is ambiguous.
+    assert!(matches!(
+        bind_error(
+            "SELECT * FROM users, orders WHERE id = 1",
+            &catalog(&["users", "orders"])
+        ),
+        ResolveError::AmbiguousColumn { .. }
+    ));
+    assert!(matches!(
+        bind_error(
+            "SELECT * FROM users ORDER BY nonexistent_column ASC",
+            &catalog(&["users"])
+        ),
+        ResolveError::ColumnNotFound { .. }
+    ));
+    // A column in no scope of a subquery is not found, not correlated.
+    assert!(matches!(
+        bind_error(
+            "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE nonexistent = 1)",
+            &catalog_with_columns(&[("users", &["id", "name"]), ("orders", &["id", "total"])])
+        ),
+        ResolveError::ColumnNotFound { .. }
+    ));
+}
 
-    let resolved = resolve_sql("SELECT *, name FROM users", &tables);
-
-    // Star expands to all columns, then the explicit column follows
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("Expected Columns");
-    };
-    assert_eq!(cols.len(), 3); // id, name (from *), name (explicit)
-
-    let ResolvedScalarExpr::Column(col) = &cols[0].expr else {
-        panic!("Expected column expression");
-    };
-    assert_eq!(col.column, "id");
-
-    let ResolvedScalarExpr::Column(col) = &cols[1].expr else {
-        panic!("Expected column expression");
-    };
-    assert_eq!(col.column, "name");
-
-    let ResolvedScalarExpr::Column(col) = &cols[2].expr else {
-        panic!("Expected column expression");
-    };
-    assert_eq!(col.column, "name");
+/// `*` expands through the bindings: a base table's columns in catalog
+/// order, a derived table's output, and a USING/NATURAL join's merged
+/// columns first (COALESCE'd on an outer join) with each side's remaining
+/// columns after, in FROM order; a qualified `t.*` is that side verbatim.
+#[test]
+fn test_star_expansion_render_cases() {
+    let users_orders = catalog(&["users", "orders"]);
+    let t1_t2 = catalog_with_columns(&[("t1", &["id", "name", "x"]), ("t2", &["id", "name", "y"])]);
+    let mut users_total = catalog(&["users"]);
+    users_total.insert_overwrite(
+        test_table_metadata_with_columns("orders", Oid::from_raw(1002), &["id", "total"]).into(),
+    );
+    #[rustfmt::skip]
+    let cases: [(&str, &Catalog, &str, &str); 11] = [
+        ("bare star",                 &users_orders, "SELECT * FROM users",
+         "SELECT public.users.id, public.users.name FROM public.users"),
+        ("explicit columns",          &users_orders, "SELECT id, name FROM users",
+         "SELECT public.users.id, public.users.name FROM public.users"),
+        ("star then a column",        &users_orders, "SELECT *, name FROM users",
+         "SELECT public.users.id, public.users.name, public.users.name FROM public.users"),
+        ("qualified star in a join",  &users_orders, "SELECT u.*, o.name FROM users u JOIN orders o ON o.id = u.id",
+         "SELECT u.id, u.name, o.name FROM public.users u JOIN public.orders o ON o.id = u.id"),
+        ("derived USING inner",       &users_orders, "SELECT * FROM (SELECT id, name FROM users) a JOIN (SELECT id, name FROM orders) b USING (id)",
+         "SELECT a.id AS id, a.name, b.name FROM (SELECT public.users.id, public.users.name FROM public.users) a JOIN (SELECT public.orders.id, public.orders.name FROM public.orders) b USING (id)"),
+        ("derived NATURAL LEFT",      &users_orders, "SELECT * FROM (SELECT name, id AS a_id FROM users) a NATURAL LEFT JOIN (SELECT name, id AS b_id FROM orders) b",
+         "SELECT coalesce(a.name, b.name) AS name, a.a_id, b.b_id FROM (SELECT public.users.name, public.users.id AS a_id FROM public.users) a LEFT JOIN (SELECT public.orders.name, public.orders.id AS b_id FROM public.orders) b USING (name)"),
+        ("single derived",            &users_orders, "SELECT * FROM (SELECT id, name FROM users) d",
+         "SELECT d.id, d.name FROM (SELECT public.users.id, public.users.name FROM public.users) d"),
+        ("multi-column USING",        &t1_t2,        "SELECT * FROM (SELECT id, name, x FROM t1) a JOIN (SELECT id, name, y FROM t2) b USING (id, name)",
+         "SELECT a.id AS id, a.name AS name, a.x, b.y FROM (SELECT public.t1.id, public.t1.name, public.t1.x FROM public.t1) a JOIN (SELECT public.t2.id, public.t2.name, public.t2.y FROM public.t2) b USING (id, name)"),
+        ("base table first",          &users_total,  "SELECT * FROM users u JOIN (SELECT id, total FROM orders) o USING (id)",
+         "SELECT u.id AS id, u.name, o.total FROM public.users u JOIN (SELECT public.orders.id, public.orders.total FROM public.orders) o USING (id)"),
+        ("derived table first",       &users_total,  "SELECT * FROM (SELECT id, total FROM orders) o JOIN users u USING (id)",
+         "SELECT o.id AS id, o.total, u.name FROM (SELECT public.orders.id, public.orders.total FROM public.orders) o JOIN public.users u USING (id)"),
+        ("qualified derived star",    &users_total,  "SELECT o.* FROM (SELECT id, total FROM orders) o JOIN users u USING (id)",
+         "SELECT o.id, o.total FROM (SELECT public.orders.id, public.orders.total FROM public.orders) o JOIN public.users u USING (id)"),
+    ];
+    for (label, tables, sql, expected) in cases {
+        assert_eq!(bound(sql, tables).sql(), expected, "{label}: {sql}");
+    }
 }
 
 #[test]
-fn test_select_qualified_star_with_column() {
+fn test_join_bind_cases() {
     let tables = catalog(&["users", "orders"]);
-
-    let resolved = resolve_sql(
-        "SELECT u.*, o.name FROM users u JOIN orders o ON o.id = u.id",
-        &tables,
-    );
-
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("Expected Columns");
-    };
-    // u.* expands to users.id, users.name, then o.name
-    assert_eq!(cols.len(), 3);
-
-    let ResolvedScalarExpr::Column(col) = &cols[0].expr else {
-        panic!("Expected column expression");
-    };
-    assert_eq!(col.column, "id");
-    assert_eq!(col.table, "users");
-
-    let ResolvedScalarExpr::Column(col) = &cols[1].expr else {
-        panic!("Expected column expression");
-    };
-    assert_eq!(col.column, "name");
-    assert_eq!(col.table, "users");
-
-    let ResolvedScalarExpr::Column(col) = &cols[2].expr else {
-        panic!("Expected column expression");
-    };
-    assert_eq!(col.column, "name");
-    assert_eq!(col.table, "orders");
-}
-
-/// The column node of a resolved select column, panicking otherwise.
-fn select_column_node(col: &ResolvedSelectColumn) -> &ResolvedColumnNode {
-    let ResolvedScalarExpr::Column(node) = &col.expr else {
-        panic!("expected column expression, got {:?}", col.expr);
-    };
-    node
-}
-
-/// Assert a star-expanded derived-table column: empty schema, synthetic
-/// table named after the alias, alias set — the same node shape an
-/// explicit `alias.column` reference resolves to.
-fn derived_column_assert(col: &ResolvedSelectColumn, alias: &str, column: &str) {
-    let node = select_column_node(col);
-    assert_eq!(node.schema, "");
-    assert_eq!(node.table, alias);
-    assert_eq!(node.table_alias.as_deref(), Some(alias));
-    assert_eq!(node.column, column);
-}
-
-/// PGC-359: `*` over a USING join of two derived tables expands to the
-/// merged join column plus each side's remaining columns.
-#[test]
-fn test_select_star_derived_using_inner() {
-    let tables = catalog(&["users", "orders"]);
-
-    let resolved = resolve_sql(
-        "SELECT * FROM (SELECT id, name FROM users) a \
-         JOIN (SELECT id, name FROM orders) b USING (id)",
-        &tables,
-    );
-
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("Expected Columns");
-    };
-    assert_eq!(cols.len(), 3); // merged id, a.name, b.name
-    assert_eq!(cols[0].alias.as_deref(), Some("id"));
-    derived_column_assert(&cols[0], "a", "id"); // inner merge = left column
-    derived_column_assert(&cols[1], "a", "name");
-    derived_column_assert(&cols[2], "b", "name");
-}
-
-/// PGC-359: `*` over a NATURAL LEFT JOIN of derived tables — merged
-/// column is COALESCE, remaining columns follow in FROM order.
-#[test]
-fn test_select_star_derived_natural_left() {
-    let tables = catalog(&["users", "orders"]);
-
-    let resolved = resolve_sql(
-        "SELECT * FROM (SELECT name, id AS a_id FROM users) a \
-         NATURAL LEFT JOIN (SELECT name, id AS b_id FROM orders) b",
-        &tables,
-    );
-
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("Expected Columns");
-    };
-    assert_eq!(cols.len(), 3); // merged name, a.a_id, b.b_id
-    assert_eq!(cols[0].alias.as_deref(), Some("name"));
-    let ResolvedScalarExpr::Function(f) = &cols[0].expr else {
-        panic!("expected COALESCE for outer-join merged column");
-    };
-    assert_eq!(f.name, "coalesce");
-    derived_column_assert(&cols[1], "a", "a_id");
-    derived_column_assert(&cols[2], "b", "b_id");
-}
-
-/// PGC-359: mixed base-then-derived USING join expands both sides.
-/// PGC-359: mixed derived-then-base USING join — `*` expands in FROM
-/// order (derived side's columns before the base table's).
-/// PGC-359: qualified `derived.*` expands that side verbatim — join
-/// column included, no merged-column injection.
-/// PGC-359 (latent case): `*` over a single derived table expands to
-/// the subquery's full output, not zero columns.
-#[test]
-fn test_select_star_single_derived() {
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_sql("SELECT * FROM (SELECT id, name FROM users) d", &tables);
-
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("Expected Columns");
-    };
-    assert_eq!(cols.len(), 2);
-    derived_column_assert(&cols[0], "d", "id");
-    derived_column_assert(&cols[1], "d", "name");
-}
-
-/// PGC-359: multi-column USING over derived tables — each merged column
-/// emitted once in USING order, both sides' consumed columns suppressed.
-#[test]
-fn test_select_star_derived_using_multi_column() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(
-        test_table_metadata_with_columns("t1", Oid::from_raw(1001), &["id", "name", "x"]).into(),
-    );
-    tables.insert_overwrite(
-        test_table_metadata_with_columns("t2", Oid::from_raw(1002), &["id", "name", "y"]).into(),
-    );
-
-    let resolved = resolve_sql(
-        "SELECT * FROM (SELECT id, name, x FROM t1) a \
-         JOIN (SELECT id, name, y FROM t2) b USING (id, name)",
-        &tables,
-    );
-
-    let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-        panic!("Expected Columns");
-    };
-    assert_eq!(cols.len(), 4); // merged id, merged name, a.x, b.y
-    assert_eq!(cols[0].alias.as_deref(), Some("id"));
-    assert_eq!(cols[1].alias.as_deref(), Some("name"));
-    derived_column_assert(&cols[2], "a", "x");
-    derived_column_assert(&cols[3], "b", "y");
+    #[rustfmt::skip]
+    let cases = [
+        ("bare",    "SELECT * FROM users JOIN orders ON users.id = orders.id", None,      None),
+        ("aliased", "SELECT * FROM users u JOIN orders o ON u.id = o.id",     Some("u"), Some("o")),
+    ];
+    for (label, sql, left_alias, right_alias) in cases {
+        let query = bound(sql, &tables);
+        let join = only_join(select_of(&query));
+        assert_eq!(join.join_type, JoinType::Inner, "{label}");
+        let (left, right) = (as_table(&join.left), as_table(&join.right));
+        assert_eq!(
+            table_slot(&query, left),
+            (
+                "public".into(),
+                "users".into(),
+                left_alias.map(Into::into),
+                1001
+            ),
+            "{label}: left side"
+        );
+        assert_eq!(
+            table_slot(&query, right),
+            (
+                "public".into(),
+                "orders".into(),
+                right_alias.map(Into::into),
+                1002
+            ),
+            "{label}: right side"
+        );
+        // The condition's columns bind to the tables whatever the spelling.
+        let on = as_binary(join_on(join));
+        assert_eq!(
+            column_ref(&query, as_column(&on.lexpr)),
+            pair("users", "id"),
+            "{label}"
+        );
+        assert_eq!(
+            column_ref(&query, as_column(&on.rexpr)),
+            pair("orders", "id"),
+            "{label}"
+        );
+    }
 }
 
 #[test]
-fn test_join_resolution() {
-    let tables = catalog(&["users", "orders"]);
-    let resolved = resolve_sql(
-        "SELECT * FROM users JOIN orders ON users.id = orders.id",
-        &tables,
-    );
-    let join = only_join(&resolved);
-    assert_eq!(join.join_type, JoinType::Inner);
-    assert_eq!(as_table(&join.left).name, "users");
-    assert_eq!(as_table(&join.right).name, "orders");
-    let cond = as_binary(join.predicate().expect("join condition"));
-    assert_eq!(column_ref(&cond.lexpr), ("users", "id"));
-    assert_eq!(column_ref(&cond.rexpr), ("orders", "id"));
-}
-
-#[test]
-fn test_join_with_aliases() {
-    let tables = catalog(&["users", "orders"]);
-    let resolved = resolve_sql(
-        "SELECT * FROM users u JOIN orders o ON u.id = o.id",
-        &tables,
-    );
-    let join = only_join(&resolved);
-    let (left, right) = (as_table(&join.left), as_table(&join.right));
-    assert_eq!(
-        (left.name.as_str(), left.alias.as_deref()),
-        ("users", Some("u"))
-    );
-    assert_eq!(
-        (right.name.as_str(), right.alias.as_deref()),
-        ("orders", Some("o"))
-    );
-    // The condition's columns resolve to the real tables even though the
-    // aliases were used.
-    let cond = as_binary(join.predicate().expect("join condition"));
-    assert_eq!(column_ref(&cond.lexpr), ("users", "id"));
-    assert_eq!(column_ref(&cond.rexpr), ("orders", "id"));
-}
-
-#[test]
-fn test_where_expr_complex() {
-    let tables = catalog(&["users"]);
-    let resolved = resolve_sql(
+fn test_where_conjunction_binds_each_side() {
+    let query = bound(
         "SELECT * FROM users WHERE id = 1 AND name = 'john'",
-        &tables,
+        &catalog(&["users"]),
     );
-    let and_expr = as_binary(resolved.where_clause.as_ref().expect("WHERE"));
+    let and_expr = as_binary(select_of(&query).where_clause.as_ref().expect("WHERE"));
     assert_eq!(and_expr.op, BinaryOp::And);
     for (side, column) in [(&and_expr.lexpr, "id"), (&and_expr.rexpr, "name")] {
         let comparison = as_binary(side);
         assert_eq!(comparison.op, BinaryOp::Equal);
-        assert_eq!(as_column(&comparison.lexpr).column, column);
+        assert_eq!(
+            column_ref(&query, as_column(&comparison.lexpr)),
+            pair("users", column)
+        );
     }
 }
 
-#[test]
-fn test_order_by_simple() {
-    let tables = catalog(&["users"]);
+// ============================================================================
+// ORDER BY, GROUP BY, HAVING, LIMIT
+// ============================================================================
 
-    // `SELECT *` expands `name` into the output list, so the unqualified
-    // ORDER BY matches the output name and resolves to `Identifier` — PG's
-    // output-first precedence rule.
-    let resolved = resolve_query(
-        "SELECT users.name FROM users ORDER BY users.name ASC",
-        &tables,
-    );
-
-    assert_eq!(resolved.order_by.len(), 1);
-    assert_eq!(resolved.order_by[0].direction, OrderDirection::Asc);
-
-    if let ResolvedScalarExpr::Column(col) = &resolved.order_by[0].expr {
-        assert_eq!(col.schema, "public");
-        assert_eq!(col.table, "users");
-        assert_eq!(col.column, "name");
-        assert_eq!(col.column_metadata.type_name, "text");
-    } else {
-        panic!("Expected column expression in ORDER BY");
-    }
+/// What an ORDER BY item binds to.
+#[derive(Debug, PartialEq)]
+enum OrderTarget {
+    Column(String, String),
+    Output(String),
 }
 
-#[test]
-fn test_order_by_multiple_columns() {
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_query(
-        "SELECT users.name, users.id FROM users ORDER BY users.name ASC, users.id DESC",
-        &tables,
-    );
-
-    assert_eq!(resolved.order_by.len(), 2);
-
-    assert_eq!(resolved.order_by[0].direction, OrderDirection::Asc);
-    if let ResolvedScalarExpr::Column(col) = &resolved.order_by[0].expr {
-        assert_eq!(col.column, "name");
-        assert_eq!(col.table, "users");
-    } else {
-        panic!("Expected column expression");
-    }
-
-    assert_eq!(resolved.order_by[1].direction, OrderDirection::Desc);
-    if let ResolvedScalarExpr::Column(col) = &resolved.order_by[1].expr {
-        assert_eq!(col.column, "id");
-        assert_eq!(col.table, "users");
-    } else {
-        panic!("Expected column expression");
-    }
+fn order_targets(bound: &ResolvedQuery) -> Vec<(OrderDirection, OrderTarget)> {
+    bound
+        .tree()
+        .order_by
+        .iter()
+        .map(|clause| {
+            let ScalarExpr::Column(column) = &clause.expr else {
+                panic!("expected a column in ORDER BY, got {:?}", clause.expr);
+            };
+            let target = match bound.column(column) {
+                Some(ColumnTarget::Output) => OrderTarget::Output(column.column.to_string()),
+                Some(ColumnTarget::Column(_) | ColumnTarget::Merged(_)) => {
+                    let (table, name) = column_ref(bound, column);
+                    OrderTarget::Column(table, name)
+                }
+                None => panic!("unbound ORDER BY column {column:?}"),
+            };
+            (clause.direction.clone(), target)
+        })
+        .collect()
 }
 
+/// An unqualified ORDER BY name matches an output name first (PG's
+/// output-first rule); a qualified one always binds through the tables.
 #[test]
-fn test_order_by_qualified_column() {
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_query("SELECT * FROM users u ORDER BY u.name DESC", &tables);
-
-    // Check ORDER BY was resolved with qualified column
-    assert_eq!(resolved.order_by.len(), 1);
-    assert_eq!(resolved.order_by[0].direction, OrderDirection::Desc);
-
-    if let ResolvedScalarExpr::Column(col) = &resolved.order_by[0].expr {
-        // Should resolve to actual table name, not alias
-        assert_eq!(col.table, "users");
-        assert_eq!(col.column, "name");
-        assert_eq!(col.schema, "public");
-    } else {
-        panic!("Expected column expression");
-    }
-}
-
-#[test]
-fn test_order_by_select_alias() {
-    let tables = catalog(&["users"]);
-
-    let sql = "SELECT id, name AS display_name FROM users ORDER BY display_name DESC";
-    let resolved = resolve_query(sql, &tables);
-
-    assert_eq!(resolved.order_by.len(), 1);
-    assert_eq!(resolved.order_by[0].direction, OrderDirection::Desc);
-    match &resolved.order_by[0].expr {
-        ResolvedScalarExpr::Identifier(name) => assert_eq!(name, "display_name"),
-        other => panic!("expected Identifier for alias, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_order_by_aggregate_alias() {
-    let tables = catalog(&["orders"]);
-
-    // Aggregate functions produce no column-derivable output name, so only an
-    // explicit alias lets ORDER BY reference them — this is the key demo case.
-    let sql = "SELECT id, SUM(id) AS total FROM orders GROUP BY id ORDER BY total DESC";
-    let resolved = resolve_query(sql, &tables);
-
-    assert_eq!(resolved.order_by.len(), 1);
-    match &resolved.order_by[0].expr {
-        ResolvedScalarExpr::Identifier(name) => assert_eq!(name, "total"),
-        other => panic!("expected Identifier for alias, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_order_by_qualified_does_not_match_alias() {
-    let tables = catalog(&["users"]);
-
-    // `u.name` is qualified — must resolve through the column path even if
-    // an alias of the same name existed.
-    let sql = "SELECT id, name AS display FROM users u ORDER BY u.name";
-    let resolved = resolve_query(sql, &tables);
-
-    assert_eq!(resolved.order_by.len(), 1);
-    match &resolved.order_by[0].expr {
-        ResolvedScalarExpr::Column(col) => {
-            assert_eq!(col.table, "users");
-            assert_eq!(col.column, "name");
-        }
-        other => panic!("expected Column for qualified ref, got {other:?}"),
-    }
-}
-
-#[test]
-fn test_order_by_with_join() {
+fn test_order_by_bind_cases() {
+    use OrderDirection::{Asc, Desc};
+    let column = |table: &str, name: &str| OrderTarget::Column(table.into(), name.into());
+    let output = |name: &str| OrderTarget::Output(name.into());
     let tables = catalog(&["users", "orders"]);
-
-    let sql = "SELECT * FROM users u JOIN orders o ON u.id = o.id ORDER BY u.name ASC, o.id DESC";
-    let resolved = resolve_query(sql, &tables);
-
-    // Check ORDER BY was resolved across joined tables
-    assert_eq!(resolved.order_by.len(), 2);
-
-    // First: u.name ASC
-    if let ResolvedScalarExpr::Column(col) = &resolved.order_by[0].expr {
-        assert_eq!(col.table, "users");
-        assert_eq!(col.column, "name");
-    } else {
-        panic!("Expected column expression");
-    }
-
-    // Second: o.id DESC
-    if let ResolvedScalarExpr::Column(col) = &resolved.order_by[1].expr {
-        assert_eq!(col.table, "orders");
-        assert_eq!(col.column, "id");
-    } else {
-        panic!("Expected column expression");
-    }
-}
-
-#[test]
-fn test_order_by_unqualified_column() {
-    let tables = catalog(&["users"]);
-
-    // Select a column whose name doesn't appear in the output list to force
-    // the unqualified ORDER BY through column resolution.
-    let resolved = resolve_query("SELECT id FROM users ORDER BY name", &tables);
-
-    assert_eq!(resolved.order_by.len(), 1);
-    if let ResolvedScalarExpr::Column(col) = &resolved.order_by[0].expr {
-        assert_eq!(col.table, "users");
-        assert_eq!(col.column, "name");
-    } else {
-        panic!("Expected column expression");
+    #[rustfmt::skip]
+    let cases = [
+        ("qualified column",       "SELECT users.name FROM users ORDER BY users.name ASC",
+         vec![(Asc, column("users", "name"))]),
+        ("two columns",            "SELECT users.name, users.id FROM users ORDER BY users.name ASC, users.id DESC",
+         vec![(Asc, column("users", "name")), (Desc, column("users", "id"))]),
+        ("alias-qualified column", "SELECT * FROM users u ORDER BY u.name DESC",
+         vec![(Desc, column("users", "name"))]),
+        ("select alias",           "SELECT id, name AS display_name FROM users ORDER BY display_name DESC",
+         vec![(Desc, output("display_name"))]),
+        ("aggregate alias",        "SELECT id, SUM(id) AS total FROM orders GROUP BY id ORDER BY total DESC",
+         vec![(Desc, output("total"))]),
+        ("qualified beats alias",  "SELECT id, name AS display FROM users u ORDER BY u.name",
+         vec![(Asc, column("users", "name"))]),
+        ("across a join",          "SELECT * FROM users u JOIN orders o ON u.id = o.id ORDER BY u.name ASC, o.id DESC",
+         vec![(Asc, column("users", "name")), (Desc, column("orders", "id"))]),
+        ("unqualified non-output", "SELECT id FROM users ORDER BY name",
+         vec![(Asc, column("users", "name"))]),
+    ];
+    for (label, sql, expected) in cases {
+        assert_eq!(
+            order_targets(&bound(sql, &tables)),
+            expected,
+            "{label}: {sql}"
+        );
     }
 }
 
 #[test]
-fn test_order_by_column_not_found() {
-    use crate::query::ast::query_expr_parse;
-
+fn test_group_by_having_and_limit_bind() {
     let tables = catalog(&["users"]);
-
-    let sql = "SELECT * FROM users ORDER BY nonexistent_column ASC";
-    let query_expr = query_expr_parse(sql).unwrap();
-
-    let result = query_expr_resolve(&query_expr, &tables, &["public"]);
-
-    // Should fail with column not found error
-    assert!(matches!(
-        result.map_err(|e| e.into_current_context()),
-        Err(ResolveError::ColumnNotFound { .. })
-    ));
-}
-
-// ==================== Deparse Tests ====================
-
-fn id_column_metadata() -> ColumnMetadata {
-    ColumnMetadata {
-        name: "id".into(),
-        position: ColumnPosition::from_raw(1),
-        type_oid: TypeOid::from_raw(23),
-        data_type: Type::INT4,
-        type_name: "int4".into(),
-        cache_type_name: "int4".into(),
-        is_primary_key: true,
-    }
-}
-
-/// PGC-262: lowercase reserved keywords are identifiers too — they must
-/// deparse quoted, and an embedded `"` must be doubled.
-#[test]
-fn test_resolved_column_equality_ignores_alias() {
-    // Two columns with same schema/table/column but different aliases should be equal
-    let col1 = ResolvedColumnNode {
-        schema: "public".into(),
-        table: "users".into(),
-        table_alias: Some("u".into()),
-        column: "id".into(),
-        column_metadata: id_column_metadata(),
-    };
-
-    let col2 = ResolvedColumnNode {
-        schema: "public".into(),
-        table: "users".into(),
-        table_alias: Some("u2".into()), // Different alias
-        column: "id".into(),
-        column_metadata: id_column_metadata(),
-    };
-
-    assert_eq!(col1, col2);
-
-    // Hash should also be equal
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher1 = DefaultHasher::new();
-    col1.hash(&mut hasher1);
-    let hash1 = hasher1.finish();
-
-    let mut hasher2 = DefaultHasher::new();
-    col2.hash(&mut hasher2);
-    let hash2 = hasher2.finish();
-
-    assert_eq!(hash1, hash2);
-}
-
-#[test]
-fn test_complexity_ordering() {
-    let tables = catalog(&["users", "orders"]);
-
-    // Simple query: SELECT * FROM users
-    let resolved1 = resolve_sql("SELECT * FROM users", &tables);
-
-    // Query with WHERE: SELECT * FROM users WHERE id = 1
-    let resolved2 = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
-
-    // Query with JOIN: SELECT * FROM users JOIN orders ON ...
-    let resolved3 = resolve_sql(
-        "SELECT * FROM users JOIN orders ON users.id = orders.id",
+    let query = bound(
+        "SELECT name FROM users GROUP BY name HAVING name != 'test' ORDER BY name LIMIT 10",
         &tables,
     );
-
-    // Verify ordering: simple < with_where < with_join
-    assert!(resolved1.complexity() < resolved2.complexity());
-    assert!(resolved2.complexity() < resolved3.complexity());
-}
-
-#[test]
-fn test_complexity_subquery_depth() {
-    let tables = catalog(&["users", "orders"]);
-
-    // No subquery: complexity = 1 predicate
-    let flat = resolve_sql("SELECT * FROM users WHERE id = 1", &tables);
-    assert_eq!(flat.subquery_depth(), 0);
-
-    // One level of subquery: depth 1
-    let one_deep = resolve_sql(
-        "SELECT * FROM users WHERE id IN (SELECT id FROM orders)",
-        &tables,
-    );
-    assert_eq!(one_deep.subquery_depth(), 1);
-
-    // Subquery adds 5 per depth level, so one_deep > flat
-    assert!(
-        one_deep.complexity() > flat.complexity(),
-        "subquery should increase complexity: {} > {}",
-        one_deep.complexity(),
-        flat.complexity()
-    );
-}
-
-#[test]
-fn test_complexity_nested_subquery_depth() {
-    let tables = catalog(&["products", "stores", "regions"]);
-
-    // Double-nested: depth 2
-    let double_nested = resolve_sql(
-        "SELECT * FROM products WHERE id IN (SELECT id FROM stores WHERE id IN (SELECT id FROM regions))",
-        &tables,
-    );
-    assert_eq!(double_nested.subquery_depth(), 2);
-
-    // Single-nested: depth 1
-    let single_nested = resolve_sql(
-        "SELECT * FROM stores WHERE id IN (SELECT id FROM regions)",
-        &tables,
-    );
-    assert_eq!(single_nested.subquery_depth(), 1);
-
-    // Inner query (no subqueries): depth 0
-    let inner = resolve_sql("SELECT * FROM regions", &tables);
-    assert_eq!(inner.subquery_depth(), 0);
-
-    // Verify ordering: inner < single_nested < double_nested
-    assert!(
-        inner.complexity() < single_nested.complexity(),
-        "inner ({}) < single_nested ({})",
-        inner.complexity(),
-        single_nested.complexity()
-    );
-    assert!(
-        single_nested.complexity() < double_nested.complexity(),
-        "single_nested ({}) < double_nested ({})",
-        single_nested.complexity(),
-        double_nested.complexity()
-    );
-}
-
-#[test]
-fn test_group_by_resolve_single_column() {
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_sql("SELECT name FROM users GROUP BY name", &tables);
-
-    assert_eq!(resolved.group_by.len(), 1);
-    assert_eq!(resolved.group_by[0].schema, "public");
-    assert_eq!(resolved.group_by[0].table, "users");
-    assert_eq!(resolved.group_by[0].column, "name");
-}
-
-#[test]
-fn test_group_by_resolve_multiple_columns() {
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_sql("SELECT id, name FROM users GROUP BY id, name", &tables);
-
-    assert_eq!(resolved.group_by.len(), 2);
-    assert_eq!(resolved.group_by[0].column, "id");
-    assert_eq!(resolved.group_by[1].column, "name");
-}
-
-#[test]
-fn test_group_by_resolve_qualified_column() {
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_sql("SELECT u.name FROM users u GROUP BY u.name", &tables);
-
-    assert_eq!(resolved.group_by.len(), 1);
-    assert_eq!(resolved.group_by[0].table, "users");
-    assert_eq!(resolved.group_by[0].table_alias.as_deref(), Some("u"));
-    assert_eq!(resolved.group_by[0].column, "name");
-}
-
-#[test]
-fn test_having_resolve() {
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_sql(
-        "SELECT name FROM users GROUP BY name HAVING name = 'alice'",
-        &tables,
-    );
-
-    assert!(resolved.having.is_some());
-    if let Some(ResolvedWhereExpr::Binary(binary)) = &resolved.having {
-        if let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(col)) = &*binary.lexpr {
-            assert_eq!(col.column, "name");
-        } else {
-            panic!("Expected column in HAVING clause");
-        }
-    } else {
-        panic!("Expected binary expression in HAVING clause");
-    }
-}
-
-#[test]
-fn test_combined_group_by_having_limit_resolve() {
-    let tables = catalog(&["users"]);
-
-    let sql = "SELECT name FROM users GROUP BY name HAVING name != 'test' ORDER BY name LIMIT 10";
-    let resolved = resolve_query(sql, &tables);
-
-    // GROUP BY and HAVING are on the select body
-    let ResolvedQueryBody::Select(select) = &resolved.body else {
-        panic!("Expected SELECT body");
-    };
-    assert_eq!(select.group_by.len(), 1);
-    assert!(select.having.is_some());
-
-    // ORDER BY and LIMIT are on the QueryExpr
-    assert!(!resolved.order_by.is_empty());
-    assert!(resolved.limit.is_some());
+    let select = select_of(&query);
+    let group_by: Vec<_> = select
+        .group_by
+        .iter()
+        .map(|c| column_ref(&query, c))
+        .collect();
+    assert_eq!(group_by, vec![pair("users", "name")]);
+    let having = as_binary(select.having.as_ref().expect("HAVING"));
     assert_eq!(
-        resolved.limit.unwrap().count,
+        column_ref(&query, as_column(&having.lexpr)),
+        pair("users", "name")
+    );
+    assert_eq!(query.tree().order_by.len(), 1);
+    assert_eq!(
+        query.tree().limit.as_ref().and_then(|l| l.count.clone()),
         Some(LiteralValue::Integer(10))
     );
+
+    let query = bound(
+        "SELECT u.id, u.name FROM users u GROUP BY u.id, u.name",
+        &tables,
+    );
+    let group_by: Vec<_> = select_of(&query)
+        .group_by
+        .iter()
+        .map(|c| column_ref(&query, c))
+        .collect();
+    assert_eq!(group_by, vec![pair("users", "id"), pair("users", "name")]);
 }
 
 #[test]
-fn test_resolved_window_function() {
+fn test_limit_cases() {
+    use LiteralValue::{Integer, Parameter};
+    // Parameterized values survive binding.
+    #[rustfmt::skip]
+    let cases = [
+        ("count only",         "SELECT * FROM users LIMIT 10",            Some((Some(Integer(10)), None))),
+        ("offset only",        "SELECT * FROM users OFFSET 5",            Some((None, Some(Integer(5))))),
+        ("count and offset",   "SELECT * FROM users LIMIT 10 OFFSET 20",  Some((Some(Integer(10)), Some(Integer(20))))),
+        ("parameterized",      "SELECT * FROM users LIMIT $1 OFFSET $2",  Some((Some(Parameter("$1".into())), Some(Parameter("$2".into()))))),
+        ("no LIMIT",           "SELECT * FROM users",                     None),
+    ];
     let tables = catalog(&["users"]);
+    for (label, sql, expected) in cases {
+        let actual = bound(sql, &tables)
+            .tree()
+            .limit
+            .as_ref()
+            .map(|l| (l.count.clone(), l.offset.clone()));
+        assert_eq!(actual, expected, "{label}: (count, offset) of {sql}");
+    }
+}
 
-    // Use columns that exist in test_table_metadata: id, name
-    let resolved = resolve_sql(
+/// A predicate over a HAVING aggregate.
+type AggregateCheck = fn(&FunctionCall) -> bool;
+
+/// FILTER, aggregate ORDER BY and DISTINCT on a HAVING aggregate survive
+/// binding and render.
+#[test]
+fn test_having_aggregate_decorations_bind_cases() {
+    #[rustfmt::skip]
+    let cases: [(&str, &str, AggregateCheck); 3] = [
+        ("count(*) FILTER",     "SELECT name FROM users GROUP BY name HAVING COUNT(*) FILTER (WHERE id > 0) > 5",
+         |f| f.name == "count" && f.agg_star && f.agg_filter.is_some()),
+        ("string_agg ORDER BY", "SELECT id FROM users GROUP BY id HAVING string_agg(name, ',' ORDER BY name) <> ''",
+         |f| f.name == "string_agg" && !f.agg_order.is_empty()),
+        ("count DISTINCT",      "SELECT name FROM users GROUP BY name HAVING COUNT(DISTINCT id) > 1",
+         |f| f.agg_distinct),
+    ];
+    let tables = catalog(&["users"]);
+    for (label, sql, check) in cases {
+        let query = bound(sql, &tables);
+        let having = as_binary(select_of(&query).having.as_ref().expect("HAVING"));
+        let WhereExpr::Scalar(ScalarExpr::Function(func)) = having.lexpr.as_ref() else {
+            panic!(
+                "{label}: expected a function on the left of HAVING, got {:?}",
+                having.lexpr
+            );
+        };
+        assert!(
+            check(func),
+            "{label}: HAVING aggregate of {sql} is {func:?}"
+        );
+    }
+    assert_eq!(
+        bound(cases[0].1, &tables).sql(),
+        "SELECT public.users.name FROM public.users GROUP BY public.users.name \
+         HAVING count(*) FILTER (WHERE public.users.id > 0) > 5"
+    );
+}
+
+#[test]
+fn test_window_function_binds_and_renders() {
+    let tables = catalog(&["users"]);
+    let query = bound(
         "SELECT sum(id) OVER (PARTITION BY name ORDER BY id) FROM users",
         &tables,
     );
-
-    let ResolvedSelectColumns::Columns(columns) = &resolved.columns else {
+    let SelectColumns::Columns(columns) = &select_of(&query).columns else {
         panic!("expected columns");
     };
-
-    let ResolvedSelectColumn {
-        expr: ResolvedScalarExpr::Function(func),
+    let SelectColumn::Expr {
+        expr: ScalarExpr::Function(func),
         ..
     } = &columns[0]
     else {
-        panic!("expected function");
+        panic!("expected a function");
     };
-
     assert_eq!(func.name, "sum");
-    assert!(func.over.is_some(), "should have OVER clause");
-
-    let window_spec = func.over.as_ref().unwrap();
-    assert_eq!(window_spec.partition_by.len(), 1);
-    assert_eq!(window_spec.order_by.len(), 1);
-}
-
-#[test]
-fn test_resolved_window_function_deparse() {
-    let tables = catalog(&["users"]);
-
-    // Use columns that exist in test_table_metadata: id, name
-    let resolved = resolve_sql(
-        "SELECT sum(id) OVER (ORDER BY name DESC) FROM users",
-        &tables,
-    );
-
-    let mut buf = String::new();
-    resolved.deparse(&mut buf);
-
-    // Should contain the window function with OVER clause
-    assert!(
-        buf.contains("OVER"),
-        "deparsed SQL should contain OVER: {}",
-        buf
-    );
-    assert!(
-        buf.contains("ORDER BY"),
-        "deparsed SQL should contain ORDER BY: {}",
-        buf
-    );
-}
-
-#[test]
-fn test_select_nodes_simple_select() {
-    let query_expr = ResolvedQueryExpr {
-        body: ResolvedQueryBody::Select(Box::default()),
-        order_by: vec![],
-        limit: None,
-    };
-
-    let branches = query_expr.select_nodes();
-    assert_eq!(branches.len(), 1, "simple SELECT should have one branch");
-}
-
-#[test]
-fn test_select_nodes_union() {
-    use crate::query::ast::SetOpType;
-
-    let left_select = ResolvedSelectNode {
-        from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-            schema: "public".into(),
-            name: "a".into(),
-            alias: None,
-            relation_oid: Oid::from_raw(1001),
-        })],
-        ..Default::default()
-    };
-
-    let right_select = ResolvedSelectNode {
-        from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-            schema: "public".into(),
-            name: "b".into(),
-            alias: None,
-            relation_oid: Oid::from_raw(1002),
-        })],
-        ..Default::default()
-    };
-
-    let set_op = ResolvedSetOpNode {
-        op: SetOpType::Union,
-        all: false,
-        left: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::Select(Box::new(left_select)),
-            order_by: vec![],
-            limit: None,
-        }),
-        right: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::Select(Box::new(right_select)),
-            order_by: vec![],
-            limit: None,
-        }),
-    };
-
-    let query_expr = ResolvedQueryExpr {
-        body: ResolvedQueryBody::SetOp(set_op),
-        order_by: vec![],
-        limit: None,
-    };
-
-    let branches = query_expr.select_nodes();
-    assert_eq!(branches.len(), 2, "UNION should have two branches");
-
-    // Verify each branch has the correct table
-    assert_eq!(branches[0].from.len(), 1);
-    assert_eq!(branches[1].from.len(), 1);
-
-    if let ResolvedTableSource::Table(t) = &branches[0].from[0] {
-        assert_eq!(t.name, "a");
-    } else {
-        panic!("Expected table source");
-    }
-
-    if let ResolvedTableSource::Table(t) = &branches[1].from[0] {
-        assert_eq!(t.name, "b");
-    } else {
-        panic!("Expected table source");
-    }
-}
-
-#[test]
-fn test_select_nodes_nested_union() {
-    use crate::query::ast::SetOpType;
-
-    // Build: (SELECT FROM a UNION SELECT FROM b) UNION SELECT FROM c
-    let a_select = ResolvedSelectNode {
-        from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-            schema: "public".into(),
-            name: "a".into(),
-            alias: None,
-            relation_oid: Oid::from_raw(1001),
-        })],
-        ..Default::default()
-    };
-
-    let b_select = ResolvedSelectNode {
-        from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-            schema: "public".into(),
-            name: "b".into(),
-            alias: None,
-            relation_oid: Oid::from_raw(1002),
-        })],
-        ..Default::default()
-    };
-
-    let c_select = ResolvedSelectNode {
-        from: vec![ResolvedTableSource::Table(ResolvedTableNode {
-            schema: "public".into(),
-            name: "c".into(),
-            alias: None,
-            relation_oid: Oid::from_raw(1003),
-        })],
-        ..Default::default()
-    };
-
-    let inner_union = ResolvedSetOpNode {
-        op: SetOpType::Union,
-        all: false,
-        left: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::Select(Box::new(a_select)),
-            order_by: vec![],
-            limit: None,
-        }),
-        right: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::Select(Box::new(b_select)),
-            order_by: vec![],
-            limit: None,
-        }),
-    };
-
-    let outer_union = ResolvedSetOpNode {
-        op: SetOpType::Union,
-        all: false,
-        left: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::SetOp(inner_union),
-            order_by: vec![],
-            limit: None,
-        }),
-        right: Box::new(ResolvedQueryExpr {
-            body: ResolvedQueryBody::Select(Box::new(c_select)),
-            order_by: vec![],
-            limit: None,
-        }),
-    };
-
-    let query_expr = ResolvedQueryExpr {
-        body: ResolvedQueryBody::SetOp(outer_union),
-        order_by: vec![],
-        limit: None,
-    };
-
-    let branches = query_expr.select_nodes();
-    assert_eq!(branches.len(), 3, "nested UNION should have three branches");
-}
-
-// ==========================================================================
-// Subquery Resolution Tests
-// ==========================================================================
-
-#[test]
-fn test_where_subquery_in_resolution() {
-    // Test resolving WHERE ... IN (SELECT ...) subquery
-    let tables = catalog(&["users", "active_users"]);
-
-    let resolved = resolve_sql(
-        "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
-        &tables,
-    );
-
-    // Should have resolved WHERE clause with subquery
-    let where_clause = resolved
-        .where_clause
-        .as_ref()
-        .expect("should have WHERE clause");
-
-    match where_clause {
-        ResolvedWhereExpr::Subquery {
-            sublink_type,
-            test_expr,
-            query,
-            ..
-        } => {
-            assert_eq!(
-                *sublink_type,
-                SubLinkType::Any,
-                "IN should resolve as SubLinkType::Any"
-            );
-            assert!(test_expr.is_some(), "IN should have test expression");
-
-            // Verify inner query was resolved
-            match &query.body {
-                ResolvedQueryBody::Select(inner_select) => {
-                    assert_eq!(inner_select.from.len(), 1);
-                    if let ResolvedTableSource::Table(t) = &inner_select.from[0] {
-                        assert_eq!(t.name, "active_users");
-                        assert_eq!(t.relation_oid.get(), 1002);
-                    } else {
-                        panic!("Expected table source");
-                    }
-                }
-                _ => panic!("Expected SELECT body in subquery"),
-            }
-        }
-        _ => panic!(
-            "Expected ResolvedWhereExpr::Subquery, got {:?}",
-            where_clause
-        ),
-    }
-}
-
-#[test]
-fn test_where_subquery_exists_resolution() {
-    // Test resolving WHERE EXISTS (SELECT ...) subquery
-    let tables = catalog(&["orders", "items"]);
-
-    let resolved = resolve_sql(
-        "SELECT * FROM orders WHERE EXISTS (SELECT id FROM items)",
-        &tables,
-    );
-
-    let where_clause = resolved
-        .where_clause
-        .as_ref()
-        .expect("should have WHERE clause");
-
-    match where_clause {
-        ResolvedWhereExpr::Subquery {
-            sublink_type,
-            test_expr,
-            ..
-        } => {
-            assert_eq!(
-                *sublink_type,
-                SubLinkType::Exists,
-                "EXISTS should resolve correctly"
-            );
-            assert!(
-                test_expr.is_none(),
-                "EXISTS should not have test expression"
-            );
-        }
-        _ => panic!("Expected ResolvedWhereExpr::Subquery"),
-    }
-}
-
-#[test]
-fn test_where_subquery_scalar_resolution() {
-    // Test resolving scalar subquery in WHERE clause
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_sql(
-        "SELECT * FROM users WHERE id > (SELECT id FROM users)",
-        &tables,
-    );
-
-    let where_clause = resolved
-        .where_clause
-        .as_ref()
-        .expect("should have WHERE clause");
-
-    // The scalar subquery should be on the right side of the > comparison
-    match where_clause {
-        ResolvedWhereExpr::Binary(binary) => match binary.rexpr.as_ref() {
-            ResolvedWhereExpr::Subquery { sublink_type, .. } => {
-                assert_eq!(
-                    *sublink_type,
-                    SubLinkType::Expr,
-                    "Scalar subquery should be SubLinkType::Expr"
-                );
-            }
-            _ => panic!("Expected ResolvedWhereExpr::Subquery on right side"),
-        },
-        _ => panic!("Expected ResolvedWhereExpr::Binary"),
-    }
-}
-
-#[test]
-fn test_table_subquery_resolution() {
-    // Test resolving subquery in FROM clause (derived table)
-    let tables = catalog(&["users"]);
-
-    // Note: Column resolution from subqueries is limited, but the subquery itself should resolve
-    let node = parse_select_node("SELECT * FROM (SELECT id FROM users) AS sub");
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    // Should resolve successfully
-    let resolved = result.expect("should resolve table subquery");
-    assert_eq!(resolved.from.len(), 1);
-
-    match &resolved.from[0] {
-        ResolvedTableSource::Subquery(sub) => {
-            assert_eq!(sub.alias.name, "sub", "Should preserve alias");
-
-            // Verify inner query was resolved
-            match &sub.query.body {
-                ResolvedQueryBody::Select(inner_select) => {
-                    assert_eq!(inner_select.from.len(), 1);
-                    if let ResolvedTableSource::Table(t) = &inner_select.from[0] {
-                        assert_eq!(t.name, "users");
-                    } else {
-                        panic!("Expected table source in inner query");
-                    }
-                }
-                _ => panic!("Expected SELECT body"),
-            }
-        }
-        _ => panic!("Expected ResolvedTableSource::Subquery"),
-    }
-}
-
-#[test]
-fn test_table_subquery_requires_alias() {
-    // Test that table subquery without alias fails resolution
-    let tables = catalog(&["users"]);
-
-    // Parse a query with subquery without alias
-    // Note: PostgreSQL parser typically requires alias, but we should still handle the error
-    // gracefully if it somehow gets through
-    let node = parse_select_node("SELECT * FROM (SELECT id FROM users) AS sub");
-
-    // This should succeed since it has an alias
-    let result = select_node_resolve(&node, &tables, &["public"]);
-    assert!(result.is_ok());
-}
-
-// ==========================================================================
-// Direct Table Nodes Tests (population uses these, not nodes())
-// ==========================================================================
-
-#[test]
-fn test_direct_table_nodes_excludes_where_subquery() {
-    let tables = catalog(&["users", "active_users"]);
-
-    let resolved = resolve_sql(
-        "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
-        &tables,
-    );
-
-    // nodes() finds both tables (full traversal)
-    let all_tables: Vec<&ResolvedTableNode> = resolved.nodes().collect();
-    assert_eq!(all_tables.len(), 2);
-
-    // direct_table_nodes() only finds the FROM-clause table
-    let direct_tables = resolved.direct_table_nodes();
-    assert_eq!(direct_tables.len(), 1, "Should only find direct FROM table");
-    assert_eq!(direct_tables[0].name, "users");
-}
-
-#[test]
-fn test_direct_table_nodes_with_join_and_subquery() {
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(
-        test_table_metadata_with_columns(
-            "items",
-            Oid::from_raw(1001),
-            &["id", "name", "category_id"],
-        )
-        .into(),
-    );
-    tables.insert_overwrite(
-        test_table_metadata_with_columns(
-            "inventory",
-            Oid::from_raw(1002),
-            &["id", "item_id", "quantity"],
-        )
-        .into(),
-    );
-    tables.insert_overwrite(
-        test_table_metadata_with_columns(
-            "categories",
-            Oid::from_raw(1003),
-            &["id", "name", "active"],
-        )
-        .into(),
-    );
-
-    let resolved = resolve_sql(
-        "SELECT i.name FROM items i \
-         JOIN inventory inv ON i.id = inv.item_id \
-         WHERE i.category_id IN (SELECT c.id FROM categories c WHERE c.active = true) \
-         ORDER BY i.name",
-        &tables,
-    );
-
-    // nodes() finds all 3 tables
-    let all_tables: Vec<&ResolvedTableNode> = resolved.nodes().collect();
-    assert_eq!(all_tables.len(), 3);
-
-    // direct_table_nodes() only finds the 2 JOIN tables, not the WHERE subquery table
-    let direct_tables = resolved.direct_table_nodes();
+    let window = func.over.as_ref().expect("an OVER clause");
+    assert_eq!((window.partition_by.len(), window.order_by.len()), (1, 1));
     assert_eq!(
-        direct_tables.len(),
-        2,
-        "Should find items and inventory but not categories"
+        bound(
+            "SELECT sum(id) OVER (ORDER BY name DESC) FROM users",
+            &tables
+        )
+        .sql(),
+        "SELECT sum(public.users.id) OVER (ORDER BY public.users.name DESC) FROM public.users"
     );
-    let names: Vec<&str> = direct_tables.iter().map(|t| t.name.as_str()).collect();
-    assert!(names.contains(&"items"));
-    assert!(names.contains(&"inventory"));
-    assert!(!names.contains(&"categories"));
+}
+
+// ============================================================================
+// Subqueries and traversal
+// ============================================================================
+
+#[test]
+fn test_select_nodes_cases() {
+    // (label, SQL, the FROM table of each branch in order)
+    #[rustfmt::skip]
+    let cases: [(&str, &str, &[&str]); 3] = [
+        ("plain SELECT",  "SELECT * FROM a",                                            &["a"]),
+        ("UNION",         "SELECT * FROM a UNION SELECT * FROM b",                      &["a", "b"]),
+        ("nested UNION",  "SELECT * FROM a UNION SELECT * FROM b UNION SELECT * FROM c", &["a", "b", "c"]),
+    ];
+    for (label, sql, expected) in cases {
+        let query = query_expr_parse(sql).expect("parse");
+        let branches: Vec<&str> = query
+            .select_nodes()
+            .iter()
+            .map(|select| select.direct_table_nodes()[0].name.as_str())
+            .collect();
+        assert_eq!(branches, expected, "{label}");
+    }
 }
 
 #[test]
-fn test_direct_table_nodes_derived_table() {
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_sql(
-        "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",
-        &tables,
+fn test_subquery_bind_cases() {
+    // IN keeps its test expression; the inner table has a slot of its own.
+    let query = bound(
+        "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
+        &catalog(&["users", "active_users"]),
     );
-
-    // nodes() finds the table inside the derived table
-    let all_tables: Vec<&ResolvedTableNode> = resolved.nodes().collect();
-    assert_eq!(all_tables.len(), 1);
-
-    // direct_table_nodes() finds nothing — the derived table is a subquery, not a direct table
-    let direct_tables = resolved.direct_table_nodes();
-    assert_eq!(
-        direct_tables.len(),
-        0,
-        "Derived table should not appear in direct_table_nodes"
-    );
-}
-
-// ==========================================================================
-// Correlated Subquery Tests
-// ==========================================================================
-
-#[test]
-fn test_doubly_nested_correlated_subquery() {
-    // Grandchild subquery references the grandparent scope
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(
-        test_table_metadata_with_columns("departments", Oid::from_raw(1001), &["id", "name"])
-            .into(),
-    );
-    tables.insert_overwrite(
-        test_table_metadata_with_columns("employees", Oid::from_raw(1002), &["id", "dept_id"])
-            .into(),
-    );
-    tables.insert_overwrite(
-        test_table_metadata_with_columns("projects", Oid::from_raw(1003), &["id", "employee_id"])
-            .into(),
-    );
-
-    // departments d → employees e (correlated on d.id) → projects (correlated on e.id)
-    let node = parse_select_node(
-        "SELECT d.id FROM departments d \
-         WHERE EXISTS (\
-           SELECT 1 FROM employees e WHERE e.dept_id = d.id AND EXISTS (\
-             SELECT 1 FROM projects WHERE employee_id = e.id\
-           )\
-         )",
-    );
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    // Resolution must succeed; the outer EXISTS subquery is correlated on d.id
-    assert!(
-        result.is_ok(),
-        "doubly-nested correlated subquery should resolve, got: {:?}",
-        result
-    );
-    let resolved = result.unwrap();
-    let Some(ResolvedWhereExpr::Subquery { outer_refs, .. }) = &resolved.where_clause else {
-        panic!("expected Subquery WHERE");
-    };
-    assert!(
-        !outer_refs.is_empty(),
-        "outer EXISTS should be correlated on departments.id"
-    );
-    assert_eq!(outer_refs[0].table, "departments");
-    assert_eq!(outer_refs[0].column, "id");
-}
-
-#[test]
-fn test_unqualified_column_not_in_any_scope() {
-    // `nonexistent` doesn't exist in any table — should remain ColumnNotFound
-    let mut tables = BiHashMap::new();
-    tables.insert_overwrite(
-        test_table_metadata_with_columns("users", Oid::from_raw(1001), &["id", "name"]).into(),
-    );
-    tables.insert_overwrite(
-        test_table_metadata_with_columns("orders", Oid::from_raw(1002), &["id", "total"]).into(),
-    );
-
-    let node = parse_select_node(
-        "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE nonexistent = 1)",
-    );
-    let result = select_node_resolve(&node, &tables, &["public"]);
-
-    assert!(
-        matches!(
-            result.as_ref().map_err(|e| e.current_context()),
-            Err(ResolveError::ColumnNotFound { .. })
-        ),
-        "Column not in any scope should remain ColumnNotFound, got: {:?}",
-        result
-    );
-}
-
-// ---------------------------------------------------------------
-// PGC-123: HAVING aggregate metadata must survive resolution and
-// resolved-side deparse.
-// ---------------------------------------------------------------
-
-fn resolved_having_lhs_function(node: &ResolvedSelectNode) -> &ResolvedFunctionCall {
-    let having = node.having.as_ref().expect("resolved HAVING present");
-    let ResolvedWhereExpr::Binary(binary) = having else {
-        panic!("expected Binary HAVING, got {having:?}");
-    };
-    let ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Function(func)) = binary.lexpr.as_ref()
+    let Some(WhereExpr::Subquery {
+        sublink_type,
+        test_expr,
+        query: inner,
+    }) = &select_of(&query).where_clause
     else {
-        panic!("expected Scalar(Function) on LHS, got {:?}", binary.lexpr);
+        panic!("expected a subquery predicate");
     };
-    func
-}
-
-#[test]
-fn test_having_filter_resolved_deparse_contains_filter() {
-    let tables = catalog(&["users"]);
-
-    let resolved = resolve_sql(
-        "SELECT name FROM users GROUP BY name \
-         HAVING COUNT(*) FILTER (WHERE id > 0) > 5",
-        &tables,
+    assert_eq!(
+        (*sublink_type, test_expr.is_some()),
+        (SubLinkType::Any, true)
+    );
+    let QueryBody::Select(inner_select) = &inner.body else {
+        panic!("expected a SELECT subquery");
+    };
+    let [TableSource::Table(inner_table)] = inner_select.from.as_slice() else {
+        panic!("expected one inner table");
+    };
+    assert_eq!(
+        table_slot(&query, inner_table),
+        ("public".into(), "active_users".into(), None, 1002)
     );
 
-    let mut buf = String::new();
-    resolved.deparse(&mut buf);
-    assert!(
-        buf.contains("FILTER (WHERE "),
-        "resolved deparse must keep FILTER, got: {buf}"
+    // EXISTS has no test expression.
+    let query = bound(
+        "SELECT * FROM orders WHERE EXISTS (SELECT id FROM items)",
+        &catalog(&["orders", "items"]),
+    );
+    let Some(WhereExpr::Subquery {
+        sublink_type,
+        test_expr,
+        ..
+    }) = &select_of(&query).where_clause
+    else {
+        panic!("expected a subquery predicate");
+    };
+    assert_eq!(
+        (*sublink_type, test_expr.is_none()),
+        (SubLinkType::Exists, true)
+    );
+
+    // A scalar subquery is the comparison's right operand.
+    let query = bound(
+        "SELECT * FROM users WHERE id > (SELECT id FROM users)",
+        &catalog(&["users"]),
+    );
+    let binary = as_binary(select_of(&query).where_clause.as_ref().expect("WHERE"));
+    assert!(matches!(
+        binary.rexpr.as_ref(),
+        WhereExpr::Subquery {
+            sublink_type: SubLinkType::Expr,
+            ..
+        }
+    ));
+
+    // A derived table binds to a slot named by its alias.
+    let query = bound(
+        "SELECT * FROM (SELECT id FROM users) AS sub",
+        &catalog(&["users"]),
+    );
+    let [TableSource::Subquery(sub)] = select_of(&query).from.as_slice() else {
+        panic!("expected a derived table");
+    };
+    assert_eq!(sub.alias.as_ref().map(|a| a.name.as_str()), Some("sub"));
+    let slot = query
+        .bindings()
+        .source(sub.id)
+        .expect("derived table bound");
+    let TableSlot::Derived { table, .. } = query.bindings().slot(slot).expect("slot") else {
+        panic!("expected a derived slot");
+    };
+    assert_eq!(table.name, "sub");
+    assert_eq!(
+        query.sql(),
+        "SELECT sub.id FROM (SELECT public.users.id FROM public.users) sub"
     );
 }
 
+/// `direct_table_nodes` is the FROM clause's own tables; `nodes` reaches
+/// every table, subqueries included.
 #[test]
-fn test_resolved_column_node_deparse_cases() {
-    // (label, schema, table, alias, column, expected)
+fn test_direct_table_nodes_cases() {
+    let users_active = catalog(&["users", "active_users"]);
+    let users = catalog(&["users"]);
+    let items = catalog_with_columns(&[
+        ("items", &["id", "name", "category_id"]),
+        ("inventory", &["id", "item_id", "quantity"]),
+        ("categories", &["id", "name", "active"]),
+    ]);
+    // (label, catalog, SQL, every table reached, direct FROM tables)
     #[rustfmt::skip]
-    let cases = [
-        ("alias wins",              "public", "users", Some("u"), "id",        "u.id"),
-        ("schema-qualified",        "public", "users", None,      "id",        "public.users.id"),
-        ("mixed case is quoted",    "Public", "Users", None,      "firstName", "\"Public\".\"Users\".\"firstName\""),
-        ("keywords are quoted",     "public", "order", None,      "user",      "public.\"order\".\"user\""),
-        ("embedded quote doubled",  "public", "users", None,      "we\"ird",   "public.users.\"we\"\"ird\""),
+    let cases: [(&str, &Catalog, &str, usize, &[&str]); 3] = [
+        ("WHERE subquery",            &users_active, "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)", 2, &["users"]),
+        ("join plus WHERE subquery",  &items,
+         "SELECT i.name FROM items i JOIN inventory inv ON i.id = inv.item_id \
+          WHERE i.category_id IN (SELECT c.id FROM categories c WHERE c.active = true) ORDER BY i.name", 3, &["items", "inventory"]),
+        ("derived table",             &users,        "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",     1, &[]),
     ];
-    for (label, schema, table, alias, column, expected) in cases {
-        let node = ResolvedColumnNode {
-            schema: schema.into(),
-            table: table.into(),
-            table_alias: alias.map(Into::into),
-            column: column.into(),
-            column_metadata: id_column_metadata(),
-        };
-        assert_eq!(deparsed(&node), expected, "{label}");
+    for (label, tables, sql, all, direct) in cases {
+        let query = bound(sql, tables);
+        let reached = query.tree().nodes::<TableNode>().count();
+        let from: Vec<&str> = select_of(&query)
+            .direct_table_nodes()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect();
+        assert_eq!((reached, from), (all, direct.to_vec()), "{label}: {sql}");
     }
 }
 
 #[test]
-fn test_resolved_table_node_deparse_cases() {
-    // (label, schema, name, alias, expected)
+fn test_table_nodes_reach_subqueries_cases() {
+    // (label, SQL, tables reached, sorted)
     #[rustfmt::skip]
-    let cases = [
-        ("with alias",           "public", "users", Some("u"), " public.users u"),
-        ("without alias",        "public", "users", None,      " public.users"),
-        ("mixed case is quoted", "Public", "Users", None,      " \"Public\".\"Users\""),
+    let cases: [(&str, &str, &[&str]); 4] = [
+        ("WHERE subquery",  "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",                                  &["active_users", "users"]),
+        ("FROM subquery",   "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",                                       &["users"]),
+        ("scalar subquery", "SELECT id, (SELECT COUNT(*) FROM users) AS user_count FROM orders WHERE id = 1",                 &["orders", "users"]),
+        ("nested",          "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE id IN (SELECT id FROM c))",                  &["a", "b", "c"]),
     ];
-    for (label, schema, name, alias, expected) in cases {
-        let node = ResolvedTableNode {
-            schema: schema.into(),
-            name: name.into(),
-            alias: alias.map(Into::into),
-            relation_oid: Oid::from_raw(1001),
-        };
-        assert_eq!(deparsed(&node), expected, "{label}");
+    for (label, sql, expected) in cases {
+        let query = query_expr_parse(sql).expect("parse");
+        let mut found: Vec<&str> = query
+            .nodes::<TableNode>()
+            .map(|t| t.name.as_str())
+            .collect();
+        found.sort_unstable();
+        assert_eq!(found, expected, "{label}: tables reached in {sql}");
     }
 }
 
+/// Unqualified columns fall back to the outer scope only when the inner
+/// scope lacks them; a column in both scopes binds to the inner one.
 #[test]
-fn test_resolved_query_deparse_cases() {
-    // `*` expands to explicit columns; references are fully qualified unless
-    // aliased.
+fn test_correlated_reference_cases() {
+    let users_orders = || catalog(&["users", "orders"]);
+    #[rustfmt::skip]
+    let cases = [
+        ("EXISTS",                     catalog(&["orders", "items"]),
+         "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.id = orders.id)",                   vec![pair("orders", "id")]),
+        ("IN",                         users_orders(),
+         "SELECT * FROM users WHERE id IN (SELECT id FROM orders WHERE orders.name = users.name)",               vec![pair("users", "name")]),
+        ("SELECT-list scalar",         users_orders(),
+         "SELECT id, (SELECT COUNT(*) FROM orders WHERE orders.id = users.id) FROM users",                       vec![pair("users", "id")]),
+        ("outer table alias",          users_orders(),
+         "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE orders.id = u.id)",                     vec![pair("users", "id")]),
+        ("unqualified, outer only",    catalog_with_columns(&[("users", &["id", "email"]), ("orders", &["id", "user_id", "total"])]),
+         "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE email = 'test@example.com')",             vec![pair("users", "email")]),
+        ("unqualified, in both",       catalog_with_columns(&[("users", &["id", "email"]), ("orders", &["id", "user_id"])]),
+         "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE user_id = id)",                      vec![]),
+        ("unqualified, scalar",        catalog_with_columns(&[("users", &["id", "status"]), ("orders", &["id", "amount"])]),
+         "SELECT id, (SELECT COUNT(*) FROM orders WHERE status = 'active') FROM users",                          vec![pair("users", "status")]),
+        ("not correlated",             catalog(&["users", "active_users"]),
+         "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",                                         vec![]),
+        ("mixed inner and outer",      catalog_with_columns(&[("departments", &["id", "region"]), ("employees", &["id", "dept_id", "region"])]),
+         "SELECT d.id FROM departments d WHERE EXISTS (SELECT 1 FROM employees WHERE dept_id = d.id)",           vec![pair("departments", "id")]),
+        ("doubly nested",              catalog_with_columns(&[("departments", &["id", "name"]), ("employees", &["id", "dept_id"]), ("projects", &["id", "employee_id"])]),
+         "SELECT d.id FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id \
+          AND EXISTS (SELECT 1 FROM projects WHERE employee_id = e.id))",                                        vec![pair("departments", "id"), pair("employees", "id")]),
+    ];
+    for (label, tables, sql, expected) in cases {
+        assert_eq!(
+            correlated_refs(&bound(sql, &tables)),
+            expected,
+            "{label}: correlated references of {sql}"
+        );
+    }
+}
+
+// ============================================================================
+// Rendering
+// ============================================================================
+
+/// `*` expands to explicit columns; references are fully qualified unless
+/// aliased.
+#[test]
+fn test_render_cases() {
     #[rustfmt::skip]
     let cases = [
         ("WHERE",          "SELECT * FROM users WHERE id = 1",
@@ -1658,244 +819,33 @@ fn test_resolved_query_deparse_cases() {
     ];
     let tables = catalog(&["users", "orders"]);
     for (label, sql, expected) in cases {
-        assert_eq!(
-            deparsed(&resolve_query(sql, &tables)),
-            expected,
-            "{label}: {sql}"
-        );
+        assert_eq!(bound(sql, &tables).sql(), expected, "{label}: {sql}");
     }
 }
 
+/// PGC-262: identifiers render quoted when mixed-case, reserved or holding
+/// a quote, which is doubled.
 #[test]
-fn test_complexity_cases() {
-    // Each predicate counts 1, each join 3, each subquery level 5.
-    #[rustfmt::skip]
-    let cases = [
-        ("one table, no WHERE",        "SELECT * FROM users",                                                   0, 0),
-        ("one table, one predicate",   "SELECT * FROM users WHERE id = 1",                                      1, 0),
-        ("one table, two predicates",  "SELECT * FROM users WHERE id = 1 AND name = 'john'",                    2, 0),
-        ("join, no WHERE",             "SELECT * FROM users JOIN orders ON users.id = orders.id",               3, 0),
-        ("join plus one predicate",    "SELECT * FROM users JOIN orders ON users.id = orders.id WHERE users.id = 1", 4, 0),
-    ];
-    let tables = catalog(&["users", "orders"]);
-    for (label, sql, complexity, depth) in cases {
-        let resolved = resolve_sql(sql, &tables);
-        assert_eq!(
-            (resolved.complexity(), resolved.subquery_depth()),
-            (complexity, depth),
-            "{label}: (complexity, subquery depth) of {sql}"
-        );
-    }
-    // A FROM subquery counts as one level of depth.
-    let from_sub = resolve_sql(
-        "SELECT * FROM (SELECT * FROM users WHERE id = 1) sub",
-        &tables,
-    );
-    assert_eq!(from_sub.subquery_depth(), 1, "FROM subquery depth");
-}
-
-#[test]
-fn test_limit_resolve_cases() {
-    use LiteralValue::{Integer, Parameter};
-    // Parameterized values are preserved through resolution.
-    #[rustfmt::skip]
-    let cases = [
-        ("count only",         "SELECT * FROM users LIMIT 10",            Some((Some(Integer(10)), None))),
-        ("offset only",        "SELECT * FROM users OFFSET 5",            Some((None, Some(Integer(5))))),
-        ("count and offset",   "SELECT * FROM users LIMIT 10 OFFSET 20",  Some((Some(Integer(10)), Some(Integer(20))))),
-        ("parameterized",      "SELECT * FROM users LIMIT $1 OFFSET $2",  Some((Some(Parameter("$1".into())), Some(Parameter("$2".into()))))),
-        ("no LIMIT",           "SELECT * FROM users",                     None),
-    ];
-    let tables = catalog(&["users"]);
-    for (label, sql, expected) in cases {
-        let actual = resolve_query(sql, &tables)
-            .limit
-            .map(|l| (l.count, l.offset));
-        assert_eq!(actual, expected, "{label}: (count, offset) of {sql}");
-    }
-}
-
-#[test]
-fn test_subquery_nodes_traversal_cases() {
-    // nodes() reaches tables in WHERE subqueries, FROM subqueries, SELECT-list
-    // scalar subqueries and nested subqueries.
-    #[rustfmt::skip]
-    let cases: [(&str, &[&str], &str, &[&str]); 4] = [
-        ("WHERE subquery",  &["users", "active_users"], "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
-                            &["active_users", "users"]),
-        ("FROM subquery",   &["users"],                 "SELECT * FROM (SELECT id FROM users WHERE id = 1) AS sub",
-                            &["users"]),
-        ("scalar subquery", &["orders", "users"],       "SELECT id, (SELECT COUNT(*) FROM users) AS user_count FROM orders WHERE id = 1",
-                            &["orders", "users"]),
-        ("nested",          &["a", "b", "c"],           "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE id IN (SELECT id FROM c))",
-                            &["a", "b", "c"]),
-    ];
-    for (label, names, sql, expected) in cases {
-        let resolved = resolve_sql(sql, &catalog(names));
-        let mut found: Vec<&str> = resolved
-            .nodes::<ResolvedTableNode>()
-            .map(|t| t.name.as_str())
-            .collect();
-        found.sort_unstable();
-        assert_eq!(found, expected, "{label}: tables reached in {sql}");
-    }
-}
-
-#[test]
-fn test_correlated_subquery_outer_refs_cases() {
-    let users_orders = || catalog(&["users", "orders"]);
-    // Unqualified columns fall back to the outer scope only when the inner
-    // scope lacks them; a column in both scopes binds to the inner one.
-    #[rustfmt::skip]
-    let cases = [
-        ("EXISTS",                     catalog(&["orders", "items"]),
-         "SELECT * FROM orders WHERE EXISTS (SELECT 1 FROM items WHERE items.id = orders.id)",                   vec![("orders", "id")]),
-        ("IN",                         users_orders(),
-         "SELECT * FROM users WHERE id IN (SELECT id FROM orders WHERE orders.name = users.name)",               vec![("users", "name")]),
-        ("SELECT-list scalar",         users_orders(),
-         "SELECT id, (SELECT COUNT(*) FROM orders WHERE orders.id = users.id) FROM users",                       vec![("users", "id")]),
-        ("outer table alias",          users_orders(),
-         "SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders WHERE orders.id = u.id)",                     vec![("users", "id")]),
-        ("unqualified, outer only",    catalog_with_columns(&[("users", &["id", "email"]), ("orders", &["id", "user_id", "total"])]),
-         "SELECT * FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE email = 'test@example.com')",             vec![("users", "email")]),
-        ("unqualified, in both",       catalog_with_columns(&[("users", &["id", "email"]), ("orders", &["id", "user_id"])]),
-         "SELECT * FROM users WHERE id IN (SELECT user_id FROM orders WHERE user_id = id)",                      vec![]),
-        ("unqualified, scalar",        catalog_with_columns(&[("users", &["id", "status"]), ("orders", &["id", "amount"])]),
-         "SELECT id, (SELECT COUNT(*) FROM orders WHERE status = 'active') FROM users",                          vec![("users", "status")]),
-        ("not correlated",             catalog(&["users", "active_users"]),
-         "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",                                         vec![]),
-        ("mixed inner and outer",      catalog_with_columns(&[("departments", &["id", "region"]), ("employees", &["id", "dept_id", "region"])]),
-         "SELECT d.id FROM departments d WHERE EXISTS (SELECT 1 FROM employees WHERE dept_id = d.id)",           vec![("departments", "id")]),
-    ];
-    for (label, tables, sql, expected) in cases {
-        let node = parse_select_node(sql);
-        let resolved = select_node_resolve(&node, &tables, &["public"])
-            .unwrap_or_else(|e| panic!("{label}: {sql} should resolve: {e:?}"));
-        assert_eq!(
-            subquery_outer_refs(&resolved),
-            expected,
-            "{label}: outer refs of {sql}"
-        );
-    }
-}
-
-/// An expected `*`-expansion output column.
-#[derive(Debug, Clone, Copy)]
-enum StarColumn {
-    /// A USING/NATURAL merged join column, emitted under its name.
-    Merged(&'static str),
-    /// A base-table column (table, column).
-    Base(&'static str, &'static str),
-    /// A derived-table column (derived alias, column).
-    Derived(&'static str, &'static str),
-}
-
-fn star_column_assert(col: &ResolvedSelectColumn, expected: StarColumn, context: &str) {
-    match expected {
-        StarColumn::Merged(name) => {
-            assert_eq!(col.alias.as_deref(), Some(name), "{context}: merged column")
-        }
-        StarColumn::Base(table, column) => {
-            let node = select_column_node(col);
-            assert_eq!(
-                (node.table.as_str(), node.column.as_str()),
-                (table, column),
-                "{context}"
-            );
-        }
-        StarColumn::Derived(alias, column) => derived_column_assert(col, alias, column),
-    }
-}
-
-#[test]
-fn test_select_star_mixed_derived_cases() {
-    use StarColumn::{Base, Derived, Merged};
-    let mut tables = catalog(&["users"]);
-    tables.insert_overwrite(
-        test_table_metadata_with_columns("orders", Oid::from_raw(1002), &["id", "total"]).into(),
-    );
-    // Unqualified `*` emits the merged USING column first, then each side's
-    // remaining columns in FROM order; qualified `o.*` is that side verbatim.
-    #[rustfmt::skip]
-    let cases: [(&str, &str, &[StarColumn]); 3] = [
-        ("base table first",    "SELECT * FROM users u JOIN (SELECT id, total FROM orders) o USING (id)",
-                                &[Merged("id"), Base("users", "name"), Derived("o", "total")]),
-        ("derived table first", "SELECT * FROM (SELECT id, total FROM orders) o JOIN users u USING (id)",
-                                &[Merged("id"), Derived("o", "total"), Base("users", "name")]),
-        ("qualified o.*",       "SELECT o.* FROM (SELECT id, total FROM orders) o JOIN users u USING (id)",
-                                &[Derived("o", "id"), Derived("o", "total")]),
-    ];
-    for (label, sql, expected) in cases {
-        let resolved = resolve_sql(sql, &tables);
-        let ResolvedSelectColumns::Columns(cols) = &resolved.columns else {
-            panic!("{label}: expected Columns for {sql}");
-        };
-        assert_eq!(cols.len(), expected.len(), "{label}: column count of {sql}");
-        for (i, (col, want)) in cols.iter().zip(expected).enumerate() {
-            star_column_assert(col, *want, &format!("{label}: column {i} of {sql}"));
-        }
-    }
-}
-
-/// A predicate over a resolved HAVING aggregate.
-type AggregateCheck = fn(&ResolvedFunctionCall) -> bool;
-
-#[test]
-fn test_having_aggregate_decorations_resolve_cases() {
-    // FILTER, aggregate ORDER BY and DISTINCT on a HAVING aggregate must
-    // survive resolution.
-    #[rustfmt::skip]
-    let cases: [(&str, &str, AggregateCheck); 3] = [
-        ("count(*) FILTER", "SELECT name FROM users GROUP BY name HAVING COUNT(*) FILTER (WHERE id > 0) > 5",
-         |f| f.name == "count" && f.agg_star && f.agg_filter.is_some()),
-        ("string_agg ORDER BY", "SELECT id FROM users GROUP BY id HAVING string_agg(name, ',' ORDER BY name) <> ''",
-         |f| f.name == "string_agg" && !f.agg_order.is_empty()),
-        ("count DISTINCT", "SELECT name FROM users GROUP BY name HAVING COUNT(DISTINCT id) > 1",
-         |f| f.agg_distinct),
-    ];
-    let tables = catalog(&["users"]);
-    for (label, sql, check) in cases {
-        let resolved = resolve_sql(sql, &tables);
-        let func = resolved_having_lhs_function(&resolved);
-        assert!(
-            check(func),
-            "{label}: HAVING aggregate of {sql} resolved to {func:?}"
-        );
-    }
-}
-
-/// PGC-287 class 2: the cache identity is the resolved query's hash, so a
-/// bare and a qualified spelling of one table share it, LIMIT does not
-/// enter it, and a different table does.
-#[test]
-fn test_resolved_query_fingerprint_identity() {
-    let tables = catalog(&["users", "orders"]);
-    let fingerprint = |sql: &str| {
-        let query = query_expr_parse(sql).expect("parse");
-        resolved_query_fingerprint(
-            &query_expr_resolve(&query, &tables, &["public"]).expect("resolve"),
-        )
+fn test_identifier_quoting_render_cases() {
+    let table = |schema: &str, name: &str, columns: &[&str], oid: u32| {
+        let mut table = test_table_metadata_with_columns(name, Oid::from_raw(oid), columns);
+        table.schema = schema.into();
+        table
     };
-    let bare = fingerprint("SELECT id FROM users WHERE id = 1");
-    assert_eq!(
-        bare,
-        fingerprint("SELECT id FROM public.users WHERE id = 1")
-    );
-    assert_eq!(
-        bare,
-        fingerprint("SELECT id FROM users WHERE id = 1 LIMIT 5")
-    );
-    assert_ne!(bare, fingerprint("SELECT id FROM orders WHERE id = 1"));
-    assert_ne!(bare, fingerprint("SELECT id FROM users WHERE id = 2"));
-    assert_ne!(
-        bare.get(),
-        query_expr_session_key(
-            &query_expr_parse("SELECT id FROM users WHERE id = 1").expect("parse"),
-            &["public".into()],
-            &LiteralSettings::default()
-        )
-        .get()
-    );
+    let mut tables = BiHashMap::new();
+    tables.insert_overwrite(table("Public", "Users", &["id", "firstName"], 1001).into());
+    tables.insert_overwrite(table("public", "order", &["id", "user"], 1002).into());
+    tables.insert_overwrite(table("public", "users", &["id", "we\"ird"], 1003).into());
+    #[rustfmt::skip]
+    let cases = [
+        ("mixed case is quoted",   r#"SELECT "firstName" FROM "Public"."Users""#, r#"SELECT "Public"."Users"."firstName" FROM "Public"."Users""#),
+        ("keywords are quoted",    r#"SELECT "user" FROM "order""#,               r#"SELECT public."order"."user" FROM public."order""#),
+        ("embedded quote doubled", r#"SELECT "we""ird" FROM users"#,              r#"SELECT public.users."we""ird" FROM public.users"#),
+        ("alias wins",             "SELECT u.id FROM users u",                    "SELECT u.id FROM public.users u"),
+    ];
+    for (label, sql, expected) in cases {
+        assert_eq!(bound(sql, &tables).sql(), expected, "{label}: {sql}");
+    }
 }
 
 // ============================================================================
