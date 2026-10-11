@@ -624,7 +624,7 @@ mod classify_tests {
         let query_expr = query_expr_parse(sql).expect("convert");
         let cacheable = CacheableQuery::try_new(query_expr, &HashMap::new()).expect("cacheable");
         let query = std::sync::Arc::new(cacheable.query().clone());
-        let (_, bindings) = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 

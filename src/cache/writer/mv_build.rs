@@ -620,7 +620,7 @@ mod tests {
     /// so tests assert on nodes, not raw text.
     fn denom_ast(sql: &str) -> QueryExpr {
         let ast = Arc::new(query_expr_parse(sql).expect("parse source"));
-        let (_, bindings) =
+        let bindings =
             query_expr_resolve_bound(&ast, &test_tables(), &["public"]).expect("resolve source");
         let denom = mv_source_count_sql(&ResolvedQuery::new(ast, bindings));
         query_expr_parse(&denom).expect("denominator SQL re-parses")

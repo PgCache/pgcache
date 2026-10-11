@@ -70,8 +70,7 @@ fn catalog(names: &[&str]) -> Catalog {
 fn constraints_of(sql: &str, tables: &Catalog) -> QueryConstraints {
     let expected = analyze_query_constraints(&resolve_sql(sql, tables));
     let query = std::sync::Arc::new(query_expr_parse(sql).expect("convert to QueryExpr"));
-    let (_, bindings) =
-        query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve bound");
+    let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve bound");
     let bound = ResolvedQuery::new(query, bindings);
     let actual = query_constraints_analyze(&bound, bound.select().expect("a SELECT"));
     assert_constraints_equal(&actual, &expected, sql);

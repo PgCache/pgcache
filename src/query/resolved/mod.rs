@@ -404,7 +404,13 @@ impl Default for ResolvedQueryExpr {
 }
 
 // Re-export public resolution functions so existing imports continue to work
-pub use super::resolve::{query_expr_resolve, select_node_resolve};
+#[cfg(test)]
+mod legacy;
+#[cfg(test)]
+pub(crate) use legacy::{
+    derived_table_columns_extract, query_expr_resolve, query_expr_resolve_legacy,
+    select_node_resolve,
+};
 
 /// The cache identity of a resolved query (PGC-287 class 2): a hash of the
 /// resolved body and ORDER BY, which carry each table's schema and each

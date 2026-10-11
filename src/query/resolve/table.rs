@@ -1,9 +1,8 @@
-//! Resolve a FROM entry: catalog lookup for a table reference, and the
+//! Bind a FROM entry: catalog lookup for a table reference, and the
 //! recursive walk over tables, joins and derived tables.
 
 use std::sync::Arc;
 
-use ecow::EcoString;
 use rootcause::Report;
 
 use super::bindings::TableSlot;
@@ -11,13 +10,9 @@ use super::entry::query_expr_resolve_scoped;
 use super::expr::where_expr_resolve;
 use super::join_using::{JoinScopeRanges, join_natural_common_columns, join_using_or_cross};
 use super::scope::ResolutionScope;
-use crate::cache::SubqueryKind;
 use crate::catalog::{Catalog, CatalogTable};
-use crate::query::ast::{JoinQual, TableAlias, TableNode, TableSource};
-use crate::query::resolved::{
-    ResolveError, ResolveResult, ResolvedJoinNode, ResolvedJoinQual, ResolvedTableNode,
-    ResolvedTableSource, ResolvedTableSubqueryNode,
-};
+use crate::query::ast::{JoinQual, TableNode, TableSource};
+use crate::query::resolved::{ResolveError, ResolveResult};
 
 /// Find table metadata for a table reference.
 ///
@@ -46,16 +41,15 @@ pub(super) fn table_metadata_find<'map, 'node: 'map>(
     None
 }
 
-/// Resolve a table source (table, join, or subquery)
+/// Bind a table source (table, join, or subquery) into the scope.
 pub(super) fn table_source_resolve<'a>(
     source: &'a TableSource,
     tables: &'a Catalog,
     scope: &mut ResolutionScope<'a>,
     search_path: &[&'a str],
-) -> ResolveResult<ResolvedTableSource> {
+) -> ResolveResult<()> {
     match source {
         TableSource::Table(table_node) => {
-            // First find the table metadata (which gives us the schema)
             let table_metadata =
                 table_metadata_find(table_node, tables, search_path).ok_or_else(|| {
                     Report::from(ResolveError::TableNotFound {
@@ -75,55 +69,37 @@ pub(super) fn table_source_resolve<'a>(
                 table_node.alias.as_ref().map(|a| a.name.as_str()),
                 slot,
             );
-
-            let resolved = ResolvedTableNode {
-                schema: table_metadata.schema.clone(),
-                name: table_metadata.name.clone(),
-                alias: table_node.alias.as_ref().map(|a| a.name.as_str().into()),
-                relation_oid: table_metadata.relation_oid,
-            };
-
-            Ok(ResolvedTableSource::Table(resolved))
+            Ok(())
         }
         TableSource::Join(join_node) => {
             // Scope index ranges per side, to qualify USING/NATURAL
             // columns to the input that exposes them.
             let left_lo = scope.entries.len();
-            let resolved_left = table_source_resolve(&join_node.left, tables, scope, search_path)?;
+            table_source_resolve(&join_node.left, tables, scope, search_path)?;
             let mid = scope.entries.len();
-            let resolved_right =
-                table_source_resolve(&join_node.right, tables, scope, search_path)?;
+            table_source_resolve(&join_node.right, tables, scope, search_path)?;
             let ranges = JoinScopeRanges {
                 left_lo,
                 mid,
                 hi: scope.entries.len(),
             };
 
-            // `USING`/`NATURAL` keep their qualifier (deparsed verbatim
-            // so Postgres merges the join column) and carry a synthesized
-            // equi-`predicate` for freshness/invalidation analysis, plus
-            // merged-column scope entries so `*` / unqualified refs see
-            // the single merged column. `Cross` has no join predicate —
-            // a cartesian product; filtering lives in WHERE.
+            // `USING`/`NATURAL` add merged-column scope entries so `*` and
+            // unqualified references see the single merged column. `Cross`
+            // has no join predicate — a cartesian product; filtering lives
+            // in WHERE.
             let jt = join_node.join_type;
-            let qual = match &join_node.qual {
-                JoinQual::On(cond) => ResolvedJoinQual::On(where_expr_resolve(cond, scope)?),
-                JoinQual::Cross => ResolvedJoinQual::Cross,
+            match &join_node.qual {
+                JoinQual::On(cond) => where_expr_resolve(cond, scope),
+                JoinQual::Cross => Ok(()),
                 JoinQual::Using(cols) => {
-                    join_using_or_cross(scope, ranges, cols.clone(), jt, join_node.id)?
+                    join_using_or_cross(scope, ranges, cols.clone(), jt, join_node.id)
                 }
                 JoinQual::Natural => {
                     let cols = join_natural_common_columns(scope, ranges);
-                    join_using_or_cross(scope, ranges, cols, jt, join_node.id)?
+                    join_using_or_cross(scope, ranges, cols, jt, join_node.id)
                 }
-            };
-
-            Ok(ResolvedTableSource::Join(Box::new(ResolvedJoinNode {
-                join_type: join_node.join_type,
-                left: resolved_left,
-                right: resolved_right,
-                qual,
-            })))
+            }
         }
         TableSource::Subquery(subquery) => {
             // Require alias for table subqueries
@@ -133,9 +109,10 @@ pub(super) fn table_source_resolve<'a>(
                 })
             })?;
 
-            // FROM-clause subqueries use a fresh scope — LATERAL (which would require access
-            // to the outer scope) is not supported and produces TableNotFound if attempted.
-            let (resolved_query, _) = query_expr_resolve_scoped(
+            // FROM-clause subqueries use a fresh scope — LATERAL (which
+            // would require access to the outer scope) is not supported and
+            // produces TableNotFound if attempted.
+            let outputs = query_expr_resolve_scoped(
                 &subquery.query,
                 tables,
                 search_path,
@@ -144,13 +121,7 @@ pub(super) fn table_source_resolve<'a>(
             )?;
 
             // Add derived table to outer scope so outer columns can reference it
-            scope.derived_table_scope_add(&resolved_query, &alias.name, subquery.id)?;
-
-            Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
-                query: Box::new(resolved_query),
-                alias: alias.clone(),
-                subquery_kind: subquery.kind,
-            }))
+            scope.derived_table_scope_add(&outputs, &alias.name, subquery.id)
         }
         TableSource::CteRef(cte_ref) => {
             let alias_name = cte_ref
@@ -160,7 +131,7 @@ pub(super) fn table_source_resolve<'a>(
                 .unwrap_or(&cte_ref.cte_name);
 
             // CTE bodies use a fresh scope (non-correlated)
-            let (resolved_query, _) = query_expr_resolve_scoped(
+            let outputs = query_expr_resolve_scoped(
                 &cte_ref.query,
                 tables,
                 search_path,
@@ -168,18 +139,7 @@ pub(super) fn table_source_resolve<'a>(
                 &mut *scope.bindings,
             )?;
 
-            let alias = TableAlias {
-                name: EcoString::from(alias_name),
-                columns: cte_ref.column_aliases.clone(),
-            };
-
-            scope.derived_table_scope_add(&resolved_query, alias_name, cte_ref.id)?;
-
-            Ok(ResolvedTableSource::Subquery(ResolvedTableSubqueryNode {
-                query: Box::new(resolved_query),
-                alias,
-                subquery_kind: SubqueryKind::Inclusion,
-            }))
+            scope.derived_table_scope_add(&outputs, alias_name, cte_ref.id)
         }
     }
 }

@@ -570,6 +570,7 @@ mod tests {
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::{AstNode, Deparse, query_expr_parse};
     use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+    use crate::query::resolved::query_expr_resolve;
 
     fn events() -> Catalog {
         let column = |name: &str, position: i16, ty: Type| ColumnMetadata {
@@ -606,8 +607,7 @@ mod tests {
 
     fn canon(sql: &str, settings: &LiteralSettings) -> (String, LiteralCanonOutcome) {
         let mut query = query_expr_parse(sql).expect("parse");
-        let (_, bindings) =
-            query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
         let outcome = query_literals_canonicalise(&mut query, &bindings, settings);
         let bound = ResolvedQuery::new(Arc::new(query), bindings);
         (bound.sql(), outcome)
@@ -623,8 +623,8 @@ mod tests {
         (Vec<LiteralValue>, LiteralCanonOutcome),
     ) {
         let mut query = query_expr_parse(sql).expect("parse");
-        let (mut resolved, bindings) =
-            query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
+        let mut resolved = query_expr_resolve(&query, &events(), &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
         let resolved_outcome = resolved_literals_canonicalise(&mut resolved, settings);
         let plain_outcome = query_literals_canonicalise(&mut query, &bindings, settings);
         let resolved_literals = resolved.nodes::<LiteralValue>().cloned().collect();
@@ -670,7 +670,8 @@ mod tests {
         let settings = tokyo_dmy();
         for sql in EQUIVALENCE_CORPUS {
             let mut query = query_expr_parse(sql).expect("parse");
-            let (mut resolved, bindings) =
+            let mut resolved = query_expr_resolve(&query, &events(), &["public"]).expect("resolve");
+            let bindings =
                 query_expr_resolve_bound(&query, &events(), &["public"]).expect("resolve");
             resolved_literals_canonicalise(&mut resolved, &settings);
             query_literals_canonicalise(&mut query, &bindings, &settings);

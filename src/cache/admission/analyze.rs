@@ -70,7 +70,7 @@ pub fn query_resolve_canonical(
     search_path: &[&str],
     settings: &LiteralSettings,
 ) -> ResolveResult<CanonicalResolution> {
-    let (_, bindings) = query_expr_resolve_bound(&base_query, tables, search_path)?;
+    let bindings = query_expr_resolve_bound(&base_query, tables, search_path)?;
     let literals = query_literals_canonicalise(&mut base_query, &bindings, settings);
     Ok(CanonicalResolution {
         bound: Arc::new(ResolvedQuery::new(Arc::new(base_query), bindings)),

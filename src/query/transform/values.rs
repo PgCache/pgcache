@@ -472,8 +472,7 @@ mod tests {
 
     fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
         let query = Arc::new(query_expr_parse(sql).expect("parse"));
-        let (_, bindings) =
-            query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 

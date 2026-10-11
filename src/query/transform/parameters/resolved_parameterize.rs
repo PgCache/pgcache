@@ -238,7 +238,7 @@ mod tests {
     use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::{Deparse, query_expr_parse};
-    use crate::query::resolve::query_expr_resolve;
+    use crate::query::resolved::query_expr_resolve;
 
     fn users_table() -> TableMetadata {
         let columns = ColumnStore::new([

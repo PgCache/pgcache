@@ -254,6 +254,12 @@ impl BindingsBuilder {
             .retain(|candidate| candidate.index() != node.index());
     }
 
+    /// The catalog column a binding names; slots are complete as soon as
+    /// they are pushed, so this reads them mid-build.
+    pub(super) fn binding_column(&self, binding: &ColumnBinding) -> Option<&ColumnMetadata> {
+        self.bindings.binding_column(binding)
+    }
+
     pub(crate) fn slot_push(&mut self, source: NodeId, slot: TableSlot) -> SlotId {
         let id = SlotId(narrow(self.bindings.slots.len()));
         self.bindings.slots.push(slot);

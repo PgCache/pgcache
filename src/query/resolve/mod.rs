@@ -1,5 +1,5 @@
-//! Resolve a parsed AST against the catalog: bind every table and column
-//! reference to concrete metadata.
+//! Bind a parsed AST against the catalog: every table and column reference
+//! to concrete metadata, as a side table keyed by node id (ADR-057).
 //!
 //! * [`scope`] — what is visible at each point in the resolution.
 //! * [`table`] — FROM entries: catalog lookup, joins, derived tables.
@@ -28,5 +28,5 @@ pub use bindings::{
     Bindings, ColumnBinding, ColumnTarget, MergedColumnBinding, MergedId, ResolvedQuery, SlotId,
     StarItem, TableSlot,
 };
-pub use entry::{query_expr_resolve, query_expr_resolve_bound, select_node_resolve};
+pub use entry::query_expr_resolve_bound;
 pub use render::SourceOverride;

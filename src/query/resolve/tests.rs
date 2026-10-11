@@ -6,7 +6,6 @@ use ecow::EcoString;
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
-use super::scope::derived_table_columns_extract;
 use super::*;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
@@ -19,7 +18,8 @@ use crate::query::ast::{
 };
 use crate::query::resolved::{
     ResolveError, ResolvedColumnNode, ResolvedQueryExpr, ResolvedScalarExpr, ResolvedTableNode,
-    ResolvedTableSubqueryNode, ResolvedWhereExpr, resolved_query_columns_by_table,
+    ResolvedTableSubqueryNode, ResolvedWhereExpr, derived_table_columns_extract,
+    query_expr_resolve, query_expr_resolve_legacy, resolved_query_columns_by_table,
 };
 
 // ============================================================================
@@ -120,7 +120,7 @@ pub(super) fn catalog_with_columns(specs: &[(&str, &[&str])]) -> Catalog {
 /// Parse and bind `sql` over `tables`.
 fn bound(sql: &str, tables: &Catalog) -> ResolvedQuery {
     let query = Arc::new(query_expr_parse(sql).expect("convert to QueryExpr"));
-    let (_, bindings) = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+    let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
     ResolvedQuery::new(query, bindings)
 }
 
@@ -1051,11 +1051,45 @@ fn bound_column_refs(query: &QueryExpr, bindings: &Bindings) -> Vec<ColumnRef> {
         .collect()
 }
 
+/// The legacy resolver's tree beside the bindings-only resolver's bindings.
 fn resolve_bound(sql: &str, catalog: &Catalog) -> (QueryExpr, ResolvedQueryExpr, Bindings) {
     let query = query_expr_parse(sql).expect("parse");
-    let (resolved, bindings) =
-        query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
+    let resolved = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
+    let bindings = query_expr_resolve_bound(&query, catalog, &["public"]).expect("bind");
     (query, resolved, bindings)
+}
+
+/// The bindings-only resolver binds exactly what the legacy resolver did,
+/// and fails where it failed.
+#[test]
+fn test_bindings_match_legacy_resolver() {
+    let catalog = binding_catalog();
+    for sql in BINDING_CORPUS {
+        let query = query_expr_parse(sql).expect("parse");
+        let (_, legacy) =
+            query_expr_resolve_legacy(&query, &catalog, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, &catalog, &["public"]).expect("bind");
+        assert_eq!(bindings.describe(), legacy.describe(), "{sql}");
+    }
+    #[rustfmt::skip]
+    let failures = [
+        ("SELECT * FROM nowhere",                                        catalog_with_columns(&[])),
+        ("SELECT * FROM users, orders WHERE id = 'x'",                   catalog_with_columns(&[("users", &["id"]), ("orders", &["id"])])),
+        ("SELECT * FROM users ORDER BY missing",                         catalog_with_columns(&[("users", &["id"])])),
+        ("SELECT * FROM users NATURAL LEFT JOIN orders",                 catalog_with_columns(&[("users", &["id"]), ("orders", &["ref"])])),
+        ("SELECT name FROM users NATURAL LEFT JOIN orders GROUP BY name", catalog_with_columns(&[("users", &["id", "name"]), ("orders", &["name"])])),
+    ];
+    for (sql, catalog) in failures {
+        let query = query_expr_parse(sql).expect("parse");
+        let legacy = query_expr_resolve_legacy(&query, &catalog, &["public"])
+            .err()
+            .map(|e| e.into_current_context().to_string());
+        let bound = query_expr_resolve_bound(&query, &catalog, &["public"])
+            .err()
+            .map(|e| e.into_current_context().to_string());
+        assert!(legacy.is_some(), "{sql}: the legacy resolver rejects it");
+        assert_eq!(bound, legacy, "{sql}");
+    }
 }
 
 #[test]

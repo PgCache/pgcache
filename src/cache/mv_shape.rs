@@ -375,6 +375,7 @@ pub(super) mod tests {
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
     use crate::query::resolve::query_expr_resolve_bound;
+    use crate::query::resolved::query_expr_resolve;
 
     #[test]
     fn test_is_reducer_matches_non_projection_shapes() {
@@ -435,7 +436,9 @@ pub(super) mod tests {
     /// The bound classification of `sql`, checked against the resolved one.
     fn classify(sql: &str) -> ShapeGate {
         let ast = std::sync::Arc::new(query_expr_parse(sql).expect("convert to AST"));
-        let (resolved, bindings) =
+        let resolved =
+            query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve query");
+        let bindings =
             query_expr_resolve_bound(&ast, &test_tables(), &["public"]).expect("resolve query");
         let bound = ResolvedQuery::new(ast, bindings);
         let actual = shape_classify(&bound, &test_aggregate_functions());

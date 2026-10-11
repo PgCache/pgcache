@@ -267,6 +267,7 @@ mod tests {
     use crate::query::ast::query_expr_parse;
     use crate::query::evaluate::where_expr_supported;
     use crate::query::resolve::{ResolvedQuery, query_expr_resolve_bound};
+    use crate::query::resolved::query_expr_resolve;
 
     fn catalog() -> Catalog {
         let column = |name: &str, index: usize, ty: Type| ColumnMetadata {
@@ -320,7 +321,8 @@ mod tests {
         ];
         for sql in corpus {
             let query = Arc::new(query_expr_parse(sql).expect("parse"));
-            let (resolved, bindings) =
+            let resolved = query_expr_resolve(&query, &catalog, &["public"]).expect("resolve");
+            let bindings =
                 query_expr_resolve_bound(&query, &catalog, &["public"]).expect("resolve");
             let bound = ResolvedQuery::new(query, bindings);
             let (Some(select), Some(resolved_select)) = (bound.select(), resolved.as_select())
@@ -416,7 +418,7 @@ mod tests {
 
     fn fixture_bound(sql: &str) -> ResolvedQuery {
         let query = Arc::new(query_expr_parse(sql).expect("parse"));
-        let (_, bindings) =
+        let bindings =
             query_expr_resolve_bound(&query, &fixture_catalog(), &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }

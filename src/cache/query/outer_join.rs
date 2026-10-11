@@ -288,7 +288,7 @@ mod tests {
     /// Parse and bind SQL over the given tables.
     fn bind(sql: &str, tables: &Catalog) -> ResolvedQuery {
         let query = Arc::new(query_expr_parse(sql).expect("convert"));
-        let (_, bindings) = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 

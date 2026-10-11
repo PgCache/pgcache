@@ -122,8 +122,7 @@ struct Outcome {
 /// Parse SQL → bind → decorrelate.
 fn resolve_and_decorrelate(sql: &str, tables: &Catalog) -> DecorrelateResult<Outcome> {
     let query = Arc::new(query_expr_parse(sql).expect("convert to AST"));
-    let (_, bindings) =
-        query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve query");
+    let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve query");
     let bound = ResolvedQuery::new(query, bindings);
     Ok(
         match query_decorrelate(&bound, &test_aggregate_functions())? {

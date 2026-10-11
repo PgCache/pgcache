@@ -697,8 +697,7 @@ mod tests {
         use crate::query::resolve::query_expr_resolve_bound;
         let catalog = population_catalog();
         let query = Arc::new(query_expr_parse(sql).expect("parse"));
-        let (_, bindings) =
-            query_expr_resolve_bound(&query, &catalog, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, &catalog, &["public"]).expect("resolve");
         let population = ResolvedQuery::new(query, bindings);
         let mut selects = Vec::new();
         for (branch, _) in population.tree().select_nodes_with_source() {

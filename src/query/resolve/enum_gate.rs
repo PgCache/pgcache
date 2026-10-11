@@ -430,6 +430,7 @@ mod tests {
     use crate::query::ast::{Deparse, query_expr_parse};
     use crate::query::resolve::query_expr_resolve_bound;
     use crate::query::resolved::enum_order_dependence_check;
+    use crate::query::resolved::query_expr_resolve;
 
     fn severity_type() -> Type {
         Type::new(
@@ -518,7 +519,8 @@ mod tests {
     fn test_bound_sql_matches_resolved_deparse() {
         for (sql, _) in CORPUS {
             let query = query_expr_parse(sql).expect("parse");
-            let (resolved, bindings) =
+            let resolved = query_expr_resolve(&query, &tables(), &["public"]).expect("resolve");
+            let bindings =
                 query_expr_resolve_bound(&query, &tables(), &["public"]).expect("resolve");
             let bound = ResolvedQuery::new(Arc::new(query), bindings);
             let mut expected = String::new();
@@ -531,8 +533,8 @@ mod tests {
     /// as displayed.
     fn verdicts(sql: &str) -> (String, String) {
         let query = query_expr_parse(sql).expect("parse");
-        let (resolved, bindings) =
-            query_expr_resolve_bound(&query, &tables(), &["public"]).expect("resolve");
+        let resolved = query_expr_resolve(&query, &tables(), &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, &tables(), &["public"]).expect("resolve");
         let bound = ResolvedQuery::new(Arc::new(query), bindings);
         let display = |result: ResolveResult<()>| match result {
             Ok(()) => "allowed".to_owned(),

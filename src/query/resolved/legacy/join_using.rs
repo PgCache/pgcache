@@ -1,0 +1,267 @@
+//! `USING` / `NATURAL` join resolution.
+//!
+//! Postgres exposes a `USING`/`NATURAL` join's common columns *once* rather
+//! than per side, so resolving them means attributing each name to the input
+//! that exposes it, synthesizing the equi-join predicate, and threading the
+//! merged columns back into the scope — where `*` expansion and unqualified
+//! references then see a single column (`COALESCE(left, right)` under an outer
+//! join).
+
+use ecow::EcoString;
+use rootcause::Report;
+
+use super::column::{ColumnLookup, column_lookup};
+use super::scope::ResolutionScope;
+use crate::query::ast::{BinaryOp, ColumnNode, JoinType, NodeId};
+use crate::query::resolve::{ColumnBinding, MergedColumnBinding, MergedId};
+use crate::query::resolved::{
+    ResolveError, ResolveResult, ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall,
+    ResolvedJoinQual, ResolvedScalarExpr, ResolvedWhereExpr,
+};
+
+/// A `USING`/`NATURAL` join's merged output column. Postgres exposes
+/// the join column(s) once (not per side); for an outer join its value
+/// is `COALESCE(left, right)`. Tracked in scope so `*` expands to the
+/// merged set and an unqualified reference resolves to one column.
+#[derive(Debug, Clone)]
+pub(super) struct MergedJoinColumn {
+    /// Join/output column name (e.g. `i` for `USING (i)`).
+    pub(super) name: EcoString,
+    /// Resolved value. Invariant: `outer == false` ⟹ this is exactly
+    /// `Column(<left column>)`; `outer == true` ⟹ `COALESCE(l, r)`.
+    pub(super) expr: ResolvedScalarExpr,
+    /// Outer join: merged value is `COALESCE`, not a plain column — so
+    /// an unqualified GROUP BY on it is unsupported (forwarded).
+    pub(super) outer: bool,
+    /// The same column in the bindings.
+    pub(super) merged: MergedId,
+}
+
+/// Scope index ranges delimiting each side of a join, into
+/// `scope.entries`, used to attribute a `USING`/`NATURAL` column to the
+/// input that exposes it.
+#[derive(Clone, Copy)]
+pub(super) struct JoinScopeRanges {
+    pub(super) left_lo: usize,
+    pub(super) mid: usize,
+    pub(super) hi: usize,
+}
+
+impl JoinScopeRanges {
+    /// `scope.entries` index range for the left input.
+    pub(super) fn left(self) -> std::ops::Range<usize> {
+        self.left_lo..self.mid
+    }
+    /// `scope.entries` index range for the right input.
+    pub(super) fn right(self) -> std::ops::Range<usize> {
+        self.mid..self.hi
+    }
+}
+
+/// `join_using_resolve` result: the resolved qualifier, the merged
+/// scope columns, and the `(qualifier, column)` pairs they consume.
+pub(super) type JoinUsingResolved = (
+    ResolvedJoinQual,
+    Vec<MergedJoinColumn>,
+    Vec<(EcoString, EcoString)>,
+);
+
+/// The qualifier (alias, else table name) of the single scope entry in
+/// the given `scope.entries` range exposing `column`. `None` if zero or
+/// more than one expose it — an ambiguous or absent `USING`/`NATURAL`
+/// column, which the caller turns into a resolve error so the query is
+/// forwarded rather than mis-cached.
+pub(super) fn join_side_qualifier(
+    scope: &ResolutionScope<'_>,
+    range: std::ops::Range<usize>,
+    column: &str,
+) -> Option<EcoString> {
+    let mut found: Option<EcoString> = None;
+    for entry in scope.entries.get(range).unwrap_or(&[]) {
+        if entry.metadata().columns.get(column).is_some() {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(EcoString::from(entry.qualifier_key()));
+        }
+    }
+    found
+}
+
+/// Column names exposed by both the left and right inputs, in left-side
+/// order — the `NATURAL JOIN` columns.
+pub(super) fn join_natural_common_columns(
+    scope: &ResolutionScope<'_>,
+    ranges: JoinScopeRanges,
+) -> Vec<EcoString> {
+    let side_names = |range: std::ops::Range<usize>| {
+        let mut names: Vec<&str> = Vec::new();
+        for entry in scope.entries.get(range).unwrap_or(&[]) {
+            names.extend(entry.metadata().columns.iter().map(|c| c.name.as_str()));
+        }
+        names
+    };
+    let right = side_names(ranges.right());
+    let mut out: Vec<EcoString> = Vec::new();
+    for name in side_names(ranges.left()) {
+        if right.contains(&name) && !out.iter().any(|o| o == name) {
+            out.push(EcoString::from(name));
+        }
+    }
+    out
+}
+
+/// Resolve `qual.column = c` against the join scope. The reference is
+/// synthesized, not a node of the tree, so it is looked up without binding.
+pub(super) fn join_side_column_resolve(
+    scope: &mut ResolutionScope<'_>,
+    qual: &EcoString,
+    column: &EcoString,
+) -> ResolveResult<(ResolvedColumnNode, ColumnBinding)> {
+    let reference = ColumnNode {
+        id: NodeId::PENDING,
+        table: Some(qual.clone()),
+        column: column.clone(),
+    };
+    match column_lookup(&reference, scope)? {
+        ColumnLookup::Column {
+            resolved, binding, ..
+        } => Ok((resolved, binding)),
+        // Qualified lookups never reach a merged column; forward if one does.
+        ColumnLookup::Merged { .. } => Err(Report::from(ResolveError::UnsupportedJoinQualifier)),
+    }
+}
+
+/// One `USING`/`NATURAL` column resolved on both join sides.
+struct UsingColumn {
+    /// `left = right`, this column's share of the join predicate.
+    conjunct: ResolvedWhereExpr,
+    merged: MergedJoinColumn,
+    /// The per-side `(qualifier, column)` pairs it consumes from `*` expansion.
+    consumed: [(EcoString, EcoString); 2],
+}
+
+fn using_column_resolve(
+    scope: &mut ResolutionScope<'_>,
+    ranges: JoinScopeRanges,
+    c: &EcoString,
+    outer: bool,
+    join: NodeId,
+) -> ResolveResult<UsingColumn> {
+    let unsupported = || Report::from(ResolveError::UnsupportedJoinQualifier);
+    let lq = join_side_qualifier(scope, ranges.left(), c).ok_or_else(unsupported)?;
+    let rq = join_side_qualifier(scope, ranges.right(), c).ok_or_else(unsupported)?;
+    let (left_col, left_binding) = join_side_column_resolve(scope, &lq, c)?;
+    let (right_col, right_binding) = join_side_column_resolve(scope, &rq, c)?;
+    let merged = scope.bindings.merged_push(MergedColumnBinding {
+        join,
+        name: c.clone(),
+        left: left_binding,
+        right: right_binding,
+        outer,
+    });
+
+    let conjunct = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+        op: BinaryOp::Equal,
+        lexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(
+            left_col.clone(),
+        ))),
+        rexpr: Box::new(ResolvedWhereExpr::Scalar(ResolvedScalarExpr::Column(
+            right_col.clone(),
+        ))),
+    });
+
+    let expr = if outer {
+        ResolvedScalarExpr::Function(ResolvedFunctionCall {
+            name: EcoString::from("coalesce"),
+            args: vec![
+                ResolvedScalarExpr::Column(left_col),
+                ResolvedScalarExpr::Column(right_col),
+            ],
+            agg_star: false,
+            agg_distinct: false,
+            agg_order: Vec::new(),
+            agg_filter: None,
+            over: None,
+        })
+    } else {
+        ResolvedScalarExpr::Column(left_col)
+    };
+    Ok(UsingColumn {
+        conjunct,
+        merged: MergedJoinColumn {
+            name: c.clone(),
+            expr,
+            outer,
+            merged,
+        },
+        consumed: [(lq, c.clone()), (rq, c.clone())],
+    })
+}
+
+/// Resolve a `USING`/`NATURAL` join over its columns `first` and `rest`: the
+/// verbatim qualifier (deparsed so Postgres merges the columns) plus its
+/// equivalent equi-`predicate` for analysis, and the merged-column
+/// scope entries (merged value = the left column for an inner join,
+/// `COALESCE(left, right)` for an outer one) with the per-side
+/// `(qualifier, column)` pairs they consume from `*` expansion.
+pub(super) fn join_using_resolve(
+    scope: &mut ResolutionScope<'_>,
+    ranges: JoinScopeRanges,
+    (first, rest): (&EcoString, &[EcoString]),
+    join_type: JoinType,
+    join: NodeId,
+) -> ResolveResult<JoinUsingResolved> {
+    let outer = join_type != JoinType::Inner;
+    let mut merged: Vec<MergedJoinColumn> = Vec::with_capacity(1 + rest.len());
+    let mut consumed: Vec<(EcoString, EcoString)> = Vec::with_capacity(2 * (1 + rest.len()));
+
+    let first_column = using_column_resolve(scope, ranges, first, outer, join)?;
+    let mut predicate = first_column.conjunct;
+    merged.push(first_column.merged);
+    consumed.extend(first_column.consumed);
+    for c in rest {
+        let column = using_column_resolve(scope, ranges, c, outer, join)?;
+        predicate = ResolvedWhereExpr::Binary(ResolvedBinaryExpr {
+            op: BinaryOp::And,
+            lexpr: Box::new(predicate),
+            rexpr: Box::new(column.conjunct),
+        });
+        merged.push(column.merged);
+        consumed.extend(column.consumed);
+    }
+
+    Ok((
+        ResolvedJoinQual::Using {
+            columns: std::iter::once(first).chain(rest).cloned().collect(),
+            predicate,
+        },
+        merged,
+        consumed,
+    ))
+}
+
+/// Resolve a `USING`/`NATURAL` join from its computed `cols`: an empty
+/// set is an inner cartesian product (`Cross`) — or, for an outer join,
+/// an unsupported condition-less join (forwarded); otherwise the
+/// merged-column entries are registered in scope and the `Using`
+/// qualifier returned.
+pub(super) fn join_using_or_cross(
+    scope: &mut ResolutionScope<'_>,
+    ranges: JoinScopeRanges,
+    cols: Vec<EcoString>,
+    join_type: JoinType,
+    join: NodeId,
+) -> ResolveResult<ResolvedJoinQual> {
+    let Some(columns) = cols.split_first() else {
+        return if join_type == JoinType::Inner {
+            Ok(ResolvedJoinQual::Cross)
+        } else {
+            Err(Report::from(ResolveError::UnsupportedJoinQualifier))
+        };
+    };
+    let (qual, merged, consumed) = join_using_resolve(scope, ranges, columns, join_type, join)?;
+    scope.merged_columns.extend(merged);
+    scope.merged_consumed.extend(consumed);
+    Ok(qual)
+}

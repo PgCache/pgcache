@@ -554,7 +554,7 @@ mod tests {
 
     fn resolve_for_serve(sql: &str) -> ResolvedQuery {
         let ast = Arc::new(query_expr_parse(sql).expect("convert to AST"));
-        let (_, bindings) =
+        let bindings =
             query_expr_resolve_bound(&ast, &test_tables(), &["public"]).expect("resolve query");
         ResolvedQuery::new(ast, bindings)
     }

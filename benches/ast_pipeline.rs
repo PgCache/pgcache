@@ -34,23 +34,23 @@ use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore,
 use pgcache_lib::oid::{Oid, TypeOid};
 use pgcache_lib::pg::ByteString;
 use pgcache_lib::query::ast::{
-    BinaryExpr, ColumnNode, CteDefinition, Deparse, FunctionCall, JoinNode, LiteralValue,
-    OrderByClause, QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectNode, TableNode,
-    TableSource, WhereExpr, query_expr_convert_raw, query_expr_session_key,
+    BinaryExpr, ColumnNode, CteDefinition, FunctionCall, JoinNode, LiteralValue, OrderByClause,
+    QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectNode, TableNode, TableSource, WhereExpr,
+    query_expr_convert_raw, query_expr_session_key,
 };
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::predicate::CompiledPredicate;
 use pgcache_lib::query::resolve::{
-    Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot, query_expr_resolve,
+    Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot,
     query_expr_resolve_bound,
 };
 use pgcache_lib::query::resolved::{
     ResolvedBinaryExpr, ResolvedColumnNode, ResolvedFunctionCall, ResolvedJoinNode,
     ResolvedOrderByClause, ResolvedQueryBody, ResolvedQueryExpr, ResolvedScalarExpr,
     ResolvedSelectColumn, ResolvedSelectNode, ResolvedTableNode, ResolvedTableSource,
-    ResolvedWhereExpr, resolved_query_fingerprint,
+    ResolvedWhereExpr,
 };
-use pgcache_lib::query::transform::resolved_literals_canonicalise;
+use pgcache_lib::query::transform::query_literals_canonicalise;
 
 // ---------------------------------------------------------------------------
 // Counting allocator
@@ -364,24 +364,20 @@ fn parse(sql: &str) -> QueryExpr {
         .expect("the fixture SQL converts")
 }
 
-fn resolve(query: &QueryExpr, catalog: &Catalog) -> ResolvedQueryExpr {
-    query_expr_resolve(query, catalog, &["public"]).expect("the fixture SQL resolves")
-}
-
-fn resolve_bound(query: &QueryExpr, catalog: &Catalog) -> (ResolvedQueryExpr, Bindings) {
+fn resolve_bound(query: &QueryExpr, catalog: &Catalog) -> Bindings {
     query_expr_resolve_bound(query, catalog, &["public"]).expect("the fixture SQL resolves")
 }
 
-fn canonicalise(resolved: &ResolvedQueryExpr, settings: &LiteralSettings) -> ResolvedQueryExpr {
-    let mut canonical = resolved.clone();
-    let _ = resolved_literals_canonicalise(&mut canonical, settings);
-    canonical
-}
-
-fn deparse(resolved: &ResolvedQueryExpr) -> String {
-    let mut sql = String::new();
-    resolved.deparse(&mut sql);
-    sql
+/// The bound query of `query` with its literals canonicalised, as
+/// registration builds it.
+fn canonicalise(
+    query: &QueryExpr,
+    bindings: &Bindings,
+    settings: &LiteralSettings,
+) -> ResolvedQuery {
+    let mut canonical = query.clone();
+    let _ = query_literals_canonicalise(&mut canonical, bindings, settings);
+    ResolvedQuery::new(Arc::new(canonical), bindings.clone())
 }
 
 fn predicate_compile(bound: &ResolvedQuery, table: &str) -> Option<CompiledPredicate> {
@@ -470,21 +466,17 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
     let search_path: [EcoString; 1] = ["public".into()];
     println!("\n== allocations per stage (count / bytes)");
     println!(
-        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
         "query",
         "convert",
         "plain_clone",
         "session_key",
         "resolve",
-        "resolved_clone",
-        "bindings",
         "bound_clone",
         "canonicalise",
         "fingerprint",
-        "deparse",
-        "bound_fp",
-        "bound_render",
-        "bound_shape",
+        "render",
+        "shape",
         "pred_compile"
     );
     for shape in shapes {
@@ -492,52 +484,39 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         let (_, plain_clone_n, plain_clone_b) = allocations_count(|| black_box(query.clone()));
         let (_, key_n, key_b) =
             allocations_count(|| query_expr_session_key(&query, &search_path, &settings));
-        let (resolved, resolve_n, resolve_b) = allocations_count(|| resolve(&query, catalog));
-        let (_, resolved_clone_n, resolved_clone_b) =
-            allocations_count(|| black_box(resolved.clone()));
-        let ((_, bindings), bound_n, bound_b) =
-            allocations_count(|| resolve_bound(&query, catalog));
-        let bound = ResolvedQuery::new(Arc::new(query.clone()), bindings);
+        let (bindings, resolve_n, resolve_b) = allocations_count(|| resolve_bound(&query, catalog));
+        let (bound, canon_n, canon_b) =
+            allocations_count(|| canonicalise(&query, &bindings, &settings));
         let (_, bound_clone_n, bound_clone_b) = allocations_count(|| black_box(bound.clone()));
-        let (canonical, canon_n, canon_b) =
-            allocations_count(|| canonicalise(&resolved, &settings));
-        let (_, fingerprint_n, fingerprint_b) =
-            allocations_count(|| resolved_query_fingerprint(&canonical));
-        let (_, deparse_n, deparse_b) = allocations_count(|| deparse(&canonical));
-        let (_, bound_fp_n, bound_fp_b) = allocations_count(|| bound.fingerprint());
-        let (_, bound_render_n, bound_render_b) = allocations_count(|| bound.sql());
-        let (_, bound_shape_n, bound_shape_b) = allocations_count(|| bound.shape());
+        let (_, fingerprint_n, fingerprint_b) = allocations_count(|| bound.fingerprint());
+        let (_, render_n, render_b) = allocations_count(|| bound.sql());
+        let (_, shape_n, shape_b) = allocations_count(|| bound.shape());
         let (_, compile_n, compile_b) =
             allocations_count(|| predicate_compile(&bound, shape.predicate_table));
+        let (_, bindings_clone_n, bindings_clone_b) =
+            allocations_count(|| black_box(bindings.clone()));
         let cell = |n: usize, b: usize| format!("{n}/{b}");
         println!(
-            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
             shape.name,
             cell(convert_n, convert_b),
             cell(plain_clone_n, plain_clone_b),
             cell(key_n, key_b),
             cell(resolve_n, resolve_b),
-            cell(resolved_clone_n, resolved_clone_b),
-            cell(
-                bound_n.saturating_sub(resolve_n),
-                bound_b.saturating_sub(resolve_b)
-            ),
             cell(bound_clone_n, bound_clone_b),
             cell(
-                canon_n - resolved_clone_n,
-                canon_b.saturating_sub(resolved_clone_b)
+                canon_n.saturating_sub(plain_clone_n + bindings_clone_n),
+                canon_b.saturating_sub(plain_clone_b + bindings_clone_b)
             ),
             cell(fingerprint_n, fingerprint_b),
-            cell(deparse_n, deparse_b),
-            cell(bound_fp_n, bound_fp_b),
-            cell(bound_render_n, bound_render_b),
-            cell(bound_shape_n, bound_shape_b),
+            cell(render_n, render_b),
+            cell(shape_n, shape_b),
             cell(compile_n, compile_b),
         );
     }
     println!(
-        "(canonicalise excludes the clone it starts from; bindings is the bound resolve's cost \
-         over resolve; convert excludes pg_query's C-side parse)\n"
+        "(canonicalise excludes the tree and bindings clones it starts from; convert excludes \
+         pg_query's C-side parse)\n"
     );
 }
 
@@ -557,10 +536,8 @@ fn bench_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("ast_pipeline");
     for shape in &shapes {
         let query = parse(&shape.sql);
-        let resolved = resolve(&query, &catalog);
-        let (_, bindings) = resolve_bound(&query, &catalog);
-        let bound = ResolvedQuery::new(Arc::new(query.clone()), bindings);
-        let canonical = canonicalise(&resolved, &settings);
+        let bindings = resolve_bound(&query, &catalog);
+        let bound = canonicalise(&query, &bindings, &settings);
         let predicate = predicate_compile(&bound, shape.predicate_table);
         let row = row_build(shape.row);
 
@@ -586,22 +563,8 @@ fn bench_pipeline(c: &mut Criterion) {
             },
         );
         group.bench_with_input(BenchmarkId::new("resolve", shape.name), &query, |b, q| {
-            b.iter(|| black_box(resolve(q, &catalog)));
+            b.iter(|| black_box(resolve_bound(q, &catalog)));
         });
-        group.bench_with_input(
-            BenchmarkId::new("resolved_clone", shape.name),
-            &resolved,
-            |b, r| {
-                b.iter(|| black_box(r.clone()));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("resolve_bound", shape.name),
-            &query,
-            |b, q| {
-                b.iter(|| black_box(resolve_bound(q, &catalog)));
-            },
-        );
         group.bench_with_input(
             BenchmarkId::new("bound_clone", shape.name),
             &bound,
@@ -611,46 +574,24 @@ fn bench_pipeline(c: &mut Criterion) {
         );
         group.bench_with_input(
             BenchmarkId::new("canonicalise", shape.name),
-            &resolved,
-            |b, r| {
-                b.iter(|| black_box(canonicalise(r, &settings)));
+            &(&query, &bindings),
+            |b, (q, bindings)| {
+                b.iter(|| black_box(canonicalise(q, bindings, &settings)));
             },
         );
         group.bench_with_input(
             BenchmarkId::new("fingerprint", shape.name),
-            &canonical,
-            |b, r| {
-                b.iter(|| black_box(resolved_query_fingerprint(r)));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("deparse", shape.name),
-            &canonical,
-            |b, r| {
-                b.iter(|| black_box(deparse(r)));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("bound_fingerprint", shape.name),
             &bound,
             |b, r| {
                 b.iter(|| black_box(r.fingerprint()));
             },
         );
-        group.bench_with_input(
-            BenchmarkId::new("bound_render", shape.name),
-            &bound,
-            |b, r| {
-                b.iter(|| black_box(r.sql()));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("bound_shape", shape.name),
-            &bound,
-            |b, r| {
-                b.iter(|| black_box(r.shape()));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("render", shape.name), &bound, |b, r| {
+            b.iter(|| black_box(r.sql()));
+        });
+        group.bench_with_input(BenchmarkId::new("shape", shape.name), &bound, |b, r| {
+            b.iter(|| black_box(r.shape()));
+        });
         group.bench_with_input(
             BenchmarkId::new("predicate_compile", shape.name),
             &bound,
@@ -674,10 +615,9 @@ fn bench_pipeline(c: &mut Criterion) {
                 b.iter(|| {
                     let query = parse(sql);
                     let key = query_expr_session_key(&query, &search_path, &settings);
-                    let resolved = resolve(&query, &catalog);
-                    let canonical = canonicalise(&resolved, &settings);
-                    let fingerprint = resolved_query_fingerprint(&canonical);
-                    black_box((key, fingerprint, deparse(&canonical)))
+                    let bindings = resolve_bound(&query, &catalog);
+                    let bound = canonicalise(&query, &bindings, &settings);
+                    black_box((key, bound.fingerprint(), bound.sql()))
                 });
             },
         );

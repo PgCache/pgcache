@@ -545,6 +545,7 @@ mod tests {
     use crate::query::literal_settings::LiteralSettings;
     use crate::query::resolve::query_expr_resolve_bound;
     use crate::query::resolve::tests::{BINDING_CORPUS, binding_catalog, catalog_with_columns};
+    use crate::query::resolved::query_expr_resolve;
     use crate::query::resolved::{ResolvedQueryExpr, resolved_query_fingerprint};
     use crate::query::shape::query_shape_derive;
 
@@ -586,8 +587,8 @@ mod tests {
 
     fn resolve_both(sql: &str, catalog: &Catalog) -> (ResolvedQuery, ResolvedQueryExpr) {
         let query = query_expr_parse(sql).expect("parse");
-        let (resolved, bindings) =
-            query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
+        let resolved = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, catalog, &["public"]).expect("resolve");
         (ResolvedQuery::new(Arc::new(query), bindings), resolved)
     }
 

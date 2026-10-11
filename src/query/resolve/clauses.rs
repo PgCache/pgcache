@@ -1,49 +1,41 @@
-//! Resolve the clauses hanging off a SELECT: the target list (including `*`
-//! expansion), ORDER BY, GROUP BY, HAVING and LIMIT.
-
-use ecow::EcoString;
+//! Bind the clauses hanging off a SELECT: the target list (including `*`
+//! expansion), ORDER BY and GROUP BY.
 
 use super::bindings::{BindingsBuilder, ColumnBinding, ColumnTarget, StarItem};
 use super::column::column_resolve;
-use super::expr::{scalar_expr_resolve, where_expr_resolve};
-use super::scope::{ResolutionScope, ScopeEntry};
+use super::expr::scalar_expr_resolve;
+use super::scope::{OutputColumn, ResolutionScope, ScopeEntry};
 use crate::query::ast::{
-    ColumnNode, LimitClause, LiteralValue, OrderByClause, ScalarExpr, SelectColumn, SelectColumns,
-    StarNode, WhereExpr,
+    ColumnNode, OrderByClause, ScalarExpr, SelectColumn, SelectColumns, StarNode,
 };
-use crate::query::resolved::{
-    ResolveResult, ResolvedArithmeticExpr, ResolvedColumnNode, ResolvedFunctionCall,
-    ResolvedLimitClause, ResolvedOrderByClause, ResolvedScalarExpr, ResolvedSelectColumn,
-    ResolvedSelectColumns, ResolvedWhereExpr,
-};
+use crate::query::resolved::ResolveResult;
 
-/// Resolve SELECT columns
-///
-/// Star expressions (`*` or `t1.*`) are expanded inline to all columns from
-/// matching tables in scope.
+/// Bind the SELECT list, returning its output columns. A star (`*` or
+/// `t1.*`) stands for all columns of the matching tables in scope.
 pub(super) fn select_columns_resolve(
     columns: &SelectColumns,
     scope: &mut ResolutionScope<'_>,
-) -> ResolveResult<ResolvedSelectColumns> {
+) -> ResolveResult<Vec<OutputColumn>> {
     let SelectColumns::Columns(cols) = columns else {
-        return Ok(ResolvedSelectColumns::None);
+        return Ok(Vec::new());
     };
-    let mut resolved_cols = Vec::new();
+    let mut outputs = Vec::new();
     for col in cols {
         match col {
-            SelectColumn::Star(star) => {
-                star_expand(star, scope, &mut resolved_cols);
-            }
+            SelectColumn::Star(star) => star_expand(star, scope, &mut outputs),
             SelectColumn::Expr { expr, alias } => {
-                let resolved_expr = scalar_expr_resolve(expr, scope)?;
-                resolved_cols.push(ResolvedSelectColumn {
-                    expr: resolved_expr,
-                    alias: alias.as_deref().map(EcoString::from),
+                let source = scalar_expr_resolve(expr, scope)?;
+                let name = alias
+                    .clone()
+                    .or_else(|| source.as_ref().map(|s| s.name.clone()));
+                outputs.push(OutputColumn {
+                    name,
+                    source: source.and_then(|s| s.binding),
                 });
             }
         }
     }
-    Ok(ResolvedSelectColumns::Columns(resolved_cols))
+    Ok(outputs)
 }
 
 /// Expand `*` or `qualifier.*` into the matching tables' columns.
@@ -52,28 +44,22 @@ pub(super) fn select_columns_resolve(
 /// once and first (as Postgres does), then each table's remaining (non-join)
 /// columns. Qualified `t.*` is that table's columns verbatim (join column
 /// included).
-fn star_expand(
-    star: &StarNode,
-    scope: &mut ResolutionScope<'_>,
-    out: &mut Vec<ResolvedSelectColumn>,
-) {
+fn star_expand(star: &StarNode, scope: &mut ResolutionScope<'_>, outputs: &mut Vec<OutputColumn>) {
     let qualifier = star.qualifier.as_deref();
     let mut items = Vec::new();
     if qualifier.is_none() {
-        out.extend(scope.merged_columns.iter().map(|m| ResolvedSelectColumn {
-            expr: m.expr.clone(),
-            alias: Some(m.name.clone()),
-        }));
-        items.extend(
-            scope
-                .merged_columns
-                .iter()
-                .map(|m| StarItem::Merged(m.merged)),
-        );
+        for merged in &scope.merged_columns {
+            outputs.push(OutputColumn {
+                name: Some(merged.name.clone()),
+                // An outer join's merged value is `COALESCE`, not a column.
+                source: (!merged.outer).then_some(merged.left),
+            });
+            items.push(StarItem::Merged(merged.merged));
+        }
     }
     for entry in &scope.entries {
         if qualifier.is_none_or(|q| entry.qualifier_matches(q)) {
-            entry_columns_expand(entry, qualifier.is_none(), scope, out, &mut items);
+            entry_columns_expand(entry, qualifier.is_none(), scope, outputs, &mut items);
         }
     }
     scope.bindings.star_bind(star.id, items);
@@ -85,29 +71,23 @@ fn entry_columns_expand(
     entry: &ScopeEntry<'_>,
     unqualified: bool,
     scope: &ResolutionScope<'_>,
-    out: &mut Vec<ResolvedSelectColumn>,
+    outputs: &mut Vec<OutputColumn>,
     items: &mut Vec<StarItem>,
 ) {
-    let table_metadata = entry.metadata();
     let key = entry.qualifier_key();
-    for column_metadata in table_metadata.columns.iter() {
+    for column_metadata in entry.metadata().columns.iter() {
         if unqualified && merged_join_column(scope, key, &column_metadata.name) {
             continue;
         }
-        out.push(ResolvedSelectColumn {
-            expr: ResolvedScalarExpr::Column(ResolvedColumnNode {
-                schema: table_metadata.schema.clone(),
-                table: table_metadata.name.clone(),
-                table_alias: entry.alias().map(EcoString::from),
-                column: column_metadata.name.clone(),
-                column_metadata: column_metadata.clone(),
-            }),
-            alias: None,
-        });
-        items.push(StarItem::Column(ColumnBinding {
+        let binding = ColumnBinding {
             slot: entry.slot(),
             position: column_metadata.position,
-        }));
+        };
+        outputs.push(OutputColumn {
+            name: Some(column_metadata.name.clone()),
+            source: Some(binding),
+        });
+        items.push(StarItem::Column(binding));
     }
 }
 
@@ -120,148 +100,87 @@ fn merged_join_column(scope: &ResolutionScope<'_>, key: &str, column: &str) -> b
         .any(|(k, c)| k == key && c == column)
 }
 
-/// Resolve ORDER BY clauses. When `select_columns` is provided, an unqualified
-/// identifier that matches a SELECT-list output name resolves to
-/// `ResolvedScalarExpr::Identifier` — matching PostgreSQL's precedence rule
-/// that ORDER BY matches output names before falling back to column lookup.
+/// Bind ORDER BY clauses. With `outputs`, an unqualified name that matches
+/// a SELECT-list output name binds to that output — PostgreSQL's
+/// precedence rule that ORDER BY matches output names before falling back
+/// to column lookup.
 pub(super) fn order_by_resolve(
     order_by: &[OrderByClause],
     scope: &mut ResolutionScope<'_>,
-    select_columns: Option<&ResolvedSelectColumns>,
-) -> ResolveResult<Vec<ResolvedOrderByClause>> {
-    let mut resolved = Vec::with_capacity(order_by.len());
+    outputs: Option<&[OutputColumn]>,
+) -> ResolveResult<()> {
     for clause in order_by {
-        let resolved_expr = match order_by_alias_match(&clause.expr, select_columns) {
-            Some((col, ident)) => {
-                scope
-                    .bindings
-                    .column_bind(col.id, ColumnTarget::Output, false);
-                ident
+        match order_by_output_match(&clause.expr, outputs) {
+            Some(col) => scope
+                .bindings
+                .column_bind(col.id, ColumnTarget::Output, false),
+            None => {
+                scalar_expr_resolve(&clause.expr, scope)?;
             }
-            None => scalar_expr_resolve(&clause.expr, scope)?,
-        };
-        resolved.push(ResolvedOrderByClause {
-            expr: resolved_expr,
-            direction: clause.direction.clone(),
-            null_order: clause.null_order,
-        });
+        }
     }
-    Ok(resolved)
+    Ok(())
 }
 
-/// If `clause_expr` is an unqualified column reference whose name matches a
-/// SELECT-list output name, return it with its `Identifier` form.
-pub(super) fn order_by_alias_match<'e>(
+/// The unqualified column reference `clause_expr` is, when its name matches
+/// a SELECT-list output name.
+fn order_by_output_match<'e>(
     clause_expr: &'e ScalarExpr,
-    select_columns: Option<&ResolvedSelectColumns>,
-) -> Option<(&'e ColumnNode, ResolvedScalarExpr)> {
+    outputs: Option<&[OutputColumn]>,
+) -> Option<&'e ColumnNode> {
     let ScalarExpr::Column(col) = clause_expr else {
         return None;
     };
     if col.table.is_some() {
         return None;
     }
-    select_columns?.position_by_output_name(col.column.as_str())?;
-    Some((col, ResolvedScalarExpr::Identifier(col.column.clone())))
-}
-
-/// Convert ORDER BY clauses to use unqualified Identifier expressions.
-/// Used for set operations where ORDER BY references output columns by name.
-pub(super) fn order_by_as_identifiers(
-    order_by: &[OrderByClause],
-    bindings: &mut BindingsBuilder,
-) -> Vec<ResolvedOrderByClause> {
-    order_by
+    outputs?
         .iter()
-        .map(|clause| {
-            let expr = scalar_expr_to_identifier(&clause.expr, bindings);
-            ResolvedOrderByClause {
-                expr,
-                direction: clause.direction.clone(),
-                null_order: clause.null_order,
-            }
-        })
-        .collect()
+        .any(|output| output.name.as_deref() == Some(col.column.as_str()))
+        .then_some(col)
 }
 
-/// Convert a ScalarExpr to a ResolvedScalarExpr using unqualified Identifier for columns.
-/// Used for ORDER BY in set operations where columns reference output names, not table columns.
-pub(super) fn scalar_expr_to_identifier(
-    expr: &ScalarExpr,
-    bindings: &mut BindingsBuilder,
-) -> ResolvedScalarExpr {
-    match expr {
-        ScalarExpr::Column(col) => {
-            bindings.column_bind(col.id, ColumnTarget::Output, false);
-            ResolvedScalarExpr::Identifier(col.column.as_str().into())
-        }
-        ScalarExpr::Literal(lit) => ResolvedScalarExpr::Literal(lit.clone()),
-        ScalarExpr::Function(func) => ResolvedScalarExpr::Function(ResolvedFunctionCall {
-            name: func.name.as_str().into(),
-            args: func
-                .args
-                .iter()
-                .map(|arg| scalar_expr_to_identifier(arg, bindings))
-                .collect(),
-            agg_star: func.agg_star,
-            agg_distinct: func.agg_distinct,
-            // Set-op ORDER BY references output column names only;
-            // intra-function decorations don't apply.
-            agg_order: vec![],
-            agg_filter: None,
-            over: None,
-        }),
-        ScalarExpr::Case(_) | ScalarExpr::Subquery(_) => {
-            // CASE and subquery expressions in ORDER BY are uncommon; use null as fallback
-            ResolvedScalarExpr::Literal(LiteralValue::Null)
-        }
-        ScalarExpr::Arithmetic(arith) => ResolvedScalarExpr::Arithmetic(ResolvedArithmeticExpr {
-            left: Box::new(scalar_expr_to_identifier(&arith.left, bindings)),
-            op: arith.op,
-            right: Box::new(scalar_expr_to_identifier(&arith.right, bindings)),
-        }),
-        ScalarExpr::Array(elems) => ResolvedScalarExpr::Array(
-            elems
-                .iter()
-                .map(|elem| scalar_expr_to_identifier(elem, bindings))
-                .collect(),
-        ),
-        ScalarExpr::TypeCast { expr, target } => ResolvedScalarExpr::TypeCast {
-            expr: Box::new(scalar_expr_to_identifier(expr, bindings)),
-            target: target.clone(),
-        },
+/// Bind ORDER BY clauses of a set operation or VALUES, whose column
+/// references name output columns, not table columns.
+pub(super) fn order_by_as_outputs(order_by: &[OrderByClause], bindings: &mut BindingsBuilder) {
+    for clause in order_by {
+        scalar_expr_bind_outputs(&clause.expr, bindings);
     }
 }
 
-/// Resolve GROUP BY clauses
+/// Bind every column reference of an output-position expression as an
+/// output reference, through function arguments, arithmetic, arrays and
+/// casts. CASE and subqueries are not entered: an output ORDER BY over
+/// them has no column references of its own to bind.
+fn scalar_expr_bind_outputs(expr: &ScalarExpr, bindings: &mut BindingsBuilder) {
+    match expr {
+        ScalarExpr::Column(col) => bindings.column_bind(col.id, ColumnTarget::Output, false),
+        ScalarExpr::Literal(_) | ScalarExpr::Case(_) | ScalarExpr::Subquery(_) => {}
+        ScalarExpr::Function(func) => {
+            for arg in &func.args {
+                scalar_expr_bind_outputs(arg, bindings);
+            }
+        }
+        ScalarExpr::Arithmetic(arith) => {
+            scalar_expr_bind_outputs(&arith.left, bindings);
+            scalar_expr_bind_outputs(&arith.right, bindings);
+        }
+        ScalarExpr::Array(elems) => {
+            for elem in elems {
+                scalar_expr_bind_outputs(elem, bindings);
+            }
+        }
+        ScalarExpr::TypeCast { expr, .. } => scalar_expr_bind_outputs(expr, bindings),
+    }
+}
+
+/// Bind GROUP BY columns.
 pub(super) fn group_by_resolve(
     group_by: &[ColumnNode],
     scope: &mut ResolutionScope<'_>,
-) -> ResolveResult<Vec<ResolvedColumnNode>> {
-    let mut resolved = Vec::with_capacity(group_by.len());
+) -> ResolveResult<()> {
     for col in group_by {
-        resolved.push(column_resolve(col, scope)?);
+        column_resolve(col, scope)?;
     }
-    Ok(resolved)
-}
-
-/// Resolve HAVING clause
-pub(super) fn having_resolve(
-    having: Option<&WhereExpr>,
-    scope: &mut ResolutionScope<'_>,
-) -> ResolveResult<Option<ResolvedWhereExpr>> {
-    match having {
-        Some(h) => Ok(Some(where_expr_resolve(h, scope)?)),
-        None => Ok(None),
-    }
-}
-
-/// Resolve LIMIT clause
-pub(super) fn limit_resolve(limit: Option<&LimitClause>) -> Option<ResolvedLimitClause> {
-    let limit = limit?;
-
-    Some(ResolvedLimitClause {
-        count: limit.count.clone(),
-        offset: limit.offset.clone(),
-    })
+    Ok(())
 }

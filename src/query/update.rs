@@ -298,8 +298,7 @@ mod tests {
         let tables = test_tables();
         let cacheable = parse_cacheable(sql);
         let query = Arc::new(cacheable.query().clone());
-        let (_, bindings) =
-            query_expr_resolve_bound(&query, &tables, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, &tables, &["public"]).expect("resolve");
         let bound = ResolvedQuery::new(query, bindings);
         query_table_update_queries_bound(&bound)
             .into_iter()
@@ -872,7 +871,7 @@ mod tests {
     fn bound(sql: &str, tables: &Catalog) -> ResolvedQuery {
         let cacheable = parse_cacheable(sql);
         let query = Arc::new(cacheable.query().clone());
-        let (_, bindings) = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
+        let bindings = query_expr_resolve_bound(&query, tables, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)
     }
 
@@ -908,7 +907,7 @@ mod tests {
         for sql in BOUND_CORPUS {
             for update in query_table_update_queries_bound(&bound(sql, &tables)) {
                 match query_expr_resolve_bound(update.bound.tree(), &tables, &["public"]) {
-                    Ok((_, expected)) => {
+                    Ok(expected) => {
                         assert_eq!(
                             update.bound.bindings().describe(),
                             expected.describe(),
