@@ -35,7 +35,7 @@ pub fn table_occurrences_find(
     branch: QueryBranch<'_>,
     table_metadata: &TableMetadata,
 ) -> AstTransformResult<Vec<TableOccurrence>> {
-    let bindings = branch.bound.rope_bindings();
+    let bindings = branch.bound.bindings();
     let mut occurrences = Vec::new();
     for table in branch.select.direct_tables() {
         let Some(slot) = bindings.source(table.id()) else {
@@ -276,7 +276,7 @@ fn membership_select_into(
         source,
         columns,
     };
-    let mut cx = branch.bound.rope_deparse_context_with_source(&override_);
+    let mut cx = branch.bound.deparse_context_with_source(&override_);
     branch_select_into(&mut cx, buf, branch.select, projection);
 }
 
@@ -362,7 +362,6 @@ pub fn membership_unnest_into(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use iddqd::BiHashMap;
     use postgres_types::Type;
@@ -370,8 +369,7 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
+    use crate::query::resolve::ResolvedQuery;
 
     fn column_metadata(name: &str, index: usize, type_name: &str) -> ColumnMetadata {
         let (type_oid, data_type) = match type_name {
@@ -415,15 +413,13 @@ mod tests {
     }
 
     fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
-        let query = Arc::new(query_expr_parse(sql).expect("parse"));
-        let bindings = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
-        ResolvedQuery::new(query, bindings)
+        ResolvedQuery::parse_resolve(sql, catalog, &["public"]).expect("resolve")
     }
 
     fn branch(bound: &ResolvedQuery) -> QueryBranch<'_> {
         QueryBranch {
             bound,
-            select: bound.rope_select().expect("a select"),
+            select: bound.select().expect("a select"),
         }
     }
 

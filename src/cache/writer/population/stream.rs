@@ -92,7 +92,7 @@ pub(super) async fn population_task(
     let mut reset: HashSet<Oid> = HashSet::new();
     let mut staged: Vec<(Oid, EcoString)> = Vec::new();
 
-    for (branch, _) in select_branches_with_source(work.population.rope().root()) {
+    for (branch, _) in select_branches_with_source(work.population.tree().root()) {
         for table_node in branch.direct_tables() {
             let table = table_metadata_find(&work.table_metadata, &work.population, table_node)?;
             let (staging, needs_create) = staging_table_find(&work.staging, table)?;
@@ -132,7 +132,7 @@ fn table_metadata_find<'a>(
     population: &ResolvedQuery,
     table_node: Table<'_>,
 ) -> CacheResult<&'a TableMetadata> {
-    let bindings = population.rope_bindings();
+    let bindings = population.bindings();
     let relation_oid = bindings
         .source(table_node.id())
         .and_then(|slot| bindings.slot(slot))
@@ -203,9 +203,9 @@ fn population_select_build(
     max_limit: Option<u64>,
 ) -> String {
     let mut buf = String::with_capacity(1024);
-    let mut cx = population.rope_deparse_context();
+    let mut cx = population.deparse_context();
     buf.push_str("SELECT DISTINCT");
-    population.rope_source_columns_into(table_node.id(), &mut buf);
+    population.source_columns_into(table_node.id(), &mut buf);
     from_deparse_with(branch.from(), &mut cx, &mut buf);
     where_clause_deparse_with(
         branch.where_clause(),
@@ -689,14 +689,10 @@ mod tests {
 
     /// Every (branch, table) population select of `sql`, in population order.
     fn population_selects(sql: &str, max_limit: Option<u64>) -> Vec<String> {
-        use crate::query::ast::query_expr_parse;
-        use crate::query::resolve::query_expr_resolve;
         let catalog = population_catalog();
-        let query = Arc::new(query_expr_parse(sql).expect("parse"));
-        let bindings = query_expr_resolve(&query, &catalog, &["public"]).expect("resolve");
-        let population = ResolvedQuery::new(query, bindings);
+        let population = ResolvedQuery::parse_resolve(sql, &catalog, &["public"]).expect("resolve");
         let mut selects = Vec::new();
-        for (branch, _) in select_branches_with_source(population.rope().root()) {
+        for (branch, _) in select_branches_with_source(population.tree().root()) {
             for table_node in branch.direct_tables() {
                 selects.push(population_select_build(
                     &population,

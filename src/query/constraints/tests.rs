@@ -8,6 +8,7 @@ use super::*;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::query_expr_parse;
+use crate::query::resolve::owned::select_owned;
 use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
 
 // Helper function to create test table metadata
@@ -55,14 +56,19 @@ fn catalog(names: &[&str]) -> Catalog {
 
 /// Parse and bind `sql` over `tables`.
 fn resolve_sql(sql: &str, tables: &Catalog) -> ResolvedQuery {
-    let query = std::sync::Arc::new(query_expr_parse(sql).expect("convert to QueryExpr"));
-    let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve bound");
-    ResolvedQuery::new(query, bindings)
+    ResolvedQuery::parse_resolve(sql, tables, &["public"]).expect("resolve")
 }
 
 /// The constraints of a bound SELECT.
 fn analyze_query_constraints(bound: &ResolvedQuery) -> QueryConstraints {
-    query_constraints_analyze(bound, bound.select().expect("a SELECT"))
+    query_constraints_analyze_tree(bound, bound.select().expect("a SELECT"))
+}
+
+/// The owned walk's constraints of `sql`: the oracle.
+fn analyze_owned(sql: &str, tables: &Catalog) -> QueryConstraints {
+    let query = query_expr_parse(sql).expect("convert to QueryExpr");
+    let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve owned");
+    query_constraints_analyze(&bindings, select_owned(&query).expect("a SELECT"))
 }
 
 /// The constraints of `sql`.
@@ -109,9 +115,8 @@ fn test_rope_constraints_match_the_owned_walk() {
         "SELECT id FROM users WHERE id = name",
         "SELECT v.id FROM (SELECT id FROM users WHERE id = 1) v WHERE v.id = 2",
     ] {
-        let bound = resolve_sql(sql, &tables);
-        let owned = analyze_query_constraints(&bound);
-        let rope = query_constraints_analyze_tree(&bound, bound.rope_select().expect("a SELECT"));
+        let owned = analyze_owned(sql, &tables);
+        let rope = analyze_query_constraints(&resolve_sql(sql, &tables));
         assert_eq!(rope.column_constraints, owned.column_constraints, "{sql}");
         assert_eq!(rope.equivalences, owned.equivalences, "{sql}");
         assert_eq!(

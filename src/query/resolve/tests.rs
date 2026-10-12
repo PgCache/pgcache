@@ -1,7 +1,6 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
-use std::sync::Arc;
-
+use ecow::EcoString;
 use iddqd::BiHashMap;
 use postgres_types::Type;
 
@@ -10,10 +9,13 @@ use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, Table
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::{
     AstNode, BinaryExpr, BinaryOp, ColumnNode, FunctionCall, JoinNode, JoinQual, JoinType,
-    LiteralValue, OrderDirection, QueryBody, ScalarExpr, SelectColumn, SelectColumns, SelectNode,
-    SubLinkType, TableNode, TableSource, WhereExpr, query_expr_parse,
+    LiteralValue, OrderDirection, QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns,
+    SelectNode, SubLinkType, TableNode, TableSource, WhereExpr, query_expr_parse,
 };
 use crate::query::resolve::ResolveError;
+use crate::query::resolve::owned::{
+    column_name_owned, column_table_owned, column_type_owned, select_owned, sql_owned,
+};
 
 // ============================================================================
 // Catalogs
@@ -110,11 +112,53 @@ pub(super) fn catalog_with_columns(specs: &[(&str, &[&str])]) -> Catalog {
 // Binding helpers
 // ============================================================================
 
-/// Parse and bind `sql` over `tables`.
-fn bound(sql: &str, tables: &Catalog) -> ResolvedQuery {
-    let query = Arc::new(query_expr_parse(sql).expect("convert to QueryExpr"));
-    let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve");
-    ResolvedQuery::new(query, bindings)
+/// An owned tree with the owned resolver's bindings: what these tests
+/// exercise, read through the owned helpers the bound query no longer
+/// carries.
+struct Owned {
+    tree: QueryExpr,
+    bindings: Bindings,
+}
+
+impl Owned {
+    fn select(&self) -> Option<&SelectNode> {
+        select_owned(&self.tree)
+    }
+
+    fn column(&self, node: &ColumnNode) -> Option<&ColumnTarget> {
+        self.bindings.column(node)
+    }
+
+    fn column_table(&self, node: &ColumnNode) -> Option<&TableMetadata> {
+        column_table_owned(&self.bindings, node)
+    }
+
+    fn column_name(&self, node: &ColumnNode) -> Option<&EcoString> {
+        column_name_owned(&self.bindings, node)
+    }
+
+    fn column_type(&self, node: &ColumnNode) -> Option<&Type> {
+        column_type_owned(&self.bindings, node)
+    }
+
+    fn bindings(&self) -> &Bindings {
+        &self.bindings
+    }
+
+    fn tree(&self) -> &QueryExpr {
+        &self.tree
+    }
+
+    fn sql(&self) -> String {
+        sql_owned(&self.tree, &self.bindings)
+    }
+}
+
+/// Parse and bind `sql` over `tables` with the owned resolver.
+fn bound(sql: &str, tables: &Catalog) -> Owned {
+    let tree = query_expr_parse(sql).expect("convert to QueryExpr");
+    let bindings = query_expr_resolve(&tree, tables, &["public"]).expect("resolve");
+    Owned { tree, bindings }
 }
 
 /// The error binding `sql` over `tables` ends in.
@@ -126,12 +170,12 @@ fn bind_error(sql: &str, tables: &Catalog) -> ResolveError {
     }
 }
 
-fn select_of(bound: &ResolvedQuery) -> &SelectNode {
+fn select_of(bound: &Owned) -> &SelectNode {
     bound.select().expect("a SELECT")
 }
 
 /// `(table, column)` a column reference is bound to.
-fn column_ref(bound: &ResolvedQuery, column: &ColumnNode) -> (String, String) {
+fn column_ref(bound: &Owned, column: &ColumnNode) -> (String, String) {
     let table = bound.column_table(column).expect("a bound column");
     let name = bound.column_name(column).expect("a bound column");
     (table.name.to_string(), name.to_string())
@@ -173,7 +217,7 @@ fn join_on(join: &JoinNode) -> &WhereExpr {
 }
 
 /// The base slot a table node is bound to: `(schema, table, alias, oid)`.
-fn table_slot(bound: &ResolvedQuery, table: &TableNode) -> (String, String, Option<String>, u32) {
+fn table_slot(bound: &Owned, table: &TableNode) -> (String, String, Option<String>, u32) {
     let slot = bound.bindings().source(table.id).expect("table bound");
     match bound.bindings().slot(slot).expect("slot") {
         TableSlot::Base { table, alias } => (
@@ -187,7 +231,7 @@ fn table_slot(bound: &ResolvedQuery, table: &TableNode) -> (String, String, Opti
 }
 
 /// `(table, column)` of every correlated reference, in tree order.
-fn correlated_refs(bound: &ResolvedQuery) -> Vec<(String, String)> {
+fn correlated_refs(bound: &Owned) -> Vec<(String, String)> {
     let bindings = bound.bindings();
     bindings
         .correlated()
@@ -399,7 +443,7 @@ enum OrderTarget {
     Output(String),
 }
 
-fn order_targets(bound: &ResolvedQuery) -> Vec<(OrderDirection, OrderTarget)> {
+fn order_targets(bound: &Owned) -> Vec<(OrderDirection, OrderTarget)> {
     bound
         .tree()
         .order_by
@@ -880,13 +924,9 @@ pub(super) const BINDING_CORPUS: &[&str] = &[
 #[test]
 fn test_bound_query_clone_shares_the_tree() {
     let catalog = binding_catalog();
-    let resolved = bound(BINDING_CORPUS[1], &catalog);
+    let resolved =
+        ResolvedQuery::parse_resolve(BINDING_CORPUS[1], &catalog, &["public"]).expect("resolve");
     let copy = resolved.clone();
-    assert!(std::ptr::eq(resolved.tree(), copy.tree()));
-    let first_column = copy.tree().nodes::<ColumnNode>().next().expect("a column");
-    assert!(matches!(
-        copy.column(first_column),
-        Some(ColumnTarget::Column(_))
-    ));
+    assert_eq!(copy.tree(), resolved.tree());
     assert_eq!(copy.bindings().slots().len(), 2);
 }

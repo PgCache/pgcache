@@ -20,14 +20,14 @@ pub struct TableUpdateQuery<'a> {
 /// every subquery, once per table directly in its FROM.
 pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery<'_>> {
     let mut result = Vec::new();
-    for (select, source) in select_branches_with_source(bound.rope().root()) {
+    for (select, source) in select_branches_with_source(bound.tree().root()) {
         let (terminal, non_terminal) = outer_join_optional_tables(bound, select);
         let branch = QueryBranch { bound, select };
         for table in select.direct_tables() {
             let relation_oid = bound
-                .rope_bindings()
+                .bindings()
                 .source(table.id())
-                .and_then(|slot| bound.rope_bindings().slot(slot))
+                .and_then(|slot| bound.bindings().slot(slot))
                 .map(|slot| slot.table().relation_oid);
             let Some(relation_oid) = relation_oid else {
                 debug_assert!(false, "a direct table of a resolved query has a slot");
@@ -276,7 +276,6 @@ mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use iddqd::BiHashMap;
     use postgres_types::Type;
@@ -287,7 +286,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve;
+    use crate::query::ast::rope::QueryTree;
 
     /// Helper to parse SQL and return a CacheableQuery
     fn parse_cacheable(sql: &str) -> CacheableQuery {
@@ -428,9 +427,8 @@ mod tests {
     fn update_queries(sql: &str) -> Vec<(String, String, UpdateQuerySource)> {
         let tables = test_tables();
         let cacheable = parse_cacheable(sql);
-        let query = Arc::new(cacheable.query().clone());
-        let bindings = query_expr_resolve(&query, &tables, &["public"]).expect("resolve");
-        let bound = ResolvedQuery::new(query, bindings);
+        let tree = QueryTree::from_query_expr(cacheable.query());
+        let bound = ResolvedQuery::resolve(tree, &tables, &["public"]).expect("resolve");
         query_table_update_queries(&bound)
             .into_iter()
             .map(|update| {

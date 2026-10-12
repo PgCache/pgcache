@@ -1,9 +1,7 @@
 mod constant_fold;
 mod literal_canon;
-mod literal_canon_tree;
 mod parameters;
 mod predicate_pushdown;
-mod pushdown_tree;
 mod values;
 mod walk;
 
@@ -36,7 +34,6 @@ pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
 pub use constant_fold::query_expr_constant_fold;
 pub use literal_canon::{LiteralCanonOutcome, query_literals_canonicalise};
-pub use literal_canon_tree::query_literals_canonicalise_tree;
 #[cfg(feature = "proxy")]
 pub(crate) use parameters::{
     delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,
@@ -44,7 +41,6 @@ pub(crate) use parameters::{
 pub(crate) use parameters::{literal_is_parameterizable, literal_value_parameters_replace};
 pub use parameters::{query_expr_parameters_replace, select_node_parameters_replace};
 pub use predicate_pushdown::query_predicate_pushdown;
-pub use pushdown_tree::query_predicate_pushdown_tree;
 pub use values::{
     BATCH_IDX_COLUMN, PgEvalTemplate, TableOccurrence, membership_batch_into,
     membership_unnest_into, membership_values_all_into, membership_values_into,

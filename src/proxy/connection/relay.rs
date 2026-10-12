@@ -594,7 +594,7 @@ fn read_shape(
         return none;
     };
     let ranges = single_table(query).and_then(|table| {
-        let constraints = query_constraints_analyze_tree(&form.bound, form.bound.rope_select()?);
+        let constraints = query_constraints_analyze_tree(&form.bound, form.bound.select()?);
         constraints
             .where_analysis_complete
             .then(|| table_column_ranges(&constraints, &table.name))

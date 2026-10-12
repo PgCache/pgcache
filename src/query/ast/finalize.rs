@@ -1,6 +1,6 @@
 //! The finalize pass: stamp every node's pre-order position (ADR-057).
 
-use super::{AstNode, IdRemap, NodePositions, QueryExpr};
+use super::{AstNode, NodePositions, QueryExpr};
 
 /// Stamp pre-order positions over the whole tree and return how many nodes
 /// it has. Runs once after conversion; until then nodes carry
@@ -9,16 +9,6 @@ pub fn query_expr_finalize(query: &mut QueryExpr) -> u32 {
     let mut positions = NodePositions::default();
     query.finalize(&mut positions);
     positions.count()
-}
-
-/// Restamp a tree a rewrite built from pieces of a finalized one: nodes
-/// kept from the source still carry their old ids, nodes the rewrite made
-/// carry `PENDING` or a provisional id. Returns where every carried id
-/// landed, so the source's side tables can be remapped (ADR-057).
-pub fn query_expr_refinalize(query: &mut QueryExpr) -> IdRemap {
-    let mut positions = NodePositions::default();
-    query.finalize(&mut positions);
-    positions.into_remap()
 }
 
 #[cfg(test)]
@@ -292,61 +282,5 @@ mod tests {
         );
         let ids = stored_ids(&replaced);
         assert!(ids.iter().all(|(_, position)| *position != u32::MAX));
-    }
-
-    /// A tree built from pieces of a finalized one: kept nodes map to their
-    /// new positions, a node copied twice maps twice, and nodes the rewrite
-    /// made are not in the remap.
-    #[test]
-    fn test_refinalize_records_kept_and_copied_nodes() {
-        let query =
-            query_expr_parse("SELECT a FROM t WHERE a = 1 ORDER BY a LIMIT 3").expect("parse");
-        let old_table = query.nodes::<TableNode>().next().expect("table").id;
-        let old_where = query.nodes::<BinaryExpr>().next().expect("predicate").id;
-        let select = match &query.body {
-            crate::query::ast::QueryBody::Select(select) => select.as_ref().clone(),
-            crate::query::ast::QueryBody::Values(_) | crate::query::ast::QueryBody::SetOp(_) => {
-                panic!("select body")
-            }
-        };
-        let where_clause = select.where_clause.clone().expect("where");
-        let doubled = crate::query::ast::WhereExpr::Binary(BinaryExpr {
-            id: NodeId::PENDING,
-            op: crate::query::ast::BinaryOp::And,
-            lexpr: Box::new(where_clause.clone()),
-            rexpr: Box::new(where_clause),
-        });
-        let mut rebuilt = QueryExpr {
-            id: NodeId::PENDING,
-            ctes: Vec::new(),
-            body: crate::query::ast::QueryBody::Select(Box::new(SelectNode {
-                where_clause: Some(doubled),
-                ..select
-            })),
-            order_by: Default::default(),
-            limit: None,
-        };
-        let remap = query_expr_refinalize(&mut rebuilt);
-        let new_table = rebuilt.nodes::<TableNode>().next().expect("table").id;
-        assert_eq!(
-            remap.new_id(old_table).map(NodeId::index),
-            Some(new_table.index())
-        );
-        let new_predicates: Vec<usize> = rebuilt
-            .nodes::<BinaryExpr>()
-            .filter(|b| b.op != crate::query::ast::BinaryOp::And)
-            .map(|b| b.id.index())
-            .collect();
-        let copied: Vec<usize> = remap.new_ids(old_where).map(NodeId::index).collect();
-        assert_eq!(copied, new_predicates);
-        assert!(
-            remap.new_id(query.id).is_none(),
-            "the new root was not kept"
-        );
-        assert!(
-            stored_ids(&rebuilt)
-                .iter()
-                .all(|(_, position)| *position != u32::MAX)
-        );
     }
 }

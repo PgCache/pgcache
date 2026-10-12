@@ -174,7 +174,7 @@ impl WriterRegistration {
         let shape_gate =
             shape_gate_classify(&bound, decorrelated.as_deref(), &self.aggregate_functions);
         let (max_limit, mv_limit) =
-            resolution_limits(bound.rope().root(), shape_gate, user_max_limit);
+            resolution_limits(bound.tree().root(), shape_gate, user_max_limit);
 
         let uq_start = Instant::now();
         let relation_oids = self.update_queries_register(

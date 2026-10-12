@@ -98,7 +98,7 @@ impl<'a> ReferencedColumns<'a> {
     }
 
     fn add_binding(&mut self, binding: &ColumnBinding) {
-        let bindings = self.bound.rope_bindings();
+        let bindings = self.bound.bindings();
         if let (Some(slot), Some(column)) = (
             bindings.slot(binding.slot),
             bindings.binding_column(binding),
@@ -128,7 +128,7 @@ impl<'a> ReferencedColumns<'a> {
     fn merged_join_add(&mut self, join: NodeId) {
         let merged: Vec<(ColumnBinding, ColumnBinding)> = self
             .bound
-            .rope_bindings()
+            .bindings()
             .merged_columns()
             .iter()
             .filter(|merged| merged.join.index() == join.index())
@@ -156,7 +156,7 @@ fn alias_exprs<'s>(
                 let output = expr
                     .alias()
                     .cloned()
-                    .or_else(|| bound.rope_column_output_name(expr.expr()));
+                    .or_else(|| bound.column_output_name(expr.expr()));
                 (output.as_ref() == Some(name)).then(|| expr.expr())
             }
             SelectItem::Star(_) => None,
@@ -182,8 +182,8 @@ pub(super) fn limit_window_columns_collect(
     table_name: &str,
 ) -> HashSet<EcoString> {
     let mut cols = ReferencedColumns::new(bound, table_name);
-    let query = bound.rope().root();
-    let select = bound.rope_select();
+    let query = bound.tree().root();
+    let select = bound.select();
     for clause in query.order_by() {
         cols.add_refs(clause.expr().node_ref());
         if let Some(name) = order_by_output(bound, clause)
@@ -211,8 +211,8 @@ pub(super) fn limit_order_keys_collect(
     bound: &ResolvedQuery,
     table_name: &str,
 ) -> Option<Box<[OrderByKey]>> {
-    let select = bound.rope_select()?;
-    let query = bound.rope().root();
+    let select = bound.select()?;
+    let query = bound.tree().root();
     if !window_is_row_level(select) {
         return None;
     }
@@ -302,7 +302,8 @@ mod classify_tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
+    use crate::query::ast::rope::QueryTree;
+    use crate::query::resolve::ResolvedQuery;
 
     fn make_table(name: &str, oid: Oid, columns: &[&str]) -> TableMetadata {
         let cols = ColumnStore::new(columns.iter().enumerate().map(|(i, c)| {
@@ -331,15 +332,14 @@ mod classify_tests {
     fn resolve(sql: &str, tables: &Catalog) -> ResolvedQuery {
         let query_expr = query_expr_parse(sql).expect("convert");
         let cacheable = CacheableQuery::try_new(query_expr, &HashMap::new()).expect("cacheable");
-        let query = std::sync::Arc::new(cacheable.query().clone());
-        let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve");
-        ResolvedQuery::new(query, bindings)
+        let tree = QueryTree::from_query_expr(cacheable.query());
+        ResolvedQuery::resolve(tree, tables, &["public"]).expect("resolve")
     }
 
     fn branch(bound: &ResolvedQuery) -> QueryBranch<'_> {
         QueryBranch {
             bound,
-            select: bound.rope_select().expect("a select"),
+            select: bound.select().expect("a select"),
         }
     }
 

@@ -369,7 +369,7 @@ pub fn statement_classify(
     // The subsumed side analyzes the original (pre-decorrelation) resolved
     // form, like the writer's subsumption_check.
     let constraints = bound
-        .rope_select()
+        .select()
         .map(|select| query_constraints_analyze_tree(&bound, select));
 
     Verdict::Cacheable(Box::new(CacheableAnalysis {

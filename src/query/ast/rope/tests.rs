@@ -9,7 +9,7 @@ use super::node::{Node, NodeKind};
 use super::owned::query_expr_from_tree;
 use super::tree::QueryTree;
 use super::view::{Body, View};
-use crate::query::ast::{Deparse, LiteralValue, NodeId, NodeRemap, QueryExpr, query_expr_parse};
+use crate::query::ast::{Deparse, LiteralValue, NodeId, QueryExpr, query_expr_parse};
 
 /// One query per node kind and child layout the converter produces.
 const CORPUS: &[&str] = &[

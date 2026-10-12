@@ -291,7 +291,7 @@ impl MvServePlan {
         sql.push_str(" FROM ");
         sql.push_str(&table);
 
-        let root = bound.rope().root();
+        let root = bound.tree().root();
         let order_by = root.order_by();
         if order_by.len() > 0 {
             match root.body() {
@@ -331,7 +331,7 @@ fn mv_order_by_positional<'t>(
     sql.push_str(" ORDER BY");
     let mut sep = "";
     for clause in order_by {
-        let pos = bound.rope_order_by_position(select, clause)?;
+        let pos = bound.order_by_position(select, clause)?;
         let _ = write!(sql, "{sep} {pos}");
         match clause.direction() {
             OrderDirection::Asc => sql.push_str(" ASC"),
@@ -351,7 +351,7 @@ fn mv_order_by_direct<'t>(sql: &mut String, bound: &ResolvedQuery, order_by: Run
     for clause in order_by {
         sql.push_str(sep);
         sql.push(' ');
-        bound.rope_order_by_into(clause, sql);
+        bound.order_by_into(clause, sql);
         sep = ",";
     }
 }
@@ -390,8 +390,6 @@ pub(crate) fn query_has_window(query: Query<'_>) -> bool {
 mod tests {
     use super::*;
     use crate::cache::mv_shape::tests::test_tables;
-    use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve;
 
     #[test]
     fn test_mv_table_name_format() {
@@ -551,10 +549,7 @@ mod tests {
     // ==================== mv_serve_sql positional ORDER BY ====================
 
     fn resolve_for_serve(sql: &str) -> ResolvedQuery {
-        let ast = Arc::new(query_expr_parse(sql).expect("convert to AST"));
-        let bindings =
-            query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve query");
-        ResolvedQuery::new(ast, bindings)
+        ResolvedQuery::parse_resolve(sql, &test_tables(), &["public"]).expect("resolve")
     }
 
     /// Empty `output_columns` exercises the positional `SELECT *` fallback,

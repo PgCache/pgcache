@@ -71,7 +71,7 @@ pub use deparse::{Clause, Deparse, DeparseContext, DeparseWith, Plain};
 pub(crate) use deparse::{
     clause_deparse_with, parenthesized_deparse_with, separated_deparse, separated_deparse_with,
 };
-pub use finalize::{query_expr_finalize, query_expr_refinalize};
+pub use finalize::query_expr_finalize;
 pub use fingerprint::*;
-pub use node_id::{IdRemap, NodeId, NodePositions, NodeRemap};
+pub use node_id::{NodeId, NodePositions};
 pub use types::*;

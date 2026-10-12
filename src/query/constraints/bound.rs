@@ -1,25 +1,31 @@
 //! The column constraints and equivalences a SELECT's predicates imply,
 //! read from the plain tree and its bindings.
 
+#[cfg(test)]
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
+#[cfg(test)]
 use super::range::{
     literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
 };
 use super::{
     ColumnConstraint, ColumnEquivalence, ConstraintColumn, QueryConstraints, TableConstraint,
 };
+#[cfg(test)]
 use crate::query::ast::{
     BinaryExpr, BinaryOp, JoinQual, LiteralValue, MultiExpr, MultiOp, ScalarExpr, SelectNode,
     TableSource, WhereExpr,
 };
+#[cfg(test)]
 use crate::query::cast::{
     cast_target_is_coercion_supported, comparison_canonicalize, where_scalar_leaf,
 };
-use crate::query::resolve::ResolvedQuery;
+use crate::query::resolve::Bindings;
+#[cfg(test)]
+use crate::query::resolve::owned::column_type_owned;
 
 /// Accumulates the constraints and equivalences a query's predicates imply.
 ///
@@ -28,17 +34,23 @@ use crate::query::resolve::ResolvedQuery;
 /// non-comparison binary shapes, subqueries): a cached query with a WHERE
 /// clause that could not be fully analysed must not be taken for a full
 /// table scan by subsumption.
+#[cfg(test)]
 struct Collector<'a> {
-    bound: &'a ResolvedQuery,
+    bindings: &'a Bindings,
     constraints: HashSet<ColumnConstraint>,
     equivalences: HashSet<ColumnEquivalence>,
     complete: bool,
 }
 
-/// The constraints of `select`, a SELECT of `bound`.
-pub fn query_constraints_analyze(bound: &ResolvedQuery, select: &SelectNode) -> QueryConstraints {
+/// The constraints of `select`, a SELECT of the owned tree `bindings`
+/// resolve: the oracle for `tree.rs`.
+#[cfg(test)]
+pub(crate) fn query_constraints_analyze(
+    bindings: &Bindings,
+    select: &SelectNode,
+) -> QueryConstraints {
     let mut collector = Collector {
-        bound,
+        bindings,
         constraints: HashSet::new(),
         equivalences: HashSet::new(),
         complete: true,
@@ -56,9 +68,10 @@ pub fn query_constraints_analyze(bound: &ResolvedQuery, select: &SelectNode) -> 
     )
 }
 
+#[cfg(test)]
 impl Collector<'_> {
     fn column(&self, node: &crate::query::ast::ColumnNode) -> Option<ConstraintColumn> {
-        ConstraintColumn::of(self.bound, node)
+        ConstraintColumn::of_owned(self.bindings, node)
     }
 
     /// Equality, inequality, BETWEEN, IN and `= ANY` on column-vs-literal
@@ -81,8 +94,9 @@ impl Collector<'_> {
     }
 
     fn comparison_analyze(&mut self, binary: &BinaryExpr) {
-        if let Some((node, target, op, value)) = comparison_canonicalize(self.bound, binary) {
-            let (Some(column), Some(base)) = (self.column(node), self.bound.column_type(node))
+        if let Some((node, target, op, value)) = comparison_canonicalize(self.bindings, binary) {
+            let (Some(column), Some(base)) =
+                (self.column(node), column_type_owned(self.bindings, node))
             else {
                 self.complete = false;
                 return;
@@ -108,8 +122,8 @@ impl Collector<'_> {
             return;
         }
         if let (Some(ScalarExpr::Column(left)), Some(ScalarExpr::Column(right))) = (
-            where_scalar_leaf(self.bound, &binary.lexpr),
-            where_scalar_leaf(self.bound, &binary.rexpr),
+            where_scalar_leaf(self.bindings, &binary.lexpr),
+            where_scalar_leaf(self.bindings, &binary.rexpr),
         ) && binary.op == BinaryOp::Equal
             && let (Some(left), Some(right)) = (self.column(left), self.column(right))
         {
@@ -145,15 +159,15 @@ impl Collector<'_> {
         match &join.qual {
             JoinQual::On(condition) => self.where_analyze(condition),
             JoinQual::Using(_) | JoinQual::Natural => {
-                let bindings = self.bound.bindings();
+                let bindings = self.bindings;
                 for merged in bindings
                     .merged_columns()
                     .iter()
                     .filter(|merged| merged.join.index() == join.id.index())
                 {
                     if let (Some(left), Some(right)) = (
-                        constraint_column_of_binding(self.bound, &merged.left),
-                        constraint_column_of_binding(self.bound, &merged.right),
+                        constraint_column_of_binding(bindings, &merged.left),
+                        constraint_column_of_binding(bindings, &merged.right),
                     ) {
                         self.equivalences.insert(ColumnEquivalence { left, right });
                     }
@@ -301,10 +315,9 @@ impl Collector<'_> {
 /// The constraint column a binding names; slots are the same in both id
 /// spaces, so either bindings table answers.
 pub(super) fn constraint_column_of_binding(
-    bound: &ResolvedQuery,
+    bindings: &Bindings,
     binding: &crate::query::resolve::ColumnBinding,
 ) -> Option<ConstraintColumn> {
-    let bindings = bound.bindings();
     let column = bindings.binding_column(binding)?.name.clone();
     Some(match bindings.slot(binding.slot)? {
         crate::query::resolve::TableSlot::Base { table, alias } => ConstraintColumn {

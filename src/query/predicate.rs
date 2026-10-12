@@ -188,7 +188,6 @@ fn column_position(bound: &ResolvedQuery, expr: Where<'_>, table_name: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use iddqd::BiHashMap;
     use postgres_types::Type;
@@ -196,9 +195,8 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::query_expr_parse;
     use crate::query::evaluate::where_expr_supported;
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
+    use crate::query::resolve::ResolvedQuery;
 
     // ------------------------------------------------------------------
     // Row evaluation. Each predicate is parsed and bound as the writer
@@ -267,16 +265,13 @@ mod tests {
     }
 
     fn fixture_bound(sql: &str) -> ResolvedQuery {
-        let query = Arc::new(query_expr_parse(sql).expect("parse"));
-        let bindings =
-            query_expr_resolve(&query, &fixture_catalog(), &["public"]).expect("resolve");
-        ResolvedQuery::new(query, bindings)
+        ResolvedQuery::parse_resolve(sql, &fixture_catalog(), &["public"]).expect("resolve")
     }
 
     /// The WHERE of `sql` compiled for rows of `table`.
     fn compiled(sql: &str, table: &str) -> CompiledPredicate {
         let bound = fixture_bound(sql);
-        let select = bound.rope_select().expect("a SELECT");
+        let select = bound.select().expect("a SELECT");
         let where_clause = select.where_clause().expect("a WHERE");
         CompiledPredicate::compile(&bound, where_clause, table)
     }
@@ -284,7 +279,7 @@ mod tests {
     /// Whether the WHERE of `sql` is one the compiled predicate decides.
     fn supported(sql: &str) -> bool {
         let bound = fixture_bound(sql);
-        let select = bound.rope_select().expect("a SELECT");
+        let select = bound.select().expect("a SELECT");
         let where_clause = select.where_clause().expect("a WHERE");
         where_expr_supported(&bound, where_clause)
     }

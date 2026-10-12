@@ -28,8 +28,7 @@ use crate::query::ast::rope::{
 };
 use crate::query::ast::{
     Clause, ColumnNode, CteRefNode, Deparse, DeparseContext, DeparseWith, FunctionCall, JoinNode,
-    LiteralValue, NodeId, OrderByClause, ScalarExpr, SelectColumn, SelectColumns, SelectNode,
-    StarNode, TableNode, separated_deparse,
+    LiteralValue, NodeId, StarNode, TableNode, separated_deparse,
 };
 use crate::query::shape::{QueryShape, ShapeKey};
 use crate::query::transform::literal_is_parameterizable;
@@ -41,13 +40,6 @@ const BOUND_FINGERPRINT_DOMAIN: u8 = 4;
 /// `tree` rendered as the cache serves it under `bindings`.
 pub(crate) fn query_tree_sql_into(tree: &QueryTree, bindings: &Bindings, buf: &mut String) {
     query_deparse_with(tree.root(), &mut RopeBound(Bound::text(bindings)), buf);
-}
-
-#[cfg(test)]
-pub(crate) fn query_tree_sql(tree: &QueryTree, bindings: &Bindings) -> String {
-    let mut buf = String::with_capacity(256);
-    query_tree_sql_into(tree, bindings, &mut buf);
-    buf
 }
 
 /// How literals render.
@@ -77,14 +69,14 @@ pub struct SourceOverride<'a> {
 }
 
 /// The context that renders a bound tree.
-struct Bound<'a> {
+pub(super) struct Bound<'a> {
     bindings: &'a Bindings,
     mode: Mode,
     source: Option<&'a SourceOverride<'a>>,
 }
 
 impl<'a> Bound<'a> {
-    fn text(bindings: &'a Bindings) -> Self {
+    pub(super) fn text(bindings: &'a Bindings) -> Self {
         Self {
             bindings,
             mode: Mode::Text,
@@ -184,7 +176,7 @@ impl<'a> Bound<'a> {
     }
 
     /// One star-expanded output: its rendered expression and its name.
-    fn star_item_output(&self, item: &StarItem) -> Output {
+    pub(super) fn star_item_output(&self, item: &StarItem) -> Output {
         let mut text = String::new();
         let name = match item {
             StarItem::Column(binding) => {
@@ -542,16 +534,16 @@ fn source_columns_render(bindings: &Bindings, source: NodeId, buf: &mut String) 
 
 /// One select-list output after star expansion: its rendered expression and
 /// its output name (the alias, else the column name of a column reference).
-struct Output {
-    text: String,
-    name: Option<EcoString>,
+pub(super) struct Output {
+    pub(super) text: String,
+    pub(super) name: Option<EcoString>,
 }
 
 impl ResolvedQuery {
     /// The context that renders this query's nodes as the cache serves
     /// them, for a caller composing its own SQL around parts of the tree.
-    pub fn deparse_context(&self) -> impl DeparseContext + '_ {
-        Bound::text(self.bindings())
+    pub fn deparse_context(&self) -> impl RopeDeparseContext + '_ {
+        RopeBound(Bound::text(self.bindings()))
     }
 
     /// [`ResolvedQuery::deparse_context`] with `source` standing in for one
@@ -559,28 +551,14 @@ impl ResolvedQuery {
     pub fn deparse_context_with_source<'a>(
         &'a self,
         source: &'a SourceOverride<'a>,
-    ) -> impl DeparseContext + 'a {
-        Bound::with_source(self.bindings(), source)
-    }
-
-    /// [`ResolvedQuery::deparse_context`] over the rope.
-    pub fn rope_deparse_context(&self) -> impl RopeDeparseContext + '_ {
-        RopeBound(Bound::text(self.rope_bindings()))
-    }
-
-    /// [`ResolvedQuery::rope_deparse_context`] with `source` standing in
-    /// for one FROM entry.
-    pub fn rope_deparse_context_with_source<'a>(
-        &'a self,
-        source: &'a SourceOverride<'a>,
     ) -> impl RopeDeparseContext + 'a {
-        RopeBound(Bound::with_source(self.rope_bindings(), source))
+        RopeBound(Bound::with_source(self.bindings(), source))
     }
 
     /// The serve SQL with `source` standing in for one FROM entry.
     pub fn sql_with_source_into(&self, source: &SourceOverride<'_>, buf: &mut String) {
-        let mut cx = RopeBound(Bound::with_source(self.rope_bindings(), source));
-        query_deparse_with(self.rope().root(), &mut cx, buf);
+        let mut cx = RopeBound(Bound::with_source(self.bindings(), source));
+        query_deparse_with(self.tree().root(), &mut cx, buf);
     }
 
     /// Every column of the table a FROM entry names, as the cache serves
@@ -590,14 +568,9 @@ impl ResolvedQuery {
         source_columns_render(self.bindings(), source, buf);
     }
 
-    /// [`ResolvedQuery::source_columns_into`] for a rope FROM entry.
-    pub fn rope_source_columns_into(&self, source: NodeId, buf: &mut String) {
-        source_columns_render(self.rope_bindings(), source, buf);
-    }
-
     /// The SQL the cache serves for this query, appended to `buf`.
     pub fn sql_into(&self, buf: &mut String) {
-        query_tree_sql_into(self.rope(), self.rope_bindings(), buf);
+        query_tree_sql_into(self.tree(), self.bindings(), buf);
     }
 
     /// The SQL the cache serves for this query.
@@ -613,8 +586,8 @@ impl ResolvedQuery {
     /// not split one.
     pub fn fingerprint(&self) -> Fingerprint {
         let mut buf = String::with_capacity(256);
-        let mut cx = RopeBound(Bound::text(self.rope_bindings()));
-        query_unlimited_deparse_with(self.rope().root(), &mut cx, &mut buf);
+        let mut cx = RopeBound(Bound::text(self.bindings()));
+        query_unlimited_deparse_with(self.tree().root(), &mut cx, &mut buf);
         let mut hasher = DefaultHasher::new();
         hasher.write_u8(BOUND_FINGERPRINT_DOMAIN);
         buf.hash(&mut hasher);
@@ -625,9 +598,9 @@ impl ResolvedQuery {
     /// predicate literals as `$1..$k`, keyed by a hash of that text, and
     /// the literals to bind.
     pub fn shape(&self) -> QueryShape {
-        let mut cx = RopeBound(Bound::shape(self.rope_bindings()));
+        let mut cx = RopeBound(Bound::shape(self.bindings()));
         let mut sql = String::with_capacity(256);
-        query_deparse_with(self.rope().root(), &mut cx, &mut sql);
+        query_deparse_with(self.tree().root(), &mut cx, &mut sql);
         let literals = cx.0.literals_take();
         let mut hasher = DefaultHasher::new();
         sql.hash(&mut hasher);
@@ -658,31 +631,12 @@ impl ResolvedQuery {
     /// The 1-based select-list position an ORDER BY item of `select` names,
     /// stars expanded: by output name when the item names an output, else
     /// by the rendered expression. `None` when no output matches.
-    pub fn order_by_position(&self, select: &SelectNode, clause: &OrderByClause) -> Option<usize> {
-        let outputs = self.select_outputs(select);
-        let found = if let ScalarExpr::Column(column) = &clause.expr
-            && matches!(self.column(column), Some(ColumnTarget::Output))
-        {
-            outputs
-                .iter()
-                .position(|output| output.name.as_ref() == Some(&column.column))
-        } else {
-            let mut text = String::new();
-            clause
-                .expr
-                .deparse_with(&mut Bound::text(self.bindings()), &mut text);
-            outputs.iter().position(|output| output.text == text)
-        };
-        found.map(|index| index + 1)
-    }
-
-    /// [`ResolvedQuery::order_by_position`] for a rope SELECT and clause.
-    pub fn rope_order_by_position(
+    pub fn order_by_position(
         &self,
         select: RopeSelect<'_>,
         clause: RopeOrderBy<'_>,
     ) -> Option<usize> {
-        let outputs = self.rope_select_outputs(select);
+        let outputs = self.select_outputs(select);
         let expr = clause.expr();
         let found = if let ScalarKind::Column(column) = expr.kind()
             && matches!(
@@ -696,7 +650,7 @@ impl ResolvedQuery {
             let mut text = String::new();
             scalar_deparse_with(
                 expr,
-                &mut RopeBound(Bound::text(self.rope_bindings())),
+                &mut RopeBound(Bound::text(self.bindings())),
                 &mut text,
             );
             outputs.iter().position(|output| output.text == text)
@@ -704,8 +658,8 @@ impl ResolvedQuery {
         found.map(|index| index + 1)
     }
 
-    fn rope_select_outputs(&self, select: RopeSelect<'_>) -> Vec<Output> {
-        let bindings = self.rope_bindings();
+    fn select_outputs(&self, select: RopeSelect<'_>) -> Vec<Output> {
+        let bindings = self.bindings();
         let cx = Bound::text(bindings);
         let Some(items) = select.items() else {
             return Vec::new();
@@ -723,7 +677,7 @@ impl ResolvedQuery {
                     let name = expr
                         .alias()
                         .cloned()
-                        .or_else(|| self.rope_column_output_name(expr.expr()));
+                        .or_else(|| self.column_output_name(expr.expr()));
                     outputs.push(Output { text, name });
                 }
                 SelectItem::Star(star) => {
@@ -736,75 +690,21 @@ impl ResolvedQuery {
         outputs
     }
 
-    /// [`ResolvedQuery::order_by_into`] for a rope clause.
-    pub fn rope_order_by_into(&self, clause: RopeOrderBy<'_>, buf: &mut String) {
-        order_by_deparse_with(
-            clause,
-            &mut RopeBound(Bound::text(self.rope_bindings())),
-            buf,
-        );
-    }
-
     /// An ORDER BY item rendered as the cache serves it.
-    pub fn order_by_into(&self, clause: &OrderByClause, buf: &mut String) {
-        clause.deparse_with(&mut Bound::text(self.bindings()), buf);
-    }
-
-    fn select_outputs(&self, select: &SelectNode) -> Vec<Output> {
-        let bindings = self.bindings();
-        let cx = Bound::text(bindings);
-        let SelectColumns::Columns(columns) = &select.columns else {
-            return Vec::new();
-        };
-        let mut outputs = Vec::with_capacity(columns.len());
-        for column in columns {
-            match column {
-                SelectColumn::Expr { expr, alias } => {
-                    let mut text = String::new();
-                    expr.deparse_with(&mut Bound::text(bindings), &mut text);
-                    let name = alias.clone().or_else(|| self.column_output_name(expr));
-                    outputs.push(Output { text, name });
-                }
-                SelectColumn::Star(star) => {
-                    for item in bindings.star(star).unwrap_or(&[]) {
-                        outputs.push(cx.star_item_output(item));
-                    }
-                }
-            }
-        }
-        outputs
-    }
-
-    /// The name PostgreSQL gives an unaliased output: the column name of a
-    /// column reference (a merged outer-join column is `coalesce`, which has
-    /// none); nothing for any other expression.
-    pub(crate) fn column_output_name(&self, expr: &ScalarExpr) -> Option<EcoString> {
-        let ScalarExpr::Column(column) = expr else {
-            return None;
-        };
-        match self.column(column)? {
-            ColumnTarget::Column(binding) => self
-                .bindings()
-                .binding_column(binding)
-                .map(|c| c.name.clone()),
-            ColumnTarget::Merged(id) => self
-                .bindings()
-                .merged(*id)
-                .filter(|merged| !merged.outer)
-                .map(|merged| merged.name.clone()),
-            ColumnTarget::Output => None,
-        }
+    pub fn order_by_into(&self, clause: RopeOrderBy<'_>, buf: &mut String) {
+        order_by_deparse_with(clause, &mut RopeBound(Bound::text(self.bindings())), buf);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::*;
     use crate::catalog::Catalog;
-    use crate::query::ast::{AstNode, query_expr_parse, query_expr_session_key};
+    use crate::query::ast::rope::{NodeKind, View};
+    use crate::query::ast::{AstNode, QueryExpr, query_expr_parse, query_expr_session_key};
     use crate::query::literal_settings::LiteralSettings;
+    use crate::query::resolve::owned::sql_owned;
     use crate::query::resolve::query_expr_resolve;
     use crate::query::resolve::tests::{BINDING_CORPUS, binding_catalog, catalog_with_columns};
 
@@ -845,24 +745,21 @@ mod tests {
     }
 
     fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
+        ResolvedQuery::parse_resolve(sql, catalog, &["public"]).expect("resolve")
+    }
+
+    /// The owned tree and the owned resolver's bindings: what the owned
+    /// renderer, the oracle for the rope renderer, reads.
+    fn owned(sql: &str, catalog: &Catalog) -> (QueryExpr, Bindings) {
         let query = query_expr_parse(sql).expect("parse");
         let bindings = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
-        ResolvedQuery::new(Arc::new(query), bindings)
+        (query, bindings)
     }
 
-    /// The owned renderer, kept as the oracle for the rope renderer.
-    fn owned_sql(bound: &ResolvedQuery) -> String {
-        let mut buf = String::new();
-        bound
-            .tree()
-            .deparse_with(&mut Bound::text(bound.bindings()), &mut buf);
-        buf
-    }
-
-    fn owned_shape(bound: &ResolvedQuery) -> QueryShape {
-        let mut cx = Bound::shape(bound.bindings());
+    fn owned_shape(tree: &QueryExpr, bindings: &Bindings) -> QueryShape {
+        let mut cx = Bound::shape(bindings);
         let mut sql = String::new();
-        bound.tree().deparse_with(&mut cx, &mut sql);
+        tree.deparse_with(&mut cx, &mut sql);
         let literals = cx.literals_take();
         let mut hasher = DefaultHasher::new();
         sql.hash(&mut hasher);
@@ -880,46 +777,52 @@ mod tests {
     fn test_rope_rendering_matches_the_owned_renderer() {
         let catalog = binding_catalog();
         for sql in corpus() {
+            let (tree, bindings) = owned(sql, &catalog);
             let bound = bound(sql, &catalog);
-            assert_eq!(bound.sql(), owned_sql(&bound), "{sql}");
+            assert_eq!(bound.sql(), sql_owned(&tree, &bindings), "{sql}");
             let mut unlimited = String::new();
-            bound
-                .tree()
-                .unlimited_deparse_with(&mut Bound::text(bound.bindings()), &mut unlimited);
+            tree.unlimited_deparse_with(&mut Bound::text(&bindings), &mut unlimited);
             let mut rope_unlimited = String::new();
             query_unlimited_deparse_with(
-                bound.rope().root(),
-                &mut RopeBound(Bound::text(bound.rope_bindings())),
+                bound.tree().root(),
+                &mut RopeBound(Bound::text(bound.bindings())),
                 &mut rope_unlimited,
             );
             assert_eq!(rope_unlimited, unlimited, "{sql}");
-            let expected = owned_shape(&bound);
+            let expected = owned_shape(&tree, &bindings);
             let shape = bound.shape();
             assert_eq!(shape.sql, expected.sql, "{sql}");
             assert_eq!(shape.key, expected.key, "{sql}");
             assert_eq!(shape.literals, expected.literals, "{sql}");
-            let Some(slot) = bound
-                .tree()
+            // The first table's slot in each resolver's own slot order.
+            let owned_slot = tree
                 .nodes::<TableNode>()
                 .next()
-                .and_then(|table| bound.bindings().source(table.id))
-            else {
+                .and_then(|table| bindings.source(table.id));
+            let rope_slot = bound
+                .tree()
+                .root()
+                .node_ref()
+                .subtree()
+                .find(|position| matches!(position.kind(), NodeKind::Table { .. }))
+                .and_then(|table| bound.bindings().source(table.id()));
+            let (Some(owned_slot), Some(rope_slot)) = (owned_slot, rope_slot) else {
                 continue;
             };
             let columns = [EcoString::from("a"), EcoString::from("b")];
-            let source = SourceOverride {
+            let stand_in = |slot| SourceOverride {
                 slot,
                 alias: "stand_in",
                 source: "VALUES (1, 2)",
                 columns: &columns,
             };
             let mut expected = String::new();
-            bound.tree().deparse_with(
-                &mut Bound::with_source(bound.bindings(), &source),
+            tree.deparse_with(
+                &mut Bound::with_source(&bindings, &stand_in(owned_slot)),
                 &mut expected,
             );
             let mut actual = String::new();
-            bound.sql_with_source_into(&source, &mut actual);
+            bound.sql_with_source_into(&stand_in(rope_slot), &mut actual);
             assert_eq!(actual, expected, "{sql}");
         }
     }
@@ -949,14 +852,10 @@ mod tests {
         let catalog = binding_catalog();
         let sql = "SELECT id FROM users WHERE id = 1";
         let bound = bound(sql, &catalog);
+        let (tree, _) = owned(sql, &catalog);
         assert_ne!(
             bound.fingerprint().get(),
-            query_expr_session_key(
-                bound.tree(),
-                &["public".into()],
-                &LiteralSettings::default()
-            )
-            .get()
+            query_expr_session_key(&tree, &["public".into()], &LiteralSettings::default()).get()
         );
     }
 

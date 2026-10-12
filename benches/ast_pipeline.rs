@@ -41,13 +41,13 @@ use pgcache_lib::query::ast::{
     QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectNode, TableNode, TableSource, WhereExpr,
     query_expr_convert_raw, query_expr_session_key,
 };
+use pgcache_lib::query::decorrelate::query_decorrelate;
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::predicate::CompiledPredicate;
 use pgcache_lib::query::resolve::{
-    Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot, query_expr_resolve,
-    query_tree_resolve,
+    Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot,
 };
-use pgcache_lib::query::transform::query_literals_canonicalise;
+use pgcache_lib::query::transform::{query_literals_canonicalise, query_predicate_pushdown};
 use pgcache_lib::query::update::query_table_update_queries;
 
 // ---------------------------------------------------------------------------
@@ -362,24 +362,18 @@ fn parse(sql: &str) -> QueryExpr {
         .expect("the fixture SQL converts")
 }
 
-fn resolve_bound(query: &QueryExpr, catalog: &Catalog) -> Bindings {
-    query_expr_resolve(query, catalog, &["public"]).expect("the fixture SQL resolves")
+fn resolve_bound(tree: &QueryTree, catalog: &Catalog) -> ResolvedQuery {
+    ResolvedQuery::resolve(tree.clone(), catalog, &["public"]).expect("the fixture SQL resolves")
 }
 
-/// The bound query of `query` with its literals canonicalised, as
-/// registration builds it.
-fn canonicalise(
-    query: &QueryExpr,
-    bindings: &Bindings,
-    settings: &LiteralSettings,
-) -> ResolvedQuery {
-    let mut canonical = query.clone();
-    let _ = query_literals_canonicalise(&mut canonical, bindings, settings);
-    ResolvedQuery::new(Arc::new(canonical), bindings.clone())
+/// The bound query with its literals canonicalised, as registration
+/// builds it; the clone is what registration's own copy costs.
+fn canonicalise(bound: &ResolvedQuery, settings: &LiteralSettings) -> ResolvedQuery {
+    query_literals_canonicalise(bound.clone(), settings).0
 }
 
 fn predicate_compile(bound: &ResolvedQuery, table: &str) -> Option<CompiledPredicate> {
-    let where_clause = bound.rope_select()?.where_clause()?;
+    let where_clause = bound.select()?.where_clause()?;
     Some(CompiledPredicate::compile(bound, where_clause, table))
 }
 
@@ -453,41 +447,45 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         .map(EcoString::from)
         .collect();
     println!("\n== allocations per stage (count / bytes)");
-    println!(
-        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+    let header = [
         "query",
         "convert",
         "plain_clone",
         "session_key",
+        "rope",
+        "rope_clone",
         "resolve",
         "bound_clone",
         "canonicalise",
+        "pushdown",
+        "decorrelate",
         "fingerprint",
         "render",
         "shape",
         "pred_compile",
         "update_queries",
         "admission",
-        "rope",
-        "rope_clone",
-        "rope_resolve"
-    );
+    ];
+    row_print(&header.map(str::to_owned));
     for shape in shapes {
         let (query, convert_n, convert_b) = allocations_count(|| parse(&shape.sql));
         let (_, plain_clone_n, plain_clone_b) = allocations_count(|| black_box(query.clone()));
         let (_, key_n, key_b) =
             allocations_count(|| query_expr_session_key(&query, &search_path, &settings));
-        let (bindings, resolve_n, resolve_b) = allocations_count(|| resolve_bound(&query, catalog));
-        let (bound, canon_n, canon_b) =
-            allocations_count(|| canonicalise(&query, &bindings, &settings));
-        let (_, bound_clone_n, bound_clone_b) = allocations_count(|| black_box(bound.clone()));
+        let (rope, rope_n, rope_b) = allocations_count(|| QueryTree::from_query_expr(&query));
+        let (_, rope_clone_n, rope_clone_b) = allocations_count(|| black_box(rope.clone()));
+        let (resolved, resolve_n, resolve_b) = allocations_count(|| resolve_bound(&rope, catalog));
+        let (_, bound_clone_n, bound_clone_b) = allocations_count(|| black_box(resolved.clone()));
+        let (bound, canon_n, canon_b) = allocations_count(|| canonicalise(&resolved, &settings));
+        let (_, pushdown_n, pushdown_b) =
+            allocations_count(|| black_box(query_predicate_pushdown(&bound)));
+        let (_, decorrelate_n, decorrelate_b) =
+            allocations_count(|| black_box(query_decorrelate(&bound, &aggregates)));
         let (fingerprint, fingerprint_n, fingerprint_b) = allocations_count(|| bound.fingerprint());
         let (_, render_n, render_b) = allocations_count(|| bound.sql());
         let (_, shape_n, shape_b) = allocations_count(|| bound.shape());
         let (_, compile_n, compile_b) =
             allocations_count(|| predicate_compile(&bound, shape.predicate_table));
-        let (_, bindings_clone_n, bindings_clone_b) =
-            allocations_count(|| black_box(bindings.clone()));
         let (_, update_n, update_b) =
             allocations_count(|| black_box(query_table_update_queries(&bound)));
         let shared = Arc::new(bound.clone());
@@ -498,7 +496,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
                     decorrelated: None,
                 },
                 fingerprint,
-                bound.tree().limit.is_some(),
+                bound.tree().root().has_limit(),
                 &aggregates,
                 catalog,
                 AdmissionDepth::Full,
@@ -506,38 +504,43 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         });
         let admission = admission.expect("the fixture SQL is admitted");
         black_box(admission.tables.len());
-        let (rope, rope_n, rope_b) = allocations_count(|| QueryTree::from_query_expr(&query));
-        let (_, rope_clone_n, rope_clone_b) = allocations_count(|| black_box(rope.clone()));
-        let (_, rope_resolve_n, rope_resolve_b) =
-            allocations_count(|| query_tree_resolve(&rope, catalog, &["public"]));
         let cell = |n: usize, b: usize| format!("{n}/{b}");
-        println!(
-            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
-            shape.name,
+        row_print(&[
+            shape.name.to_owned(),
             cell(convert_n, convert_b),
             cell(plain_clone_n, plain_clone_b),
             cell(key_n, key_b),
+            cell(rope_n, rope_b),
+            cell(rope_clone_n, rope_clone_b),
             cell(resolve_n, resolve_b),
             cell(bound_clone_n, bound_clone_b),
             cell(
-                canon_n.saturating_sub(plain_clone_n + bindings_clone_n),
-                canon_b.saturating_sub(plain_clone_b + bindings_clone_b)
+                canon_n.saturating_sub(bound_clone_n),
+                canon_b.saturating_sub(bound_clone_b),
             ),
+            cell(pushdown_n, pushdown_b),
+            cell(decorrelate_n, decorrelate_b),
             cell(fingerprint_n, fingerprint_b),
             cell(render_n, render_b),
             cell(shape_n, shape_b),
             cell(compile_n, compile_b),
             cell(update_n, update_b),
             cell(admission_n, admission_b),
-            cell(rope_n, rope_b),
-            cell(rope_clone_n, rope_clone_b),
-            cell(rope_resolve_n, rope_resolve_b),
-        );
+        ]);
     }
-    println!(
-        "(canonicalise excludes the tree and bindings clones it starts from; convert excludes \
-         pg_query's C-side parse)\n"
-    );
+}
+
+/// One row of the allocations table: the query name, then a cell per stage.
+fn row_print(cells: &[String; 17]) {
+    let mut line = String::new();
+    for (index, cell) in cells.iter().enumerate() {
+        if index == 0 {
+            line.push_str(&format!("{cell:<14}"));
+        } else {
+            line.push_str(&format!("{cell:>14}"));
+        }
+    }
+    println!("{line}");
 }
 
 // ---------------------------------------------------------------------------
@@ -552,12 +555,17 @@ fn bench_pipeline(c: &mut Criterion) {
 
     let settings = LiteralSettings::default();
     let search_path: [EcoString; 1] = ["public".into()];
+    let aggregates: HashSet<EcoString> = ["count", "sum", "avg", "min", "max"]
+        .into_iter()
+        .map(EcoString::from)
+        .collect();
 
     let mut group = c.benchmark_group("ast_pipeline");
     for shape in &shapes {
         let query = parse(&shape.sql);
-        let bindings = resolve_bound(&query, &catalog);
-        let bound = canonicalise(&query, &bindings, &settings);
+        let tree = QueryTree::from_query_expr(&query);
+        let resolved = resolve_bound(&tree, &catalog);
+        let bound = canonicalise(&resolved, &settings);
         let predicate = predicate_compile(&bound, shape.predicate_table);
         let row = row_build(shape.row);
 
@@ -582,8 +590,11 @@ fn bench_pipeline(c: &mut Criterion) {
                 b.iter(|| black_box(query_expr_session_key(q, &search_path, &settings)));
             },
         );
-        group.bench_with_input(BenchmarkId::new("resolve", shape.name), &query, |b, q| {
-            b.iter(|| black_box(resolve_bound(q, &catalog)));
+        group.bench_with_input(BenchmarkId::new("rope", shape.name), &query, |b, q| {
+            b.iter(|| black_box(QueryTree::from_query_expr(q)));
+        });
+        group.bench_with_input(BenchmarkId::new("resolve", shape.name), &tree, |b, t| {
+            b.iter(|| black_box(resolve_bound(t, &catalog)));
         });
         group.bench_with_input(
             BenchmarkId::new("bound_clone", shape.name),
@@ -594,9 +605,19 @@ fn bench_pipeline(c: &mut Criterion) {
         );
         group.bench_with_input(
             BenchmarkId::new("canonicalise", shape.name),
-            &(&query, &bindings),
-            |b, (q, bindings)| {
-                b.iter(|| black_box(canonicalise(q, bindings, &settings)));
+            &resolved,
+            |b, r| {
+                b.iter(|| black_box(canonicalise(r, &settings)));
+            },
+        );
+        group.bench_with_input(BenchmarkId::new("pushdown", shape.name), &bound, |b, r| {
+            b.iter(|| black_box(query_predicate_pushdown(r)));
+        });
+        group.bench_with_input(
+            BenchmarkId::new("decorrelate", shape.name),
+            &bound,
+            |b, r| {
+                b.iter(|| black_box(query_decorrelate(r, &aggregates)));
             },
         );
         group.bench_with_input(
@@ -635,8 +656,9 @@ fn bench_pipeline(c: &mut Criterion) {
                 b.iter(|| {
                     let query = parse(sql);
                     let key = query_expr_session_key(&query, &search_path, &settings);
-                    let bindings = resolve_bound(&query, &catalog);
-                    let bound = canonicalise(&query, &bindings, &settings);
+                    let tree = QueryTree::from_query_expr(&query);
+                    let resolved = resolve_bound(&tree, &catalog);
+                    let bound = canonicalise(&resolved, &settings);
                     black_box((key, bound.fingerprint(), bound.sql()))
                 });
             },

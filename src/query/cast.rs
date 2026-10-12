@@ -21,9 +21,14 @@ use ecow::EcoString;
 use postgres_types::Type;
 
 use crate::query::ast::rope::{Binary, Column, Scalar, ScalarKind, Where, WhereKind};
+#[cfg(test)]
 use crate::query::ast::{BinaryExpr, ColumnNode, ScalarExpr, WhereExpr};
 use crate::query::ast::{BinaryOp, LiteralValue};
+#[cfg(test)]
+use crate::query::resolve::Bindings;
 use crate::query::resolve::ResolvedQuery;
+#[cfg(test)]
+use crate::query::resolve::owned::column_type_owned;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CastTarget {
@@ -197,7 +202,8 @@ pub fn bool_literal_parse(s: &str) -> Option<bool> {
 
 /// `expr` without an identity cast: `column::text` on a text column is the
 /// column itself. Any other cast, or a cast of a non-column, is kept.
-pub fn identity_cast_strip<'a>(bound: &ResolvedQuery, expr: &'a ScalarExpr) -> &'a ScalarExpr {
+#[cfg(test)]
+pub(crate) fn identity_cast_strip<'a>(bindings: &Bindings, expr: &'a ScalarExpr) -> &'a ScalarExpr {
     let ScalarExpr::TypeCast {
         expr: inner,
         target,
@@ -208,7 +214,7 @@ pub fn identity_cast_strip<'a>(bound: &ResolvedQuery, expr: &'a ScalarExpr) -> &
     let ScalarExpr::Column(column) = inner.as_ref() else {
         return expr;
     };
-    match bound.column_type(column) {
+    match column_type_owned(bindings, column) {
         Some(base) if cast_target_is_identity_on(target, base) => inner.as_ref(),
         Some(_) | None => expr,
     }
@@ -296,18 +302,23 @@ pub fn comparison_canonicalize_tree<'t>(
 }
 
 /// The scalar a `WhereExpr::Scalar` holds, without an identity cast.
-pub fn where_scalar_leaf<'a>(bound: &ResolvedQuery, expr: &'a WhereExpr) -> Option<&'a ScalarExpr> {
+#[cfg(test)]
+pub(crate) fn where_scalar_leaf<'a>(
+    bindings: &Bindings,
+    expr: &'a WhereExpr,
+) -> Option<&'a ScalarExpr> {
     if let WhereExpr::Scalar(scalar) = expr {
-        Some(identity_cast_strip(bound, scalar))
+        Some(identity_cast_strip(bindings, scalar))
     } else {
         None
     }
 }
 
-/// [`canonicalize_comparison`] on the bound query: `(column, cast target,
-/// op with the column on the left, literal)`.
-pub fn comparison_canonicalize<'a>(
-    bound: &ResolvedQuery,
+/// [`comparison_canonicalize_tree`] on an owned comparison: `(column, cast
+/// target, op with the column on the left, literal)`.
+#[cfg(test)]
+pub(crate) fn comparison_canonicalize<'a>(
+    bindings: &Bindings,
     binary: &'a BinaryExpr,
 ) -> Option<(
     &'a ColumnNode,
@@ -315,8 +326,8 @@ pub fn comparison_canonicalize<'a>(
     BinaryOp,
     &'a LiteralValue,
 )> {
-    let lleaf = where_scalar_leaf(bound, &binary.lexpr);
-    let rleaf = where_scalar_leaf(bound, &binary.rexpr);
+    let lleaf = where_scalar_leaf(bindings, &binary.lexpr);
+    let rleaf = where_scalar_leaf(bindings, &binary.rexpr);
     let column_target = |scalar: &'a ScalarExpr| match scalar {
         ScalarExpr::Column(column) => Some((column, None)),
         ScalarExpr::TypeCast { expr, target } => match expr.as_ref() {

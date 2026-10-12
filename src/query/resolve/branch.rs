@@ -16,9 +16,7 @@ pub struct QueryBranch<'a> {
 impl<'a> QueryBranch<'a> {
     /// The branch `id` names in `bound`, when it has one.
     pub fn find(bound: &'a ResolvedQuery, id: NodeId) -> Option<Self> {
-        bound
-            .rope_select_node(id)
-            .map(|select| Self { bound, select })
+        bound.select_node(id).map(|select| Self { bound, select })
     }
 
     /// Whether the row evaluation reads one table: no join, and no subquery
@@ -46,12 +44,7 @@ impl<'a> QueryBranch<'a> {
 
     /// `SELECT true` over the branch, as the cache serves it.
     pub fn sql_into(&self, buf: &mut String) {
-        branch_select_into(
-            &mut self.bound.rope_deparse_context(),
-            buf,
-            self.select,
-            "true",
-        );
+        branch_select_into(&mut self.bound.deparse_context(), buf, self.select, "true");
     }
 
     pub fn sql(&self) -> String {

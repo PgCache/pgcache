@@ -5,9 +5,14 @@ use std::sync::Arc;
 
 use ecow::EcoString;
 
+use super::ResolveResult;
+use super::rope::query_tree_resolve;
+use crate::catalog::Catalog;
 use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
+#[cfg(test)]
+use crate::query::ast::query_expr_parse;
 use crate::query::ast::rope::{QueryTree, Remap};
-use crate::query::ast::{ColumnNode, NodeId, NodeRemap, QueryExpr, StarNode};
+use crate::query::ast::{ColumnNode, NodeId, StarNode};
 
 /// Index of a table source in [`Bindings::slots`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -215,7 +220,7 @@ impl BindingsBuilder {
     /// several places binds in each, a node the rewrite dropped binds
     /// nowhere. Slots are kept as they are, so what the rewrite added binds
     /// into them by slot and position.
-    pub(crate) fn from_remapped<R: NodeRemap>(source: &Bindings, remap: &R) -> Self {
+    pub(crate) fn from_remapped(source: &Bindings, remap: &Remap) -> Self {
         // A derived slot names the node it stands for; the slot keeps its
         // index and follows the node.
         let slots = source
@@ -395,59 +400,41 @@ impl Bindings {
     }
 }
 
-/// A finalized tree with its bindings: the only way to hold resolved facts
-/// about a plain tree (ADR-057). Cloning shares the tree.
-///
-/// While consumers move to the rope, the query also carries the rope and
-/// the same bindings keyed by rope positions, derived here from the owned
-/// pair; the owned pair goes when the last consumer has moved.
+/// A query tree with its bindings: the only way to hold resolved facts
+/// about a tree (ADR-057). Cloning shares the tree.
 #[derive(Debug, Clone)]
 pub struct ResolvedQuery {
-    tree: Arc<QueryExpr>,
+    tree: QueryTree,
     bindings: Bindings,
-    rope: QueryTree,
-    rope_bindings: Bindings,
-    /// Where each owned node sits in the rope, for the consumers that
-    /// still hold owned ids while the rest have moved.
-    origins: Remap,
 }
 
 impl ResolvedQuery {
-    pub fn new(tree: Arc<QueryExpr>, bindings: Bindings) -> Self {
-        let (rope, origins) = QueryTree::from_query_expr_with_origins(&tree);
-        let rope_bindings = BindingsBuilder::from_remapped(&bindings, &origins).finish();
-        Self {
-            tree,
-            bindings,
-            rope,
-            rope_bindings,
-            origins,
-        }
+    pub fn new(tree: QueryTree, bindings: Bindings) -> Self {
+        Self { tree, bindings }
     }
 
-    /// The rope position of the owned node `owned`.
-    pub fn rope_position(&self, owned: NodeId) -> Option<NodeId> {
-        self.origins.new_id(owned)
+    /// `tree` resolved against `tables` on `search_path`.
+    pub fn resolve(tree: QueryTree, tables: &Catalog, search_path: &[&str]) -> ResolveResult<Self> {
+        let bindings = query_tree_resolve(&tree, tables, search_path)?;
+        Ok(Self { tree, bindings })
     }
 
-    pub fn tree(&self) -> &QueryExpr {
+    /// `sql` parsed and resolved against `tables` on `search_path`.
+    #[cfg(test)]
+    pub(crate) fn parse_resolve(
+        sql: &str,
+        tables: &Catalog,
+        search_path: &[&str],
+    ) -> ResolveResult<Self> {
+        let owned = query_expr_parse(sql).unwrap_or_else(|e| panic!("{sql} parses: {e:?}"));
+        Self::resolve(QueryTree::from_query_expr(&owned), tables, search_path)
+    }
+
+    pub fn tree(&self) -> &QueryTree {
         &self.tree
     }
 
     pub fn bindings(&self) -> &Bindings {
         &self.bindings
-    }
-
-    pub fn rope(&self) -> &QueryTree {
-        &self.rope
-    }
-
-    /// The bindings keyed by the rope's positions.
-    pub fn rope_bindings(&self) -> &Bindings {
-        &self.rope_bindings
-    }
-
-    pub fn column(&self, node: &ColumnNode) -> Option<&ColumnTarget> {
-        self.bindings.column(node)
     }
 }

@@ -83,7 +83,7 @@ impl WriterRegistration {
 
         // Set operations (UNION/INTERSECT/EXCEPT) require per-branch constraint
         // analysis which isn't implemented yet. Reject unconditionally for now.
-        let Some(select) = resolution.bound.rope_select() else {
+        let Some(select) = resolution.bound.select() else {
             return false;
         };
 

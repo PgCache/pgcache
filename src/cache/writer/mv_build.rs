@@ -445,11 +445,7 @@ fn mv_gate_input_sql_into<C: RopeDeparseContext>(query: Query<'_>, cx: &mut C, b
 fn mv_source_count_sql(bound: &ResolvedQuery) -> String {
     let mut sql = String::with_capacity(256);
     sql.push_str("SELECT count(*) FROM (");
-    mv_gate_input_sql_into(
-        bound.rope().root(),
-        &mut bound.rope_deparse_context(),
-        &mut sql,
-    );
+    mv_gate_input_sql_into(bound.tree().root(), &mut bound.deparse_context(), &mut sql);
     sql.push_str(") _mv_gate_denom");
     sql
 }
@@ -576,7 +572,6 @@ mod tests {
         AstNode, ColumnNode, FunctionCall, SelectNode, SetOpNode, SetOpType, TableNode,
         query_expr_parse,
     };
-    use crate::query::resolve::query_expr_resolve;
 
     fn test_table(name: &str, oid: Oid, cols: &[&str]) -> TableMetadata {
         let columns = ColumnStore::new(cols.iter().enumerate().map(|(i, c)| {
@@ -614,10 +609,9 @@ mod tests {
     /// Build the Measure-gate denominator for `sql` and re-parse it into an AST
     /// so tests assert on nodes, not raw text.
     fn denom_ast(sql: &str) -> QueryExpr {
-        let ast = Arc::new(query_expr_parse(sql).expect("parse source"));
-        let bindings =
-            query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve source");
-        let denom = mv_source_count_sql(&ResolvedQuery::new(ast, bindings));
+        let bound =
+            ResolvedQuery::parse_resolve(sql, &test_tables(), &["public"]).expect("resolve source");
+        let denom = mv_source_count_sql(&bound);
         query_expr_parse(&denom).expect("denominator SQL re-parses")
     }
 

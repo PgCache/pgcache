@@ -24,6 +24,8 @@ mod enum_gate;
 mod enum_gate_owned;
 mod expr;
 mod join_using;
+#[cfg(test)]
+pub(crate) mod owned;
 mod render;
 mod rope;
 mod scope;
@@ -80,6 +82,4 @@ pub use bindings::{
 pub use branch::QueryBranch;
 pub use entry::query_expr_resolve;
 pub use render::SourceOverride;
-#[cfg(test)]
-pub(crate) use render::query_tree_sql;
 pub use rope::query_tree_resolve;

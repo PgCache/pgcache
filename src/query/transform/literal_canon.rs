@@ -10,13 +10,14 @@
 //! meaning, is left as written and reported, so the entry is served only to
 //! sessions on the reference settings it will be populated under.
 
-use crate::query::ast::{
-    CaseExpr, FunctionCall, JoinQual, LiteralValue, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
-    SelectColumns, SelectNode, TableSource, ValuesClause, WhereExpr,
+use crate::query::ast::rope::{
+    Body, Case, Function, JoinQual, NodeKind, Query, Replacement, Replacements, Scalar, ScalarKind,
+    Select, SelectItem, Source, TreeBuilder, Values, View, Where, WhereKind,
 };
+use crate::query::ast::{LiteralValue, NodeId};
 use crate::query::cast::{CastTarget, cast_target_from_canonical};
 use crate::query::literal_settings::LiteralSettings;
-use crate::query::resolve::{Bindings, ColumnTarget};
+use crate::query::resolve::{BindingsBuilder, ResolvedQuery};
 use crate::query::typed_compare::{ValueKind, literal_canonical_text};
 
 /// What the pass found.
@@ -27,232 +28,245 @@ pub struct LiteralCanonOutcome {
     pub residual: bool,
 }
 
-/// Canonicalise every date-time literal of a finalized plain tree under
-/// `settings`, reading column types through `bindings` (ADR-057). Values
-/// change, structure does not, so the tree's ids stay valid. CTE definition
-/// bodies are skipped: the resolver binds only the copy each reference
-/// embeds, and that copy is canonicalised in its place.
+/// Canonicalise every date-time literal of `bound` under `settings`,
+/// reading column types through its bindings (ADR-057): a walk over the
+/// views collecting each rewritten literal as a replacement, then one copy
+/// of the tree with those positions replaced. The query comes back as it
+/// was when no literal changes; the bindings carry over, since the tree's
+/// shape is the same. CTE definition bodies are skipped: the resolver
+/// binds only the copy each reference embeds, and that copy is
+/// canonicalised in its place.
 pub fn query_literals_canonicalise(
-    query: &mut QueryExpr,
-    bindings: &Bindings,
+    bound: ResolvedQuery,
     settings: &LiteralSettings,
-) -> LiteralCanonOutcome {
-    let mut pass = BoundPass {
-        bindings,
-        literals: Pass {
-            settings,
-            outcome: LiteralCanonOutcome::default(),
-        },
+) -> (ResolvedQuery, LiteralCanonOutcome) {
+    let (mut replacements, outcome) = {
+        let mut pass = TreePass {
+            bound: &bound,
+            literals: Pass {
+                settings,
+                outcome: LiteralCanonOutcome::default(),
+            },
+            replacements: Replacements::new(),
+        };
+        pass.query(bound.tree().root());
+        (pass.replacements, pass.literals.outcome)
     };
-    pass.query(query);
-    pass.literals.outcome
+    if replacements.is_empty() {
+        return (bound, outcome);
+    }
+    let mut builder = TreeBuilder::over(bound.tree());
+    builder.copy(bound.tree().root().node_ref(), &mut replacements);
+    let (tree, remap) = builder.finish();
+    let bindings = BindingsBuilder::from_remapped(bound.bindings(), &remap).finish();
+    (ResolvedQuery::new(tree, bindings), outcome)
 }
 
-/// The plain-tree walk; literal handling is shared with the resolved walk.
-struct BoundPass<'a> {
-    bindings: &'a Bindings,
+/// The walk over views: literals rewritten on a copy of their value and
+/// recorded by position when they change; the type context of each
+/// position is the bindings'.
+struct TreePass<'a> {
+    bound: &'a ResolvedQuery,
     literals: Pass<'a>,
+    replacements: Replacements,
 }
 
-impl BoundPass<'_> {
-    fn query(&mut self, query: &mut QueryExpr) {
-        match &mut query.body {
-            QueryBody::Select(select) => self.select(select),
-            QueryBody::SetOp(set_op) => {
-                self.query(&mut set_op.left);
-                self.query(&mut set_op.right);
+impl TreePass<'_> {
+    fn query(&mut self, query: Query<'_>) {
+        match query.body() {
+            Body::Select(select) => self.select(select),
+            Body::SetOp(set_op) => {
+                self.query(set_op.left());
+                self.query(set_op.right());
             }
-            QueryBody::Values(values) => self.literals.values(values),
+            Body::Values(values) => self.values(values),
         }
-        for clause in &mut query.order_by {
-            self.scalar(&mut clause.expr, None);
+        for clause in query.order_by() {
+            self.scalar(clause.expr(), None);
         }
     }
 
-    fn select(&mut self, select: &mut SelectNode) {
-        for source in &mut select.from {
+    fn values(&mut self, values: Values<'_>) {
+        for row in values.rows() {
+            for literal in row.literals() {
+                self.literal(literal.node_ref().id(), literal.value(), None);
+            }
+        }
+    }
+
+    fn select(&mut self, select: Select<'_>) {
+        for source in select.from() {
             self.source(source);
         }
-        if let Some(where_clause) = &mut select.where_clause {
+        if let Some(where_clause) = select.where_clause() {
             self.where_expr(where_clause);
         }
-        if let Some(having) = &mut select.having {
+        if let Some(having) = select.having() {
             self.where_expr(having);
         }
-        if let SelectColumns::Columns(columns) = &mut select.columns {
-            for column in columns {
-                if let SelectColumn::Expr { expr, .. } = column {
-                    self.scalar(expr, None);
-                }
+        for item in select.items().into_iter().flatten() {
+            if let SelectItem::Expr(expr) = item {
+                self.scalar(expr.expr(), None);
             }
         }
     }
 
-    fn source(&mut self, source: &mut TableSource) {
+    fn source(&mut self, source: Source<'_>) {
         match source {
-            TableSource::Table(_) => {}
-            TableSource::Subquery(subquery) => self.query(&mut subquery.query),
-            TableSource::CteRef(cte_ref) => self.query(&mut cte_ref.query),
-            TableSource::Join(join) => {
-                self.source(&mut join.left);
-                self.source(&mut join.right);
-                if let JoinQual::On(on) = &mut join.qual {
+            Source::Table(_) => {}
+            Source::Subquery(subquery) => self.query(subquery.query()),
+            Source::CteRef(cte_ref) => self.query(cte_ref.query()),
+            Source::Join(join) => {
+                self.source(join.left());
+                self.source(join.right());
+                if let JoinQual::On(on) = join.qual() {
                     self.where_expr(on);
                 }
             }
         }
     }
 
-    fn where_expr(&mut self, expr: &mut WhereExpr) {
-        match expr {
-            WhereExpr::Scalar(scalar) => self.scalar(scalar, None),
-            WhereExpr::Unary(unary) => self.where_expr(&mut unary.expr),
-            WhereExpr::Binary(binary) => {
+    fn where_expr(&mut self, expr: Where<'_>) {
+        match expr.kind() {
+            WhereKind::Scalar(scalar) => self.scalar(scalar, None),
+            WhereKind::Unary(unary) => self.where_expr(unary.expr()),
+            WhereKind::Binary(binary) => {
                 let kind = self
-                    .column_kind(&binary.lexpr)
-                    .or_else(|| self.column_kind(&binary.rexpr));
-                self.operand(&mut binary.lexpr, kind);
-                self.operand(&mut binary.rexpr, kind);
+                    .column_kind(binary.lexpr())
+                    .or_else(|| self.column_kind(binary.rexpr()));
+                self.operand(binary.lexpr(), kind);
+                self.operand(binary.rexpr(), kind);
             }
-            WhereExpr::Multi(multi) => {
+            WhereKind::Multi(multi) => {
                 let kind = multi
-                    .exprs
-                    .first()
+                    .exprs()
+                    .next()
                     .and_then(|first| self.column_kind(first));
-                for (i, member) in multi.exprs.iter_mut().enumerate() {
+                for (i, member) in multi.exprs().enumerate() {
                     self.operand(member, kind.filter(|_| i > 0));
                 }
             }
-            WhereExpr::Subquery {
-                query, test_expr, ..
-            } => {
-                if let Some(test) = test_expr {
+            WhereKind::Subquery(subquery) => {
+                if let Some(test) = subquery.test_expr() {
                     self.scalar(test, None);
                 }
-                self.query(query);
+                self.query(subquery.query());
             }
         }
     }
 
-    fn operand(&mut self, side: &mut WhereExpr, kind: Option<ValueKind>) {
-        if let WhereExpr::Scalar(scalar) = side {
-            self.scalar(scalar, kind);
-        } else {
-            self.where_expr(side);
+    fn operand(&mut self, side: Where<'_>, kind: Option<ValueKind>) {
+        match side.kind() {
+            WhereKind::Scalar(scalar) => self.scalar(scalar, kind),
+            WhereKind::Unary(_)
+            | WhereKind::Binary(_)
+            | WhereKind::Multi(_)
+            | WhereKind::Subquery(_) => self.where_expr(side),
         }
     }
 
-    fn scalar(&mut self, expr: &mut ScalarExpr, kind: Option<ValueKind>) {
-        match expr {
-            ScalarExpr::Literal(literal) => self.literals.literal(literal, kind),
-            ScalarExpr::TypeCast {
-                expr: inner,
-                target,
-            } => {
-                let cast = cast_kind(target);
-                if let ScalarExpr::Literal(literal) = inner.as_mut() {
-                    self.literals.literal(literal, cast);
-                    self.literals.mixed_kinds_check(kind, cast);
+    fn scalar(&mut self, expr: Scalar<'_>, kind: Option<ValueKind>) {
+        match expr.kind() {
+            ScalarKind::Literal(literal) => self.literal(literal.id(), literal.value(), kind),
+            ScalarKind::TypeCast(cast) => {
+                let target = cast_kind(cast.target());
+                let inner = cast.expr();
+                if let ScalarKind::Literal(literal) = inner.kind() {
+                    self.literal(literal.id(), literal.value(), target);
+                    self.literals.mixed_kinds_check(kind, target);
                 } else {
                     self.scalar(inner, None);
                 }
             }
-            ScalarExpr::Array(elems) => {
-                for elem in elems {
-                    self.scalar(elem, kind);
+            ScalarKind::Array(array) => {
+                for element in array.elements() {
+                    self.scalar(element, kind);
                 }
             }
-            ScalarExpr::Function(function) => self.function(function),
-            ScalarExpr::Case(case) => self.case(case),
-            ScalarExpr::Arithmetic(arith) => {
-                self.scalar(&mut arith.left, None);
-                self.scalar(&mut arith.right, None);
+            ScalarKind::Function(function) => self.function(function),
+            ScalarKind::Case(case) => self.case(case),
+            ScalarKind::Arithmetic(arithmetic) => {
+                self.scalar(arithmetic.left(), None);
+                self.scalar(arithmetic.right(), None);
             }
-            ScalarExpr::Subquery(query) => self.query(query),
-            ScalarExpr::Column(_) => {}
+            ScalarKind::Subquery(subquery) => self.query(subquery.query()),
+            ScalarKind::Column(_) => {}
         }
     }
 
-    fn function(&mut self, function: &mut FunctionCall) {
-        for arg in &mut function.args {
+    fn function(&mut self, function: Function<'_>) {
+        for arg in function.args() {
             self.scalar(arg, None);
         }
-        if let Some(filter) = &mut function.agg_filter {
+        if let Some(filter) = function.filter() {
             self.where_expr(filter);
         }
-        for clause in &mut function.agg_order {
-            self.scalar(&mut clause.expr, None);
+        for clause in function.agg_order() {
+            self.scalar(clause.expr(), None);
         }
     }
 
-    fn case(&mut self, case: &mut CaseExpr) {
-        if let Some(arg) = &mut case.arg {
+    fn case(&mut self, case: Case<'_>) {
+        if let Some(arg) = case.arg() {
             self.scalar(arg, None);
         }
-        for when in &mut case.whens {
-            self.where_expr(&mut when.condition);
-            self.scalar(&mut when.result, None);
+        for when in case.whens() {
+            self.where_expr(when.condition());
+            self.scalar(when.result(), None);
         }
-        if let Some(default) = &mut case.default {
+        if let Some(default) = case.default() {
             self.scalar(default, None);
+        }
+    }
+
+    /// Rewrite the literal at `id`; recorded as a replacement when its
+    /// value changes.
+    fn literal(&mut self, id: NodeId, value: &LiteralValue, kind: Option<ValueKind>) {
+        let mut rewritten = value.clone();
+        self.literals.literal(&mut rewritten, kind);
+        if rewritten != *value {
+            self.replacements
+                .push(id, Replacement::Leaf(NodeKind::Literal(rewritten)));
         }
     }
 
     /// The kind of the column a comparison side names, looking through a
     /// cast; an inner join's merged column has its left column's kind.
-    fn column_kind(&self, side: &WhereExpr) -> Option<ValueKind> {
-        let WhereExpr::Scalar(scalar) = side else {
+    fn column_kind(&self, side: Where<'_>) -> Option<ValueKind> {
+        let WhereKind::Scalar(scalar) = side.kind() else {
             return None;
         };
         self.scalar_column_kind(scalar)
     }
 
-    fn scalar_column_kind(&self, scalar: &ScalarExpr) -> Option<ValueKind> {
-        match scalar {
-            ScalarExpr::Column(column) => {
-                let metadata = match self.bindings.column(column)? {
-                    ColumnTarget::Column(binding) => self.bindings.binding_column(binding)?,
-                    ColumnTarget::Merged(id) => {
-                        let merged = self.bindings.merged(*id)?;
-                        if merged.outer {
-                            return None;
-                        }
-                        self.bindings.binding_column(&merged.left)?
-                    }
-                    ColumnTarget::Output => return None,
-                };
-                Some(ValueKind::of_type(&metadata.data_type))
+    fn scalar_column_kind(&self, scalar: Scalar<'_>) -> Option<ValueKind> {
+        match scalar.kind() {
+            ScalarKind::Column(column) => self
+                .bound
+                .column_type_at(column.id())
+                .map(ValueKind::of_type),
+            ScalarKind::TypeCast(cast) => {
+                cast_kind(cast.target()).or_else(|| self.scalar_column_kind(cast.expr()))
             }
-            ScalarExpr::TypeCast { expr, target } => {
-                cast_kind(target).or_else(|| self.scalar_column_kind(expr))
-            }
-            ScalarExpr::Literal(_)
-            | ScalarExpr::Function(_)
-            | ScalarExpr::Case(_)
-            | ScalarExpr::Arithmetic(_)
-            | ScalarExpr::Subquery(_)
-            | ScalarExpr::Array(_) => None,
+            ScalarKind::Literal(_)
+            | ScalarKind::Function(_)
+            | ScalarKind::Case(_)
+            | ScalarKind::Arithmetic(_)
+            | ScalarKind::Subquery(_)
+            | ScalarKind::Array(_) => None,
         }
     }
 }
 
-pub(super) struct Pass<'a> {
-    pub(super) settings: &'a LiteralSettings,
-    pub(super) outcome: LiteralCanonOutcome,
+struct Pass<'a> {
+    settings: &'a LiteralSettings,
+    outcome: LiteralCanonOutcome,
 }
 
 impl Pass<'_> {
-    fn values(&mut self, values: &mut ValuesClause) {
-        for row in &mut values.rows {
-            for literal in row {
-                self.literal(literal, None);
-            }
-        }
-    }
-
     /// Rewrite one literal of `kind`; `None` is a position whose type the
     /// pass cannot see.
-    pub(super) fn literal(&mut self, literal: &mut LiteralValue, kind: Option<ValueKind>) {
+    fn literal(&mut self, literal: &mut LiteralValue, kind: Option<ValueKind>) {
         match literal {
             LiteralValue::String(text) => self.text(text, kind),
             LiteralValue::StringWithCast(text, cast) => {
@@ -326,7 +340,7 @@ impl Pass<'_> {
 
 /// The kind a cast target names. A type whose text input no tracked setting
 /// changes reads as `Text`, so a literal cast to it is never residual.
-pub(super) fn cast_kind(target: &CastTarget) -> Option<ValueKind> {
+fn cast_kind(target: &CastTarget) -> Option<ValueKind> {
     Some(match target {
         CastTarget::Text => ValueKind::Text,
         CastTarget::Int4 | CastTarget::Int8 => ValueKind::Integer,
@@ -382,17 +396,13 @@ fn literal_settings_sensitive(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve, query_tree_sql};
-    use crate::query::transform::query_literals_canonicalise_tree;
+    use crate::query::resolve::ResolvedQuery;
 
     fn events() -> Catalog {
         let column = |name: &str, position: i16, ty: Type| ColumnMetadata {
@@ -427,40 +437,24 @@ mod tests {
         tables
     }
 
-    /// Canonicalise `sql` with the owned pass, and check the rope pass
-    /// renders the same SQL with the same outcome and the same bindings.
     fn canon(sql: &str, settings: &LiteralSettings) -> (String, LiteralCanonOutcome) {
-        let mut query = query_expr_parse(sql).expect("parse");
-        let bindings = query_expr_resolve(&query, &events(), &["public"]).expect("resolve");
-        let as_written = ResolvedQuery::new(Arc::new(query.clone()), bindings.clone());
-        let outcome = query_literals_canonicalise(&mut query, &bindings, settings);
-        let bound = ResolvedQuery::new(Arc::new(query), bindings);
-        let sql_owned = bound.sql();
-
-        let (rope, rope_outcome) = query_literals_canonicalise_tree(&as_written, settings);
-        assert_eq!(rope_outcome, outcome, "{sql}");
-        let (sql_rope, bindings_rope) = match rope {
-            Some((tree, bindings)) => (query_tree_sql(&tree, &bindings), bindings),
-            None => (as_written.sql(), as_written.rope_bindings().clone()),
-        };
-        assert_eq!(sql_rope, sql_owned, "{sql}");
-        assert_eq!(
-            bindings_rope.describe(),
-            as_written.rope_bindings().describe(),
-            "{sql}"
-        );
-        (sql_owned, outcome)
+        let bound = ResolvedQuery::parse_resolve(sql, &events(), &["public"]).expect("resolve");
+        let (bound, outcome) = query_literals_canonicalise(bound, settings);
+        (bound.sql(), outcome)
     }
 
-    /// A query no setting can change comes back as it was.
+    /// A query no setting can change comes back sharing its tree.
     #[test]
-    fn test_rope_pass_leaves_an_unaffected_query_shared() {
-        let query =
-            query_expr_parse("SELECT id FROM events WHERE label = 'x' AND id = 7").expect("parse");
-        let bindings = query_expr_resolve(&query, &events(), &["public"]).expect("resolve");
-        let bound = ResolvedQuery::new(Arc::new(query), bindings);
-        let (rope, outcome) = query_literals_canonicalise_tree(&bound, &tokyo_dmy());
-        assert!(rope.is_none());
+    fn test_unaffected_query_keeps_its_tree() {
+        let bound = ResolvedQuery::parse_resolve(
+            "SELECT id FROM events WHERE label = 'x' AND id = 7",
+            &events(),
+            &["public"],
+        )
+        .expect("resolve");
+        let before = bound.tree().clone();
+        let (after, outcome) = query_literals_canonicalise(bound, &tokyo_dmy());
+        assert_eq!(*after.tree(), before);
         assert!(!outcome.residual);
     }
 

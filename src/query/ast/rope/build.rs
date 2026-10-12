@@ -6,7 +6,7 @@ use std::sync::Arc;
 use super::node::{Node, NodeKind};
 use super::tree::{Chunk, QueryTree, position};
 use super::view::NodeRef;
-use crate::query::ast::{NodeId, NodeRemap};
+use crate::query::ast::NodeId;
 
 /// A table is compacted past this many chunks or a quarter of the
 /// positions, whichever is larger: lookups and sequential walks stay cheap
@@ -24,8 +24,9 @@ pub struct TreeBuilder<'b> {
     /// The next position.
     next: u32,
     kept: Vec<Kept>,
-    /// `(origin, position)` per node opened with an origin.
-    origins: Vec<(NodeId, NodeId)>,
+    /// `(origin, position)` per node opened with an origin: always over a
+    /// base, whose bindings follow the origins; on request otherwise.
+    origins: Option<Vec<(NodeId, NodeId)>>,
 }
 
 enum Pending {
@@ -59,15 +60,23 @@ impl<'b> TreeBuilder<'b> {
             fresh: Vec::new(),
             next: 0,
             kept: Vec::new(),
-            origins: Vec::new(),
+            origins: None,
         }
     }
 
-    /// A builder that can `keep` subtrees of `base`.
+    /// Record where each node opened with an origin lands, for a tree whose
+    /// side tables will be carried over by origin.
+    pub fn recording_origins(mut self) -> Self {
+        self.origins = Some(Vec::new());
+        self
+    }
+
+    /// A builder that can `keep` subtrees of `base`; it records origins, as
+    /// a rewrite's bindings follow them.
     pub fn over(base: &'b QueryTree) -> Self {
         Self {
             base: Some(base),
-            ..Self::new()
+            ..Self::new().recording_origins()
         }
     }
 
@@ -124,8 +133,9 @@ impl<'b> TreeBuilder<'b> {
     /// another tree, so what was bound to the origin follows it.
     pub fn open_from(&mut self, kind: NodeKind, origin: NodeId) -> Open {
         let open = self.open(kind);
-        self.origins
-            .push((origin, NodeId::from_index(open.position)));
+        if let Some(origins) = &mut self.origins {
+            origins.push((origin, NodeId::from_index(open.position)));
+        }
         open
     }
 
@@ -228,7 +238,7 @@ impl<'b> TreeBuilder<'b> {
     /// where every kept subtree and every node opened with an origin
     /// landed.
     pub fn finish(self) -> (QueryTree, Remap) {
-        let mut origins = self.origins;
+        let mut origins = self.origins.unwrap_or_default();
         origins.sort_by_key(|(origin, _)| origin.index());
         let fresh: Arc<[Node]> = self.fresh.into();
         let chunks: Vec<Chunk> = self
@@ -361,10 +371,15 @@ impl Remap {
     pub fn is_empty(&self) -> bool {
         self.kept.is_empty() && self.origins.is_empty()
     }
-}
 
-impl NodeRemap for Remap {
-    fn new_ids(&self, old: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+    /// The new position of the node that was at `old`, when it landed in
+    /// one place.
+    pub fn new_id(&self, old: NodeId) -> Option<NodeId> {
+        self.new_ids(old).next()
+    }
+
+    /// Every new position of the node that was at `old`.
+    pub fn new_ids(&self, old: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         let old = position(old);
         let start = self
             .origins

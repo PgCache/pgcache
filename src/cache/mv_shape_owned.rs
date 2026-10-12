@@ -12,13 +12,13 @@ use crate::query::ast::SetOpType;
 use crate::query::ast::{
     QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns, SelectNode, TableSource,
 };
-use crate::query::resolve::{ColumnTarget, ResolvedQuery};
+use crate::query::resolve::owned::{order_by_position_owned, output_names_owned};
+use crate::query::resolve::{Bindings, ColumnTarget};
 
 /// Every top-level ORDER BY item can be served against the MV: for a
 /// SELECT, each names an output position; for a set operation, each names
 /// an output of the leftmost branch by name.
-fn order_by_serve_viable_owned(bound: &ResolvedQuery) -> bool {
-    let query = bound.tree();
+fn order_by_serve_viable_owned(query: &QueryExpr, bindings: &Bindings) -> bool {
     if query.order_by.is_empty() {
         return true;
     }
@@ -26,15 +26,15 @@ fn order_by_serve_viable_owned(bound: &ResolvedQuery) -> bool {
         QueryBody::Select(select) => query
             .order_by
             .iter()
-            .all(|clause| bound.order_by_position(select, clause).is_some()),
+            .all(|clause| order_by_position_owned(bindings, select, clause).is_some()),
         QueryBody::SetOp(_) => {
             let Some(leftmost) = leftmost_query_owned(query) else {
                 return false;
             };
-            let names = bound.output_names(leftmost);
+            let names = output_names_owned(bindings, leftmost);
             query.order_by.iter().all(|clause| match &clause.expr {
                 ScalarExpr::Column(column)
-                    if matches!(bound.column(column), Some(ColumnTarget::Output)) =>
+                    if matches!(bindings.column(column), Some(ColumnTarget::Output)) =>
                 {
                     names
                         .iter()
@@ -74,10 +74,11 @@ fn leftmost_query_owned(query: &QueryExpr) -> Option<&QueryExpr> {
 /// `aggregate_functions` is the set of aggregate function names loaded from
 /// `pg_proc` at writer startup (`catalog::aggregate_functions_load`).
 pub(super) fn shape_classify_owned(
-    bound: &ResolvedQuery,
+    tree: &QueryExpr,
+    bindings: &Bindings,
     aggregate_functions: &HashSet<EcoString>,
 ) -> ShapeGate {
-    let shape = match &bound.tree().body {
+    let shape = match &tree.body {
         // VALUES is already literal — nothing to materialize that we don't
         // already emit inline on every serve.
         QueryBody::Values(_) => return ShapeGate::Skip,
@@ -118,7 +119,7 @@ pub(super) fn shape_classify_owned(
     // MV-specific viability: every top-level ORDER BY expression must be
     // serveable against the MV. If not, downgrade to Skip — serving without
     // the ORDER BY would give arbitrary rows for user LIMIT < max_limit.
-    if !order_by_serve_viable_owned(bound) {
+    if !order_by_serve_viable_owned(tree, bindings) {
         return ShapeGate::Skip;
     }
 

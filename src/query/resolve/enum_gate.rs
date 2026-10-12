@@ -36,9 +36,9 @@ impl ResolvedQuery {
     /// forward.
     pub fn enum_order_dependence_check(&self) -> ResolveResult<()> {
         let gate = Gate {
-            bindings: self.rope_bindings(),
+            bindings: self.bindings(),
         };
-        gate.query_check(self.rope().root())
+        gate.query_check(self.tree().root())
     }
 }
 
@@ -405,8 +405,6 @@ fn multi_op_is_order_dependent(op: MultiOp) -> bool {
 mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
-    use std::sync::Arc;
-
     use iddqd::BiHashMap;
     use postgres_types::{Kind, Type};
 
@@ -502,9 +500,8 @@ mod tests {
     /// The gate's verdict on one query: "allowed", or the rejection as
     /// displayed.
     fn verdict(sql: &str) -> String {
-        let query = query_expr_parse(sql).expect("parse");
-        let bindings = query_expr_resolve(&query, &tables(), &["public"]).expect("resolve");
-        match ResolvedQuery::new(Arc::new(query), bindings).enum_order_dependence_check() {
+        let bound = ResolvedQuery::parse_resolve(sql, &tables(), &["public"]).expect("resolve");
+        match bound.enum_order_dependence_check() {
             Ok(()) => "allowed".to_owned(),
             Err(e) => e.into_current_context().to_string(),
         }
@@ -609,16 +606,16 @@ mod tests {
     #[test]
     fn test_rope_gate_matches_the_owned_gate() {
         for (sql, _) in CORPUS {
+            let bound = ResolvedQuery::parse_resolve(sql, &tables(), &["public"]).expect("resolve");
             let query = query_expr_parse(sql).expect("parse");
             let bindings = query_expr_resolve(&query, &tables(), &["public"]).expect("resolve");
-            let bound = ResolvedQuery::new(Arc::new(query), bindings);
             let text = |result: ResolveResult<()>| match result {
                 Ok(()) => "allowed".to_owned(),
                 Err(e) => e.into_current_context().to_string(),
             };
             assert_eq!(
                 text(bound.enum_order_dependence_check()),
-                text(enum_order_dependence_check_owned(&bound)),
+                text(enum_order_dependence_check_owned(&query, &bindings)),
                 "{sql}"
             );
         }

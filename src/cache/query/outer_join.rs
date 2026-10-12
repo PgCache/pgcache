@@ -44,7 +44,7 @@ fn column_table_refs_collect(
     node: NodeRef<'_>,
     tables: &mut HashSet<EcoString>,
 ) {
-    let bindings = bound.rope_bindings();
+    let bindings = bound.bindings();
     for position in node.subtree() {
         if !matches!(position.kind(), NodeKind::Column { .. }) {
             continue;
@@ -104,7 +104,7 @@ fn join_terminality_walk(
             column_table_refs_collect(bound, condition.node_ref(), &mut child_refs);
         }
         JoinQual::Using(_) | JoinQual::Natural => {
-            let bindings = bound.rope_bindings();
+            let bindings = bound.bindings();
             let join_id = join.id();
             for merged in bindings
                 .merged_columns()
@@ -131,16 +131,13 @@ fn join_terminality_walk(
 mod tests {
     #![allow(clippy::wildcard_enum_match_arm)]
 
-    use std::sync::Arc;
-
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
+    use crate::query::resolve::ResolvedQuery;
 
     /// Create test table metadata with given column names.
     /// First column is the primary key (INT4), rest are TEXT.
@@ -170,16 +167,14 @@ mod tests {
 
     /// Parse and bind SQL over the given tables.
     fn bind(sql: &str, tables: &Catalog) -> ResolvedQuery {
-        let query = Arc::new(query_expr_parse(sql).expect("convert"));
-        let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve");
-        ResolvedQuery::new(query, bindings)
+        ResolvedQuery::parse_resolve(sql, tables, &["public"]).expect("resolve")
     }
 
     /// Terminal and non-terminal optional tables of `sql` over the standard
     /// terminality tables.
     fn terminality(sql: &str) -> (HashSet<EcoString>, HashSet<EcoString>) {
         let bound = bind(sql, &terminality_test_tables());
-        outer_join_optional_tables(&bound, bound.rope_select().expect("a SELECT"))
+        outer_join_optional_tables(&bound, bound.select().expect("a SELECT"))
     }
 
     /// Create standard test tables for terminality tests:
@@ -322,7 +317,7 @@ mod tests {
         tables.insert_overwrite(test_table("users", Oid::from_raw(1), &["id", "name"]).into());
         let bound = bind("SELECT * FROM users WHERE id = 1", &tables);
         let (terminal, non_terminal) =
-            outer_join_optional_tables(&bound, bound.rope_select().expect("a SELECT"));
+            outer_join_optional_tables(&bound, bound.select().expect("a SELECT"));
         assert!(terminal.is_empty());
         assert!(non_terminal.is_empty());
     }

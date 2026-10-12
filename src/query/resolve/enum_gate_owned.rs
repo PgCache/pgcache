@@ -6,7 +6,7 @@ use std::ops::ControlFlow;
 use ecow::EcoString;
 use rootcause::Report;
 
-use super::bindings::{Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem};
+use super::bindings::{Bindings, ColumnBinding, ColumnTarget, StarItem};
 use crate::query::ast::{
     AstNode, BinaryExpr, BinaryOp, CaseExpr, ColumnNode, FunctionCall, JoinQual, LiteralValue,
     MultiExpr, MultiOp, OrderByClause, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
@@ -15,11 +15,12 @@ use crate::query::ast::{
 use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// The owned gate's verdict, the oracle for the rope gate.
-pub(super) fn enum_order_dependence_check_owned(bound: &ResolvedQuery) -> ResolveResult<()> {
-    let gate = Gate {
-        bindings: bound.bindings(),
-    };
-    gate.query_check(bound.tree())
+pub(super) fn enum_order_dependence_check_owned(
+    tree: &QueryExpr,
+    bindings: &Bindings,
+) -> ResolveResult<()> {
+    let gate = Gate { bindings };
+    gate.query_check(tree)
 }
 
 /// An enum-ordered column reached from a checked position, named as the

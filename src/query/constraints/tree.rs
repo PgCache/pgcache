@@ -183,7 +183,7 @@ impl Collector<'_> {
         match join.qual() {
             JoinQual::On(condition) => self.where_analyze(condition),
             JoinQual::Using(_) | JoinQual::Natural => {
-                let bindings = self.bound.rope_bindings();
+                let bindings = self.bound.bindings();
                 let join_id = join.id();
                 for merged in bindings
                     .merged_columns()
@@ -191,8 +191,8 @@ impl Collector<'_> {
                     .filter(|merged| merged.join.index() == join_id.index())
                 {
                     if let (Some(left), Some(right)) = (
-                        constraint_column_of_binding(self.bound, &merged.left),
-                        constraint_column_of_binding(self.bound, &merged.right),
+                        constraint_column_of_binding(bindings, &merged.left),
+                        constraint_column_of_binding(bindings, &merged.right),
                     ) {
                         self.equivalences.insert(ColumnEquivalence { left, right });
                     }

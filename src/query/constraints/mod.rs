@@ -17,8 +17,12 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
-use crate::query::ast::{BinaryOp, ColumnNode, LiteralValue, NodeId};
+#[cfg(test)]
+use crate::query::ast::ColumnNode;
+use crate::query::ast::{BinaryOp, LiteralValue, NodeId};
 use crate::query::cast::CastTarget;
+#[cfg(test)]
+use crate::query::resolve::owned::column_binding_owned;
 use crate::query::resolve::{Bindings, ColumnBinding, ResolvedQuery, TableSlot};
 
 mod bound;
@@ -30,7 +34,8 @@ mod subsume;
 mod tests;
 mod tree;
 
-pub use bound::query_constraints_analyze;
+#[cfg(test)]
+pub(crate) use bound::query_constraints_analyze;
 pub use subsume::table_constraints_subsumed;
 pub use tree::query_constraints_analyze_tree;
 
@@ -69,15 +74,16 @@ impl std::hash::Hash for ConstraintColumn {
 }
 
 impl ConstraintColumn {
-    /// The column a bound reference stands for; `None` for an outer-join
-    /// merged column or an output name.
-    pub fn of(bound: &ResolvedQuery, node: &ColumnNode) -> Option<Self> {
-        Self::of_binding(bound.bindings(), bound.column_binding(node)?)
+    /// The column the reference at `id` stands for; `None` for an
+    /// outer-join merged column or an output name.
+    pub fn at(bound: &ResolvedQuery, id: NodeId) -> Option<Self> {
+        Self::of_binding(bound.bindings(), bound.column_binding_at(id)?)
     }
 
-    /// [`ConstraintColumn::of`] for the column at rope position `id`.
-    pub fn at(bound: &ResolvedQuery, id: NodeId) -> Option<Self> {
-        Self::of_binding(bound.rope_bindings(), bound.column_binding_at(id)?)
+    /// [`ConstraintColumn::at`] for an owned reference node.
+    #[cfg(test)]
+    pub(crate) fn of_owned(bindings: &Bindings, node: &ColumnNode) -> Option<Self> {
+        Self::of_binding(bindings, column_binding_owned(bindings, node)?)
     }
 
     fn of_binding(bindings: &Bindings, binding: ColumnBinding) -> Option<Self> {

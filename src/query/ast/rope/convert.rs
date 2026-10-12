@@ -30,7 +30,7 @@ impl QueryTree {
     /// The tree with where each id-bearing owned node landed, for oracles
     /// that compare side tables across the two id spaces.
     pub fn from_query_expr_with_origins(query: &QueryExpr) -> (QueryTree, Remap) {
-        let mut builder = TreeBuilder::new();
+        let mut builder = TreeBuilder::new().recording_origins();
         query_build(&mut builder, query);
         let (tree, origins) = builder.finish();
         (tree, origins)

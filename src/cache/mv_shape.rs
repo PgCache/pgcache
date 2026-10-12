@@ -47,14 +47,14 @@ impl ShapeGate {
 /// a SELECT names a select-list position, and one of a set operation
 /// names an output of its leftmost branch.
 fn order_by_serve_viable(bound: &ResolvedQuery) -> bool {
-    let query = bound.rope().root();
+    let query = bound.tree().root();
     let mut order_by = query.order_by();
     if order_by.len() == 0 {
         return true;
     }
     match query.body() {
         Body::Select(select) => {
-            order_by.all(|clause| bound.rope_order_by_position(select, clause).is_some())
+            order_by.all(|clause| bound.order_by_position(select, clause).is_some())
         }
         Body::SetOp(_) => leftmost_query(query)
             .is_some_and(|leftmost| set_op_order_by_viable(bound, leftmost, order_by)),
@@ -69,7 +69,7 @@ fn set_op_order_by_viable<'t>(
     leftmost: Query<'t>,
     mut order_by: Run<'t, OrderBy<'t>>,
 ) -> bool {
-    let names = bound.rope_output_names(leftmost);
+    let names = bound.output_names(leftmost);
     order_by.all(|clause| match clause.expr().kind() {
         ScalarKind::Column(column)
             if matches!(
@@ -110,7 +110,7 @@ pub fn shape_classify(
     bound: &ResolvedQuery,
     aggregate_functions: &HashSet<EcoString>,
 ) -> ShapeGate {
-    let shape = match bound.rope().root().body() {
+    let shape = match bound.tree().root().body() {
         Body::Values(_) => return ShapeGate::Skip,
         Body::SetOp(set_op) => {
             if set_op.op() == SetOpType::Union && set_op.all() {
@@ -226,13 +226,17 @@ pub(super) mod tests {
     }
 
     fn classify(sql: &str) -> ShapeGate {
-        let ast = std::sync::Arc::new(query_expr_parse(sql).expect("convert to AST"));
-        let bindings =
-            query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve query");
-        let bound = ResolvedQuery::new(ast, bindings);
+        let tables = test_tables();
+        let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve query");
         let shape = shape_classify(&bound, &test_aggregate_functions());
+        let owned = query_expr_parse(sql).expect("convert to AST");
+        let bindings = query_expr_resolve(&owned, &tables, &["public"]).expect("resolve query");
         assert_eq!(
-            crate::cache::mv_shape_owned::shape_classify_owned(&bound, &test_aggregate_functions()),
+            crate::cache::mv_shape_owned::shape_classify_owned(
+                &owned,
+                &bindings,
+                &test_aggregate_functions()
+            ),
             shape,
             "the owned classifier agrees: {sql}"
         );

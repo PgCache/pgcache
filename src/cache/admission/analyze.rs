@@ -17,13 +17,14 @@ use crate::cache::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySou
 use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::query::Fingerprint;
+use crate::query::ast::rope::QueryTree;
 use crate::query::ast::{QueryBody, QueryExpr};
 use crate::query::constraints::{QueryConstraints, query_constraints_analyze_tree};
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
 use crate::query::resolve::ResolveResult;
-use crate::query::resolve::{QueryBranch, ResolvedQuery, query_expr_resolve};
+use crate::query::resolve::{QueryBranch, ResolvedQuery};
 use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
 };
@@ -62,18 +63,19 @@ pub struct CanonicalResolution {
 }
 
 /// Resolve `base_query` on `search_path` and canonicalise its date-time
-/// literals under `settings`. `base_query` is the caller's own copy; it is
-/// canonicalised in place and becomes the shared tree.
+/// literals under `settings`: the one conversion of the owned tree to the
+/// rope, everything after it reads and rewrites the rope.
 pub fn query_resolve_canonical(
-    mut base_query: QueryExpr,
+    base_query: QueryExpr,
     tables: &Catalog,
     search_path: &[&str],
     settings: &LiteralSettings,
 ) -> ResolveResult<CanonicalResolution> {
-    let bindings = query_expr_resolve(&base_query, tables, search_path)?;
-    let literals = query_literals_canonicalise(&mut base_query, &bindings, settings);
+    let tree = QueryTree::from_query_expr(&base_query);
+    let bound = ResolvedQuery::resolve(tree, tables, search_path)?;
+    let (bound, literals) = query_literals_canonicalise(bound, settings);
     Ok(CanonicalResolution {
-        bound: Arc::new(ResolvedQuery::new(Arc::new(base_query), bindings)),
+        bound: Arc::new(bound),
         literals,
     })
 }
