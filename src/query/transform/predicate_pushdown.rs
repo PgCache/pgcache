@@ -373,10 +373,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
-    use crate::query::ast::rope::QueryTree;
-    use crate::query::resolve::{
-        Bindings, query_expr_resolve, query_tree_resolve, query_tree_sql_into,
-    };
+    use crate::query::resolve::{query_expr_resolve, query_tree_resolve, query_tree_sql};
     use crate::query::transform::query_predicate_pushdown_tree;
 
     /// A catalog of text-column tables, given as (name, columns), with
@@ -529,12 +526,6 @@ mod tests {
         }
     }
 
-    fn tree_sql(tree: &QueryTree, bindings: &Bindings) -> String {
-        let mut buf = String::new();
-        query_tree_sql_into(tree, bindings, &mut buf);
-        buf
-    }
-
     /// The rope rewrite moves what the owned rewrite moves, renders the
     /// same SQL, and its carried bindings are the ones the resolver makes
     /// for the rewritten tree.
@@ -549,7 +540,7 @@ mod tests {
             let (Some(owned), Some((tree, bindings))) = (owned, rope) else {
                 continue;
             };
-            assert_eq!(tree_sql(&tree, &bindings), owned.sql(), "{sql}");
+            assert_eq!(query_tree_sql(&tree, &bindings), owned.sql(), "{sql}");
             let resolved = query_tree_resolve(&tree, &catalog, &["public"])
                 .unwrap_or_else(|e| panic!("{sql}: the pushed-down rope resolves: {e:?}"));
             let mut carried = bindings.describe();
@@ -563,7 +554,8 @@ mod tests {
     #[test]
     fn test_rope_pushdown_render_cases() {
         render_cases_check(|bound| {
-            query_predicate_pushdown_tree(bound).map(|(tree, bindings)| tree_sql(&tree, &bindings))
+            query_predicate_pushdown_tree(bound)
+                .map(|(tree, bindings)| query_tree_sql(&tree, &bindings))
         });
     }
 

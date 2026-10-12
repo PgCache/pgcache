@@ -81,5 +81,5 @@ pub use branch::QueryBranch;
 pub use entry::query_expr_resolve;
 pub use render::SourceOverride;
 #[cfg(test)]
-pub(crate) use render::query_tree_sql_into;
+pub(crate) use render::query_tree_sql;
 pub use rope::query_tree_resolve;

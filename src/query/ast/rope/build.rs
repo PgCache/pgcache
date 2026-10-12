@@ -78,9 +78,18 @@ impl<'b> TreeBuilder<'b> {
 
     /// Begin a node at the next position; its children follow.
     pub fn open(&mut self, kind: NodeKind) -> Open {
+        let (position, fresh_index) = self.fresh_push(Node { len: 1, kind });
+        Open {
+            fresh_index,
+            position,
+        }
+    }
+
+    /// A fresh node at the next position, extending the current fresh run.
+    fn fresh_push(&mut self, node: Node) -> (u32, usize) {
         let position = self.next;
         let fresh_index = self.fresh.len();
-        self.fresh.push(Node { len: 1, kind });
+        self.fresh.push(node);
         match self.pending.last_mut() {
             Some(Pending::Fresh { len, .. }) => *len += 1,
             _ => self.pending.push(Pending::Fresh {
@@ -90,10 +99,17 @@ impl<'b> TreeBuilder<'b> {
             }),
         }
         self.next += 1;
-        Open {
-            fresh_index,
-            position,
+        (position, fresh_index)
+    }
+
+    /// A subtree given as nodes in pre-order with their lengths set, placed
+    /// at the next position; returns where its root landed.
+    pub fn fragment(&mut self, nodes: &[Node]) -> NodeId {
+        let start = self.next;
+        for node in nodes {
+            self.fresh_push(node.clone());
         }
+        NodeId::from_index(start)
     }
 
     /// End a node: its subtree is everything built since it was opened.
@@ -189,6 +205,7 @@ impl<'b> TreeBuilder<'b> {
             let placed = match replacement {
                 Replacement::Leaf(kind) => self.leaf(kind.clone()),
                 Replacement::LeafFrom(kind) => self.leaf_from(kind.clone(), node.id()),
+                Replacement::Fragment(nodes) => self.fragment(nodes),
                 Replacement::Subtree(other) => self.keep(*other),
             };
             if let Some(slot) = replacements.placed.get_mut(index) {
@@ -259,6 +276,8 @@ pub enum Replacement {
     /// A fresh leaf standing in for the node it replaces, so what was bound
     /// to that node follows it.
     LeafFrom(NodeKind),
+    /// A fresh subtree, as nodes in pre-order with their lengths set.
+    Fragment(Vec<Node>),
     /// Another subtree of the base, placed here.
     Subtree(NodeId),
 }

@@ -533,7 +533,7 @@ impl WherePass {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
@@ -567,7 +567,7 @@ mod tests {
         }
     }
 
-    fn test_tables() -> Catalog {
+    pub(crate) fn test_tables() -> Catalog {
         let mut tables = BiHashMap::new();
         for (name, oid, columns) in [
             (
@@ -591,7 +591,7 @@ mod tests {
         tables
     }
 
-    fn aggregates() -> HashSet<EcoString> {
+    pub(crate) fn aggregates() -> HashSet<EcoString> {
         [
             "count",
             "sum",
@@ -683,11 +683,11 @@ mod tests {
         "SELECT id FROM employees e WHERE EXISTS (SELECT 1 FROM orders o WHERE o.emp_id = e.id AND EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id AND c.region = e.status))",
     ];
 
-    fn corpus() -> impl Iterator<Item = &'static str> {
+    pub(crate) fn corpus() -> impl Iterator<Item = &'static str> {
         CORPUS.iter().chain(EXTRA_CORPUS).copied()
     }
 
-    fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
+    pub(crate) fn bound(sql: &str, catalog: &Catalog) -> ResolvedQuery {
         let query = Arc::new(query_expr_parse(sql).expect("parse"));
         let bindings = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
         ResolvedQuery::new(query, bindings)

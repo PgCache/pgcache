@@ -43,6 +43,13 @@ pub(crate) fn query_tree_sql_into(tree: &QueryTree, bindings: &Bindings, buf: &m
     query_deparse_with(tree.root(), &mut RopeBound(Bound::text(bindings)), buf);
 }
 
+#[cfg(test)]
+pub(crate) fn query_tree_sql(tree: &QueryTree, bindings: &Bindings) -> String {
+    let mut buf = String::with_capacity(256);
+    query_tree_sql_into(tree, bindings, &mut buf);
+    buf
+}
+
 /// How literals render.
 enum Mode {
     /// As written.
