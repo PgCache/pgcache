@@ -466,8 +466,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::cache::query::CacheableQuery;
+    use crate::cache::query::{CacheableQuery, query_tree_has_volatile_function};
     use crate::query::ast::query_expr_parse;
+    use crate::query::ast::rope::QueryTree;
 
     /// Build a test volatility map with common functions.
     fn test_func_volatility() -> FunctionVolatilityMap {
@@ -495,11 +496,52 @@ mod tests {
         map
     }
 
-    /// Parse SQL and check cacheability using the test volatility map.
+    /// Parse SQL and check cacheability using the test volatility map. The
+    /// rope check must give the same verdict, so every case here is also a
+    /// parity case for it.
     fn check_cacheable(sql: &str) -> Result<CacheableQuery, CacheabilityError> {
         let fv = test_func_volatility();
         let query_expr = query_expr_parse(sql).expect("convert");
+        let owned = CacheableQuery::cacheable(&query_expr, &fv);
+        let tree = QueryTree::from_query_expr(&query_expr);
+        assert_eq!(
+            CacheableQuery::cacheable_tree(&tree, &fv).map_err(|e| e.to_string()),
+            owned.as_ref().copied().map_err(|e| e.to_string()),
+            "the rope check agrees: {sql}"
+        );
+        assert_eq!(
+            query_tree_has_volatile_function(&tree, &fv),
+            query_has_volatile_function(&query_expr, &fv),
+            "the rope volatility scan agrees: {sql}"
+        );
         CacheableQuery::try_new(query_expr, &fv)
+    }
+
+    /// Over every corpus in the crate the rope check gives the owned
+    /// check's verdict and the volatility scans agree.
+    #[test]
+    fn test_rope_cacheability_matches_the_owned_check_over_the_corpora() {
+        let fv = test_func_volatility();
+        for sql in crate::query::ast::convert_raw::tests::CORPUS
+            .iter()
+            .chain(crate::query::resolve::tests::BINDING_CORPUS)
+            .chain(crate::query::resolve::tests::RENDER_CORPUS)
+            .copied()
+            .chain(crate::query::decorrelate::fixtures::corpus())
+        {
+            let query_expr = query_expr_parse(sql).expect("convert");
+            let tree = QueryTree::from_query_expr(&query_expr);
+            assert_eq!(
+                CacheableQuery::cacheable_tree(&tree, &fv).map_err(|e| e.to_string()),
+                CacheableQuery::cacheable(&query_expr, &fv).map_err(|e| e.to_string()),
+                "{sql}"
+            );
+            assert_eq!(
+                query_tree_has_volatile_function(&tree, &fv),
+                query_has_volatile_function(&query_expr, &fv),
+                "{sql}"
+            );
+        }
     }
 
     #[test]

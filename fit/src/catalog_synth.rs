@@ -17,6 +17,10 @@ use pgcache_lib::query::ast::{
 };
 use postgres_types::Type;
 
+mod tree;
+
+pub use tree::catalog_synthesize_tree;
+
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SynthesisStats {
     pub tables: usize,
@@ -150,7 +154,7 @@ impl Synthesizer {
             if column.table.is_none() && output_aliases.contains(&column.column) {
                 continue;
             }
-            self.column_attribute(column, scopes);
+            self.column_attribute(column.table.as_ref(), &column.column, scopes);
         }
         if let Some(having) = &select.having {
             self.expr_attribute(having, scopes);
@@ -242,18 +246,23 @@ impl Synthesizer {
 
     /// Attribute one column reference to a table, counting heuristic and
     /// skipped attributions.
-    fn column_attribute(&mut self, column: &ColumnNode, scopes: &[Scope]) {
-        match &column.table {
+    fn column_attribute(
+        &mut self,
+        table: Option<&EcoString>,
+        column: &EcoString,
+        scopes: &[Scope],
+    ) {
+        match table {
             Some(qualifier) => {
                 if let Some(entry) = scope_entry_find(scopes, qualifier) {
                     if let Some(key) = entry.key.clone() {
-                        self.column_add(key, column.column.clone());
+                        self.column_add(key, column.clone());
                     }
                     return;
                 }
                 // Unknown qualifier: assume it names a table in public.
                 let key = (EcoString::from("public"), qualifier.clone());
-                self.column_add(key, column.column.clone());
+                self.column_add(key, column.clone());
             }
             None => match scope_unqualified_resolve(scopes) {
                 UnqualifiedResolution::Table { entry, ambiguous } => {
@@ -261,7 +270,7 @@ impl Synthesizer {
                         self.heuristic_attributions += 1;
                     }
                     if let Some(key) = entry.key.clone() {
-                        self.column_add(key, column.column.clone());
+                        self.column_add(key, column.clone());
                     }
                 }
                 UnqualifiedResolution::Derived => self.skipped_unqualified += 1,
@@ -272,8 +281,8 @@ impl Synthesizer {
 
     /// Resolve a column to its table without counting or side effects — used
     /// by type inference, which runs after attribution.
-    fn column_key_resolve(&self, column: &ColumnNode, scopes: &[Scope]) -> Option<TableKey> {
-        match &column.table {
+    fn column_key_resolve(&self, table: Option<&EcoString>, scopes: &[Scope]) -> Option<TableKey> {
+        match table {
             Some(qualifier) => {
                 if let Some(entry) = scope_entry_find(scopes, qualifier) {
                     return entry.key.clone();
@@ -310,7 +319,7 @@ impl Synthesizer {
             .filter(|c| !nested_columns.contains(&std::ptr::from_ref(*c)))
             .collect();
         for column in direct {
-            self.column_attribute(column, scopes);
+            self.column_attribute(column.table.as_ref(), &column.column, scopes);
         }
     }
 
@@ -331,7 +340,12 @@ impl Synthesizer {
                     ];
                     for (column, literal) in sides {
                         if let (Some(column), Some(literal)) = (column, literal) {
-                            self.evidence_note(column, literal, scopes);
+                            self.evidence_note(
+                                column.table.as_ref(),
+                                &column.column,
+                                literal,
+                                scopes,
+                            );
                             return;
                         }
                     }
@@ -350,7 +364,12 @@ impl Synthesizer {
                         .collect();
                     if !literals.is_empty() && literals.len() == multi.exprs.len() - 1 {
                         for literal in literals {
-                            self.evidence_note(column, literal, scopes);
+                            self.evidence_note(
+                                column.table.as_ref(),
+                                &column.column,
+                                literal,
+                                scopes,
+                            );
                         }
                         return;
                     }
@@ -364,7 +383,13 @@ impl Synthesizer {
         }
     }
 
-    fn evidence_note(&mut self, column: &ColumnNode, literal: &LiteralValue, scopes: &[Scope]) {
+    fn evidence_note(
+        &mut self,
+        table: Option<&EcoString>,
+        column: &EcoString,
+        literal: &LiteralValue,
+        scopes: &[Scope],
+    ) {
         let observed = match literal {
             LiteralValue::Integer(_) => Some(TypeEvidence::Integer),
             LiteralValue::Float(_) => Some(TypeEvidence::Float),
@@ -374,7 +399,7 @@ impl Synthesizer {
             _ => None,
         };
         let Some(observed) = observed else { return };
-        let Some(key) = self.column_key_resolve(column, scopes) else {
+        let Some(key) = self.column_key_resolve(table, scopes) else {
             return;
         };
         let Some(facts) = self.tables.get_mut(&key) else {
@@ -382,7 +407,7 @@ impl Synthesizer {
         };
         facts
             .evidence
-            .entry(column.column.clone())
+            .entry(column.clone())
             .and_modify(|existing| {
                 *existing = match (*existing, observed) {
                     (TypeEvidence::Integer, TypeEvidence::Integer) => TypeEvidence::Integer,
@@ -529,12 +554,53 @@ fn where_as_literal(expr: &WhereExpr) -> Option<&LiteralValue> {
 
 #[cfg(test)]
 mod tests {
+    use pgcache_lib::query::ast::rope::QueryTree;
+
     use super::*;
     use crate::classify::query_parse;
 
+    /// Synthesize over the owned trees, checked against the rope walk on
+    /// the same corpus: the same tables, columns, types, keys and stats.
     fn synthesize(sqls: &[&str]) -> SynthCatalog {
         let queries: Vec<QueryExpr> = sqls.iter().map(|s| query_parse(s)).collect();
-        catalog_synthesize(queries.iter())
+        let owned = catalog_synthesize(queries.iter());
+        let trees: Vec<QueryTree> = queries.iter().map(QueryTree::from_query_expr).collect();
+        let tree = catalog_synthesize_tree(trees.iter());
+        assert_eq!(describe(&tree), describe(&owned), "{sqls:?}");
+        owned
+    }
+
+    /// One line per table, in relation order, with its key, columns and
+    /// types, then the stats.
+    fn describe(catalog: &SynthCatalog) -> Vec<String> {
+        let mut tables: Vec<&TableMetadata> = catalog.tables.iter().map(|table| &**table).collect();
+        tables.sort_by_key(|table| table.relation_oid.get());
+        let mut lines: Vec<String> = tables
+            .iter()
+            .map(|table| {
+                let columns: Vec<String> = table
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        format!(
+                            "{}:{}{}",
+                            c.name,
+                            c.type_name,
+                            if c.is_primary_key { "*" } else { "" }
+                        )
+                    })
+                    .collect();
+                format!(
+                    "{} {}.{} [{}]",
+                    table.relation_oid.get(),
+                    table.schema,
+                    table.name,
+                    columns.join(", ")
+                )
+            })
+            .collect();
+        lines.push(format!("{:?}", catalog.stats));
+        lines
     }
 
     fn table<'a>(catalog: &'a SynthCatalog, name: &str) -> &'a TableMetadata {

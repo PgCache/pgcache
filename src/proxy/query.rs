@@ -15,6 +15,10 @@ use crate::{
     cache::query::{CacheableQuery, query_has_volatile_function},
     catalog::FunctionVolatility,
     id_hash::{BuildIdHasher, impl_id_hashable},
+    query::ast::rope::{
+        Body, Function as RopeFunction, NodeKind, QueryTree, Scalar as RopeScalar, ScalarKind,
+        Select as RopeSelect, SelectItem, View,
+    },
     query::ast::{
         AstError, AstNode, FunctionCall, LiteralValue, QueryBody, QueryExpr, RawStatement,
         ScalarExpr, SelectColumn, SelectColumns, SelectNode, statement_convert_raw,
@@ -133,6 +137,154 @@ fn explain_spec_build(args: &[ScalarExpr]) -> Option<ExplainSpec> {
     Some(ExplainSpec { target, options })
 }
 
+/// [`explain_spec_extract`] read from the rope.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once the proxy parses to the rope")
+)]
+fn explain_spec_extract_tree(tree: &QueryTree) -> Option<ExplainSpec> {
+    let select = bare_select_tree(tree)?;
+    let function = single_function_item_tree(select)?;
+    // `name()` is the last name component, so a schema-qualified
+    // `x.pgcache_explain(...)` also matches.
+    if function.name() != EXPLAIN_FUNCTION_NAME || !plain_call_tree(function) {
+        return None;
+    }
+    explain_spec_build_tree(function)
+}
+
+/// [`bare_select`] read from the rope.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once the proxy parses to the rope")
+)]
+fn bare_select_tree(tree: &QueryTree) -> Option<RopeSelect<'_>> {
+    let root = tree.root();
+    let unordered = root.order_by().len() == 0 && !root.has_limit();
+    if root.ctes().len() > 0 || !unordered {
+        return None;
+    }
+    let Body::Select(select) = root.body() else {
+        return None;
+    };
+    select_is_bare_tree(select).then_some(select)
+}
+
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once the proxy parses to the rope")
+)]
+fn select_is_bare_tree(select: RopeSelect<'_>) -> bool {
+    let unfiltered = select.from().len() == 0 && select.where_clause().is_none();
+    let ungrouped = select.group_by().len() == 0 && select.having().is_none();
+    unfiltered && ungrouped && !select.distinct()
+}
+
+/// The function call a SELECT projects as its only item.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once the proxy parses to the rope")
+)]
+fn single_function_item_tree(select: RopeSelect<'_>) -> Option<RopeFunction<'_>> {
+    let mut items = select.items()?;
+    let (Some(SelectItem::Expr(item)), None) = (items.next(), items.next()) else {
+        return None;
+    };
+    let ScalarKind::Function(function) = item.expr().kind() else {
+        return None;
+    };
+    Some(function)
+}
+
+/// [`explain_spec_build`] over a rope call's arguments.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once the proxy parses to the rope")
+)]
+fn explain_spec_build_tree(function: RopeFunction<'_>) -> Option<ExplainSpec> {
+    let mut args = function.args();
+    let (first, options) = match (args.next(), args.next(), args.next()) {
+        (Some(first), None, _) => (first, EcoString::new()),
+        (Some(first), Some(second), None) => (first, EcoString::from(arg_string_tree(second)?)),
+        _ => return None,
+    };
+    let first = arg_string_tree(first)?;
+    let target = match first.parse::<u64>() {
+        Ok(fingerprint) => ExplainTarget::Fingerprint(fingerprint),
+        Err(_) => ExplainTarget::Sql(first.to_owned()),
+    };
+    Some(ExplainSpec { target, options })
+}
+
+/// [`plain_call`] for a rope function.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once the proxy parses to the rope")
+)]
+fn plain_call_tree(function: RopeFunction<'_>) -> bool {
+    let no_aggregate_form = !function.agg_star() && !function.agg_distinct();
+    let unfiltered = function.over().is_none() && function.filter().is_none();
+    let unordered = unfiltered && function.agg_order().len() == 0;
+    no_aggregate_form && unordered
+}
+
+/// [`arg_string_extract`] for a rope argument.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once the proxy parses to the rope")
+)]
+fn arg_string_tree(arg: RopeScalar<'_>) -> Option<&str> {
+    if let Some(LiteralValue::String(value)) = arg_literal_tree(arg) {
+        Some(value.as_str())
+    } else {
+        None
+    }
+}
+
+/// A literal argument's value, or `None` for any other expression.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once the proxy parses to the rope")
+)]
+fn arg_literal_tree(arg: RopeScalar<'_>) -> Option<&LiteralValue> {
+    if let ScalarKind::Literal(literal) = arg.kind() {
+        Some(literal.value())
+    } else {
+        None
+    }
+}
+
+/// [`set_config_calls_effect`] read from the rope.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "used once the proxy parses to the rope")
+)]
+fn set_config_calls_effect_tree(tree: &QueryTree) -> SettingsEffect {
+    let mut effect = SettingsEffect::NONE;
+    let mut calls = 0usize;
+    for position in tree.root().node_ref().subtree() {
+        let NodeKind::Function { name, .. } = position.kind() else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("set_config") {
+            continue;
+        }
+        calls += 1;
+        let mut args = RopeFunction::from_ref(position).args();
+        let Some(LiteralValue::String(name)) = args.next().and_then(arg_literal_tree) else {
+            return SettingsEffect::all();
+        };
+        let local = args.nth(1).and_then(arg_literal_tree) == Some(&LiteralValue::Boolean(true));
+        if let Some(guc) = Guc::parse(name.as_str()) {
+            effect = effect.union(SettingsEffect::guc(guc, local));
+        }
+    }
+    if calls == 0 {
+        return SettingsEffect::all();
+    }
+    effect
+}
+
 /// Test-only: parse `sql` then run [`explain_spec_extract`]. Production
 /// detection runs inside [`analyze`] on the AST it already converted, so this
 /// wrapper (which parses) is never on a hot path.
@@ -143,7 +295,13 @@ fn explain_intercept_parse(sql: &str) -> Option<ExplainSpec> {
     })
     .ok()?
     .ok()?;
-    explain_spec_extract(&query)
+    let spec = explain_spec_extract(&query);
+    assert_eq!(
+        explain_spec_extract_tree(&QueryTree::from_query_expr(&query)),
+        spec,
+        "the rope extraction agrees: {sql}"
+    );
+    spec
 }
 
 /// A plain string-literal argument's value, or `None` for any other expression
@@ -772,6 +930,28 @@ mod tests {
         match analyze_fresh(sql, &HashMap::new()) {
             Action::Forward(_, effects) => effects.settings,
             _ => panic!("expected a forward for {sql:?}"),
+        }
+    }
+
+    /// The rope scan finds the `set_config` calls the owned scan finds.
+    #[test]
+    fn test_rope_set_config_scan_matches_the_owned_scan() {
+        for sql in [
+            "SELECT set_config('timezone', 'UTC', true)",
+            "SELECT set_config('search_path', 'a', false), set_config('role', 'r', false)",
+            "SELECT set_config('request.jwt.claims', '{}', true)",
+            "SELECT set_config($1, 'x', false)",
+            "SELECT set_config('timezone', 'UTC', $1)",
+            "SELECT id FROM t WHERE x = set_config('timezone', 'UTC', false)",
+            "SELECT now()",
+            "SELECT upper(set_config('DateStyle', 'ISO', true)) FROM t",
+        ] {
+            let query = crate::query::ast::query_expr_parse(sql).expect("parse");
+            assert_eq!(
+                set_config_calls_effect_tree(&QueryTree::from_query_expr(&query)),
+                set_config_calls_effect(&query),
+                "{sql}"
+            );
         }
     }
 

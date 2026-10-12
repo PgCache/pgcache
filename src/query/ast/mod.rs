@@ -1,4 +1,4 @@
-mod convert_raw;
+pub(crate) mod convert_raw;
 #[cfg(test)]
 mod convert_raw_tests;
 mod convert_tree;

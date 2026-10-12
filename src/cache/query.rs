@@ -11,12 +11,15 @@ use crate::query::ast::rope::{Body, QueryTree, Select};
 use crate::query::transform::{AstTransformResult, query_tree_parameters_replace};
 
 mod cacheability;
+mod cacheability_tree;
 mod limit;
 mod outer_join;
 mod request;
 
 pub use cacheability::query_has_volatile_function;
 use cacheability::{is_cacheable_body, references_system_catalog};
+pub use cacheability_tree::query_tree_has_volatile_function;
+use cacheability_tree::{body_cacheable, references_system_catalog_tree};
 
 pub use limit::{limit_clause_of, limit_is_sufficient, limit_rows_needed};
 pub use outer_join::outer_join_optional_tables;
@@ -108,6 +111,15 @@ impl CacheableQuery {
         // e.g. psql's \d, which queries pg_class/pg_namespace.
         references_system_catalog(query)?;
         is_cacheable_body(&query.body, fv)
+    }
+
+    /// [`Self::cacheable`] read from the rope.
+    pub fn cacheable_tree(
+        tree: &QueryTree,
+        fv: &FunctionVolatilityMap,
+    ) -> Result<(), CacheabilityError> {
+        references_system_catalog_tree(tree)?;
+        body_cacheable(tree.root().body(), fv)
     }
 
     /// Build a cacheable query, validating it first. Fails with the same
