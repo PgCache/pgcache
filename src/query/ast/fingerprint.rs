@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
@@ -57,12 +58,18 @@ pub fn query_expr_session_key(
 }
 
 fn query_expr_has_string_literal(query: &QueryExpr) -> bool {
-    query.nodes::<LiteralValue>().any(|literal| {
-        matches!(
-            literal,
-            LiteralValue::String(_) | LiteralValue::StringWithCast(..)
-        )
-    })
+    query
+        .try_for_each_node::<LiteralValue, ()>(&mut |literal| {
+            if matches!(
+                literal,
+                LiteralValue::String(_) | LiteralValue::StringWithCast(..)
+            ) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        })
+        .is_break()
 }
 
 #[cfg(test)]
