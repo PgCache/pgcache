@@ -6,6 +6,7 @@ mod finalize;
 mod fingerprint;
 mod node_id;
 pub(crate) mod raw;
+pub mod rope;
 mod types;
 #[cfg(test)]
 mod where_clause_tests;

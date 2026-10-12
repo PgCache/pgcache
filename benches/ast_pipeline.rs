@@ -35,6 +35,7 @@ use pgcache_lib::cache::admission::{AdmissionDepth, AdmissionQuery, query_admiss
 use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use pgcache_lib::oid::{Oid, TypeOid};
 use pgcache_lib::pg::ByteString;
+use pgcache_lib::query::ast::rope::QueryTree;
 use pgcache_lib::query::ast::{
     BinaryExpr, ColumnNode, CteDefinition, FunctionCall, JoinNode, LiteralValue, OrderByClause,
     QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectNode, TableNode, TableSource, WhereExpr,
@@ -452,7 +453,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         .collect();
     println!("\n== allocations per stage (count / bytes)");
     println!(
-        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+        "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
         "query",
         "convert",
         "plain_clone",
@@ -465,7 +466,9 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         "shape",
         "pred_compile",
         "update_queries",
-        "admission"
+        "admission",
+        "rope",
+        "rope_clone"
     );
     for shape in shapes {
         let (query, convert_n, convert_b) = allocations_count(|| parse(&shape.sql));
@@ -501,9 +504,11 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         });
         let admission = admission.expect("the fixture SQL is admitted");
         black_box(admission.tables.len());
+        let (rope, rope_n, rope_b) = allocations_count(|| QueryTree::from_query_expr(&query));
+        let (_, rope_clone_n, rope_clone_b) = allocations_count(|| black_box(rope.clone()));
         let cell = |n: usize, b: usize| format!("{n}/{b}");
         println!(
-            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
+            "{:<14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}{:>14}",
             shape.name,
             cell(convert_n, convert_b),
             cell(plain_clone_n, plain_clone_b),
@@ -520,6 +525,8 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
             cell(compile_n, compile_b),
             cell(update_n, update_b),
             cell(admission_n, admission_b),
+            cell(rope_n, rope_b),
+            cell(rope_clone_n, rope_clone_b),
         );
     }
     println!(

@@ -17,6 +17,11 @@ impl NodeId {
         NodeId(u32::MAX - 1 - k)
     }
 
+    /// The id of the node at pre-order position `index`.
+    pub const fn from_index(index: u32) -> NodeId {
+        NodeId(index)
+    }
+
     pub const fn index(self) -> usize {
         self.0 as usize
     }
