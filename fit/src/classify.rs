@@ -18,7 +18,7 @@ use pgcache_lib::query::ast::{
     AstError, QueryExpr, RawStatement, WhereParseError, statement_convert_raw,
 };
 use pgcache_lib::query::constraints::{
-    QueryConstraints, TableConstraint, query_constraints_analyze,
+    QueryConstraints, TableConstraint, query_constraints_analyze_tree,
 };
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::transform::query_expr_parameters_replace;
@@ -369,8 +369,8 @@ pub fn statement_classify(
     // The subsumed side analyzes the original (pre-decorrelation) resolved
     // form, like the writer's subsumption_check.
     let constraints = bound
-        .select()
-        .map(|select| query_constraints_analyze(&bound, select));
+        .rope_select()
+        .map(|select| query_constraints_analyze_tree(&bound, select));
 
     Verdict::Cacheable(Box::new(CacheableAnalysis {
         fingerprint,

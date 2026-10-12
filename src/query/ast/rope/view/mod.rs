@@ -81,6 +81,11 @@ impl<'t> NodeRef<'t> {
         self.at(self.id + 1)
     }
 
+    /// The position `id`, reached through this view's chunk hint.
+    pub fn at_position(&self, id: NodeId) -> NodeRef<'t> {
+        self.at(u32::try_from(id.index()).unwrap_or(u32::MAX))
+    }
+
     pub fn next_sibling(&self) -> NodeRef<'t> {
         self.at(self.end())
     }

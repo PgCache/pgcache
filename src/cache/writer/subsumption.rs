@@ -18,7 +18,7 @@ use crate::cache::types::{Cache, SharedQueryShape, SharedResolvedQuery};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::oid::Oid;
 use crate::query::constraint_index::table_constraints_keyed;
-use crate::query::constraints::{TableConstraint, query_constraints_analyze};
+use crate::query::constraints::{TableConstraint, query_constraints_analyze_tree};
 use crate::result::error_chain_format;
 use crate::timing::duration_to_ns_u64;
 
@@ -83,11 +83,11 @@ impl WriterRegistration {
 
         // Set operations (UNION/INTERSECT/EXCEPT) require per-branch constraint
         // analysis which isn't implemented yet. Reject unconditionally for now.
-        let Some(select) = resolution.bound.select() else {
+        let Some(select) = resolution.bound.rope_select() else {
             return false;
         };
 
-        let new_constraints = query_constraints_analyze(&resolution.bound, select);
+        let new_constraints = query_constraints_analyze_tree(&resolution.bound, select);
 
         let mut relations = Vec::with_capacity(resolution.relation_oids.len());
         for &oid in &resolution.relation_oids {

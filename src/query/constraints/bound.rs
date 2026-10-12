@@ -298,7 +298,9 @@ impl Collector<'_> {
 }
 
 /// [`ConstraintColumn::of`] for a binding rather than a reference node.
-fn constraint_column_of_binding(
+/// The constraint column a binding names; slots are the same in both id
+/// spaces, so either bindings table answers.
+pub(super) fn constraint_column_of_binding(
     bound: &ResolvedQuery,
     binding: &crate::query::resolve::ColumnBinding,
 ) -> Option<ConstraintColumn> {
@@ -376,7 +378,7 @@ impl ColumnConstraint {
 
 /// The constraints of a query from what its predicates imply: propagated
 /// through the equivalences, then organised by table.
-fn query_constraints_build(
+pub(super) fn query_constraints_build(
     constraints: HashSet<ColumnConstraint>,
     equivalences: HashSet<ColumnEquivalence>,
     where_analysis_complete: bool,

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ecow::EcoString;
 
 use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
-use crate::query::ast::rope::QueryTree;
+use crate::query::ast::rope::{OriginMap, QueryTree};
 use crate::query::ast::{ColumnNode, IdRemap, NodeId, QueryExpr, StarNode};
 
 /// Index of a table source in [`Bindings::slots`].
@@ -407,19 +407,27 @@ pub struct ResolvedQuery {
     bindings: Bindings,
     rope: QueryTree,
     rope_bindings: Bindings,
+    /// Where each owned node sits in the rope, for the consumers that
+    /// still hold owned ids while the rest have moved.
+    origins: OriginMap,
 }
 
 impl ResolvedQuery {
     pub fn new(tree: Arc<QueryExpr>, bindings: Bindings) -> Self {
         let (rope, origins) = QueryTree::from_query_expr_with_origins(&tree);
-        let rope_bindings =
-            BindingsBuilder::from_remapped(&bindings, &origins.into_remap()).finish();
+        let rope_bindings = BindingsBuilder::from_remapped(&bindings, &origins.to_remap()).finish();
         Self {
             tree,
             bindings,
             rope,
             rope_bindings,
+            origins,
         }
+    }
+
+    /// The rope position of the owned node `owned`.
+    pub fn rope_position(&self, owned: NodeId) -> Option<NodeId> {
+        self.origins.position(owned)
     }
 
     pub fn tree(&self) -> &QueryExpr {

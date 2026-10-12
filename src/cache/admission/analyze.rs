@@ -18,12 +18,14 @@ use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::query::Fingerprint;
 use crate::query::ast::{QueryBody, QueryExpr};
-use crate::query::constraints::query_constraints_analyze;
+use crate::query::constraints::{
+    QueryConstraints, query_constraints_analyze, query_constraints_analyze_tree,
+};
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
 use crate::query::resolve::ResolveResult;
-use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
+use crate::query::resolve::{QueryBranch, ResolvedQuery, query_expr_resolve};
 use crate::query::transform::{
     LiteralCanonOutcome, PgEvalTemplate, query_literals_canonicalise, query_predicate_pushdown,
 };
@@ -99,6 +101,21 @@ pub fn query_decorrelate_checked(
         .attach_loc("decorrelating correlated subqueries")
 }
 
+/// The constraints of an update branch, read from the rope; the owned walk
+/// stands in should a branch have no rope position, which no branch has.
+fn branch_constraints(bound: &ResolvedQuery, branch: QueryBranch<'_>) -> QueryConstraints {
+    match bound
+        .rope_position(branch.select.id)
+        .and_then(|position| bound.rope_select_node(position))
+    {
+        Some(select) => query_constraints_analyze_tree(bound, select),
+        None => {
+            debug_assert!(false, "an update branch has a rope position");
+            query_constraints_analyze(bound, branch.select)
+        }
+    }
+}
+
 /// Classify a query's shape for MV eligibility on its decorrelated form
 /// when it has one, so the shape classified is the shape population and
 /// rebuild see.
@@ -141,7 +158,7 @@ pub fn query_admission_analyze(
         let source = bound_update.source;
         let relation_oid = bound_update.relation_oid;
         let branch = bound_update.branch;
-        let constraints = query_constraints_analyze(update_source, branch.select);
+        let constraints = branch_constraints(update_source, branch);
         let eval_strategy = update_eval_strategy_classify(branch, source);
         let pg_batchable = depth == AdmissionDepth::Full
             && eval_strategy == UpdateEvalStrategy::PgEval

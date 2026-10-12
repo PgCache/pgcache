@@ -36,7 +36,7 @@ use crate::proxy::session_settings::SessionSettings;
 use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::SessionKey;
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
-use crate::query::constraints::{ColumnRange, query_constraints_analyze, table_column_ranges};
+use crate::query::constraints::{ColumnRange, query_constraints_analyze_tree, table_column_ranges};
 use crate::query::guc::Guc;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::ColumnsByTable;
@@ -594,7 +594,7 @@ fn read_shape(
         return none;
     };
     let ranges = single_table(query).and_then(|table| {
-        let constraints = query_constraints_analyze(&form.bound, form.bound.select()?);
+        let constraints = query_constraints_analyze_tree(&form.bound, form.bound.rope_select()?);
         constraints
             .where_analysis_complete
             .then(|| table_column_ranges(&constraints, &table.name))

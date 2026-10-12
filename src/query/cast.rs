@@ -20,6 +20,7 @@
 use ecow::EcoString;
 use postgres_types::Type;
 
+use crate::query::ast::rope::{Binary, Column, Scalar, ScalarKind, Where, WhereKind};
 use crate::query::ast::{BinaryExpr, ColumnNode, ScalarExpr, WhereExpr};
 use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::resolve::ResolvedQuery;
@@ -211,6 +212,87 @@ pub fn identity_cast_strip<'a>(bound: &ResolvedQuery, expr: &'a ScalarExpr) -> &
         Some(base) if cast_target_is_identity_on(target, base) => inner.as_ref(),
         Some(_) | None => expr,
     }
+}
+
+/// [`identity_cast_strip`] over the rope.
+pub fn identity_cast_strip_tree<'t>(bound: &ResolvedQuery, expr: Scalar<'t>) -> Scalar<'t> {
+    let ScalarKind::TypeCast(cast) = expr.kind() else {
+        return expr;
+    };
+    let inner = cast.expr();
+    let ScalarKind::Column(column) = inner.kind() else {
+        return expr;
+    };
+    match bound.column_type_at(column.id()) {
+        Some(base) if cast_target_is_identity_on(cast.target(), base) => inner,
+        Some(_) | None => expr,
+    }
+}
+
+/// [`where_scalar_leaf`] over the rope.
+pub fn scalar_leaf_tree<'t>(bound: &ResolvedQuery, expr: Where<'t>) -> Option<Scalar<'t>> {
+    match expr.kind() {
+        WhereKind::Scalar(scalar) => Some(identity_cast_strip_tree(bound, scalar)),
+        WhereKind::Unary(_)
+        | WhereKind::Binary(_)
+        | WhereKind::Multi(_)
+        | WhereKind::Subquery(_) => None,
+    }
+}
+
+/// [`comparison_canonicalize`] over the rope.
+pub fn comparison_canonicalize_tree<'t>(
+    bound: &ResolvedQuery,
+    binary: Binary<'t>,
+) -> Option<(
+    Column<'t>,
+    Option<&'t CastTarget>,
+    BinaryOp,
+    &'t LiteralValue,
+)> {
+    let lleaf = scalar_leaf_tree(bound, binary.lexpr());
+    let rleaf = scalar_leaf_tree(bound, binary.rexpr());
+    let column_target = |scalar: Scalar<'t>| match scalar.kind() {
+        ScalarKind::Column(column) => Some((column, None)),
+        ScalarKind::TypeCast(cast) => match cast.expr().kind() {
+            ScalarKind::Column(column) => Some((column, Some(cast.target()))),
+            ScalarKind::Function(_)
+            | ScalarKind::Literal(_)
+            | ScalarKind::Case(_)
+            | ScalarKind::Arithmetic(_)
+            | ScalarKind::Subquery(_)
+            | ScalarKind::Array(_)
+            | ScalarKind::TypeCast(_) => None,
+        },
+        ScalarKind::Function(_)
+        | ScalarKind::Literal(_)
+        | ScalarKind::Case(_)
+        | ScalarKind::Arithmetic(_)
+        | ScalarKind::Subquery(_)
+        | ScalarKind::Array(_) => None,
+    };
+    let literal = |scalar: Option<Scalar<'t>>| match scalar?.kind() {
+        ScalarKind::Literal(literal) => Some(literal.value()),
+        ScalarKind::Column(_)
+        | ScalarKind::Function(_)
+        | ScalarKind::Case(_)
+        | ScalarKind::Arithmetic(_)
+        | ScalarKind::Subquery(_)
+        | ScalarKind::Array(_)
+        | ScalarKind::TypeCast(_) => None,
+    };
+    if let (Some(left), Some(value)) = (lleaf, literal(rleaf))
+        && let Some((column, target)) = column_target(left)
+    {
+        return Some((column, target, binary.op(), value));
+    }
+    if let (Some(value), Some(right)) = (literal(lleaf), rleaf)
+        && let Some((column, target)) = column_target(right)
+    {
+        let flipped = binary.op().op_flip()?;
+        return Some((column, target, flipped, value));
+    }
+    None
 }
 
 /// The scalar a `WhereExpr::Scalar` holds, without an identity cast.

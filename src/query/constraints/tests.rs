@@ -66,6 +66,66 @@ fn analyze_query_constraints(bound: &ResolvedQuery) -> QueryConstraints {
 }
 
 /// The constraints of `sql`.
+/// `table_constraints` in a comparable order: the walks visit a hash set,
+/// so their per-table lists come out in any order.
+fn table_constraints_sorted(constraints: &QueryConstraints) -> Vec<(ecow::EcoString, Vec<String>)> {
+    let mut tables: Vec<(ecow::EcoString, Vec<String>)> = constraints
+        .table_constraints
+        .iter()
+        .map(|(table, list)| {
+            let mut list: Vec<String> = list.iter().map(|c| format!("{c:?}")).collect();
+            list.sort();
+            (table.clone(), list)
+        })
+        .collect();
+    tables.sort();
+    tables
+}
+
+/// The rope walk finds what the owned walk finds, over every shape the
+/// extractors handle and the ones they give up on.
+#[test]
+fn test_rope_constraints_match_the_owned_walk() {
+    let tables = catalog(&["users", "orders", "items"]);
+    for sql in [
+        "SELECT id FROM users WHERE id = 1",
+        "SELECT id FROM users WHERE 1 = id AND name = 'a'",
+        "SELECT id FROM users WHERE id > 1 AND id <= 9 AND name <> 'x'",
+        "SELECT id FROM users WHERE id IN (3, 1, 2, 1) AND name NOT IN ('a', 'b')",
+        "SELECT id FROM users WHERE id BETWEEN 1 AND 5 AND name BETWEEN SYMMETRIC 'z' AND 'a'",
+        "SELECT id FROM users WHERE id = ANY (ARRAY[1, 2]) AND name = ANY ('{a,b}'::text[])",
+        "SELECT id FROM users WHERE id = ANY (ARRAY[id, 2])",
+        "SELECT id FROM users WHERE id::text = '1' AND name::int4 = 2 AND id::date = '2020-01-01'",
+        "SELECT id FROM users WHERE id = 1 OR name = 'a'",
+        "SELECT id FROM users WHERE NOT (id = 1)",
+        "SELECT id FROM users WHERE id IN (SELECT id FROM orders)",
+        "SELECT u.id FROM users u JOIN orders o ON u.id = o.id AND o.name = 'x' WHERE u.name = 'y'",
+        "SELECT u.id FROM users u JOIN orders o USING (id) WHERE id = 1",
+        "SELECT u.id FROM users u NATURAL JOIN orders o JOIN items i ON i.id = o.id",
+        "SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id CROSS JOIN items",
+        "SELECT id FROM users WHERE id NOT IN (1, name, 2)",
+        "SELECT id FROM users WHERE id IN (1, name)",
+        "SELECT id FROM users WHERE id NOT BETWEEN 1 AND 2 AND name LIKE 'a%'",
+        "SELECT id FROM users WHERE id = name",
+        "SELECT v.id FROM (SELECT id FROM users WHERE id = 1) v WHERE v.id = 2",
+    ] {
+        let bound = resolve_sql(sql, &tables);
+        let owned = analyze_query_constraints(&bound);
+        let rope = query_constraints_analyze_tree(&bound, bound.rope_select().expect("a SELECT"));
+        assert_eq!(rope.column_constraints, owned.column_constraints, "{sql}");
+        assert_eq!(rope.equivalences, owned.equivalences, "{sql}");
+        assert_eq!(
+            table_constraints_sorted(&rope),
+            table_constraints_sorted(&owned),
+            "{sql}"
+        );
+        assert_eq!(
+            rope.where_analysis_complete, owned.where_analysis_complete,
+            "{sql}"
+        );
+    }
+}
+
 fn constraints_of(sql: &str, tables: &Catalog) -> QueryConstraints {
     analyze_query_constraints(&resolve_sql(sql, tables))
 }

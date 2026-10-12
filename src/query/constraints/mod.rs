@@ -17,9 +17,9 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
-use crate::query::ast::{BinaryOp, ColumnNode, LiteralValue};
+use crate::query::ast::{BinaryOp, ColumnNode, LiteralValue, NodeId};
 use crate::query::cast::CastTarget;
-use crate::query::resolve::{ResolvedQuery, TableSlot};
+use crate::query::resolve::{Bindings, ColumnBinding, ResolvedQuery, TableSlot};
 
 mod bound;
 mod range;
@@ -28,9 +28,11 @@ mod range_overlap;
 mod subsume;
 #[cfg(test)]
 mod tests;
+mod tree;
 
 pub use bound::query_constraints_analyze;
 pub use subsume::table_constraints_subsumed;
+pub use tree::query_constraints_analyze_tree;
 
 pub(crate) use range::{ColumnRange, column_range_build};
 #[cfg(feature = "proxy")]
@@ -70,8 +72,15 @@ impl ConstraintColumn {
     /// The column a bound reference stands for; `None` for an outer-join
     /// merged column or an output name.
     pub fn of(bound: &ResolvedQuery, node: &ColumnNode) -> Option<Self> {
-        let bindings = bound.bindings();
-        let binding = bound.column_binding(node)?;
+        Self::of_binding(bound.bindings(), bound.column_binding(node)?)
+    }
+
+    /// [`ConstraintColumn::of`] for the column at rope position `id`.
+    pub fn at(bound: &ResolvedQuery, id: NodeId) -> Option<Self> {
+        Self::of_binding(bound.rope_bindings(), bound.column_binding_at(id)?)
+    }
+
+    fn of_binding(bindings: &Bindings, binding: ColumnBinding) -> Option<Self> {
         let column = bindings.binding_column(&binding)?.name.clone();
         Some(match bindings.slot(binding.slot)? {
             TableSlot::Base { table, alias } => Self {

@@ -7,9 +7,10 @@ use std::ops::ControlFlow;
 use ecow::EcoString;
 use postgres_types::Type;
 
-use super::bindings::{ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot};
+use super::bindings::{Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
+use crate::query::ast::rope::{Body, NodeKind, Select, View};
 use crate::query::ast::{
     AstNode, ColumnNode, NodeId, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode,
     StarNode,
@@ -47,32 +48,55 @@ impl ResolvedQuery {
     /// The catalog column a reference stands for: its own, or the left
     /// column of an inner-join merged column (which is exactly that
     /// column); nothing for an outer-join merged column or an output name.
-    pub fn column_binding(&self, node: &ColumnNode) -> Option<ColumnBinding> {
-        match self.column(node)? {
-            ColumnTarget::Column(binding) => Some(*binding),
-            ColumnTarget::Merged(id) => self
-                .bindings()
-                .merged(*id)
-                .filter(|merged| !merged.outer)
-                .map(|merged| merged.left),
-            ColumnTarget::Output => None,
+    /// The root SELECT of the rope, when the query is one.
+    pub fn rope_select(&self) -> Option<Select<'_>> {
+        match self.rope().root().body() {
+            Body::Select(select) => Some(select),
+            Body::SetOp(_) | Body::Values(_) => None,
         }
     }
 
-    /// The table of the column a reference stands for (a derived table's
-    /// synthetic metadata is named by its alias).
+    /// The SELECT at rope position `id`, when the node there is one.
+    pub fn rope_select_node(&self, id: NodeId) -> Option<Select<'_>> {
+        matches!(self.rope().node(id).kind, NodeKind::Select { .. })
+            .then(|| Select::from_ref(self.rope().root().node_ref().at_position(id)))
+    }
+
+    /// [`Bindings::column_by_id`] in the rope's id space.
+    pub fn column_target_at(&self, id: NodeId) -> Option<&ColumnTarget> {
+        self.rope_bindings().column_by_id(id)
+    }
+
+    /// The catalog column a reference stands for: its own, or the left
+    /// column of an inner-join merged column (which is exactly that
+    /// column); nothing for an outer-join merged column or an output name.
+    pub fn column_binding(&self, node: &ColumnNode) -> Option<ColumnBinding> {
+        binding_of_target(self.bindings(), self.column(node)?)
+    }
+
+    /// [`ResolvedQuery::column_binding`] for the column at rope position `id`.
+    pub fn column_binding_at(&self, id: NodeId) -> Option<ColumnBinding> {
+        binding_of_target(self.rope_bindings(), self.column_target_at(id)?)
+    }
+
     pub fn column_table(&self, node: &ColumnNode) -> Option<&TableMetadata> {
-        let binding = self.column_binding(node)?;
-        self.bindings().slot(binding.slot).map(TableSlot::table)
+        binding_table(self.bindings(), self.column_binding(node)?)
     }
 
-    /// The name of the column a reference stands for.
+    pub fn column_table_at(&self, id: NodeId) -> Option<&TableMetadata> {
+        binding_table(self.rope_bindings(), self.column_binding_at(id)?)
+    }
+
     pub fn column_name(&self, node: &ColumnNode) -> Option<&EcoString> {
-        let binding = self.column_binding(node)?;
-        self.bindings().binding_column(&binding).map(|c| &c.name)
+        binding_name(self.bindings(), self.column_binding(node)?)
     }
 
-    /// How many FROM entries name the relation `relation_oid`, at any depth.
+    pub fn column_name_at(&self, id: NodeId) -> Option<&EcoString> {
+        binding_name(self.rope_bindings(), self.column_binding_at(id)?)
+    }
+
+    /// How many FROM entries of the query are `relation_oid`, subqueries
+    /// included: a self-join references the relation twice.
     pub fn relation_occurrences(&self, relation_oid: Oid) -> usize {
         self.bindings()
             .slots()
@@ -81,12 +105,12 @@ impl ResolvedQuery {
             .count()
     }
 
-    /// The type of the column a reference stands for.
     pub fn column_type(&self, node: &ColumnNode) -> Option<&Type> {
-        let binding = self.column_binding(node)?;
-        self.bindings()
-            .binding_column(&binding)
-            .map(|column| &column.data_type)
+        binding_type(self.bindings(), self.column_binding(node)?)
+    }
+
+    pub fn column_type_at(&self, id: NodeId) -> Option<&Type> {
+        binding_type(self.rope_bindings(), self.column_binding_at(id)?)
     }
 
     /// Which columns of each table the query reads anywhere: select list,
@@ -170,4 +194,30 @@ impl ResolvedQuery {
                 .insert(column.name.clone());
         }
     }
+}
+
+/// The binding a reference's target names, when it names one column.
+fn binding_of_target(bindings: &Bindings, target: &ColumnTarget) -> Option<ColumnBinding> {
+    match target {
+        ColumnTarget::Column(binding) => Some(*binding),
+        ColumnTarget::Merged(merged) => bindings
+            .merged(*merged)
+            .filter(|merged| !merged.outer)
+            .map(|merged| merged.left),
+        ColumnTarget::Output => None,
+    }
+}
+
+fn binding_table(bindings: &Bindings, binding: ColumnBinding) -> Option<&TableMetadata> {
+    bindings.slot(binding.slot).map(TableSlot::table)
+}
+
+fn binding_name(bindings: &Bindings, binding: ColumnBinding) -> Option<&EcoString> {
+    bindings.binding_column(&binding).map(|c| &c.name)
+}
+
+fn binding_type(bindings: &Bindings, binding: ColumnBinding) -> Option<&Type> {
+    bindings
+        .binding_column(&binding)
+        .map(|column| &column.data_type)
 }

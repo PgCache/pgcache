@@ -220,7 +220,7 @@ impl<'b> TreeBuilder<'b> {
 }
 
 /// Where nodes of another tree landed in a built one, by their origin id.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct OriginMap {
     pairs: Vec<(NodeId, NodeId)>,
 }
@@ -245,8 +245,8 @@ impl OriginMap {
 
     /// The map as a remap, so side tables keyed by origin ids carry over
     /// through the same path a rewrite's do.
-    pub(crate) fn into_remap(self) -> IdRemap {
-        IdRemap::from_sorted_pairs(self.pairs)
+    pub(crate) fn to_remap(&self) -> IdRemap {
+        IdRemap::from_sorted_pairs(self.pairs.clone())
     }
 }
 
