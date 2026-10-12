@@ -11,11 +11,14 @@ use crate::cache::Generation;
 use crate::cache::serve_decision::AdmitAction;
 use crate::cache::types::{SharedQueryShape, SharedResolvedQuery};
 use crate::cache::{
-    CacheError, CacheMessage, Report, query::CacheableQuery, query_cache::QueryType,
+    CacheError, CacheMessage, Report,
+    query::{CacheableQuery, RequestQuery},
+    query_cache::QueryType,
 };
 use crate::oid::Oid;
 use crate::pg::Lsn;
 use crate::pg::protocol::session::ResultFormats;
+use crate::query::ast::LimitClause;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, SessionKey};
 
@@ -36,52 +39,53 @@ pub enum SubsumptionResult {
 /// Converted query data ready for processing
 pub struct QueryData {
     pub data: BytesMut,
-    pub cacheable_query: Arc<CacheableQuery>,
+    pub query: RequestQuery,
+    /// The LIMIT with its bind values in place.
+    pub limit: Option<LimitClause>,
     pub query_type: QueryType,
     pub result_formats: ResultFormats,
 }
 
 impl CacheMessage {
-    /// Converts the cache message into query data ready for processing.
-    /// For parameterized queries, this performs parameter replacement in the AST.
+    /// Converts the cache message into query data ready for processing. A
+    /// parameterized read keeps its values beside the placeholder tree: a
+    /// hit never substitutes them, a miss does so for the writer.
     ///
     /// On error, returns the original data buffer so it can be forwarded to the origin.
     pub fn into_query_data(self) -> Result<QueryData, (Report<CacheError>, BytesMut)> {
         match self {
-            CacheMessage::Query(data, cacheable_query) => Ok(QueryData {
-                data,
-                cacheable_query,
-                query_type: QueryType::Simple,
-                result_formats: ResultFormats::Implicit,
-            }),
+            CacheMessage::Query(data, cacheable_query) => {
+                let query = RequestQuery::unparameterized(cacheable_query);
+                query_data(data, query, QueryType::Simple, ResultFormats::Implicit)
+            }
             CacheMessage::QueryParameterized(data, cacheable_query, parameters, result_formats) => {
-                if parameters.is_empty() {
-                    // No bind parameters → nothing to substitute. Reuse the shared
-                    // CacheableQuery (Arc clone) instead of cloning the whole AST.
-                    // The convert-time constant fold already ran; the bind-time
-                    // fold only matters once a parameter has been substituted.
-                    return Ok(QueryData {
-                        data,
-                        cacheable_query,
-                        query_type: QueryType::Extended,
-                        result_formats,
-                    });
-                }
-                // Replace parameters in AST, producing the per-literal form.
-                match cacheable_query.parameters_replace(&parameters) {
-                    Ok(replaced) => Ok(QueryData {
-                        data,
-                        cacheable_query: Arc::new(replaced),
-                        query_type: QueryType::Extended,
-                        result_formats,
-                    }),
-                    Err(e) => Err((e.context_transform(CacheError::from), data)),
-                }
+                let query = RequestQuery::new(cacheable_query, parameters);
+                query_data(data, query, QueryType::Extended, result_formats)
             }
             // Explain is routed by `dispatch_proxy` before `into_query_data`; if
             // it ever reaches here, forward the original bytes to origin.
             CacheMessage::Explain(_, data) => Err((CacheError::InvalidMessage.into(), data)),
         }
+    }
+}
+
+/// Query data for a read, or the bytes to forward when a LIMIT value does
+/// not decode.
+fn query_data(
+    data: BytesMut,
+    query: RequestQuery,
+    query_type: QueryType,
+    result_formats: ResultFormats,
+) -> Result<QueryData, (Report<CacheError>, BytesMut)> {
+    match query.limit() {
+        Ok(limit) => Ok(QueryData {
+            data,
+            query,
+            limit,
+            query_type,
+            result_formats,
+        }),
+        Err(e) => Err((e.context_transform(CacheError::from), data)),
     }
 }
 

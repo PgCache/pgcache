@@ -102,7 +102,7 @@ impl CacheDispatch {
             }
         };
         let binary = msg.result_formats.is_binary();
-        let shape = MemoShape::from_limit(&msg.cacheable_query.query().limit)?;
+        let shape = MemoShape::from_limit(&msg.limit)?;
         let key = MemoKey {
             fingerprint,
             binary,
@@ -263,7 +263,7 @@ impl CacheDispatch {
             client_socket: msg.client_socket,
             reply_tx: msg.reply_tx,
             timing: msg.timing,
-            limit: msg.cacheable_query.query().limit.clone(),
+            limit: msg.limit,
             emit_rfq,
             transaction_status: msg.transaction_status,
             has_parse,

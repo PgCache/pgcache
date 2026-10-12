@@ -30,6 +30,7 @@ use crate::cache::types::{
 use crate::cache::{CacheError, CacheResult, fast_path};
 use crate::pg::Lsn;
 use crate::proxy::ClientSocket;
+use crate::query::ast::LimitClause;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, SessionKey};
 use crate::result::error_chain_format;
@@ -155,13 +156,13 @@ impl CacheDispatch {
     pub(super) async fn session_key_resolve(
         &self,
         session_key: SessionKey,
-        cacheable_query: &Arc<CacheableQuery>,
+        cacheable_query: Arc<CacheableQuery>,
         keying: &Arc<KeyingSettings>,
     ) -> Option<Fingerprint> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let request = ResolveRequest {
             session_key,
-            cacheable_query: Arc::clone(cacheable_query),
+            cacheable_query,
             keying: Arc::clone(keying),
             reply_tx,
         };
@@ -266,7 +267,8 @@ impl CacheDispatch {
                 let request = QueryRequest {
                     query_type: query_data.query_type,
                     data: query_data.data,
-                    cacheable_query: query_data.cacheable_query,
+                    query: query_data.query,
+                    limit: query_data.limit,
                     result_formats: query_data.result_formats,
                     client_socket,
                     reply_tx,
@@ -277,12 +279,7 @@ impl CacheDispatch {
                     pipeline,
                     transaction_status,
                 };
-                if let Err(e) = self.query_dispatch(request).await {
-                    error!(
-                        "query dispatch failed: {}",
-                        error_chain_format(e.current_context()),
-                    );
-                }
+                self.query_dispatch_logged(request).await;
             }
             Err((e, data)) => {
                 debug!("forwarding to origin due to parameter conversion error: {e}");
@@ -296,6 +293,17 @@ impl CacheDispatch {
         }
     }
 
+    /// Dispatch a request and log a failure: the client has been answered or
+    /// forwarded by then, so nothing upstream can act on it.
+    async fn query_dispatch_logged(&mut self, request: QueryRequest) {
+        if let Err(e) = self.query_dispatch(request).await {
+            error!(
+                "query dispatch failed: {}",
+                error_chain_format(e.current_context()),
+            );
+        }
+    }
+
     // Span at trace level: at info/debug the fmt layer allocates per-span
     // extensions, which would put one heap allocation on every cache hit.
     #[instrument(skip_all, level = "trace")]
@@ -305,7 +313,7 @@ impl CacheDispatch {
         let Some(fingerprint) = self.identity_resolve(&msg, &cfg).await else {
             return msg.forward();
         };
-        let target = self.dispatch_target(fingerprint, &msg.cacheable_query, &cfg);
+        let target = self.dispatch_target(fingerprint, &msg.limit, &cfg);
         trace!("{fingerprint}");
 
         let mut cache_entry = self.entry_lookup_timed(fingerprint);
@@ -394,10 +402,7 @@ impl CacheDispatch {
         msg: &QueryRequest,
         cfg: &DynamicConfig,
     ) -> Option<Fingerprint> {
-        if !fast_path::query_allowlist_check(
-            &cfg.allowed_tables_parsed,
-            msg.cacheable_query.query(),
-        ) {
+        if !fast_path::query_allowlist_check(&cfg.allowed_tables_parsed, msg.query.query()) {
             crate::metrics::handles()
                 .query
                 .allowlist_skipped
@@ -406,7 +411,7 @@ impl CacheDispatch {
         }
         let session_key = msg
             .session_key
-            .unwrap_or_else(|| msg.keying.session_key(msg.cacheable_query.query()));
+            .unwrap_or_else(|| msg.query.session_key(&msg.keying));
         if let Some(fingerprint) = self.fingerprint_for_key(session_key) {
             return Some(fingerprint);
         }
@@ -417,7 +422,11 @@ impl CacheDispatch {
                 .increment(1);
             return None;
         }
-        self.session_key_resolve(session_key, &msg.cacheable_query, &msg.keying)
+        let Ok(cacheable_query) = msg.query.substituted() else {
+            debug!("session key {session_key} has bind values that do not substitute; forwarding");
+            return None;
+        };
+        self.session_key_resolve(session_key, cacheable_query, &msg.keying)
             .await
     }
 
@@ -425,13 +434,13 @@ impl CacheDispatch {
     fn dispatch_target(
         &self,
         fingerprint: Fingerprint,
-        cacheable_query: &CacheableQuery,
+        limit: &Option<LimitClause>,
         cfg: &DynamicConfig,
     ) -> DispatchTarget {
         DispatchTarget {
             fingerprint,
             input: DecisionInput {
-                rows_needed: limit_rows_needed(&cacheable_query.query().limit),
+                rows_needed: limit_rows_needed(limit),
                 admission_threshold: cfg.admission_threshold,
                 cache_policy: cfg.cache_policy,
                 throttled: self.state_view.throttled(),

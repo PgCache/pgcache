@@ -52,7 +52,7 @@ impl QueryWalkerMut for ParameterReplacer<'_> {
     }
 }
 
-pub(super) fn literal_value_parameters_replace(
+pub(crate) fn literal_value_parameters_replace(
     literal: &mut LiteralValue,
     parameters: &QueryParameters,
 ) -> AstTransformResult<()> {

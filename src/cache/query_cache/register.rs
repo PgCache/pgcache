@@ -41,7 +41,7 @@ impl CacheDispatch {
         for pq in pinned {
             let session_key = keying.session_key(pq.cacheable_query.query());
             let fingerprint = match self
-                .session_key_resolve(session_key, &pq.cacheable_query, &keying)
+                .session_key_resolve(session_key, Arc::clone(&pq.cacheable_query), &keying)
                 .await
             {
                 Some(fingerprint) => fingerprint,
@@ -102,11 +102,16 @@ impl CacheDispatch {
         fingerprint: Fingerprint,
         admit_action: AdmitAction,
     ) -> CacheResult<()> {
+        let Ok(cacheable_query) = msg.query.substituted() else {
+            debug!("register {fingerprint}: bind values do not substitute; forwarding");
+            self.metrics_miss_record(fingerprint);
+            return msg.forward();
+        };
         let (subsumption_tx, subsumption_rx) = oneshot::channel();
 
         let request = RegisterRequest {
             fingerprint,
-            cacheable_query: Arc::clone(&msg.cacheable_query),
+            cacheable_query,
             keying: Arc::clone(&msg.keying),
             started_at: Instant::now(),
             subsumption_tx,
@@ -131,7 +136,7 @@ impl CacheDispatch {
                 // Subsumed queries have mv_state = MeasurePending (see Future Work:
                 // "MV first-pop for subsumed queries"); mv_dispatch_decide returns
                 // false and the serve goes through the fallthrough path.
-                let rows_needed = limit_rows_needed(&msg.cacheable_query.query().limit);
+                let rows_needed = limit_rows_needed(&msg.limit);
                 let mv = self.mv_dispatch_decide(fingerprint, rows_needed);
                 self.pool_serve(fingerprint, msg, bound, serve_shape, generation, mv)
             }

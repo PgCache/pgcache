@@ -86,7 +86,7 @@ impl CoalesceKey {
             has_bind,
             pipeline_describe,
             result_formats: msg.result_formats.clone(),
-            limit: msg.cacheable_query.query().limit.clone(),
+            limit: msg.limit.clone(),
             profile: msg.output_settings.profile(),
         }
     }

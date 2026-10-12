@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use ecow::EcoString;
 
+use crate::cache::QueryParameters;
 use crate::query::SessionKey;
-use crate::query::ast::{QueryExpr, query_expr_session_key};
+use crate::query::ast::{QueryExpr, query_expr_session_key, query_expr_session_key_with_binds};
 use crate::query::literal_settings::LiteralSettings;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -23,5 +24,19 @@ impl KeyingSettings {
     /// The proxy-side key of `query` under these settings.
     pub fn session_key(&self, query: &QueryExpr) -> SessionKey {
         query_expr_session_key(query, &self.search_path, &self.literals)
+    }
+
+    /// The key of a parameterized `query` with `parameters` still to bind.
+    pub fn session_key_with_parameters(
+        &self,
+        query: &QueryExpr,
+        parameters: &QueryParameters,
+    ) -> SessionKey {
+        query_expr_session_key_with_binds(
+            query,
+            &(&parameters.values, &parameters.formats, &parameters.oids),
+            &self.search_path,
+            &self.literals,
+        )
     }
 }

@@ -252,7 +252,8 @@ async fn handle_connection(
                 };
                 crate::metrics::handles().query.cacheable.increment(1);
                 // Hashed once here for the gate, the timing id and dispatch. A
-                // parameterized read with binds is keyed after substitution.
+                // parameterized read is keyed on its placeholders and values,
+                // never on a substituted tree.
                 let session_key = match &msg {
                     CacheMessage::Query(_, cq) => Some(keying.session_key(cq.query())),
                     CacheMessage::QueryParameterized(_, cq, parameters, _)
@@ -260,7 +261,10 @@ async fn handle_connection(
                     {
                         Some(keying.session_key(cq.query()))
                     }
-                    CacheMessage::QueryParameterized(..) | CacheMessage::Explain(..) => None,
+                    CacheMessage::QueryParameterized(_, cq, parameters, _) => {
+                        Some(keying.session_key_with_parameters(cq.query(), parameters))
+                    }
+                    CacheMessage::Explain(..) => None,
                 };
 
                 // Transaction gate (PGC-387): inside a block, serve only when the

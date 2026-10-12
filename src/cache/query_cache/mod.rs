@@ -9,7 +9,7 @@ use super::explain::ExplainJob;
 use super::messages::{CacheReply, MessageSlices, PipelineContext, PipelineDescribe, QueryCommand};
 use super::mv::MvServe;
 use super::output_settings::OutputSettings;
-use super::query::CacheableQuery;
+use super::query::RequestQuery;
 use super::reg_bucket::RegRateBucket;
 use super::reply::ReplySender;
 use super::types::{CacheStateView, SharedQueryShape, SharedResolvedQuery};
@@ -50,7 +50,9 @@ pub struct CoalescedClient {
 pub struct QueryRequest {
     pub query_type: QueryType,
     pub data: BytesMut,
-    pub cacheable_query: Arc<CacheableQuery>,
+    pub query: RequestQuery,
+    /// The LIMIT with its bind values in place.
+    pub limit: Option<LimitClause>,
     pub result_formats: ResultFormats,
     pub client_socket: ClientSocket,
     pub reply_tx: ReplySender<CacheReply>,

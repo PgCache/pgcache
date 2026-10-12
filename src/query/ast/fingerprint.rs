@@ -57,6 +57,23 @@ pub fn query_expr_session_key(
     SessionKey::from_raw(hasher.finish())
 }
 
+/// The key of a parameterized read before substitution: the tree with its
+/// placeholders, then the bind values as sent. The literal settings always
+/// fold in, since a bound value may be a string whose meaning they decide.
+pub fn query_expr_session_key_with_binds(
+    query: &QueryExpr,
+    binds: &impl Hash,
+    search_path: &[EcoString],
+    literals: &LiteralSettings,
+) -> SessionKey {
+    let mut hasher = query_expr_hasher(query);
+    hasher.write_u8(DOMAIN_SESSION);
+    search_path.hash(&mut hasher);
+    binds.hash(&mut hasher);
+    literals.hash(&mut hasher);
+    SessionKey::from_raw(hasher.finish())
+}
+
 fn query_expr_has_string_literal(query: &QueryExpr) -> bool {
     query
         .try_for_each_node::<LiteralValue, ()>(&mut |literal| {
@@ -102,6 +119,23 @@ mod tests {
         assert_ne!(
             query_expr_session_key(&text, &path(&["public"]), &tokyo),
             query_expr_session_key(&text, &path(&["public"]), &utc)
+        );
+    }
+
+    #[test]
+    fn test_session_key_with_binds_keys_on_values_and_settings() {
+        let query = parse("SELECT id FROM users WHERE id = $1");
+        let utc = LiteralSettings::default();
+        let tokyo = LiteralSettings::from_texts("Asia/Tokyo", "ISO, MDY", "postgres", "Default");
+        let key = |binds: &[u8], literals: &LiteralSettings| {
+            query_expr_session_key_with_binds(&query, &binds, &path(&["public"]), literals)
+        };
+        assert_eq!(key(b"1", &utc), key(b"1", &utc));
+        assert_ne!(key(b"1", &utc), key(b"2", &utc));
+        assert_ne!(key(b"1", &utc), key(b"1", &tokyo));
+        assert_ne!(
+            key(b"1", &utc),
+            query_expr_session_key(&query, &path(&["public"]), &utc)
         );
     }
 

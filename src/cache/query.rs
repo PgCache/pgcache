@@ -12,12 +12,14 @@ use crate::query::transform::{AstTransformResult, query_expr_parameters_replace}
 mod cacheability;
 mod limit;
 mod outer_join;
+mod request;
 
 pub use cacheability::query_has_volatile_function;
 use cacheability::{is_cacheable_body, references_system_catalog};
 
 pub use limit::{limit_is_sufficient, limit_rows_needed};
 pub use outer_join::outer_join_optional_tables;
+pub use request::RequestQuery;
 
 // Each variant names the item that triggered it: pgcache-fit's per-statement
 // detail and the proxy's passthrough log both print it (never the SQL body).
