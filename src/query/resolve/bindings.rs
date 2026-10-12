@@ -170,7 +170,11 @@ impl Bindings {
     }
 
     pub fn star(&self, node: &StarNode) -> Option<&[StarItem]> {
-        by_node(&self.stars, node.id).map(Vec::as_slice)
+        self.star_by_id(node.id)
+    }
+
+    pub fn star_by_id(&self, id: NodeId) -> Option<&[StarItem]> {
+        by_node(&self.stars, id).map(Vec::as_slice)
     }
 
     pub fn merged(&self, id: MergedId) -> Option<&MergedColumnBinding> {

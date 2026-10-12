@@ -16,6 +16,14 @@ use super::bindings::{
 };
 use crate::oid::Oid;
 use crate::query::Fingerprint;
+use crate::query::ast::rope::deparse::{
+    column_plain_deparse, names_deparse, query_deparse_with, query_unlimited_deparse_with,
+    star_plain_deparse, table_alias_deparse, table_plain_deparse,
+};
+use crate::query::ast::rope::{
+    Column as RopeColumn, CteRef as RopeCteRef, Function as RopeFunction, Join as RopeJoin,
+    RopeDeparseContext, Star as RopeStar, Table as RopeTable,
+};
 use crate::query::ast::{
     Clause, ColumnNode, CteRefNode, Deparse, DeparseContext, DeparseWith, FunctionCall, JoinNode,
     LiteralValue, NodeId, OrderByClause, ScalarExpr, SelectColumn, SelectColumns, SelectNode,
@@ -171,72 +179,25 @@ impl<'a> Bound<'a> {
 
 impl DeparseContext for Bound<'_> {
     fn table_deparse(&mut self, node: &TableNode, buf: &mut String) {
-        let Some(slot) = self.bindings.source(node.id) else {
-            debug_assert!(false, "table reference without a slot");
-            node.deparse_plain(buf);
-            return;
-        };
-        if let Some(source) = self.source_override(slot) {
-            buf.push_str(" (");
-            buf.push_str(source.source);
-            buf.push_str(") ");
-            source.alias.deparse(buf);
-            if !source.columns.is_empty() {
-                buf.push('(');
-                separated_deparse(buf, source.columns, ", ");
-                buf.push(')');
-            }
-            return;
-        }
-        match self.bindings.slot(slot) {
-            Some(slot) => {
-                let table = slot.table();
-                buf.push(' ');
-                table.schema.deparse(buf);
-                buf.push('.');
-                table.name.deparse(buf);
-                node.alias_deparse(buf);
-            }
-            None => {
-                debug_assert!(false, "table reference without a slot");
-                node.deparse_plain(buf);
-            }
-        }
+        self.table_render(
+            self.bindings.source(node.id),
+            |buf| node.alias_deparse(buf),
+            |buf| node.deparse_plain(buf),
+            buf,
+        );
     }
 
     fn column_deparse(&mut self, node: &ColumnNode, buf: &mut String) {
-        match self.bindings.column(node) {
-            Some(ColumnTarget::Column(binding)) => self.column_binding_deparse(binding, buf),
-            Some(ColumnTarget::Merged(id)) => match self.bindings.merged(*id) {
-                Some(merged) => self.merged_deparse(merged, buf),
-                None => {
-                    debug_assert!(false, "column names a missing merged column");
-                    node.deparse_plain(buf);
-                }
-            },
-            // An output name is unqualified whatever the reference wrote.
-            Some(ColumnTarget::Output) => {
-                node.column.deparse(buf);
-            }
-            None => {
-                debug_assert!(false, "column reference without a binding");
-                node.deparse_plain(buf);
-            }
-        }
+        self.column_render(
+            self.bindings.column(node),
+            &node.column,
+            |buf| node.deparse_plain(buf),
+            buf,
+        );
     }
 
     fn star_deparse(&mut self, node: &StarNode, buf: &mut String) {
-        let Some(items) = self.bindings.star(node) else {
-            debug_assert!(false, "star without an expansion");
-            node.deparse_plain(buf);
-            return;
-        };
-        let mut sep = "";
-        for item in items {
-            buf.push_str(sep);
-            self.star_item_deparse(item, buf);
-            sep = ", ";
-        }
+        self.star_render(self.bindings.star(node), |buf| node.deparse_plain(buf), buf);
     }
 
     /// The CTE body inline as a derived table, named by the reference's
@@ -276,6 +237,110 @@ impl DeparseContext for Bound<'_> {
     }
 
     fn literal_deparse(&mut self, literal: &LiteralValue, buf: &mut String) {
+        self.literal_render(literal, buf);
+    }
+
+    fn clause_enter(&mut self, clause: Clause) {
+        self.clause_entered(clause);
+    }
+
+    fn clause_leave(&mut self, clause: Clause) {
+        self.clause_left(clause);
+    }
+}
+
+impl Bound<'_> {
+    /// A FROM table through its slot: the source standing in for it, else
+    /// the schema-qualified table with `alias`; `plain` when it has no slot.
+    fn table_render(
+        &self,
+        slot: Option<SlotId>,
+        alias: impl FnOnce(&mut String),
+        plain: impl FnOnce(&mut String),
+        buf: &mut String,
+    ) {
+        let Some(slot) = slot else {
+            debug_assert!(false, "table reference without a slot");
+            plain(buf);
+            return;
+        };
+        if let Some(source) = self.source_override(slot) {
+            buf.push_str(" (");
+            buf.push_str(source.source);
+            buf.push_str(") ");
+            source.alias.deparse(buf);
+            if !source.columns.is_empty() {
+                buf.push('(');
+                separated_deparse(buf, source.columns, ", ");
+                buf.push(')');
+            }
+            return;
+        }
+        match self.bindings.slot(slot) {
+            Some(slot) => {
+                let table = slot.table();
+                buf.push(' ');
+                table.schema.deparse(buf);
+                buf.push('.');
+                table.name.deparse(buf);
+                alias(buf);
+            }
+            None => {
+                debug_assert!(false, "table reference without a slot");
+                plain(buf);
+            }
+        }
+    }
+
+    /// A column reference through its target; an output name is unqualified
+    /// whatever the reference wrote, and `plain` renders an unbound one.
+    fn column_render(
+        &self,
+        target: Option<&ColumnTarget>,
+        name: &EcoString,
+        plain: impl FnOnce(&mut String),
+        buf: &mut String,
+    ) {
+        match target {
+            Some(ColumnTarget::Column(binding)) => self.column_binding_deparse(binding, buf),
+            Some(ColumnTarget::Merged(id)) => match self.bindings.merged(*id) {
+                Some(merged) => self.merged_deparse(merged, buf),
+                None => {
+                    debug_assert!(false, "column names a missing merged column");
+                    plain(buf);
+                }
+            },
+            Some(ColumnTarget::Output) => {
+                name.deparse(buf);
+            }
+            None => {
+                debug_assert!(false, "column reference without a binding");
+                plain(buf);
+            }
+        }
+    }
+
+    /// A star through its expansion, `, `-separated; `plain` when it has none.
+    fn star_render(
+        &self,
+        items: Option<&[StarItem]>,
+        plain: impl FnOnce(&mut String),
+        buf: &mut String,
+    ) {
+        let Some(items) = items else {
+            debug_assert!(false, "star without an expansion");
+            plain(buf);
+            return;
+        };
+        let mut sep = "";
+        for item in items {
+            buf.push_str(sep);
+            self.star_item_deparse(item, buf);
+            sep = ", ";
+        }
+    }
+
+    fn literal_render(&mut self, literal: &LiteralValue, buf: &mut String) {
         match &mut self.mode {
             Mode::Shape {
                 literals,
@@ -294,7 +359,7 @@ impl DeparseContext for Bound<'_> {
         }
     }
 
-    fn clause_enter(&mut self, clause: Clause) {
+    fn clause_entered(&mut self, clause: Clause) {
         let Mode::Shape {
             predicate_depth,
             projection_depth,
@@ -314,7 +379,7 @@ impl DeparseContext for Bound<'_> {
         }
     }
 
-    fn clause_leave(&mut self, clause: Clause) {
+    fn clause_left(&mut self, clause: Clause) {
         let Mode::Shape {
             predicate_depth,
             projection_depth,
@@ -332,6 +397,89 @@ impl DeparseContext for Bound<'_> {
             | Clause::Values => *projection_depth -= 1,
             Clause::From | Clause::GroupBy => {}
         }
+    }
+}
+
+/// The context that renders a bound rope: the same decisions as [`Bound`],
+/// read through views and the rope-keyed bindings.
+struct RopeBound<'a>(Bound<'a>);
+
+impl RopeDeparseContext for RopeBound<'_> {
+    fn table_deparse(&mut self, table: RopeTable<'_>, buf: &mut String) {
+        self.0.table_render(
+            self.0.bindings.source(table.id()),
+            |buf| table_alias_deparse(table, buf),
+            |buf| table_plain_deparse(table, buf),
+            buf,
+        );
+    }
+
+    fn column_deparse(&mut self, column: RopeColumn<'_>, buf: &mut String) {
+        self.0.column_render(
+            self.0.bindings.column_by_id(column.id()),
+            column.column(),
+            |buf| column_plain_deparse(column, buf),
+            buf,
+        );
+    }
+
+    fn star_deparse(&mut self, star: RopeStar<'_>, buf: &mut String) {
+        self.0.star_render(
+            self.0.bindings.star_by_id(star.id()),
+            |buf| star_plain_deparse(star, buf),
+            buf,
+        );
+    }
+
+    /// The CTE body inline as a derived table, named by the reference's
+    /// alias or the CTE's name, with the CTE's column aliases.
+    fn cte_ref_deparse(&mut self, cte_ref: RopeCteRef<'_>, buf: &mut String) {
+        buf.push_str(" (");
+        query_deparse_with(cte_ref.query(), self, buf);
+        buf.push_str(") ");
+        match cte_ref.alias() {
+            Some(alias) => alias.deparse(buf),
+            None => cte_ref.cte_name().deparse(buf),
+        };
+        let aliases = cte_ref.column_aliases();
+        if aliases.len() > 0 {
+            buf.push('(');
+            names_deparse(aliases, ", ", buf);
+            buf.push(')');
+        }
+    }
+
+    fn with_clause_renders(&self) -> bool {
+        false
+    }
+
+    fn natural_join_columns(&mut self, join: RopeJoin<'_>) -> Option<Vec<EcoString>> {
+        let join = join.id();
+        Some(
+            self.0
+                .bindings
+                .merged_columns()
+                .iter()
+                .filter(|merged| merged.join.index() == join.index())
+                .map(|merged| merged.name.clone())
+                .collect(),
+        )
+    }
+
+    fn function_name_deparse(&mut self, function: RopeFunction<'_>, buf: &mut String) {
+        buf.push_str(function.name());
+    }
+
+    fn literal_deparse(&mut self, literal: &LiteralValue, buf: &mut String) {
+        self.0.literal_render(literal, buf);
+    }
+
+    fn clause_enter(&mut self, clause: Clause) {
+        self.0.clause_entered(clause);
+    }
+
+    fn clause_leave(&mut self, clause: Clause) {
+        self.0.clause_left(clause);
     }
 }
 
@@ -358,10 +506,24 @@ impl ResolvedQuery {
         Bound::with_source(self.bindings(), source)
     }
 
+    /// [`ResolvedQuery::deparse_context`] over the rope.
+    pub fn rope_deparse_context(&self) -> impl RopeDeparseContext + '_ {
+        RopeBound(Bound::text(self.rope_bindings()))
+    }
+
+    /// [`ResolvedQuery::rope_deparse_context`] with `source` standing in
+    /// for one FROM entry.
+    pub fn rope_deparse_context_with_source<'a>(
+        &'a self,
+        source: &'a SourceOverride<'a>,
+    ) -> impl RopeDeparseContext + 'a {
+        RopeBound(Bound::with_source(self.rope_bindings(), source))
+    }
+
     /// The serve SQL with `source` standing in for one FROM entry.
     pub fn sql_with_source_into(&self, source: &SourceOverride<'_>, buf: &mut String) {
-        self.tree()
-            .deparse_with(&mut Bound::with_source(self.bindings(), source), buf);
+        let mut cx = RopeBound(Bound::with_source(self.rope_bindings(), source));
+        query_deparse_with(self.rope().root(), &mut cx, buf);
     }
 
     /// Every column of the table a FROM entry names, as the cache serves
@@ -389,8 +551,8 @@ impl ResolvedQuery {
 
     /// The SQL the cache serves for this query, appended to `buf`.
     pub fn sql_into(&self, buf: &mut String) {
-        self.tree()
-            .deparse_with(&mut Bound::text(self.bindings()), buf);
+        let mut cx = RopeBound(Bound::text(self.rope_bindings()));
+        query_deparse_with(self.rope().root(), &mut cx, buf);
     }
 
     /// The SQL the cache serves for this query.
@@ -406,8 +568,8 @@ impl ResolvedQuery {
     /// not split one.
     pub fn fingerprint(&self) -> Fingerprint {
         let mut buf = String::with_capacity(256);
-        self.tree()
-            .unlimited_deparse_with(&mut Bound::text(self.bindings()), &mut buf);
+        let mut cx = RopeBound(Bound::text(self.rope_bindings()));
+        query_unlimited_deparse_with(self.rope().root(), &mut cx, &mut buf);
         let mut hasher = DefaultHasher::new();
         hasher.write_u8(BOUND_FINGERPRINT_DOMAIN);
         buf.hash(&mut hasher);
@@ -418,10 +580,10 @@ impl ResolvedQuery {
     /// predicate literals as `$1..$k`, keyed by a hash of that text, and
     /// the literals to bind.
     pub fn shape(&self) -> QueryShape {
-        let mut cx = Bound::shape(self.bindings());
+        let mut cx = RopeBound(Bound::shape(self.rope_bindings()));
         let mut sql = String::with_capacity(256);
-        self.tree().deparse_with(&mut cx, &mut sql);
-        let literals = cx.literals_take();
+        query_deparse_with(self.rope().root(), &mut cx, &mut sql);
+        let literals = cx.0.literals_take();
         let mut hasher = DefaultHasher::new();
         sql.hash(&mut hasher);
         QueryShape {
@@ -541,7 +703,7 @@ mod tests {
 
     use super::*;
     use crate::catalog::Catalog;
-    use crate::query::ast::{query_expr_parse, query_expr_session_key};
+    use crate::query::ast::{AstNode, query_expr_parse, query_expr_session_key};
     use crate::query::literal_settings::LiteralSettings;
     use crate::query::resolve::query_expr_resolve;
     use crate::query::resolve::tests::{BINDING_CORPUS, binding_catalog, catalog_with_columns};
@@ -586,6 +748,80 @@ mod tests {
         let query = query_expr_parse(sql).expect("parse");
         let bindings = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
         ResolvedQuery::new(Arc::new(query), bindings)
+    }
+
+    /// The owned renderer, kept as the oracle for the rope renderer.
+    fn owned_sql(bound: &ResolvedQuery) -> String {
+        let mut buf = String::new();
+        bound
+            .tree()
+            .deparse_with(&mut Bound::text(bound.bindings()), &mut buf);
+        buf
+    }
+
+    fn owned_shape(bound: &ResolvedQuery) -> QueryShape {
+        let mut cx = Bound::shape(bound.bindings());
+        let mut sql = String::new();
+        bound.tree().deparse_with(&mut cx, &mut sql);
+        let literals = cx.literals_take();
+        let mut hasher = DefaultHasher::new();
+        sql.hash(&mut hasher);
+        QueryShape {
+            sql: sql.into(),
+            key: ShapeKey::from_raw(hasher.finish()),
+            literals,
+        }
+    }
+
+    /// Every rendering of a bound query through the rope is byte for byte
+    /// the owned renderer's: the serve SQL, the identity text, the shape
+    /// and a rendering with a source standing in for the first table.
+    #[test]
+    fn test_rope_rendering_matches_the_owned_renderer() {
+        let catalog = binding_catalog();
+        for sql in corpus() {
+            let bound = bound(sql, &catalog);
+            assert_eq!(bound.sql(), owned_sql(&bound), "{sql}");
+            let mut unlimited = String::new();
+            bound
+                .tree()
+                .unlimited_deparse_with(&mut Bound::text(bound.bindings()), &mut unlimited);
+            let mut rope_unlimited = String::new();
+            query_unlimited_deparse_with(
+                bound.rope().root(),
+                &mut RopeBound(Bound::text(bound.rope_bindings())),
+                &mut rope_unlimited,
+            );
+            assert_eq!(rope_unlimited, unlimited, "{sql}");
+            let expected = owned_shape(&bound);
+            let shape = bound.shape();
+            assert_eq!(shape.sql, expected.sql, "{sql}");
+            assert_eq!(shape.key, expected.key, "{sql}");
+            assert_eq!(shape.literals, expected.literals, "{sql}");
+            let Some(slot) = bound
+                .tree()
+                .nodes::<TableNode>()
+                .next()
+                .and_then(|table| bound.bindings().source(table.id))
+            else {
+                continue;
+            };
+            let columns = [EcoString::from("a"), EcoString::from("b")];
+            let source = SourceOverride {
+                slot,
+                alias: "stand_in",
+                source: "VALUES (1, 2)",
+                columns: &columns,
+            };
+            let mut expected = String::new();
+            bound.tree().deparse_with(
+                &mut Bound::with_source(bound.bindings(), &source),
+                &mut expected,
+            );
+            let mut actual = String::new();
+            bound.sql_with_source_into(&source, &mut actual);
+            assert_eq!(actual, expected, "{sql}");
+        }
     }
 
     /// PGC-287 class 2: a bare and a qualified spelling of one table share

@@ -7,6 +7,7 @@
 
 mod build;
 mod convert;
+pub mod deparse;
 mod node;
 #[cfg(test)]
 mod owned;
@@ -16,6 +17,7 @@ mod tree;
 mod view;
 
 pub use build::{ChunkRemap, Open, OriginMap, TreeBuilder};
+pub use deparse::{RopeDeparseContext, RopePlain};
 pub use node::{FrameBoundKind, JoinQualKind, Node, NodeKind};
 pub use tree::QueryTree;
 pub use view::{

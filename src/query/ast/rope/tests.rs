@@ -147,6 +147,15 @@ fn test_round_trip_rebuilds_the_owned_tree() {
 }
 
 #[test]
+fn test_plain_rendering_matches_the_owned_deparse() {
+    for text in CORPUS {
+        let owned = parse(text);
+        let rope = QueryTree::from_query_expr(&owned);
+        assert_eq!(rope.sql(), sql(&owned), "{text}");
+    }
+}
+
+#[test]
 fn test_positions_follow_pre_order_lengths() {
     let tree = tree("SELECT a FROM t WHERE b = 1");
     assert_eq!(lens(&tree), vec![8, 7, 2, 1, 1, 3, 1, 1]);
