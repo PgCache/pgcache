@@ -25,10 +25,11 @@ use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
 use crate::pg::Lsn;
-use crate::query::ast::{
-    Clause, DeparseContext, SelectNode, TableNode, clause_deparse_with, separated_deparse_with,
-};
+use crate::query::ast::Clause;
+use crate::query::ast::rope::deparse::{from_deparse_with, where_clause_deparse_with};
+use crate::query::ast::rope::{Select, Table};
 use crate::query::resolve::ResolvedQuery;
+use crate::query::update::select_branches_with_source;
 
 /// Number of rows to batch per INSERT statement sent to the cache database.
 const POPULATION_INSERT_BATCH_SIZE: usize = 200;
@@ -91,8 +92,8 @@ pub(super) async fn population_task(
     let mut reset: HashSet<Oid> = HashSet::new();
     let mut staged: Vec<(Oid, EcoString)> = Vec::new();
 
-    for (branch, _) in work.population.tree().select_nodes_with_source() {
-        for table_node in branch.direct_table_nodes() {
+    for (branch, _) in select_branches_with_source(work.population.rope().root()) {
+        for table_node in branch.direct_tables() {
             let table = table_metadata_find(&work.table_metadata, &work.population, table_node)?;
             let (staging, needs_create) = staging_table_find(&work.staging, table)?;
             let fresh = reset.insert(table.relation_oid);
@@ -129,11 +130,11 @@ pub(super) async fn population_task(
 fn table_metadata_find<'a>(
     table_metadata: &'a [Arc<TableMetadata>],
     population: &ResolvedQuery,
-    table_node: &TableNode,
+    table_node: Table<'_>,
 ) -> CacheResult<&'a TableMetadata> {
-    let bindings = population.bindings();
+    let bindings = population.rope_bindings();
     let relation_oid = bindings
-        .source(table_node.id)
+        .source(table_node.id())
         .and_then(|slot| bindings.slot(slot))
         .map(|slot| slot.table().relation_oid);
     relation_oid
@@ -146,7 +147,7 @@ fn table_metadata_find<'a>(
         .ok_or_else(|| {
             CacheError::UnknownTable {
                 oid: relation_oid,
-                name: Some(table_node.name.to_string()),
+                name: Some(table_node.name().to_string()),
             }
             .into()
         })
@@ -197,26 +198,21 @@ async fn staging_table_create(
 /// because the cache holds raw rows and aggregates at retrieval.
 fn population_select_build(
     population: &ResolvedQuery,
-    table_node: &TableNode,
-    branch: &SelectNode,
+    table_node: Table<'_>,
+    branch: Select<'_>,
     max_limit: Option<u64>,
 ) -> String {
     let mut buf = String::with_capacity(1024);
-    let mut cx = population.deparse_context();
+    let mut cx = population.rope_deparse_context();
     buf.push_str("SELECT DISTINCT");
-    population.source_columns_into(table_node.id, &mut buf);
-    if !branch.from.is_empty() {
-        cx.clause_enter(Clause::From);
-        buf.push_str(" FROM");
-        separated_deparse_with(&mut cx, &mut buf, &branch.from, ",");
-        cx.clause_leave(Clause::From);
-    }
-    clause_deparse_with(
-        &mut cx,
-        &mut buf,
+    population.rope_source_columns_into(table_node.id(), &mut buf);
+    from_deparse_with(branch.from(), &mut cx, &mut buf);
+    where_clause_deparse_with(
+        branch.where_clause(),
         Clause::Where,
         " WHERE ",
-        branch.where_clause.as_ref(),
+        &mut cx,
+        &mut buf,
     );
     if let Some(limit) = max_limit {
         write!(buf, " LIMIT {limit}").ok();
@@ -700,8 +696,8 @@ mod tests {
         let bindings = query_expr_resolve(&query, &catalog, &["public"]).expect("resolve");
         let population = ResolvedQuery::new(query, bindings);
         let mut selects = Vec::new();
-        for (branch, _) in population.tree().select_nodes_with_source() {
-            for table_node in branch.direct_table_nodes() {
+        for (branch, _) in select_branches_with_source(population.rope().root()) {
+            for table_node in branch.direct_tables() {
                 selects.push(population_select_build(
                     &population,
                     table_node,

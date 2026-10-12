@@ -12,8 +12,9 @@
 //! `where_expr_evaluate` for the expression it was compiled from.
 
 use crate::pg::protocol::ByteString;
-use crate::query::ast::{BinaryOp, LiteralValue, ScalarExpr, UnaryOp, WhereExpr};
-use crate::query::cast::{CastTarget, cast_target_coerce_text, comparison_canonicalize};
+use crate::query::ast::rope::{ScalarKind, Where, WhereKind};
+use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
+use crate::query::cast::{CastTarget, cast_target_coerce_text, comparison_canonicalize_tree};
 use crate::query::evaluate::literal_compare;
 use crate::query::resolve::ResolvedQuery;
 use crate::query::typed_compare::TypedLiteral;
@@ -56,16 +57,16 @@ pub enum CompiledPredicate {
 impl CompiledPredicate {
     /// Compile a WHERE expression of `bound` for rows of `table_name`. Total —
     /// every input maps to a node.
-    pub fn compile(bound: &ResolvedQuery, expr: &WhereExpr, table_name: &str) -> Self {
-        match expr {
-            WhereExpr::Binary(b) => match b.op {
+    pub fn compile(bound: &ResolvedQuery, expr: Where<'_>, table_name: &str) -> Self {
+        match expr.kind() {
+            WhereKind::Binary(binary) => match binary.op() {
                 BinaryOp::And => Self::And(
-                    Box::new(Self::compile(bound, &b.lexpr, table_name)),
-                    Box::new(Self::compile(bound, &b.rexpr, table_name)),
+                    Box::new(Self::compile(bound, binary.lexpr(), table_name)),
+                    Box::new(Self::compile(bound, binary.rexpr(), table_name)),
                 ),
                 BinaryOp::Or => Self::Or(
-                    Box::new(Self::compile(bound, &b.lexpr, table_name)),
-                    Box::new(Self::compile(bound, &b.rexpr, table_name)),
+                    Box::new(Self::compile(bound, binary.lexpr(), table_name)),
+                    Box::new(Self::compile(bound, binary.rexpr(), table_name)),
                 ),
                 BinaryOp::Equal
                 | BinaryOp::NotEqual
@@ -73,11 +74,11 @@ impl CompiledPredicate {
                 | BinaryOp::LessThanOrEqual
                 | BinaryOp::GreaterThan
                 | BinaryOp::GreaterThanOrEqual => {
-                    let compare = comparison_canonicalize(bound, b).and_then(
+                    let compare = comparison_canonicalize_tree(bound, binary).and_then(
                         |(column, target, op, value)| {
-                            let binding = bound.column_binding(column)?;
-                            let table = bound.column_table(column)?;
-                            let data_type = bound.column_type(column)?;
+                            let binding = bound.column_binding_at(column.id())?;
+                            let table = bound.column_table_at(column.id())?;
+                            let data_type = bound.column_type_at(column.id())?;
                             Some(Self::Compare {
                                 col: binding.position.index(),
                                 in_table: table.name.as_str() == table_name,
@@ -94,8 +95,8 @@ impl CompiledPredicate {
                     Self::ConstFalse
                 }
             },
-            WhereExpr::Unary(u) => match u.op {
-                UnaryOp::Not => Self::Not(Box::new(Self::compile(bound, &u.expr, table_name))),
+            WhereKind::Unary(unary) => match unary.op() {
+                UnaryOp::Not => Self::Not(Box::new(Self::compile(bound, unary.expr(), table_name))),
                 op @ (UnaryOp::IsNull
                 | UnaryOp::IsNotNull
                 | UnaryOp::IsTrue
@@ -103,12 +104,10 @@ impl CompiledPredicate {
                 | UnaryOp::IsFalse
                 | UnaryOp::IsNotFalse) => Self::NullCheck {
                     op,
-                    col: column_position(bound, &u.expr, table_name),
+                    col: column_position(bound, unary.expr(), table_name),
                 },
             },
-            WhereExpr::Scalar(_) | WhereExpr::Multi(_) | WhereExpr::Subquery { .. } => {
-                Self::ConstFalse
-            }
+            WhereKind::Scalar(_) | WhereKind::Multi(_) | WhereKind::Subquery(_) => Self::ConstFalse,
         }
     }
 
@@ -173,15 +172,18 @@ impl CompiledPredicate {
 /// Row position of `expr` when it is an in-table bare column reference, matching
 /// the value `unary_expr_evaluate` reads for IS NULL/TRUE/FALSE checks: `None`
 /// for any non-column inner, or a column belonging to another table.
-fn column_position(bound: &ResolvedQuery, expr: &WhereExpr, table_name: &str) -> Option<usize> {
-    let WhereExpr::Scalar(ScalarExpr::Column(column)) = expr else {
+fn column_position(bound: &ResolvedQuery, expr: Where<'_>, table_name: &str) -> Option<usize> {
+    let WhereKind::Scalar(scalar) = expr.kind() else {
         return None;
     };
-    let table = bound.column_table(column)?;
+    let ScalarKind::Column(column) = scalar.kind() else {
+        return None;
+    };
+    let table = bound.column_table_at(column.id())?;
     if table.name.as_str() != table_name {
         return None;
     }
-    Some(bound.column_binding(column)?.position.index())
+    Some(bound.column_binding_at(column.id())?.position.index())
 }
 
 #[cfg(test)]
@@ -274,16 +276,16 @@ mod tests {
     /// The WHERE of `sql` compiled for rows of `table`.
     fn compiled(sql: &str, table: &str) -> CompiledPredicate {
         let bound = fixture_bound(sql);
-        let select = bound.select().expect("a SELECT");
-        let where_clause = select.where_clause.as_ref().expect("a WHERE");
+        let select = bound.rope_select().expect("a SELECT");
+        let where_clause = select.where_clause().expect("a WHERE");
         CompiledPredicate::compile(&bound, where_clause, table)
     }
 
     /// Whether the WHERE of `sql` is one the compiled predicate decides.
     fn supported(sql: &str) -> bool {
         let bound = fixture_bound(sql);
-        let select = bound.select().expect("a SELECT");
-        let where_clause = select.where_clause.as_ref().expect("a WHERE");
+        let select = bound.rope_select().expect("a SELECT");
+        let where_clause = select.where_clause().expect("a WHERE");
         where_expr_supported(&bound, where_clause)
     }
 

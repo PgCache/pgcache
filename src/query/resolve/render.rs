@@ -505,6 +505,28 @@ impl RopeDeparseContext for RopeBound<'_> {
     }
 }
 
+/// Every column of the base table a FROM entry's slot names, as the cache
+/// serves them: ` q.c1, q.c2, …` with the entry's qualifier; nothing for a
+/// derived table or an unbound entry.
+fn source_columns_render(bindings: &Bindings, source: NodeId, buf: &mut String) {
+    let Some(slot) = bindings.source(source).and_then(|slot| bindings.slot(slot)) else {
+        debug_assert!(false, "FROM entry without a slot");
+        return;
+    };
+    let TableSlot::Base { table, .. } = slot else {
+        return;
+    };
+    let mut sep = "";
+    for column in table.columns.iter() {
+        buf.push_str(sep);
+        buf.push(' ');
+        Bound::slot_name_deparse(slot, buf);
+        buf.push('.');
+        column.name.deparse(buf);
+        sep = ",";
+    }
+}
+
 /// One select-list output after star expansion: its rendered expression and
 /// its output name (the alias, else the column name of a column reference).
 struct Output {
@@ -552,23 +574,12 @@ impl ResolvedQuery {
     /// them: ` q.c1, q.c2, …` with the entry's qualifier. Nothing for a
     /// derived table or an unbound entry.
     pub fn source_columns_into(&self, source: NodeId, buf: &mut String) {
-        let bindings = self.bindings();
-        let Some(slot) = bindings.source(source).and_then(|slot| bindings.slot(slot)) else {
-            debug_assert!(false, "FROM entry without a slot");
-            return;
-        };
-        let TableSlot::Base { table, .. } = slot else {
-            return;
-        };
-        let mut sep = "";
-        for column in table.columns.iter() {
-            buf.push_str(sep);
-            buf.push(' ');
-            Bound::slot_name_deparse(slot, buf);
-            buf.push('.');
-            column.name.deparse(buf);
-            sep = ",";
-        }
+        source_columns_render(self.bindings(), source, buf);
+    }
+
+    /// [`ResolvedQuery::source_columns_into`] for a rope FROM entry.
+    pub fn rope_source_columns_into(&self, source: NodeId, buf: &mut String) {
+        source_columns_render(self.rope_bindings(), source, buf);
     }
 
     /// The SQL the cache serves for this query, appended to `buf`.

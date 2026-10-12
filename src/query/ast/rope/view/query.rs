@@ -6,7 +6,7 @@ use ecow::EcoString;
 
 use super::{
     Column, Cte, EMPTY_NAME, Literal, Name, NodeRef, OrderBy, Query, Run, Scalar, Select,
-    SelectExpr, SetOp, Source, Star, Values, ValuesRow, View, Where, mismatch,
+    SelectExpr, SetOp, Source, Star, Table, Values, ValuesRow, View, Where, mismatch,
 };
 use crate::query::ast::rope::node::NodeKind;
 use crate::query::ast::{CteMaterialization, NullOrder, OrderDirection, SetOpType};
@@ -206,6 +206,16 @@ impl<'t> Select<'t> {
         )
     }
 
+    /// The tables directly in FROM, through joins but not into subqueries
+    /// or CTE references.
+    pub fn direct_tables(&self) -> Vec<Table<'t>> {
+        let mut tables = Vec::new();
+        for source in self.from() {
+            source_direct_tables_collect(source, &mut tables);
+        }
+        tables
+    }
+
     pub fn having(&self) -> Option<Where<'t>> {
         let layout = self.layout();
         layout.has_having.then(|| {
@@ -336,5 +346,16 @@ impl<'t> OrderBy<'t> {
 
     pub fn null_order(&self) -> NullOrder {
         self.layout().1
+    }
+}
+
+fn source_direct_tables_collect<'t>(source: Source<'t>, tables: &mut Vec<Table<'t>>) {
+    match source {
+        Source::Table(table) => tables.push(table),
+        Source::Join(join) => {
+            source_direct_tables_collect(join.left(), tables);
+            source_direct_tables_collect(join.right(), tables);
+        }
+        Source::Subquery(_) | Source::CteRef(_) => {}
     }
 }

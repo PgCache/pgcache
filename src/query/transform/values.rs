@@ -12,10 +12,8 @@ use rootcause::Report;
 use super::{AstTransformError, AstTransformResult};
 use crate::catalog::TableMetadata;
 use crate::pg::protocol::ByteString;
-use crate::query::ast::{
-    Clause, Deparse, DeparseContext, LiteralValue, SelectNode, clause_deparse_with,
-    emit_escaped_string_literal, separated_deparse_with,
-};
+use crate::query::ast::rope::deparse::branch_select_into;
+use crate::query::ast::{Deparse, LiteralValue, emit_escaped_string_literal};
 use crate::query::resolve::{QueryBranch, SlotId, SourceOverride, TableSlot};
 
 /// Synthetic leading column carrying each batched row's ordinal through the
@@ -37,10 +35,10 @@ pub fn table_occurrences_find(
     branch: QueryBranch<'_>,
     table_metadata: &TableMetadata,
 ) -> AstTransformResult<Vec<TableOccurrence>> {
-    let bindings = branch.bound.bindings();
+    let bindings = branch.bound.rope_bindings();
     let mut occurrences = Vec::new();
-    for table in branch.select.direct_table_nodes() {
-        let Some(slot) = bindings.source(table.id) else {
+    for table in branch.select.direct_tables() {
+        let Some(slot) = bindings.source(table.id()) else {
             continue;
         };
         if let Some(TableSlot::Base {
@@ -278,40 +276,8 @@ fn membership_select_into(
         source,
         columns,
     };
-    let mut cx = branch.bound.deparse_context_with_source(&override_);
+    let mut cx = branch.bound.rope_deparse_context_with_source(&override_);
     branch_select_into(&mut cx, buf, branch.select, projection);
-}
-
-/// `SELECT <projection>` over a branch's FROM, WHERE, GROUP BY and HAVING,
-/// rendered by `cx`.
-pub fn branch_select_into<C: DeparseContext>(
-    cx: &mut C,
-    buf: &mut String,
-    select: &SelectNode,
-    projection: &str,
-) {
-    buf.push_str("SELECT ");
-    buf.push_str(projection);
-    if !select.from.is_empty() {
-        cx.clause_enter(Clause::From);
-        buf.push_str(" FROM");
-        separated_deparse_with(cx, buf, &select.from, ",");
-        cx.clause_leave(Clause::From);
-    }
-    clause_deparse_with(
-        cx,
-        buf,
-        Clause::Where,
-        " WHERE ",
-        select.where_clause.as_ref(),
-    );
-    if !select.group_by.is_empty() {
-        cx.clause_enter(Clause::GroupBy);
-        buf.push_str(" GROUP BY ");
-        separated_deparse_with(cx, buf, &select.group_by, ", ");
-        cx.clause_leave(Clause::GroupBy);
-    }
-    clause_deparse_with(cx, buf, Clause::Having, " HAVING ", select.having.as_ref());
 }
 
 /// Multi-row membership for batched evaluation (PGC-241): the relation's sole
@@ -457,7 +423,7 @@ mod tests {
     fn branch(bound: &ResolvedQuery) -> QueryBranch<'_> {
         QueryBranch {
             bound,
-            select: bound.select().expect("a select"),
+            select: bound.rope_select().expect("a select"),
         }
     }
 

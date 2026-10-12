@@ -3,24 +3,21 @@
 //! columns define a LIMIT window.
 
 use std::collections::HashSet;
-use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
 use crate::cache::update_query::{OrderByKey, UpdateEvalStrategy, UpdateQuerySource};
 use crate::oid::Oid;
-use crate::query::ast::{
-    AstNode, ColumnNode, JoinNode, JoinQual, NullOrder, OrderByClause, OrderDirection, QueryExpr,
-    ScalarExpr, SelectColumn, SelectColumns, SelectNode,
+use crate::query::ast::rope::{
+    Column, JoinQualKind, NodeKind, NodeRef, OrderBy, Scalar, ScalarKind, Select, SelectItem, View,
 };
+use crate::query::ast::{NodeId, NullOrder, OrderDirection};
 use crate::query::evaluate::where_expr_supported;
 use crate::query::resolve::{ColumnBinding, ColumnTarget, QueryBranch, ResolvedQuery};
 
-/// Conservative classifier: rejects anything the Rust evaluator can't decide
-/// from a single CDC row. GROUP BY / HAVING are rejected because row-level
-/// matching doesn't capture post-aggregation filtering. Non-FromClause sources
-/// are rejected because their CDC semantics (subquery membership, outer join
-/// null-padding cascade) aren't expressible as a row-level predicate.
+/// How CDC decides a changed row's membership in a branch: locally, when
+/// the branch reads one table and its WHERE is one the compiled predicate
+/// decides; otherwise through the cache PG.
 pub(super) fn update_eval_strategy_classify(
     branch: QueryBranch<'_>,
     source: UpdateQuerySource,
@@ -29,13 +26,13 @@ pub(super) fn update_eval_strategy_classify(
         return UpdateEvalStrategy::PgEval;
     }
     let select = branch.select;
-    if !select.is_single_table() {
+    if !select_is_single_table(select) {
         return UpdateEvalStrategy::PgEval;
     }
-    if !select.group_by.is_empty() || select.having.is_some() {
+    if select.group_by().len() > 0 || select.having().is_some() {
         return UpdateEvalStrategy::PgEval;
     }
-    let Some(where_expr) = &select.where_clause else {
+    let Some(where_expr) = select.where_clause() else {
         return UpdateEvalStrategy::LocalEval;
     };
     if where_expr_supported(branch.bound, where_expr) {
@@ -45,41 +42,40 @@ pub(super) fn update_eval_strategy_classify(
     }
 }
 
-/// Whether a PgEval query's membership predicate stays per-row correct when
-/// evaluated for many CDC rows in one multi-row VALUES statement (PGC-241).
-///
-/// Per-row membership substitutes the changed table with *only that row*; a
-/// multi-row VALUES is equivalent iff each row's answer is independent of the
-/// others. GROUP BY / HAVING / SELECT-list aggregates evaluate against the
-/// substituted rows as a set, so they must stay on the per-row path. (LIMIT and
-/// ORDER BY never reach the predicate, and aggregates can't appear in WHERE.)
-///
-/// Relations appearing more than once (self-joins) are excluded: a
-/// single-occurrence substitution is not a complete membership test
-/// (PGC-256), and batching pre-evaluates unfiltered.
+/// Whether FROM is exactly one table reference.
+fn select_is_single_table(select: Select<'_>) -> bool {
+    let mut from = select.from();
+    matches!(
+        (from.next(), from.next()),
+        (Some(crate::query::ast::rope::Source::Table(_)), None)
+    )
+}
+
+/// Whether many CDC rows can be evaluated against the branch in one
+/// multi-row VALUES (PGC-241): no GROUP BY, HAVING or aggregate, and the
+/// relation occurring once.
 pub(super) fn pg_batchable_classify(
     branch: QueryBranch<'_>,
     relation_oid: Oid,
     aggregate_functions: &HashSet<EcoString>,
 ) -> bool {
     let select = branch.select;
-    if !select.group_by.is_empty() || select.having.is_some() {
+    if select.group_by().len() > 0 || select.having().is_some() {
         return false;
     }
     if branch.bound.relation_occurrences(relation_oid) > 1 {
         return false;
     }
-    match &select.columns {
-        SelectColumns::None => true,
-        SelectColumns::Columns(columns) => columns.iter().all(|column| match column {
-            SelectColumn::Expr { expr, .. } => !expr.has_aggregate(aggregate_functions),
-            SelectColumn::Star(_) => true,
+    match select.items() {
+        None => true,
+        Some(mut items) => items.all(|item| match item {
+            SelectItem::Expr(expr) => !expr.expr().has_aggregate(aggregate_functions),
+            SelectItem::Star(_) => true,
         }),
     }
 }
 
-/// Column names of one table, collected from column references anywhere
-/// under the nodes added.
+/// Collects the columns of one table that a set of expressions reads.
 struct ReferencedColumns<'a> {
     bound: &'a ResolvedQuery,
     table: &'a str,
@@ -95,14 +91,14 @@ impl<'a> ReferencedColumns<'a> {
         }
     }
 
-    fn add(&mut self, column: &ColumnNode) {
-        if let Some(binding) = self.bound.column_binding(column) {
+    fn add(&mut self, column: Column<'_>) {
+        if let Some(binding) = self.bound.column_binding_at(column.id()) {
             self.add_binding(&binding);
         }
     }
 
     fn add_binding(&mut self, binding: &ColumnBinding) {
-        let bindings = self.bound.bindings();
+        let bindings = self.bound.rope_bindings();
         if let (Some(slot), Some(column)) = (
             bindings.slot(binding.slot),
             bindings.binding_column(binding),
@@ -112,152 +108,153 @@ impl<'a> ReferencedColumns<'a> {
         }
     }
 
-    /// Every column reference under `node` (zero-allocation walk), plus
-    /// both sides of each column a USING or NATURAL join under it merges:
-    /// the tree names those without a column reference.
-    fn add_refs<N: AstNode>(&mut self, node: &N) {
-        let _ = node.try_for_each_node::<ColumnNode, ()>(&mut |column| {
-            self.add(column);
-            ControlFlow::Continue(())
-        });
-        let _ = node.try_for_each_node::<JoinNode, ()>(&mut |join| {
-            if matches!(join.qual, JoinQual::Using(_) | JoinQual::Natural) {
-                for merged in self.bound.bindings().merged_columns() {
-                    if merged.join.index() == join.id.index() {
-                        self.add_binding(&merged.left);
-                        self.add_binding(&merged.right);
-                    }
-                }
+    /// Every column reference under `node`, and both sides of every
+    /// `USING`/`NATURAL` join under it.
+    fn add_refs(&mut self, node: NodeRef<'_>) {
+        for position in node.subtree() {
+            if matches!(position.kind(), NodeKind::Column { .. }) {
+                self.add(Column::from_ref(position));
+            } else if let NodeKind::Join {
+                qual: JoinQualKind::Using(_) | JoinQualKind::Natural,
+                ..
+            } = position.kind()
+            {
+                self.merged_join_add(position.id());
             }
-            ControlFlow::Continue(())
-        });
+        }
+    }
+
+    /// Both sides of a `USING`/`NATURAL` join's merged columns.
+    fn merged_join_add(&mut self, join: NodeId) {
+        let merged: Vec<(ColumnBinding, ColumnBinding)> = self
+            .bound
+            .rope_bindings()
+            .merged_columns()
+            .iter()
+            .filter(|merged| merged.join.index() == join.index())
+            .map(|merged| (merged.left, merged.right))
+            .collect();
+        for (left, right) in merged {
+            self.add_binding(&left);
+            self.add_binding(&right);
+        }
     }
 }
 
-/// The SELECT-list expressions an `ORDER BY alias` names (output-name match).
+/// The select-list expressions whose output name is `name`.
 fn alias_exprs<'s>(
     bound: &'s ResolvedQuery,
-    select: &'s SelectNode,
+    select: Select<'s>,
     name: &'s EcoString,
-) -> impl Iterator<Item = &'s ScalarExpr> {
-    let columns: &[SelectColumn] = match &select.columns {
-        SelectColumns::Columns(columns) => columns,
-        SelectColumns::None => &[],
-    };
-    columns.iter().filter_map(move |column| match column {
-        SelectColumn::Expr { expr, alias } => {
-            let output = alias.clone().or_else(|| bound.column_output_name(expr));
-            (output.as_ref() == Some(name)).then_some(expr)
-        }
-        SelectColumn::Star(_) => None,
-    })
+) -> impl Iterator<Item = Scalar<'s>> {
+    select
+        .items()
+        .into_iter()
+        .flatten()
+        .filter_map(move |item| match item {
+            SelectItem::Expr(expr) => {
+                let output = expr
+                    .alias()
+                    .cloned()
+                    .or_else(|| bound.rope_column_output_name(expr.expr()));
+                (output.as_ref() == Some(name)).then(|| expr.expr())
+            }
+            SelectItem::Star(_) => None,
+        })
 }
 
-/// The output an ORDER BY item names, when it names one.
-fn order_by_output<'s>(bound: &ResolvedQuery, clause: &'s OrderByClause) -> Option<&'s EcoString> {
-    let ScalarExpr::Column(column) = &clause.expr else {
+/// The output name an ORDER BY item names, when it names one.
+fn order_by_output<'s>(bound: &ResolvedQuery, clause: OrderBy<'s>) -> Option<&'s EcoString> {
+    let ScalarKind::Column(column) = clause.expr().kind() else {
         return None;
     };
-    matches!(bound.column(column), Some(ColumnTarget::Output)).then_some(&column.column)
+    matches!(
+        bound.column_target_at(column.id()),
+        Some(ColumnTarget::Output)
+    )
+    .then(|| column.column())
 }
 
-/// Collect column names on `table_name` that participate in the parent
-/// query's LIMIT-window definition: top-level ORDER BY, WHERE, and HAVING.
-///
-/// PGC-94: used by row_cached_invalidation_check to decide whether a CDC
-/// UPDATE on a cached row may shift the window such that an untracked
-/// row needs to fill the gap. Returns an empty set when the query has
-/// no window-defining references on this table.
-///
-/// Aliased ORDER BY (`ORDER BY count(*) DESC LIMIT 10`) carries no table
-/// reference and naturally produces no entries here. Those shapes are
-/// Measure queries that already use PgEval/MV invalidation paths.
+/// The columns of `table_name` that decide a LIMIT window: ORDER BY keys
+/// (through output aliases), WHERE and HAVING.
 pub(super) fn limit_window_columns_collect(
     bound: &ResolvedQuery,
     table_name: &str,
 ) -> HashSet<EcoString> {
     let mut cols = ReferencedColumns::new(bound, table_name);
-    let query: &QueryExpr = bound.tree();
-    let select = bound.select();
-    for clause in &query.order_by {
-        cols.add_refs(&clause.expr);
-        // Aliased `ORDER BY value` names an output; chase it through the
-        // SELECT list to recover the underlying base-table column refs.
+    let query = bound.rope().root();
+    let select = bound.rope_select();
+    for clause in query.order_by() {
+        cols.add_refs(clause.expr().node_ref());
         if let Some(name) = order_by_output(bound, clause)
             && let Some(select) = select
         {
             for expr in alias_exprs(bound, select, name) {
-                cols.add_refs(expr);
+                cols.add_refs(expr.node_ref());
             }
         }
     }
     if let Some(select) = select {
-        if let Some(where_expr) = &select.where_clause {
-            cols.add_refs(where_expr);
+        if let Some(where_expr) = select.where_clause() {
+            cols.add_refs(where_expr.node_ref());
         }
-        if let Some(having) = &select.having {
-            cols.add_refs(having);
+        if let Some(having) = select.having() {
+            cols.add_refs(having.node_ref());
         }
     }
     cols.columns
 }
 
-/// The ORDER BY key spec for direction-aware window invalidation (PGC-334):
-/// `Some` only when the parent query is a plain SELECT (no set-op, GROUP BY,
-/// HAVING, or DISTINCT — their windows aren't row-level) and every key
-/// resolves to exactly one plain column of `table_name`, directly or through
-/// a bare-column SELECT alias. Anything else returns `None` and the window
-/// check stays direction-blind (always invalidates).
+/// The ORDER BY keys of a row-level LIMIT window as plain columns of
+/// `table_name`, or `None` when any key is not one (PGC-334).
 pub(super) fn limit_order_keys_collect(
     bound: &ResolvedQuery,
     table_name: &str,
 ) -> Option<Box<[OrderByKey]>> {
-    let select = bound.select()?;
-    let query: &QueryExpr = bound.tree();
-    if !window_is_row_level(query, select) {
+    let select = bound.rope_select()?;
+    let query = bound.rope().root();
+    if !window_is_row_level(select) {
         return None;
     }
-    let mut keys = Vec::with_capacity(query.order_by.len());
-    for clause in &query.order_by {
+    let order_by = query.order_by();
+    let mut keys = Vec::with_capacity(order_by.len());
+    for clause in order_by {
         let column = order_key(bound, clause, select)?;
-        if bound.column_table(column)?.name.as_str() != table_name {
+        if bound.column_table_at(column.id())?.name.as_str() != table_name {
             return None;
         }
-        keys.push(order_key_build(bound.column_name(column)?, clause));
+        keys.push(order_key_build(bound.column_name_at(column.id())?, clause));
     }
     Some(keys.into())
 }
 
-/// A window whose rows are the SELECT's own rows: ordered, and no DISTINCT,
-/// GROUP BY or HAVING reshaping them.
-fn window_is_row_level(query: &QueryExpr, select: &SelectNode) -> bool {
-    let reshaped = select.distinct || !select.group_by.is_empty() || select.having.is_some();
-    !reshaped && !query.order_by.is_empty()
+/// A window over rows as they are: no DISTINCT, GROUP BY or HAVING, and an
+/// ORDER BY to rank them by.
+fn window_is_row_level(select: Select<'_>) -> bool {
+    let reshaped = select.distinct() || select.group_by().len() > 0 || select.having().is_some();
+    !reshaped && select.node_ref().tree().root().order_by().len() > 0
 }
 
-/// The plain column an ORDER BY key sorts by: the key itself, or the bare
-/// column an `ORDER BY alias` names.
+/// The column an ORDER BY item ranks by, through an output alias.
 fn order_key<'s>(
     bound: &'s ResolvedQuery,
-    clause: &'s OrderByClause,
-    select: &'s SelectNode,
-) -> Option<&'s ColumnNode> {
+    clause: OrderBy<'s>,
+    select: Select<'s>,
+) -> Option<Column<'s>> {
     let target = match order_by_output(bound, clause) {
         Some(name) => alias_exprs(bound, select, name).next()?,
-        None => &clause.expr,
+        None => clause.expr(),
     };
-    if let ScalarExpr::Column(column) = target {
+    if let ScalarKind::Column(column) = target.kind() {
         Some(column)
     } else {
         None
     }
 }
 
-/// `Default` null ordering resolves per PG semantics — NULLs sort larger than
-/// every value, so ASC → last, DESC → first.
-fn order_key_build(column: &EcoString, clause: &OrderByClause) -> OrderByKey {
-    let descending = matches!(clause.direction, OrderDirection::Desc);
-    let nulls_first = match clause.null_order {
+fn order_key_build(column: &EcoString, clause: OrderBy<'_>) -> OrderByKey {
+    let descending = matches!(clause.direction(), OrderDirection::Desc);
+    let nulls_first = match clause.null_order() {
         NullOrder::NullsFirst => true,
         NullOrder::NullsLast => false,
         NullOrder::Default => descending,
@@ -269,28 +266,25 @@ fn order_key_build(column: &EcoString, clause: &OrderByClause) -> OrderByKey {
     }
 }
 
-/// Collect column names on `table_name` whose values CDC eval reads for this
-/// update query: WHERE, from-source join predicates (including any nested
-/// subquery internals — over-collection errs toward invalidation, the safe
-/// direction), GROUP BY, and HAVING. The outer SELECT list is excluded: it
-/// never feeds a membership or invalidation verdict (PGC-264).
+/// The columns of `table_name` whose values CDC evaluation reads: FROM
+/// (join predicates), WHERE, GROUP BY and HAVING, not the select list.
 pub(super) fn predicate_columns_collect(
     branch: QueryBranch<'_>,
     table_name: &str,
 ) -> HashSet<EcoString> {
     let mut cols = ReferencedColumns::new(branch.bound, table_name);
     let select = branch.select;
-    for source in &select.from {
-        cols.add_refs(source);
+    for source in select.from() {
+        cols.add_refs(source.node_ref());
     }
-    if let Some(where_expr) = &select.where_clause {
-        cols.add_refs(where_expr);
+    if let Some(where_expr) = select.where_clause() {
+        cols.add_refs(where_expr.node_ref());
     }
-    for column in &select.group_by {
+    for column in select.group_by() {
         cols.add(column);
     }
-    if let Some(having) = &select.having {
-        cols.add_refs(having);
+    if let Some(having) = select.having() {
+        cols.add_refs(having.node_ref());
     }
     cols.columns
 }
@@ -345,7 +339,7 @@ mod classify_tests {
     fn branch(bound: &ResolvedQuery) -> QueryBranch<'_> {
         QueryBranch {
             bound,
-            select: bound.select().expect("a select"),
+            select: bound.rope_select().expect("a select"),
         }
     }
 

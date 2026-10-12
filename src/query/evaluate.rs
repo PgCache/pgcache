@@ -4,9 +4,10 @@
 
 #![allow(clippy::wildcard_enum_match_arm)]
 
-use crate::query::ast::{BinaryExpr, BinaryOp, LiteralValue, ScalarExpr, WhereExpr};
+use crate::query::ast::rope::{Binary, ScalarKind, Where, WhereKind};
+use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::{
-    CastTarget, cast_target_is_coercion_supported, comparison_canonicalize,
+    CastTarget, cast_target_is_coercion_supported, comparison_canonicalize_tree,
     is_canonical_date_literal,
 };
 use crate::query::resolve::ResolvedQuery;
@@ -113,15 +114,18 @@ pub fn bool_wire_text_parse(text: &str) -> Option<bool> {
 /// Whether the compiled predicate can decide `expr` against a single CDC row.
 /// Must stay in lockstep with `CompiledPredicate::compile`: any shape it
 /// compiles to `ConstFalse` is unsupported.
-pub fn where_expr_supported(bound: &ResolvedQuery, expr: &WhereExpr) -> bool {
-    match expr {
-        WhereExpr::Scalar(scalar) => {
-            matches!(scalar, ScalarExpr::Column(_) | ScalarExpr::Literal(_))
+pub fn where_expr_supported(bound: &ResolvedQuery, expr: Where<'_>) -> bool {
+    match expr.kind() {
+        WhereKind::Scalar(scalar) => {
+            matches!(
+                scalar.kind(),
+                ScalarKind::Column(_) | ScalarKind::Literal(_)
+            )
         }
-        WhereExpr::Binary(binary) => match binary.op {
+        WhereKind::Binary(binary) => match binary.op() {
             BinaryOp::And | BinaryOp::Or => {
-                where_expr_supported(bound, &binary.lexpr)
-                    && where_expr_supported(bound, &binary.rexpr)
+                where_expr_supported(bound, binary.lexpr())
+                    && where_expr_supported(bound, binary.rexpr())
             }
             BinaryOp::Equal
             | BinaryOp::NotEqual
@@ -131,19 +135,19 @@ pub fn where_expr_supported(bound: &ResolvedQuery, expr: &WhereExpr) -> bool {
             | BinaryOp::GreaterThanOrEqual => comparison_is_simple(bound, binary),
             BinaryOp::Like | BinaryOp::ILike | BinaryOp::NotLike | BinaryOp::NotILike => false,
         },
-        WhereExpr::Unary(unary) => where_expr_supported(bound, &unary.expr),
-        WhereExpr::Multi(_) | WhereExpr::Subquery { .. } => false,
+        WhereKind::Unary(unary) => where_expr_supported(bound, unary.expr()),
+        WhereKind::Multi(_) | WhereKind::Subquery(_) => false,
     }
 }
 
 /// Whether a comparison is one the compiled predicate decides locally:
 /// `column op literal` (either order), through an identity cast, or through
 /// a coercion the cast module supports; a `::date` literal must be canonical.
-pub fn comparison_is_simple(bound: &ResolvedQuery, binary: &BinaryExpr) -> bool {
-    let Some((column, target, op, literal)) = comparison_canonicalize(bound, binary) else {
+pub fn comparison_is_simple(bound: &ResolvedQuery, binary: Binary<'_>) -> bool {
+    let Some((column, target, op, literal)) = comparison_canonicalize_tree(bound, binary) else {
         return false;
     };
-    let Some(base) = bound.column_type(column) else {
+    let Some(base) = bound.column_type_at(column.id()) else {
         return false;
     };
     let Some(target) = target else {

@@ -1,25 +1,24 @@
-//! One SELECT of a bound query, as CDC evaluates a changed row against it.
-
-use std::ops::ControlFlow;
+//! One SELECT of a bound query as CDC evaluates a changed row against it
+//! (ADR-057): a branch is a position in the shared rope, never a copy.
 
 use super::bindings::ResolvedQuery;
-use crate::query::ast::{AstNode, NodeId, SelectNode, TableNode};
-use crate::query::transform::branch_select_into;
+use crate::query::ast::NodeId;
+use crate::query::ast::rope::deparse::branch_select_into;
+use crate::query::ast::rope::{NodeKind, Select, View};
 
-/// One SELECT of a bound query as CDC evaluates a changed row against it:
-/// its FROM, WHERE, GROUP BY and HAVING with the select list read as `true`,
-/// and no ORDER BY or LIMIT. The branch is a node of the query it came
-/// from, so the query's bindings serve it and nothing is copied (ADR-057).
+/// A SELECT of `bound`, by position: the root or any subquery.
 #[derive(Clone, Copy)]
 pub struct QueryBranch<'a> {
     pub bound: &'a ResolvedQuery,
-    pub select: &'a SelectNode,
+    pub select: Select<'a>,
 }
 
 impl<'a> QueryBranch<'a> {
     /// The branch `id` names in `bound`, when it has one.
     pub fn find(bound: &'a ResolvedQuery, id: NodeId) -> Option<Self> {
-        bound.select_node(id).map(|select| Self { bound, select })
+        bound
+            .rope_select_node(id)
+            .map(|select| Self { bound, select })
     }
 
     /// Whether the row evaluation reads one table: no join, and no subquery
@@ -27,35 +26,32 @@ impl<'a> QueryBranch<'a> {
     /// subquery there does not count.
     pub fn is_single_table(&self) -> bool {
         let mut count = 0u8;
-        let mut visit = |_: &TableNode| {
-            count += 1;
-            if count >= 2 {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
+        let sources = self.select.from().map(|source| source.node_ref());
+        let clauses = [self.select.where_clause(), self.select.having()]
+            .into_iter()
+            .flatten()
+            .map(|expr| expr.node_ref());
+        for root in sources.chain(clauses) {
+            for node in root.subtree() {
+                if matches!(node.kind(), NodeKind::Table { .. }) {
+                    count += 1;
+                    if count >= 2 {
+                        return false;
+                    }
+                }
             }
-        };
-        let from = self
-            .select
-            .from
-            .iter()
-            .try_for_each(|source| source.try_for_each_node(&mut visit));
-        let where_clause = self
-            .select
-            .where_clause
-            .iter()
-            .try_for_each(|expr| expr.try_for_each_node(&mut visit));
-        let having = self
-            .select
-            .having
-            .iter()
-            .try_for_each(|expr| expr.try_for_each_node(&mut visit));
-        from.is_continue() && where_clause.is_continue() && having.is_continue()
+        }
+        true
     }
 
-    /// The update query as SQL: `SELECT true` over the branch.
+    /// `SELECT true` over the branch, as the cache serves it.
     pub fn sql_into(&self, buf: &mut String) {
-        branch_select_into(&mut self.bound.deparse_context(), buf, self.select, "true");
+        branch_select_into(
+            &mut self.bound.rope_deparse_context(),
+            buf,
+            self.select,
+            "true",
+        );
     }
 
     pub fn sql(&self) -> String {

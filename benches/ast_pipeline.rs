@@ -379,7 +379,7 @@ fn canonicalise(
 }
 
 fn predicate_compile(bound: &ResolvedQuery, table: &str) -> Option<CompiledPredicate> {
-    let where_clause = bound.select()?.where_clause.as_ref()?;
+    let where_clause = bound.rope_select()?.where_clause()?;
     Some(CompiledPredicate::compile(bound, where_clause, table))
 }
 

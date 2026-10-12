@@ -42,7 +42,7 @@ pub(crate) use parameters::{literal_is_parameterizable, literal_value_parameters
 pub use parameters::{query_expr_parameters_replace, select_node_parameters_replace};
 pub use predicate_pushdown::query_predicate_pushdown;
 pub use values::{
-    BATCH_IDX_COLUMN, PgEvalTemplate, TableOccurrence, branch_select_into, membership_batch_into,
+    BATCH_IDX_COLUMN, PgEvalTemplate, TableOccurrence, membership_batch_into,
     membership_unnest_into, membership_values_all_into, membership_values_into,
     table_occurrences_find,
 };

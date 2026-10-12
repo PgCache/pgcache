@@ -1,37 +1,42 @@
-use crate::cache::UpdateQuerySource;
 use crate::cache::query::outer_join_optional_tables;
+use crate::cache::{SubqueryKind, UpdateQuerySource};
 use crate::oid::Oid;
-use crate::query::ast::TableNode;
+use crate::query::ast::rope::{
+    Body, JoinQual, Query, Scalar, ScalarKind, Select, SelectItem, Source, Table, Where, WhereKind,
+};
+use crate::query::ast::{SubLinkType, UnaryOp};
 use crate::query::resolve::{QueryBranch, ResolvedQuery};
 
-/// One table's update query: the branch it sits in, as a query of its own.
+/// One table's update query: the branch it sits in, as the cache
+/// evaluates a changed row of the table against it.
 pub struct TableUpdateQuery<'a> {
-    pub table: &'a TableNode,
+    pub table: Table<'a>,
     pub relation_oid: Oid,
     pub branch: QueryBranch<'a>,
     pub source: UpdateQuerySource,
 }
 
-/// One update query per direct table of each branch of `bound`.
+/// Every (table, branch) pair of the query: each SELECT, the root and
+/// every subquery, once per table directly in its FROM.
 pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery<'_>> {
     let mut result = Vec::new();
-    for (select, source) in bound.tree().select_nodes_with_source() {
+    for (select, source) in select_branches_with_source(bound.rope().root()) {
         let (terminal, non_terminal) = outer_join_optional_tables(bound, select);
         let branch = QueryBranch { bound, select };
-        for table in select.direct_table_nodes() {
+        for table in select.direct_tables() {
             let relation_oid = bound
-                .bindings()
-                .source(table.id)
-                .and_then(|slot| bound.bindings().slot(slot))
+                .rope_bindings()
+                .source(table.id())
+                .and_then(|slot| bound.rope_bindings().slot(slot))
                 .map(|slot| slot.table().relation_oid);
             let Some(relation_oid) = relation_oid else {
                 debug_assert!(false, "a direct table of a resolved query has a slot");
                 continue;
             };
             let effective_source = if source == UpdateQuerySource::FromClause {
-                if non_terminal.contains(table.name.as_str()) {
+                if non_terminal.contains(table.name().as_str()) {
                     UpdateQuerySource::OuterJoinOptional
-                } else if terminal.contains(table.name.as_str()) {
+                } else if terminal.contains(table.name().as_str()) {
                     UpdateQuerySource::OuterJoinTerminal
                 } else {
                     source
@@ -48,6 +53,221 @@ pub fn query_table_update_queries(bound: &ResolvedQuery) -> Vec<TableUpdateQuery
         }
     }
     result
+}
+
+/// Every SELECT of `query` with where it sits: the root body
+/// (`FromClause`), or a subquery with its kind. CTE definitions are not
+/// collected directly: their branches are collected through each reference,
+/// inheriting the reference site's context.
+pub fn select_branches_with_source(query: Query<'_>) -> Vec<(Select<'_>, UpdateQuerySource)> {
+    let mut branches = Vec::new();
+    query_branches_collect(query, &mut branches, UpdateQuerySource::FromClause, false);
+    branches
+}
+
+/// `negated` tracks NOT-wrapping, which flips Inclusion and Exclusion.
+fn query_branches_collect<'t>(
+    query: Query<'t>,
+    branches: &mut Vec<(Select<'t>, UpdateQuerySource)>,
+    outer_source: UpdateQuerySource,
+    negated: bool,
+) {
+    match query.body() {
+        Body::Select(select) => {
+            branches.push((select, outer_source));
+            for source in select.from() {
+                source_branches_collect(source, branches, negated);
+            }
+            if let Some(where_clause) = select.where_clause() {
+                where_branches_collect(where_clause, branches, negated);
+            }
+            if let Some(having) = select.having() {
+                where_branches_collect(having, branches, negated);
+            }
+            if let Some(items) = select.items() {
+                for item in items {
+                    if let SelectItem::Expr(expr) = item {
+                        scalar_branches_collect(expr.expr(), branches);
+                    }
+                }
+            }
+        }
+        Body::SetOp(set_op) => {
+            query_branches_collect(set_op.left(), branches, outer_source, negated);
+            query_branches_collect(set_op.right(), branches, outer_source, negated);
+        }
+        Body::Values(_) => {}
+    }
+}
+
+fn source_branches_collect<'t>(
+    source: Source<'t>,
+    branches: &mut Vec<(Select<'t>, UpdateQuerySource)>,
+    negated: bool,
+) {
+    match source {
+        Source::Table(_) => {}
+        Source::Subquery(subquery) => {
+            let kind = match (subquery.kind(), negated) {
+                (SubqueryKind::Scalar, _) => SubqueryKind::Scalar,
+                (SubqueryKind::Inclusion, true) => SubqueryKind::Exclusion,
+                (SubqueryKind::Exclusion, true) => SubqueryKind::Inclusion,
+                (kind, false) => kind,
+            };
+            query_branches_collect(
+                subquery.query(),
+                branches,
+                UpdateQuerySource::Subquery(kind),
+                negated,
+            );
+        }
+        Source::CteRef(cte_ref) => {
+            let kind = if negated {
+                SubqueryKind::Exclusion
+            } else {
+                SubqueryKind::Inclusion
+            };
+            query_branches_collect(
+                cte_ref.query(),
+                branches,
+                UpdateQuerySource::Subquery(kind),
+                negated,
+            );
+        }
+        Source::Join(join) => {
+            source_branches_collect(join.left(), branches, negated);
+            source_branches_collect(join.right(), branches, negated);
+            if let JoinQual::On(condition) = join.qual() {
+                where_branches_collect(condition, branches, negated);
+            }
+        }
+    }
+}
+
+fn where_branches_collect<'t>(
+    expr: Where<'t>,
+    branches: &mut Vec<(Select<'t>, UpdateQuerySource)>,
+    negated: bool,
+) {
+    match expr.kind() {
+        WhereKind::Scalar(scalar) => scalar_branches_collect(scalar, branches),
+        WhereKind::Binary(binary) => {
+            where_branches_collect(binary.lexpr(), branches, negated);
+            where_branches_collect(binary.rexpr(), branches, negated);
+        }
+        WhereKind::Unary(unary) => {
+            let child_negated = if unary.op() == UnaryOp::Not {
+                !negated
+            } else {
+                negated
+            };
+            where_branches_collect(unary.expr(), branches, child_negated);
+        }
+        WhereKind::Multi(multi) => {
+            for operand in multi.exprs() {
+                where_branches_collect(operand, branches, negated);
+            }
+        }
+        WhereKind::Subquery(subquery) => {
+            let kind = match subquery.sublink_type() {
+                SubLinkType::Expr => SubqueryKind::Scalar,
+                SubLinkType::Any | SubLinkType::Exists => {
+                    if negated {
+                        SubqueryKind::Exclusion
+                    } else {
+                        SubqueryKind::Inclusion
+                    }
+                }
+                SubLinkType::All => {
+                    if negated {
+                        SubqueryKind::Inclusion
+                    } else {
+                        SubqueryKind::Exclusion
+                    }
+                }
+            };
+            query_branches_collect(
+                subquery.query(),
+                branches,
+                UpdateQuerySource::Subquery(kind),
+                negated,
+            );
+            if let Some(test) = subquery.test_expr() {
+                scalar_branches_collect(test, branches);
+            }
+        }
+    }
+}
+
+/// Like [`where_branches_collect`] but every collected subquery is
+/// `SubqueryKind::Scalar` whatever its sublink type: its truth value feeds
+/// an enclosing scalar (aggregate FILTER, CASE WHEN condition), so
+/// shrink-skip rules are unsound (PGC-107).
+fn where_branches_collect_as_scalar<'t>(
+    expr: Where<'t>,
+    branches: &mut Vec<(Select<'t>, UpdateQuerySource)>,
+) {
+    let start = branches.len();
+    where_branches_collect(expr, branches, false);
+    for (_, source) in branches.iter_mut().skip(start) {
+        if let UpdateQuerySource::Subquery(kind) = source {
+            *kind = SubqueryKind::Scalar;
+        }
+    }
+}
+
+fn scalar_branches_collect<'t>(
+    expr: Scalar<'t>,
+    branches: &mut Vec<(Select<'t>, UpdateQuerySource)>,
+) {
+    match expr.kind() {
+        ScalarKind::Column(_) | ScalarKind::Literal(_) => {}
+        ScalarKind::Function(function) => {
+            for arg in function.args() {
+                scalar_branches_collect(arg, branches);
+            }
+            for clause in function.agg_order() {
+                scalar_branches_collect(clause.expr(), branches);
+            }
+            if let Some(filter) = function.filter() {
+                where_branches_collect_as_scalar(filter, branches);
+            }
+            if let Some(over) = function.over() {
+                for partition in over.partition_by() {
+                    scalar_branches_collect(partition, branches);
+                }
+                for clause in over.order_by() {
+                    scalar_branches_collect(clause.expr(), branches);
+                }
+            }
+        }
+        ScalarKind::Case(case) => {
+            if let Some(arg) = case.arg() {
+                scalar_branches_collect(arg, branches);
+            }
+            for when in case.whens() {
+                where_branches_collect_as_scalar(when.condition(), branches);
+                scalar_branches_collect(when.result(), branches);
+            }
+            if let Some(default) = case.default() {
+                scalar_branches_collect(default, branches);
+            }
+        }
+        ScalarKind::Arithmetic(arithmetic) => {
+            scalar_branches_collect(arithmetic.left(), branches);
+            scalar_branches_collect(arithmetic.right(), branches);
+        }
+        ScalarKind::Subquery(subquery) => {
+            let source = UpdateQuerySource::Subquery(SubqueryKind::Scalar);
+            query_branches_collect(subquery.query(), branches, source, false);
+        }
+        ScalarKind::Array(array) => {
+            for element in array.elements() {
+                scalar_branches_collect(element, branches);
+            }
+        }
+        ScalarKind::TypeCast(cast) => scalar_branches_collect(cast.expr(), branches),
+    }
 }
 
 #[cfg(test)]
@@ -215,7 +435,7 @@ mod tests {
             .into_iter()
             .map(|update| {
                 (
-                    update.table.name.to_string(),
+                    update.table.name().to_string(),
                     update.branch.sql(),
                     update.source,
                 )

@@ -5,23 +5,24 @@ use std::collections::HashSet;
 
 use ecow::EcoString;
 
-use crate::query::ast::{
-    AstNode, ColumnNode, JoinNode, JoinQual, JoinType, SelectNode, TableSource, WhereExpr,
-};
+use crate::query::ast::JoinType;
+use crate::query::ast::rope::{Join, JoinQual, NodeKind, NodeRef, Select, Source, View};
 use crate::query::resolve::{ColumnTarget, ResolvedQuery};
 
-/// [`outer_join_optional_tables`] on a branch of a bound query: the same
-/// sets, read from the bindings.
+/// The optional-side tables of a SELECT whose FROM is one outer join tree,
+/// split into those no predicate references (terminal: a change there
+/// cannot drop a cached row) and those one does (non-terminal).
 pub fn outer_join_optional_tables(
     bound: &ResolvedQuery,
-    select: &SelectNode,
+    select: Select<'_>,
 ) -> (HashSet<EcoString>, HashSet<EcoString>) {
-    let [TableSource::Join(join)] = select.from.as_slice() else {
+    let mut from = select.from();
+    let (Some(Source::Join(join)), None) = (from.next(), from.next()) else {
         return (HashSet::new(), HashSet::new());
     };
     let mut non_terminal_refs = HashSet::new();
-    if let Some(where_clause) = &select.where_clause {
-        column_table_refs_collect(bound, where_clause, &mut non_terminal_refs);
+    if let Some(where_clause) = select.where_clause() {
+        column_table_refs_collect(bound, where_clause.node_ref(), &mut non_terminal_refs);
     }
     let mut all_optional = HashSet::new();
     let mut non_terminal = HashSet::new();
@@ -36,16 +37,19 @@ pub fn outer_join_optional_tables(
     (terminal, non_terminal)
 }
 
-/// The tables the column references of a predicate are bound to, a merged
-/// column counting for its left column.
+/// The tables the column references under `node` bind to: a merged column
+/// counts as its left side.
 fn column_table_refs_collect(
     bound: &ResolvedQuery,
-    expr: &WhereExpr,
+    node: NodeRef<'_>,
     tables: &mut HashSet<EcoString>,
 ) {
-    let bindings = bound.bindings();
-    for column in expr.nodes::<ColumnNode>() {
-        let binding = match bindings.column(column) {
+    let bindings = bound.rope_bindings();
+    for position in node.subtree() {
+        if !matches!(position.kind(), NodeKind::Column { .. }) {
+            continue;
+        }
+        let binding = match bindings.column_by_id(position.id()) {
             Some(ColumnTarget::Column(binding)) => Some(*binding),
             Some(ColumnTarget::Merged(id)) => bindings.merged(*id).map(|merged| merged.left),
             Some(ColumnTarget::Output) | None => None,
@@ -56,34 +60,32 @@ fn column_table_refs_collect(
     }
 }
 
-/// The table names of a FROM subtree, through joins but not into derived
-/// tables.
-fn source_table_names_collect(source: &TableSource, names: &mut HashSet<EcoString>) {
+fn source_table_names_collect(source: Source<'_>, names: &mut HashSet<EcoString>) {
     match source {
-        TableSource::Table(table) => {
-            names.insert(table.name.clone());
+        Source::Table(table) => {
+            names.insert(table.name().clone());
         }
-        TableSource::Join(join) => {
-            source_table_names_collect(&join.left, names);
-            source_table_names_collect(&join.right, names);
+        Source::Join(join) => {
+            source_table_names_collect(join.left(), names);
+            source_table_names_collect(join.right(), names);
         }
-        TableSource::Subquery(_) | TableSource::CteRef(_) => {}
+        Source::Subquery(_) | Source::CteRef(_) => {}
     }
 }
 
-/// Walk a join tree classifying each outer join's optional side as terminal
-/// or non-terminal; a `USING`/`NATURAL` join's condition refers to both
-/// sides of each merged column.
+/// Walk a join tree: each optional side's tables join `all_optional`, and
+/// `non_terminal` when a predicate above the join references them; a
+/// join's own condition counts for the joins nested inside it.
 fn join_terminality_walk(
     bound: &ResolvedQuery,
-    join: &JoinNode,
+    join: Join<'_>,
     non_terminal_refs: &HashSet<EcoString>,
     all_optional: &mut HashSet<EcoString>,
     non_terminal: &mut HashSet<EcoString>,
 ) {
-    let optional_side = match join.join_type {
-        JoinType::Left => Some(&join.right),
-        JoinType::Right => Some(&join.left),
+    let optional_side = match join.join_type() {
+        JoinType::Left => Some(join.right()),
+        JoinType::Right => Some(join.left()),
         JoinType::Inner | JoinType::Full => None,
     };
     if let Some(optional_side) = optional_side {
@@ -97,14 +99,17 @@ fn join_terminality_walk(
         }
     }
     let mut child_refs = non_terminal_refs.clone();
-    match &join.qual {
-        JoinQual::On(condition) => column_table_refs_collect(bound, condition, &mut child_refs),
+    match join.qual() {
+        JoinQual::On(condition) => {
+            column_table_refs_collect(bound, condition.node_ref(), &mut child_refs);
+        }
         JoinQual::Using(_) | JoinQual::Natural => {
-            let bindings = bound.bindings();
+            let bindings = bound.rope_bindings();
+            let join_id = join.id();
             for merged in bindings
                 .merged_columns()
                 .iter()
-                .filter(|merged| merged.join.index() == join.id.index())
+                .filter(|merged| merged.join.index() == join_id.index())
             {
                 for binding in [&merged.left, &merged.right] {
                     if let Some(slot) = bindings.slot(binding.slot) {
@@ -115,8 +120,8 @@ fn join_terminality_walk(
         }
         JoinQual::Cross => {}
     }
-    for side in [&*join.left, &*join.right] {
-        if let TableSource::Join(nested) = side {
+    for side in [join.left(), join.right()] {
+        if let Source::Join(nested) = side {
             join_terminality_walk(bound, nested, &child_refs, all_optional, non_terminal);
         }
     }
@@ -174,7 +179,7 @@ mod tests {
     /// terminality tables.
     fn terminality(sql: &str) -> (HashSet<EcoString>, HashSet<EcoString>) {
         let bound = bind(sql, &terminality_test_tables());
-        outer_join_optional_tables(&bound, bound.select().expect("a SELECT"))
+        outer_join_optional_tables(&bound, bound.rope_select().expect("a SELECT"))
     }
 
     /// Create standard test tables for terminality tests:
@@ -317,7 +322,7 @@ mod tests {
         tables.insert_overwrite(test_table("users", Oid::from_raw(1), &["id", "name"]).into());
         let bound = bind("SELECT * FROM users WHERE id = 1", &tables);
         let (terminal, non_terminal) =
-            outer_join_optional_tables(&bound, bound.select().expect("a SELECT"));
+            outer_join_optional_tables(&bound, bound.rope_select().expect("a SELECT"));
         assert!(terminal.is_empty());
         assert!(non_terminal.is_empty());
     }

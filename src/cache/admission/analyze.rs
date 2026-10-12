@@ -18,9 +18,7 @@ use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::query::Fingerprint;
 use crate::query::ast::{QueryBody, QueryExpr};
-use crate::query::constraints::{
-    QueryConstraints, query_constraints_analyze, query_constraints_analyze_tree,
-};
+use crate::query::constraints::{QueryConstraints, query_constraints_analyze_tree};
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
@@ -104,16 +102,7 @@ pub fn query_decorrelate_checked(
 /// The constraints of an update branch, read from the rope; the owned walk
 /// stands in should a branch have no rope position, which no branch has.
 fn branch_constraints(bound: &ResolvedQuery, branch: QueryBranch<'_>) -> QueryConstraints {
-    match bound
-        .rope_position(branch.select.id)
-        .and_then(|position| bound.rope_select_node(position))
-    {
-        Some(select) => query_constraints_analyze_tree(bound, select),
-        None => {
-            debug_assert!(false, "an update branch has a rope position");
-            query_constraints_analyze(bound, branch.select)
-        }
-    }
+    query_constraints_analyze_tree(bound, branch.select)
 }
 
 /// Classify a query's shape for MV eligibility on its decorrelated form
@@ -165,29 +154,27 @@ pub fn query_admission_analyze(
             && pg_batchable_classify(branch, relation_oid, aggregate_functions);
         // Walk the whole query: the branch has no ORDER BY.
         let limit_window_columns = if has_limit {
-            limit_window_columns_collect(bound, table_node.name.as_str())
+            limit_window_columns_collect(bound, table_node.name().as_str())
         } else {
             HashSet::new()
         };
-        let predicate_columns = predicate_columns_collect(branch, table_node.name.as_str());
+        let predicate_columns = predicate_columns_collect(branch, table_node.name().as_str());
         let is_single_table = branch.is_single_table();
         // Direction-aware window spec (PGC-334) — the shapes the cached-path
         // window check can reason about. Walks the parent query like
         // `limit_window_columns` (the branch has no ORDER BY).
         let order_by_keys =
             (has_limit && is_single_table && matches!(source, UpdateQuerySource::FromClause))
-                .then(|| limit_order_keys_collect(bound, table_node.name.as_str()))
+                .then(|| limit_order_keys_collect(bound, table_node.name().as_str()))
                 .flatten();
         // Compile the LocalEval WHERE once so the per-row CDC membership probe
         // doesn't re-destructure the tree (PGC-339). PgEval queries never
         // consult this, so skip building it.
         let compiled_where =
             if depth == AdmissionDepth::Full && eval_strategy == UpdateEvalStrategy::LocalEval {
-                branch
-                    .select
-                    .where_clause
-                    .as_ref()
-                    .map(|w| CompiledPredicate::compile(update_source, w, table_node.name.as_str()))
+                branch.select.where_clause().map(|w| {
+                    CompiledPredicate::compile(update_source, w, table_node.name().as_str())
+                })
             } else {
                 None
             };
@@ -203,11 +190,11 @@ pub fn query_admission_analyze(
                 None
             };
 
-        let table_name = table_node.name.clone();
+        let table_name = table_node.name().clone();
         let mut update_query = UpdateQuery {
             fingerprint,
             bound: Arc::clone(update_source),
-            branch: branch.select.id,
+            branch: branch.select.id(),
             source,
             constraints,
             has_limit,

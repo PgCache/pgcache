@@ -279,7 +279,7 @@ pub fn select_deparse_with<C: RopeDeparseContext>(
 }
 
 /// ` FROM a, b` when the select has sources.
-fn from_deparse_with<C: RopeDeparseContext>(
+pub fn from_deparse_with<C: RopeDeparseContext>(
     from: Run<'_, Source<'_>>,
     cx: &mut C,
     buf: &mut String,
@@ -299,7 +299,7 @@ fn from_deparse_with<C: RopeDeparseContext>(
 }
 
 /// `keyword` then `expr`, when present, reported to the context as `clause`.
-fn where_clause_deparse_with<C: RopeDeparseContext>(
+pub fn where_clause_deparse_with<C: RopeDeparseContext>(
     expr: Option<Where<'_>>,
     clause: Clause,
     keyword: &str,
@@ -316,7 +316,7 @@ fn where_clause_deparse_with<C: RopeDeparseContext>(
 }
 
 /// ` GROUP BY a, b` when the select groups.
-fn group_by_deparse_with<C: RopeDeparseContext>(
+pub fn group_by_deparse_with<C: RopeDeparseContext>(
     group_by: Run<'_, Column<'_>>,
     cx: &mut C,
     buf: &mut String,
@@ -333,6 +333,23 @@ fn group_by_deparse_with<C: RopeDeparseContext>(
         sep = ", ";
     }
     cx.clause_leave(Clause::GroupBy);
+}
+
+/// `SELECT <projection>` over a branch's FROM, WHERE, GROUP BY and
+/// HAVING: the select list, ORDER BY and LIMIT never render, so a CDC row
+/// standing in for a table is evaluated for membership alone.
+pub fn branch_select_into<C: RopeDeparseContext>(
+    cx: &mut C,
+    buf: &mut String,
+    select: Select<'_>,
+    projection: &str,
+) {
+    buf.push_str("SELECT ");
+    buf.push_str(projection);
+    from_deparse_with(select.from(), cx, buf);
+    where_clause_deparse_with(select.where_clause(), Clause::Where, " WHERE ", cx, buf);
+    group_by_deparse_with(select.group_by(), cx, buf);
+    where_clause_deparse_with(select.having(), Clause::Having, " HAVING ", cx, buf);
 }
 
 /// The select list; an item that renders to nothing (an empty star
