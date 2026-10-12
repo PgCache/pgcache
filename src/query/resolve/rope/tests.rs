@@ -1,11 +1,13 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::sync::Arc;
+
 use super::query_tree_resolve;
 use crate::catalog::Catalog;
-use crate::query::ast::rope::QueryTree;
+use crate::query::ast::rope::{NodeKind, QueryTree};
 use crate::query::ast::{NodeId, query_expr_parse};
-use crate::query::resolve::query_expr_resolve;
 use crate::query::resolve::tests::{BINDING_CORPUS, binding_catalog, catalog};
+use crate::query::resolve::{ResolvedQuery, TableSlot, query_expr_resolve};
 
 /// The bindings the owned resolver produces for `sql`, with its node ids
 /// mapped into the rope's id space, against the rope resolver's; an error
@@ -95,6 +97,38 @@ fn test_rope_resolver_reports_the_owned_resolver_errors() {
         "SELECT x.id FROM users WHERE id = '1'",
     ] {
         oracle(sql, &tables);
+    }
+}
+
+/// The bindings a bound query carries for its rope are the owned bindings
+/// carried over by origin, and they equal resolving the rope itself.
+#[test]
+fn test_bound_query_carries_bindings_equal_to_resolving_the_rope() {
+    let tables = binding_catalog();
+    for sql in BINDING_CORPUS {
+        let owned = query_expr_parse(sql).expect("parse query");
+        let bindings = query_expr_resolve(&owned, &tables, &["public"]).expect("resolve");
+        let bound = ResolvedQuery::new(Arc::new(owned), bindings);
+        let resolved =
+            query_tree_resolve(bound.rope(), &tables, &["public"]).expect("resolve rope");
+        let mut carried = bound.rope_bindings().describe();
+        let mut expected = resolved.describe();
+        carried.sort();
+        expected.sort();
+        assert_eq!(carried, expected, "{sql}");
+        let derived_follow = bound.rope_bindings().slots().iter().all(|slot| match slot {
+            TableSlot::Derived { node, .. } => {
+                matches!(
+                    bound.rope().node(*node).kind,
+                    NodeKind::Subquery { .. } | NodeKind::CteRef { .. }
+                )
+            }
+            TableSlot::Base { .. } => true,
+        });
+        assert!(
+            derived_follow,
+            "{sql}: derived slots name rope subquery nodes"
+        );
     }
 }
 

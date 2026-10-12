@@ -6,6 +6,7 @@ use std::sync::Arc;
 use ecow::EcoString;
 
 use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
+use crate::query::ast::rope::QueryTree;
 use crate::query::ast::{ColumnNode, IdRemap, NodeId, QueryExpr, StarNode};
 
 /// Index of a table source in [`Bindings::slots`].
@@ -211,8 +212,21 @@ impl BindingsBuilder {
     /// nowhere. Slots are kept as they are, so what the rewrite added binds
     /// into them by slot and position.
     pub(crate) fn from_remapped(source: &Bindings, remap: &IdRemap) -> Self {
+        // A derived slot names the node it stands for; the slot keeps its
+        // index and follows the node.
+        let slots = source
+            .slots
+            .iter()
+            .map(|slot| match slot {
+                TableSlot::Derived { node, table } => TableSlot::Derived {
+                    node: remap.new_id(*node).unwrap_or(*node),
+                    table: Arc::clone(table),
+                },
+                TableSlot::Base { .. } => slot.clone(),
+            })
+            .collect();
         let mut bindings = Bindings {
-            slots: source.slots.clone(),
+            slots,
             ..Bindings::default()
         };
         for (node, slot) in &source.sources {
@@ -379,15 +393,29 @@ impl Bindings {
 
 /// A finalized tree with its bindings: the only way to hold resolved facts
 /// about a plain tree (ADR-057). Cloning shares the tree.
+///
+/// While consumers move to the rope, the query also carries the rope and
+/// the same bindings keyed by rope positions, derived here from the owned
+/// pair; the owned pair goes when the last consumer has moved.
 #[derive(Debug, Clone)]
 pub struct ResolvedQuery {
     tree: Arc<QueryExpr>,
     bindings: Bindings,
+    rope: QueryTree,
+    rope_bindings: Bindings,
 }
 
 impl ResolvedQuery {
     pub fn new(tree: Arc<QueryExpr>, bindings: Bindings) -> Self {
-        Self { tree, bindings }
+        let (rope, origins) = QueryTree::from_query_expr_with_origins(&tree);
+        let rope_bindings =
+            BindingsBuilder::from_remapped(&bindings, &origins.into_remap()).finish();
+        Self {
+            tree,
+            bindings,
+            rope,
+            rope_bindings,
+        }
     }
 
     pub fn tree(&self) -> &QueryExpr {
@@ -396,6 +424,15 @@ impl ResolvedQuery {
 
     pub fn bindings(&self) -> &Bindings {
         &self.bindings
+    }
+
+    pub fn rope(&self) -> &QueryTree {
+        &self.rope
+    }
+
+    /// The bindings keyed by the rope's positions.
+    pub fn rope_bindings(&self) -> &Bindings {
+        &self.rope_bindings
     }
 
     pub fn column(&self, node: &ColumnNode) -> Option<&ColumnTarget> {

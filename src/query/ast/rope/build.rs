@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use super::node::{Node, NodeKind};
 use super::tree::{Chunk, QueryTree, position};
-use crate::query::ast::NodeId;
+use crate::query::ast::{IdRemap, NodeId};
 
 /// A table is compacted past this many chunks or a quarter of the
 /// positions, whichever is larger: lookups and sequential walks stay cheap
@@ -241,6 +241,12 @@ impl OriginMap {
 
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
+    }
+
+    /// The map as a remap, so side tables keyed by origin ids carry over
+    /// through the same path a rewrite's do.
+    pub(crate) fn into_remap(self) -> IdRemap {
+        IdRemap::from_sorted_pairs(self.pairs)
     }
 }
 

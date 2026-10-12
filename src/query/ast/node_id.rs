@@ -40,6 +40,18 @@ pub struct IdRemap {
 }
 
 impl IdRemap {
+    /// A remap from `pairs` already in old-id order.
+    pub(crate) fn from_sorted_pairs(pairs: Vec<(NodeId, NodeId)>) -> Self {
+        debug_assert!(
+            pairs
+                .iter()
+                .zip(pairs.iter().skip(1))
+                .all(|(first, second)| first.0.index() <= second.0.index()),
+            "remap pairs in old-id order"
+        );
+        Self { pairs }
+    }
+
     /// Every new position of the node that carried `old`.
     pub fn new_ids(&self, old: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         let start = self
