@@ -17,10 +17,8 @@ use postgres_protocol::escape::escape_identifier;
 
 use super::mv_shape::ShapeGate;
 use crate::query::Fingerprint;
-use crate::query::ast::{
-    Deparse, LimitClause, OrderByClause, OrderDirection, QueryBody, QueryExpr, SelectColumn,
-    SelectColumns, SelectNode, TableSource,
-};
+use crate::query::ast::rope::{Body, OrderBy, Query, Run, Select, SelectItem, Source};
+use crate::query::ast::{Deparse, LimitClause, OrderDirection};
 use crate::query::resolve::ResolvedQuery;
 
 /// Runtime state of the materialized result for a cached query.
@@ -293,14 +291,15 @@ impl MvServePlan {
         sql.push_str(" FROM ");
         sql.push_str(&table);
 
-        let tree = bound.tree();
-        if !tree.order_by.is_empty() {
-            match &tree.body {
-                QueryBody::Select(select) => {
-                    mv_order_by_positional(&mut sql, bound, select, &tree.order_by)?;
+        let root = bound.rope().root();
+        let order_by = root.order_by();
+        if order_by.len() > 0 {
+            match root.body() {
+                Body::Select(select) => {
+                    mv_order_by_positional(&mut sql, bound, select, order_by)?;
                 }
-                QueryBody::SetOp(_) => mv_order_by_direct(&mut sql, bound, &tree.order_by),
-                QueryBody::Values(_) => return None,
+                Body::SetOp(_) => mv_order_by_direct(&mut sql, bound, order_by),
+                Body::Values(_) => return None,
             }
         }
         Some(Self {
@@ -323,18 +322,18 @@ pub fn mv_serve_sql_into(sql: &mut String, plan: &MvServePlan, limit: Option<&Li
 
 /// Emit `ORDER BY N ASC|DESC, ...` by looking each expression's 1-based
 /// position up in the SELECT list; `None` when one is missing.
-fn mv_order_by_positional(
+fn mv_order_by_positional<'t>(
     sql: &mut String,
     bound: &ResolvedQuery,
-    select: &SelectNode,
-    order_by: &[OrderByClause],
+    select: Select<'t>,
+    order_by: Run<'t, OrderBy<'t>>,
 ) -> Option<()> {
     sql.push_str(" ORDER BY");
     let mut sep = "";
-    for o in order_by {
-        let pos = bound.order_by_position(select, o)?;
+    for clause in order_by {
+        let pos = bound.rope_order_by_position(select, clause)?;
         let _ = write!(sql, "{sep} {pos}");
-        match o.direction {
+        match clause.direction() {
             OrderDirection::Asc => sql.push_str(" ASC"),
             OrderDirection::Desc => sql.push_str(" DESC"),
         }
@@ -346,45 +345,44 @@ fn mv_order_by_positional(
 /// Emit `ORDER BY <expr> ASC|DESC, ...` by rendering each item directly.
 /// Used for set-op MVs, whose ORDER BY names output columns: bare names
 /// that match the MV table's column names.
-fn mv_order_by_direct(sql: &mut String, bound: &ResolvedQuery, order_by: &[OrderByClause]) {
+fn mv_order_by_direct<'t>(sql: &mut String, bound: &ResolvedQuery, order_by: Run<'t, OrderBy<'t>>) {
     sql.push_str(" ORDER BY");
     let mut sep = "";
-    for o in order_by {
+    for clause in order_by {
         sql.push_str(sep);
         sql.push(' ');
-        bound.order_by_into(o, sql);
+        bound.rope_order_by_into(clause, sql);
         sep = ",";
     }
 }
 
 /// Top-level body is a SELECT with a join. Only joins get an MV LIMIT
 /// cap; other reducers collapse the input regardless.
-pub(crate) fn query_has_join(query: &QueryExpr) -> bool {
-    match &query.body {
-        QueryBody::Select(select) => {
-            select.from.len() > 1
+pub(crate) fn query_has_join(query: Query<'_>) -> bool {
+    match query.body() {
+        Body::Select(select) => {
+            select.from().len() > 1
                 || select
-                    .from
-                    .iter()
-                    .any(|source| matches!(source, TableSource::Join(_)))
+                    .from()
+                    .any(|source| matches!(source, Source::Join(_)))
         }
-        QueryBody::SetOp(_) | QueryBody::Values(_) => false,
+        Body::SetOp(_) | Body::Values(_) => false,
     }
 }
 
 /// Top-level SELECT projects a window function. A window MV must store the
 /// whole result (the window depends on the full partition), so it's excluded
 /// from the join top-N `mv_limit` cap even when it also contains a join.
-pub(crate) fn query_has_window(query: &QueryExpr) -> bool {
-    let QueryBody::Select(select) = &query.body else {
+pub(crate) fn query_has_window(query: Query<'_>) -> bool {
+    let Body::Select(select) = query.body() else {
         return false;
     };
-    let SelectColumns::Columns(columns) = &select.columns else {
+    let Some(mut items) = select.items() else {
         return false;
     };
-    columns.iter().any(|column| match column {
-        SelectColumn::Expr { expr, .. } => expr.has_window(),
-        SelectColumn::Star(_) => false,
+    items.any(|item| match item {
+        SelectItem::Expr(expr) => expr.expr().has_window(),
+        SelectItem::Star(_) => false,
     })
 }
 

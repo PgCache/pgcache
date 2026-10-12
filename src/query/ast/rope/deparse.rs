@@ -241,7 +241,11 @@ fn body_deparse_with<C: RopeDeparseContext>(body: Body<'_>, cx: &mut C, buf: &mu
     }
 }
 
-fn values_deparse_with<C: RopeDeparseContext>(values: Values<'_>, cx: &mut C, buf: &mut String) {
+pub fn values_deparse_with<C: RopeDeparseContext>(
+    values: Values<'_>,
+    cx: &mut C,
+    buf: &mut String,
+) {
     cx.clause_enter(Clause::Values);
     buf.push_str("VALUES ");
     let mut row_sep = "";

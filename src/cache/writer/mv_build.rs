@@ -34,10 +34,11 @@ use crate::cache::{
 };
 use crate::pg;
 use crate::query::Fingerprint;
-use crate::query::ast::{
-    Clause, DeparseContext, DeparseWith, QueryBody, QueryExpr, clause_deparse_with,
-    separated_deparse_with,
+use crate::query::ast::Clause;
+use crate::query::ast::rope::deparse::{
+    from_deparse_with, values_deparse_with, where_clause_deparse_with,
 };
+use crate::query::ast::rope::{Body, Query, RopeDeparseContext};
 use crate::query::resolve::ResolvedQuery;
 use crate::result::error_chain_format;
 use crate::settings::PgSettings;
@@ -419,34 +420,23 @@ async fn mv_result_count(client: &Client, ctx: &MvBuildContext) -> CacheResult<u
 ///   result. This keeps the gate measuring reduction for UNION/INTERSECT/EXCEPT
 ///   the way it does for an aggregate's pre-grouping rows (PGC-329).
 /// - **VALUES**: the literal rows themselves.
-fn mv_gate_input_sql_into<C: DeparseContext>(query: &QueryExpr, cx: &mut C, buf: &mut String) {
-    match &query.body {
-        QueryBody::Select(select) => {
+fn mv_gate_input_sql_into<C: RopeDeparseContext>(query: Query<'_>, cx: &mut C, buf: &mut String) {
+    match query.body() {
+        Body::Select(select) => {
             // Constant projection, no DISTINCT: counts scanned rows (including
             // join fan-out) — the work the query does.
             buf.push_str("SELECT 1");
-            if !select.from.is_empty() {
-                cx.clause_enter(Clause::From);
-                buf.push_str(" FROM");
-                separated_deparse_with(cx, buf, &select.from, ",");
-                cx.clause_leave(Clause::From);
-            }
-            clause_deparse_with(
-                cx,
-                buf,
-                Clause::Where,
-                " WHERE ",
-                select.where_clause.as_ref(),
-            );
+            from_deparse_with(select.from(), cx, buf);
+            where_clause_deparse_with(select.where_clause(), Clause::Where, " WHERE ", cx, buf);
         }
         // `UNION ALL` (not the original op) so no branch rows are deduped or
         // dropped — the denominator is the total input the set-op scans.
-        QueryBody::SetOp(set_op) => {
-            mv_gate_input_sql_into(&set_op.left, cx, buf);
+        Body::SetOp(set_op) => {
+            mv_gate_input_sql_into(set_op.left(), cx, buf);
             buf.push_str(" UNION ALL ");
-            mv_gate_input_sql_into(&set_op.right, cx, buf);
+            mv_gate_input_sql_into(set_op.right(), cx, buf);
         }
-        QueryBody::Values(values) => values.deparse_with(cx, buf),
+        Body::Values(values) => values_deparse_with(values, cx, buf),
     }
 }
 
@@ -455,7 +445,11 @@ fn mv_gate_input_sql_into<C: DeparseContext>(query: &QueryExpr, cx: &mut C, buf:
 fn mv_source_count_sql(bound: &ResolvedQuery) -> String {
     let mut sql = String::with_capacity(256);
     sql.push_str("SELECT count(*) FROM (");
-    mv_gate_input_sql_into(bound.tree(), &mut bound.deparse_context(), &mut sql);
+    mv_gate_input_sql_into(
+        bound.rope().root(),
+        &mut bound.rope_deparse_context(),
+        &mut sql,
+    );
     sql.push_str(") _mv_gate_denom");
     sql
 }
@@ -577,6 +571,7 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
+    use crate::query::ast::QueryExpr;
     use crate::query::ast::{
         AstNode, ColumnNode, FunctionCall, SelectNode, SetOpNode, SetOpType, TableNode,
         query_expr_parse,

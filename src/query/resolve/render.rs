@@ -17,8 +17,9 @@ use super::bindings::{
 use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::deparse::{
-    column_plain_deparse, names_deparse, query_deparse_with, query_unlimited_deparse_with,
-    scalar_deparse_with, star_plain_deparse, table_alias_deparse, table_plain_deparse,
+    column_plain_deparse, names_deparse, order_by_deparse_with, query_deparse_with,
+    query_unlimited_deparse_with, scalar_deparse_with, star_plain_deparse, table_alias_deparse,
+    table_plain_deparse,
 };
 use crate::query::ast::rope::{
     Column as RopeColumn, CteRef as RopeCteRef, Function as RopeFunction, Join as RopeJoin,
@@ -722,6 +723,15 @@ impl ResolvedQuery {
             }
         }
         outputs
+    }
+
+    /// [`ResolvedQuery::order_by_into`] for a rope clause.
+    pub fn rope_order_by_into(&self, clause: RopeOrderBy<'_>, buf: &mut String) {
+        order_by_deparse_with(
+            clause,
+            &mut RopeBound(Bound::text(self.rope_bindings())),
+            buf,
+        );
     }
 
     /// An ORDER BY item rendered as the cache serves it.

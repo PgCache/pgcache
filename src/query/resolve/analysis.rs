@@ -1,6 +1,8 @@
 //! Whole-query facts read from a [`ResolvedQuery`]: the tree plus its
 //! bindings, with no resolved hierarchy in between.
 
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
@@ -15,7 +17,6 @@ use crate::query::ast::rope::{
 };
 use crate::query::ast::{
     AstNode, ColumnNode, NodeId, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode,
-    StarNode,
 };
 
 /// The columns a query reads from each table, by table name.
@@ -122,25 +123,32 @@ impl ResolvedQuery {
     /// tables of one name in different schemas share an entry, which only
     /// over-approximates.
     pub fn columns_by_table(&self) -> ColumnsByTable {
-        let bindings = self.bindings();
+        let bindings = self.rope_bindings();
         let mut columns: ColumnsByTable = HashMap::new();
         for slot in bindings.slots() {
             if let TableSlot::Base { table, .. } = slot {
                 columns.entry(table.name.clone()).or_default();
             }
         }
-        for column in self.tree().nodes::<ColumnNode>() {
-            if let Some(ColumnTarget::Column(binding)) = bindings.column(column) {
-                self.column_add(&mut columns, binding);
-            }
-            // A merged-column reference reads the join's side columns, which
-            // the merged-column loop below already adds.
-        }
-        for star in self.tree().nodes::<StarNode>() {
-            for item in bindings.star(star).unwrap_or(&[]) {
-                if let StarItem::Column(binding) = item {
-                    self.column_add(&mut columns, binding);
+        for position in self.rope().root().node_ref().subtree() {
+            match position.kind() {
+                NodeKind::Column { .. } => {
+                    if let Some(ColumnTarget::Column(binding)) =
+                        bindings.column_by_id(position.id())
+                    {
+                        self.column_add(&mut columns, binding);
+                    }
+                    // A merged-column reference reads the join's side columns, which
+                    // the merged-column loop below already adds.
                 }
+                NodeKind::Star { .. } => {
+                    for item in bindings.star_by_id(position.id()).unwrap_or(&[]) {
+                        if let StarItem::Column(binding) = item {
+                            self.column_add(&mut columns, binding);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         for merged in bindings.merged_columns() {
@@ -238,7 +246,7 @@ impl ResolvedQuery {
     }
 
     fn column_add(&self, columns: &mut ColumnsByTable, binding: &ColumnBinding) {
-        let bindings = self.bindings();
+        let bindings = self.rope_bindings();
         if let (Some(slot), Some(column)) = (
             bindings.slot(binding.slot),
             bindings.binding_column(binding),

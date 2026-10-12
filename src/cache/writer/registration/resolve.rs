@@ -22,6 +22,7 @@ use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
+use crate::query::ast::rope::Query;
 use crate::query::ast::{AstNode, QueryExpr, TableNode};
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::keying_settings::KeyingSettings;
@@ -112,7 +113,7 @@ fn serve_shape_render(bound: &ResolvedQuery) -> SharedQueryShape {
 /// window functions — a windowed MV must store the full result because the
 /// window depends on the whole partition.
 fn resolution_limits(
-    query: &QueryExpr,
+    query: Query<'_>,
     shape_gate: ShapeGate,
     user_max_limit: Option<u64>,
 ) -> (Option<u64>, Option<u64>) {
@@ -172,7 +173,8 @@ impl WriterRegistration {
             query_decorrelate_checked(&bound, &self.aggregate_functions)?.map(Arc::new);
         let shape_gate =
             shape_gate_classify(&bound, decorrelated.as_deref(), &self.aggregate_functions);
-        let (max_limit, mv_limit) = resolution_limits(bound.tree(), shape_gate, user_max_limit);
+        let (max_limit, mv_limit) =
+            resolution_limits(bound.rope().root(), shape_gate, user_max_limit);
 
         let uq_start = Instant::now();
         let relation_oids = self.update_queries_register(
