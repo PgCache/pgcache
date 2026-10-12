@@ -159,6 +159,18 @@ impl QueryTree {
         self.table.chunks.iter().flat_map(Chunk::slice)
     }
 
+    /// Every base table the tree references, subqueries and CTE bodies
+    /// included, as `(schema, name)`.
+    pub fn table_names(&self) -> impl Iterator<Item = (Option<&str>, &str)> {
+        self.nodes().filter_map(|node| match &node.kind {
+            NodeKind::Table { schema, name, .. } => Some((
+                (!schema.is_empty()).then_some(schema.as_str()),
+                name.as_str(),
+            )),
+            _ => None,
+        })
+    }
+
     /// The same tree in one chunk.
     pub fn compacted(&self) -> QueryTree {
         let nodes: Arc<[Node]> = self.nodes().cloned().collect();

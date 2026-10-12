@@ -22,8 +22,7 @@ use crate::cache::writer::core::WriterCore;
 use crate::cache::{CacheError, CacheResult, ReportExt};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
-use crate::query::ast::rope::Query;
-use crate::query::ast::{AstNode, QueryExpr, TableNode};
+use crate::query::ast::rope::{Query, QueryTree};
 use crate::query::constraint_index::table_constraints_keyed;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::ResolvedQuery;
@@ -31,15 +30,13 @@ use crate::query::resolve::ResolvedQuery;
 /// Resolve schema for a table: use explicit schema if provided, otherwise lookup via search path.
 async fn table_schema_resolve(
     core: &mut WriterCore,
-    table_node: &TableNode,
+    schema: Option<&str>,
+    table_name: &str,
     search_path: &Arc<[EcoString]>,
 ) -> CacheResult<EcoString> {
-    match &table_node.schema {
-        Some(schema) => Ok(schema.clone()),
-        None => {
-            core.schema_for_table_find(table_node.name.as_str(), search_path)
-                .await
-        }
+    match schema {
+        Some(schema) => Ok(EcoString::from(schema)),
+        None => core.schema_for_table_find(table_name, search_path).await,
     }
 }
 
@@ -47,12 +44,16 @@ async fn table_schema_resolve(
 /// Resolves schemas and creates cache tables as needed.
 async fn cache_tables_ensure(
     core: &mut WriterCore,
-    base_query: &QueryExpr,
+    base_query: &QueryTree,
     search_path: &Arc<[EcoString]>,
 ) -> CacheResult<()> {
-    for table_node in base_query.nodes::<TableNode>() {
-        let table_name = table_node.name.as_str();
-        let schema = table_schema_resolve(core, table_node, search_path).await?;
+    let tables: Vec<(Option<EcoString>, EcoString)> = base_query
+        .table_names()
+        .map(|(schema, name)| (schema.map(EcoString::from), EcoString::from(name)))
+        .collect();
+    for (schema, table_name) in &tables {
+        let table_name = table_name.as_str();
+        let schema = table_schema_resolve(core, schema.as_deref(), table_name, search_path).await?;
         if !core
             .cache
             .tables
@@ -71,7 +72,7 @@ async fn cache_tables_ensure(
 /// two agree.
 pub(super) async fn query_fingerprint_resolve(
     core: &mut WriterCore,
-    query: &QueryExpr,
+    query: &QueryTree,
     keying: &KeyingSettings,
 ) -> CacheResult<Fingerprint> {
     let (base_query, _) = base_query_prepare(query);
@@ -138,7 +139,7 @@ impl WriterRegistration {
         core: &mut WriterCore,
         request: &RegisterRequest,
     ) -> CacheResult<QueryResolution> {
-        let (base_query, user_max_limit) = base_query_prepare(request.cacheable_query.query());
+        let (base_query, user_max_limit) = base_query_prepare(request.cacheable_query.tree());
 
         cache_tables_ensure(core, &base_query, &request.keying.search_path).await?;
 

@@ -286,7 +286,6 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_expr_parse;
-    use crate::query::ast::rope::QueryTree;
 
     /// Helper to parse SQL and return a CacheableQuery
     fn parse_cacheable(sql: &str) -> CacheableQuery {
@@ -427,7 +426,7 @@ mod tests {
     fn update_queries(sql: &str) -> Vec<(String, String, UpdateQuerySource)> {
         let tables = test_tables();
         let cacheable = parse_cacheable(sql);
-        let tree = QueryTree::from_query_expr(cacheable.query());
+        let tree = cacheable.tree().clone();
         let bound = ResolvedQuery::resolve(tree, &tables, &["public"]).expect("resolve");
         query_table_update_queries(&bound)
             .into_iter()

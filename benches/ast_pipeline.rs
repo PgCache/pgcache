@@ -39,7 +39,7 @@ use pgcache_lib::query::ast::rope::QueryTree;
 use pgcache_lib::query::ast::{
     BinaryExpr, ColumnNode, CteDefinition, FunctionCall, JoinNode, LiteralValue, OrderByClause,
     QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectNode, TableNode, TableSource, WhereExpr,
-    query_expr_convert_raw, query_expr_session_key,
+    query_expr_convert_raw, query_tree_session_key,
 };
 use pgcache_lib::query::decorrelate::query_decorrelate;
 use pgcache_lib::query::literal_settings::LiteralSettings;
@@ -470,9 +470,9 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
     for shape in shapes {
         let (query, convert_n, convert_b) = allocations_count(|| parse(&shape.sql));
         let (_, plain_clone_n, plain_clone_b) = allocations_count(|| black_box(query.clone()));
-        let (_, key_n, key_b) =
-            allocations_count(|| query_expr_session_key(&query, &search_path, &settings));
         let (rope, rope_n, rope_b) = allocations_count(|| QueryTree::from_query_expr(&query));
+        let (_, key_n, key_b) =
+            allocations_count(|| query_tree_session_key(&rope, &search_path, &settings));
         let (_, rope_clone_n, rope_clone_b) = allocations_count(|| black_box(rope.clone()));
         let (resolved, resolve_n, resolve_b) = allocations_count(|| resolve_bound(&rope, catalog));
         let (_, bound_clone_n, bound_clone_b) = allocations_count(|| black_box(resolved.clone()));
@@ -585,9 +585,9 @@ fn bench_pipeline(c: &mut Criterion) {
         );
         group.bench_with_input(
             BenchmarkId::new("session_key", shape.name),
-            &query,
-            |b, q| {
-                b.iter(|| black_box(query_expr_session_key(q, &search_path, &settings)));
+            &tree,
+            |b, t| {
+                b.iter(|| black_box(query_tree_session_key(t, &search_path, &settings)));
             },
         );
         group.bench_with_input(BenchmarkId::new("rope", shape.name), &query, |b, q| {
@@ -655,8 +655,8 @@ fn bench_pipeline(c: &mut Criterion) {
             |b, sql| {
                 b.iter(|| {
                     let query = parse(sql);
-                    let key = query_expr_session_key(&query, &search_path, &settings);
                     let tree = QueryTree::from_query_expr(&query);
+                    let key = query_tree_session_key(&tree, &search_path, &settings);
                     let resolved = resolve_bound(&tree, &catalog);
                     let bound = canonicalise(&resolved, &settings);
                     black_box((key, bound.fingerprint(), bound.sql()))

@@ -378,19 +378,24 @@ mod tests {
     use crate::cache::{QueryParameter, QueryParameters};
     use crate::oid::TypeOid;
     use crate::query::ast::{
-        Deparse, LiteralValue, QueryBody, SelectNode, query_expr_fingerprint, query_expr_parse,
+        Deparse, LiteralValue, QueryExpr, query_expr_fingerprint, query_expr_parse,
     };
-    use crate::query::transform::AstTransformError;
     use crate::query::transform::parameters::{
-        parameter_to_literal, query_expr_parameters_replace, select_node_parameters_replace,
+        parameter_to_literal, query_expr_parameters_replace,
     };
+    use crate::query::transform::{AstTransformError, AstTransformResult};
 
-    fn parse_select_node(sql: &str) -> SelectNode {
-        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
-        match query_expr.body {
-            QueryBody::Select(node) => *node,
-            _ => panic!("expected SELECT"),
-        }
+    fn parse_select_node(sql: &str) -> QueryExpr {
+        query_expr_parse(sql).expect("convert to QueryExpr")
+    }
+
+    /// Bind `params` into `query` in place.
+    fn query_parameters_replace_in_place(
+        query: &mut QueryExpr,
+        params: &QueryParameters,
+    ) -> AstTransformResult<()> {
+        *query = query_expr_parameters_replace(query, params)?;
+        Ok(())
     }
 
     fn binary_params(values: Vec<(Option<&[u8]>, PgType)>) -> QueryParameters {
@@ -440,7 +445,7 @@ mod tests {
     fn binary_query_render(sql: &str, bytes: &[u8], ty: PgType) -> String {
         let mut node = parse_select_node(sql);
         let params = binary_params(vec![(Some(bytes), ty)]);
-        select_node_parameters_replace(&mut node, &params).expect("substitute binary parameter");
+        query_parameters_replace_in_place(&mut node, &params).expect("substitute binary parameter");
         let mut buf = String::new();
         node.deparse(&mut buf);
         assert!(
@@ -1226,7 +1231,7 @@ mod tests {
     fn test_binary_int4_in_query() {
         let mut node = parse_select_node("SELECT id FROM users WHERE id = $1");
         let params = binary_params(vec![(Some(&[0x00, 0x00, 0x00, 0x2A]), PgType::INT4)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
+        query_parameters_replace_in_place(&mut node, &params).expect("to replace parameters");
 
         let mut buf = String::new();
         node.deparse(&mut buf);

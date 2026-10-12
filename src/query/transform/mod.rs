@@ -35,12 +35,12 @@ pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
 pub use constant_fold::query_expr_constant_fold;
 pub use literal_canon::{LiteralCanonOutcome, query_literals_canonicalise};
+pub use parameters::query_expr_parameters_replace;
 #[cfg(feature = "proxy")]
 pub(crate) use parameters::{
     delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,
 };
 pub(crate) use parameters::{literal_is_parameterizable, literal_value_parameters_replace};
-pub use parameters::{query_expr_parameters_replace, select_node_parameters_replace};
 pub use predicate_pushdown::query_predicate_pushdown;
 pub use substitute::query_tree_parameters_replace;
 pub use values::{

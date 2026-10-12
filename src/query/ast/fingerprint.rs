@@ -1,10 +1,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
-use super::{AstNode, LiteralValue, QueryExpr, SelectNode};
+use super::rope::{NodeKind, QueryTree};
+use super::{LiteralValue, QueryExpr, SelectNode};
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::{Fingerprint, SessionKey};
 
@@ -42,16 +42,18 @@ pub fn query_expr_fingerprint(query: &QueryExpr) -> Fingerprint {
 /// The proxy's key for a query under the session's resolved search_path and,
 /// when the query has a string literal whose meaning they could change, its
 /// literal settings. The alias map maps it to the fingerprint the writer
-/// resolved the triple to.
-pub fn query_expr_session_key(
-    query: &QueryExpr,
+/// resolved the triple to. The root LIMIT/OFFSET are excluded, so queries
+/// differing only there share an entry; dispatch tracks `max_limit` apart.
+pub fn query_tree_session_key(
+    tree: &QueryTree,
     search_path: &[EcoString],
     literals: &LiteralSettings,
 ) -> SessionKey {
-    let mut hasher = query_expr_hasher(query);
+    let mut hasher = DefaultHasher::new();
+    tree.session_hash(&mut hasher);
     hasher.write_u8(DOMAIN_SESSION);
     search_path.hash(&mut hasher);
-    if query_expr_has_string_literal(query) {
+    if query_tree_has_string_literal(tree) {
         literals.hash(&mut hasher);
     }
     SessionKey::from_raw(hasher.finish())
@@ -60,13 +62,14 @@ pub fn query_expr_session_key(
 /// The key of a parameterized read before substitution: the tree with its
 /// placeholders, then the bind values as sent. The literal settings always
 /// fold in, since a bound value may be a string whose meaning they decide.
-pub fn query_expr_session_key_with_binds(
-    query: &QueryExpr,
+pub fn query_tree_session_key_with_binds(
+    tree: &QueryTree,
     binds: &impl Hash,
     search_path: &[EcoString],
     literals: &LiteralSettings,
 ) -> SessionKey {
-    let mut hasher = query_expr_hasher(query);
+    let mut hasher = DefaultHasher::new();
+    tree.session_hash(&mut hasher);
     hasher.write_u8(DOMAIN_SESSION);
     search_path.hash(&mut hasher);
     binds.hash(&mut hasher);
@@ -74,19 +77,13 @@ pub fn query_expr_session_key_with_binds(
     SessionKey::from_raw(hasher.finish())
 }
 
-fn query_expr_has_string_literal(query: &QueryExpr) -> bool {
-    query
-        .try_for_each_node::<LiteralValue, ()>(&mut |literal| {
-            if matches!(
-                literal,
-                LiteralValue::String(_) | LiteralValue::StringWithCast(..)
-            ) {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .is_break()
+fn query_tree_has_string_literal(tree: &QueryTree) -> bool {
+    tree.nodes().any(|node| {
+        matches!(
+            node.kind,
+            NodeKind::Literal(LiteralValue::String(_) | LiteralValue::StringWithCast(..))
+        )
+    })
 }
 
 #[cfg(test)]
@@ -94,8 +91,8 @@ mod tests {
     use super::*;
     use crate::query::ast::query_expr_parse;
 
-    fn parse(sql: &str) -> QueryExpr {
-        query_expr_parse(sql).expect("parse query")
+    fn parse(sql: &str) -> QueryTree {
+        QueryTree::from_query_expr(&query_expr_parse(sql).expect("parse query"))
     }
 
     fn path(schemas: &[&str]) -> Vec<EcoString> {
@@ -103,7 +100,7 @@ mod tests {
     }
 
     fn session_key(sql: &str, search_path: &[&str]) -> SessionKey {
-        query_expr_session_key(&parse(sql), &path(search_path), &LiteralSettings::default())
+        query_tree_session_key(&parse(sql), &path(search_path), &LiteralSettings::default())
     }
 
     #[test]
@@ -112,13 +109,13 @@ mod tests {
         let utc = LiteralSettings::default();
         let numeric = parse("SELECT id FROM users WHERE id = 1");
         assert_eq!(
-            query_expr_session_key(&numeric, &path(&["public"]), &tokyo),
-            query_expr_session_key(&numeric, &path(&["public"]), &utc)
+            query_tree_session_key(&numeric, &path(&["public"]), &tokyo),
+            query_tree_session_key(&numeric, &path(&["public"]), &utc)
         );
         let text = parse("SELECT id FROM users WHERE created_at > '2024-01-01'");
         assert_ne!(
-            query_expr_session_key(&text, &path(&["public"]), &tokyo),
-            query_expr_session_key(&text, &path(&["public"]), &utc)
+            query_tree_session_key(&text, &path(&["public"]), &tokyo),
+            query_tree_session_key(&text, &path(&["public"]), &utc)
         );
     }
 
@@ -128,14 +125,14 @@ mod tests {
         let utc = LiteralSettings::default();
         let tokyo = LiteralSettings::from_texts("Asia/Tokyo", "ISO, MDY", "postgres", "Default");
         let key = |binds: &[u8], literals: &LiteralSettings| {
-            query_expr_session_key_with_binds(&query, &binds, &path(&["public"]), literals)
+            query_tree_session_key_with_binds(&query, &binds, &path(&["public"]), literals)
         };
         assert_eq!(key(b"1", &utc), key(b"1", &utc));
         assert_ne!(key(b"1", &utc), key(b"2", &utc));
         assert_ne!(key(b"1", &utc), key(b"1", &tokyo));
         assert_ne!(
             key(b"1", &utc),
-            query_expr_session_key(&query, &path(&["public"]), &utc)
+            query_tree_session_key(&query, &path(&["public"]), &utc)
         );
     }
 
@@ -169,10 +166,11 @@ mod tests {
 
     #[test]
     fn test_session_key_never_equals_the_plain_fingerprint() {
-        let query = parse("SELECT id FROM users WHERE id = 1");
+        let owned = query_expr_parse("SELECT id FROM users WHERE id = 1").expect("parse query");
+        let tree = QueryTree::from_query_expr(&owned);
         assert_ne!(
-            query_expr_session_key(&query, &path(&[]), &LiteralSettings::default()).get(),
-            query_expr_fingerprint(&query).get()
+            query_tree_session_key(&tree, &path(&[]), &LiteralSettings::default()).get(),
+            query_expr_fingerprint(&owned).get()
         );
     }
 }

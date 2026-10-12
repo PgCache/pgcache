@@ -702,7 +702,7 @@ mod tests {
     use super::*;
     use crate::catalog::Catalog;
     use crate::query::ast::rope::{NodeKind, View};
-    use crate::query::ast::{AstNode, QueryExpr, query_expr_parse, query_expr_session_key};
+    use crate::query::ast::{AstNode, QueryExpr, query_expr_parse, query_tree_session_key};
     use crate::query::literal_settings::LiteralSettings;
     use crate::query::resolve::owned::sql_owned;
     use crate::query::resolve::query_expr_resolve;
@@ -852,10 +852,14 @@ mod tests {
         let catalog = binding_catalog();
         let sql = "SELECT id FROM users WHERE id = 1";
         let bound = bound(sql, &catalog);
-        let (tree, _) = owned(sql, &catalog);
         assert_ne!(
             bound.fingerprint().get(),
-            query_expr_session_key(&tree, &["public".into()], &LiteralSettings::default()).get()
+            query_tree_session_key(
+                bound.tree(),
+                &["public".into()],
+                &LiteralSettings::default()
+            )
+            .get()
         );
     }
 

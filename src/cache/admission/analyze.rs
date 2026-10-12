@@ -12,13 +12,12 @@ use super::update_classify::{
 };
 use super::{AdmissionAnalysis, TableAdmission};
 use crate::cache::mv_shape::{ShapeGate, shape_classify};
-use crate::cache::query::limit_rows_needed;
+use crate::cache::query::{limit_clause_of, limit_rows_needed};
 use crate::cache::update_query::{UpdateEvalStrategy, UpdateQuery, UpdateQuerySource};
 use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::query::Fingerprint;
-use crate::query::ast::rope::QueryTree;
-use crate::query::ast::{QueryBody, QueryExpr};
+use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
 use crate::query::constraints::{QueryConstraints, query_constraints_analyze_tree};
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
@@ -41,18 +40,52 @@ pub enum AdmissionDepth {
     DecisionOnly,
 }
 
-/// Clone the query, strip LIMIT, and compute max_limit for population.
-/// Set operations force max_limit = None since population runs per-branch.
-pub fn base_query_prepare(query: &QueryExpr) -> (QueryExpr, Option<u64>) {
-    let is_set_op = matches!(query.body, QueryBody::SetOp(_));
-    let max_limit = if is_set_op {
-        None
-    } else {
-        limit_rows_needed(&query.limit)
+/// The query without its root LIMIT, and max_limit for population. Set
+/// operations force max_limit = None since population runs per-branch.
+pub fn base_query_prepare(query: &QueryTree) -> (QueryTree, Option<u64>) {
+    let root = query.root();
+    let max_limit = match root.body() {
+        Body::SetOp(_) => None,
+        Body::Select(_) | Body::Values(_) => limit_rows_needed(&limit_clause_of(root)),
     };
-    let mut base_query = query.clone();
-    base_query.limit = None;
-    (base_query, max_limit)
+    (query_tree_without_limit(query), max_limit)
+}
+
+/// `query` with its root LIMIT/OFFSET dropped: the root re-emitted without
+/// the limit children, everything under it kept. The tree itself when it
+/// has none.
+fn query_tree_without_limit(query: &QueryTree) -> QueryTree {
+    let root = query.root();
+    let NodeKind::Query {
+        cte_count,
+        order_by_count,
+        ..
+    } = *root.node_ref().kind()
+    else {
+        return query.clone();
+    };
+    if !root.has_limit() {
+        return query.clone();
+    }
+    let mut builder = TreeBuilder::over(query);
+    let open = builder.open_from(
+        NodeKind::Query {
+            cte_count,
+            order_by_count,
+            has_limit_count: false,
+            has_limit_offset: false,
+        },
+        root.id(),
+    );
+    for cte in root.ctes() {
+        builder.keep(cte.id());
+    }
+    builder.keep(root.body().id());
+    for clause in root.order_by() {
+        builder.keep(clause.id());
+    }
+    builder.close(open);
+    builder.finish().0
 }
 
 /// The identity-bearing form of a query.
@@ -63,16 +96,14 @@ pub struct CanonicalResolution {
 }
 
 /// Resolve `base_query` on `search_path` and canonicalise its date-time
-/// literals under `settings`: the one conversion of the owned tree to the
-/// rope, everything after it reads and rewrites the rope.
+/// literals under `settings`.
 pub fn query_resolve_canonical(
-    base_query: QueryExpr,
+    base_query: QueryTree,
     tables: &Catalog,
     search_path: &[&str],
     settings: &LiteralSettings,
 ) -> ResolveResult<CanonicalResolution> {
-    let tree = QueryTree::from_query_expr(&base_query);
-    let bound = ResolvedQuery::resolve(tree, tables, search_path)?;
+    let bound = ResolvedQuery::resolve(base_query, tables, search_path)?;
     let (bound, literals) = query_literals_canonicalise(bound, settings);
     Ok(CanonicalResolution {
         bound: Arc::new(bound),

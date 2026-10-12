@@ -9,7 +9,8 @@ use super::log::WriteLog;
 use super::tiers::TableTiers;
 use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
 use crate::pg::Lsn;
-use crate::query::ast::{BinaryOp, LiteralValue, QueryExpr};
+use crate::query::ast::rope::QueryTree;
+use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::constraints::ColumnRange;
 use crate::query::resolve::ColumnsByTable;
 use crate::query::write::{
@@ -48,8 +49,8 @@ fn connection_pending(log: &WriteLog) -> bool {
     !log.connection.is_empty()
 }
 
-fn query(sql: &str) -> QueryExpr {
-    crate::query::ast::query_expr_parse(sql).expect("parse query")
+fn query(sql: &str) -> QueryTree {
+    QueryTree::from_query_expr(&crate::query::ast::query_expr_parse(sql).expect("parse query"))
 }
 
 #[test]

@@ -2,7 +2,6 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     net::SocketAddr,
-    ops::ControlFlow,
     pin::Pin,
     sync::{
         Arc, LazyLock,
@@ -27,6 +26,7 @@ use super::{
     OriginReadHalf, OriginWriteHalf, QueryTelemetry, RawDecision, RawForwardCause,
     RawForwardReason, TransactionForwardReason, WriteLog, forward_cause, origin_connect,
 };
+use crate::cache::query::CacheableQuery;
 use crate::catalog::FunctionVolatility;
 use crate::proxy::CacheabilityStore;
 use crate::proxy::ParseError;
@@ -35,12 +35,11 @@ use crate::proxy::query::{Action, CacheabilityCache, ForwardReason, handle_query
 use crate::proxy::session_settings::SessionSettings;
 use crate::proxy::{ConnectionError, ConnectionResult, ProxyMode, ProxyStatus};
 use crate::query::SessionKey;
-use crate::query::ast::{AstNode, QueryExpr, TableNode};
+use crate::query::ast::rope::QueryTree;
 use crate::query::constraints::{ColumnRange, query_constraints_analyze_tree, table_column_ranges};
 use crate::query::guc::Guc;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::resolve::ColumnsByTable;
-use crate::query::transform::query_expr_parameters_replace;
 use crate::query::write::StatementEffects;
 use crate::result::ReportExt;
 use crate::{
@@ -255,14 +254,14 @@ async fn handle_connection(
                 // parameterized read is keyed on its placeholders and values,
                 // never on a substituted tree.
                 let session_key = match &msg {
-                    CacheMessage::Query(_, cq) => Some(keying.session_key(cq.query())),
+                    CacheMessage::Query(_, cq) => Some(keying.session_key(cq.tree())),
                     CacheMessage::QueryParameterized(_, cq, parameters, _)
                         if parameters.is_empty() =>
                     {
-                        Some(keying.session_key(cq.query()))
+                        Some(keying.session_key(cq.tree()))
                     }
                     CacheMessage::QueryParameterized(_, cq, parameters, _) => {
-                        Some(keying.session_key_with_parameters(cq.query(), parameters))
+                        Some(keying.session_key_with_parameters(cq.tree(), parameters))
                     }
                     CacheMessage::Explain(..) => None,
                 };
@@ -309,7 +308,7 @@ async fn handle_connection(
                         // the cache is registered under. Only worthwhile when a
                         // row predicate is pending.
                         let bound = has_pred.then(|| read_query_bound(&msg)).flatten();
-                        let read_query = bound.as_ref().unwrap_or_else(|| cq.query());
+                        let read_query = bound.as_ref().map_or(cq.tree(), CacheableQuery::tree);
                         let shape = has_pred.then(|| {
                             read_shape(
                                 read_query,
@@ -552,14 +551,14 @@ pub async fn connection_task(
 /// there is nothing to substitute (simple protocol / no parameters) or the
 /// substitution fails — the caller then reasons about the placeholder form,
 /// which yields no ranges and forwards conservatively.
-fn read_query_bound(msg: &CacheMessage) -> Option<QueryExpr> {
+fn read_query_bound(msg: &CacheMessage) -> Option<CacheableQuery> {
     let CacheMessage::QueryParameterized(_, cq, parameters, _) = msg else {
         return None;
     };
     if parameters.is_empty() {
         return None;
     }
-    query_expr_parameters_replace(cq.query(), parameters).ok()
+    cq.parameters_replace(parameters).ok()
 }
 
 /// What the read-after-write gate can prove with: the read's per-column
@@ -573,7 +572,7 @@ struct ReadShape {
 }
 
 fn read_shape(
-    query: &QueryExpr,
+    query: &QueryTree,
     session_key: Option<SessionKey>,
     keying: &KeyingSettings,
     dispatch_handle: &CacheDispatchHandle,
@@ -584,8 +583,8 @@ fn read_shape(
         columns: None,
     };
     let pending = query
-        .nodes::<TableNode>()
-        .any(|table| write_log.table_has_row_predicate(table));
+        .table_names()
+        .any(|(schema, name)| write_log.table_has_row_predicate(schema, name));
     if !pending {
         return none;
     }
@@ -597,7 +596,7 @@ fn read_shape(
         let constraints = query_constraints_analyze_tree(&form.bound, form.bound.select()?);
         constraints
             .where_analysis_complete
-            .then(|| table_column_ranges(&constraints, &table.name))
+            .then(|| table_column_ranges(&constraints, table))
     });
     ReadShape {
         ranges,
@@ -607,15 +606,12 @@ fn read_shape(
 
 /// The single table a read references, or `None` if it references zero or more
 /// than one — a join, self-join, subquery, or CTE is conservative.
-fn single_table(query: &QueryExpr) -> Option<&TableNode> {
-    let mut count = 0usize;
-    let mut found = None;
-    let _ = query.try_for_each_node::<TableNode, ()>(&mut |table| {
-        count += 1;
-        found = Some(table);
-        ControlFlow::Continue(())
-    });
-    (count == 1).then_some(found).flatten()
+fn single_table(query: &QueryTree) -> Option<&str> {
+    let mut tables = query.table_names();
+    match (tables.next(), tables.next()) {
+        (Some((_, name)), None) => Some(name),
+        _ => None,
+    }
 }
 
 /// Increment the per-reason counter for a forwarded (non-cacheable) statement.

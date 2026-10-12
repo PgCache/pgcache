@@ -1,6 +1,15 @@
 //! How many rows a LIMIT/OFFSET needs, and whether a cached row cap covers it.
 
+use crate::query::ast::rope::Query;
 use crate::query::ast::{LimitClause, LiteralValue};
+
+/// The LIMIT clause of `query` as written, with its literals as they are.
+pub fn limit_clause_of(query: Query<'_>) -> Option<LimitClause> {
+    query.has_limit().then(|| LimitClause {
+        count: query.limit_count().map(|literal| literal.value().clone()),
+        offset: query.limit_offset().map(|literal| literal.value().clone()),
+    })
+}
 
 /// Extract the total rows needed from a LIMIT clause.
 ///

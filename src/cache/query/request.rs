@@ -5,9 +5,10 @@
 
 use std::sync::Arc;
 
-use crate::cache::query::{CacheableQuery, QueryParameters};
+use crate::cache::query::{CacheableQuery, QueryParameters, limit_clause_of};
 use crate::query::SessionKey;
-use crate::query::ast::{LimitClause, QueryExpr};
+use crate::query::ast::LimitClause;
+use crate::query::ast::rope::QueryTree;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::transform::{AstTransformResult, literal_value_parameters_replace};
 
@@ -36,25 +37,24 @@ impl RequestQuery {
 
     /// The query as parsed, placeholders included: what a table-level read
     /// such as the allowlist check needs.
-    pub fn query(&self) -> &QueryExpr {
-        self.cacheable.query()
+    pub fn tree(&self) -> &QueryTree {
+        self.cacheable.tree()
     }
 
     /// The proxy's key for this read under `keying`; the one the alias map
     /// is filled under, so it must match what the connection computed.
     pub fn session_key(&self, keying: &KeyingSettings) -> SessionKey {
         match &self.parameters {
-            None => keying.session_key(self.query()),
-            Some(parameters) => keying.session_key_with_parameters(self.query(), parameters),
+            None => keying.session_key(self.tree()),
+            Some(parameters) => keying.session_key_with_parameters(self.tree(), parameters),
         }
     }
 
     /// The LIMIT with its bind values in place.
     pub fn limit(&self) -> AstTransformResult<Option<LimitClause>> {
-        let Some(clause) = &self.query().limit else {
+        let Some(mut clause) = limit_clause_of(self.tree().root()) else {
             return Ok(None);
         };
-        let mut clause = clause.clone();
         if let Some(parameters) = &self.parameters {
             if let Some(count) = &mut clause.count {
                 literal_value_parameters_replace(count, parameters)?;
@@ -85,7 +85,7 @@ mod tests {
 
     use super::*;
     use crate::oid::TypeOid;
-    use crate::query::ast::{Deparse, LiteralValue, query_expr_parse};
+    use crate::query::ast::{LiteralValue, query_expr_parse};
 
     fn cacheable(sql: &str) -> Arc<CacheableQuery> {
         let query = query_expr_parse(sql).expect("parse query");
@@ -123,9 +123,10 @@ mod tests {
             .expect("limit present");
         assert_eq!(limit.count, Some(LiteralValue::Integer(10)));
         assert_eq!(limit.offset, Some(LiteralValue::Integer(5)));
-        let mut sql = String::new();
-        request.query().deparse(&mut sql);
-        assert_eq!(sql, "SELECT id FROM users WHERE id = $1 LIMIT $2 OFFSET $3");
+        assert_eq!(
+            request.tree().sql(),
+            "SELECT id FROM users WHERE id = $1 LIMIT $2 OFFSET $3"
+        );
     }
 
     #[test]
@@ -169,9 +170,10 @@ mod tests {
             int_params(&[b"42"]),
         );
         let substituted = request.substituted().expect("substitute");
-        let mut sql = String::new();
-        substituted.query().deparse(&mut sql);
-        assert_eq!(sql, "SELECT id FROM users WHERE id = 42");
+        assert_eq!(
+            substituted.tree().sql(),
+            "SELECT id FROM users WHERE id = 42"
+        );
     }
 
     #[test]
@@ -182,13 +184,10 @@ mod tests {
         let other = RequestQuery::new(Arc::clone(&query), int_params(&[b"2"]));
         assert_eq!(
             bound.session_key(&keying),
-            keying.session_key_with_parameters(query.query(), &int_params(&[b"1"]))
+            keying.session_key_with_parameters(query.tree(), &int_params(&[b"1"]))
         );
         assert_ne!(bound.session_key(&keying), other.session_key(&keying));
         let plain = RequestQuery::new(Arc::clone(&query), empty_params());
-        assert_eq!(
-            plain.session_key(&keying),
-            keying.session_key(query.query())
-        );
+        assert_eq!(plain.session_key(&keying), keying.session_key(query.tree()));
     }
 }

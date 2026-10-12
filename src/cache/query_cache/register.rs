@@ -39,7 +39,7 @@ impl CacheDispatch {
             literals: reference_settings::current().literals.clone(),
         });
         for pq in pinned {
-            let session_key = keying.session_key(pq.cacheable_query.query());
+            let session_key = keying.session_key(pq.cacheable_query.tree());
             let fingerprint = match self
                 .session_key_resolve(session_key, Arc::clone(&pq.cacheable_query), &keying)
                 .await

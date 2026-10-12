@@ -402,7 +402,7 @@ impl CacheDispatch {
         msg: &QueryRequest,
         cfg: &DynamicConfig,
     ) -> Option<Fingerprint> {
-        if !fast_path::query_allowlist_check(&cfg.allowed_tables_parsed, msg.query.query()) {
+        if !fast_path::query_allowlist_check(&cfg.allowed_tables_parsed, msg.query.tree()) {
             crate::metrics::handles()
                 .query
                 .allowlist_skipped

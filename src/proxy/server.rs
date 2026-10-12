@@ -504,8 +504,8 @@ mod tests {
         let result = pinned_queries_validate(&settings, &HashMap::new());
         assert_eq!(result.len(), 2);
         assert_ne!(
-            result[0].cacheable_query.query(),
-            result[1].cacheable_query.query()
+            result[0].cacheable_query.tree(),
+            result[1].cacheable_query.tree()
         );
     }
 

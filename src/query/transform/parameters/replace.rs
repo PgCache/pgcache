@@ -5,8 +5,8 @@ use rootcause::Report;
 
 use super::parameter_to_literal;
 use crate::cache::QueryParameters;
-use crate::query::ast::{LiteralValue, QueryExpr, ScalarExpr, SelectNode, query_expr_finalize};
-use crate::query::transform::walk::{QueryWalkerMut, query_expr_walk_mut, select_node_walk_mut};
+use crate::query::ast::{LiteralValue, QueryExpr, ScalarExpr, query_expr_finalize};
+use crate::query::transform::walk::{QueryWalkerMut, query_expr_walk_mut};
 use crate::query::transform::{AstTransformError, AstTransformResult, query_expr_constant_fold};
 
 pub fn query_expr_parameters_replace(
@@ -23,14 +23,6 @@ pub fn query_expr_parameters_replace(
     query_expr_finalize(&mut new_query);
 
     Ok(new_query)
-}
-
-pub fn select_node_parameters_replace(
-    select_node: &mut SelectNode,
-    parameters: &QueryParameters,
-) -> AstTransformResult<()> {
-    let mut replacer = ParameterReplacer { parameters };
-    select_node_walk_mut(select_node, &mut replacer)
 }
 
 struct ParameterReplacer<'a> {
@@ -103,19 +95,11 @@ mod tests {
     use bytes::Bytes;
     use postgres_types::Type as PgType;
 
-    use super::{query_expr_parameters_replace, select_node_parameters_replace};
+    use super::query_expr_parameters_replace;
     use crate::cache::QueryParameters;
     use crate::oid::TypeOid;
-    use crate::query::ast::{Deparse, QueryBody, SelectNode, query_expr_parse};
-    use crate::query::transform::AstTransformError;
-
-    fn parse_select_node(sql: &str) -> SelectNode {
-        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
-        match query_expr.body {
-            QueryBody::Select(node) => *node,
-            _ => panic!("expected SELECT"),
-        }
-    }
+    use crate::query::ast::{Deparse, query_expr_parse};
+    use crate::query::transform::{AstTransformError, AstTransformResult};
 
     fn text_params(values: Vec<Option<&[u8]>>) -> QueryParameters {
         let len = values.len();
@@ -142,49 +126,57 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_ast_parameters_replace_simple() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE id = $1");
-        let params = text_params(vec![Some(b"42")]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
+    /// `sql` with `params` bound, as rendered.
+    fn replaced(sql: &str, params: &QueryParameters) -> AstTransformResult<String> {
+        let query = query_expr_parse(sql).expect("convert to QueryExpr");
+        let replaced = query_expr_parameters_replace(&query, params)?;
         let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert_eq!(buf, "SELECT id FROM users WHERE id = '42'");
+        replaced.deparse(&mut buf);
+        Ok(buf)
     }
 
+    /// Placeholders bound wherever they sit: predicates, joins, subqueries
+    /// at every depth, scalar subqueries; a NULL value renders as NULL.
     #[test]
-    fn test_ast_parameters_replace_multiple_params() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE id = $1 AND name = $2");
-        let params = text_params(vec![Some(b"42"), Some(b"alice")]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE id = '42' AND name = 'alice'"
-        );
-    }
-
-    #[test]
-    fn test_ast_parameters_replace_null() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE name = $1");
-        let params = text_params(vec![None]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert_eq!(buf, "SELECT id FROM users WHERE name = NULL");
+    fn test_parameters_replace_cases() {
+        let int = |value: &'static [u8]| (Some(value), PgType::INT4);
+        let text = |value: &'static [u8]| (Some(value), PgType::TEXT);
+        #[rustfmt::skip]
+        let cases: Vec<(&str, QueryParameters, &str)> = vec![
+            ("SELECT id FROM users WHERE id = $1", text_params(vec![Some(b"42")]),
+             "SELECT id FROM users WHERE id = '42'"),
+            ("SELECT id FROM users WHERE id = $1 AND name = $2", text_params(vec![Some(b"42"), Some(b"alice")]),
+             "SELECT id FROM users WHERE id = '42' AND name = 'alice'"),
+            ("SELECT id FROM users WHERE name = $1", text_params(vec![None]),
+             "SELECT id FROM users WHERE name = NULL"),
+            ("SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > $1", text_params(vec![Some(b"100")]),
+             "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > '100'"),
+            ("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > $1)", typed_text_params(vec![int(b"100")]),
+             "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > 100)"),
+            ("SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > $1)", typed_text_params(vec![int(b"50")]),
+             "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > 50)"),
+            ("SELECT id FROM users WHERE status = $1 AND id IN (SELECT user_id FROM orders WHERE total > $2)", typed_text_params(vec![text(b"active"), int(b"200")]),
+             "SELECT id FROM users WHERE status = 'active' AND id IN (SELECT user_id FROM orders WHERE total > 200)"),
+            ("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE product_id IN (SELECT id FROM products WHERE price > $1))", typed_text_params(vec![int(b"99")]),
+             "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE product_id IN (SELECT id FROM products WHERE price > 99))"),
+            ("SELECT id FROM users WHERE age > (SELECT avg(age) FROM users WHERE status = $1)", typed_text_params(vec![text(b"active")]),
+             "SELECT id FROM users WHERE age > (SELECT AVG(age) FROM users WHERE status = 'active')"),
+        ];
+        for (sql, params, expected) in cases {
+            assert_eq!(
+                replaced(sql, &params).expect("to replace parameters"),
+                expected,
+                "{sql}"
+            );
+        }
     }
 
     #[test]
     fn test_ast_parameters_replace_out_of_bounds() {
-        let mut node = parse_select_node("SELECT id FROM users WHERE id = $2");
-        let params = text_params(vec![Some(b"42")]);
-        let result = select_node_parameters_replace(&mut node, &params);
-
-        assert!(result.is_err());
+        let result = replaced(
+            "SELECT id FROM users WHERE id = $2",
+            &text_params(vec![Some(b"42")]),
+        );
         match result.map_err(|e| e.into_current_context()) {
             Err(AstTransformError::ParameterOutOfBounds { index, count }) => {
                 assert_eq!(index, 1);
@@ -192,107 +184,6 @@ mod tests {
             }
             _ => panic!("Expected ParameterOutOfBounds error"),
         }
-    }
-
-    #[test]
-    fn test_ast_parameters_replace_in_join() {
-        let mut node = parse_select_node(
-            "SELECT u.id FROM users u JOIN orders o ON o.user_id = u.id WHERE o.total > $1",
-        );
-        let params = text_params(vec![Some(b"100")]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert!(buf.contains("WHERE o.total > '100'"));
-    }
-
-    #[test]
-    fn test_parameters_replace_in_subquery() {
-        let mut node = parse_select_node(
-            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > $1)",
-        );
-
-        let params = typed_text_params(vec![(Some(b"100"), PgType::INT4)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE total > 100)"
-        );
-    }
-
-    #[test]
-    fn test_parameters_replace_exists_subquery() {
-        let mut node = parse_select_node(
-            "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > $1)",
-        );
-
-        let params = typed_text_params(vec![(Some(b"50"), PgType::INT4)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE total > 50)"
-        );
-    }
-
-    #[test]
-    fn test_parameters_replace_subquery_with_outer_param() {
-        let mut node = parse_select_node(
-            "SELECT id FROM users WHERE status = $1 AND id IN (SELECT user_id FROM orders WHERE total > $2)",
-        );
-
-        let params = typed_text_params(vec![
-            (Some(b"active"), PgType::TEXT),
-            (Some(b"200"), PgType::INT4),
-        ]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE status = 'active' AND id IN (SELECT user_id FROM orders WHERE total > 200)"
-        );
-    }
-
-    #[test]
-    fn test_parameters_replace_nested_subquery() {
-        let mut node = parse_select_node(
-            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE product_id IN (SELECT id FROM products WHERE price > $1))",
-        );
-
-        let params = typed_text_params(vec![(Some(b"99"), PgType::INT4)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE product_id IN (SELECT id FROM products WHERE price > 99))"
-        );
-    }
-
-    #[test]
-    fn test_parameters_replace_scalar_subquery_in_where() {
-        let mut node = parse_select_node(
-            "SELECT id FROM users WHERE age > (SELECT avg(age) FROM users WHERE status = $1)",
-        );
-
-        let params = typed_text_params(vec![(Some(b"active"), PgType::TEXT)]);
-        select_node_parameters_replace(&mut node, &params).expect("to replace parameters");
-
-        let mut buf = String::new();
-        node.deparse(&mut buf);
-        assert_eq!(
-            buf,
-            "SELECT id FROM users WHERE age > (SELECT AVG(age) FROM users WHERE status = 'active')"
-        );
     }
 
     /// `SELECT $1 FROM …` — bind-time parameter substitution must reach the

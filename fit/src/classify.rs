@@ -10,7 +10,7 @@ use pgcache_lib::cache::admission::{
     query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
     shape_gate_classify,
 };
-use pgcache_lib::cache::query::limit_rows_needed;
+use pgcache_lib::cache::query::{limit_clause_of, limit_rows_needed};
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::Catalog;
 use pgcache_lib::oid::Oid;
@@ -295,7 +295,7 @@ pub fn statement_classify(
     // preparation: LIMIT stripped and max_limit derived (base_query_prepare),
     // predicates pushed into derived-table branches, and reducer shapes
     // forcing unbounded population, exactly as in query_resolve.
-    let (base_query, user_max_limit) = base_query_prepare(cacheable.query());
+    let (base_query, user_max_limit) = base_query_prepare(cacheable.tree());
 
     // The identity is the bound query's serve SQL, literals canonicalised
     // under the default settings, before the pushdown transform — as
@@ -377,7 +377,7 @@ pub fn statement_classify(
         shape_key: bound.shape().key,
         relations,
         has_limit,
-        rows_needed: limit_rows_needed(&cacheable.query().limit),
+        rows_needed: limit_rows_needed(&limit_clause_of(cacheable.tree().root())),
         max_limit,
         constraints,
         admissions,

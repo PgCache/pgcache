@@ -13,7 +13,7 @@ use crate::cache::QueryParameter;
 use crate::query::ast::LiteralValue;
 
 pub(crate) use replace::literal_value_parameters_replace;
-pub use replace::{query_expr_parameters_replace, select_node_parameters_replace};
+pub use replace::query_expr_parameters_replace;
 #[cfg(feature = "proxy")]
 pub(crate) use write_parameterize::{
     delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,

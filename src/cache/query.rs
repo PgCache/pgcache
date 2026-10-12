@@ -6,8 +6,9 @@ use error_set::error_set;
 
 use crate::catalog::FunctionVolatility;
 use crate::oid::TypeOid;
-use crate::query::ast::{QueryExpr, SelectNode};
-use crate::query::transform::{AstTransformResult, query_expr_parameters_replace};
+use crate::query::ast::QueryExpr;
+use crate::query::ast::rope::{Body, QueryTree, Select};
+use crate::query::transform::{AstTransformResult, query_tree_parameters_replace};
 
 mod cacheability;
 mod limit;
@@ -17,7 +18,7 @@ mod request;
 pub use cacheability::query_has_volatile_function;
 use cacheability::{is_cacheable_body, references_system_catalog};
 
-pub use limit::{limit_is_sufficient, limit_rows_needed};
+pub use limit::{limit_clause_of, limit_is_sufficient, limit_rows_needed};
 pub use outer_join::outer_join_optional_tables;
 pub use request::RequestQuery;
 
@@ -56,25 +57,27 @@ error_set! {
 /// Type alias for the function volatility map passed through cacheability checks.
 type FunctionVolatilityMap = HashMap<EcoString, FunctionVolatility>;
 
-/// A query that passed the cacheability check. The field is private so
-/// `try_new` (and the invariant-preserving `parameters_replace`) are the only
-/// ways to construct one — a `CacheableQuery` in hand is proof of validation.
+/// A query that passed the cacheability check, held as the rope (ADR-057).
+/// The field is private so `try_new` (and the invariant-preserving
+/// `parameters_replace`) are the only ways to construct one — a
+/// `CacheableQuery` in hand is proof of validation.
 #[derive(Debug, Clone)]
 pub struct CacheableQuery {
-    query: QueryExpr,
+    tree: QueryTree,
 }
 
 impl CacheableQuery {
-    pub fn query(&self) -> &QueryExpr {
-        &self.query
+    pub fn tree(&self) -> &QueryTree {
+        &self.tree
     }
 
-    /// Get the SELECT body of this query, if it is a simple SELECT.
-    ///
-    /// Returns `Some` if the query body is a SELECT statement, `None` if it's
+    /// The SELECT body of this query, if it is a simple SELECT: `None` for
     /// a set operation (UNION/INTERSECT/EXCEPT) or VALUES clause.
-    pub fn as_select(&self) -> Option<&SelectNode> {
-        self.query.as_select()
+    pub fn as_select(&self) -> Option<Select<'_>> {
+        match self.tree.root().body() {
+            Body::Select(select) => Some(select),
+            Body::SetOp(_) | Body::Values(_) => None,
+        }
     }
 
     /// Substitute bind parameters, producing the per-literal form of this
@@ -84,7 +87,7 @@ impl CacheableQuery {
         &self,
         parameters: &QueryParameters,
     ) -> AstTransformResult<CacheableQuery> {
-        query_expr_parameters_replace(&self.query, parameters).map(|query| CacheableQuery { query })
+        query_tree_parameters_replace(&self.tree, parameters).map(|tree| CacheableQuery { tree })
     }
 }
 
@@ -108,15 +111,16 @@ impl CacheableQuery {
     }
 
     /// Build a cacheable query, validating it first. Fails with the same
-    /// verdict as [`Self::cacheable`].
+    /// verdict as [`Self::cacheable`]. This is the one conversion of the
+    /// parsed tree to the rope; the parsed tree is not kept.
     pub fn try_new(
         query: QueryExpr,
         fv: &FunctionVolatilityMap,
     ) -> Result<Self, CacheabilityError> {
         Self::cacheable(&query, fv)?;
-        // Take ownership of the (freshly built, ephemeral) query rather than
-        // cloning the whole AST — the caller has no further use for it.
-        Ok(CacheableQuery { query })
+        Ok(CacheableQuery {
+            tree: QueryTree::from_query_expr(&query),
+        })
     }
 }
 

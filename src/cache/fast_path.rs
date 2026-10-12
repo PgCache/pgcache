@@ -6,7 +6,6 @@
 //! and are factored out so the dispatch logic stays readable.
 
 use std::num::NonZeroU64;
-use std::ops::ControlFlow;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -19,7 +18,7 @@ use super::{
     types::CacheStateView,
 };
 use crate::query::Fingerprint;
-use crate::query::ast::{AstNode, QueryExpr, TableNode};
+use crate::query::ast::rope::QueryTree;
 use crate::settings::{Allowlist, CachePolicy};
 use crate::timing::duration_to_ns_u64;
 
@@ -35,36 +34,24 @@ pub(crate) enum MvDecision {
 
 /// Check whether all tables in the query are in the allowlist. Returns true if
 /// no allowlist is configured (all tables allowed).
-pub(crate) fn query_allowlist_check(allowlist: &Allowlist, query: &QueryExpr) -> bool {
+pub(crate) fn query_allowlist_check(allowlist: &Allowlist, query: &QueryTree) -> bool {
     let Some(entries) = allowlist else {
         return true;
     };
-    // Allowed iff every TableNode matches an allowlist entry: break on the
-    // first non-matching table, so a clean walk (Continue) means "all allowed".
-    // Entries are lowercased at parse time; match without allocating a
-    // lowercased copy of each table/schema name on this serve-path walk.
-    query
-        .try_for_each_node::<TableNode, ()>(&mut |t| {
-            let allowed = entries.iter().any(|(ws, wt)| {
-                eq_lowercased(wt, &t.name)
-                    && match ws {
-                        Some(ws) => t.schema.as_deref().is_some_and(|s| eq_lowercased(ws, s)),
-                        None => true,
-                    }
-            });
-            if allowed {
-                ControlFlow::Continue(())
-            } else {
-                ControlFlow::Break(())
-            }
+    // Allowed iff every table matches an allowlist entry. Entries are
+    // lowercased at parse time; match without allocating a lowercased copy
+    // of each table/schema name on this serve-path walk.
+    query.table_names().all(|(schema, name)| {
+        entries.iter().any(|(ws, wt)| {
+            eq_lowercased(wt, name)
+                && match ws {
+                    Some(ws) => schema.is_some_and(|s| eq_lowercased(ws, s)),
+                    None => true,
+                }
         })
-        .is_continue()
+    })
 }
 
-/// Unicode case-insensitive equality without allocating. `lowered` must already
-/// be lowercased (allowlist entries are, at parse time); `raw` is lowercased
-/// lazily per character during the comparison. Equivalent to
-/// `lowered == raw.to_lowercase()` with no intermediate `String`.
 fn eq_lowercased(lowered: &str, raw: &str) -> bool {
     lowered.chars().eq(raw.chars().flat_map(char::to_lowercase))
 }

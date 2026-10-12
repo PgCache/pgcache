@@ -2,7 +2,6 @@
 //! purging on the settled watermark, and the per-read gate verdict.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
 
 use ecow::EcoString;
 
@@ -14,7 +13,7 @@ use super::aggregate::{
 use super::tiers::{ConnectionTiers, TableTiers};
 use super::{DisjointKinds, RawBlocker, RawDecision, RawForwardReason};
 use crate::pg::Lsn;
-use crate::query::ast::{AstNode, QueryExpr, TableNode};
+use crate::query::ast::rope::QueryTree;
 use crate::query::constraints::{
     ColumnRange, column_ranges_disjoint, column_ranges_from_comparisons,
 };
@@ -259,7 +258,7 @@ impl WriteLog {
     /// forward conservatively.
     pub(crate) fn decide(
         &self,
-        query: &QueryExpr,
+        query: &QueryTree,
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
         read_columns: Option<&ColumnsByTable>,
     ) -> RawDecision {
@@ -273,17 +272,16 @@ impl WriteLog {
         // a later table could in principle carry a still-later bound, but one
         // blocking table suffices for attribution (PGC-440).
         let mut kinds = DisjointKinds::default();
-        let blocked = query.try_for_each_node::<TableNode, RawBlocker>(&mut |table| match self
-            .table_intersects(
-                table,
+        let blocked = query.table_names().find_map(|(schema, name)| {
+            self.table_intersects(
+                schema,
+                name,
                 read_ranges,
-                read_columns.and_then(|columns| columns.get(&table.name)),
+                read_columns.and_then(|columns| columns.get(name)),
                 &mut kinds,
-            ) {
-            Some(blocker) => ControlFlow::Break(blocker),
-            None => ControlFlow::Continue(()),
+            )
         });
-        if let ControlFlow::Break(blocker) = blocked {
+        if let Some(blocker) = blocked {
             RawDecision::Forward(RawForwardReason::Table, blocker)
         } else if kinds.any() {
             RawDecision::ServeDisjoint(kinds)
@@ -299,15 +297,16 @@ impl WriteLog {
     /// blocker is the slowest-to-clear constraint (PGC-440 attribution).
     fn table_intersects(
         &self,
-        table: &TableNode,
+        table_schema: Option<&str>,
+        table_name: &str,
         read_ranges: Option<&HashMap<EcoString, ColumnRange>>,
         read_columns: Option<&HashSet<EcoString>>,
         kinds: &mut DisjointKinds,
     ) -> Option<RawBlocker> {
-        let bucket = self.tables.get(&table.name)?;
+        let bucket = self.tables.get(table_name)?;
         let mut blocker: Option<RawBlocker> = None;
         for (schema, tiers) in bucket {
-            if !schema_matches(schema, &table.schema) {
+            if !schema_matches(schema, table_schema) {
                 continue;
             }
             for (bound, agg) in tiers.aggregates_bounded() {
@@ -385,10 +384,14 @@ impl WriteLog {
     /// INSERT, DELETE, or UPDATE). Cheap gate so the read-after-write gate skips
     /// the expensive per-column range derivation for reads no such write could
     /// affect (PGC-369, PGC-381, PGC-382).
-    pub(crate) fn table_has_row_predicate(&self, table: &TableNode) -> bool {
-        self.tables.get(&table.name).is_some_and(|bucket| {
+    pub(crate) fn table_has_row_predicate(
+        &self,
+        table_schema: Option<&str>,
+        table_name: &str,
+    ) -> bool {
+        self.tables.get(table_name).is_some_and(|bucket| {
             bucket.iter().any(|(schema, tiers)| {
-                schema_matches(schema, &table.schema)
+                schema_matches(schema, table_schema)
                     && tiers.aggregates().any(TableAggregate::has_row_predicates)
             })
         })
@@ -398,7 +401,7 @@ impl WriteLog {
 /// (the bucket key). Compared only when *both* sides are schema-qualified — an
 /// unqualified name on either side conservatively matches, since the proxy
 /// can't resolve `search_path` to a concrete schema.
-fn schema_matches(relation: &Option<EcoString>, table: &Option<EcoString>) -> bool {
+fn schema_matches(relation: &Option<EcoString>, table: Option<&str>) -> bool {
     match (relation, table) {
         (Some(a), Some(b)) => a == b,
         _ => true,

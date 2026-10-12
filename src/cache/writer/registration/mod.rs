@@ -206,7 +206,7 @@ async fn resolve_command(core: &mut WriterCore, request: ResolveRequest) {
     trace!("command query resolve {session_key}");
     let result = match resolve::query_fingerprint_resolve(
         core,
-        request.cacheable_query.query(),
+        request.cacheable_query.tree(),
         &request.keying,
     )
     .await

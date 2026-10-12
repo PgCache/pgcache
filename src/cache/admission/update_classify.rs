@@ -302,7 +302,6 @@ mod classify_tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_expr_parse;
-    use crate::query::ast::rope::QueryTree;
     use crate::query::resolve::ResolvedQuery;
 
     fn make_table(name: &str, oid: Oid, columns: &[&str]) -> TableMetadata {
@@ -332,7 +331,7 @@ mod classify_tests {
     fn resolve(sql: &str, tables: &Catalog) -> ResolvedQuery {
         let query_expr = query_expr_parse(sql).expect("convert");
         let cacheable = CacheableQuery::try_new(query_expr, &HashMap::new()).expect("cacheable");
-        let tree = QueryTree::from_query_expr(cacheable.query());
+        let tree = cacheable.tree().clone();
         ResolvedQuery::resolve(tree, tables, &["public"]).expect("resolve")
     }
 
