@@ -15,7 +15,7 @@ mod tests;
 mod tree;
 mod view;
 
-pub use build::{ChunkRemap, Open, TreeBuilder};
+pub use build::{ChunkRemap, Open, OriginMap, TreeBuilder};
 pub use node::{FrameBoundKind, JoinQualKind, Node, NodeKind};
 pub use tree::QueryTree;
 pub use view::{

@@ -6,7 +6,7 @@ use rootcause::Report;
 use super::bindings::{ColumnBinding, ColumnTarget, MergedId, SlotId};
 use super::scope::ResolutionScope;
 use crate::catalog::ColumnMetadata;
-use crate::query::ast::ColumnNode;
+use crate::query::ast::NodeId;
 use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// What a column name denotes in scope.
@@ -20,25 +20,25 @@ pub(super) enum ColumnLookup {
     Merged { merged: MergedId },
 }
 
-/// Bind a column reference, recording its target against the node.
+/// Bind the column reference at `node`, recording its target against it.
 pub(super) fn column_resolve(
-    column_node: &ColumnNode,
+    node: NodeId,
+    qualifier: Option<&str>,
+    column: &str,
     scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<ColumnLookup> {
-    let lookup = column_lookup(column_node, scope)?;
+    let lookup = column_lookup(qualifier, column, scope)?;
     match &lookup {
         ColumnLookup::Column {
             binding,
             correlated,
-        } => {
-            scope
-                .bindings
-                .column_bind(column_node.id, ColumnTarget::Column(*binding), *correlated)
-        }
+        } => scope
+            .bindings
+            .column_bind(node, ColumnTarget::Column(*binding), *correlated),
         ColumnLookup::Merged { merged } => {
             scope
                 .bindings
-                .column_bind(column_node.id, ColumnTarget::Merged(*merged), false);
+                .column_bind(node, ColumnTarget::Merged(*merged), false);
         }
     }
     Ok(lookup)
@@ -51,19 +51,18 @@ pub(super) fn column_resolve(
 /// `outer_tables` set (i.e. we are inside a subquery body), the outer tables
 /// are tried as a fallback; a match there is a correlated reference.
 pub(super) fn column_lookup(
-    column_node: &ColumnNode,
+    qualifier: Option<&str>,
+    column_name: &str,
     scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<ColumnLookup> {
-    let column_name = &column_node.column;
-
     // Table-qualified reference (e.g. `o.id`)
-    if let Some(table_qualifier) = &column_node.table {
+    if let Some(table_qualifier) = qualifier {
         // Try inner scope first
         if let Some(entry) = scope.table_scope_find(table_qualifier) {
             let table_metadata = entry.metadata();
             let column_metadata = table_metadata
                 .columns
-                .get(column_name.as_str())
+                .get(column_name)
                 .ok_or_else(|| column_not_found(&table_metadata.name, column_name))?;
             return Ok(ColumnLookup::Column {
                 binding: column_binding(entry.slot(), column_metadata),
@@ -76,7 +75,7 @@ pub(super) fn column_lookup(
             let column_metadata = outer
                 .table
                 .columns
-                .get(column_name.as_str())
+                .get(column_name)
                 .ok_or_else(|| column_not_found(&outer.table.name, column_name))?;
             return Ok(ColumnLookup::Column {
                 binding: column_binding(outer.slot, column_metadata),
@@ -85,7 +84,7 @@ pub(super) fn column_lookup(
         }
 
         return Err(Report::from(ResolveError::TableNotFound {
-            name: table_qualifier.to_string(),
+            name: table_qualifier.to_owned(),
         }));
     }
 
@@ -94,7 +93,7 @@ pub(super) fn column_lookup(
     // context (GROUP BY): an inner join's merged column is the left column;
     // an outer join's is `COALESCE`, which is not a column, so forward the
     // query.
-    if let Some(merged) = scope.merged_column_find(column_name.as_str()) {
+    if let Some(merged) = scope.merged_column_find(column_name) {
         if !merged.outer {
             return Ok(ColumnLookup::Merged {
                 merged: merged.merged,
@@ -104,7 +103,7 @@ pub(super) fn column_lookup(
     }
 
     // Unqualified column — search inner scope first
-    let matches = scope.column_matches_find(column_name.as_str());
+    let matches = scope.column_matches_find(column_name);
     match matches.as_slice() {
         [] => {
             // Fall back to outer scope (correlated reference)
@@ -112,7 +111,7 @@ pub(super) fn column_lookup(
                 outer
                     .table
                     .columns
-                    .get(column_name.as_str())
+                    .get(column_name)
                     .map(|col_meta| (outer, col_meta))
             });
             if let Some((outer, column_metadata)) = outer_match {
@@ -128,7 +127,7 @@ pub(super) fn column_lookup(
             correlated: false,
         }),
         _ => Err(Report::from(ResolveError::AmbiguousColumn {
-            column: column_name.to_string(),
+            column: column_name.to_owned(),
         })),
     }
 }

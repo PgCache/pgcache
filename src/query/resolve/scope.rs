@@ -11,10 +11,12 @@ use rootcause::Report;
 use super::bindings::{BindingsBuilder, ColumnBinding, SlotId, TableSlot};
 use super::entry::query_expr_resolve_scoped;
 use super::join_using::MergedJoinColumn;
+use super::rope::query_resolve_scoped;
 use crate::catalog::{
     Catalog, CatalogTable, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata,
 };
 use crate::oid::{Oid, TypeOid};
+use crate::query::ast::rope::Query;
 use crate::query::ast::{NodeId, QueryExpr};
 use crate::query::resolve::{ResolveError, ResolveResult};
 
@@ -262,9 +264,31 @@ impl<'a> ResolutionScope<'a> {
     /// found only in `outer_tables` binds to the outer slot and is
     /// recorded as correlated.
     pub(super) fn subquery_resolve(&mut self, query: &QueryExpr) -> ResolveResult<()> {
+        self.subquery_resolve_with(|tables, search_path, outer_tables, bindings| {
+            query_expr_resolve_scoped(query, tables, search_path, outer_tables, bindings)
+        })
+    }
+
+    /// [`ResolutionScope::subquery_resolve`] for a rope subquery.
+    pub(super) fn subquery_resolve_tree(&mut self, query: Query<'a>) -> ResolveResult<()> {
+        self.subquery_resolve_with(|tables, search_path, outer_tables, bindings| {
+            query_resolve_scoped(query, tables, search_path, outer_tables, bindings)
+        })
+    }
+
+    /// Run `resolve` for a subquery body in a scope that sees this one's
+    /// tables and its ancestors' as outer tables.
+    fn subquery_resolve_with<F>(&mut self, resolve: F) -> ResolveResult<()>
+    where
+        F: for<'b> FnOnce(
+            &'b Catalog,
+            &'b [&'b str],
+            Vec<OuterTable>,
+            &'b mut BindingsBuilder,
+        ) -> ResolveResult<Vec<OutputColumn>>,
+    {
         let outer_tables = self.scope_tables_snapshot();
-        query_expr_resolve_scoped(
-            query,
+        resolve(
             self.catalog_tables,
             &self.search_path,
             outer_tables,

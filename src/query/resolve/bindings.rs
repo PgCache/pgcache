@@ -311,6 +311,12 @@ impl Bindings {
     /// two resolutions of one tree compare equal whatever order their
     /// slots were made in.
     pub(crate) fn describe(&self) -> Vec<String> {
+        self.describe_with(|id| id.index().to_string())
+    }
+
+    /// [`Bindings::describe`] with node ids rendered by `id_text`, so the
+    /// bindings of one query in two id spaces compare through a mapping.
+    pub(crate) fn describe_with(&self, id_text: impl Fn(NodeId) -> String) -> Vec<String> {
         let slot_text = |id: SlotId| match self.slot(id) {
             Some(TableSlot::Base { table, alias }) => {
                 let alias = alias
@@ -335,7 +341,7 @@ impl Bindings {
             Some(m) => format!(
                 "merged {} join {} {} = {} outer={}",
                 m.name,
-                m.join.index(),
+                id_text(m.join),
                 binding_text(&m.left),
                 binding_text(&m.right),
                 m.outer
@@ -344,7 +350,7 @@ impl Bindings {
         };
         let mut lines = Vec::new();
         for (node, slot) in &self.sources {
-            lines.push(format!("source {} -> {}", node.index(), slot_text(*slot)));
+            lines.push(format!("source {} -> {}", id_text(*node), slot_text(*slot)));
         }
         for (node, target) in &self.columns {
             let target = match target {
@@ -352,7 +358,7 @@ impl Bindings {
                 ColumnTarget::Merged(id) => merged_text(*id),
                 ColumnTarget::Output => "output".to_owned(),
             };
-            lines.push(format!("column {} -> {target}", node.index()));
+            lines.push(format!("column {} -> {target}", id_text(*node)));
         }
         for (node, items) in &self.stars {
             let items: Vec<String> = items
@@ -362,10 +368,10 @@ impl Bindings {
                     StarItem::Merged(id) => merged_text(*id),
                 })
                 .collect();
-            lines.push(format!("star {} -> [{}]", node.index(), items.join(", ")));
+            lines.push(format!("star {} -> [{}]", id_text(*node), items.join(", ")));
         }
         for node in &self.correlated {
-            lines.push(format!("correlated {}", node.index()));
+            lines.push(format!("correlated {}", id_text(*node)));
         }
         lines
     }

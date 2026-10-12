@@ -12,7 +12,7 @@ use rootcause::Report;
 use super::bindings::{ColumnBinding, MergedColumnBinding, MergedId};
 use super::column::{ColumnLookup, column_lookup};
 use super::scope::ResolutionScope;
-use crate::query::ast::{ColumnNode, JoinType, NodeId};
+use crate::query::ast::{JoinType, NodeId};
 use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// A `USING`/`NATURAL` join's merged output column. Postgres exposes the
@@ -105,12 +105,7 @@ fn join_side_column_resolve(
     qual: &EcoString,
     column: &EcoString,
 ) -> ResolveResult<ColumnBinding> {
-    let reference = ColumnNode {
-        id: NodeId::PENDING,
-        table: Some(qual.clone()),
-        column: column.clone(),
-    };
-    match column_lookup(&reference, scope)? {
+    match column_lookup(Some(qual), column, scope)? {
         ColumnLookup::Column { binding, .. } => Ok(binding),
         // Qualified lookups never reach a merged column; forward if one does.
         ColumnLookup::Merged { .. } => Err(Report::from(ResolveError::UnsupportedJoinQualifier)),

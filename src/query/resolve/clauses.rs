@@ -180,7 +180,7 @@ pub(super) fn group_by_resolve(
     scope: &mut ResolutionScope<'_>,
 ) -> ResolveResult<()> {
     for col in group_by {
-        column_resolve(col, scope)?;
+        column_resolve(col.id, col.table.as_deref(), &col.column, scope)?;
     }
     Ok(())
 }

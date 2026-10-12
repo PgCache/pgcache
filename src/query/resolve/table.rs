@@ -11,23 +11,22 @@ use super::expr::where_expr_resolve;
 use super::join_using::{JoinScopeRanges, join_natural_common_columns, join_using_or_cross};
 use super::scope::ResolutionScope;
 use crate::catalog::{Catalog, CatalogTable};
-use crate::query::ast::{JoinQual, TableNode, TableSource};
+use crate::query::ast::{JoinQual, TableSource};
 use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// Find table metadata for a table reference.
 ///
 /// If the table has an explicit schema qualifier, use it directly.
 /// Otherwise, search through the search_path schemas in order.
-pub(super) fn table_metadata_find<'map, 'node: 'map>(
-    table_node: &'node TableNode,
+pub(super) fn table_metadata_find<'map>(
+    schema: Option<&'map str>,
+    table_name: &'map str,
     tables: &'map Catalog,
     search_path: &[&'map str],
 ) -> Option<&'map CatalogTable> {
-    let table_name = table_node.name.as_str();
-
     // If table has explicit schema, use it directly
-    if let Some(schema) = &table_node.schema {
-        let table_metadata = tables.get2(&(schema.as_str(), table_name))?;
+    if let Some(schema) = schema {
+        let table_metadata = tables.get2(&(schema, table_name))?;
         return Some(table_metadata);
     }
 
@@ -50,12 +49,17 @@ pub(super) fn table_source_resolve<'a>(
 ) -> ResolveResult<()> {
     match source {
         TableSource::Table(table_node) => {
-            let table_metadata =
-                table_metadata_find(table_node, tables, search_path).ok_or_else(|| {
-                    Report::from(ResolveError::TableNotFound {
-                        name: table_node.name.to_string(),
-                    })
-                })?;
+            let table_metadata = table_metadata_find(
+                table_node.schema.as_deref(),
+                &table_node.name,
+                tables,
+                search_path,
+            )
+            .ok_or_else(|| {
+                Report::from(ResolveError::TableNotFound {
+                    name: table_node.name.to_string(),
+                })
+            })?;
 
             let slot = scope.bindings.slot_push(
                 table_node.id,

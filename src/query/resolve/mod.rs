@@ -23,6 +23,7 @@ mod enum_gate;
 mod expr;
 mod join_using;
 mod render;
+mod rope;
 mod scope;
 mod table;
 #[cfg(test)]
@@ -77,3 +78,4 @@ pub use bindings::{
 pub use branch::QueryBranch;
 pub use entry::query_expr_resolve;
 pub use render::SourceOverride;
+pub use rope::query_tree_resolve;

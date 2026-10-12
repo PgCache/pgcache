@@ -55,7 +55,7 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
 
 /// A catalog of `test_table_metadata` tables (`id int4`, `name text`), with
 /// relation OIDs from 1001 in order.
-fn catalog(names: &[&str]) -> Catalog {
+pub(super) fn catalog(names: &[&str]) -> Catalog {
     let mut tables = BiHashMap::new();
     for (oid, name) in (1001..).zip(names) {
         tables.insert_overwrite(test_table_metadata(name, Oid::from_raw(oid)).into());

@@ -23,6 +23,8 @@ pub struct TreeBuilder<'b> {
     /// The next position.
     next: u32,
     kept: Vec<Kept>,
+    /// `(origin, position)` per node opened with an origin, when recording.
+    origins: Option<Vec<(NodeId, NodeId)>>,
 }
 
 enum Pending {
@@ -56,7 +58,15 @@ impl<'b> TreeBuilder<'b> {
             fresh: Vec::new(),
             next: 0,
             kept: Vec::new(),
+            origins: None,
         }
+    }
+
+    /// Record where each node opened with an origin lands, for
+    /// [`TreeBuilder::finish_with_origins`].
+    pub fn recording_origins(mut self) -> Self {
+        self.origins = Some(Vec::new());
+        self
     }
 
     /// A builder that can `keep` subtrees of `base`.
@@ -100,9 +110,25 @@ impl<'b> TreeBuilder<'b> {
         NodeId::from_index(open.position)
     }
 
+    /// [`TreeBuilder::open`] for a node standing in for `origin` of
+    /// another tree, recorded when origins are.
+    pub fn open_from(&mut self, kind: NodeKind, origin: NodeId) -> Open {
+        let open = self.open(kind);
+        if let Some(origins) = &mut self.origins {
+            origins.push((origin, NodeId::from_index(open.position)));
+        }
+        open
+    }
+
     /// A node with no children.
     pub fn leaf(&mut self, kind: NodeKind) -> NodeId {
         let open = self.open(kind);
+        self.close(open)
+    }
+
+    /// [`TreeBuilder::leaf`] with an origin.
+    pub fn leaf_from(&mut self, kind: NodeKind, origin: NodeId) -> NodeId {
+        let open = self.open_from(kind, origin);
         self.close(open)
     }
 
@@ -157,6 +183,16 @@ impl<'b> TreeBuilder<'b> {
     /// The tree, compacted when its table grew past the threshold, and
     /// where every kept subtree landed.
     pub fn finish(self) -> (QueryTree, ChunkRemap) {
+        let (tree, remap, _) = self.finish_with_origins();
+        (tree, remap)
+    }
+
+    /// [`TreeBuilder::finish`] with where every node opened with an origin
+    /// landed; empty unless the builder was recording.
+    pub fn finish_with_origins(self) -> (QueryTree, ChunkRemap, OriginMap) {
+        let mut pairs = self.origins.unwrap_or_default();
+        pairs.sort_by_key(|(origin, _)| origin.index());
+        let origins = OriginMap { pairs };
         let fresh: Arc<[Node]> = self.fresh.into();
         let chunks: Vec<Chunk> = self
             .pending
@@ -179,7 +215,32 @@ impl<'b> TreeBuilder<'b> {
         } else {
             tree
         };
-        (tree, ChunkRemap { kept: self.kept })
+        (tree, ChunkRemap { kept: self.kept }, origins)
+    }
+}
+
+/// Where nodes of another tree landed in a built one, by their origin id.
+#[derive(Debug, Default)]
+pub struct OriginMap {
+    pairs: Vec<(NodeId, NodeId)>,
+}
+
+impl OriginMap {
+    /// The position of the node that stood in for `origin`.
+    pub fn position(&self, origin: NodeId) -> Option<NodeId> {
+        self.pairs
+            .binary_search_by_key(&origin.index(), |(from, _)| from.index())
+            .ok()
+            .and_then(|found| self.pairs.get(found))
+            .map(|(_, to)| *to)
+    }
+
+    pub fn len(&self) -> usize {
+        self.pairs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
     }
 }
 

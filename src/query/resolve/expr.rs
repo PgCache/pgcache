@@ -77,7 +77,8 @@ pub(super) fn scalar_expr_resolve(
                     .column_bind(col.id, ColumnTarget::Merged(id), false);
                 return Ok(source);
             }
-            Ok(Some(match column_resolve(col, scope)? {
+            let lookup = column_resolve(col.id, col.table.as_deref(), &col.column, scope)?;
+            Ok(Some(match lookup {
                 ColumnLookup::Column { binding, .. } => OutputSource {
                     name: col.column.clone(),
                     binding: Some(binding),
