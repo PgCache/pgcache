@@ -10,7 +10,9 @@ use postgres_types::Type;
 use super::bindings::{Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem, TableSlot};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
-use crate::query::ast::rope::{Body, NodeKind, Select, View};
+use crate::query::ast::rope::{
+    Body, NodeKind, Query, Scalar, ScalarKind, Select, SelectItem, View,
+};
 use crate::query::ast::{
     AstNode, ColumnNode, NodeId, QueryBody, QueryExpr, SelectColumn, SelectColumns, SelectNode,
     StarNode,
@@ -168,18 +170,71 @@ impl ResolvedQuery {
                     names.push(alias.clone().or_else(|| self.column_output_name(expr)));
                 }
                 SelectColumn::Star(star) => {
-                    for item in bindings.star(star).unwrap_or(&[]) {
-                        names.push(match item {
-                            StarItem::Column(binding) => {
-                                bindings.binding_column(binding).map(|c| c.name.clone())
-                            }
-                            StarItem::Merged(id) => bindings.merged(*id).map(|m| m.name.clone()),
-                        });
-                    }
+                    names.extend(
+                        bindings
+                            .star(star)
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|item| star_item_name(bindings, item)),
+                    );
                 }
             }
         }
         names
+    }
+
+    /// [`ResolvedQuery::output_names`] for a rope query.
+    pub fn rope_output_names(&self, query: Query<'_>) -> Vec<Option<EcoString>> {
+        let select = match query.body() {
+            Body::Select(select) => select,
+            Body::SetOp(set_op) => return self.rope_output_names(set_op.left()),
+            Body::Values(_) => return Vec::new(),
+        };
+        let Some(items) = select.items() else {
+            return Vec::new();
+        };
+        let bindings = self.rope_bindings();
+        let mut names = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                SelectItem::Expr(expr) => {
+                    names.push(
+                        expr.alias()
+                            .cloned()
+                            .or_else(|| self.rope_column_output_name(expr.expr())),
+                    );
+                }
+                SelectItem::Star(star) => {
+                    names.extend(
+                        bindings
+                            .star_by_id(star.id())
+                            .unwrap_or(&[])
+                            .iter()
+                            .map(|item| star_item_name(bindings, item)),
+                    );
+                }
+            }
+        }
+        names
+    }
+
+    /// [`ResolvedQuery::column_output_name`] for a rope expression.
+    pub(crate) fn rope_column_output_name(&self, expr: Scalar<'_>) -> Option<EcoString> {
+        let ScalarKind::Column(column) = expr.kind() else {
+            return None;
+        };
+        match self.column_target_at(column.id())? {
+            ColumnTarget::Column(binding) => self
+                .rope_bindings()
+                .binding_column(binding)
+                .map(|c| c.name.clone()),
+            ColumnTarget::Merged(id) => self
+                .rope_bindings()
+                .merged(*id)
+                .filter(|merged| !merged.outer)
+                .map(|merged| merged.name.clone()),
+            ColumnTarget::Output => None,
+        }
     }
 
     fn column_add(&self, columns: &mut ColumnsByTable, binding: &ColumnBinding) {
@@ -193,6 +248,14 @@ impl ResolvedQuery {
                 .or_default()
                 .insert(column.name.clone());
         }
+    }
+}
+
+/// The output name of one column a star expands to.
+fn star_item_name(bindings: &Bindings, item: &StarItem) -> Option<EcoString> {
+    match item {
+        StarItem::Column(binding) => bindings.binding_column(binding).map(|c| c.name.clone()),
+        StarItem::Merged(id) => bindings.merged(*id).map(|m| m.name.clone()),
     }
 }
 

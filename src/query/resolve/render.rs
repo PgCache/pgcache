@@ -18,11 +18,12 @@ use crate::oid::Oid;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::deparse::{
     column_plain_deparse, names_deparse, query_deparse_with, query_unlimited_deparse_with,
-    star_plain_deparse, table_alias_deparse, table_plain_deparse,
+    scalar_deparse_with, star_plain_deparse, table_alias_deparse, table_plain_deparse,
 };
 use crate::query::ast::rope::{
     Column as RopeColumn, CteRef as RopeCteRef, Function as RopeFunction, Join as RopeJoin,
-    RopeDeparseContext, Star as RopeStar, Table as RopeTable,
+    OrderBy as RopeOrderBy, RopeDeparseContext, ScalarKind, Select as RopeSelect, SelectItem,
+    Star as RopeStar, Table as RopeTable,
 };
 use crate::query::ast::{
     Clause, ColumnNode, CteRefNode, Deparse, DeparseContext, DeparseWith, FunctionCall, JoinNode,
@@ -167,6 +168,27 @@ impl<'a> Bound<'a> {
                 None => debug_assert!(false, "star item names a missing merged column"),
             },
         }
+    }
+
+    /// One star-expanded output: its rendered expression and its name.
+    fn star_item_output(&self, item: &StarItem) -> Output {
+        let mut text = String::new();
+        let name = match item {
+            StarItem::Column(binding) => {
+                self.column_binding_deparse(binding, &mut text);
+                self.bindings
+                    .binding_column(binding)
+                    .map(|c| c.name.clone())
+            }
+            StarItem::Merged(id) => {
+                let merged = self.bindings.merged(*id);
+                if let Some(merged) = merged {
+                    self.merged_deparse(merged, &mut text);
+                }
+                merged.map(|merged| merged.name.clone())
+            }
+        };
+        Output { text, name }
     }
 
     fn literals_take(self) -> Vec<LiteralValue> {
@@ -631,6 +653,66 @@ impl ResolvedQuery {
         found.map(|index| index + 1)
     }
 
+    /// [`ResolvedQuery::order_by_position`] for a rope SELECT and clause.
+    pub fn rope_order_by_position(
+        &self,
+        select: RopeSelect<'_>,
+        clause: RopeOrderBy<'_>,
+    ) -> Option<usize> {
+        let outputs = self.rope_select_outputs(select);
+        let expr = clause.expr();
+        let found = if let ScalarKind::Column(column) = expr.kind()
+            && matches!(
+                self.column_target_at(column.id()),
+                Some(ColumnTarget::Output)
+            ) {
+            outputs
+                .iter()
+                .position(|output| output.name.as_ref() == Some(column.column()))
+        } else {
+            let mut text = String::new();
+            scalar_deparse_with(
+                expr,
+                &mut RopeBound(Bound::text(self.rope_bindings())),
+                &mut text,
+            );
+            outputs.iter().position(|output| output.text == text)
+        };
+        found.map(|index| index + 1)
+    }
+
+    fn rope_select_outputs(&self, select: RopeSelect<'_>) -> Vec<Output> {
+        let bindings = self.rope_bindings();
+        let cx = Bound::text(bindings);
+        let Some(items) = select.items() else {
+            return Vec::new();
+        };
+        let mut outputs = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                SelectItem::Expr(expr) => {
+                    let mut text = String::new();
+                    scalar_deparse_with(
+                        expr.expr(),
+                        &mut RopeBound(Bound::text(bindings)),
+                        &mut text,
+                    );
+                    let name = expr
+                        .alias()
+                        .cloned()
+                        .or_else(|| self.rope_column_output_name(expr.expr()));
+                    outputs.push(Output { text, name });
+                }
+                SelectItem::Star(star) => {
+                    for item in bindings.star_by_id(star.id()).unwrap_or(&[]) {
+                        outputs.push(cx.star_item_output(item));
+                    }
+                }
+            }
+        }
+        outputs
+    }
+
     /// An ORDER BY item rendered as the cache serves it.
     pub fn order_by_into(&self, clause: &OrderByClause, buf: &mut String) {
         clause.deparse_with(&mut Bound::text(self.bindings()), buf);
@@ -653,21 +735,7 @@ impl ResolvedQuery {
                 }
                 SelectColumn::Star(star) => {
                     for item in bindings.star(star).unwrap_or(&[]) {
-                        let mut text = String::new();
-                        let name = match item {
-                            StarItem::Column(binding) => {
-                                cx.column_binding_deparse(binding, &mut text);
-                                bindings.binding_column(binding).map(|c| c.name.clone())
-                            }
-                            StarItem::Merged(id) => {
-                                let merged = bindings.merged(*id);
-                                if let Some(merged) = merged {
-                                    cx.merged_deparse(merged, &mut text);
-                                }
-                                merged.map(|merged| merged.name.clone())
-                            }
-                        };
-                        outputs.push(Output { text, name });
+                        outputs.push(cx.star_item_output(item));
                     }
                 }
             }

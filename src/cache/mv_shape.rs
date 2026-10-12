@@ -8,14 +8,11 @@ use std::collections::HashSet;
 use ecow::EcoString;
 
 use crate::query::ast::SetOpType;
-use crate::query::ast::{
-    QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns, SelectNode, TableSource,
+use crate::query::ast::rope::{
+    Body, OrderBy, Query, Run, Scalar, ScalarKind, Select, SelectItem, Source,
 };
 use crate::query::resolve::{ColumnTarget, ResolvedQuery};
 
-/// Shape classification set at registration from the decorrelated, resolved
-/// form of the query. Never changes for the life of the cache entry; eviction
-/// + re-registration is the only way to re-classify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShapeGate {
     /// Shape can benefit from an MV — it does non-trivial recompute (join,
@@ -46,138 +43,117 @@ impl ShapeGate {
     }
 }
 
-/// Every top-level ORDER BY item can be served against the MV: for a
-/// SELECT, each names an output position; for a set operation, each names
-/// an output of the leftmost branch by name.
+/// Whether every ORDER BY item of the query can be served: an ORDER BY of
+/// a SELECT names a select-list position, and one of a set operation
+/// names an output of its leftmost branch.
 fn order_by_serve_viable(bound: &ResolvedQuery) -> bool {
-    let query = bound.tree();
-    if query.order_by.is_empty() {
+    let query = bound.rope().root();
+    let mut order_by = query.order_by();
+    if order_by.len() == 0 {
         return true;
     }
-    match &query.body {
-        QueryBody::Select(select) => query
-            .order_by
-            .iter()
-            .all(|clause| bound.order_by_position(select, clause).is_some()),
-        QueryBody::SetOp(_) => {
-            let Some(leftmost) = leftmost_query(query) else {
-                return false;
-            };
-            let names = bound.output_names(leftmost);
-            query.order_by.iter().all(|clause| match &clause.expr {
-                ScalarExpr::Column(column)
-                    if matches!(bound.column(column), Some(ColumnTarget::Output)) =>
-                {
-                    names
-                        .iter()
-                        .any(|name| name.as_ref() == Some(&column.column))
-                }
-                ScalarExpr::Column(_)
-                | ScalarExpr::Function(_)
-                | ScalarExpr::Literal(_)
-                | ScalarExpr::Case(_)
-                | ScalarExpr::Arithmetic(_)
-                | ScalarExpr::Subquery(_)
-                | ScalarExpr::Array(_)
-                | ScalarExpr::TypeCast { .. } => false,
-            })
+    match query.body() {
+        Body::Select(select) => {
+            order_by.all(|clause| bound.rope_order_by_position(select, clause).is_some())
         }
-        QueryBody::Values(_) => false,
+        Body::SetOp(_) => leftmost_query(query)
+            .is_some_and(|leftmost| set_op_order_by_viable(bound, leftmost, order_by)),
+        Body::Values(_) => false,
     }
 }
 
-/// Down the left side of a (possibly nested) set operation to the query
-/// whose body is a SELECT; `None` when it is `VALUES`.
-fn leftmost_query(query: &QueryExpr) -> Option<&QueryExpr> {
-    match &query.body {
-        QueryBody::Select(_) => Some(query),
-        QueryBody::SetOp(set_op) => leftmost_query(&set_op.left),
-        QueryBody::Values(_) => None,
+/// Every ORDER BY item of a set operation names an output of its leftmost
+/// branch by name.
+fn set_op_order_by_viable<'t>(
+    bound: &ResolvedQuery,
+    leftmost: Query<'t>,
+    mut order_by: Run<'t, OrderBy<'t>>,
+) -> bool {
+    let names = bound.rope_output_names(leftmost);
+    order_by.all(|clause| match clause.expr().kind() {
+        ScalarKind::Column(column)
+            if matches!(
+                bound.column_target_at(column.id()),
+                Some(ColumnTarget::Output)
+            ) =>
+        {
+            names
+                .iter()
+                .any(|name| name.as_ref() == Some(column.column()))
+        }
+        ScalarKind::Column(_)
+        | ScalarKind::Function(_)
+        | ScalarKind::Literal(_)
+        | ScalarKind::Case(_)
+        | ScalarKind::Arithmetic(_)
+        | ScalarKind::Subquery(_)
+        | ScalarKind::Array(_)
+        | ScalarKind::TypeCast(_) => false,
+    })
+}
+
+/// The leftmost SELECT query of a set operation tree.
+fn leftmost_query(query: Query<'_>) -> Option<Query<'_>> {
+    match query.body() {
+        Body::Select(_) => Some(query),
+        Body::SetOp(set_op) => leftmost_query(set_op.left()),
+        Body::Values(_) => None,
     }
 }
 
-/// Classify a query's shape to decide whether it's a materialization
-/// candidate. Runs at registration on the decorrelated form, so the shape
-/// classified is the shape population and rebuild see.
-///
-/// Classification is **top-level only** — scalar subqueries in the SELECT
-/// list and subqueries in FROM or WHERE don't change the output shape.
-///
-/// `aggregate_functions` is the set of aggregate function names loaded from
-/// `pg_proc` at writer startup (`catalog::aggregate_functions_load`).
+/// Classify a query for the MV layer: `Gated` when its result is computed
+/// from the source rows (aggregates, GROUP BY, HAVING, DISTINCT, windows,
+/// joins, deduplicating set operations) and can be served from an MV;
+/// `Skip` when it is a plain projection, a `UNION ALL`, VALUES, or its
+/// ORDER BY cannot be served.
 pub fn shape_classify(
     bound: &ResolvedQuery,
     aggregate_functions: &HashSet<EcoString>,
 ) -> ShapeGate {
-    let shape = match &bound.tree().body {
-        // VALUES is already literal — nothing to materialize that we don't
-        // already emit inline on every serve.
-        QueryBody::Values(_) => return ShapeGate::Skip,
-
-        QueryBody::SetOp(set_op) => {
-            // UNION ALL is strictly additive — no dedup, no compute. Branches
-            // are already cached; concatenating them at serve time is two seq
-            // scans, cheap. MV would duplicate storage without saving anything.
-            if set_op.op == SetOpType::Union && set_op.all {
+    let shape = match bound.rope().root().body() {
+        Body::Values(_) => return ShapeGate::Skip,
+        Body::SetOp(set_op) => {
+            if set_op.op() == SetOpType::Union && set_op.all() {
                 return ShapeGate::Skip;
             }
-            // UNION (dedup), INTERSECT [ALL], EXCEPT [ALL] do real dedup work and
-            // can reduce the result — the build-time gates decide.
             ShapeGate::Gated
         }
-
-        QueryBody::Select(select) => {
-            // Any non-trivial recompute — window, aggregate/GROUP BY/HAVING/
-            // DISTINCT, or a join — can earn an MV. The two build-time gates
-            // (row reduction OR compute avoidance) decide whether it actually
-            // does; classification only fences off shapes that can never benefit.
-            let computes = columns_any(&select.columns, &ScalarExpr::has_window)
-                || select.distinct
-                || !select.group_by.is_empty()
-                || select.having.is_some()
-                || columns_any(&select.columns, &|e| e.has_aggregate(aggregate_functions))
+        Body::Select(select) => {
+            let computes = items_any(select, &|e| e.has_window())
+                || select.distinct()
+                || select.group_by().len() > 0
+                || select.having().is_some()
+                || items_any(select, &|e| e.has_aggregate(aggregate_functions))
                 || select_has_join(select);
             if computes {
                 ShapeGate::Gated
             } else {
-                // Single-table plain filter/projection — source-row cache
-                // already stores exactly these rows; MV would duplicate it.
                 return ShapeGate::Skip;
             }
         }
     };
-
-    // MV-specific viability: every top-level ORDER BY expression must be
-    // serveable against the MV. If not, downgrade to Skip — serving without
-    // the ORDER BY would give arbitrary rows for user LIMIT < max_limit.
     if !order_by_serve_viable(bound) {
         return ShapeGate::Skip;
     }
-
     shape
 }
 
-/// Top-level FROM joins two or more base tables (explicit JOIN or comma
-/// list). Subqueries in FROM are not descended into.
-fn select_has_join(select: &SelectNode) -> bool {
-    select.from.len() > 1
+fn select_has_join(select: Select<'_>) -> bool {
+    select.from().len() > 1
         || select
-            .from
-            .iter()
-            .any(|source| matches!(source, TableSource::Join(_)))
+            .from()
+            .any(|source| matches!(source, Source::Join(_)))
 }
 
-/// Whether any top-level column expression of the SELECT list satisfies
-/// `pred`; a star is never one.
-fn columns_any<P>(columns: &SelectColumns, pred: &P) -> bool
+fn items_any<P>(select: Select<'_>, pred: &P) -> bool
 where
-    P: Fn(&ScalarExpr) -> bool,
+    P: Fn(Scalar<'_>) -> bool,
 {
-    match columns {
-        SelectColumns::None => false,
-        SelectColumns::Columns(columns) => columns.iter().any(|column| match column {
-            SelectColumn::Expr { expr, .. } => pred(expr),
-            SelectColumn::Star(_) => false,
+    match select.items() {
+        None => false,
+        Some(mut items) => items.any(|item| match item {
+            SelectItem::Expr(expr) => pred(expr.expr()),
+            SelectItem::Star(_) => false,
         }),
     }
 }
@@ -253,10 +229,14 @@ pub(super) mod tests {
         let ast = std::sync::Arc::new(query_expr_parse(sql).expect("convert to AST"));
         let bindings =
             query_expr_resolve(&ast, &test_tables(), &["public"]).expect("resolve query");
-        shape_classify(
-            &ResolvedQuery::new(ast, bindings),
-            &test_aggregate_functions(),
-        )
+        let bound = ResolvedQuery::new(ast, bindings);
+        let shape = shape_classify(&bound, &test_aggregate_functions());
+        assert_eq!(
+            crate::cache::mv_shape_owned::shape_classify_owned(&bound, &test_aggregate_functions()),
+            shape,
+            "the owned classifier agrees: {sql}"
+        );
+        shape
     }
 
     #[test]

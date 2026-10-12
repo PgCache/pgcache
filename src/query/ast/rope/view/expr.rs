@@ -2,6 +2,8 @@
 
 #![allow(clippy::wildcard_enum_match_arm)]
 
+use std::collections::HashSet;
+
 use ecow::EcoString;
 
 use super::{
@@ -274,6 +276,58 @@ impl<'t> Scalar<'t> {
                 debug_assert!(false, "a scalar position holds a scalar node");
                 ScalarKind::Literal(Literal(self.0))
             }
+        }
+    }
+}
+
+impl<'t> Scalar<'t> {
+    /// Whether the expression computes a window function anywhere above a
+    /// subquery boundary.
+    pub fn has_window(&self) -> bool {
+        match self.kind() {
+            ScalarKind::Function(function) => {
+                function.over().is_some() || function.args().any(|arg| arg.has_window())
+            }
+            ScalarKind::Case(case) => {
+                case.arg().is_some_and(|arg| arg.has_window())
+                    || case.whens().any(|when| when.result().has_window())
+                    || case.default().is_some_and(|default| default.has_window())
+            }
+            ScalarKind::Arithmetic(arithmetic) => {
+                arithmetic.left().has_window() || arithmetic.right().has_window()
+            }
+            ScalarKind::Array(array) => array.elements().any(|element| element.has_window()),
+            ScalarKind::TypeCast(cast) => cast.expr().has_window(),
+            ScalarKind::Column(_) | ScalarKind::Literal(_) | ScalarKind::Subquery(_) => false,
+        }
+    }
+
+    /// Whether the expression calls one of `aggregates` anywhere above a
+    /// subquery boundary.
+    pub fn has_aggregate(&self, aggregates: &HashSet<EcoString>) -> bool {
+        match self.kind() {
+            ScalarKind::Function(function) => {
+                aggregates.contains(function.name().as_str())
+                    || function.args().any(|arg| arg.has_aggregate(aggregates))
+            }
+            ScalarKind::Case(case) => {
+                case.arg().is_some_and(|arg| arg.has_aggregate(aggregates))
+                    || case
+                        .whens()
+                        .any(|when| when.result().has_aggregate(aggregates))
+                    || case
+                        .default()
+                        .is_some_and(|default| default.has_aggregate(aggregates))
+            }
+            ScalarKind::Arithmetic(arithmetic) => {
+                arithmetic.left().has_aggregate(aggregates)
+                    || arithmetic.right().has_aggregate(aggregates)
+            }
+            ScalarKind::Array(array) => array
+                .elements()
+                .any(|element| element.has_aggregate(aggregates)),
+            ScalarKind::TypeCast(cast) => cast.expr().has_aggregate(aggregates),
+            ScalarKind::Column(_) | ScalarKind::Literal(_) | ScalarKind::Subquery(_) => false,
         }
     }
 }
