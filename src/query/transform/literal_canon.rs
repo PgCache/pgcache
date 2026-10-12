@@ -236,9 +236,9 @@ impl BoundPass<'_> {
     }
 }
 
-struct Pass<'a> {
-    settings: &'a LiteralSettings,
-    outcome: LiteralCanonOutcome,
+pub(super) struct Pass<'a> {
+    pub(super) settings: &'a LiteralSettings,
+    pub(super) outcome: LiteralCanonOutcome,
 }
 
 impl Pass<'_> {
@@ -252,7 +252,7 @@ impl Pass<'_> {
 
     /// Rewrite one literal of `kind`; `None` is a position whose type the
     /// pass cannot see.
-    fn literal(&mut self, literal: &mut LiteralValue, kind: Option<ValueKind>) {
+    pub(super) fn literal(&mut self, literal: &mut LiteralValue, kind: Option<ValueKind>) {
         match literal {
             LiteralValue::String(text) => self.text(text, kind),
             LiteralValue::StringWithCast(text, cast) => {
@@ -307,7 +307,11 @@ impl Pass<'_> {
     /// A canonical literal of one date-time kind compared to a column of
     /// another is converted at population, and date ↔ timestamptz (or
     /// timestamp ↔ timestamptz) conversion uses the session zone.
-    fn mixed_kinds_check(&mut self, column: Option<ValueKind>, literal: Option<ValueKind>) {
+    pub(super) fn mixed_kinds_check(
+        &mut self,
+        column: Option<ValueKind>,
+        literal: Option<ValueKind>,
+    ) {
         let (Some(column), Some(literal)) = (column, literal) else {
             return;
         };
@@ -322,7 +326,7 @@ impl Pass<'_> {
 
 /// The kind a cast target names. A type whose text input no tracked setting
 /// changes reads as `Text`, so a literal cast to it is never residual.
-fn cast_kind(target: &CastTarget) -> Option<ValueKind> {
+pub(super) fn cast_kind(target: &CastTarget) -> Option<ValueKind> {
     Some(match target {
         CastTarget::Text => ValueKind::Text,
         CastTarget::Int4 | CastTarget::Int8 => ValueKind::Integer,
@@ -387,7 +391,8 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
+    use crate::query::resolve::{ResolvedQuery, query_expr_resolve, query_tree_sql};
+    use crate::query::transform::query_literals_canonicalise_tree;
 
     fn events() -> Catalog {
         let column = |name: &str, position: i16, ty: Type| ColumnMetadata {
@@ -422,12 +427,41 @@ mod tests {
         tables
     }
 
+    /// Canonicalise `sql` with the owned pass, and check the rope pass
+    /// renders the same SQL with the same outcome and the same bindings.
     fn canon(sql: &str, settings: &LiteralSettings) -> (String, LiteralCanonOutcome) {
         let mut query = query_expr_parse(sql).expect("parse");
         let bindings = query_expr_resolve(&query, &events(), &["public"]).expect("resolve");
+        let as_written = ResolvedQuery::new(Arc::new(query.clone()), bindings.clone());
         let outcome = query_literals_canonicalise(&mut query, &bindings, settings);
         let bound = ResolvedQuery::new(Arc::new(query), bindings);
-        (bound.sql(), outcome)
+        let sql_owned = bound.sql();
+
+        let (rope, rope_outcome) = query_literals_canonicalise_tree(&as_written, settings);
+        assert_eq!(rope_outcome, outcome, "{sql}");
+        let (sql_rope, bindings_rope) = match rope {
+            Some((tree, bindings)) => (query_tree_sql(&tree, &bindings), bindings),
+            None => (as_written.sql(), as_written.rope_bindings().clone()),
+        };
+        assert_eq!(sql_rope, sql_owned, "{sql}");
+        assert_eq!(
+            bindings_rope.describe(),
+            as_written.rope_bindings().describe(),
+            "{sql}"
+        );
+        (sql_owned, outcome)
+    }
+
+    /// A query no setting can change comes back as it was.
+    #[test]
+    fn test_rope_pass_leaves_an_unaffected_query_shared() {
+        let query =
+            query_expr_parse("SELECT id FROM events WHERE label = 'x' AND id = 7").expect("parse");
+        let bindings = query_expr_resolve(&query, &events(), &["public"]).expect("resolve");
+        let bound = ResolvedQuery::new(Arc::new(query), bindings);
+        let (rope, outcome) = query_literals_canonicalise_tree(&bound, &tokyo_dmy());
+        assert!(rope.is_none());
+        assert!(!outcome.residual);
     }
 
     fn tokyo_dmy() -> LiteralSettings {

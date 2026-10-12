@@ -1,5 +1,6 @@
 mod constant_fold;
 mod literal_canon;
+mod literal_canon_tree;
 mod parameters;
 mod predicate_pushdown;
 mod pushdown_tree;
@@ -35,6 +36,7 @@ pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
 pub use constant_fold::query_expr_constant_fold;
 pub use literal_canon::{LiteralCanonOutcome, query_literals_canonicalise};
+pub use literal_canon_tree::query_literals_canonicalise_tree;
 #[cfg(feature = "proxy")]
 pub(crate) use parameters::{
     delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,
