@@ -17,17 +17,17 @@
 //! anywhere under that position (casts, arithmetic, subqueries) rejects
 //! conservatively. False positives only cost caching — the query forwards.
 
-use std::ops::ControlFlow;
+#![allow(clippy::wildcard_enum_match_arm)]
 
 use ecow::EcoString;
 use rootcause::Report;
 
 use super::bindings::{Bindings, ColumnBinding, ColumnTarget, ResolvedQuery, StarItem};
-use crate::query::ast::{
-    AstNode, BinaryExpr, BinaryOp, CaseExpr, ColumnNode, FunctionCall, JoinQual, LiteralValue,
-    MultiExpr, MultiOp, OrderByClause, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
-    SelectColumns, SelectNode, TableSource, WhereExpr,
+use crate::query::ast::rope::{
+    Binary, Body, Case, Column, Function, JoinQual, Multi, NodeKind, NodeRef, OrderBy, Query, Run,
+    Scalar, ScalarKind, Select, SelectItem, Source, View, Where, WhereKind,
 };
+use crate::query::ast::{BinaryOp, LiteralValue, MultiOp};
 use crate::query::resolve::{ResolveError, ResolveResult};
 
 impl ResolvedQuery {
@@ -36,9 +36,9 @@ impl ResolvedQuery {
     /// forward.
     pub fn enum_order_dependence_check(&self) -> ResolveResult<()> {
         let gate = Gate {
-            bindings: self.bindings(),
+            bindings: self.rope_bindings(),
         };
-        gate.query_check(self.tree())
+        gate.query_check(self.rope().root())
     }
 }
 
@@ -64,7 +64,7 @@ struct Gate<'a> {
 }
 
 impl Gate<'_> {
-    /// The enum-ordered column `binding` names, if it is one.
+    /// The enum column a binding names, when its type is an ordered enum.
     fn binding_enum(&self, binding: &ColumnBinding) -> Option<EnumColumn> {
         let slot = self.bindings.slot(binding.slot)?;
         let column = self.bindings.binding_column(binding)?;
@@ -74,42 +74,41 @@ impl Gate<'_> {
         })
     }
 
-    /// The enum-ordered column a reference stands for. A merged column
-    /// stands for its left column, and under an outer join for the right
-    /// one too (`COALESCE(left, right)`).
-    fn column_enum(&self, column: &ColumnNode) -> Option<EnumColumn> {
-        match self.bindings.column(column)? {
+    /// The enum column a reference stands for: a merged column is its left
+    /// side, or under an outer join either side.
+    fn column_enum(&self, column: Column<'_>) -> Option<EnumColumn> {
+        match self.bindings.column_by_id(column.id())? {
             ColumnTarget::Column(binding) => self.binding_enum(binding),
             ColumnTarget::Merged(id) => {
                 let merged = self.bindings.merged(*id)?;
-                self.binding_enum(&merged.left).or_else(|| {
-                    merged
-                        .outer
-                        .then(|| self.binding_enum(&merged.right))
-                        .flatten()
-                })
+                self.merged_enum(merged.outer, &merged.left, &merged.right)
             }
             ColumnTarget::Output => None,
         }
     }
 
-    /// First enum-ordered column reachable under `node`, if any.
-    fn enum_column_find<N: AstNode>(&self, node: &N) -> Option<EnumColumn> {
-        match node.try_for_each_node::<ColumnNode, EnumColumn>(&mut |column| match self
-            .column_enum(column)
-        {
-            Some(found) => ControlFlow::Break(found),
-            None => ControlFlow::Continue(()),
-        }) {
-            ControlFlow::Break(found) => Some(found),
-            ControlFlow::Continue(()) => None,
-        }
+    fn merged_enum(
+        &self,
+        outer: bool,
+        left: &ColumnBinding,
+        right: &ColumnBinding,
+    ) -> Option<EnumColumn> {
+        self.binding_enum(left)
+            .or_else(|| outer.then(|| self.binding_enum(right)).flatten())
     }
 
-    /// Reject at `position` if any of `nodes` reaches an enum-ordered column.
-    fn enum_reject<'n, T: AstNode + 'n>(
+    /// The first enum column referenced anywhere under `node`.
+    fn enum_column_find(&self, node: NodeRef<'_>) -> Option<EnumColumn> {
+        node.subtree().find_map(|position| match position.kind() {
+            NodeKind::Column { .. } => self.column_enum(Column::from_ref(position)),
+            _ => None,
+        })
+    }
+
+    /// Reject when any of `nodes` references an enum column.
+    fn enum_reject<'t>(
         &self,
-        nodes: impl IntoIterator<Item = &'n T>,
+        nodes: impl IntoIterator<Item = NodeRef<'t>>,
         position: &'static str,
     ) -> ResolveResult<()> {
         match nodes
@@ -121,24 +120,22 @@ impl Gate<'_> {
         }
     }
 
-    fn query_check(&self, query: &QueryExpr) -> ResolveResult<()> {
-        self.order_by_check(&query.order_by, &query.body, "ORDER BY")?;
-        // CTE definitions are not resolved; the copy each reference embeds
-        // is walked in its place.
-        match &query.body {
-            QueryBody::Select(select) => self.select_check(select),
-            QueryBody::SetOp(set_op) => {
-                self.query_check(&set_op.left)?;
-                self.query_check(&set_op.right)
+    fn query_check(&self, query: Query<'_>) -> ResolveResult<()> {
+        self.order_by_check(query.order_by(), query.body(), "ORDER BY")?;
+        match query.body() {
+            Body::Select(select) => self.select_check(select),
+            Body::SetOp(set_op) => {
+                self.query_check(set_op.left())?;
+                self.query_check(set_op.right())
             }
-            QueryBody::Values(_) => Ok(()),
+            Body::Values(_) => Ok(()),
         }
     }
 
-    fn order_by_check(
+    fn order_by_check<'t>(
         &self,
-        clauses: &[OrderByClause],
-        body: &QueryBody,
+        clauses: Run<'t, OrderBy<'t>>,
+        body: Body<'t>,
         position: &'static str,
     ) -> ResolveResult<()> {
         for clause in clauses {
@@ -149,92 +146,65 @@ impl Gate<'_> {
         Ok(())
     }
 
-    /// The enum column an ORDER BY clause sorts by, if any.
-    fn order_clause_enum_column(
-        &self,
-        clause: &OrderByClause,
-        body: &QueryBody,
-    ) -> Option<EnumColumn> {
-        if let Some(found) = self.enum_column_find(&clause.expr) {
+    /// The enum column an ORDER BY item orders by: in its expression, or
+    /// the output it names by name or by ordinal.
+    fn order_clause_enum_column(&self, clause: OrderBy<'_>, body: Body<'_>) -> Option<EnumColumn> {
+        let expr = clause.expr();
+        if let Some(found) = self.enum_column_find(expr.node_ref()) {
             return Some(found);
         }
-        // An ORDER BY naming an output column hides the column behind the
-        // output name; check the named output expression instead.
-        if let ScalarExpr::Column(column) = &clause.expr
-            && matches!(self.bindings.column(column), Some(ColumnTarget::Output))
-        {
-            return self
-                .output_columns(body)?
-                .into_iter()
-                .find(|output| output.name.as_ref() == Some(&column.column))?
-                .enum_column;
+        match expr.kind() {
+            ScalarKind::Column(column)
+                if matches!(
+                    self.bindings.column_by_id(column.id()),
+                    Some(ColumnTarget::Output)
+                ) =>
+            {
+                self.output_columns(body)?
+                    .into_iter()
+                    .find(|output| output.name.as_ref() == Some(column.column()))?
+                    .enum_column
+            }
+            ScalarKind::Literal(literal) => {
+                let LiteralValue::Integer(ordinal) = literal.value() else {
+                    return None;
+                };
+                let index = usize::try_from(ordinal.checked_sub(1)?).ok()?;
+                self.output_columns(body)?
+                    .into_iter()
+                    .nth(index)?
+                    .enum_column
+            }
+            _ => None,
         }
-        // An ordinal (`ORDER BY 2`) is an integer literal but sorts by the
-        // referenced output column.
-        if let ScalarExpr::Literal(LiteralValue::Integer(ordinal)) = &clause.expr {
-            let index = usize::try_from(ordinal.checked_sub(1)?).ok()?;
-            return self
-                .output_columns(body)?
-                .into_iter()
-                .nth(index)?
-                .enum_column;
-        }
-        None
     }
 
-    /// The output columns ORDER BY references resolve against — the
-    /// SELECT's, or the leftmost SELECT's for a set operation — with stars
-    /// expanded: each with its output name and the enum column it carries.
-    fn output_columns(&self, body: &QueryBody) -> Option<Vec<OutputColumn>> {
+    /// The output columns of a body: a set operation's are its left
+    /// branch's; VALUES has none the gate can name.
+    fn output_columns(&self, body: Body<'_>) -> Option<Vec<OutputColumn>> {
         let select = match body {
-            QueryBody::Select(select) => select,
-            QueryBody::SetOp(set_op) => return self.output_columns(&set_op.left.body),
-            QueryBody::Values(_) => return None,
+            Body::Select(select) => select,
+            Body::SetOp(set_op) => return self.output_columns(set_op.left().body()),
+            Body::Values(_) => return None,
         };
-        let SelectColumns::Columns(columns) = &select.columns else {
-            return None;
-        };
-        let mut outputs = Vec::with_capacity(columns.len());
-        for column in columns {
-            match column {
-                SelectColumn::Expr { expr, alias } => {
-                    let name = alias.clone().or_else(|| match expr {
-                        ScalarExpr::Column(column) => Some(column.column.clone()),
-                        ScalarExpr::Function(_)
-                        | ScalarExpr::Literal(_)
-                        | ScalarExpr::Case(_)
-                        | ScalarExpr::Arithmetic(_)
-                        | ScalarExpr::Subquery(_)
-                        | ScalarExpr::Array(_)
-                        | ScalarExpr::TypeCast { .. } => None,
+        let items = select.items()?;
+        let mut outputs = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                SelectItem::Expr(expr) => {
+                    let scalar = expr.expr();
+                    let name = expr.alias().cloned().or_else(|| match scalar.kind() {
+                        ScalarKind::Column(column) => Some(column.column().clone()),
+                        _ => None,
                     });
                     outputs.push(OutputColumn {
                         name,
-                        enum_column: self.enum_column_find(expr),
+                        enum_column: self.enum_column_find(scalar.node_ref()),
                     });
                 }
-                SelectColumn::Star(star) => {
-                    for item in self.bindings.star(star).unwrap_or(&[]) {
-                        outputs.push(match item {
-                            StarItem::Column(binding) => OutputColumn {
-                                name: self
-                                    .bindings
-                                    .binding_column(binding)
-                                    .map(|c| c.name.clone()),
-                                enum_column: self.binding_enum(binding),
-                            },
-                            StarItem::Merged(id) => {
-                                let merged = self.bindings.merged(*id);
-                                OutputColumn {
-                                    name: merged.map(|m| m.name.clone()),
-                                    enum_column: merged.and_then(|m| {
-                                        self.binding_enum(&m.left).or_else(|| {
-                                            m.outer.then(|| self.binding_enum(&m.right)).flatten()
-                                        })
-                                    }),
-                                }
-                            }
-                        });
+                SelectItem::Star(star) => {
+                    for item in self.bindings.star_by_id(star.id()).unwrap_or(&[]) {
+                        outputs.push(self.star_item_output(item));
                     }
                 }
             }
@@ -242,151 +212,169 @@ impl Gate<'_> {
         Some(outputs)
     }
 
-    fn select_check(&self, select: &SelectNode) -> ResolveResult<()> {
-        if let SelectColumns::Columns(columns) = &select.columns {
-            for column in columns {
-                if let SelectColumn::Expr { expr, .. } = column {
-                    self.scalar_check(expr)?;
+    fn star_item_output(&self, item: &StarItem) -> OutputColumn {
+        match item {
+            StarItem::Column(binding) => OutputColumn {
+                name: self
+                    .bindings
+                    .binding_column(binding)
+                    .map(|c| c.name.clone()),
+                enum_column: self.binding_enum(binding),
+            },
+            StarItem::Merged(id) => {
+                let merged = self.bindings.merged(*id);
+                OutputColumn {
+                    name: merged.map(|m| m.name.clone()),
+                    enum_column: merged.and_then(|m| self.merged_enum(m.outer, &m.left, &m.right)),
                 }
             }
         }
-        for source in &select.from {
-            self.table_source_check(source)?;
+    }
+
+    fn select_check(&self, select: Select<'_>) -> ResolveResult<()> {
+        if let Some(items) = select.items() {
+            for item in items {
+                if let SelectItem::Expr(expr) = item {
+                    self.scalar_check(expr.expr())?;
+                }
+            }
         }
-        if let Some(where_clause) = &select.where_clause {
+        for source in select.from() {
+            self.source_check(source)?;
+        }
+        if let Some(where_clause) = select.where_clause() {
             self.where_check(where_clause)?;
         }
-        // group_by is equality semantics — allowed.
-        if let Some(having) = &select.having {
+        if let Some(having) = select.having() {
             self.where_check(having)?;
         }
         Ok(())
     }
 
-    fn table_source_check(&self, source: &TableSource) -> ResolveResult<()> {
+    fn source_check(&self, source: Source<'_>) -> ResolveResult<()> {
         match source {
-            TableSource::Table(_) => Ok(()),
-            TableSource::Subquery(subquery) => self.query_check(&subquery.query),
-            TableSource::CteRef(cte_ref) => self.query_check(&cte_ref.query),
-            TableSource::Join(join) => {
-                self.table_source_check(&join.left)?;
-                self.table_source_check(&join.right)?;
-                match &join.qual {
+            Source::Table(_) => Ok(()),
+            Source::Subquery(subquery) => self.query_check(subquery.query()),
+            Source::CteRef(cte_ref) => self.query_check(cte_ref.query()),
+            Source::Join(join) => {
+                self.source_check(join.left())?;
+                self.source_check(join.right())?;
+                match join.qual() {
                     JoinQual::On(condition) => self.where_check(condition),
-                    // USING/NATURAL merge on equality; Cross has no qualifier.
                     JoinQual::Using(_) | JoinQual::Natural | JoinQual::Cross => Ok(()),
                 }
             }
         }
     }
 
-    fn where_check(&self, expr: &WhereExpr) -> ResolveResult<()> {
-        match expr {
-            WhereExpr::Scalar(scalar) => self.scalar_check(scalar),
-            WhereExpr::Unary(unary) => self.where_check(&unary.expr),
-            WhereExpr::Binary(binary) => self.binary_check(binary),
-            WhereExpr::Multi(multi) => self.multi_check(multi),
-            // Predicate sublinks carry equality semantics (IN/NOT IN; ALL is
-            // restricted to `<>` at AST conversion), so the test expression is
-            // safe; the subquery body still needs its own walk.
-            WhereExpr::Subquery { query, .. } => self.query_check(query),
+    fn where_check(&self, expr: Where<'_>) -> ResolveResult<()> {
+        match expr.kind() {
+            WhereKind::Scalar(scalar) => self.scalar_check(scalar),
+            WhereKind::Unary(unary) => self.where_check(unary.expr()),
+            WhereKind::Binary(binary) => self.binary_check(binary),
+            WhereKind::Multi(multi) => self.multi_check(multi),
+            WhereKind::Subquery(subquery) => self.query_check(subquery.query()),
         }
     }
 
-    fn binary_check(&self, binary: &BinaryExpr) -> ResolveResult<()> {
-        if binary_op_is_range(binary.op) {
-            self.enum_reject([&*binary.lexpr, &*binary.rexpr], "range comparison")?;
+    fn binary_check(&self, binary: Binary<'_>) -> ResolveResult<()> {
+        if binary_op_is_range(binary.op()) {
+            self.enum_reject(
+                [binary.lexpr().node_ref(), binary.rexpr().node_ref()],
+                "range comparison",
+            )?;
         }
-        self.where_check(&binary.lexpr)?;
-        self.where_check(&binary.rexpr)
+        self.where_check(binary.lexpr())?;
+        self.where_check(binary.rexpr())
     }
 
-    fn multi_check(&self, multi: &MultiExpr) -> ResolveResult<()> {
-        let order_dependent = multi_op_is_order_dependent(multi.op);
-        for expr in &multi.exprs {
+    fn multi_check(&self, multi: Multi<'_>) -> ResolveResult<()> {
+        let order_dependent = multi_op_is_order_dependent(multi.op());
+        for expr in multi.exprs() {
             if order_dependent {
-                self.enum_reject([expr], "range comparison")?;
+                self.enum_reject([expr.node_ref()], "range comparison")?;
             }
             self.where_check(expr)?;
         }
         Ok(())
     }
 
-    fn scalar_check(&self, expr: &ScalarExpr) -> ResolveResult<()> {
-        match expr {
-            ScalarExpr::Column(_) | ScalarExpr::Literal(_) => Ok(()),
-            ScalarExpr::Function(function) => self.function_check(function),
-            ScalarExpr::Case(case) => self.case_check(case),
-            ScalarExpr::Arithmetic(arithmetic) => {
-                self.scalar_check(&arithmetic.left)?;
-                self.scalar_check(&arithmetic.right)
+    fn scalar_check(&self, expr: Scalar<'_>) -> ResolveResult<()> {
+        match expr.kind() {
+            ScalarKind::Column(_) | ScalarKind::Literal(_) => Ok(()),
+            ScalarKind::Function(function) => self.function_check(function),
+            ScalarKind::Case(case) => self.case_check(case),
+            ScalarKind::Arithmetic(arithmetic) => {
+                self.scalar_check(arithmetic.left())?;
+                self.scalar_check(arithmetic.right())
             }
-            ScalarExpr::Subquery(query) => self.query_check(query),
-            ScalarExpr::Array(elems) => {
-                for elem in elems {
-                    self.scalar_check(elem)?;
+            ScalarKind::Subquery(subquery) => self.query_check(subquery.query()),
+            ScalarKind::Array(array) => {
+                for element in array.elements() {
+                    self.scalar_check(element)?;
                 }
                 Ok(())
             }
-            ScalarExpr::TypeCast { expr, .. } => self.scalar_check(expr),
+            ScalarKind::TypeCast(cast) => self.scalar_check(cast.expr()),
         }
     }
 
-    fn function_check(&self, function: &FunctionCall) -> ResolveResult<()> {
+    fn function_check(&self, function: Function<'_>) -> ResolveResult<()> {
         self.function_order_positions_check(function)?;
-        if let Some(over) = &function.over {
-            // partition_by is equality semantics — allowed.
-            for expr in &over.partition_by {
+        if let Some(over) = function.over() {
+            for expr in over.partition_by() {
                 self.scalar_check(expr)?;
             }
         }
-        for arg in &function.args {
+        for arg in function.args() {
             self.scalar_check(arg)?;
         }
-        if let Some(filter) = &function.agg_filter {
+        if let Some(filter) = function.filter() {
             self.where_check(filter)?;
         }
         Ok(())
     }
 
-    /// The order-dependent positions of a call: min/max arguments, the
-    /// aggregate ORDER BY, and the window ORDER BY.
-    fn function_order_positions_check(&self, function: &FunctionCall) -> ResolveResult<()> {
-        let min_max =
-            function.name.eq_ignore_ascii_case("min") || function.name.eq_ignore_ascii_case("max");
-        if min_max {
-            self.enum_reject(&function.args, "min/max aggregate")?;
+    /// `min`/`max` arguments, an aggregate's ORDER BY and a window's ORDER
+    /// BY are order-dependent positions.
+    fn function_order_positions_check(&self, function: Function<'_>) -> ResolveResult<()> {
+        let name = function.name();
+        if name.eq_ignore_ascii_case("min") || name.eq_ignore_ascii_case("max") {
+            self.enum_reject(
+                function.args().map(|arg| arg.node_ref()),
+                "min/max aggregate",
+            )?;
         }
         self.enum_reject(
-            function.agg_order.iter().map(|clause| &clause.expr),
+            function.agg_order().map(|clause| clause.expr().node_ref()),
             "aggregate ORDER BY",
         )?;
-        if let Some(over) = &function.over {
+        if let Some(over) = function.over() {
             self.enum_reject(
-                over.order_by.iter().map(|clause| &clause.expr),
+                over.order_by().map(|clause| clause.expr().node_ref()),
                 "window ORDER BY",
             )?;
         }
         Ok(())
     }
 
-    fn case_check(&self, case: &CaseExpr) -> ResolveResult<()> {
-        // Simple-CASE arg tests equality against WHEN values — safe.
-        if let Some(arg) = &case.arg {
+    fn case_check(&self, case: Case<'_>) -> ResolveResult<()> {
+        if let Some(arg) = case.arg() {
             self.scalar_check(arg)?;
         }
-        for when in &case.whens {
-            self.where_check(&when.condition)?;
-            self.scalar_check(&when.result)?;
+        for when in case.whens() {
+            self.where_check(when.condition())?;
+            self.scalar_check(when.result())?;
         }
-        if let Some(default) = &case.default {
+        if let Some(default) = case.default() {
             self.scalar_check(default)?;
         }
         Ok(())
     }
 }
 
-/// One output column of a select list, as ORDER BY names or numbers it.
+/// One output column of a select list: its name, and the enum column it
+/// carries when it is one.
 struct OutputColumn {
     name: Option<EcoString>,
     enum_column: Option<EnumColumn>,
@@ -402,8 +390,6 @@ fn binary_op_is_range(op: BinaryOp) -> bool {
     )
 }
 
-/// BETWEEN forms always order; ANY/ALL order when their comparison is a range;
-/// IN / NOT IN are equality.
 fn multi_op_is_order_dependent(op: MultiOp) -> bool {
     match op {
         MultiOp::Between
@@ -428,6 +414,7 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
+    use crate::query::resolve::enum_gate_owned::enum_order_dependence_check_owned;
     use crate::query::resolve::query_expr_resolve;
 
     fn severity_type() -> Type {
@@ -616,6 +603,26 @@ mod tests {
             true,
         ),
     ];
+
+    /// The rope gate and the owned gate give the same verdict on every
+    /// corpus query.
+    #[test]
+    fn test_rope_gate_matches_the_owned_gate() {
+        for (sql, _) in CORPUS {
+            let query = query_expr_parse(sql).expect("parse");
+            let bindings = query_expr_resolve(&query, &tables(), &["public"]).expect("resolve");
+            let bound = ResolvedQuery::new(Arc::new(query), bindings);
+            let text = |result: ResolveResult<()>| match result {
+                Ok(()) => "allowed".to_owned(),
+                Err(e) => e.into_current_context().to_string(),
+            };
+            assert_eq!(
+                text(bound.enum_order_dependence_check()),
+                text(enum_order_dependence_check_owned(&bound)),
+                "{sql}"
+            );
+        }
+    }
 
     #[test]
     fn test_gate_verdict_cases() {

@@ -24,5 +24,6 @@ pub use view::{
     Arithmetic, Array, Binary, Body, Case, Children, Column, Cte, CteRef, Frame, FrameBound,
     Function, Join, JoinQual, Literal, Multi, Name, NodeRef, OrderBy, Query, Run, Scalar,
     ScalarKind, ScalarSubquery, Select, SelectExpr, SelectItem, SetOp, Source, Star, Subquery,
-    Table, TypeCast, Unary, Values, ValuesRow, View, When, Where, WhereKind, WhereSubquery, Window,
+    Subtree, Table, TypeCast, Unary, Values, ValuesRow, View, When, Where, WhereKind,
+    WhereSubquery, Window,
 };

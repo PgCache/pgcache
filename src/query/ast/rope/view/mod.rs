@@ -90,6 +90,14 @@ impl<'t> NodeRef<'t> {
         self.at(self.end())
     }
 
+    /// Every position of this subtree in order, this node first.
+    pub fn subtree(&self) -> Subtree<'t> {
+        Subtree {
+            next: *self,
+            end: self.end(),
+        }
+    }
+
     /// This node's children, each the root of a subtree.
     pub fn children(&self) -> Children<'t> {
         Children {
@@ -136,6 +144,25 @@ impl<'t> Iterator for Children<'t> {
         }
         let current = self.next;
         self.next = current.next_sibling();
+        Some(current)
+    }
+}
+
+/// The positions of a subtree in order.
+pub struct Subtree<'t> {
+    next: NodeRef<'t>,
+    end: u32,
+}
+
+impl<'t> Iterator for Subtree<'t> {
+    type Item = NodeRef<'t>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next.id >= self.end {
+            return None;
+        }
+        let current = self.next;
+        self.next = current.at(current.id + 1);
         Some(current)
     }
 }

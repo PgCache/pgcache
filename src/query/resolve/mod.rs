@@ -20,6 +20,8 @@ mod clauses;
 mod column;
 mod entry;
 mod enum_gate;
+#[cfg(test)]
+mod enum_gate_owned;
 mod expr;
 mod join_using;
 mod render;
