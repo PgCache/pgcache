@@ -12,7 +12,7 @@ mod node;
 #[cfg(test)]
 mod owned;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod tree;
 mod view;
 

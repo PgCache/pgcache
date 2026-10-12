@@ -31,7 +31,7 @@ mod rope;
 mod scope;
 mod table;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 error_set! {
     ResolveError := {

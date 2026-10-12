@@ -215,6 +215,87 @@ impl FrameBoundKind {
 }
 
 impl NodeKind {
+    /// How many children the kind's counts and flags declare: what a
+    /// builder must emit under it for the views to read it.
+    pub fn child_count(&self) -> u32 {
+        let flag = u32::from;
+        match self {
+            NodeKind::Query {
+                cte_count,
+                order_by_count,
+                has_limit_count,
+                has_limit_offset,
+            } => cte_count + 1 + order_by_count + flag(*has_limit_count) + flag(*has_limit_offset),
+            NodeKind::Cte { alias_count, .. } => alias_count + 1,
+            NodeKind::Select {
+                item_count,
+                from_count,
+                has_where,
+                group_by_count,
+                has_having,
+                ..
+            } => {
+                item_count.unwrap_or(0)
+                    + from_count
+                    + flag(*has_where)
+                    + group_by_count
+                    + flag(*has_having)
+            }
+            NodeKind::Values { row_count } => *row_count,
+            NodeKind::ValuesRow { width } => *width,
+            NodeKind::SetOp { .. } | NodeKind::Binary { .. } | NodeKind::Arithmetic { .. } => 2,
+            NodeKind::OrderBy { .. }
+            | NodeKind::SelectExpr { .. }
+            | NodeKind::Unary { .. }
+            | NodeKind::ScalarSubquery
+            | NodeKind::TypeCast { .. } => 1,
+            NodeKind::Star { .. }
+            | NodeKind::Literal(_)
+            | NodeKind::Column { .. }
+            | NodeKind::Name(_) => 0,
+            NodeKind::Table {
+                alias_column_count, ..
+            } => *alias_column_count,
+            NodeKind::Subquery {
+                alias_column_count, ..
+            } => alias_column_count + 1,
+            NodeKind::CteRef {
+                column_alias_count,
+                alias_column_count,
+                ..
+            } => column_alias_count + alias_column_count + 1,
+            NodeKind::Join { qual, .. } => {
+                2 + match qual {
+                    JoinQualKind::On => 1,
+                    JoinQualKind::Using(count) => *count,
+                    JoinQualKind::Natural | JoinQualKind::Cross => 0,
+                }
+            }
+            NodeKind::Function {
+                arg_count,
+                order_count,
+                has_filter,
+                has_over,
+                ..
+            } => arg_count + order_count + flag(*has_filter) + flag(*has_over),
+            NodeKind::Window {
+                partition_count,
+                order_count,
+                has_frame,
+                ..
+            } => partition_count + order_count + flag(*has_frame),
+            NodeKind::Frame { start, end, .. } => flag(start.has_offset()) + flag(end.has_offset()),
+            NodeKind::Multi { count, .. } | NodeKind::Array { count } => *count,
+            NodeKind::WhereSubquery { has_test_expr, .. } => 1 + flag(*has_test_expr),
+            NodeKind::Case {
+                has_arg,
+                when_count,
+                has_default,
+            } => flag(*has_arg) + when_count + flag(*has_default),
+            NodeKind::When => 2,
+        }
+    }
+
     /// How many LIMIT literals end a query node's subtree.
     pub(super) fn limit_count(&self) -> u32 {
         match self {

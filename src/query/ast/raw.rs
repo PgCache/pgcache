@@ -221,6 +221,12 @@ pub(crate) unsafe fn list_nodes(list: *const List) -> ListIter {
     }
 }
 
+/// The length of a (possibly null) PG node `List *`; zero for NIL or a
+/// non-pointer list, as [`list_nodes`] iterates it.
+pub(crate) unsafe fn list_len(list: *const List) -> u32 {
+    unsafe { u32::try_from(list_nodes(list).len()).unwrap_or(u32::MAX) }
+}
+
 /// Whether a (possibly null) PG `List *` is empty (NIL or zero-length).
 pub(crate) unsafe fn list_is_empty(list: *const List) -> bool {
     list.is_null() || unsafe { (*list).length } <= 0

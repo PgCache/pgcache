@@ -39,7 +39,7 @@ use pgcache_lib::query::ast::rope::QueryTree;
 use pgcache_lib::query::ast::{
     BinaryExpr, ColumnNode, CteDefinition, FunctionCall, JoinNode, LiteralValue, OrderByClause,
     QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectNode, TableNode, TableSource, WhereExpr,
-    query_expr_convert_raw, query_tree_session_key,
+    query_expr_convert_raw, query_tree_convert_raw, query_tree_session_key,
 };
 use pgcache_lib::query::decorrelate::query_decorrelate;
 use pgcache_lib::query::literal_settings::LiteralSettings;
@@ -362,6 +362,13 @@ fn parse(sql: &str) -> QueryExpr {
         .expect("the fixture SQL converts")
 }
 
+/// The rope straight from the raw parse tree.
+fn parse_tree(sql: &str) -> QueryTree {
+    pg_query::parse_raw_scoped(sql, |tree| unsafe { query_tree_convert_raw(tree) })
+        .expect("pg_query parses the fixture SQL")
+        .expect("the fixture SQL converts")
+}
+
 fn resolve_bound(tree: &QueryTree, catalog: &Catalog) -> ResolvedQuery {
     ResolvedQuery::resolve(tree.clone(), catalog, &["public"]).expect("the fixture SQL resolves")
 }
@@ -453,6 +460,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         "plain_clone",
         "session_key",
         "rope",
+        "rope_convert",
         "rope_clone",
         "resolve",
         "bound_clone",
@@ -471,6 +479,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         let (query, convert_n, convert_b) = allocations_count(|| parse(&shape.sql));
         let (_, plain_clone_n, plain_clone_b) = allocations_count(|| black_box(query.clone()));
         let (rope, rope_n, rope_b) = allocations_count(|| QueryTree::from_query_expr(&query));
+        let (_, rope_convert_n, rope_convert_b) = allocations_count(|| parse_tree(&shape.sql));
         let (_, key_n, key_b) =
             allocations_count(|| query_tree_session_key(&rope, &search_path, &settings));
         let (_, rope_clone_n, rope_clone_b) = allocations_count(|| black_box(rope.clone()));
@@ -511,6 +520,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
             cell(plain_clone_n, plain_clone_b),
             cell(key_n, key_b),
             cell(rope_n, rope_b),
+            cell(rope_convert_n, rope_convert_b),
             cell(rope_clone_n, rope_clone_b),
             cell(resolve_n, resolve_b),
             cell(bound_clone_n, bound_clone_b),
@@ -531,7 +541,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
 }
 
 /// One row of the allocations table: the query name, then a cell per stage.
-fn row_print(cells: &[String; 17]) {
+fn row_print(cells: &[String; 18]) {
     let mut line = String::new();
     for (index, cell) in cells.iter().enumerate() {
         if index == 0 {
@@ -593,6 +603,13 @@ fn bench_pipeline(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("rope", shape.name), &query, |b, q| {
             b.iter(|| black_box(QueryTree::from_query_expr(q)));
         });
+        group.bench_with_input(
+            BenchmarkId::new("rope_convert", shape.name),
+            &shape.sql,
+            |b, sql| {
+                b.iter(|| black_box(parse_tree(sql)));
+            },
+        );
         group.bench_with_input(BenchmarkId::new("resolve", shape.name), &tree, |b, t| {
             b.iter(|| black_box(resolve_bound(t, &catalog)));
         });

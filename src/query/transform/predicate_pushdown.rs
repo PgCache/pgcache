@@ -582,7 +582,7 @@ fn select_kind_with_where(select: Select<'_>, has_where: bool) -> NodeKind {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
@@ -637,7 +637,7 @@ mod tests {
     }
 
     /// (sql, whether a predicate moves) over the shapes pushdown decides on.
-    const CORPUS: &[(&str, bool)] = &[
+    pub(crate) const CORPUS: &[(&str, bool)] = &[
         (
             "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'",
             true,

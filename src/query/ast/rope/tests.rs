@@ -12,7 +12,7 @@ use super::view::{Body, View};
 use crate::query::ast::{Deparse, LiteralValue, NodeId, QueryExpr, query_expr_parse};
 
 /// One query per node kind and child layout the converter produces.
-const CORPUS: &[&str] = &[
+pub(crate) const CORPUS: &[&str] = &[
     "SELECT a FROM t WHERE b = 1",
     "SELECT DISTINCT t.a AS x, *, u.* FROM t, u",
     "SELECT * FROM public.t AS t1 (c1, c2)",
@@ -354,4 +354,16 @@ fn test_clone_shares_the_table() {
         copy.node(NodeId::from_index(3)),
         base.node(NodeId::from_index(3))
     ));
+}
+
+/// A kind that declares more children than are emitted under it is caught
+/// at `close`, where the mistake was made, rather than misread by a view.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a node's kind declares the children emitted under it")]
+fn test_close_checks_the_declared_children() {
+    let mut builder = TreeBuilder::new();
+    let open = builder.open(NodeKind::Array { count: 2 });
+    builder.leaf(NodeKind::Literal(LiteralValue::Integer(1)));
+    builder.close(open);
 }

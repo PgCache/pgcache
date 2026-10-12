@@ -24,6 +24,23 @@ pub fn query_tree_parameters_replace(
     tree: &QueryTree,
     parameters: &QueryParameters,
 ) -> AstTransformResult<QueryTree> {
+    tree_rewrite(tree, Some(parameters))
+}
+
+/// `tree` with its literal arithmetic folded and its placeholders left as
+/// they are: the convert-time fold.
+pub fn query_tree_constant_fold(tree: &QueryTree) -> QueryTree {
+    match tree_rewrite(tree, None) {
+        Ok(folded) => folded,
+        // Without parameters nothing can fail; keep the tree as written.
+        Err(_) => tree.clone(),
+    }
+}
+
+fn tree_rewrite(
+    tree: &QueryTree,
+    parameters: Option<&QueryParameters>,
+) -> AstTransformResult<QueryTree> {
     let mut pass = Pass {
         parameters,
         replacements: Replacements::new(),
@@ -38,7 +55,8 @@ pub fn query_tree_parameters_replace(
 }
 
 struct Pass<'a> {
-    parameters: &'a QueryParameters,
+    /// `None` folds only: a placeholder is neither replaced nor foldable.
+    parameters: Option<&'a QueryParameters>,
     replacements: Replacements,
 }
 
@@ -65,7 +83,7 @@ impl Pass<'_> {
     fn position(&self, position: NodeRef<'_>) -> AstTransformResult<Option<Replacement>> {
         let kind = position.kind();
         let folded = if let NodeKind::Literal(LiteralValue::Parameter(_)) = kind {
-            Some(self.bound(Scalar::from_ref(position))?)
+            self.bound(Scalar::from_ref(position))?
         } else if let NodeKind::Arithmetic { .. } = kind {
             self.fold(Scalar::from_ref(position))?
         } else {
@@ -80,7 +98,7 @@ impl Pass<'_> {
         Ok(match expr.kind() {
             ScalarKind::Literal(literal) => {
                 if let LiteralValue::Parameter(_) = literal.value() {
-                    Some(self.bound(expr)?)
+                    self.bound(expr)?
                 } else {
                     Some(literal.value().clone())
                 }
@@ -103,14 +121,18 @@ impl Pass<'_> {
         })
     }
 
-    /// The value bound to the placeholder at `expr`.
-    fn bound(&self, expr: Scalar<'_>) -> AstTransformResult<LiteralValue> {
+    /// The value bound to the placeholder at `expr`; `None` when there are
+    /// no parameters to bind.
+    fn bound(&self, expr: Scalar<'_>) -> AstTransformResult<Option<LiteralValue>> {
+        let Some(parameters) = self.parameters else {
+            return Ok(None);
+        };
         let NodeKind::Literal(value) = expr.node_ref().kind() else {
-            return Ok(LiteralValue::Null);
+            return Ok(None);
         };
         let mut value = value.clone();
-        literal_value_parameters_replace(&mut value, self.parameters)?;
-        Ok(value)
+        literal_value_parameters_replace(&mut value, parameters)?;
+        Ok(Some(value))
     }
 }
 

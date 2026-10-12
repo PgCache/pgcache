@@ -898,7 +898,7 @@ pub(super) fn binding_catalog() -> Catalog {
     ])
 }
 
-pub(super) const BINDING_CORPUS: &[&str] = &[
+pub(crate) const BINDING_CORPUS: &[&str] = &[
     "SELECT u.id, name FROM users u WHERE dept_id = 'x'",
     "SELECT u.id, d.name AS dname FROM users u JOIN departments d ON u.dept_id = d.id \
      WHERE d.name = 'a' ORDER BY dname, u.id DESC",
@@ -930,3 +930,35 @@ fn test_bound_query_clone_shares_the_tree() {
     assert_eq!(copy.tree(), resolved.tree());
     assert_eq!(copy.bindings().slots().len(), 2);
 }
+
+/// Shapes the binding corpus leaves out: stars over outer and `NATURAL`
+/// joins, qualified stars, aliased and chained CTE references, set-op
+/// and alias ordering, nested predicates, windows, filters and casts.
+pub(crate) const RENDER_CORPUS: &[&str] = &[
+    "SELECT * FROM users u LEFT JOIN departments d USING (id) ORDER BY id",
+    "SELECT u.*, d.name FROM users u NATURAL JOIN departments d",
+    "SELECT * FROM users NATURAL LEFT JOIN departments WHERE id = 1",
+    "SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 5 \
+     ORDER BY o.amount DESC NULLS LAST, u.id",
+    "WITH t AS (SELECT id, name FROM users) SELECT x.name FROM t AS x WHERE x.id = 1",
+    "WITH a AS (SELECT id FROM users), b AS (SELECT id FROM a WHERE id = 1) SELECT b.id FROM b",
+    "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount = 1 LIMIT 5) \
+     ORDER BY id LIMIT 3 OFFSET 1",
+    "SELECT id FROM users UNION ALL SELECT id FROM departments ORDER BY id DESC",
+    "SELECT id FROM users WHERE id > 1 INTERSECT SELECT id FROM departments WHERE id < 9",
+    "SELECT name, count(*) AS n FROM users GROUP BY name HAVING count(*) > 1 ORDER BY n DESC, name",
+    "SELECT rank() OVER (PARTITION BY dept_id ORDER BY id ROWS BETWEEN 1 PRECEDING AND \
+     CURRENT ROW) FROM users",
+    "SELECT count(*) FILTER (WHERE amount > 2), string_agg(sku, ',' ORDER BY items.id) \
+     FROM orders JOIN items ON items.order_id = orders.id",
+    "SELECT DISTINCT dept_id, CASE WHEN name = 'a' THEN 1 ELSE 0 END FROM users \
+     WHERE id = ANY (ARRAY[1, 2]) AND name NOT IN ('x', 'y') AND id BETWEEN 1 AND 9",
+    "SELECT (id)::text FROM users WHERE id IS NOT NULL AND NOT (id = 1 OR name = 'a')",
+    "SELECT u.name, (SELECT max(o.amount) FROM orders o WHERE o.user_id = u.id) AS top \
+     FROM users u ORDER BY top",
+    "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v",
+    "SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id \
+     AND o.amount = 3) AND NOT EXISTS (SELECT 1 FROM items i WHERE i.id = u.id)",
+    "SELECT a.id, b.id FROM users a CROSS JOIN departments b WHERE a.id = b.id",
+    "SELECT (amount * 2) + 1 FROM orders WHERE amount <> ALL (ARRAY[1]) ORDER BY 1",
+];

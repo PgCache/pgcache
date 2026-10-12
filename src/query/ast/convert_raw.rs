@@ -113,7 +113,7 @@ pub unsafe fn statement_convert_raw(tree_root: *const c_void) -> Result<RawState
 }
 
 /// Unwrap the single root statement of a parse tree.
-unsafe fn root_statement(tree_root: *const c_void) -> Result<NodePtr, AstError> {
+pub(super) unsafe fn root_statement(tree_root: *const c_void) -> Result<NodePtr, AstError> {
     unsafe {
         let mut stmts = list_nodes(tree_root as *const pg::List);
         let (Some(raw_stmt), None) = (stmts.next(), stmts.next()) else {
@@ -206,13 +206,13 @@ pub(crate) fn query_expr_parse(sql: &str) -> Result<QueryExpr, AstError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::query::ast::Deparse;
 
     /// Queries exercising every node kind the converter handles. Each must
     /// convert successfully and survive a deparse→reparse roundtrip.
-    const CORPUS: &[&str] = &[
+    pub(crate) const CORPUS: &[&str] = &[
         // basic select / projection
         "SELECT id, name FROM users WHERE id = 1",
         "SELECT * FROM products",

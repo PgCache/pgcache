@@ -27,6 +27,10 @@ pub struct TreeBuilder<'b> {
     /// `(origin, position)` per node opened with an origin: always over a
     /// base, whose bindings follow the origins; on request otherwise.
     origins: Option<Vec<(NodeId, NodeId)>>,
+    /// The open nodes, innermost last, each with the direct children emitted
+    /// under it so far: `close` checks them against what the kind declares.
+    #[cfg(debug_assertions)]
+    open: Vec<(usize, u32)>,
 }
 
 enum Pending {
@@ -61,6 +65,16 @@ impl<'b> TreeBuilder<'b> {
             next: 0,
             kept: Vec::new(),
             origins: None,
+            #[cfg(debug_assertions)]
+            open: Vec::new(),
+        }
+    }
+
+    /// One more direct child under the innermost open node.
+    fn child_emitted(&mut self) {
+        #[cfg(debug_assertions)]
+        if let Some((_, children)) = self.open.last_mut() {
+            *children += 1;
         }
     }
 
@@ -87,7 +101,10 @@ impl<'b> TreeBuilder<'b> {
 
     /// Begin a node at the next position; its children follow.
     pub fn open(&mut self, kind: NodeKind) -> Open {
+        self.child_emitted();
         let (position, fresh_index) = self.fresh_push(Node { len: 1, kind });
+        #[cfg(debug_assertions)]
+        self.open.push((fresh_index, 0));
         Open {
             fresh_index,
             position,
@@ -114,6 +131,7 @@ impl<'b> TreeBuilder<'b> {
     /// A subtree given as nodes in pre-order with their lengths set, placed
     /// at the next position; returns where its root landed.
     pub fn fragment(&mut self, nodes: &[Node]) -> NodeId {
+        self.child_emitted();
         let start = self.next;
         for node in nodes {
             self.fresh_push(node.clone());
@@ -122,7 +140,28 @@ impl<'b> TreeBuilder<'b> {
     }
 
     /// End a node: its subtree is everything built since it was opened.
+    /// The children emitted under it must be the ones its kind declares,
+    /// since the views read the kind's counts to find them.
     pub fn close(&mut self, open: Open) -> NodeId {
+        #[cfg(debug_assertions)]
+        {
+            let emitted = self.open.pop();
+            let declared = self
+                .fresh
+                .get(open.fresh_index)
+                .map(|node| node.kind.child_count());
+            debug_assert_eq!(
+                emitted.map(|(index, _)| index),
+                Some(open.fresh_index),
+                "nodes close in the order they were opened"
+            );
+            debug_assert_eq!(
+                emitted.map(|(_, children)| children),
+                declared,
+                "a node's kind declares the children emitted under it: {:?}",
+                self.fresh.get(open.fresh_index).map(|node| &node.kind)
+            );
+        }
         if let Some(node) = self.fresh.get_mut(open.fresh_index) {
             node.len = self.next - open.position;
         }
@@ -154,6 +193,7 @@ impl<'b> TreeBuilder<'b> {
     /// Place `subtree` of the base at the next position: table entries over
     /// its underlying slices, clipped to the subtree, no node copied.
     pub fn keep(&mut self, subtree: NodeId) -> NodeId {
+        self.child_emitted();
         let new_start = self.next;
         let Some(base) = self.base else {
             debug_assert!(false, "keep needs a base tree");
