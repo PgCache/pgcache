@@ -23,8 +23,8 @@ use crate::query::ast::rope::deparse::{
 };
 use crate::query::ast::rope::{
     Column as RopeColumn, CteRef as RopeCteRef, Function as RopeFunction, Join as RopeJoin,
-    OrderBy as RopeOrderBy, RopeDeparseContext, ScalarKind, Select as RopeSelect, SelectItem,
-    Star as RopeStar, Table as RopeTable,
+    OrderBy as RopeOrderBy, QueryTree, RopeDeparseContext, ScalarKind, Select as RopeSelect,
+    SelectItem, Star as RopeStar, Table as RopeTable,
 };
 use crate::query::ast::{
     Clause, ColumnNode, CteRefNode, Deparse, DeparseContext, DeparseWith, FunctionCall, JoinNode,
@@ -37,6 +37,11 @@ use crate::query::transform::literal_is_parameterizable;
 /// Keeps a bound fingerprint from colliding with a resolved fingerprint (3)
 /// or a session key (2) hashed from the same text.
 const BOUND_FINGERPRINT_DOMAIN: u8 = 4;
+
+/// `tree` rendered as the cache serves it under `bindings`.
+pub(crate) fn query_tree_sql_into(tree: &QueryTree, bindings: &Bindings, buf: &mut String) {
+    query_deparse_with(tree.root(), &mut RopeBound(Bound::text(bindings)), buf);
+}
 
 /// How literals render.
 enum Mode {
@@ -585,8 +590,7 @@ impl ResolvedQuery {
 
     /// The SQL the cache serves for this query, appended to `buf`.
     pub fn sql_into(&self, buf: &mut String) {
-        let mut cx = RopeBound(Bound::text(self.rope_bindings()));
-        query_deparse_with(self.rope().root(), &mut cx, buf);
+        query_tree_sql_into(self.rope(), self.rope_bindings(), buf);
     }
 
     /// The SQL the cache serves for this query.

@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use super::node::{Node, NodeKind};
 use super::tree::{Chunk, QueryTree, position};
-use crate::query::ast::{IdRemap, NodeId};
+use super::view::NodeRef;
+use crate::query::ast::{NodeId, NodeRemap};
 
 /// A table is compacted past this many chunks or a quarter of the
 /// positions, whichever is larger: lookups and sequential walks stay cheap
@@ -23,8 +24,8 @@ pub struct TreeBuilder<'b> {
     /// The next position.
     next: u32,
     kept: Vec<Kept>,
-    /// `(origin, position)` per node opened with an origin, when recording.
-    origins: Option<Vec<(NodeId, NodeId)>>,
+    /// `(origin, position)` per node opened with an origin.
+    origins: Vec<(NodeId, NodeId)>,
 }
 
 enum Pending {
@@ -58,15 +59,8 @@ impl<'b> TreeBuilder<'b> {
             fresh: Vec::new(),
             next: 0,
             kept: Vec::new(),
-            origins: None,
+            origins: Vec::new(),
         }
-    }
-
-    /// Record where each node opened with an origin lands, for
-    /// [`TreeBuilder::finish_with_origins`].
-    pub fn recording_origins(mut self) -> Self {
-        self.origins = Some(Vec::new());
-        self
     }
 
     /// A builder that can `keep` subtrees of `base`.
@@ -111,12 +105,11 @@ impl<'b> TreeBuilder<'b> {
     }
 
     /// [`TreeBuilder::open`] for a node standing in for `origin` of
-    /// another tree, recorded when origins are.
+    /// another tree, so what was bound to the origin follows it.
     pub fn open_from(&mut self, kind: NodeKind, origin: NodeId) -> Open {
         let open = self.open(kind);
-        if let Some(origins) = &mut self.origins {
-            origins.push((origin, NodeId::from_index(open.position)));
-        }
+        self.origins
+            .push((origin, NodeId::from_index(open.position)));
         open
     }
 
@@ -180,19 +173,46 @@ impl<'b> TreeBuilder<'b> {
         self.pending.push(Pending::Base(chunk));
     }
 
-    /// The tree, compacted when its table grew past the threshold, and
-    /// where every kept subtree landed.
-    pub fn finish(self) -> (QueryTree, ChunkRemap) {
-        let (tree, remap, _) = self.finish_with_origins();
-        (tree, remap)
+    /// Place `subtree` of the base at the next position with some of its
+    /// positions replaced: a subtree holding no replacement is kept whole,
+    /// one holding some has its ancestors re-emitted with their origins.
+    /// Where each replacement landed is recorded on `replacements`.
+    pub fn copy(&mut self, subtree: NodeRef<'b>, replacements: &mut Replacements) {
+        replacements.sort();
+        self.copy_sorted(subtree, replacements);
     }
 
-    /// [`TreeBuilder::finish`] with where every node opened with an origin
-    /// landed; empty unless the builder was recording.
-    pub fn finish_with_origins(self) -> (QueryTree, ChunkRemap, OriginMap) {
-        let mut pairs = self.origins.unwrap_or_default();
-        pairs.sort_by_key(|(origin, _)| origin.index());
-        let origins = OriginMap { pairs };
+    fn copy_sorted(&mut self, node: NodeRef<'b>, replacements: &mut Replacements) {
+        let id = position(node.id());
+        let from = replacements.first_at_or_after(id);
+        if let Some((index, replacement)) = replacements.at(from, id) {
+            let placed = match replacement {
+                Replacement::Leaf(kind) => self.leaf(kind.clone()),
+                Replacement::LeafFrom(kind) => self.leaf_from(kind.clone(), node.id()),
+                Replacement::Subtree(other) => self.keep(*other),
+            };
+            if let Some(slot) = replacements.placed.get_mut(index) {
+                *slot = Some(placed);
+            }
+            return;
+        }
+        if !replacements.any_before(from, node.end()) {
+            self.keep(node.id());
+            return;
+        }
+        let open = self.open_from(node.kind().clone(), node.id());
+        for child in node.children() {
+            self.copy_sorted(child, replacements);
+        }
+        self.close(open);
+    }
+
+    /// The tree, compacted when its table grew past the threshold, and
+    /// where every kept subtree and every node opened with an origin
+    /// landed.
+    pub fn finish(self) -> (QueryTree, Remap) {
+        let mut origins = self.origins;
+        origins.sort_by_key(|(origin, _)| origin.index());
         let fresh: Arc<[Node]> = self.fresh.into();
         let chunks: Vec<Chunk> = self
             .pending
@@ -215,38 +235,13 @@ impl<'b> TreeBuilder<'b> {
         } else {
             tree
         };
-        (tree, ChunkRemap { kept: self.kept }, origins)
-    }
-}
-
-/// Where nodes of another tree landed in a built one, by their origin id.
-#[derive(Debug, Default, Clone)]
-pub struct OriginMap {
-    pairs: Vec<(NodeId, NodeId)>,
-}
-
-impl OriginMap {
-    /// The position of the node that stood in for `origin`.
-    pub fn position(&self, origin: NodeId) -> Option<NodeId> {
-        self.pairs
-            .binary_search_by_key(&origin.index(), |(from, _)| from.index())
-            .ok()
-            .and_then(|found| self.pairs.get(found))
-            .map(|(_, to)| *to)
-    }
-
-    pub fn len(&self) -> usize {
-        self.pairs.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.pairs.is_empty()
-    }
-
-    /// The map as a remap, so side tables keyed by origin ids carry over
-    /// through the same path a rewrite's do.
-    pub(crate) fn to_remap(&self) -> IdRemap {
-        IdRemap::from_sorted_pairs(self.pairs.clone())
+        (
+            tree,
+            Remap {
+                kept: self.kept,
+                origins,
+            },
+        )
     }
 }
 
@@ -256,30 +251,116 @@ impl Default for TreeBuilder<'_> {
     }
 }
 
-/// Where the subtrees a builder kept came from: one range per `keep`, so
-/// a position's new ids are its offsets into every range that held it.
-#[derive(Debug, Default)]
-pub struct ChunkRemap {
-    kept: Vec<Kept>,
+/// What a position of a copied subtree becomes.
+#[derive(Debug, Clone)]
+pub enum Replacement {
+    /// A fresh leaf bound to nothing.
+    Leaf(NodeKind),
+    /// A fresh leaf standing in for the node it replaces, so what was bound
+    /// to that node follows it.
+    LeafFrom(NodeKind),
+    /// Another subtree of the base, placed here.
+    Subtree(NodeId),
 }
 
-impl ChunkRemap {
-    /// Every new position of the node that was at `old`.
-    pub fn new_ids(&self, old: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+/// The replacements of one [`TreeBuilder::copy`], by base position, and
+/// where each landed once the copy is made.
+#[derive(Debug, Default)]
+pub struct Replacements {
+    /// `(base position, index into `placed`, replacement)`; sorted by
+    /// position once a copy begins.
+    entries: Vec<(u32, usize, Replacement)>,
+    placed: Vec<Option<NodeId>>,
+    sorted: bool,
+}
+
+impl Replacements {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace the subtree at `at`; the index reads back where it landed.
+    pub fn push(&mut self, at: NodeId, replacement: Replacement) -> usize {
+        let index = self.placed.len();
+        self.entries.push((position(at), index, replacement));
+        self.placed.push(None);
+        self.sorted = false;
+        index
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// How many replacements have been pushed: the index the next one
+    /// will take.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Where the replacement pushed as `index` landed; `None` before the
+    /// copy or when its position was not under the copied subtree.
+    pub fn placed(&self, index: usize) -> Option<NodeId> {
+        self.placed.get(index).copied().flatten()
+    }
+
+    fn sort(&mut self) {
+        if !self.sorted {
+            self.entries.sort_by_key(|(at, _, _)| *at);
+            self.sorted = true;
+        }
+    }
+
+    fn first_at_or_after(&self, at: u32) -> usize {
+        self.entries.partition_point(|(entry, _, _)| *entry < at)
+    }
+
+    fn at(&self, from: usize, at: u32) -> Option<(usize, &Replacement)> {
+        self.entries
+            .get(from)
+            .filter(|(entry, _, _)| *entry == at)
+            .map(|(_, index, replacement)| (*index, replacement))
+    }
+
+    /// Whether an entry at or after `from` sits before `end`.
+    fn any_before(&self, from: usize, end: u32) -> bool {
+        self.entries.get(from).is_some_and(|(at, _, _)| *at < end)
+    }
+}
+
+/// Where the nodes of a base tree landed in a built one: the subtrees the
+/// builder kept, one range per `keep`, and the nodes it opened with an
+/// origin. A position kept in several places has several new ids.
+#[derive(Debug, Default, Clone)]
+pub struct Remap {
+    kept: Vec<Kept>,
+    /// `(origin, position)` in origin order.
+    origins: Vec<(NodeId, NodeId)>,
+}
+
+impl Remap {
+    pub fn is_empty(&self) -> bool {
+        self.kept.is_empty() && self.origins.is_empty()
+    }
+}
+
+impl NodeRemap for Remap {
+    fn new_ids(&self, old: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         let old = position(old);
+        let start = self
+            .origins
+            .partition_point(|(origin, _)| position(*origin) < old);
+        let opened = self
+            .origins
+            .get(start..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(move |(origin, _)| position(*origin) == old)
+            .map(|(_, to)| *to);
         self.kept
             .iter()
             .filter(move |kept| kept.old_start <= old && old < kept.old_end)
             .map(move |kept| NodeId::from_index(kept.new_start + (old - kept.old_start)))
-    }
-
-    /// The new position of the node that was at `old`, when it was kept
-    /// in one place.
-    pub fn new_id(&self, old: NodeId) -> Option<NodeId> {
-        self.new_ids(old).next()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.kept.is_empty()
+            .chain(opened)
     }
 }

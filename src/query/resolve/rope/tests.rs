@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::query_tree_resolve;
 use crate::catalog::Catalog;
 use crate::query::ast::rope::{NodeKind, QueryTree};
-use crate::query::ast::{NodeId, query_expr_parse};
+use crate::query::ast::{NodeId, NodeRemap, query_expr_parse};
 use crate::query::resolve::tests::{BINDING_CORPUS, binding_catalog, catalog};
 use crate::query::resolve::{ResolvedQuery, TableSlot, query_expr_resolve};
 
@@ -20,7 +20,7 @@ fn oracle(sql: &str, tables: &Catalog) {
     match (expected, actual) {
         (Ok(expected), Ok(actual)) => {
             let mut expected = expected.describe_with(|id: NodeId| {
-                origins.position(id).map_or_else(
+                origins.new_id(id).map_or_else(
                     || format!("unmapped {}", id.index()),
                     |p| p.index().to_string(),
                 )

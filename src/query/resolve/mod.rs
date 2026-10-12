@@ -80,4 +80,6 @@ pub use bindings::{
 pub use branch::QueryBranch;
 pub use entry::query_expr_resolve;
 pub use render::SourceOverride;
+#[cfg(test)]
+pub(crate) use render::query_tree_sql_into;
 pub use rope::query_tree_resolve;

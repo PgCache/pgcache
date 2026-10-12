@@ -6,8 +6,8 @@ use std::sync::Arc;
 use ecow::EcoString;
 
 use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
-use crate::query::ast::rope::{OriginMap, QueryTree};
-use crate::query::ast::{ColumnNode, IdRemap, NodeId, QueryExpr, StarNode};
+use crate::query::ast::rope::{QueryTree, Remap};
+use crate::query::ast::{ColumnNode, NodeId, NodeRemap, QueryExpr, StarNode};
 
 /// Index of a table source in [`Bindings::slots`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -215,7 +215,7 @@ impl BindingsBuilder {
     /// several places binds in each, a node the rewrite dropped binds
     /// nowhere. Slots are kept as they are, so what the rewrite added binds
     /// into them by slot and position.
-    pub(crate) fn from_remapped(source: &Bindings, remap: &IdRemap) -> Self {
+    pub(crate) fn from_remapped<R: NodeRemap>(source: &Bindings, remap: &R) -> Self {
         // A derived slot names the node it stands for; the slot keeps its
         // index and follows the node.
         let slots = source
@@ -409,13 +409,13 @@ pub struct ResolvedQuery {
     rope_bindings: Bindings,
     /// Where each owned node sits in the rope, for the consumers that
     /// still hold owned ids while the rest have moved.
-    origins: OriginMap,
+    origins: Remap,
 }
 
 impl ResolvedQuery {
     pub fn new(tree: Arc<QueryExpr>, bindings: Bindings) -> Self {
         let (rope, origins) = QueryTree::from_query_expr_with_origins(&tree);
-        let rope_bindings = BindingsBuilder::from_remapped(&bindings, &origins.to_remap()).finish();
+        let rope_bindings = BindingsBuilder::from_remapped(&bindings, &origins).finish();
         Self {
             tree,
             bindings,
@@ -427,7 +427,7 @@ impl ResolvedQuery {
 
     /// The rope position of the owned node `owned`.
     pub fn rope_position(&self, owned: NodeId) -> Option<NodeId> {
-        self.origins.position(owned)
+        self.origins.new_id(owned)
     }
 
     pub fn tree(&self) -> &QueryExpr {

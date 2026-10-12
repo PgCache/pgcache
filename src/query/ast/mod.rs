@@ -73,5 +73,5 @@ pub(crate) use deparse::{
 };
 pub use finalize::{query_expr_finalize, query_expr_refinalize};
 pub use fingerprint::*;
-pub use node_id::{IdRemap, NodeId, NodePositions};
+pub use node_id::{IdRemap, NodeId, NodePositions, NodeRemap};
 pub use types::*;

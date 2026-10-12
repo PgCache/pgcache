@@ -31,6 +31,16 @@ impl NodeId {
     }
 }
 
+/// Where the nodes of one tree landed in another: every new position of a
+/// node, and the one position when it landed in one place.
+pub trait NodeRemap {
+    fn new_ids(&self, old: NodeId) -> impl Iterator<Item = NodeId> + '_;
+
+    fn new_id(&self, old: NodeId) -> Option<NodeId> {
+        self.new_ids(old).next()
+    }
+}
+
 /// Where each node of a refinalized tree came from: the id it carried
 /// before the pass against its new position, in old-id order. A node copied
 /// into several places maps to several positions.
@@ -40,18 +50,6 @@ pub struct IdRemap {
 }
 
 impl IdRemap {
-    /// A remap from `pairs` already in old-id order.
-    pub(crate) fn from_sorted_pairs(pairs: Vec<(NodeId, NodeId)>) -> Self {
-        debug_assert!(
-            pairs
-                .iter()
-                .zip(pairs.iter().skip(1))
-                .all(|(first, second)| first.0.index() <= second.0.index()),
-            "remap pairs in old-id order"
-        );
-        Self { pairs }
-    }
-
     /// Every new position of the node that carried `old`.
     pub fn new_ids(&self, old: NodeId) -> impl Iterator<Item = NodeId> + '_ {
         let start = self
@@ -73,6 +71,12 @@ impl IdRemap {
 
     pub fn is_empty(&self) -> bool {
         self.pairs.is_empty()
+    }
+}
+
+impl NodeRemap for IdRemap {
+    fn new_ids(&self, old: NodeId) -> impl Iterator<Item = NodeId> + '_ {
+        IdRemap::new_ids(self, old)
     }
 }
 

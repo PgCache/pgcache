@@ -237,6 +237,24 @@ pub enum WhereKind<'t> {
 }
 
 impl<'t> Where<'t> {
+    /// The top-level AND operands, left to right; the expression itself
+    /// when it is not an AND.
+    pub fn conjuncts(self) -> Vec<Where<'t>> {
+        let mut out = Vec::new();
+        self.conjuncts_into(&mut out);
+        out
+    }
+
+    fn conjuncts_into(self, out: &mut Vec<Where<'t>>) {
+        match self.kind() {
+            WhereKind::Binary(binary) if binary.op() == BinaryOp::And => {
+                binary.lexpr().conjuncts_into(out);
+                binary.rexpr().conjuncts_into(out);
+            }
+            _ => out.push(self),
+        }
+    }
+
     pub fn kind(&self) -> WhereKind<'t> {
         match self.0.kind() {
             NodeKind::Unary { .. } => WhereKind::Unary(Unary(self.0)),

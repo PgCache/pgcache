@@ -373,7 +373,11 @@ mod tests {
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve;
+    use crate::query::ast::rope::QueryTree;
+    use crate::query::resolve::{
+        Bindings, query_expr_resolve, query_tree_resolve, query_tree_sql_into,
+    };
+    use crate::query::transform::query_predicate_pushdown_tree;
 
     /// A catalog of text-column tables, given as (name, columns), with
     /// relation OIDs from 1001 in order.
@@ -525,6 +529,44 @@ mod tests {
         }
     }
 
+    fn tree_sql(tree: &QueryTree, bindings: &Bindings) -> String {
+        let mut buf = String::new();
+        query_tree_sql_into(tree, bindings, &mut buf);
+        buf
+    }
+
+    /// The rope rewrite moves what the owned rewrite moves, renders the
+    /// same SQL, and its carried bindings are the ones the resolver makes
+    /// for the rewritten tree.
+    #[test]
+    fn test_rope_pushdown_matches_the_owned_rewrite() {
+        let catalog = two_tables();
+        for (sql, moves) in CORPUS {
+            let bound = bound(sql, &catalog);
+            let owned = query_predicate_pushdown(&bound);
+            let rope = query_predicate_pushdown_tree(&bound);
+            assert_eq!(rope.is_some(), *moves, "{sql}");
+            let (Some(owned), Some((tree, bindings))) = (owned, rope) else {
+                continue;
+            };
+            assert_eq!(tree_sql(&tree, &bindings), owned.sql(), "{sql}");
+            let resolved = query_tree_resolve(&tree, &catalog, &["public"])
+                .unwrap_or_else(|e| panic!("{sql}: the pushed-down rope resolves: {e:?}"));
+            let mut carried = bindings.describe();
+            let mut expected = resolved.describe();
+            carried.sort();
+            expected.sort();
+            assert_eq!(carried, expected, "{sql}");
+        }
+    }
+
+    #[test]
+    fn test_rope_pushdown_render_cases() {
+        render_cases_check(|bound| {
+            query_predicate_pushdown_tree(bound).map(|(tree, bindings)| tree_sql(&tree, &bindings))
+        });
+    }
+
     #[test]
     fn test_pushed_predicate_is_restated_per_branch() {
         let catalog = two_tables();
@@ -558,50 +600,65 @@ mod tests {
         );
     }
 
+    type PushedCase = (&'static str, Catalog, &'static str, &'static str);
+    type KeptCase = (&'static str, Catalog, &'static str);
+
     /// Where a predicate lands: every branch of a pushable derived table,
     /// AND-ed onto a branch's own WHERE with its columns restated per
-    /// branch; shapes whose result it would change keep the outer WHERE.
-    #[test]
-    fn test_pushdown_render_cases() {
-        let ab_ab = tables(&[("t1", &["a", "b"]), ("t2", &["a", "b"])]);
-        let ab_cd = tables(&[("t1", &["a", "b"]), ("t2", &["c", "d"])]);
-        let ab = tables(&[("t1", &["a", "b"])]);
+    /// branch; and shapes whose result it would change, which keep the
+    /// outer WHERE.
+    fn render_cases() -> (Vec<PushedCase>, Vec<KeptCase>) {
+        let ab_ab = || tables(&[("t1", &["a", "b"]), ("t2", &["a", "b"])]);
+        let ab_cd = || tables(&[("t1", &["a", "b"]), ("t2", &["c", "d"])]);
+        let ab = || tables(&[("t1", &["a", "b"])]);
         #[rustfmt::skip]
-        let pushed: [(&str, &Catalog, &str, &str); 7] = [
-            ("both UNION branches",       &ab_ab, "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'",
+        let pushed = vec![
+            ("both UNION branches",       ab_ab(), "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'",
              "SELECT sub.a, sub.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.a = 'x' UNION ALL SELECT public.t2.a, public.t2.b FROM public.t2 WHERE public.t2.a = 'x') sub"),
-            ("columns remapped by position", &ab_cd, "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT c, d FROM t2) sub WHERE sub.a = 'x'",
+            ("columns remapped by position", ab_cd(), "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT c, d FROM t2) sub WHERE sub.a = 'x'",
              "SELECT sub.a, sub.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.a = 'x' UNION ALL SELECT public.t2.c, public.t2.d FROM public.t2 WHERE public.t2.c = 'x') sub"),
-            ("existing WHERE AND-ed",     &ab_ab, "SELECT * FROM (SELECT a, b FROM t1 WHERE b = 'y' UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'",
+            ("existing WHERE AND-ed",     ab_ab(), "SELECT * FROM (SELECT a, b FROM t1 WHERE b = 'y' UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x'",
              "SELECT sub.a, sub.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.b = 'y' AND public.t1.a = 'x' UNION ALL SELECT public.t2.a, public.t2.b FROM public.t2 WHERE public.t2.a = 'x') sub"),
-            ("every conjunct",            &ab_ab, "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x' AND sub.b = 'y'",
+            ("every conjunct",            ab_ab(), "SELECT * FROM (SELECT a, b FROM t1 UNION ALL SELECT a, b FROM t2) sub WHERE sub.a = 'x' AND sub.b = 'y'",
              "SELECT sub.a, sub.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.a = 'x' AND public.t1.b = 'y' UNION ALL SELECT public.t2.a, public.t2.b FROM public.t2 WHERE public.t2.a = 'x' AND public.t2.b = 'y') sub"),
-            ("plain derived table",       &ab,    "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a = 'x'",
+            ("plain derived table",       ab(),    "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a = 'x'",
              "SELECT sub.a, sub.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.a = 'x') sub"),
-            ("literal columns beside",    &ab_ab, "SELECT * FROM (SELECT a, 'CONST' AS label, NULL AS extra FROM t1 UNION ALL SELECT a, 'OTHER' AS label, NULL AS extra FROM t2) sub WHERE sub.a = 'x'",
+            ("literal columns beside",    ab_ab(), "SELECT * FROM (SELECT a, 'CONST' AS label, NULL AS extra FROM t1 UNION ALL SELECT a, 'OTHER' AS label, NULL AS extra FROM t2) sub WHERE sub.a = 'x'",
              "SELECT sub.a, sub.label, sub.extra FROM (SELECT public.t1.a, 'CONST' AS label, NULL AS extra FROM public.t1 WHERE public.t1.a = 'x' UNION ALL SELECT public.t2.a, 'OTHER' AS label, NULL AS extra FROM public.t2 WHERE public.t2.a = 'x') sub"),
-            ("set-op branches recurse",   &ab_ab, "SELECT * FROM (SELECT a, b FROM t1) sub1 WHERE sub1.a = 'x' UNION ALL SELECT * FROM (SELECT a, b FROM t2) sub2 WHERE sub2.a = 'y'",
+            ("set-op branches recurse",   ab_ab(), "SELECT * FROM (SELECT a, b FROM t1) sub1 WHERE sub1.a = 'x' UNION ALL SELECT * FROM (SELECT a, b FROM t2) sub2 WHERE sub2.a = 'y'",
              "SELECT sub1.a, sub1.b FROM (SELECT public.t1.a, public.t1.b FROM public.t1 WHERE public.t1.a = 'x') sub1 UNION ALL SELECT sub2.a, sub2.b FROM (SELECT public.t2.a, public.t2.b FROM public.t2 WHERE public.t2.a = 'y') sub2"),
         ];
-        for (label, catalog, sql, expected) in pushed {
-            let result = query_predicate_pushdown(&bound(sql, catalog))
-                .unwrap_or_else(|| panic!("{label}: expected a pushdown of {sql}"));
-            assert_eq!(result.sql(), expected, "{label}");
-        }
         #[rustfmt::skip]
-        let kept: [(&str, &Catalog, &str); 6] = [
-            ("literal output column", &ab,    "SELECT * FROM (SELECT a, 42 AS val FROM t1) sub WHERE sub.val = 99"),
-            ("GROUP BY",              &ab,    "SELECT * FROM (SELECT a, count(b) AS cnt FROM t1 GROUP BY a) sub WHERE sub.a = 'x'"),
-            ("window function",       &ab,    "SELECT * FROM (SELECT a, row_number() OVER (ORDER BY b) AS rn FROM t1) sub WHERE sub.a = 'x'"),
-            ("no derived table",      &ab,    "SELECT a, b FROM t1 WHERE a = 'x'"),
-            ("subquery predicate",    &ab_ab, "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a IN (SELECT a FROM t2)"),
-            ("LIMIT in the branch",   &ab,    "SELECT * FROM (SELECT a, b FROM t1 LIMIT 10) sub WHERE sub.a = 'x'"),
+        let kept = vec![
+            ("literal output column", ab(),    "SELECT * FROM (SELECT a, 42 AS val FROM t1) sub WHERE sub.val = 99"),
+            ("GROUP BY",              ab(),    "SELECT * FROM (SELECT a, count(b) AS cnt FROM t1 GROUP BY a) sub WHERE sub.a = 'x'"),
+            ("window function",       ab(),    "SELECT * FROM (SELECT a, row_number() OVER (ORDER BY b) AS rn FROM t1) sub WHERE sub.a = 'x'"),
+            ("no derived table",      ab(),    "SELECT a, b FROM t1 WHERE a = 'x'"),
+            ("subquery predicate",    ab_ab(), "SELECT * FROM (SELECT a, b FROM t1) sub WHERE sub.a IN (SELECT a FROM t2)"),
+            ("LIMIT in the branch",   ab(),    "SELECT * FROM (SELECT a, b FROM t1 LIMIT 10) sub WHERE sub.a = 'x'"),
         ];
-        for (label, catalog, sql) in kept {
+        (pushed, kept)
+    }
+
+    /// `pushdown` (a rewrite as its rendered SQL, or `None`) over the
+    /// render cases.
+    fn render_cases_check(pushdown: impl Fn(&ResolvedQuery) -> Option<String>) {
+        let (pushed, kept) = render_cases();
+        for (label, catalog, sql, expected) in &pushed {
+            let result = pushdown(&bound(sql, catalog))
+                .unwrap_or_else(|| panic!("{label}: expected a pushdown of {sql}"));
+            assert_eq!(result, *expected, "{label}");
+        }
+        for (label, catalog, sql) in &kept {
             assert!(
-                query_predicate_pushdown(&bound(sql, catalog)).is_none(),
+                pushdown(&bound(sql, catalog)).is_none(),
                 "{label}: {sql} keeps its WHERE"
             );
         }
+    }
+
+    #[test]
+    fn test_pushdown_render_cases() {
+        render_cases_check(|bound| query_predicate_pushdown(bound).map(|pushed| pushed.sql()));
     }
 }

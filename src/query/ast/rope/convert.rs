@@ -3,7 +3,7 @@
 
 use ecow::EcoString;
 
-use super::build::{OriginMap, TreeBuilder};
+use super::build::{Remap, TreeBuilder};
 use super::node::{FrameBoundKind, JoinQualKind, NodeKind};
 use super::tree::QueryTree;
 use crate::query::ast::{
@@ -29,10 +29,10 @@ impl QueryTree {
 
     /// The tree with where each id-bearing owned node landed, for oracles
     /// that compare side tables across the two id spaces.
-    pub fn from_query_expr_with_origins(query: &QueryExpr) -> (QueryTree, OriginMap) {
-        let mut builder = TreeBuilder::new().recording_origins();
+    pub fn from_query_expr_with_origins(query: &QueryExpr) -> (QueryTree, Remap) {
+        let mut builder = TreeBuilder::new();
         query_build(&mut builder, query);
-        let (tree, _, origins) = builder.finish_with_origins();
+        let (tree, origins) = builder.finish();
         (tree, origins)
     }
 }

@@ -4,12 +4,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 
-use super::build::{ChunkRemap, TreeBuilder};
+use super::build::{Remap, Replacement, Replacements, TreeBuilder};
 use super::node::{Node, NodeKind};
 use super::owned::query_expr_from_tree;
 use super::tree::QueryTree;
-use super::view::{Body, NodeRef, View};
-use crate::query::ast::{Deparse, LiteralValue, NodeId, QueryExpr, query_expr_parse};
+use super::view::{Body, View};
+use crate::query::ast::{Deparse, LiteralValue, NodeId, NodeRemap, QueryExpr, query_expr_parse};
 
 /// One query per node kind and child layout the converter produces.
 const CORPUS: &[&str] = &[
@@ -77,32 +77,18 @@ fn lens(tree: &QueryTree) -> Vec<u32> {
     tree.nodes().map(|node| node.len).collect()
 }
 
-/// Rebuild `node` into `builder`, replacing the literal at each target
-/// position: ancestors of a target are rebuilt, everything else is kept.
-fn rebuild(builder: &mut TreeBuilder<'_>, node: NodeRef<'_>, targets: &[(u32, LiteralValue)]) {
-    let id = u32::try_from(node.id().index()).unwrap();
-    if let Some((_, value)) = targets.iter().find(|(target, _)| *target == id) {
-        builder.leaf(NodeKind::Literal(value.clone()));
-        return;
-    }
-    let end = node.end();
-    if !targets
-        .iter()
-        .any(|(target, _)| id < *target && *target < end)
-    {
-        builder.keep(node.id());
-        return;
-    }
-    let open = builder.open(node.kind().clone());
-    for child in node.children() {
-        rebuild(builder, child, targets);
-    }
-    builder.close(open);
-}
-
-fn rewrite(base: &QueryTree, targets: &[(u32, LiteralValue)]) -> (QueryTree, ChunkRemap) {
+/// `base` with the literal at each target position replaced: a copy of the
+/// root with those positions as fresh leaves bound to nothing.
+fn rewrite(base: &QueryTree, targets: &[(u32, LiteralValue)]) -> (QueryTree, Remap) {
     let mut builder = TreeBuilder::over(base);
-    rebuild(&mut builder, base.root().node_ref(), targets);
+    let mut replacements = Replacements::new();
+    for (target, value) in targets {
+        replacements.push(
+            NodeId::from_index(*target),
+            Replacement::Leaf(NodeKind::Literal(value.clone())),
+        );
+    }
+    builder.copy(base.root().node_ref(), &mut replacements);
     builder.finish()
 }
 
@@ -205,7 +191,16 @@ fn test_same_shape_rewrite_shares_every_other_node() {
         remap.new_id(NodeId::from_index(6)).map(NodeId::index),
         Some(6)
     );
-    assert!(remap.new_id(NodeId::from_index(0)).is_none());
+    // Re-emitted ancestors stand in for themselves; a `Leaf` replacement
+    // stands in for nothing.
+    for ancestor in [0, 1, 5] {
+        assert_eq!(
+            remap
+                .new_id(NodeId::from_index(ancestor))
+                .map(NodeId::index),
+            Some(ancestor as usize)
+        );
+    }
     assert!(remap.new_id(NodeId::from_index(7)).is_none());
     assert_eq!(rewritten.compacted(), rewritten);
     assert_eq!(
