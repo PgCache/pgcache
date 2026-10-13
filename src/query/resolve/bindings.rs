@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ecow::EcoString;
 
 use super::ResolveResult;
-use super::rope::query_tree_resolve;
+use super::entry::query_tree_resolve;
 use crate::catalog::Catalog;
 use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::query::ast::NodeId;

@@ -1,21 +1,19 @@
-//! Bind a FROM entry of the rope: catalog lookup for a table reference,
-//! and the walk over tables, joins and derived tables.
+//! Bind a FROM entry: catalog lookup for a table reference, and the walk
+//! over tables, joins and derived tables.
 
 use std::sync::Arc;
 
 use ecow::EcoString;
 use rootcause::Report;
 
+use super::bindings::TableSlot;
+use super::entry::query_resolve_scoped;
 use super::expr::where_resolve;
-use super::query_resolve_scoped;
+use super::join_using::{JoinScopeRanges, join_natural_common_columns, join_using_or_cross};
+use super::scope::ResolutionScope;
+use super::{ResolveError, ResolveResult};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::query::ast::rope::{CteRef, Join, JoinQual, Source, Subquery, Table};
-use crate::query::resolve::bindings::TableSlot;
-use crate::query::resolve::join_using::{
-    JoinScopeRanges, join_natural_common_columns, join_using_or_cross,
-};
-use crate::query::resolve::scope::ResolutionScope;
-use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// Bind a table source (table, join, or subquery) into the scope.
 pub(super) fn source_resolve<'a>(

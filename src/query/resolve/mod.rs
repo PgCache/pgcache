@@ -2,10 +2,12 @@
 //! to concrete metadata, as a side table keyed by node id (ADR-057).
 //!
 //! * [`scope`] — what is visible at each point in the resolution.
+//! * [`table`] — FROM entries: catalog lookup, joins, derived tables.
 //! * [`column`] — column references, including correlated outer refs.
+//! * [`expr`] — WHERE predicates, scalar expressions, window specs.
+//! * [`clauses`] — target list, ORDER BY / GROUP BY / HAVING.
 //! * [`join_using`] — the `USING`/`NATURAL` merged-column cluster.
-//! * [`rope`] — the walk over the tree's views: FROM entries, predicates,
-//!   scalar expressions, the target list and the ordering clauses.
+//! * [`entry`] — the public entry point and the scoped subquery variant.
 
 use ecow::EcoString;
 use error_set::error_set;
@@ -14,12 +16,15 @@ use rootcause::Report;
 mod analysis;
 mod bindings;
 mod branch;
+mod clauses;
 mod column;
+mod entry;
 mod enum_gate;
+mod expr;
 mod join_using;
 mod render;
-mod rope;
 mod scope;
+mod table;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -70,5 +75,5 @@ pub use bindings::{
     StarItem, TableSlot,
 };
 pub use branch::QueryBranch;
+pub use entry::query_tree_resolve;
 pub use render::SourceOverride;
-pub use rope::query_tree_resolve;

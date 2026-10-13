@@ -1,16 +1,16 @@
-//! Bind rope expressions: WHERE predicates, scalar expressions, and the
-//! window specifications that hang off a window function call.
+//! Bind expressions: WHERE predicates, scalar expressions, and the window
+//! specifications that hang off a window function call.
 
 use ecow::EcoString;
 
+use super::ResolveResult;
+use super::bindings::{ColumnBinding, ColumnTarget};
 use super::clauses::order_by_resolve;
+use super::column::{ColumnLookup, column_resolve};
+use super::scope::ResolutionScope;
 use crate::query::ast::rope::{
     Column, Frame, FrameBound, Scalar, ScalarKind, Where, WhereKind, Window,
 };
-use crate::query::resolve::ResolveResult;
-use crate::query::resolve::bindings::{ColumnBinding, ColumnTarget};
-use crate::query::resolve::column::{ColumnLookup, column_resolve};
-use crate::query::resolve::scope::ResolutionScope;
 
 /// What a SELECT-list expression contributes to its output column: the name
 /// a bare column reference gives it, and the catalog column it carries

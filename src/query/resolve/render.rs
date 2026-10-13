@@ -35,7 +35,7 @@ const BOUND_FINGERPRINT_DOMAIN: u8 = 4;
 
 /// `tree` rendered as the cache serves it under `bindings`.
 pub(crate) fn query_tree_sql_into(tree: &QueryTree, bindings: &Bindings, buf: &mut String) {
-    query_deparse_with(tree.root(), &mut RopeBound(Bound::text(bindings)), buf);
+    query_deparse_with(tree.root(), &mut Bound::text(bindings), buf);
 }
 
 /// How literals render.
@@ -351,14 +351,10 @@ impl Bound<'_> {
     }
 }
 
-/// The context that renders a bound rope: the same decisions as [`Bound`],
-/// read through views and the rope-keyed bindings.
-struct RopeBound<'a>(Bound<'a>);
-
-impl DeparseContext for RopeBound<'_> {
+impl DeparseContext for Bound<'_> {
     fn table_deparse(&mut self, table: Table<'_>, buf: &mut String) {
-        self.0.table_render(
-            self.0.bindings.source(table.id()),
+        self.table_render(
+            self.bindings.source(table.id()),
             |buf| table_alias_deparse(table, buf),
             |buf| table_plain_deparse(table, buf),
             buf,
@@ -366,8 +362,8 @@ impl DeparseContext for RopeBound<'_> {
     }
 
     fn column_deparse(&mut self, column: Column<'_>, buf: &mut String) {
-        self.0.column_render(
-            self.0.bindings.column_by_id(column.id()),
+        self.column_render(
+            self.bindings.column_by_id(column.id()),
             column.column(),
             |buf| column_plain_deparse(column, buf),
             buf,
@@ -375,8 +371,8 @@ impl DeparseContext for RopeBound<'_> {
     }
 
     fn star_deparse(&mut self, star: Star<'_>, buf: &mut String) {
-        self.0.star_render(
-            self.0.bindings.star_by_id(star.id()),
+        self.star_render(
+            self.bindings.star_by_id(star.id()),
             |buf| star_plain_deparse(star, buf),
             buf,
         );
@@ -407,8 +403,7 @@ impl DeparseContext for RopeBound<'_> {
     fn natural_join_columns(&mut self, join: Join<'_>) -> Option<Vec<EcoString>> {
         let join = join.id();
         Some(
-            self.0
-                .bindings
+            self.bindings
                 .merged_columns()
                 .iter()
                 .filter(|merged| merged.join.index() == join.index())
@@ -422,15 +417,15 @@ impl DeparseContext for RopeBound<'_> {
     }
 
     fn literal_deparse(&mut self, literal: &LiteralValue, buf: &mut String) {
-        self.0.literal_render(literal, buf);
+        self.literal_render(literal, buf);
     }
 
     fn clause_enter(&mut self, clause: Clause) {
-        self.0.clause_entered(clause);
+        self.clause_entered(clause);
     }
 
     fn clause_leave(&mut self, clause: Clause) {
-        self.0.clause_left(clause);
+        self.clause_left(clause);
     }
 }
 
@@ -467,7 +462,7 @@ impl ResolvedQuery {
     /// The context that renders this query's nodes as the cache serves
     /// them, for a caller composing its own SQL around parts of the tree.
     pub fn deparse_context(&self) -> impl DeparseContext + '_ {
-        RopeBound(Bound::text(self.bindings()))
+        Bound::text(self.bindings())
     }
 
     /// [`ResolvedQuery::deparse_context`] with `source` standing in for one
@@ -476,12 +471,12 @@ impl ResolvedQuery {
         &'a self,
         source: &'a SourceOverride<'a>,
     ) -> impl DeparseContext + 'a {
-        RopeBound(Bound::with_source(self.bindings(), source))
+        Bound::with_source(self.bindings(), source)
     }
 
     /// The serve SQL with `source` standing in for one FROM entry.
     pub fn sql_with_source_into(&self, source: &SourceOverride<'_>, buf: &mut String) {
-        let mut cx = RopeBound(Bound::with_source(self.bindings(), source));
+        let mut cx = Bound::with_source(self.bindings(), source);
         query_deparse_with(self.tree().root(), &mut cx, buf);
     }
 
@@ -510,7 +505,7 @@ impl ResolvedQuery {
     /// not split one.
     pub fn fingerprint(&self) -> Fingerprint {
         let mut buf = String::with_capacity(256);
-        let mut cx = RopeBound(Bound::text(self.bindings()));
+        let mut cx = Bound::text(self.bindings());
         query_unlimited_deparse_with(self.tree().root(), &mut cx, &mut buf);
         let mut hasher = DefaultHasher::new();
         hasher.write_u8(BOUND_FINGERPRINT_DOMAIN);
@@ -522,10 +517,10 @@ impl ResolvedQuery {
     /// predicate literals as `$1..$k`, keyed by a hash of that text, and
     /// the literals to bind.
     pub fn shape(&self) -> QueryShape {
-        let mut cx = RopeBound(Bound::shape(self.bindings()));
+        let mut cx = Bound::shape(self.bindings());
         let mut sql = String::with_capacity(256);
         query_deparse_with(self.tree().root(), &mut cx, &mut sql);
-        let literals = cx.0.literals_take();
+        let literals = cx.literals_take();
         let mut hasher = DefaultHasher::new();
         sql.hash(&mut hasher);
         QueryShape {
@@ -568,11 +563,7 @@ impl ResolvedQuery {
                 .position(|output| output.name.as_ref() == Some(column.column()))
         } else {
             let mut text = String::new();
-            scalar_deparse_with(
-                expr,
-                &mut RopeBound(Bound::text(self.bindings())),
-                &mut text,
-            );
+            scalar_deparse_with(expr, &mut Bound::text(self.bindings()), &mut text);
             outputs.iter().position(|output| output.text == text)
         };
         found.map(|index| index + 1)
@@ -589,11 +580,7 @@ impl ResolvedQuery {
             match item {
                 SelectItem::Expr(expr) => {
                     let mut text = String::new();
-                    scalar_deparse_with(
-                        expr.expr(),
-                        &mut RopeBound(Bound::text(bindings)),
-                        &mut text,
-                    );
+                    scalar_deparse_with(expr.expr(), &mut Bound::text(bindings), &mut text);
                     let name = expr
                         .alias()
                         .cloned()
@@ -612,7 +599,7 @@ impl ResolvedQuery {
 
     /// An ORDER BY item rendered as the cache serves it.
     pub fn order_by_into(&self, clause: OrderBy<'_>, buf: &mut String) {
-        order_by_deparse_with(clause, &mut RopeBound(Bound::text(self.bindings())), buf);
+        order_by_deparse_with(clause, &mut Bound::text(self.bindings()), buf);
     }
 }
 
@@ -925,7 +912,7 @@ mod tests {
             let mut text = String::new();
             query_unlimited_deparse_with(
                 bound.tree().root(),
-                &mut RopeBound(Bound::text(bound.bindings())),
+                &mut Bound::text(bound.bindings()),
                 &mut text,
             );
             text

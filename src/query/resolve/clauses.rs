@@ -1,13 +1,13 @@
-//! Bind the clauses hanging off a rope SELECT: the select list (including
-//! `*` expansion), ORDER BY and GROUP BY.
+//! Bind the clauses hanging off a SELECT: the select list (including `*`
+//! expansion), ORDER BY and GROUP BY.
 
+use super::ResolveResult;
+use super::bindings::{BindingsBuilder, ColumnBinding, ColumnTarget, StarItem};
+use super::column::column_resolve;
 use super::expr::scalar_resolve;
+use super::scope::{OutputColumn, ResolutionScope, ScopeEntry};
 use crate::query::ast::NodeId;
 use crate::query::ast::rope::{Column, OrderBy, Run, Scalar, ScalarKind, Select, SelectItem};
-use crate::query::resolve::ResolveResult;
-use crate::query::resolve::bindings::{BindingsBuilder, ColumnBinding, ColumnTarget, StarItem};
-use crate::query::resolve::column::column_resolve;
-use crate::query::resolve::scope::{OutputColumn, ResolutionScope, ScopeEntry};
 
 /// Bind the select list, returning its output columns. A star (`*` or
 /// `t1.*`) stands for all columns of the matching tables in scope.

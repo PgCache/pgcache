@@ -9,8 +9,8 @@ use postgres_types::Type;
 use rootcause::Report;
 
 use super::bindings::{BindingsBuilder, ColumnBinding, SlotId, TableSlot};
+use super::entry::query_resolve_scoped;
 use super::join_using::MergedJoinColumn;
-use super::rope::query_resolve_scoped;
 use crate::catalog::{
     Catalog, CatalogTable, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata,
 };

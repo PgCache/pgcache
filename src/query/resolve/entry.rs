@@ -1,21 +1,16 @@
-//! The resolver: the binding rules, read through views over the tree. The
-//! scope, column lookup and USING cluster live beside it in `resolve`.
+//! The entry point: bind a query against the catalog, and the scoped
+//! variant used for subquery bodies.
 
-mod clauses;
-mod expr;
-mod table;
-#[cfg(test)]
-mod tests;
-
-use clauses::{group_by_resolve, order_by_as_outputs, order_by_resolve, select_items_resolve};
-use expr::where_resolve;
-use table::source_resolve;
-
+use super::ResolveResult;
 use super::bindings::{Bindings, BindingsBuilder};
+use super::clauses::{
+    group_by_resolve, order_by_as_outputs, order_by_resolve, select_items_resolve,
+};
+use super::expr::where_resolve;
 use super::scope::{OuterTable, OutputColumn, ResolutionScope};
+use super::table::source_resolve;
 use crate::catalog::Catalog;
 use crate::query::ast::rope::{Body, Query, QueryTree, Select};
-use crate::query::resolve::ResolveResult;
 
 /// Bind every table and column reference of `tree` to the catalog
 /// (ADR-057).
