@@ -1,7 +1,11 @@
 use std::borrow::Cow;
 use std::sync::atomic::Ordering;
+#[cfg(feature = "fault-injection")]
+use std::time::Duration;
 
 use ecow::EcoString;
+#[cfg(feature = "fault-injection")]
+use tokio::time::sleep;
 use tracing::{error, info};
 
 use super::segment_eval::{BatchEvalView, SegmentMembership};
@@ -375,6 +379,7 @@ impl WriterCdc {
         // Buffered writes go to `frame_buf`; the COMMIT is in `frame_finalize`,
         // which the bracket spans.
         self.frame_rows_replay(core).await?;
+        fault_memo_bracket_delay(core).await;
 
         let memo_active = memo_bracket_begin(core);
         // Always publish the post-commit version (end the seqlock) before
@@ -519,9 +524,10 @@ fn frame_keys_stamp(core: &mut WriterCore, lsn: Lsn) {
 /// (even→odd) over every relation the batched frames touched, so any memo
 /// over them is invalidated atomically with the batch becoming visible —
 /// the relation-granularity twin of the per-query MV dirty hooks in
-/// `frame_finalize`. Rung 3b bumps `Memo(F)` only for the predicate-matched
-/// eviction set (`frame_memo_evictions`); the `Relation` slot is still bumped
-/// for every touched relation as the capture-window guard.
+/// `frame_finalize`. Rung 3b bumps `Memo(F)` only for the predicate-matched,
+/// memo-eligible eviction set (`frame_memo_evictions`), whether or not F has an
+/// entry yet; the `Relation` slot is still bumped for every touched relation as
+/// the capture-window guard.
 ///
 /// Gated on `bracket_wanted`: while memoization is enabled a capture may be
 /// in flight against the current versions even when no entry exists yet, and
@@ -541,6 +547,27 @@ fn memo_bracket_begin(core: &WriterCore) -> bool {
     }
     memo_active
 }
+
+/// Test-only hold between replay and the memo bracket
+/// (`PGCACHE_FAULT_MEMO_BRACKET_DELAY_MS`): leaves a batch replayed but
+/// uncommitted so a test can complete a capture in the gap (PGC-350). Fires
+/// only on flushes that bracket memo slots, so setup run with memoization off
+/// is not slowed.
+#[cfg(feature = "fault-injection")]
+async fn fault_memo_bracket_delay(core: &WriterCore) {
+    if !core.state_view.memo.bracket_wanted() || core.frame_relation_oids.is_empty() {
+        return;
+    }
+    if let Some(ms) = std::env::var("PGCACHE_FAULT_MEMO_BRACKET_DELAY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+    {
+        sleep(Duration::from_millis(ms)).await;
+    }
+}
+#[cfg(not(feature = "fault-injection"))]
+async fn fault_memo_bracket_delay(_core: &WriterCore) {}
 
 /// Close the bracket opened by [`memo_bracket_begin`] (odd→even).
 fn memo_bracket_end(core: &WriterCore, memo_active: bool) {

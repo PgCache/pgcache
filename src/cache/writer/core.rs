@@ -20,7 +20,7 @@ use crate::cache::reference_settings;
 use crate::cache::{
     CacheError, CacheResult, MapIntoReport, ReportExt,
     messages::{QueryCommand, WriterNotify},
-    mv::MvMeta,
+    mv::{MvMeta, MvState},
     mv_shape::ShapeGate,
     types::{
         ActiveRelations, Cache, CacheStateView, CachedQueryState, CachedQueryView,
@@ -183,11 +183,17 @@ pub(super) struct WriterCore {
     /// frame's handlers, applied just before `frame_commit` (so invalidation
     /// is atomic with the maintenance it accompanies, not visible mid-frame).
     pub(super) frame_invalidations: FingerprintSet,
-    /// Memoized fingerprints whose in-process snapshot the in-progress frame's
-    /// row changes affect (rung 3b). Bumped via `SlotKey::Memo` at the frame
-    /// flush so eviction is predicate-matched, not relation-coarse: a change
-    /// that doesn't touch a memo's predicate/membership leaves it intact.
+    /// Memo-eligible fingerprints whose in-process snapshot the in-progress
+    /// frame's row changes affect (rung 3b). Bumped via `SlotKey::Memo` at the
+    /// frame flush so eviction is predicate-matched, not relation-coarse: a
+    /// change that doesn't touch a memo's predicate/membership leaves it intact.
+    /// Collected whether or not an entry exists yet: a capture can store one
+    /// after its row was replayed but before the commit (PGC-350).
     pub(super) frame_memo_evictions: FingerprintSet,
+    /// Fingerprints whose `MvState` is memo-eligible — the filter the CDC rows
+    /// apply to their candidates before `frame_memo_evictions`. Writer-owned,
+    /// kept in step with every eligible state write and with query removal.
+    pub(super) memo_eligible: FingerprintSet,
     /// Relation OIDs touched by the in-progress frame, accumulated from frame
     /// start so a mid-frame `40P01` can invalidate+truncate every affected
     /// relation (commands applied before the deadlock were rolled back too).
@@ -472,6 +478,7 @@ impl WriterCore {
             frame_state: FrameState::Idle,
             frame_invalidations: HashSet::default(),
             frame_memo_evictions: HashSet::default(),
+            memo_eligible: HashSet::default(),
             candidate_scratch: Vec::new(),
             schema_resolutions: HashMap::new(),
             alias_tick: 0,
@@ -580,13 +587,30 @@ impl WriterCore {
     /// to exist — it is inserted on the dispatch path before dispatching
     /// `QueryCommand::Register`.
     pub(super) fn mv_state_set(
-        &self,
+        &mut self,
         fingerprint: Fingerprint,
         shape_gate: ShapeGate,
         mv_limit: Option<u64>,
     ) {
+        let meta = MvMeta::new(shape_gate, mv_limit);
+        let state = meta.state();
         if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
-            view.mv = MvMeta::new(shape_gate, mv_limit);
+            view.mv = meta;
+        }
+        self.memo_eligibility_record(fingerprint, state);
+    }
+
+    /// Track a query's MV state for the CDC memo-eviction filter. A query that
+    /// turns eligible while a batch is open joins the batch's eviction set: rows
+    /// replayed earlier filtered it out, yet a capture can still land before
+    /// the commit.
+    pub(super) fn memo_eligibility_record(&mut self, fingerprint: Fingerprint, state: MvState) {
+        if !state.memo_eligible() {
+            return;
+        }
+        self.memo_eligible.insert(fingerprint);
+        if self.frame_state != FrameState::Idle {
+            self.frame_memo_evictions.insert(fingerprint);
         }
     }
 

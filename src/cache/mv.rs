@@ -70,6 +70,14 @@ impl MvState {
         }
     }
 
+    /// Whether a source-row serve of this query may be captured into the
+    /// in-process result memo. Both states are terminal, so a memo never
+    /// shadows an MV built later. The capture gate and the CDC memo-eviction
+    /// filter must agree on this, or a capture can land unseen by the frame.
+    pub fn memo_eligible(self) -> bool {
+        matches!(self, MvState::Skipped | MvState::Ineligible)
+    }
+
     /// State after a relevant CDC change (insert/update/delete that could
     /// affect the query's result), or `None` when the change has no effect.
     /// `Fresh` loses its table-is-current claim; an in-flight build is marked
@@ -423,6 +431,19 @@ mod tests {
         assert!(MvState::Building { has_table: true }.has_table());
         assert!(MvState::BuildingDirty { has_table: true }.has_table());
         assert!(MvState::Fresh.has_table());
+    }
+
+    #[test]
+    fn test_memo_eligible_only_for_terminal_no_mv_states() {
+        assert!(MvState::Skipped.memo_eligible());
+        assert!(MvState::Ineligible.memo_eligible());
+        for has_table in [false, true] {
+            assert!(!MvState::Pending { has_table }.memo_eligible());
+            assert!(!MvState::Scheduled { has_table }.memo_eligible());
+            assert!(!MvState::Building { has_table }.memo_eligible());
+            assert!(!MvState::BuildingDirty { has_table }.memo_eligible());
+        }
+        assert!(!MvState::Fresh.memo_eligible());
     }
 
     #[test]

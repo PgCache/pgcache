@@ -57,7 +57,7 @@ pub(super) fn eval_candidates_into(
     }
 }
 
-/// Accumulate the memoized fingerprints this CDC row change affects into
+/// Accumulate the memo-eligible fingerprints this CDC row change affects into
 /// `frame_memo_evictions` (rung 3b); the frame flush bumps `SlotKey::Memo(F)`
 /// for the set, so eviction is predicate-matched rather than relation-coarse.
 ///
@@ -66,26 +66,32 @@ pub(super) fn eval_candidates_into(
 /// INSERT just the new row — see the dispatch). A memo's result changes only if
 /// the row matched the query now or before, which makes the query satisfy its
 /// extracted constraints → it is in that union (the never-under-return guarantee
-/// of ADR-037 holds in both directions). So membership alone is complete — no
-/// per-memo predicate eval, and no PgEval special case (a non-candidate provably
-/// can't be in the result). Over-eviction (a candidate whose result didn't
-/// actually change) is harmless. Orphan memos (query no longer registered) are
-/// invalidated eagerly at eviction (`cache_query_evict`), not here.
+/// of ADR-037 holds in both directions). So the candidate set alone is complete —
+/// no per-memo predicate eval, and no PgEval special case (a non-candidate
+/// provably can't be in the result). Over-eviction (a candidate whose result
+/// didn't actually change) is harmless. Orphan memos (query no longer
+/// registered) are invalidated eagerly at eviction (`cache_query_evict`), not
+/// here.
+///
+/// Filtered by eligibility, not by whether an entry exists now: a capture can
+/// store F's first entry after this row is replayed and before the frame
+/// commits, and only a bump of `Memo(F)` reaches it (PGC-350).
 pub(super) fn memo_frame_accumulate(
     core: &mut WriterCore,
-    relation_oid: Oid,
     memo_candidates: impl IntoIterator<Item = Fingerprint>,
 ) {
-    if core.state_view.memo.is_empty() {
+    // Not gated on memoization being enabled: a runtime enable mid-batch lets
+    // a capture land after rows replayed while it was off.
+    if core.memo_eligible.is_empty() {
         return;
     }
     // Takes an iterator so callers can chain the new- and old-image candidate
     // sets without materializing their union (PGC-340). `frame_memo_evictions`
     // is a set, so a fingerprint present in both images inserts idempotently.
-    core.state_view.memo.candidates_memoized_into(
-        relation_oid,
-        memo_candidates,
-        &mut core.frame_memo_evictions,
+    core.frame_memo_evictions.extend(
+        memo_candidates
+            .into_iter()
+            .filter(|fingerprint| core.memo_eligible.contains(fingerprint)),
     );
 }
 

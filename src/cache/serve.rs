@@ -10,7 +10,7 @@ use tracing::{debug, instrument, trace, warn};
 use super::{
     CacheError, CacheResult,
     memo::{MEMO_CAPTURE_MIN_HITS, MemoCapture, MemoKey, MemoShape},
-    mv::{MvServe, MvState, mv_serve_sql_into},
+    mv::{MvServe, mv_serve_sql_into},
     query_cache::{QueryType, ServeRequest},
     types::CacheStateView,
     write_queue::WriteQueue,
@@ -72,7 +72,7 @@ fn memo_capture_begin(
     let mv_ineligible = state_view
         .cached_queries
         .get(&msg.fingerprint)
-        .is_some_and(|v| matches!(v.mv.state(), MvState::Skipped | MvState::Ineligible));
+        .is_some_and(|v| v.mv.state().memo_eligible());
     if !mv_ineligible {
         return None;
     }

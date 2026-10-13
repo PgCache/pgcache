@@ -182,7 +182,7 @@ impl WriterCore {
     /// Apply a build outcome to the incarnation that started it (state is
     /// `Building` or `BuildingDirty`).
     async fn mv_build_outcome_apply(
-        &self,
+        &mut self,
         fingerprint: Fingerprint,
         state: MvState,
         outcome: MvBuildOutcome,
@@ -520,9 +520,12 @@ impl WriterCore {
     /// The single choke point for writing an MV's state: `MvMeta.state` is
     /// writer-module-private, so every writer transition routes here. No-op when
     /// the entry is gone (evicted during a build).
-    pub(super) fn mv_state_write(&self, fingerprint: Fingerprint, new_state: MvState) {
-        if let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) {
-            view.mv.state_set(new_state);
-        }
+    pub(super) fn mv_state_write(&mut self, fingerprint: Fingerprint, new_state: MvState) {
+        let Some(mut view) = self.state_view.cached_queries.get_mut(&fingerprint) else {
+            return;
+        };
+        view.mv.state_set(new_state);
+        drop(view);
+        self.memo_eligibility_record(fingerprint, new_state);
     }
 }

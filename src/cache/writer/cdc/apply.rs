@@ -364,7 +364,7 @@ impl WriterCdc {
 
         // Rung 3b: evict memos this insert grows into. An INSERT only adds the
         // row, so the new-row candidates are the full memo-eviction set (ADR-045).
-        memo_frame_accumulate(core, relation_oid, local_candidates.iter().copied());
+        memo_frame_accumulate(core, local_candidates.iter().copied());
         core.candidate_set_return(local_candidates);
 
         // The inserted row is alive at origin: cancel any tracked deletion of
@@ -439,7 +439,6 @@ impl WriterCdc {
         // Symmetric new ∪ old candidates, chained to avoid allocating the union.
         memo_frame_accumulate(
             core,
-            relation_oid,
             local_candidates
                 .iter()
                 .copied()
@@ -715,7 +714,7 @@ impl WriterCdc {
             .and_then(|view| view.old_image)
             .unwrap_or(row_data);
         eval_candidates_into(core, relation_oid, old_image, &mut del_candidates);
-        memo_frame_accumulate(core, relation_oid, del_candidates.iter().copied());
+        memo_frame_accumulate(core, del_candidates.iter().copied());
 
         // A deleted row leaves stale rows in any Fresh MV that materialized it;
         // CDC removals never went through the upsert path's dirty-mark, so the

@@ -539,6 +539,7 @@ impl WriterCore {
 
         // Remove from state view
         self.state_view.cached_queries.remove(&fingerprint);
+        self.memo_eligible.remove(&fingerprint);
 
         // Eagerly invalidate this query's captured memo by bumping its
         // per-fingerprint slot (ADR-045). The memo-eviction pass no longer scans

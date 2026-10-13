@@ -494,3 +494,68 @@ async fn test_memo_busted_by_deadlock_recovery() -> Result<(), Error> {
     );
     Ok(())
 }
+
+/// PGC-350: a capture that begins and finishes while a frame is replayed but
+/// not yet committed reads the pre-commit row. The frame chose its memo
+/// evictions while no entry for the query existed, so before the fix nothing
+/// ever invalidated the entry the capture stored. The fault hook holds the
+/// frame between replay and commit; memoization stays off until the query is
+/// warm so the gap's capture is the first entry. Gated on `fault-injection`.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_memo_capture_during_frame_replay_not_served_stale() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[
+        ("PGCACHE_MEMO_CACHE_SIZE", "0"),
+        ("PGCACHE_FAULT_MEMO_BRACKET_DELAY_MS", "2000"),
+    ])
+    .await?;
+    ctx.query(
+        "create table memo_replay (id integer primary key, val text)",
+        &[],
+    )
+    .await?;
+    ctx.query("insert into memo_replay values (1, 'old')", &[])
+        .await?;
+
+    let sql = "select val from memo_replay where id = 1";
+    let mut warm = false;
+    for _ in 0..80 {
+        ctx.simple_query(sql).await?;
+        if ctx.metrics().await?.queries_cache_hit >= 1 {
+            warm = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(warm, "query never served from the cache");
+
+    let (status, body) = http_put(
+        ctx.metrics_port,
+        "/config",
+        r#"{"memo_cache_size": 67108864}"#,
+    )
+    .await?;
+    assert_eq!(status, 200, "enable PUT failed: {body}");
+
+    // The writer replays this update, then holds before the bracket.
+    ctx.origin_query("update memo_replay set val = 'new' where id = 1", &[])
+        .await?;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("val", "old")])?;
+    let mut captured = false;
+    for _ in 0..40 {
+        if ctx.metrics().await?.cache_memo_captures >= 1 {
+            captured = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(captured, "the read in the gap was not captured");
+
+    ctx.cdc_apply_settle().await?;
+    let res = ctx.simple_query(sql).await?;
+    assert_row_at(&res, 1, &[("val", "new")])?;
+    Ok(())
+}

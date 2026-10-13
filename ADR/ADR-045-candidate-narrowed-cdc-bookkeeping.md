@@ -33,6 +33,8 @@ Replace the full-set scan in `update_queries_check_invalidate` and memo eviction
 - **UPDATE** — `candidates(new) ∪ candidates(old-image)`
 - **DELETE** — `candidates(old-image)` (PK-only under REPLICA IDENTITY DEFAULT → conservative via the `Unknown` wildcard, matching today's full eviction)
 
+The memo set is then filtered by **eligibility** (`MvState::memo_eligible`: `Skipped` or `Ineligible`), not by whether an entry exists, and the frame bumps `Memo(F)` for every survivor (PGC-350).
+
 backed by three small per-relation sets maintained on `UpdateQueries` alongside the existing indexes, used by the invalidation set:
 
 - `always_check` — fingerprints whose source is `Subquery` or `OuterJoinOptional` (they invalidate unconditionally).
@@ -52,6 +54,8 @@ The precise per-query check (`row_cached`/`row_uncached_invalidation_check`) and
 
 **Memo** must evict whenever the query's rows change in either direction. `candidates(new)` covers grow and in-place-now-matches; `candidates(old-image)` covers shrink (the row left) and in-place value changes (the row's PK still matches the query). Their union is *more precise* than today's "any predicate column changed" proxy (which over-evicts queries the row never belonged to) while remaining complete. The PgEval-memo conservative fallback (evict when the query isn't locally evaluable) is retained — the probe cannot reason about non-locally-evaluable predicates. Under REPLICA IDENTITY DEFAULT the old image is PK-only, so `candidates(old-image)` over-returns via the `Unknown` wildcard — exactly the conservative behaviour today's full DELETE eviction already has.
 
+Filtering by current memo membership is unsound. The per-row sample runs during replay, before the frame's seqlock bracket; a capture that begins and finishes in between reads pre-commit state, passes its `Relation` re-check, and stores an entry the sample never saw. Eligibility is fixed for the whole frame (terminal states, written only by the writer), so every capture that can land mid-frame is already in the set, and the `Memo(F)` slot it stamped is what the bump moves. The bracket itself stays around finalize only, so capture viability under write load is unchanged.
+
 The shared old-image probe is the same one MV already uses, so memo and MV converge on one narrowing for removed rows; invalidation keeps its own asymmetric set. Maintaining the carve-out sets as membership lists (not recomputed per row) keeps per-row cost O(candidates + carve-outs).
 
 ## Consequences
@@ -64,8 +68,10 @@ The shared old-image probe is the same one MV already uses, so memo and MV conve
 - Three more per-relation sets to maintain on query insert/remove, plus a second (old-image) probe per UPDATE for the memo pass.
 - The never-under-return guarantee is now load-bearing for **invalidation and memo**, not just optimization: any change to the probe forms, the carve-out rules, or the source/limit classification that drops a true candidate becomes a stale-read bug. The asymmetric (invalidation) vs symmetric (memo) split is itself part of the invariant — narrowing memo with the invalidation set would miss shrinks.
 - Conservative full-set fallbacks remain where the probe cannot reason precisely (PgEval memos; PK-only old images under REPLICA IDENTITY DEFAULT), so those do not benefit.
+- Frames bump `Memo(F)` for eligible candidates that have no entry, creating slot-map entries earlier than eviction would. The capture gate and the eviction filter must share `memo_eligible`, or a capturable query escapes the bump.
 
 ## Implementation Notes
 - Carve-out sets live on `UpdateQueries` (`src/cache/update_query.rs`), updated wherever queries are inserted/removed (mirroring `subsumption`/`eval_index`).
 - `update_queries_check_invalidate` takes the asymmetric invalidation set; `memo_frame_accumulate` takes the symmetric `candidates(new) ∪ candidates(old-image)` set (both in `src/cache/writer/cdc/invalidation.rs`). The old-image probe reuses the same `eval_index.candidates_point` call MV already makes in `mv_dirty_mark_removed_row`. The per-row dispatch (`src/cache/writer/cdc/dispatch.rs`) computes the sets once per row. MV dirty-marking is unchanged (already narrowed, PGC-292).
+- The eligible set is writer-owned (`WriterCore.memo_eligible`), recorded at `mv_state_set`/`mv_state_write` and removed with the query. A query that turns eligible while a batch is open also joins `frame_memo_evictions`, since rows replayed earlier filtered it out. Repro: `test_memo_capture_during_frame_replay_not_served_stale` (fault hook `PGCACHE_FAULT_MEMO_BRACKET_DELAY_MS`).
 - Tests cover each branch (see `tests/cdc_invalidation_narrowing_test.rs`): subquery unconditional invalidation, DELETE on a limit query, predicate-change-leaves-window, join-grow, and the single-table in-place skip. Add a memo-shrink case: populate a memo for a non-limit single-table query, shrink it via UPDATE/DELETE, and assert the re-served result is fresh (not the stale memo).
