@@ -523,14 +523,12 @@ fn frame_keys_stamp(core: &mut WriterCore, lsn: Lsn) {
 /// eviction set (`frame_memo_evictions`); the `Relation` slot is still bumped
 /// for every touched relation as the capture-window guard.
 ///
-/// Gated on the store being non-empty rather than on `enabled()`: when no
-/// memo exists there is nothing to bust, and (unlike an `enabled()` gate)
-/// this keeps the seqlock authoritative even while memoization is toggled
-/// off at runtime — a change landing during the disabled window still bumps
-/// the slot, so a later re-enable cannot serve a snapshot that predates it.
-/// Returns whether the relation slots were bracketed.
+/// Gated on `bracket_wanted`: while memoization is enabled a capture may be
+/// in flight against the current versions even when no entry exists yet, and
+/// entries captured before a runtime disable still need busting. Returns
+/// whether the relation slots were bracketed.
 fn memo_bracket_begin(core: &WriterCore) -> bool {
-    let memo_active = !core.state_view.memo.is_empty();
+    let memo_active = core.state_view.memo.bracket_wanted();
     if memo_active {
         for &oid in &core.frame_relation_oids {
             core.state_view

@@ -219,6 +219,16 @@ impl ResultMemo {
         self.budget() > 0
     }
 
+    /// Whether a frame must bracket the slots of the relations it touches.
+    /// An empty store is not "no reader": a capture can be in flight on a
+    /// worker, stamped against the current versions, and it stores its
+    /// snapshot at finish unless a slot moved. A capture begins only while
+    /// enabled, and one that outlives a disable is refused at insert, so the
+    /// bracket is needed exactly while enabled or while entries exist.
+    pub fn bracket_wanted(&self) -> bool {
+        self.enabled() || !self.is_empty()
+    }
+
     /// Enter the pending (odd) phase of a slot's seqlock: `version` even→odd.
     /// Writer/CDC path — call this *before* the frame COMMIT for every relation
     /// the frame touches. Existing memos over the slot stop being served at once.
@@ -671,6 +681,36 @@ mod tests {
     /// guard — stamped at `begin`, re-checked at `finish`, never stored in the
     /// entry — is what closes the race; per-fingerprint slots alone would store a
     /// snapshot predating the commit.
+    /// A frame that commits while the first capture is in flight has no
+    /// entry to look at, yet its bracket must still move the relation slot
+    /// or the capture stores a snapshot from before the commit.
+    #[test]
+    fn test_capture_over_an_empty_store_is_dropped_by_the_bracket() {
+        let m = memo(1 << 20);
+        let oid = Oid::from_raw(10);
+        assert!(m.is_empty());
+        assert!(
+            m.bracket_wanted(),
+            "an enabled memo may have a capture in flight"
+        );
+        let mut cap = MemoCapture::begin(&m, key(7), &[oid]).expect("capture begins");
+        cap.row_description_push(b"rd");
+        cap.command_complete_push(b"cc");
+        if m.bracket_wanted() {
+            m.slot_dirty_begin(SlotKey::Relation(oid));
+            m.slot_dirty_end(SlotKey::Relation(oid));
+        }
+        assert!(!cap.finish(&m), "the capture predates the commit");
+        assert!(m.is_empty());
+
+        let disabled = memo(0);
+        assert!(
+            !disabled.bracket_wanted(),
+            "nothing can capture while disabled"
+        );
+        assert!(MemoCapture::begin(&disabled, key(7), &[oid]).is_none());
+    }
+
     #[test]
     fn test_capture_dropped_when_read_relation_written_mid_window() {
         let m = memo(1 << 20);
