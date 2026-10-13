@@ -3,6 +3,8 @@
 
 use std::sync::Arc;
 
+use smallvec::SmallVec;
+
 use super::node::{Node, NodeKind};
 use super::tree::{Chunk, QueryTree, position};
 use super::view::NodeRef;
@@ -13,20 +15,26 @@ use crate::query::ast::NodeId;
 /// without copying the common case.
 const COMPACT_CHUNK_FLOOR: usize = 16;
 
+/// A small rewrite keeps a handful of subtrees, opens a few nodes with an
+/// origin and replaces a few positions: that bookkeeping lives inline, so
+/// only the fresh nodes themselves are heap-allocated.
+const INLINE_KEPT: usize = 8;
+const INLINE_REPLACEMENTS: usize = 4;
+
 /// Builds a tree front to back. `open`/`close` make a node whose children
 /// are whatever is built in between; `keep` places a subtree of the base
 /// tree as table entries over the base's slices.
 pub struct TreeBuilder<'b> {
     base: Option<&'b QueryTree>,
-    pending: Vec<Pending>,
+    pending: SmallVec<[Pending; INLINE_KEPT]>,
     /// Every node this builder makes, in position order.
     fresh: Vec<Node>,
     /// The next position.
     next: u32,
-    kept: Vec<Kept>,
+    kept: SmallVec<[Kept; INLINE_KEPT]>,
     /// `(origin, position)` per node opened with an origin: always over a
     /// base, whose bindings follow the origins; on request otherwise.
-    origins: Option<Vec<(NodeId, NodeId)>>,
+    origins: Option<SmallVec<[(NodeId, NodeId); INLINE_KEPT]>>,
     /// The open nodes, innermost last, each with the direct children emitted
     /// under it so far: `close` checks them against what the kind declares.
     #[cfg(debug_assertions)]
@@ -67,10 +75,10 @@ impl<'b> TreeBuilder<'b> {
     pub fn with_capacity(nodes: usize) -> Self {
         Self {
             base: None,
-            pending: Vec::new(),
+            pending: SmallVec::new(),
             fresh: Vec::with_capacity(nodes),
             next: 0,
-            kept: Vec::new(),
+            kept: SmallVec::new(),
             origins: None,
             #[cfg(debug_assertions)]
             open: Vec::new(),
@@ -88,7 +96,7 @@ impl<'b> TreeBuilder<'b> {
     /// Record where each node opened with an origin lands, for a tree whose
     /// side tables will be carried over by origin.
     pub fn recording_origins(mut self) -> Self {
-        self.origins = Some(Vec::new());
+        self.origins = Some(SmallVec::new());
         self
     }
 
@@ -97,7 +105,9 @@ impl<'b> TreeBuilder<'b> {
     pub fn over(base: &'b QueryTree) -> Self {
         Self {
             base: Some(base),
-            ..Self::new().recording_origins()
+            // A rewrite re-emits the ancestors of what it changes plus its
+            // own nodes: a few, so one small allocation covers the usual case.
+            ..Self::with_capacity(INLINE_KEPT * 2).recording_origins()
         }
     }
 
@@ -345,8 +355,8 @@ pub enum Replacement {
 pub struct Replacements {
     /// `(base position, index into `placed`, replacement)`; sorted by
     /// position once a copy begins.
-    entries: Vec<(u32, usize, Replacement)>,
-    placed: Vec<Option<NodeId>>,
+    entries: SmallVec<[(u32, usize, Replacement); INLINE_REPLACEMENTS]>,
+    placed: SmallVec<[Option<NodeId>; INLINE_REPLACEMENTS]>,
     sorted: bool,
 }
 
@@ -409,9 +419,9 @@ impl Replacements {
 /// origin. A position kept in several places has several new ids.
 #[derive(Debug, Default, Clone)]
 pub struct Remap {
-    kept: Vec<Kept>,
+    kept: SmallVec<[Kept; INLINE_KEPT]>,
     /// `(origin, position)` in origin order.
-    origins: Vec<(NodeId, NodeId)>,
+    origins: SmallVec<[(NodeId, NodeId); INLINE_KEPT]>,
 }
 
 impl Remap {
