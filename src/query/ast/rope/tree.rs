@@ -24,8 +24,6 @@ pub struct QueryTree {
 
 #[derive(Debug)]
 struct ChunkTable {
-    /// `chunks[i].start`, kept apart so a lookup scans a dense array.
-    starts: Box<[u32]>,
     chunks: Box<[Chunk]>,
 }
 
@@ -76,23 +74,21 @@ static OUTSIDE: Node = Node {
     kind: NodeKind::When,
 };
 
-/// The chunk covering `id` in a table with these starts; the first chunk
+/// The entry covering `id` among entries sorted by `start`; the first
 /// starts at 0, so every position in the tree has one.
-pub(super) fn chunk_index_in(starts: &[u32], id: u32) -> usize {
-    let covering = if starts.len() <= LINEAR_SCAN_MAX {
-        starts.iter().filter(|&&start| start <= id).count()
+pub(super) fn chunk_index_in<T>(entries: &[T], start: impl Fn(&T) -> u32, id: u32) -> usize {
+    let covering = if entries.len() <= LINEAR_SCAN_MAX {
+        entries.iter().filter(|entry| start(entry) <= id).count()
     } else {
-        starts.partition_point(|&start| start <= id)
+        entries.partition_point(|entry| start(entry) <= id)
     };
     covering.saturating_sub(1)
 }
 
 impl QueryTree {
     pub(super) fn from_chunks(chunks: Vec<Chunk>, len: u32) -> Self {
-        let starts = chunks.iter().map(|chunk| chunk.start).collect();
         Self {
             table: Arc::new(ChunkTable {
-                starts,
                 chunks: chunks.into_boxed_slice(),
             }),
             len,
@@ -117,7 +113,7 @@ impl QueryTree {
     }
 
     pub(super) fn chunk_index(&self, id: u32) -> usize {
-        chunk_index_in(&self.table.starts, id)
+        chunk_index_in(&self.table.chunks, |chunk| chunk.start, id)
     }
 
     /// The chunk covering `id`: `hint` when it still does, else a lookup.
@@ -237,18 +233,19 @@ mod tests {
 
     #[test]
     fn test_chunk_lookup_scans_short_tables_and_searches_long_ones() {
+        let at = |starts: &[u32], id: u32| chunk_index_in(starts, |start| *start, id);
         let short = [0, 2, 4, 5, 6];
-        assert_eq!(chunk_index_in(&short, 0), 0);
-        assert_eq!(chunk_index_in(&short, 1), 0);
-        assert_eq!(chunk_index_in(&short, 2), 1);
-        assert_eq!(chunk_index_in(&short, 5), 3);
-        assert_eq!(chunk_index_in(&short, 9), 4);
+        assert_eq!(at(&short, 0), 0);
+        assert_eq!(at(&short, 1), 0);
+        assert_eq!(at(&short, 2), 1);
+        assert_eq!(at(&short, 5), 3);
+        assert_eq!(at(&short, 9), 4);
         let long: Vec<u32> = (0..100).map(|i| i * 3).collect();
         assert!(long.len() > LINEAR_SCAN_MAX);
-        assert_eq!(chunk_index_in(&long, 0), 0);
-        assert_eq!(chunk_index_in(&long, 2), 0);
-        assert_eq!(chunk_index_in(&long, 3), 1);
-        assert_eq!(chunk_index_in(&long, 298), 99);
-        assert_eq!(chunk_index_in(&long, 1_000), 99);
+        assert_eq!(at(&long, 0), 0);
+        assert_eq!(at(&long, 2), 0);
+        assert_eq!(at(&long, 3), 1);
+        assert_eq!(at(&long, 298), 99);
+        assert_eq!(at(&long, 1_000), 99);
     }
 }
