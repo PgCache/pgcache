@@ -4,7 +4,6 @@ mod parameters;
 pub(crate) mod predicate_pushdown;
 mod substitute;
 mod values;
-mod walk;
 
 use ecow::EcoString;
 use error_set::error_set;
@@ -33,9 +32,7 @@ error_set! {
 /// Result type with location-tracking error reports for AST transform operations.
 pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
-pub use constant_fold::query_expr_constant_fold;
 pub use literal_canon::{LiteralCanonOutcome, query_literals_canonicalise};
-pub use parameters::query_expr_parameters_replace;
 #[cfg(feature = "proxy")]
 pub(crate) use parameters::{
     delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,

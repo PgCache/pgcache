@@ -11,7 +11,7 @@ use pg_query::pg_nodes as pg;
 use super::ParseContext;
 use super::scalar::{arithmetic_emit, arithmetic_op_from_str, operator_name_single, scalar_emit};
 use super::select::query_emit;
-use crate::query::ast::convert_raw::sublink_type_map;
+use super::sublink_type_map;
 use crate::query::ast::raw::{
     NodePtr, aexpr_kind_name, cast, cstr, list_is_empty, list_len, list_nodes, node_tag,
     string_node_value,

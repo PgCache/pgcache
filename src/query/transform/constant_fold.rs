@@ -1,14 +1,11 @@
-//! Constant folding for arithmetic on literal operands.
+//! Constant folding for arithmetic on literal operands: the fold a
+//! conversion and a bind-time substitution apply to an arithmetic node whose
+//! operands are both literals.
 //!
-//! Walks a `QueryExpr` and replaces `ScalarExpr::Arithmetic` nodes whose
-//! operands fold to a single `LiteralValue`. The pass is bottom-up: nested
-//! arithmetic is folded inside-out so the outer node sees freshly-folded
-//! literals at each step.
-//!
-//! Without this pass, the cache treats e.g. `WHERE user_id = 12345 % 10000 + 1`
+//! Without it, the cache treats e.g. `WHERE user_id = 12345 % 10000 + 1`
 //! and `WHERE user_id = 67890 % 10000 + 1` as distinct queries (different
-//! fingerprints embedding the literal arithmetic tree), even though both
-//! reduce to `WHERE user_id = N + 1`.
+//! trees embedding the literal arithmetic), even though both reduce to
+//! `WHERE user_id = N + 1`.
 //!
 //! Fold rules:
 //! - `Integer op Integer`: checked arithmetic; overflow → leave unfolded.
@@ -18,38 +15,9 @@
 //! - Any non-numeric operand (string, bool, null, parameter, array): not
 //!   folded.
 
-use std::convert::Infallible;
-
 use ordered_float::NotNan;
 
-use super::walk::{QueryWalkerMut, query_expr_walk_mut};
-use crate::query::ast::{ArithmeticOp, LiteralValue, QueryExpr, ScalarExpr};
-
-/// Fold pure-literal arithmetic subtrees in `expr` in place.
-pub fn query_expr_constant_fold(expr: &mut QueryExpr) {
-    let mut folder = ConstantFolder;
-    // ConstantFolder::Error is Infallible, so the walker cannot fail.
-    let Ok(()) = query_expr_walk_mut(expr, &mut folder);
-}
-
-struct ConstantFolder;
-
-impl QueryWalkerMut for ConstantFolder {
-    type Error = Infallible;
-
-    fn visit_scalar_post(&mut self, expr: &mut ScalarExpr) -> Result<(), Self::Error> {
-        let ScalarExpr::Arithmetic(arith) = expr else {
-            return Ok(());
-        };
-        let (ScalarExpr::Literal(l), ScalarExpr::Literal(r)) = (&*arith.left, &*arith.right) else {
-            return Ok(());
-        };
-        if let Some(folded) = literal_arithmetic_fold(l, arith.op, r) {
-            *expr = ScalarExpr::Literal(folded);
-        }
-        Ok(())
-    }
-}
+use crate::query::ast::{ArithmeticOp, LiteralValue};
 
 /// Evaluate `left op right` when both sides are foldable numeric literals.
 /// Returns `None` for non-numeric operands, overflow, divide/mod by zero,

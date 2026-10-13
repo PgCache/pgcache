@@ -11,15 +11,12 @@ use ecow::EcoString;
 use iddqd::BiHashMap;
 use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use pgcache_lib::oid::{Oid, TypeOid};
-use pgcache_lib::query::ast::{
-    AstNode, ColumnNode, JoinQual, LiteralValue, OrderByClause, QueryBody, QueryExpr, ScalarExpr,
-    SelectColumn, SelectColumns, SelectNode, TableSource, WhereExpr,
-};
+use pgcache_lib::query::ast::LiteralValue;
 use postgres_types::Type;
 
 mod tree;
 
-pub use tree::catalog_synthesize_tree;
+pub use tree::catalog_synthesize;
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct SynthesisStats {
@@ -39,15 +36,6 @@ pub struct SynthesisStats {
 pub struct SynthCatalog {
     pub tables: Catalog,
     pub stats: SynthesisStats,
-}
-
-pub fn catalog_synthesize<'a>(queries: impl IntoIterator<Item = &'a QueryExpr>) -> SynthCatalog {
-    let mut synthesizer = Synthesizer::default();
-    for query in queries {
-        let mut scopes = Vec::new();
-        synthesizer.query_walk(query, &mut scopes);
-    }
-    synthesizer.finish()
 }
 
 type TableKey = (EcoString, EcoString);
@@ -92,135 +80,6 @@ struct Synthesizer {
 }
 
 impl Synthesizer {
-    fn query_walk(&mut self, query: &QueryExpr, scopes: &mut Vec<Scope>) {
-        // CTE bodies are walked once at their definition; references in FROM
-        // are treated as derived sources.
-        for cte in &query.ctes {
-            let mut fresh = Vec::new();
-            self.query_walk(&cte.query, &mut fresh);
-        }
-        match &query.body {
-            QueryBody::Select(select) => self.select_walk(select, &query.order_by, scopes),
-            QueryBody::SetOp(set_op) => {
-                self.query_walk(&set_op.left, scopes);
-                self.query_walk(&set_op.right, scopes);
-            }
-            QueryBody::Values(_) => {}
-        }
-    }
-
-    fn select_walk(
-        &mut self,
-        select: &SelectNode,
-        order_by: &[OrderByClause],
-        scopes: &mut Vec<Scope>,
-    ) {
-        let mut scope = Scope::default();
-        let mut join_quals: Vec<&WhereExpr> = Vec::new();
-        for source in &select.from {
-            self.table_source_collect(source, &mut scope, scopes, &mut join_quals);
-        }
-        scopes.push(scope);
-
-        let output_aliases: HashSet<&EcoString> = match &select.columns {
-            SelectColumns::Columns(columns) => columns
-                .iter()
-                .filter_map(|c| match c {
-                    SelectColumn::Expr {
-                        alias: Some(alias), ..
-                    } => Some(alias),
-                    _ => None,
-                })
-                .collect(),
-            SelectColumns::None => HashSet::new(),
-        };
-
-        if let SelectColumns::Columns(columns) = &select.columns {
-            for column in columns {
-                if let SelectColumn::Expr { expr, .. } = column {
-                    self.expr_attribute(expr, scopes);
-                }
-            }
-        }
-        for qual in join_quals {
-            self.expr_attribute(qual, scopes);
-            self.where_infer(qual, scopes);
-        }
-        if let Some(where_clause) = &select.where_clause {
-            self.expr_attribute(where_clause, scopes);
-            self.where_infer(where_clause, scopes);
-        }
-        for column in &select.group_by {
-            if column.table.is_none() && output_aliases.contains(&column.column) {
-                continue;
-            }
-            self.column_attribute(column.table.as_ref(), &column.column, scopes);
-        }
-        if let Some(having) = &select.having {
-            self.expr_attribute(having, scopes);
-        }
-        for order in order_by {
-            match &order.expr {
-                // ORDER BY <output alias> and ORDER BY <position> reference
-                // the select list, not table columns.
-                ScalarExpr::Column(col)
-                    if col.table.is_none() && output_aliases.contains(&col.column) => {}
-                ScalarExpr::Literal(_) => {}
-                expr => self.expr_attribute(expr, scopes),
-            }
-        }
-
-        scopes.pop();
-    }
-
-    fn table_source_collect<'a>(
-        &mut self,
-        source: &'a TableSource,
-        scope: &mut Scope,
-        scopes: &mut Vec<Scope>,
-        join_quals: &mut Vec<&'a WhereExpr>,
-    ) {
-        match source {
-            TableSource::Table(table) => {
-                let key = self.table_key(table.schema.as_ref(), &table.name);
-                self.table_ensure(&key);
-                let alias = table
-                    .alias
-                    .as_ref()
-                    .map_or_else(|| table.name.clone(), |a| a.name.clone());
-                scope.entries.push(ScopeEntry {
-                    alias,
-                    key: Some(key),
-                });
-            }
-            TableSource::Subquery(subquery) => {
-                scope.has_derived = true;
-                if let Some(alias) = &subquery.alias {
-                    scope.entries.push(ScopeEntry {
-                        alias: alias.name.clone(),
-                        key: None,
-                    });
-                }
-                self.query_walk(&subquery.query, scopes);
-            }
-            TableSource::CteRef(cte_ref) => {
-                scope.has_derived = true;
-                let alias = cte_ref
-                    .alias
-                    .as_ref()
-                    .map_or_else(|| cte_ref.cte_name.clone(), |a| a.name.clone());
-                scope.entries.push(ScopeEntry { alias, key: None });
-            }
-            TableSource::Join(join) => {
-                self.table_source_collect(&join.left, scope, scopes, join_quals);
-                self.table_source_collect(&join.right, scope, scopes, join_quals);
-                if let JoinQual::On(qual) = &join.qual {
-                    join_quals.push(qual);
-                }
-            }
-        }
-    }
-
     fn table_key(&self, schema: Option<&EcoString>, name: &EcoString) -> TableKey {
         (
             schema.cloned().unwrap_or_else(|| EcoString::from("public")),
@@ -294,92 +153,6 @@ impl Synthesizer {
                 UnqualifiedResolution::Table { entry, .. } => entry.key.clone(),
                 UnqualifiedResolution::Derived | UnqualifiedResolution::NoScope => None,
             },
-        }
-    }
-
-    /// Attribute columns in an expression, descending into subqueries with
-    /// their own scopes. Direct columns are separated from subquery-internal
-    /// ones by identity: everything under a nested `QueryExpr` is attributed
-    /// by the recursive walk, not here.
-    fn expr_attribute<T: AstNode>(&mut self, expr: &T, scopes: &mut Vec<Scope>) {
-        let subqueries: Vec<&QueryExpr> = expr.nodes::<QueryExpr>().collect();
-        for subquery in subqueries
-            .iter()
-            .filter(|q| !subqueries.iter().any(|outer| query_contains(outer, q)))
-        {
-            self.query_walk(subquery, scopes);
-        }
-        let nested_columns: HashSet<*const ColumnNode> = subqueries
-            .iter()
-            .flat_map(|q| q.nodes::<ColumnNode>())
-            .map(std::ptr::from_ref)
-            .collect();
-        let direct: Vec<&ColumnNode> = expr
-            .nodes::<ColumnNode>()
-            .filter(|c| !nested_columns.contains(&std::ptr::from_ref(*c)))
-            .collect();
-        for column in direct {
-            self.column_attribute(column.table.as_ref(), &column.column, scopes);
-        }
-    }
-
-    /// Record literal-comparison type evidence from WHERE/JOIN predicates.
-    fn where_infer(&mut self, expr: &WhereExpr, scopes: &[Scope]) {
-        match expr {
-            WhereExpr::Binary(binary) => {
-                if binary.op.is_comparison() {
-                    let sides = [
-                        (
-                            where_as_column(&binary.lexpr),
-                            where_as_literal(&binary.rexpr),
-                        ),
-                        (
-                            where_as_column(&binary.rexpr),
-                            where_as_literal(&binary.lexpr),
-                        ),
-                    ];
-                    for (column, literal) in sides {
-                        if let (Some(column), Some(literal)) = (column, literal) {
-                            self.evidence_note(
-                                column.table.as_ref(),
-                                &column.column,
-                                literal,
-                                scopes,
-                            );
-                            return;
-                        }
-                    }
-                }
-                self.where_infer(&binary.lexpr, scopes);
-                self.where_infer(&binary.rexpr, scopes);
-            }
-            WhereExpr::Multi(multi) => {
-                // col IN (v1, v2, ...) / col BETWEEN a AND b shapes.
-                if let Some(WhereExpr::Scalar(ScalarExpr::Column(column))) = multi.exprs.first() {
-                    let literals: Vec<&LiteralValue> = multi
-                        .exprs
-                        .iter()
-                        .skip(1)
-                        .filter_map(where_as_literal)
-                        .collect();
-                    if !literals.is_empty() && literals.len() == multi.exprs.len() - 1 {
-                        for literal in literals {
-                            self.evidence_note(
-                                column.table.as_ref(),
-                                &column.column,
-                                literal,
-                                scopes,
-                            );
-                        }
-                        return;
-                    }
-                }
-                for inner in &multi.exprs {
-                    self.where_infer(inner, scopes);
-                }
-            }
-            WhereExpr::Unary(unary) => self.where_infer(&unary.expr, scopes),
-            WhereExpr::Scalar(_) | WhereExpr::Subquery { .. } => {}
         }
     }
 
@@ -534,24 +307,6 @@ fn scope_entry_find<'a>(scopes: &'a [Scope], qualifier: &EcoString) -> Option<&'
         .find_map(|scope| scope.entries.iter().find(|e| &e.alias == qualifier))
 }
 
-fn query_contains(outer: &QueryExpr, inner: &QueryExpr) -> bool {
-    !std::ptr::eq(outer, inner) && outer.nodes::<QueryExpr>().any(|q| std::ptr::eq(q, inner))
-}
-
-fn where_as_column(expr: &WhereExpr) -> Option<&ColumnNode> {
-    match expr {
-        WhereExpr::Scalar(ScalarExpr::Column(column)) => Some(column),
-        _ => None,
-    }
-}
-
-fn where_as_literal(expr: &WhereExpr) -> Option<&LiteralValue> {
-    match expr {
-        WhereExpr::Scalar(ScalarExpr::Literal(literal)) => Some(literal),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use pgcache_lib::query::ast::rope::QueryTree;
@@ -559,48 +314,9 @@ mod tests {
     use super::*;
     use crate::classify::query_parse;
 
-    /// Synthesize over the owned trees, checked against the rope walk on
-    /// the same corpus: the same tables, columns, types, keys and stats.
     fn synthesize(sqls: &[&str]) -> SynthCatalog {
-        let queries: Vec<QueryExpr> = sqls.iter().map(|s| query_parse(s)).collect();
-        let owned = catalog_synthesize(queries.iter());
-        let trees: Vec<QueryTree> = queries.iter().map(QueryTree::from_query_expr).collect();
-        let tree = catalog_synthesize_tree(trees.iter());
-        assert_eq!(describe(&tree), describe(&owned), "{sqls:?}");
-        owned
-    }
-
-    /// One line per table, in relation order, with its key, columns and
-    /// types, then the stats.
-    fn describe(catalog: &SynthCatalog) -> Vec<String> {
-        let mut tables: Vec<&TableMetadata> = catalog.tables.iter().map(|table| &**table).collect();
-        tables.sort_by_key(|table| table.relation_oid.get());
-        let mut lines: Vec<String> = tables
-            .iter()
-            .map(|table| {
-                let columns: Vec<String> = table
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        format!(
-                            "{}:{}{}",
-                            c.name,
-                            c.type_name,
-                            if c.is_primary_key { "*" } else { "" }
-                        )
-                    })
-                    .collect();
-                format!(
-                    "{} {}.{} [{}]",
-                    table.relation_oid.get(),
-                    table.schema,
-                    table.name,
-                    columns.join(", ")
-                )
-            })
-            .collect();
-        lines.push(format!("{:?}", catalog.stats));
-        lines
+        let trees: Vec<QueryTree> = sqls.iter().map(|s| query_parse(s)).collect();
+        catalog_synthesize(trees.iter())
     }
 
     fn table<'a>(catalog: &'a SynthCatalog, name: &str) -> &'a TableMetadata {

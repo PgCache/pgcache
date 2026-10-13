@@ -18,7 +18,6 @@ use tokio_postgres::{Client, Error};
 
 use crate::cache::CacheError;
 use crate::oid::{Oid, TypeOid};
-use crate::query::ast::{ColumnNode, NodeId, ScalarExpr, SelectColumn, SelectColumns, TableAlias};
 
 /// Column storage: sorted by position with O(1) name lookups.
 ///
@@ -139,41 +138,6 @@ impl TableMetadata {
     /// [`ColumnMetadata::is_toastable`].
     pub fn has_toastable_column(&self) -> bool {
         self.columns.iter().any(ColumnMetadata::is_toastable)
-    }
-
-    /// Generate SELECT columns for all columns in this table.
-    ///
-    /// If an alias is provided, column references will use the alias name
-    /// and respect any column aliases defined in the TableAlias.
-    ///
-    pub fn select_columns(&self, alias: Option<&TableAlias>) -> SelectColumns {
-        let columns = self
-            .columns
-            .iter()
-            .map(|c| SelectColumn::Expr {
-                expr: ScalarExpr::Column(ColumnNode {
-                    id: NodeId::PENDING,
-                    table: if let Some(alias) = alias {
-                        Some(alias.name.clone())
-                    } else {
-                        Some(EcoString::from(self.name.as_str()))
-                    },
-                    column: if let Some(alias) = alias {
-                        alias
-                            .columns
-                            .get(c.index())
-                            .map(EcoString::as_str)
-                            .unwrap_or(c.name.as_str())
-                            .into()
-                    } else {
-                        EcoString::from(c.name.as_str())
-                    },
-                }),
-                alias: None,
-            })
-            .collect();
-
-        SelectColumns::Columns(columns)
     }
 }
 

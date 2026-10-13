@@ -411,9 +411,6 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::enum_gate_owned::enum_order_dependence_check_owned;
-    use crate::query::resolve::query_expr_resolve;
 
     fn severity_type() -> Type {
         Type::new(
@@ -600,26 +597,6 @@ mod tests {
             true,
         ),
     ];
-
-    /// The rope gate and the owned gate give the same verdict on every
-    /// corpus query.
-    #[test]
-    fn test_rope_gate_matches_the_owned_gate() {
-        for (sql, _) in CORPUS {
-            let bound = ResolvedQuery::parse_resolve(sql, &tables(), &["public"]).expect("resolve");
-            let query = query_expr_parse(sql).expect("parse");
-            let bindings = query_expr_resolve(&query, &tables(), &["public"]).expect("resolve");
-            let text = |result: ResolveResult<()>| match result {
-                Ok(()) => "allowed".to_owned(),
-                Err(e) => e.into_current_context().to_string(),
-            };
-            assert_eq!(
-                text(bound.enum_order_dependence_check()),
-                text(enum_order_dependence_check_owned(&query, &bindings)),
-                "{sql}"
-            );
-        }
-    }
 
     #[test]
     fn test_gate_verdict_cases() {

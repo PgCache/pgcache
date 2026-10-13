@@ -9,15 +9,14 @@ use postgres_types::Type;
 use rootcause::Report;
 
 use super::bindings::{BindingsBuilder, ColumnBinding, SlotId, TableSlot};
-use super::entry::query_expr_resolve_scoped;
 use super::join_using::MergedJoinColumn;
 use super::rope::query_resolve_scoped;
 use crate::catalog::{
     Catalog, CatalogTable, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata,
 };
 use crate::oid::{Oid, TypeOid};
+use crate::query::ast::NodeId;
 use crate::query::ast::rope::Query;
-use crate::query::ast::{NodeId, QueryExpr};
 use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// A FROM-clause entry visible in scope. Entries are kept in FROM order,
@@ -263,13 +262,8 @@ impl<'a> ResolutionScope<'a> {
     /// subqueries, where correlated references are allowed: a column
     /// found only in `outer_tables` binds to the outer slot and is
     /// recorded as correlated.
-    pub(super) fn subquery_resolve(&mut self, query: &QueryExpr) -> ResolveResult<()> {
-        self.subquery_resolve_with(|tables, search_path, outer_tables, bindings| {
-            query_expr_resolve_scoped(query, tables, search_path, outer_tables, bindings)
-        })
-    }
-
-    /// [`ResolutionScope::subquery_resolve`] for a rope subquery.
+    /// Resolve a subquery body in a scope that sees this one's tables and
+    /// its ancestors' as outer tables.
     pub(super) fn subquery_resolve_tree(&mut self, query: Query<'a>) -> ResolveResult<()> {
         self.subquery_resolve_with(|tables, search_path, outer_tables, bindings| {
             query_resolve_scoped(query, tables, search_path, outer_tables, bindings)

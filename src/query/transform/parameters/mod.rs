@@ -1,5 +1,4 @@
-//! Substitute extended-query Bind values for `$N` placeholders in a parsed
-//! AST. The decoder pipeline forks on wire format: `text` for UTF-8 text
+//! Decode extended-query Bind values for `$N` placeholders. The decoder pipeline forks on wire format: `text` for UTF-8 text
 //! values (format=0), `binary` for the per-type wire formats (format=1).
 
 mod binary;
@@ -13,7 +12,6 @@ use crate::cache::QueryParameter;
 use crate::query::ast::LiteralValue;
 
 pub(crate) use replace::literal_value_parameters_replace;
-pub use replace::query_expr_parameters_replace;
 #[cfg(feature = "proxy")]
 pub(crate) use write_parameterize::{
     delete_statement_parameterize, insert_statement_parameterize, update_statement_parameterize,

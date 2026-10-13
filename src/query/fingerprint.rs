@@ -50,11 +50,11 @@ impl fmt::Display for Fingerprint {
 }
 
 /// The proxy-side key for a query: the content hash of the unresolved
-/// `QueryExpr` folded with the session's resolved search_path. Two sessions
+/// tree folded with the session's resolved search_path. Two sessions
 /// that send the same text under the same resolved path share one session
 /// key; the alias map (`SessionKey` → [`Fingerprint`]) says which cached
 /// query that pair resolved to. Only ever produced by
-/// [`query_expr_session_key`](super::ast::query_expr_session_key).
+/// [`query_tree_session_key`](super::ast::query_tree_session_key).
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionKey(u64);

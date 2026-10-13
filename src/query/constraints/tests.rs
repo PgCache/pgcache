@@ -1,4 +1,4 @@
-#![allow(clippy::wildcard_enum_match_arm)]
+#![allow(clippy::wildcard_enum_match_arm, clippy::type_complexity)]
 
 use iddqd::BiHashMap;
 use postgres_types::Type;
@@ -7,9 +7,7 @@ use super::subsume::table_constraints_subsumed;
 use super::*;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
-use crate::query::ast::query_expr_parse;
-use crate::query::resolve::owned::select_owned;
-use crate::query::resolve::{ResolvedQuery, query_expr_resolve};
+use crate::query::resolve::ResolvedQuery;
 
 // Helper function to create test table metadata
 fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
@@ -64,13 +62,6 @@ fn analyze_query_constraints(bound: &ResolvedQuery) -> QueryConstraints {
     query_constraints_analyze_tree(bound, bound.select().expect("a SELECT"))
 }
 
-/// The owned walk's constraints of `sql`: the oracle.
-fn analyze_owned(sql: &str, tables: &Catalog) -> QueryConstraints {
-    let query = query_expr_parse(sql).expect("convert to QueryExpr");
-    let bindings = query_expr_resolve(&query, tables, &["public"]).expect("resolve owned");
-    query_constraints_analyze(&bindings, select_owned(&query).expect("a SELECT"))
-}
-
 /// The constraints of `sql`.
 /// `table_constraints` in a comparable order: the walks visit a hash set,
 /// so their per-table lists come out in any order.
@@ -88,46 +79,134 @@ fn table_constraints_sorted(constraints: &QueryConstraints) -> Vec<(ecow::EcoStr
     tables
 }
 
-/// The rope walk finds what the owned walk finds, over every shape the
-/// extractors handle and the ones they give up on.
+/// What the walk extracts from each shape: the column constraints and
+/// equivalences (each as its sorted debug lines), the per-table lists and
+/// whether the WHERE was analyzed completely.
+#[rustfmt::skip]
+const CONSTRAINTS_EXPECTED: &[(&str, &[&str], &[&str], &str, bool)] = &[
+    ("SELECT id FROM users WHERE id = 1",
+     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: Equal, value: Integer(1) }"#],
+     &[],
+     r#"[("users", ["Comparison(\"id\", Equal, Integer(1))"])]"#,
+     true),
+    ("SELECT id FROM users WHERE 1 = id AND name = 'a'",
+     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: Equal, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" }, op: Equal, value: String("a") }"#],
+     &[],
+     r#"[("users", ["Comparison(\"id\", Equal, Integer(1))", "Comparison(\"name\", Equal, String(\"a\"))"])]"#,
+     true),
+    ("SELECT id FROM users WHERE id > 1 AND id <= 9 AND name <> 'x'",
+     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: GreaterThan, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: LessThanOrEqual, value: Integer(9) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" }, op: NotEqual, value: String("x") }"#],
+     &[],
+     r#"[("users", ["Comparison(\"id\", GreaterThan, Integer(1))", "Comparison(\"id\", LessThanOrEqual, Integer(9))", "Comparison(\"name\", NotEqual, String(\"x\"))"])]"#,
+     true),
+    ("SELECT id FROM users WHERE id IN (3, 1, 2, 1) AND name NOT IN ('a', 'b')",
+     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" }, op: NotEqual, value: String("a") }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" }, op: NotEqual, value: String("b") }"#, r#"InSet { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, values: [Integer(1), Integer(2), Integer(3)] }"#],
+     &[],
+     r#"[("users", ["AnyOf(\"id\", [Integer(1), Integer(2), Integer(3)])", "Comparison(\"name\", NotEqual, String(\"a\"))", "Comparison(\"name\", NotEqual, String(\"b\"))"])]"#,
+     true),
+    ("SELECT id FROM users WHERE id BETWEEN 1 AND 5 AND name BETWEEN SYMMETRIC 'z' AND 'a'",
+     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: GreaterThanOrEqual, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: LessThanOrEqual, value: Integer(5) }"#],
+     &[],
+     r#"[("users", ["Comparison(\"id\", GreaterThanOrEqual, Integer(1))", "Comparison(\"id\", LessThanOrEqual, Integer(5))"])]"#,
+     true),
+    ("SELECT id FROM users WHERE id = ANY (ARRAY[1, 2]) AND name = ANY ('{a,b}'::text[])",
+     &[r#"InSet { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, values: [Integer(1), Integer(2)] }"#],
+     &[],
+     r#"[("users", ["AnyOf(\"id\", [Integer(1), Integer(2)])"])]"#,
+     false),
+    ("SELECT id FROM users WHERE id = ANY (ARRAY[id, 2])",
+     &[],
+     &[],
+     "[]",
+     false),
+    ("SELECT id FROM users WHERE id::text = '1' AND name::int4 = 2 AND id::date = '2020-01-01'",
+     &[r#"CastComparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" }, cast: Int4, op: Equal, value: Integer(2) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: Equal, value: String("1") }"#],
+     &[],
+     r#"[("users", ["CastComparison(\"name\", Int4, Equal, Integer(2))", "Comparison(\"id\", Equal, String(\"1\"))"])]"#,
+     false),
+    ("SELECT id FROM users WHERE id = 1 OR name = 'a'",
+     &[],
+     &[],
+     "[]",
+     false),
+    ("SELECT id FROM users WHERE NOT (id = 1)",
+     &[],
+     &[],
+     "[]",
+     false),
+    ("SELECT id FROM users WHERE id IN (SELECT id FROM orders)",
+     &[],
+     &[],
+     "[]",
+     false),
+    ("SELECT u.id FROM users u JOIN orders o ON u.id = o.id AND o.name = 'x' WHERE u.name = 'y'",
+     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "name" }, op: Equal, value: String("x") }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "name" }, op: Equal, value: String("y") }"#],
+     &[r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "id" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" } }"#],
+     r#"[("orders", ["Comparison(\"name\", Equal, String(\"x\"))"]), ("users", ["Comparison(\"name\", Equal, String(\"y\"))"])]"#,
+     true),
+    ("SELECT u.id FROM users u JOIN orders o USING (id) WHERE id = 1",
+     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" }, op: Equal, value: Integer(1) }"#, r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "id" }, op: Equal, value: Integer(1) }"#],
+     &[r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "id" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" } }"#],
+     r#"[("orders", ["Comparison(\"id\", Equal, Integer(1))"]), ("users", ["Comparison(\"id\", Equal, Integer(1))"])]"#,
+     true),
+    ("SELECT u.id FROM users u NATURAL JOIN orders o JOIN items i ON i.id = o.id",
+     &[],
+     &[r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "items", alias: Some("i"), column: "id" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" } }"#, r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "id" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" } }"#, r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "name" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "name" } }"#],
+     "[]",
+     true),
+    ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id CROSS JOIN items",
+     &[],
+     &[r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "id" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" } }"#],
+     "[]",
+     true),
+    ("SELECT id FROM users WHERE id NOT IN (1, name, 2)",
+     &[r#"Comparison { column: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, op: NotEqual, value: Integer(1) }"#],
+     &[],
+     r#"[("users", ["Comparison(\"id\", NotEqual, Integer(1))"])]"#,
+     true),
+    ("SELECT id FROM users WHERE id IN (1, name)",
+     &[],
+     &[],
+     "[]",
+     true),
+    ("SELECT id FROM users WHERE id NOT BETWEEN 1 AND 2 AND name LIKE 'a%'",
+     &[],
+     &[],
+     "[]",
+     false),
+    ("SELECT id FROM users WHERE id = name",
+     &[],
+     &[r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: None, column: "id" }, right: ConstraintColumn { schema: "public", table: "users", alias: None, column: "name" } }"#],
+     "[]",
+     true),
+    ("SELECT v.id FROM (SELECT id FROM users WHERE id = 1) v WHERE v.id = 2",
+     &[r#"Comparison { column: ConstraintColumn { schema: "", table: "v", alias: Some("v"), column: "id" }, op: Equal, value: Integer(2) }"#],
+     &[],
+     r#"[("v", ["Comparison(\"id\", Equal, Integer(2))"])]"#,
+     true),
+];
+
+fn sorted_debug<T: std::fmt::Debug>(items: impl IntoIterator<Item = T>) -> Vec<String> {
+    let mut out: Vec<String> = items.into_iter().map(|item| format!("{item:?}")).collect();
+    out.sort();
+    out
+}
+
+/// Every shape the extractors handle, and the ones they give up on,
+/// analyzes to its expected constraints.
 #[test]
-fn test_rope_constraints_match_the_owned_walk() {
+fn test_constraints_expectations() {
     let tables = catalog(&["users", "orders", "items"]);
-    for sql in [
-        "SELECT id FROM users WHERE id = 1",
-        "SELECT id FROM users WHERE 1 = id AND name = 'a'",
-        "SELECT id FROM users WHERE id > 1 AND id <= 9 AND name <> 'x'",
-        "SELECT id FROM users WHERE id IN (3, 1, 2, 1) AND name NOT IN ('a', 'b')",
-        "SELECT id FROM users WHERE id BETWEEN 1 AND 5 AND name BETWEEN SYMMETRIC 'z' AND 'a'",
-        "SELECT id FROM users WHERE id = ANY (ARRAY[1, 2]) AND name = ANY ('{a,b}'::text[])",
-        "SELECT id FROM users WHERE id = ANY (ARRAY[id, 2])",
-        "SELECT id FROM users WHERE id::text = '1' AND name::int4 = 2 AND id::date = '2020-01-01'",
-        "SELECT id FROM users WHERE id = 1 OR name = 'a'",
-        "SELECT id FROM users WHERE NOT (id = 1)",
-        "SELECT id FROM users WHERE id IN (SELECT id FROM orders)",
-        "SELECT u.id FROM users u JOIN orders o ON u.id = o.id AND o.name = 'x' WHERE u.name = 'y'",
-        "SELECT u.id FROM users u JOIN orders o USING (id) WHERE id = 1",
-        "SELECT u.id FROM users u NATURAL JOIN orders o JOIN items i ON i.id = o.id",
-        "SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id CROSS JOIN items",
-        "SELECT id FROM users WHERE id NOT IN (1, name, 2)",
-        "SELECT id FROM users WHERE id IN (1, name)",
-        "SELECT id FROM users WHERE id NOT BETWEEN 1 AND 2 AND name LIKE 'a%'",
-        "SELECT id FROM users WHERE id = name",
-        "SELECT v.id FROM (SELECT id FROM users WHERE id = 1) v WHERE v.id = 2",
-    ] {
-        let owned = analyze_owned(sql, &tables);
-        let rope = analyze_query_constraints(&resolve_sql(sql, &tables));
-        assert_eq!(rope.column_constraints, owned.column_constraints, "{sql}");
-        assert_eq!(rope.equivalences, owned.equivalences, "{sql}");
+    for (sql, columns, equivalences, per_table, complete) in CONSTRAINTS_EXPECTED {
+        let actual = analyze_query_constraints(&resolve_sql(sql, &tables));
+        assert_eq!(sorted_debug(&actual.column_constraints), *columns, "{sql}");
+        assert_eq!(sorted_debug(&actual.equivalences), *equivalences, "{sql}");
         assert_eq!(
-            table_constraints_sorted(&rope),
-            table_constraints_sorted(&owned),
+            format!("{:?}", table_constraints_sorted(&actual)),
+            *per_table,
             "{sql}"
         );
-        assert_eq!(
-            rope.where_analysis_complete, owned.where_analysis_complete,
-            "{sql}"
-        );
+        assert_eq!(actual.where_analysis_complete, *complete, "{sql}");
     }
 }
 

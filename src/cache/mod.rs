@@ -36,8 +36,6 @@ pub(crate) mod messages;
 #[cfg(feature = "proxy")]
 pub(crate) mod mv;
 pub(crate) mod mv_shape;
-#[cfg(test)]
-mod mv_shape_owned;
 #[cfg(feature = "proxy")]
 pub(crate) mod output_settings;
 #[cfg(feature = "proxy")]

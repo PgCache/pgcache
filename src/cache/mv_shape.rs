@@ -166,8 +166,6 @@ pub(super) mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::query_expr_parse;
-    use crate::query::resolve::query_expr_resolve;
 
     #[test]
     fn test_is_reducer_matches_non_projection_shapes() {
@@ -228,19 +226,7 @@ pub(super) mod tests {
     fn classify(sql: &str) -> ShapeGate {
         let tables = test_tables();
         let bound = ResolvedQuery::parse_resolve(sql, &tables, &["public"]).expect("resolve query");
-        let shape = shape_classify(&bound, &test_aggregate_functions());
-        let owned = query_expr_parse(sql).expect("convert to AST");
-        let bindings = query_expr_resolve(&owned, &tables, &["public"]).expect("resolve query");
-        assert_eq!(
-            crate::cache::mv_shape_owned::shape_classify_owned(
-                &owned,
-                &bindings,
-                &test_aggregate_functions()
-            ),
-            shape,
-            "the owned classifier agrees: {sql}"
-        );
-        shape
+        shape_classify(&bound, &test_aggregate_functions())
     }
 
     #[test]

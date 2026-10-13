@@ -23,7 +23,7 @@ use crate::{
     },
     catalog::{FunctionVolatility, function_volatility_map_load},
     pg::{cdc::replication_cleanup, connect},
-    query::ast::query_expr_convert_raw,
+    query::ast::query_tree_convert_raw,
     settings::{Settings, SslMode},
     telemetry, tls,
 };
@@ -106,8 +106,8 @@ fn pinned_queries_validate(
     queries
         .iter()
         .filter_map(|sql| {
-            let query_expr = match pg_query::parse_raw_scoped(sql, |tree| unsafe {
-                query_expr_convert_raw(tree)
+            let tree = match pg_query::parse_raw_scoped(sql, |tree| unsafe {
+                query_tree_convert_raw(tree)
             }) {
                 Ok(Ok(q)) => q,
                 Ok(Err(e)) => {
@@ -119,7 +119,7 @@ fn pinned_queries_validate(
                     return None;
                 }
             };
-            let cacheable_query = match CacheableQuery::try_new(query_expr, func_volatility) {
+            let cacheable_query = match CacheableQuery::try_new(tree, func_volatility) {
                 Ok(cq) => cq,
                 Err(e) => {
                     tracing::warn!("pinned query not cacheable, skipping: {sql} ({e})");

@@ -14,14 +14,13 @@ use pgcache_lib::cache::query::{limit_clause_of, limit_rows_needed};
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
 use pgcache_lib::catalog::Catalog;
 use pgcache_lib::oid::Oid;
-use pgcache_lib::query::ast::{
-    AstError, QueryExpr, RawStatement, WhereParseError, statement_convert_raw,
-};
+use pgcache_lib::query::ast::rope::QueryTree;
+use pgcache_lib::query::ast::{AstError, RawStatement, WhereParseError, statement_convert_raw};
 use pgcache_lib::query::constraints::{
     QueryConstraints, TableConstraint, query_constraints_analyze_tree,
 };
 use pgcache_lib::query::literal_settings::LiteralSettings;
-use pgcache_lib::query::transform::query_expr_parameters_replace;
+use pgcache_lib::query::transform::query_tree_parameters_replace;
 use pgcache_lib::query::write::{TransactionBoundary, WriteClass};
 use pgcache_lib::query::{Fingerprint, ShapeKey};
 
@@ -31,7 +30,7 @@ use crate::volatility::BuiltinFunctions;
 /// Result of parsing one traced statement through the converter (and
 /// substituting logged bind parameters when present).
 pub enum ParseOutcome {
-    Select(Box<QueryExpr>),
+    Select(QueryTree),
     SelectUnconvertible {
         error: String,
         cte_write: Option<WriteClass>,
@@ -79,8 +78,8 @@ pub fn statement_parse(sql: &str, trace_parameters: &[Option<EcoString>]) -> Par
                 } else {
                     let (parameters, inferred) = query_parameters_infer(trace_parameters);
                     inferred_parameters = inferred;
-                    match query_expr_parameters_replace(&expr, &parameters) {
-                        Ok(substituted) => ParseOutcome::Select(Box::new(substituted)),
+                    match query_tree_parameters_replace(&expr, &parameters) {
+                        Ok(substituted) => ParseOutcome::Select(substituted),
                         Err(error) => ParseOutcome::ParameterError(error.to_string()),
                     }
                 }
@@ -279,7 +278,7 @@ pub fn statement_classify(
     };
 
     // Stage A: syntactic cacheability against the builtin volatility map.
-    let cacheable = match CacheableQuery::try_new((**expr).clone(), &builtins.volatility) {
+    let cacheable = match CacheableQuery::try_new(expr.clone(), &builtins.volatility) {
         Ok(cacheable) => cacheable,
         Err(error) => {
             let (reason, detail) = cacheability_reason(&error);
@@ -384,15 +383,15 @@ pub fn statement_classify(
     }))
 }
 
-/// Test-only: parse SQL straight to a `QueryExpr` through the same raw path
-/// the pipeline uses.
+/// Test-only: parse SQL straight to a tree through the same raw path the
+/// pipeline uses.
 #[cfg(test)]
-pub(crate) fn query_parse(sql: &str) -> QueryExpr {
+pub(crate) fn query_parse(sql: &str) -> QueryTree {
     let raw = pg_query::parse_raw_scoped(sql, |tree| unsafe { statement_convert_raw(tree) })
         .expect("parse SQL")
         .expect("classify statement");
     match raw {
-        RawStatement::Select { converted, .. } => *converted.expect("convert SELECT"),
+        RawStatement::Select { converted, .. } => converted.expect("convert SELECT"),
         _ => panic!("expected SELECT statement"),
     }
 }
@@ -411,8 +410,8 @@ mod tests {
         let parameters: Vec<Option<EcoString>> =
             parameters.iter().map(|p| p.map(EcoString::from)).collect();
         let parsed = statement_parse(sql, &parameters);
-        let corpus: Vec<QueryExpr> = match &parsed.outcome {
-            ParseOutcome::Select(expr) => vec![(**expr).clone()],
+        let corpus: Vec<QueryTree> = match &parsed.outcome {
+            ParseOutcome::Select(expr) => vec![expr.clone()],
             _ => vec![],
         };
         let catalog = catalog_synthesize(corpus.iter());

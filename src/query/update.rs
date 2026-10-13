@@ -285,12 +285,12 @@ mod tests {
     use crate::cache::query::CacheableQuery;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::TypeOid;
-    use crate::query::ast::query_expr_parse;
+    use crate::query::ast::query_tree_parse;
 
     /// Helper to parse SQL and return a CacheableQuery
     fn parse_cacheable(sql: &str) -> CacheableQuery {
-        let query_expr = query_expr_parse(sql).expect("convert to QueryExpr");
-        CacheableQuery::try_new(query_expr, &HashMap::new()).expect("query to be cacheable")
+        let tree = query_tree_parse(sql).expect("parse");
+        CacheableQuery::try_new(tree, &HashMap::new()).expect("query to be cacheable")
     }
 
     /// Create test table metadata with given column names.

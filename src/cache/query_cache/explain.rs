@@ -13,8 +13,7 @@ use crate::cache::reply::ReplySender;
 use crate::cache::types::{CachedQueryState, CachedQueryView};
 use crate::pg::protocol::backend::TransactionStatus;
 use crate::proxy::{ClientSocket, ExplainSpec, ExplainTarget};
-use crate::query::ast::query_expr_convert_raw;
-use crate::query::ast::rope::QueryTree;
+use crate::query::ast::query_tree_convert_raw;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, SessionKey};
 use crate::timing::QueryTiming;
@@ -146,8 +145,8 @@ fn explain_kind_for_view(
 /// dispatch keys it (raw-tree convert → rope → `query_tree_session_key`), so the
 /// lookup hits the cached entry. `None` if the argument doesn't parse as a SELECT.
 fn explain_sql_key(sql: &str, keying: &KeyingSettings) -> Option<SessionKey> {
-    pg_query::parse_raw_scoped(sql, |tree| unsafe { query_expr_convert_raw(tree) })
+    pg_query::parse_raw_scoped(sql, |tree| unsafe { query_tree_convert_raw(tree) })
         .ok()
         .and_then(Result::ok)
-        .map(|query| keying.session_key(&QueryTree::from_query_expr(&query)))
+        .map(|tree| keying.session_key(&tree))
 }

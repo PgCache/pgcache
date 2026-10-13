@@ -3,41 +3,14 @@ use std::hash::{Hash, Hasher};
 
 use ecow::EcoString;
 
+use super::LiteralValue;
 use super::rope::{NodeKind, QueryTree};
-use super::{LiteralValue, QueryExpr, SelectNode};
+use crate::query::SessionKey;
 use crate::query::literal_settings::LiteralSettings;
-use crate::query::{Fingerprint, SessionKey};
 
 /// Domain tag mixed into a session key after the AST so it never shares a
 /// value with a resolved fingerprint built from the same query.
 const DOMAIN_SESSION: u8 = 2;
-
-/// Generate a fingerprint hash for a SelectNode.
-/// This is used for cache key generation.
-pub fn select_node_fingerprint(node: &SelectNode) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    node.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Hash the parts of a `QueryExpr` that identify it: `ctes`, `body`,
-/// `order_by`. LIMIT/OFFSET are intentionally excluded so that queries
-/// differing only in LIMIT/OFFSET share a cache entry; the cache dispatch
-/// tracks `max_limit` separately to decide when cached rows are sufficient.
-fn query_expr_hasher(query: &QueryExpr) -> DefaultHasher {
-    let mut hasher = DefaultHasher::new();
-    query.ctes.hash(&mut hasher);
-    query.body.hash(&mut hasher);
-    query.order_by.hash(&mut hasher);
-    hasher
-}
-
-/// The content fingerprint of a `QueryExpr` as written. Not a cache identity
-/// (that is the bound query's, `ResolvedQuery::fingerprint`); used where
-/// only the text's own identity matters, such as tests.
-pub fn query_expr_fingerprint(query: &QueryExpr) -> Fingerprint {
-    Fingerprint::from_raw(query_expr_hasher(query).finish())
-}
 
 /// The proxy's key for a query under the session's resolved search_path and,
 /// when the query has a string literal whose meaning they could change, its
@@ -89,7 +62,7 @@ fn query_tree_has_string_literal(tree: &QueryTree) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::ast::{query_expr_parse, query_tree_parse};
+    use crate::query::ast::query_tree_parse;
 
     fn parse(sql: &str) -> QueryTree {
         query_tree_parse(sql).expect("parse query")
@@ -161,16 +134,6 @@ mod tests {
         assert_eq!(
             base,
             session_key("SELECT id FROM users LIMIT 5 OFFSET 2", &["alpha"])
-        );
-    }
-
-    #[test]
-    fn test_session_key_never_equals_the_plain_fingerprint() {
-        let owned = query_expr_parse("SELECT id FROM users WHERE id = 1").expect("parse query");
-        let tree = QueryTree::from_query_expr(&owned);
-        assert_ne!(
-            query_tree_session_key(&tree, &path(&[]), &LiteralSettings::default()).get(),
-            query_expr_fingerprint(&owned).get()
         );
     }
 }

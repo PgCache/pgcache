@@ -12,17 +12,14 @@ use tracing::{debug, trace};
 
 use super::{ParseError, cacheability_store::CacheabilityStore};
 use crate::{
-    cache::query::{CacheableQuery, query_has_volatile_function},
+    cache::query::{CacheableQuery, query_tree_has_volatile_function},
     catalog::FunctionVolatility,
     id_hash::{BuildIdHasher, impl_id_hashable},
     query::ast::rope::{
         Body, Function as RopeFunction, NodeKind, QueryTree, Scalar as RopeScalar, ScalarKind,
         Select as RopeSelect, SelectItem, View,
     },
-    query::ast::{
-        AstError, AstNode, FunctionCall, LiteralValue, QueryBody, QueryExpr, RawStatement,
-        ScalarExpr, SelectColumn, SelectColumns, SelectNode, statement_convert_raw,
-    },
+    query::ast::{AstError, LiteralValue, RawStatement, statement_convert_raw},
     query::guc::Guc,
     query::write::{IsolationEffect, SettingsEffect, StatementEffects, WriteClass},
 };
@@ -62,103 +59,21 @@ pub struct ExplainSpec {
 /// option list. Fingerprints must be quoted (`pgcache_explain('12345')`): they
 /// span the full `u64` range, which PostgreSQL parses as a float literal whose
 /// value the shared literal converter would round to `f64`, losing precision.
-fn explain_spec_extract(query: &QueryExpr) -> Option<ExplainSpec> {
-    let select = bare_select(query)?;
-    let func = single_function_column(select)?;
-    // `func.name` is the last name component, so a schema-qualified
-    // `x.pgcache_explain(...)` also matches. Acceptable: the name is
-    // pgcache-reserved, so shadowing a real user function of that name is not a
-    // concern worth carrying the raw funcname list to detect.
-    if func.name != EXPLAIN_FUNCTION_NAME || !plain_call(func) {
-        return None;
-    }
-    explain_spec_build(&func.args)
-}
-
-/// The SELECT of a bare projection — no CTEs, ORDER BY, LIMIT, FROM, WHERE,
-/// GROUP BY, HAVING, or DISTINCT — otherwise a real query that merely mentions
-/// the function would be intercepted.
-fn bare_select(query: &QueryExpr) -> Option<&SelectNode> {
-    let unordered = query.order_by.is_empty() && query.limit.is_none();
-    if !query.ctes.is_empty() || !unordered {
-        return None;
-    }
-    let QueryBody::Select(select) = &query.body else {
-        return None;
-    };
-    select_is_bare(select).then_some(select.as_ref())
-}
-
-fn select_is_bare(select: &SelectNode) -> bool {
-    let unfiltered = select.from.is_empty() && select.where_clause.is_none();
-    let ungrouped = select.group_by.is_empty() && select.having.is_none();
-    unfiltered && ungrouped && !select.distinct
-}
-
-/// The function call a SELECT projects as its only column.
-fn single_function_column(select: &SelectNode) -> Option<&FunctionCall> {
-    let SelectColumns::Columns(columns) = &select.columns else {
-        return None;
-    };
-    match columns.as_slice() {
-        [
-            SelectColumn::Expr {
-                expr: ScalarExpr::Function(func),
-                ..
-            },
-        ] => Some(func),
-        _ => None,
-    }
-}
-
-/// A plain call: not an aggregate (`*`, DISTINCT, FILTER, ORDER BY) or window
-/// (OVER) form.
-fn plain_call(func: &FunctionCall) -> bool {
-    let no_aggregate_form = !func.agg_star && !func.agg_distinct;
-    let unfiltered = func.over.is_none() && func.agg_filter.is_none();
-    let unordered = unfiltered && func.agg_order.is_empty();
-    no_aggregate_form && unordered
-}
-
-/// The spec from `pgcache_explain`'s one or two string arguments: a target
-/// that parses as `u64` is a fingerprint, otherwise inline SQL; the second is
-/// the option list.
-fn explain_spec_build(args: &[ScalarExpr]) -> Option<ExplainSpec> {
-    let (first, options) = match args {
-        [first] => (first, EcoString::new()),
-        [first, second] => (first, EcoString::from(arg_string_extract(second)?)),
-        _ => return None,
-    };
-    let first = arg_string_extract(first)?;
-    let target = match first.parse::<u64>() {
-        Ok(fingerprint) => ExplainTarget::Fingerprint(fingerprint),
-        Err(_) => ExplainTarget::Sql(first.to_owned()),
-    };
-    Some(ExplainSpec { target, options })
-}
-
-/// [`explain_spec_extract`] read from the rope.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once the proxy parses to the rope")
-)]
-fn explain_spec_extract_tree(tree: &QueryTree) -> Option<ExplainSpec> {
-    let select = bare_select_tree(tree)?;
-    let function = single_function_item_tree(select)?;
+fn explain_spec_extract(tree: &QueryTree) -> Option<ExplainSpec> {
+    let select = bare_select(tree)?;
+    let function = single_function_item(select)?;
     // `name()` is the last name component, so a schema-qualified
     // `x.pgcache_explain(...)` also matches.
-    if function.name() != EXPLAIN_FUNCTION_NAME || !plain_call_tree(function) {
+    if function.name() != EXPLAIN_FUNCTION_NAME || !plain_call(function) {
         return None;
     }
-    explain_spec_build_tree(function)
+    explain_spec_build(function)
 }
 
-/// [`bare_select`] read from the rope.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once the proxy parses to the rope")
-)]
-fn bare_select_tree(tree: &QueryTree) -> Option<RopeSelect<'_>> {
+/// The SELECT of a bare projection: no CTEs, ORDER BY, LIMIT, FROM, WHERE,
+/// GROUP BY, HAVING, or DISTINCT, otherwise a real query that merely mentions
+/// the function would be intercepted.
+fn bare_select(tree: &QueryTree) -> Option<RopeSelect<'_>> {
     let root = tree.root();
     let unordered = root.order_by().len() == 0 && !root.has_limit();
     if root.ctes().len() > 0 || !unordered {
@@ -167,25 +82,17 @@ fn bare_select_tree(tree: &QueryTree) -> Option<RopeSelect<'_>> {
     let Body::Select(select) = root.body() else {
         return None;
     };
-    select_is_bare_tree(select).then_some(select)
+    select_is_bare(select).then_some(select)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once the proxy parses to the rope")
-)]
-fn select_is_bare_tree(select: RopeSelect<'_>) -> bool {
+fn select_is_bare(select: RopeSelect<'_>) -> bool {
     let unfiltered = select.from().len() == 0 && select.where_clause().is_none();
     let ungrouped = select.group_by().len() == 0 && select.having().is_none();
     unfiltered && ungrouped && !select.distinct()
 }
 
 /// The function call a SELECT projects as its only item.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once the proxy parses to the rope")
-)]
-fn single_function_item_tree(select: RopeSelect<'_>) -> Option<RopeFunction<'_>> {
+fn single_function_item(select: RopeSelect<'_>) -> Option<RopeFunction<'_>> {
     let mut items = select.items()?;
     let (Some(SelectItem::Expr(item)), None) = (items.next(), items.next()) else {
         return None;
@@ -196,19 +103,17 @@ fn single_function_item_tree(select: RopeSelect<'_>) -> Option<RopeFunction<'_>>
     Some(function)
 }
 
-/// [`explain_spec_build`] over a rope call's arguments.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once the proxy parses to the rope")
-)]
-fn explain_spec_build_tree(function: RopeFunction<'_>) -> Option<ExplainSpec> {
+/// The spec from `pgcache_explain`'s one or two string arguments: a target
+/// that parses as `u64` is a fingerprint, otherwise inline SQL; the second is
+/// the option list.
+fn explain_spec_build(function: RopeFunction<'_>) -> Option<ExplainSpec> {
     let mut args = function.args();
     let (first, options) = match (args.next(), args.next(), args.next()) {
         (Some(first), None, _) => (first, EcoString::new()),
-        (Some(first), Some(second), None) => (first, EcoString::from(arg_string_tree(second)?)),
+        (Some(first), Some(second), None) => (first, EcoString::from(arg_string(second)?)),
         _ => return None,
     };
-    let first = arg_string_tree(first)?;
+    let first = arg_string(first)?;
     let target = match first.parse::<u64>() {
         Ok(fingerprint) => ExplainTarget::Fingerprint(fingerprint),
         Err(_) => ExplainTarget::Sql(first.to_owned()),
@@ -216,25 +121,20 @@ fn explain_spec_build_tree(function: RopeFunction<'_>) -> Option<ExplainSpec> {
     Some(ExplainSpec { target, options })
 }
 
-/// [`plain_call`] for a rope function.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once the proxy parses to the rope")
-)]
-fn plain_call_tree(function: RopeFunction<'_>) -> bool {
+/// A plain call: not an aggregate (`*`, DISTINCT, FILTER, ORDER BY) or window
+/// (OVER) form.
+fn plain_call(function: RopeFunction<'_>) -> bool {
     let no_aggregate_form = !function.agg_star() && !function.agg_distinct();
     let unfiltered = function.over().is_none() && function.filter().is_none();
     let unordered = unfiltered && function.agg_order().len() == 0;
     no_aggregate_form && unordered
 }
 
-/// [`arg_string_extract`] for a rope argument.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once the proxy parses to the rope")
-)]
-fn arg_string_tree(arg: RopeScalar<'_>) -> Option<&str> {
-    if let Some(LiteralValue::String(value)) = arg_literal_tree(arg) {
+/// A plain string-literal argument's value, or `None` for any other expression
+/// (a cast, number, column reference, ...). Both `pgcache_explain` arguments are
+/// string literals.
+fn arg_string(arg: RopeScalar<'_>) -> Option<&str> {
+    if let Some(LiteralValue::String(value)) = arg_literal(arg) {
         Some(value.as_str())
     } else {
         None
@@ -242,11 +142,7 @@ fn arg_string_tree(arg: RopeScalar<'_>) -> Option<&str> {
 }
 
 /// A literal argument's value, or `None` for any other expression.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once the proxy parses to the rope")
-)]
-fn arg_literal_tree(arg: RopeScalar<'_>) -> Option<&LiteralValue> {
+fn arg_literal(arg: RopeScalar<'_>) -> Option<&LiteralValue> {
     if let ScalarKind::Literal(literal) = arg.kind() {
         Some(literal.value())
     } else {
@@ -254,12 +150,13 @@ fn arg_literal_tree(arg: RopeScalar<'_>) -> Option<&LiteralValue> {
     }
 }
 
-/// [`set_config_calls_effect`] read from the rope.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "used once the proxy parses to the rope")
-)]
-fn set_config_calls_effect_tree(tree: &QueryTree) -> SettingsEffect {
+/// The settings effect of the `set_config` calls in a converted statement:
+/// each call with a literal name touches that setting (an untracked name is
+/// not an effect), scoped by a literal `is_local`; a call whose name is not a
+/// literal may change anything. The caller only asks when the text mentions
+/// `set_config`, so finding no call means it hides somewhere the converter
+/// does not model and the answer is likewise everything.
+fn set_config_calls_effect(tree: &QueryTree) -> SettingsEffect {
     let mut effect = SettingsEffect::NONE;
     let mut calls = 0usize;
     for position in tree.root().node_ref().subtree() {
@@ -271,10 +168,10 @@ fn set_config_calls_effect_tree(tree: &QueryTree) -> SettingsEffect {
         }
         calls += 1;
         let mut args = RopeFunction::from_ref(position).args();
-        let Some(LiteralValue::String(name)) = args.next().and_then(arg_literal_tree) else {
+        let Some(LiteralValue::String(name)) = args.next().and_then(arg_literal) else {
             return SettingsEffect::all();
         };
-        let local = args.nth(1).and_then(arg_literal_tree) == Some(&LiteralValue::Boolean(true));
+        let local = args.nth(1).and_then(arg_literal) == Some(&LiteralValue::Boolean(true));
         if let Some(guc) = Guc::parse(name.as_str()) {
             effect = effect.union(SettingsEffect::guc(guc, local));
         }
@@ -291,28 +188,11 @@ fn set_config_calls_effect_tree(tree: &QueryTree) -> SettingsEffect {
 #[cfg(test)]
 fn explain_intercept_parse(sql: &str) -> Option<ExplainSpec> {
     let query = pg_query::parse_raw_scoped(sql, |tree| unsafe {
-        crate::query::ast::query_expr_convert_raw(tree)
+        crate::query::ast::query_tree_convert_raw(tree)
     })
     .ok()?
     .ok()?;
-    let spec = explain_spec_extract(&query);
-    assert_eq!(
-        explain_spec_extract_tree(&QueryTree::from_query_expr(&query)),
-        spec,
-        "the rope extraction agrees: {sql}"
-    );
-    spec
-}
-
-/// A plain string-literal argument's value, or `None` for any other expression
-/// (a cast, number, column reference, ...). Both `pgcache_explain` arguments are
-/// string literals.
-fn arg_string_extract(arg: &ScalarExpr) -> Option<&str> {
-    if let ScalarExpr::Literal(LiteralValue::String(value)) = arg {
-        Some(value.as_str())
-    } else {
-        None
-    }
+    explain_spec_extract(&query)
 }
 
 /// A hash of a SQL query's *text* (not its AST). Keys the proxy's cacheability
@@ -474,37 +354,6 @@ fn sql_mentions_set_config(sql: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }
 
-/// The settings effect of the `set_config` calls in a converted statement:
-/// each call with a literal name touches that setting (an untracked name is
-/// not an effect), scoped by a literal `is_local`; a call whose name is not a
-/// literal may change anything. The caller only asks when the text mentions
-/// `set_config`, so finding no call means it hides somewhere the converter
-/// does not model and the answer is likewise everything.
-fn set_config_calls_effect(query: &QueryExpr) -> SettingsEffect {
-    let mut effect = SettingsEffect::NONE;
-    let mut calls = 0usize;
-    for call in query.nodes::<FunctionCall>() {
-        if !call.name.eq_ignore_ascii_case("set_config") {
-            continue;
-        }
-        calls += 1;
-        let Some(ScalarExpr::Literal(LiteralValue::String(name))) = call.args.first() else {
-            return SettingsEffect::all();
-        };
-        let local = matches!(
-            call.args.get(2),
-            Some(ScalarExpr::Literal(LiteralValue::Boolean(true)))
-        );
-        if let Some(guc) = Guc::parse(name.as_str()) {
-            effect = effect.union(SettingsEffect::guc(guc, local));
-        }
-    }
-    if calls == 0 {
-        return SettingsEffect::all();
-    }
-    effect
-}
-
 /// Extract the SQL text from a simple-query (`Q`) frame: tag (1) + length (4) +
 /// the null-terminated query string. Returns `None` on a malformed frame or
 /// non-UTF-8 body.
@@ -544,7 +393,7 @@ pub(super) fn analyze(
         return Ok(verdict);
     }
 
-    // Build the QueryExpr straight off the raw parse tree, skipping the protobuf
+    // Build the tree straight off the raw parse tree, skipping the protobuf
     // serialize/decode round-trip (PGC-192). This is the only parse/convert; the
     // explain interception, cacheability classification, and write
     // classification (PGC-124) all read this one pass.
@@ -585,7 +434,7 @@ pub(super) fn analyze(
                 match CacheableQuery::cacheable(&query, func_volatility) {
                     // `cacheable` just passed, so `try_new` (same validation)
                     // cannot fail; forward conservatively if it ever disagrees.
-                    Ok(()) => match CacheableQuery::try_new(*query, func_volatility) {
+                    Ok(()) => match CacheableQuery::try_new(query, func_volatility) {
                         Ok(cacheable_query) => Action::CacheCheck(Arc::new(cacheable_query)),
                         Err(_) => Action::Forward(
                             ForwardReason::UncacheableSelect,
@@ -599,7 +448,7 @@ pub(super) fn analyze(
                         // carrying one is a potential write (PGC-124). Scanned
                         // only now that the query is known uncacheable — the
                         // cacheable path never pays for it.
-                        let effects = if query_has_volatile_function(&query, func_volatility) {
+                        let effects = if query_tree_has_volatile_function(&query, func_volatility) {
                             StatementEffects::write(WriteClass::Connection, isolation)
                         } else {
                             StatementEffects::read_only(isolation, None)
@@ -930,28 +779,6 @@ mod tests {
         match analyze_fresh(sql, &HashMap::new()) {
             Action::Forward(_, effects) => effects.settings,
             _ => panic!("expected a forward for {sql:?}"),
-        }
-    }
-
-    /// The rope scan finds the `set_config` calls the owned scan finds.
-    #[test]
-    fn test_rope_set_config_scan_matches_the_owned_scan() {
-        for sql in [
-            "SELECT set_config('timezone', 'UTC', true)",
-            "SELECT set_config('search_path', 'a', false), set_config('role', 'r', false)",
-            "SELECT set_config('request.jwt.claims', '{}', true)",
-            "SELECT set_config($1, 'x', false)",
-            "SELECT set_config('timezone', 'UTC', $1)",
-            "SELECT id FROM t WHERE x = set_config('timezone', 'UTC', false)",
-            "SELECT now()",
-            "SELECT upper(set_config('DateStyle', 'ISO', true)) FROM t",
-        ] {
-            let query = crate::query::ast::query_expr_parse(sql).expect("parse");
-            assert_eq!(
-                set_config_calls_effect_tree(&QueryTree::from_query_expr(&query)),
-                set_config_calls_effect(&query),
-                "{sql}"
-            );
         }
     }
 

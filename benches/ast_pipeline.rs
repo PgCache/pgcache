@@ -35,12 +35,8 @@ use pgcache_lib::cache::admission::{AdmissionDepth, AdmissionQuery, query_admiss
 use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use pgcache_lib::oid::{Oid, TypeOid};
 use pgcache_lib::pg::ByteString;
-use pgcache_lib::query::ast::rope::QueryTree;
-use pgcache_lib::query::ast::{
-    BinaryExpr, ColumnNode, CteDefinition, FunctionCall, JoinNode, LiteralValue, OrderByClause,
-    QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectNode, TableNode, TableSource, WhereExpr,
-    query_expr_convert_raw, query_tree_convert_raw, query_tree_session_key,
-};
+use pgcache_lib::query::ast::rope::{Node, NodeKind, QueryTree};
+use pgcache_lib::query::ast::{LiteralValue, query_tree_convert_raw, query_tree_session_key};
 use pgcache_lib::query::decorrelate::query_decorrelate;
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::predicate::CompiledPredicate;
@@ -356,14 +352,8 @@ fn shapes() -> Vec<Shape> {
 // Stages
 // ---------------------------------------------------------------------------
 
-fn parse(sql: &str) -> QueryExpr {
-    pg_query::parse_raw_scoped(sql, |tree| unsafe { query_expr_convert_raw(tree) })
-        .expect("pg_query parses the fixture SQL")
-        .expect("the fixture SQL converts")
-}
-
 /// The rope straight from the raw parse tree.
-fn parse_tree(sql: &str) -> QueryTree {
+fn parse(sql: &str) -> QueryTree {
     pg_query::parse_raw_scoped(sql, |tree| unsafe { query_tree_convert_raw(tree) })
         .expect("pg_query parses the fixture SQL")
         .expect("the fixture SQL converts")
@@ -400,25 +390,14 @@ fn row_build(row: &[Option<&str>]) -> Vec<Option<ByteString>> {
 // ---------------------------------------------------------------------------
 
 fn sizes_report() {
-    println!("\n== node sizes (bytes)");
-    let plain: [(&str, usize); 15] = [
-        ("QueryExpr", size_of::<QueryExpr>()),
-        ("QueryBody", size_of::<QueryBody>()),
-        ("SelectNode", size_of::<SelectNode>()),
-        ("SelectColumn", size_of::<SelectColumn>()),
-        ("TableSource", size_of::<TableSource>()),
-        ("TableNode", size_of::<TableNode>()),
-        ("JoinNode", size_of::<JoinNode>()),
-        ("ScalarExpr", size_of::<ScalarExpr>()),
-        ("WhereExpr", size_of::<WhereExpr>()),
-        ("BinaryExpr", size_of::<BinaryExpr>()),
-        ("ColumnNode", size_of::<ColumnNode>()),
+    println!("\n== tree (bytes)");
+    let tree: [(&str, usize); 4] = [
+        ("Node", size_of::<Node>()),
+        ("NodeKind", size_of::<NodeKind>()),
         ("LiteralValue", size_of::<LiteralValue>()),
-        ("FunctionCall", size_of::<FunctionCall>()),
-        ("OrderByClause", size_of::<OrderByClause>()),
-        ("CteDefinition", size_of::<CteDefinition>()),
+        ("QueryTree", size_of::<QueryTree>()),
     ];
-    for (name, size) in plain {
+    for (name, size) in tree {
         println!("{name:<28}{size:>8}");
     }
     println!("\n== metadata (bytes)");
@@ -457,10 +436,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
     let header = [
         "query",
         "convert",
-        "plain_clone",
         "session_key",
-        "rope",
-        "rope_convert",
         "rope_clone",
         "resolve",
         "bound_clone",
@@ -476,10 +452,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
     ];
     row_print(&header.map(str::to_owned));
     for shape in shapes {
-        let (query, convert_n, convert_b) = allocations_count(|| parse(&shape.sql));
-        let (_, plain_clone_n, plain_clone_b) = allocations_count(|| black_box(query.clone()));
-        let (rope, rope_n, rope_b) = allocations_count(|| QueryTree::from_query_expr(&query));
-        let (_, rope_convert_n, rope_convert_b) = allocations_count(|| parse_tree(&shape.sql));
+        let (rope, convert_n, convert_b) = allocations_count(|| parse(&shape.sql));
         let (_, key_n, key_b) =
             allocations_count(|| query_tree_session_key(&rope, &search_path, &settings));
         let (_, rope_clone_n, rope_clone_b) = allocations_count(|| black_box(rope.clone()));
@@ -517,10 +490,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
         row_print(&[
             shape.name.to_owned(),
             cell(convert_n, convert_b),
-            cell(plain_clone_n, plain_clone_b),
             cell(key_n, key_b),
-            cell(rope_n, rope_b),
-            cell(rope_convert_n, rope_convert_b),
             cell(rope_clone_n, rope_clone_b),
             cell(resolve_n, resolve_b),
             cell(bound_clone_n, bound_clone_b),
@@ -541,7 +511,7 @@ fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
 }
 
 /// One row of the allocations table: the query name, then a cell per stage.
-fn row_print(cells: &[String; 18]) {
+fn row_print(cells: &[String; 15]) {
     let mut line = String::new();
     for (index, cell) in cells.iter().enumerate() {
         if index == 0 {
@@ -572,8 +542,7 @@ fn bench_pipeline(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("ast_pipeline");
     for shape in &shapes {
-        let query = parse(&shape.sql);
-        let tree = QueryTree::from_query_expr(&query);
+        let tree = parse(&shape.sql);
         let resolved = resolve_bound(&tree, &catalog);
         let bound = canonicalise(&resolved, &settings);
         let predicate = predicate_compile(&bound, shape.predicate_table);
@@ -587,27 +556,10 @@ fn bench_pipeline(c: &mut Criterion) {
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("plain_clone", shape.name),
-            &query,
-            |b, q| {
-                b.iter(|| black_box(q.clone()));
-            },
-        );
-        group.bench_with_input(
             BenchmarkId::new("session_key", shape.name),
             &tree,
             |b, t| {
                 b.iter(|| black_box(query_tree_session_key(t, &search_path, &settings)));
-            },
-        );
-        group.bench_with_input(BenchmarkId::new("rope", shape.name), &query, |b, q| {
-            b.iter(|| black_box(QueryTree::from_query_expr(q)));
-        });
-        group.bench_with_input(
-            BenchmarkId::new("rope_convert", shape.name),
-            &shape.sql,
-            |b, sql| {
-                b.iter(|| black_box(parse_tree(sql)));
             },
         );
         group.bench_with_input(BenchmarkId::new("resolve", shape.name), &tree, |b, t| {
@@ -671,8 +623,7 @@ fn bench_pipeline(c: &mut Criterion) {
             &shape.sql,
             |b, sql| {
                 b.iter(|| {
-                    let query = parse(sql);
-                    let tree = QueryTree::from_query_expr(&query);
+                    let tree = parse(sql);
                     let key = query_tree_session_key(&tree, &search_path, &settings);
                     let resolved = resolve_bound(&tree, &catalog);
                     let bound = canonicalise(&resolved, &settings);

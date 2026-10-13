@@ -18,7 +18,7 @@ use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
 use ecow::EcoString;
-use pgcache_lib::query::ast::QueryExpr;
+use pgcache_lib::query::ast::rope::QueryTree;
 
 use crate::catalog_synth::{SynthCatalog, catalog_synthesize};
 use crate::classify::{
@@ -73,10 +73,10 @@ pub fn trace_analyze(content: &str, format: TraceFormat) -> anyhow::Result<Analy
         })
         .collect();
 
-    let corpus: Vec<&QueryExpr> = distinct
+    let corpus: Vec<&QueryTree> = distinct
         .iter()
         .filter_map(|p| match &p.outcome {
-            ParseOutcome::Select(expr) => Some(&**expr),
+            ParseOutcome::Select(expr) => Some(expr),
             _ => None,
         })
         .collect();

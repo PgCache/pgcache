@@ -7,7 +7,7 @@ use ecow::EcoString;
 use pg_query::pg_nodes as pg;
 
 use super::scalar::scalar_emit;
-use crate::query::ast::convert_raw::{null_order_map, order_dir_map};
+use super::{null_order_map, order_dir_map};
 use crate::query::ast::raw::{NodePtr, cast, cstr, list_len, list_nodes, node_tag, node_tag_name};
 use crate::query::ast::rope::{FrameBoundKind, NodeKind, TreeBuilder};
 use crate::query::ast::{AstError, FrameExclusion, FrameMode};

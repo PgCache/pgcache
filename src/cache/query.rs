@@ -6,20 +6,16 @@ use error_set::error_set;
 
 use crate::catalog::FunctionVolatility;
 use crate::oid::TypeOid;
-use crate::query::ast::QueryExpr;
 use crate::query::ast::rope::{Body, QueryTree, Select};
 use crate::query::transform::{AstTransformResult, query_tree_parameters_replace};
 
 mod cacheability;
-mod cacheability_tree;
 mod limit;
 mod outer_join;
 mod request;
 
-pub use cacheability::query_has_volatile_function;
-use cacheability::{is_cacheable_body, references_system_catalog};
-pub use cacheability_tree::query_tree_has_volatile_function;
-use cacheability_tree::{body_cacheable, references_system_catalog_tree};
+pub use cacheability::query_tree_has_volatile_function;
+use cacheability::{body_cacheable, references_system_catalog};
 
 pub use limit::{limit_clause_of, limit_is_sufficient, limit_rows_needed};
 pub use outer_join::outer_join_optional_tables;
@@ -102,62 +98,22 @@ impl CacheableQuery {
     /// Validates the query structure and ensures all functions in WHERE/FROM
     /// clauses are immutable. Functions in SELECT lists are always allowed.
     pub fn cacheable(
-        query: &QueryExpr,
+        tree: &QueryTree,
         fv: &FunctionVolatilityMap,
     ) -> Result<(), CacheabilityError> {
         // System catalogs (pg_catalog, pg_toast, unqualified pg_* relations) can't
         // be logically replicated, so registration against the cache db fails with
         // "unacceptable schema name". Reject up front and forward to origin —
         // e.g. psql's \d, which queries pg_class/pg_namespace.
-        references_system_catalog(query)?;
-        is_cacheable_body(&query.body, fv)
-    }
-
-    /// [`Self::cacheable`] read from the rope.
-    pub fn cacheable_tree(
-        tree: &QueryTree,
-        fv: &FunctionVolatilityMap,
-    ) -> Result<(), CacheabilityError> {
-        references_system_catalog_tree(tree)?;
+        references_system_catalog(tree)?;
         body_cacheable(tree.root().body(), fv)
     }
 
     /// Build a cacheable query, validating it first. Fails with the same
-    /// verdict as [`Self::cacheable`]. This is the one conversion of the
-    /// parsed tree to the rope; the parsed tree is not kept.
-    pub fn try_new(
-        query: QueryExpr,
-        fv: &FunctionVolatilityMap,
-    ) -> Result<Self, CacheabilityError> {
-        Self::cacheable(&query, fv)?;
-        Ok(CacheableQuery {
-            tree: QueryTree::from_query_expr(&query),
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::query::ast::{query_expr_fingerprint, query_expr_parse};
-
-    #[test]
-    fn test_limit_offset_fingerprint_match() {
-        let base = "SELECT * FROM orders WHERE tenant_id = 1";
-        let with_limit = "SELECT * FROM orders WHERE tenant_id = 1 LIMIT 10";
-        let with_offset = "SELECT * FROM orders WHERE tenant_id = 1 OFFSET 5";
-        let with_both = "SELECT * FROM orders WHERE tenant_id = 1 LIMIT 10 OFFSET 5";
-
-        let fp_base = { query_expr_fingerprint(&query_expr_parse(base).unwrap()) };
-        let fp_limit = { query_expr_fingerprint(&query_expr_parse(with_limit).unwrap()) };
-        let fp_offset = { query_expr_fingerprint(&query_expr_parse(with_offset).unwrap()) };
-        let fp_both = { query_expr_fingerprint(&query_expr_parse(with_both).unwrap()) };
-
-        assert_eq!(fp_base, fp_limit, "LIMIT should not affect fingerprint");
-        assert_eq!(fp_base, fp_offset, "OFFSET should not affect fingerprint");
-        assert_eq!(
-            fp_base, fp_both,
-            "LIMIT+OFFSET should not affect fingerprint"
-        );
+    /// verdict as [`Self::cacheable`].
+    pub fn try_new(tree: QueryTree, fv: &FunctionVolatilityMap) -> Result<Self, CacheabilityError> {
+        Self::cacheable(&tree, fv)?;
+        Ok(CacheableQuery { tree })
     }
 }
 

@@ -198,7 +198,7 @@ mod tests {
     use crate::classify::{ParseOutcome, statement_classify, statement_parse};
     use crate::input::TraceStatement;
     use crate::volatility::builtin_functions_load;
-    use pgcache_lib::query::ast::QueryExpr;
+    use pgcache_lib::query::ast::rope::QueryTree;
 
     fn replay(sqls: &[&str]) -> HitrateStats {
         replay_with(sqls, ReplayConfig::default())
@@ -206,10 +206,10 @@ mod tests {
 
     fn replay_with(sqls: &[&str], config: ReplayConfig) -> HitrateStats {
         let parsed: Vec<_> = sqls.iter().map(|sql| statement_parse(sql, &[])).collect();
-        let corpus: Vec<QueryExpr> = parsed
+        let corpus: Vec<QueryTree> = parsed
             .iter()
             .filter_map(|p| match &p.outcome {
-                ParseOutcome::Select(expr) => Some((**expr).clone()),
+                ParseOutcome::Select(expr) => Some(expr.clone()),
                 _ => None,
             })
             .collect();
@@ -278,8 +278,8 @@ mod tests {
     fn test_pgss_calls_weighting() {
         let sql = "SELECT * FROM users WHERE id = 7";
         let parsed = statement_parse(sql, &[]);
-        let corpus: Vec<QueryExpr> = match &parsed.outcome {
-            ParseOutcome::Select(expr) => vec![(**expr).clone()],
+        let corpus: Vec<QueryTree> = match &parsed.outcome {
+            ParseOutcome::Select(expr) => vec![expr.clone()],
             _ => vec![],
         };
         let catalog = catalog_synthesize(corpus.iter());

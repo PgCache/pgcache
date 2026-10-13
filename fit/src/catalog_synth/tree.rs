@@ -1,5 +1,5 @@
-//! The synthesis walk over the rope: `catalog_synth`'s owned walk read
-//! through views, feeding the same facts in the same order.
+//! The synthesis walk: every relation and column reference a corpus of
+//! trees makes, read through views and fed to the synthesizer's facts.
 
 use std::collections::HashSet;
 
@@ -12,14 +12,12 @@ use pgcache_lib::query::ast::rope::{
 
 use super::{Scope, ScopeEntry, SynthCatalog, Synthesizer};
 
-/// [`super::catalog_synthesize`] over rope trees.
-pub fn catalog_synthesize_tree<'a>(
-    queries: impl IntoIterator<Item = &'a QueryTree>,
-) -> SynthCatalog {
+/// The catalog a corpus of queries implies.
+pub fn catalog_synthesize<'a>(queries: impl IntoIterator<Item = &'a QueryTree>) -> SynthCatalog {
     let mut synthesizer = Synthesizer::default();
     for query in queries {
         let mut scopes = Vec::new();
-        synthesizer.query_walk_tree(query.root(), &mut scopes);
+        synthesizer.query_walk(query.root(), &mut scopes);
     }
     synthesizer.finish()
 }
@@ -33,28 +31,28 @@ fn column_of(position: NodeRef<'_>) -> Option<(Option<&EcoString>, &EcoString)> 
 }
 
 impl Synthesizer {
-    fn query_walk_tree(&mut self, query: Query<'_>, scopes: &mut Vec<Scope>) {
+    fn query_walk(&mut self, query: Query<'_>, scopes: &mut Vec<Scope>) {
         // CTE bodies are walked once at their definition; references in FROM
         // are treated as derived sources.
         for cte in query.ctes() {
             let mut fresh = Vec::new();
-            self.query_walk_tree(cte.query(), &mut fresh);
+            self.query_walk(cte.query(), &mut fresh);
         }
         match query.body() {
-            Body::Select(select) => self.select_walk_tree(select, query, scopes),
+            Body::Select(select) => self.select_walk(select, query, scopes),
             Body::SetOp(set_op) => {
-                self.query_walk_tree(set_op.left(), scopes);
-                self.query_walk_tree(set_op.right(), scopes);
+                self.query_walk(set_op.left(), scopes);
+                self.query_walk(set_op.right(), scopes);
             }
             Body::Values(_) => {}
         }
     }
 
-    fn select_walk_tree(&mut self, select: Select<'_>, query: Query<'_>, scopes: &mut Vec<Scope>) {
+    fn select_walk(&mut self, select: Select<'_>, query: Query<'_>, scopes: &mut Vec<Scope>) {
         let mut scope = Scope::default();
         let mut join_quals: Vec<Where<'_>> = Vec::new();
         for source in select.from() {
-            self.source_collect_tree(source, &mut scope, scopes, &mut join_quals);
+            self.source_collect(source, &mut scope, scopes, &mut join_quals);
         }
         scopes.push(scope);
 
@@ -70,16 +68,16 @@ impl Synthesizer {
 
         for item in select.items().into_iter().flatten() {
             if let SelectItem::Expr(expr) = item {
-                self.expr_attribute_tree(expr.expr().node_ref(), scopes);
+                self.expr_attribute(expr.expr().node_ref(), scopes);
             }
         }
         for qual in join_quals {
-            self.expr_attribute_tree(qual.node_ref(), scopes);
-            self.where_infer_tree(qual, scopes);
+            self.expr_attribute(qual.node_ref(), scopes);
+            self.where_infer(qual, scopes);
         }
         if let Some(where_clause) = select.where_clause() {
-            self.expr_attribute_tree(where_clause.node_ref(), scopes);
-            self.where_infer_tree(where_clause, scopes);
+            self.expr_attribute(where_clause.node_ref(), scopes);
+            self.where_infer(where_clause, scopes);
         }
         for column in select.group_by() {
             if column.table().is_none() && output_aliases.contains(column.column()) {
@@ -88,7 +86,7 @@ impl Synthesizer {
             self.column_attribute(column.table(), column.column(), scopes);
         }
         if let Some(having) = select.having() {
-            self.expr_attribute_tree(having.node_ref(), scopes);
+            self.expr_attribute(having.node_ref(), scopes);
         }
         for order in query.order_by() {
             match order.expr().kind() {
@@ -97,14 +95,14 @@ impl Synthesizer {
                 ScalarKind::Column(column)
                     if column.table().is_none() && output_aliases.contains(column.column()) => {}
                 ScalarKind::Literal(_) => {}
-                _ => self.expr_attribute_tree(order.expr().node_ref(), scopes),
+                _ => self.expr_attribute(order.expr().node_ref(), scopes),
             }
         }
 
         scopes.pop();
     }
 
-    fn source_collect_tree<'t>(
+    fn source_collect<'t>(
         &mut self,
         source: Source<'t>,
         scope: &mut Scope,
@@ -130,7 +128,7 @@ impl Synthesizer {
                         key: None,
                     });
                 }
-                self.query_walk_tree(subquery.query(), scopes);
+                self.query_walk(subquery.query(), scopes);
             }
             Source::CteRef(cte_ref) => {
                 scope.has_derived = true;
@@ -141,8 +139,8 @@ impl Synthesizer {
                 scope.entries.push(ScopeEntry { alias, key: None });
             }
             Source::Join(join) => {
-                self.source_collect_tree(join.left(), scope, scopes, join_quals);
-                self.source_collect_tree(join.right(), scope, scopes, join_quals);
+                self.source_collect(join.left(), scope, scopes, join_quals);
+                self.source_collect(join.right(), scope, scopes, join_quals);
                 if let JoinQual::On(qual) = join.qual() {
                     join_quals.push(qual);
                 }
@@ -152,10 +150,10 @@ impl Synthesizer {
 
     /// Attribute the columns of an expression: its nested subqueries walked
     /// first with their own scopes, then the columns at its own level.
-    fn expr_attribute_tree(&mut self, expr: NodeRef<'_>, scopes: &mut Vec<Scope>) {
+    fn expr_attribute(&mut self, expr: NodeRef<'_>, scopes: &mut Vec<Scope>) {
         for nested in own_level(expr, true) {
             if let NodeKind::Query { .. } = nested.kind() {
-                self.query_walk_tree(Query::from_ref(nested), scopes);
+                self.query_walk(Query::from_ref(nested), scopes);
             }
         }
         for position in own_level(expr, false) {
@@ -166,7 +164,7 @@ impl Synthesizer {
     }
 
     /// Record literal-comparison type evidence from WHERE/JOIN predicates.
-    fn where_infer_tree(&mut self, expr: Where<'_>, scopes: &[Scope]) {
+    fn where_infer(&mut self, expr: Where<'_>, scopes: &[Scope]) {
         match expr.kind() {
             WhereKind::Binary(binary) => {
                 if binary.op().is_comparison() {
@@ -181,8 +179,8 @@ impl Synthesizer {
                         }
                     }
                 }
-                self.where_infer_tree(binary.lexpr(), scopes);
-                self.where_infer_tree(binary.rexpr(), scopes);
+                self.where_infer(binary.lexpr(), scopes);
+                self.where_infer(binary.rexpr(), scopes);
             }
             WhereKind::Multi(multi) => {
                 // col IN (v1, v2, ...) / col BETWEEN a AND b shapes.
@@ -197,10 +195,10 @@ impl Synthesizer {
                     }
                 }
                 for inner in multi.exprs() {
-                    self.where_infer_tree(inner, scopes);
+                    self.where_infer(inner, scopes);
                 }
             }
-            WhereKind::Unary(unary) => self.where_infer_tree(unary.expr(), scopes),
+            WhereKind::Unary(unary) => self.where_infer(unary.expr(), scopes),
             WhereKind::Scalar(_) | WhereKind::Subquery(_) => {}
         }
     }

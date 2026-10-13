@@ -6,10 +6,9 @@ use std::mem::size_of;
 
 use super::build::{Remap, Replacement, Replacements, TreeBuilder};
 use super::node::{Node, NodeKind};
-use super::owned::query_expr_from_tree;
 use super::tree::QueryTree;
 use super::view::{Body, View};
-use crate::query::ast::{Deparse, LiteralValue, NodeId, QueryExpr, query_expr_parse};
+use crate::query::ast::{LiteralValue, NodeId, query_tree_parse};
 
 /// One query per node kind and child layout the converter produces.
 pub(crate) const CORPUS: &[&str] = &[
@@ -47,18 +46,8 @@ pub(crate) const CORPUS: &[&str] = &[
     "SELECT a FROM t WHERE a = ANY (ARRAY[1, 2]) AND b <> ALL (ARRAY[3, 4])",
 ];
 
-fn parse(sql: &str) -> QueryExpr {
-    query_expr_parse(sql).expect("parse query")
-}
-
 fn tree(sql: &str) -> QueryTree {
-    QueryTree::from_query_expr(&parse(sql))
-}
-
-fn sql(query: &QueryExpr) -> String {
-    let mut buf = String::new();
-    query.deparse(&mut buf);
-    buf
+    query_tree_parse(sql).expect("parse query")
 }
 
 fn session_hash(tree: &QueryTree) -> u64 {
@@ -115,29 +104,51 @@ fn test_node_size_stays_within_budget() {
     );
 }
 
-#[test]
-fn test_round_trip_rebuilds_the_owned_tree() {
-    for text in CORPUS {
-        let owned = parse(text);
-        let tree = QueryTree::from_query_expr(&owned);
-        assert_eq!(tree.chunk_count(), 1, "{text}");
-        assert_eq!(
-            lens(&tree)[0],
-            tree.len(),
-            "{text}: the root spans the tree"
-        );
-        let back = query_expr_from_tree(&tree);
-        assert_eq!(back, owned, "{text}");
-        assert_eq!(sql(&back), sql(&owned), "{text}");
-    }
-}
+/// The plain rendering of each corpus query.
+#[rustfmt::skip]
+const PLAIN_EXPECTED: &[&str] = &[
+    "SELECT a FROM t WHERE b = 1",
+    "SELECT DISTINCT t.a AS x, *, u.* FROM t, u",
+    "SELECT * FROM public.t t1(c1, c2)",
+    "SELECT a FROM t JOIN u ON t.id = u.id LEFT JOIN v USING (k) NATURAL JOIN w CROSS JOIN x",
+    "SELECT a FROM t RIGHT JOIN u ON t.id = u.id FULL JOIN v ON u.id = v.id",
+    "SELECT a FROM (SELECT b AS a FROM t) s(a)",
+    "SELECT a FROM t, LATERAL (SELECT t.a) l",
+    "WITH c(x) AS MATERIALIZED (SELECT 1), d AS NOT MATERIALIZED (SELECT 2) SELECT x FROM c cc(y), d",
+    "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v(n, s)",
+    "SELECT a FROM t UNION ALL SELECT a FROM u EXCEPT SELECT a FROM v INTERSECT SELECT a FROM w",
+    "SELECT a FROM t ORDER BY a DESC NULLS FIRST, b ASC NULLS LAST LIMIT 10 OFFSET 5",
+    "SELECT a FROM t LIMIT 3",
+    "SELECT a FROM t OFFSET 4",
+    "SELECT COUNT(*), COUNT(DISTINCT a), STRING_AGG(b, ',' ORDER BY b ASC) FILTER (WHERE c > 0), pg_catalog.NOW() FROM t GROUP BY a, t.b HAVING COUNT(*) > 1",
+    "SELECT SUM(a) OVER (PARTITION BY b, c ORDER BY d ASC ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING EXCLUDE TIES), RANK() OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), DENSE_RANK() OVER (GROUPS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM t",
+    "SELECT a FROM t WHERE NOT a IS NULL AND b IS NOT NULL OR c IS TRUE AND d IS NOT FALSE",
+    "SELECT a FROM t WHERE a IN (1, 2, 3) AND b NOT IN (4) AND c BETWEEN 1 AND 10 AND d NOT BETWEEN SYMMETRIC 1 AND 2",
+    "SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.id = t.id) AND a IN (SELECT b FROM v) AND a <> ALL (SELECT c FROM w) AND NOT EXISTS (SELECT 1 FROM x) AND a = (SELECT MAX(d) FROM y)",
+    "SELECT (((a + b) * 2) - ((c / 3) % 4)), (a)::text, (b)::int4, (c)::date, (d)::numeric(10,2), (e)::bool, CASE a WHEN 1 THEN 'x' WHEN 2 THEN 'z' ELSE 'y' END, CASE WHEN b > 1 THEN c END FROM t",
+    "SELECT a FROM t WHERE b LIKE 'x%' AND c ILIKE 'y' AND d NOT LIKE 'z' AND e NOT ILIKE 'w'",
+    "SELECT a FROM t WHERE b = $1 AND c = 'x' AND d = 1.5 AND e = true AND f IS NULL AND g = (NULL)::int4 AND h = ('{1,2}')::int4[] AND i = ('x')::date",
+    "SELECT a FROM t WHERE a = 1 AND (b = 2 OR c = 3) AND d != 4 AND e <= 5 AND f >= 6",
+    "SELECT a FROM t WHERE a = ANY (ARRAY[1, 2]) AND b != ALL (ARRAY[3, 4])",
+];
 
 #[test]
-fn test_plain_rendering_matches_the_owned_deparse() {
-    for text in CORPUS {
-        let owned = parse(text);
-        let rope = QueryTree::from_query_expr(&owned);
-        assert_eq!(rope.sql(), sql(&owned), "{text}");
+fn test_plain_rendering_expectations() {
+    assert_eq!(CORPUS.len(), PLAIN_EXPECTED.len());
+    for (text, expected) in CORPUS.iter().zip(PLAIN_EXPECTED) {
+        let parsed = tree(text);
+        assert_eq!(parsed.chunk_count(), 1, "{text}");
+        assert_eq!(
+            lens(&parsed)[0],
+            parsed.len(),
+            "{text}: the root spans the tree"
+        );
+        assert_eq!(parsed.sql(), *expected, "{text}");
+        assert_eq!(
+            tree(expected),
+            parsed,
+            "{text}: the rendering parses back to the tree"
+        );
     }
 }
 
@@ -336,11 +347,7 @@ fn test_a_tree_is_equal_to_its_compacted_copy() {
         assert_eq!(compacted.chunk_count(), 1, "{text}");
         assert_eq!(compacted, rewritten, "{text}");
         assert_eq!(full_hash(&compacted), full_hash(&rewritten), "{text}");
-        assert_eq!(
-            sql(&query_expr_from_tree(&compacted)),
-            sql(&query_expr_from_tree(&rewritten)),
-            "{text}"
-        );
+        assert_eq!(compacted.sql(), rewritten.sql(), "{text}");
     }
 }
 

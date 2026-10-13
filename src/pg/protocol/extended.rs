@@ -372,7 +372,8 @@ mod tests {
 
     use super::*;
     use crate::cache::query::CacheableQuery;
-    use crate::query::ast::{QueryBody, query_expr_parse};
+    use crate::query::ast::query_tree_parse;
+    use crate::query::ast::rope::NodeKind;
 
     /// A frontend message: `tag`, the length word (counting itself), `body`.
     fn frame(tag: u8, body: &[u8]) -> BytesMut {
@@ -550,7 +551,7 @@ mod tests {
         assert_eq!(result.parameter_oids, vec![TypeOid::from_raw(23)]);
 
         // Test that this SQL would be cacheable
-        let query = query_expr_parse(&result.sql).unwrap();
+        let query = query_tree_parse(&result.sql).unwrap();
         let cacheable = CacheableQuery::try_new(query, &HashMap::new());
         assert!(
             cacheable.is_ok(),
@@ -575,15 +576,15 @@ mod tests {
         assert_eq!(result.statement_name, "");
 
         // Test that this SQL parses and IS cacheable (non-correlated subquery)
-        let query = query_expr_parse(&result.sql).expect("subquery should parse to AST");
+        let query = query_tree_parse(&result.sql).expect("subquery should parse to a tree");
 
-        // Verify has_subqueries() detects the subquery
-        let QueryBody::Select(select) = &query.body else {
-            panic!("expected SELECT");
-        };
+        // The WHERE holds a nested query.
         assert!(
-            select.has_subqueries(),
-            "has_subqueries() should detect subquery in WHERE"
+            query
+                .nodes()
+                .skip(1)
+                .any(|node| matches!(node.kind, NodeKind::Query { .. })),
+            "the subquery in WHERE converts"
         );
 
         // Verify cacheability check accepts it (non-correlated subqueries are now cacheable)
@@ -609,7 +610,7 @@ mod tests {
         let result = parse_parse_message(&data.freeze()).unwrap();
 
         // Test that INSERT is not cacheable (not a SELECT)
-        let cacheable_result = query_expr_parse(&result.sql);
+        let cacheable_result = query_tree_parse(&result.sql);
         assert!(
             cacheable_result.is_err(),
             "INSERT should not convert to cacheable query"

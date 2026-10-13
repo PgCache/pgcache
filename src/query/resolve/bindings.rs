@@ -9,10 +9,10 @@ use super::ResolveResult;
 use super::rope::query_tree_resolve;
 use crate::catalog::Catalog;
 use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
+use crate::query::ast::NodeId;
 #[cfg(test)]
 use crate::query::ast::query_tree_parse;
 use crate::query::ast::rope::{QueryTree, Remap};
-use crate::query::ast::{ColumnNode, NodeId, StarNode};
 
 /// Index of a table source in [`Bindings::slots`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -128,10 +128,6 @@ fn by_node<T>(entries: &[(NodeId, T)], id: NodeId) -> Option<&T> {
 }
 
 impl Bindings {
-    pub fn column(&self, node: &ColumnNode) -> Option<&ColumnTarget> {
-        self.column_by_id(node.id)
-    }
-
     /// The catalog column a binding names.
     pub fn binding_column(&self, binding: &ColumnBinding) -> Option<&ColumnMetadata> {
         self.slot(binding.slot)?
@@ -142,21 +138,7 @@ impl Bindings {
 
     /// The catalog column a `Column`-bound node names; `None` for a merged
     /// or output reference.
-    pub fn column_metadata(&self, node: &ColumnNode) -> Option<&ColumnMetadata> {
-        match self.column(node)? {
-            ColumnTarget::Column(binding) => self.binding_column(binding),
-            ColumnTarget::Merged(_) | ColumnTarget::Output => None,
-        }
-    }
-
     /// The slot a `Column`-bound node refers into.
-    pub fn column_slot(&self, node: &ColumnNode) -> Option<&TableSlot> {
-        match self.column(node)? {
-            ColumnTarget::Column(binding) => self.slot(binding.slot),
-            ColumnTarget::Merged(_) | ColumnTarget::Output => None,
-        }
-    }
-
     pub fn column_by_id(&self, id: NodeId) -> Option<&ColumnTarget> {
         by_node(&self.columns, id)
     }
@@ -174,10 +156,6 @@ impl Bindings {
         &self.slots
     }
 
-    pub fn star(&self, node: &StarNode) -> Option<&[StarItem]> {
-        self.star_by_id(node.id)
-    }
-
     pub fn star_by_id(&self, id: NodeId) -> Option<&[StarItem]> {
         by_node(&self.stars, id).map(Vec::as_slice)
     }
@@ -188,12 +166,6 @@ impl Bindings {
 
     pub fn merged_columns(&self) -> &[MergedColumnBinding] {
         &self.merged
-    }
-
-    pub fn is_correlated(&self, node: &ColumnNode) -> bool {
-        self.correlated
-            .binary_search_by_key(&node.id.index(), |id| id.index())
-            .is_ok()
     }
 
     pub fn correlated(&self) -> &[NodeId] {

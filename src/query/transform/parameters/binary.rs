@@ -377,24 +377,22 @@ mod tests {
     };
     use crate::cache::{QueryParameter, QueryParameters};
     use crate::oid::TypeOid;
-    use crate::query::ast::{
-        Deparse, LiteralValue, QueryExpr, query_expr_fingerprint, query_expr_parse,
-    };
-    use crate::query::transform::parameters::{
-        parameter_to_literal, query_expr_parameters_replace,
-    };
+    use crate::query::ast::rope::QueryTree;
+    use crate::query::ast::{Deparse, LiteralValue, query_tree_parse};
+    use crate::query::transform::parameters::parameter_to_literal;
+    use crate::query::transform::query_tree_parameters_replace;
     use crate::query::transform::{AstTransformError, AstTransformResult};
 
-    fn parse_select_node(sql: &str) -> QueryExpr {
-        query_expr_parse(sql).expect("convert to QueryExpr")
+    fn parse_select_node(sql: &str) -> QueryTree {
+        query_tree_parse(sql).expect("parse")
     }
 
     /// Bind `params` into `query` in place.
     fn query_parameters_replace_in_place(
-        query: &mut QueryExpr,
+        query: &mut QueryTree,
         params: &QueryParameters,
     ) -> AstTransformResult<()> {
-        *query = query_expr_parameters_replace(query, params)?;
+        *query = query_tree_parameters_replace(query, params)?;
         Ok(())
     }
 
@@ -446,8 +444,7 @@ mod tests {
         let mut node = parse_select_node(sql);
         let params = binary_params(vec![(Some(bytes), ty)]);
         query_parameters_replace_in_place(&mut node, &params).expect("substitute binary parameter");
-        let mut buf = String::new();
-        node.deparse(&mut buf);
+        let buf = node.sql();
         assert!(
             !buf.as_bytes().contains(&0),
             "deparsed SQL must not contain NUL bytes; got {buf:?}"
@@ -1233,8 +1230,7 @@ mod tests {
         let params = binary_params(vec![(Some(&[0x00, 0x00, 0x00, 0x2A]), PgType::INT4)]);
         query_parameters_replace_in_place(&mut node, &params).expect("to replace parameters");
 
-        let mut buf = String::new();
-        node.deparse(&mut buf);
+        let buf = node.sql();
         assert_eq!(buf, "SELECT id FROM users WHERE id = 42");
     }
 
@@ -1251,14 +1247,13 @@ mod tests {
     }
 
     #[test]
-    fn test_binary_int4_array_distinct_values_produce_distinct_fingerprints() {
+    fn test_binary_int4_array_distinct_values_produce_distinct_trees() {
         // Sanity check that two different binary int4[] parameter values
         // substituted into the same query template produce different
-        // post-substitution fingerprints. Otherwise pgcache would route
+        // post-substitution trees. Otherwise pgcache would route
         // them to the same cache entry and one query's results would bleed
         // into the other's.
-        let q1 = query_expr_parse("SELECT id FROM widgets WHERE id = ANY($1)")
-            .expect("convert to QueryExpr");
+        let q1 = query_tree_parse("SELECT id FROM widgets WHERE id = ANY($1)").expect("parse");
         let q2 = q1.clone();
 
         let arr1 = vec![
@@ -1275,20 +1270,16 @@ mod tests {
         let p1 = binary_params(vec![(Some(&arr1), PgType::INT4_ARRAY)]);
         let p2 = binary_params(vec![(Some(&arr2), PgType::INT4_ARRAY)]);
 
-        let r1 = query_expr_parameters_replace(&q1, &p1).expect("replace 1");
-        let r2 = query_expr_parameters_replace(&q2, &p2).expect("replace 2");
-
-        let mut s1 = String::new();
-        let mut s2 = String::new();
-        r1.deparse(&mut s1);
-        r2.deparse(&mut s2);
-        assert_ne!(s1, s2, "deparsed SQL should differ between arrays");
-
-        let f1 = query_expr_fingerprint(&r1);
-        let f2 = query_expr_fingerprint(&r2);
+        let r1 = query_tree_parameters_replace(&q1, &p1).expect("replace 1");
+        let r2 = query_tree_parameters_replace(&q2, &p2).expect("replace 2");
         assert_ne!(
-            f1, f2,
-            "different binary int4[] values must produce different fingerprints"
+            r1.sql(),
+            r2.sql(),
+            "rendered SQL should differ between arrays"
+        );
+        assert_ne!(
+            r1, r2,
+            "different binary int4[] values must produce different trees"
         );
     }
 

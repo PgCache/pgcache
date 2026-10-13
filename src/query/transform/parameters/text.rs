@@ -58,22 +58,22 @@ mod tests {
 
     use crate::cache::{QueryParameter, QueryParameters};
     use crate::oid::TypeOid;
-    use crate::query::ast::{Deparse, QueryExpr, query_expr_parse};
-    use crate::query::transform::parameters::{
-        parameter_to_literal, query_expr_parameters_replace,
-    };
+    use crate::query::ast::query_tree_parse;
+    use crate::query::ast::rope::QueryTree;
+    use crate::query::transform::parameters::parameter_to_literal;
+    use crate::query::transform::query_tree_parameters_replace;
     use crate::query::transform::{AstTransformError, AstTransformResult};
 
-    fn parse_select_node(sql: &str) -> QueryExpr {
-        query_expr_parse(sql).expect("convert to QueryExpr")
+    fn parse_select_node(sql: &str) -> QueryTree {
+        query_tree_parse(sql).expect("parse")
     }
 
     /// Bind `params` into `query` in place.
     fn query_parameters_replace_in_place(
-        query: &mut QueryExpr,
+        query: &mut QueryTree,
         params: &QueryParameters,
     ) -> AstTransformResult<()> {
-        *query = query_expr_parameters_replace(query, params)?;
+        *query = query_tree_parameters_replace(query, params)?;
         Ok(())
     }
 
@@ -96,8 +96,7 @@ mod tests {
         let params = typed_text_params(vec![(Some(b"42"), PgType::INT4)]);
         query_parameters_replace_in_place(&mut node, &params).expect("to replace parameters");
 
-        let mut buf = String::new();
-        node.deparse(&mut buf);
+        let buf = node.sql();
         assert_eq!(buf, "SELECT id FROM users WHERE id = 42");
     }
 
@@ -107,8 +106,7 @@ mod tests {
         let params = typed_text_params(vec![(Some(b"t"), PgType::BOOL)]);
         query_parameters_replace_in_place(&mut node, &params).expect("to replace parameters");
 
-        let mut buf = String::new();
-        node.deparse(&mut buf);
+        let buf = node.sql();
         assert_eq!(buf, "SELECT id FROM users WHERE active = true");
     }
 
@@ -118,8 +116,7 @@ mod tests {
         let params = typed_text_params(vec![(Some(b"3.14"), PgType::FLOAT8)]);
         query_parameters_replace_in_place(&mut node, &params).expect("to replace parameters");
 
-        let mut buf = String::new();
-        node.deparse(&mut buf);
+        let buf = node.sql();
         assert_eq!(buf, "SELECT id FROM users WHERE score > 3.14");
     }
 
@@ -147,8 +144,7 @@ mod tests {
         )]);
         query_parameters_replace_in_place(&mut node, &params).expect("to replace parameters");
 
-        let mut buf = String::new();
-        node.deparse(&mut buf);
+        let buf = node.sql();
         assert_eq!(
             buf,
             "SELECT id FROM users WHERE uuid = '550e8400-e29b-41d4-a716-446655440000'"

@@ -8,14 +8,13 @@ use rootcause::Report;
 
 use super::expr::where_resolve;
 use super::query_resolve_scoped;
-use crate::catalog::Catalog;
+use crate::catalog::{Catalog, CatalogTable};
 use crate::query::ast::rope::{CteRef, Join, JoinQual, Source, Subquery, Table};
 use crate::query::resolve::bindings::TableSlot;
 use crate::query::resolve::join_using::{
     JoinScopeRanges, join_natural_common_columns, join_using_or_cross,
 };
 use crate::query::resolve::scope::ResolutionScope;
-use crate::query::resolve::table::table_metadata_find;
 use crate::query::resolve::{ResolveError, ResolveResult};
 
 /// Bind a table source (table, join, or subquery) into the scope.
@@ -135,4 +134,22 @@ fn cte_ref_resolve<'a>(
         &mut *scope.bindings,
     )?;
     scope.derived_table_scope_add(&outputs, alias_name, cte_ref.id())
+}
+
+/// Find table metadata for a table reference.
+///
+/// If the table has an explicit schema qualifier, use it directly.
+/// Otherwise, search through the search_path schemas in order.
+fn table_metadata_find<'map>(
+    schema: Option<&'map str>,
+    table_name: &'map str,
+    tables: &'map Catalog,
+    search_path: &[&'map str],
+) -> Option<&'map CatalogTable> {
+    if let Some(schema) = schema {
+        return tables.get2(&(schema, table_name));
+    }
+    search_path
+        .iter()
+        .find_map(|schema| tables.get2(&(*schema, table_name)))
 }

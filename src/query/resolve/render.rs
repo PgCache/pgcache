@@ -26,10 +26,7 @@ use crate::query::ast::rope::{
     OrderBy as RopeOrderBy, QueryTree, RopeDeparseContext, ScalarKind, Select as RopeSelect,
     SelectItem, Star as RopeStar, Table as RopeTable,
 };
-use crate::query::ast::{
-    Clause, ColumnNode, CteRefNode, Deparse, DeparseContext, DeparseWith, FunctionCall, JoinNode,
-    LiteralValue, NodeId, StarNode, TableNode, separated_deparse,
-};
+use crate::query::ast::{Clause, Deparse, LiteralValue, NodeId, separated_deparse};
 use crate::query::shape::{QueryShape, ShapeKey};
 use crate::query::transform::literal_is_parameterizable;
 
@@ -201,78 +198,6 @@ impl<'a> Bound<'a> {
             Mode::Text => Vec::new(),
             Mode::Shape { literals, .. } => literals,
         }
-    }
-}
-
-impl DeparseContext for Bound<'_> {
-    fn table_deparse(&mut self, node: &TableNode, buf: &mut String) {
-        self.table_render(
-            self.bindings.source(node.id),
-            |buf| node.alias_deparse(buf),
-            |buf| node.deparse_plain(buf),
-            buf,
-        );
-    }
-
-    fn column_deparse(&mut self, node: &ColumnNode, buf: &mut String) {
-        self.column_render(
-            self.bindings.column(node),
-            &node.column,
-            |buf| node.deparse_plain(buf),
-            buf,
-        );
-    }
-
-    fn star_deparse(&mut self, node: &StarNode, buf: &mut String) {
-        self.star_render(self.bindings.star(node), |buf| node.deparse_plain(buf), buf);
-    }
-
-    /// The CTE body inline as a derived table, named by the reference's
-    /// alias or the CTE's name, with the CTE's column aliases.
-    fn cte_ref_deparse(&mut self, node: &CteRefNode, buf: &mut String) {
-        buf.push_str(" (");
-        node.query.deparse_with(self, buf);
-        buf.push_str(") ");
-        match &node.alias {
-            Some(alias) => alias.name.deparse(buf),
-            None => node.cte_name.deparse(buf),
-        };
-        if !node.column_aliases.is_empty() {
-            buf.push('(');
-            separated_deparse(buf, &node.column_aliases, ", ");
-            buf.push(')');
-        }
-    }
-
-    fn with_clause_renders(&self) -> bool {
-        false
-    }
-
-    fn natural_join_columns(&mut self, join: &JoinNode) -> Option<Vec<EcoString>> {
-        Some(
-            self.bindings
-                .merged_columns()
-                .iter()
-                .filter(|merged| merged.join == join.id)
-                .map(|merged| merged.name.clone())
-                .collect(),
-        )
-    }
-
-    fn function_name_deparse(&mut self, call: &FunctionCall, buf: &mut String) {
-        buf.push_str(&call.name);
-    }
-
-    fn literal_deparse(&mut self, literal: &LiteralValue, buf: &mut String) {
-        self.literal_render(literal, buf);
-    }
-
-    fn clause_enter(&mut self, clause: Clause) {
-        self.clause_entered(clause);
-    }
-
-    fn clause_leave(&mut self, clause: Clause) {
-        self.clause_left(clause);
     }
 }
 

@@ -1,10 +1,10 @@
 //! The column constraints and equivalences a SELECT's predicates imply,
-//! read from the rope and its bindings: the walk of `bound.rs` over views.
+//! read from the rope and its bindings.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
-use super::bound::{constraint_column_of_binding, query_constraints_build};
+use super::query_constraints_build;
 use super::range::{
     literal_value_canonical_order, literal_value_is_incomparable, literal_value_order,
 };
@@ -191,8 +191,8 @@ impl Collector<'_> {
                     .filter(|merged| merged.join.index() == join_id.index())
                 {
                     if let (Some(left), Some(right)) = (
-                        constraint_column_of_binding(bindings, &merged.left),
-                        constraint_column_of_binding(bindings, &merged.right),
+                        ConstraintColumn::of_binding(bindings, merged.left),
+                        ConstraintColumn::of_binding(bindings, merged.right),
                     ) {
                         self.equivalences.insert(ColumnEquivalence { left, right });
                     }

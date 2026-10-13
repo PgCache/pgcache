@@ -144,10 +144,9 @@ mod tests {
     use super::query_tree_parameters_replace;
     use crate::cache::QueryParameters;
     use crate::oid::TypeOid;
+    use crate::query::ast::query_tree_parse;
     use crate::query::ast::rope::deparse::query_deparse_with;
     use crate::query::ast::rope::{QueryTree, RopePlain};
-    use crate::query::ast::{Deparse, query_expr_parse};
-    use crate::query::transform::query_expr_parameters_replace;
 
     fn params(values: &[Option<(&[u8], PgType)>]) -> QueryParameters {
         QueryParameters {
@@ -169,61 +168,47 @@ mod tests {
         buf
     }
 
-    /// The rope substitution renders what the owned substitution renders,
-    /// and fails where it fails with the same error, over placeholders in
-    /// every position and arithmetic that folds or must not.
+    /// Every placeholder position and every arithmetic that folds or must
+    /// not: the rendering after substitution, or the error.
     #[test]
-    fn test_rope_substitution_matches_the_owned_walker() {
+    fn test_substitution_expectations() {
         let text = |value: &'static str| Some((value.as_bytes(), PgType::TEXT));
         let int = |value: &'static str| Some((value.as_bytes(), PgType::INT4));
         #[rustfmt::skip]
-        let cases: Vec<(&str, QueryParameters)> = vec![
-            ("SELECT id FROM users WHERE id = $1", params(&[text("42")])),
-            ("SELECT id FROM users WHERE id = $1 AND name = $2", params(&[text("42"), text("alice")])),
-            ("SELECT id FROM users WHERE name = $1", params(&[None])),
-            ("SELECT id FROM users WHERE id IN ($1, $2, 3)", params(&[int("1"), int("2")])),
-            ("SELECT id FROM users WHERE id = $1 LIMIT $2 OFFSET $3", params(&[int("1"), int("10"), int("5")])),
-            ("SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v WHERE column1 = $1", params(&[int("1")])),
-            ("SELECT id FROM users WHERE id = $1 % 10 + 1", params(&[int("12345")])),
-            ("SELECT id FROM users WHERE id = ($1 + 2) * 3 - 4 / 2", params(&[int("1")])),
-            ("SELECT id FROM users WHERE id = $1 / 0", params(&[int("7")])),
-            ("SELECT id FROM users WHERE id = (1 + 2) / 0", params(&[])),
-            ("SELECT id FROM users WHERE id = id + $1 * 2", params(&[int("3")])),
-            ("SELECT id FROM users WHERE total = $1 * 1.5", params(&[int("2")])),
-            ("SELECT id FROM users WHERE id = 1 + 2", params(&[])),
-            ("SELECT id FROM users WHERE id = $1 AND EXISTS (SELECT 1 FROM orders WHERE amount = $2 + 1)", params(&[int("1"), int("2")])),
-            ("SELECT count(*) FILTER (WHERE id = $1) FROM users ORDER BY $2 + 1", params(&[int("1"), int("0")])),
-            ("SELECT id FROM users u JOIN orders o ON o.user_id = u.id AND o.amount > $1", params(&[int("5")])),
-            ("SELECT id FROM users WHERE id = $2", params(&[text("42")])),
-            ("SELECT id FROM users WHERE id = $1", params(&[Some((b"not a number", PgType::INT4))])),
+        let cases: Vec<(&str, QueryParameters, &str)> = vec![
+            ("SELECT id FROM users WHERE id = $1", params(&[text("42")]), "SELECT id FROM users WHERE id = '42'"),
+            ("SELECT id FROM users WHERE id = $1 AND name = $2", params(&[text("42"), text("alice")]), "SELECT id FROM users WHERE id = '42' AND name = 'alice'"),
+            ("SELECT id FROM users WHERE name = $1", params(&[None]), "SELECT id FROM users WHERE name = NULL"),
+            ("SELECT id FROM users WHERE id IN ($1, $2, 3)", params(&[int("1"), int("2")]), "SELECT id FROM users WHERE id IN (1, 2, 3)"),
+            ("SELECT id FROM users WHERE id = $1 LIMIT $2 OFFSET $3", params(&[int("1"), int("10"), int("5")]), "SELECT id FROM users WHERE id = 1 LIMIT 10 OFFSET 5"),
+            ("SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v WHERE column1 = $1", params(&[int("1")]), "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v WHERE column1 = 1"),
+            ("SELECT id FROM users WHERE id = $1 % 10 + 1", params(&[int("12345")]), "SELECT id FROM users WHERE id = 6"),
+            ("SELECT id FROM users WHERE id = ($1 + 2) * 3 - 4 / 2", params(&[int("1")]), "SELECT id FROM users WHERE id = 7"),
+            ("SELECT id FROM users WHERE id = $1 / 0", params(&[int("7")]), "SELECT id FROM users WHERE id = (7 / 0)"),
+            ("SELECT id FROM users WHERE id = (1 + 2) / 0", params(&[]), "SELECT id FROM users WHERE id = (3 / 0)"),
+            ("SELECT id FROM users WHERE id = id + $1 * 2", params(&[int("3")]), "SELECT id FROM users WHERE id = (id + 6)"),
+            ("SELECT id FROM users WHERE total = $1 * 1.5", params(&[int("2")]), "SELECT id FROM users WHERE total = 3"),
+            ("SELECT id FROM users WHERE id = 1 + 2", params(&[]), "SELECT id FROM users WHERE id = 3"),
+            ("SELECT id FROM users WHERE id = $1 AND EXISTS (SELECT 1 FROM orders WHERE amount = $2 + 1)", params(&[int("1"), int("2")]), "SELECT id FROM users WHERE id = 1 AND EXISTS (SELECT 1 FROM orders WHERE amount = 3)"),
+            ("SELECT count(*) FILTER (WHERE id = $1) FROM users ORDER BY $2 + 1", params(&[int("1"), int("0")]), "SELECT COUNT(*) FILTER (WHERE id = 1) FROM users ORDER BY 1 ASC"),
+            ("SELECT id FROM users u JOIN orders o ON o.user_id = u.id AND o.amount > $1", params(&[int("5")]), "SELECT id FROM users u JOIN orders o ON o.user_id = u.id AND o.amount > 5"),
+            ("SELECT id FROM users WHERE id = $2", params(&[text("42")]), "ERR Parameter index 1 out of bounds (have 1 parameters)"),
+            ("SELECT id FROM users WHERE id = $1", params(&[Some((b"not a number", PgType::INT4))]), "ERR Invalid parameter value: invalid integer 'not a number': invalid digit found in string"),
         ];
-        for (sql, parameters) in cases {
-            let owned = query_expr_parse(sql).expect("parse");
-            let tree = QueryTree::from_query_expr(&owned);
-            let expected = query_expr_parameters_replace(&owned, &parameters);
-            let actual = query_tree_parameters_replace(&tree, &parameters);
-            match (expected, actual) {
-                (Ok(expected), Ok(actual)) => {
-                    let mut text = String::new();
-                    expected.deparse(&mut text);
-                    assert_eq!(plain(&actual), text, "{sql}");
-                }
-                (Err(expected), Err(actual)) => assert_eq!(
-                    actual.current_context().to_string(),
-                    expected.current_context().to_string(),
-                    "{sql}"
-                ),
-                (Ok(_), Err(e)) => panic!("{sql}: the rope substitution failed: {e}"),
-                (Err(e), Ok(_)) => panic!("{sql}: the owned substitution failed: {e}"),
-            }
+        for (sql, parameters, expected) in cases {
+            let tree = query_tree_parse(sql).expect("parse");
+            let actual = match query_tree_parameters_replace(&tree, &parameters) {
+                Ok(tree) => plain(&tree),
+                Err(e) => format!("ERR {}", e.current_context()),
+            };
+            assert_eq!(actual, expected, "{sql}");
         }
     }
 
     /// Nothing to substitute or fold: the tree comes back shared.
     #[test]
     fn test_unchanged_tree_is_shared() {
-        let owned = query_expr_parse("SELECT id FROM users WHERE id = 1").expect("parse");
-        let tree = QueryTree::from_query_expr(&owned);
+        let tree = query_tree_parse("SELECT id FROM users WHERE id = 1").expect("parse");
         let same = query_tree_parameters_replace(&tree, &params(&[])).expect("substitute");
         assert_eq!(same, tree);
         assert_eq!(same.chunk_count(), tree.chunk_count());

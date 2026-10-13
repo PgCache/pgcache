@@ -6,11 +6,8 @@
 //! the absolute position a side table such as the bindings is keyed by.
 
 mod build;
-mod convert;
 pub mod deparse;
 mod node;
-#[cfg(test)]
-mod owned;
 #[cfg(test)]
 pub(crate) mod tests;
 mod tree;
