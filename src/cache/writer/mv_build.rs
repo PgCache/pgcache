@@ -567,11 +567,8 @@ mod tests {
     use super::*;
     use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
     use crate::oid::{Oid, TypeOid};
-    use crate::query::ast::QueryExpr;
-    use crate::query::ast::{
-        AstNode, ColumnNode, FunctionCall, SelectNode, SetOpNode, SetOpType, TableNode,
-        query_expr_parse,
-    };
+    use crate::query::ast::rope::{NodeKind, QueryTree};
+    use crate::query::ast::{SetOpType, query_tree_parse};
 
     fn test_table(name: &str, oid: Oid, cols: &[&str]) -> TableMetadata {
         let columns = ColumnStore::new(cols.iter().enumerate().map(|(i, c)| {
@@ -606,20 +603,61 @@ mod tests {
         t
     }
 
-    /// Build the Measure-gate denominator for `sql` and re-parse it into an AST
-    /// so tests assert on nodes, not raw text.
-    fn denom_ast(sql: &str) -> QueryExpr {
+    /// Build the Measure-gate denominator for `sql` and re-parse it into a
+    /// tree so tests assert on nodes, not raw text.
+    fn denom_ast(sql: &str) -> QueryTree {
         let bound =
             ResolvedQuery::parse_resolve(sql, &test_tables(), &["public"]).expect("resolve source");
         let denom = mv_source_count_sql(&bound);
-        query_expr_parse(&denom).expect("denominator SQL re-parses")
+        query_tree_parse(&denom).expect("denominator SQL re-parses")
     }
 
-    /// Count of `count()` aggregate calls anywhere in the AST.
-    fn count_aggs(ast: &QueryExpr) -> usize {
-        ast.nodes::<FunctionCall>()
-            .filter(|f| f.name.eq_ignore_ascii_case("count"))
+    fn kinds(tree: &QueryTree) -> impl Iterator<Item = &NodeKind> {
+        tree.nodes().map(|node| &node.kind)
+    }
+
+    /// Count of `count()` aggregate calls anywhere in the tree.
+    fn count_aggs(tree: &QueryTree) -> usize {
+        kinds(tree)
+            .filter(|kind| matches!(kind, NodeKind::Function { name, .. } if name.eq_ignore_ascii_case("count")))
             .count()
+    }
+
+    fn has_column(tree: &QueryTree, column: &str) -> bool {
+        kinds(tree)
+            .any(|kind| matches!(kind, NodeKind::Column { column: name, .. } if name == column))
+    }
+
+    fn has_table(tree: &QueryTree, table: &str) -> bool {
+        tree.table_names().any(|(_, name)| name == table)
+    }
+
+    fn union_all_count(tree: &QueryTree) -> usize {
+        kinds(tree)
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    NodeKind::SetOp {
+                        op: SetOpType::Union,
+                        all: true
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// Whether any query node carries ORDER BY or LIMIT.
+    fn any_ordered_or_limited(tree: &QueryTree) -> bool {
+        kinds(tree).any(|kind| {
+            matches!(kind, NodeKind::Query { order_by_count, has_limit_count, has_limit_offset, .. }
+            if *order_by_count > 0 || *has_limit_count || *has_limit_offset)
+        })
+    }
+
+    fn any_grouped(tree: &QueryTree) -> bool {
+        kinds(tree).any(
+            |kind| matches!(kind, NodeKind::Select { group_by_count, .. } if *group_by_count > 0),
+        )
     }
 
     /// The WHERE predicate survives (the bug dropped it) and the inner aggregate
@@ -628,13 +666,10 @@ mod tests {
     fn test_denominator_keeps_predicate_drops_aggregate() {
         let ast = denom_ast("SELECT count(*) FROM orders WHERE status = 'open'");
         assert!(
-            ast.nodes::<ColumnNode>().any(|c| c.column == "status"),
+            has_column(&ast, "status"),
             "predicate column `status` must survive in the denominator"
         );
-        assert!(
-            ast.nodes::<TableNode>().any(|t| t.name == "orders"),
-            "source table must survive"
-        );
+        assert!(has_table(&ast, "orders"), "source table must survive");
         assert_eq!(count_aggs(&ast), 1, "only the wrapper count() remains");
     }
 
@@ -643,11 +678,8 @@ mod tests {
     fn test_denominator_strips_group_by() {
         let ast =
             denom_ast("SELECT status, count(*) FROM orders WHERE status = 'open' GROUP BY status");
-        assert!(
-            ast.nodes::<SelectNode>().all(|s| s.group_by.is_empty()),
-            "no SELECT node may carry GROUP BY"
-        );
-        assert!(ast.nodes::<ColumnNode>().any(|c| c.column == "status"));
+        assert!(!any_grouped(&ast), "no SELECT node may carry GROUP BY");
+        assert!(has_column(&ast, "status"));
         assert_eq!(count_aggs(&ast), 1);
     }
 
@@ -657,8 +689,7 @@ mod tests {
     fn test_denominator_strips_order_and_limit() {
         let ast = denom_ast("SELECT count(*) FROM orders WHERE status = 'open' LIMIT 5");
         assert!(
-            ast.nodes::<QueryExpr>()
-                .all(|q| q.limit.is_none() && q.order_by.is_empty()),
+            !any_ordered_or_limited(&ast),
             "no query node may carry ORDER BY / LIMIT"
         );
     }
@@ -670,26 +701,22 @@ mod tests {
     fn test_denominator_sums_branch_inputs() {
         let ast = denom_ast("SELECT id FROM orders UNION SELECT id FROM users");
         // Both branch source tables survive.
-        assert!(ast.nodes::<TableNode>().any(|t| t.name == "orders"));
-        assert!(ast.nodes::<TableNode>().any(|t| t.name == "users"));
+        assert!(has_table(&ast, "orders"));
+        assert!(has_table(&ast, "users"));
         // Each branch is stripped to a constant projection — no `id` column ref,
         // so the count is over scanned rows, not the projected/deduped result.
         assert!(
-            ast.nodes::<ColumnNode>().all(|c| c.column != "id"),
+            !has_column(&ast, "id"),
             "branch projections must be stripped to a constant"
         );
         // Branches are combined with UNION ALL so the denominator is the *sum*
         // of branch inputs, never the deduped UNION result.
         assert!(
-            ast.nodes::<SetOpNode>()
-                .any(|s| s.op == SetOpType::Union && s.all),
+            union_all_count(&ast) > 0,
             "branches must be UNION ALL'd (sum of inputs, no dedup)"
         );
         assert_eq!(count_aggs(&ast), 1, "only the wrapper count()");
-        assert!(
-            ast.nodes::<QueryExpr>().all(|q| q.limit.is_none()),
-            "outer LIMIT dropped"
-        );
+        assert!(!any_ordered_or_limited(&ast), "outer LIMIT dropped");
     }
 
     /// More than two branches: the binary set-op tree is recursed fully, so every
@@ -701,18 +728,15 @@ mod tests {
         let ast = denom_ast(
             "SELECT id FROM orders UNION SELECT id FROM users UNION SELECT status FROM orders",
         );
-        assert!(ast.nodes::<TableNode>().any(|t| t.name == "orders"));
-        assert!(ast.nodes::<TableNode>().any(|t| t.name == "users"));
+        assert!(has_table(&ast, "orders"));
+        assert!(has_table(&ast, "users"));
         assert_eq!(
-            ast.nodes::<SetOpNode>()
-                .filter(|s| s.op == SetOpType::Union && s.all)
-                .count(),
+            union_all_count(&ast),
             2,
             "three branches → two UNION ALL nodes"
         );
         assert!(
-            ast.nodes::<ColumnNode>()
-                .all(|c| c.column != "id" && c.column != "status"),
+            !has_column(&ast, "id") && !has_column(&ast, "status"),
             "every branch projection stripped to a constant"
         );
         assert_eq!(count_aggs(&ast), 1, "only the wrapper count()");
@@ -725,13 +749,9 @@ mod tests {
     #[test]
     fn test_denominator_setop_aggregate_branches() {
         let ast = denom_ast("SELECT count(*) FROM orders UNION SELECT count(*) FROM users");
-        assert!(ast.nodes::<TableNode>().any(|t| t.name == "orders"));
-        assert!(ast.nodes::<TableNode>().any(|t| t.name == "users"));
-        assert!(
-            ast.nodes::<SetOpNode>()
-                .any(|s| s.op == SetOpType::Union && s.all),
-            "branches UNION ALL'd"
-        );
+        assert!(has_table(&ast, "orders"));
+        assert!(has_table(&ast, "users"));
+        assert!(union_all_count(&ast) > 0, "branches UNION ALL'd");
         assert_eq!(
             count_aggs(&ast),
             1,

@@ -5,12 +5,9 @@
 use ecow::EcoString;
 use postgres_types::Type;
 
-use super::analysis::{
-    binding_name, binding_of_target, binding_table, binding_type, star_item_name,
-};
+use super::analysis::{binding_of_target, binding_type, star_item_name};
 use super::bindings::{Bindings, ColumnBinding, ColumnTarget};
 use super::render::{Bound, Output};
-use crate::catalog::TableMetadata;
 use crate::query::ast::{
     ColumnNode, DeparseWith, OrderByClause, QueryBody, QueryExpr, ScalarExpr, SelectColumn,
     SelectColumns, SelectNode,
@@ -31,29 +28,8 @@ pub(crate) fn column_binding_owned(
     binding_of_target(bindings, bindings.column(node)?)
 }
 
-pub(crate) fn column_table_owned<'a>(
-    bindings: &'a Bindings,
-    node: &ColumnNode,
-) -> Option<&'a TableMetadata> {
-    binding_table(bindings, column_binding_owned(bindings, node)?)
-}
-
-pub(crate) fn column_name_owned<'a>(
-    bindings: &'a Bindings,
-    node: &ColumnNode,
-) -> Option<&'a EcoString> {
-    binding_name(bindings, column_binding_owned(bindings, node)?)
-}
-
 pub(crate) fn column_type_owned<'a>(bindings: &'a Bindings, node: &ColumnNode) -> Option<&'a Type> {
     binding_type(bindings, column_binding_owned(bindings, node)?)
-}
-
-/// The serve SQL of an owned tree under `bindings`.
-pub(crate) fn sql_owned(tree: &QueryExpr, bindings: &Bindings) -> String {
-    let mut buf = String::new();
-    tree.deparse_with(&mut Bound::text(bindings), &mut buf);
-    buf
 }
 
 /// The output names of `query`, one per output position with stars

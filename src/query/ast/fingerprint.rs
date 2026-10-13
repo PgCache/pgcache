@@ -89,10 +89,10 @@ fn query_tree_has_string_literal(tree: &QueryTree) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query::ast::query_expr_parse;
+    use crate::query::ast::{query_expr_parse, query_tree_parse};
 
     fn parse(sql: &str) -> QueryTree {
-        QueryTree::from_query_expr(&query_expr_parse(sql).expect("parse query"))
+        query_tree_parse(sql).expect("parse query")
     }
 
     fn path(schemas: &[&str]) -> Vec<EcoString> {

@@ -50,7 +50,7 @@ fn connection_pending(log: &WriteLog) -> bool {
 }
 
 fn query(sql: &str) -> QueryTree {
-    QueryTree::from_query_expr(&crate::query::ast::query_expr_parse(sql).expect("parse query"))
+    crate::query::ast::query_tree_parse(sql).expect("parse query")
 }
 
 #[test]

@@ -1,7 +1,7 @@
 pub(crate) mod convert_raw;
-#[cfg(test)]
-mod convert_raw_tests;
 mod convert_tree;
+#[cfg(test)]
+mod convert_tree_tests;
 mod deparse;
 mod finalize;
 mod fingerprint;
@@ -69,6 +69,8 @@ error_set! {
 pub(crate) use convert_raw::query_expr_parse;
 pub use convert_raw::{RawStatement, query_expr_convert_raw, statement_convert_raw};
 pub use convert_tree::query_tree_convert_raw;
+#[cfg(test)]
+pub(crate) use convert_tree::query_tree_parse;
 pub use deparse::{Clause, Deparse, DeparseContext, DeparseWith, Plain};
 pub(crate) use deparse::{
     clause_deparse_with, parenthesized_deparse_with, separated_deparse, separated_deparse_with,

@@ -1,225 +1,251 @@
+//! The WHERE clause converter's tests: each predicate shape parses to
+//! exactly the expected rope fragment.
+
 #![allow(clippy::wildcard_enum_match_arm)]
+
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 
 use ecow::EcoString;
 
-use crate::query::ast::*;
+use crate::query::ast::rope::{
+    Body, Node, NodeKind, QueryTree, ScalarKind, SelectItem, View, Where, WhereKind,
+};
+use crate::query::ast::{
+    ArithmeticOp, AstError, BinaryOp, LiteralValue, MultiOp, NodeId, UnaryOp, query_tree_parse,
+};
+use crate::query::cast::CastTarget;
 
-/// Parse SQL and extract the WHERE clause via the AST layer.
-fn where_clause_parse(sql: &str) -> Result<Option<WhereExpr>, AstError> {
-    let query_expr = query_expr_parse(sql)?;
-    Ok(query_expr.where_clause().cloned())
+fn parse(sql: &str) -> QueryTree {
+    query_tree_parse(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"))
 }
 
-fn col(name: &str) -> WhereExpr {
-    WhereExpr::Scalar(s_col(name))
+/// The WHERE clause of `sql`'s SELECT, if any.
+fn where_of(tree: &QueryTree) -> Option<Where<'_>> {
+    match tree.root().body() {
+        Body::Select(select) => select.where_clause(),
+        _ => panic!("expected a SELECT"),
+    }
 }
 
-fn qcol(table: &str, name: &str) -> WhereExpr {
-    WhereExpr::Scalar(ScalarExpr::Column(ColumnNode {
-        id: NodeId::PENDING,
-        table: Some(EcoString::from(table)),
-        column: EcoString::from(name),
-    }))
+/// The nodes of a view's subtree, as a fragment.
+fn fragment<'t>(view: impl View<'t>) -> Vec<Node> {
+    let node = view.node_ref();
+    let start = u32::try_from(node.id().index()).expect("position fits");
+    (start..node.end())
+        .map(|position| node.tree().node(NodeId::from_index(position)).clone())
+        .collect()
 }
 
-fn lit(value: LiteralValue) -> WhereExpr {
-    WhereExpr::Scalar(ScalarExpr::Literal(value))
+/// Parse SQL and return its WHERE clause as a fragment.
+fn where_clause_parse(sql: &str) -> Result<Option<Vec<Node>>, AstError> {
+    let tree = query_tree_parse(sql)?;
+    Ok(where_of(&tree).map(fragment))
 }
 
-fn text(value: &str) -> WhereExpr {
+// ---------- The expected-fragment DSL ----------
+
+fn node(kind: NodeKind, children: &[Vec<Node>]) -> Vec<Node> {
+    let len = 1 + children.iter().map(|child| child.len()).sum::<usize>();
+    let mut out = vec![Node {
+        len: u32::try_from(len).expect("fragment fits"),
+        kind,
+    }];
+    for child in children {
+        out.extend(child.iter().cloned());
+    }
+    out
+}
+
+fn col(name: &str) -> Vec<Node> {
+    node(
+        NodeKind::Column {
+            table: None,
+            column: EcoString::from(name),
+        },
+        &[],
+    )
+}
+
+fn qcol(table: &str, name: &str) -> Vec<Node> {
+    node(
+        NodeKind::Column {
+            table: Some(EcoString::from(table)),
+            column: EcoString::from(name),
+        },
+        &[],
+    )
+}
+
+fn lit(value: LiteralValue) -> Vec<Node> {
+    node(NodeKind::Literal(value), &[])
+}
+
+fn text(value: &str) -> Vec<Node> {
     lit(LiteralValue::String(value.into()))
 }
 
-fn int(value: i64) -> WhereExpr {
+fn int(value: i64) -> Vec<Node> {
     lit(LiteralValue::Integer(value))
 }
 
-fn param(name: &str) -> WhereExpr {
+fn param(name: &str) -> Vec<Node> {
     lit(LiteralValue::Parameter(name.into()))
 }
 
-fn boolean(value: bool) -> WhereExpr {
+fn boolean(value: bool) -> Vec<Node> {
     lit(LiteralValue::Boolean(value))
 }
 
-fn null() -> WhereExpr {
+fn null() -> Vec<Node> {
     lit(LiteralValue::Null)
 }
 
-fn cmp(op: BinaryOp, lexpr: WhereExpr, rexpr: WhereExpr) -> WhereExpr {
-    WhereExpr::Binary(BinaryExpr {
-        id: NodeId::PENDING,
-        op,
-        lexpr: Box::new(lexpr),
-        rexpr: Box::new(rexpr),
-    })
+fn cmp(op: BinaryOp, lexpr: Vec<Node>, rexpr: Vec<Node>) -> Vec<Node> {
+    node(NodeKind::Binary { op }, &[lexpr, rexpr])
 }
 
-fn and(lexpr: WhereExpr, rexpr: WhereExpr) -> WhereExpr {
+fn and(lexpr: Vec<Node>, rexpr: Vec<Node>) -> Vec<Node> {
     cmp(BinaryOp::And, lexpr, rexpr)
 }
 
-fn or(lexpr: WhereExpr, rexpr: WhereExpr) -> WhereExpr {
+fn or(lexpr: Vec<Node>, rexpr: Vec<Node>) -> Vec<Node> {
     cmp(BinaryOp::Or, lexpr, rexpr)
 }
 
-fn unary(op: UnaryOp, expr: WhereExpr) -> WhereExpr {
-    WhereExpr::Unary(UnaryExpr {
-        id: NodeId::PENDING,
-        op,
-        expr: Box::new(expr),
-    })
+fn unary(op: UnaryOp, expr: Vec<Node>) -> Vec<Node> {
+    node(NodeKind::Unary { op }, &[expr])
 }
 
-fn not(expr: WhereExpr) -> WhereExpr {
+fn not(expr: Vec<Node>) -> Vec<Node> {
     unary(UnaryOp::Not, expr)
 }
 
-fn multi(op: MultiOp, exprs: Vec<WhereExpr>) -> WhereExpr {
-    WhereExpr::Multi(MultiExpr {
-        id: NodeId::PENDING,
-        op,
-        exprs,
-    })
+fn multi(op: MultiOp, exprs: Vec<Vec<Node>>) -> Vec<Node> {
+    let count = u32::try_from(exprs.len()).expect("operand count fits");
+    node(NodeKind::Multi { op, count }, &exprs)
 }
 
-fn array(elements: Vec<ScalarExpr>) -> WhereExpr {
-    WhereExpr::Scalar(ScalarExpr::Array(elements))
+fn array(elements: Vec<Vec<Node>>) -> Vec<Node> {
+    let count = u32::try_from(elements.len()).expect("element count fits");
+    node(NodeKind::Array { count }, &elements)
 }
 
-fn s_col(name: &str) -> ScalarExpr {
-    ScalarExpr::Column(ColumnNode {
-        id: NodeId::PENDING,
-        table: None,
-        column: EcoString::from(name),
-    })
+fn arith(op: ArithmeticOp, left: Vec<Node>, right: Vec<Node>) -> Vec<Node> {
+    node(NodeKind::Arithmetic { op }, &[left, right])
 }
 
-fn s_int(value: i64) -> ScalarExpr {
-    ScalarExpr::Literal(LiteralValue::Integer(value))
-}
-
-fn s_text(value: &str) -> ScalarExpr {
-    ScalarExpr::Literal(LiteralValue::String(value.into()))
-}
-
-fn s_param(name: &str) -> ScalarExpr {
-    ScalarExpr::Literal(LiteralValue::Parameter(name.into()))
-}
-
-fn arith(op: ArithmeticOp, left: ScalarExpr, right: ScalarExpr) -> ScalarExpr {
-    ScalarExpr::Arithmetic(ArithmeticExpr {
-        id: NodeId::PENDING,
-        left: Box::new(left),
-        op,
-        right: Box::new(right),
-    })
-}
-
-/// Each case's WHERE clause must parse to exactly the expected tree.
-fn where_cases_check(cases: Vec<(&str, &str, Option<WhereExpr>)>) {
+/// Each case's WHERE clause must parse to exactly the expected fragment.
+fn where_cases_check(cases: Vec<(&str, &str, Option<Vec<Node>>)>) {
     for (label, sql, expected) in cases {
         let actual = where_clause_parse(sql).unwrap_or_else(|e| panic!("{label}: {sql}: {e:?}"));
         assert_eq!(actual, expected, "{label}: {sql}");
     }
 }
 
-#[test]
-fn test_fingerprint_literals_differ() {
-    let q1 = query_expr_parse("select id, str from test where str = 'hello'").unwrap();
-    let q2 = query_expr_parse("select id, str from test where str = 'bye'").unwrap();
+fn session_hash(tree: &QueryTree) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    tree.session_hash(&mut hasher);
+    hasher.finish()
+}
 
-    assert_ne!(query_expr_fingerprint(&q1), query_expr_fingerprint(&q2));
+#[test]
+fn test_session_hash_differs_by_literal() {
+    let q1 = parse("select id, str from test where str = 'hello'");
+    let q2 = parse("select id, str from test where str = 'bye'");
+    assert_ne!(session_hash(&q1), session_hash(&q2));
 }
 
 #[test]
 fn test_select_columns() {
-    let q = query_expr_parse("select id, str from test where str = 'hello'").unwrap();
-    let select = q.as_select().unwrap();
-    let SelectColumns::Columns(cols) = &select.columns else {
-        panic!("expected explicit columns");
+    let describe = |sql: &str| -> Vec<String> {
+        let tree = parse(sql);
+        let Body::Select(select) = tree.root().body() else {
+            panic!("expected a SELECT");
+        };
+        select
+            .items()
+            .expect("explicit items")
+            .map(|item| match item {
+                SelectItem::Expr(expr) => match expr.expr().kind() {
+                    ScalarKind::Column(column) => format!("column {}", column.column()),
+                    ScalarKind::Function(function) => format!("function {}", function.name()),
+                    _ => "other".to_owned(),
+                },
+                SelectItem::Star(_) => "star".to_owned(),
+            })
+            .collect()
     };
-    assert_eq!(cols.len(), 2);
-    assert!(matches!(&cols[0].expr().unwrap(), ScalarExpr::Column(c) if c.column == "id"));
-    assert!(matches!(&cols[1].expr().unwrap(), ScalarExpr::Column(c) if c.column == "str"));
-
-    let q = query_expr_parse("select count(id), str from test where str = 'hihi'").unwrap();
-    let select = q.as_select().unwrap();
-    let SelectColumns::Columns(cols) = &select.columns else {
-        panic!("expected explicit columns");
-    };
-    assert_eq!(cols.len(), 2);
-    assert!(matches!(&cols[0].expr().unwrap(), ScalarExpr::Function(f) if f.name == "count"));
-    assert!(matches!(&cols[1].expr().unwrap(), ScalarExpr::Column(c) if c.column == "str"));
+    assert_eq!(
+        describe("select id, str from test where str = 'hello'"),
+        ["column id", "column str"]
+    );
+    assert_eq!(
+        describe("select count(id), str from test where str = 'hihi'"),
+        ["function count", "column str"]
+    );
 }
 
 // ------------------------------------------------------------------
 // Arithmetic in WHERE (PGC-118 layer 1)
 //
-// Layer 2 (constant_fold) runs at the end of `query_expr_convert_raw`, so
+// Layer 2 (the constant fold) runs at the end of conversion, so
 // pure-literal arithmetic is folded away before these assertions see
 // the tree. Each test uses at least one non-literal operand (column or
 // parameter) to keep the arithmetic node observable.
 // ------------------------------------------------------------------
 
-/// Pull the RHS of `WHERE col = <rhs>` so each arithmetic test can
-/// assert on the scalar shape directly.
-fn where_clause_rhs(sql: &str) -> ScalarExpr {
-    let WhereExpr::Binary(binary) = where_clause_parse(sql).unwrap().unwrap() else {
-        panic!("expected binary WHERE");
+/// The RHS of `WHERE col = <rhs>` as a fragment.
+fn where_clause_rhs(sql: &str) -> Vec<Node> {
+    let tree = parse(sql);
+    let WhereKind::Binary(binary) = where_of(&tree).expect("a WHERE").kind() else {
+        panic!("expected a binary WHERE");
     };
-    let WhereExpr::Scalar(scalar) = *binary.rexpr else {
-        panic!("expected scalar RHS");
-    };
-    scalar
+    fragment(binary.rexpr())
 }
 
 #[test]
-fn test_where_clause_arithmetic_deparse() {
-    // Round-trip a non-foldable arithmetic query to confirm Scalar wrapping deparses cleanly.
-    let q = query_expr_parse("SELECT * FROM t WHERE x = a % 10000 + 1").unwrap();
-    let mut buf = String::new();
-    q.deparse(&mut buf);
-    // ArithmeticExpr::deparse parenthesizes each level, so nested
-    // `a % 10000 + 1` round-trips as `((a % 10000) + 1)`.
-    assert_eq!(buf, "SELECT * FROM t WHERE x = ((a % 10000) + 1)");
+fn test_where_clause_arithmetic_render() {
+    // Each arithmetic level is parenthesized, so nested `a % 10000 + 1`
+    // renders as `((a % 10000) + 1)`.
+    assert_eq!(
+        parse("SELECT * FROM t WHERE x = a % 10000 + 1").sql(),
+        "SELECT * FROM t WHERE x = ((a % 10000) + 1)"
+    );
 }
 
 #[test]
 fn test_where_clause_typecast_column() {
-    // PGC-120: column cast on the left of a comparison. Must parse as
-    // WhereExpr::Scalar(ScalarExpr::TypeCast{...}), not UnsupportedPattern.
-    let where_clause = where_clause_parse("SELECT * FROM t WHERE col::text = 'foo'")
-        .unwrap()
-        .unwrap();
-    let WhereExpr::Binary(binary) = &where_clause else {
-        panic!("expected Binary, got {where_clause:?}");
+    // PGC-120: a column cast on the left of a comparison is a scalar cast,
+    // not an unsupported pattern.
+    let tree = parse("SELECT * FROM t WHERE col::text = 'foo'");
+    let WhereKind::Binary(binary) = where_of(&tree).expect("a WHERE").kind() else {
+        panic!("expected a comparison");
     };
-    let WhereExpr::Scalar(ScalarExpr::TypeCast { expr, target }) = &*binary.lexpr else {
-        panic!("expected Scalar(TypeCast), got {:?}", binary.lexpr);
+    let WhereKind::Scalar(scalar) = binary.lexpr().kind() else {
+        panic!("expected a scalar on the left");
     };
-    assert_eq!(*target, crate::query::cast::CastTarget::Text);
-    assert!(matches!(&**expr, ScalarExpr::Column(c) if c.column == "col"));
+    let ScalarKind::TypeCast(cast) = scalar.kind() else {
+        panic!("expected a cast on the left");
+    };
+    assert_eq!(*cast.target(), CastTarget::Text);
+    assert!(matches!(cast.expr().kind(), ScalarKind::Column(c) if c.column() == "col"));
 }
 
 #[test]
-fn test_where_clause_typecast_deparse() {
-    // PGC-120: round-trip a few common cast shapes through Deparse.
+fn test_where_clause_typecast_round_trips() {
+    // PGC-120: common cast shapes parse → render → parse to the same tree.
     for sql in [
         "SELECT * FROM t WHERE col::text = 'foo'",
         "SELECT * FROM t WHERE created_at::date = '2024-01-01'",
         "SELECT * FROM t WHERE (a + b)::int > 10",
     ] {
-        let q = query_expr_parse(sql).unwrap_or_else(|e| panic!("convert failed for {sql}: {e}"));
-        let mut buf = String::new();
-        q.deparse(&mut buf);
-        // Re-parse the deparsed SQL to confirm semantic round-trip.
-        let q2 =
-            query_expr_parse(&buf).unwrap_or_else(|e| panic!("re-convert failed for {buf:?}: {e}"));
+        let tree = parse(sql);
+        let rendered = tree.sql();
         assert_eq!(
-            query_expr_fingerprint(&q),
-            query_expr_fingerprint(&q2),
-            "fingerprint mismatch after deparse round-trip\n  in:  {sql}\n  out: {buf}",
+            parse(&rendered),
+            tree,
+            "round trip of {sql} through {rendered}"
         );
     }
 }
@@ -227,7 +253,7 @@ fn test_where_clause_typecast_deparse() {
 #[test]
 fn test_where_comparison_cases() {
     #[rustfmt::skip]
-    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+    let cases: Vec<(&str, &str, Option<Vec<Node>>)> = vec![
         ("=, text", "SELECT id, str FROM test WHERE str = 'hello'", Some(cmp(BinaryOp::Equal, col("str"), text("hello")))),
         ("=, integer", "SELECT id FROM test WHERE id = 123", Some(cmp(BinaryOp::Equal, col("id"), int(123)))),
         ("=, boolean", "SELECT id FROM test WHERE active = true", Some(cmp(BinaryOp::Equal, col("active"), boolean(true)))),
@@ -248,7 +274,7 @@ fn test_where_comparison_cases() {
 fn test_where_logical_cases() {
     // AND and OR chains associate to the left.
     #[rustfmt::skip]
-    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+    let cases: Vec<(&str, &str, Option<Vec<Node>>)> = vec![
         ("AND", "SELECT id FROM test WHERE str = 'hello' AND id = 123", Some(and(cmp(BinaryOp::Equal, col("str"), text("hello")), cmp(BinaryOp::Equal, col("id"), int(123))))),
         ("OR", "SELECT id FROM test WHERE str = 'hello' OR str = 'world'", Some(or(cmp(BinaryOp::Equal, col("str"), text("hello")), cmp(BinaryOp::Equal, col("str"), text("world"))))),
         ("NOT", "SELECT id FROM test WHERE NOT str = 'hello'", Some(not(cmp(BinaryOp::Equal, col("str"), text("hello"))))),
@@ -261,7 +287,7 @@ fn test_where_logical_cases() {
 #[test]
 fn test_where_parameter_cases() {
     #[rustfmt::skip]
-    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+    let cases: Vec<(&str, &str, Option<Vec<Node>>)> = vec![
         ("single", "SELECT id FROM test WHERE id = $1", Some(cmp(BinaryOp::Equal, col("id"), param("$1")))),
         ("multiple", "SELECT id FROM test WHERE name = $1 AND age > $2", Some(and(cmp(BinaryOp::Equal, col("name"), param("$1")), cmp(BinaryOp::GreaterThan, col("age"), param("$2"))))),
         ("mixed with literals", "SELECT id FROM test WHERE name = $1 AND active = true", Some(and(cmp(BinaryOp::Equal, col("name"), param("$1")), cmp(BinaryOp::Equal, col("active"), boolean(true))))),
@@ -273,7 +299,7 @@ fn test_where_parameter_cases() {
 fn test_where_in_list_cases() {
     // The tested column first, then the list values.
     #[rustfmt::skip]
-    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+    let cases: Vec<(&str, &str, Option<Vec<Node>>)> = vec![
         ("IN strings",       "SELECT * FROM t WHERE status IN ('active', 'pending', 'complete')",
                              Some(multi(MultiOp::In, vec![col("status"), text("active"), text("pending"), text("complete")]))),
         ("NOT IN",           "SELECT * FROM t WHERE id NOT IN (1, 2, 3)",
@@ -289,7 +315,7 @@ fn test_where_in_list_cases() {
 #[test]
 fn test_where_is_test_cases() {
     #[rustfmt::skip]
-    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+    let cases: Vec<(&str, &str, Option<Vec<Node>>)> = vec![
         ("IS NULL",                  "SELECT id FROM test WHERE deleted_at IS NULL",  Some(unary(UnaryOp::IsNull, col("deleted_at")))),
         ("IS NOT NULL",              "SELECT id FROM test WHERE name IS NOT NULL",    Some(unary(UnaryOp::IsNotNull, col("name")))),
         ("IS TRUE",                  "SELECT id FROM test WHERE active IS TRUE",      Some(unary(UnaryOp::IsTrue, col("active")))),
@@ -310,7 +336,7 @@ fn test_where_is_test_cases() {
 fn test_where_between_cases() {
     // The tested column, then the low and high bounds.
     #[rustfmt::skip]
-    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+    let cases: Vec<(&str, &str, Option<Vec<Node>>)> = vec![
         ("integers",              "SELECT * FROM t WHERE id BETWEEN 1 AND 10",
                                   Some(multi(MultiOp::Between, vec![col("id"), int(1), int(10)]))),
         ("NOT BETWEEN",           "SELECT * FROM t WHERE price NOT BETWEEN 100 AND 200",
@@ -334,17 +360,17 @@ fn test_where_between_cases() {
 fn test_where_any_all_cases() {
     // The tested column, then the array (or array parameter).
     #[rustfmt::skip]
-    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+    let cases: Vec<(&str, &str, Option<Vec<Node>>)> = vec![
         ("= ANY(ARRAY)",   "SELECT * FROM t WHERE id = ANY(ARRAY[1, 2, 3])",
-                           Some(multi(MultiOp::Any { comparison: BinaryOp::Equal }, vec![col("id"), array(vec![s_int(1), s_int(2), s_int(3)])]))),
+                           Some(multi(MultiOp::Any { comparison: BinaryOp::Equal }, vec![col("id"), array(vec![int(1), int(2), int(3)])]))),
         ("= ANY($1)",      "SELECT * FROM t WHERE id = ANY($1)",
                            Some(multi(MultiOp::Any { comparison: BinaryOp::Equal }, vec![col("id"), param("$1")]))),
         ("> ALL(ARRAY)",   "SELECT * FROM t WHERE score > ALL(ARRAY[80, 90])",
-                           Some(multi(MultiOp::All { comparison: BinaryOp::GreaterThan }, vec![col("score"), array(vec![s_int(80), s_int(90)])]))),
+                           Some(multi(MultiOp::All { comparison: BinaryOp::GreaterThan }, vec![col("score"), array(vec![int(80), int(90)])]))),
         ("<> ANY(ARRAY)",  "SELECT * FROM t WHERE status <> ANY(ARRAY['a', 'b'])",
-                           Some(multi(MultiOp::Any { comparison: BinaryOp::NotEqual }, vec![col("status"), array(vec![s_text("a"), s_text("b")])]))),
+                           Some(multi(MultiOp::Any { comparison: BinaryOp::NotEqual }, vec![col("status"), array(vec![text("a"), text("b")])]))),
         ("ANY under AND",  "SELECT * FROM t WHERE tenant_id = 1 AND id = ANY(ARRAY[10, 20])",
-                           Some(and(cmp(BinaryOp::Equal, col("tenant_id"), int(1)), multi(MultiOp::Any { comparison: BinaryOp::Equal }, vec![col("id"), array(vec![s_int(10), s_int(20)])])))),
+                           Some(and(cmp(BinaryOp::Equal, col("tenant_id"), int(1)), multi(MultiOp::Any { comparison: BinaryOp::Equal }, vec![col("id"), array(vec![int(10), int(20)])])))),
     ];
     where_cases_check(cases);
 }
@@ -352,7 +378,7 @@ fn test_where_any_all_cases() {
 #[test]
 fn test_where_like_cases() {
     #[rustfmt::skip]
-    let cases: Vec<(&str, &str, Option<WhereExpr>)> = vec![
+    let cases: Vec<(&str, &str, Option<Vec<Node>>)> = vec![
         ("LIKE",            "SELECT id FROM test WHERE name LIKE 'test%'",    Some(cmp(BinaryOp::Like, col("name"), text("test%")))),
         ("NOT LIKE",        "SELECT * FROM t WHERE name NOT LIKE '%test%'",   Some(cmp(BinaryOp::NotLike, col("name"), text("%test%")))),
         ("ILIKE",           "SELECT * FROM t WHERE name ILIKE '%test%'",      Some(cmp(BinaryOp::ILike, col("name"), text("%test%")))),
@@ -367,17 +393,17 @@ fn test_where_like_cases() {
 #[test]
 fn test_where_arithmetic_rhs_cases() {
     #[rustfmt::skip]
-    let cases: Vec<(&str, &str, ScalarExpr)> = vec![
-        ("column + literal",     "SELECT * FROM t WHERE x = a + 1",              arith(ArithmeticOp::Add, s_col("a"), s_int(1))),
-        ("-",                    "SELECT * FROM t WHERE x = a - 2",              arith(ArithmeticOp::Subtract, s_col("a"), s_int(2))),
-        ("*",                    "SELECT * FROM t WHERE x = a * 2",              arith(ArithmeticOp::Multiply, s_col("a"), s_int(2))),
-        ("/",                    "SELECT * FROM t WHERE x = a / 2",              arith(ArithmeticOp::Divide, s_col("a"), s_int(2))),
-        ("%",                    "SELECT * FROM t WHERE x = a % 3",              arith(ArithmeticOp::Modulo, s_col("a"), s_int(3))),
-        ("parameter % literal",  "SELECT * FROM t WHERE x = $1 % 10",            arith(ArithmeticOp::Modulo, s_param("$1"), s_int(10))),
+    let cases: Vec<(&str, &str, Vec<Node>)> = vec![
+        ("column + literal",     "SELECT * FROM t WHERE x = a + 1",              arith(ArithmeticOp::Add, col("a"), int(1))),
+        ("-",                    "SELECT * FROM t WHERE x = a - 2",              arith(ArithmeticOp::Subtract, col("a"), int(2))),
+        ("*",                    "SELECT * FROM t WHERE x = a * 2",              arith(ArithmeticOp::Multiply, col("a"), int(2))),
+        ("/",                    "SELECT * FROM t WHERE x = a / 2",              arith(ArithmeticOp::Divide, col("a"), int(2))),
+        ("%",                    "SELECT * FROM t WHERE x = a % 3",              arith(ArithmeticOp::Modulo, col("a"), int(3))),
+        ("parameter % literal",  "SELECT * FROM t WHERE x = $1 % 10",            arith(ArithmeticOp::Modulo, param("$1"), int(10))),
         // `%` binds tighter than `+`.
         ("nested with parameter", "SELECT * FROM t WHERE user_id = $1 % 10000 + 1",
-                                  arith(ArithmeticOp::Add, arith(ArithmeticOp::Modulo, s_param("$1"), s_int(10000)), s_int(1))),
-        ("two columns",          "SELECT * FROM t WHERE x = a + b",              arith(ArithmeticOp::Add, s_col("a"), s_col("b"))),
+                                  arith(ArithmeticOp::Add, arith(ArithmeticOp::Modulo, param("$1"), int(10000)), int(1))),
+        ("two columns",          "SELECT * FROM t WHERE x = a + b",              arith(ArithmeticOp::Add, col("a"), col("b"))),
     ];
     for (label, sql, expected) in cases {
         assert_eq!(where_clause_rhs(sql), expected, "{label}: {sql}");

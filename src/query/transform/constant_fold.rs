@@ -108,30 +108,46 @@ fn float_op(a: f64, op: ArithmeticOp, b: f64) -> Option<LiteralValue> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::wildcard_enum_match_arm)]
+
     use bytes::Bytes;
     use postgres_types::Type as PgType;
 
     use super::*;
     use crate::cache::QueryParameters;
     use crate::oid::TypeOid;
-    use crate::query::ast::{WhereExpr, query_expr_fingerprint, query_expr_parse};
-    use crate::query::transform::query_expr_parameters_replace;
+    use crate::query::ast::query_tree_parse;
+    use crate::query::ast::rope::{Body, QueryTree, ScalarKind, WhereKind};
+    use crate::query::transform::query_tree_parameters_replace;
 
-    fn parse_and_fold(sql: &str) -> QueryExpr {
-        let mut q = query_expr_parse(sql).unwrap();
-        query_expr_constant_fold(&mut q);
-        q
+    /// Conversion folds literal arithmetic as it finishes.
+    fn parse_and_fold(sql: &str) -> QueryTree {
+        query_tree_parse(sql).expect("parse")
     }
 
-    fn where_rhs_literal(q: &QueryExpr) -> &LiteralValue {
-        let select = q.as_select().expect("select");
-        let WhereExpr::Binary(binary) = select.where_clause.as_ref().expect("where") else {
+    /// The right operand of a `WHERE col = <rhs>` comparison.
+    fn where_rhs(tree: &QueryTree) -> crate::query::ast::rope::Scalar<'_> {
+        let Body::Select(select) = tree.root().body() else {
+            panic!("expected a SELECT");
+        };
+        let WhereKind::Binary(binary) = select.where_clause().expect("where").kind() else {
             panic!("expected binary WHERE");
         };
-        let WhereExpr::Scalar(ScalarExpr::Literal(lit)) = binary.rexpr.as_ref() else {
-            panic!("expected folded literal RHS, got {:?}", binary.rexpr);
-        };
-        lit
+        match binary.rexpr().kind() {
+            WhereKind::Scalar(scalar) => scalar,
+            _ => panic!("expected a scalar right operand"),
+        }
+    }
+
+    fn where_rhs_literal(tree: &QueryTree) -> &LiteralValue {
+        match where_rhs(tree).kind() {
+            ScalarKind::Literal(literal) => literal.value(),
+            _ => panic!("expected a folded literal right operand"),
+        }
+    }
+
+    fn where_rhs_is_arithmetic(tree: &QueryTree) -> bool {
+        matches!(where_rhs(tree).kind(), ScalarKind::Arithmetic(_))
     }
 
     #[test]
@@ -149,47 +165,27 @@ mod tests {
 
     #[test]
     fn test_fold_distinct_inputs_same_result() {
-        // Two different sid values that fold to the same user_id share a fingerprint.
+        // Two different sid values that fold to the same user_id give one tree.
         let q1 = parse_and_fold("SELECT id FROM t WHERE user_id = 12345 % 10000 + 1");
         let q2 = parse_and_fold("SELECT id FROM t WHERE user_id = 22345 % 10000 + 1");
-        assert_eq!(query_expr_fingerprint(&q1), query_expr_fingerprint(&q2));
+        assert_eq!(q1, q2);
     }
 
     #[test]
-    fn test_fold_with_column_left_unfolded() {
-        // Mixed literal+column cannot fold.
-        let q = parse_and_fold("SELECT id FROM t WHERE x = a + 1");
-        let select = q.as_select().expect("select");
-        let WhereExpr::Binary(binary) = select.where_clause.as_ref().expect("where") else {
-            panic!("expected binary WHERE");
-        };
-        let WhereExpr::Scalar(ScalarExpr::Arithmetic(_)) = binary.rexpr.as_ref() else {
-            panic!("expected arithmetic to stay unfolded with column operand");
-        };
-    }
-
-    #[test]
-    fn test_fold_divide_by_zero_left_unfolded() {
-        let q = parse_and_fold("SELECT id FROM t WHERE x = 10 / 0");
-        let select = q.as_select().expect("select");
-        let WhereExpr::Binary(binary) = select.where_clause.as_ref().expect("where") else {
-            panic!("expected binary WHERE");
-        };
-        let WhereExpr::Scalar(ScalarExpr::Arithmetic(_)) = binary.rexpr.as_ref() else {
-            panic!("expected divide-by-zero to stay unfolded");
-        };
-    }
-
-    #[test]
-    fn test_fold_modulo_by_zero_left_unfolded() {
-        let q = parse_and_fold("SELECT id FROM t WHERE x = 10 % 0");
-        let select = q.as_select().expect("select");
-        let WhereExpr::Binary(binary) = select.where_clause.as_ref().expect("where") else {
-            panic!("expected binary WHERE");
-        };
-        let WhereExpr::Scalar(ScalarExpr::Arithmetic(_)) = binary.rexpr.as_ref() else {
-            panic!("expected modulo-by-zero to stay unfolded");
-        };
+    fn test_fold_left_unfolded_cases() {
+        for (label, sql) in [
+            // Mixed literal+column cannot fold.
+            ("column operand", "SELECT id FROM t WHERE x = a + 1"),
+            ("divide by zero", "SELECT id FROM t WHERE x = 10 / 0"),
+            ("modulo by zero", "SELECT id FROM t WHERE x = 10 % 0"),
+            // Pre-bind: $1 is a Parameter literal, not numeric.
+            ("parameter", "SELECT id FROM t WHERE x = $1 % 10"),
+        ] {
+            assert!(
+                where_rhs_is_arithmetic(&parse_and_fold(sql)),
+                "{label}: {sql}"
+            );
+        }
     }
 
     #[test]
@@ -224,19 +220,6 @@ mod tests {
         assert!((f.into_inner() - 3.5).abs() < 1e-9);
     }
 
-    #[test]
-    fn test_fold_parameter_left_unfolded() {
-        // Pre-bind: $1 is a Parameter literal, not numeric — leave unfolded.
-        let q = parse_and_fold("SELECT id FROM t WHERE x = $1 % 10");
-        let select = q.as_select().expect("select");
-        let WhereExpr::Binary(binary) = select.where_clause.as_ref().expect("where") else {
-            panic!("expected binary WHERE");
-        };
-        let WhereExpr::Scalar(ScalarExpr::Arithmetic(_)) = binary.rexpr.as_ref() else {
-            panic!("expected parameter to stay unfolded");
-        };
-    }
-
     fn int8_param(value: i64) -> QueryParameters {
         QueryParameters {
             values: vec![Some(Bytes::from(value.to_string().into_bytes()))],
@@ -248,40 +231,21 @@ mod tests {
     #[test]
     fn test_fold_after_parameter_bind() {
         // Post-bind fold: `$1 % 10000 + 1` with $1=12345 folds to 2346.
-        let parsed = query_expr_parse("SELECT id FROM t WHERE user_id = $1 % 10000 + 1").unwrap();
-        let bound = query_expr_parameters_replace(&parsed, &int8_param(12345)).unwrap();
-
-        let select = bound.as_select().expect("select");
-        let WhereExpr::Binary(binary) = select.where_clause.as_ref().expect("where") else {
-            panic!("expected binary WHERE");
-        };
-        let WhereExpr::Scalar(ScalarExpr::Literal(LiteralValue::Integer(n))) =
-            binary.rexpr.as_ref()
-        else {
-            panic!("expected folded literal after bind, got {:?}", binary.rexpr);
-        };
-        assert_eq!(*n, 2346);
+        let parsed = parse_and_fold("SELECT id FROM t WHERE user_id = $1 % 10000 + 1");
+        let bound = query_tree_parameters_replace(&parsed, &int8_param(12345)).expect("bind");
+        assert_eq!(*where_rhs_literal(&bound), LiteralValue::Integer(2346));
     }
 
     #[test]
-    fn test_fold_after_parameter_bind_collapses_fingerprints() {
-        // Different $1 values that fold to the same user_id share a fingerprint
-        // after bind-time fold — the writer-bottleneck fix that PGC-118 targets.
-        let parsed = query_expr_parse("SELECT id FROM t WHERE user_id = $1 % 10000 + 1").unwrap();
-
-        let bound1 = query_expr_parameters_replace(&parsed, &int8_param(12345)).unwrap();
-        let bound2 = query_expr_parameters_replace(&parsed, &int8_param(22345)).unwrap();
-        assert_eq!(
-            query_expr_fingerprint(&bound1),
-            query_expr_fingerprint(&bound2),
-            "12345 and 22345 both fold to 2346; fingerprints must match",
-        );
-
+    fn test_fold_after_parameter_bind_collapses_trees() {
+        // Different $1 values that fold to the same user_id give one tree
+        // after the bind-time fold: the writer-bottleneck fix PGC-118 targets.
+        let parsed = parse_and_fold("SELECT id FROM t WHERE user_id = $1 % 10000 + 1");
+        let bound1 = query_tree_parameters_replace(&parsed, &int8_param(12345)).expect("bind");
+        let bound2 = query_tree_parameters_replace(&parsed, &int8_param(22345)).expect("bind");
+        assert_eq!(bound1, bound2, "12345 and 22345 both fold to 2346");
         // Sanity: distinct fold results stay distinct.
-        let bound3 = query_expr_parameters_replace(&parsed, &int8_param(11111)).unwrap();
-        assert_ne!(
-            query_expr_fingerprint(&bound1),
-            query_expr_fingerprint(&bound3),
-        );
+        let bound3 = query_tree_parameters_replace(&parsed, &int8_param(11111)).expect("bind");
+        assert_ne!(bound1, bound3);
     }
 }

@@ -701,11 +701,9 @@ mod tests {
 
     use super::*;
     use crate::catalog::Catalog;
+    use crate::query::ast::query_tree_session_key;
     use crate::query::ast::rope::{NodeKind, View};
-    use crate::query::ast::{AstNode, QueryExpr, query_expr_parse, query_tree_session_key};
     use crate::query::literal_settings::LiteralSettings;
-    use crate::query::resolve::owned::sql_owned;
-    use crate::query::resolve::query_expr_resolve;
     use crate::query::resolve::tests::{
         BINDING_CORPUS, RENDER_CORPUS, binding_catalog, catalog_with_columns,
     };
@@ -718,82 +716,308 @@ mod tests {
         ResolvedQuery::parse_resolve(sql, catalog, &["public"]).expect("resolve")
     }
 
-    /// The owned tree and the owned resolver's bindings: what the owned
-    /// renderer, the oracle for the rope renderer, reads.
-    fn owned(sql: &str, catalog: &Catalog) -> (QueryExpr, Bindings) {
-        let query = query_expr_parse(sql).expect("parse");
-        let bindings = query_expr_resolve(&query, catalog, &["public"]).expect("resolve");
-        (query, bindings)
-    }
+    /// The renderings of every corpus query: the serve SQL, the shape SQL and
+    /// the shape's literals, as the owned renderer produced them before it
+    /// was removed.
+    #[rustfmt::skip]
+    const RENDER_EXPECTED: &[(&str, &str, &str, &[&str])] = &[
+        ("SELECT u.id, name FROM users u WHERE dept_id = 'x'",
+         "SELECT u.id, u.name FROM public.users u WHERE u.dept_id = 'x'",
+         "SELECT u.id, u.name FROM public.users u WHERE u.dept_id = $1",
+         &["'x'"]),
+        ("SELECT u.id, d.name AS dname FROM users u JOIN departments d ON u.dept_id = d.id WHERE d.name = 'a' ORDER BY dname, u.id DESC",
+         "SELECT u.id, d.name AS dname FROM public.users u JOIN public.departments d ON u.dept_id = d.id WHERE d.name = 'a' ORDER BY dname ASC, u.id DESC",
+         "SELECT u.id, d.name AS dname FROM public.users u JOIN public.departments d ON u.dept_id = d.id WHERE d.name = $1 ORDER BY dname ASC, u.id DESC",
+         &["'a'"]),
+        ("SELECT * FROM users JOIN departments USING (id)",
+         "SELECT public.users.id AS id, public.users.name, public.users.dept_id, public.departments.name, public.departments.manager_id FROM public.users JOIN public.departments USING (id)",
+         "SELECT public.users.id AS id, public.users.name, public.users.dept_id, public.departments.name, public.departments.manager_id FROM public.users JOIN public.departments USING (id)",
+         &[]),
+        ("SELECT * FROM users LEFT JOIN departments USING (id) WHERE id = '1'",
+         "SELECT coalesce(public.users.id, public.departments.id) AS id, public.users.name, public.users.dept_id, public.departments.name, public.departments.manager_id FROM public.users LEFT JOIN public.departments USING (id) WHERE coalesce(public.users.id, public.departments.id) = '1'",
+         "SELECT coalesce(public.users.id, public.departments.id) AS id, public.users.name, public.users.dept_id, public.departments.name, public.departments.manager_id FROM public.users LEFT JOIN public.departments USING (id) WHERE coalesce(public.users.id, public.departments.id) = $1",
+         &["'1'"]),
+        ("SELECT id, count(*) FROM users JOIN departments USING (id) GROUP BY id",
+         "SELECT public.users.id, count(*) FROM public.users JOIN public.departments USING (id) GROUP BY public.users.id",
+         "SELECT public.users.id, count(*) FROM public.users JOIN public.departments USING (id) GROUP BY public.users.id",
+         &[]),
+        ("SELECT * FROM users NATURAL JOIN departments",
+         "SELECT public.users.id AS id, public.users.name AS name, public.users.dept_id, public.departments.manager_id FROM public.users JOIN public.departments USING (id, name)",
+         "SELECT public.users.id AS id, public.users.name AS name, public.users.dept_id, public.departments.manager_id FROM public.users JOIN public.departments USING (id, name)",
+         &[]),
+        ("SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM users u WHERE u.dept_id = d.id)",
+         "SELECT d.name FROM public.departments d WHERE EXISTS (SELECT 1 FROM public.users u WHERE u.dept_id = d.id)",
+         "SELECT d.name FROM public.departments d WHERE EXISTS (SELECT 1 FROM public.users u WHERE u.dept_id = d.id)",
+         &[]),
+        ("SELECT v.total, v.uid FROM (SELECT user_id AS uid, amount AS total FROM orders) v WHERE v.total = '5'",
+         "SELECT v.total, v.uid FROM (SELECT public.orders.user_id AS uid, public.orders.amount AS total FROM public.orders) v WHERE v.total = '5'",
+         "SELECT v.total, v.uid FROM (SELECT public.orders.user_id AS uid, public.orders.amount AS total FROM public.orders) v WHERE v.total = $1",
+         &["'5'"]),
+        ("WITH big AS (SELECT id, amount FROM orders WHERE amount = '9') SELECT big.id FROM big JOIN items ON items.order_id = big.id",
+         "SELECT big.id FROM (SELECT public.orders.id, public.orders.amount FROM public.orders WHERE public.orders.amount = '9') big JOIN public.items ON public.items.order_id = big.id",
+         "SELECT big.id FROM (SELECT public.orders.id, public.orders.amount FROM public.orders WHERE public.orders.amount = $1) big JOIN public.items ON public.items.order_id = big.id",
+         &["'9'"]),
+        ("SELECT id FROM users UNION SELECT id FROM departments ORDER BY id",
+         "SELECT public.users.id FROM public.users UNION SELECT public.departments.id FROM public.departments ORDER BY id ASC",
+         "SELECT public.users.id FROM public.users UNION SELECT public.departments.id FROM public.departments ORDER BY id ASC",
+         &[]),
+        ("SELECT name, count(*) FROM users GROUP BY name HAVING count(*) > 1 ORDER BY count(*) DESC",
+         "SELECT public.users.name, count(*) FROM public.users GROUP BY public.users.name HAVING count(*) > 1 ORDER BY count(*) DESC",
+         "SELECT public.users.name, count(*) FROM public.users GROUP BY public.users.name HAVING count(*) > $1 ORDER BY count(*) DESC",
+         &["1"]),
+        ("SELECT u.name, (SELECT max(o.amount) FROM orders o WHERE o.user_id = u.id) FROM users u WHERE u.id IN (SELECT user_id FROM orders WHERE amount = '1')",
+         "SELECT u.name, (SELECT max(o.amount) FROM public.orders o WHERE o.user_id = u.id) FROM public.users u WHERE u.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.amount = '1')",
+         "SELECT u.name, (SELECT max(o.amount) FROM public.orders o WHERE o.user_id = u.id) FROM public.users u WHERE u.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.amount = $1)",
+         &["'1'"]),
+        ("SELECT u.* FROM users u JOIN departments d ON d.id = u.dept_id WHERE d.id = ANY(ARRAY['1', '2']) AND u.name LIKE 'a%'",
+         "SELECT u.id, u.name, u.dept_id FROM public.users u JOIN public.departments d ON d.id = u.dept_id WHERE d.id = ANY (ARRAY['1', '2']) AND u.name LIKE 'a%'",
+         "SELECT u.id, u.name, u.dept_id FROM public.users u JOIN public.departments d ON d.id = u.dept_id WHERE d.id = ANY (ARRAY[$1, $2]) AND u.name LIKE $3",
+         &["'1'", "'2'", "'a%'"]),
+        ("SELECT CASE WHEN amount = '0' THEN sku ELSE order_id END FROM orders o JOIN items i ON i.order_id = o.id ORDER BY i.sku NULLS FIRST",
+         "SELECT CASE WHEN o.amount = '0' THEN i.sku ELSE i.order_id END FROM public.orders o JOIN public.items i ON i.order_id = o.id ORDER BY i.sku ASC NULLS FIRST",
+         "SELECT CASE WHEN o.amount = '0' THEN i.sku ELSE i.order_id END FROM public.orders o JOIN public.items i ON i.order_id = o.id ORDER BY i.sku ASC NULLS FIRST",
+         &[]),
+        ("SELECT * FROM users u LEFT JOIN departments d USING (id) ORDER BY id",
+         "SELECT coalesce(u.id, d.id) AS id, u.name, u.dept_id, d.name, d.manager_id FROM public.users u LEFT JOIN public.departments d USING (id) ORDER BY id ASC",
+         "SELECT coalesce(u.id, d.id) AS id, u.name, u.dept_id, d.name, d.manager_id FROM public.users u LEFT JOIN public.departments d USING (id) ORDER BY id ASC",
+         &[]),
+        ("SELECT u.*, d.name FROM users u NATURAL JOIN departments d",
+         "SELECT u.id, u.name, u.dept_id, d.name FROM public.users u JOIN public.departments d USING (id, name)",
+         "SELECT u.id, u.name, u.dept_id, d.name FROM public.users u JOIN public.departments d USING (id, name)",
+         &[]),
+        ("SELECT * FROM users NATURAL LEFT JOIN departments WHERE id = 1",
+         "SELECT coalesce(public.users.id, public.departments.id) AS id, coalesce(public.users.name, public.departments.name) AS name, public.users.dept_id, public.departments.manager_id FROM public.users LEFT JOIN public.departments USING (id, name) WHERE coalesce(public.users.id, public.departments.id) = 1",
+         "SELECT coalesce(public.users.id, public.departments.id) AS id, coalesce(public.users.name, public.departments.name) AS name, public.users.dept_id, public.departments.manager_id FROM public.users LEFT JOIN public.departments USING (id, name) WHERE coalesce(public.users.id, public.departments.id) = $1",
+         &["1"]),
+        ("SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 5 ORDER BY o.amount DESC NULLS LAST, u.id",
+         "SELECT u.id, u.name, u.dept_id, o.id, o.user_id, o.amount FROM public.users u JOIN public.orders o ON u.id = o.user_id WHERE o.amount > 5 ORDER BY o.amount DESC NULLS LAST, u.id ASC",
+         "SELECT u.id, u.name, u.dept_id, o.id, o.user_id, o.amount FROM public.users u JOIN public.orders o ON u.id = o.user_id WHERE o.amount > $1 ORDER BY o.amount DESC NULLS LAST, u.id ASC",
+         &["5"]),
+        ("WITH t AS (SELECT id, name FROM users) SELECT x.name FROM t AS x WHERE x.id = 1",
+         "SELECT x.name FROM (SELECT public.users.id, public.users.name FROM public.users) x WHERE x.id = 1",
+         "SELECT x.name FROM (SELECT public.users.id, public.users.name FROM public.users) x WHERE x.id = $1",
+         &["1"]),
+        ("WITH a AS (SELECT id FROM users), b AS (SELECT id FROM a WHERE id = 1) SELECT b.id FROM b",
+         "SELECT b.id FROM (SELECT a.id FROM (SELECT public.users.id FROM public.users) a WHERE a.id = 1) b",
+         "SELECT b.id FROM (SELECT a.id FROM (SELECT public.users.id FROM public.users) a WHERE a.id = $1) b",
+         &["1"]),
+        ("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount = 1 LIMIT 5) ORDER BY id LIMIT 3 OFFSET 1",
+         "SELECT public.users.id FROM public.users WHERE public.users.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.amount = 1 LIMIT 5) ORDER BY id ASC LIMIT 3 OFFSET 1",
+         "SELECT public.users.id FROM public.users WHERE public.users.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.amount = $1 LIMIT 5) ORDER BY id ASC LIMIT 3 OFFSET 1",
+         &["1"]),
+        ("SELECT id FROM users UNION ALL SELECT id FROM departments ORDER BY id DESC",
+         "SELECT public.users.id FROM public.users UNION ALL SELECT public.departments.id FROM public.departments ORDER BY id DESC",
+         "SELECT public.users.id FROM public.users UNION ALL SELECT public.departments.id FROM public.departments ORDER BY id DESC",
+         &[]),
+        ("SELECT id FROM users WHERE id > 1 INTERSECT SELECT id FROM departments WHERE id < 9",
+         "SELECT public.users.id FROM public.users WHERE public.users.id > 1 INTERSECT SELECT public.departments.id FROM public.departments WHERE public.departments.id < 9",
+         "SELECT public.users.id FROM public.users WHERE public.users.id > $1 INTERSECT SELECT public.departments.id FROM public.departments WHERE public.departments.id < $2",
+         &["1", "9"]),
+        ("SELECT name, count(*) AS n FROM users GROUP BY name HAVING count(*) > 1 ORDER BY n DESC, name",
+         "SELECT public.users.name, count(*) AS n FROM public.users GROUP BY public.users.name HAVING count(*) > 1 ORDER BY n DESC, name ASC",
+         "SELECT public.users.name, count(*) AS n FROM public.users GROUP BY public.users.name HAVING count(*) > $1 ORDER BY n DESC, name ASC",
+         &["1"]),
+        ("SELECT rank() OVER (PARTITION BY dept_id ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users",
+         "SELECT rank() OVER (PARTITION BY public.users.dept_id ORDER BY public.users.id ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM public.users",
+         "SELECT rank() OVER (PARTITION BY public.users.dept_id ORDER BY public.users.id ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM public.users",
+         &[]),
+        ("SELECT count(*) FILTER (WHERE amount > 2), string_agg(sku, ',' ORDER BY items.id) FROM orders JOIN items ON items.order_id = orders.id",
+         "SELECT count(*) FILTER (WHERE public.orders.amount > 2), string_agg(public.items.sku, ',' ORDER BY public.items.id ASC) FROM public.orders JOIN public.items ON public.items.order_id = public.orders.id",
+         "SELECT count(*) FILTER (WHERE public.orders.amount > 2), string_agg(public.items.sku, ',' ORDER BY public.items.id ASC) FROM public.orders JOIN public.items ON public.items.order_id = public.orders.id",
+         &[]),
+        ("SELECT DISTINCT dept_id, CASE WHEN name = 'a' THEN 1 ELSE 0 END FROM users WHERE id = ANY (ARRAY[1, 2]) AND name NOT IN ('x', 'y') AND id BETWEEN 1 AND 9",
+         "SELECT DISTINCT public.users.dept_id, CASE WHEN public.users.name = 'a' THEN 1 ELSE 0 END FROM public.users WHERE public.users.id = ANY (ARRAY[1, 2]) AND public.users.name NOT IN ('x', 'y') AND public.users.id BETWEEN 1 AND 9",
+         "SELECT DISTINCT public.users.dept_id, CASE WHEN public.users.name = 'a' THEN 1 ELSE 0 END FROM public.users WHERE public.users.id = ANY (ARRAY[$1, $2]) AND public.users.name NOT IN ($3, $4) AND public.users.id BETWEEN $5 AND $6",
+         &["1", "2", "'x'", "'y'", "1", "9"]),
+        ("SELECT (id)::text FROM users WHERE id IS NOT NULL AND NOT (id = 1 OR name = 'a')",
+         "SELECT (public.users.id)::text FROM public.users WHERE public.users.id IS NOT NULL AND NOT (public.users.id = 1 OR public.users.name = 'a')",
+         "SELECT (public.users.id)::text FROM public.users WHERE public.users.id IS NOT NULL AND NOT (public.users.id = $1 OR public.users.name = $2)",
+         &["1", "'a'"]),
+        ("SELECT u.name, (SELECT max(o.amount) FROM orders o WHERE o.user_id = u.id) AS top FROM users u ORDER BY top",
+         "SELECT u.name, (SELECT max(o.amount) FROM public.orders o WHERE o.user_id = u.id) AS top FROM public.users u ORDER BY top ASC",
+         "SELECT u.name, (SELECT max(o.amount) FROM public.orders o WHERE o.user_id = u.id) AS top FROM public.users u ORDER BY top ASC",
+         &[]),
+        ("SELECT * FROM (VALUES (1, 'a'), (2, 'b')) v",
+         "SELECT FROM (VALUES (1, 'a'), (2, 'b')) v",
+         "SELECT FROM (VALUES (1, 'a'), (2, 'b')) v",
+         &[]),
+        ("SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount = 3) AND NOT EXISTS (SELECT 1 FROM items i WHERE i.id = u.id)",
+         "SELECT u.id FROM public.users u WHERE EXISTS (SELECT 1 FROM public.orders o WHERE o.user_id = u.id AND o.amount = 3) AND NOT EXISTS (SELECT 1 FROM public.items i WHERE i.id = u.id)",
+         "SELECT u.id FROM public.users u WHERE EXISTS (SELECT 1 FROM public.orders o WHERE o.user_id = u.id AND o.amount = $1) AND NOT EXISTS (SELECT 1 FROM public.items i WHERE i.id = u.id)",
+         &["3"]),
+        ("SELECT a.id, b.id FROM users a CROSS JOIN departments b WHERE a.id = b.id",
+         "SELECT a.id, b.id FROM public.users a CROSS JOIN public.departments b WHERE a.id = b.id",
+         "SELECT a.id, b.id FROM public.users a CROSS JOIN public.departments b WHERE a.id = b.id",
+         &[]),
+        ("SELECT (amount * 2) + 1 FROM orders WHERE amount <> ALL (ARRAY[1]) ORDER BY 1",
+         "SELECT ((public.orders.amount * 2) + 1) FROM public.orders WHERE public.orders.amount != ALL (ARRAY[1]) ORDER BY 1 ASC",
+         "SELECT ((public.orders.amount * 2) + 1) FROM public.orders WHERE public.orders.amount != ALL (ARRAY[$1]) ORDER BY 1 ASC",
+         &["1"]),
+    ];
 
-    fn owned_shape(tree: &QueryExpr, bindings: &Bindings) -> QueryShape {
-        let mut cx = Bound::shape(bindings);
-        let mut sql = String::new();
-        tree.deparse_with(&mut cx, &mut sql);
-        let literals = cx.literals_take();
-        let mut hasher = DefaultHasher::new();
-        sql.hash(&mut hasher);
-        QueryShape {
-            sql: sql.into(),
-            key: ShapeKey::from_raw(hasher.finish()),
-            literals,
-        }
-    }
+    /// The corpus queries rendered with a stand-in for their first base
+    /// table's slot: `(VALUES (1, 2)) stand_in(a, b)` in its place and every
+    /// reference to it re-qualified.
+    #[rustfmt::skip]
+    const SOURCE_EXPECTED: &[(&str, &str)] = &[
+        ("SELECT u.id, name FROM users u WHERE dept_id = 'x'",
+         "SELECT stand_in.id, stand_in.name FROM (VALUES (1, 2)) stand_in(a, b) WHERE stand_in.dept_id = 'x'"),
+        ("SELECT u.id, d.name AS dname FROM users u JOIN departments d ON u.dept_id = d.id WHERE d.name = 'a' ORDER BY dname, u.id DESC",
+         "SELECT stand_in.id, d.name AS dname FROM (VALUES (1, 2)) stand_in(a, b) JOIN public.departments d ON stand_in.dept_id = d.id WHERE d.name = 'a' ORDER BY dname ASC, stand_in.id DESC"),
+        ("SELECT * FROM users JOIN departments USING (id)",
+         "SELECT stand_in.id AS id, stand_in.name, stand_in.dept_id, public.departments.name, public.departments.manager_id FROM (VALUES (1, 2)) stand_in(a, b) JOIN public.departments USING (id)"),
+        ("SELECT * FROM users LEFT JOIN departments USING (id) WHERE id = '1'",
+         "SELECT coalesce(stand_in.id, public.departments.id) AS id, stand_in.name, stand_in.dept_id, public.departments.name, public.departments.manager_id FROM (VALUES (1, 2)) stand_in(a, b) LEFT JOIN public.departments USING (id) WHERE coalesce(stand_in.id, public.departments.id) = '1'"),
+        ("SELECT id, count(*) FROM users JOIN departments USING (id) GROUP BY id",
+         "SELECT stand_in.id, count(*) FROM (VALUES (1, 2)) stand_in(a, b) JOIN public.departments USING (id) GROUP BY stand_in.id"),
+        ("SELECT * FROM users NATURAL JOIN departments",
+         "SELECT stand_in.id AS id, stand_in.name AS name, stand_in.dept_id, public.departments.manager_id FROM (VALUES (1, 2)) stand_in(a, b) JOIN public.departments USING (id, name)"),
+        ("SELECT d.name FROM departments d WHERE EXISTS (SELECT 1 FROM users u WHERE u.dept_id = d.id)",
+         "SELECT stand_in.name FROM (VALUES (1, 2)) stand_in(a, b) WHERE EXISTS (SELECT 1 FROM public.users u WHERE u.dept_id = stand_in.id)"),
+        ("SELECT v.total, v.uid FROM (SELECT user_id AS uid, amount AS total FROM orders) v WHERE v.total = '5'",
+         "SELECT v.total, v.uid FROM (SELECT stand_in.user_id AS uid, stand_in.amount AS total FROM (VALUES (1, 2)) stand_in(a, b)) v WHERE v.total = '5'"),
+        ("SELECT id FROM users UNION SELECT id FROM departments ORDER BY id",
+         "SELECT stand_in.id FROM (VALUES (1, 2)) stand_in(a, b) UNION SELECT public.departments.id FROM public.departments ORDER BY id ASC"),
+        ("SELECT name, count(*) FROM users GROUP BY name HAVING count(*) > 1 ORDER BY count(*) DESC",
+         "SELECT stand_in.name, count(*) FROM (VALUES (1, 2)) stand_in(a, b) GROUP BY stand_in.name HAVING count(*) > 1 ORDER BY count(*) DESC"),
+        ("SELECT u.name, (SELECT max(o.amount) FROM orders o WHERE o.user_id = u.id) FROM users u WHERE u.id IN (SELECT user_id FROM orders WHERE amount = '1')",
+         "SELECT u.name, (SELECT max(stand_in.amount) FROM (VALUES (1, 2)) stand_in(a, b) WHERE stand_in.user_id = u.id) FROM public.users u WHERE u.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.amount = '1')"),
+        ("SELECT u.* FROM users u JOIN departments d ON d.id = u.dept_id WHERE d.id = ANY(ARRAY['1', '2']) AND u.name LIKE 'a%'",
+         "SELECT stand_in.id, stand_in.name, stand_in.dept_id FROM (VALUES (1, 2)) stand_in(a, b) JOIN public.departments d ON d.id = stand_in.dept_id WHERE d.id = ANY (ARRAY['1', '2']) AND stand_in.name LIKE 'a%'"),
+        ("SELECT CASE WHEN amount = '0' THEN sku ELSE order_id END FROM orders o JOIN items i ON i.order_id = o.id ORDER BY i.sku NULLS FIRST",
+         "SELECT CASE WHEN stand_in.amount = '0' THEN i.sku ELSE i.order_id END FROM (VALUES (1, 2)) stand_in(a, b) JOIN public.items i ON i.order_id = stand_in.id ORDER BY i.sku ASC NULLS FIRST"),
+        ("SELECT * FROM users u LEFT JOIN departments d USING (id) ORDER BY id",
+         "SELECT coalesce(stand_in.id, d.id) AS id, stand_in.name, stand_in.dept_id, d.name, d.manager_id FROM (VALUES (1, 2)) stand_in(a, b) LEFT JOIN public.departments d USING (id) ORDER BY id ASC"),
+        ("SELECT u.*, d.name FROM users u NATURAL JOIN departments d",
+         "SELECT stand_in.id, stand_in.name, stand_in.dept_id, d.name FROM (VALUES (1, 2)) stand_in(a, b) JOIN public.departments d USING (id, name)"),
+        ("SELECT * FROM users NATURAL LEFT JOIN departments WHERE id = 1",
+         "SELECT coalesce(stand_in.id, public.departments.id) AS id, coalesce(stand_in.name, public.departments.name) AS name, stand_in.dept_id, public.departments.manager_id FROM (VALUES (1, 2)) stand_in(a, b) LEFT JOIN public.departments USING (id, name) WHERE coalesce(stand_in.id, public.departments.id) = 1"),
+        ("SELECT * FROM users u JOIN orders o ON u.id = o.user_id WHERE o.amount > 5 ORDER BY o.amount DESC NULLS LAST, u.id",
+         "SELECT stand_in.id, stand_in.name, stand_in.dept_id, o.id, o.user_id, o.amount FROM (VALUES (1, 2)) stand_in(a, b) JOIN public.orders o ON stand_in.id = o.user_id WHERE o.amount > 5 ORDER BY o.amount DESC NULLS LAST, stand_in.id ASC"),
+        ("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount = 1 LIMIT 5) ORDER BY id LIMIT 3 OFFSET 1",
+         "SELECT stand_in.id FROM (VALUES (1, 2)) stand_in(a, b) WHERE stand_in.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.amount = 1 LIMIT 5) ORDER BY id ASC LIMIT 3 OFFSET 1"),
+        ("SELECT id FROM users UNION ALL SELECT id FROM departments ORDER BY id DESC",
+         "SELECT stand_in.id FROM (VALUES (1, 2)) stand_in(a, b) UNION ALL SELECT public.departments.id FROM public.departments ORDER BY id DESC"),
+        ("SELECT id FROM users WHERE id > 1 INTERSECT SELECT id FROM departments WHERE id < 9",
+         "SELECT stand_in.id FROM (VALUES (1, 2)) stand_in(a, b) WHERE stand_in.id > 1 INTERSECT SELECT public.departments.id FROM public.departments WHERE public.departments.id < 9"),
+        ("SELECT name, count(*) AS n FROM users GROUP BY name HAVING count(*) > 1 ORDER BY n DESC, name",
+         "SELECT stand_in.name, count(*) AS n FROM (VALUES (1, 2)) stand_in(a, b) GROUP BY stand_in.name HAVING count(*) > 1 ORDER BY n DESC, name ASC"),
+        ("SELECT rank() OVER (PARTITION BY dept_id ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users",
+         "SELECT rank() OVER (PARTITION BY stand_in.dept_id ORDER BY stand_in.id ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM (VALUES (1, 2)) stand_in(a, b)"),
+        ("SELECT count(*) FILTER (WHERE amount > 2), string_agg(sku, ',' ORDER BY items.id) FROM orders JOIN items ON items.order_id = orders.id",
+         "SELECT count(*) FILTER (WHERE stand_in.amount > 2), string_agg(public.items.sku, ',' ORDER BY public.items.id ASC) FROM (VALUES (1, 2)) stand_in(a, b) JOIN public.items ON public.items.order_id = stand_in.id"),
+        ("SELECT DISTINCT dept_id, CASE WHEN name = 'a' THEN 1 ELSE 0 END FROM users WHERE id = ANY (ARRAY[1, 2]) AND name NOT IN ('x', 'y') AND id BETWEEN 1 AND 9",
+         "SELECT DISTINCT stand_in.dept_id, CASE WHEN stand_in.name = 'a' THEN 1 ELSE 0 END FROM (VALUES (1, 2)) stand_in(a, b) WHERE stand_in.id = ANY (ARRAY[1, 2]) AND stand_in.name NOT IN ('x', 'y') AND stand_in.id BETWEEN 1 AND 9"),
+        ("SELECT (id)::text FROM users WHERE id IS NOT NULL AND NOT (id = 1 OR name = 'a')",
+         "SELECT (stand_in.id)::text FROM (VALUES (1, 2)) stand_in(a, b) WHERE stand_in.id IS NOT NULL AND NOT (stand_in.id = 1 OR stand_in.name = 'a')"),
+        ("SELECT u.name, (SELECT max(o.amount) FROM orders o WHERE o.user_id = u.id) AS top FROM users u ORDER BY top",
+         "SELECT u.name, (SELECT max(stand_in.amount) FROM (VALUES (1, 2)) stand_in(a, b) WHERE stand_in.user_id = u.id) AS top FROM public.users u ORDER BY top ASC"),
+        ("SELECT u.id FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id AND o.amount = 3) AND NOT EXISTS (SELECT 1 FROM items i WHERE i.id = u.id)",
+         "SELECT stand_in.id FROM (VALUES (1, 2)) stand_in(a, b) WHERE EXISTS (SELECT 1 FROM public.orders o WHERE o.user_id = stand_in.id AND o.amount = 3) AND NOT EXISTS (SELECT 1 FROM public.items i WHERE i.id = stand_in.id)"),
+        ("SELECT a.id, b.id FROM users a CROSS JOIN departments b WHERE a.id = b.id",
+         "SELECT stand_in.id, b.id FROM (VALUES (1, 2)) stand_in(a, b) CROSS JOIN public.departments b WHERE stand_in.id = b.id"),
+        ("SELECT (amount * 2) + 1 FROM orders WHERE amount <> ALL (ARRAY[1]) ORDER BY 1",
+         "SELECT ((stand_in.amount * 2) + 1) FROM (VALUES (1, 2)) stand_in(a, b) WHERE stand_in.amount != ALL (ARRAY[1]) ORDER BY 1 ASC"),
+    ];
 
-    /// Every rendering of a bound query through the rope is byte for byte
-    /// the owned renderer's: the serve SQL, the identity text, the shape
-    /// and a rendering with a source standing in for the first table.
+    /// The corpus queries whose unlimited rendering differs from the serve
+    /// SQL: the outer LIMIT and OFFSET dropped, inner ones kept.
+    #[rustfmt::skip]
+    const UNLIMITED_EXPECTED: &[(&str, &str)] = &[
+        ("SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE amount = 1 LIMIT 5) ORDER BY id LIMIT 3 OFFSET 1",
+         "SELECT public.users.id FROM public.users WHERE public.users.id IN (SELECT public.orders.user_id FROM public.orders WHERE public.orders.amount = 1 LIMIT 5) ORDER BY id ASC"),
+    ];
+
+    /// Every corpus query renders to its captured serve SQL, shape SQL and
+    /// shape literals.
     #[test]
-    fn test_rope_rendering_matches_the_owned_renderer() {
+    fn test_render_corpus_expectations() {
         let catalog = binding_catalog();
+        let mut expected = RENDER_EXPECTED.iter();
         for sql in corpus() {
-            let (tree, bindings) = owned(sql, &catalog);
-            let bound = bound(sql, &catalog);
-            assert_eq!(bound.sql(), sql_owned(&tree, &bindings), "{sql}");
-            let mut unlimited = String::new();
-            tree.unlimited_deparse_with(&mut Bound::text(&bindings), &mut unlimited);
-            let mut rope_unlimited = String::new();
-            query_unlimited_deparse_with(
-                bound.tree().root(),
-                &mut RopeBound(Bound::text(bound.bindings())),
-                &mut rope_unlimited,
-            );
-            assert_eq!(rope_unlimited, unlimited, "{sql}");
-            let expected = owned_shape(&tree, &bindings);
-            let shape = bound.shape();
-            assert_eq!(shape.sql, expected.sql, "{sql}");
-            assert_eq!(shape.key, expected.key, "{sql}");
-            assert_eq!(shape.literals, expected.literals, "{sql}");
-            // The first table's slot in each resolver's own slot order.
-            let owned_slot = tree
-                .nodes::<TableNode>()
+            let (expected_sql, served, shape_sql, literals) = expected
                 .next()
-                .and_then(|table| bindings.source(table.id));
-            let rope_slot = bound
+                .unwrap_or_else(|| panic!("no expectation for {sql}"));
+            assert_eq!(
+                *expected_sql, sql,
+                "the expectations follow the corpus order"
+            );
+            let bound = bound(sql, &catalog);
+            assert_eq!(bound.sql(), *served, "{sql}");
+            let shape = bound.shape();
+            assert_eq!(shape.sql, *shape_sql, "{sql}");
+            let rendered: Vec<String> = shape
+                .literals
+                .iter()
+                .map(|literal| {
+                    let mut text = String::new();
+                    literal.deparse(&mut text);
+                    text
+                })
+                .collect();
+            assert_eq!(rendered, *literals, "{sql}");
+        }
+        assert!(expected.next().is_none(), "every expectation is used");
+    }
+
+    #[test]
+    fn test_render_with_source_expectations() {
+        let catalog = binding_catalog();
+        let mut expected = SOURCE_EXPECTED.iter();
+        for sql in corpus() {
+            let bound = bound(sql, &catalog);
+            let Some(slot) = bound
                 .tree()
                 .root()
                 .node_ref()
                 .subtree()
                 .find(|position| matches!(position.kind(), NodeKind::Table { .. }))
-                .and_then(|table| bound.bindings().source(table.id()));
-            let (Some(owned_slot), Some(rope_slot)) = (owned_slot, rope_slot) else {
+                .and_then(|table| bound.bindings().source(table.id()))
+            else {
                 continue;
             };
+            let (expected_sql, with_source) = expected
+                .next()
+                .unwrap_or_else(|| panic!("no expectation for {sql}"));
+            assert_eq!(
+                *expected_sql, sql,
+                "the expectations follow the corpus order"
+            );
             let columns = [EcoString::from("a"), EcoString::from("b")];
-            let stand_in = |slot| SourceOverride {
+            let stand_in = SourceOverride {
                 slot,
                 alias: "stand_in",
                 source: "VALUES (1, 2)",
                 columns: &columns,
             };
-            let mut expected = String::new();
-            tree.deparse_with(
-                &mut Bound::with_source(&bindings, &stand_in(owned_slot)),
-                &mut expected,
-            );
             let mut actual = String::new();
-            bound.sql_with_source_into(&stand_in(rope_slot), &mut actual);
-            assert_eq!(actual, expected, "{sql}");
+            bound.sql_with_source_into(&stand_in, &mut actual);
+            assert_eq!(actual, *with_source, "{sql}");
+        }
+        assert!(expected.next().is_none(), "every expectation is used");
+    }
+
+    /// The unlimited rendering is the serve SQL without the outer LIMIT and
+    /// OFFSET.
+    #[test]
+    fn test_render_unlimited_expectations() {
+        let catalog = binding_catalog();
+        let unlimited_of = |bound: &ResolvedQuery| {
+            let mut text = String::new();
+            query_unlimited_deparse_with(
+                bound.tree().root(),
+                &mut RopeBound(Bound::text(bound.bindings())),
+                &mut text,
+            );
+            text
+        };
+        for sql in corpus() {
+            let bound = bound(sql, &catalog);
+            let expected = UNLIMITED_EXPECTED
+                .iter()
+                .find(|(expected_sql, _)| *expected_sql == sql)
+                .map_or_else(|| bound.sql(), |(_, unlimited)| (*unlimited).to_owned());
+            assert_eq!(unlimited_of(&bound), expected, "{sql}");
         }
     }
 

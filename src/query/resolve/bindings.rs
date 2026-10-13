@@ -10,7 +10,7 @@ use super::rope::query_tree_resolve;
 use crate::catalog::Catalog;
 use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
 #[cfg(test)]
-use crate::query::ast::query_expr_parse;
+use crate::query::ast::query_tree_parse;
 use crate::query::ast::rope::{QueryTree, Remap};
 use crate::query::ast::{ColumnNode, NodeId, StarNode};
 
@@ -426,8 +426,8 @@ impl ResolvedQuery {
         tables: &Catalog,
         search_path: &[&str],
     ) -> ResolveResult<Self> {
-        let owned = query_expr_parse(sql).unwrap_or_else(|e| panic!("{sql} parses: {e:?}"));
-        Self::resolve(QueryTree::from_query_expr(&owned), tables, search_path)
+        let tree = query_tree_parse(sql).unwrap_or_else(|e| panic!("{sql} parses: {e:?}"));
+        Self::resolve(tree, tables, search_path)
     }
 
     pub fn tree(&self) -> &QueryTree {

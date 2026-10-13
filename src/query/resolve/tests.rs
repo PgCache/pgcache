@@ -7,15 +7,15 @@ use postgres_types::Type;
 use super::*;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use crate::oid::{Oid, TypeOid};
+use crate::query::ast::rope::{
+    Binary, Body, Column, Function, Join, JoinQual, NodeKind, ScalarKind, Select, SelectItem,
+    Source, Table, Where, WhereKind,
+};
 use crate::query::ast::{
-    AstNode, BinaryExpr, BinaryOp, ColumnNode, FunctionCall, JoinNode, JoinQual, JoinType,
-    LiteralValue, OrderDirection, QueryBody, QueryExpr, ScalarExpr, SelectColumn, SelectColumns,
-    SelectNode, SubLinkType, TableNode, TableSource, WhereExpr, query_expr_parse,
+    BinaryOp, JoinType, LiteralValue, OrderDirection, SubLinkType, query_tree_parse,
 };
 use crate::query::resolve::ResolveError;
-use crate::query::resolve::owned::{
-    column_name_owned, column_table_owned, column_type_owned, select_owned, sql_owned,
-};
+use crate::query::update::select_branches_with_source;
 
 // ============================================================================
 // Catalogs
@@ -112,113 +112,91 @@ pub(super) fn catalog_with_columns(specs: &[(&str, &[&str])]) -> Catalog {
 // Binding helpers
 // ============================================================================
 
-/// An owned tree with the owned resolver's bindings: what these tests
-/// exercise, read through the owned helpers the bound query no longer
-/// carries.
-struct Owned {
-    tree: QueryExpr,
-    bindings: Bindings,
-}
-
-impl Owned {
-    fn select(&self) -> Option<&SelectNode> {
-        select_owned(&self.tree)
-    }
-
-    fn column(&self, node: &ColumnNode) -> Option<&ColumnTarget> {
-        self.bindings.column(node)
-    }
-
-    fn column_table(&self, node: &ColumnNode) -> Option<&TableMetadata> {
-        column_table_owned(&self.bindings, node)
-    }
-
-    fn column_name(&self, node: &ColumnNode) -> Option<&EcoString> {
-        column_name_owned(&self.bindings, node)
-    }
-
-    fn column_type(&self, node: &ColumnNode) -> Option<&Type> {
-        column_type_owned(&self.bindings, node)
-    }
-
-    fn bindings(&self) -> &Bindings {
-        &self.bindings
-    }
-
-    fn tree(&self) -> &QueryExpr {
-        &self.tree
-    }
-
-    fn sql(&self) -> String {
-        sql_owned(&self.tree, &self.bindings)
-    }
-}
-
-/// Parse and bind `sql` over `tables` with the owned resolver.
-fn bound(sql: &str, tables: &Catalog) -> Owned {
-    let tree = query_expr_parse(sql).expect("convert to QueryExpr");
-    let bindings = query_expr_resolve(&tree, tables, &["public"]).expect("resolve");
-    Owned { tree, bindings }
+/// Parse and bind `sql` over `tables`.
+fn bound(sql: &str, tables: &Catalog) -> ResolvedQuery {
+    ResolvedQuery::parse_resolve(sql, tables, &["public"]).expect("resolve")
 }
 
 /// The error binding `sql` over `tables` ends in.
 fn bind_error(sql: &str, tables: &Catalog) -> ResolveError {
-    let query = query_expr_parse(sql).expect("convert to QueryExpr");
-    match query_expr_resolve(&query, tables, &["public"]) {
+    match ResolvedQuery::parse_resolve(sql, tables, &["public"]) {
         Ok(_) => panic!("expected {sql} not to resolve"),
         Err(e) => e.into_current_context(),
     }
 }
 
-fn select_of(bound: &Owned) -> &SelectNode {
+fn select_of(bound: &ResolvedQuery) -> Select<'_> {
     bound.select().expect("a SELECT")
 }
 
 /// `(table, column)` a column reference is bound to.
-fn column_ref(bound: &Owned, column: &ColumnNode) -> (String, String) {
-    let table = bound.column_table(column).expect("a bound column");
-    let name = bound.column_name(column).expect("a bound column");
+fn column_ref(bound: &ResolvedQuery, column: Column<'_>) -> (String, String) {
+    let table = bound.column_table_at(column.id()).expect("a bound column");
+    let name = bound.column_name_at(column.id()).expect("a bound column");
     (table.name.to_string(), name.to_string())
 }
 
-fn as_binary(expr: &WhereExpr) -> &BinaryExpr {
-    let WhereExpr::Binary(binary) = expr else {
-        panic!("expected a binary expression, got {expr:?}");
-    };
-    binary
-}
-
-fn as_column(expr: &WhereExpr) -> &ColumnNode {
-    let WhereExpr::Scalar(ScalarExpr::Column(column)) = expr else {
-        panic!("expected a column, got {expr:?}");
-    };
-    column
-}
-
-fn only_join(select: &SelectNode) -> &JoinNode {
-    match select.from.as_slice() {
-        [TableSource::Join(join)] => join,
-        other => panic!("expected a single join source, got {other:?}"),
+fn as_binary(expr: Where<'_>) -> Binary<'_> {
+    match expr.kind() {
+        WhereKind::Binary(binary) => binary,
+        _ => panic!("expected a binary expression"),
     }
 }
 
-fn as_table(source: &TableSource) -> &TableNode {
-    let TableSource::Table(table) = source else {
-        panic!("expected a table source, got {source:?}");
-    };
-    table
+fn as_column(expr: Where<'_>) -> Column<'_> {
+    match expr.kind() {
+        WhereKind::Scalar(scalar) => match scalar.kind() {
+            ScalarKind::Column(column) => column,
+            _ => panic!("expected a column"),
+        },
+        _ => panic!("expected a column"),
+    }
 }
 
-fn join_on(join: &JoinNode) -> &WhereExpr {
-    let JoinQual::On(on) = &join.qual else {
-        panic!("expected an ON join, got {:?}", join.qual);
-    };
-    on
+fn only_table(select: Select<'_>) -> Table<'_> {
+    let mut from = select.from();
+    match (from.next(), from.next()) {
+        (Some(Source::Table(table)), None) => table,
+        _ => panic!("expected a single table source"),
+    }
+}
+
+fn only_join(select: Select<'_>) -> Join<'_> {
+    let mut from = select.from();
+    match (from.next(), from.next()) {
+        (Some(Source::Join(join)), None) => join,
+        _ => panic!("expected a single join source"),
+    }
+}
+
+fn as_table(source: Source<'_>) -> Table<'_> {
+    match source {
+        Source::Table(table) => table,
+        _ => panic!("expected a table source"),
+    }
+}
+
+fn join_on(join: Join<'_>) -> Where<'_> {
+    match join.qual() {
+        JoinQual::On(on) => on,
+        _ => panic!("expected an ON join"),
+    }
+}
+
+/// The function a select item holds.
+fn item_function(item: SelectItem<'_>) -> Function<'_> {
+    match item {
+        SelectItem::Expr(expr) => match expr.expr().kind() {
+            ScalarKind::Function(function) => function,
+            _ => panic!("expected a function"),
+        },
+        SelectItem::Star(_) => panic!("expected an expression item"),
+    }
 }
 
 /// The base slot a table node is bound to: `(schema, table, alias, oid)`.
-fn table_slot(bound: &Owned, table: &TableNode) -> (String, String, Option<String>, u32) {
-    let slot = bound.bindings().source(table.id).expect("table bound");
+fn table_slot(bound: &ResolvedQuery, table: Table<'_>) -> (String, String, Option<String>, u32) {
+    let slot = bound.bindings().source(table.id()).expect("table bound");
     match bound.bindings().slot(slot).expect("slot") {
         TableSlot::Base { table, alias } => (
             table.schema.to_string(),
@@ -231,7 +209,7 @@ fn table_slot(bound: &Owned, table: &TableNode) -> (String, String, Option<Strin
 }
 
 /// `(table, column)` of every correlated reference, in tree order.
-fn correlated_refs(bound: &Owned) -> Vec<(String, String)> {
+fn correlated_refs(bound: &ResolvedQuery) -> Vec<(String, String)> {
     let bindings = bound.bindings();
     bindings
         .correlated()
@@ -251,6 +229,18 @@ fn pair(table: &str, column: &str) -> (String, String) {
     (table.to_owned(), column.to_owned())
 }
 
+/// The name of every base table in the tree, in pre-order.
+fn table_names(bound: &ResolvedQuery) -> Vec<&str> {
+    bound
+        .tree()
+        .nodes()
+        .filter_map(|node| match &node.kind {
+            NodeKind::Table { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 // ============================================================================
 // Tables and columns
 // ============================================================================
@@ -268,16 +258,14 @@ fn test_table_and_column_bind_cases() {
     for (label, sql, alias, column, type_name) in cases {
         let query = bound(sql, &tables);
         let select = select_of(&query);
-        let [TableSource::Table(table)] = select.from.as_slice() else {
-            panic!("{label}: expected a single table source in {sql:?}");
-        };
+        let table = only_table(select);
         assert_eq!(
             table_slot(&query, table),
             ("public".into(), "users".into(), alias.map(Into::into), 1001),
             "{label}: table of {sql:?}"
         );
-        let binary = as_binary(select.where_clause.as_ref().expect("WHERE"));
-        let col = as_column(&binary.lexpr);
+        let binary = as_binary(select.where_clause().expect("WHERE"));
+        let col = as_column(binary.lexpr());
         assert_eq!(
             column_ref(&query, col),
             pair("users", column),
@@ -285,7 +273,7 @@ fn test_table_and_column_bind_cases() {
         );
         if let Some(type_name) = type_name {
             assert_eq!(
-                query.column_type(col).expect("column type").name(),
+                query.column_type_at(col.id()).expect("column type").name(),
                 type_name,
                 "{label}: column type of {sql:?}"
             );
@@ -377,8 +365,8 @@ fn test_join_bind_cases() {
     for (label, sql, left_alias, right_alias) in cases {
         let query = bound(sql, &tables);
         let join = only_join(select_of(&query));
-        assert_eq!(join.join_type, JoinType::Inner, "{label}");
-        let (left, right) = (as_table(&join.left), as_table(&join.right));
+        assert_eq!(join.join_type(), JoinType::Inner, "{label}");
+        let (left, right) = (as_table(join.left()), as_table(join.right()));
         assert_eq!(
             table_slot(&query, left),
             (
@@ -402,12 +390,12 @@ fn test_join_bind_cases() {
         // The condition's columns bind to the tables whatever the spelling.
         let on = as_binary(join_on(join));
         assert_eq!(
-            column_ref(&query, as_column(&on.lexpr)),
+            column_ref(&query, as_column(on.lexpr())),
             pair("users", "id"),
             "{label}"
         );
         assert_eq!(
-            column_ref(&query, as_column(&on.rexpr)),
+            column_ref(&query, as_column(on.rexpr())),
             pair("orders", "id"),
             "{label}"
         );
@@ -420,13 +408,13 @@ fn test_where_conjunction_binds_each_side() {
         "SELECT * FROM users WHERE id = 1 AND name = 'john'",
         &catalog(&["users"]),
     );
-    let and_expr = as_binary(select_of(&query).where_clause.as_ref().expect("WHERE"));
-    assert_eq!(and_expr.op, BinaryOp::And);
-    for (side, column) in [(&and_expr.lexpr, "id"), (&and_expr.rexpr, "name")] {
+    let and_expr = as_binary(select_of(&query).where_clause().expect("WHERE"));
+    assert_eq!(and_expr.op(), BinaryOp::And);
+    for (side, column) in [(and_expr.lexpr(), "id"), (and_expr.rexpr(), "name")] {
         let comparison = as_binary(side);
-        assert_eq!(comparison.op, BinaryOp::Equal);
+        assert_eq!(comparison.op(), BinaryOp::Equal);
         assert_eq!(
-            column_ref(&query, as_column(&comparison.lexpr)),
+            column_ref(&query, as_column(comparison.lexpr())),
             pair("users", column)
         );
     }
@@ -443,24 +431,24 @@ enum OrderTarget {
     Output(String),
 }
 
-fn order_targets(bound: &Owned) -> Vec<(OrderDirection, OrderTarget)> {
+fn order_targets(bound: &ResolvedQuery) -> Vec<(OrderDirection, OrderTarget)> {
     bound
         .tree()
-        .order_by
-        .iter()
+        .root()
+        .order_by()
         .map(|clause| {
-            let ScalarExpr::Column(column) = &clause.expr else {
-                panic!("expected a column in ORDER BY, got {:?}", clause.expr);
+            let ScalarKind::Column(column) = clause.expr().kind() else {
+                panic!("expected a column in ORDER BY");
             };
-            let target = match bound.column(column) {
-                Some(ColumnTarget::Output) => OrderTarget::Output(column.column.to_string()),
+            let target = match bound.column_target_at(column.id()) {
+                Some(ColumnTarget::Output) => OrderTarget::Output(column.column().to_string()),
                 Some(ColumnTarget::Column(_) | ColumnTarget::Merged(_)) => {
                     let (table, name) = column_ref(bound, column);
                     OrderTarget::Column(table, name)
                 }
-                None => panic!("unbound ORDER BY column {column:?}"),
+                None => panic!("unbound ORDER BY column {}", column.column()),
             };
-            (clause.direction.clone(), target)
+            (clause.direction(), target)
         })
         .collect()
 }
@@ -509,20 +497,16 @@ fn test_group_by_having_and_limit_bind() {
         &tables,
     );
     let select = select_of(&query);
-    let group_by: Vec<_> = select
-        .group_by
-        .iter()
-        .map(|c| column_ref(&query, c))
-        .collect();
+    let group_by: Vec<_> = select.group_by().map(|c| column_ref(&query, c)).collect();
     assert_eq!(group_by, vec![pair("users", "name")]);
-    let having = as_binary(select.having.as_ref().expect("HAVING"));
+    let having = as_binary(select.having().expect("HAVING"));
     assert_eq!(
-        column_ref(&query, as_column(&having.lexpr)),
+        column_ref(&query, as_column(having.lexpr())),
         pair("users", "name")
     );
-    assert_eq!(query.tree().order_by.len(), 1);
+    assert_eq!(query.tree().root().order_by().len(), 1);
     assert_eq!(
-        query.tree().limit.as_ref().and_then(|l| l.count.clone()),
+        query.tree().root().limit_count().map(|l| l.value().clone()),
         Some(LiteralValue::Integer(10))
     );
 
@@ -531,8 +515,7 @@ fn test_group_by_having_and_limit_bind() {
         &tables,
     );
     let group_by: Vec<_> = select_of(&query)
-        .group_by
-        .iter()
+        .group_by()
         .map(|c| column_ref(&query, c))
         .collect();
     assert_eq!(group_by, vec![pair("users", "id"), pair("users", "name")]);
@@ -544,25 +527,26 @@ fn test_limit_cases() {
     // Parameterized values survive binding.
     #[rustfmt::skip]
     let cases = [
-        ("count only",         "SELECT * FROM users LIMIT 10",            Some((Some(Integer(10)), None))),
-        ("offset only",        "SELECT * FROM users OFFSET 5",            Some((None, Some(Integer(5))))),
-        ("count and offset",   "SELECT * FROM users LIMIT 10 OFFSET 20",  Some((Some(Integer(10)), Some(Integer(20))))),
-        ("parameterized",      "SELECT * FROM users LIMIT $1 OFFSET $2",  Some((Some(Parameter("$1".into())), Some(Parameter("$2".into()))))),
-        ("no LIMIT",           "SELECT * FROM users",                     None),
+        ("count only",         "SELECT * FROM users LIMIT 10",            (Some(Integer(10)), None)),
+        ("offset only",        "SELECT * FROM users OFFSET 5",            (None, Some(Integer(5)))),
+        ("count and offset",   "SELECT * FROM users LIMIT 10 OFFSET 20",  (Some(Integer(10)), Some(Integer(20)))),
+        ("parameterized",      "SELECT * FROM users LIMIT $1 OFFSET $2",  (Some(Parameter("$1".into())), Some(Parameter("$2".into())))),
+        ("no LIMIT",           "SELECT * FROM users",                     (None, None)),
     ];
     let tables = catalog(&["users"]);
     for (label, sql, expected) in cases {
-        let actual = bound(sql, &tables)
-            .tree()
-            .limit
-            .as_ref()
-            .map(|l| (l.count.clone(), l.offset.clone()));
+        let query = bound(sql, &tables);
+        let root = query.tree().root();
+        let actual = (
+            root.limit_count().map(|l| l.value().clone()),
+            root.limit_offset().map(|l| l.value().clone()),
+        );
         assert_eq!(actual, expected, "{label}: (count, offset) of {sql}");
     }
 }
 
 /// A predicate over a HAVING aggregate.
-type AggregateCheck = fn(&FunctionCall) -> bool;
+type AggregateCheck = for<'t> fn(Function<'t>) -> bool;
 
 /// FILTER, aggregate ORDER BY and DISTINCT on a HAVING aggregate survive
 /// binding and render.
@@ -571,26 +555,23 @@ fn test_having_aggregate_decorations_bind_cases() {
     #[rustfmt::skip]
     let cases: [(&str, &str, AggregateCheck); 3] = [
         ("count(*) FILTER",     "SELECT name FROM users GROUP BY name HAVING COUNT(*) FILTER (WHERE id > 0) > 5",
-         |f| f.name == "count" && f.agg_star && f.agg_filter.is_some()),
+         |f| f.name() == "count" && f.agg_star() && f.filter().is_some()),
         ("string_agg ORDER BY", "SELECT id FROM users GROUP BY id HAVING string_agg(name, ',' ORDER BY name) <> ''",
-         |f| f.name == "string_agg" && !f.agg_order.is_empty()),
+         |f| f.name() == "string_agg" && f.agg_order().len() > 0),
         ("count DISTINCT",      "SELECT name FROM users GROUP BY name HAVING COUNT(DISTINCT id) > 1",
-         |f| f.agg_distinct),
+         |f| f.agg_distinct()),
     ];
     let tables = catalog(&["users"]);
     for (label, sql, check) in cases {
         let query = bound(sql, &tables);
-        let having = as_binary(select_of(&query).having.as_ref().expect("HAVING"));
-        let WhereExpr::Scalar(ScalarExpr::Function(func)) = having.lexpr.as_ref() else {
-            panic!(
-                "{label}: expected a function on the left of HAVING, got {:?}",
-                having.lexpr
-            );
+        let having = as_binary(select_of(&query).having().expect("HAVING"));
+        let WhereKind::Scalar(scalar) = having.lexpr().kind() else {
+            panic!("{label}: expected a scalar on the left of HAVING");
         };
-        assert!(
-            check(func),
-            "{label}: HAVING aggregate of {sql} is {func:?}"
-        );
+        let ScalarKind::Function(func) = scalar.kind() else {
+            panic!("{label}: expected a function on the left of HAVING");
+        };
+        assert!(check(func), "{label}: HAVING aggregate of {sql}");
     }
     assert_eq!(
         bound(cases[0].1, &tables).sql(),
@@ -606,19 +587,18 @@ fn test_window_function_binds_and_renders() {
         "SELECT sum(id) OVER (PARTITION BY name ORDER BY id) FROM users",
         &tables,
     );
-    let SelectColumns::Columns(columns) = &select_of(&query).columns else {
-        panic!("expected columns");
-    };
-    let SelectColumn::Expr {
-        expr: ScalarExpr::Function(func),
-        ..
-    } = &columns[0]
-    else {
-        panic!("expected a function");
-    };
-    assert_eq!(func.name, "sum");
-    let window = func.over.as_ref().expect("an OVER clause");
-    assert_eq!((window.partition_by.len(), window.order_by.len()), (1, 1));
+    let item = select_of(&query)
+        .items()
+        .expect("items")
+        .next()
+        .expect("an item");
+    let func = item_function(item);
+    assert_eq!(func.name(), "sum");
+    let window = func.over().expect("an OVER clause");
+    assert_eq!(
+        (window.partition_by().len(), window.order_by().len()),
+        (1, 1)
+    );
     assert_eq!(
         bound(
             "SELECT sum(id) OVER (ORDER BY name DESC) FROM users",
@@ -643,11 +623,10 @@ fn test_select_nodes_cases() {
         ("nested UNION",  "SELECT * FROM a UNION SELECT * FROM b UNION SELECT * FROM c", &["a", "b", "c"]),
     ];
     for (label, sql, expected) in cases {
-        let query = query_expr_parse(sql).expect("parse");
-        let branches: Vec<&str> = query
-            .select_nodes()
-            .iter()
-            .map(|select| select.direct_table_nodes()[0].name.as_str())
+        let tree = query_tree_parse(sql).expect("parse");
+        let branches: Vec<&str> = select_branches_with_source(tree.root())
+            .into_iter()
+            .map(|(select, _)| select.direct_tables()[0].name().as_str())
             .collect();
         assert_eq!(branches, expected, "{label}");
     }
@@ -660,26 +639,19 @@ fn test_subquery_bind_cases() {
         "SELECT * FROM users WHERE id IN (SELECT id FROM active_users)",
         &catalog(&["users", "active_users"]),
     );
-    let Some(WhereExpr::Subquery {
-        sublink_type,
-        test_expr,
-        query: inner,
-    }) = &select_of(&query).where_clause
+    let WhereKind::Subquery(subquery) = select_of(&query).where_clause().expect("WHERE").kind()
     else {
         panic!("expected a subquery predicate");
     };
     assert_eq!(
-        (*sublink_type, test_expr.is_some()),
+        (subquery.sublink_type(), subquery.test_expr().is_some()),
         (SubLinkType::Any, true)
     );
-    let QueryBody::Select(inner_select) = &inner.body else {
+    let Body::Select(inner_select) = subquery.query().body() else {
         panic!("expected a SELECT subquery");
     };
-    let [TableSource::Table(inner_table)] = inner_select.from.as_slice() else {
-        panic!("expected one inner table");
-    };
     assert_eq!(
-        table_slot(&query, inner_table),
+        table_slot(&query, only_table(inner_select)),
         ("public".into(), "active_users".into(), None, 1002)
     );
 
@@ -688,16 +660,12 @@ fn test_subquery_bind_cases() {
         "SELECT * FROM orders WHERE EXISTS (SELECT id FROM items)",
         &catalog(&["orders", "items"]),
     );
-    let Some(WhereExpr::Subquery {
-        sublink_type,
-        test_expr,
-        ..
-    }) = &select_of(&query).where_clause
+    let WhereKind::Subquery(subquery) = select_of(&query).where_clause().expect("WHERE").kind()
     else {
         panic!("expected a subquery predicate");
     };
     assert_eq!(
-        (*sublink_type, test_expr.is_none()),
+        (subquery.sublink_type(), subquery.test_expr().is_none()),
         (SubLinkType::Exists, true)
     );
 
@@ -706,13 +674,10 @@ fn test_subquery_bind_cases() {
         "SELECT * FROM users WHERE id > (SELECT id FROM users)",
         &catalog(&["users"]),
     );
-    let binary = as_binary(select_of(&query).where_clause.as_ref().expect("WHERE"));
+    let binary = as_binary(select_of(&query).where_clause().expect("WHERE"));
     assert!(matches!(
-        binary.rexpr.as_ref(),
-        WhereExpr::Subquery {
-            sublink_type: SubLinkType::Expr,
-            ..
-        }
+        binary.rexpr().kind(),
+        WhereKind::Subquery(subquery) if subquery.sublink_type() == SubLinkType::Expr
     ));
 
     // A derived table binds to a slot named by its alias.
@@ -720,13 +685,13 @@ fn test_subquery_bind_cases() {
         "SELECT * FROM (SELECT id FROM users) AS sub",
         &catalog(&["users"]),
     );
-    let [TableSource::Subquery(sub)] = select_of(&query).from.as_slice() else {
+    let Some(Source::Subquery(sub)) = select_of(&query).from().next() else {
         panic!("expected a derived table");
     };
-    assert_eq!(sub.alias.as_ref().map(|a| a.name.as_str()), Some("sub"));
+    assert_eq!(sub.alias().map(EcoString::as_str), Some("sub"));
     let slot = query
         .bindings()
-        .source(sub.id)
+        .source(sub.id())
         .expect("derived table bound");
     let TableSlot::Derived { table, .. } = query.bindings().slot(slot).expect("slot") else {
         panic!("expected a derived slot");
@@ -738,10 +703,10 @@ fn test_subquery_bind_cases() {
     );
 }
 
-/// `direct_table_nodes` is the FROM clause's own tables; `nodes` reaches
+/// `direct_tables` is the FROM clause's own tables; the tree's nodes reach
 /// every table, subqueries included.
 #[test]
-fn test_direct_table_nodes_cases() {
+fn test_direct_tables_cases() {
     let users_active = catalog(&["users", "active_users"]);
     let users = catalog(&["users"]);
     let items = catalog_with_columns(&[
@@ -760,11 +725,11 @@ fn test_direct_table_nodes_cases() {
     ];
     for (label, tables, sql, all, direct) in cases {
         let query = bound(sql, tables);
-        let reached = query.tree().nodes::<TableNode>().count();
+        let reached = table_names(&query).len();
         let from: Vec<&str> = select_of(&query)
-            .direct_table_nodes()
+            .direct_tables()
             .iter()
-            .map(|t| t.name.as_str())
+            .map(|t| t.name().as_str())
             .collect();
         assert_eq!((reached, from), (all, direct.to_vec()), "{label}: {sql}");
     }
@@ -781,11 +746,8 @@ fn test_table_nodes_reach_subqueries_cases() {
         ("nested",          "SELECT * FROM a WHERE id IN (SELECT id FROM b WHERE id IN (SELECT id FROM c))",                  &["a", "b", "c"]),
     ];
     for (label, sql, expected) in cases {
-        let query = query_expr_parse(sql).expect("parse");
-        let mut found: Vec<&str> = query
-            .nodes::<TableNode>()
-            .map(|t| t.name.as_str())
-            .collect();
+        let tree = query_tree_parse(sql).expect("parse");
+        let mut found: Vec<&str> = tree.table_names().map(|(_, name)| name).collect();
         found.sort_unstable();
         assert_eq!(found, expected, "{label}: tables reached in {sql}");
     }
