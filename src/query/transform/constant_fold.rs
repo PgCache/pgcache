@@ -22,7 +22,7 @@ use crate::query::ast::{ArithmeticOp, LiteralValue};
 /// Evaluate `left op right` when both sides are foldable numeric literals.
 /// Returns `None` for non-numeric operands, overflow, divide/mod by zero,
 /// or NaN — leaving the arithmetic node untouched.
-pub(super) fn literal_arithmetic_fold(
+pub(crate) fn literal_arithmetic_fold(
     left: &LiteralValue,
     op: ArithmeticOp,
     right: &LiteralValue,

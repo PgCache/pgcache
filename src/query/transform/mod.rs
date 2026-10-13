@@ -32,6 +32,7 @@ error_set! {
 /// Result type with location-tracking error reports for AST transform operations.
 pub type AstTransformResult<T> = Result<T, Report<AstTransformError>>;
 
+pub(crate) use constant_fold::literal_arithmetic_fold;
 pub use literal_canon::{LiteralCanonOutcome, query_literals_canonicalise};
 #[cfg(feature = "proxy")]
 pub(crate) use parameters::{
@@ -39,7 +40,7 @@ pub(crate) use parameters::{
 };
 pub(crate) use parameters::{literal_is_parameterizable, literal_value_parameters_replace};
 pub use predicate_pushdown::query_predicate_pushdown;
-pub use substitute::{query_tree_constant_fold, query_tree_parameters_replace};
+pub use substitute::query_tree_parameters_replace;
 pub use values::{
     BATCH_IDX_COLUMN, PgEvalTemplate, TableOccurrence, membership_batch_into,
     membership_unnest_into, membership_values_all_into, membership_values_into,

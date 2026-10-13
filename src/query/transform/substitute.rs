@@ -24,23 +24,6 @@ pub fn query_tree_parameters_replace(
     tree: &QueryTree,
     parameters: &QueryParameters,
 ) -> AstTransformResult<QueryTree> {
-    tree_rewrite(tree, Some(parameters))
-}
-
-/// `tree` with its literal arithmetic folded and its placeholders left as
-/// they are: the convert-time fold.
-pub fn query_tree_constant_fold(tree: &QueryTree) -> QueryTree {
-    match tree_rewrite(tree, None) {
-        Ok(folded) => folded,
-        // Without parameters nothing can fail; keep the tree as written.
-        Err(_) => tree.clone(),
-    }
-}
-
-fn tree_rewrite(
-    tree: &QueryTree,
-    parameters: Option<&QueryParameters>,
-) -> AstTransformResult<QueryTree> {
     let mut pass = Pass {
         parameters,
         replacements: Replacements::new(),
@@ -55,8 +38,7 @@ fn tree_rewrite(
 }
 
 struct Pass<'a> {
-    /// `None` folds only: a placeholder is neither replaced nor foldable.
-    parameters: Option<&'a QueryParameters>,
+    parameters: &'a QueryParameters,
     replacements: Replacements,
 }
 
@@ -121,17 +103,13 @@ impl Pass<'_> {
         })
     }
 
-    /// The value bound to the placeholder at `expr`; `None` when there are
-    /// no parameters to bind.
+    /// The value bound to the placeholder at `expr`.
     fn bound(&self, expr: Scalar<'_>) -> AstTransformResult<Option<LiteralValue>> {
-        let Some(parameters) = self.parameters else {
-            return Ok(None);
-        };
         let NodeKind::Literal(value) = expr.node_ref().kind() else {
             return Ok(None);
         };
         let mut value = value.clone();
-        literal_value_parameters_replace(&mut value, parameters)?;
+        literal_value_parameters_replace(&mut value, self.parameters)?;
         Ok(Some(value))
     }
 }

@@ -13,8 +13,9 @@ use crate::query::ast::raw::{
     string_node_value,
 };
 use crate::query::ast::rope::{NodeKind, TreeBuilder};
-use crate::query::ast::{ArithmeticOp, AstError, Deparse};
+use crate::query::ast::{ArithmeticOp, AstError, Deparse, LiteralValue};
 use crate::query::cast::cast_target_from_canonical;
+use crate::query::transform::literal_arithmetic_fold;
 
 /// A scalar expression. `windows` is the enclosing SELECT's named window
 /// definitions when the expression sits in its select list, where an
@@ -315,11 +316,49 @@ pub(super) unsafe fn arithmetic_emit(
                 feature: "arithmetic expression without right operand".to_owned(),
             });
         }
+        // Arithmetic over literals alone is one literal in the tree, so two
+        // spellings of a value are one query; what does not fold (a
+        // placeholder, a column, division by zero) is emitted as written.
+        if let Some(folded) = literal_fold(aexpr as NodePtr)? {
+            builder.leaf(NodeKind::Literal(folded));
+            return Ok(());
+        }
         let open = builder.open(NodeKind::Arithmetic { op });
         scalar_emit(builder, (*aexpr).lexpr, windows)?;
         scalar_emit(builder, (*aexpr).rexpr, windows)?;
         builder.close(open);
         Ok(())
+    }
+}
+
+/// The literal a raw expression folds to: a constant as it is, or
+/// arithmetic whose operands both fold and whose result is defined.
+unsafe fn literal_fold(node: NodePtr) -> Result<Option<LiteralValue>, AstError> {
+    unsafe {
+        match node_tag(node) {
+            pg::NodeTag_T_A_Const => Ok(Some(const_value_extract(cast::<pg::A_Const>(node))?)),
+            pg::NodeTag_T_A_Expr => {
+                let aexpr = cast::<pg::A_Expr>(node);
+                if (*aexpr).kind != pg::A_Expr_Kind_AEXPR_OP
+                    || (*aexpr).lexpr.is_null()
+                    || (*aexpr).rexpr.is_null()
+                {
+                    return Ok(None);
+                }
+                let Some(op) = operator_name_single((*aexpr).name).and_then(arithmetic_op_from_str)
+                else {
+                    return Ok(None);
+                };
+                let (Some(left), Some(right)) = (
+                    literal_fold((*aexpr).lexpr as NodePtr)?,
+                    literal_fold((*aexpr).rexpr as NodePtr)?,
+                ) else {
+                    return Ok(None);
+                };
+                Ok(literal_arithmetic_fold(&left, op, &right))
+            }
+            _ => Ok(None),
+        }
     }
 }
 

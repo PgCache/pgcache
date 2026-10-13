@@ -25,7 +25,6 @@ use super::raw::{
 };
 use super::rope::{QueryTree, TreeBuilder};
 use super::{AstError, CteMaterialization, NullOrder, OrderDirection, SubLinkType};
-use crate::query::transform::query_tree_constant_fold;
 use crate::query::write::{IsolationEffect, SettingsEffect, TransactionBoundary, WriteClass};
 
 mod from;
@@ -135,13 +134,12 @@ pub(super) unsafe fn root_statement(tree_root: *const c_void) -> Result<NodePtr,
     }
 }
 
-/// Convert a root `SelectStmt`, then fold the literal arithmetic it holds.
+/// Convert a root `SelectStmt`.
 unsafe fn select_root_convert(select: *const pg::SelectStmt) -> Result<QueryTree, AstError> {
     unsafe {
         let mut builder = TreeBuilder::new();
         query_emit(&mut builder, select, &ParseContext::empty())?;
-        let (tree, _) = builder.finish();
-        Ok(query_tree_constant_fold(&tree))
+        Ok(builder.finish().0)
     }
 }
 
