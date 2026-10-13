@@ -3,6 +3,7 @@
 #![allow(clippy::wildcard_enum_match_arm)]
 
 use ecow::EcoString;
+use smallvec::SmallVec;
 
 use super::{
     Column, Cte, EMPTY_NAME, Literal, Name, NodeRef, OrderBy, Query, Run, Scalar, Select,
@@ -208,8 +209,8 @@ impl<'t> Select<'t> {
 
     /// The tables directly in FROM, through joins but not into subqueries
     /// or CTE references.
-    pub fn direct_tables(&self) -> Vec<Table<'t>> {
-        let mut tables = Vec::new();
+    pub fn direct_tables(&self) -> DirectTables<'t> {
+        let mut tables = SmallVec::new();
         for source in self.from() {
             source_direct_tables_collect(source, &mut tables);
         }
@@ -349,7 +350,10 @@ impl<'t> OrderBy<'t> {
     }
 }
 
-fn source_direct_tables_collect<'t>(source: Source<'t>, tables: &mut Vec<Table<'t>>) {
+/// The tables a FROM names directly: a few, so they live inline.
+pub type DirectTables<'t> = SmallVec<[Table<'t>; 4]>;
+
+fn source_direct_tables_collect<'t>(source: Source<'t>, tables: &mut DirectTables<'t>) {
     match source {
         Source::Table(table) => tables.push(table),
         Source::Join(join) => {

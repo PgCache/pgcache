@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 
 use ecow::EcoString;
+use smallvec::SmallVec;
 
 use super::{
     Arithmetic, Array, Binary, Case, Column, EMPTY_NAME, Frame, Function, Literal, Multi, NULL,
@@ -236,16 +237,19 @@ pub enum WhereKind<'t> {
     Subquery(WhereSubquery<'t>),
 }
 
+/// The AND operands of a WHERE: a few, so they live inline.
+pub type Conjuncts<'t> = SmallVec<[Where<'t>; 8]>;
+
 impl<'t> Where<'t> {
     /// The top-level AND operands, left to right; the expression itself
     /// when it is not an AND.
-    pub fn conjuncts(self) -> Vec<Where<'t>> {
-        let mut out = Vec::new();
+    pub fn conjuncts(self) -> Conjuncts<'t> {
+        let mut out = SmallVec::new();
         self.conjuncts_into(&mut out);
         out
     }
 
-    fn conjuncts_into(self, out: &mut Vec<Where<'t>>) {
+    fn conjuncts_into(self, out: &mut Conjuncts<'t>) {
         match self.kind() {
             WhereKind::Binary(binary) if binary.op() == BinaryOp::And => {
                 binary.lexpr().conjuncts_into(out);

@@ -13,8 +13,8 @@ use std::marker::PhantomData;
 
 use ecow::EcoString;
 
-pub use expr::{FrameBound, ScalarKind, WhereKind};
-pub use query::{Body, SelectItem};
+pub use expr::{Conjuncts, FrameBound, ScalarKind, WhereKind};
+pub use query::{Body, DirectTables, SelectItem};
 pub use source::{JoinQual, Source};
 
 use super::node::{Node, NodeKind};
