@@ -7,7 +7,7 @@ use ecow::EcoString;
 use lru::LruCache;
 use tokio_util::bytes::BytesMut;
 
-use super::query::CacheabilityCache;
+use super::cacheability_memo::CacheabilityCache;
 use super::{ProxyMode, ProxyStatus};
 use crate::catalog::FunctionVolatility;
 use crate::query::write::IsolationLevel;

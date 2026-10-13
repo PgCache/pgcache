@@ -301,6 +301,15 @@ impl<'t> Scalar<'t> {
 impl<'t> Scalar<'t> {
     /// Whether the expression computes a window function anywhere above a
     /// subquery boundary.
+    /// The literal this expression is, or `None` for any other expression.
+    pub fn literal(&self) -> Option<&'t LiteralValue> {
+        if let ScalarKind::Literal(literal) = self.kind() {
+            Some(literal.value())
+        } else {
+            None
+        }
+    }
+
     pub fn has_window(&self) -> bool {
         match self.kind() {
             ScalarKind::Function(function) => {

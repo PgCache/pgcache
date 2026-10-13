@@ -1,153 +1,20 @@
-use std::{
-    collections::HashMap,
-    hash::{DefaultHasher, Hash, Hasher},
-    num::NonZeroUsize,
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use ecow::EcoString;
-use lru::LruCache;
 use tokio_util::bytes::BytesMut;
-use tracing::{debug, trace};
+use tracing::debug;
 
-use super::{ParseError, cacheability_store::CacheabilityStore};
+use super::ParseError;
+use super::cacheability_memo::{CacheabilityCache, SqlTextHash};
+use super::explain::{ExplainSpec, explain_spec_extract};
 use crate::{
     cache::query::{CacheableQuery, query_tree_has_volatile_function},
     catalog::FunctionVolatility,
-    id_hash::{BuildIdHasher, impl_id_hashable},
-    query::ast::rope::{
-        Body, Function, NodeKind, QueryTree, Scalar, ScalarKind, Select, SelectItem, View,
-    },
+    query::ast::rope::{Function, NodeKind, QueryTree, View},
     query::ast::{AstError, LiteralValue, RawStatement, statement_convert_raw},
     query::guc::Guc,
     query::write::{IsolationEffect, SettingsEffect, StatementEffects, WriteClass},
 };
-
-/// Name of the pseudo-function the proxy intercepts to explain a cached query
-/// against the cache database (PGC-345). It is never executed as a real
-/// function — the proxy recognizes the call shape and routes it to the cache.
-const EXPLAIN_FUNCTION_NAME: &str = "pgcache_explain";
-
-/// What `pgcache_explain(...)` should explain: either an inline SQL string
-/// (re-parsed and fingerprinted in the cache dispatch) or a fingerprint value
-/// as printed by `/status`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExplainTarget {
-    Sql(String),
-    Fingerprint(u64),
-}
-
-/// A recognized `pgcache_explain(<target>[, <options>])` call. `options` is the
-/// verbatim EXPLAIN option list (e.g. `ANALYZE, FORMAT JSON`), empty when the
-/// second argument is absent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExplainSpec {
-    pub target: ExplainTarget,
-    pub options: EcoString,
-}
-
-/// Recognize a bare `SELECT pgcache_explain(<string>[, <string>])` in an
-/// already-converted [`QueryExpr`] and extract its arguments, or `None` for any
-/// other statement. Runs on the AST the cacheability path already built (inside
-/// [`analyze`]), so detection costs no extra parse/convert on the query hot path
-/// (PGC-345).
-///
-/// Both arguments are string literals. The first is the target: a value that
-/// parses as `u64` is a fingerprint (as printed by `/status`), otherwise it is
-/// inline SQL to explain. The optional second argument is the verbatim EXPLAIN
-/// option list. Fingerprints must be quoted (`pgcache_explain('12345')`): they
-/// span the full `u64` range, which PostgreSQL parses as a float literal whose
-/// value the shared literal converter would round to `f64`, losing precision.
-fn explain_spec_extract(tree: &QueryTree) -> Option<ExplainSpec> {
-    let select = bare_select(tree)?;
-    let function = single_function_item(select)?;
-    // `name()` is the last name component, so a schema-qualified
-    // `x.pgcache_explain(...)` also matches.
-    if function.name() != EXPLAIN_FUNCTION_NAME || !plain_call(function) {
-        return None;
-    }
-    explain_spec_build(function)
-}
-
-/// The SELECT of a bare projection: no CTEs, ORDER BY, LIMIT, FROM, WHERE,
-/// GROUP BY, HAVING, or DISTINCT, otherwise a real query that merely mentions
-/// the function would be intercepted.
-fn bare_select(tree: &QueryTree) -> Option<Select<'_>> {
-    let root = tree.root();
-    let unordered = root.order_by().len() == 0 && !root.has_limit();
-    if root.ctes().len() > 0 || !unordered {
-        return None;
-    }
-    let Body::Select(select) = root.body() else {
-        return None;
-    };
-    select_is_bare(select).then_some(select)
-}
-
-fn select_is_bare(select: Select<'_>) -> bool {
-    let unfiltered = select.from().len() == 0 && select.where_clause().is_none();
-    let ungrouped = select.group_by().len() == 0 && select.having().is_none();
-    unfiltered && ungrouped && !select.distinct()
-}
-
-/// The function call a SELECT projects as its only item.
-fn single_function_item(select: Select<'_>) -> Option<Function<'_>> {
-    let mut items = select.items()?;
-    let (Some(SelectItem::Expr(item)), None) = (items.next(), items.next()) else {
-        return None;
-    };
-    let ScalarKind::Function(function) = item.expr().kind() else {
-        return None;
-    };
-    Some(function)
-}
-
-/// The spec from `pgcache_explain`'s one or two string arguments: a target
-/// that parses as `u64` is a fingerprint, otherwise inline SQL; the second is
-/// the option list.
-fn explain_spec_build(function: Function<'_>) -> Option<ExplainSpec> {
-    let mut args = function.args();
-    let (first, options) = match (args.next(), args.next(), args.next()) {
-        (Some(first), None, _) => (first, EcoString::new()),
-        (Some(first), Some(second), None) => (first, EcoString::from(arg_string(second)?)),
-        _ => return None,
-    };
-    let first = arg_string(first)?;
-    let target = match first.parse::<u64>() {
-        Ok(fingerprint) => ExplainTarget::Fingerprint(fingerprint),
-        Err(_) => ExplainTarget::Sql(first.to_owned()),
-    };
-    Some(ExplainSpec { target, options })
-}
-
-/// A plain call: not an aggregate (`*`, DISTINCT, FILTER, ORDER BY) or window
-/// (OVER) form.
-fn plain_call(function: Function<'_>) -> bool {
-    let no_aggregate_form = !function.agg_star() && !function.agg_distinct();
-    let unfiltered = function.over().is_none() && function.filter().is_none();
-    let unordered = unfiltered && function.agg_order().len() == 0;
-    no_aggregate_form && unordered
-}
-
-/// A plain string-literal argument's value, or `None` for any other expression
-/// (a cast, number, column reference, ...). Both `pgcache_explain` arguments are
-/// string literals.
-fn arg_string(arg: Scalar<'_>) -> Option<&str> {
-    if let Some(LiteralValue::String(value)) = arg_literal(arg) {
-        Some(value.as_str())
-    } else {
-        None
-    }
-}
-
-/// A literal argument's value, or `None` for any other expression.
-fn arg_literal(arg: Scalar<'_>) -> Option<&LiteralValue> {
-    if let ScalarKind::Literal(literal) = arg.kind() {
-        Some(literal.value())
-    } else {
-        None
-    }
-}
 
 /// The settings effect of the `set_config` calls in a converted statement:
 /// each call with a literal name touches that setting (an untracked name is
@@ -167,10 +34,10 @@ fn set_config_calls_effect(tree: &QueryTree) -> SettingsEffect {
         }
         calls += 1;
         let mut args = Function::from_ref(position).args();
-        let Some(LiteralValue::String(name)) = args.next().and_then(arg_literal) else {
+        let Some(LiteralValue::String(name)) = args.next().and_then(|arg| arg.literal()) else {
             return SettingsEffect::all();
         };
-        let local = args.nth(1).and_then(arg_literal) == Some(&LiteralValue::Boolean(true));
+        let local = args.nth(1).and_then(|arg| arg.literal()) == Some(&LiteralValue::Boolean(true));
         if let Some(guc) = Guc::parse(name.as_str()) {
             effect = effect.union(SettingsEffect::guc(guc, local));
         }
@@ -179,116 +46,6 @@ fn set_config_calls_effect(tree: &QueryTree) -> SettingsEffect {
         return SettingsEffect::all();
     }
     effect
-}
-
-/// Test-only: parse `sql` then run [`explain_spec_extract`]. Production
-/// detection runs inside [`analyze`] on the AST it already converted, so this
-/// wrapper (which parses) is never on a hot path.
-#[cfg(test)]
-fn explain_intercept_parse(sql: &str) -> Option<ExplainSpec> {
-    let query = pg_query::parse_raw_scoped(sql, |tree| unsafe {
-        crate::query::ast::query_tree_convert_raw(tree, sql.len())
-    })
-    .ok()?
-    .ok()?;
-    explain_spec_extract(&query)
-}
-
-/// A hash of a SQL query's *text* (not its AST). Keys the proxy's cacheability
-/// memo — identical query text yields the same cacheability verdict, so the
-/// parse/convert/classify work is done once. Deliberately distinct from
-/// [`Fingerprint`](crate::query::Fingerprint), an AST content hash: different
-/// input, different domain, not interchangeable. Already a uniformly-distributed
-/// hash, so the memo uses the passthrough [`BuildIdHasher`].
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct SqlTextHash(u64);
-
-impl_id_hashable!(SqlTextHash);
-
-impl SqlTextHash {
-    /// Hash a SQL string's text.
-    pub(super) fn of(sql: &str) -> Self {
-        let mut hasher = DefaultHasher::new();
-        sql.hash(&mut hasher);
-        Self(hasher.finish())
-    }
-}
-
-/// Bounded per connection so a dynamic-SQL workload can't grow it unbounded,
-/// matching the describe cache. A miss here is not a re-analysis — it falls
-/// back to the shared store, which is a sharded-map lookup and an `Arc` clone
-/// — so erring small costs little.
-const CACHEABILITY_MEMO_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).unwrap();
-
-/// The proxy's per-connection cacheability memo: SQL text hash → the analyzed
-/// verdict (cacheable AST, forward reason, or an explain interception), so the
-/// parse/convert/classify work is done once per distinct query text.
-///
-/// Entries are cheap handles into [`CacheabilityStore`]; the payload itself is
-/// interned there once for the whole process. Dropping a handle — by LRU
-/// eviction, epoch drain, or the connection closing — releases the key back to
-/// the store, which reclaims it if nothing else holds it.
-pub(super) struct CacheabilityCache {
-    entries: LruCache<SqlTextHash, Arc<Action>, BuildIdHasher<SqlTextHash>>,
-    store: Arc<CacheabilityStore>,
-    /// Drain epoch this memo was last reconciled against.
-    epoch: u64,
-}
-
-impl CacheabilityCache {
-    pub(super) fn new(store: Arc<CacheabilityStore>) -> Self {
-        Self {
-            entries: LruCache::with_hasher(CACHEABILITY_MEMO_CAPACITY, BuildIdHasher::default()),
-            epoch: store.epoch(),
-            store,
-        }
-    }
-
-    /// Feed a memory-pressure sample through to the shared store. Called where
-    /// the connection already holds a `CacheDispatch`, which carries the flag
-    /// for the current cache generation.
-    pub(super) fn pressure_observe(&self, pressured: bool) {
-        self.store.pressure_observed(pressured);
-    }
-
-    /// Drop every handle and release the keys, so the store can reclaim any
-    /// entry this memo was the last to hold.
-    fn drain(&mut self) {
-        let keys: Vec<SqlTextHash> = self.entries.iter().map(|(key, _)| *key).collect();
-        self.entries.clear();
-        for key in keys {
-            self.store.release(key);
-        }
-    }
-
-    /// Reconcile against a wholesale drop: clearing the store alone frees
-    /// nothing while connections still hold `Arc`s, so each connection drains
-    /// when it notices the epoch move.
-    pub(super) fn epoch_reconcile(&mut self) {
-        let current = self.store.epoch();
-        if current != self.epoch {
-            self.drain();
-            self.epoch = current;
-        }
-    }
-
-    /// Record a handle, releasing whatever the LRU evicted to make room.
-    fn remember(&mut self, key: SqlTextHash, action: Arc<Action>) {
-        if let Some((evicted_key, evicted)) = self.entries.push(key, action) {
-            // Drop before releasing: the scrutinee temporary outlives the body,
-            // so a handle still held here keeps the store's count above 1 and
-            // the release silently does nothing.
-            drop(evicted);
-            self.store.release(evicted_key);
-        }
-    }
-}
-
-impl Drop for CacheabilityCache {
-    fn drop(&mut self) {
-        self.drain();
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -379,17 +136,8 @@ pub(super) fn analyze(
     cacheability_cache.epoch_reconcile();
 
     let key = SqlTextHash::of(sql);
-
-    if let Some(action) = cacheability_cache.entries.get(&key) {
-        trace!("cacheability memo hit");
-        return Ok((**action).clone());
-    }
-
-    if let Some(action) = cacheability_cache.store.get(key) {
-        trace!("cacheability store hit");
-        let verdict = (*action).clone();
-        cacheability_cache.remember(key, action);
-        return Ok(verdict);
+    if let Some(action) = cacheability_cache.lookup(key) {
+        return Ok(action);
     }
 
     // Build the tree straight off the raw parse tree, skipping the protobuf
@@ -524,10 +272,7 @@ pub(super) fn analyze(
     if matches!(&action, Action::Forward(_, effects) if effects.write.is_some()) {
         return Ok(action);
     }
-    let interned = cacheability_cache.store.intern(key, action);
-    let verdict = (*interned).clone();
-    cacheability_cache.remember(key, interned);
-    Ok(verdict)
+    Ok(cacheability_cache.intern(key, action))
 }
 
 #[cfg(test)]
@@ -537,8 +282,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::proxy::cacheability_memo::CACHEABILITY_MEMO_CAPACITY;
     use crate::proxy::cacheability_store::CacheabilityStore;
-    use crate::query::write::IsolationLevel;
 
     fn empty_volatility() -> HashMap<EcoString, FunctionVolatility> {
         HashMap::new()
@@ -584,7 +329,7 @@ mod tests {
         }
 
         assert_eq!(
-            memo.entries.len(),
+            memo.entry_count(),
             CACHEABILITY_MEMO_CAPACITY.get(),
             "per-connection memo must stay at its cap"
         );
@@ -645,74 +390,12 @@ mod tests {
 
         store.pressure_observed(true);
         assert_eq!(store.len(), 0, "store cleared");
-        assert_eq!(memo.entries.len(), 1, "connection has not noticed yet");
+        assert_eq!(memo.entry_count(), 1, "connection has not noticed yet");
 
         // Next query on that connection reconciles the epoch and drains.
         analyze("SELECT a FROM t WHERE id = 2", &mut memo, &fv).expect("analyze");
-        assert_eq!(memo.entries.len(), 1, "drained, then re-populated with one");
+        assert_eq!(memo.entry_count(), 1, "drained, then re-populated with one");
         assert_eq!(store.len(), 1);
-    }
-
-    #[test]
-    fn test_explain_intercept_parse_sql_argument() {
-        let spec = explain_intercept_parse("SELECT pgcache_explain('SELECT id FROM orders')")
-            .expect("detect SQL-mode explain");
-        assert_eq!(
-            spec,
-            ExplainSpec {
-                target: ExplainTarget::Sql("SELECT id FROM orders".to_owned()),
-                options: EcoString::new(),
-            }
-        );
-    }
-
-    #[test]
-    fn test_explain_intercept_parse_fingerprint_argument() {
-        let spec = explain_intercept_parse("SELECT pgcache_explain('12345')")
-            .expect("detect fingerprint-mode explain");
-        assert_eq!(spec.target, ExplainTarget::Fingerprint(12345));
-    }
-
-    #[test]
-    fn test_explain_intercept_parse_fingerprint_above_i64_max() {
-        // Fingerprints span the full u64 range. Quoted, the digits survive as a
-        // string literal and parse losslessly — unlike an unquoted literal this
-        // large, which PostgreSQL parses as a float the AST rounds to f64.
-        let big = u64::MAX;
-        let spec = explain_intercept_parse(&format!("SELECT pgcache_explain('{big}')"))
-            .expect("detect large fingerprint");
-        assert_eq!(spec.target, ExplainTarget::Fingerprint(big));
-    }
-
-    #[test]
-    fn test_explain_intercept_parse_unquoted_number_is_not_fingerprint() {
-        // A fingerprint must be quoted; an unquoted numeric argument is not a
-        // string literal, so it is not intercepted (falls through to normal
-        // handling rather than being explained against a rounded value).
-        assert!(explain_intercept_parse("SELECT pgcache_explain(12345)").is_none());
-    }
-
-    #[test]
-    fn test_explain_intercept_parse_with_options() {
-        let spec =
-            explain_intercept_parse("SELECT pgcache_explain('SELECT 1', 'ANALYZE, FORMAT JSON')")
-                .expect("detect explain with options");
-        assert_eq!(spec.target, ExplainTarget::Sql("SELECT 1".to_owned()));
-        assert_eq!(spec.options, "ANALYZE, FORMAT JSON");
-    }
-
-    #[test]
-    fn test_explain_intercept_parse_rejects_non_explain() {
-        assert!(explain_intercept_parse("SELECT 1").is_none());
-        assert!(explain_intercept_parse("SELECT id FROM orders").is_none());
-        // A different function call must not be intercepted.
-        assert!(explain_intercept_parse("SELECT now()").is_none());
-        // The pseudo-function projected over a table is not the bare call form.
-        assert!(explain_intercept_parse("SELECT pgcache_explain('x') FROM orders").is_none());
-        // Too many arguments.
-        assert!(explain_intercept_parse("SELECT pgcache_explain('x', 'y', 'z')").is_none());
-        assert!(explain_intercept_parse("INSERT INTO t VALUES (1)").is_none());
-        assert!(explain_intercept_parse("not even sql").is_none());
     }
 
     fn analyze_fresh(sql: &str, fv: &HashMap<EcoString, FunctionVolatility>) -> Action {
@@ -786,97 +469,47 @@ mod tests {
     /// scope; anything less certain may change every tracked setting.
     #[test]
     fn test_analyze_settings_effect_of_set_config() {
-        assert_eq!(
-            settings_of("SELECT set_config('timezone', 'UTC', true)"),
-            SettingsEffect::guc(Guc::TimeZone, true)
-        );
-        assert_eq!(
-            settings_of(
-                "SELECT set_config('search_path', 'a', false), set_config('role', 'r', false)"
-            ),
-            SettingsEffect::guc(Guc::SearchPath, false)
-                .union(SettingsEffect::guc(Guc::Role, false))
-        );
-        // Untracked names are no effect; a non-literal name may be anything.
-        assert_eq!(
-            settings_of("SELECT set_config('request.jwt.claims', '{}', true)"),
-            SettingsEffect::NONE
-        );
-        assert_eq!(
-            settings_of("SELECT set_config($1, 'x', false)"),
-            SettingsEffect::all()
-        );
-        // Hidden from the converter: the text scan's answer stands.
-        assert_eq!(
-            settings_of("DO $$ BEGIN PERFORM SET_CONFIG('x', 'y', false); END $$"),
-            SettingsEffect::all()
-        );
-        assert_eq!(settings_of("SELECT now()"), SettingsEffect::NONE);
-        assert_eq!(
-            settings_of("SET LOCAL search_path = a"),
-            SettingsEffect::guc(Guc::SearchPath, true)
-        );
+        #[rustfmt::skip]
+        let cases = [
+            ("SELECT set_config('timezone', 'UTC', true)", SettingsEffect::guc(Guc::TimeZone, true)),
+            ("SELECT set_config('search_path', 'a', false), set_config('role', 'r', false)",
+             SettingsEffect::guc(Guc::SearchPath, false).union(SettingsEffect::guc(Guc::Role, false))),
+            // Untracked names are no effect; a non-literal name may be anything.
+            ("SELECT set_config('request.jwt.claims', '{}', true)", SettingsEffect::NONE),
+            ("SELECT set_config($1, 'x', false)", SettingsEffect::all()),
+            // Hidden from the converter: the text scan's answer stands.
+            ("DO $$ BEGIN PERFORM SET_CONFIG('x', 'y', false); END $$", SettingsEffect::all()),
+            ("SELECT now()", SettingsEffect::NONE),
+            ("SET LOCAL search_path = a", SettingsEffect::guc(Guc::SearchPath, true)),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(settings_of(sql), expected, "{sql}");
+        }
         assert!(StatementEffects::unknown().settings.all);
     }
 
-    /// PGC-387: a `set_config()` call anywhere in a forwarded statement
-    /// invalidates the tracked isolation default; whitelisted SET statements
-    /// carry their parsed effect.
     #[test]
     fn test_analyze_isolation_effects() {
-        let fv = HashMap::new();
-        assert!(matches!(
-            analyze_fresh(
-                "SELECT set_config('default_transaction_isolation', 'serializable', false)",
-                &fv
-            ),
-            Action::Forward(
-                _,
-                StatementEffects {
-                    write: Some(WriteClass::Connection),
-                    isolation: IsolationEffect::SessionUnknown,
-                    ..
-                }
-            )
-        ));
-        assert!(matches!(
-            analyze_fresh(
-                "DO $$ BEGIN PERFORM SET_CONFIG('x', 'y', false); END $$",
-                &fv
-            ),
-            Action::Forward(
-                _,
-                StatementEffects {
-                    write: Some(WriteClass::Connection),
-                    isolation: IsolationEffect::SessionUnknown,
-                    ..
-                }
-            )
-        ));
-        assert!(matches!(
-            analyze_fresh("BEGIN ISOLATION LEVEL SERIALIZABLE", &fv),
-            Action::Forward(
-                ForwardReason::UnsupportedStatement,
-                StatementEffects {
-                    isolation: IsolationEffect::Transaction(IsolationLevel::Serializable),
-                    ..
-                }
-            )
-        ));
-        assert!(matches!(
-            analyze_fresh("SET search_path TO public", &fv),
-            Action::Forward(
-                ForwardReason::UnsupportedStatement,
-                StatementEffects {
-                    isolation: IsolationEffect::None,
-                    ..
-                }
-            )
-        ));
-        assert!(matches!(
-            analyze_fresh("SELECT * FROM t WHERE id = 1", &fv),
-            Action::CacheCheck(_)
-        ));
+        // (sql, the forward's reason, write class and isolation effect)
+        #[rustfmt::skip]
+        let cases = [
+            ("SELECT set_config('default_transaction_isolation', 'serializable', false)",
+             "UncacheableSelect write=Some(Connection) isolation=SessionUnknown"),
+            ("DO $$ BEGIN PERFORM SET_CONFIG('x', 'y', false); END $$",
+             "UnsupportedStatement write=Some(Connection) isolation=SessionUnknown"),
+            ("BEGIN ISOLATION LEVEL SERIALIZABLE",
+             "UnsupportedStatement write=None isolation=Transaction(Serializable)"),
+            ("SET search_path TO public",
+             "UnsupportedStatement write=None isolation=None"),
+            ("SELECT * FROM t WHERE id = 1", "CacheCheck"),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(
+                action_described(&analyze_fresh(sql, &HashMap::new())),
+                expected,
+                "{sql}"
+            );
+        }
     }
 
     #[test]
@@ -978,20 +611,32 @@ mod tests {
     fn test_writes_are_not_memoized() {
         let fv = HashMap::new();
         let mut cache = CacheabilityCache::new(Arc::new(CacheabilityStore::new()));
-        // A write is classified but left out of the memo (DML text is ~unique
-        // and its class can carry a row payload).
-        assert!(matches!(
-            analyze("INSERT INTO t (a) VALUES (1)", &mut cache, &fv),
-            Ok(Action::Forward(_, StatementEffects { write: Some(_), .. }))
-        ));
-        assert!(cache.entries.is_empty(), "writes must not be memoized");
+        // (sql, its action, memo entries afterwards): a write is classified
+        // but left out of the memo (DML text is ~unique and its class can
+        // carry a row payload); a read verdict is memoized as before.
+        let cases = [
+            ("INSERT INTO t (a) VALUES (1)", "ForwardWrite", 0),
+            ("SELECT * FROM t WHERE a = 1", "CacheCheck", 1),
+        ];
+        for (sql, expected, memoized) in cases {
+            let action = analyze(sql, &mut cache, &fv).expect("analyze");
+            assert_eq!(
+                (discriminant_name(&action), cache.entry_count()),
+                (expected, memoized),
+                "{sql}"
+            );
+        }
+    }
 
-        // A read verdict is memoized as before.
-        assert!(matches!(
-            analyze("SELECT * FROM t WHERE a = 1", &mut cache, &fv),
-            Ok(Action::CacheCheck(_))
-        ));
-        assert_eq!(cache.entries.len(), 1);
+    /// A forward's reason and effects, or the other actions' names.
+    fn action_described(action: &Action) -> String {
+        match action {
+            Action::Forward(reason, effects) => format!(
+                "{reason:?} write={:?} isolation={:?}",
+                effects.write, effects.isolation
+            ),
+            other => discriminant_name(other).to_owned(),
+        }
     }
 
     fn discriminant_name(action: &Action) -> &'static str {

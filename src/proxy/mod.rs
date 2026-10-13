@@ -1,8 +1,10 @@
 mod cache_sender;
+mod cacheability_memo;
 mod cacheability_store;
 mod client_stream;
 mod connection;
 mod egress;
+mod explain;
 mod origin_stream;
 mod query;
 pub mod search_path;
@@ -14,7 +16,7 @@ pub use cache_sender::{StatusSender, StatusSenderUpdater};
 pub use cacheability_store::CacheabilityStore;
 
 pub use client_stream::{ClientSocket, OwnedClientReadHalf};
-pub use query::{ExplainSpec, ExplainTarget};
+pub use explain::{ExplainSpec, ExplainTarget};
 
 use std::io;
 use std::sync::Arc;
