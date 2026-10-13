@@ -11,9 +11,8 @@
 //! references replaced by the branch's own column node, or by a fresh
 //! reference bound to the column a star stood for.
 
-use std::collections::HashMap;
-
 use ecow::EcoString;
+use smallvec::SmallVec;
 
 use crate::query::ast::rope::{
     Body, Name, NodeKind, NodeRef, Query, Replacement, Replacements, Scalar, ScalarKind, Select,
@@ -33,23 +32,36 @@ enum BranchColumn<'t> {
     Star(ColumnBinding),
 }
 
-/// One branch SELECT of a derived table and, by name, what each column
-/// of a pushed conjunct becomes in it.
+/// One branch SELECT of a derived table and what each of its output
+/// positions projects.
 struct Branch<'t> {
     select: Select<'t>,
     /// Each output position as the column it projects; `None` where the
     /// output is not a plain column.
     outputs: Vec<Option<BranchColumn<'t>>>,
-    columns: HashMap<EcoString, BranchColumn<'t>>,
 }
 
 /// A candidate SELECT and what moves out of its WHERE.
 struct Move<'t> {
     select: Select<'t>,
     source: Source<'t>,
+    /// The derived table's output names, by position: what a pushed
+    /// conjunct's columns name.
+    names: Vec<Option<EcoString>>,
     pushed: Vec<Where<'t>>,
     remaining: Vec<Where<'t>>,
     branches: Vec<Branch<'t>>,
+}
+
+impl<'t> Move<'t> {
+    /// What `column` of a pushed conjunct becomes in `branch`.
+    fn branch_column(&self, branch: &Branch<'t>, column: &str) -> Option<BranchColumn<'t>> {
+        let position = self
+            .names
+            .iter()
+            .position(|name| name.as_deref() == Some(column))?;
+        branch.outputs.get(position).copied().flatten()
+    }
 }
 
 /// Push the outer WHERE conjuncts of every sole-derived-table SELECT into
@@ -116,34 +128,24 @@ impl<'t> Analysis<'t> {
             return None;
         }
         let slot = self.bindings.source(derived)?;
-        let positions: HashMap<EcoString, usize> = self
-            .bound
-            .output_names(body)
-            .into_iter()
-            .enumerate()
-            .filter_map(|(position, name)| name.map(|name| (name, position)))
-            .collect();
         let mut branches = Vec::new();
         self.branches_collect(body, &mut branches)?;
-
-        let mut pushed = Vec::new();
-        let mut remaining = Vec::new();
-        for conjunct in where_clause.conjuncts() {
-            if self.conjunct_targets(conjunct, slot)
-                && conjunct_push(conjunct, &positions, &mut branches)
-            {
-                pushed.push(conjunct);
-            } else {
-                remaining.push(conjunct);
-            }
-        }
-        (!pushed.is_empty()).then_some(Move {
+        let mut planned = Move {
             select,
             source,
-            pushed,
-            remaining,
+            names: self.bound.output_names(body),
+            pushed: Vec::new(),
+            remaining: Vec::new(),
             branches,
-        })
+        };
+        for conjunct in where_clause.conjuncts() {
+            if self.conjunct_targets(conjunct, slot) && planned.conjunct_restatable(conjunct) {
+                planned.pushed.push(conjunct);
+            } else {
+                planned.remaining.push(conjunct);
+            }
+        }
+        (!planned.pushed.is_empty()).then_some(planned)
     }
 
     /// The branch SELECTs of a derived table in pre-order; `None` when a
@@ -157,7 +159,6 @@ impl<'t> Analysis<'t> {
                 out.push(Branch {
                     select,
                     outputs: self.branch_outputs(select),
-                    columns: HashMap::new(),
                 });
                 Some(())
             }
@@ -231,41 +232,22 @@ impl<'t> Analysis<'t> {
     }
 }
 
-/// Whether `conjunct` can be restated against every branch; on success
-/// each branch records what the conjunct's columns become in it.
-fn conjunct_push<'t>(
-    conjunct: Where<'t>,
-    positions: &HashMap<EcoString, usize>,
-    branches: &mut [Branch<'t>],
-) -> bool {
-    conjunct_is_restatable(conjunct)
-        && branches
-            .iter_mut()
-            .all(|branch| branch_columns_plan(conjunct, positions, branch))
-}
-
-/// Record what each column of `conjunct` becomes in `branch`; `false` when
-/// one has no plain column behind it.
-fn branch_columns_plan<'t>(
-    conjunct: Where<'t>,
-    positions: &HashMap<EcoString, usize>,
-    branch: &mut Branch<'t>,
-) -> bool {
-    for position in conjunct.node_ref().subtree() {
-        let NodeKind::Column { column, .. } = position.kind() else {
-            continue;
-        };
-        let Some(replacement) = positions
-            .get(column)
-            .and_then(|position| branch.outputs.get(*position))
-            .copied()
-            .flatten()
-        else {
-            return false;
-        };
-        branch.columns.insert(column.clone(), replacement);
+impl<'t> Move<'t> {
+    /// Whether `conjunct` can be restated against every branch: its form
+    /// is one the rewrite copies, and each of its columns has a plain
+    /// column behind it in each branch.
+    fn conjunct_restatable(&self, conjunct: Where<'t>) -> bool {
+        conjunct_is_restatable(conjunct)
+            && self.branches.iter().all(|branch| {
+                conjunct.node_ref().subtree().all(|position| {
+                    if let NodeKind::Column { column, .. } = position.kind() {
+                        self.branch_column(branch, column).is_some()
+                    } else {
+                        true
+                    }
+                })
+            })
     }
-    true
 }
 
 /// The expression forms the rewrite restates: comparisons, logic and
@@ -303,8 +285,10 @@ fn branch_is_safe(branch: Select<'_>) -> bool {
 /// One operand of a fresh AND chain.
 enum AndItem<'a, 't> {
     Keep(Where<'t>),
-    Copy(Where<'t>, &'a Branch<'t>),
+    Copy(Where<'t>, &'a Branch<'t>, &'a Move<'t>),
 }
+
+type AndChain<'a, 't> = SmallVec<[AndItem<'a, 't>; 4]>;
 
 struct Emit<'a, 't> {
     builder: TreeBuilder<'t>,
@@ -385,8 +369,7 @@ impl<'a, 't> Emit<'a, 't> {
         );
         self.items_keep(select);
         self.derived_source_emit(m);
-        let remaining: Vec<AndItem<'a, 't>> =
-            m.remaining.iter().map(|c| AndItem::Keep(*c)).collect();
+        let remaining: AndChain<'a, 't> = m.remaining.iter().map(|c| AndItem::Keep(*c)).collect();
         self.and_chain_emit(&remaining);
         self.select_tail_keep(select);
         self.builder.close(open);
@@ -471,9 +454,9 @@ impl<'a, 't> Emit<'a, 't> {
         for source in select.from() {
             self.builder.keep(source.id());
         }
-        let mut items: Vec<AndItem<'a, 't>> = Vec::with_capacity(m.pushed.len() + 1);
+        let mut items = AndChain::new();
         items.extend(select.where_clause().map(AndItem::Keep));
-        items.extend(m.pushed.iter().map(|c| AndItem::Copy(*c, branch)));
+        items.extend(m.pushed.iter().map(|c| AndItem::Copy(*c, branch, m)));
         self.and_chain_emit(&items);
         self.select_tail_keep(select);
         self.builder.close(open);
@@ -514,28 +497,28 @@ impl<'a, 't> Emit<'a, 't> {
             AndItem::Keep(conjunct) => {
                 self.builder.keep(conjunct.id());
             }
-            AndItem::Copy(conjunct, branch) => self.conjunct_copy(*conjunct, branch),
+            AndItem::Copy(conjunct, branch, m) => self.conjunct_copy(*conjunct, branch, m),
         }
     }
 
     /// `conjunct` restated against `branch`: a copy with every column
     /// reference replaced.
-    fn conjunct_copy(&mut self, conjunct: Where<'t>, branch: &Branch<'t>) {
+    fn conjunct_copy(&mut self, conjunct: Where<'t>, branch: &Branch<'t>, m: &Move<'t>) {
         let mut replacements = Replacements::new();
-        let mut star_references = Vec::new();
+        let mut star_references: SmallVec<[(usize, ColumnBinding); 4]> = SmallVec::new();
         for position in conjunct.node_ref().subtree() {
             let NodeKind::Column { column, .. } = position.kind() else {
                 continue;
             };
-            let Some(replacement) = branch.columns.get(column) else {
+            let Some(replacement) = m.branch_column(branch, column) else {
                 debug_assert!(false, "a pushed conjunct's columns are all planned");
                 continue;
             };
             let replacement = match replacement {
                 BranchColumn::Node(node) => Replacement::Subtree(node.id()),
                 BranchColumn::Star(binding) => {
-                    star_references.push((replacements.len(), *binding));
-                    Replacement::Leaf(self.star_reference_kind(*binding))
+                    star_references.push((replacements.len(), binding));
+                    Replacement::Leaf(self.star_reference_kind(binding))
                 }
             };
             replacements.push(position.id(), replacement);
