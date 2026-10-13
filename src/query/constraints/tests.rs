@@ -226,11 +226,18 @@ fn table_constraint_any(
         .is_some_and(|cs| cs.iter().any(matches))
 }
 
+/// Whether `table` carries exactly `expected`.
+fn has_table_constraint(
+    constraints: &QueryConstraints,
+    table: &str,
+    expected: &TableConstraint,
+) -> bool {
+    table_constraint_any(constraints, table, |tc| tc == expected)
+}
+
 fn has_constraint(constraints: &QueryConstraints, spec: &ComparisonSpec) -> bool {
-    table_constraint_any(constraints, spec.table, |tc| {
-        matches!(tc, TableConstraint::Comparison(c, o, v)
-            if c == spec.column && *o == spec.op && *v == spec.value)
-    })
+    let expected = TableConstraint::Comparison(spec.column.into(), spec.op, spec.value.clone());
+    has_table_constraint(constraints, spec.table, &expected)
 }
 
 fn has_in_constraint(constraints: &QueryConstraints, spec: &InSetSpec) -> bool {
@@ -525,6 +532,12 @@ fn test_between_extraction_cases() {
             sql: "SELECT * FROM users WHERE id NOT BETWEEN 100 AND 500",
             expectations: vec![count(0)],
         },
+    ]);
+}
+
+#[test]
+fn test_between_symmetric_extraction_cases() {
+    extraction_cases_check(vec![
         // Bounds are reversed (500, 100) — should normalize to (100, 500)
         ExtractionCase {
             label: "between symmetric reversed bounds",
@@ -658,6 +671,10 @@ fn test_subsumption_cases() {
         ("equal not subsumed by range", "SELECT * FROM users WHERE id = 5", "SELECT * FROM users WHERE id > 3", false),
         // Cached != 5, new = 3. 3 ≠ 5, so new's result is within cached's — subsumed
         ("not equal by different equal", "SELECT * FROM users WHERE id != 5", "SELECT * FROM users WHERE id = 3", true),
+        // A redundant ::text on a TEXT column is the same constraint
+        ("identity text cast", "SELECT * FROM users WHERE name = 'alice'", "SELECT * FROM users WHERE name::text = 'alice'", true),
+        // Identical cast comparisons subsume each other
+        ("same cast comparison", "SELECT * FROM users WHERE name::int4 = 42", "SELECT * FROM users WHERE name::int4 = 42", true),
         // Cached != 5, new = 5 — 5 is excluded by cached. Not subsumed.
         ("not equal by same equal", "SELECT * FROM users WHERE id != 5", "SELECT * FROM users WHERE id = 5", false),
         // Cached != 5, new id > 10 — entire range excludes 5. Subsumed.
@@ -898,72 +915,53 @@ fn test_in_with_parameter_skipped() {
 
 // ========== IN + range intersection in column_range_build ==========
 
-#[test]
-fn test_in_set_with_range_filter() {
-    // IN (1,2,3,4,5) AND id > 3 → InSet({4, 5})
-    let tcs = [
-        TableConstraint::AnyOf("id".into(), vec![int(1), int(2), int(3), int(4), int(5)]),
-        TableConstraint::Comparison("id".into(), BinaryOp::GreaterThan, int(3)),
-    ];
-    let refs: Vec<&TableConstraint> = tcs.iter().collect();
-    let range = column_range_build(&refs);
+/// An `id` constraint for the narrowing table.
+fn id_in(values: &[i64]) -> TableConstraint {
+    TableConstraint::AnyOf("id".into(), values.iter().copied().map(int).collect())
+}
+
+fn id_is(op: BinaryOp, value: i64) -> TableConstraint {
+    TableConstraint::Comparison("id".into(), op, int(value))
+}
+
+/// A narrowed range spelled for comparison, its IN members sorted.
+fn range_described(range: &ColumnRange) -> String {
+    let short = |value: &LiteralValue| match value {
+        LiteralValue::Integer(n) => n.to_string(),
+        other => format!("{other:?}"),
+    };
     match range {
+        ColumnRange::Empty => "empty".to_owned(),
+        ColumnRange::Equal(value) => format!("= {}", short(value)),
         ColumnRange::InSet(set) => {
-            assert_eq!(set.len(), 2);
-            assert!(set.contains(&int(4)));
-            assert!(set.contains(&int(5)));
+            let mut members: Vec<String> = set.iter().map(short).collect();
+            members.sort();
+            format!("in [{}]", members.join(", "))
         }
-        _ => panic!("expected InSet, got {range:?}"),
+        other => format!("{other:?}"),
     }
 }
 
+/// An IN list AND a comparison on the same column narrows to the values
+/// that satisfy both.
 #[test]
-fn test_in_set_with_equality_match() {
-    // IN (1,2,3) AND id = 2 → Equal(2)
-    let tcs = [
-        TableConstraint::AnyOf("id".into(), vec![int(1), int(2), int(3)]),
-        TableConstraint::Comparison("id".into(), BinaryOp::Equal, int(2)),
+fn test_in_set_narrowing_cases() {
+    #[rustfmt::skip]
+    let cases = [
+        ("range filter",     vec![id_in(&[1, 2, 3, 4, 5]), id_is(BinaryOp::GreaterThan, 3)], "in [4, 5]"),
+        ("equality match",   vec![id_in(&[1, 2, 3]), id_is(BinaryOp::Equal, 2)],             "= 2"),
+        ("equality miss",    vec![id_in(&[1, 2, 3]), id_is(BinaryOp::Equal, 5)],             "empty"),
+        ("not equal",        vec![id_in(&[1, 2, 3]), id_is(BinaryOp::NotEqual, 2)],          "in [1, 3]"),
     ];
-    let refs: Vec<&TableConstraint> = tcs.iter().collect();
-    let range = column_range_build(&refs);
-    assert!(matches!(
-        range,
-        ColumnRange::Equal(LiteralValue::Integer(2))
-    ));
-}
-
-#[test]
-fn test_in_set_with_equality_mismatch() {
-    // IN (1,2,3) AND id = 5 → Empty
-    let tcs = [
-        TableConstraint::AnyOf("id".into(), vec![int(1), int(2), int(3)]),
-        TableConstraint::Comparison("id".into(), BinaryOp::Equal, int(5)),
-    ];
-    let refs: Vec<&TableConstraint> = tcs.iter().collect();
-    let range = column_range_build(&refs);
-    assert!(matches!(range, ColumnRange::Empty));
-}
-
-#[test]
-fn test_in_set_with_not_equal() {
-    // IN (1,2,3) AND id != 2 → InSet({1, 3})
-    let tcs = [
-        TableConstraint::AnyOf("id".into(), vec![int(1), int(2), int(3)]),
-        TableConstraint::Comparison("id".into(), BinaryOp::NotEqual, int(2)),
-    ];
-    let refs: Vec<&TableConstraint> = tcs.iter().collect();
-    let range = column_range_build(&refs);
-    match range {
-        ColumnRange::InSet(set) => {
-            assert_eq!(set.len(), 2);
-            assert!(set.contains(&int(1)));
-            assert!(set.contains(&int(3)));
-        }
-        _ => panic!("expected InSet, got {range:?}"),
+    for (label, constraints, expected) in cases {
+        let refs: Vec<&TableConstraint> = constraints.iter().collect();
+        assert_eq!(
+            range_described(&column_range_build(&refs)),
+            expected,
+            "{label}"
+        );
     }
 }
-
-// ========== PGC-106: where_analysis_complete tracking ==========
 
 #[test]
 fn test_no_where_clause_is_complete() {
@@ -1061,129 +1059,44 @@ fn test_subsumption_full_scan_still_subsumes() {
 // PGC-149: identity TypeCast strip in constraint extraction
 // ------------------------------------------------------------------
 
-#[test]
-fn test_identity_text_cast_extracts_comparison_constraint() {
-    // `name::text = 'alice'` on a TEXT column must extract the same
-    // ColumnConstraint::Comparison as `name = 'alice'` would.
-    let tables = catalog(&["users"]);
-
-    let constraints = analyze_query_constraints(&resolve_sql(
-        "SELECT * FROM users WHERE name::text = 'alice'",
-        &tables,
-    ));
-
-    assert!(constraints.where_analysis_complete);
-    assert!(has_constraint(
-        &constraints,
-        &cmp("users", "name", BinaryOp::Equal, text("alice")),
-    ));
+fn cast_comparison(
+    column: &str,
+    cast: CastTarget,
+    op: BinaryOp,
+    value: LiteralValue,
+) -> TableConstraint {
+    TableConstraint::CastComparison(column.into(), cast, op, value)
 }
 
+/// A cast on a compared column: an identity cast extracts the plain
+/// comparison (PGC-177), a real cast a `CastComparison` (PGC-182), and a
+/// coercion the analysis cannot model leaves it incomplete.
 #[test]
-fn test_identity_text_cast_enables_subsumption() {
-    // Two queries that only differ by a redundant `::text` on a TEXT
-    // column should subsume each other.
-    let tables = catalog(&["users"]);
-
-    let cached = analyze_query_constraints(&resolve_sql(
-        "SELECT * FROM users WHERE name = 'alice'",
-        &tables,
-    ));
-    let new = analyze_query_constraints(&resolve_sql(
-        "SELECT * FROM users WHERE name::text = 'alice'",
-        &tables,
-    ));
-
-    assert!(cached.where_analysis_complete);
-    assert!(new.where_analysis_complete);
-    assert!(table_constraints_subsumed(&new, &cached, "users"));
-}
-
-#[test]
-fn test_identity_text_cast_on_int_column_extracts_constraint() {
-    // PGC-177: int → ::text is identity, so the constraint must be
-    // extracted as `id = 42` for subsumption to work.
-    let tables = catalog(&["users"]);
-
-    let constraints = analyze_query_constraints(&resolve_sql(
-        "SELECT * FROM users WHERE id::text = '42'",
-        &tables,
-    ));
-
-    assert!(constraints.where_analysis_complete);
-    assert!(has_constraint(
-        &constraints,
-        &cmp("users", "id", BinaryOp::Equal, text("42")),
-    ));
-}
-
-#[test]
-fn test_non_identity_text_cast_keeps_analysis_incomplete() {
-    // `name::numeric = 42` is a text → numeric coercion, not identity.
-    // Analysis must remain incomplete so subsumption stays conservative.
-    let tables = catalog(&["users"]);
-
-    let constraints = analyze_query_constraints(&resolve_sql(
-        "SELECT * FROM users WHERE name::numeric = 42",
-        &tables,
-    ));
-
-    assert!(
-        !constraints.where_analysis_complete,
-        "non-identity cast must leave analysis incomplete"
-    );
-}
-
-// ---------------------------------------------------------------
-// PGC-182: subsumption for non-identity casts via CastComparison.
-// ---------------------------------------------------------------
-
-fn has_cast_constraint(
-    constraints: &QueryConstraints,
-    spec: &ComparisonSpec,
-    cast: &CastTarget,
-) -> bool {
-    table_constraint_any(constraints, spec.table, |tc| {
-        matches!(tc, TableConstraint::CastComparison(c, k, o, v)
-            if c == spec.column && k == cast && *o == spec.op && *v == spec.value)
-    })
-}
-
-#[test]
-fn test_text_to_int4_extracts_cast_comparison() {
-    let tables = catalog(&["users"]);
-
-    let constraints = analyze_query_constraints(&resolve_sql(
-        "SELECT * FROM users WHERE name::int4 = 42",
-        &tables,
-    ));
-
-    assert!(constraints.where_analysis_complete);
-    assert!(has_cast_constraint(
-        &constraints,
-        &cmp("users", "name", BinaryOp::Equal, int(42)),
-        &CastTarget::Int4
-    ));
-}
-
-#[test]
-fn test_cast_comparison_subsumes_self() {
-    // Identical cast queries: both extract the same CastComparison,
-    // subsumption holds.
-    let tables = catalog(&["users"]);
-
-    let cached = analyze_query_constraints(&resolve_sql(
-        "SELECT * FROM users WHERE name::int4 = 42",
-        &tables,
-    ));
-    let new = analyze_query_constraints(&resolve_sql(
-        "SELECT * FROM users WHERE name::int4 = 42",
-        &tables,
-    ));
-
-    assert!(cached.where_analysis_complete);
-    assert!(new.where_analysis_complete);
-    assert!(table_constraints_subsumed(&new, &cached, "users"));
+fn test_cast_extraction_cases() {
+    // (label, sql, analysis complete, the constraint on `users`)
+    #[rustfmt::skip]
+    let cases = [
+        ("identity text cast on text column", "SELECT * FROM users WHERE name::text = 'alice'", true,
+         Some(TableConstraint::Comparison("name".into(), BinaryOp::Equal, text("alice")))),
+        ("identity text cast on int column",  "SELECT * FROM users WHERE id::text = '42'", true,
+         Some(TableConstraint::Comparison("id".into(), BinaryOp::Equal, text("42")))),
+        ("text to int4",                      "SELECT * FROM users WHERE name::int4 = 42", true,
+         Some(cast_comparison("name", CastTarget::Int4, BinaryOp::Equal, int(42)))),
+        ("text to numeric",                   "SELECT * FROM users WHERE name::numeric = 42", false, None),
+    ];
+    for (label, sql, complete, expected) in cases {
+        let constraints = constraints_of(sql, &catalog(&["users"]));
+        assert_eq!(
+            constraints.where_analysis_complete, complete,
+            "{label}: completeness"
+        );
+        if let Some(expected) = expected {
+            assert!(
+                has_table_constraint(&constraints, "users", &expected),
+                "{label}: {expected:?}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1200,15 +1113,16 @@ fn test_cast_comparison_does_not_propagate_through_equivalence() {
     ));
 
     // u.name::int4 = 5 is extracted, but u2.name has no cast constraint.
-    assert!(has_cast_constraint(
+    let cast_equal_five = cast_comparison("name", CastTarget::Int4, BinaryOp::Equal, int(5));
+    assert!(has_table_constraint(
         &constraints,
-        &cmp("users", "name", BinaryOp::Equal, int(5)),
-        &CastTarget::Int4
+        "users",
+        &cast_equal_five
     ));
-    assert!(!has_cast_constraint(
+    assert!(!has_table_constraint(
         &constraints,
-        &cmp("users2", "name", BinaryOp::Equal, int(5)),
-        &CastTarget::Int4
+        "users2",
+        &cast_equal_five
     ));
 }
 
