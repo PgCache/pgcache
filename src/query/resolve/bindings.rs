@@ -206,9 +206,15 @@ impl BindingsBuilder {
                 TableSlot::Base { .. } => slot.clone(),
             })
             .collect();
+        // A rewrite keeps most nodes once, so the source's counts size the
+        // carried vectors without growth.
         let mut bindings = Bindings {
             slots,
-            ..Bindings::default()
+            sources: Vec::with_capacity(source.sources.len()),
+            columns: Vec::with_capacity(source.columns.len()),
+            stars: Vec::with_capacity(source.stars.len()),
+            merged: Vec::new(),
+            correlated: Vec::with_capacity(source.correlated.len()),
         };
         for (node, slot) in &source.sources {
             bindings
