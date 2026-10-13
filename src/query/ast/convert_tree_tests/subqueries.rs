@@ -430,6 +430,37 @@ fn test_cte_name_resolution_cases() {
     assert_eq!(value, LiteralValue::Integer(2));
 }
 
+/// Every subquery position sees the enclosing CTEs: a reference inside one
+/// converts to a CTE reference, never to a table of the CTE's name.
+#[test]
+fn test_cte_reference_inside_subquery_cases() {
+    #[rustfmt::skip]
+    let cases = [
+        ("IN",            "recent", "WITH recent AS (SELECT customer_id FROM payment WHERE amount > 5) SELECT * FROM customer WHERE customer_id IN (SELECT customer_id FROM recent)"),
+        ("EXISTS",        "recent", "WITH recent AS (SELECT customer_id FROM payment WHERE amount > 5) SELECT * FROM customer c WHERE EXISTS (SELECT 1 FROM recent r WHERE r.customer_id = c.customer_id)"),
+        ("scalar",        "recent", "WITH recent AS (SELECT customer_id FROM payment WHERE amount > 5) SELECT customer_id, (SELECT COUNT(*) FROM recent) AS n FROM customer"),
+        ("HAVING",        "recent", "WITH recent AS (SELECT customer_id FROM payment WHERE amount > 5) SELECT customer_id FROM payment GROUP BY customer_id HAVING COUNT(*) > (SELECT COUNT(*) FROM recent)"),
+        ("later CTE",     "a",      "WITH a AS (SELECT id FROM users), b AS (SELECT id FROM orders WHERE id IN (SELECT id FROM a)) SELECT * FROM b"),
+        ("derived table", "recent", "WITH recent AS (SELECT customer_id FROM payment WHERE amount > 5) SELECT * FROM (SELECT customer_id FROM customer WHERE customer_id IN (SELECT customer_id FROM recent)) s"),
+    ];
+    for (label, cte, sql) in cases {
+        let tree = parse(sql);
+        let tables = tree
+            .nodes()
+            .filter(|node| matches!(&node.kind, NodeKind::Table { name, .. } if name == cte))
+            .count();
+        let references = tree
+            .nodes()
+            .filter(
+                |node| matches!(&node.kind, NodeKind::CteRef { cte_name, .. } if cte_name == cte),
+            )
+            .count();
+        assert_eq!(tables, 0, "{label}: a table of the CTE's name in {sql}");
+        assert!(references >= 1, "{label}: no CTE reference in {sql}");
+        assert_eq!(tree.sql(), sql, "{label}: renders as written");
+    }
+}
+
 #[test]
 fn test_cte_materialization_cases() {
     let tree = parse("WITH x AS MATERIALIZED (SELECT id FROM users) SELECT * FROM x");

@@ -20,6 +20,7 @@ use ecow::EcoString;
 use pg_query::pg_nodes as pg;
 
 use self::select::query_emit;
+use self::window::WindowDefs;
 use super::raw::{
     NodePtr, cast, cstr, list_nodes, node_tag, node_tag_name, string_node_value, sublink_type_name,
 };
@@ -201,6 +202,34 @@ impl<'a> ParseContext<'a> {
             return Some((cte, defined_in));
         }
         self.outer?.cte_find(name)
+    }
+}
+
+/// What an expression resolves names against: the CTEs in scope, and the
+/// enclosing select list's named windows when the expression sits in that
+/// list, where alone an `OVER w` resolves.
+#[derive(Clone, Copy)]
+pub(super) struct ExpressionScope<'a> {
+    context: &'a ParseContext<'a>,
+    windows: Option<&'a WindowDefs>,
+}
+
+impl<'a> ExpressionScope<'a> {
+    /// The scope of an expression outside a select list: CTEs only.
+    fn of(context: &'a ParseContext<'a>) -> Self {
+        Self {
+            context,
+            windows: None,
+        }
+    }
+
+    /// The same CTEs with no window reference allowed, for a nested
+    /// position such as a window's own PARTITION BY.
+    fn without_windows(self) -> Self {
+        Self {
+            windows: None,
+            ..self
+        }
     }
 }
 

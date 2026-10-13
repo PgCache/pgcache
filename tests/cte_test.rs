@@ -108,6 +108,71 @@ async fn test_cte_simple() -> Result<(), Error> {
     Ok(())
 }
 
+/// A CTE referenced only from a WHERE subquery is cached and maintained
+/// like one referenced from FROM.
+///
+/// Pattern: WITH cte AS (SELECT ...) SELECT ... FROM table WHERE id IN (SELECT id FROM cte)
+#[tokio::test]
+async fn test_cte_referenced_from_subquery() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department TEXT, active BOOLEAN)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO employees (id, name, department, active) VALUES \
+         (1, 'Alice', 'eng', true), \
+         (2, 'Bob', 'eng', false), \
+         (3, 'Charlie', 'sales', true), \
+         (4, 'Diana', 'sales', true)",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "WITH active_emp AS (SELECT id FROM employees WHERE active = true) \
+                 SELECT name, department FROM employees \
+                 WHERE id IN (SELECT id FROM active_emp) ORDER BY name";
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5);
+    assert_row_at(&res, 1, &[("name", "Alice"), ("department", "eng")])?;
+    assert_row_at(&res, 2, &[("name", "Charlie"), ("department", "sales")])?;
+    assert_row_at(&res, 3, &[("name", "Diana"), ("department", "sales")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5);
+    let m = assert_cache_hit(&mut ctx, m).await?;
+
+    // Activating Bob grows the result: served correctly after CDC.
+    ctx.origin_query("UPDATE employees SET active = true WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 6);
+    assert_row_at(&res, 2, &[("name", "Bob"), ("department", "eng")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+
+    // Deleting Diana shrinks it: applied in place, still a hit.
+    ctx.origin_query("DELETE FROM employees WHERE id = 4", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let res = ctx.simple_query(query).await?;
+    assert_eq!(res.len(), 5);
+    assert_row_at(&res, 3, &[("name", "Charlie"), ("department", "sales")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
 /// Test CTE joined with a regular table.
 ///
 /// Pattern: WITH cte AS (SELECT ...) SELECT ... FROM cte JOIN table ON ...

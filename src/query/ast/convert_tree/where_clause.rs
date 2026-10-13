@@ -8,10 +8,10 @@ use ecow::EcoString;
 use ordered_float::NotNan;
 use pg_query::pg_nodes as pg;
 
-use super::ParseContext;
 use super::scalar::{arithmetic_emit, arithmetic_op_from_str, operator_name_single, scalar_emit};
 use super::select::query_emit;
 use super::sublink_type_map;
+use super::{ExpressionScope, ParseContext};
 use crate::query::ast::raw::{
     NodePtr, aexpr_kind_name, cast, cstr, list_is_empty, list_len, list_nodes, node_tag,
     string_node_value,
@@ -97,24 +97,30 @@ pub(super) unsafe fn param_ref_extract(param_ref: *const pg::ParamRef) -> Litera
 // ---------- WHERE clause ----------
 
 /// A predicate, in the WHERE error domain folded into `AstError`.
+/// A predicate over the CTEs of `context`; no window reference resolves
+/// inside one.
 pub(super) unsafe fn where_emit(
     builder: &mut TreeBuilder<'_>,
     node: NodePtr,
+    context: &ParseContext<'_>,
 ) -> Result<(), AstError> {
-    unsafe { where_expr_emit(builder, node).map_err(AstError::from) }
+    unsafe { where_expr_emit(builder, node, ExpressionScope::of(context)).map_err(AstError::from) }
 }
 
 pub(super) unsafe fn where_expr_emit(
     builder: &mut TreeBuilder<'_>,
     node: NodePtr,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         match node_tag(node) {
-            pg::NodeTag_T_A_Expr => a_expr_emit(builder, cast::<pg::A_Expr>(node)),
-            pg::NodeTag_T_BoolExpr => bool_expr_emit(builder, cast::<pg::BoolExpr>(node)),
-            pg::NodeTag_T_SubLink => sublink_emit(builder, cast::<pg::SubLink>(node)),
-            pg::NodeTag_T_NullTest => null_test_emit(builder, cast::<pg::NullTest>(node)),
-            pg::NodeTag_T_BooleanTest => boolean_test_emit(builder, cast::<pg::BooleanTest>(node)),
+            pg::NodeTag_T_A_Expr => a_expr_emit(builder, cast::<pg::A_Expr>(node), scope),
+            pg::NodeTag_T_BoolExpr => bool_expr_emit(builder, cast::<pg::BoolExpr>(node), scope),
+            pg::NodeTag_T_SubLink => sublink_emit(builder, cast::<pg::SubLink>(node), scope),
+            pg::NodeTag_T_NullTest => null_test_emit(builder, cast::<pg::NullTest>(node), scope),
+            pg::NodeTag_T_BooleanTest => {
+                boolean_test_emit(builder, cast::<pg::BooleanTest>(node), scope)
+            }
             pg::NodeTag_T_ColumnRef => column_ref_emit(builder, cast::<pg::ColumnRef>(node)),
             pg::NodeTag_T_A_Const => {
                 let value = const_value_extract(cast::<pg::A_Const>(node))?;
@@ -128,7 +134,7 @@ pub(super) unsafe fn where_expr_emit(
                 Ok(())
             }
             pg::NodeTag_T_FuncCall | pg::NodeTag_T_TypeCast => {
-                scalar_emit(builder, node, None).map_err(WhereParseError::from)
+                scalar_emit(builder, node, scope).map_err(WhereParseError::from)
             }
             _ => Err(WhereParseError::UnsupportedPattern),
         }
@@ -138,6 +144,7 @@ pub(super) unsafe fn where_expr_emit(
 unsafe fn sublink_emit(
     builder: &mut TreeBuilder<'_>,
     sub_link: *const pg::SubLink,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let subselect = (*sub_link).subselect as NodePtr;
@@ -157,13 +164,9 @@ unsafe fn sublink_emit(
             sublink_type,
             has_test_expr: !test_expr.is_null(),
         });
-        query_emit(
-            builder,
-            cast::<pg::SelectStmt>(subselect),
-            &ParseContext::empty(),
-        )?;
+        query_emit(builder, cast::<pg::SelectStmt>(subselect), scope.context)?;
         if !test_expr.is_null() {
-            scalar_emit(builder, test_expr, None)?;
+            scalar_emit(builder, test_expr, scope)?;
         }
         builder.close(open);
         Ok(())
@@ -224,10 +227,11 @@ unsafe fn unary_emit(
     builder: &mut TreeBuilder<'_>,
     op: UnaryOp,
     arg: NodePtr,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let open = builder.open(NodeKind::Unary { op });
-        where_expr_emit(builder, arg)?;
+        where_expr_emit(builder, arg, scope)?;
         builder.close(open);
         Ok(())
     }
@@ -236,6 +240,7 @@ unsafe fn unary_emit(
 unsafe fn null_test_emit(
     builder: &mut TreeBuilder<'_>,
     null_test: *const pg::NullTest,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let arg = (*null_test).arg as NodePtr;
@@ -251,13 +256,14 @@ unsafe fn null_test_emit(
                 });
             }
         };
-        unary_emit(builder, op, arg)
+        unary_emit(builder, op, arg, scope)
     }
 }
 
 unsafe fn boolean_test_emit(
     builder: &mut TreeBuilder<'_>,
     bool_test: *const pg::BooleanTest,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let arg = (*bool_test).arg as NodePtr;
@@ -277,39 +283,42 @@ unsafe fn boolean_test_emit(
                 });
             }
         };
-        unary_emit(builder, op, arg)
+        unary_emit(builder, op, arg, scope)
     }
 }
 
 unsafe fn a_expr_emit(
     builder: &mut TreeBuilder<'_>,
     expr: *const pg::A_Expr,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         match (*expr).kind {
-            pg::A_Expr_Kind_AEXPR_OP => a_expr_operator_emit(builder, expr),
-            pg::A_Expr_Kind_AEXPR_IN => a_expr_in_emit(builder, expr),
-            pg::A_Expr_Kind_AEXPR_BETWEEN => a_expr_between_emit(builder, expr, MultiOp::Between),
+            pg::A_Expr_Kind_AEXPR_OP => a_expr_operator_emit(builder, expr, scope),
+            pg::A_Expr_Kind_AEXPR_IN => a_expr_in_emit(builder, expr, scope),
+            pg::A_Expr_Kind_AEXPR_BETWEEN => {
+                a_expr_between_emit(builder, expr, MultiOp::Between, scope)
+            }
             pg::A_Expr_Kind_AEXPR_NOT_BETWEEN => {
-                a_expr_between_emit(builder, expr, MultiOp::NotBetween)
+                a_expr_between_emit(builder, expr, MultiOp::NotBetween, scope)
             }
             pg::A_Expr_Kind_AEXPR_BETWEEN_SYM => {
-                a_expr_between_emit(builder, expr, MultiOp::BetweenSymmetric)
+                a_expr_between_emit(builder, expr, MultiOp::BetweenSymmetric, scope)
             }
             pg::A_Expr_Kind_AEXPR_NOT_BETWEEN_SYM => {
-                a_expr_between_emit(builder, expr, MultiOp::NotBetweenSymmetric)
+                a_expr_between_emit(builder, expr, MultiOp::NotBetweenSymmetric, scope)
             }
             pg::A_Expr_Kind_AEXPR_LIKE | pg::A_Expr_Kind_AEXPR_ILIKE => {
                 let op = like_operator_extract((*expr).name)?;
-                binary_emit(builder, expr, op)
+                binary_emit(builder, expr, op, scope)
             }
             pg::A_Expr_Kind_AEXPR_OP_ANY => {
                 let comparison = operator_extract((*expr).name)?;
-                a_expr_any_all_emit(builder, expr, MultiOp::Any { comparison })
+                a_expr_any_all_emit(builder, expr, MultiOp::Any { comparison }, scope)
             }
             pg::A_Expr_Kind_AEXPR_OP_ALL => {
                 let comparison = operator_extract((*expr).name)?;
-                a_expr_any_all_emit(builder, expr, MultiOp::All { comparison })
+                a_expr_any_all_emit(builder, expr, MultiOp::All { comparison }, scope)
             }
             other => Err(WhereParseError::UnsupportedAExpr {
                 expr: format!("{} in WHERE", aexpr_kind_name(other)),
@@ -335,12 +344,13 @@ unsafe fn binary_emit(
     builder: &mut TreeBuilder<'_>,
     expr: *const pg::A_Expr,
     op: BinaryOp,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let (lexpr, rexpr) = a_expr_operands(expr)?;
         let open = builder.open(NodeKind::Binary { op });
-        where_expr_emit(builder, lexpr)?;
-        where_expr_emit(builder, rexpr)?;
+        where_expr_emit(builder, lexpr, scope)?;
+        where_expr_emit(builder, rexpr, scope)?;
         builder.close(open);
         Ok(())
     }
@@ -350,25 +360,27 @@ unsafe fn binary_emit(
 unsafe fn a_expr_operator_emit(
     builder: &mut TreeBuilder<'_>,
     expr: *const pg::A_Expr,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let op_name = operator_name_single((*expr).name).ok_or_else(|| WhereParseError::Other {
             error: "Multi-part operator names not supported".to_owned(),
         })?;
         if arithmetic_op_from_str(op_name).is_some() {
-            return arithmetic_emit(builder, expr, None).map_err(WhereParseError::from);
+            return arithmetic_emit(builder, expr, scope).map_err(WhereParseError::from);
         }
         let op =
             binary_op_from_str(op_name).ok_or_else(|| WhereParseError::UnsupportedOperator {
                 operator: op_name.to_owned(),
             })?;
-        binary_emit(builder, expr, op)
+        binary_emit(builder, expr, op, scope)
     }
 }
 
 unsafe fn a_expr_in_emit(
     builder: &mut TreeBuilder<'_>,
     expr: *const pg::A_Expr,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let op = in_operator_extract((*expr).name)?;
@@ -383,14 +395,14 @@ unsafe fn a_expr_in_emit(
                 0
             },
         });
-        where_expr_emit(builder, lexpr)?;
+        where_expr_emit(builder, lexpr, scope)?;
         if !list_ok {
             return Err(WhereParseError::Other {
                 error: "IN clause: expected List on right side".to_owned(),
             });
         }
         for value in list_nodes(rexpr as *const pg::List) {
-            where_expr_emit(builder, value)?;
+            where_expr_emit(builder, value, scope)?;
         }
         builder.close(open);
         Ok(())
@@ -401,11 +413,12 @@ unsafe fn a_expr_between_emit(
     builder: &mut TreeBuilder<'_>,
     expr: *const pg::A_Expr,
     op: MultiOp,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let (lexpr, rexpr) = a_expr_operands(expr)?;
         let open = builder.open(NodeKind::Multi { op, count: 3 });
-        where_expr_emit(builder, lexpr)?;
+        where_expr_emit(builder, lexpr, scope)?;
         if node_tag(rexpr) != pg::NodeTag_T_List {
             return Err(WhereParseError::Other {
                 error: "BETWEEN clause: expected List on right side".to_owned(),
@@ -421,8 +434,8 @@ unsafe fn a_expr_between_emit(
                 ),
             });
         };
-        where_expr_emit(builder, low)?;
-        where_expr_emit(builder, high)?;
+        where_expr_emit(builder, low, scope)?;
+        where_expr_emit(builder, high, scope)?;
         builder.close(open);
         Ok(())
     }
@@ -432,22 +445,23 @@ unsafe fn a_expr_any_all_emit(
     builder: &mut TreeBuilder<'_>,
     expr: *const pg::A_Expr,
     op: MultiOp,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let (lexpr, rexpr) = a_expr_operands(expr)?;
         let open = builder.open(NodeKind::Multi { op, count: 2 });
-        where_expr_emit(builder, lexpr)?;
+        where_expr_emit(builder, lexpr, scope)?;
         if node_tag(rexpr) == pg::NodeTag_T_A_ArrayExpr {
             let elements = (*cast::<pg::A_ArrayExpr>(rexpr)).elements;
             let array = builder.open(NodeKind::Array {
                 count: list_len(elements),
             });
             for element in list_nodes(elements) {
-                scalar_emit(builder, element, None)?;
+                scalar_emit(builder, element, scope)?;
             }
             builder.close(array);
         } else {
-            where_expr_emit(builder, rexpr)?;
+            where_expr_emit(builder, rexpr, scope)?;
         }
         builder.close(open);
         Ok(())
@@ -502,6 +516,7 @@ unsafe fn operator_extract(name: *const pg::List) -> Result<BinaryOp, WhereParse
 unsafe fn bool_expr_emit(
     builder: &mut TreeBuilder<'_>,
     expr: *const pg::BoolExpr,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let args: Vec<_> = list_nodes((*expr).args).collect();
@@ -517,7 +532,7 @@ unsafe fn bool_expr_emit(
                         error: "boolean expression with < 2 arguments not supported".to_owned(),
                     });
                 }
-                bool_chain_emit(builder, op, &args)
+                bool_chain_emit(builder, op, &args, scope)
             }
             pg::BoolExprType_NOT_EXPR => {
                 let [arg] = args.as_slice() else {
@@ -525,7 +540,7 @@ unsafe fn bool_expr_emit(
                         error: "NOT with != 1 argument not supported".to_owned(),
                     });
                 };
-                unary_emit(builder, UnaryOp::Not, *arg)
+                unary_emit(builder, UnaryOp::Not, *arg, scope)
             }
             other => Err(WhereParseError::Other {
                 error: format!("boolean expression type {other}"),
@@ -540,6 +555,7 @@ unsafe fn bool_chain_emit(
     builder: &mut TreeBuilder<'_>,
     op: BinaryOp,
     args: &[NodePtr],
+    scope: ExpressionScope<'_>,
 ) -> Result<(), WhereParseError> {
     unsafe {
         let Some((last, init)) = args.split_last() else {
@@ -547,11 +563,11 @@ unsafe fn bool_chain_emit(
         };
         let open = builder.open(NodeKind::Binary { op });
         if let [first] = init {
-            where_expr_emit(builder, *first)?;
+            where_expr_emit(builder, *first, scope)?;
         } else {
-            bool_chain_emit(builder, op, init)?;
+            bool_chain_emit(builder, op, init, scope)?;
         }
-        where_expr_emit(builder, *last)?;
+        where_expr_emit(builder, *last, scope)?;
         builder.close(open);
         Ok(())
     }

@@ -7,7 +7,7 @@ use ecow::EcoString;
 use pg_query::pg_nodes as pg;
 
 use super::scalar::scalar_emit;
-use super::{null_order_map, order_dir_map};
+use super::{ExpressionScope, null_order_map, order_dir_map};
 use crate::query::ast::raw::{NodePtr, cast, cstr, list_len, list_nodes, node_tag, node_tag_name};
 use crate::query::ast::rope::{FrameBoundKind, NodeKind, TreeBuilder};
 use crate::query::ast::{AstError, FrameExclusion, FrameMode};
@@ -67,14 +67,14 @@ pub(super) unsafe fn window_defs_extract(
 pub(super) unsafe fn window_emit(
     builder: &mut TreeBuilder<'_>,
     win_def: *const pg::WindowDef,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let name = cstr((*win_def).name);
         if name.is_empty() {
-            return window_spec_emit(builder, win_def);
+            return window_spec_emit(builder, win_def, scope.without_windows());
         }
-        let Some(windows) = windows else {
+        let Some(windows) = scope.windows else {
             return Err(AstError::UnsupportedFeature {
                 feature: "window reference outside the SELECT list".to_owned(),
             });
@@ -84,7 +84,7 @@ pub(super) unsafe fn window_emit(
                 feature: format!("reference to undefined window {name}"),
             });
         };
-        window_spec_emit(builder, *definition)
+        window_spec_emit(builder, *definition, scope.without_windows())
     }
 }
 
@@ -114,6 +114,7 @@ struct Frame {
 unsafe fn window_spec_emit(
     builder: &mut TreeBuilder<'_>,
     win_def: *const pg::WindowDef,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         window_spec_check(win_def)?;
@@ -125,18 +126,22 @@ unsafe fn window_spec_emit(
             ref_name: None,
         });
         for expr in list_nodes((*win_def).partitionClause) {
-            scalar_emit(builder, expr, None)?;
+            scalar_emit(builder, expr, scope)?;
         }
-        order_by_emit(builder, (*win_def).orderClause, None)?;
+        order_by_emit(builder, (*win_def).orderClause, scope)?;
         if let Some(frame) = &frame {
-            frame_emit(builder, frame)?;
+            frame_emit(builder, frame, scope)?;
         }
         builder.close(open);
         Ok(())
     }
 }
 
-unsafe fn frame_emit(builder: &mut TreeBuilder<'_>, frame: &Frame) -> Result<(), AstError> {
+unsafe fn frame_emit(
+    builder: &mut TreeBuilder<'_>,
+    frame: &Frame,
+    scope: ExpressionScope<'_>,
+) -> Result<(), AstError> {
     unsafe {
         let open = builder.open(NodeKind::Frame {
             mode: frame.mode,
@@ -146,7 +151,7 @@ unsafe fn frame_emit(builder: &mut TreeBuilder<'_>, frame: &Frame) -> Result<(),
         });
         for (kind, offset) in [frame.start, frame.end] {
             if kind.has_offset() {
-                scalar_emit(builder, offset, None)?;
+                scalar_emit(builder, offset, scope)?;
             }
         }
         builder.close(open);
@@ -250,7 +255,7 @@ fn frame_bound_decode(
 pub(super) unsafe fn order_by_emit(
     builder: &mut TreeBuilder<'_>,
     order_clause: *const pg::List,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         for sort_node in list_nodes(order_clause) {
@@ -270,7 +275,7 @@ pub(super) unsafe fn order_by_emit(
                 direction: order_dir_map((*sort_by).sortby_dir)?,
                 null_order: null_order_map((*sort_by).sortby_nulls)?,
             });
-            scalar_emit(builder, expr_node, windows)?;
+            scalar_emit(builder, expr_node, scope)?;
             builder.close(open);
         }
         Ok(())

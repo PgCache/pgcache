@@ -8,8 +8,8 @@ use smallvec::SmallVec;
 use super::from::source_emit;
 use super::scalar::scalar_emit;
 use super::where_clause::{column_ref_emit, const_value_extract, where_emit};
-use super::window::{WindowDefs, order_by_emit, window_defs_extract};
-use super::{ParseContext, RawCte, cte_raw};
+use super::window::{order_by_emit, window_defs_extract};
+use super::{ExpressionScope, ParseContext, RawCte, cte_raw};
 use crate::query::ast::raw::{
     NodePtr, cast, cstr, list_is_empty, list_len, list_nodes, node_tag, node_tag_name,
     string_node_value,
@@ -45,7 +45,11 @@ pub(super) unsafe fn query_emit(
             cte_emit(builder, cte, &cte_ctx)?;
         }
         body_emit(builder, select_stmt, &ctx)?;
-        order_by_emit(builder, (*select_stmt).sortClause, None)?;
+        order_by_emit(
+            builder,
+            (*select_stmt).sortClause,
+            ExpressionScope::of(&ctx),
+        )?;
         for literal in [limit_count, limit_offset].into_iter().flatten() {
             builder.leaf(NodeKind::Literal(literal));
         }
@@ -181,14 +185,18 @@ unsafe fn select_emit(
             has_having: !having.is_null(),
         });
         let windows = window_defs_extract((*select_stmt).windowClause)?;
+        let scope = ExpressionScope {
+            context: ctx,
+            windows: Some(&windows),
+        };
         for target in list_nodes(target_list) {
-            select_item_emit(builder, target, &windows)?;
+            select_item_emit(builder, target, scope)?;
         }
         for from_node in list_nodes((*select_stmt).fromClause) {
             source_emit(builder, from_node, "FROM clause", ctx)?;
         }
         if !where_clause.is_null() {
-            where_emit(builder, where_clause)?;
+            where_emit(builder, where_clause, ctx)?;
         }
         for node in list_nodes((*select_stmt).groupClause) {
             if node_tag(node) != pg::NodeTag_T_ColumnRef {
@@ -199,7 +207,7 @@ unsafe fn select_emit(
             column_ref_emit(builder, cast::<pg::ColumnRef>(node)).map_err(AstError::from)?;
         }
         if !having.is_null() {
-            where_emit(builder, having)?;
+            where_emit(builder, having, ctx)?;
         }
         builder.close(open);
         Ok(())
@@ -255,7 +263,7 @@ unsafe fn values_row_emit(
 unsafe fn select_item_emit(
     builder: &mut TreeBuilder<'_>,
     target: NodePtr,
-    windows: &WindowDefs,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         if node_tag(target) != pg::NodeTag_T_ResTarget {
@@ -279,7 +287,7 @@ unsafe fn select_item_emit(
         let name = cstr((*res_target).name);
         let alias = (!name.is_empty()).then(|| EcoString::from(name));
         let open = builder.open(NodeKind::SelectExpr { alias });
-        scalar_emit(builder, val_node, Some(windows))?;
+        scalar_emit(builder, val_node, scope)?;
         builder.close(open);
         Ok(())
     }

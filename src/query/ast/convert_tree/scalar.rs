@@ -4,10 +4,10 @@
 use ecow::EcoString;
 use pg_query::pg_nodes as pg;
 
-use super::ParseContext;
+use super::ExpressionScope;
 use super::select::query_emit;
 use super::where_clause::{column_ref_emit, const_value_extract, param_ref_extract, where_emit};
-use super::window::{WindowDefs, order_by_emit, window_emit};
+use super::window::{order_by_emit, window_emit};
 use crate::query::ast::raw::{
     NodePtr, aexpr_kind_name, cast, list_is_empty, list_len, list_nodes, node_tag, node_tag_name,
     string_node_value,
@@ -17,13 +17,11 @@ use crate::query::ast::{ArithmeticOp, AstError, Deparse, LiteralValue};
 use crate::query::cast::cast_target_from_canonical;
 use crate::query::transform::literal_arithmetic_fold;
 
-/// A scalar expression. `windows` is the enclosing SELECT's named window
-/// definitions when the expression sits in its select list, where an
-/// `OVER w` resolves; anywhere else such a reference is unsupported.
+/// A scalar expression, with the names it resolves against in `scope`.
 pub(super) unsafe fn scalar_emit(
     builder: &mut TreeBuilder<'_>,
     node: NodePtr,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         match node_tag(node) {
@@ -41,25 +39,27 @@ pub(super) unsafe fn scalar_emit(
                 ))));
                 Ok(())
             }
-            pg::NodeTag_T_SubLink => scalar_subquery_emit(builder, cast::<pg::SubLink>(node)),
-            pg::NodeTag_T_FuncCall => func_call_emit(builder, cast::<pg::FuncCall>(node), windows),
+            pg::NodeTag_T_SubLink => {
+                scalar_subquery_emit(builder, cast::<pg::SubLink>(node), scope)
+            }
+            pg::NodeTag_T_FuncCall => func_call_emit(builder, cast::<pg::FuncCall>(node), scope),
             pg::NodeTag_T_CoalesceExpr => {
                 let args = (*cast::<pg::CoalesceExpr>(node)).args;
-                function_bare_emit(builder, "coalesce", args, windows)
+                function_bare_emit(builder, "coalesce", args, scope)
             }
-            pg::NodeTag_T_MinMaxExpr => minmax_emit(builder, cast::<pg::MinMaxExpr>(node), windows),
+            pg::NodeTag_T_MinMaxExpr => minmax_emit(builder, cast::<pg::MinMaxExpr>(node), scope),
             pg::NodeTag_T_A_Expr => {
                 let aexpr = cast::<pg::A_Expr>(node);
                 match (*aexpr).kind {
-                    pg::A_Expr_Kind_AEXPR_NULLIF => nullif_emit(builder, aexpr, windows),
-                    pg::A_Expr_Kind_AEXPR_OP => arithmetic_emit(builder, aexpr, windows),
+                    pg::A_Expr_Kind_AEXPR_NULLIF => nullif_emit(builder, aexpr, scope),
+                    pg::A_Expr_Kind_AEXPR_OP => arithmetic_emit(builder, aexpr, scope),
                     other => Err(AstError::UnsupportedFeature {
                         feature: format!("{} in a column expression", aexpr_kind_name(other)),
                     }),
                 }
             }
-            pg::NodeTag_T_CaseExpr => case_emit(builder, cast::<pg::CaseExpr>(node), windows),
-            pg::NodeTag_T_TypeCast => type_cast_emit(builder, cast::<pg::TypeCast>(node), windows),
+            pg::NodeTag_T_CaseExpr => case_emit(builder, cast::<pg::CaseExpr>(node), scope),
+            pg::NodeTag_T_TypeCast => type_cast_emit(builder, cast::<pg::TypeCast>(node), scope),
             other => Err(AstError::UnsupportedFeature {
                 feature: format!("{} in a column expression", node_tag_name(other)),
             }),
@@ -70,6 +70,7 @@ pub(super) unsafe fn scalar_emit(
 unsafe fn scalar_subquery_emit(
     builder: &mut TreeBuilder<'_>,
     sub_link: *const pg::SubLink,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let subselect = (*sub_link).subselect as NodePtr;
@@ -79,11 +80,7 @@ unsafe fn scalar_subquery_emit(
             });
         }
         let open = builder.open(NodeKind::ScalarSubquery);
-        query_emit(
-            builder,
-            cast::<pg::SelectStmt>(subselect),
-            &ParseContext::empty(),
-        )?;
+        query_emit(builder, cast::<pg::SelectStmt>(subselect), scope.context)?;
         builder.close(open);
         Ok(())
     }
@@ -93,7 +90,7 @@ unsafe fn scalar_subquery_emit(
 unsafe fn minmax_emit(
     builder: &mut TreeBuilder<'_>,
     minmax: *const pg::MinMaxExpr,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let name = match (*minmax).op {
@@ -105,14 +102,14 @@ unsafe fn minmax_emit(
                 });
             }
         };
-        function_bare_emit(builder, name, (*minmax).args, windows)
+        function_bare_emit(builder, name, (*minmax).args, scope)
     }
 }
 
 unsafe fn type_cast_emit(
     builder: &mut TreeBuilder<'_>,
     tc: *const pg::TypeCast,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let arg = (*tc).arg as NodePtr;
@@ -130,7 +127,7 @@ unsafe fn type_cast_emit(
         let open = builder.open(NodeKind::TypeCast {
             target: cast_target_from_canonical(&target_type),
         });
-        scalar_emit(builder, arg, windows)?;
+        scalar_emit(builder, arg, scope)?;
         builder.close(open);
         Ok(())
     }
@@ -197,7 +194,7 @@ unsafe fn typmods_render(typmods: *const pg::List, out: &mut String) -> Result<(
 unsafe fn func_call_emit(
     builder: &mut TreeBuilder<'_>,
     func_call: *const pg::FuncCall,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let mut parts = list_nodes((*func_call).funcname).filter_map(|n| string_node_value(n));
@@ -231,15 +228,15 @@ unsafe fn func_call_emit(
         });
         if !agg_star {
             for arg in list_nodes((*func_call).args) {
-                scalar_emit(builder, arg, windows)?;
+                scalar_emit(builder, arg, scope)?;
             }
         }
-        order_by_emit(builder, (*func_call).agg_order, windows)?;
+        order_by_emit(builder, (*func_call).agg_order, scope)?;
         if !agg_filter.is_null() {
-            where_emit(builder, agg_filter)?;
+            where_emit(builder, agg_filter, scope.context)?;
         }
         if !over.is_null() {
-            window_emit(builder, over, windows)?;
+            window_emit(builder, over, scope)?;
         }
         builder.close(open);
         Ok(())
@@ -252,12 +249,12 @@ unsafe fn function_bare_emit(
     builder: &mut TreeBuilder<'_>,
     name: &str,
     args: *const pg::List,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let open = builder.open(function_bare_kind(name, list_len(args)));
         for arg in list_nodes(args) {
-            scalar_emit(builder, arg, windows)?;
+            scalar_emit(builder, arg, scope)?;
         }
         builder.close(open);
         Ok(())
@@ -280,7 +277,7 @@ fn function_bare_kind(name: &str, arg_count: u32) -> NodeKind {
 unsafe fn nullif_emit(
     builder: &mut TreeBuilder<'_>,
     aexpr: *const pg::A_Expr,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let operands: Vec<NodePtr> = [(*aexpr).lexpr as NodePtr, (*aexpr).rexpr as NodePtr]
@@ -292,7 +289,7 @@ unsafe fn nullif_emit(
             u32::try_from(operands.len()).unwrap_or(u32::MAX),
         ));
         for operand in operands {
-            scalar_emit(builder, operand, windows)?;
+            scalar_emit(builder, operand, scope)?;
         }
         builder.close(open);
         Ok(())
@@ -302,7 +299,7 @@ unsafe fn nullif_emit(
 pub(super) unsafe fn arithmetic_emit(
     builder: &mut TreeBuilder<'_>,
     aexpr: *const pg::A_Expr,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let op = arithmetic_op_extract((*aexpr).name)?;
@@ -324,8 +321,8 @@ pub(super) unsafe fn arithmetic_emit(
             return Ok(());
         }
         let open = builder.open(NodeKind::Arithmetic { op });
-        scalar_emit(builder, (*aexpr).lexpr, windows)?;
-        scalar_emit(builder, (*aexpr).rexpr, windows)?;
+        scalar_emit(builder, (*aexpr).lexpr, scope)?;
+        scalar_emit(builder, (*aexpr).rexpr, scope)?;
         builder.close(open);
         Ok(())
     }
@@ -399,7 +396,7 @@ unsafe fn arithmetic_op_extract(name: *const pg::List) -> Result<ArithmeticOp, A
 unsafe fn case_emit(
     builder: &mut TreeBuilder<'_>,
     case_expr: *const pg::CaseExpr,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let arg = (*case_expr).arg as NodePtr;
@@ -410,13 +407,13 @@ unsafe fn case_emit(
             has_default: !default.is_null(),
         });
         if !arg.is_null() {
-            scalar_emit(builder, arg, windows)?;
+            scalar_emit(builder, arg, scope)?;
         }
         for when in list_nodes((*case_expr).args) {
-            case_when_emit(builder, when, windows)?;
+            case_when_emit(builder, when, scope)?;
         }
         if !default.is_null() {
-            scalar_emit(builder, default, windows)?;
+            scalar_emit(builder, default, scope)?;
         }
         builder.close(open);
         Ok(())
@@ -426,7 +423,7 @@ unsafe fn case_emit(
 unsafe fn case_when_emit(
     builder: &mut TreeBuilder<'_>,
     node: NodePtr,
-    windows: Option<&WindowDefs>,
+    scope: ExpressionScope<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         if node_tag(node) != pg::NodeTag_T_CaseWhen {
@@ -442,14 +439,14 @@ unsafe fn case_when_emit(
             });
         }
         let open = builder.open(NodeKind::When);
-        where_emit(builder, cond)?;
+        where_emit(builder, cond, scope.context)?;
         let res = (*case_when).result as NodePtr;
         if res.is_null() {
             return Err(AstError::UnsupportedFeature {
                 feature: "CASE WHEN without result".to_owned(),
             });
         }
-        scalar_emit(builder, res, windows)?;
+        scalar_emit(builder, res, scope)?;
         builder.close(open);
         Ok(())
     }

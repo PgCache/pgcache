@@ -159,7 +159,7 @@ unsafe fn join_emit(
         source_emit(builder, larg, "join left argument", ctx)?;
         source_emit(builder, rarg, "join right argument", ctx)?;
         match qual {
-            JoinQual::On(quals) => where_emit(builder, quals)?,
+            JoinQual::On(quals) => where_emit(builder, quals, ctx)?,
             JoinQual::Using(columns) => {
                 for column in columns {
                     builder.leaf(NodeKind::Name(column));

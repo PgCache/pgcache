@@ -9,7 +9,8 @@ use std::sync::Arc;
 use ecow::EcoString;
 use pg_query::pg_nodes as pg;
 
-use super::where_clause::{const_value_extract, param_ref_extract, where_expr_emit};
+use super::ParseContext;
+use super::where_clause::{const_value_extract, param_ref_extract, where_emit};
 use crate::query::ast::raw::{NodePtr, cast, cstr, list_is_empty, list_nodes, node_tag};
 use crate::query::ast::rope::{Binary, ScalarKind, TreeBuilder, View, Where, WhereKind};
 use crate::query::ast::{BinaryOp, LiteralValue};
@@ -626,7 +627,9 @@ unsafe fn where_comparisons_extract(where_node: NodePtr) -> Option<Vec<WriteComp
             return None;
         }
         let mut builder = TreeBuilder::new();
-        where_expr_emit(&mut builder, where_node).ok()?;
+        // A write's own WITH list is not in scope: the predicate is read only
+        // for its bare-column comparisons, which no subquery contributes.
+        where_emit(&mut builder, where_node, &ParseContext::empty()).ok()?;
         let (tree, _) = builder.finish();
         let where_expr = Where::from_ref(tree.root().node_ref());
         where_comparisons(where_expr).filter(|comparisons| !comparisons.is_empty())
