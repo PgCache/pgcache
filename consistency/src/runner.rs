@@ -247,9 +247,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
     };
 
+    let http = reqwest::Client::new();
+    let memo_hits = metric_sum(&http, &stack.metrics_url, "pgcache_cache_memo_hits").await?;
+    let memo_captures =
+        metric_sum(&http, &stack.metrics_url, "pgcache_cache_memo_captures").await?;
     tracing::info!(
         snapshots,
         reads,
+        memo_hits,
+        memo_captures,
         writes = counts.total(),
         version_bumps = counts.version_bump,
         cross_group_txns = counts.cross_group_txn,
