@@ -1,6 +1,8 @@
 //! Bind the clauses hanging off a SELECT: the select list (including `*`
 //! expansion), ORDER BY and GROUP BY.
 
+use ecow::EcoString;
+
 use super::ResolveResult;
 use super::bindings::{BindingsBuilder, ColumnBinding, ColumnTarget, StarItem};
 use super::column::column_resolve;
@@ -18,7 +20,14 @@ pub(super) fn select_items_resolve<'a>(
     let Some(items) = select.items() else {
         return Ok(Vec::new());
     };
-    let mut outputs = Vec::new();
+    // One output per item, a star standing for every column it expands to.
+    let width: usize = items
+        .map(|item| match item {
+            SelectItem::Star(star) => star_width(star.qualifier().map(EcoString::as_str), scope),
+            SelectItem::Expr(_) => 1,
+        })
+        .sum();
+    let mut outputs = Vec::with_capacity(width);
     for item in items {
         match item {
             SelectItem::Star(star) => star_expand(
@@ -55,7 +64,7 @@ fn star_expand(
     scope: &mut ResolutionScope<'_>,
     outputs: &mut Vec<OutputColumn>,
 ) {
-    let mut items = Vec::new();
+    let mut items = Vec::with_capacity(star_width(qualifier, scope));
     if qualifier.is_none() {
         for merged in &scope.merged_columns {
             outputs.push(OutputColumn {
@@ -72,6 +81,18 @@ fn star_expand(
         }
     }
     scope.bindings.star_bind(star, items);
+}
+
+/// How many columns a star stands for at most: the merged join columns
+/// plus every column of each table it names.
+fn star_width(qualifier: Option<&str>, scope: &ResolutionScope<'_>) -> usize {
+    scope.merged_columns.len()
+        + scope
+            .entries
+            .iter()
+            .filter(|entry| qualifier.is_none_or(|q| entry.qualifier_matches(q)))
+            .map(|entry| entry.metadata().columns.len())
+            .sum::<usize>()
 }
 
 /// One table's columns for `*`. Under unqualified `*`, columns merged into a

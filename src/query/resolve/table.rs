@@ -10,7 +10,7 @@ use super::bindings::TableSlot;
 use super::entry::query_resolve_scoped;
 use super::expr::where_resolve;
 use super::join_using::{JoinScopeRanges, join_natural_common_columns, join_using_or_cross};
-use super::scope::ResolutionScope;
+use super::scope::{OuterTables, ResolutionScope};
 use super::{ResolveError, ResolveResult};
 use crate::catalog::{Catalog, CatalogTable};
 use crate::query::ast::rope::{CteRef, Join, JoinQual, Source, Subquery, Table};
@@ -110,7 +110,7 @@ fn subquery_resolve<'a>(
         subquery.query(),
         tables,
         search_path,
-        Vec::new(),
+        OuterTables::new(),
         &mut *scope.bindings,
     )?;
     scope.derived_table_scope_add(&outputs, alias, subquery.id())
@@ -128,7 +128,7 @@ fn cte_ref_resolve<'a>(
         cte_ref.query(),
         tables,
         search_path,
-        Vec::new(),
+        OuterTables::new(),
         &mut *scope.bindings,
     )?;
     scope.derived_table_scope_add(&outputs, alias_name, cte_ref.id())

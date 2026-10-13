@@ -7,6 +7,7 @@ use std::sync::Arc;
 use ecow::EcoString;
 use postgres_types::Type;
 use rootcause::Report;
+use smallvec::SmallVec;
 
 use super::bindings::{BindingsBuilder, ColumnBinding, SlotId, TableSlot};
 use super::entry::query_resolve_scoped;
@@ -81,6 +82,11 @@ impl ScopeEntry<'_> {
     }
 }
 
+/// The tables of a scope level: a FROM clause names a few, so they live
+/// inline.
+pub(super) type ScopeEntries<'a> = SmallVec<[ScopeEntry<'a>; 4]>;
+pub(super) type OuterTables = SmallVec<[OuterTable; 4]>;
+
 /// A table of an enclosing scope, snapshotted for correlated lookups.
 #[derive(Debug, Clone)]
 pub(super) struct OuterTable {
@@ -102,15 +108,15 @@ pub(super) struct OutputColumn {
 #[derive(Debug)]
 pub(super) struct ResolutionScope<'a> {
     /// Base and derived tables visible in this scope, in FROM order.
-    pub(super) entries: Vec<ScopeEntry<'a>>,
+    pub(super) entries: ScopeEntries<'a>,
     /// Catalog of all known tables (for subquery resolution)
     pub(super) catalog_tables: &'a Catalog,
     /// Search path for schema resolution
-    pub(super) search_path: Vec<&'a str>,
+    pub(super) search_path: &'a [&'a str],
     /// Owned snapshot of ancestor scope tables for correlated reference
     /// fallback. Populated when this scope was created for a WHERE/SELECT
     /// subquery body. Empty at top level.
-    pub(super) outer_tables: Vec<OuterTable>,
+    pub(super) outer_tables: OuterTables,
     /// `USING`/`NATURAL` merged join columns, in `*`-expansion order.
     pub(super) merged_columns: Vec<MergedJoinColumn>,
     /// `(scope-key, column)` pairs consumed into a merge — skipped by
@@ -128,14 +134,14 @@ impl<'a> ResolutionScope<'a> {
     /// (correlated references).
     pub(super) fn new_with_outer(
         catalog_tables: &'a Catalog,
-        search_path: &[&'a str],
-        outer_tables: Vec<OuterTable>,
+        search_path: &'a [&'a str],
+        outer_tables: OuterTables,
         bindings: &'a mut BindingsBuilder,
     ) -> Self {
         Self {
-            entries: Vec::new(),
+            entries: SmallVec::new(),
             catalog_tables,
-            search_path: search_path.to_vec(),
+            search_path,
             outer_tables,
             merged_columns: Vec::new(),
             merged_consumed: Vec::new(),
@@ -146,8 +152,8 @@ impl<'a> ResolutionScope<'a> {
     /// Snapshot the current scope's tables (including derived and outer)
     /// for passing to a child subquery scope. The child needs access to all
     /// ancestor tables.
-    pub(super) fn scope_tables_snapshot(&self) -> Vec<OuterTable> {
-        let mut snapshot: Vec<OuterTable> = self
+    pub(super) fn scope_tables_snapshot(&self) -> OuterTables {
+        let mut snapshot: OuterTables = self
             .entries
             .iter()
             .map(|entry| OuterTable {
@@ -246,8 +252,8 @@ impl<'a> ResolutionScope<'a> {
     pub(super) fn column_matches_find<'b>(
         &'b self,
         column: &str,
-    ) -> Vec<(&'b ScopeEntry<'a>, &'b ColumnMetadata)> {
-        let mut matches = Vec::new();
+    ) -> SmallVec<[(&'b ScopeEntry<'a>, &'b ColumnMetadata); 2]> {
+        let mut matches = SmallVec::new();
 
         for entry in &self.entries {
             if let Some(col_meta) = entry.metadata().columns.get(column) {
@@ -277,14 +283,14 @@ impl<'a> ResolutionScope<'a> {
         F: for<'b> FnOnce(
             &'b Catalog,
             &'b [&'b str],
-            Vec<OuterTable>,
+            OuterTables,
             &'b mut BindingsBuilder,
         ) -> ResolveResult<Vec<OutputColumn>>,
     {
         let outer_tables = self.scope_tables_snapshot();
         resolve(
             self.catalog_tables,
-            &self.search_path,
+            self.search_path,
             outer_tables,
             &mut *self.bindings,
         )?;

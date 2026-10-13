@@ -12,7 +12,7 @@ use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::query::ast::NodeId;
 #[cfg(test)]
 use crate::query::ast::query_tree_parse;
-use crate::query::ast::rope::{QueryTree, Remap};
+use crate::query::ast::rope::{NodeKind, QueryTree, Remap};
 
 /// Index of a table source in [`Bindings::slots`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -187,6 +187,35 @@ fn narrow(index: usize) -> u32 {
 }
 
 impl BindingsBuilder {
+    /// A builder sized for `tree`: a slot per source, a binding per column
+    /// node and an entry per star, counted in one pass so nothing grows
+    /// while the resolver binds.
+    pub(crate) fn sized_for(tree: &QueryTree) -> Self {
+        let (mut sources, mut columns, mut stars) = (0, 0, 0);
+        for node in tree.nodes() {
+            if matches!(
+                node.kind,
+                NodeKind::Table { .. } | NodeKind::Subquery { .. } | NodeKind::CteRef { .. }
+            ) {
+                sources += 1;
+            } else if let NodeKind::Column { .. } = node.kind {
+                columns += 1;
+            } else if let NodeKind::Star { .. } = node.kind {
+                stars += 1;
+            }
+        }
+        Self {
+            bindings: Bindings {
+                slots: Vec::with_capacity(sources),
+                sources: Vec::with_capacity(sources),
+                columns: Vec::with_capacity(columns),
+                stars: Vec::with_capacity(stars),
+                merged: Vec::new(),
+                correlated: Vec::new(),
+            },
+        }
+    }
+
     /// The bindings of a tree a rewrite built from pieces of `source`'s,
     /// carried to the pieces' new positions (ADR-057): a node kept in
     /// several places binds in each, a node the rewrite dropped binds

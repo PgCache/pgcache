@@ -7,7 +7,7 @@ use super::clauses::{
     group_by_resolve, order_by_as_outputs, order_by_resolve, select_items_resolve,
 };
 use super::expr::where_resolve;
-use super::scope::{OuterTable, OutputColumn, ResolutionScope};
+use super::scope::{OuterTables, OutputColumn, ResolutionScope};
 use super::table::source_resolve;
 use crate::catalog::Catalog;
 use crate::query::ast::rope::{Body, Query, QueryTree, Select};
@@ -19,8 +19,14 @@ pub fn query_tree_resolve(
     tables: &Catalog,
     search_path: &[&str],
 ) -> ResolveResult<Bindings> {
-    let mut bindings = BindingsBuilder::default();
-    query_resolve_scoped(tree.root(), tables, search_path, Vec::new(), &mut bindings)?;
+    let mut bindings = BindingsBuilder::sized_for(tree);
+    query_resolve_scoped(
+        tree.root(),
+        tables,
+        search_path,
+        OuterTables::new(),
+        &mut bindings,
+    )?;
     Ok(bindings.finish())
 }
 
@@ -50,8 +56,8 @@ fn select_resolve_scoped<'a>(
 pub(super) fn query_resolve_scoped<'a>(
     query: Query<'a>,
     catalog_tables: &'a Catalog,
-    search_path: &[&'a str],
-    outer_tables: Vec<OuterTable>,
+    search_path: &'a [&'a str],
+    outer_tables: OuterTables,
     bindings: &'a mut BindingsBuilder,
 ) -> ResolveResult<Vec<OutputColumn>> {
     let mut scope =
