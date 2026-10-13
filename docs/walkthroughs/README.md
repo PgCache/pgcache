@@ -11,3 +11,4 @@ Conventions:
 | Walkthrough | Subsystem | Mirrored by |
 |---|---|---|
 | [subsumption-index.md](subsumption-index.md) | Constraint-containment index, region probe, precise subsumption check (ADR-024/029/030/037) | `test_walkthrough_two_parents_four_queries` in `src/query/constraint_index/tests.rs` |
+| [query-tree.md](query-tree.md) | The rope query tree: conversion, views, bindings and a rewrite (ADR-057) | `test_positions_follow_pre_order_lengths` and `test_same_shape_rewrite_shares_every_other_node` in `src/query/ast/rope/tests.rs` |
