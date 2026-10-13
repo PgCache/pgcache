@@ -35,6 +35,7 @@ use pgcache_lib::cache::admission::{AdmissionDepth, AdmissionQuery, query_admiss
 use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
 use pgcache_lib::oid::{Oid, TypeOid};
 use pgcache_lib::pg::ByteString;
+use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::ast::rope::{Node, NodeKind, QueryTree};
 use pgcache_lib::query::ast::{LiteralValue, query_tree_convert_raw, query_tree_session_key};
 use pgcache_lib::query::decorrelate::query_decorrelate;
@@ -79,6 +80,16 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 /// Run `f` and return its result with the allocations and bytes it requested.
+/// Allocations and bytes one run of a stage makes.
+type Cost = (usize, usize);
+
+/// The cost of `f`, its product dropped.
+fn cost<T>(f: impl FnOnce() -> T) -> Cost {
+    let (product, allocations, bytes) = allocations_count(f);
+    black_box(product);
+    (allocations, bytes)
+}
+
 fn allocations_count<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
     let allocations = ALLOCATIONS.load(Ordering::Relaxed);
     let bytes = BYTES.load(Ordering::Relaxed);
@@ -118,121 +129,118 @@ fn table(oid: u32, name: &str, primary_key: &str, columns: Vec<ColumnMetadata>) 
     }
 }
 
+/// The pagila subset: `(oid, name, primary key, columns as (name, type, in
+/// the primary key))`.
+#[rustfmt::skip]
+type CatalogTable = (u32, &'static str, &'static str, &'static [(&'static str, Type, bool)]);
+
+const CATALOG_TABLES: &[CatalogTable] = &[
+    (
+        1001,
+        "actor",
+        "actor_id",
+        &[
+            ("actor_id", Type::INT4, true),
+            ("first_name", Type::TEXT, false),
+            ("last_name", Type::TEXT, false),
+            ("last_update", Type::TIMESTAMPTZ, false),
+        ],
+    ),
+    (
+        1002,
+        "film",
+        "film_id",
+        &[
+            ("film_id", Type::INT4, true),
+            ("title", Type::TEXT, false),
+            ("description", Type::TEXT, false),
+            ("release_year", Type::INT4, false),
+            ("language_id", Type::INT4, false),
+            ("original_language_id", Type::INT4, false),
+            ("rental_duration", Type::INT2, false),
+            ("rental_rate", Type::NUMERIC, false),
+            ("length", Type::INT2, false),
+            ("replacement_cost", Type::NUMERIC, false),
+            ("rating", Type::TEXT, false),
+            ("last_update", Type::TIMESTAMPTZ, false),
+            ("special_features", Type::TEXT_ARRAY, false),
+            ("fulltext", Type::TEXT, false),
+        ],
+    ),
+    (
+        1003,
+        "film_actor",
+        "actor_id",
+        &[
+            ("actor_id", Type::INT4, true),
+            ("film_id", Type::INT4, true),
+            ("last_update", Type::TIMESTAMPTZ, false),
+        ],
+    ),
+    (
+        1004,
+        "category",
+        "category_id",
+        &[
+            ("category_id", Type::INT4, true),
+            ("name", Type::TEXT, false),
+            ("last_update", Type::TIMESTAMPTZ, false),
+        ],
+    ),
+    (
+        1005,
+        "film_category",
+        "film_id",
+        &[
+            ("film_id", Type::INT4, true),
+            ("category_id", Type::INT4, true),
+            ("last_update", Type::TIMESTAMPTZ, false),
+        ],
+    ),
+    (
+        1006,
+        "payment",
+        "payment_id",
+        &[
+            ("payment_id", Type::INT4, true),
+            ("customer_id", Type::INT4, false),
+            ("staff_id", Type::INT4, false),
+            ("rental_id", Type::INT4, false),
+            ("amount", Type::NUMERIC, false),
+            ("payment_date", Type::TIMESTAMPTZ, false),
+        ],
+    ),
+    (
+        1007,
+        "customer",
+        "customer_id",
+        &[
+            ("customer_id", Type::INT4, true),
+            ("store_id", Type::INT4, false),
+            ("first_name", Type::TEXT, false),
+            ("last_name", Type::TEXT, false),
+            ("email", Type::TEXT, false),
+            ("address_id", Type::INT4, false),
+            ("activebool", Type::BOOL, false),
+            ("create_date", Type::DATE, false),
+            ("last_update", Type::TIMESTAMPTZ, false),
+            ("active", Type::INT4, false),
+        ],
+    ),
+];
+
 fn catalog() -> Catalog {
     let mut tables = BiHashMap::new();
-    tables.insert_overwrite(
-        table(
-            1001,
-            "actor",
-            "actor_id",
-            vec![
-                column("actor_id", 0, Type::INT4, true),
-                column("first_name", 1, Type::TEXT, false),
-                column("last_name", 2, Type::TEXT, false),
-                column("last_update", 3, Type::TIMESTAMPTZ, false),
-            ],
-        )
-        .into(),
-    );
-    tables.insert_overwrite(
-        table(
-            1002,
-            "film",
-            "film_id",
-            vec![
-                column("film_id", 0, Type::INT4, true),
-                column("title", 1, Type::TEXT, false),
-                column("description", 2, Type::TEXT, false),
-                column("release_year", 3, Type::INT4, false),
-                column("language_id", 4, Type::INT4, false),
-                column("original_language_id", 5, Type::INT4, false),
-                column("rental_duration", 6, Type::INT2, false),
-                column("rental_rate", 7, Type::NUMERIC, false),
-                column("length", 8, Type::INT2, false),
-                column("replacement_cost", 9, Type::NUMERIC, false),
-                column("rating", 10, Type::TEXT, false),
-                column("last_update", 11, Type::TIMESTAMPTZ, false),
-                column("special_features", 12, Type::TEXT_ARRAY, false),
-                column("fulltext", 13, Type::TEXT, false),
-            ],
-        )
-        .into(),
-    );
-    tables.insert_overwrite(
-        table(
-            1003,
-            "film_actor",
-            "actor_id",
-            vec![
-                column("actor_id", 0, Type::INT4, true),
-                column("film_id", 1, Type::INT4, true),
-                column("last_update", 2, Type::TIMESTAMPTZ, false),
-            ],
-        )
-        .into(),
-    );
-    tables.insert_overwrite(
-        table(
-            1004,
-            "category",
-            "category_id",
-            vec![
-                column("category_id", 0, Type::INT4, true),
-                column("name", 1, Type::TEXT, false),
-                column("last_update", 2, Type::TIMESTAMPTZ, false),
-            ],
-        )
-        .into(),
-    );
-    tables.insert_overwrite(
-        table(
-            1005,
-            "film_category",
-            "film_id",
-            vec![
-                column("film_id", 0, Type::INT4, true),
-                column("category_id", 1, Type::INT4, true),
-                column("last_update", 2, Type::TIMESTAMPTZ, false),
-            ],
-        )
-        .into(),
-    );
-    tables.insert_overwrite(
-        table(
-            1006,
-            "payment",
-            "payment_id",
-            vec![
-                column("payment_id", 0, Type::INT4, true),
-                column("customer_id", 1, Type::INT4, false),
-                column("staff_id", 2, Type::INT4, false),
-                column("rental_id", 3, Type::INT4, false),
-                column("amount", 4, Type::NUMERIC, false),
-                column("payment_date", 5, Type::TIMESTAMPTZ, false),
-            ],
-        )
-        .into(),
-    );
-    tables.insert_overwrite(
-        table(
-            1007,
-            "customer",
-            "customer_id",
-            vec![
-                column("customer_id", 0, Type::INT4, true),
-                column("store_id", 1, Type::INT4, false),
-                column("first_name", 2, Type::TEXT, false),
-                column("last_name", 3, Type::TEXT, false),
-                column("email", 4, Type::TEXT, false),
-                column("address_id", 5, Type::INT4, false),
-                column("activebool", 6, Type::BOOL, false),
-                column("create_date", 7, Type::DATE, false),
-                column("last_update", 8, Type::TIMESTAMPTZ, false),
-                column("active", 9, Type::INT4, false),
-            ],
-        )
-        .into(),
-    );
+    for (oid, name, primary_key, columns) in CATALOG_TABLES {
+        let columns = columns
+            .iter()
+            .enumerate()
+            .map(|(index, (name, data_type, is_primary_key))| {
+                column(name, index, data_type.clone(), *is_primary_key)
+            })
+            .collect();
+        tables.insert_overwrite(table(*oid, name, primary_key, columns).into());
+    }
     tables
 }
 
@@ -276,76 +284,60 @@ const PAYMENT_ROW: &[Option<&str>] = &[
     Some("2024-01-16 10:00:00+00"),
 ];
 
+/// The fixed query shapes: `(name, SQL, predicate table, row)`; the 50-item
+/// IN list is generated.
+#[rustfmt::skip]
+const FIXED_SHAPES: &[(&str, &str, &str, &[Option<&str>])] = &[
+    ("read_simple", "SELECT * FROM actor WHERE actor_id = 42", "actor", ACTOR_ROW),
+    ("read_join",
+     "SELECT fa.film_id, a.first_name, a.last_name FROM film_actor fa \
+      JOIN actor a ON a.actor_id = fa.actor_id WHERE fa.film_id = 7",
+     "film_actor", &[Some("5"), Some("7"), Some("2024-01-15 10:00:00+00")]),
+    ("read_agg",
+     "SELECT c.name, COUNT(*) FROM film_category fc \
+      JOIN category c ON fc.category_id = c.category_id GROUP BY c.name",
+     "category", &[Some("1"), Some("Action"), Some("2024-01-15 10:00:00+00")]),
+    ("join_five",
+     "SELECT f.title, a.first_name, c.name FROM film f \
+      JOIN film_actor fa ON fa.film_id = f.film_id \
+      JOIN actor a ON a.actor_id = fa.actor_id \
+      JOIN film_category fc ON fc.film_id = f.film_id \
+      JOIN category c ON c.category_id = fc.category_id \
+      WHERE f.film_id = 7 AND a.last_name <> 'X' ORDER BY a.first_name",
+     "film", FILM_ROW),
+    ("in_subquery",
+     "SELECT title FROM film WHERE film_id IN \
+      (SELECT film_id FROM film_actor WHERE actor_id = 5)",
+     "film", FILM_ROW),
+    ("cte_datetime",
+     "WITH recent AS (SELECT customer_id, amount FROM payment \
+      WHERE payment_date > '2024-01-15 10:00:00+00') \
+      SELECT customer_id, amount FROM recent WHERE amount > 5.0",
+     "payment", PAYMENT_ROW),
+    ("wide_star", "SELECT * FROM film WHERE film_id = 7", "film", FILM_ROW),
+];
+
 fn shapes() -> Vec<Shape> {
     let in_list: Vec<String> = (1..=50).map(|n| n.to_string()).collect();
-    vec![
-        Shape {
-            name: "read_simple",
-            sql: "SELECT * FROM actor WHERE actor_id = 42".to_owned(),
-            predicate_table: "actor",
-            row: ACTOR_ROW,
-        },
-        Shape {
-            name: "read_join",
-            sql: "SELECT fa.film_id, a.first_name, a.last_name FROM film_actor fa \
-                  JOIN actor a ON a.actor_id = fa.actor_id WHERE fa.film_id = 7"
-                .to_owned(),
-            predicate_table: "film_actor",
-            row: &[Some("5"), Some("7"), Some("2024-01-15 10:00:00+00")],
-        },
-        Shape {
-            name: "read_agg",
-            sql: "SELECT c.name, COUNT(*) FROM film_category fc \
-                  JOIN category c ON fc.category_id = c.category_id GROUP BY c.name"
-                .to_owned(),
-            predicate_table: "category",
-            row: &[Some("1"), Some("Action"), Some("2024-01-15 10:00:00+00")],
-        },
-        Shape {
-            name: "join_five",
-            sql: "SELECT f.title, a.first_name, c.name FROM film f \
-                  JOIN film_actor fa ON fa.film_id = f.film_id \
-                  JOIN actor a ON a.actor_id = fa.actor_id \
-                  JOIN film_category fc ON fc.film_id = f.film_id \
-                  JOIN category c ON c.category_id = fc.category_id \
-                  WHERE f.film_id = 7 AND a.last_name <> 'X' ORDER BY a.first_name"
-                .to_owned(),
-            predicate_table: "film",
-            row: FILM_ROW,
-        },
-        Shape {
-            name: "in_subquery",
-            sql: "SELECT title FROM film WHERE film_id IN \
-                  (SELECT film_id FROM film_actor WHERE actor_id = 5)"
-                .to_owned(),
-            predicate_table: "film",
-            row: FILM_ROW,
-        },
-        Shape {
-            name: "cte_datetime",
-            sql: "WITH recent AS (SELECT customer_id, amount FROM payment \
-                  WHERE payment_date > '2024-01-15 10:00:00+00') \
-                  SELECT customer_id, amount FROM recent WHERE amount > 5.0"
-                .to_owned(),
-            predicate_table: "payment",
-            row: PAYMENT_ROW,
-        },
-        Shape {
-            name: "wide_star",
-            sql: "SELECT * FROM film WHERE film_id = 7".to_owned(),
-            predicate_table: "film",
-            row: FILM_ROW,
-        },
-        Shape {
-            name: "in_list_50",
-            sql: format!(
-                "SELECT actor_id, first_name FROM actor WHERE actor_id IN ({})",
-                in_list.join(", ")
-            ),
-            predicate_table: "actor",
-            row: ACTOR_ROW,
-        },
-    ]
+    let mut shapes: Vec<Shape> = FIXED_SHAPES
+        .iter()
+        .map(|(name, sql, predicate_table, row)| Shape {
+            name,
+            sql: (*sql).to_owned(),
+            predicate_table,
+            row,
+        })
+        .collect();
+    shapes.push(Shape {
+        name: "in_list_50",
+        sql: format!(
+            "SELECT actor_id, first_name FROM actor WHERE actor_id IN ({})",
+            in_list.join(", ")
+        ),
+        predicate_table: "actor",
+        row: ACTOR_ROW,
+    });
+    shapes
 }
 
 // ---------------------------------------------------------------------------
@@ -426,94 +418,113 @@ fn sizes_report() {
     }
 }
 
-fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
-    let settings = LiteralSettings::default();
-    let search_path: [EcoString; 1] = ["public".into()];
-    // The aggregates the writer loads from `pg_proc` that the fixtures use.
-    let aggregates: HashSet<EcoString> = ["count", "sum", "avg", "min", "max"]
+/// The aggregates the writer loads from `pg_proc` that the fixtures use.
+fn aggregates() -> HashSet<EcoString> {
+    ["count", "sum", "avg", "min", "max"]
         .into_iter()
         .map(EcoString::from)
-        .collect();
-    println!("\n== allocations per stage (count / bytes)");
-    let header = [
-        "query",
-        "convert",
-        "session_key",
-        "rope_clone",
-        "resolve",
-        "bound_clone",
-        "canonicalise",
-        "pushdown",
-        "decorrelate",
-        "fingerprint",
-        "render",
-        "shape",
-        "pred_compile",
-        "update_queries",
-        "admission",
-    ];
-    row_print(&header.map(str::to_owned));
-    for shape in shapes {
-        let (rope, convert_n, convert_b) = allocations_count(|| parse(&shape.sql));
-        let (_, key_n, key_b) =
-            allocations_count(|| query_tree_session_key(&rope, &search_path, &settings));
-        let (_, rope_clone_n, rope_clone_b) = allocations_count(|| black_box(rope.clone()));
-        let (resolved, resolve_n, resolve_b) = allocations_count(|| resolve_bound(&rope, catalog));
-        let (_, bound_clone_n, bound_clone_b) = allocations_count(|| black_box(resolved.clone()));
-        let (bound, canon_n, canon_b) = allocations_count(|| canonicalise(&resolved, &settings));
-        let (_, pushdown_n, pushdown_b) =
-            allocations_count(|| black_box(query_predicate_pushdown(&bound)));
-        let (_, decorrelate_n, decorrelate_b) =
-            allocations_count(|| black_box(query_decorrelate(&bound, &aggregates)));
-        let (fingerprint, fingerprint_n, fingerprint_b) = allocations_count(|| bound.fingerprint());
-        let (_, render_n, render_b) = allocations_count(|| bound.sql());
-        let (_, shape_n, shape_b) = allocations_count(|| bound.shape());
-        let (_, compile_n, compile_b) =
-            allocations_count(|| predicate_compile(&bound, shape.predicate_table));
-        let (_, update_n, update_b) =
-            allocations_count(|| black_box(query_table_update_queries(&bound)));
-        let shared = Arc::new(bound.clone());
-        let (admission, admission_n, admission_b) = allocations_count(|| {
-            query_admission_analyze(
-                AdmissionQuery {
-                    bound: &shared,
-                    decorrelated: None,
-                },
-                fingerprint,
-                bound.tree().root().has_limit(),
-                &aggregates,
-                catalog,
-                AdmissionDepth::Full,
-            )
-        });
-        let admission = admission.expect("the fixture SQL is admitted");
-        black_box(admission.tables.len());
-        let cell = |n: usize, b: usize| format!("{n}/{b}");
-        row_print(&[
-            shape.name.to_owned(),
-            cell(convert_n, convert_b),
-            cell(key_n, key_b),
-            cell(rope_clone_n, rope_clone_b),
-            cell(resolve_n, resolve_b),
-            cell(bound_clone_n, bound_clone_b),
-            cell(
-                canon_n.saturating_sub(bound_clone_n),
-                canon_b.saturating_sub(bound_clone_b),
+        .collect()
+}
+
+/// What admitting `bound` costs, with the products the admission reads.
+fn admission_cost(
+    bound: &Arc<ResolvedQuery>,
+    fingerprint: Fingerprint,
+    aggregates: &HashSet<EcoString>,
+    catalog: &Catalog,
+) -> Cost {
+    let (admission, allocations, bytes) = allocations_count(|| {
+        query_admission_analyze(
+            AdmissionQuery {
+                bound,
+                decorrelated: None,
+            },
+            fingerprint,
+            bound.tree().root().has_limit(),
+            aggregates,
+            catalog,
+            AdmissionDepth::Full,
+        )
+    });
+    black_box(admission.expect("the fixture SQL is admitted").tables.len());
+    (allocations, bytes)
+}
+
+/// The cost of each stage on one shape, in column order. The products of
+/// the chain (parse, resolve, canonicalise, fingerprint) are kept as they
+/// are made, since each later stage reads them.
+fn stage_costs(shape: &Shape, catalog: &Catalog) -> Vec<(&'static str, Cost)> {
+    let settings = LiteralSettings::default();
+    let search_path: [EcoString; 1] = ["public".into()];
+    let aggregates = aggregates();
+    let (rope, convert_n, convert_b) = allocations_count(|| parse(&shape.sql));
+    let (resolved, resolve_n, resolve_b) = allocations_count(|| resolve_bound(&rope, catalog));
+    let bound_clone = cost(|| resolved.clone());
+    let (bound, canon_n, canon_b) = allocations_count(|| canonicalise(&resolved, &settings));
+    let (fingerprint, fingerprint_n, fingerprint_b) = allocations_count(|| bound.fingerprint());
+    let shared = Arc::new(bound.clone());
+    vec![
+        ("convert", (convert_n, convert_b)),
+        (
+            "session_key",
+            cost(|| query_tree_session_key(&rope, &search_path, &settings)),
+        ),
+        ("rope_clone", cost(|| rope.clone())),
+        ("resolve", (resolve_n, resolve_b)),
+        ("bound_clone", bound_clone),
+        // Canonicalising clones the bound query first; the cell is its own cost.
+        (
+            "canonicalise",
+            (
+                canon_n.saturating_sub(bound_clone.0),
+                canon_b.saturating_sub(bound_clone.1),
             ),
-            cell(pushdown_n, pushdown_b),
-            cell(decorrelate_n, decorrelate_b),
-            cell(fingerprint_n, fingerprint_b),
-            cell(render_n, render_b),
-            cell(shape_n, shape_b),
-            cell(compile_n, compile_b),
-            cell(update_n, update_b),
-            cell(admission_n, admission_b),
-        ]);
+        ),
+        ("pushdown", cost(|| query_predicate_pushdown(&bound))),
+        (
+            "decorrelate",
+            cost(|| query_decorrelate(&bound, &aggregates)),
+        ),
+        ("fingerprint", (fingerprint_n, fingerprint_b)),
+        ("render", cost(|| bound.sql())),
+        ("shape", cost(|| bound.shape())),
+        (
+            "pred_compile",
+            cost(|| predicate_compile(&bound, shape.predicate_table)),
+        ),
+        (
+            "update_queries",
+            cost(|| query_table_update_queries(&bound)),
+        ),
+        (
+            "admission",
+            admission_cost(&shared, fingerprint, &aggregates, catalog),
+        ),
+    ]
+}
+
+fn allocations_report(shapes: &[Shape], catalog: &Catalog) {
+    println!("\n== allocations per stage (count / bytes)");
+    let mut header_printed = false;
+    for shape in shapes {
+        let costs = stage_costs(shape, catalog);
+        if !header_printed {
+            let header: Vec<String> = std::iter::once("query")
+                .chain(costs.iter().map(|(stage, _)| *stage))
+                .map(str::to_owned)
+                .collect();
+            row_print(&header);
+            header_printed = true;
+        }
+        let row: Vec<String> = std::iter::once(shape.name.to_owned())
+            .chain(costs.iter().map(|(_, (n, b))| format!("{n}/{b}")))
+            .collect();
+        row_print(&row);
     }
 }
 
 /// One row of the allocations table: the query name, then a cell per stage.
-fn row_print(cells: &[String; 15]) {
+fn row_print(cells: &[String]) {
     let mut line = String::new();
     for (index, cell) in cells.iter().enumerate() {
         if index == 0 {
@@ -529,110 +540,160 @@ fn row_print(cells: &[String; 15]) {
 // Criterion
 // ---------------------------------------------------------------------------
 
+/// One timed stage: its name and the work criterion repeats.
+type Stage<'a> = (&'a str, Box<dyn Fn() + 'a>);
+
+/// What the pipeline shares across shapes.
+struct Environment {
+    catalog: Catalog,
+    settings: LiteralSettings,
+    search_path: [EcoString; 1],
+    aggregates: HashSet<EcoString>,
+}
+
+/// One shape's products, each stage fed the previous stage's output as a
+/// fixed input so a regression lands on one bar.
+struct Products {
+    tree: QueryTree,
+    resolved: ResolvedQuery,
+    bound: ResolvedQuery,
+    predicate: Option<CompiledPredicate>,
+    row: Vec<Option<ByteString>>,
+}
+
+fn products(shape: &Shape, env: &Environment) -> Products {
+    let tree = parse(&shape.sql);
+    let resolved = resolve_bound(&tree, &env.catalog);
+    let bound = canonicalise(&resolved, &env.settings);
+    let predicate = predicate_compile(&bound, shape.predicate_table);
+    let row = row_build(shape.row);
+    Products {
+        tree,
+        resolved,
+        bound,
+        predicate,
+        row,
+    }
+}
+
+fn timed_stages<'a>(shape: &'a Shape, made: &'a Products, env: &'a Environment) -> Vec<Stage<'a>> {
+    let Products {
+        tree,
+        resolved,
+        bound,
+        predicate,
+        row,
+    } = made;
+    let mut stages: Vec<Stage<'a>> = vec![
+        (
+            "convert",
+            Box::new(|| {
+                black_box(parse(&shape.sql));
+            }),
+        ),
+        (
+            "session_key",
+            Box::new(|| {
+                black_box(query_tree_session_key(
+                    tree,
+                    &env.search_path,
+                    &env.settings,
+                ));
+            }),
+        ),
+        (
+            "resolve",
+            Box::new(|| {
+                black_box(resolve_bound(tree, &env.catalog));
+            }),
+        ),
+        (
+            "bound_clone",
+            Box::new(|| {
+                black_box(bound.clone());
+            }),
+        ),
+        (
+            "canonicalise",
+            Box::new(|| {
+                black_box(canonicalise(resolved, &env.settings));
+            }),
+        ),
+        (
+            "pushdown",
+            Box::new(|| {
+                black_box(query_predicate_pushdown(bound));
+            }),
+        ),
+        (
+            "decorrelate",
+            Box::new(|| {
+                let _ = black_box(query_decorrelate(bound, &env.aggregates));
+            }),
+        ),
+        (
+            "fingerprint",
+            Box::new(|| {
+                black_box(bound.fingerprint());
+            }),
+        ),
+        (
+            "render",
+            Box::new(|| {
+                black_box(bound.sql());
+            }),
+        ),
+        (
+            "shape",
+            Box::new(|| {
+                black_box(bound.shape());
+            }),
+        ),
+        (
+            "predicate_compile",
+            Box::new(|| {
+                black_box(predicate_compile(bound, shape.predicate_table));
+            }),
+        ),
+        (
+            "end_to_end",
+            Box::new(|| {
+                let tree = parse(&shape.sql);
+                let key = query_tree_session_key(&tree, &env.search_path, &env.settings);
+                let resolved = resolve_bound(&tree, &env.catalog);
+                let bound = canonicalise(&resolved, &env.settings);
+                black_box((key, bound.fingerprint(), bound.sql()));
+            }),
+        ),
+    ];
+    if let Some(predicate) = predicate {
+        stages.push((
+            "predicate_eval",
+            Box::new(|| {
+                black_box(predicate.eval(row));
+            }),
+        ));
+    }
+    stages
+}
+
 fn bench_pipeline(c: &mut Criterion) {
-    let catalog = catalog();
+    let env = Environment {
+        catalog: catalog(),
+        settings: LiteralSettings::default(),
+        search_path: ["public".into()],
+        aggregates: aggregates(),
+    };
     let shapes = shapes();
     sizes_report();
-    allocations_report(&shapes, &catalog);
-
-    let settings = LiteralSettings::default();
-    let search_path: [EcoString; 1] = ["public".into()];
-    let aggregates: HashSet<EcoString> = ["count", "sum", "avg", "min", "max"]
-        .into_iter()
-        .map(EcoString::from)
-        .collect();
+    allocations_report(&shapes, &env.catalog);
 
     let mut group = c.benchmark_group("ast_pipeline");
     for shape in &shapes {
-        let tree = parse(&shape.sql);
-        let resolved = resolve_bound(&tree, &catalog);
-        let bound = canonicalise(&resolved, &settings);
-        let predicate = predicate_compile(&bound, shape.predicate_table);
-        let row = row_build(shape.row);
-
-        group.bench_with_input(
-            BenchmarkId::new("convert", shape.name),
-            &shape.sql,
-            |b, sql| {
-                b.iter(|| black_box(parse(sql)));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("session_key", shape.name),
-            &tree,
-            |b, t| {
-                b.iter(|| black_box(query_tree_session_key(t, &search_path, &settings)));
-            },
-        );
-        group.bench_with_input(BenchmarkId::new("resolve", shape.name), &tree, |b, t| {
-            b.iter(|| black_box(resolve_bound(t, &catalog)));
-        });
-        group.bench_with_input(
-            BenchmarkId::new("bound_clone", shape.name),
-            &bound,
-            |b, r| {
-                b.iter(|| black_box(r.clone()));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("canonicalise", shape.name),
-            &resolved,
-            |b, r| {
-                b.iter(|| black_box(canonicalise(r, &settings)));
-            },
-        );
-        group.bench_with_input(BenchmarkId::new("pushdown", shape.name), &bound, |b, r| {
-            b.iter(|| black_box(query_predicate_pushdown(r)));
-        });
-        group.bench_with_input(
-            BenchmarkId::new("decorrelate", shape.name),
-            &bound,
-            |b, r| {
-                b.iter(|| black_box(query_decorrelate(r, &aggregates)));
-            },
-        );
-        group.bench_with_input(
-            BenchmarkId::new("fingerprint", shape.name),
-            &bound,
-            |b, r| {
-                b.iter(|| black_box(r.fingerprint()));
-            },
-        );
-        group.bench_with_input(BenchmarkId::new("render", shape.name), &bound, |b, r| {
-            b.iter(|| black_box(r.sql()));
-        });
-        group.bench_with_input(BenchmarkId::new("shape", shape.name), &bound, |b, r| {
-            b.iter(|| black_box(r.shape()));
-        });
-        group.bench_with_input(
-            BenchmarkId::new("predicate_compile", shape.name),
-            &bound,
-            |b, r| {
-                b.iter(|| black_box(predicate_compile(r, shape.predicate_table)));
-            },
-        );
-        if let Some(predicate) = &predicate {
-            group.bench_with_input(
-                BenchmarkId::new("predicate_eval", shape.name),
-                &(predicate, &row),
-                |b, (p, row)| {
-                    b.iter(|| black_box(p.eval(row)));
-                },
-            );
+        let made = products(shape, &env);
+        for (stage, run) in timed_stages(shape, &made, &env) {
+            group.bench_function(BenchmarkId::new(stage, shape.name), |b| b.iter(&run));
         }
-        group.bench_with_input(
-            BenchmarkId::new("end_to_end", shape.name),
-            &shape.sql,
-            |b, sql| {
-                b.iter(|| {
-                    let tree = parse(sql);
-                    let key = query_tree_session_key(&tree, &search_path, &settings);
-                    let resolved = resolve_bound(&tree, &catalog);
-                    let bound = canonicalise(&resolved, &settings);
-                    black_box((key, bound.fingerprint(), bound.sql()))
-                });
-            },
-        );
     }
     group.finish();
 }
