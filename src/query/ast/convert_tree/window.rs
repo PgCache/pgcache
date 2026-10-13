@@ -168,28 +168,14 @@ unsafe fn frame_decode(win_def: *const pg::WindowDef) -> Result<Option<Frame>, A
         if opts & FRAMEOPTION_NONDEFAULT == 0 {
             return Ok(None);
         }
-        let mode = if opts & FRAMEOPTION_RANGE != 0 {
-            FrameMode::Range
-        } else if opts & FRAMEOPTION_ROWS != 0 {
-            FrameMode::Rows
-        } else if opts & FRAMEOPTION_GROUPS != 0 {
-            FrameMode::Groups
-        } else {
+        let Some(mode) = flagged(opts, &FRAME_MODES) else {
             return Err(AstError::UnsupportedFeature {
                 feature: format!("window frame mode (frameOptions={opts:#x})"),
             });
         };
         let start = frame_bound_decode(opts, &START_BOUND, "start")?;
         let end = frame_bound_decode(opts, &END_BOUND, "end")?;
-        let exclusion = if opts & FRAMEOPTION_EXCLUDE_CURRENT_ROW != 0 {
-            FrameExclusion::CurrentRow
-        } else if opts & FRAMEOPTION_EXCLUDE_GROUP != 0 {
-            FrameExclusion::Group
-        } else if opts & FRAMEOPTION_EXCLUDE_TIES != 0 {
-            FrameExclusion::Ties
-        } else {
-            FrameExclusion::NoOthers
-        };
+        let exclusion = flagged(opts, &FRAME_EXCLUSIONS).unwrap_or(FrameExclusion::NoOthers);
         Ok(Some(Frame {
             mode,
             start: (start, (*win_def).startOffset as NodePtr),
@@ -197,6 +183,26 @@ unsafe fn frame_decode(win_def: *const pg::WindowDef) -> Result<Option<Frame>, A
             exclusion,
         }))
     }
+}
+
+const FRAME_MODES: [(i32, FrameMode); 3] = [
+    (FRAMEOPTION_RANGE, FrameMode::Range),
+    (FRAMEOPTION_ROWS, FrameMode::Rows),
+    (FRAMEOPTION_GROUPS, FrameMode::Groups),
+];
+
+const FRAME_EXCLUSIONS: [(i32, FrameExclusion); 3] = [
+    (FRAMEOPTION_EXCLUDE_CURRENT_ROW, FrameExclusion::CurrentRow),
+    (FRAMEOPTION_EXCLUDE_GROUP, FrameExclusion::Group),
+    (FRAMEOPTION_EXCLUDE_TIES, FrameExclusion::Ties),
+];
+
+/// The first entry whose bit is set in `opts`; a zero bit is never set.
+fn flagged<T: Copy>(opts: i32, table: &[(i32, T)]) -> Option<T> {
+    table
+        .iter()
+        .find(|(flag, _)| *flag != 0 && opts & flag != 0)
+        .map(|(_, value)| *value)
 }
 
 /// The `frameOptions` bits of one frame bound; a bit of zero is a form
@@ -232,22 +238,22 @@ fn frame_bound_decode(
     flags: &BoundFlags,
     which: &str,
 ) -> Result<FrameBoundKind, AstError> {
-    let set = |flag: i32| flag != 0 && opts & flag != 0;
-    if set(flags.unbounded_preceding) {
-        Ok(FrameBoundKind::UnboundedPreceding)
-    } else if set(flags.unbounded_following) {
-        Ok(FrameBoundKind::UnboundedFollowing)
-    } else if set(flags.current_row) {
-        Ok(FrameBoundKind::CurrentRow)
-    } else if set(flags.offset_preceding) {
-        Ok(FrameBoundKind::OffsetPreceding)
-    } else if set(flags.offset_following) {
-        Ok(FrameBoundKind::OffsetFollowing)
-    } else {
-        Err(AstError::UnsupportedFeature {
-            feature: format!("window frame {which} bound (frameOptions={opts:#x})"),
-        })
-    }
+    let kinds = [
+        (
+            flags.unbounded_preceding,
+            FrameBoundKind::UnboundedPreceding,
+        ),
+        (
+            flags.unbounded_following,
+            FrameBoundKind::UnboundedFollowing,
+        ),
+        (flags.current_row, FrameBoundKind::CurrentRow),
+        (flags.offset_preceding, FrameBoundKind::OffsetPreceding),
+        (flags.offset_following, FrameBoundKind::OffsetFollowing),
+    ];
+    flagged(opts, &kinds).ok_or_else(|| AstError::UnsupportedFeature {
+        feature: format!("window frame {which} bound (frameOptions={opts:#x})"),
+    })
 }
 
 /// The `OrderBy` nodes of a sort list: a query's ORDER BY, a window's, an
