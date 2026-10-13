@@ -3,6 +3,8 @@
 //! rewritten SELECT with their column references re-qualified, and the
 //! joins, derived tables and references the rewrite makes.
 
+use smallvec::SmallVec;
+
 use ecow::EcoString;
 
 use crate::query::ast::rope::{NodeRef, Query, Replacement, Select};
@@ -34,6 +36,9 @@ pub(super) enum Bind {
         right: Option<ColumnBinding>,
     },
 }
+
+/// A plan's lists: a rewrite moves a few things, so they live inline.
+pub(super) type Planned<T> = SmallVec<[T; 4]>;
 
 /// A replacement inside a moved subtree, with what it binds to.
 #[derive(Debug, Clone)]
@@ -105,11 +110,11 @@ impl<'t> Piece<'t> {
 pub(super) struct DerivedPlan {
     pub(super) index: usize,
     pub(super) alias: EcoString,
-    pub(super) keys: Vec<NodeId>,
+    pub(super) keys: Planned<NodeId>,
     pub(super) scalar: NodeId,
     pub(super) scalar_alias: EcoString,
-    pub(super) from: Vec<NodeId>,
-    pub(super) residual: Vec<NodeId>,
+    pub(super) from: Planned<NodeId>,
+    pub(super) residual: Planned<NodeId>,
     pub(super) grouped: bool,
 }
 

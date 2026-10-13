@@ -28,7 +28,7 @@ use error_set::error_set;
 use rootcause::Report;
 
 use self::emit::Emitter;
-use self::plan::{Bind, BodyPlan, QueryPlan};
+use self::plan::{Bind, BodyPlan, Planned, QueryPlan};
 
 error_set! {
     DecorrelateError := {
@@ -53,10 +53,10 @@ pub(super) struct Planner<'t> {
     derived_counter: u32,
     scalar_counter: u32,
     /// The metadata of each derived table the rewrite makes, in order.
-    derived: Vec<Arc<TableMetadata>>,
+    derived: Planned<Arc<TableMetadata>>,
     /// Column nodes carried into the scope they referred to, by base id:
     /// no longer correlated.
-    uncorrelated: Vec<NodeId>,
+    uncorrelated: Planned<NodeId>,
 }
 
 /// Decorrelate every correlated subquery of `bound`. `Ok(None)` when it has
@@ -79,8 +79,8 @@ pub fn query_decorrelate(
         aggregate_functions,
         derived_counter: 0,
         scalar_counter: 0,
-        derived: Vec::new(),
-        uncorrelated: Vec::new(),
+        derived: Planned::new(),
+        uncorrelated: Planned::new(),
     };
     let Some(plan) = planner.query_plan(bound.tree().root())? else {
         return Ok(None);
@@ -99,7 +99,7 @@ fn bindings_build(
     planner: &Planner<'_>,
     base: &Bindings,
     remap: &Remap,
-    binds: Vec<(NodeId, Bind)>,
+    binds: Planned<(NodeId, Bind)>,
     derived_nodes: &[(usize, NodeId)],
 ) -> DecorrelateResult<Bindings> {
     let mut builder = BindingsBuilder::from_remapped(base, remap);

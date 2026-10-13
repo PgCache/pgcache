@@ -7,9 +7,11 @@ use ecow::EcoString;
 use postgres_types::Type;
 
 use super::Planner;
+use smallvec::smallvec;
+
 use super::plan::{
-    Bind, DerivedPlan, DerivedRef, GroupPlan, ItemPlan, Piece, PlannedReplacement, ScalarPlan,
-    SelectPlan, WherePlan,
+    Bind, DerivedPlan, DerivedRef, GroupPlan, ItemPlan, Piece, Planned, PlannedReplacement,
+    ScalarPlan, SelectPlan, WherePlan,
 };
 use super::rejected;
 use super::scope::{
@@ -59,7 +61,7 @@ impl<'t> WhereState<'t> {
 /// as its WHERE, the scope of its FROM, and whether it is DISTINCT.
 struct SelectState<'t> {
     from: Vec<Piece<'t>>,
-    remaining: Vec<WhereState<'t>>,
+    remaining: Planned<WhereState<'t>>,
     scope: Scope,
     distinct: bool,
     transformed: bool,
@@ -82,7 +84,7 @@ struct JoinInputs<'t> {
     test: Option<Scalar<'t>>,
     output: Option<Column<'t>>,
     predicates: Correlations<'t>,
-    residual: Vec<Where<'t>>,
+    residual: Planned<Where<'t>>,
 }
 
 /// What a scalar subquery with a join form is made of.
@@ -90,7 +92,7 @@ struct ScalarInputs<'t> {
     inner: Select<'t>,
     scalar: Scalar<'t>,
     predicates: Correlations<'t>,
-    residual: Vec<Where<'t>>,
+    residual: Planned<Where<'t>>,
     has_aggregate: bool,
 }
 
@@ -202,7 +204,7 @@ impl<'t> Planner<'t> {
         }
         let mut state = SelectState {
             from: select.from().map(|s| Piece::Keep(s.id())).collect(),
-            remaining: Vec::new(),
+            remaining: Planned::new(),
             scope,
             distinct: select.distinct(),
             transformed: false,
@@ -559,7 +561,7 @@ impl<'t> Planner<'t> {
         inputs: &JoinInputs<'t>,
         condition: WherePlan<'t>,
         destination: &Scope,
-    ) -> (WherePlan<'t>, Vec<WhereState<'t>>) {
+    ) -> (WherePlan<'t>, Planned<WhereState<'t>>) {
         let residual: Vec<WherePlan<'t>> = inputs
             .residual
             .iter()
@@ -573,7 +575,7 @@ impl<'t> Planner<'t> {
             Some(residual) => and(condition, residual),
             None => condition,
         };
-        (on, vec![is_null])
+        (on, smallvec![is_null])
     }
 
     fn moved_scalar(
@@ -740,9 +742,9 @@ impl<'t> Planner<'t> {
         inputs: &ScalarInputs<'t>,
         derived_alias: &EcoString,
         scalar_alias: &EcoString,
-    ) -> DecorrelateResult<(usize, Vec<NodeId>, ColumnPosition)> {
+    ) -> DecorrelateResult<(usize, Planned<NodeId>, ColumnPosition)> {
         let mut metadata = Vec::with_capacity(inputs.predicates.len() + 1);
-        let mut keys = Vec::with_capacity(inputs.predicates.len());
+        let mut keys = Planned::with_capacity(inputs.predicates.len());
         for (position, predicate) in inputs.predicates.iter().enumerate() {
             let binding = self
                 .inner_binding(predicate.inner)

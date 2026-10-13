@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use ecow::EcoString;
 
 use super::Planner;
-use super::plan::{Bind, Moved, PlannedReplacement};
+use super::plan::{Bind, Moved, Planned, PlannedReplacement};
 use crate::query::ast::rope::{
     Column, Node, NodeKind, NodeRef, Query, Replacement, Scalar, ScalarKind, View, Where,
     WhereKind, WhereSubquery,
@@ -201,7 +201,7 @@ pub(super) struct Correlation<'t> {
 /// Non-empty: existence of one guarantees at least one predicate.
 pub(super) struct Correlations<'t> {
     pub(super) first: Correlation<'t>,
-    pub(super) rest: Vec<Correlation<'t>>,
+    pub(super) rest: Planned<Correlation<'t>>,
 }
 
 impl<'t> Correlations<'t> {
@@ -241,9 +241,9 @@ pub(super) fn where_correlation_partition<'t>(
     planner: &Planner<'_>,
     scope: &Scope,
     where_clause: Where<'t>,
-) -> Option<(Correlations<'t>, Vec<Where<'t>>)> {
-    let mut predicates = Vec::new();
-    let mut residual = Vec::new();
+) -> Option<(Correlations<'t>, Planned<Where<'t>>)> {
+    let mut predicates = Planned::new();
+    let mut residual = Planned::new();
     for conjunct in where_clause.conjuncts() {
         if let Some((left, right)) = column_equality(conjunct) {
             match (

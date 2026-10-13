@@ -3,7 +3,7 @@
 //! derived tables report where they landed so the entry binds them.
 
 use super::plan::{
-    Bind, BodyPlan, DerivedPlan, DerivedRef, GroupPlan, ItemPlan, Moved, Piece, QueryPlan,
+    Bind, BodyPlan, DerivedPlan, DerivedRef, GroupPlan, ItemPlan, Moved, Piece, Planned, QueryPlan,
     ScalarPlan, SelectPlan, WherePlan,
 };
 use crate::cache::SubqueryKind;
@@ -16,9 +16,9 @@ use crate::query::ast::{BinaryOp, NodeId, UnaryOp};
 pub(super) struct Emitter<'t> {
     builder: TreeBuilder<'t>,
     /// Fresh references by the position they landed at.
-    binds: Vec<(NodeId, Bind)>,
+    binds: Planned<(NodeId, Bind)>,
     /// Each derived table's index and the position of its FROM node.
-    derived_nodes: Vec<(usize, NodeId)>,
+    derived_nodes: Planned<(usize, NodeId)>,
 }
 
 fn count(len: usize) -> u32 {
@@ -29,13 +29,20 @@ impl<'t> Emitter<'t> {
     pub(super) fn new(base: &'t QueryTree) -> Self {
         Self {
             builder: TreeBuilder::over(base),
-            binds: Vec::new(),
-            derived_nodes: Vec::new(),
+            binds: Planned::new(),
+            derived_nodes: Planned::new(),
         }
     }
 
     #[allow(clippy::type_complexity)]
-    pub(super) fn finish(self) -> (QueryTree, Remap, Vec<(NodeId, Bind)>, Vec<(usize, NodeId)>) {
+    pub(super) fn finish(
+        self,
+    ) -> (
+        QueryTree,
+        Remap,
+        Planned<(NodeId, Bind)>,
+        Planned<(usize, NodeId)>,
+    ) {
         let (tree, remap) = self.builder.finish();
         (tree, remap, self.binds, self.derived_nodes)
     }
@@ -347,9 +354,9 @@ impl<'t> Emitter<'t> {
 
 /// A moved piece's replacements for the copier, and which of them bind,
 /// by replacement index.
-fn replacements_planned(moved: &Moved<'_>) -> (Replacements, Vec<(usize, Bind)>) {
+fn replacements_planned(moved: &Moved<'_>) -> (Replacements, Planned<(usize, Bind)>) {
     let mut replacements = Replacements::new();
-    let mut binds = Vec::new();
+    let mut binds = Planned::new();
     for planned in &moved.replacements {
         let index = replacements.push(planned.at, planned.replacement.clone());
         if let Some(bind) = &planned.bind {
