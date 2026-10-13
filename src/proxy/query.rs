@@ -187,7 +187,7 @@ fn set_config_calls_effect(tree: &QueryTree) -> SettingsEffect {
 #[cfg(test)]
 fn explain_intercept_parse(sql: &str) -> Option<ExplainSpec> {
     let query = pg_query::parse_raw_scoped(sql, |tree| unsafe {
-        crate::query::ast::query_tree_convert_raw(tree)
+        crate::query::ast::query_tree_convert_raw(tree, sql.len())
     })
     .ok()?
     .ok()?;
@@ -396,8 +396,9 @@ pub(super) fn analyze(
     // serialize/decode round-trip (PGC-192). This is the only parse/convert; the
     // explain interception, cacheability classification, and write
     // classification (PGC-124) all read this one pass.
-    let convert_result =
-        pg_query::parse_raw_scoped(sql, |tree| unsafe { statement_convert_raw(tree) })?;
+    let convert_result = pg_query::parse_raw_scoped(sql, |tree| unsafe {
+        statement_convert_raw(tree, sql.len())
+    })?;
 
     // `set_config('default_transaction_isolation', ...)` can hide in any
     // forwarded statement (a SELECT, a DO block, a CALL); a text scan is the

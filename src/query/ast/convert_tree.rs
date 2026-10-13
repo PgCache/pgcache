@@ -35,16 +35,20 @@ mod window;
 mod write;
 
 /// Convert the root of a raw parse tree (`List *` of `RawStmt`, as an opaque
-/// pointer from `parse_raw_scoped`) into a [`QueryTree`].
+/// pointer from `parse_raw_scoped`) into a [`QueryTree`]. `sql_len` is the
+/// statement text's length, which sizes the builder.
 ///
 /// # Safety
 /// `tree_root` must be the live `List *` handed to the `parse_raw_scoped`
 /// callback, valid for the duration of this call.
-pub unsafe fn query_tree_convert_raw(tree_root: *const c_void) -> Result<QueryTree, AstError> {
+pub unsafe fn query_tree_convert_raw(
+    tree_root: *const c_void,
+    sql_len: usize,
+) -> Result<QueryTree, AstError> {
     unsafe {
         let stmt = root_statement(tree_root)?;
         match node_tag(stmt) {
-            pg::NodeTag_T_SelectStmt => select_root_convert(cast::<pg::SelectStmt>(stmt)),
+            pg::NodeTag_T_SelectStmt => select_root_convert(cast::<pg::SelectStmt>(stmt), sql_len),
             other => Err(AstError::UnsupportedStatement {
                 statement_type: node_tag_name(other).into_owned(),
             }),
@@ -85,13 +89,16 @@ pub enum RawStatement {
 /// # Safety
 /// `tree_root` must be the live `List *` handed to the `parse_raw_scoped`
 /// callback, valid for the duration of this call.
-pub unsafe fn statement_convert_raw(tree_root: *const c_void) -> Result<RawStatement, AstError> {
+pub unsafe fn statement_convert_raw(
+    tree_root: *const c_void,
+    sql_len: usize,
+) -> Result<RawStatement, AstError> {
     unsafe {
         let stmt = root_statement(tree_root)?;
         Ok(match node_tag(stmt) {
             pg::NodeTag_T_SelectStmt => {
                 let select = cast::<pg::SelectStmt>(stmt);
-                let converted = select_root_convert(select);
+                let converted = select_root_convert(select, sql_len);
                 let cte_write = if converted.is_err() {
                     write::select_cte_write_class(select)
                 } else {
@@ -134,10 +141,16 @@ pub(super) unsafe fn root_statement(tree_root: *const c_void) -> Result<NodePtr,
     }
 }
 
-/// Convert a root `SelectStmt`.
-unsafe fn select_root_convert(select: *const pg::SelectStmt) -> Result<QueryTree, AstError> {
+/// Convert a root `SelectStmt`. The builder is sized from the statement
+/// text: the bench fixtures run four to nine bytes of SQL per node, and the
+/// vector is transient, so sizing for the densest only costs a short-lived
+/// over-allocation on the rest.
+unsafe fn select_root_convert(
+    select: *const pg::SelectStmt,
+    sql_len: usize,
+) -> Result<QueryTree, AstError> {
     unsafe {
-        let mut builder = TreeBuilder::new();
+        let mut builder = TreeBuilder::with_capacity(sql_len / 4 + 8);
         query_emit(&mut builder, select, &ParseContext::empty())?;
         Ok(builder.finish().0)
     }
@@ -145,7 +158,6 @@ unsafe fn select_root_convert(select: *const pg::SelectStmt) -> Result<QueryTree
 
 /// A CTE in scope: its raw definition, re-emitted at each reference, and
 /// the context it was defined in.
-#[derive(Clone)]
 pub(super) struct RawCte {
     name: EcoString,
     node: *const pg::CommonTableExpr,
@@ -153,34 +165,42 @@ pub(super) struct RawCte {
     materialization: CteMaterialization,
 }
 
-/// The CTEs visible to a query: the outer scopes' first, then its own in
-/// order, so a CTE's own context is every entry before it.
-pub(super) struct ParseContext {
-    ctes: Vec<RawCte>,
+/// The CTEs visible to a query: its own in order, over the scope they were
+/// defined in; a CTE's own context is the entries before it. Each level
+/// borrows its query's list, so a nested query or a reference costs nothing.
+pub(super) struct ParseContext<'a> {
+    outer: Option<&'a ParseContext<'a>>,
+    ctes: &'a [RawCte],
 }
 
-impl ParseContext {
+impl<'a> ParseContext<'a> {
     fn empty() -> Self {
-        Self { ctes: Vec::new() }
+        Self {
+            outer: None,
+            ctes: &[],
+        }
     }
 
-    /// The outer context's CTEs plus this query's own.
-    fn with_ctes(outer: &ParseContext, ctes: &[RawCte]) -> Self {
-        let mut all = outer.ctes.clone();
-        all.extend_from_slice(ctes);
-        Self { ctes: all }
+    /// `ctes` in scope over `outer`.
+    fn with_ctes(outer: &'a ParseContext<'a>, ctes: &'a [RawCte]) -> Self {
+        Self {
+            outer: Some(outer),
+            ctes,
+        }
     }
 
-    /// The CTE `name` refers to, with the context its body is converted in.
-    fn cte_find(&self, name: &str) -> Option<(&RawCte, ParseContext)> {
-        let index = self.ctes.iter().position(|cte| cte.name == name)?;
-        let cte = self.ctes.get(index)?;
-        Some((
-            cte,
-            ParseContext {
-                ctes: self.ctes.get(..index).unwrap_or(&[]).to_vec(),
-            },
-        ))
+    /// The CTE `name` refers to, innermost scope first, with the context
+    /// its body is converted in.
+    fn cte_find(&self, name: &str) -> Option<(&'a RawCte, ParseContext<'a>)> {
+        if let Some(index) = self.ctes.iter().position(|cte| cte.name == name) {
+            let cte = self.ctes.get(index)?;
+            let defined_in = ParseContext {
+                outer: self.outer,
+                ctes: self.ctes.get(..index).unwrap_or(&[]),
+            };
+            return Some((cte, defined_in));
+        }
+        self.outer?.cte_find(name)
     }
 }
 
@@ -267,8 +287,10 @@ pub(super) fn sublink_type_map(t: pg::SubLinkType) -> Result<SubLinkType, AstErr
 /// for every fixture that starts from SQL.
 #[cfg(test)]
 pub(crate) fn query_tree_parse(sql: &str) -> Result<QueryTree, AstError> {
-    pg_query::parse_raw_scoped(sql, |tree| unsafe { query_tree_convert_raw(tree) })
-        .expect("parse SQL")
+    pg_query::parse_raw_scoped(sql, |tree| unsafe {
+        query_tree_convert_raw(tree, sql.len())
+    })
+    .expect("parse SQL")
 }
 
 #[cfg(test)]

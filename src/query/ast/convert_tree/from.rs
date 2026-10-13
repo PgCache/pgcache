@@ -20,7 +20,7 @@ pub(super) unsafe fn source_emit(
     builder: &mut TreeBuilder<'_>,
     node: NodePtr,
     context: &str,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         match node_tag(node) {
@@ -62,7 +62,7 @@ fn alias_names_emit(builder: &mut TreeBuilder<'_>, alias: Option<&Alias>) {
 unsafe fn table_emit(
     builder: &mut TreeBuilder<'_>,
     range_var: *const pg::RangeVar,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let schema = EcoString::from(cstr((*range_var).schemaname));
@@ -106,7 +106,7 @@ unsafe fn table_emit(
 unsafe fn subquery_emit(
     builder: &mut TreeBuilder<'_>,
     range_subselect: *const pg::RangeSubselect,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let subquery = (*range_subselect).subquery as NodePtr;
@@ -136,7 +136,7 @@ unsafe fn subquery_emit(
 unsafe fn join_emit(
     builder: &mut TreeBuilder<'_>,
     join_expr: *const pg::JoinExpr,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let larg = (*join_expr).larg as NodePtr;

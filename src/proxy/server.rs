@@ -107,7 +107,7 @@ fn pinned_queries_validate(
         .iter()
         .filter_map(|sql| {
             let tree = match pg_query::parse_raw_scoped(sql, |tree| unsafe {
-                query_tree_convert_raw(tree)
+                query_tree_convert_raw(tree, sql.len())
             }) {
                 Ok(Ok(q)) => q,
                 Ok(Err(e)) => {

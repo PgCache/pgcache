@@ -59,7 +59,9 @@ pub struct AnalyzedStatement {
 
 pub fn statement_parse(sql: &str, trace_parameters: &[Option<EcoString>]) -> ParsedStatement {
     let mut inferred_parameters = 0;
-    let raw = pg_query::parse_raw_scoped(sql, |tree| unsafe { statement_convert_raw(tree) });
+    let raw = pg_query::parse_raw_scoped(sql, |tree| unsafe {
+        statement_convert_raw(tree, sql.len())
+    });
     let outcome = match raw {
         Err(parse_error) => ParseOutcome::ParseError(parse_error.to_string()),
         // Structural failure (empty input, multiple statements in one payload).
@@ -387,9 +389,11 @@ pub fn statement_classify(
 /// pipeline uses.
 #[cfg(test)]
 pub(crate) fn query_parse(sql: &str) -> QueryTree {
-    let raw = pg_query::parse_raw_scoped(sql, |tree| unsafe { statement_convert_raw(tree) })
-        .expect("parse SQL")
-        .expect("classify statement");
+    let raw = pg_query::parse_raw_scoped(sql, |tree| unsafe {
+        statement_convert_raw(tree, sql.len())
+    })
+    .expect("parse SQL")
+    .expect("classify statement");
     match raw {
         RawStatement::Select { converted, .. } => converted.expect("convert SELECT"),
         _ => panic!("expected SELECT statement"),

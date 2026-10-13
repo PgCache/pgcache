@@ -15,8 +15,10 @@ use crate::query::write::{
 
 /// Classify one SQL statement through the public entry point.
 fn classify(sql: &str) -> Result<RawStatement, AstError> {
-    pg_query::parse_raw_scoped(sql, |tree| unsafe { statement_convert_raw(tree) })
-        .expect("parse sql")
+    pg_query::parse_raw_scoped(sql, |tree| unsafe {
+        statement_convert_raw(tree, sql.len())
+    })
+    .expect("parse sql")
 }
 
 fn classify_write(sql: &str) -> WriteClass {

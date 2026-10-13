@@ -21,7 +21,7 @@ use crate::query::ast::{AstError, LiteralValue, SetOpType};
 pub(super) unsafe fn query_emit(
     builder: &mut TreeBuilder<'_>,
     select_stmt: *const pg::SelectStmt,
-    outer_ctx: &ParseContext,
+    outer_ctx: &ParseContext<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         if !list_is_empty((*select_stmt).lockingClause) {
@@ -79,7 +79,7 @@ unsafe fn with_clause_extract(with_clause: *const pg::WithClause) -> Result<Vec<
 unsafe fn cte_emit(
     builder: &mut TreeBuilder<'_>,
     cte: &RawCte,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let open = builder.open(NodeKind::Cte {
@@ -100,7 +100,7 @@ unsafe fn cte_emit(
 pub(super) unsafe fn cte_query_emit(
     builder: &mut TreeBuilder<'_>,
     cte: &RawCte,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let inner = cast::<pg::SelectStmt>((*cte.node).ctequery as NodePtr);
@@ -112,7 +112,7 @@ pub(super) unsafe fn cte_query_emit(
 unsafe fn body_emit(
     builder: &mut TreeBuilder<'_>,
     select_stmt: *const pg::SelectStmt,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         match (*select_stmt).op {
@@ -140,7 +140,7 @@ unsafe fn set_op_emit(
     builder: &mut TreeBuilder<'_>,
     select_stmt: *const pg::SelectStmt,
     op: SetOpType,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let larg = (*select_stmt).larg;
@@ -166,7 +166,7 @@ unsafe fn set_op_emit(
 unsafe fn select_emit(
     builder: &mut TreeBuilder<'_>,
     select_stmt: *const pg::SelectStmt,
-    ctx: &ParseContext,
+    ctx: &ParseContext<'_>,
 ) -> Result<(), AstError> {
     unsafe {
         let target_list = (*select_stmt).targetList;

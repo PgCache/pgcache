@@ -58,10 +58,17 @@ pub struct Open {
 
 impl<'b> TreeBuilder<'b> {
     pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    /// A builder expecting about `nodes` fresh nodes: the vector they are
+    /// collected in is sized once instead of doubling as they arrive. The
+    /// finished slice is exact whatever the guess.
+    pub fn with_capacity(nodes: usize) -> Self {
         Self {
             base: None,
             pending: Vec::new(),
-            fresh: Vec::new(),
+            fresh: Vec::with_capacity(nodes),
             next: 0,
             kept: Vec::new(),
             origins: None,

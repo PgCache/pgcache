@@ -354,9 +354,11 @@ fn shapes() -> Vec<Shape> {
 
 /// The rope straight from the raw parse tree.
 fn parse(sql: &str) -> QueryTree {
-    pg_query::parse_raw_scoped(sql, |tree| unsafe { query_tree_convert_raw(tree) })
-        .expect("pg_query parses the fixture SQL")
-        .expect("the fixture SQL converts")
+    pg_query::parse_raw_scoped(sql, |tree| unsafe {
+        query_tree_convert_raw(tree, sql.len())
+    })
+    .expect("pg_query parses the fixture SQL")
+    .expect("the fixture SQL converts")
 }
 
 fn resolve_bound(tree: &QueryTree, catalog: &Catalog) -> ResolvedQuery {

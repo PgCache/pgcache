@@ -145,8 +145,10 @@ fn explain_kind_for_view(
 /// dispatch keys it (raw-tree convert → rope → `query_tree_session_key`), so the
 /// lookup hits the cached entry. `None` if the argument doesn't parse as a SELECT.
 fn explain_sql_key(sql: &str, keying: &KeyingSettings) -> Option<SessionKey> {
-    pg_query::parse_raw_scoped(sql, |tree| unsafe { query_tree_convert_raw(tree) })
-        .ok()
-        .and_then(Result::ok)
-        .map(|tree| keying.session_key(&tree))
+    pg_query::parse_raw_scoped(sql, |tree| unsafe {
+        query_tree_convert_raw(tree, sql.len())
+    })
+    .ok()
+    .and_then(Result::ok)
+    .map(|tree| keying.session_key(&tree))
 }

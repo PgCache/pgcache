@@ -406,6 +406,28 @@ fn test_cte_name_resolution_cases() {
     let table = only_table(select_of(&tree));
     assert_eq!(table.schema().map(EcoString::as_str), Some("public"));
     assert_eq!(table.name(), "users");
+    // A derived table's own CTE shadows an outer one of the same name.
+    let tree = parse(
+        "WITH a AS (SELECT 1 AS x) \
+         SELECT * FROM (WITH a AS (SELECT 2 AS x) SELECT x FROM a) s",
+    );
+    let Some(Source::Subquery(derived)) = select_of(&tree).from().next() else {
+        panic!("expected a derived table");
+    };
+    let Body::Select(inner) = derived.query().body() else {
+        panic!("expected a SELECT body");
+    };
+    let Some(Source::CteRef(reference)) = inner.from().next() else {
+        panic!("expected a CTE reference");
+    };
+    let Body::Select(definition) = reference.query().body() else {
+        panic!("expected the CTE's SELECT body");
+    };
+    let value = match expr_of(items(definition)[0]).kind() {
+        ScalarKind::Literal(literal) => literal.value().clone(),
+        _ => panic!("expected a literal"),
+    };
+    assert_eq!(value, LiteralValue::Integer(2));
 }
 
 #[test]
