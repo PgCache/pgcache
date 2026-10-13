@@ -1,6 +1,5 @@
-//! The resolver over the rope: the binding rules of the owned walk, read
-//! through views. The owned resolver is its oracle until the owned tree
-//! goes; the scope, column lookup and USING cluster are shared.
+//! The resolver: the binding rules, read through views over the tree. The
+//! scope, column lookup and USING cluster live beside it in `resolve`.
 
 mod clauses;
 mod expr;

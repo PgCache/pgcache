@@ -16,8 +16,7 @@ use crate::{
     catalog::FunctionVolatility,
     id_hash::{BuildIdHasher, impl_id_hashable},
     query::ast::rope::{
-        Body, Function as RopeFunction, NodeKind, QueryTree, Scalar as RopeScalar, ScalarKind,
-        Select as RopeSelect, SelectItem, View,
+        Body, Function, NodeKind, QueryTree, Scalar, ScalarKind, Select, SelectItem, View,
     },
     query::ast::{AstError, LiteralValue, RawStatement, statement_convert_raw},
     query::guc::Guc,
@@ -73,7 +72,7 @@ fn explain_spec_extract(tree: &QueryTree) -> Option<ExplainSpec> {
 /// The SELECT of a bare projection: no CTEs, ORDER BY, LIMIT, FROM, WHERE,
 /// GROUP BY, HAVING, or DISTINCT, otherwise a real query that merely mentions
 /// the function would be intercepted.
-fn bare_select(tree: &QueryTree) -> Option<RopeSelect<'_>> {
+fn bare_select(tree: &QueryTree) -> Option<Select<'_>> {
     let root = tree.root();
     let unordered = root.order_by().len() == 0 && !root.has_limit();
     if root.ctes().len() > 0 || !unordered {
@@ -85,14 +84,14 @@ fn bare_select(tree: &QueryTree) -> Option<RopeSelect<'_>> {
     select_is_bare(select).then_some(select)
 }
 
-fn select_is_bare(select: RopeSelect<'_>) -> bool {
+fn select_is_bare(select: Select<'_>) -> bool {
     let unfiltered = select.from().len() == 0 && select.where_clause().is_none();
     let ungrouped = select.group_by().len() == 0 && select.having().is_none();
     unfiltered && ungrouped && !select.distinct()
 }
 
 /// The function call a SELECT projects as its only item.
-fn single_function_item(select: RopeSelect<'_>) -> Option<RopeFunction<'_>> {
+fn single_function_item(select: Select<'_>) -> Option<Function<'_>> {
     let mut items = select.items()?;
     let (Some(SelectItem::Expr(item)), None) = (items.next(), items.next()) else {
         return None;
@@ -106,7 +105,7 @@ fn single_function_item(select: RopeSelect<'_>) -> Option<RopeFunction<'_>> {
 /// The spec from `pgcache_explain`'s one or two string arguments: a target
 /// that parses as `u64` is a fingerprint, otherwise inline SQL; the second is
 /// the option list.
-fn explain_spec_build(function: RopeFunction<'_>) -> Option<ExplainSpec> {
+fn explain_spec_build(function: Function<'_>) -> Option<ExplainSpec> {
     let mut args = function.args();
     let (first, options) = match (args.next(), args.next(), args.next()) {
         (Some(first), None, _) => (first, EcoString::new()),
@@ -123,7 +122,7 @@ fn explain_spec_build(function: RopeFunction<'_>) -> Option<ExplainSpec> {
 
 /// A plain call: not an aggregate (`*`, DISTINCT, FILTER, ORDER BY) or window
 /// (OVER) form.
-fn plain_call(function: RopeFunction<'_>) -> bool {
+fn plain_call(function: Function<'_>) -> bool {
     let no_aggregate_form = !function.agg_star() && !function.agg_distinct();
     let unfiltered = function.over().is_none() && function.filter().is_none();
     let unordered = unfiltered && function.agg_order().len() == 0;
@@ -133,7 +132,7 @@ fn plain_call(function: RopeFunction<'_>) -> bool {
 /// A plain string-literal argument's value, or `None` for any other expression
 /// (a cast, number, column reference, ...). Both `pgcache_explain` arguments are
 /// string literals.
-fn arg_string(arg: RopeScalar<'_>) -> Option<&str> {
+fn arg_string(arg: Scalar<'_>) -> Option<&str> {
     if let Some(LiteralValue::String(value)) = arg_literal(arg) {
         Some(value.as_str())
     } else {
@@ -142,7 +141,7 @@ fn arg_string(arg: RopeScalar<'_>) -> Option<&str> {
 }
 
 /// A literal argument's value, or `None` for any other expression.
-fn arg_literal(arg: RopeScalar<'_>) -> Option<&LiteralValue> {
+fn arg_literal(arg: Scalar<'_>) -> Option<&LiteralValue> {
     if let ScalarKind::Literal(literal) = arg.kind() {
         Some(literal.value())
     } else {
@@ -167,7 +166,7 @@ fn set_config_calls_effect(tree: &QueryTree) -> SettingsEffect {
             continue;
         }
         calls += 1;
-        let mut args = RopeFunction::from_ref(position).args();
+        let mut args = Function::from_ref(position).args();
         let Some(LiteralValue::String(name)) = args.next().and_then(arg_literal) else {
             return SettingsEffect::all();
         };

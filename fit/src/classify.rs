@@ -17,7 +17,7 @@ use pgcache_lib::oid::Oid;
 use pgcache_lib::query::ast::rope::QueryTree;
 use pgcache_lib::query::ast::{AstError, RawStatement, WhereParseError, statement_convert_raw};
 use pgcache_lib::query::constraints::{
-    QueryConstraints, TableConstraint, query_constraints_analyze_tree,
+    QueryConstraints, TableConstraint, query_constraints_analyze,
 };
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::transform::query_tree_parameters_replace;
@@ -369,7 +369,7 @@ pub fn statement_classify(
     // form, like the writer's subsumption_check.
     let constraints = bound
         .select()
-        .map(|select| query_constraints_analyze_tree(&bound, select));
+        .map(|select| query_constraints_analyze(&bound, select));
 
     Verdict::Cacheable(Box::new(CacheableAnalysis {
         fingerprint,

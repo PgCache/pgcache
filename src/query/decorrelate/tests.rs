@@ -11,7 +11,7 @@ use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, Table
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::rope::deparse::where_deparse_with;
 use crate::query::ast::rope::{
-    Body, Join, JoinQual, Query, RopePlain, Select, SelectItem, Source, Subquery, Where, WhereKind,
+    Body, Join, JoinQual, Plain, Query, Select, SelectItem, Source, Subquery, Where, WhereKind,
 };
 use crate::query::ast::{JoinType, UnaryOp};
 use crate::query::resolve::ResolvedQuery;
@@ -304,7 +304,7 @@ fn join_on(join: Join<'_>) -> Where<'_> {
 /// checks.
 fn deparse_expr(expr: Where<'_>) -> String {
     let mut buf = String::new();
-    where_deparse_with(expr, &mut RopePlain, &mut buf);
+    where_deparse_with(expr, &mut Plain, &mut buf);
     buf
 }
 

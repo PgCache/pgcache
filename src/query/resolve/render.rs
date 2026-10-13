@@ -22,9 +22,8 @@ use crate::query::ast::rope::deparse::{
     table_plain_deparse,
 };
 use crate::query::ast::rope::{
-    Column as RopeColumn, CteRef as RopeCteRef, Function as RopeFunction, Join as RopeJoin,
-    OrderBy as RopeOrderBy, QueryTree, RopeDeparseContext, ScalarKind, Select as RopeSelect,
-    SelectItem, Star as RopeStar, Table as RopeTable,
+    Column, CteRef, DeparseContext, Function, Join, OrderBy, QueryTree, ScalarKind, Select,
+    SelectItem, Star, Table,
 };
 use crate::query::ast::{Clause, Deparse, LiteralValue, NodeId, separated_deparse};
 use crate::query::shape::{QueryShape, ShapeKey};
@@ -356,8 +355,8 @@ impl Bound<'_> {
 /// read through views and the rope-keyed bindings.
 struct RopeBound<'a>(Bound<'a>);
 
-impl RopeDeparseContext for RopeBound<'_> {
-    fn table_deparse(&mut self, table: RopeTable<'_>, buf: &mut String) {
+impl DeparseContext for RopeBound<'_> {
+    fn table_deparse(&mut self, table: Table<'_>, buf: &mut String) {
         self.0.table_render(
             self.0.bindings.source(table.id()),
             |buf| table_alias_deparse(table, buf),
@@ -366,7 +365,7 @@ impl RopeDeparseContext for RopeBound<'_> {
         );
     }
 
-    fn column_deparse(&mut self, column: RopeColumn<'_>, buf: &mut String) {
+    fn column_deparse(&mut self, column: Column<'_>, buf: &mut String) {
         self.0.column_render(
             self.0.bindings.column_by_id(column.id()),
             column.column(),
@@ -375,7 +374,7 @@ impl RopeDeparseContext for RopeBound<'_> {
         );
     }
 
-    fn star_deparse(&mut self, star: RopeStar<'_>, buf: &mut String) {
+    fn star_deparse(&mut self, star: Star<'_>, buf: &mut String) {
         self.0.star_render(
             self.0.bindings.star_by_id(star.id()),
             |buf| star_plain_deparse(star, buf),
@@ -385,7 +384,7 @@ impl RopeDeparseContext for RopeBound<'_> {
 
     /// The CTE body inline as a derived table, named by the reference's
     /// alias or the CTE's name, with the CTE's column aliases.
-    fn cte_ref_deparse(&mut self, cte_ref: RopeCteRef<'_>, buf: &mut String) {
+    fn cte_ref_deparse(&mut self, cte_ref: CteRef<'_>, buf: &mut String) {
         buf.push_str(" (");
         query_deparse_with(cte_ref.query(), self, buf);
         buf.push_str(") ");
@@ -405,7 +404,7 @@ impl RopeDeparseContext for RopeBound<'_> {
         false
     }
 
-    fn natural_join_columns(&mut self, join: RopeJoin<'_>) -> Option<Vec<EcoString>> {
+    fn natural_join_columns(&mut self, join: Join<'_>) -> Option<Vec<EcoString>> {
         let join = join.id();
         Some(
             self.0
@@ -418,7 +417,7 @@ impl RopeDeparseContext for RopeBound<'_> {
         )
     }
 
-    fn function_name_deparse(&mut self, function: RopeFunction<'_>, buf: &mut String) {
+    fn function_name_deparse(&mut self, function: Function<'_>, buf: &mut String) {
         buf.push_str(function.name());
     }
 
@@ -467,7 +466,7 @@ pub(super) struct Output {
 impl ResolvedQuery {
     /// The context that renders this query's nodes as the cache serves
     /// them, for a caller composing its own SQL around parts of the tree.
-    pub fn deparse_context(&self) -> impl RopeDeparseContext + '_ {
+    pub fn deparse_context(&self) -> impl DeparseContext + '_ {
         RopeBound(Bound::text(self.bindings()))
     }
 
@@ -476,7 +475,7 @@ impl ResolvedQuery {
     pub fn deparse_context_with_source<'a>(
         &'a self,
         source: &'a SourceOverride<'a>,
-    ) -> impl RopeDeparseContext + 'a {
+    ) -> impl DeparseContext + 'a {
         RopeBound(Bound::with_source(self.bindings(), source))
     }
 
@@ -556,11 +555,7 @@ impl ResolvedQuery {
     /// The 1-based select-list position an ORDER BY item of `select` names,
     /// stars expanded: by output name when the item names an output, else
     /// by the rendered expression. `None` when no output matches.
-    pub fn order_by_position(
-        &self,
-        select: RopeSelect<'_>,
-        clause: RopeOrderBy<'_>,
-    ) -> Option<usize> {
+    pub fn order_by_position(&self, select: Select<'_>, clause: OrderBy<'_>) -> Option<usize> {
         let outputs = self.select_outputs(select);
         let expr = clause.expr();
         let found = if let ScalarKind::Column(column) = expr.kind()
@@ -583,7 +578,7 @@ impl ResolvedQuery {
         found.map(|index| index + 1)
     }
 
-    fn select_outputs(&self, select: RopeSelect<'_>) -> Vec<Output> {
+    fn select_outputs(&self, select: Select<'_>) -> Vec<Output> {
         let bindings = self.bindings();
         let cx = Bound::text(bindings);
         let Some(items) = select.items() else {
@@ -616,7 +611,7 @@ impl ResolvedQuery {
     }
 
     /// An ORDER BY item rendered as the cache serves it.
-    pub fn order_by_into(&self, clause: RopeOrderBy<'_>, buf: &mut String) {
+    pub fn order_by_into(&self, clause: OrderBy<'_>, buf: &mut String) {
         order_by_deparse_with(clause, &mut RopeBound(Bound::text(self.bindings())), buf);
     }
 }
@@ -642,8 +637,7 @@ mod tests {
     }
 
     /// The renderings of every corpus query: the serve SQL, the shape SQL and
-    /// the shape's literals, as the owned renderer produced them before it
-    /// was removed.
+    /// the shape's literals.
     #[rustfmt::skip]
     const RENDER_EXPECTED: &[(&str, &str, &str, &[&str])] = &[
         ("SELECT u.id, name FROM users u WHERE dept_id = 'x'",

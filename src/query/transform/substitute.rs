@@ -3,8 +3,8 @@
 //! copy of the tree. A tree with no placeholder and nothing to fold comes
 //! back by refcount.
 //!
-//! The fold is decided bottom-up so nested arithmetic folds inside out, as
-//! the owned walker's post-order pass did, and the topmost subtree that
+//! The fold is decided bottom-up so nested arithmetic folds inside out, and
+//! the topmost subtree that
 //! folds is the one replaced; a subtree that does not fold (overflow,
 //! division by zero, a non-numeric operand) is entered so what folds
 //! inside it still does.
@@ -146,7 +146,7 @@ mod tests {
     use crate::oid::TypeOid;
     use crate::query::ast::query_tree_parse;
     use crate::query::ast::rope::deparse::query_deparse_with;
-    use crate::query::ast::rope::{QueryTree, RopePlain};
+    use crate::query::ast::rope::{Plain, QueryTree};
 
     fn params(values: &[Option<(&[u8], PgType)>]) -> QueryParameters {
         QueryParameters {
@@ -164,7 +164,7 @@ mod tests {
 
     fn plain(tree: &QueryTree) -> String {
         let mut buf = String::new();
-        query_deparse_with(tree.root(), &mut RopePlain, &mut buf);
+        query_deparse_with(tree.root(), &mut Plain, &mut buf);
         buf
     }
 

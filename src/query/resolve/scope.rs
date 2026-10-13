@@ -264,7 +264,7 @@ impl<'a> ResolutionScope<'a> {
     /// recorded as correlated.
     /// Resolve a subquery body in a scope that sees this one's tables and
     /// its ancestors' as outer tables.
-    pub(super) fn subquery_resolve_tree(&mut self, query: Query<'a>) -> ResolveResult<()> {
+    pub(super) fn subquery_resolve(&mut self, query: Query<'a>) -> ResolveResult<()> {
         self.subquery_resolve_with(|tables, search_path, outer_tables, bindings| {
             query_resolve_scoped(query, tables, search_path, outer_tables, bindings)
         })

@@ -145,8 +145,8 @@ unsafe fn select_root_convert(select: *const pg::SelectStmt) -> Result<QueryTree
     }
 }
 
-/// A CTE in scope: its raw definition, re-emitted at each reference as the
-/// owned converter embedded a copy, and the context it was defined in.
+/// A CTE in scope: its raw definition, re-emitted at each reference, and
+/// the context it was defined in.
 #[derive(Clone)]
 pub(super) struct RawCte {
     name: EcoString,
@@ -186,8 +186,7 @@ impl ParseContext {
     }
 }
 
-/// The string entries of a raw name list, as the owned converter read
-/// them: other entries are skipped.
+/// The string entries of a raw name list; other entries are skipped.
 pub(super) unsafe fn names_extract(list: *const pg::List) -> Vec<EcoString> {
     unsafe {
         list_nodes(list)
@@ -196,8 +195,7 @@ pub(super) unsafe fn names_extract(list: *const pg::List) -> Vec<EcoString> {
     }
 }
 
-/// The raw definition behind a CTE node, validated as the owned converter
-/// validates it.
+/// The raw definition behind a CTE node: not recursive, with a SELECT body.
 pub(super) unsafe fn cte_raw(node: NodePtr) -> Result<RawCte, AstError> {
     unsafe {
         if node_tag(node) != pg::NodeTag_T_CommonTableExpr {

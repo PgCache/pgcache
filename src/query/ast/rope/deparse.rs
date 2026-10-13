@@ -1,6 +1,6 @@
 //! Render a rope tree as SQL: one walk over views, with a context that
 //! decides what the references in it render as, so the plain tree and a
-//! bound tree share it (ADR-057). Byte for byte the owned walk's output.
+//! bound tree share it (ADR-057).
 
 #![allow(clippy::wildcard_enum_match_arm)]
 
@@ -19,7 +19,7 @@ use crate::query::cast::cast_target_deparse;
 
 /// What the walk asks its context at each reference. Every hook defaults
 /// to the node as written.
-pub trait RopeDeparseContext: Sized {
+pub trait DeparseContext: Sized {
     /// A table reference in FROM, with its leading space and alias.
     fn table_deparse(&mut self, table: Table<'_>, buf: &mut String) {
         table_plain_deparse(table, buf);
@@ -66,14 +66,14 @@ pub trait RopeDeparseContext: Sized {
 }
 
 /// The context that renders a tree as written.
-pub struct RopePlain;
+pub struct Plain;
 
-impl RopeDeparseContext for RopePlain {}
+impl DeparseContext for Plain {}
 
 impl QueryTree {
     /// The tree as written, appended to `buf`.
     pub fn deparse_into(&self, buf: &mut String) {
-        query_deparse_with(self.root(), &mut RopePlain, buf);
+        query_deparse_with(self.root(), &mut Plain, buf);
     }
 
     pub fn sql(&self) -> String {
@@ -149,7 +149,7 @@ pub fn cte_ref_plain_deparse(cte_ref: CteRef<'_>, buf: &mut String) {
     }
 }
 
-/// `schema.NAME`: the name upper-cased, as the owned walk writes it.
+/// `schema.NAME`: the name upper-cased.
 pub fn function_name_plain_deparse(function: Function<'_>, buf: &mut String) {
     if let Some(schema) = function.schema() {
         buf.push_str(schema);
@@ -160,7 +160,7 @@ pub fn function_name_plain_deparse(function: Function<'_>, buf: &mut String) {
 
 // --- the walk --------------------------------------------------------------
 
-pub fn query_deparse_with<C: RopeDeparseContext>(query: Query<'_>, cx: &mut C, buf: &mut String) {
+pub fn query_deparse_with<C: DeparseContext>(query: Query<'_>, cx: &mut C, buf: &mut String) {
     query_unlimited_deparse_with(query, cx, buf);
     if query.has_limit() {
         cx.clause_enter(Clause::Limit);
@@ -177,7 +177,7 @@ pub fn query_deparse_with<C: RopeDeparseContext>(query: Query<'_>, cx: &mut C, b
 }
 
 /// The query without its LIMIT/OFFSET.
-pub fn query_unlimited_deparse_with<C: RopeDeparseContext>(
+pub fn query_unlimited_deparse_with<C: DeparseContext>(
     query: Query<'_>,
     cx: &mut C,
     buf: &mut String,
@@ -205,7 +205,7 @@ pub fn query_unlimited_deparse_with<C: RopeDeparseContext>(
     }
 }
 
-fn cte_deparse_with<C: RopeDeparseContext>(cte: Cte<'_>, cx: &mut C, buf: &mut String) {
+fn cte_deparse_with<C: DeparseContext>(cte: Cte<'_>, cx: &mut C, buf: &mut String) {
     cte.name().deparse(buf);
     let aliases = cte.column_aliases();
     if aliases.len() > 0 {
@@ -224,7 +224,7 @@ fn cte_deparse_with<C: RopeDeparseContext>(cte: Cte<'_>, cx: &mut C, buf: &mut S
     buf.push(')');
 }
 
-fn body_deparse_with<C: RopeDeparseContext>(body: Body<'_>, cx: &mut C, buf: &mut String) {
+fn body_deparse_with<C: DeparseContext>(body: Body<'_>, cx: &mut C, buf: &mut String) {
     match body {
         Body::Select(select) => select_deparse_with(select, cx, buf),
         Body::Values(values) => values_deparse_with(values, cx, buf),
@@ -241,11 +241,7 @@ fn body_deparse_with<C: RopeDeparseContext>(body: Body<'_>, cx: &mut C, buf: &mu
     }
 }
 
-pub fn values_deparse_with<C: RopeDeparseContext>(
-    values: Values<'_>,
-    cx: &mut C,
-    buf: &mut String,
-) {
+pub fn values_deparse_with<C: DeparseContext>(values: Values<'_>, cx: &mut C, buf: &mut String) {
     cx.clause_enter(Clause::Values);
     buf.push_str("VALUES ");
     let mut row_sep = "";
@@ -264,11 +260,7 @@ pub fn values_deparse_with<C: RopeDeparseContext>(
     cx.clause_leave(Clause::Values);
 }
 
-pub fn select_deparse_with<C: RopeDeparseContext>(
-    select: Select<'_>,
-    cx: &mut C,
-    buf: &mut String,
-) {
+pub fn select_deparse_with<C: DeparseContext>(select: Select<'_>, cx: &mut C, buf: &mut String) {
     buf.push_str("SELECT");
     if select.distinct() {
         buf.push_str(" DISTINCT");
@@ -283,7 +275,7 @@ pub fn select_deparse_with<C: RopeDeparseContext>(
 }
 
 /// ` FROM a, b` when the select has sources.
-pub fn from_deparse_with<C: RopeDeparseContext>(
+pub fn from_deparse_with<C: DeparseContext>(
     from: Run<'_, Source<'_>>,
     cx: &mut C,
     buf: &mut String,
@@ -303,7 +295,7 @@ pub fn from_deparse_with<C: RopeDeparseContext>(
 }
 
 /// `keyword` then `expr`, when present, reported to the context as `clause`.
-pub fn where_clause_deparse_with<C: RopeDeparseContext>(
+pub fn where_clause_deparse_with<C: DeparseContext>(
     expr: Option<Where<'_>>,
     clause: Clause,
     keyword: &str,
@@ -320,7 +312,7 @@ pub fn where_clause_deparse_with<C: RopeDeparseContext>(
 }
 
 /// ` GROUP BY a, b` when the select groups.
-pub fn group_by_deparse_with<C: RopeDeparseContext>(
+pub fn group_by_deparse_with<C: DeparseContext>(
     group_by: Run<'_, Column<'_>>,
     cx: &mut C,
     buf: &mut String,
@@ -342,7 +334,7 @@ pub fn group_by_deparse_with<C: RopeDeparseContext>(
 /// `SELECT <projection>` over a branch's FROM, WHERE, GROUP BY and
 /// HAVING: the select list, ORDER BY and LIMIT never render, so a CDC row
 /// standing in for a table is evaluated for membership alone.
-pub fn branch_select_into<C: RopeDeparseContext>(
+pub fn branch_select_into<C: DeparseContext>(
     cx: &mut C,
     buf: &mut String,
     select: Select<'_>,
@@ -358,11 +350,7 @@ pub fn branch_select_into<C: RopeDeparseContext>(
 
 /// The select list; an item that renders to nothing (an empty star
 /// expansion) is dropped with its separator.
-fn select_items_deparse_with<C: RopeDeparseContext>(
-    select: Select<'_>,
-    cx: &mut C,
-    buf: &mut String,
-) {
+fn select_items_deparse_with<C: DeparseContext>(select: Select<'_>, cx: &mut C, buf: &mut String) {
     let Some(items) = select.items() else {
         buf.push(' ');
         return;
@@ -390,7 +378,7 @@ fn select_items_deparse_with<C: RopeDeparseContext>(
     }
 }
 
-fn order_by_list_deparse_with<C: RopeDeparseContext>(
+fn order_by_list_deparse_with<C: DeparseContext>(
     order_by: Run<'_, OrderBy<'_>>,
     cx: &mut C,
     buf: &mut String,
@@ -403,18 +391,14 @@ fn order_by_list_deparse_with<C: RopeDeparseContext>(
     }
 }
 
-pub fn order_by_deparse_with<C: RopeDeparseContext>(
-    clause: OrderBy<'_>,
-    cx: &mut C,
-    buf: &mut String,
-) {
+pub fn order_by_deparse_with<C: DeparseContext>(clause: OrderBy<'_>, cx: &mut C, buf: &mut String) {
     scalar_deparse_with(clause.expr(), cx, buf);
     buf.push(' ');
     clause.direction().deparse(buf);
     clause.null_order().deparse(buf);
 }
 
-fn source_deparse_with<C: RopeDeparseContext>(source: Source<'_>, cx: &mut C, buf: &mut String) {
+fn source_deparse_with<C: DeparseContext>(source: Source<'_>, cx: &mut C, buf: &mut String) {
     match source {
         Source::Table(table) => cx.table_deparse(table, buf),
         Source::Subquery(subquery) => subquery_deparse_with(subquery, cx, buf),
@@ -423,11 +407,7 @@ fn source_deparse_with<C: RopeDeparseContext>(source: Source<'_>, cx: &mut C, bu
     }
 }
 
-fn subquery_deparse_with<C: RopeDeparseContext>(
-    subquery: Subquery<'_>,
-    cx: &mut C,
-    buf: &mut String,
-) {
+fn subquery_deparse_with<C: DeparseContext>(subquery: Subquery<'_>, cx: &mut C, buf: &mut String) {
     buf.push(' ');
     if subquery.lateral() {
         buf.push_str("LATERAL ");
@@ -451,7 +431,7 @@ enum JoinQualText<'t> {
     Cross,
 }
 
-fn join_deparse_with<C: RopeDeparseContext>(join: Join<'_>, cx: &mut C, buf: &mut String) {
+fn join_deparse_with<C: DeparseContext>(join: Join<'_>, cx: &mut C, buf: &mut String) {
     source_deparse_with(join.left(), cx, buf);
     let qual = match join.qual() {
         JoinQual::Natural => match cx.natural_join_columns(join) {
@@ -507,7 +487,7 @@ fn join_deparse_with<C: RopeDeparseContext>(join: Join<'_>, cx: &mut C, buf: &mu
 
 // --- expressions -----------------------------------------------------------
 
-pub fn where_deparse_with<C: RopeDeparseContext>(expr: Where<'_>, cx: &mut C, buf: &mut String) {
+pub fn where_deparse_with<C: DeparseContext>(expr: Where<'_>, cx: &mut C, buf: &mut String) {
     match expr.kind() {
         WhereKind::Scalar(scalar) => scalar_deparse_with(scalar, cx, buf),
         WhereKind::Unary(unary) => unary_deparse_with(unary, cx, buf),
@@ -534,7 +514,7 @@ pub fn where_deparse_with<C: RopeDeparseContext>(expr: Where<'_>, cx: &mut C, bu
     }
 }
 
-fn unary_deparse_with<C: RopeDeparseContext>(unary: Unary<'_>, cx: &mut C, buf: &mut String) {
+fn unary_deparse_with<C: DeparseContext>(unary: Unary<'_>, cx: &mut C, buf: &mut String) {
     let op = unary.op();
     let operand = unary.expr();
     match op {
@@ -555,7 +535,7 @@ fn unary_deparse_with<C: RopeDeparseContext>(unary: Unary<'_>, cx: &mut C, buf: 
     }
 }
 
-fn binary_deparse_with<C: RopeDeparseContext>(binary: Binary<'_>, cx: &mut C, buf: &mut String) {
+fn binary_deparse_with<C: DeparseContext>(binary: Binary<'_>, cx: &mut C, buf: &mut String) {
     let op = binary.op();
     let (lexpr, rexpr) = (binary.lexpr(), binary.rexpr());
     where_parenthesized_deparse_with(lexpr, binary_child_needs_parens(op, lexpr), cx, buf);
@@ -573,7 +553,7 @@ fn binary_child_needs_parens(op: BinaryOp, child: Where<'_>) -> bool {
     }
 }
 
-fn where_parenthesized_deparse_with<C: RopeDeparseContext>(
+fn where_parenthesized_deparse_with<C: DeparseContext>(
     expr: Where<'_>,
     parens: bool,
     cx: &mut C,
@@ -588,7 +568,7 @@ fn where_parenthesized_deparse_with<C: RopeDeparseContext>(
     }
 }
 
-fn multi_deparse_with<C: RopeDeparseContext>(multi: Multi<'_>, cx: &mut C, buf: &mut String) {
+fn multi_deparse_with<C: DeparseContext>(multi: Multi<'_>, cx: &mut C, buf: &mut String) {
     let mut exprs = multi.exprs();
     let Some(first) = exprs.next() else {
         return;
@@ -628,7 +608,7 @@ fn multi_deparse_with<C: RopeDeparseContext>(multi: Multi<'_>, cx: &mut C, buf: 
     buf.push(')');
 }
 
-pub fn scalar_deparse_with<C: RopeDeparseContext>(expr: Scalar<'_>, cx: &mut C, buf: &mut String) {
+pub fn scalar_deparse_with<C: DeparseContext>(expr: Scalar<'_>, cx: &mut C, buf: &mut String) {
     match expr.kind() {
         ScalarKind::Column(column) => cx.column_deparse(column, buf),
         ScalarKind::Function(function) => function_deparse_with(function, cx, buf),
@@ -662,7 +642,7 @@ pub fn scalar_deparse_with<C: RopeDeparseContext>(expr: Scalar<'_>, cx: &mut C, 
     }
 }
 
-fn scalar_list_deparse_with<C: RopeDeparseContext>(
+fn scalar_list_deparse_with<C: DeparseContext>(
     exprs: Run<'_, Scalar<'_>>,
     separator: &str,
     cx: &mut C,
@@ -676,7 +656,7 @@ fn scalar_list_deparse_with<C: RopeDeparseContext>(
     }
 }
 
-fn case_deparse_with<C: RopeDeparseContext>(case: Case<'_>, cx: &mut C, buf: &mut String) {
+fn case_deparse_with<C: DeparseContext>(case: Case<'_>, cx: &mut C, buf: &mut String) {
     buf.push_str("CASE");
     if let Some(arg) = case.arg() {
         buf.push(' ');
@@ -695,11 +675,7 @@ fn case_deparse_with<C: RopeDeparseContext>(case: Case<'_>, cx: &mut C, buf: &mu
     buf.push_str(" END");
 }
 
-fn function_deparse_with<C: RopeDeparseContext>(
-    function: Function<'_>,
-    cx: &mut C,
-    buf: &mut String,
-) {
+fn function_deparse_with<C: DeparseContext>(function: Function<'_>, cx: &mut C, buf: &mut String) {
     cx.function_name_deparse(function, buf);
     buf.push('(');
     if function.agg_distinct() {
@@ -727,7 +703,7 @@ fn function_deparse_with<C: RopeDeparseContext>(
     }
 }
 
-fn window_deparse_with<C: RopeDeparseContext>(window: Window<'_>, cx: &mut C, buf: &mut String) {
+fn window_deparse_with<C: DeparseContext>(window: Window<'_>, cx: &mut C, buf: &mut String) {
     buf.push('(');
     let mut parts = 0u32;
     let partition_by = window.partition_by();
@@ -757,7 +733,7 @@ fn window_part_separate(parts: &mut u32, buf: &mut String) {
     *parts += 1;
 }
 
-fn frame_deparse_with<C: RopeDeparseContext>(frame: Frame<'_>, cx: &mut C, buf: &mut String) {
+fn frame_deparse_with<C: DeparseContext>(frame: Frame<'_>, cx: &mut C, buf: &mut String) {
     frame.mode().deparse(buf);
     buf.push_str(" BETWEEN ");
     frame_bound_deparse_with(frame.start(), cx, buf);
@@ -766,7 +742,7 @@ fn frame_deparse_with<C: RopeDeparseContext>(frame: Frame<'_>, cx: &mut C, buf: 
     frame.exclusion().deparse(buf);
 }
 
-fn frame_bound_deparse_with<C: RopeDeparseContext>(
+fn frame_bound_deparse_with<C: DeparseContext>(
     bound: FrameBound<'_>,
     cx: &mut C,
     buf: &mut String,

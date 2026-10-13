@@ -14,7 +14,7 @@ mod tree;
 mod view;
 
 pub use build::{Open, Remap, Replacement, Replacements, TreeBuilder};
-pub use deparse::{RopeDeparseContext, RopePlain};
+pub use deparse::{DeparseContext, Plain};
 pub use node::{FrameBoundKind, JoinQualKind, Node, NodeKind};
 pub use tree::QueryTree;
 pub use view::{

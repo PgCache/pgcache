@@ -1,6 +1,7 @@
 //! Decorrelation (ADR-014 to ADR-017, ADR-057): every correlated subquery
-//! becomes a join, planned over views and built over the base tree. A planner decides what each rewritten SELECT holds (the
-//! owned rewrite's flatten-one-conjunct-at-a-time result, as one plan),
+//! becomes a join, planned over views and built over the base tree. A
+//! planner decides what each rewritten SELECT holds (every correlated
+//! conjunct flattened, as one plan),
 //! then an emitter writes the plan in pre-order: untouched subtrees kept
 //! whole, carried pieces as copies with their references re-qualified,
 //! fresh nodes for the joins, the `_dcN` derived tables and the references

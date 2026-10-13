@@ -18,7 +18,7 @@ use crate::cache::{CacheError, CacheResult};
 use crate::catalog::Catalog;
 use crate::query::Fingerprint;
 use crate::query::ast::rope::{Body, NodeKind, QueryTree, TreeBuilder, View};
-use crate::query::constraints::{QueryConstraints, query_constraints_analyze_tree};
+use crate::query::constraints::{QueryConstraints, query_constraints_analyze};
 use crate::query::decorrelate::query_decorrelate;
 use crate::query::literal_settings::LiteralSettings;
 use crate::query::predicate::CompiledPredicate;
@@ -132,10 +132,9 @@ pub fn query_decorrelate_checked(
         .attach_loc("decorrelating correlated subqueries")
 }
 
-/// The constraints of an update branch, read from the rope; the owned walk
-/// stands in should a branch have no rope position, which no branch has.
+/// The constraints of an update branch, read at the branch's position.
 fn branch_constraints(bound: &ResolvedQuery, branch: QueryBranch<'_>) -> QueryConstraints {
-    query_constraints_analyze_tree(bound, branch.select)
+    query_constraints_analyze(bound, branch.select)
 }
 
 /// Classify a query's shape for MV eligibility on its decorrelated form

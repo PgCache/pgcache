@@ -38,7 +38,7 @@ use crate::query::ast::Clause;
 use crate::query::ast::rope::deparse::{
     from_deparse_with, values_deparse_with, where_clause_deparse_with,
 };
-use crate::query::ast::rope::{Body, Query, RopeDeparseContext};
+use crate::query::ast::rope::{Body, DeparseContext, Query};
 use crate::query::resolve::ResolvedQuery;
 use crate::result::error_chain_format;
 use crate::settings::PgSettings;
@@ -420,7 +420,7 @@ async fn mv_result_count(client: &Client, ctx: &MvBuildContext) -> CacheResult<u
 ///   result. This keeps the gate measuring reduction for UNION/INTERSECT/EXCEPT
 ///   the way it does for an aggregate's pre-grouping rows (PGC-329).
 /// - **VALUES**: the literal rows themselves.
-fn mv_gate_input_sql_into<C: RopeDeparseContext>(query: Query<'_>, cx: &mut C, buf: &mut String) {
+fn mv_gate_input_sql_into<C: DeparseContext>(query: Query<'_>, cx: &mut C, buf: &mut String) {
     match query.body() {
         Body::Select(select) => {
             // Constant projection, no DISTINCT: counts scanned rows (including

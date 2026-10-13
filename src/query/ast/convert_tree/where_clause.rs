@@ -373,7 +373,7 @@ unsafe fn a_expr_in_emit(
     unsafe {
         let op = in_operator_extract((*expr).name)?;
         let (lexpr, rexpr) = a_expr_operands(expr)?;
-        // The owned converter converts the subject before checking the list.
+        // The subject converts before the list is checked, so its error wins.
         let list_ok = node_tag(rexpr) == pg::NodeTag_T_List;
         let open = builder.open(NodeKind::Multi {
             op,
@@ -534,8 +534,8 @@ unsafe fn bool_expr_emit(
     }
 }
 
-/// `args` as a left-associated chain of `op`, as the owned converter
-/// nests an n-ary boolean expression.
+/// `args` as a left-associated chain of `op`: how pg_query's n-ary boolean
+/// expression nests.
 unsafe fn bool_chain_emit(
     builder: &mut TreeBuilder<'_>,
     op: BinaryOp,

@@ -15,7 +15,7 @@ use crate::query::ast::rope::{
 };
 use crate::query::ast::{BinaryOp, LiteralValue, MultiOp};
 use crate::query::cast::{
-    CastTarget, cast_target_is_coercion_supported, comparison_canonicalize_tree, scalar_leaf_tree,
+    CastTarget, cast_target_is_coercion_supported, comparison_canonicalize, scalar_leaf,
 };
 use crate::query::resolve::ResolvedQuery;
 
@@ -27,10 +27,7 @@ struct Collector<'a> {
 }
 
 /// The constraints of `select`, a SELECT of `bound`'s rope.
-pub fn query_constraints_analyze_tree(
-    bound: &ResolvedQuery,
-    select: Select<'_>,
-) -> QueryConstraints {
+pub fn query_constraints_analyze(bound: &ResolvedQuery, select: Select<'_>) -> QueryConstraints {
     let mut collector = Collector {
         bound,
         constraints: HashSet::new(),
@@ -51,7 +48,7 @@ pub fn query_constraints_analyze_tree(
 }
 
 /// The column and literal of `exprs[index]` when it is a bare column or
-/// literal, as the extractors pattern-match the owned list.
+/// literal, as the extractors pattern-match the operand list.
 enum Operand<'t> {
     Column(Column<'t>),
     Literal(Literal<'t>),
@@ -100,8 +97,7 @@ impl Collector<'_> {
     }
 
     fn comparison_analyze(&mut self, binary: Binary<'_>) {
-        if let Some((column, target, op, value)) = comparison_canonicalize_tree(self.bound, binary)
-        {
+        if let Some((column, target, op, value)) = comparison_canonicalize(self.bound, binary) {
             self.canonical_insert(column, target, op, value);
         } else if let Some((left, right)) = self.column_pair(binary) {
             self.equivalences.insert(ColumnEquivalence { left, right });
@@ -150,8 +146,8 @@ impl Collector<'_> {
         if binary.op() != BinaryOp::Equal {
             return None;
         }
-        let left = scalar_leaf_tree(self.bound, binary.lexpr())?;
-        let right = scalar_leaf_tree(self.bound, binary.rexpr())?;
+        let left = scalar_leaf(self.bound, binary.lexpr())?;
+        let right = scalar_leaf(self.bound, binary.rexpr())?;
         let (ScalarKind::Column(left), ScalarKind::Column(right)) = (left.kind(), right.kind())
         else {
             return None;
@@ -303,7 +299,7 @@ impl Collector<'_> {
     }
 
     /// Each `col <> value` up to the first operand that is not a comparable
-    /// literal, as the owned walk inserts them.
+    /// literal.
     fn not_in_extract<'t>(&mut self, mut exprs: Run<'t, Where<'t>>) {
         let Some(Operand::Column(column)) = exprs.next().map(operand) else {
             return;

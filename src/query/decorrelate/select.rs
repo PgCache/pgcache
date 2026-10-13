@@ -1,8 +1,7 @@
 //! One SELECT: scalar subqueries in its select list, then its WHERE
 //! conjuncts; EXISTS / NOT EXISTS / IN / NOT IN flatten to a join, a
 //! correlated scalar subquery becomes a LEFT JOINed derived table, the
-//! rest stays. The plan is the owned rewrite's result, decided in one pass
-//! and written once.
+//! rest stays. The plan is decided in one pass and written once.
 
 use ecow::EcoString;
 use postgres_types::Type;

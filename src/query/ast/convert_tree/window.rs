@@ -53,7 +53,7 @@ pub(super) unsafe fn window_defs_extract(
                     feature: "unnamed WINDOW clause entry".to_owned(),
                 });
             }
-            // The owned converter validates every definition up front.
+            // Every definition is validated up front, referenced or not.
             window_spec_check(win_def)?;
             defs.insert(EcoString::from(name), win_def);
         }
@@ -62,8 +62,8 @@ pub(super) unsafe fn window_defs_extract(
 }
 
 /// A function's `OVER` clause: a bare `OVER w` emits the named definition
-/// (only in the select list that holds the `WINDOW` clause, as the owned
-/// converter resolved it); an inline `OVER (...)` is emitted directly.
+/// (only in the select list that holds the `WINDOW` clause); an inline
+/// `OVER (...)` is emitted directly.
 pub(super) unsafe fn window_emit(
     builder: &mut TreeBuilder<'_>,
     win_def: *const pg::WindowDef,

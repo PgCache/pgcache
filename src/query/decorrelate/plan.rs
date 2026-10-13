@@ -65,7 +65,7 @@ pub(super) enum WherePlan<'t> {
 }
 
 impl<'t> WherePlan<'t> {
-    /// `items` AND-ed left to right, as the owned rewrite folds conjuncts.
+    /// `items` AND-ed left to right.
     pub(super) fn and_fold(items: Vec<WherePlan<'t>>) -> Option<WherePlan<'t>> {
         items
             .into_iter()

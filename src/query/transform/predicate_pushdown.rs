@@ -494,8 +494,7 @@ impl<'a, 't> Emit<'a, 't> {
         }
     }
 
-    /// `items` as a left-associated AND chain, as the owned rewrite joins
-    /// conjuncts; nothing for no items.
+    /// `items` as a left-associated AND chain; nothing for no items.
     fn and_chain_emit(&mut self, items: &[AndItem<'a, 't>]) {
         let Some((last, init)) = items.split_last() else {
             return;

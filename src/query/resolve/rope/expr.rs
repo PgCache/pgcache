@@ -46,7 +46,7 @@ pub(super) fn where_resolve<'a>(
             if let Some(test_expr) = subquery.test_expr() {
                 scalar_resolve(test_expr, scope)?;
             }
-            scope.subquery_resolve_tree(subquery.query())?;
+            scope.subquery_resolve(subquery.query())?;
         }
     }
     Ok(())
@@ -96,7 +96,7 @@ pub(super) fn scalar_resolve<'a>(
             Ok(None)
         }
         ScalarKind::Subquery(subquery) => {
-            scope.subquery_resolve_tree(subquery.query())?;
+            scope.subquery_resolve(subquery.query())?;
             Ok(None)
         }
         ScalarKind::Array(array) => {

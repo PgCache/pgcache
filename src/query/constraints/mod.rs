@@ -30,7 +30,7 @@ mod tests;
 mod tree;
 
 pub use subsume::table_constraints_subsumed;
-pub use tree::query_constraints_analyze_tree;
+pub use tree::query_constraints_analyze;
 
 pub(crate) use range::{ColumnRange, column_range_build};
 #[cfg(feature = "proxy")]

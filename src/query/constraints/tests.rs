@@ -59,7 +59,7 @@ fn resolve_sql(sql: &str, tables: &Catalog) -> ResolvedQuery {
 
 /// The constraints of a bound SELECT.
 fn analyze_query_constraints(bound: &ResolvedQuery) -> QueryConstraints {
-    query_constraints_analyze_tree(bound, bound.select().expect("a SELECT"))
+    query_constraints_analyze(bound, bound.select().expect("a SELECT"))
 }
 
 /// The constraints of `sql`.

@@ -196,7 +196,7 @@ pub fn bool_literal_parse(s: &str) -> Option<bool> {
 
 /// `expr` without an identity cast: `column::text` on a text column is the
 /// column itself. Any other cast, or a cast of a non-column, is kept.
-pub fn identity_cast_strip_tree<'t>(bound: &ResolvedQuery, expr: Scalar<'t>) -> Scalar<'t> {
+pub fn identity_cast_strip<'t>(bound: &ResolvedQuery, expr: Scalar<'t>) -> Scalar<'t> {
     let ScalarKind::TypeCast(cast) = expr.kind() else {
         return expr;
     };
@@ -211,9 +211,9 @@ pub fn identity_cast_strip_tree<'t>(bound: &ResolvedQuery, expr: Scalar<'t>) -> 
 }
 
 /// The scalar a WHERE operand holds, without an identity cast.
-pub fn scalar_leaf_tree<'t>(bound: &ResolvedQuery, expr: Where<'t>) -> Option<Scalar<'t>> {
+pub fn scalar_leaf<'t>(bound: &ResolvedQuery, expr: Where<'t>) -> Option<Scalar<'t>> {
     match expr.kind() {
-        WhereKind::Scalar(scalar) => Some(identity_cast_strip_tree(bound, scalar)),
+        WhereKind::Scalar(scalar) => Some(identity_cast_strip(bound, scalar)),
         WhereKind::Unary(_)
         | WhereKind::Binary(_)
         | WhereKind::Multi(_)
@@ -221,7 +221,7 @@ pub fn scalar_leaf_tree<'t>(bound: &ResolvedQuery, expr: Where<'t>) -> Option<Sc
     }
 }
 
-pub fn comparison_canonicalize_tree<'t>(
+pub fn comparison_canonicalize<'t>(
     bound: &ResolvedQuery,
     binary: Binary<'t>,
 ) -> Option<(
@@ -230,8 +230,8 @@ pub fn comparison_canonicalize_tree<'t>(
     BinaryOp,
     &'t LiteralValue,
 )> {
-    let lleaf = scalar_leaf_tree(bound, binary.lexpr());
-    let rleaf = scalar_leaf_tree(bound, binary.rexpr());
+    let lleaf = scalar_leaf(bound, binary.lexpr());
+    let rleaf = scalar_leaf(bound, binary.rexpr());
     let column_target = |scalar: Scalar<'t>| match scalar.kind() {
         ScalarKind::Column(column) => Some((column, None)),
         ScalarKind::TypeCast(cast) => match cast.expr().kind() {

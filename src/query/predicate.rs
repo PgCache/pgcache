@@ -14,7 +14,7 @@
 use crate::pg::protocol::ByteString;
 use crate::query::ast::rope::{ScalarKind, Where, WhereKind};
 use crate::query::ast::{BinaryOp, LiteralValue, UnaryOp};
-use crate::query::cast::{CastTarget, cast_target_coerce_text, comparison_canonicalize_tree};
+use crate::query::cast::{CastTarget, cast_target_coerce_text, comparison_canonicalize};
 use crate::query::evaluate::literal_compare;
 use crate::query::resolve::ResolvedQuery;
 use crate::query::typed_compare::TypedLiteral;
@@ -74,7 +74,7 @@ impl CompiledPredicate {
                 | BinaryOp::LessThanOrEqual
                 | BinaryOp::GreaterThan
                 | BinaryOp::GreaterThanOrEqual => {
-                    let compare = comparison_canonicalize_tree(bound, binary).and_then(
+                    let compare = comparison_canonicalize(bound, binary).and_then(
                         |(column, target, op, value)| {
                             let binding = bound.column_binding_at(column.id())?;
                             let table = bound.column_table_at(column.id())?;
