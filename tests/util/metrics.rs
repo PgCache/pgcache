@@ -44,6 +44,8 @@ pub(crate) struct MetricsSnapshot {
     pub cache_serve_settings_applied: u64,
     pub cache_reference_only_forwards: u64,
     pub cache_memo_evictions: u64,
+    /// Gauge: memo version slots currently held.
+    pub cache_memo_slots: u64,
     pub cache_cdc_local_eval_hits: u64,
     pub cache_cdc_pg_eval_hits: u64,
     pub protocol_describe_cache_hits: u64,
@@ -154,6 +156,7 @@ const SAMPLES: &[Sample] = samples! {
     "pgcache_cache_serve_settings_applied" => cache_serve_settings_applied,
     "pgcache_cache_reference_only_forward_total" => cache_reference_only_forwards,
     "pgcache_cache_memo_evictions" => cache_memo_evictions,
+    "pgcache_cache_memo_slots" => cache_memo_slots,
     "pgcache_cache_cdc_local_eval_hits" => cache_cdc_local_eval_hits,
     "pgcache_cache_cdc_pg_eval_hits" => cache_cdc_pg_eval_hits,
     "pgcache_protocol_describe_cache_hits" => protocol_describe_cache_hits,

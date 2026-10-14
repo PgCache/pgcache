@@ -6,7 +6,6 @@ use super::core::WriterCore;
 #[cfg(feature = "fault-injection")]
 use super::core::fault;
 use crate::cache::Generation;
-use crate::cache::memo::SlotKey;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, types::CachedQueryState};
 use crate::oid::Oid;
 use crate::query::Fingerprint;
@@ -375,6 +374,7 @@ impl WriterCore {
                     .update_queries_remove_fingerprint(*fp, &query.relation_oids);
                 self.active_relations_release(&query.relation_oids);
             }
+            self.memo_eligible_remove(*fp);
         }
 
         self.state_view
@@ -539,22 +539,10 @@ impl WriterCore {
 
         // Remove from state view
         self.state_view.cached_queries.remove(&fingerprint);
-        self.memo_eligible.remove(&fingerprint);
-
-        // Eagerly invalidate this query's captured memo by bumping its
-        // per-fingerprint slot (ADR-045). The memo-eviction pass no longer scans
-        // every memo per CDC row, so it can't catch an evicted query's orphan
-        // memo once the query leaves `update_queries`/`eval_index`; without this
-        // bump a re-registration could serve a stale orphan (the first serve
-        // precedes re-capture). The bump (begin→end, +2) makes any stamped
-        // orphan version stale at once, so `memo.get` rejects it; the next
-        // capture re-stamps the new version.
-        self.state_view
-            .memo
-            .slot_dirty_begin(SlotKey::Memo(fingerprint));
-        self.state_view
-            .memo
-            .slot_dirty_end(SlotKey::Memo(fingerprint));
+        // Removing the memo slot turns any orphan memo stale at once (ADR-045):
+        // once the query leaves `update_queries`/`eval_index` no CDC row bumps it,
+        // so a re-registration could otherwise serve it before re-capture.
+        self.memo_eligible_remove(fingerprint);
 
         // Drain coalesced waiters parked on the now-removed query (eviction can
         // remove a Loading query whose waiters would otherwise never be drained).

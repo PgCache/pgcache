@@ -192,6 +192,9 @@ pub mod names {
     pub const CACHE_MEMO_ENTRIES: &str = "pgcache.cache.memo_entries";
     /// Current total bytes held by the memo.
     pub const CACHE_MEMO_BYTES: &str = "pgcache.cache.memo_bytes";
+    /// Current number of memo version slots: one `Memo` slot per memo-eligible
+    /// query plus one `Relation` slot per relation a frame has touched.
+    pub const CACHE_MEMO_SLOTS: &str = "pgcache.cache.memo_slots";
 
     // Cache state metrics (admission/eviction policy)
     pub const CACHE_QUERIES_PENDING: &str = "pgcache.cache.queries_pending";
@@ -664,6 +667,7 @@ pub struct CacheHandles {
     pub serve_settings_applied: Counter,
     pub memo_entries: Gauge,
     pub memo_bytes: Gauge,
+    pub memo_slots: Gauge,
     /// Incremented each time the supervisor rebuilds the cache subsystem.
     pub restarts_total: Counter,
     /// Incremented each time a discarded serve-pool connection is replaced.
@@ -704,13 +708,13 @@ impl CacheHandles {
             CACHE_COALESCE_DEADLINE_FORWARD, CACHE_COALESCE_SERVED, CACHE_COALESCE_WAITING,
             CACHE_LOOKUP_LATENCY_SECONDS, CACHE_MARGINAL_BYTES_PER_QUERY, CACHE_MEMO_BYTES,
             CACHE_MEMO_CAPTURES, CACHE_MEMO_ENTRIES, CACHE_MEMO_EVICTIONS, CACHE_MEMO_HITS,
-            CACHE_MEMORY_BUDGET_BYTES, CACHE_MEMORY_USED_BYTES, CACHE_MV_BUILDS_SUPPRESSED,
-            CACHE_MV_FALLTHROUGH, CACHE_MV_HITS, CACHE_POOL_AVAILABLE, CACHE_POOL_RECYCLED,
-            CACHE_POOL_REPLENISHED, CACHE_QUERY_COUNT_CAP, CACHE_REFERENCE_ONLY_FORWARD_TOTAL,
-            CACHE_REG_GATE_BTLBW, CACHE_REG_GATE_DRAIN_RATE, CACHE_REG_GATE_LOADING,
-            CACHE_REG_GATE_QUEUE_MIN, CACHE_REG_GATE_RATE, CACHE_REGISTRATION_THROTTLED,
-            CACHE_REGISTRATION_THROTTLED_TOTAL, CACHE_RESTARTS_TOTAL, CACHE_RSS_BYTES,
-            CACHE_SERVE_DESYNC_TOTAL, CACHE_SERVE_DIRTY_RETURN_TOTAL,
+            CACHE_MEMO_SLOTS, CACHE_MEMORY_BUDGET_BYTES, CACHE_MEMORY_USED_BYTES,
+            CACHE_MV_BUILDS_SUPPRESSED, CACHE_MV_FALLTHROUGH, CACHE_MV_HITS, CACHE_POOL_AVAILABLE,
+            CACHE_POOL_RECYCLED, CACHE_POOL_REPLENISHED, CACHE_QUERY_COUNT_CAP,
+            CACHE_REFERENCE_ONLY_FORWARD_TOTAL, CACHE_REG_GATE_BTLBW, CACHE_REG_GATE_DRAIN_RATE,
+            CACHE_REG_GATE_LOADING, CACHE_REG_GATE_QUEUE_MIN, CACHE_REG_GATE_RATE,
+            CACHE_REGISTRATION_THROTTLED, CACHE_REGISTRATION_THROTTLED_TOTAL, CACHE_RESTARTS_TOTAL,
+            CACHE_RSS_BYTES, CACHE_SERVE_DESYNC_TOTAL, CACHE_SERVE_DIRTY_RETURN_TOTAL,
             CACHE_SERVE_POOL_BACKSTOP_GROWS, CACHE_SERVE_POOL_SCALE_DOWN,
             CACHE_SERVE_POOL_SCALE_UP, CACHE_SERVE_POOL_SIZE, CACHE_SERVE_SETTINGS_APPLIED,
             CACHE_SERVE_STALL_TOTAL, CACHE_SERVES_IN_FLIGHT,
@@ -729,6 +733,7 @@ impl CacheHandles {
             memo_evictions: metrics::counter!(CACHE_MEMO_EVICTIONS),
             memo_entries: metrics::gauge!(CACHE_MEMO_ENTRIES),
             memo_bytes: metrics::gauge!(CACHE_MEMO_BYTES),
+            memo_slots: metrics::gauge!(CACHE_MEMO_SLOTS),
             restarts_total: metrics::counter!(CACHE_RESTARTS_TOTAL),
             pool_replenished: metrics::counter!(CACHE_POOL_REPLENISHED),
             pool_recycled: metrics::counter!(CACHE_POOL_RECYCLED),

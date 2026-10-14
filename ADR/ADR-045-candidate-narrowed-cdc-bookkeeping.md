@@ -68,7 +68,7 @@ The shared old-image probe is the same one MV already uses, so memo and MV conve
 - Three more per-relation sets to maintain on query insert/remove, plus a second (old-image) probe per UPDATE for the memo pass.
 - The never-under-return guarantee is now load-bearing for **invalidation and memo**, not just optimization: any change to the probe forms, the carve-out rules, or the source/limit classification that drops a true candidate becomes a stale-read bug. The asymmetric (invalidation) vs symmetric (memo) split is itself part of the invariant — narrowing memo with the invalidation set would miss shrinks.
 - Conservative full-set fallbacks remain where the probe cannot reason precisely (PgEval memos; PK-only old images under REPLICA IDENTITY DEFAULT), so those do not benefit.
-- Frames bump `Memo(F)` for eligible candidates that have no entry, creating slot-map entries earlier than eviction would. The capture gate and the eviction filter must share `memo_eligible`, or a capturable query escapes the bump.
+- Frames bump `Memo(F)` for eligible candidates that have no entry; the slot already exists from eligibility (ADR-036), so this adds no slot-map entries. The capture gate and the eviction filter must share `memo_eligible`, or a capturable query escapes the bump.
 
 ## Implementation Notes
 - Carve-out sets live on `UpdateQueries` (`src/cache/update_query.rs`), updated wherever queries are inserted/removed (mirroring `subsumption`/`eval_index`).

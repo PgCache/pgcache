@@ -609,18 +609,32 @@ impl WriterCore {
         self.memo_eligibility_record(fingerprint, state);
     }
 
-    /// Track a query's MV state for the CDC memo-eviction filter. A query that
-    /// turns eligible while a batch is open joins the batch's eviction set: rows
-    /// replayed earlier filtered it out, yet a capture can still land before
-    /// the commit.
+    /// Track a query's MV state for the CDC memo-eviction filter, creating its
+    /// memo slot as it turns eligible. A query that turns eligible while a
+    /// batch is open joins the batch's eviction set: rows replayed earlier
+    /// filtered it out, yet a capture can still land before the commit.
     pub(super) fn memo_eligibility_record(&mut self, fingerprint: Fingerprint, state: MvState) {
         if !state.memo_eligible() {
             return;
         }
-        self.memo_eligible.insert(fingerprint);
+        if self.memo_eligible.insert(fingerprint) {
+            self.state_view.memo.memo_slot_create(fingerprint);
+        }
         if self.frame_state != FrameState::Idle {
             self.frame_memo_evictions.insert(fingerprint);
         }
+    }
+
+    /// Retire a query from memoization on eviction, failure or invalidation
+    /// purge: its memo slot is removed, which turns every entry and in-flight
+    /// capture of it stale, and an open frame stops bracketing it so the
+    /// bracket cannot recreate the slot. A never-eligible query has no slot.
+    pub(super) fn memo_eligible_remove(&mut self, fingerprint: Fingerprint) {
+        if !self.memo_eligible.remove(&fingerprint) {
+            return;
+        }
+        self.frame_memo_evictions.remove(&fingerprint);
+        self.state_view.memo.memo_slot_remove(fingerprint);
     }
 
     /// Preserves shape_gate and mv_state. Private — callers must go through

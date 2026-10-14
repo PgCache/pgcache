@@ -436,7 +436,7 @@ impl WriterRegistration {
         }
 
         core.state_view.cached_queries.remove(&fingerprint);
-        core.memo_eligible.remove(&fingerprint);
+        core.memo_eligible_remove(fingerprint);
         core.waiters_fail(fingerprint);
     }
 }

@@ -49,8 +49,21 @@
 //!
 //! The writer is single-threaded and processes frames serially, so `begin`/`end`
 //! are balanced per relation per frame and the version never sticks odd.
+//!
+//! ## Slot lifetime: versions never decrease
+//!
+//! A `Memo` slot lives exactly as long as its fingerprint is capturable: the
+//! writer creates it as the query turns memo-eligible and removes it when the
+//! query is evicted or fails. A missing `Memo` slot reads [`ResultMemo`]'s
+//! floor rather than 0, and both create and remove first raise the floor above
+//! every version ever written. So the version a slot reads never decreases, a
+//! stamp matches only while its slot has not moved past it, and a removal can
+//! only turn a stamp stale — never make a stale stamp valid again, whatever
+//! entries or captures are in flight. A missing `Memo` slot is never stamped,
+//! so every stamp sits below every later floor. Relation slots are never
+//! removed, so they start at 0 and a floor raise leaves them alone.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
@@ -182,6 +195,11 @@ pub struct MemoHit {
 pub struct ResultMemo {
     entries: DashMap<MemoKey, MemoEntry>,
     slot_epochs: DashMap<SlotKey, u64>,
+    /// Version of every missing `Memo` slot, and the version one is created at.
+    /// Raised above `version_max` by every `Memo` slot create and remove.
+    slot_floor: AtomicU64,
+    /// Highest version any `Memo` slot has been bumped to. Writer only.
+    version_max: AtomicU64,
     total_bytes: AtomicUsize,
     /// Set when a slot is bumped (an entry may have become stale); cleared by
     /// `gc`. Lets the periodic sweep skip the full scan when nothing changed
@@ -195,6 +213,8 @@ impl ResultMemo {
         Self {
             entries: DashMap::new(),
             slot_epochs: DashMap::new(),
+            slot_floor: AtomicU64::new(0),
+            version_max: AtomicU64::new(0),
             total_bytes: AtomicUsize::new(0),
             gc_pending: AtomicBool::new(false),
             dynamic,
@@ -224,7 +244,7 @@ impl ResultMemo {
     /// Writer/CDC path — call this *before* the frame COMMIT for every relation
     /// the frame touches. Existing memos over the slot stop being served at once.
     pub fn slot_dirty_begin(&self, slot: SlotKey) {
-        *self.slot_epochs.entry(slot).or_insert(0) += 1;
+        self.slot_advance(slot);
         // An entry may now be stale; arm the next gc sweep.
         self.gc_pending.store(true, Ordering::Relaxed);
     }
@@ -233,25 +253,74 @@ impl ResultMemo {
     /// odd→even. Writer/CDC path — call this *after* the frame COMMIT. Balances
     /// the preceding [`slot_dirty_begin`](Self::slot_dirty_begin).
     pub fn slot_dirty_end(&self, slot: SlotKey) {
-        *self.slot_epochs.entry(slot).or_insert(0) += 1;
+        // Only an open bracket closes: a slot created even mid-bracket would
+        // otherwise stick odd and never be captured again.
+        let Some(mut version) = self.slot_epochs.get_mut(&slot) else {
+            return;
+        };
+        if version.is_multiple_of(2) {
+            return;
+        }
+        *version += 1;
+        self.version_max_track(slot, *version);
     }
 
-    /// Current seqlock version of a slot (`0` if never touched; even = stable,
-    /// odd = a write is in progress).
+    fn slot_advance(&self, slot: SlotKey) {
+        let mut version = self
+            .slot_epochs
+            .entry(slot)
+            .or_insert_with(|| self.slot_base(slot));
+        *version += 1;
+        self.version_max_track(slot, *version);
+    }
+
+    /// Only `Memo` slots read the floor, so only their versions bound it.
+    fn version_max_track(&self, slot: SlotKey, version: u64) {
+        if matches!(slot, SlotKey::Memo(_)) && version > self.version_max.load(Ordering::Relaxed) {
+            self.version_max.store(version, Ordering::Relaxed);
+        }
+    }
+
+    /// Current seqlock version of a slot (its base if it has no entry; even =
+    /// stable, odd = a write is in progress).
     pub fn slot_version(&self, slot: SlotKey) -> u64 {
-        self.slot_epochs.get(&slot).map(|e| *e).unwrap_or(0)
+        self.slot_epochs
+            .get(&slot)
+            .map_or_else(|| self.slot_base(slot), |e| *e)
+    }
+
+    /// Version of a slot with no entry: the floor for a `Memo` slot, 0 for the
+    /// never-removed relation slots.
+    fn slot_base(&self, slot: SlotKey) -> u64 {
+        match slot {
+            SlotKey::Memo(_) => self.floor(),
+            SlotKey::Relation(_) | SlotKey::RelationMembership(_) | SlotKey::RelationColumn(..) => {
+                0
+            }
+        }
+    }
+
+    fn floor(&self) -> u64 {
+        self.slot_floor.load(Ordering::Acquire)
     }
 
     /// Snapshot the current versions of `slots` (worker/capture path), to be
     /// called *before* issuing the serve query whose bytes will be captured.
     /// Returns `None` if any slot is mid-write (odd) — capture must skip rather
-    /// than stamp a pending version.
+    /// than stamp a pending version — or a `Memo` slot is missing: a capturable
+    /// query always has one, so its query is retired and a stamp at the floor
+    /// could outlive it.
     pub fn slots_stamp(&self, slots: &[SlotKey]) -> Option<Box<[(SlotKey, u64)]>> {
         slots
             .iter()
             .map(|&slot| {
-                let v = self.slot_version(slot);
-                v.is_multiple_of(2).then_some((slot, v))
+                let version = match slot {
+                    SlotKey::Memo(_) => *self.slot_epochs.get(&slot)?,
+                    SlotKey::Relation(_)
+                    | SlotKey::RelationMembership(_)
+                    | SlotKey::RelationColumn(..) => self.slot_version(slot),
+                };
+                version.is_multiple_of(2).then_some((slot, version))
             })
             .collect()
     }
@@ -355,6 +424,8 @@ impl ResultMemo {
         cache.memo_entries.set(self.entries.len() as f64);
         #[allow(clippy::cast_precision_loss)]
         cache.memo_bytes.set(self.total_bytes() as f64);
+        #[allow(clippy::cast_precision_loss)]
+        cache.memo_slots.set(self.slot_epochs.len() as f64);
     }
 
     /// Sweep entries whose stamped versions have advanced, reclaiming their
@@ -374,6 +445,36 @@ impl ResultMemo {
         for key in stale {
             self.remove(&key);
         }
+    }
+
+    /// Create a fingerprint's `Memo` slot as the query turns memo-eligible.
+    /// Writer only. Raising the floor first puts the slot above any stamp taken
+    /// while it was missing, such as a capture that passed the serve gate just
+    /// before the fingerprint's last eviction.
+    pub fn memo_slot_create(&self, fingerprint: Fingerprint) {
+        let slot = SlotKey::Memo(fingerprint);
+        if self.slot_epochs.contains_key(&slot) {
+            return;
+        }
+        let floor = self.floor_raise();
+        self.slot_epochs.insert(slot, floor);
+    }
+
+    /// Remove a fingerprint's `Memo` slot once the query can no longer be
+    /// captured. Writer only. The floor is raised first, so the missing slot
+    /// reads above every stamp taken against it and its entries and in-flight
+    /// captures turn stale. Safe mid-bracket: the raise covers an odd version.
+    pub fn memo_slot_remove(&self, fingerprint: Fingerprint) {
+        self.floor_raise();
+        self.slot_epochs.remove(&SlotKey::Memo(fingerprint));
+        self.gc_pending.store(true, Ordering::Relaxed);
+    }
+
+    fn floor_raise(&self) -> u64 {
+        let version_max = self.version_max.load(Ordering::Relaxed).max(self.floor());
+        let floor = (version_max + 2) & !1;
+        self.slot_floor.store(floor, Ordering::Release);
+        floor
     }
 
     pub fn len(&self) -> usize {
@@ -532,6 +633,7 @@ mod tests {
     #[test]
     fn test_capture_stamps_only_memo_slot() {
         let m = memo(1 << 20);
+        m.memo_slot_create(Fingerprint::from_raw(7));
         let oid = Oid::from_raw(10);
         let k = key(7);
 
@@ -554,6 +656,7 @@ mod tests {
     #[test]
     fn test_capture_stored_mid_replay_is_busted_by_its_memo_bump() {
         let m = memo(1 << 20);
+        m.memo_slot_create(Fingerprint::from_raw(7));
         let oid = Oid::from_raw(10);
         let k = key(7);
         let slot = SlotKey::Memo(k.fingerprint);
@@ -576,6 +679,7 @@ mod tests {
     #[test]
     fn test_entry_inserted_after_its_memo_bump_is_not_served() {
         let m = memo(1 << 20);
+        m.memo_slot_create(Fingerprint::from_raw(7));
         let k = key(7);
         let slot = SlotKey::Memo(k.fingerprint);
         let stamped = stamp(&m, &[slot]);
@@ -595,6 +699,7 @@ mod tests {
     #[test]
     fn test_capture_over_an_empty_store_is_dropped_by_the_bracket() {
         let m = memo(1 << 20);
+        m.memo_slot_create(Fingerprint::from_raw(7));
         let oid = Oid::from_raw(10);
         assert!(m.is_empty());
         assert!(
@@ -629,6 +734,8 @@ mod tests {
     #[test]
     fn test_capture_dropped_when_read_relation_written_mid_window() {
         let m = memo(1 << 20);
+        m.memo_slot_create(Fingerprint::from_raw(7));
+        let created = m.slot_version(SlotKey::Memo(Fingerprint::from_raw(7)));
         let oid = Oid::from_raw(10);
         let k = key(7);
 
@@ -643,7 +750,7 @@ mod tests {
         m.slot_dirty_end(SlotKey::Relation(oid));
         assert_eq!(
             m.slot_version(SlotKey::Memo(Fingerprint::from_raw(7))),
-            0,
+            created,
             "the fingerprint's own Memo slot was not bumped"
         );
 
@@ -831,6 +938,168 @@ mod tests {
         assert!(m.is_empty(), "stale entry swept once gc is armed");
     }
 
+    fn slot_bump(m: &ResultMemo, slot: SlotKey) {
+        m.slot_dirty_begin(slot);
+        m.slot_dirty_end(slot);
+    }
+
+    /// A capture validated before its query was evicted, inserted only after the
+    /// slot was removed, must not be served.
+    #[test]
+    fn test_memo_slot_remove_late_insert_not_served() {
+        let m = memo(1 << 20);
+        let fingerprint = Fingerprint::from_raw(1);
+        m.memo_slot_create(fingerprint);
+        let stamped = stamp(&m, &[SlotKey::Memo(fingerprint)]);
+        assert!(m.slots_valid(&stamped), "capture validated before removal");
+
+        m.memo_slot_remove(fingerprint);
+        m.insert(key(1), entry(b"orphan", &stamped));
+
+        assert!(m.get(&key(1)).is_none(), "orphan not served");
+    }
+
+    #[test]
+    fn test_memo_slot_remove_drops_inflight_capture() {
+        let m = memo(1 << 20);
+        let fingerprint = Fingerprint::from_raw(1);
+        m.memo_slot_create(fingerprint);
+        let mut capture =
+            MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).expect("capture begins");
+        capture.command_complete_push(b"C");
+
+        m.memo_slot_remove(fingerprint);
+
+        assert!(!capture.finish(&m), "capture across removal dropped");
+        assert!(m.is_empty());
+    }
+
+    /// A capture whose serve gate passed just before its query was evicted must
+    /// not stamp the missing slot: a floor stamp could outlive a re-registration
+    /// that never turns eligible, and so never raises the floor.
+    #[test]
+    fn test_capture_refused_on_removed_memo_slot() {
+        let m = memo(1 << 20);
+        let fingerprint = Fingerprint::from_raw(1);
+        m.memo_slot_create(fingerprint);
+        m.memo_slot_remove(fingerprint);
+
+        assert!(MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).is_none());
+    }
+
+    #[test]
+    fn test_memo_slot_recreated_above_old_stamps() {
+        let m = memo(1 << 20);
+        let fingerprint = Fingerprint::from_raw(1);
+        m.memo_slot_create(fingerprint);
+        slot_bump(&m, SlotKey::Memo(fingerprint));
+        let old = stamp(&m, &[SlotKey::Memo(fingerprint)]);
+        m.insert(key(1), entry(b"old", &old));
+        m.memo_slot_remove(fingerprint);
+
+        m.memo_slot_create(fingerprint);
+
+        assert!(m.slot_version(SlotKey::Memo(fingerprint)) > old[0].1);
+        assert!(
+            m.get(&key(1)).is_none(),
+            "old entry not served after re-create"
+        );
+    }
+
+    /// A query turning eligible inside a frame's bracket gets an even slot; the
+    /// bracket's end must not flip it odd.
+    #[test]
+    fn test_slot_dirty_end_leaves_even_slot() {
+        let m = memo(1 << 20);
+        let fingerprint = Fingerprint::from_raw(1);
+        m.memo_slot_create(fingerprint);
+        let created = m.slot_version(SlotKey::Memo(fingerprint));
+
+        m.slot_dirty_end(SlotKey::Memo(fingerprint));
+        m.slot_dirty_end(SlotKey::Memo(Fingerprint::from_raw(2)));
+
+        assert_eq!(m.slot_version(SlotKey::Memo(fingerprint)), created);
+        assert!(
+            !m.slot_epochs
+                .contains_key(&SlotKey::Memo(Fingerprint::from_raw(2))),
+            "end creates no slot"
+        );
+    }
+
+    #[test]
+    fn test_memo_slot_remove_leaves_others_served() {
+        let m = memo(1 << 20);
+        let kept = Fingerprint::from_raw(1);
+        let removed = Fingerprint::from_raw(2);
+        m.memo_slot_create(kept);
+        m.memo_slot_create(removed);
+        slot_bump(&m, SlotKey::Memo(kept));
+        m.insert(key(1), entry(b"one", &stamp(&m, &[SlotKey::Memo(kept)])));
+        m.insert(key(2), entry(b"two", &stamp(&m, &[SlotKey::Memo(removed)])));
+        let mut capture = MemoCapture::begin(
+            &m,
+            MemoKey {
+                binary: true,
+                ..key(1)
+            },
+            &[Oid::from_raw(10)],
+        )
+        .expect("capture begins");
+        capture.command_complete_push(b"C");
+
+        m.memo_slot_remove(removed);
+
+        assert!(m.get(&key(1)).is_some(), "other entry still served");
+        assert!(m.get(&key(2)).is_none(), "removed entry stale");
+        assert!(
+            capture.finish(&m),
+            "capture over an unwritten relation kept"
+        );
+        assert_eq!(m.slot_epochs.len(), 1, "only the kept slot remains");
+    }
+
+    /// Eviction can land inside a frame's bracket: the removed slot must read
+    /// an even version above the odd one, and nothing can stamp the odd value.
+    #[test]
+    fn test_memo_slot_remove_mid_bracket() {
+        let m = memo(1 << 20);
+        let fingerprint = Fingerprint::from_raw(1);
+        let slot = SlotKey::Memo(fingerprint);
+        m.memo_slot_create(fingerprint);
+        m.slot_dirty_begin(slot);
+        let open = m.slot_version(slot);
+
+        m.memo_slot_remove(fingerprint);
+
+        let after = m.slot_version(slot);
+        assert!(
+            after > open && after.is_multiple_of(2),
+            "{after} after {open}"
+        );
+    }
+
+    #[test]
+    fn test_relation_slot_unaffected_by_floor_raise() {
+        let m = memo(1 << 20);
+        let relation = SlotKey::Relation(Oid::from_raw(10));
+        slot_bump(&m, relation);
+        let fingerprint = Fingerprint::from_raw(1);
+        m.memo_slot_create(fingerprint);
+        m.memo_slot_remove(fingerprint);
+
+        assert_eq!(m.slot_version(relation), 2, "relation slot untouched");
+        assert_eq!(
+            m.slot_version(SlotKey::Relation(Oid::from_raw(20))),
+            0,
+            "missing relation slot reads 0"
+        );
+        assert_eq!(
+            m.slot_version(SlotKey::RelationColumn(Oid::from_raw(20), 1)),
+            0,
+            "missing reserved slot reads 0"
+        );
+    }
+
     #[test]
     fn test_gc_sweeps_stale() {
         let m = memo(1 << 20);
@@ -884,6 +1153,7 @@ mod tests {
     #[test]
     fn test_capture_roundtrip_and_rd_len() {
         let m = memo(1 << 20);
+        m.memo_slot_create(Fingerprint::from_raw(1));
         let mut cap = MemoCapture::begin(&m, key(1), &[Oid::from_raw(10), Oid::from_raw(20)])
             .expect("relations stable, memo enabled");
         cap.row_description_push(b"RD");
@@ -900,6 +1170,7 @@ mod tests {
     #[test]
     fn test_capture_dropped_when_relation_changes_mid_serve() {
         let m = memo(1 << 20);
+        m.memo_slot_create(Fingerprint::from_raw(1));
         let mut cap =
             MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).expect("stable at begin");
         cap.row_description_push(b"RD");
@@ -928,6 +1199,7 @@ mod tests {
     #[test]
     fn test_capture_aborts_over_cap() {
         let m = memo(1 << 30);
+        m.memo_slot_create(Fingerprint::from_raw(1));
         let mut cap = MemoCapture::begin(&m, key(1), &[Oid::from_raw(10)]).expect("enabled");
         cap.row_description_push(b"RD");
         cap.data_push(&vec![0u8; MAX_MEMO_ENTRY_BYTES + 1]);

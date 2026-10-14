@@ -70,8 +70,8 @@ pub(super) fn eval_candidates_into(
 /// no per-memo predicate eval, and no PgEval special case (a non-candidate
 /// provably can't be in the result). Over-eviction (a candidate whose result
 /// didn't actually change) is harmless. Orphan memos (query no longer
-/// registered) are invalidated eagerly at eviction (`cache_query_evict`), not
-/// here.
+/// registered) turn stale when `memo_eligible_remove` removes the query's slot
+/// (eviction, failure cleanup, invalidation purge), not here.
 ///
 /// Filtered by eligibility, not by whether an entry exists now: a capture can
 /// store F's first entry after this row is replayed and before the frame

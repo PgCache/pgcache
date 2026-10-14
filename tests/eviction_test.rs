@@ -70,6 +70,52 @@ async fn publication_table_removed_wait(
     }
 }
 
+/// Evicting a memo-eligible query removes its memo slot, so slots track the
+/// cached queries instead of every fingerprint ever evicted.
+#[tokio::test]
+async fn test_eviction_removes_memo_slot() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_small_cache(1).await?;
+    let timeout = Duration::from_secs(5);
+    let tables = ["memo_slot_a", "memo_slot_b", "memo_slot_c", "memo_slot_d"];
+
+    // Seeded before any query registers, so no CDC frame touches these tables.
+    for table in &tables {
+        ctx.query(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, val TEXT)"),
+            &[],
+        )
+        .await?;
+        ctx.query(&format!("INSERT INTO {table} VALUES (1, 'a')"), &[])
+            .await?;
+    }
+
+    for table in &tables {
+        ctx.simple_query(&format!("SELECT val FROM {table} WHERE id = 1"))
+            .await?;
+        publication_table_wait(&mut ctx, table, timeout).await?;
+        ctx.cache_settle().await?;
+    }
+    for table in &tables[..3] {
+        publication_table_removed_wait(&mut ctx, table, timeout).await?;
+    }
+
+    // The gauge is published on the writer's 1s tick.
+    let start = std::time::Instant::now();
+    loop {
+        let slots = ctx.metrics().await?.cache_memo_slots;
+        if slots == 1 {
+            break;
+        }
+        if start.elapsed() > timeout {
+            return Err(Error::other(format!(
+                "expected only the surviving query's memo slot, got {slots}"
+            )));
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Ok(())
+}
+
 /// Test that tables are added to and removed from the publication
 /// as queries are registered and evicted.
 ///
