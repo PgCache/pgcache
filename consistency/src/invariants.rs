@@ -6,14 +6,16 @@
 //! 1. **Intra-snapshot atomicity** — each group shows exactly one version.
 //! 2. **Per-group monotonicity** — a group's version never decreases across
 //!    snapshots (versions only ever increment at origin, and group ids are
-//!    never reused at a lower version).
+//!    never reused at a lower version). One move is exempt: a cache-served read
+//!    below an earlier read pgcache forwarded to origin. The cache serves at its
+//!    apply watermark, which may trail what origin already showed (ADR-054).
 //! 3. **Paired-group equality** — groups bumped together in one transaction
 //!    always show equal versions.
 //!
 //! (Final cache-vs-origin exact equality lives in `snapshot`, not here, since
 //! it compares two live reads rather than reducing one snapshot.)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +31,8 @@ pub enum Violation {
         group: i32,
         previous: i32,
         observed: i32,
+        /// The backwards read was forwarded to origin, not cache-served.
+        forwarded: bool,
     },
     /// A bumped-together pair showed unequal versions.
     Pair {
@@ -62,10 +66,16 @@ impl fmt::Display for Violation {
                 group,
                 previous,
                 observed,
+                forwarded,
             } => write!(
                 f,
                 "monotonicity: group {group} went backwards from version {previous} to {observed} \
-                 (a stale write overwrote a newer value)"
+                 in a {} read (a stale write overwrote a newer value)",
+                if *forwarded {
+                    "forwarded"
+                } else {
+                    "cache-served"
+                }
             ),
             Violation::Pair {
                 group_a,
@@ -113,9 +123,17 @@ pub fn intra_snapshot_reduce(rows: &[(i32, i32)]) -> Result<HashMap<i32, i32>, V
 }
 
 /// Tracks the highest version seen per group across snapshots (invariant 2).
+///
+/// A forwarded read sees origin, which is never behind anything already
+/// observed, so it must not fall below any earlier read. A cache-served read
+/// must not fall below an earlier cache-served read: the apply watermark only
+/// advances. Falling below only a forwarded read is the accepted ADR-054
+/// window, counted rather than failed.
 #[derive(Debug, Default)]
 pub struct MonotonicTracker {
     max: HashMap<i32, i32>,
+    cache_max: HashMap<i32, i32>,
+    forward_regressions: u64,
 }
 
 impl MonotonicTracker {
@@ -124,20 +142,45 @@ impl MonotonicTracker {
     }
 
     /// Fold one snapshot's group→version map in, returning the first backwards
-    /// move if any.
-    pub fn observe(&mut self, group_versions: &HashMap<i32, i32>) -> Option<Violation> {
+    /// move if any. `forwarded` holds the groups whose read was forwarded.
+    pub fn observe(
+        &mut self,
+        group_versions: &HashMap<i32, i32>,
+        forwarded: &HashSet<i32>,
+    ) -> Option<Violation> {
         for (&group, &version) in group_versions {
-            let previous = self.max.entry(group).or_insert(version);
-            if version < *previous {
+            let origin_served = forwarded.contains(&group);
+            let floor = if origin_served {
+                self.max.get(&group)
+            } else {
+                self.cache_max.get(&group)
+            };
+            if let Some(&previous) = floor
+                && version < previous
+            {
                 return Some(Violation::Monotonic {
                     group,
-                    previous: *previous,
+                    previous,
                     observed: version,
+                    forwarded: origin_served,
                 });
             }
-            *previous = version;
+            let max = self.max.entry(group).or_insert(version);
+            if version < *max {
+                self.forward_regressions += 1;
+            }
+            *max = (*max).max(version);
+            if !origin_served {
+                let cache_max = self.cache_max.entry(group).or_insert(version);
+                *cache_max = (*cache_max).max(version);
+            }
         }
         None
+    }
+
+    /// Cache-served reads that fell below an earlier forwarded read.
+    pub fn forward_regressions(&self) -> u64 {
+        self.forward_regressions
     }
 }
 
@@ -188,24 +231,76 @@ mod tests {
         );
     }
 
+    fn cache_served() -> HashSet<i32> {
+        HashSet::new()
+    }
+
     #[test]
     fn monotonic_accepts_nondecreasing() {
         let mut t = MonotonicTracker::new();
-        assert_eq!(t.observe(&HashMap::from([(1, 1), (2, 1)])), None);
-        assert_eq!(t.observe(&HashMap::from([(1, 2), (2, 1)])), None);
-        assert_eq!(t.observe(&HashMap::from([(1, 2), (2, 5)])), None);
+        let none = cache_served();
+        assert_eq!(t.observe(&HashMap::from([(1, 1), (2, 1)]), &none), None);
+        assert_eq!(t.observe(&HashMap::from([(1, 2), (2, 1)]), &none), None);
+        assert_eq!(t.observe(&HashMap::from([(1, 2), (2, 5)]), &none), None);
     }
 
     #[test]
     fn monotonic_flags_backwards_move() {
         let mut t = MonotonicTracker::new();
-        assert_eq!(t.observe(&HashMap::from([(1, 7)])), None);
+        assert_eq!(t.observe(&HashMap::from([(1, 7)]), &cache_served()), None);
         assert_eq!(
-            t.observe(&HashMap::from([(1, 6)])),
+            t.observe(&HashMap::from([(1, 6)]), &cache_served()),
             Some(Violation::Monotonic {
                 group: 1,
                 previous: 7,
-                observed: 6
+                observed: 6,
+                forwarded: false,
+            })
+        );
+    }
+
+    #[test]
+    fn monotonic_counts_cache_read_below_forwarded_read() {
+        let mut t = MonotonicTracker::new();
+        assert_eq!(t.observe(&HashMap::from([(1, 5)]), &cache_served()), None);
+        assert_eq!(
+            t.observe(&HashMap::from([(1, 9)]), &HashSet::from([1])),
+            None
+        );
+        assert_eq!(t.observe(&HashMap::from([(1, 8)]), &cache_served()), None);
+        assert_eq!(t.forward_regressions(), 1);
+    }
+
+    #[test]
+    fn monotonic_flags_cache_read_below_earlier_cache_read() {
+        let mut t = MonotonicTracker::new();
+        assert_eq!(t.observe(&HashMap::from([(1, 6)]), &cache_served()), None);
+        assert_eq!(
+            t.observe(&HashMap::from([(1, 9)]), &HashSet::from([1])),
+            None
+        );
+        assert_eq!(
+            t.observe(&HashMap::from([(1, 5)]), &cache_served()),
+            Some(Violation::Monotonic {
+                group: 1,
+                previous: 6,
+                observed: 5,
+                forwarded: false,
+            })
+        );
+    }
+
+    #[test]
+    fn monotonic_flags_forwarded_read_below_any_earlier_read() {
+        let mut t = MonotonicTracker::new();
+        assert_eq!(t.observe(&HashMap::from([(1, 7)]), &cache_served()), None);
+        assert_eq!(
+            t.observe(&HashMap::from([(1, 6)]), &HashSet::from([1])),
+            Some(Violation::Monotonic {
+                group: 1,
+                previous: 7,
+                observed: 6,
+                forwarded: true,
             })
         );
     }

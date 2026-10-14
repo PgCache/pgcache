@@ -1,6 +1,7 @@
 //! Orchestration: spawn the stack, seed, drive load, snapshot-and-check, then
 //! verify cache == origin once the dust settles.
 
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
@@ -68,6 +69,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         ));
     }
     let faults_requested = !env.is_empty();
+    // Not a requested fault: a build without the hook ignores it, and the
+    // monotonicity check then treats every read as cache-served.
+    env.push(("PGCACHE_FAULT_FORWARD_NOTICE".to_owned(), "1".to_owned()));
     // Injected delays stretch every settle/converge phase; pad their budgets
     // so a long configured lag isn't misreported as a hang.
     let fault_slack =
@@ -96,6 +100,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             "--cdc-lag-ms / --population-delay-ms need fault hooks, but the spawned pgcache \
              was built without them; rebuild with `cargo build --features fault-injection` \
              (or point --pgcache-bin at a fault-enabled build)"
+        );
+    }
+    if !status
+        .fault_injection()
+        .await
+        .context("checking /status for fault-injection support")?
+    {
+        tracing::warn!(
+            "pgcache built without fault hooks: forwarded reads can't be told from cache \
+             serves, so a cache read below an earlier forwarded read (ADR-054) fails the run"
         );
     }
     let origin = db::connect(&stack.origin_url).await?;
@@ -208,7 +222,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     if loop_result.is_err() || task_error.is_some() {
         failure_diagnostics(&stack.metrics_url, &stack.origin_url, &stack.cache_db_url).await;
     }
-    let snapshots = loop_result?;
+    let stats = loop_result?;
     if let Some(e) = task_error {
         db::teardown_begin();
         stack.shutdown().await;
@@ -252,7 +266,9 @@ pub async fn run(cli: Cli) -> Result<()> {
     let memo_captures =
         metric_sum(&http, &stack.metrics_url, "pgcache_cache_memo_captures").await?;
     tracing::info!(
-        snapshots,
+        snapshots = stats.snapshots,
+        forwarded_group_reads = stats.forwarded_reads,
+        forward_regressions = stats.forward_regressions,
         reads,
         memo_hits,
         memo_captures,
@@ -284,7 +300,7 @@ async fn snapshot_loop(
     cross_sql: &str,
     deadline: Instant,
     interval_ms: u64,
-) -> Result<u64> {
+) -> Result<LoopStats> {
     let interval = Duration::from_millis(interval_ms);
     let pair_ids: Vec<i32> = scenario
         .model
@@ -294,11 +310,19 @@ async fn snapshot_loop(
         .collect();
     let mut tracker = MonotonicTracker::new();
     let mut snapshots = 0u64;
+    let mut forwarded_reads = 0u64;
 
     while Instant::now() < deadline {
         // Per-group reads (one query per group, each atomic), fanned across the
         // connection pool: intra-group atomicity and per-group monotonicity.
-        let rows = reader.read(groups).await?;
+        let reads = reader.read_tagged(groups).await?;
+        let forwarded: HashSet<i32> = reads
+            .iter()
+            .filter(|read| read.forwarded)
+            .map(|read| read.group)
+            .collect();
+        forwarded_reads += forwarded.len() as u64;
+        let rows: Vec<_> = reads.into_iter().flat_map(|read| read.rows).collect();
         let group_versions = snapshot::group_versions(&rows);
         let group_versions = match intra_snapshot_reduce(&group_versions) {
             Ok(map) => map,
@@ -316,7 +340,7 @@ async fn snapshot_loop(
                 return violation_fail(v);
             }
         };
-        if let Some(v) = tracker.observe(&group_versions) {
+        if let Some(v) = tracker.observe(&group_versions, &forwarded) {
             return violation_fail(v);
         }
 
@@ -340,11 +364,24 @@ async fn snapshot_loop(
         tokio::time::sleep(interval).await;
     }
 
-    Ok(snapshots)
+    Ok(LoopStats {
+        snapshots,
+        forwarded_reads,
+        forward_regressions: tracker.forward_regressions(),
+    })
+}
+
+/// What the snapshot loop observed, for the run summary.
+struct LoopStats {
+    snapshots: u64,
+    /// Per-group reads pgcache forwarded to origin.
+    forwarded_reads: u64,
+    /// Cache-served reads below an earlier forwarded read (ADR-054).
+    forward_regressions: u64,
 }
 
 /// Log the violation and fail the run.
-fn violation_fail(violation: crate::invariants::Violation) -> Result<u64> {
+fn violation_fail<T>(violation: crate::invariants::Violation) -> Result<T> {
     tracing::error!(%violation, "consistency violation in served view");
     bail!("consistency violation: {violation}");
 }

@@ -28,6 +28,8 @@ use super::{
 };
 use crate::cache::query::CacheableQuery;
 use crate::catalog::FunctionVolatility;
+#[cfg(feature = "fault-injection")]
+use crate::pg::protocol::encode::notice_response_encode;
 use crate::proxy::CacheabilityStore;
 use crate::proxy::ParseError;
 use crate::proxy::cacheability_memo::CacheabilityCache;
@@ -615,7 +617,28 @@ fn single_table(query: &QueryTree) -> Option<&str> {
     }
 }
 
-/// Increment the per-reason counter for a forwarded (non-cacheable) statement.
+/// Test-only forward tag (`PGCACHE_FAULT_FORWARD_NOTICE`): a cacheable read
+/// that falls back to origin is preceded by a NOTICE, so the consistency
+/// harness can tell origin-served reads from cache serves (PGC-483).
+#[cfg(feature = "fault-injection")]
+fn fault_forward_notice_push(egress: &mut EgressQueue<CacheMessage>) {
+    static ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("PGCACHE_FAULT_FORWARD_NOTICE").is_some());
+    if !*ENABLED {
+        return;
+    }
+    let mut buf = BytesMut::new();
+    if notice_response_encode(FORWARD_NOTICE, &mut buf).is_ok() {
+        egress.head_origin_prepend(buf.freeze());
+    }
+}
+#[cfg(not(feature = "fault-injection"))]
+fn fault_forward_notice_push(_egress: &mut EgressQueue<CacheMessage>) {}
+
+/// The message of the forward tag; the consistency harness matches it verbatim.
+#[cfg(feature = "fault-injection")]
+const FORWARD_NOTICE: &str = "pgcache: forwarded to origin";
+
 /// Strip `SCRAM-SHA-256-PLUS` from a SASL authentication request's mechanism
 /// list, in place: channel binding cannot be supported because the proxy
 /// terminates TLS. The post-strip length field (bytes 1-4, big-endian i32,
@@ -649,6 +672,7 @@ fn sasl_plus_mechanism_strip(data: &mut BytesMut) {
     data[1..5].copy_from_slice(&new_len.to_be_bytes());
 }
 
+/// Increment the per-reason counter for a forwarded (non-cacheable) statement.
 fn forward_reason_metric(reason: ForwardReason) {
     let m = crate::metrics::handles();
     match reason {
@@ -1089,6 +1113,7 @@ impl ConnectionState {
     /// search_path-unknown, cache-unavailable).
     pub(super) fn forward_current_and_rest(&mut self, current_bytes: BytesMut) {
         self.egress.cache_to_origin();
+        fault_forward_notice_push(&mut self.egress);
         if let Some(stmt_name) = self.extended.pending_lazy_parse.take() {
             forward_lazy_parse_install(
                 &stmt_name,

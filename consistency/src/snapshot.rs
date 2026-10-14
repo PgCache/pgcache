@@ -11,7 +11,10 @@
 //! in-place by CDC (e.g. the full-table scan) never exposes them — so the
 //! oracle must inspect the queries that actually populate under load.
 
-use anyhow::Result;
+use std::sync::Mutex;
+
+use anyhow::{Result, anyhow};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio_postgres::{Client, Statement};
 
 use crate::db;
@@ -19,6 +22,10 @@ use crate::schema::DATA_MAX;
 
 /// Upper bound of the cross-group read probe (lower half of the data range).
 pub const PROBE_DATA_HI: i32 = DATA_MAX / 2;
+
+/// The NOTICE a fault-injection pgcache sends ahead of a cacheable read it
+/// forwarded to origin (`PGCACHE_FAULT_FORWARD_NOTICE`); matched verbatim.
+pub const FORWARD_NOTICE: &str = "pgcache: forwarded to origin";
 
 /// One served item row: `(id, group_id, version, data, payload_len)`.
 /// `payload_len` is `length(payload)` — `None` only for rows inserted by the
@@ -53,16 +60,50 @@ async fn group_query(client: &Client, stmt: &Statement, group: i32) -> Result<Ve
 /// the groups across N connections runs those blocking reads concurrently, so a
 /// snapshot costs `ceil(groups / N)` blocking reads instead of `groups`.
 pub struct GroupReader {
-    conns: Vec<(Client, Statement)>,
+    conns: Vec<ReaderConnection>,
+}
+
+/// One group's served rows, and whether pgcache forwarded the read to origin.
+pub struct GroupRead {
+    pub group: i32,
+    pub rows: Vec<ItemRow>,
+    pub forwarded: bool,
+}
+
+struct ReaderConnection {
+    client: Client,
+    stmt: Statement,
+    /// The connection runs one read at a time, so a forward tag drained right
+    /// after a read belongs to that read.
+    notices: Mutex<UnboundedReceiver<String>>,
+}
+
+impl ReaderConnection {
+    /// Whether a forward tag arrived since the last call; drains the channel.
+    fn forward_tag_take(&self) -> Result<bool> {
+        let mut notices = self
+            .notices
+            .lock()
+            .map_err(|_| anyhow!("notice channel lock poisoned"))?;
+        let mut tagged = false;
+        while let Ok(message) = notices.try_recv() {
+            tagged |= message == FORWARD_NOTICE;
+        }
+        Ok(tagged)
+    }
 }
 
 impl GroupReader {
     pub async fn connect(url: &str, conns: usize, sql: &str) -> Result<Self> {
         let mut pool = Vec::with_capacity(conns);
         for _ in 0..conns.max(1) {
-            let client = db::connect(url).await?;
+            let (client, notices) = db::connect_with_notices(url).await?;
             let stmt = client.prepare(sql).await?;
-            pool.push((client, stmt));
+            pool.push(ReaderConnection {
+                client,
+                stmt,
+                notices: Mutex::new(notices),
+            });
         }
         Ok(Self { conns: pool })
     }
@@ -70,13 +111,31 @@ impl GroupReader {
     /// Read every row across `groups`, distributing the groups round-robin over
     /// the pooled connections and running each connection's slice concurrently.
     pub async fn read(&self, groups: &[i32]) -> Result<Vec<ItemRow>> {
+        Ok(self
+            .read_tagged(groups)
+            .await?
+            .into_iter()
+            .flat_map(|read| read.rows)
+            .collect())
+    }
+
+    /// [`read`](Self::read), keeping each group's rows apart with its forward
+    /// tag.
+    pub async fn read_tagged(&self, groups: &[i32]) -> Result<Vec<GroupRead>> {
         let n = self.conns.len();
-        let slices = self.conns.iter().enumerate().map(|(i, (client, stmt))| {
+        let slices = self.conns.iter().enumerate().map(|(i, conn)| {
             let mine: Vec<i32> = groups.iter().copied().skip(i).step_by(n).collect();
             async move {
-                let mut out = Vec::new();
-                for g in mine {
-                    out.extend(group_query(client, stmt, g).await?);
+                let mut out = Vec::with_capacity(mine.len());
+                for group in mine {
+                    conn.forward_tag_take()?;
+                    let rows = group_query(&conn.client, &conn.stmt, group).await?;
+                    let forwarded = conn.forward_tag_take()?;
+                    out.push(GroupRead {
+                        group,
+                        rows,
+                        forwarded,
+                    });
                 }
                 Ok::<_, anyhow::Error>(out)
             }

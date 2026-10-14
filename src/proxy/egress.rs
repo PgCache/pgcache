@@ -373,6 +373,16 @@ impl<C> EgressQueue<C> {
         }
     }
 
+    /// Put `bytes` ahead of everything in the head `Origin` slot, so they reach
+    /// the client right before the origin response it awaits. No-op unless the
+    /// head is an `Origin` slot.
+    #[cfg(feature = "fault-injection")]
+    pub(super) fn head_origin_prepend(&mut self, bytes: Bytes) {
+        if let Some(EgressSlot::Origin { buf, .. }) = self.client_head_mut() {
+            buf.push_front(bytes);
+        }
+    }
+
     /// Pop the head `Cache` slot after its `CacheReply` was received.
     pub(super) fn cache_done(&mut self) {
         let Some(idx) = self.client_head() else {
