@@ -15,7 +15,7 @@ use super::PopulationWork;
 use crate::cache::messages::QueryCommand;
 use crate::cache::population_pool::PopulationPool;
 use crate::oid::Oid;
-use crate::pg::Lsn;
+use crate::pg::{Lsn, OriginSnapshot};
 use crate::settings::PgSettings;
 
 mod stream;
@@ -53,6 +53,8 @@ struct PopulationOutcome {
     row_count: u64,
     /// Staging tables loaded, one per relation.
     staged: Vec<(Oid, EcoString)>,
+    /// Origin snapshot taken before the reads.
+    snapshot: Arc<OriginSnapshot>,
     /// Origin WAL position after the reads; the merge gate's deadline.
     snapshot_lsn: Lsn,
 }

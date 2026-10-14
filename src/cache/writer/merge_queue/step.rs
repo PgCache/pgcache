@@ -157,7 +157,7 @@ impl WriterCore {
             staging,
             window,
         };
-        if self.merge_keys_lost() {
+        if self.merge_keys_lost() || self.merge_fallback_missed() {
             return Ok(MergeStep::Aborted);
         }
         // A relation evicted mid-population has no cache table to merge into;
@@ -246,30 +246,46 @@ impl WriterCore {
         })
     }
 
+    /// Whether a toast fallback matched the active merge's query in a
+    /// transaction its reads may have missed (PGC-484): the row may be absent
+    /// or stale in staging, so the merge aborts and the query repopulates.
+    fn merge_fallback_missed(&self) -> bool {
+        let Some(in_progress) = self.merges.active.as_ref() else {
+            return false;
+        };
+        let DrainTarget::Apply(merge) = &in_progress.target else {
+            return false;
+        };
+        let missed = self
+            .population_deleted_keys
+            .fallback_missed(merge.fingerprint, merge.generation);
+        if missed {
+            crate::metrics::handles()
+                .cdc
+                .toast_stale_aborts
+                .increment(1);
+        }
+        missed
+    }
+
     /// Whether this population staged a row a toast fallback has since left
-    /// unrepairable (PGC-464): keys recorded above its anchor floor that are
-    /// present in its staging table. Probed only when that key set moved since
-    /// the last chunk.
+    /// unrepairable (PGC-464): keys its reads may have missed that are present
+    /// in its staging table. Probed only when that key set moved since the
+    /// last chunk.
     async fn merge_toast_stale_hit(
         &mut self,
         target: &ChunkTarget,
         plan: &MergePlan,
-        (fingerprint, generation): (Fingerprint, Generation),
+        population: (Fingerprint, Generation),
     ) -> CacheResult<bool> {
         let relation_oid = target.relation_oid;
-        let Some(floor) = self
-            .population_deleted_keys
-            .floor(relation_oid, fingerprint, generation)
-        else {
-            return Ok(false);
-        };
         let Some(predicate) = self.merges.active.as_mut().and_then(|in_progress| {
             let scope = KeyScope {
                 keys: &self.population_deleted_keys,
                 relation_oid,
                 pk_columns_paren: &plan.pk_columns_paren,
             };
-            in_progress.stale_probe_predicate(scope, floor)
+            in_progress.stale_probe_predicate(scope, population)
         }) else {
             return Ok(false);
         };

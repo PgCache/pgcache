@@ -44,6 +44,7 @@ fn frame_begin_handle(core: &mut WriterCore, xid: u32) {
     );
     trace!(xid, "cdc frame begin");
     core.frame_open = true;
+    core.frame_xid = xid;
     // Reset only at a fresh batch — when accumulating (PGC-242) the log,
     // buffers, and pending bookkeeping span frames.
     if core.frame_state == FrameState::Idle {
@@ -54,6 +55,7 @@ fn frame_begin_handle(core: &mut WriterCore, xid: u32) {
         core.frame_chunk_flushed = false;
         core.frame_deleted_keys.clear();
         core.frame_toast_stale_keys.clear();
+        core.frame_fallback_matches.clear();
         core.frame_truncated_relations.clear();
         core.batch_deleted_pks.clear();
         core.toast_overlay_reset();
@@ -353,8 +355,10 @@ impl WriterCdc {
         // replay* (`frame_cache_delete` runs in the decide pass), so
         // the per-frame LSN context must travel with the events for
         // logs that span multiple frames.
-        core.frame_rows
-            .push(FrameRowEvent::Boundary { commit_lsn: lsn });
+        core.frame_rows.push(FrameRowEvent::Boundary {
+            commit_lsn: lsn,
+            xid: core.frame_xid,
+        });
         core.batch_frames += 1;
         core.batch_last_lsn = lsn;
         core.frame_open = false;

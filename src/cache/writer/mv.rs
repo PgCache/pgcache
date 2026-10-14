@@ -59,7 +59,8 @@ impl WriterCore {
         if !view.mv.build_permitted(Instant::now()) {
             return;
         }
-        // Pending → Scheduled: neither state is dirtiable, so the index is untouched.
+        // Pending → Scheduled: neither state is memo-eligible, so there's no
+        // eligibility to record.
         view.mv.state_set(MvState::Scheduled { has_table });
         drop(view);
         let _ = self.query_tx.send(QueryCommand::MvBuild { fingerprint });
@@ -233,8 +234,6 @@ impl WriterCore {
                         self.mv_state_write(fingerprint, MvState::Ineligible);
                         return;
                     }
-                    // →Fresh through the choke point: `Fresh` is dirtiable, so the
-                    // index insert must accompany the state write (PGC-338).
                     self.mv_state_write(fingerprint, MvState::Fresh);
                     crate::metrics::handles().mv.rebuilds.increment(1);
                     trace!("mv build: fresh for {fingerprint}");

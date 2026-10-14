@@ -384,6 +384,7 @@ impl PopulationWorker {
                     staged: outcome.staged,
                     cached_bytes: outcome.cached_bytes,
                     row_count: outcome.row_count,
+                    snapshot: outcome.snapshot,
                     snapshot_lsn: outcome.snapshot_lsn,
                     enqueued_at: Instant::now(),
                     fetch_stage_ms: fetch_stage.as_secs_f64() * 1000.0,

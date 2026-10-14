@@ -14,7 +14,7 @@ use tracing::debug;
 use super::frame::{FRAME_BUF_CAPACITY, FrameRowEvent, FrameState, OverlayEntry};
 use super::merge_queue::MergeQueue;
 use super::mv_build::MvBuildPool;
-use super::staging::{PopulationDeletedKeys, StagingPool};
+use super::staging::{PopulationDeletedKeys, PopulationKey, StagingPool};
 use crate::cache::Generation;
 use crate::cache::reference_settings;
 use crate::cache::{
@@ -255,8 +255,8 @@ pub(super) struct WriterCore {
     /// in progress, and the gate's bookkeeping (PGC-272 / PGC-418).
     pub(super) merges: MergeQueue,
     /// Mirror of `WriterCdc.last_received_lsn`, updated as the CDC path advances
-    /// the watermark. Read at population dispatch to seed the deleted-key
-    /// anchor floor (a lower bound on the population's snapshot LSN).
+    /// the watermark. Read at population dispatch to mark where its deleted-key
+    /// recording began.
     pub(super) last_received_lsn: Lsn,
     /// Mirror of `WriterCdc.last_applied_lsn` — the commit-only apply
     /// watermark, advanced only on an actual cache commit.
@@ -270,6 +270,12 @@ pub(super) struct WriterCore {
     /// drained at `CommitMark` into `population_deleted_keys`' toast-stale set
     /// — same commit-LSN deferral as `frame_deleted_keys`.
     pub(super) frame_toast_stale_keys: Vec<(Oid, EcoString)>,
+    /// Loading populations a toast fallback in the in-progress frame matched
+    /// (PGC-484), drained at `CommitMark` into `population_deleted_keys`
+    /// stamped with the frame's xid; the merge decides whether to abort.
+    pub(super) frame_fallback_matches: Vec<PopulationKey>,
+    /// Xid of the open source transaction, from its `Begin`.
+    pub(super) frame_xid: u32,
     /// Relations bulk-invalidated by the in-progress frame (TRUNCATE, or 40P01
     /// recovery), drained at `CommitMark` to raise their deleted-key abort
     /// watermark to the commit LSN — same commit-LSN-deferral as
@@ -496,6 +502,8 @@ impl WriterCore {
             last_applied_lsn: Lsn::from_raw(0),
             frame_deleted_keys: Vec::new(),
             frame_toast_stale_keys: Vec::new(),
+            frame_fallback_matches: Vec::new(),
+            frame_xid: 0,
             frame_truncated_relations: Vec::new(),
             batch_truncated_relations: Vec::new(),
             batch_frames: 0,

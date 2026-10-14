@@ -235,13 +235,14 @@ async fn test_toast_fallback_on_uncached_row_leaves_other_queries_ready() -> Res
     Ok(())
 }
 
-/// A toasted UPDATE of a row the in-flight guard staged, whose post-image
-/// still matches the guard's predicate: membership evaluation invalidates the
-/// guard (the row could grow its result and can't be upserted) and nothing
-/// else; the guard repopulates with the post-update row, and the Ready query
-/// is untouched.
+/// A toasted UPDATE of a row the in-flight guard staged, committed after the
+/// guard read origin, whose post-image still matches the guard's predicate:
+/// the guard is Loading, so the fallback defers to its merge, which aborts
+/// because the guard's reads missed the update (PGC-484). Nothing is
+/// invalidated; the guard repopulates with the post-update row, and the Ready
+/// query is untouched.
 #[tokio::test]
-async fn test_toast_fallback_matching_inflight_predicate_invalidates_only_it() -> Result<(), Error>
+async fn test_toast_fallback_matching_inflight_predicate_aborts_only_its_merge() -> Result<(), Error>
 {
     let mut ctx = TestContext::setup_fault(&[STALE_DELAY]).await?;
     let big: String = std::iter::repeat_n('x', TOAST_LEN).collect();
@@ -260,8 +261,8 @@ async fn test_toast_fallback_matching_inflight_predicate_invalidates_only_it() -
         "expected the uncached-row fallback"
     );
     assert_eq!(
-        delta.cache_invalidations, 1,
-        "only the guard is invalidated"
+        delta.cache_invalidations, 0,
+        "the Loading guard is left to its merge"
     );
 
     assert_group_hit(&mut ctx, 1, "0").await?;
@@ -275,7 +276,82 @@ async fn test_toast_fallback_matching_inflight_predicate_invalidates_only_it() -
         "TOAST value intact after repopulation"
     );
     let delta = metrics_delta(&before, &ctx.metrics().await?);
-    assert_eq!(delta.cache_cdc_toast_stale_aborts, 0);
+    assert_eq!(
+        delta.cache_cdc_toast_stale_aborts, 1,
+        "the guard's merge must abort exactly once"
+    );
+    Ok(())
+}
+
+/// Under the clock policy, the guard's aborted merge leaves it Invalidated
+/// rather than unregistered, so the next read readmits it (PGC-484).
+#[tokio::test]
+async fn test_toast_fallback_aborted_merge_readmits_under_clock() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault_clock(&[STALE_DELAY]).await?;
+    let big: String = std::iter::repeat_n('x', TOAST_LEN).collect();
+    stale_setup(&mut ctx, &big).await?;
+
+    read_until_hit(&mut ctx, &group_query(1)).await?;
+    guard_start(&mut ctx).await?;
+
+    let before = ctx.metrics().await?;
+    ctx.origin_query("update toast_stale set v = 1 where id = 3", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    guard_converges(&mut ctx, "1", 1).await?;
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(
+        delta.cache_cdc_toast_stale_aborts, 1,
+        "the guard's merge aborts"
+    );
+    assert_eq!(
+        delta.cache_invalidations, 1,
+        "the abort invalidates the guard"
+    );
+    assert_eq!(delta.cache_readmissions, 1, "the guard is readmitted");
+    assert_group_hit(&mut ctx, 1, "0").await?;
+    Ok(())
+}
+
+/// A toasted UPDATE that committed before the guard's population read origin
+/// but is applied, under CDC lag, while the guard is still Loading: the
+/// population's snapshot saw it, so the fallback neither invalidates the
+/// guard nor aborts its merge, and the guard serves the post-update row
+/// (PGC-484).
+#[tokio::test]
+async fn test_toast_fallback_committed_before_population_reads_keeps_its_merge() -> Result<(), Error>
+{
+    let mut ctx =
+        TestContext::setup_fault(&[STALE_DELAY, ("PGCACHE_FAULT_CDC_APPLY_LAG_MS", "1000")])
+            .await?;
+    let big: String = std::iter::repeat_n('x', TOAST_LEN).collect();
+    stale_setup(&mut ctx, &big).await?;
+    // Publishes the relation, so the update below is streamed.
+    read_until_hit(&mut ctx, &group_query(1)).await?;
+    ctx.cdc_apply_settle().await?;
+
+    let before = ctx.metrics().await?;
+    ctx.origin_query("update toast_stale set v = 1 where id = 3", &[])
+        .await?;
+    // Inside the lag window: the guard reads origin after the update
+    // committed, and is still in flight when the writer applies it.
+    ctx.simple_query(GUARD).await?;
+    ctx.cdc_apply_settle().await?;
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert!(
+        delta.cache_cdc_toast_fallbacks >= 1,
+        "expected the uncached-row fallback"
+    );
+    assert_eq!(
+        delta.cache_invalidations, 0,
+        "the guard's reads already saw the update"
+    );
+
+    guard_converges(&mut ctx, "1", 1).await?;
+    let delta = metrics_delta(&before, &ctx.metrics().await?);
+    assert_eq!(delta.cache_cdc_toast_stale_aborts, 0, "the guard merges");
+    assert_eq!(delta.cache_invalidations, 0);
     Ok(())
 }
 

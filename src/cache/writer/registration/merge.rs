@@ -13,7 +13,7 @@ use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::merge_queue::{
     DrainTarget, HeapStop, MERGE_FLUSH_FORCE_AFTER, MergeStep, PendingMerge,
 };
-use crate::cache::{CacheError, CacheResult, Report};
+use crate::cache::{CacheError, CacheResult, Report, ReportExt};
 use crate::pg::Lsn;
 use crate::query::Fingerprint;
 use crate::result::error_chain_format;
@@ -101,6 +101,26 @@ async fn merge_stall_handle(core: &mut WriterCore, stop: HeapStop) -> CacheResul
     Ok(())
 }
 
+/// A merge aborted by a CDC event its population can't reconcile (key
+/// overflow, bulk invalidation, a toast fallback on a staged or matching row):
+/// invalidate the query as that event would have had it been Ready, so its
+/// waiters go to origin and the next read readmits it without re-registering,
+/// then drain the remaining staging. The abort lands only when the merge comes
+/// up, which also delays the retry (PGC-484).
+async fn merge_abort_invalidate(core: &mut WriterCore, head: MergeHead) -> CacheResult<()> {
+    core.population_deleted_keys
+        .deactivate(head.fingerprint, head.generation);
+    if core
+        .cache_query_cdc_invalidate(head.fingerprint)
+        .await
+        .attach_loc("invalidating the query of an aborted merge")?
+    {
+        crate::metrics::handles().cdc.invalidations.increment(1);
+    }
+    core.population_merge_discard_remaining();
+    Ok(())
+}
+
 /// The active drain's identity, copied out before stepping it.
 #[derive(Clone, Copy)]
 struct MergeHead {
@@ -175,10 +195,10 @@ impl WriterRegistration {
             Ok(MergeStep::Done) => self.merge_done(core, head).await,
             Ok(MergeStep::Aborted) => {
                 debug!(
-                    "population merge aborted (overflow / truncate) {}",
+                    "population merge aborted (overflow / truncate / toast fallback) {}",
                     head.fingerprint
                 );
-                self.merge_apply_abandon(core, head);
+                merge_abort_invalidate(core, head).await?;
             }
             Err(e) => self.merge_step_failed(core, head, &e).await,
         }

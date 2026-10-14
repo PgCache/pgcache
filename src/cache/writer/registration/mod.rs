@@ -312,6 +312,11 @@ impl WriterRegistration {
                 // is open (PGC-250) AND the apply watermark has reached its
                 // snapshot LSN (PGC-272). Running it here could be mid-frame,
                 // racing the CDC writer's frame txn on the shared cache table.
+                core.population_deleted_keys.snapshot_set(
+                    merge.fingerprint,
+                    merge.generation,
+                    Arc::clone(&merge.snapshot),
+                );
                 core.merges.pending.push(Reverse(PendingMerge(merge)));
             }
             QueryCommand::Failed {

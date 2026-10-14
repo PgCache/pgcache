@@ -262,9 +262,17 @@ pub async fn run(cli: Cli) -> Result<()> {
     };
 
     let http = reqwest::Client::new();
-    let memo_hits = metric_sum(&http, &stack.metrics_url, "pgcache_cache_memo_hits").await?;
-    let memo_captures =
-        metric_sum(&http, &stack.metrics_url, "pgcache_cache_memo_captures").await?;
+    let body = metrics_body(&http, &stack.metrics_url).await?;
+    let metric = |name: &str| metrics_lines_sum(&body, name);
+    let memo_hits = metric("pgcache_cache_memo_hits");
+    let memo_captures = metric("pgcache_cache_memo_captures");
+    let invalidations = metric("pgcache_cache_invalidations");
+    let toast_fallbacks = metric("pgcache_cache_cdc_toast_fallbacks");
+    let toast_stale_aborts = metric("pgcache_cache_cdc_toast_stale_aborts");
+    let populations = metric("pgcache_cache_population_task_seconds_count");
+    let readmissions = metric("pgcache_cache_readmissions");
+    let merges_applied = metric("pgcache_cache_merge_applied_total");
+    let merge_wait_seconds = metric("pgcache_cache_merge_wait_seconds_sum");
     tracing::info!(
         snapshots = stats.snapshots,
         forwarded_group_reads = stats.forwarded_reads,
@@ -272,6 +280,13 @@ pub async fn run(cli: Cli) -> Result<()> {
         reads,
         memo_hits,
         memo_captures,
+        invalidations,
+        toast_fallbacks,
+        toast_stale_aborts,
+        populations,
+        readmissions,
+        merges_applied,
+        merge_wait_seconds,
         writes = counts.total(),
         version_bumps = counts.version_bump,
         cross_group_txns = counts.cross_group_txn,

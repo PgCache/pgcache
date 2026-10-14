@@ -60,6 +60,7 @@ pub(super) enum FrameRowEvent {
     /// eval segments (cross-frame batching is the point).
     Boundary {
         commit_lsn: Lsn,
+        xid: u32,
     },
 }
 

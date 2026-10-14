@@ -10,10 +10,14 @@ pub(crate) mod cdc;
 #[cfg(feature = "proxy")]
 pub(crate) mod connect;
 pub(crate) mod protocol;
+#[cfg(feature = "proxy")]
+mod snapshot;
 
 #[cfg(feature = "proxy")]
 pub use connect::{config_build, config_connect, connect};
 pub use protocol::ByteString;
+#[cfg(feature = "proxy")]
+pub use snapshot::OriginSnapshot;
 
 /// A PostgreSQL WAL log sequence number — a monotonic byte position in the WAL
 /// stream, used as the CDC apply/flush/snapshot watermark. A newtype over `u64`

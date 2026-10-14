@@ -10,8 +10,8 @@ use super::{
     StaleProbeCache,
 };
 use crate::cache::Generation;
+use crate::cache::writer::staging::PopulationKey;
 use crate::oid::Oid;
-use crate::pg::Lsn;
 use crate::query::Fingerprint;
 
 /// Heap blocks drained per merge chunk on a merge's first chunk; adapted
@@ -100,25 +100,25 @@ impl MergeInProgress {
 
     /// The toast-stale membership predicate to probe the staging table with
     /// before the chunk, or `None` when the set is unchanged since the last
-    /// probe (or empty above this population's floor).
+    /// probe (or holds nothing `population` can be missing).
     pub(super) fn stale_probe_predicate(
         &mut self,
         scope: KeyScope<'_>,
-        floor: Lsn,
+        population: PopulationKey,
     ) -> Option<String> {
         let KeyScope {
             keys,
             relation_oid,
             pk_columns_paren,
         } = scope;
-        let version = keys.stale_version_above(relation_oid, floor)?;
+        let version = keys.stale_version_for(relation_oid, population)?;
         let probed = self
             .stale_probe
             .is_some_and(|c| c.relation_oid == relation_oid && c.version == version);
         if probed {
             return None;
         }
-        let predicate = keys.stale_predicate(relation_oid, floor, pk_columns_paren)?;
+        let predicate = keys.stale_predicate(relation_oid, population, pk_columns_paren)?;
         self.stale_probe = Some(StaleProbeCache {
             relation_oid,
             version,
@@ -181,9 +181,20 @@ mod tests {
 
     use super::*;
     use crate::cache::messages::PopulationMerge;
-    use crate::cache::writer::staging::PopulationDeletedKeys;
+    use crate::cache::writer::staging::{EventStamp, PopulationDeletedKeys};
+    use std::sync::Arc;
+
+    use crate::pg::{Lsn, OriginSnapshot};
 
     const REL: Oid = Oid::from_raw(10);
+    const POPULATION: PopulationKey = (Fingerprint::from_raw(1), Generation::from_raw(1));
+
+    fn stamp(lsn: u64, xid: u32) -> EventStamp {
+        EventStamp {
+            lsn: Lsn::from_raw(lsn),
+            xid: Some(xid),
+        }
+    }
 
     fn drain() -> MergeInProgress {
         MergeInProgress::new(
@@ -205,12 +216,7 @@ mod tests {
 
     fn keys_recording() -> PopulationDeletedKeys {
         let mut keys = PopulationDeletedKeys::default();
-        keys.activate(
-            Fingerprint::from_raw(1),
-            Generation::from_raw(1),
-            &[REL],
-            Lsn::from_raw(1),
-        );
+        keys.activate(POPULATION.0, POPULATION.1, &[REL], Lsn::from_raw(1));
         keys
     }
 
@@ -222,7 +228,7 @@ mod tests {
         let mut drain = drain();
         assert!(drain.filter_predicate(scope(&keys)).is_none());
 
-        keys.record(REL, EcoString::from("4"), Lsn::from_raw(10));
+        keys.record(REL, EcoString::from("4"), stamp(10, 10));
         let first = drain
             .filter_predicate(scope(&keys))
             .expect("filter present")
@@ -233,7 +239,7 @@ mod tests {
             .as_ptr();
         assert_eq!(first, again, "unchanged key set reuses the rendering");
 
-        keys.record(REL, EcoString::from("7"), Lsn::from_raw(11));
+        keys.record(REL, EcoString::from("7"), stamp(11, 11));
         let grown = drain
             .filter_predicate(scope(&keys))
             .expect("filter present");
@@ -252,56 +258,68 @@ mod tests {
         assert!(drain.filter_predicate(scope(&keys)).is_none());
     }
 
-    /// PGC-464: toast-stale keys render only above the population's floor, the
-    /// probe predicate is re-rendered exactly when that set moves, a delete
-    /// supersedes a stale key, and a stale key cancels a tracked delete.
+    /// PGC-464/PGC-484: toast-stale keys render only when the population's
+    /// snapshot doesn't see their transaction, the probe predicate is
+    /// re-rendered exactly when that set moves, a delete supersedes a stale
+    /// key, and a stale key cancels a tracked delete.
     #[test]
-    fn test_stale_probe_follows_key_set_and_floor() {
+    fn test_stale_probe_follows_key_set_and_snapshot() {
         let mut keys = keys_recording();
+        // Sees xids below 20 except 15.
+        keys.snapshot_set(
+            POPULATION.0,
+            POPULATION.1,
+            Arc::new(OriginSnapshot::new(10, 20, vec![15])),
+        );
         let mut drain = drain();
-        let floor = Lsn::from_raw(5);
-        assert!(drain.stale_probe_predicate(scope(&keys), floor).is_none());
+        assert!(
+            drain
+                .stale_probe_predicate(scope(&keys), POPULATION)
+                .is_none()
+        );
 
-        // At or below the floor: the population's snapshot already reflects it.
-        keys.record_toast_stale(REL, EcoString::from("4"), Lsn::from_raw(5));
-        assert!(drain.stale_probe_predicate(scope(&keys), floor).is_none());
+        // Seen by the snapshot: the population's reads already reflect it.
+        keys.record_toast_stale(REL, EcoString::from("4"), stamp(5, 12));
+        assert!(
+            drain
+                .stale_probe_predicate(scope(&keys), POPULATION)
+                .is_none()
+        );
 
-        keys.record_toast_stale(REL, EcoString::from("7"), Lsn::from_raw(10));
+        keys.record_toast_stale(REL, EcoString::from("7"), stamp(10, 15));
         let first = drain
-            .stale_probe_predicate(scope(&keys), floor)
+            .stale_probe_predicate(scope(&keys), POPULATION)
             .expect("predicate present");
         assert!(first.contains("(7)") && !first.contains("(4)"), "{first}");
         assert!(
-            drain.stale_probe_predicate(scope(&keys), floor).is_none(),
+            drain
+                .stale_probe_predicate(scope(&keys), POPULATION)
+                .is_none(),
             "unchanged set is not re-probed"
         );
 
         // A stale key cancels a tracked delete of the same row (alive at origin).
-        keys.record(REL, EcoString::from("9"), Lsn::from_raw(11));
+        keys.record(REL, EcoString::from("9"), stamp(11, 21));
         assert!(
             keys.filter_predicate(REL, "(id)")
                 .expect("delete filter")
                 .contains("(9)")
         );
-        keys.record_toast_stale(REL, EcoString::from("9"), Lsn::from_raw(12));
+        keys.record_toast_stale(REL, EcoString::from("9"), stamp(12, 22));
         assert!(keys.filter_predicate(REL, "(id)").is_none());
         let grown = drain
-            .stale_probe_predicate(scope(&keys), floor)
+            .stale_probe_predicate(scope(&keys), POPULATION)
             .expect("predicate present");
         assert!(grown.contains("(7)") && grown.contains("(9)"), "{grown}");
 
         // A later delete supersedes the stale key: the merge omits the row.
-        keys.record(REL, EcoString::from("9"), Lsn::from_raw(13));
+        keys.record(REL, EcoString::from("9"), stamp(13, 23));
         let shrunk = drain
-            .stale_probe_predicate(scope(&keys), floor)
+            .stale_probe_predicate(scope(&keys), POPULATION)
             .expect("predicate present");
         assert!(
             shrunk.contains("(7)") && !shrunk.contains("(9)"),
             "{shrunk}"
-        );
-        assert_eq!(
-            keys.floor(REL, Fingerprint::from_raw(1), Generation::from_raw(1)),
-            Some(Lsn::from_raw(1))
         );
     }
 
@@ -327,6 +345,7 @@ mod tests {
             staged: vec![],
             cached_bytes: 0,
             row_count: 0,
+            snapshot: Arc::new(OriginSnapshot::new(0, 0, vec![])),
             snapshot_lsn: Lsn::from_raw(0),
             enqueued_at: Instant::now(),
             fetch_stage_ms: 0.0,

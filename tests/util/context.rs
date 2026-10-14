@@ -9,9 +9,9 @@ use super::http::http_get;
 use super::metrics::MetricsSnapshot;
 use super::process::{
     PgCacheProcess, TempDBs, connect_pgcache, connect_pgcache_allowlist, connect_pgcache_args,
-    connect_pgcache_clock, connect_pgcache_fault, connect_pgcache_pinned,
-    connect_pgcache_pinned_fault, connect_pgcache_pinned_small_cache, connect_pgcache_small_cache,
-    start_databases, test_db_connect,
+    connect_pgcache_clock, connect_pgcache_fault, connect_pgcache_fault_policy,
+    connect_pgcache_pinned, connect_pgcache_pinned_fault, connect_pgcache_pinned_small_cache,
+    connect_pgcache_small_cache, start_databases, test_db_connect,
 };
 
 /// Test context combining all resources needed for integration tests.
@@ -101,6 +101,22 @@ impl TestContext {
     pub(crate) async fn setup_fault(env: &[(&str, &str)]) -> Result<Self, Error> {
         let (dbs, origin) = start_databases().await?;
         let (pgcache, cache_port, metrics_port, cache) = connect_pgcache_fault(&dbs, env).await?;
+        Ok(Self {
+            dbs,
+            pgcache,
+            cache_port,
+            metrics_port,
+            cache,
+            origin,
+        })
+    }
+
+    /// [`Self::setup_fault`] under the clock eviction policy, where an
+    /// invalidated query is kept for fast readmission.
+    pub(crate) async fn setup_fault_clock(env: &[(&str, &str)]) -> Result<Self, Error> {
+        let (dbs, origin) = start_databases().await?;
+        let (pgcache, cache_port, metrics_port, cache) =
+            connect_pgcache_fault_policy(&dbs, "clock", env).await?;
         Ok(Self {
             dbs,
             pgcache,

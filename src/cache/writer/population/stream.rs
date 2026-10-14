@@ -24,7 +24,7 @@ use super::{PopulationConnections, PopulationOutcome, PopulationWork};
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
-use crate::pg::Lsn;
+use crate::pg::{Lsn, OriginSnapshot};
 use crate::query::ast::Clause;
 use crate::query::ast::rope::deparse::{from_deparse_with, where_clause_deparse_with};
 use crate::query::ast::rope::{Select, Table};
@@ -92,6 +92,14 @@ pub(super) async fn population_task(
     let mut reset: HashSet<Oid> = HashSet::new();
     let mut staged: Vec<(Oid, EcoString)> = Vec::new();
 
+    // Taken before the first read, so every transaction it sees is visible to
+    // each per-table read that follows.
+    let snapshot = OriginSnapshot::current(&connections.origin)
+        .await
+        .map(Arc::new)
+        .map_into_report::<CacheError>()
+        .attach_loc("reading the population's origin snapshot")?;
+
     for (branch, _) in select_branches_with_source(work.population.tree().root()) {
         for table_node in branch.direct_tables() {
             let table = table_metadata_find(&work.table_metadata, &work.population, table_node)?;
@@ -123,6 +131,7 @@ pub(super) async fn population_task(
         cached_bytes,
         row_count,
         staged,
+        snapshot,
         snapshot_lsn,
     })
 }

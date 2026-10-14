@@ -129,14 +129,11 @@ impl WriterRegistration {
         // the worker reads its snapshot (PGC-250). Released at merge or on
         // failure.
         let relation_oids: Vec<Oid> = work.table_metadata.iter().map(|t| t.relation_oid).collect();
-        // Anchor floor: a lower bound on this population's snapshot LSN, used to
-        // prune deleted keys it can no longer need (PGC-250).
-        let anchor_floor = core.last_received_lsn;
         core.population_deleted_keys.activate(
             fingerprint,
             generation,
             &relation_oids,
-            anchor_floor,
+            core.last_received_lsn,
         );
         // Check out a reusable staging table per relation (PGC-293); the writer
         // returns them to the pool at merge / failure.

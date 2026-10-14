@@ -3,10 +3,10 @@ use std::time::Instant;
 use ecow::EcoString;
 use tracing::debug;
 
+use super::CdcOperation;
 use super::row_match::{
     join_membership_unchanged, row_constraints_match, window_move_is_promotion,
 };
-use super::{CdcOperation, WriterCdc};
 use crate::cache::CacheResult;
 use crate::cache::Generation;
 use crate::cache::messages::QueryCommand;
@@ -411,7 +411,7 @@ fn query_invalidated_mark(core: &mut WriterCore, fingerprint: Fingerprint, gener
     core.waiters_fail(fingerprint);
 }
 
-impl WriterCdc {
+impl WriterCore {
     /// CDC-triggered invalidation of a cached query.
     /// For FIFO: delegates to full eviction.
     /// For CLOCK: marks the entry as Invalidated, keeping metadata for fast readmission.
@@ -425,9 +425,8 @@ impl WriterCdc {
     /// counts real events and is not inflated by re-flagging the standing
     /// invalidated set every frame.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
-    pub(super) async fn cache_query_cdc_invalidate(
-        &self,
-        core: &mut WriterCore,
+    pub(crate) async fn cache_query_cdc_invalidate(
+        &mut self,
         fingerprint: Fingerprint,
     ) -> CacheResult<bool> {
         // Pinned queries: defer readmission to the writer event loop. Still
@@ -435,23 +434,23 @@ impl WriterCdc {
         // under churn (waiting on it risks the same hang as the unpinned path).
         // A pinned invalidation is a real event (it queues a readmit), so it
         // counts — unlike the already-invalidated re-flag below.
-        if core
+        if self
             .cache
             .cached_queries
             .get1(&fingerprint)
             .is_some_and(|q| q.pinned)
         {
             debug!("pinned query invalidated, deferring readmit {fingerprint}");
-            let _ = core.query_tx.send(QueryCommand::Readmit { fingerprint });
-            core.waiters_fail(fingerprint);
+            let _ = self.query_tx.send(QueryCommand::Readmit { fingerprint });
+            self.waiters_fail(fingerprint);
             return Ok(true);
         }
 
-        if core.cache.dynamic.load().cache_policy == CachePolicy::Fifo {
-            return core.cache_query_evict(fingerprint).await.map(|()| true);
+        if self.cache.dynamic.load().cache_policy == CachePolicy::Fifo {
+            return self.cache_query_evict(fingerprint).await.map(|()| true);
         }
 
-        let Some(generation) = core
+        let Some(generation) = self
             .cache
             .cached_queries
             .get1(&fingerprint)
@@ -462,14 +461,14 @@ impl WriterCdc {
         };
 
         debug!("cdc invalidating query {fingerprint}");
-        let prev_generation_threshold = core.cache.generation_purge_threshold();
-        query_invalidated_mark(core, fingerprint, generation);
+        let prev_generation_threshold = self.cache.generation_purge_threshold();
+        query_invalidated_mark(self, fingerprint, generation);
 
         // Purge stale rows if the generation threshold moved and the cache
         // volume is under disk pressure (statvfs, PGC-276).
-        let new_threshold = core.cache.generation_purge_threshold();
-        if new_threshold > prev_generation_threshold && core.disk_pressure() {
-            core.generation_purge(new_threshold).await?;
+        let new_threshold = self.cache.generation_purge_threshold();
+        if new_threshold > prev_generation_threshold && self.disk_pressure() {
+            self.generation_purge(new_threshold).await?;
         }
 
         Ok(true)

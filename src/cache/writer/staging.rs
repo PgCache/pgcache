@@ -13,7 +13,8 @@
 //! permanently. `PopulationDeletedKeys` records every key CDC removes while a
 //! population over that relation is in flight; the merge filters those keys out.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use ecow::EcoString;
 use postgres_protocol::escape;
@@ -23,58 +24,95 @@ use super::core::WriterCore;
 use crate::cache::Generation;
 use crate::catalog::TableMetadata;
 use crate::oid::Oid;
-use crate::pg::Lsn;
 use crate::pg::protocol::ByteString;
+use crate::pg::{Lsn, OriginSnapshot};
 use crate::query::Fingerprint;
 
 /// Per-relation backstop cap on retained distinct deleted-key tuples. The
-/// primary bound is the LSN-anchored prune (`DeletedKeyEntry::prune`): a deleted
-/// key is dropped once every in-flight population's snapshot is at or after the
-/// delete, so the set is bounded by the oldest in-flight population's window.
-/// The cap only bites if a single population stays in flight long enough on a
-/// high-delete relation to accumulate this many keys; on overflow the keys are
-/// dropped and every merge over the relation is aborted (the query repopulates
-/// with a fresh snapshot) until the last in-flight population deactivates.
+/// primary bound is the prune (`PopulationDeletedKeys::relation_prune`): a key
+/// is dropped once no in-flight population can be missing the event that
+/// recorded it, so the set is bounded by the oldest in-flight population's
+/// window. The cap only bites if a single population stays in flight long
+/// enough on a high-delete relation to accumulate this many keys; on overflow
+/// the keys are dropped and every merge over the relation is aborted (the query
+/// repopulates with a fresh snapshot) until the last in-flight population
+/// deactivates. It also bounds a population's toast-fallback matches awaiting
+/// its snapshot.
 const POPULATION_DELETED_KEY_CAP: usize = 100_000;
 
 /// Tracks primary keys removed by CDC while populations are in flight, per
 /// relation, so a population merge can filter out rows CDC already removed.
 ///
-/// Each deleted key is stamped with the commit LSN at which it was removed, and
-/// each in-flight population contributes an *anchor floor* (a lower bound on its
-/// snapshot LSN). A delete at `lsn_d` only matters to a population whose
-/// snapshot predates it (`snapshot < lsn_d`); once every in-flight population's
-/// floor reaches `lsn_d`, the key is irrelevant and pruned. This bounds the set
-/// to the oldest in-flight population's window rather than letting it grow with
-/// total delete volume under sustained overlap.
+/// Each key is stamped with the commit LSN and xid of the transaction that
+/// recorded it. A population can be missing that event only if it was applied
+/// after the population began recording and its xid is not visible to the
+/// origin snapshot the population took before reading (PGC-484). Once no
+/// in-flight population can be missing a key's event, the key is pruned. This
+/// bounds the set to the oldest in-flight population's window rather than
+/// letting it grow with total delete volume under sustained overlap.
 /// Identifies one in-flight population: `(fingerprint, generation)`. Keying on
 /// the pair (not fingerprint alone) keeps two populations of the same query —
 /// e.g. one parked post-merge while a readmit dispatches the next generation —
 /// tracked independently, so deactivating one never tears down the other.
-type PopulationKey = (Fingerprint, Generation);
+pub(super) type PopulationKey = (Fingerprint, Generation);
+
+/// The source transaction a CDC event committed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct EventStamp {
+    pub(super) lsn: Lsn,
+    /// `None` when the transaction is unknown; treated as unseen by every
+    /// snapshot.
+    pub(super) xid: Option<u32>,
+}
 
 #[derive(Default)]
 pub(super) struct PopulationDeletedKeys {
     relations: HashMap<Oid, DeletedKeyEntry>,
-    /// population → relations it activated, so deactivate is exact.
-    inflight: HashMap<PopulationKey, Vec<Oid>>,
+    inflight: HashMap<PopulationKey, InflightPopulation>,
+}
+
+struct InflightPopulation {
+    relation_oids: Vec<Oid>,
+    /// `last_received_lsn` at dispatch. An event stamped at or below it was
+    /// applied before recording began and is assumed visible to the reads
+    /// (PGC-485).
+    activated_at: Lsn,
+    /// The origin snapshot taken before the reads, once the population reports
+    /// it.
+    snapshot: Option<Arc<OriginSnapshot>>,
+    /// Transactions whose toast fallback matched this population's query,
+    /// awaiting the snapshot.
+    fallback_pending: Vec<Option<u32>>,
+    /// A toast fallback matched the query in a transaction the reads may have
+    /// missed, so the merge must abort.
+    fallback_missed: bool,
+}
+
+impl InflightPopulation {
+    /// Whether the reads may be missing the event stamped `stamp`.
+    fn misses(&self, stamp: EventStamp) -> bool {
+        stamp.lsn > self.activated_at && !self.sees(stamp.xid)
+    }
+
+    fn sees(&self, xid: Option<u32>) -> bool {
+        matches!((&self.snapshot, xid), (Some(snapshot), Some(xid)) if snapshot.sees(xid))
+    }
 }
 
 #[derive(Default)]
 struct DeletedKeyEntry {
-    /// In-flight populations over this relation: population → anchor floor
-    /// (lower bound on the population's snapshot LSN). Empty ⇒ remove the entry.
-    floors: HashMap<PopulationKey, Lsn>,
-    /// Rendered PK tuple body (e.g. `42` or `'a','b'`) → commit LSN of the delete.
-    keys: HashMap<EcoString, Lsn>,
-    /// Bumped whenever the key *set* changes (not an LSN restamp), so a merge
-    /// can reuse its rendered filter across chunks until the set moves.
+    /// In-flight populations over this relation. Empty ⇒ remove the entry.
+    populations: HashSet<PopulationKey>,
+    /// Rendered PK tuple body (e.g. `42` or `'a','b'`) → the delete's stamp.
+    keys: HashMap<EcoString, EventStamp>,
+    /// Bumped whenever the key *set* changes (not a restamp), so a merge can
+    /// reuse its rendered filter across chunks until the set moves.
     version: u64,
-    /// PK tuple body → commit LSN of a toast fallback on that row (PGC-464): a
-    /// row CDC could neither upsert (incomplete image) nor record as deleted
-    /// (alive at origin). A population whose staged snapshot holds the row
-    /// from before that LSN cannot be repaired at merge and must repopulate.
-    stale_keys: HashMap<EcoString, Lsn>,
+    /// PK tuple body → stamp of a toast fallback on that row (PGC-464): a row
+    /// CDC could neither upsert (incomplete image) nor record as deleted
+    /// (alive at origin). A population whose staging holds the row from before
+    /// that transaction cannot be repaired at merge and must repopulate.
+    stale_keys: HashMap<EcoString, EventStamp>,
     /// Bumped whenever `stale_keys` changes, for the merge's probe cache.
     stale_version: u64,
     /// Set once `keys` exceeds the cap; keys are dropped and *every* merge over
@@ -88,35 +126,26 @@ struct DeletedKeyEntry {
 }
 
 impl DeletedKeyEntry {
-    /// Drop keys no in-flight population can still need: a delete at `lsn_d` is
-    /// irrelevant once every floor is `>= lsn_d` (every snapshot is at/after the
-    /// delete, so none read the row alive). Keeps keys with `lsn_d > min(floor)`.
-    fn prune(&mut self) {
-        let Some(min_floor) = self.floors.values().copied().min() else {
-            return;
-        };
-        self.keys_retain(|lsn| lsn > min_floor);
-        self.stale_keys_retain(|lsn| lsn > min_floor);
-    }
-
-    fn stale_key_insert(&mut self, key: EcoString, lsn: Lsn) {
-        // Later fallback on the same key: keep the later LSN (a population
-        // floored between the two still holds a copy from before the later).
-        let slot = self.stale_keys.entry(key).or_insert(lsn);
-        *slot = (*slot).max(lsn);
+    fn stale_key_insert(&mut self, key: EcoString, stamp: EventStamp) {
+        // A later fallback on the same key wins: its writer waited on the
+        // earlier one's row lock, so a snapshot that sees it sees both.
+        let slot = self.stale_keys.entry(key).or_insert(stamp);
+        if stamp.lsn >= slot.lsn {
+            *slot = stamp;
+        }
         self.stale_version += 1;
     }
 
-    fn stale_keys_retain(&mut self, keep: impl Fn(Lsn) -> bool) {
+    fn stale_keys_retain(&mut self, keep: impl Fn(EventStamp) -> bool) {
         let before = self.stale_keys.len();
-        self.stale_keys.retain(|_, lsn| keep(*lsn));
+        self.stale_keys.retain(|_, stamp| keep(*stamp));
         if self.stale_keys.len() != before {
             self.stale_version += 1;
         }
     }
 
-    fn key_insert(&mut self, key: EcoString, lsn: Lsn) {
-        if self.keys.insert(key, lsn).is_none() {
+    fn key_insert(&mut self, key: EcoString, stamp: EventStamp) {
+        if self.keys.insert(key, stamp).is_none() {
             self.version += 1;
         }
     }
@@ -130,9 +159,9 @@ impl DeletedKeyEntry {
         removed
     }
 
-    fn keys_retain(&mut self, keep: impl Fn(Lsn) -> bool) {
+    fn keys_retain(&mut self, keep: impl Fn(EventStamp) -> bool) {
         let before = self.keys.len();
-        self.keys.retain(|_, lsn| keep(*lsn));
+        self.keys.retain(|_, stamp| keep(*stamp));
         if self.keys.len() != before {
             self.version += 1;
         }
@@ -155,8 +184,8 @@ impl DeletedKeyEntry {
     /// truncate and irrelevant to surviving post-event snapshots).
     fn abort_below(&mut self, lsn: Lsn) {
         self.aborted_below = self.aborted_below.max(lsn);
-        self.keys_retain(|key_lsn| key_lsn > lsn);
-        self.stale_keys_retain(|key_lsn| key_lsn > lsn);
+        self.keys_retain(|stamp| stamp.lsn > lsn);
+        self.stale_keys_retain(|stamp| stamp.lsn > lsn);
     }
 
     /// Whether a merge whose snapshot is `snapshot_lsn` must abort: keys were
@@ -172,18 +201,16 @@ impl DeletedKeyEntry {
 }
 
 impl PopulationDeletedKeys {
-    /// Begin recording deletes for a population's relations. Called at dispatch,
-    /// before the worker reads its snapshot — a delete CDC processed earlier has
-    /// an LSN below the watermark, hence below the snapshot boundary, so its row
-    /// isn't in the snapshot and can't be resurrected. `anchor_floor` is the
-    /// apply watermark at dispatch, a lower bound on this population's snapshot
-    /// LSN, used to prune keys it can no longer need. Idempotent per fingerprint.
+    /// Begin recording deletes for a population's relations. Called at
+    /// dispatch, before the worker reads its snapshot. `activated_at` is the
+    /// receive watermark at dispatch: events stamped at or below it were
+    /// applied before recording began. Idempotent per population.
     pub(super) fn activate(
         &mut self,
         fingerprint: Fingerprint,
         generation: Generation,
         relation_oids: &[Oid],
-        anchor_floor: Lsn,
+        activated_at: Lsn,
     ) {
         let key = (fingerprint, generation);
         if self.inflight.contains_key(&key) {
@@ -193,35 +220,80 @@ impl PopulationDeletedKeys {
             self.relations
                 .entry(oid)
                 .or_default()
-                .floors
-                .insert(key, anchor_floor);
+                .populations
+                .insert(key);
         }
-        self.inflight.insert(key, relation_oids.to_vec());
+        self.inflight.insert(
+            key,
+            InflightPopulation {
+                relation_oids: relation_oids.to_vec(),
+                activated_at,
+                snapshot: None,
+                fallback_pending: Vec::new(),
+                fallback_missed: false,
+            },
+        );
     }
 
-    /// Stop recording for a population: drop its floor and prune (its departure
-    /// may have raised the relation's min floor). Removes a relation's entry once
-    /// its last in-flight population leaves.
+    /// Stop recording for a population and prune what only it needed. Removes
+    /// a relation's entry once its last in-flight population leaves.
     pub(super) fn deactivate(&mut self, fingerprint: Fingerprint, generation: Generation) {
         let key = (fingerprint, generation);
-        let Some(oids) = self.inflight.remove(&key) else {
+        let Some(population) = self.inflight.remove(&key) else {
             return;
         };
-        for oid in oids {
-            if let Some(entry) = self.relations.get_mut(&oid) {
-                entry.floors.remove(&key);
-                if entry.floors.is_empty() {
-                    self.relations.remove(&oid);
-                } else {
-                    entry.prune();
-                }
+        for oid in population.relation_oids {
+            let Some(entry) = self.relations.get_mut(&oid) else {
+                continue;
+            };
+            entry.populations.remove(&key);
+            if entry.populations.is_empty() {
+                self.relations.remove(&oid);
+            } else {
+                self.relation_prune(oid);
             }
         }
     }
 
-    /// Record a removed PK (stamped with the delete's commit LSN) for
-    /// `relation_oid` if a population is recording it.
-    pub(super) fn record(&mut self, relation_oid: Oid, key: EcoString, lsn: Lsn) {
+    /// Record the origin snapshot a population took before its reads. Settles
+    /// the toast-fallback matches it was holding and prunes what the snapshot
+    /// shows it already read.
+    pub(super) fn snapshot_set(
+        &mut self,
+        fingerprint: Fingerprint,
+        generation: Generation,
+        snapshot: Arc<OriginSnapshot>,
+    ) {
+        let Some(population) = self.inflight.get_mut(&(fingerprint, generation)) else {
+            return;
+        };
+        population.snapshot = Some(snapshot);
+        let pending = std::mem::take(&mut population.fallback_pending);
+        let missed = pending.into_iter().any(|xid| !population.sees(xid));
+        population.fallback_missed |= missed;
+        for oid in population.relation_oids.clone() {
+            self.relation_prune(oid);
+        }
+    }
+
+    /// Drop keys no in-flight population over `relation_oid` can be missing.
+    fn relation_prune(&mut self, relation_oid: Oid) {
+        let inflight = &self.inflight;
+        let Some(entry) = self.relations.get_mut(&relation_oid) else {
+            return;
+        };
+        let populations: Vec<&InflightPopulation> = entry
+            .populations
+            .iter()
+            .filter_map(|key| inflight.get(key))
+            .collect();
+        let needed = |stamp: EventStamp| populations.iter().any(|p| p.misses(stamp));
+        entry.keys_retain(needed);
+        entry.stale_keys_retain(needed);
+    }
+
+    /// Record a removed PK for `relation_oid` if a population is recording it.
+    pub(super) fn record(&mut self, relation_oid: Oid, key: EcoString, stamp: EventStamp) {
         let Some(entry) = self.relations.get_mut(&relation_oid) else {
             return;
         };
@@ -232,7 +304,7 @@ impl PopulationDeletedKeys {
         if entry.stale_keys.remove(&key).is_some() {
             entry.stale_version += 1;
         }
-        entry.key_insert(key, lsn);
+        entry.key_insert(key, stamp);
         if entry.keys.len() > POPULATION_DELETED_KEY_CAP {
             entry.disable();
             error!(
@@ -243,12 +315,16 @@ impl PopulationDeletedKeys {
         }
     }
 
-    /// Record a toast fallback on the row at `key` (PGC-464), stamped with the
-    /// fallback's commit LSN, if a population is recording `relation_oid`.
-    /// The row is alive at origin, so it also cancels any tracked delete of
-    /// the key. Shares the deleted-key cap: overflow aborts every merge over
-    /// the relation until the last population leaves.
-    pub(super) fn record_toast_stale(&mut self, relation_oid: Oid, key: EcoString, lsn: Lsn) {
+    /// Record a toast fallback on the row at `key` (PGC-464) if a population is
+    /// recording `relation_oid`. The row is alive at origin, so it also cancels
+    /// any tracked delete of the key. Shares the deleted-key cap: overflow
+    /// aborts every merge over the relation until the last population leaves.
+    pub(super) fn record_toast_stale(
+        &mut self,
+        relation_oid: Oid,
+        key: EcoString,
+        stamp: EventStamp,
+    ) {
         let Some(entry) = self.relations.get_mut(&relation_oid) else {
             return;
         };
@@ -256,7 +332,7 @@ impl PopulationDeletedKeys {
             return;
         }
         entry.key_remove(&key);
-        entry.stale_key_insert(key, lsn);
+        entry.stale_key_insert(key, stamp);
         if entry.stale_keys.len() > POPULATION_DELETED_KEY_CAP {
             entry.disable();
             error!(
@@ -265,6 +341,44 @@ impl PopulationDeletedKeys {
                  affected populations will repopulate"
             );
         }
+    }
+
+    /// Record that a toast fallback in transaction `xid` matched `population`'s
+    /// query (PGC-484). If the population's reads may have missed it, the row
+    /// may be absent or stale in staging, so the merge aborts.
+    pub(super) fn fallback_match_record(&mut self, population: PopulationKey, xid: Option<u32>) {
+        let Some(inflight) = self.inflight.get_mut(&population) else {
+            return;
+        };
+        if inflight.fallback_missed {
+            return;
+        }
+        if inflight.snapshot.is_some() {
+            inflight.fallback_missed = !inflight.sees(xid);
+            return;
+        }
+        if inflight.fallback_pending.last() != Some(&xid) {
+            inflight.fallback_pending.push(xid);
+        }
+        if inflight.fallback_pending.len() > POPULATION_DELETED_KEY_CAP {
+            inflight.fallback_pending = Vec::new();
+            inflight.fallback_missed = true;
+        }
+    }
+
+    /// Whether a toast fallback matched the population's query in a
+    /// transaction its reads may have missed.
+    pub(super) fn fallback_missed(&self, fingerprint: Fingerprint, generation: Generation) -> bool {
+        self.inflight
+            .get(&(fingerprint, generation))
+            .is_some_and(|population| population.fallback_missed)
+    }
+
+    /// Whether `population` is in flight and recording `relation_oid`.
+    pub(super) fn records(&self, population: PopulationKey, relation_oid: Oid) -> bool {
+        self.relations
+            .get(&relation_oid)
+            .is_some_and(|entry| entry.populations.contains(&population))
     }
 
     /// Drop a toast-stale key whose row CDC has re-written with a complete
@@ -283,48 +397,39 @@ impl PopulationDeletedKeys {
         removed
     }
 
-    /// The anchor floor a population registered for `relation_oid` at
-    /// dispatch: a lower bound on its snapshot, so any event at or below it is
-    /// reflected in what it staged.
-    pub(super) fn floor(
+    /// Version of the toast-stale key set for `relation_oid`, or `None` when
+    /// `population` can be missing none of them. Changes exactly when the set a
+    /// merge would probe with could, so the merge can cache its probe result.
+    pub(super) fn stale_version_for(
         &self,
         relation_oid: Oid,
-        fingerprint: Fingerprint,
-        generation: Generation,
-    ) -> Option<Lsn> {
-        self.relations
-            .get(&relation_oid)?
-            .floors
-            .get(&(fingerprint, generation))
-            .copied()
-    }
-
-    /// Version of the toast-stale key set for `relation_oid`, or `None` when
-    /// there is nothing above `floor` to probe. Changes exactly when the set a
-    /// merge would probe with could, so the merge can cache its probe result.
-    pub(super) fn stale_version_above(&self, relation_oid: Oid, floor: Lsn) -> Option<u64> {
+        population: PopulationKey,
+    ) -> Option<u64> {
         let entry = self.relations.get(&relation_oid)?;
+        let inflight = self.inflight.get(&population)?;
         entry
             .stale_keys
             .values()
-            .any(|lsn| *lsn > floor)
+            .any(|stamp| inflight.misses(*stamp))
             .then_some(entry.stale_version)
     }
 
     /// Render the `(<pk cols>) IN (...)` membership predicate over the
-    /// toast-stale keys above `floor`, or `None` when there are none.
+    /// toast-stale keys `population` can be missing, or `None` when there are
+    /// none.
     pub(super) fn stale_predicate(
         &self,
         relation_oid: Oid,
-        floor: Lsn,
+        population: PopulationKey,
         pk_columns_paren: &str,
     ) -> Option<String> {
         let entry = self.relations.get(&relation_oid)?;
+        let inflight = self.inflight.get(&population)?;
         let mut tuples = String::new();
         for key in entry
             .stale_keys
             .iter()
-            .filter(|(_, lsn)| **lsn > floor)
+            .filter(|(_, stamp)| inflight.misses(**stamp))
             .map(|(key, _)| key)
         {
             if !tuples.is_empty() {
@@ -668,8 +773,24 @@ mod tests {
     const REL: Oid = Oid::from_raw(10);
     const GEN: Generation = Generation::from_raw(1);
 
+    const FP1: Fingerprint = Fingerprint::from_raw(1);
+    const FP2: Fingerprint = Fingerprint::from_raw(2);
+
+    /// A stamp whose xid equals its LSN, which keeps the tests' arithmetic
+    /// readable.
+    fn stamp(lsn: u64) -> EventStamp {
+        EventStamp {
+            lsn: Lsn::from_raw(lsn),
+            xid: u32::try_from(lsn).ok(),
+        }
+    }
+
     fn record(keys: &mut PopulationDeletedKeys, body: &str, lsn: Lsn) {
-        keys.record(REL, EcoString::from(body), lsn);
+        keys.record(REL, EcoString::from(body), stamp(lsn.get()));
+    }
+
+    fn filtered(keys: &PopulationDeletedKeys) -> String {
+        keys.filter_predicate(REL, "(id)").unwrap_or_default()
     }
 
     /// The filter version moves exactly when the rendered filter would: on a
@@ -701,7 +822,7 @@ mod tests {
             "cancel of untracked key"
         );
 
-        // fp1 leaves: min floor 200 prunes the delete at 160.
+        // fp1 leaves: fp2 activated at 200, so the delete at 160 is pruned.
         keys.deactivate(Fingerprint::from_raw(1), GEN);
         assert!(keys.filter_version(REL).is_none(), "pruned to empty");
 
@@ -720,10 +841,10 @@ mod tests {
         );
     }
 
-    /// Deactivating a population raises the relation's min floor, pruning deletes
-    /// that predate every remaining in-flight population's snapshot.
+    /// Deactivating a population prunes deletes every remaining in-flight
+    /// population had already received before it began recording.
     #[test]
-    fn test_deactivate_prunes_below_min_floor() {
+    fn test_deactivate_prunes_keys_received_before_remaining_activations() {
         let mut keys = PopulationDeletedKeys::default();
         keys.activate(Fingerprint::from_raw(1), GEN, &[REL], Lsn::from_raw(100));
         keys.activate(Fingerprint::from_raw(2), GEN, &[REL], Lsn::from_raw(200));
@@ -735,8 +856,8 @@ mod tests {
         let before = keys.filter_predicate(REL, "(id)").expect("filter present");
         assert!(before.contains("(5)") && before.contains("(15)") && before.contains("(25)"));
 
-        // fp1 leaves → min floor becomes 200 → deletes at LSN <= 200 are
-        // irrelevant to fp2 (snapshot >= 200) and pruned.
+        // fp1 leaves → deletes received before fp2 activated (LSN <= 200) are
+        // irrelevant to fp2 and pruned.
         keys.deactivate(Fingerprint::from_raw(1), GEN);
         let after = keys.filter_predicate(REL, "(id)").expect("filter present");
         assert!(after.contains("(25)"), "kept recent delete: {after}");
@@ -842,6 +963,96 @@ mod tests {
             filter.contains("(25)") && !filter.contains("(5)"),
             "filter: {filter}"
         );
+    }
+
+    /// A reported snapshot prunes the keys whose transactions it sees and
+    /// keeps the ones it doesn't.
+    #[test]
+    fn test_snapshot_prunes_keys_it_sees() {
+        let mut keys = PopulationDeletedKeys::default();
+        keys.activate(FP1, GEN, &[REL], Lsn::from_raw(100));
+        record(&mut keys, "5", Lsn::from_raw(150));
+        record(&mut keys, "6", Lsn::from_raw(160));
+        record(&mut keys, "7", Lsn::from_raw(170));
+
+        // Sees xids below 170 except 160.
+        keys.snapshot_set(FP1, GEN, Arc::new(OriginSnapshot::new(150, 170, vec![160])));
+        let filter = filtered(&keys);
+        assert!(
+            !filter.contains("(5)") && filter.contains("(6)") && filter.contains("(7)"),
+            "{filter}"
+        );
+    }
+
+    /// A population that hasn't reported its snapshot holds every key
+    /// received since it activated, even ones another population has seen.
+    #[test]
+    fn test_population_without_snapshot_holds_its_keys() {
+        let mut keys = PopulationDeletedKeys::default();
+        keys.activate(FP1, GEN, &[REL], Lsn::from_raw(100));
+        keys.activate(FP2, GEN, &[REL], Lsn::from_raw(100));
+        record(&mut keys, "5", Lsn::from_raw(150));
+
+        keys.snapshot_set(FP1, GEN, Arc::new(OriginSnapshot::new(200, 200, vec![])));
+        assert!(filtered(&keys).contains("(5)"), "fp2 may still need it");
+
+        keys.snapshot_set(FP2, GEN, Arc::new(OriginSnapshot::new(200, 200, vec![])));
+        assert!(keys.filter_predicate(REL, "(id)").is_none(), "both saw it");
+    }
+
+    /// Fallback matches held before the snapshot arrives are settled by it: a
+    /// seen transaction leaves the merge alone, an unseen one aborts it.
+    #[test]
+    fn test_fallback_matches_settled_by_snapshot() {
+        let mut keys = PopulationDeletedKeys::default();
+        keys.activate(FP1, GEN, &[REL], Lsn::from_raw(100));
+        keys.activate(FP2, GEN, &[REL], Lsn::from_raw(100));
+        keys.fallback_match_record((FP1, GEN), Some(50));
+        keys.fallback_match_record((FP2, GEN), Some(60));
+
+        // Sees xids below 70 except 60.
+        keys.snapshot_set(FP1, GEN, Arc::new(OriginSnapshot::new(55, 70, vec![60])));
+        keys.snapshot_set(FP2, GEN, Arc::new(OriginSnapshot::new(55, 70, vec![60])));
+        assert!(!keys.fallback_missed(FP1, GEN), "fp1's match was seen");
+        assert!(
+            keys.fallback_missed(FP2, GEN),
+            "fp2's match was in progress"
+        );
+
+        // After the snapshot, a match is judged on arrival.
+        keys.fallback_match_record((FP1, GEN), Some(65));
+        assert!(
+            !keys.fallback_missed(FP1, GEN),
+            "committed before the snapshot"
+        );
+        keys.fallback_match_record((FP1, GEN), Some(80));
+        assert!(
+            keys.fallback_missed(FP1, GEN),
+            "committed after the snapshot"
+        );
+
+        keys.deactivate(FP1, GEN);
+        assert!(
+            !keys.fallback_missed(FP1, GEN),
+            "cleared with the population"
+        );
+    }
+
+    /// A match in an unknown transaction is never assumed seen, and too many
+    /// matches waiting on the snapshot abort the merge.
+    #[test]
+    fn test_fallback_match_unknown_or_overflowing_is_missed() {
+        let mut keys = PopulationDeletedKeys::default();
+        keys.activate(FP1, GEN, &[REL], Lsn::from_raw(100));
+        keys.activate(FP2, GEN, &[REL], Lsn::from_raw(100));
+        keys.fallback_match_record((FP1, GEN), None);
+        keys.snapshot_set(FP1, GEN, Arc::new(OriginSnapshot::new(1000, 1000, vec![])));
+        assert!(keys.fallback_missed(FP1, GEN));
+
+        for xid in 0..=POPULATION_DELETED_KEY_CAP {
+            keys.fallback_match_record((FP2, GEN), u32::try_from(xid).ok());
+        }
+        assert!(keys.fallback_missed(FP2, GEN), "overflow aborts");
     }
 
     /// A returned table is reused by the next checkout (no recreate).

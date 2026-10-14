@@ -204,6 +204,38 @@ fn toast_stale_key_record(
     core.frame_toast_stale_keys.push((relation_oid, key));
 }
 
+/// Defer a toast fallback's invalidation of a Loading query whose population is
+/// recording the relation (PGC-484): buffer it for the frame's xid, and let the
+/// merge abort only if the population's reads may have missed the transaction.
+/// The update usually committed before the reads and is already in staging.
+/// Returns false when the query must be invalidated now.
+fn toast_fallback_defer(
+    core: &mut WriterCore,
+    relation_oid: Oid,
+    fingerprint: Fingerprint,
+) -> bool {
+    let Some(population) = core
+        .cache
+        .cached_queries
+        .get1(&fingerprint)
+        .filter(|query| !query.invalidated)
+        .map(|query| (fingerprint, query.generation))
+    else {
+        return false;
+    };
+    if !core
+        .population_deleted_keys
+        .records(population, relation_oid)
+    {
+        return false;
+    }
+    core.frame_fallback_matches.push(population);
+    if core.memo_eligible.contains(&fingerprint) {
+        core.frame_memo_evictions.insert(fingerprint);
+    }
+    true
+}
+
 /// Buffer a PK-qualified delete of `row_data` from the relation's cache table
 /// into the open frame (PGC-228), opening the frame txn if needed. The
 /// relation is known-present by the time a handler reaches a delete, so a
@@ -557,6 +589,10 @@ impl WriterCdc {
     /// (PGC-464): the merge aborts exactly the populations whose staging holds
     /// it, and every other population — including ones registered after this
     /// event, which snapshot post-update origin — merges cleanly.
+    ///
+    /// A matched query that is Loading under such a population is not
+    /// invalidated here: the merge aborts it only if the population's reads may
+    /// have missed this transaction (PGC-484).
     // Trace level: at info/debug the fmt layer allocates per-span extensions,
     // which would put a heap allocation on every CDC event.
     #[instrument(skip_all, level = "trace")]
@@ -578,9 +614,13 @@ impl WriterCdc {
         };
 
         let recording = core.population_deleted_keys.is_recording(relation_oid);
-        let fp_list = self
+        let matched = self
             .toast_fallback_invalidations(core, update, toasted_columns)
             .await?;
+        let fp_list: Vec<Fingerprint> = matched
+            .into_iter()
+            .filter(|&fingerprint| !toast_fallback_defer(core, relation_oid, fingerprint))
+            .collect();
         // Only the row's live (new) PK: after a PK change the old PK's row is
         // genuinely dead at origin and its recorded delete below lets merges
         // omit it, which is exact where a stale key would only abort.

@@ -226,10 +226,10 @@ impl MvMeta {
         self.state = next;
     }
 
-    /// Raw state write. Prefer `WriterCore::mv_state_write`, which also keeps the
-    /// dirtiable-MV index consistent (PGC-338); call this directly only for the
-    /// non-dirtiable dispatch-side transition (`mv_schedule`), which the index
-    /// never tracks.
+    /// Raw state write. Prefer `WriterCore::mv_state_write`, which also records
+    /// memo eligibility (ADR-045); call this directly only for the
+    /// `Pending → Scheduled` transition (dispatch's `mv_schedule`, the pinned
+    /// bootstrap), which can't change it.
     pub(super) fn state_set(&mut self, state: MvState) {
         self.state = state;
     }

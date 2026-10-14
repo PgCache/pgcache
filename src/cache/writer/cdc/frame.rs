@@ -17,6 +17,7 @@ use crate::cache::writer::deadlock::{SQLSTATE_DEADLOCK, cache_error_sqlstate};
 use crate::cache::writer::frame::{
     FRAME_BUF_CAPACITY, FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, ToastState,
 };
+use crate::cache::writer::staging::EventStamp;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::oid::Oid;
 use crate::pg::Lsn;
@@ -83,6 +84,7 @@ impl WriterCdc {
         // affected relations in `frame_recover`.
         core.frame_deleted_keys.clear();
         core.frame_toast_stale_keys.clear();
+        core.frame_fallback_matches.clear();
         core.frame_truncated_relations.clear();
         core.batch_deleted_pks.clear();
         core.toast_overlay_reset();
@@ -107,8 +109,8 @@ impl WriterCdc {
         // those no-ops inflated the metric ~8x over real transitions.
         let mut count = 0u64;
         for fp in fps {
-            if self
-                .cache_query_cdc_invalidate(core, fp)
+            if core
+                .cache_query_cdc_invalidate(fp)
                 .await
                 .attach_loc("flushing deferred invalidation")?
             {
@@ -343,9 +345,13 @@ impl WriterCdc {
             // Truncate); a no-op keeps this panic-free.
             FrameRowEvent::Truncate { .. } => (Ok(()), "cdc replay truncate"),
             // Frame commit boundary (PGC-242): stamp the bookkeeping this
-            // frame's replay produced with its commit LSN.
-            FrameRowEvent::Boundary { commit_lsn } => {
-                frame_keys_stamp(core, *commit_lsn);
+            // frame's replay produced with its commit LSN and xid.
+            FrameRowEvent::Boundary { commit_lsn, xid } => {
+                let stamp = EventStamp {
+                    lsn: *commit_lsn,
+                    xid: Some(*xid),
+                };
+                frame_keys_stamp(core, stamp);
                 (Ok(()), "cdc replay boundary")
             }
         }
@@ -396,7 +402,7 @@ impl WriterCdc {
         // replay; this catches what replay didn't reach — pending entries from
         // a frame that entered `Recovering` before its boundary (no-ops in the
         // normal path, where the lists are already empty).
-        frame_keys_stamp(core, lsn);
+        frame_keys_stamp(core, EventStamp { lsn, xid: None });
         // Bulk invalidations recorded outside replay (mid-batch DDL drops,
         // 40P01 recovery) — flush-LSN-stamped by design (an upper bound on the
         // triggering frame's commit; over-aborts, never under-aborts).
@@ -505,19 +511,26 @@ impl<'m> EventSlot<'m> {
     }
 }
 
-/// Record the frame's deferred bookkeeping against `lsn`: deleted keys
-/// (PGC-250), toast-stale keys (PGC-464), and truncate abort watermarks.
-/// Drained in place so the buffers keep their capacity across frames.
-fn frame_keys_stamp(core: &mut WriterCore, lsn: Lsn) {
+/// Record the frame's deferred bookkeeping against `stamp`: deleted keys
+/// (PGC-250), toast-stale keys (PGC-464), toast-fallback matches of Loading
+/// populations (PGC-484), and truncate abort watermarks. Drained in place so
+/// the buffers keep their capacity across frames.
+fn frame_keys_stamp(core: &mut WriterCore, stamp: EventStamp) {
     for (relation_oid, key) in core.frame_deleted_keys.drain(..) {
-        core.population_deleted_keys.record(relation_oid, key, lsn);
+        core.population_deleted_keys
+            .record(relation_oid, key, stamp);
     }
     for (relation_oid, key) in core.frame_toast_stale_keys.drain(..) {
         core.population_deleted_keys
-            .record_toast_stale(relation_oid, key, lsn);
+            .record_toast_stale(relation_oid, key, stamp);
+    }
+    for population in core.frame_fallback_matches.drain(..) {
+        core.population_deleted_keys
+            .fallback_match_record(population, stamp.xid);
     }
     for relation_oid in core.frame_truncated_relations.drain(..) {
-        core.population_deleted_keys.abort_below(relation_oid, lsn);
+        core.population_deleted_keys
+            .abort_below(relation_oid, stamp.lsn);
     }
 }
 

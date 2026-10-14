@@ -16,8 +16,8 @@ use crate::cache::{
     query_cache::QueryType,
 };
 use crate::oid::Oid;
-use crate::pg::Lsn;
 use crate::pg::protocol::session::ResultFormats;
+use crate::pg::{Lsn, OriginSnapshot};
 use crate::query::ast::LimitClause;
 use crate::query::keying_settings::KeyingSettings;
 use crate::query::{Fingerprint, SessionKey};
@@ -238,6 +238,9 @@ pub struct PopulationMerge {
     pub staged: Vec<(Oid, EcoString)>,
     pub cached_bytes: usize,
     pub row_count: u64,
+    /// Origin snapshot taken before the population reads: a transaction it
+    /// sees is reflected in every staged table (PGC-484).
+    pub snapshot: Arc<OriginSnapshot>,
     /// Origin WAL LSN captured after the population reads (upper bound on the
     /// snapshot). The merge itself is withheld until the CDC apply watermark
     /// reaches this (PGC-272, superseding the PGC-250 Slice B Ready-time
