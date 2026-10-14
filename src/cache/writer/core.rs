@@ -188,7 +188,8 @@ pub(super) struct WriterCore {
     /// frame flush so eviction is predicate-matched, not relation-coarse: a
     /// change that doesn't touch a memo's predicate/membership leaves it intact.
     /// Collected whether or not an entry exists yet: a capture can store one
-    /// after its row was replayed but before the commit (PGC-350).
+    /// after its row was replayed but before the commit (PGC-350). Every query
+    /// the frame invalidates joins it before the bracket.
     pub(super) frame_memo_evictions: FingerprintSet,
     /// Fingerprints whose `MvState` is memo-eligible — the filter the CDC rows
     /// apply to their candidates before `frame_memo_evictions`. Writer-owned,

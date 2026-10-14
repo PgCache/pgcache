@@ -559,3 +559,62 @@ async fn test_memo_capture_during_frame_replay_not_served_stale() -> Result<(), 
     assert_row_at(&res, 1, &[("val", "new")])?;
     Ok(())
 }
+
+/// A frame can invalidate a query without its row reaching the per-row memo
+/// pass: an UPDATE whose unchanged out-of-line TOAST column can't be repaired
+/// (the row isn't cached) takes the fallback, which only invalidates. The
+/// memo captured before must not come back once the query is readmitted.
+#[tokio::test]
+async fn test_memo_not_served_after_toast_fallback_invalidation() -> Result<(), Error> {
+    // CLOCK, the production default: under the FIFO test default an
+    // invalidation is an eviction, and eviction already bumps the memo slot.
+    let mut ctx = TestContext::setup_clock(1).await?;
+    ctx.query(
+        "create table memo_toast (id integer primary key, k integer, big text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "alter table memo_toast alter column big set storage external",
+        &[],
+    )
+    .await?;
+    let big: String = std::iter::repeat_n('x', 8000).collect();
+    ctx.query(
+        &format!("insert into memo_toast values (1, 1, '{big}'), (2, 0, '{big}')"),
+        &[],
+    )
+    .await?;
+
+    let sql = "select id from memo_toast where k = 1 order by id";
+    warm_until_memoized(&mut ctx, sql).await?;
+
+    // Row 2 is cached by no query, so its unchanged `big` can't be repaired.
+    let before = ctx.metrics().await?;
+    ctx.origin_query("update memo_toast set k = 1 where id = 2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    assert!(
+        ctx.metrics().await?.cache_cdc_toast_fallbacks > before.cache_cdc_toast_fallbacks,
+        "the update took the TOAST fallback"
+    );
+
+    let after_update = ctx.metrics().await?;
+    let mut served_from_cache = false;
+    for _ in 0..80 {
+        let res = ctx.simple_query(sql).await?;
+        assert_eq!(res.len(), 4, "both rows: RowDescription + 2 rows + CC");
+        assert_row_at(&res, 1, &[("id", "1")])?;
+        assert_row_at(&res, 2, &[("id", "2")])?;
+        if ctx.metrics().await?.queries_cache_hit > after_update.queries_cache_hit {
+            served_from_cache = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        served_from_cache,
+        "the readmitted query was never served from cache"
+    );
+    Ok(())
+}

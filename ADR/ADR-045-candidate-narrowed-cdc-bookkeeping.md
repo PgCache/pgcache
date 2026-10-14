@@ -33,7 +33,7 @@ Replace the full-set scan in `update_queries_check_invalidate` and memo eviction
 - **UPDATE** — `candidates(new) ∪ candidates(old-image)`
 - **DELETE** — `candidates(old-image)` (PK-only under REPLICA IDENTITY DEFAULT → conservative via the `Unknown` wildcard, matching today's full eviction)
 
-The memo set is then filtered by **eligibility** (`MvState::memo_eligible`: `Skipped` or `Ineligible`), not by whether an entry exists, and the frame bumps `Memo(F)` for every survivor (PGC-350).
+The memo set is then filtered by **eligibility** (`MvState::memo_eligible`: `Skipped` or `Ineligible`), not by whether an entry exists, and the frame bumps `Memo(F)` for every survivor (PGC-350). Every eligible query the frame invalidates is added as well: not every invalidation runs the per-row pass (the unrepairable-TOAST fallback only invalidates), and under CLOCK an invalidated query keeps its memo across readmit unless its slot moves.
 
 backed by three small per-relation sets maintained on `UpdateQueries` alongside the existing indexes, used by the invalidation set:
 

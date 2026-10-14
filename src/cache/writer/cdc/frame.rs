@@ -381,6 +381,7 @@ impl WriterCdc {
         self.frame_rows_replay(core).await?;
         fault_memo_bracket_delay(core).await;
 
+        memo_evictions_invalidated_add(core);
         let memo_active = memo_bracket_begin(core);
         // Always publish the post-commit version (end the seqlock) before
         // propagating any finalize error: a slot left odd would permanently
@@ -546,6 +547,19 @@ fn memo_bracket_begin(core: &WriterCore) -> bool {
         core.state_view.memo.slot_dirty_begin(SlotKey::Memo(fp));
     }
     memo_active
+}
+
+/// Add the frame's invalidated queries to its memo evictions. Not every
+/// invalidation runs the per-row memo pass (the TOAST fallback only
+/// invalidates), and a memo that survives one is served again once the query
+/// is readmitted Ready.
+fn memo_evictions_invalidated_add(core: &mut WriterCore) {
+    core.frame_memo_evictions.extend(
+        core.frame_invalidations
+            .iter()
+            .copied()
+            .filter(|fingerprint| core.memo_eligible.contains(fingerprint)),
+    );
 }
 
 /// Test-only hold between replay and the memo bracket
