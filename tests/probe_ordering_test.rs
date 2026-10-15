@@ -1,8 +1,8 @@
 //! Probe replies must never be mistaken for a client statement's response.
 //!
-//! pgcache injects probes (`SHOW default_transaction_isolation`, `SHOW
-//! search_path` before PG 18, `pg_current_wal_insert_lsn()`) on the origin
-//! socket and swallows their replies. A probe is injected at an origin
+//! pgcache injects probes (the batched session-settings sample and
+//! `pg_current_wal_insert_lsn()`) on the origin socket and swallows their
+//! replies. A probe is injected at an origin
 //! `ReadyForQuery`, and a client statement may already be in flight behind
 //! that point. Before the fix the probe's intercept swallowed whatever came
 //! back next — the client's real response — and the probe's own rows were

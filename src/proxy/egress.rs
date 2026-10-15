@@ -15,14 +15,13 @@
 //! `origin_inflight_syncs` gate) with one structure whose invariant is easy to
 //! state and check.
 //!
-//! The queue also orders the proxy's own **probes** (`SHOW search_path`, `SHOW
-//! default_transaction_isolation`, `pg_current_wal_insert_lsn()`): queries the
-//! proxy injects on the origin socket whose responses must never reach the
-//! client. Origin answers everything on its socket in order, so a probe holds
-//! a `Probe` slot at its position in that order and its reply is routed there
-//! and swallowed — however many client requests are in flight around it. A
-//! probe slot carries nothing for the client and is invisible to the flush
-//! driver.
+//! The queue also orders the proxy's own **probes** (the session-settings
+//! sample, `pg_current_wal_insert_lsn()`): queries the proxy injects on the
+//! origin socket whose responses must never reach the client. Origin answers
+//! everything on its socket in order, so a probe holds a `Probe` slot at its
+//! position in that order and its reply is routed there and swallowed —
+//! however many client requests are in flight around it. A probe slot carries
+//! nothing for the client and is invisible to the flush driver.
 //!
 //! ## Flush model
 //!
@@ -191,9 +190,8 @@ impl<C> EgressQueue<C> {
 
     /// Reserve a slot for a client-facing forward to origin. Call this when a
     /// query (or the startup/auth handshake) is sent to origin and its response
-    /// will be relayed to the client. Injected, fully-swallowed origin queries
-    /// (e.g. a proactive `SHOW search_path`) must NOT open a slot — their bytes
-    /// never reach the client.
+    /// will be relayed to the client. A probe takes a `Probe` slot through
+    /// [`Self::probe_push`] instead.
     pub(super) fn origin_open(&mut self) {
         self.slots.push_back(EgressSlot::Origin {
             buf: VecDeque::new(),

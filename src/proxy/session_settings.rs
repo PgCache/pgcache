@@ -243,14 +243,17 @@ impl SettingsForwardReason {
 /// Settings whose non-default value changes what a statement means in a way
 /// the proxy's parser does not model: `standard_conforming_strings` off
 /// (pg_query parses as if on), `transform_null_equals` on (`= NULL` becomes
-/// `IS NULL`), `array_nulls` off (`'NULL'` array elements are strings) and a
-/// non-zero `gin_fuzzy_search_limit` (GIN results become a random sample).
+/// `IS NULL`), `array_nulls` off (`'NULL'` array elements are strings), a
+/// non-zero `gin_fuzzy_search_limit` (GIN results become a random sample) and
+/// a `client_encoding` other than UTF-8 (the proxy decodes statements and
+/// parameters only as UTF-8).
 fn parsing_incompatible(guc: Guc, value: &str) -> bool {
     let is = |expected: &str| value.trim().eq_ignore_ascii_case(expected);
     match guc {
         Guc::StandardConformingStrings | Guc::ArrayNulls => !is("on"),
         Guc::TransformNullEquals => is("on"),
         Guc::GinFuzzySearchLimit => !is("0"),
+        Guc::ClientEncoding => !is("UTF8"),
         Guc::SearchPath
         | Guc::TimeZone
         | Guc::DateStyle
@@ -260,7 +263,6 @@ fn parsing_incompatible(guc: Guc, value: &str) -> bool {
         | Guc::TimezoneAbbreviations
         | Guc::ExtraFloatDigits
         | Guc::ByteaOutput
-        | Guc::ClientEncoding
         | Guc::LcMonetary
         | Guc::LcNumeric
         | Guc::LcTime
@@ -420,6 +422,7 @@ impl SessionSettings {
             Guc::TransformNullEquals,
             Guc::ArrayNulls,
             Guc::GinFuzzySearchLimit,
+            Guc::ClientEncoding,
         ]
         .into_iter()
         .find(|guc| {
@@ -687,6 +690,7 @@ mod tests {
                 Guc::StandardConformingStrings | Guc::ArrayNulls => Some("on".into()),
                 Guc::TransformNullEquals => Some("off".into()),
                 Guc::GinFuzzySearchLimit => Some("0".into()),
+                Guc::ClientEncoding => Some("UTF8".into()),
                 _ => Some("x".into()),
             })
             .collect()
@@ -913,6 +917,7 @@ mod tests {
             (Guc::TransformNullEquals, "on", "off"),
             (Guc::ArrayNulls, "off", "on"),
             (Guc::GinFuzzySearchLimit, "100", "0"),
+            (Guc::ClientEncoding, "LATIN1", "UTF8"),
         ] {
             settings.effect_apply(SettingsEffect::guc(guc, false), false);
             let mut row = sample("public");

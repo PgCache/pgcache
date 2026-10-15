@@ -183,10 +183,8 @@ impl ConnectionState {
 
     /// Cacheability analysis is memoized in `cacheability_cache` (shared with
     /// the simple-query path); a hit skips the parse/convert/classify entirely.
-    /// search_path mutation detection — which the inline parse used to fold in
-    /// — isn't captured by that cache, so it's replayed for the non-SELECT
-    /// statements that can mutate it (no piggyback for extended; a standalone
-    /// SHOW is issued via the lazy path on RFQ).
+    /// The statement's effects, settings changes included, are memoized with
+    /// the verdict.
     fn statement_analyze(&mut self, sql: &str) -> StatementAnalysis {
         let analyzed = analyze(sql, &mut self.cacheability_cache, &self.func_volatility);
         let (sql_type, effects) = match analyzed {

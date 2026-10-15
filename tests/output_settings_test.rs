@@ -5,7 +5,11 @@
 use std::io::Error;
 use std::time::Duration;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, metrics_delta};
+use tokio_postgres::SimpleQueryMessage;
+
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_row_at, extract_row, metrics_delta,
+};
 
 mod util;
 
@@ -17,10 +21,70 @@ const READ_AT: &str = "SELECT id, at FROM render_items WHERE id = 1";
 const READ_F_B: &str = "SELECT id, f, b FROM render_items WHERE id = 1";
 
 async fn seed(ctx: &mut TestContext) -> Result<(), Error> {
-    ctx.query(TABLE_SQL, &[]).await?;
-    ctx.simple_query(SEED_SQL).await?;
+    table_seed(ctx, TABLE_SQL, SEED_SQL).await
+}
+
+async fn table_seed(ctx: &mut TestContext, create: &str, insert: &str) -> Result<(), Error> {
+    ctx.query(create, &[]).await?;
+    ctx.simple_query(insert).await?;
     ctx.cache_settle().await?;
     Ok(())
+}
+
+/// The first row's values for `columns`, in order.
+fn row_values(
+    messages: &[SimpleQueryMessage],
+    columns: &[&str],
+) -> Result<Vec<Option<String>>, Error> {
+    let row = extract_row(messages, 1)?;
+    Ok(columns
+        .iter()
+        .map(|column| row.get::<&str>(column).map(str::to_owned))
+        .collect())
+}
+
+/// Apply `sets` on the client and on a direct origin session, then register
+/// `read` and check its hit renders `columns` as origin does. Each column
+/// must render differently from origin's defaults, so a setting the serve
+/// ignored cannot pass. Returns origin's rendering.
+async fn rendering_matches_origin(
+    ctx: &mut TestContext,
+    sets: &[&str],
+    read: &str,
+    columns: &[&str],
+) -> Result<Vec<Option<String>>, Error> {
+    let origin = ctx.origin_connect().await?;
+    let defaults = row_values(
+        &origin.simple_query(read).await.map_err(Error::other)?,
+        columns,
+    )?;
+    for sql in sets {
+        origin.simple_query(sql).await.map_err(Error::other)?;
+        ctx.simple_query(sql).await?;
+    }
+    let expected = row_values(
+        &origin.simple_query(read).await.map_err(Error::other)?,
+        columns,
+    )?;
+    for (column, (default, value)) in columns.iter().zip(defaults.iter().zip(&expected)) {
+        assert_ne!(
+            default, value,
+            "{column} renders the same under the defaults"
+        );
+    }
+
+    let m = ctx.metrics().await?;
+    let _ = ctx.simple_query(read).await?;
+    let m = assert_cache_miss(ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(read).await?;
+    let _m = assert_cache_hit(ctx, m).await?;
+    assert_eq!(
+        row_values(&res, columns)?,
+        expected,
+        "the hit renders as origin"
+    );
+    Ok(expected)
 }
 
 /// The miss (rendered by origin) and the hit (rendered by the cache DB) show
@@ -122,5 +186,55 @@ async fn test_settings_applied_once_per_connection() -> Result<(), Error> {
         "settings re-applied on every hit: {}",
         delta.cache_serve_settings_applied
     );
+    Ok(())
+}
+
+/// `lc_monetary`, `lc_numeric` and `lc_time` are applied on the serve
+/// connection: a `money` column and locale-aware `to_char` patterns render
+/// on a hit as origin renders them.
+#[tokio::test]
+async fn test_locale_rendering_matches_origin_on_hit() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    table_seed(
+        &mut ctx,
+        "CREATE TABLE locale_items (id int primary key, m money, n numeric, at timestamptz)",
+        "INSERT INTO locale_items VALUES (1, 1234.56, 1234.5, '2024-01-15 12:00:00+00')",
+    )
+    .await?;
+    let rendered = rendering_matches_origin(
+        &mut ctx,
+        &[
+            "SET lc_monetary = 'de_DE.UTF-8'",
+            "SET lc_numeric = 'de_DE.UTF-8'",
+            "SET lc_time = 'de_DE.UTF-8'",
+        ],
+        "SELECT m, to_char(n, 'FM9G999D99') AS n, to_char(at, 'TMMonth') AS month \
+         FROM locale_items WHERE id = 1",
+        &["m", "n", "month"],
+    )
+    .await?;
+    assert_eq!(rendered[1].as_deref(), Some("1.234,5"));
+    assert_eq!(rendered[2].as_deref(), Some("Januar"));
+    Ok(())
+}
+
+/// `IntervalStyle` is applied on the serve connection.
+#[tokio::test]
+async fn test_interval_style_rendering_matches_origin_on_hit() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+    table_seed(
+        &mut ctx,
+        "CREATE TABLE interval_items (id int primary key, d interval)",
+        "INSERT INTO interval_items VALUES (1, '1 year 2 mons 3 days 04:05:06')",
+    )
+    .await?;
+    let rendered = rendering_matches_origin(
+        &mut ctx,
+        &["SET IntervalStyle = 'sql_standard'"],
+        "SELECT d FROM interval_items WHERE id = 1",
+        &["d"],
+    )
+    .await?;
+    assert_eq!(rendered[0].as_deref(), Some("+1-2 +3 +4:05:06"));
     Ok(())
 }
