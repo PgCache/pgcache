@@ -372,3 +372,217 @@ async fn test_subsumption_two_single_tables_cover_join() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// A self-joined new query must not be subsumed by a parent that covers only
+/// one arm (PGC-493). The new query's constraints are keyed by table name, so
+/// `e.dept = 'x'` and `m.name = 'ceo'` collapse into one set for `emp` that
+/// implies the parent's `dept = 'x'`. The `m` arm needs the ceo row, which is
+/// `dept = 'exec'` and was never loaded.
+#[tokio::test]
+async fn test_subsumption_self_join_child_not_subsumed() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE test_sub_emp (id integer PRIMARY KEY, name text, manager_id integer, dept text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_sub_emp VALUES (1, 'ceo', NULL, 'exec'), (2, 'alice', 1, 'x'), (3, 'bob', 1, 'x')",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id FROM test_sub_emp WHERE dept = 'x'")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query(
+            "SELECT e.id FROM test_sub_emp e \
+             JOIN test_sub_emp m ON m.id = e.manager_id \
+             WHERE e.dept = 'x' AND m.name = 'ceo' ORDER BY e.id",
+        )
+        .await?;
+    assert_eq!(res.len(), 4, "alice and bob report to the ceo");
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    assert_row_at(&res, 2, &[("id", "3")])?;
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A new query that reads a table in both the outer query and a subquery must
+/// not be subsumed by a parent covering only the outer predicate (PGC-493).
+/// The subquery's `y = 2` is not extracted, so the table's constraints are the
+/// outer `x = 1` alone; the subquery needs row 1, which has `x = 0`.
+#[tokio::test]
+async fn test_subsumption_subquery_same_table_child_not_subsumed() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE test_sub_node (id integer PRIMARY KEY, parent_id integer, x integer, y integer)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_sub_node VALUES (1, NULL, 0, 2), (2, 1, 1, 0), (3, 1, 1, 0)",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id FROM test_sub_node WHERE x = 1")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query(
+            "SELECT id FROM test_sub_node WHERE x = 1 \
+             AND parent_id IN (SELECT id FROM test_sub_node WHERE y = 2) ORDER BY id",
+        )
+        .await?;
+    assert_eq!(res.len(), 4, "rows 2 and 3 have parent 1");
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    assert_row_at(&res, 2, &[("id", "3")])?;
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// The CTE form of the subquery case (PGC-493): the table is read once in the
+/// CTE body and once in the outer query.
+#[tokio::test]
+async fn test_subsumption_cte_same_table_child_not_subsumed() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE test_sub_node_cte (id integer PRIMARY KEY, parent_id integer, x integer, y integer)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_sub_node_cte VALUES (1, NULL, 0, 2), (2, 1, 1, 0), (3, 1, 1, 0)",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id FROM test_sub_node_cte WHERE x = 1")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query(
+            "WITH c AS (SELECT id FROM test_sub_node_cte WHERE y = 2) \
+             SELECT id FROM test_sub_node_cte WHERE x = 1 \
+             AND parent_id IN (SELECT id FROM c) ORDER BY id",
+        )
+        .await?;
+    assert_eq!(res.len(), 4, "rows 2 and 3 have parent 1");
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    assert_row_at(&res, 2, &[("id", "3")])?;
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A full-table parent holds every row any occurrence could need, so it still
+/// subsumes a self-joined new query (PGC-493 keeps this precision).
+#[tokio::test]
+async fn test_subsumption_full_table_covers_self_join_child() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE test_sub_emp_full (id integer PRIMARY KEY, name text, manager_id integer, dept text)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_sub_emp_full VALUES (1, 'ceo', NULL, 'exec'), (2, 'alice', 1, 'x'), (3, 'bob', 1, 'x')",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT * FROM test_sub_emp_full").await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query(
+            "SELECT e.id FROM test_sub_emp_full e \
+             JOIN test_sub_emp_full m ON m.id = e.manager_id \
+             WHERE e.dept = 'x' AND m.name = 'ceo' ORDER BY e.id",
+        )
+        .await?;
+    assert_eq!(res.len(), 4, "alice and bob report to the ceo");
+    assert_row_at(&res, 1, &[("id", "2")])?;
+    assert_row_at(&res, 2, &[("id", "3")])?;
+    let _m = assert_subsume_hit(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// Two tables sharing a name across schemas must not share constraints
+/// (PGC-493). Constraints are keyed by table name, so `a.x = 1` would also be
+/// read as a constraint on `test_sub_schema_b.item`, which both parents then
+/// appear to cover; the `b` side needs row 10, which has `x = 0`.
+#[tokio::test]
+async fn test_subsumption_same_name_across_schemas_not_subsumed() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    for schema in ["test_sub_schema_a", "test_sub_schema_b"] {
+        ctx.query(&format!("CREATE SCHEMA {schema}"), &[]).await?;
+        ctx.query(
+            &format!(
+                "CREATE TABLE {schema}.item (id integer PRIMARY KEY, ref_id integer, x integer)"
+            ),
+            &[],
+        )
+        .await?;
+    }
+    ctx.query(
+        "INSERT INTO test_sub_schema_a.item VALUES (1, 10, 1), (2, 10, 1)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO test_sub_schema_b.item VALUES (10, NULL, 0), (11, NULL, 1)",
+        &[],
+    )
+    .await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id FROM test_sub_schema_a.item WHERE x = 1")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    ctx.simple_query("SELECT id FROM test_sub_schema_b.item WHERE x = 1")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let res = ctx
+        .simple_query(
+            "SELECT a.id FROM test_sub_schema_a.item a \
+             JOIN test_sub_schema_b.item b ON b.id = a.ref_id \
+             WHERE a.x = 1 ORDER BY a.id",
+        )
+        .await?;
+    assert_eq!(res.len(), 4, "rows 1 and 2 reference b row 10");
+    assert_row_at(&res, 1, &[("id", "1")])?;
+    assert_row_at(&res, 2, &[("id", "2")])?;
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
+
+    Ok(())
+}

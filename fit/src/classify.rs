@@ -8,7 +8,7 @@ use ecow::EcoString;
 use pgcache_lib::cache::admission::{
     AdmissionDepth, AdmissionQuery, CanonicalResolution, base_query_prepare,
     query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
-    shape_gate_classify,
+    shape_gate_classify, subsumption_constraints,
 };
 use pgcache_lib::cache::query::{limit_clause_of, limit_rows_needed};
 use pgcache_lib::cache::{CacheabilityError, CacheableQuery};
@@ -16,9 +16,7 @@ use pgcache_lib::catalog::Catalog;
 use pgcache_lib::oid::Oid;
 use pgcache_lib::query::ast::rope::QueryTree;
 use pgcache_lib::query::ast::{AstError, RawStatement, WhereParseError, statement_convert_raw};
-use pgcache_lib::query::constraints::{
-    QueryConstraints, TableConstraint, query_constraints_analyze,
-};
+use pgcache_lib::query::constraints::{QueryConstraints, TableConstraint};
 use pgcache_lib::query::literal_settings::LiteralSettings;
 use pgcache_lib::query::transform::query_tree_parameters_replace;
 use pgcache_lib::query::write::{TransactionBoundary, WriteClass};
@@ -371,7 +369,7 @@ pub fn statement_classify(
     // form, like the writer's subsumption_check.
     let constraints = bound
         .select()
-        .map(|select| query_constraints_analyze(&bound, select));
+        .map(|select| subsumption_constraints(&bound, select));
 
     Verdict::Cacheable(Box::new(CacheableAnalysis {
         fingerprint,

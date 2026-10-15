@@ -13,12 +13,14 @@ use super::registration::{
     QueryResolution, RegistrationIdentity, WriterRegistration, cached_query_insert,
 };
 use crate::cache::Generation;
-use crate::cache::admission::{SubsumerCandidate, SubsumerSource, subsumption_covered};
+use crate::cache::admission::{
+    SubsumerCandidate, SubsumerSource, subsumption_constraints, subsumption_covered,
+};
 use crate::cache::types::{Cache, SharedQueryShape, SharedResolvedQuery};
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::oid::Oid;
 use crate::query::constraint_index::table_constraints_keyed;
-use crate::query::constraints::{TableConstraint, query_constraints_analyze};
+use crate::query::constraints::TableConstraint;
 use crate::result::error_chain_format;
 use crate::timing::duration_to_ns_u64;
 
@@ -87,7 +89,7 @@ impl WriterRegistration {
             return false;
         };
 
-        let new_constraints = query_constraints_analyze(&resolution.bound, select);
+        let new_constraints = subsumption_constraints(&resolution.bound, select);
 
         let mut relations = Vec::with_capacity(resolution.relation_oids.len());
         for &oid in &resolution.relation_oids {

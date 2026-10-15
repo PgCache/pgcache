@@ -20,7 +20,7 @@ pub use analyze::{
     query_admission_analyze, query_decorrelate_checked, query_pushdown, query_resolve_canonical,
     shape_gate_classify,
 };
-pub use subsume::subsumption_covered;
+pub use subsume::{subsumption_constraints, subsumption_covered};
 
 /// Everything the writer stores (and pgcache-fit simulates) for one table of
 /// an admitted query.
