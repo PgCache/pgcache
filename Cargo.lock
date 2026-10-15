@@ -2153,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "pgcache"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "arc-swap",
  "async-stream",
