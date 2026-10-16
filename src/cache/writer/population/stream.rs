@@ -1,9 +1,8 @@
 //! One population task: stream each branch's rows from origin into the
-//! relation's staging table in PK-sorted batches (PGC-250, PGC-133).
+//! relation's staging table with COPY (PGC-250).
 
 use std::collections::HashSet;
 use std::fmt::Write;
-use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(feature = "fault-injection")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,12 +10,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 
+use bytes::Bytes;
 use ecow::EcoString;
+use futures_util::SinkExt;
 use postgres_protocol::escape;
 use postgres_types::PgLsn;
 #[cfg(feature = "fault-injection")]
 use tokio::time::sleep;
-use tokio_postgres::{Client, SimpleColumn, SimpleQueryMessage, SimpleQueryRow, SimpleQueryStream};
+use tokio_postgres::Client;
 use tokio_stream::StreamExt;
 use tracing::trace;
 
@@ -30,9 +31,6 @@ use crate::query::ast::rope::deparse::{from_deparse_with, where_clause_deparse_w
 use crate::query::ast::rope::{Select, Table};
 use crate::query::resolve::ResolvedQuery;
 use crate::query::update::select_branches_with_source;
-
-/// Number of rows to batch per INSERT statement sent to the cache database.
-const POPULATION_INSERT_BATCH_SIZE: usize = 200;
 
 /// Test-only population delay (fault-injection feature, PGC-250). Sleeps after
 /// the origin snapshot has been read but before the rows are inserted into the
@@ -108,8 +106,11 @@ pub(super) async fn population_task(
             if fresh && needs_create {
                 staging_table_create(&connections.cache, table, &staging).await?;
             }
-            let sql = population_select_build(&work.population, table_node, branch, work.max_limit);
-            let (bytes, rows) = population_stream(connections, &sql, table, &staging).await?;
+            let select =
+                population_select_build(&work.population, table_node, branch, work.max_limit);
+            let copy_out = population_copy_out_sql(&select, table);
+            let copy_in = staging_copy_in_sql(&work.population, table_node, &staging);
+            let (bytes, rows) = population_stream(connections, &copy_out, &copy_in, table).await?;
             cached_bytes += bytes;
             row_count += rows;
             if fresh {
@@ -253,15 +254,48 @@ async fn origin_snapshot_lsn(db_origin: &Client) -> CacheResult<Lsn> {
     Ok(Lsn::from(row.get::<_, PgLsn>(0)))
 }
 
+/// Wrap a population SELECT in the origin COPY that streams it, dropping
+/// NULL-padded phantom rows from outer joins: a cached table's PK is never NULL,
+/// and staging inherits its NOT NULL constraints. The filter sits outside the
+/// SELECT so it applies after the LIMIT, as row skipping did.
+fn population_copy_out_sql(select: &str, table: &TableMetadata) -> String {
+    debug_assert!(
+        !table.primary_key_columns.is_empty(),
+        "populated table without a primary key"
+    );
+    let mut sql = format!("COPY (SELECT * FROM ({select}) population");
+    let mut keyword = " WHERE ";
+    for pk in &table.primary_key_columns {
+        write!(
+            sql,
+            "{keyword}population.{} IS NOT NULL",
+            escape::escape_identifier(pk)
+        )
+        .ok();
+        keyword = " AND ";
+    }
+    sql.push_str(") TO STDOUT");
+    sql
+}
+
+/// The cache COPY that loads a table's population rows into its staging table,
+/// naming the columns in the population SELECT's order.
+fn staging_copy_in_sql(population: &ResolvedQuery, table_node: Table<'_>, staging: &str) -> String {
+    let mut sql = format!("COPY pgcache_stage.{staging} (");
+    population.source_column_names_into(table_node.id(), &mut sql);
+    sql.push_str(") FROM STDIN");
+    sql
+}
+
 /// Stream one table's rows into its staging table, recording the stream time.
 async fn population_stream(
     connections: &PopulationConnections,
-    sql: &str,
+    copy_out: &str,
+    copy_in: &str,
     table: &TableMetadata,
-    staging: &str,
 ) -> CacheResult<(usize, u64)> {
     let stream_start = Instant::now();
-    let (bytes, rows) = staging_rows_load(connections, sql, table, staging).await?;
+    let (bytes, rows) = staging_rows_load(connections, copy_out, copy_in).await?;
     let stream_elapsed = stream_start.elapsed();
     crate::metrics::handles()
         .reg
@@ -274,424 +308,98 @@ async fn population_stream(
     Ok((bytes, rows))
 }
 
-/// Stream one table's rows from origin into its staging table in batches
-/// (PGC-250), without materializing the result set in memory. Returns
-/// `(cached_bytes, row_count)`.
+/// Pipe one table's rows from origin into its staging table: origin's COPY text
+/// is forwarded to the cache's COPY unread, so no row is parsed, escaped or
+/// rendered as SQL here. Both sessions are pinned to the reference settings,
+/// so the text one renders is the text the other parses. Returns
+/// `(copied_bytes, row_count)`.
 async fn staging_rows_load(
     connections: &PopulationConnections,
-    sql: &str,
-    table: &TableMetadata,
-    staging: &str,
+    copy_out: &str,
+    copy_in: &str,
 ) -> CacheResult<(usize, u64)> {
-    let stream = connections
+    let source = connections
         .origin
-        .simple_query_raw(sql)
+        .copy_out_simple(copy_out)
         .await
-        .map_into_report::<CacheError>()?;
-    tokio::pin!(stream);
+        .map_into_report::<CacheError>()
+        .attach_loc("starting the population COPY from origin")?;
+    tokio::pin!(source);
 
-    let Some(row_description) = row_description_read(stream.as_mut()).await? else {
-        return Ok((0, 0));
-    };
-    let mut batch = StagingBatch::new(
-        &connections.cache,
-        insert_statement_build(table, &row_description, staging),
-    );
-
-    // Snapshot is fixed at query execution (RowDescription received above);
-    // rows are not yet in the cache. See PGC-250.
+    // The origin statement has started, so its snapshot is fixed; rows are not
+    // yet in staging. See PGC-250.
     fault_population_delay().await;
 
-    loop {
-        match stream.next().await {
-            Some(Ok(SimpleQueryMessage::Row(row))) => batch.row_push(&row).await?,
-            Some(Ok(SimpleQueryMessage::CommandComplete(_))) | None => break,
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(CacheError::from(e).into()),
-        }
+    // Extended-protocol COPY: `copy_in_simple` ends with the Sync the extended
+    // protocol needs, and the stray ReadyForQuery it draws desyncs the session.
+    let sink = connections
+        .cache
+        .copy_in::<_, Bytes>(copy_in)
+        .await
+        .map_into_report::<CacheError>()
+        .attach_loc("starting the staging COPY on the cache")?;
+    tokio::pin!(sink);
+
+    // An error return drops the sink unfinished, which aborts the staging COPY.
+    let mut copied_bytes = 0;
+    while let Some(chunk) = source.next().await {
+        let chunk = chunk.map_into_report::<CacheError>()?;
+        copied_bytes += chunk.len();
+        sink.feed(chunk).await.map_into_report::<CacheError>()?;
     }
-    batch.finish().await
-}
-
-/// Read the stream's leading RowDescription; `None` for an empty stream.
-async fn row_description_read(
-    mut stream: Pin<&mut SimpleQueryStream>,
-) -> CacheResult<Option<Arc<[SimpleColumn]>>> {
-    match stream.next().await {
-        Some(Ok(SimpleQueryMessage::RowDescription(cols))) => Ok(Some(cols)),
-        Some(Ok(_)) => Err(CacheError::InvalidMessage.into()),
-        Some(Err(e)) => {
-            Err(CacheError::from(e).into()).attach_loc("reading population row description")
-        }
-        None => Ok(None),
-    }
-}
-
-/// Pre-computed parts of the batched INSERT...ON CONFLICT statement.
-struct InsertStatement {
-    prefix: String,
-    suffix: String,
-    /// Column positions of primary key fields, for detecting NULL-padded phantom rows.
-    pkey_positions: Vec<usize>,
-    num_columns: usize,
-}
-
-/// Build the staging INSERT template from the row description and table metadata.
-///
-/// Targets the population's per-relation staging table in `pgcache_stage`. No
-/// `ON CONFLICT`: staging is a fresh per-population table, and re-stamping
-/// pre-existing rows with the query generation happens in the writer's merge,
-/// not here (PGC-250). `pkey_positions` is still computed to drop NULL-padded
-/// phantom rows from outer joins.
-fn insert_statement_build(
-    table: &TableMetadata,
-    row_description: &Arc<[SimpleColumn]>,
-    staging: &str,
-) -> InsertStatement {
-    let columns: Vec<String> = row_description
-        .iter()
-        .map(|c| escape::escape_identifier(c.name()))
-        .collect();
-
-    let pkey_positions: Vec<usize> = table
-        .primary_key_columns
-        .iter()
-        .filter_map(|pk| row_description.iter().position(|c| c.name() == pk.as_str()))
-        .collect();
-
-    let columns_joined = columns.join(",");
-
-    InsertStatement {
-        prefix: format!("INSERT INTO pgcache_stage.{staging}({columns_joined}) VALUES "),
-        suffix: String::new(),
-        pkey_positions,
-        num_columns: row_description.len(),
-    }
-}
-
-/// Rows accumulated for the next multi-row INSERT into a staging table, plus
-/// the running totals for the table.
-struct StagingBatch<'a> {
-    db_cache: &'a Client,
-    insert: InsertStatement,
-    value_tuples: Vec<(Vec<String>, String)>,
-    cached_bytes: usize,
-    row_count: u64,
-}
-
-impl<'a> StagingBatch<'a> {
-    fn new(db_cache: &'a Client, insert: InsertStatement) -> Self {
-        Self {
-            db_cache,
-            insert,
-            value_tuples: Vec::with_capacity(POPULATION_INSERT_BATCH_SIZE),
-            cached_bytes: 0,
-            row_count: 0,
-        }
-    }
-
-    /// Add a row, flushing once the batch is full. Phantom rows are skipped.
-    async fn row_push(&mut self, row: &SimpleQueryRow) -> CacheResult<()> {
-        let Some((pk_key, tuple, bytes)) = row_to_tuple(row, &self.insert) else {
-            return Ok(());
-        };
-        self.cached_bytes += bytes;
-        self.row_count += 1;
-        self.value_tuples.push((pk_key, tuple));
-        if self.value_tuples.len() >= POPULATION_INSERT_BATCH_SIZE {
-            self.flush().await?;
-        }
-        Ok(())
-    }
-
-    /// Flush the remainder and return `(cached_bytes, row_count)`.
-    async fn finish(mut self) -> CacheResult<(usize, u64)> {
-        if !self.value_tuples.is_empty() {
-            self.flush().await?;
-        }
-        Ok((self.cached_bytes, self.row_count))
-    }
-
-    /// Send the batch as a single multi-row INSERT, then clear it.
-    async fn flush(&mut self) -> CacheResult<()> {
-        let sql = batch_sql_build(
-            &self.insert.prefix,
-            &self.insert.suffix,
-            &mut self.value_tuples,
-        );
-        self.db_cache
-            .batch_execute(&sql)
-            .await
-            .map_into_report::<CacheError>()?;
-        self.value_tuples.clear();
-        Ok(())
-    }
-}
-
-/// Convert a streamed row into `(pk_key, tuple_string, row_byte_count)`.
-///
-/// Returns `None` for phantom rows (NULL primary keys from outer joins).
-/// `pk_key` is the escaped primary-key values, used to order rows within a batch.
-fn row_to_tuple(
-    row: &SimpleQueryRow,
-    insert: &InsertStatement,
-) -> Option<(Vec<String>, String, usize)> {
-    // Skip NULL-padded phantom rows from outer joins
-    if insert
-        .pkey_positions
-        .iter()
-        .any(|&pos| row.get(pos).is_none())
-    {
-        return None;
-    }
-    Some(escaped_tuple_build(
-        insert.num_columns,
-        &insert.pkey_positions,
-        |idx| row.get(idx),
-    ))
-}
-
-/// Build the `(pk_key, tuple_string, row_byte_count)` for one row, escaping each
-/// value directly into the tuple buffer — no per-column `Vec<String>` and no
-/// `join` temporary (PGC-347). `get(idx)` returns the column value or `None` for
-/// SQL NULL. Split from [`row_to_tuple`] so it can be unit-tested without a live
-/// `SimpleQueryRow`.
-fn escaped_tuple_build<'a>(
-    num_columns: usize,
-    pkey_positions: &[usize],
-    get: impl Fn(usize) -> Option<&'a str>,
-) -> (Vec<String>, String, usize) {
-    // Escaped PK values in conflict-column order. PK identity is snapshot-stable,
-    // so this key is identical across workers even when non-PK columns drift
-    // between MVCC snapshots; sorting on it (PGC-133) avoids the PK-index deadlock.
-    // PKs are non-NULL here (phantom rows already skipped by the caller).
-    let pk_key: Vec<String> = pkey_positions
-        .iter()
-        .map(|&pos| get(pos).map(literal_escape).unwrap_or_default())
-        .collect();
-
-    // Pre-pass to size the tuple buffer exactly once (no growth reallocs).
-    let row_bytes: usize = (0..num_columns)
-        .map(|idx| get(idx).map_or(0, str::len))
-        .sum();
-    // Slack for escaping (doubled quotes/backslashes), separators, and parens.
-    let mut tuple = String::with_capacity(row_bytes + row_bytes / 4 + num_columns + 2);
-    tuple.push('(');
-    for idx in 0..num_columns {
-        if idx > 0 {
-            tuple.push(',');
-        }
-        // Reuse the already-escaped PK value instead of escaping it a second time.
-        match pk_escaped_get(&pk_key, pkey_positions, idx) {
-            Some(escaped) => tuple.push_str(escaped),
-            None => value_escape_into(get(idx), &mut tuple),
-        }
-    }
-    tuple.push(')');
-
-    (pk_key, tuple, row_bytes)
-}
-
-fn literal_escape(value: &str) -> String {
-    let mut escaped = String::new();
-    let _ = escape::escape_literal_into(value, &mut escaped);
-    escaped
-}
-
-/// The escaped PK value for column `idx`, if it is a PK column.
-fn pk_escaped_get<'k>(
-    pk_key: &'k [String],
-    pkey_positions: &[usize],
-    idx: usize,
-) -> Option<&'k str> {
-    pkey_positions
-        .iter()
-        .position(|&pos| pos == idx)
-        .and_then(|i| pk_key.get(i))
-        .map(String::as_str)
-}
-
-/// Append a column value as a SQL literal, or `NULL`.
-fn value_escape_into(value: Option<&str>, out: &mut String) {
-    match value {
-        Some(value) => {
-            let _ = escape::escape_literal_into(value, out);
-        }
-        None => out.push_str("NULL"),
-    }
-}
-
-/// Sort rows by primary key, then assemble the multi-row INSERT statement.
-///
-/// Sorting every batch (including the final partial one) by PK keeps the
-/// PK-index lock acquisition order consistent across concurrent populations,
-/// which is what prevents the deadlock in PGC-133. Each flush autocommits, so
-/// a consistent intra-batch order is sufficient.
-fn batch_sql_build(
-    insert_prefix: &str,
-    insert_suffix: &str,
-    value_tuples: &mut [(Vec<String>, String)],
-) -> String {
-    value_tuples.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-
-    let mut sql = String::with_capacity(
-        insert_prefix.len()
-            + insert_suffix.len()
-            + value_tuples.iter().map(|(_, t)| t.len() + 1).sum::<usize>(),
-    );
-    sql.push_str(insert_prefix);
-    for (i, (_, tuple)) in value_tuples.iter().enumerate() {
-        if i > 0 {
-            sql.push(',');
-        }
-        sql.push_str(tuple);
-    }
-    sql.push_str(insert_suffix);
-    sql
+    let rows = sink
+        .as_mut()
+        .finish()
+        .await
+        .map_into_report::<CacheError>()?;
+    Ok((copied_bytes, rows))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Two populations that stream the same rows in different orders must emit
-    /// byte-identical INSERT bodies so PG locks the PK index in the same order.
-    #[test]
-    fn test_batch_sql_build_orders_by_pk() {
-        let prefix = "INSERT INTO t(a,b) VALUES ";
-        let suffix = " ON CONFLICT (a) DO NOTHING";
+    // ==================== population select ====================
 
-        let mut worker_a = vec![
-            (vec!["1".to_owned()], "(1,'x')".to_owned()),
-            (vec!["3".to_owned()], "(3,'y')".to_owned()),
-            (vec!["2".to_owned()], "(2,'z')".to_owned()),
-        ];
-        // Same rows, different stream order, and a non-PK column that drifted
-        // between MVCC snapshots — the PK key must still drive the ordering.
-        let mut worker_b = vec![
-            (vec!["2".to_owned()], "(2,'DRIFTED')".to_owned()),
-            (vec!["1".to_owned()], "(1,'x')".to_owned()),
-            (vec!["3".to_owned()], "(3,'y')".to_owned()),
-        ];
-
-        let sql_a = batch_sql_build(prefix, suffix, &mut worker_a);
-        let sql_b = batch_sql_build(prefix, suffix, &mut worker_b);
-
-        assert_eq!(
-            sql_a,
-            "INSERT INTO t(a,b) VALUES (1,'x'),(2,'z'),(3,'y') ON CONFLICT (a) DO NOTHING"
-        );
-        // PK order is identical across workers; only the drifted non-PK value
-        // differs, never the row sequence.
-        assert_eq!(
-            sql_b,
-            "INSERT INTO t(a,b) VALUES (1,'x'),(2,'DRIFTED'),(3,'y') ON CONFLICT (a) DO NOTHING"
-        );
-    }
-
-    #[test]
-    fn test_batch_sql_build_composite_pk_no_separator_ambiguity() {
-        // ("a","b") vs ("ab", "") must not collide into the same sort key.
-        let mut rows = vec![
-            (
-                vec!["'ab'".to_owned(), "''".to_owned()],
-                "('ab','')".to_owned(),
-            ),
-            (
-                vec!["'a'".to_owned(), "'b'".to_owned()],
-                "('a','b')".to_owned(),
-            ),
-        ];
-        let sql = batch_sql_build("", "", &mut rows);
-        assert_eq!(sql, "('a','b'),('ab','')");
-    }
-
-    /// The prior implementation, reproduced as an oracle: escape every column
-    /// into a `Vec<String>`, then `(` + join(",") + `)`. PGC-347's zero-alloc
-    /// `escaped_tuple_build` must match it byte-for-byte.
-    fn oracle(values: &[Option<&str>], pkey_positions: &[usize]) -> (Vec<String>, String) {
-        let escaped: Vec<String> = values
-            .iter()
-            .map(|v| {
-                v.map(escape::escape_literal)
-                    .unwrap_or_else(|| "NULL".to_owned())
-            })
-            .collect();
-        let pk: Vec<String> = pkey_positions
-            .iter()
-            .filter_map(|&pos| escaped.get(pos).cloned())
-            .collect();
-        (pk, format!("({})", escaped.join(",")))
-    }
-
-    #[test]
-    fn test_escaped_tuple_build_matches_prior_output() {
-        let cases: &[&[Option<&str>]] = &[
-            &[Some("1"), Some("x")],
-            &[Some("42"), None, Some("o'brien")], // NULL + quote-escaping
-            &[Some("a\\b"), Some("both ' and \\")], // backslash → E'…'
-            &[Some(""), Some("''''")],            // empty + only quotes
-            &[Some("café ☕"), None],             // multibyte + NULL
-        ];
-        for &values in cases {
-            let pkey_positions = [0usize];
-            let (pk, tuple, row_bytes) =
-                escaped_tuple_build(values.len(), &pkey_positions, |idx| values[idx]);
-            let (want_pk, want_tuple) = oracle(values, &pkey_positions);
-            assert_eq!(tuple, want_tuple, "tuple mismatch for {values:?}");
-            assert_eq!(pk, want_pk, "pk_key mismatch for {values:?}");
-            let want_bytes: usize = values.iter().map(|v| v.map_or(0, str::len)).sum();
-            assert_eq!(row_bytes, want_bytes, "row_bytes mismatch for {values:?}");
+    /// An int4 table whose leading `pk_count` columns form the primary key.
+    fn table_metadata(name: &str, oid: u32, columns: &[&str], pk_count: usize) -> TableMetadata {
+        use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore};
+        use crate::oid::TypeOid;
+        use postgres_types::Type;
+        let store =
+            ColumnStore::new(
+                columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, column)| ColumnMetadata {
+                        name: (*column).into(),
+                        position: ColumnPosition::from_index(i).expect("column position in range"),
+                        type_oid: TypeOid::from_raw(23),
+                        data_type: Type::INT4,
+                        type_name: "int4".into(),
+                        cache_type_name: "int4".into(),
+                        is_primary_key: i < pk_count,
+                    }),
+            );
+        TableMetadata {
+            replica_identity_full: false,
+            relation_oid: Oid::from_raw(oid),
+            name: name.into(),
+            schema: "public".into(),
+            primary_key_columns: columns.iter().take(pk_count).map(|c| (*c).into()).collect(),
+            columns: store,
+            indexes: Vec::new(),
         }
     }
 
-    #[test]
-    fn test_escaped_tuple_build_composite_pk() {
-        let values = [Some("ab"), Some("cd"), Some("ef")];
-        let (pk, tuple, _) = escaped_tuple_build(3, &[0, 2], |idx| values[idx]);
-        assert_eq!(tuple, "('ab','cd','ef')");
-        assert_eq!(pk, vec!["'ab'".to_owned(), "'ef'".to_owned()]);
-    }
-
-    // ==================== population select ====================
-
     fn population_catalog() -> crate::catalog::Catalog {
-        use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
-        use crate::oid::TypeOid;
-        use postgres_types::Type;
         let mut tables = iddqd::BiHashMap::new();
-        for (name, oid, columns) in [
-            ("users", 1u32, &["id", "name"][..]),
-            ("orders", 2, &["id", "user_id", "total"][..]),
+        for table in [
+            table_metadata("users", 1, &["id", "name"], 1),
+            table_metadata("orders", 2, &["id", "user_id", "total"], 1),
+            table_metadata("Odd Table", 3, &["Region", "id", "it's"], 2),
         ] {
-            let store =
-                ColumnStore::new(
-                    columns
-                        .iter()
-                        .enumerate()
-                        .map(|(i, column)| ColumnMetadata {
-                            name: (*column).into(),
-                            position: ColumnPosition::from_index(i)
-                                .expect("column position in range"),
-                            type_oid: TypeOid::from_raw(23),
-                            data_type: Type::INT4,
-                            type_name: "int4".into(),
-                            cache_type_name: "int4".into(),
-                            is_primary_key: i == 0,
-                        }),
-                );
-            tables.insert_overwrite(
-                TableMetadata {
-                    replica_identity_full: false,
-                    relation_oid: Oid::from_raw(oid),
-                    name: name.into(),
-                    schema: "public".into(),
-                    primary_key_columns: vec![columns[0].into()],
-                    columns: store,
-                    indexes: Vec::new(),
-                }
-                .into(),
-            );
+            tables.insert_overwrite(table.into());
         }
         tables
     }
@@ -746,5 +454,45 @@ mod tests {
                 "{label}: {sql}"
             );
         }
+    }
+
+    // ==================== COPY statements ====================
+
+    /// The origin COPY wraps the select and drops phantom rows on every PK
+    /// column, quoted, after the select's own LIMIT.
+    #[test]
+    fn test_population_copy_out_sql() {
+        let odd = table_metadata("Odd Table", 3, &["Region", "id", "it's"], 2);
+        assert_eq!(
+            population_copy_out_sql("SELECT DISTINCT o.\"Region\", o.id FROM t o LIMIT 5", &odd),
+            "COPY (SELECT * FROM (SELECT DISTINCT o.\"Region\", o.id FROM t o LIMIT 5) population \
+             WHERE population.\"Region\" IS NOT NULL AND population.\"id\" IS NOT NULL) TO STDOUT"
+        );
+    }
+
+    /// The staging COPY names each table's columns in its population select's
+    /// order, quoted as the select quotes them.
+    #[test]
+    fn test_staging_copy_in_sql() {
+        let catalog = population_catalog();
+        let population = ResolvedQuery::parse_resolve(
+            "SELECT u.name FROM users u JOIN \"Odd Table\" o ON o.id = u.id",
+            &catalog,
+            &["public"],
+        )
+        .expect("resolve");
+        let mut statements = Vec::new();
+        for (branch, _) in select_branches_with_source(population.tree().root()) {
+            for table_node in branch.direct_tables() {
+                statements.push(staging_copy_in_sql(&population, table_node, "stage_1"));
+            }
+        }
+        assert_eq!(
+            statements,
+            [
+                "COPY pgcache_stage.stage_1 (id,name) FROM STDIN",
+                "COPY pgcache_stage.stage_1 (\"Region\",id,\"it's\") FROM STDIN",
+            ]
+        );
     }
 }

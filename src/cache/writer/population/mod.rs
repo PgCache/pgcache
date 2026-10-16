@@ -49,6 +49,7 @@ pub(super) struct PopulationConnections {
 
 /// A completed population task, handed to the writer as a `PopulationMerge`.
 struct PopulationOutcome {
+    /// Bytes of COPY text loaded into staging.
     cached_bytes: usize,
     row_count: u64,
     /// Staging tables loaded, one per relation.

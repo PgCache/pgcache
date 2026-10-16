@@ -430,9 +430,9 @@ impl DeparseContext for Bound<'_> {
 }
 
 /// Every column of the base table a FROM entry's slot names, as the cache
-/// serves them: ` q.c1, q.c2, …` with the entry's qualifier; nothing for a
-/// derived table or an unbound entry.
-fn source_columns_render(bindings: &Bindings, source: NodeId, buf: &mut String) {
+/// serves them: ` q.c1, q.c2, …` with the entry's qualifier, or `c1,c2,…`
+/// unqualified; nothing for a derived table or an unbound entry.
+fn source_columns_render(bindings: &Bindings, source: NodeId, qualified: bool, buf: &mut String) {
     let Some(slot) = bindings.source(source).and_then(|slot| bindings.slot(slot)) else {
         debug_assert!(false, "FROM entry without a slot");
         return;
@@ -443,9 +443,11 @@ fn source_columns_render(bindings: &Bindings, source: NodeId, buf: &mut String) 
     let mut sep = "";
     for column in table.columns.iter() {
         buf.push_str(sep);
-        buf.push(' ');
-        Bound::slot_name_deparse(slot, buf);
-        buf.push('.');
+        if qualified {
+            buf.push(' ');
+            Bound::slot_name_deparse(slot, buf);
+            buf.push('.');
+        }
         column.name.deparse(buf);
         sep = ",";
     }
@@ -484,7 +486,13 @@ impl ResolvedQuery {
     /// them: ` q.c1, q.c2, …` with the entry's qualifier. Nothing for a
     /// derived table or an unbound entry.
     pub fn source_columns_into(&self, source: NodeId, buf: &mut String) {
-        source_columns_render(self.bindings(), source, buf);
+        source_columns_render(self.bindings(), source, true, buf);
+    }
+
+    /// The same columns as [`Self::source_columns_into`], in the same order,
+    /// unqualified: `c1,c2,…`, for a statement that writes them back.
+    pub fn source_column_names_into(&self, source: NodeId, buf: &mut String) {
+        source_columns_render(self.bindings(), source, false, buf);
     }
 
     /// The SQL the cache serves for this query, appended to `buf`.

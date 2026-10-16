@@ -28,13 +28,10 @@ use crate::result::error_chain_format;
 use crate::settings::PgSettings;
 use crate::timing::duration_to_us_u64;
 
-/// A population deadlock is transient: concurrent workers materializing
-/// *different* subsets of a shared source cache table can cross on the
-/// PK index / ON CONFLICT path (PGC-147 — the PGC-133 byte-identical
-/// invariant only holds for same-row populations, which doesn't apply
-/// here). Postgres aborts one side; re-running the whole task
-/// succeeds. The task is idempotent (ON CONFLICT upsert + generation
-/// re-stamp), so retry it a few times with exponential backoff.
+/// Retry budget for a population that hits a deadlock (40P01). Populations load
+/// private, unindexed staging tables (PGC-250), so the shared-index case this was
+/// written for (PGC-147) can't recur; a retry stays safe because staging is
+/// emptied and the snapshot retaken first.
 const POPULATION_DEADLOCK_MAX_RETRIES: u32 = 5;
 const POPULATION_DEADLOCK_BACKOFF_BASE: Duration = Duration::from_millis(20);
 
