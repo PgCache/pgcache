@@ -364,11 +364,14 @@ pub(super) async fn handle_cached_query(
     // no per-read timeout, so a stalled cache-DB connection or a response desync
     // would park here forever holding the pooled connection. On the deadline,
     // poison (discard + replenish) and forward to origin.
-    let serve_deadline = tokio::time::Instant::now() + SERVE_STALL_TIMEOUT;
+    // Created once: a fresh sleep per iteration registers and drops a timer-wheel
+    // entry for every frame, which contends across workers at high serve rates.
+    let serve_deadline = tokio::time::sleep(SERVE_STALL_TIMEOUT);
+    tokio::pin!(serve_deadline);
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep_until(serve_deadline) => {
+            _ = &mut serve_deadline => {
                 let diagnostics = &relay.diagnostics;
                 warn!(
                     fingerprint = %diagnostics.fingerprint,
