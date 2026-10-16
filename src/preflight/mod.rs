@@ -158,6 +158,9 @@ pub async fn preflight_run(settings: &PreflightSettings) -> PreflightReport {
         .push(privileges::cdc_objects_check(&client, &settings.cdc).await);
     report
         .results
+        .push(privileges::schema_signal_check(&client, superuser, environment).await);
+    report
+        .results
         .push(connection::replication_connect_check(&settings.replication, environment).await);
 
     match relations::relations_load(&client, &settings.allowed_tables).await {

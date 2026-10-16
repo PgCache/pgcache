@@ -9,6 +9,8 @@ pub(crate) mod cache_connection;
 pub(crate) mod cdc;
 #[cfg(feature = "proxy")]
 pub(crate) mod connect;
+#[cfg(feature = "proxy")]
+pub(crate) mod event_trigger;
 pub(crate) mod protocol;
 #[cfg(feature = "proxy")]
 mod snapshot;

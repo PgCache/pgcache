@@ -8,6 +8,7 @@ use tokio_postgres::{Client, Error};
 use tracing::{debug, error};
 
 use super::connect::{config_build, config_connect, connect};
+use super::event_trigger::{event_triggers_install, event_triggers_shutdown_note};
 use crate::pg::Lsn;
 use crate::result::{MapIntoReport, ReportExt, error_chain_format};
 use crate::settings::{PgSettings, Settings};
@@ -64,6 +65,11 @@ pub(crate) async fn replication_provision(settings: &Settings) -> PgCdcResult<()
         .map_into_report::<PgCdcError>()
         .attach_loc("creating publication")?;
     debug!("Publication created (empty)");
+
+    event_triggers_install(&client, &settings.origin.user)
+        .await
+        .map_into_report::<PgCdcError>()
+        .attach_loc("installing schema-change event triggers")?;
 
     // Check if replication slot exists
     let slot_exists = client
@@ -128,6 +134,8 @@ pub(crate) async fn replication_cleanup(settings: &Settings) -> PgCdcResult<()> 
         .await
         .map_into_report::<PgCdcError>()
         .attach_loc("dropping publication")?;
+
+    event_triggers_shutdown_note(&client).await;
 
     debug!("Replication cleanup complete");
     Ok(())

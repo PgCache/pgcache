@@ -73,6 +73,7 @@ async fn test_check_passes_on_prepared_origin() -> Result<(), Error> {
         "{report}"
     );
     assert!(report.contains("  PASS  role privileges"), "{report}");
+    assert!(report.contains("  PASS  schema-change signal"), "{report}");
     assert!(
         report.contains("all 1 tables have a primary key"),
         "{report}"
