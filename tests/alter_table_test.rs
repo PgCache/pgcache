@@ -77,3 +77,45 @@ async fn test_alter_table_add_column_repopulates() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// The same schema change with no write after it. pgoutput resends a Relation
+/// message only before the relation's next row change, so without the
+/// event-trigger signal (PGC-458) the cache would keep serving the pre-ALTER
+/// result; with it, the DDL alone invalidates the query.
+#[tokio::test]
+async fn test_alter_table_without_write_invalidates() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table alter_quiet (id integer primary key, val text)",
+        &[],
+    )
+    .await?;
+    ctx.query("insert into alter_quiet (id, val) values (1, 'one')", &[])
+        .await?;
+
+    let q = "select id, val from alter_quiet where id = 1";
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("val", "one")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("val", "one")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.query("alter table alter_quiet add column extra text", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("val", "one")])?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_row_at(&res, 1, &[("id", "1"), ("val", "one")])?;
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    Ok(())
+}

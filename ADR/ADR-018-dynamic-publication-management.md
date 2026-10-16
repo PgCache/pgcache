@@ -25,7 +25,7 @@ Under CLOCK eviction, CDC invalidation keeps cached query entries with `invalida
 
 **Eager registration update preserves correctness**: Population inserts rows into cache tables and relies on CDC to track subsequent changes. If the table isn't in the publication when population starts, CDC events during that window are lost, leading to stale cache entries.
 
-**OID-to-name resolution is always valid**: Table metadata is never removed from the cache, so resolving OIDs to qualified `schema.table` names for the ALTER PUBLICATION SQL always succeeds.
+**OID-to-name resolution is always valid**: Table metadata is never removed from the cache, so resolving OIDs to qualified `schema.table` names for the ALTER PUBLICATION SQL always succeeds. *(Amended by ADR-058: a `DROP TABLE` signalled through the event-trigger message removes the relation's metadata and publication entry, since origin has already dropped it from the publication and naming it again would fail.)*
 
 ## Consequences
 

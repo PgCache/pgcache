@@ -47,6 +47,24 @@ pub(crate) fn cdc_values_convert(
     toasted
 }
 
+/// Origin relations a DDL command changed, decoded from the event-trigger
+/// logical message (`pg::event_trigger`). Every listed OID is as origin
+/// reports it; the writer ignores the ones it has no cache table for.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SchemaChange {
+    /// `ALTER TABLE` in any form: column changes, partition attach/detach,
+    /// RLS flags, owner.
+    pub(crate) altered_tables: Vec<Oid>,
+    /// `DROP TABLE`, directly or by cascade.
+    pub(crate) dropped_tables: Vec<Oid>,
+}
+
+impl SchemaChange {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.altered_tables.is_empty() && self.dropped_tables.is_empty()
+    }
+}
+
 /// Commands for CDC mutations and relation tracking, sent to the writer thread
 #[derive(Debug)]
 pub(crate) enum CdcCommand {
@@ -81,6 +99,10 @@ pub(crate) enum CdcCommand {
 
     /// CDC Truncate operation
     Truncate { relation_oids: Vec<Oid> },
+
+    /// A DDL command on origin, at its position inside the source
+    /// transaction (the event-trigger message is transactional).
+    SchemaChange(SchemaChange),
 
     /// Transaction commit marker. Emitted by the CDC processor after all
     /// mutations from a single transaction have been sent. Carries the

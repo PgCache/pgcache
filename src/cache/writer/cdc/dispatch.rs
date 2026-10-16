@@ -8,11 +8,11 @@ use std::time::Instant;
 
 use lru::LruCache;
 use metrics::Histogram;
-use tracing::trace;
+use tracing::{info, trace};
 
 use super::segment_eval::PreparedEvalKey;
 use super::{BATCH_FRAMES_MAX, PREPARED_EVAL_CACHE_CAPACITY, SQL_BUFFER_CAPACITY, WriterCdc};
-use crate::cache::messages::{CdcCommand, CdcValue};
+use crate::cache::messages::{CdcCommand, CdcValue, SchemaChange};
 use crate::cache::reference_settings;
 use crate::cache::writer::core::WriterCore;
 use crate::cache::writer::frame::{FRAME_ROWS_CAPACITY, FrameRowEvent, FrameState, ToastState};
@@ -32,6 +32,7 @@ fn cdc_command_histogram(cmd: &CdcCommand) -> &'static Histogram {
         CdcCommand::Update { .. } => &m.cdc.cmd_update,
         CdcCommand::Delete { .. } => &m.cdc.cmd_delete,
         CdcCommand::Truncate { .. } => &m.cdc.cmd_truncate,
+        CdcCommand::SchemaChange(_) => &m.cdc.cmd_schema_change,
         CdcCommand::CommitMark { .. } => &m.cdc.cmd_commit_mark,
         CdcCommand::KeepAliveMark { .. } => &m.cdc.cmd_keepalive_mark,
     }
@@ -173,6 +174,10 @@ impl WriterCdc {
                 row_data,
             } => delete_command_event(core, relation_oid, row_data),
             CdcCommand::Truncate { relation_oids } => truncate_command_event(core, relation_oids),
+            CdcCommand::SchemaChange(change) => {
+                self.schema_change_handle(core, change).await?;
+                None
+            }
             CdcCommand::CommitMark { lsn } => {
                 self.commit_mark_handle(core, lsn, queued).await?;
                 None
@@ -286,43 +291,57 @@ impl WriterCdc {
             .get1(&relation_oid)
             .is_none_or(|current| !current.schema_eq(&table_metadata));
         if metadata_changed {
-            if core.frame_buf_relations.contains(&relation_oid) {
-                // The relation's cache-table writes (naming the old
-                // columns) are already committed to `frame_buf` or
-                // executed in the open cache txn — a partial replay
-                // moved them out of `frame_rows`, so discarding events
-                // can't retract them, and at COMMIT they would run
-                // against the recreated table and fail. Escalate to
-                // frame recovery: roll the cache txn back and let
-                // CommitMark invalidate + repopulate every relation the
-                // frame touched from post-DDL origin (PGC-264).
-                self.frame_recover_enter(core)
-                    .await
-                    .attach_loc("mid-frame DDL on a buffered relation")?;
-            } else {
-                // No buffered writes yet: the relation's events are all
-                // still in `frame_rows`. Discard them and purge its
-                // toast overlay (a different relation's partial replay
-                // may have recorded a stale entry under the old layout);
-                // the recreate evicts its queries and empties the table,
-                // so it rebuilds from origin (PGC-264).
-                core.toast_overlay_relation_invalidate(relation_oid);
-                let before = core.frame_rows.len();
-                core.frame_rows.retain(|event| match event {
-                    FrameRowEvent::Insert {
-                        relation_oid: r, ..
-                    }
-                    | FrameRowEvent::Update {
-                        relation_oid: r, ..
-                    }
-                    | FrameRowEvent::Delete {
-                        relation_oid: r, ..
-                    } => *r != relation_oid,
-                    FrameRowEvent::Truncate { .. } | FrameRowEvent::Boundary { .. } => true,
-                });
-                if core.frame_rows.len() != before {
-                    core.batch_truncated_relations.push(relation_oid);
+            self.frame_relation_reshape(core, relation_oid).await?;
+        }
+        core.cache_table_register(table_metadata)
+            .await
+            .attach_loc("cdc table register")?;
+        Ok(())
+    }
+
+    /// A relation's shape changed mid-frame (intra-txn DDL): make the frame
+    /// safe to continue, and drop what was derived from the old shape.
+    async fn frame_relation_reshape(
+        &mut self,
+        core: &mut WriterCore,
+        relation_oid: Oid,
+    ) -> CacheResult<()> {
+        if core.frame_buf_relations.contains(&relation_oid) {
+            // The relation's cache-table writes (naming the old
+            // columns) are already committed to `frame_buf` or
+            // executed in the open cache txn — a partial replay
+            // moved them out of `frame_rows`, so discarding events
+            // can't retract them, and at COMMIT they would run
+            // against the recreated table and fail. Escalate to
+            // frame recovery: roll the cache txn back and let
+            // CommitMark invalidate + repopulate every relation the
+            // frame touched from post-DDL origin (PGC-264).
+            self.frame_recover_enter(core)
+                .await
+                .attach_loc("mid-frame DDL on a buffered relation")?;
+        } else {
+            // No buffered writes yet: the relation's events are all
+            // still in `frame_rows`. Discard them and purge its
+            // toast overlay (a different relation's partial replay
+            // may have recorded a stale entry under the old layout);
+            // the recreate evicts its queries and empties the table,
+            // so it rebuilds from origin (PGC-264).
+            core.toast_overlay_relation_invalidate(relation_oid);
+            let before = core.frame_rows.len();
+            core.frame_rows.retain(|event| match event {
+                FrameRowEvent::Insert {
+                    relation_oid: r, ..
                 }
+                | FrameRowEvent::Update {
+                    relation_oid: r, ..
+                }
+                | FrameRowEvent::Delete {
+                    relation_oid: r, ..
+                } => *r != relation_oid,
+                FrameRowEvent::Truncate { .. } | FrameRowEvent::Boundary { .. } => true,
+            });
+            if core.frame_rows.len() != before {
+                core.batch_truncated_relations.push(relation_oid);
             }
         }
         // Schema change: prepared eval SQL embeds the column list —
@@ -338,9 +357,62 @@ impl WriterCdc {
         for key in stale {
             self.prepared_membership.pop(&key);
         }
-        core.cache_table_register(table_metadata)
+        Ok(())
+    }
+
+    /// The event-trigger signal for a DDL command, at its position in the
+    /// frame. Every cached relation it names is evicted and forgotten: its
+    /// queries go, in-flight populations with a pre-DDL snapshot abort at
+    /// CommitMark, and the publication drain drops the cache table once no
+    /// query references it. The next registration reloads the relation's
+    /// metadata from the origin catalog, so an added column, an attached
+    /// partition's pre-existing rows, or a detached partition's absence all
+    /// take effect on repopulation. Nothing is reshaped in place.
+    pub(super) async fn schema_change_handle(
+        &mut self,
+        core: &mut WriterCore,
+        change: SchemaChange,
+    ) -> CacheResult<()> {
+        for relation_oid in change.altered_tables {
+            if !core.cache.tables.contains_key1(&relation_oid) {
+                continue;
+            }
+            info!(relation_oid = %relation_oid, "origin altered a cached table: evicting its queries");
+            self.cached_relation_forget(core, relation_oid)
+                .await
+                .attach_loc("altered table")?;
+        }
+        for relation_oid in change.dropped_tables {
+            if !core.cache.tables.contains_key1(&relation_oid) {
+                continue;
+            }
+            info!(relation_oid = %relation_oid, "origin dropped a cached table: evicting its queries");
+            self.cached_relation_forget(core, relation_oid)
+                .await
+                .attach_loc("dropped table")?;
+            // Origin already took the table out of the publication; the next
+            // `ALTER PUBLICATION` must not name it (it would fail on a
+            // nonexistent relation), and its metadata is gone for good.
+            core.publication_oids.remove(&relation_oid);
+            core.cache_tables_drop(&[relation_oid]).await;
+        }
+        Ok(())
+    }
+
+    async fn cached_relation_forget(
+        &mut self,
+        core: &mut WriterCore,
+        relation_oid: Oid,
+    ) -> CacheResult<()> {
+        self.frame_relation_reshape(core, relation_oid).await?;
+        core.cache_table_invalidate(relation_oid)
             .await
-            .attach_loc("cdc table register")?;
+            .attach_loc("evicting a changed relation's queries")?;
+        core.staging_pool_relation_purge(relation_oid).await;
+        // Like TRUNCATE (ADR-035): a population whose snapshot predates this
+        // commit may hold pre-DDL rows; stamped with the commit LSN at
+        // CommitMark.
+        core.batch_truncated_relations.push(relation_oid);
         Ok(())
     }
 

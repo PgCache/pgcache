@@ -33,6 +33,7 @@ use crate::result::error_chain_format;
 use crate::settings::Settings;
 
 mod decode;
+mod schema_change;
 
 use super::{
     CacheError, CacheResult, MapIntoReport, ReportExt, messages::CdcCommand, types::ActiveRelations,
@@ -41,6 +42,7 @@ use decode::{
     parse_delete_row_data, parse_insert_row_data, parse_relation_to_table_metadata,
     parse_update_row_data,
 };
+use schema_change::schema_change_parse;
 
 error_set! {
     /// Why the replication processor stopped. A `PgError` is a stream or
@@ -597,6 +599,9 @@ impl CdcProcessor {
     /// Only the `pgcache` prefix is ours; any other tool's messages on the same
     /// database arrive too and are dropped. An empty payload is the writer's
     /// WAL-flush marker (PGC-290): its transaction frame alone does the work.
+    /// Anything else is the event triggers' schema-change signal, forwarded
+    /// unfiltered: a drop must reach the writer even for a relation already
+    /// leaving `active_relations`, so the publication bookkeeping stays honest.
     fn process_message(&self, body: &MessageBody) -> Result<(), CdcEventError> {
         crate::metrics::handles().cdc.messages.increment(1);
         if body.prefix().ok() != Some(MESSAGE_PREFIX) {
@@ -606,12 +611,25 @@ impl CdcProcessor {
         if body.content().is_empty() {
             return Ok(());
         }
+        let change = match schema_change_parse(body.content()) {
+            Ok(change) => change,
+            // Our own trigger wrote it, so this is a version skew between the
+            // installed trigger and this binary: report it rather than stop
+            // the stream over a message no reinstall of ours would change.
+            Err(e) => {
+                error!("undecodable pgcache schema-change message: {e}");
+                return Ok(());
+            }
+        };
+        if change.is_empty() {
+            return Ok(());
+        }
         debug!(
-            bytes = body.content().len(),
-            transactional = body.flags() == 1,
-            "pgcache logical message"
+            altered = change.altered_tables.len(),
+            dropped = change.dropped_tables.len(),
+            "schema change signalled"
         );
-        Ok(())
+        self.writer_send(CdcCommand::SchemaChange(change))
     }
 
     fn writer_send(&self, command: CdcCommand) -> Result<(), CdcEventError> {
