@@ -20,6 +20,8 @@ pub mod pg;
 #[cfg(feature = "proxy")]
 pub mod preflight;
 #[cfg(feature = "proxy")]
+mod profiling;
+#[cfg(feature = "proxy")]
 pub mod proxy;
 #[cfg(feature = "proxy")]
 pub mod stream_utils;

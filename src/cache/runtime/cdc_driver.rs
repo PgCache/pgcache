@@ -18,6 +18,7 @@ use crate::cache::messages::CdcCommand;
 use crate::cache::{CacheError, CacheResult, MapIntoReport, ReportExt};
 use crate::pg::Lsn;
 use crate::pg::cdc::{PgCdcResult, slot_confirmed_lsn};
+use crate::profiling::runtime_build;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
 
@@ -108,10 +109,9 @@ pub(super) fn cdc_run(
     cancel: CancellationToken,
     cdc_connected: Arc<AtomicBool>,
 ) -> CacheResult<()> {
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_into_report::<CacheError>()?;
+    let mut builder = Builder::new_current_thread();
+    builder.enable_all();
+    let rt = runtime_build(builder, "cdc").map_into_report::<CacheError>()?;
 
     debug!("cdc loop");
     rt.block_on(async {

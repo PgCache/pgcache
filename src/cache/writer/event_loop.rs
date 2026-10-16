@@ -23,6 +23,7 @@ use super::registration::WriterRegistration;
 use crate::cache::messages::{CdcCommand, QueryCommand};
 use crate::cache::status::StatusRequest;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
+use crate::profiling::runtime_build;
 use crate::result::error_chain_format;
 use crate::settings::Settings;
 
@@ -48,10 +49,9 @@ pub(crate) fn writer_run(
     channels: WriterChannels,
     shared: WriterShared,
 ) -> CacheResult<()> {
-    let rt = Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_into_report::<CacheError>()?;
+    let mut builder = Builder::new_current_thread();
+    builder.enable_all();
+    let rt = runtime_build(builder, "writer").map_into_report::<CacheError>()?;
 
     debug!("writer loop");
     rt.block_on(async {

@@ -14,6 +14,7 @@ use super::{
     CacheabilityStore, ConnectionError, ConnectionResult, StatusSenderUpdater, connection_task,
 };
 use crate::admin::admin_server_spawn;
+use crate::profiling::runtime_shared_build;
 use crate::result::{MapIntoReport, ReportExt};
 use crate::{
     cache::query::CacheableQuery,
@@ -160,13 +161,10 @@ pub fn proxy_run(
     // One shared multi-thread runtime hosts connection tasks + worker serves
     // (PGC Option A probe). Writer and CDC remain dedicated threads.
     let worker_threads = settings.num_workers.max(2);
-    let rt = Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .enable_all()
-        .build()
-        .map_into_report::<ConnectionError>()?;
+    let (profiling, rt) =
+        runtime_shared_build(worker_threads).map_into_report::<ConnectionError>()?;
 
-    thread::scope(|scope| {
+    let result = thread::scope(|scope| {
         let rt_handle = rt.handle().clone();
 
         // The cache publishes a CacheDispatch and a status sender via watch
@@ -281,7 +279,11 @@ pub fn proxy_run(
         accept_handle.join().unwrap_or_else(|_panic| {
             Err(ConnectionError::IoError(std::io::Error::other("accept thread panicked")).into())
         })
-    })
+    });
+
+    drop(rt);
+    profiling.shutdown();
+    result
 }
 
 /// Per-connection values cloned into every accepted connection's task.

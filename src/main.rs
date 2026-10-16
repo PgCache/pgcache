@@ -30,9 +30,17 @@ use pgcache_lib::tracing_utils::SimpeFormatter;
 #[cfg(not(feature = "console"))]
 const LOG_BUFFERED_LINES: usize = 4096;
 
-#[cfg(not(any(feature = "dhat-heap", feature = "system-allocator")))]
+#[cfg(not(any(feature = "dhat-heap", feature = "system-allocator", feature = "dial9")))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(all(
+    feature = "dial9",
+    not(any(feature = "dhat-heap", feature = "system-allocator"))
+))]
+#[global_allocator]
+static GLOBAL: dial9::memory::Dial9Allocator<mimalloc::MiMalloc> =
+    dial9::memory::Dial9Allocator::new(mimalloc::MiMalloc);
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
