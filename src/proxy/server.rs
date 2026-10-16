@@ -14,7 +14,7 @@ use super::{
     CacheabilityStore, ConnectionError, ConnectionResult, StatusSenderUpdater, connection_task,
 };
 use crate::admin::admin_server_spawn;
-use crate::profiling::runtime_shared_build;
+use crate::profiling::{runtime_build, runtime_shared_build};
 use crate::result::{MapIntoReport, ReportExt};
 use crate::{
     cache::query::CacheableQuery,
@@ -189,9 +189,19 @@ pub fn proxy_run(
             .attach_loc("spawning admin server")?;
         }
 
-        telemetry::telemetry_spawn(settings.telemetry, cancel.child_token(), telemetry_metrics)
-            .map_into_report::<ConnectionError>()
-            .attach_loc("spawning telemetry thread")?;
+        // Cancelled when this closure returns on any path, so a startup failure
+        // doesn't leave the scope waiting on the background thread forever.
+        let background_cancel = cancel.child_token();
+        let _background_guard = background_cancel.clone().drop_guard();
+        let background =
+            background_spawn(scope, background_cancel).attach_loc("spawning background thread")?;
+
+        telemetry::telemetry_spawn(
+            settings.telemetry,
+            cancel.child_token(),
+            telemetry_metrics,
+            &background,
+        );
 
         // Build the first cache generation fail-fast, before accepting traffic,
         // so "Listening" implies the cache is up (the supervisor then handles
@@ -219,7 +229,7 @@ pub fn proxy_run(
         let cacheability_store = Arc::new(CacheabilityStore::new());
 
         metrics_upkeep_spawn(
-            &rt_handle,
+            &background,
             Arc::clone(&cacheability_store),
             upkeep_metrics,
             cancel.child_token(),
@@ -373,7 +383,25 @@ async fn accept_run(
     Ok(())
 }
 
-/// Periodic metrics maintenance, on a 1s tick.
+/// Start the `background` thread: a current-thread runtime for low-priority
+/// periodic work (metrics upkeep, telemetry). It exits when `cancel` fires,
+/// dropping whatever tasks are still on it.
+fn background_spawn<'scope, 'env>(
+    scope: &'scope thread::Scope<'scope, 'env>,
+    cancel: CancellationToken,
+) -> ConnectionResult<Handle> {
+    let mut builder = Builder::new_current_thread();
+    builder.enable_all();
+    let rt = runtime_build(builder, "background").map_into_report::<ConnectionError>()?;
+    let handle = rt.handle().clone();
+    thread::Builder::new()
+        .name("background".to_owned())
+        .spawn_scoped(scope, move || rt.block_on(cancel.cancelled()))
+        .map_into_report::<ConnectionError>()?;
+    Ok(handle)
+}
+
+/// Periodic metrics maintenance, on a 1s tick, on the background thread.
 ///
 /// Publishing the store's size here rather than on every membership change
 /// keeps an all-shards operation off the churn path: `DashMap::len`
@@ -386,14 +414,16 @@ async fn accept_run(
 /// that is never scraped retains every sample it has ever recorded —
 /// ~180 bytes per query, which is unbounded growth under load. Draining
 /// every second also keeps each drain small and improves the time
-/// attribution of samples into the exporter's rolling windows.
+/// attribution of samples into the exporter's rolling windows. The drain is
+/// synchronous and takes 6-27ms at 20-80k qps, so it must stay off the
+/// shared runtime, where it would stall a connection worker every tick.
 fn metrics_upkeep_spawn(
-    rt_handle: &Handle,
+    background: &Handle,
     store: Arc<CacheabilityStore>,
     metrics: PrometheusHandle,
     cancel: CancellationToken,
 ) {
-    rt_handle.spawn(async move {
+    background.spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {

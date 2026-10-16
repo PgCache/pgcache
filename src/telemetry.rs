@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Serialize;
+use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, trace};
 use uuid::Uuid;
@@ -147,18 +148,19 @@ async fn ping_send(client: &reqwest::Client, endpoint: &str, payload: &Telemetry
     trace!("Anonymous telemetry {rv:?}");
 }
 
-/// Spawn the telemetry background thread.
+/// Spawn the telemetry task onto the proxy's background runtime.
 ///
-/// Runs on a dedicated thread with its own single-threaded tokio runtime.
 /// Sends a startup ping, then heartbeats every 24h with jitter.
 /// All network failures are silently ignored — telemetry never affects proxy operation.
+/// It shares that runtime with metrics upkeep, so it must never block synchronously.
 pub fn telemetry_spawn(
     telemetry_enabled: bool,
     cancel: CancellationToken,
     metrics_handle: PrometheusHandle,
-) -> Result<(), std::io::Error> {
+    background: &Handle,
+) {
     if !telemetry_enabled || cfg!(debug_assertions) {
-        return Ok(());
+        return;
     }
 
     info!(
@@ -166,14 +168,7 @@ pub fn telemetry_spawn(
          See https://pgcache.com/docs/telemetry"
     );
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    std::thread::Builder::new()
-        .name("telemetry".to_owned())
-        .spawn(move || rt.block_on(telemetry_run(cancel, metrics_handle)))?;
-
-    Ok(())
+    background.spawn(telemetry_run(cancel, metrics_handle));
 }
 
 async fn telemetry_run(cancel: CancellationToken, metrics_handle: PrometheusHandle) {
