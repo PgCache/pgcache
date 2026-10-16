@@ -565,13 +565,13 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::ast::rope::{NodeKind, QueryTree};
     use crate::query::ast::{SetOpType, query_tree_parse};
 
     fn test_table(name: &str, oid: Oid, cols: &[&str]) -> TableMetadata {
-        let columns = ColumnStore::new(cols.iter().enumerate().map(|(i, c)| {
+        let columns = cols.iter().enumerate().map(|(i, c)| {
             let is_pk = i == 0;
             ColumnMetadata {
                 name: (*c).into(),
@@ -582,16 +582,8 @@ mod tests {
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
             }
-        }));
-        TableMetadata {
-            replica_identity_full: false,
-            relation_oid: oid,
-            name: name.into(),
-            schema: "public".into(),
-            primary_key_columns: vec![cols[0].into()],
-            columns,
-            indexes: Vec::new(),
-        }
+        });
+        TableMetadata::for_test(name, oid.get(), columns)
     }
 
     fn test_tables() -> Catalog {

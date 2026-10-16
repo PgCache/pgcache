@@ -119,6 +119,17 @@ pub struct TableMetadata {
     /// bypassed (the tuple itself is authoritative) and PK changes are
     /// detected by comparing PK columns rather than key-tuple presence.
     pub replica_identity_full: bool,
+    /// Every partition under this table, leaves and intermediate levels
+    /// alike (`pg_inherits` descendants). Under `publish_via_partition_root`
+    /// a partition's rows stream as this table's, so a schema change signalled
+    /// on a partition (truncate, drop, a sub-partition attached) is resolved
+    /// to this table through the list. Empty for a plain table.
+    pub partitions: Vec<Oid>,
+    /// Every table above this one (`pg_inherits` ancestors). An `ALTER
+    /// TABLE` on a partitioned root reaches its partitions, so a change
+    /// signalled on an ancestor is resolved to this table through the list.
+    /// Empty for a plain table or a root.
+    pub ancestors: Vec<Oid>,
 }
 
 impl TableMetadata {
@@ -138,6 +149,34 @@ impl TableMetadata {
     /// [`ColumnMetadata::is_toastable`].
     pub fn has_toastable_column(&self) -> bool {
         self.columns.iter().any(ColumnMetadata::is_toastable)
+    }
+
+    /// A `public.<name>` fixture for tests and benches: the key is the
+    /// columns flagged `is_primary_key`, no indexes, no partition tree,
+    /// default replica identity. The one place a new catalog-only field gets its
+    /// fixture default.
+    pub fn for_test(
+        name: &str,
+        oid: u32,
+        columns: impl IntoIterator<Item = ColumnMetadata>,
+    ) -> Self {
+        let columns = ColumnStore::new(columns);
+        let primary_key_columns = columns
+            .iter()
+            .filter(|column| column.is_primary_key)
+            .map(|column| column.name.clone())
+            .collect();
+        Self {
+            relation_oid: Oid::from_raw(oid),
+            name: name.into(),
+            schema: "public".into(),
+            primary_key_columns,
+            columns,
+            indexes: Vec::new(),
+            replica_identity_full: false,
+            partitions: Vec::new(),
+            ancestors: Vec::new(),
+        }
     }
 }
 

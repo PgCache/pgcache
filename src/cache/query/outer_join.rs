@@ -135,14 +135,14 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::{Oid, TypeOid};
     use crate::query::resolve::ResolvedQuery;
 
     /// Create test table metadata with given column names.
     /// First column is the primary key (INT4), rest are TEXT.
     fn test_table(name: &str, relation_oid: Oid, column_names: &[&str]) -> TableMetadata {
-        let columns = ColumnStore::new(column_names.iter().enumerate().map(|(i, col_name)| {
+        let columns = column_names.iter().enumerate().map(|(i, col_name)| {
             let is_pk = i == 0;
             ColumnMetadata {
                 name: (*col_name).into(),
@@ -153,16 +153,8 @@ mod tests {
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
             }
-        }));
-        TableMetadata {
-            replica_identity_full: false,
-            relation_oid,
-            name: name.into(),
-            schema: "public".into(),
-            primary_key_columns: vec![column_names[0].into()],
-            columns,
-            indexes: Vec::new(),
-        }
+        });
+        TableMetadata::for_test(name, relation_oid.get(), columns)
     }
 
     /// Parse and bind SQL over the given tables.

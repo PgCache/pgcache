@@ -77,6 +77,7 @@ impl WriterCore {
             // Already in sync. Clear the dirty flag so a deferred drain
             // doesn't redo this comparison.
             self.relations_dirty = false;
+            self.forgotten_tables_drop().await;
             return Ok(());
         }
 
@@ -87,53 +88,85 @@ impl WriterCore {
             .collect();
 
         let sql = if new_oids.is_empty() {
-            let table_list =
-                self.oids_to_table_list(&self.publication_oids.iter().copied().collect::<Vec<_>>());
-            format!(
-                "ALTER PUBLICATION {} DROP TABLE {}",
-                self.publication_name, table_list
-            )
+            let published: Vec<Oid> = self.publication_oids.iter().copied().collect();
+            let table_list = self.origin_table_list(&published).await?;
+            (!table_list.is_empty()).then(|| {
+                format!(
+                    "ALTER PUBLICATION {} DROP TABLE {}",
+                    self.publication_name, table_list
+                )
+            })
         } else {
             let table_list = self.oids_to_table_list(&new_oids.iter().copied().collect::<Vec<_>>());
-            format!(
+            Some(format!(
                 "ALTER PUBLICATION {} SET TABLE {}",
                 self.publication_name, table_list
-            )
+            ))
         };
 
-        debug!("publication update: {sql}");
-        self.db_origin
-            .batch_execute(&sql)
-            .await
-            .map_into_report::<CacheError>()
-            .attach_loc("updating publication table list")?;
+        if let Some(sql) = sql {
+            debug!("publication update: {sql}");
+            self.db_origin
+                .batch_execute(&sql)
+                .await
+                .map_into_report::<CacheError>()
+                .attach_loc("updating publication table list")?;
+        }
         self.publication_oids = new_oids;
 
         if !removed.is_empty() {
             self.cache_tables_drop(&removed).await;
         }
+        self.forgotten_tables_drop().await;
         // Publication now matches active_relations; any pending drain is
         // satisfied by this call.
         self.relations_dirty = false;
         Ok(())
     }
 
-    /// Resolve a list of OIDs to a comma-separated `schema.table` string.
+    /// Resolve active relations to a comma-separated `schema.table` string
+    /// from the writer's catalog.
     fn oids_to_table_list(&self, oids: &[Oid]) -> String {
         oids.iter()
-            .filter_map(|oid| {
-                self.cache.tables.get1(oid).map(|t| {
-                    format!(
-                        "{}.{}",
-                        escape::escape_identifier(&t.schema),
-                        escape::escape_identifier(&t.name)
-                    )
-                })
-            })
+            .filter_map(|oid| self.cache.tables.get1(oid))
+            .map(|table| table_qualified(&table.schema, &table.name))
             .collect::<Vec<_>>()
             .join(", ")
     }
 
+    /// Resolve relations leaving the publication to their current names on
+    /// origin. A forgotten relation is out of the writer's catalog, and the
+    /// name it was registered under may be stale by now (`RENAME`, `SET
+    /// SCHEMA`); one dropped since is already out of the publication and is
+    /// left out here.
+    async fn origin_table_list(&self, oids: &[Oid]) -> CacheResult<String> {
+        let rows = self
+            .db_origin
+            .query(
+                "SELECT n.nspname, c.relname FROM pg_class c \
+                 JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = ANY($1)",
+                &[&oids],
+            )
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("resolving the names of relations leaving the publication")?;
+        Ok(rows
+            .iter()
+            .map(|row| table_qualified(row.get(0), row.get(1)))
+            .collect::<Vec<_>>()
+            .join(", "))
+    }
+}
+
+fn table_qualified(schema: &str, name: &str) -> String {
+    format!(
+        "{}.{}",
+        escape::escape_identifier(schema),
+        escape::escape_identifier(name)
+    )
+}
+
+impl WriterCore {
     /// Drain the dirty flag: sync the origin publication (which also drops
     /// orphaned cache tables). `active_relations` is kept up to date
     /// incrementally via `active_relations_acquire` / `_release`, so the only

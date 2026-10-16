@@ -8,9 +8,10 @@ use tokio_postgres::types::Type;
 use tracing::{debug, error, info, instrument, warn};
 
 use super::core::WriterCore;
+use crate::cache::messages::PartitionCreated;
 use crate::cache::{CacheError, CacheResult, MapIntoReport};
 use crate::catalog::{
-    ColumnMetadata, ColumnPosition, ColumnStore, IndexMetadata, TableMetadata,
+    CatalogTable, ColumnMetadata, ColumnPosition, ColumnStore, IndexMetadata, TableMetadata,
     cache_type_name_resolve,
 };
 use crate::oid::{Oid, TypeOid};
@@ -169,6 +170,8 @@ impl WriterCore {
 
         let indexes = self.query_table_indexes_get(relation_oid).await?;
         let replica_identity_full = self.query_replica_identity_full(relation_oid).await?;
+        let partitions = self.query_table_partitions_get(relation_oid).await?;
+        let ancestors = self.query_table_ancestors_get(relation_oid).await?;
 
         let table = TableMetadata {
             replica_identity_full,
@@ -178,6 +181,8 @@ impl WriterCore {
             primary_key_columns,
             columns: ColumnStore::new(columns),
             indexes,
+            partitions,
+            ancestors,
         };
 
         Ok(table)
@@ -277,6 +282,50 @@ impl WriterCore {
             .map_into_report::<CacheError>()?;
 
         Ok(row.map(|r| r.get::<_, Oid>(0)))
+    }
+
+    /// Every descendant partition of the relation, in no particular order.
+    #[instrument(skip_all)]
+    pub(super) async fn query_table_partitions_get(
+        &self,
+        relation_oid: Oid,
+    ) -> CacheResult<Vec<Oid>> {
+        let sql = r"
+            WITH RECURSIVE descendants(oid) AS (
+                SELECT inhrelid FROM pg_inherits WHERE inhparent = $1
+                UNION
+                SELECT i.inhrelid FROM pg_inherits i JOIN descendants d ON i.inhparent = d.oid
+            )
+            SELECT oid::oid FROM descendants
+        ";
+        let rows = self
+            .db_origin
+            .query(sql, &[&relation_oid])
+            .await
+            .map_into_report::<CacheError>()?;
+        Ok(rows.iter().map(|row| row.get::<_, Oid>(0)).collect())
+    }
+
+    /// Every ancestor of the relation, in no particular order.
+    #[instrument(skip_all)]
+    pub(super) async fn query_table_ancestors_get(
+        &self,
+        relation_oid: Oid,
+    ) -> CacheResult<Vec<Oid>> {
+        let sql = r"
+            WITH RECURSIVE ancestors(oid) AS (
+                SELECT inhparent FROM pg_inherits WHERE inhrelid = $1
+                UNION
+                SELECT i.inhparent FROM pg_inherits i JOIN ancestors a ON i.inhrelid = a.oid
+            )
+            SELECT oid::oid FROM ancestors
+        ";
+        let rows = self
+            .db_origin
+            .query(sql, &[&relation_oid])
+            .await
+            .map_into_report::<CacheError>()?;
+        Ok(rows.iter().map(|row| row.get::<_, Oid>(0)).collect())
     }
 
     #[instrument(skip_all)]
@@ -492,16 +541,45 @@ impl WriterCore {
     /// the eviction path. Oids without metadata are silently skipped.
     #[instrument(skip(self, relation_oids))]
     pub(super) async fn cache_tables_drop(&mut self, relation_oids: &[Oid]) {
-        let mut quoted = Vec::with_capacity(relation_oids.len());
-        for oid in relation_oids {
-            if let Some(table) = self.cache.tables.remove1(oid) {
-                quoted.push(format!(
+        let tables: Vec<CatalogTable> = relation_oids
+            .iter()
+            .filter_map(|oid| self.cache.tables.remove1(oid))
+            .collect();
+        self.cache_table_objects_drop(&tables).await;
+    }
+
+    /// Drop the cache tables of metadata a schema-change signal already
+    /// removed from `cache.tables`. One recreated since under the same name
+    /// (a registration, or a Relation message) replaced the object on the way
+    /// in, so dropping by name now would take the new table with it.
+    pub(super) async fn forgotten_tables_drop(&mut self) {
+        if self.forgotten_tables.is_empty() {
+            return;
+        }
+        let forgotten = std::mem::take(&mut self.forgotten_tables);
+        let orphaned: Vec<CatalogTable> = forgotten
+            .into_iter()
+            .filter(|table| {
+                !self
+                    .cache
+                    .tables
+                    .contains_key2(&(table.schema.as_str(), table.name.as_str()))
+            })
+            .collect();
+        self.cache_table_objects_drop(&orphaned).await;
+    }
+
+    async fn cache_table_objects_drop(&mut self, tables: &[CatalogTable]) {
+        let quoted: Vec<String> = tables
+            .iter()
+            .map(|table| {
+                format!(
                     "{}.{}",
                     escape::escape_identifier(&table.schema),
                     escape::escape_identifier(&table.name)
-                ));
-            }
-        }
+                )
+            })
+            .collect();
         if quoted.is_empty() {
             return;
         }
@@ -519,6 +597,55 @@ impl WriterCore {
             );
         }
     }
+
+    /// The cached tables a signal on `relation_oid` lands on: the tables
+    /// whose partition tree holds it, and every cached partition under it
+    /// (an `ALTER TABLE` on a partitioned root reaches its partitions).
+    pub(super) fn tables_over_relation(&self, relation_oid: Oid) -> Vec<Oid> {
+        self.cache
+            .tables
+            .iter()
+            .filter(|table| {
+                table_tree_holds(table, relation_oid) || table.ancestors.contains(&relation_oid)
+            })
+            .map(|table| table.relation_oid)
+            .collect()
+    }
+
+    /// The cached tables whose own partition tree holds `relation_oid`: the
+    /// relation itself when cached, and every cached table above it (under
+    /// `publish_via_partition_root` a partition's rows are its root's; a
+    /// cached mid-level partition counts too).
+    fn tables_holding_relation(&self, relation_oid: Oid) -> Vec<Oid> {
+        self.cache
+            .tables
+            .iter()
+            .filter(|table| table_tree_holds(table, relation_oid))
+            .map(|table| table.relation_oid)
+            .collect()
+    }
+
+    /// A partition created under a cached table (directly or under one of its
+    /// partitions): extend the partition list so a later truncate or drop of
+    /// it resolves to the table. A registration that loaded the catalog after
+    /// the create already lists it.
+    pub(super) fn table_partition_add(&mut self, created: PartitionCreated) {
+        for owner in self.tables_holding_relation(created.parent) {
+            let Some(table) = self.cache.tables.get1(&owner) else {
+                continue;
+            };
+            if table.partitions.contains(&created.partition) {
+                continue;
+            }
+            let mut table = (**table).clone();
+            table.partitions.push(created.partition);
+            self.cache.tables.insert_overwrite(table.into());
+        }
+    }
+}
+
+fn table_tree_holds(table: &TableMetadata, relation_oid: Oid) -> bool {
+    table.relation_oid == relation_oid || table.partitions.contains(&relation_oid)
 }
 
 /// Retarget a canonical `pg_get_indexdef` statement onto the cache table.
@@ -573,9 +700,13 @@ impl WriterCore {
             self.staging_pool_relation_purge(relation_oid).await;
         }
 
+        // A Relation message carries columns only; the catalog-only facts
+        // are read fresh (a stale partition tree would lose a drop signal).
         if table_metadata.indexes.is_empty() {
             table_metadata.indexes = self.query_table_indexes_get(relation_oid).await?;
         }
+        table_metadata.partitions = self.query_table_partitions_get(relation_oid).await?;
+        table_metadata.ancestors = self.query_table_ancestors_get(relation_oid).await?;
 
         self.cache_table_create_from_metadata(&table_metadata)
             .await?;

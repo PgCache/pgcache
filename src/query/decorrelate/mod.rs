@@ -233,12 +233,12 @@ pub(crate) mod fixtures {
     use iddqd::BiHashMap;
     use postgres_types::Type;
 
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
-    use crate::oid::{Oid, TypeOid};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::oid::TypeOid;
     use crate::query::resolve::ResolvedQuery;
 
     fn test_table(name: &str, relation_oid: u32, column_names: &[&str]) -> TableMetadata {
-        let columns = ColumnStore::new(column_names.iter().enumerate().map(|(i, column)| {
+        let columns = column_names.iter().enumerate().map(|(i, column)| {
             let is_pk = i == 0;
             ColumnMetadata {
                 name: (*column).into(),
@@ -249,16 +249,8 @@ pub(crate) mod fixtures {
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
             }
-        }));
-        TableMetadata {
-            replica_identity_full: false,
-            relation_oid: Oid::from_raw(relation_oid),
-            name: name.into(),
-            schema: "public".into(),
-            primary_key_columns: vec![column_names[0].into()],
-            columns,
-            indexes: Vec::new(),
-        }
+        });
+        TableMetadata::for_test(name, relation_oid, columns)
     }
 
     pub(crate) fn test_tables() -> Catalog {

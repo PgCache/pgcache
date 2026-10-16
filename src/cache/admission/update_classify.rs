@@ -299,13 +299,13 @@ mod classify_tests {
 
     use super::*;
     use crate::cache::query::CacheableQuery;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
     use crate::query::ast::query_tree_parse;
     use crate::query::resolve::ResolvedQuery;
 
     fn make_table(name: &str, oid: Oid, columns: &[&str]) -> TableMetadata {
-        let cols = ColumnStore::new(columns.iter().enumerate().map(|(i, c)| {
+        let cols = columns.iter().enumerate().map(|(i, c)| {
             let is_pk = i == 0;
             ColumnMetadata {
                 name: (*c).into(),
@@ -316,16 +316,8 @@ mod classify_tests {
                 cache_type_name: if is_pk { "int4" } else { "text" }.into(),
                 is_primary_key: is_pk,
             }
-        }));
-        TableMetadata {
-            replica_identity_full: false,
-            relation_oid: oid,
-            name: name.into(),
-            schema: "public".into(),
-            primary_key_columns: vec![columns[0].into()],
-            columns: cols,
-            indexes: Vec::new(),
-        }
+        });
+        TableMetadata::for_test(name, oid.get(), cols)
     }
 
     fn resolve(sql: &str, tables: &Catalog) -> ResolvedQuery {

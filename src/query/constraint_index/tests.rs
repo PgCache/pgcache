@@ -823,8 +823,8 @@ mod point {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
-    use crate::oid::{Oid, TypeOid};
+    use crate::catalog::{ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::oid::TypeOid;
     use crate::pg::protocol::ByteString;
     use crate::query::constraint_index::point::{ColumnForms, row_value_forms};
     use crate::query::constraints::ColumnRange;
@@ -835,7 +835,7 @@ mod point {
 
     /// `[id int4 (pk), name text, active bool]` — row layout `[id, name, active]`.
     fn point_table() -> TableMetadata {
-        let columns = ColumnStore::new([
+        let columns = [
             ColumnMetadata {
                 name: "id".into(),
                 position: ColumnPosition::from_raw(1),
@@ -863,16 +863,8 @@ mod point {
                 cache_type_name: "bool".into(),
                 is_primary_key: false,
             },
-        ]);
-        TableMetadata {
-            replica_identity_full: false,
-            name: "t".into(),
-            schema: "public".into(),
-            relation_oid: Oid::from_raw(1),
-            primary_key_columns: vec!["id".into()],
-            columns,
-            indexes: Vec::new(),
-        }
+        ];
+        TableMetadata::for_test("t", 1, columns)
     }
 
     // Point probe: the row is an `Equal`-on-every-column degenerate query.
@@ -950,20 +942,16 @@ mod point {
             cache_type_name: type_name.into(),
             is_primary_key: position == 1,
         };
-        TableMetadata {
-            replica_identity_full: false,
-            name: "typed".into(),
-            schema: "public".into(),
-            relation_oid: Oid::from_raw(777),
-            primary_key_columns: vec!["id".into()],
-            columns: ColumnStore::new([
+        TableMetadata::for_test(
+            "typed",
+            777,
+            [
                 column("id", 1, Type::INT4, "int4"),
                 column("at", 2, Type::TIMESTAMP, "timestamp"),
                 column("price", 3, Type::NUMERIC, "numeric"),
                 column("day", 4, Type::DATE, "date"),
-            ]),
-            indexes: Vec::new(),
-        }
+            ],
+        )
     }
 
     /// PGC-478: entries keyed by their literal's typed form are found by a row

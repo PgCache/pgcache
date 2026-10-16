@@ -193,8 +193,8 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
-    use crate::oid::{Oid, TypeOid};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::oid::TypeOid;
     use crate::query::evaluate::where_expr_supported;
     use crate::query::resolve::ResolvedQuery;
 
@@ -217,14 +217,8 @@ mod tests {
             data_type: ty,
             is_primary_key: index == 0,
         };
-        let table = |name: &str, oid: u32, columns: Vec<ColumnMetadata>| TableMetadata {
-            replica_identity_full: false,
-            relation_oid: Oid::from_raw(oid),
-            name: name.into(),
-            schema: "public".into(),
-            primary_key_columns: vec!["id".into()],
-            columns: ColumnStore::new(columns),
-            indexes: Vec::new(),
+        let table = |name: &str, oid: u32, columns: Vec<ColumnMetadata>| {
+            TableMetadata::for_test(name, oid, columns)
         };
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(

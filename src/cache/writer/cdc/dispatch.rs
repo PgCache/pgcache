@@ -23,6 +23,24 @@ use crate::pg;
 use crate::pg::Lsn;
 use crate::settings::Settings;
 
+/// What the schema-change signal reports for a relation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaChangeKind {
+    Altered,
+    Truncated,
+    Dropped,
+}
+
+impl SchemaChangeKind {
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Altered => "altered",
+            Self::Truncated => "truncated",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
 fn cdc_command_histogram(cmd: &CdcCommand) -> &'static Histogram {
     let m = crate::metrics::handles();
     match cmd {
@@ -361,40 +379,59 @@ impl WriterCdc {
     }
 
     /// The event-trigger signal for a DDL command, at its position in the
-    /// frame. Every cached relation it names is evicted and forgotten: its
-    /// queries go, in-flight populations with a pre-DDL snapshot abort at
-    /// CommitMark, and the publication drain drops the cache table once no
-    /// query references it. The next registration reloads the relation's
-    /// metadata from the origin catalog, so an added column, an attached
-    /// partition's pre-existing rows, or a detached partition's absence all
-    /// take effect on repopulation. Nothing is reshaped in place.
+    /// frame. Every cached relation it lands on (the relation itself, or the
+    /// cached table whose partition tree holds it) is evicted and forgotten:
+    /// its queries go, in-flight populations with a pre-DDL snapshot abort at
+    /// CommitMark, and the publication drain drops the cache table. The next
+    /// registration reloads the relation's metadata from the origin catalog,
+    /// so an added column, an attached partition's pre-existing rows, or a
+    /// detached, truncated or dropped partition's absence all take effect on
+    /// repopulation. Nothing is reshaped in place.
     pub(super) async fn schema_change_handle(
         &mut self,
         core: &mut WriterCore,
         change: SchemaChange,
     ) -> CacheResult<()> {
-        for relation_oid in change.altered_tables {
-            if !core.cache.tables.contains_key1(&relation_oid) {
-                continue;
-            }
-            info!(relation_oid = %relation_oid, "origin altered a cached table: evicting its queries");
-            self.cached_relation_forget(core, relation_oid)
-                .await
-                .attach_loc("altered table")?;
+        for created in change.partitions_created {
+            core.table_partition_add(created);
         }
-        for relation_oid in change.dropped_tables {
-            if !core.cache.tables.contains_key1(&relation_oid) {
-                continue;
+        let signalled = change
+            .altered_tables
+            .iter()
+            .map(|oid| (*oid, SchemaChangeKind::Altered))
+            .chain(
+                change
+                    .truncated_tables
+                    .iter()
+                    .map(|oid| (*oid, SchemaChangeKind::Truncated)),
+            )
+            .chain(
+                change
+                    .dropped_tables
+                    .iter()
+                    .map(|oid| (*oid, SchemaChangeKind::Dropped)),
+            );
+        for (relation_oid, kind) in signalled {
+            // A forgotten table leaves `cache.tables`, so a second signal on
+            // the same tree in one command resolves to nothing.
+            for cached_oid in core.tables_over_relation(relation_oid) {
+                info!(
+                    relation_oid = %relation_oid,
+                    cached_oid = %cached_oid,
+                    "origin {} a cached table or a relation in its partition tree: \
+                     evicting its queries",
+                    kind.verb()
+                );
+                self.cached_relation_forget(core, cached_oid)
+                    .await
+                    .attach_loc("schema change on a cached table")?;
             }
-            info!(relation_oid = %relation_oid, "origin dropped a cached table: evicting its queries");
-            self.cached_relation_forget(core, relation_oid)
-                .await
-                .attach_loc("dropped table")?;
-            // Origin already took the table out of the publication; the next
-            // `ALTER PUBLICATION` must not name it (it would fail on a
-            // nonexistent relation), and its metadata is gone for good.
-            core.publication_oids.remove(&relation_oid);
-            core.cache_tables_drop(&[relation_oid]).await;
+            if kind == SchemaChangeKind::Dropped {
+                // Origin already took the table out of the publication; the
+                // next `ALTER PUBLICATION` must not name it (it would fail on
+                // a nonexistent relation).
+                core.publication_oids.remove(&relation_oid);
+            }
         }
         Ok(())
     }
@@ -413,6 +450,15 @@ impl WriterCdc {
         // commit may hold pre-DDL rows; stamped with the commit LSN at
         // CommitMark.
         core.batch_truncated_relations.push(relation_oid);
+        // The metadata must go now, not at the drain: a registration can run
+        // between a mid-frame signal and the frame's commit, and would reuse
+        // the pre-DDL entry (or, after a drop, the old OID under the new
+        // table's name). The cache table itself waits for the drain, since
+        // the open frame may hold locks on it.
+        if let Some(table) = core.cache.tables.remove1(&relation_oid) {
+            core.forgotten_tables.push(table);
+            core.relations_dirty = true;
+        }
         Ok(())
     }
 

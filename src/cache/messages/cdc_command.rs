@@ -57,11 +57,28 @@ pub(crate) struct SchemaChange {
     pub(crate) altered_tables: Vec<Oid>,
     /// `DROP TABLE`, directly or by cascade.
     pub(crate) dropped_tables: Vec<Oid>,
+    /// `TRUNCATE` of a partition, which pgoutput leaves out under
+    /// `publish_via_partition_root`; signalled by pgcache's per-partition
+    /// trigger, so a partitioned root's own truncate never appears here.
+    pub(crate) truncated_tables: Vec<Oid>,
+    /// `CREATE TABLE … PARTITION OF`: a new, empty partition. Nothing to
+    /// evict, but the parent's partition list must learn of it.
+    pub(crate) partitions_created: Vec<PartitionCreated>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PartitionCreated {
+    pub(crate) partition: Oid,
+    /// The direct parent, itself possibly a partition.
+    pub(crate) parent: Oid,
 }
 
 impl SchemaChange {
     pub(crate) fn is_empty(&self) -> bool {
-        self.altered_tables.is_empty() && self.dropped_tables.is_empty()
+        self.altered_tables.is_empty()
+            && self.dropped_tables.is_empty()
+            && self.truncated_tables.is_empty()
+            && self.partitions_created.is_empty()
     }
 }
 

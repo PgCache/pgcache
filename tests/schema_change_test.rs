@@ -192,3 +192,245 @@ async fn test_ddl_between_writes_in_one_transaction() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Register `q`, expecting `expected_ids` in order: a miss, then a hit once
+/// populated. Returns the metrics after the hit.
+async fn assert_repopulated(
+    ctx: &mut TestContext,
+    q: &str,
+    expected_ids: &[&str],
+) -> Result<(), Error> {
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    let rows = rows_of(&res);
+    assert_eq!(rows.len(), expected_ids.len(), "row count after the signal");
+    for (index, id) in expected_ids.iter().enumerate() {
+        assert_row_at(&res, index + 1, &[("id", id)])?;
+    }
+    let m = assert_cache_miss(ctx, m).await?;
+    ctx.cache_settle().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(rows_of(&res).len(), expected_ids.len());
+    let m = assert_cache_hit(ctx, m).await?;
+    assert_eq!(m.cache_restarts_total, 0, "writer must survive the signal");
+    Ok(())
+}
+
+/// `TRUNCATE` of a partition under `publish_via_partition_root` (PGC-70):
+/// pgoutput sends nothing for it, so the per-partition truncate trigger must
+/// signal it and the parent's queries repopulate without the partition's rows.
+#[tokio::test]
+async fn test_partition_truncate_repopulates_parent() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    for statement in [
+        "create table events (id integer, day integer, primary key (id, day)) \
+         partition by range (day)",
+        "create table events_p1 partition of events for values from (1) to (10)",
+        "create table events_p2 partition of events for values from (10) to (20)",
+        "insert into events (id, day) values (1, 1), (2, 15)",
+    ] {
+        ctx.query(statement, &[]).await?;
+    }
+
+    let q = "select id, day from events where day < 100 order by id";
+    assert_repopulated(&mut ctx, q, &["1", "2"]).await?;
+
+    ctx.query("truncate events_p2", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    Ok(())
+}
+
+/// `DROP TABLE` of a leaf under a sub-partitioned partition: `sql_drop`
+/// names only the leaf, and pgcache resolves it to the cached root through
+/// the partition list it loaded at registration.
+#[tokio::test]
+async fn test_partition_drop_resolves_through_sub_partition() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    for statement in [
+        "create table events (id integer, day integer, primary key (id, day)) \
+         partition by range (day)",
+        "create table events_p1 partition of events for values from (1) to (10)",
+        "create table events_p2 partition of events for values from (10) to (20) \
+         partition by range (day)",
+        "create table events_p2a partition of events_p2 for values from (10) to (15)",
+        "insert into events (id, day) values (1, 1), (2, 12)",
+    ] {
+        ctx.query(statement, &[]).await?;
+    }
+
+    let q = "select id, day from events where day < 100 order by id";
+    assert_repopulated(&mut ctx, q, &["1", "2"]).await?;
+
+    ctx.query("drop table events_p2a", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    Ok(())
+}
+
+/// A partition created after the parent was registered: the create signal
+/// extends the parent's partition list and installs the truncate trigger on
+/// the new partition, so its later truncate and drop both resolve to the
+/// parent. Row changes through it apply in place as usual.
+#[tokio::test]
+async fn test_partition_created_after_registration_is_tracked() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    for statement in [
+        "create table events (id integer, day integer, primary key (id, day)) \
+         partition by range (day)",
+        "create table events_p1 partition of events for values from (1) to (10)",
+        "insert into events (id, day) values (1, 1)",
+    ] {
+        ctx.query(statement, &[]).await?;
+    }
+
+    let q = "select id, day from events where day < 100 order by id";
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    ctx.query(
+        "create table events_p2 partition of events for values from (10) to (20)",
+        &[],
+    )
+    .await?;
+    ctx.query("insert into events (id, day) values (2, 15)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(
+        rows_of(&res).len(),
+        2,
+        "insert through the new partition applied in place"
+    );
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.query("truncate events_p2", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    ctx.query("insert into events (id, day) values (3, 16)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    let m = ctx.metrics().await?;
+    let res = ctx.simple_query(q).await?;
+    assert_eq!(rows_of(&res).len(), 2);
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.query("drop table events_p2", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    Ok(())
+}
+
+/// `TRUNCATE` of the partitioned root: pgoutput reports it as a truncate of
+/// the root, and every partition's trigger signals too. The signals resolve
+/// to a table already forgotten by the first, and the writer survives.
+#[tokio::test]
+async fn test_partitioned_root_truncate_empties_cache() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    for statement in [
+        "create table events (id integer, day integer, primary key (id, day)) \
+         partition by range (day)",
+        "create table events_p1 partition of events for values from (1) to (10)",
+        "create table events_p2 partition of events for values from (10) to (20)",
+        "insert into events (id, day) values (1, 1), (2, 15)",
+    ] {
+        ctx.query(statement, &[]).await?;
+    }
+
+    let q = "select id, day from events where day < 100 order by id";
+    assert_repopulated(&mut ctx, q, &["1", "2"]).await?;
+
+    ctx.query("truncate events", &[]).await?;
+    ctx.cdc_apply_settle().await?;
+    assert_repopulated(&mut ctx, q, &[]).await?;
+
+    Ok(())
+}
+
+/// `ALTER TABLE` on a partitioned root reaches every partition, so a query
+/// cached directly on a partition must repopulate too: the signal names only
+/// the root, and pgcache resolves it downward through the ancestor list it
+/// loaded at registration.
+#[tokio::test]
+async fn test_alter_root_repopulates_directly_cached_partition() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    for statement in [
+        "create table events (id integer, day integer, primary key (id, day)) \
+         partition by range (day)",
+        "create table events_p1 partition of events for values from (1) to (10)",
+        "insert into events (id, day) values (1, 1)",
+    ] {
+        ctx.query(statement, &[]).await?;
+    }
+
+    let q = "select id, day from events_p1 where day < 100 order by id";
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    ctx.query("alter table events add column note text", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    Ok(())
+}
+
+/// Renaming a cached table: the signal forgets it under its old name, and
+/// the publication drain that follows must name it as origin now knows it,
+/// or the `ALTER PUBLICATION` fails and restarts the writer.
+#[tokio::test]
+async fn test_rename_of_cached_table_survives_publication_drain() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "create table renamed_t (id integer primary key, val text)",
+        &[],
+    )
+    .await?;
+    ctx.query("insert into renamed_t (id, val) values (1, 'one')", &[])
+        .await?;
+
+    let q = "select id, val from renamed_t where id = 1";
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    ctx.query("alter table renamed_t rename to renamed_t2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let q = "select id, val from renamed_t2 where id = 1";
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    Ok(())
+}
+
+/// A legacy inheritance child with two parents: the DDL trigger's parent
+/// lookup runs inside the user's statement and must not fail it (a scalar
+/// subquery over `pg_inherits` did). The stream carries on afterwards.
+#[tokio::test]
+async fn test_multi_parent_inheritance_child_does_not_fail_ddl() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    for statement in [
+        "create table parent_a (id integer primary key, val text)",
+        "create table parent_b (id integer primary key, extra text)",
+        "create table child_ab (note text) inherits (parent_a, parent_b)",
+        "insert into parent_a (id, val) values (1, 'one')",
+        "drop table child_ab",
+    ] {
+        ctx.query(statement, &[]).await?;
+    }
+    ctx.cdc_apply_settle().await?;
+
+    let q = "select id, val from parent_a where id = 1";
+    assert_repopulated(&mut ctx, q, &["1"]).await?;
+
+    Ok(())
+}

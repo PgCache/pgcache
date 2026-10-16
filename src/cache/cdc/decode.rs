@@ -67,7 +67,10 @@ pub(super) fn parse_relation_to_table_metadata(relation_body: &RelationBody) -> 
         relation_oid,
         primary_key_columns,
         columns: ColumnStore::new(columns),
-        indexes: Vec::new(), // Indexes are queried separately in cache_table_register
+        // Catalog-only facts, filled by `cache_table_register`.
+        indexes: Vec::new(),
+        partitions: Vec::new(),
+        ancestors: Vec::new(),
     }
 }
 

@@ -363,33 +363,22 @@ mod tests {
 
     /// An int4 table whose leading `pk_count` columns form the primary key.
     fn table_metadata(name: &str, oid: u32, columns: &[&str], pk_count: usize) -> TableMetadata {
-        use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore};
+        use crate::catalog::{ColumnMetadata, ColumnPosition};
         use crate::oid::TypeOid;
         use postgres_types::Type;
-        let store =
-            ColumnStore::new(
-                columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, column)| ColumnMetadata {
-                        name: (*column).into(),
-                        position: ColumnPosition::from_index(i).expect("column position in range"),
-                        type_oid: TypeOid::from_raw(23),
-                        data_type: Type::INT4,
-                        type_name: "int4".into(),
-                        cache_type_name: "int4".into(),
-                        is_primary_key: i < pk_count,
-                    }),
-            );
-        TableMetadata {
-            replica_identity_full: false,
-            relation_oid: Oid::from_raw(oid),
-            name: name.into(),
-            schema: "public".into(),
-            primary_key_columns: columns.iter().take(pk_count).map(|c| (*c).into()).collect(),
-            columns: store,
-            indexes: Vec::new(),
-        }
+        let store = columns
+            .iter()
+            .enumerate()
+            .map(|(i, column)| ColumnMetadata {
+                name: (*column).into(),
+                position: ColumnPosition::from_index(i).expect("column position in range"),
+                type_oid: TypeOid::from_raw(23),
+                data_type: Type::INT4,
+                type_name: "int4".into(),
+                cache_type_name: "int4".into(),
+                is_primary_key: i < pk_count,
+            });
+        TableMetadata::for_test(name, oid, store)
     }
 
     fn population_catalog() -> crate::catalog::Catalog {

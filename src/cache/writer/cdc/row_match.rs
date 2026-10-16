@@ -224,8 +224,8 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore};
-    use crate::oid::{Oid, TypeOid};
+    use crate::catalog::{ColumnMetadata, ColumnPosition};
+    use crate::oid::TypeOid;
     use crate::query::ast::LiteralValue;
     use crate::query::cast::CastTarget;
 
@@ -240,19 +240,15 @@ mod tests {
             cache_type_name: type_name.into(),
             is_primary_key: position == 1,
         };
-        TableMetadata {
-            replica_identity_full: false,
-            relation_oid: Oid::from_raw(1001),
-            name: "users".into(),
-            schema: "public".into(),
-            primary_key_columns: vec!["id".into()],
-            columns: ColumnStore::new([
+        TableMetadata::for_test(
+            "users",
+            1001,
+            [
                 column("id", 1, Type::INT4, "int4"),
                 column("name", 2, Type::TEXT, "text"),
                 column("created_at", 3, Type::TIMESTAMP, "timestamp"),
-            ]),
-            indexes: Vec::new(),
-        }
+            ],
+        )
     }
 
     fn row(name: Option<&str>, created_at: Option<&str>) -> Vec<Option<ByteString>> {

@@ -5,7 +5,7 @@ use iddqd::BiHashMap;
 use postgres_types::Type;
 
 use super::*;
-use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::ast::rope::{
     Binary, Body, Column, Function, Join, JoinQual, NodeKind, ScalarKind, Select, SelectItem,
@@ -23,7 +23,7 @@ use crate::query::update::select_branches_with_source;
 
 /// `name(id int4, name text)` with `id` the key.
 fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
-    let columns = ColumnStore::new([
+    let columns = [
         ColumnMetadata {
             name: "id".into(),
             position: ColumnPosition::from_raw(1),
@@ -42,17 +42,9 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
             cache_type_name: "text".into(),
             is_primary_key: false,
         },
-    ]);
+    ];
 
-    TableMetadata {
-        replica_identity_full: false,
-        relation_oid,
-        name: name.into(),
-        schema: "public".into(),
-        primary_key_columns: vec!["id".into()],
-        columns,
-        indexes: Vec::new(),
-    }
+    TableMetadata::for_test(name, relation_oid.get(), columns)
 }
 
 /// A catalog of `test_table_metadata` tables (`id int4`, `name text`), with
@@ -71,30 +63,19 @@ fn test_table_metadata_with_columns(
     relation_oid: Oid,
     column_names: &[&str],
 ) -> TableMetadata {
-    let columns =
-        ColumnStore::new(
-            column_names
-                .iter()
-                .enumerate()
-                .map(|(i, col_name)| ColumnMetadata {
-                    name: (*col_name).into(),
-                    position: ColumnPosition::from_index(i).expect("column position in range"),
-                    type_oid: TypeOid::from_raw(25),
-                    data_type: Type::TEXT,
-                    type_name: "text".into(),
-                    cache_type_name: "text".into(),
-                    is_primary_key: i == 0,
-                }),
-        );
-    TableMetadata {
-        replica_identity_full: false,
-        relation_oid,
-        name: name.into(),
-        schema: "public".into(),
-        primary_key_columns: vec![column_names[0].into()],
-        columns,
-        indexes: Vec::new(),
-    }
+    let columns = column_names
+        .iter()
+        .enumerate()
+        .map(|(i, col_name)| ColumnMetadata {
+            name: (*col_name).into(),
+            position: ColumnPosition::from_index(i).expect("column position in range"),
+            type_oid: TypeOid::from_raw(25),
+            data_type: Type::TEXT,
+            type_name: "text".into(),
+            cache_type_name: "text".into(),
+            is_primary_key: i == 0,
+        });
+    TableMetadata::for_test(name, relation_oid.get(), columns)
 }
 
 /// A catalog of all-text tables given as (name, columns), OIDs from 1001.

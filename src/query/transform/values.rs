@@ -367,8 +367,8 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore};
-    use crate::oid::{Oid, TypeOid};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition};
+    use crate::oid::TypeOid;
     use crate::query::resolve::ResolvedQuery;
 
     fn column_metadata(name: &str, index: usize, type_name: &str) -> ColumnMetadata {
@@ -388,20 +388,11 @@ mod tests {
     }
 
     fn table_metadata(name: &str, oid: u32, cols: &[(&str, &str)]) -> TableMetadata {
-        let columns = ColumnStore::new(
-            cols.iter()
-                .enumerate()
-                .map(|(i, (name, type_name))| column_metadata(name, i, type_name)),
-        );
-        TableMetadata {
-            replica_identity_full: false,
-            relation_oid: Oid::from_raw(oid),
-            name: name.into(),
-            schema: "public".into(),
-            primary_key_columns: vec![cols[0].0.into()],
-            columns,
-            indexes: Vec::new(),
-        }
+        let columns = cols
+            .iter()
+            .enumerate()
+            .map(|(i, (name, type_name))| column_metadata(name, i, type_name));
+        TableMetadata::for_test(name, oid, columns)
     }
 
     fn catalog(tables: &[&TableMetadata]) -> Catalog {

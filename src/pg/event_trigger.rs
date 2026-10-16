@@ -7,6 +7,12 @@
 //! changes around them. Nothing else on the stream reports `DROP TABLE`, a
 //! partition attach/detach, or an `ALTER TABLE` not followed by a write.
 //!
+//! `TRUNCATE` is not DDL and fires no event trigger, and under
+//! `publish_via_partition_root` pgoutput skips a truncated partition, so each
+//! partition carries a statement-level `AFTER TRUNCATE` trigger that emits the
+//! same kind of message. The `ddl_command_end` trigger installs it on every
+//! partition created or attached after the install.
+//!
 //! Creating event triggers needs a superuser (or the managed-PG master role),
 //! which pgcache's own role usually is not: installation is attempted at
 //! provisioning and otherwise left to the admin, with the SQL printed by
@@ -17,39 +23,112 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::{Client, Error};
 use tracing::{info, warn};
 
-/// Names of the two triggers, as `pg_event_trigger.evtname`.
-pub(crate) const TRIGGER_DDL_COMMAND_END: &str = "pgcache_ddl_command_end";
-pub(crate) const TRIGGER_SQL_DROP: &str = "pgcache_sql_drop";
+use crate::pg::cdc::message_prefix;
+
+/// Names of the two triggers, as `pg_event_trigger.evtname`; macros as well
+/// as consts so the SQL below can `concat!` the literals in.
+macro_rules! trigger_ddl_command_end {
+    () => {
+        "pgcache_ddl_command_end"
+    };
+}
+macro_rules! trigger_sql_drop {
+    () => {
+        "pgcache_sql_drop"
+    };
+}
+pub(crate) const TRIGGER_DDL_COMMAND_END: &str = trigger_ddl_command_end!();
+pub(crate) const TRIGGER_SQL_DROP: &str = trigger_sql_drop!();
 
 /// Idempotent: re-runnable on an origin that already has the triggers, and
-/// safe when two pgcache instances provision the same database at once (no
-/// drop-and-recreate window). `ENABLE ALWAYS` keeps the triggers firing under
-/// `session_replication_role = replica`, which some migration tools set.
+/// serialised by an advisory lock when two pgcache instances provision the
+/// same database at once (`CREATE SCHEMA IF NOT EXISTS` and the trigger
+/// creates would otherwise race to a duplicate-key error). The script runs
+/// as one implicit transaction. `ENABLE ALWAYS` keeps the triggers firing
+/// under `session_replication_role = replica`, which some migration tools
+/// set.
 ///
-/// Self-noise is filtered at the source: pgcache's own `ALTER PUBLICATION`
+/// Self-noise is filtered at the source. pgcache's own `ALTER PUBLICATION`
 /// per registration and eviction reports `publication relation` objects, and
 /// a message there would put a row-less frame on the stream at every
-/// registration. Temp tables are the other high-frequency DDL with nothing
-/// cacheable behind it.
-pub(crate) const INSTALL_SQL: &str = r"
+/// registration; temp tables are the other high-frequency DDL with nothing
+/// cacheable behind it. The `pgcache_signal.installing` setting mutes the
+/// DDL trigger while this script and the partition-trigger installer run
+/// their own DDL.
+pub(crate) const INSTALL_SQL: &str = concat!(
+    r"
+SELECT pg_advisory_xact_lock(hashtext('pgcache_event_triggers'));
+SELECT set_config('pgcache_signal.installing', '1', false);
+
 CREATE SCHEMA IF NOT EXISTS pgcache;
+
+CREATE OR REPLACE FUNCTION pgcache.partition_truncate() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_logical_emit_message(true, '",
+    message_prefix!(),
+    r"', json_build_object(
+        'kind', 'truncate',
+        'objects', json_build_array(json_build_object(
+            'oid', TG_RELID::bigint, 'identity', TG_RELID::regclass::text)))::text);
+    RETURN NULL;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION pgcache.partition_signal_install(partition regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM set_config('pgcache_signal.installing', '1', true);
+    BEGIN
+        EXECUTE format('CREATE OR REPLACE TRIGGER pgcache_truncate AFTER TRUNCATE ON %s '
+                       'FOR EACH STATEMENT EXECUTE FUNCTION pgcache.partition_truncate()',
+                       partition);
+        EXECUTE format('ALTER TABLE %s ENABLE ALWAYS TRIGGER pgcache_truncate', partition);
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pgcache: truncate signal not installed on %: %', partition, SQLERRM;
+    END;
+    PERFORM set_config('pgcache_signal.installing', '', true);
+END
+$$;
 
 CREATE OR REPLACE FUNCTION pgcache.ddl_command_end() RETURNS event_trigger
 LANGUAGE plpgsql AS $$
 DECLARE
     objects json;
+    partition regclass;
 BEGIN
+    IF current_setting('pgcache_signal.installing', true) = '1' THEN
+        RETURN;
+    END IF;
     SELECT json_agg(json_build_object(
                'tag', command_tag, 'type', object_type,
-               'oid', objid::bigint, 'identity', object_identity))
+               'oid', objid::bigint, 'identity', object_identity,
+               'parent', (SELECT min(inhparent)::bigint FROM pg_inherits WHERE inhrelid = objid)))
       INTO objects
       FROM pg_event_trigger_ddl_commands()
      WHERE object_type NOT LIKE 'publication%'
-       AND coalesce(schema_name, '') NOT LIKE 'pg\_temp%';
+       AND coalesce(schema_name, '') NOT LIKE 'pg\_temp%'
+       AND coalesce(schema_name, '') <> 'pgcache';
     IF objects IS NOT NULL THEN
-        PERFORM pg_logical_emit_message(true, 'pgcache',
+        PERFORM pg_logical_emit_message(true, '",
+    message_prefix!(),
+    r"',
             json_build_object('kind', 'ddl', 'objects', objects)::text);
     END IF;
+    FOR partition IN
+        SELECT DISTINCT c.oid::regclass
+          FROM pg_event_trigger_ddl_commands() d
+          JOIN pg_class c
+            ON c.relispartition
+           AND c.relkind IN ('r', 'p', 'f')
+           AND (c.oid = d.objid
+                OR c.oid IN (SELECT inhrelid FROM pg_inherits WHERE inhparent = d.objid))
+         WHERE d.object_type IN ('table', 'foreign table')
+           AND NOT EXISTS (SELECT 1 FROM pg_trigger t
+                            WHERE t.tgrelid = c.oid AND t.tgname = 'pgcache_truncate')
+    LOOP
+        PERFORM pgcache.partition_signal_install(partition);
+    END LOOP;
 END
 $$;
 
@@ -64,9 +143,12 @@ BEGIN
       INTO objects
       FROM pg_event_trigger_dropped_objects()
      WHERE object_type NOT LIKE 'publication%'
-       AND coalesce(schema_name, '') NOT LIKE 'pg\_temp%';
+       AND coalesce(schema_name, '') NOT LIKE 'pg\_temp%'
+       AND coalesce(schema_name, '') <> 'pgcache';
     IF objects IS NOT NULL THEN
-        PERFORM pg_logical_emit_message(true, 'pgcache',
+        PERFORM pg_logical_emit_message(true, '",
+    message_prefix!(),
+    r"',
             json_build_object('kind', 'drop', 'objects', objects)::text);
     END IF;
 END
@@ -74,26 +156,63 @@ $$;
 
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'pgcache_ddl_command_end') THEN
-        CREATE EVENT TRIGGER pgcache_ddl_command_end ON ddl_command_end
+    IF NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = '",
+    trigger_ddl_command_end!(),
+    r"') THEN
+        CREATE EVENT TRIGGER ",
+    trigger_ddl_command_end!(),
+    r" ON ddl_command_end
             EXECUTE FUNCTION pgcache.ddl_command_end();
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = 'pgcache_sql_drop') THEN
-        CREATE EVENT TRIGGER pgcache_sql_drop ON sql_drop
+    IF NOT EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname = '",
+    trigger_sql_drop!(),
+    r"') THEN
+        CREATE EVENT TRIGGER ",
+    trigger_sql_drop!(),
+    r" ON sql_drop
             EXECUTE FUNCTION pgcache.sql_drop();
     END IF;
 END
 $$;
 
-ALTER EVENT TRIGGER pgcache_ddl_command_end ENABLE ALWAYS;
-ALTER EVENT TRIGGER pgcache_sql_drop ENABLE ALWAYS;
-";
+ALTER EVENT TRIGGER ",
+    trigger_ddl_command_end!(),
+    r" ENABLE ALWAYS;
+ALTER EVENT TRIGGER ",
+    trigger_sql_drop!(),
+    r" ENABLE ALWAYS;
+
+DO $$
+DECLARE
+    partition regclass;
+BEGIN
+    FOR partition IN
+        SELECT c.oid::regclass FROM pg_class c
+         WHERE c.relispartition
+           AND c.relkind IN ('r', 'p', 'f')
+           AND NOT EXISTS (SELECT 1 FROM pg_trigger t
+                            WHERE t.tgrelid = c.oid AND t.tgname = 'pgcache_truncate')
+    LOOP
+        PERFORM pgcache.partition_signal_install(partition);
+    END LOOP;
+END
+$$;
+
+SELECT set_config('pgcache_signal.installing', '', false);
+"
+);
 
 /// The triggers are shared by every pgcache instance on the database, so no
-/// instance drops them on its own; this is the admin's uninstall.
-pub(crate) const UNINSTALL_SQL: &str = "DROP EVENT TRIGGER IF EXISTS pgcache_ddl_command_end; \
-     DROP EVENT TRIGGER IF EXISTS pgcache_sql_drop; \
-     DROP SCHEMA IF EXISTS pgcache CASCADE;";
+/// instance drops them on its own; this is the admin's uninstall. The schema
+/// drop cascades to the per-partition truncate triggers through their
+/// function.
+pub(crate) const UNINSTALL_SQL: &str = concat!(
+    "DROP EVENT TRIGGER IF EXISTS ",
+    trigger_ddl_command_end!(),
+    "; DROP EVENT TRIGGER IF EXISTS ",
+    trigger_sql_drop!(),
+    "; DROP SCHEMA IF EXISTS pgcache CASCADE;"
+);
 
 /// Whether each trigger exists and fires. Both must, for the signal to be
 /// complete: `ddl_command_end` alone never reports a drop.

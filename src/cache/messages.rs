@@ -21,7 +21,9 @@ pub(crate) use super::serve_decision::AdmitAction;
 mod cdc_command;
 mod query_command;
 
-pub(crate) use cdc_command::{CdcCommand, CdcValue, SchemaChange, cdc_values_convert};
+pub(crate) use cdc_command::{
+    CdcCommand, CdcValue, PartitionCreated, SchemaChange, cdc_values_convert,
+};
 pub(crate) use query_command::{
     MvBuildOutcome, PopulationMerge, QueryCommand, RegisterRequest, ResolveRequest, ResolveResult,
     SubsumptionResult,

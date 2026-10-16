@@ -400,8 +400,8 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
-    use crate::oid::{Oid, TypeOid};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::oid::TypeOid;
     use crate::query::resolve::ResolvedQuery;
 
     fn events() -> Catalog {
@@ -416,22 +416,18 @@ mod tests {
         };
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(
-            TableMetadata {
-                replica_identity_full: false,
-                relation_oid: Oid::from_raw(1001),
-                name: "events".into(),
-                schema: "public".into(),
-                primary_key_columns: vec!["id".into()],
-                columns: ColumnStore::new([
+            TableMetadata::for_test(
+                "events",
+                1001,
+                [
                     column("id", 1, Type::INT4),
                     column("day", 2, Type::DATE),
                     column("at", 3, Type::TIMESTAMPTZ),
                     column("local_at", 4, Type::TIMESTAMP),
                     column("label", 5, Type::TEXT),
                     column("span", 6, Type::INTERVAL),
-                ]),
-                indexes: Vec::new(),
-            }
+                ],
+            )
             .into(),
         );
         tables

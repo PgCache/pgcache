@@ -409,8 +409,8 @@ mod tests {
     use postgres_types::{Kind, Type};
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
-    use crate::oid::{Oid, TypeOid};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::oid::TypeOid;
 
     fn severity_type() -> Type {
         Type::new(
@@ -455,14 +455,8 @@ mod tests {
             Kind::Domain(Type::INT4),
             "public".to_owned(),
         );
-        let table = |oid: u32, name: &str, columns: Vec<ColumnMetadata>| TableMetadata {
-            replica_identity_full: false,
-            relation_oid: Oid::from_raw(oid),
-            name: name.into(),
-            schema: "public".into(),
-            primary_key_columns: vec!["id".into()],
-            columns: ColumnStore::new(columns),
-            indexes: Vec::new(),
+        let table = |oid: u32, name: &str, columns: Vec<ColumnMetadata>| {
+            TableMetadata::for_test(name, oid, columns)
         };
         let mut tables = BiHashMap::new();
         tables.insert_overwrite(

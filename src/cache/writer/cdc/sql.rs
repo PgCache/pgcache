@@ -338,7 +338,7 @@ mod tests {
     use tokio_postgres::types::Type;
 
     use super::*;
-    use crate::catalog::{ColumnMetadata, ColumnPosition, ColumnStore};
+    use crate::catalog::{ColumnMetadata, ColumnPosition};
     use crate::oid::TypeOid;
 
     /// A table exercising every identifier hazard: mixed-case name,
@@ -353,20 +353,16 @@ mod tests {
             cache_type_name: "text".into(),
             is_primary_key,
         };
-        TableMetadata {
-            replica_identity_full: false,
-            relation_oid: Oid::from_raw(4242),
-            name: "Order".into(),
-            schema: "public".into(),
-            primary_key_columns: vec!["id".into()],
-            columns: ColumnStore::new([
+        TableMetadata::for_test(
+            "Order",
+            4242,
+            [
                 column("id", 1, true),
                 column("user", 2, false),
                 column("camelCase", 3, false),
                 column("we\"ird", 4, false),
-            ]),
-            indexes: Vec::new(),
-        }
+            ],
+        )
     }
 
     fn cell(value: &'static str) -> Option<ByteString> {

@@ -76,7 +76,7 @@ mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
     use crate::oid::TypeOid;
 
     fn column(name: &str, position: i16, data_type: Type, type_name: &str) -> ColumnMetadata {
@@ -92,18 +92,16 @@ mod tests {
     }
 
     fn table(schema: &str, name: &str, oid: u32) -> TableMetadata {
-        TableMetadata {
-            replica_identity_full: false,
-            relation_oid: Oid::from_raw(oid),
-            name: name.into(),
-            schema: schema.into(),
-            primary_key_columns: vec!["id".into()],
-            columns: ColumnStore::new([
+        let mut table = TableMetadata::for_test(
+            name,
+            oid,
+            [
                 column("id", 1, Type::INT4, "int4"),
                 column("name", 2, Type::TEXT, "text"),
-            ]),
-            indexes: Vec::new(),
-        }
+            ],
+        );
+        table.schema = schema.into();
+        table
     }
 
     fn catalog() -> Catalog {

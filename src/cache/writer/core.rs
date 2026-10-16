@@ -27,6 +27,7 @@ use crate::cache::{
         SharedQueryShape, SharedResolvedQuery,
     },
 };
+use crate::catalog::CatalogTable;
 use crate::oid::Oid;
 use crate::pg;
 use crate::pg::Lsn;
@@ -155,6 +156,10 @@ pub(super) struct WriterCore {
     pub(super) publication_oids: HashSet<Oid>,
     /// Set when a removal path changes active relations; drained by command handlers.
     pub(super) relations_dirty: bool,
+    /// Metadata a schema-change signal removed from `cache.tables` while the
+    /// open frame may still hold locks on the cache table; the table itself
+    /// is dropped at the next publication drain (`forgotten_tables_drop`).
+    pub(super) forgotten_tables: Vec<CatalogTable>,
     /// Loopback command channel into the writer select loop. Used by CDC
     /// invalidation to defer pinned readmits, by MV to schedule builds, and
     /// cloned to population workers so they can report Ready/Failed.
@@ -478,6 +483,7 @@ impl WriterCore {
             publication_name: settings.cdc.publication_name.as_str().into(),
             publication_oids: HashSet::new(),
             relations_dirty: false,
+            forgotten_tables: Vec::new(),
             query_tx,
             runtime,
             mv_build_pool: Arc::new(MvBuildPool::new(settings.cache.clone())),

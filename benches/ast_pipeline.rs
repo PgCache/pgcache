@@ -32,8 +32,8 @@ use iddqd::BiHashMap;
 use postgres_types::Type;
 
 use pgcache_lib::cache::admission::{AdmissionDepth, AdmissionQuery, query_admission_analyze};
-use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
-use pgcache_lib::oid::{Oid, TypeOid};
+use pgcache_lib::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+use pgcache_lib::oid::TypeOid;
 use pgcache_lib::pg::ByteString;
 use pgcache_lib::query::Fingerprint;
 use pgcache_lib::query::ast::rope::{Node, NodeKind, QueryTree};
@@ -117,28 +117,15 @@ fn column(name: &str, index: usize, data_type: Type, is_primary_key: bool) -> Co
     }
 }
 
-fn table(oid: u32, name: &str, primary_key: &str, columns: Vec<ColumnMetadata>) -> TableMetadata {
-    TableMetadata {
-        relation_oid: Oid::from_raw(oid),
-        name: name.into(),
-        schema: "public".into(),
-        primary_key_columns: vec![primary_key.into()],
-        columns: ColumnStore::new(columns),
-        indexes: Vec::new(),
-        replica_identity_full: false,
-    }
-}
-
-/// The pagila subset: `(oid, name, primary key, columns as (name, type, in
-/// the primary key))`.
+/// The pagila subset: `(oid, name, columns as (name, type, in the primary
+/// key))`.
 #[rustfmt::skip]
-type CatalogTable = (u32, &'static str, &'static str, &'static [(&'static str, Type, bool)]);
+type CatalogTable = (u32, &'static str, &'static [(&'static str, Type, bool)]);
 
 const CATALOG_TABLES: &[CatalogTable] = &[
     (
         1001,
         "actor",
-        "actor_id",
         &[
             ("actor_id", Type::INT4, true),
             ("first_name", Type::TEXT, false),
@@ -149,7 +136,6 @@ const CATALOG_TABLES: &[CatalogTable] = &[
     (
         1002,
         "film",
-        "film_id",
         &[
             ("film_id", Type::INT4, true),
             ("title", Type::TEXT, false),
@@ -170,7 +156,6 @@ const CATALOG_TABLES: &[CatalogTable] = &[
     (
         1003,
         "film_actor",
-        "actor_id",
         &[
             ("actor_id", Type::INT4, true),
             ("film_id", Type::INT4, true),
@@ -180,7 +165,6 @@ const CATALOG_TABLES: &[CatalogTable] = &[
     (
         1004,
         "category",
-        "category_id",
         &[
             ("category_id", Type::INT4, true),
             ("name", Type::TEXT, false),
@@ -190,7 +174,6 @@ const CATALOG_TABLES: &[CatalogTable] = &[
     (
         1005,
         "film_category",
-        "film_id",
         &[
             ("film_id", Type::INT4, true),
             ("category_id", Type::INT4, true),
@@ -200,7 +183,6 @@ const CATALOG_TABLES: &[CatalogTable] = &[
     (
         1006,
         "payment",
-        "payment_id",
         &[
             ("payment_id", Type::INT4, true),
             ("customer_id", Type::INT4, false),
@@ -213,7 +195,6 @@ const CATALOG_TABLES: &[CatalogTable] = &[
     (
         1007,
         "customer",
-        "customer_id",
         &[
             ("customer_id", Type::INT4, true),
             ("store_id", Type::INT4, false),
@@ -231,15 +212,15 @@ const CATALOG_TABLES: &[CatalogTable] = &[
 
 fn catalog() -> Catalog {
     let mut tables = BiHashMap::new();
-    for (oid, name, primary_key, columns) in CATALOG_TABLES {
-        let columns = columns
-            .iter()
-            .enumerate()
-            .map(|(index, (name, data_type, is_primary_key))| {
-                column(name, index, data_type.clone(), *is_primary_key)
-            })
-            .collect();
-        tables.insert_overwrite(table(*oid, name, primary_key, columns).into());
+    for (oid, name, columns) in CATALOG_TABLES {
+        let columns =
+            columns
+                .iter()
+                .enumerate()
+                .map(|(index, (name, data_type, is_primary_key))| {
+                    column(name, index, data_type.clone(), *is_primary_key)
+                });
+        tables.insert_overwrite(TableMetadata::for_test(name, *oid, columns).into());
     }
     tables
 }

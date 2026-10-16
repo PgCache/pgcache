@@ -569,8 +569,8 @@ pub(crate) mod tests {
     use postgres_types::Type;
 
     use super::*;
-    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
-    use crate::oid::{Oid, TypeOid};
+    use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
+    use crate::oid::TypeOid;
     use crate::query::resolve::query_tree_resolve;
 
     /// A catalog of text-column tables, given as (name, columns), with
@@ -578,34 +578,19 @@ pub(crate) mod tests {
     fn tables(specs: &[(&str, &[&str])]) -> Catalog {
         let mut tables = BiHashMap::new();
         for (oid, (name, columns)) in (1001..).zip(specs) {
-            let store =
-                ColumnStore::new(
-                    columns
-                        .iter()
-                        .enumerate()
-                        .map(|(i, column)| ColumnMetadata {
-                            name: (*column).into(),
-                            position: ColumnPosition::from_index(i)
-                                .expect("column position in range"),
-                            type_oid: TypeOid::from_raw(25),
-                            data_type: Type::TEXT,
-                            type_name: "text".into(),
-                            cache_type_name: "text".into(),
-                            is_primary_key: i == 0,
-                        }),
-                );
-            tables.insert_overwrite(
-                TableMetadata {
-                    replica_identity_full: false,
-                    relation_oid: Oid::from_raw(oid),
-                    name: (*name).into(),
-                    schema: "public".into(),
-                    columns: store,
-                    primary_key_columns: vec![columns[0].into()],
-                    indexes: Vec::new(),
-                }
-                .into(),
-            );
+            let store = columns
+                .iter()
+                .enumerate()
+                .map(|(i, column)| ColumnMetadata {
+                    name: (*column).into(),
+                    position: ColumnPosition::from_index(i).expect("column position in range"),
+                    type_oid: TypeOid::from_raw(25),
+                    data_type: Type::TEXT,
+                    type_name: "text".into(),
+                    cache_type_name: "text".into(),
+                    is_primary_key: i == 0,
+                });
+            tables.insert_overwrite(TableMetadata::for_test(name, oid, store).into());
         }
         tables
     }

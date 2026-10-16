@@ -5,13 +5,13 @@ use postgres_types::Type;
 
 use super::subsume::table_constraints_subsumed;
 use super::*;
-use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, ColumnStore, TableMetadata};
+use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::oid::{Oid, TypeOid};
 use crate::query::resolve::ResolvedQuery;
 
 // Helper function to create test table metadata
 fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
-    let columns = ColumnStore::new([
+    let columns = [
         ColumnMetadata {
             name: "id".into(),
             position: ColumnPosition::from_raw(1),
@@ -30,17 +30,9 @@ fn test_table_metadata(name: &str, relation_oid: Oid) -> TableMetadata {
             cache_type_name: "text".into(),
             is_primary_key: false,
         },
-    ]);
+    ];
 
-    TableMetadata {
-        replica_identity_full: false,
-        relation_oid,
-        name: name.into(),
-        schema: "public".into(),
-        primary_key_columns: vec!["id".into()],
-        columns,
-        indexes: Vec::new(),
-    }
+    TableMetadata::for_test(name, relation_oid.get(), columns)
 }
 
 /// A catalog of `test_table_metadata` tables, OIDs from 1001 in order.
@@ -774,13 +766,10 @@ fn test_transitive_propagation() {
     let mut tables = catalog(&["a", "b"]);
 
     tables.insert_overwrite(
-        TableMetadata {
-            replica_identity_full: false,
-            relation_oid: Oid::from_raw(1003),
-            name: "c".into(),
-            schema: "public".into(),
-            primary_key_columns: vec!["id".into()],
-            columns: ColumnStore::new([ColumnMetadata {
+        TableMetadata::for_test(
+            "c",
+            1003,
+            [ColumnMetadata {
                 name: "id".into(),
                 position: ColumnPosition::from_raw(1),
                 type_oid: TypeOid::from_raw(23),
@@ -788,9 +777,8 @@ fn test_transitive_propagation() {
                 type_name: "int4".into(),
                 cache_type_name: "int4".into(),
                 is_primary_key: true,
-            }]),
-            indexes: Vec::new(),
-        }
+            }],
+        )
         .into(),
     );
 
