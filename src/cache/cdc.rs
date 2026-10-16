@@ -7,9 +7,9 @@ use error_set::error_set;
 use postgres_replication::{
     LogicalReplicationStream,
     protocol::{
-        BeginBody, CommitBody, DeleteBody, InsertBody, LogicalReplicationMessage, OriginBody,
-        PrimaryKeepAliveBody, RelationBody, ReplicationMessage, TruncateBody, TypeBody, UpdateBody,
-        XLogDataBody,
+        BeginBody, CommitBody, DeleteBody, InsertBody, LogicalReplicationMessage, MessageBody,
+        OriginBody, PrimaryKeepAliveBody, RelationBody, ReplicationMessage, TruncateBody, TypeBody,
+        UpdateBody, XLogDataBody,
     },
 };
 use postgres_types::PgLsn;
@@ -28,7 +28,7 @@ use tracing::{debug, error, trace};
 use crate::cache::reference_settings;
 use crate::oid::Oid;
 use crate::pg::Lsn;
-use crate::pg::cdc::connect_replication;
+use crate::pg::cdc::{MESSAGE_PREFIX, connect_replication};
 use crate::result::error_chain_format;
 use crate::settings::Settings;
 
@@ -182,8 +182,11 @@ impl CdcProcessor {
         // Start replication stream
         let slot = self.slot_name.as_str();
         let publ = self.publication_name.as_str();
+        // `messages` delivers every `pg_logical_emit_message` in the database,
+        // transactional ones at their position inside the source transaction;
+        // the origin event triggers signal schema changes through them.
         let query = format!(
-            "START_REPLICATION SLOT {slot} LOGICAL 0/0 (proto_version '4', publication_names '{publ}')"
+            "START_REPLICATION SLOT {slot} LOGICAL 0/0 (proto_version '4', publication_names '{publ}', messages 'true')"
         );
 
         let copy_stream = self.cdc_client.copy_both_simple::<Bytes>(&query).await?;
@@ -455,7 +458,8 @@ impl CdcProcessor {
                     LogicalReplicationMessage::Update(body) => self.process_update(body).await,
                     LogicalReplicationMessage::Delete(body) => self.process_delete(body).await,
                     LogicalReplicationMessage::Truncate(body) => self.process_truncate(&body).await,
-                    LogicalReplicationMessage::Message(_) | _ => {
+                    LogicalReplicationMessage::Message(body) => self.process_message(&body),
+                    _ => {
                         debug!("unhandled replication message type");
                         Ok::<(), CdcEventError>(())
                     }
@@ -586,6 +590,28 @@ impl CdcProcessor {
             }
         }
         self.writer_send(CdcCommand::Truncate { relation_oids: ids })
+    }
+
+    /// Processes logical decoding messages (`pg_logical_emit_message`).
+    ///
+    /// Only the `pgcache` prefix is ours; any other tool's messages on the same
+    /// database arrive too and are dropped. An empty payload is the writer's
+    /// WAL-flush marker (PGC-290): its transaction frame alone does the work.
+    fn process_message(&self, body: &MessageBody) -> Result<(), CdcEventError> {
+        crate::metrics::handles().cdc.messages.increment(1);
+        if body.prefix().ok() != Some(MESSAGE_PREFIX) {
+            trace!("foreign logical message dropped");
+            return Ok(());
+        }
+        if body.content().is_empty() {
+            return Ok(());
+        }
+        debug!(
+            bytes = body.content().len(),
+            transactional = body.flags() == 1,
+            "pgcache logical message"
+        );
+        Ok(())
     }
 
     fn writer_send(&self, command: CdcCommand) -> Result<(), CdcEventError> {

@@ -30,6 +30,7 @@ use crate::cache::{
 use crate::oid::Oid;
 use crate::pg;
 use crate::pg::Lsn;
+use crate::pg::cdc::MESSAGE_PREFIX;
 use crate::pg::protocol::ByteString;
 use crate::query::{Fingerprint, FingerprintSet};
 use crate::settings::{PgSettings, Settings};
@@ -570,13 +571,17 @@ impl WriterCore {
     /// advancing the flush pointer (and so, via the decoder + keepalive, the
     /// apply watermark) past every snapshot LSN at or below the marker. The
     /// marker is later in WAL than any gated snapshot, so one marker unsticks the
-    /// whole gated backlog. It is not streamed to pgcache (no `messages` option)
-    /// and a `Message` record is ignored if it ever arrived. Returns the marker
-    /// LSN. See PGC-290.
+    /// whole gated backlog. The marker does come back on the stream as an empty
+    /// `pgcache` message inside its own row-less frame; the CDC processor drops
+    /// the message and the frame's CommitMark advances the watermark. Returns
+    /// the marker LSN. See PGC-290.
     pub(super) async fn origin_flush_force(&self) -> CacheResult<Lsn> {
         let row = self
             .db_origin
-            .query_one("SELECT pg_logical_emit_message(true, 'pgcache', '')", &[])
+            .query_one(
+                "SELECT pg_logical_emit_message(true, $1, '')",
+                &[&MESSAGE_PREFIX],
+            )
             .await
             .map_into_report::<CacheError>()
             .attach_loc("forcing origin WAL flush")?;

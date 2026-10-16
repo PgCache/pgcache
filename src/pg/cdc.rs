@@ -22,6 +22,10 @@ error_set! {
 /// Result type with location-tracking error reports for CDC operations.
 pub(crate) type PgCdcResult<T> = Result<T, Report<PgCdcError>>;
 
+/// Prefix of the logical messages pgcache emits on origin (the event-trigger
+/// schema-change signal and the writer's WAL-flush marker).
+pub(crate) const MESSAGE_PREFIX: &str = "pgcache";
+
 /// Ensures publication and replication slot exist on origin.
 /// Uses a regular (non-replication) connection since replication connections can't run SQL.
 pub(crate) async fn replication_provision(settings: &Settings) -> PgCdcResult<()> {

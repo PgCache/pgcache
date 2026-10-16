@@ -116,6 +116,9 @@ pub mod names {
     pub const CDC_INSERTS: &str = "pgcache.cdc.inserts";
     pub const CDC_UPDATES: &str = "pgcache.cdc.updates";
     pub const CDC_DELETES: &str = "pgcache.cdc.deletes";
+    /// Logical decoding messages (`pg_logical_emit_message`) delivered on the
+    /// stream, every prefix; pgcache's own carry the schema-change signal.
+    pub const CDC_MESSAGES: &str = "pgcache.cdc.messages";
     pub const CDC_LAG_BYTES: &str = "pgcache.cdc.lag_bytes";
     pub const CDC_LAG_SECONDS: &str = "pgcache.cdc.lag_seconds";
     /// Keepalive marks absorbed into the run they arrived in (PGC-420): a run of
@@ -768,6 +771,7 @@ pub struct CdcHandles {
     pub inserts: Counter,
     pub updates: Counter,
     pub deletes: Counter,
+    pub messages: Counter,
     pub lag_seconds: Gauge,
     pub lag_bytes: Gauge,
     pub flush_staleness: Gauge,
@@ -816,13 +820,14 @@ impl CdcHandles {
             CACHE_HANDLE_UPDATES, CACHE_INVALIDATIONS, CACHE_WRITER_COMMAND_HANDLE_SECONDS,
             CDC_APPLIED_LSN, CDC_DELETES, CDC_EVENTS_PROCESSED, CDC_FLUSH_STALENESS_SECONDS,
             CDC_FLUSHED_LSN, CDC_INSERTS, CDC_KEEPALIVE_MARKS_COALESCED, CDC_LAG_BYTES,
-            CDC_LAG_SECONDS, CDC_RECEIVED_LSN, CDC_UPDATES,
+            CDC_LAG_SECONDS, CDC_MESSAGES, CDC_RECEIVED_LSN, CDC_UPDATES,
         };
         Self {
             events_processed: metrics::counter!(CDC_EVENTS_PROCESSED),
             inserts: metrics::counter!(CDC_INSERTS),
             updates: metrics::counter!(CDC_UPDATES),
             deletes: metrics::counter!(CDC_DELETES),
+            messages: metrics::counter!(CDC_MESSAGES),
             lag_seconds: metrics::gauge!(CDC_LAG_SECONDS),
             lag_bytes: metrics::gauge!(CDC_LAG_BYTES),
             flush_staleness: metrics::gauge!(CDC_FLUSH_STALENESS_SECONDS),
