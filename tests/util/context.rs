@@ -472,6 +472,40 @@ impl TestContext {
         })
     }
 
+    /// Wait until the writer reports exactly `count` registered queries on
+    /// `/status`. Orders a test step after an eviction the writer performs
+    /// on its own (a truncate's replay, the count cap) when no settle can
+    /// stand in, such as under a held batch.
+    pub(crate) async fn queries_registered_wait(
+        &self,
+        count: usize,
+        timeout: Duration,
+    ) -> Result<(), Error> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let (status, body) = http_get(self.metrics_port, "/status").await?;
+            if status != 200 {
+                return Err(Error::other(format!("/status returned {status}: {body}")));
+            }
+            let json: serde_json::Value = serde_json::from_str(&body)
+                .map_err(|e| Error::other(format!("invalid JSON: {e}\nbody: {body}")))?;
+            let registered = json
+                .get("cache")
+                .and_then(|cache| cache.get("queries_registered"))
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| Error::other("cache.queries_registered missing"))?;
+            if registered == count as u64 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::other(format!(
+                    "expected {count} registered queries, still {registered} after {timeout:?}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Wait for all currently-registered queries to reach a terminal state
     /// (i.e. no entry remains in `Loading` or `Pending(_)`). Use after a
     /// cache miss when the next read should be served from cache.

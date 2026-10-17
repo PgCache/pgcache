@@ -16,10 +16,10 @@ impl WriterCore {
     ///
     /// O(|oids| + |active_set|) per call vs. the previous O(|cached_queries|)
     /// rebuild — typically a handful of integer ops since most registers
-    /// add no new tables. Returns `true` if the active set changed; callers
-    /// may sync the publication inline for cases where the new relation
-    /// must be in the publication before subsequent work (e.g., population
-    /// fetches from origin).
+    /// add no new tables. Returns `true` if the active set changed; a
+    /// registration then adds the new relations inline
+    /// (`publication_relations_add`), since they must be in the publication
+    /// before its population snapshots origin.
     pub(super) fn active_relations_acquire(&mut self, oids: &[Oid]) -> bool {
         let mut newly_active: Vec<Oid> = Vec::new();
         for &oid in oids {
@@ -70,7 +70,44 @@ impl WriterCore {
         true
     }
 
-    pub(super) async fn publication_update(&mut self) -> CacheResult<()> {
+    /// Add the active relations not yet published, inline at registration.
+    /// Only additions: a removal drops the relation's cache table with it,
+    /// and that `DROP TABLE` on the cache DB would wait on the locks an open
+    /// frame holds, with the writer loop that commits the frame stuck here
+    /// (PGC-501). Removals wait for the guarded drain.
+    pub(super) async fn publication_relations_add(&mut self) -> CacheResult<()> {
+        let added: Vec<Oid> = self
+            .active_relations
+            .load()
+            .iter()
+            .copied()
+            .filter(|oid| {
+                !self.publication_oids.contains(oid) && self.cache.tables.contains_key1(oid)
+            })
+            .collect();
+        if added.is_empty() {
+            return Ok(());
+        }
+        let sql = format!(
+            "ALTER PUBLICATION {} ADD TABLE {}",
+            self.publication_name,
+            self.oids_to_table_list(&added)
+        );
+        debug!("publication add: {sql}");
+        self.db_origin
+            .batch_execute(&sql)
+            .await
+            .map_into_report::<CacheError>()
+            .attach_loc("adding relations to the publication")?;
+        self.publication_oids.extend(added);
+        Ok(())
+    }
+
+    /// Bring the publication to the active set and drop the cache tables of
+    /// everything that left it. Only the guarded drain
+    /// (`publication_dirty_drain`) runs this: the drops need locks an open
+    /// frame may hold.
+    async fn publication_update(&mut self) -> CacheResult<()> {
         let new_oids: HashSet<Oid> = (**self.active_relations.load()).clone();
 
         if new_oids == self.publication_oids {

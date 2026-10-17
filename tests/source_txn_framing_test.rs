@@ -990,3 +990,78 @@ async fn test_batch_deadlock_recovery_covers_all_frames() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// PGC-501: a registration while a frame's cache transaction is open must
+/// not drop cache tables. The frame truncates `pl_x` first and then carries
+/// more rows than a replay chunk holds, so the mid-frame replay evicts
+/// `pl_x`'s only query (the relation released, the drain deferred) and
+/// flushes the chunk, leaving the open transaction holding the cache table's
+/// lock while the frame's remaining rows are still being delivered, slowly
+/// under the delivery-delay fault (`pl_w` stays cached so the fault keeps
+/// delaying once `pl_x` is released). The registration on `pl_z` in that
+/// window adds to the publication inline; dropping `pl_x`'s cache table
+/// there would wait on the lock while the writer loop that commits the frame
+/// is the one waiting, and the settle would time out.
+#[cfg(feature = "fault-injection")]
+#[tokio::test]
+async fn test_registration_during_open_frame_does_not_drop_locked_table() -> Result<(), Error> {
+    let mut ctx = TestContext::setup_fault(&[("PGCACHE_FAULT_CDC_DELIVER_DELAY_MS", "1")]).await?;
+
+    for table in ["pl_x", "pl_w", "pl_z"] {
+        ctx.simple_query(&format!(
+            "create table {table} (id int primary key, v int not null)"
+        ))
+        .await?;
+        ctx.simple_query(&format!("insert into {table} (id, v) values (1, 10)"))
+            .await?;
+    }
+    ctx.cdc_decode_settle().await?;
+
+    let qx = "select id, v from pl_x order by id";
+    ctx.simple_query(qx).await?;
+    ctx.simple_query("select id, v from pl_w order by id")
+        .await?;
+    ctx.cache_settle().await?;
+
+    // One frame: truncate, then a replay chunk (4096 events) plus a tail
+    // that takes seconds to deliver under the fault.
+    ctx.origin
+        .batch_execute(
+            "BEGIN; truncate pl_x; \
+             insert into pl_x (id, v) select g, g from generate_series(1, 5600) g; \
+             COMMIT;",
+        )
+        .await
+        .map_err(Error::other)?;
+    // The mid-frame replay has evicted pl_x's query: the transaction is open.
+    ctx.queries_registered_wait(1, Duration::from_secs(30))
+        .await?;
+
+    let qz = "select id, v from pl_z order by id";
+    let before = ctx.metrics().await?;
+    ctx.simple_query(qz).await?;
+    let before = assert_cache_miss(&mut ctx, before).await?;
+    // Ready once the frame commits and the drain drops pl_x's cache table.
+    ctx.cache_settle_with_timeout(Duration::from_secs(15))
+        .await?;
+    let served = ctx.simple_query(qz).await?;
+    let m = assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(row_count(&served), 1);
+    assert_eq!(
+        m.cache_restarts_total, 0,
+        "writer must survive the registration"
+    );
+
+    // pl_x registers again on a fresh cache table and serves the frame's rows.
+    let before = ctx.metrics().await?;
+    let served = ctx.simple_query(qx).await?;
+    assert_eq!(row_count(&served), 5600);
+    let before = assert_cache_miss(&mut ctx, before).await?;
+    ctx.cache_settle_with_timeout(Duration::from_secs(30))
+        .await?;
+    let served = ctx.simple_query(qx).await?;
+    assert_cache_hit(&mut ctx, before).await?;
+    assert_eq!(row_count(&served), 5600);
+
+    Ok(())
+}

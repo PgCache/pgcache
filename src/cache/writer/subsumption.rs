@@ -126,7 +126,7 @@ impl WriterRegistration {
         let (generation, relations_changed) = cached_query_insert(core, identity, resolution);
 
         if relations_changed {
-            core.publication_update().await?;
+            core.publication_relations_add().await?;
         }
 
         // Stamp rows: SET generation, execute query, reset generation

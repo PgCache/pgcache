@@ -164,8 +164,8 @@ impl WriterRegistration {
         Ok(())
     }
 
-    /// Admit a non-subsumed query: insert the entry, sync the publication if a
-    /// relation became active, and dispatch its population.
+    /// Admit a non-subsumed query: insert the entry, publish any relation that
+    /// became active, and dispatch its population.
     async fn query_admit(
         &mut self,
         core: &mut WriterCore,
@@ -190,7 +190,7 @@ impl WriterRegistration {
 
         if relations_changed {
             let pub_start = Instant::now();
-            core.publication_update().await?;
+            core.publication_relations_add().await?;
             crate::metrics::handles()
                 .reg
                 .register_publication_update
