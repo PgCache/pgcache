@@ -13,7 +13,11 @@
 
 use std::io::Error;
 
-use crate::util::{TestContext, assert_cache_hit, assert_cache_miss, assert_row_at};
+use tokio_postgres::SimpleQueryMessage;
+
+use crate::util::{
+    TestContext, assert_cache_hit, assert_cache_miss, assert_not_subsumed, assert_row_at, rows_of,
+};
 
 mod util;
 
@@ -549,6 +553,247 @@ async fn test_left_join_cdc_insert_preserved_side() -> Result<(), Error> {
         "new order should have NULL item"
     );
     let _m = assert_cache_miss(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+// =============================================================================
+// Literal predicates in an outer join's ON clause
+// =============================================================================
+
+/// Every row of a simple-query result as its column values, in order.
+fn result_rows(messages: &[SimpleQueryMessage]) -> Vec<Vec<Option<String>>> {
+    rows_of(messages)
+        .iter()
+        .map(|row| {
+            (0..row.len())
+                .map(|i| row.get(i).map(str::to_owned))
+                .collect()
+        })
+        .collect()
+}
+
+/// Run `query` through pgcache and directly on origin.
+async fn proxy_and_origin_rows(
+    ctx: &mut TestContext,
+    query: &str,
+) -> Result<(Vec<Vec<Option<String>>>, Vec<Vec<Option<String>>>), Error> {
+    let proxied = result_rows(&ctx.simple_query(query).await?);
+    let origin = result_rows(&ctx.origin.simple_query(query).await.map_err(Error::other)?);
+    Ok((proxied, origin))
+}
+
+/// A literal on the preserved side in a LEFT JOIN's ON clause filters
+/// nothing: every order is returned, matched or NULL-padded. A preserved-side
+/// INSERT that fails the ON literal must still appear after CDC.
+#[tokio::test]
+async fn test_left_join_on_preserved_literal_cdc_insert() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE lonp_orders (id INTEGER PRIMARY KEY, status TEXT, customer_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE lonp_customers (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO lonp_orders VALUES (1, 'x', 10), (2, 'y', 10)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO lonp_customers VALUES (10, 'Acme')", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT o.id, o.status, c.name \
+                 FROM lonp_orders o LEFT JOIN lonp_customers c \
+                 ON o.customer_id = c.id AND o.status = 'x' \
+                 ORDER BY o.id";
+
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(proxied, origin, "initial result");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(proxied, origin, "cached result");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("INSERT INTO lonp_orders VALUES (3, 'y', 10)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(origin.len(), 3, "origin returns every order");
+    assert_eq!(proxied, origin, "result after preserved-side insert");
+
+    Ok(())
+}
+
+/// A literal on the nullable side of a LEFT JOIN's ON clause, equated to a
+/// preserved-side column, still filters no preserved rows. An order whose
+/// customer_id differs from that literal must still appear after CDC.
+#[tokio::test]
+async fn test_left_join_on_nullable_literal_cdc_insert() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE lonn_orders (id INTEGER PRIMARY KEY, status TEXT, customer_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE lonn_customers (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO lonn_orders VALUES (1, 'x', 10), (2, 'x', 20)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO lonn_customers VALUES (10, 'Acme'), (20, 'Globex')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT o.id, o.status, c.name \
+                 FROM lonn_orders o LEFT JOIN lonn_customers c \
+                 ON o.customer_id = c.id AND c.id = 10 \
+                 ORDER BY o.id";
+
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(proxied, origin, "initial result");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(proxied, origin, "cached result");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("INSERT INTO lonn_orders VALUES (3, 'x', 20)", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(origin.len(), 3, "origin returns every order");
+    assert_eq!(proxied, origin, "result after preserved-side insert");
+
+    Ok(())
+}
+
+/// A LEFT JOIN with a preserved-side literal in its ON clause needs every
+/// order, so a cached parent holding only the orders matching that literal
+/// cannot cover it.
+#[tokio::test]
+async fn test_left_join_on_preserved_literal_not_subsumed() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE lons_orders (id INTEGER PRIMARY KEY, status TEXT, customer_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE lons_customers (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO lons_orders VALUES (1, 'x', 10), (2, 'y', 10)",
+        &[],
+    )
+    .await?;
+    ctx.query("INSERT INTO lons_customers VALUES (10, 'Acme')", &[])
+        .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let m = ctx.metrics().await?;
+    ctx.simple_query("SELECT id, status, customer_id FROM lons_orders WHERE status = 'x'")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    ctx.simple_query("SELECT id, name FROM lons_customers")
+        .await?;
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let query = "SELECT o.id, o.status, c.name \
+                 FROM lons_orders o LEFT JOIN lons_customers c \
+                 ON o.customer_id = c.id AND o.status = 'x' \
+                 ORDER BY o.id";
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(origin.len(), 2, "origin returns every order");
+    assert_eq!(proxied, origin, "join result");
+    let _m = assert_not_subsumed(&mut ctx, m).await?;
+
+    Ok(())
+}
+
+/// A preserved-side column in a LEFT JOIN's ON clause decides which
+/// nullable-side row attaches. Updating it can attach a customer the cache
+/// never loaded, so the order must not be patched in place.
+#[tokio::test]
+async fn test_left_join_on_preserved_literal_cdc_update() -> Result<(), Error> {
+    let mut ctx = TestContext::setup().await?;
+
+    ctx.query(
+        "CREATE TABLE lonu_orders (id INTEGER PRIMARY KEY, status TEXT, customer_id INTEGER)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "CREATE TABLE lonu_customers (id INTEGER PRIMARY KEY, name TEXT)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO lonu_orders VALUES (1, 'x', 10), (2, 'y', 20)",
+        &[],
+    )
+    .await?;
+    ctx.query(
+        "INSERT INTO lonu_customers VALUES (10, 'Acme'), (20, 'Globex')",
+        &[],
+    )
+    .await?;
+    ctx.cdc_decode_settle().await?;
+
+    let query = "SELECT o.id, o.status, c.name \
+                 FROM lonu_orders o LEFT JOIN lonu_customers c \
+                 ON o.customer_id = c.id AND o.status = 'x' \
+                 ORDER BY o.id";
+
+    let m = ctx.metrics().await?;
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(proxied, origin, "initial result");
+    let m = assert_cache_miss(&mut ctx, m).await?;
+    ctx.cache_settle().await?;
+
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(proxied, origin, "cached result");
+    let _m = assert_cache_hit(&mut ctx, m).await?;
+
+    ctx.origin_query("UPDATE lonu_orders SET status = 'x' WHERE id = 2", &[])
+        .await?;
+    ctx.cdc_apply_settle().await?;
+
+    let (proxied, origin) = proxy_and_origin_rows(&mut ctx, query).await?;
+    assert_eq!(
+        origin.get(1).and_then(|row| row.get(2)).cloned().flatten(),
+        Some("Globex".to_owned()),
+        "origin attaches the newly matching customer"
+    );
+    assert_eq!(proxied, origin, "result after preserved-side update");
 
     Ok(())
 }

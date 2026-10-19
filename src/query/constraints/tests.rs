@@ -7,6 +7,7 @@ use super::subsume::table_constraints_subsumed;
 use super::*;
 use crate::catalog::{Catalog, ColumnMetadata, ColumnPosition, TableMetadata};
 use crate::oid::{Oid, TypeOid};
+use crate::query::decorrelate::query_decorrelate;
 use crate::query::resolve::ResolvedQuery;
 
 // Helper function to create test table metadata
@@ -148,7 +149,7 @@ const CONSTRAINTS_EXPECTED: &[(&str, &[&str], &[&str], &str, bool)] = &[
      true),
     ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id CROSS JOIN items",
      &[],
-     &[r#"ColumnEquivalence { left: ConstraintColumn { schema: "public", table: "users", alias: Some("u"), column: "id" }, right: ConstraintColumn { schema: "public", table: "orders", alias: Some("o"), column: "id" } }"#],
+     &[],
      "[]",
      true),
     ("SELECT id FROM users WHERE id NOT IN (1, name, 2)",
@@ -1134,4 +1135,126 @@ fn test_constraint_column_identity_ignores_alias() {
         hasher.finish()
     };
     assert_eq!(hash(&u), hash(&u2));
+}
+
+/// Per-table constraints, each as its debug line, in a comparable order.
+fn table_constraint_lines(constraints: &QueryConstraints) -> Vec<(String, Vec<String>)> {
+    table_constraints_sorted(constraints)
+        .into_iter()
+        .map(|(table, list)| (table.to_string(), list))
+        .collect()
+}
+
+fn expected_lines(expected: &[(&str, &[&str])]) -> Vec<(String, Vec<String>)> {
+    expected
+        .iter()
+        .map(|(table, list)| {
+            let mut list: Vec<String> = list.iter().map(|line| line.to_string()).collect();
+            list.sort();
+            (table.to_string(), list)
+        })
+        .collect()
+}
+
+/// An outer join's ON clause constrains only its nullable side, and an
+/// equality there carries constraints from the preserved side only. A
+/// NULL-rejecting predicate on the nullable side from WHERE, or from an
+/// enclosing ON clause, reduces the join to an inner join (PGC-505).
+#[test]
+fn test_outer_join_constraints() {
+    let tables = catalog(&["users", "orders", "items"]);
+    #[rustfmt::skip]
+    let cases: &[(&str, &[(&str, &[&str])])] = &[
+        ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id AND u.name = 'x'",
+         &[]),
+        ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id AND o.id = 5",
+         &[("orders", &[r#"Comparison("id", Equal, Integer(5))"#])]),
+        ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id WHERE u.id = 5",
+         &[("orders", &[r#"Comparison("id", Equal, Integer(5))"#]),
+           ("users", &[r#"Comparison("id", Equal, Integer(5))"#])]),
+        ("SELECT u.id FROM users u LEFT JOIN orders o USING (id) WHERE u.id = 5",
+         &[("orders", &[r#"Comparison("id", Equal, Integer(5))"#]),
+           ("users", &[r#"Comparison("id", Equal, Integer(5))"#])]),
+        ("SELECT u.id FROM orders o RIGHT JOIN users u ON u.id = o.id AND u.name = 'x' AND o.id = 5",
+         &[("orders", &[r#"Comparison("id", Equal, Integer(5))"#])]),
+        ("SELECT a.id FROM users a LEFT JOIN users b ON a.id = b.id AND a.name = 'x'",
+         &[]),
+        ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id \
+          LEFT JOIN items i ON o.id = i.id AND u.name = 'x'",
+         &[]),
+        // Reduced by WHERE: the equality carries both ways.
+        ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id WHERE o.id = 5",
+         &[("orders", &[r#"Comparison("id", Equal, Integer(5))"#]),
+           ("users", &[r#"Comparison("id", Equal, Integer(5))"#])]),
+        // Reduced: a preserved-side ON literal filters too.
+        ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id AND u.name = 'x' \
+          WHERE o.name = 'y'",
+         &[("orders", &[r#"Comparison("name", Equal, String("y"))"#]),
+           ("users", &[r#"Comparison("name", Equal, String("x"))"#])]),
+        // IS NULL keeps NULL-padded rows: no reduction.
+        ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id AND o.id = 5 \
+          WHERE o.name IS NULL",
+         &[("orders", &[r#"Comparison("id", Equal, Integer(5))"#])]),
+        // WHERE on the innermost nullable side reduces both joins.
+        ("SELECT u.id FROM users u LEFT JOIN (orders o LEFT JOIN items i ON o.id = i.id) \
+          ON u.id = o.id WHERE i.id = 7",
+         &[("items", &[r#"Comparison("id", Equal, Integer(7))"#]),
+           ("orders", &[r#"Comparison("id", Equal, Integer(7))"#]),
+           ("users", &[r#"Comparison("id", Equal, Integer(7))"#])]),
+        // The enclosing ON reduces the nested join, not its own.
+        ("SELECT u.id FROM users u LEFT JOIN (orders o LEFT JOIN items i ON o.id = i.id) \
+          ON u.id = o.id AND i.id = 3",
+         &[("items", &[r#"Comparison("id", Equal, Integer(3))"#]),
+           ("orders", &[r#"Comparison("id", Equal, Integer(3))"#])]),
+        // An inner join's ON above reduces the outer join below it.
+        ("SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id \
+          JOIN items i ON o.id = i.id AND i.id = 2",
+         &[("items", &[r#"Comparison("id", Equal, Integer(2))"#]),
+           ("orders", &[r#"Comparison("id", Equal, Integer(2))"#]),
+           ("users", &[r#"Comparison("id", Equal, Integer(2))"#])]),
+    ];
+    for (sql, expected) in cases {
+        let constraints = constraints_of(sql, &tables);
+        assert_eq!(
+            table_constraint_lines(&constraints),
+            expected_lines(expected),
+            "{sql}"
+        );
+    }
+}
+
+/// Preserved-side columns of an outer join's ON clause decide which
+/// nullable-side row attaches, so they count as join columns.
+#[test]
+fn test_outer_join_match_columns() {
+    let tables = catalog(&["users", "orders"]);
+    let constraints = constraints_of(
+        "SELECT u.id FROM users u LEFT JOIN orders o ON u.id = o.id AND u.name = 'x'",
+        &tables,
+    );
+    let mut users: Vec<&str> = constraints.table_join_columns("users").collect();
+    users.sort();
+    assert_eq!(users, ["id", "name"]);
+    let orders: Vec<&str> = constraints.table_join_columns("orders").collect();
+    assert_eq!(orders, ["id"]);
+}
+
+/// A decorrelated NOT EXISTS is a LEFT JOIN: the subquery's literal on its
+/// correlated column constrains only the subquery table.
+#[test]
+fn test_not_exists_literal_stays_on_subquery_table() {
+    let tables = catalog(&["users", "orders"]);
+    let bound = resolve_sql(
+        "SELECT u.id FROM users u WHERE NOT EXISTS \
+         (SELECT 1 FROM orders o WHERE o.id = u.id AND o.id = 5)",
+        &tables,
+    );
+    let decorrelated = query_decorrelate(&bound, &HashSet::new())
+        .expect("decorrelate")
+        .expect("a NOT EXISTS to decorrelate");
+    let constraints = analyze_query_constraints(&decorrelated);
+    assert_eq!(
+        table_constraint_lines(&constraints),
+        expected_lines(&[("orders", &[r#"Comparison("id", Equal, Integer(5))"#])]),
+    );
 }

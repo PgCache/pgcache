@@ -17,9 +17,9 @@ use std::collections::{HashMap, HashSet};
 
 use ecow::EcoString;
 
-use crate::query::ast::{BinaryOp, LiteralValue, NodeId};
+use crate::query::ast::{BinaryOp, LiteralValue};
 use crate::query::cast::CastTarget;
-use crate::query::resolve::{Bindings, ColumnBinding, ResolvedQuery, TableSlot};
+use crate::query::resolve::{Bindings, ColumnBinding, TableSlot};
 
 mod range;
 #[cfg(feature = "proxy")]
@@ -67,12 +67,6 @@ impl std::hash::Hash for ConstraintColumn {
 }
 
 impl ConstraintColumn {
-    /// The column the reference at `id` stands for; `None` for an
-    /// outer-join merged column or an output name.
-    pub fn at(bound: &ResolvedQuery, id: NodeId) -> Option<Self> {
-        Self::of_binding(bound.bindings(), bound.column_binding_at(id)?)
-    }
-
     pub(super) fn of_binding(bindings: &Bindings, binding: ColumnBinding) -> Option<Self> {
         let column = bindings.binding_column(&binding)?.name.clone();
         Some(match bindings.slot(binding.slot)? {
@@ -145,6 +139,15 @@ impl ColumnEquivalence {
     }
 }
 
+/// An equality in an outer join's ON clause between a preserved-side and a
+/// nullable-side column. Every preserved row survives the join, so a
+/// constraint crosses it from the preserved side only.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OuterJoinEquality {
+    pub preserved: ConstraintColumn,
+    pub nullable: ConstraintColumn,
+}
+
 /// A constraint clause organized for per-table CDC matching and subsumption.
 /// All clauses within a table's Vec are AND-connected.
 #[derive(Debug, Clone, PartialEq)]
@@ -168,6 +171,14 @@ pub struct QueryConstraints {
     /// Column equivalences from JOIN conditions and WHERE clause
     pub equivalences: HashSet<ColumnEquivalence>,
 
+    /// Preserved-to-nullable equalities from outer-join ON clauses.
+    pub outer_equalities: HashSet<OuterJoinEquality>,
+
+    /// Preserved-side columns an outer join's ON clause references outside
+    /// `outer_equalities`. They filter no preserved row, but a change to one
+    /// can attach a nullable-side row, so they count as join columns.
+    pub outer_match_columns: HashSet<ConstraintColumn>,
+
     /// Constraints organized by table for quick lookup
     pub table_constraints: HashMap<EcoString, Vec<TableConstraint>>,
 
@@ -188,6 +199,8 @@ impl Default for QueryConstraints {
         Self {
             column_constraints: HashSet::new(),
             equivalences: HashSet::new(),
+            outer_equalities: HashSet::new(),
+            outer_match_columns: HashSet::new(),
             table_constraints: HashMap::new(),
             where_analysis_complete: true,
         }
@@ -197,7 +210,8 @@ impl Default for QueryConstraints {
 impl QueryConstraints {
     /// Returns column names involved in join conditions for the given table
     pub fn table_join_columns<'a>(&'a self, table_name: &'a str) -> impl Iterator<Item = &'a str> {
-        self.equivalences
+        let equivalence_columns = self
+            .equivalences
             .iter()
             .filter(|eq| eq.is_join())
             .filter_map(move |eq| {
@@ -208,22 +222,44 @@ impl QueryConstraints {
                 } else {
                     None
                 }
-            })
+            });
+        let outer_columns = self
+            .outer_equalities
+            .iter()
+            .flat_map(|eq| [&eq.preserved, &eq.nullable])
+            .chain(&self.outer_match_columns)
+            .filter(move |column| column.table == table_name)
+            .map(|column| column.column.as_str());
+        equivalence_columns.chain(outer_columns)
     }
 }
 
+/// `constraints` closed under the equalities: each equivalence carries a
+/// constraint both ways, each outer-join equality from its preserved column
+/// to its nullable one only.
 pub(super) fn propagate_constraints(
     mut constraints: HashSet<ColumnConstraint>,
     equivalences: &HashSet<ColumnEquivalence>,
+    outer_equalities: &HashSet<OuterJoinEquality>,
 ) -> HashSet<ColumnConstraint> {
+    let edges: Vec<(&ConstraintColumn, &ConstraintColumn)> = equivalences
+        .iter()
+        .flat_map(|equiv| [(&equiv.left, &equiv.right), (&equiv.right, &equiv.left)])
+        .chain(
+            outer_equalities
+                .iter()
+                .map(|equality| (&equality.preserved, &equality.nullable)),
+        )
+        .collect();
     // Fixpoint iteration: propagate until no changes
     loop {
-        let new_constraints: Vec<ColumnConstraint> = equivalences
+        let new_constraints: Vec<ColumnConstraint> = edges
             .iter()
-            .flat_map(|equiv| {
+            .flat_map(|&(from, to)| {
                 constraints
                     .iter()
-                    .filter_map(move |constraint| constraint.across(equiv))
+                    .filter(move |constraint| constraint.column() == from)
+                    .filter_map(move |constraint| constraint.restated_on(to))
             })
             .collect();
         let mut changed = false;
@@ -239,9 +275,11 @@ pub(super) fn propagate_constraints(
 pub(super) fn query_constraints_build(
     constraints: HashSet<ColumnConstraint>,
     equivalences: HashSet<ColumnEquivalence>,
+    outer_equalities: HashSet<OuterJoinEquality>,
+    outer_match_columns: HashSet<ConstraintColumn>,
     where_analysis_complete: bool,
 ) -> QueryConstraints {
-    let column_constraints = propagate_constraints(constraints, &equivalences);
+    let column_constraints = propagate_constraints(constraints, &equivalences, &outer_equalities);
     let mut table_constraints: HashMap<EcoString, Vec<TableConstraint>> = HashMap::new();
     for constraint in &column_constraints {
         let tc = match constraint {
@@ -272,22 +310,16 @@ pub(super) fn query_constraints_build(
     QueryConstraints {
         column_constraints,
         equivalences,
+        outer_equalities,
+        outer_match_columns,
         table_constraints,
         where_analysis_complete,
     }
 }
 
 impl ColumnConstraint {
-    /// This constraint copied onto the other column of `equiv`, when it
-    /// constrains one of them.
-    fn across(&self, equiv: &ColumnEquivalence) -> Option<ColumnConstraint> {
-        let other = if *self.column() == equiv.left {
-            &equiv.right
-        } else if *self.column() == equiv.right {
-            &equiv.left
-        } else {
-            return None;
-        };
+    /// This constraint restated on `other`, a column equal to its own.
+    fn restated_on(&self, other: &ConstraintColumn) -> Option<ColumnConstraint> {
         match self {
             ColumnConstraint::Comparison { op, value, .. } => Some(ColumnConstraint::Comparison {
                 column: other.clone(),
